@@ -358,6 +358,41 @@ from the `data/model-health.json` records the worker/review outcome jobs already
   `::warning::`), never the exemption — the backoff is an optimization and must not reintroduce
   fail-closed starvation.
 
+**Exemption is NOT reachability** ([issue #639](https://github.com/jeswr/agent-account-registry/issues/639)).
+Being exempt from the quota probe means *no usage token is required*; it never meant *the account is
+reachable*, and reading it that way is what kept handing a `credential-remint-required` account
+(#596 / alert #622) to the allocator every tick. Every exempt entry therefore **carries** a
+three-valued `reachability`, derived by `model-health.credential_states` from the same 48 h health
+window as the backoff:
+
+| value | evidence | dispatch | public page |
+| --- | --- | --- | --- |
+| `live` | a `success` record in the window | eligible | `available` |
+| `unproven` | no decisive record (also: no salt, unreadable ledger) | eligible, **bounded** | `available` |
+| `dead` | ≥ `CREDENTIAL_DEAD_MIN` consecutive `auth` rejections, no later success | **ineligible** | `unavailable` |
+| absent / unrecognised | the producer never stated it | **ineligible** | `unknown` |
+
+`usage_eligible` allowlists only `{live, unproven}`, so an unstated or unrecognised value fails
+CLOSED; `usage-alert.classify` and the dashboard's `_quota_state` apply the same allowlist, so
+monitoring, the public page and dispatch cannot disagree. `dead` carries **no TTL** — unlike the
+#596 cooldown it is evidence, not a hold — and clears the instant a `success` is recorded, which is
+why it does not overturn that decision for the interleaved failure pattern it was calibrated on.
+`unproven` still admits because there is no independent liveness probe for an exempt provider
+(`account-whoami.yml` is manual-dispatch and disabled on a public repo), so refusing it would
+self-latch: no dispatch ⇒ no records ⇒ unproven forever. What it costs is bounded to
+`CREDENTIAL_DEAD_MIN` trial dispatches per health window, after which the evidence turns `dead`.
+`prune` preserves a dead run's tail against the `MAX_RECORDS` cap, so a flood of unrelated records
+cannot silently readmit the account.
+
+**The probe must PROVE its materialization** (same issue). `dispatch.yml`'s probe — the lane that
+spends real capacity — now applies the ledgergate the dashboard lane got in #219/#612: the ACCT_*
+materialization step carries **no** `continue-on-error`, the probe step **parses** the token subset
+(a substring test accepts `{"ACCT01_TOKEN":""}` and a truncated `{"ACCT01_TOKEN":`), it records an
+outcome sidecar (`usage-probe.json`, schema `account-usage-probe/v1`) that `usage-alert.py` reads
+fail-closed, and the exempt branch runs **after** that proof — so an unusable subset yields an
+**empty** usage map and the wholesale-outage alert actually fires, instead of a non-empty map of
+exempt accounts nothing was measuring.
+
 ### Credential-outage exits are not declines (issue #596)
 
 A model launch that dies on the **worker account's credential or capacity** — exit class `auth`,

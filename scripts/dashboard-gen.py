@@ -353,6 +353,18 @@ def _quota_state(account, entry, now):
     if availability != "available":
         return availability, None
     if entry.get("exempt") is True:
+        # [registry #639] Exemption skips the QUOTA probe; it never asserts reachability. The page
+        # must not publish as capacity what dispatch refuses to use, in EITHER direction (sol finding
+        # 2, PR #281), so the same allowlist the allocator applies decides here: a credential the
+        # health record proves dead is `unavailable` (a rejected credential, exactly like a non-allowed
+        # probe status), and an entry that states no reachability at all is `unknown` (the producer did
+        # not evaluate it — no measurement to publish), never `available`.
+        reachability = entry.get("reachability")
+        if reachability == _select_and_claim_module().USAGE_REACHABILITY_DEAD:
+            return "unavailable", None
+        if not isinstance(reachability, str) or \
+                reachability not in _select_and_claim_module().USAGE_REACHABILITY_ADMITTED:
+            return "unknown", None
         until = _backoff_epoch(entry.get("backoff_until"))
         if until is not None and until > now:
             return "capped", until
@@ -1512,7 +1524,9 @@ def _self_test():
         "anth-late": {"status": "allowed", "7d_reset": now + 900},
         "anth-unknown": {"status": "allowed"},
         "anth-soon": {"status": "allowed", "7d_reset": now + 100},
-        "openai-one": {"exempt": True},
+        # [#639] the probe stamps reachability on every exempt entry (absent => unknown, so a
+        # fixture without it would exercise the refusal path rather than the healthy one).
+        "openai-one": {"exempt": True, "reachability": "live"},
         "future-one": {"status": "allowed", "7d_reset": now + 500},
     }
     activity_leases = {"leases": [
@@ -1611,7 +1625,7 @@ def _self_test():
         # multi-c: probe fail-closed omitted — counts in the total and as UNKNOWN/unreported
         # (dispatch treats the omission as unavailable), never in accounts_reporting and
         # never as free (sol finding 2, PR #281 fix round)
-        "solo-openai": {"exempt": True, "backoff_until": now + 300},
+        "solo-openai": {"exempt": True, "reachability": "live", "backoff_until": now + 300},
     }
     quota_rows = _provider_quota(quota_accounts, quota_usage, now)
     check("cumulative quota: multi-account provider aggregates mixed capped/free", quota_rows[0], {
@@ -1665,14 +1679,36 @@ def _self_test():
                                (10 ** 400, False),              # absurd int: float() overflows
                                ("garbage", False), (None, False), ([], False), ({}, False),
                                (True, False)):
-        entry = {"exempt": True, "backoff_until": stamp}
+        entry = {"exempt": True, "reachability": "live", "backoff_until": stamp}
         state, _until = _quota_state(exempt_account, entry, now)
         check(f"backoff stamp {str(stamp)[:24]!r}: dashboard capped == allocator excluded",
               (state == "capped", not allocator.usage_eligible(entry, now=now)),
               (want_capped, want_capped))
+    # [registry #639] EXEMPTION IS NOT REACHABILITY, on the page too. #612 made the page honest about
+    # a failed PROBE; this makes it honest about a dead CREDENTIAL. The pairing is the point: every row
+    # asserts the page state and the allocator verdict TOGETHER, so neither surface can drift into
+    # advertising capacity the other refuses (or vice versa).
+    for reachability, want_state in (("live", "available"), ("unproven", "available"),
+                                     ("dead", "unavailable"),
+                                     (None, "unknown"),          # producer never stated it
+                                     ("LIVE", "unknown"), ("available", "unknown"),
+                                     (True, "unknown"), ({}, "unknown")):
+        reach_entry = {"exempt": True}
+        if reachability is not None:
+            reach_entry["reachability"] = reachability
+        state, _until = _quota_state(exempt_account, reach_entry, now)
+        check(f"[#639] exempt reachability {reachability!r}: page state == allocator verdict",
+              (state, state == "available", allocator.usage_eligible(dict(reach_entry), now=now)),
+              (want_state, want_state == "available", want_state == "available"))
+    check("[#639] a DEAD exempt account contributes no cumulative capacity either",
+          [(row["accounts_available"], row["accounts_capped"], row["accounts_unavailable"])
+           for row in _provider_quota(
+               quota_accounts[3:], {"solo-openai": {"exempt": True, "reachability": "dead"}}, now)],
+          [(0, 0, 1)])
     check("cumulative quota: expired backoff no longer counts as capped",
           [(row["accounts_available"], row["accounts_capped"]) for row in _provider_quota(
-              quota_accounts[3:], {"solo-openai": {"exempt": True, "backoff_until": now - 1}},
+              quota_accounts[3:],
+              {"solo-openai": {"exempt": True, "reachability": "live", "backoff_until": now - 1}},
               now)],
           [(1, 0)])
     # PARTIAL probe entries are never free (sol finding 1, PR #281 fix round 3):

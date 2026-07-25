@@ -109,6 +109,38 @@ SAFETY_MARGIN = 0.10  # default fraction of each window that must remain free to
 PREMIUM_MODELS = frozenset({"fable"})
 FABLE_WINDOW = "fable_7d_oi"  # prefix of the fable sub-quota util/reset keys in the usage map
 
+# --- EXEMPTION IS NOT REACHABILITY (registry #639) -------------------------------------------------
+# The probe exemption (issue #29) answers ONE question: this provider publishes no usage headers, so
+# do not require them. It was ALSO being read as "assume the account is available", which is a
+# different claim and one nothing had established — so a credential the system had already diagnosed
+# as dead (`credential-remint-required`, #596 / alert #622) kept being handed to the allocator, and
+# every review dispatch burned a runner plus a lease to reach a 3-second auth failure.
+#
+# So an exempt entry must now CARRY its reachability, derived from the health record by
+# account-usage.py (model-health.credential_states): `live` = a success in the window, `dead` = a run
+# of auth rejections with no later success, `unproven` = no decisive record. Only the two ADMITTING
+# values are allowlisted below, so `dead`, an ABSENT field (a producer that never evaluated
+# reachability — e.g. this stamping deleted), a non-string, or any unrecognised spelling is
+# INELIGIBLE. Allowlisting the admitting side (rather than blocklisting "dead") is what makes the
+# fail direction unprovable-or-unstated ⇒ NOT eligible.
+#
+# WHY `unproven` STILL ADMITS (deliberate, argued — registry #639). There is no independent liveness
+# probe for an exempt provider: the only reachability evidence in this system is a run OUTCOME, and
+# account-whoami.yml (the one credential probe) is manual-dispatch and disabled on a public repo. So
+# refusing `unproven` outright SELF-LATCHES — no dispatch ⇒ no records ⇒ unproven forever ⇒ no
+# dispatch — with no recovery path, converting a bounded cost into permanent starvation of the
+# fleet's only cross-provider reviewer. What `unproven` actually buys is BOUNDED: at most
+# CREDENTIAL_DEAD_MIN trial dispatches per health window, after which the evidence turns `dead` and
+# the account is out until a success proves otherwise. That is the fail-closed bound that IS
+# implementable here, and it is ~2 dead runs per 48 h window against the ~144/day the pre-fix
+# unconditional exemption spent.
+USAGE_REACHABILITY_LIVE = "live"
+USAGE_REACHABILITY_DEAD = "dead"
+USAGE_REACHABILITY_UNPROVEN = "unproven"
+# Parity with model-health.CREDENTIAL_* is asserted in account-usage.py's self-test (the producer
+# that maps one vocabulary onto the other), so the two spellings cannot drift apart silently.
+USAGE_REACHABILITY_ADMITTED = frozenset({USAGE_REACHABILITY_LIVE, USAGE_REACHABILITY_UNPROVEN})
+
 
 def _usage_num(v):
     # OverflowError (cross-provider review r2 finding 3): a forged `backoff_until: 10**400` is
@@ -144,15 +176,29 @@ def usage_eligible(u, margin=SAFETY_MARGIN, model=None, now=None):
 
     PROBE-EXEMPT providers (openai/codex — maintainer decision 2026-07-17, registry issue #29): their
     usage is not observable via any API, so the fail-closed require-usage arm does NOT apply to them —
-    they are eligible WITHOUT usage data and are governed REACTIVELY instead: account-usage.py stamps
+    they need no usage DATA and are governed REACTIVELY instead: account-usage.py stamps
     `backoff_until` (derived from the model-health rate-limit records) onto an exempt entry, and the
     account is excluded while now < backoff_until. A missing or malformed stamp means NO backoff
     (fail-open — the backoff is an optimization; the exemption must never reintroduce the fail-closed
-    starvation it removes). Anthropic accounts keep the fail-closed probing below unchanged."""
+    starvation it removes).
+
+    Needing no usage data is NOT the same as being REACHABLE (registry #639): the exempt arm
+    additionally requires the entry to carry an admitted `reachability` (see
+    USAGE_REACHABILITY_ADMITTED above), so a credential proven dead by the health record — or an
+    entry that never stated reachability at all — is INELIGIBLE. Anthropic accounts keep the
+    fail-closed probing below unchanged (a rejected credential there already fails the probe)."""
     if not isinstance(u, dict):
         return False                                  # no probe data -> do not risk it
     if u.get("exempt") is True:                       # STRICT: only the literal producer-set flag —
         # a forged truthy string (e.g. "false") must not ride the exempt arm (cross-provider r1).
+        # [#639] Exemption skips the QUOTA PROBE; it never asserts reachability. The entry must state
+        # a reachability the producer actually evaluated, and it must not be `dead`.
+        reachability = u.get("reachability")
+        # isinstance FIRST (the OverflowError lesson of cross-provider r2 finding 3): a forged
+        # unhashable value — `{}` / `[]` in a hand-edited snapshot — makes a bare `in <frozenset>`
+        # raise TypeError and abort the whole dispatch instead of failing closed on that one account.
+        if not isinstance(reachability, str) or reachability not in USAGE_REACHABILITY_ADMITTED:
+            return False                              # dead / unstated / unrecognised -> not eligible
         until = _usage_num(u.get("backoff_until"))
         # Finite stamps only (cross-provider review r1): `inf` would sideline the account FOREVER
         # (now < inf is always True) while usage-alert's nan/inf guard reports it healthy — a
@@ -1168,7 +1214,10 @@ def _self_test():
     # DYNAMIC-CONCURRENCY ACCOUNTING: dispatch-claim.py feeds read_accounts output straight into
     # dynamic_concurrency, so the normalized legacy record counts capacity for a sol chain
     # (openai accounts are probe-exempt) while the customized record does not.
-    exempt_usage = {"acctL": {"exempt": True}, "acctC": {"exempt": True}}
+    # [#639] the probe stamps reachability on every exempt entry; a fixture without it is
+    # ineligible by design, so the accounting rows below would pass for the wrong reason.
+    exempt_live = {"exempt": True, "reachability": USAGE_REACHABILITY_LIVE}
+    exempt_usage = {"acctL": dict(exempt_live), "acctC": dict(exempt_live)}
     check("dynamic concurrency counts the normalized legacy record for a sol chain",
           dynamic_concurrency(norm_cat, exempt_usage, ["sol"], now=now), 4)
 
@@ -1553,7 +1602,7 @@ def _self_test():
          "harness": "claude", "credential_format": "claude-oauth-token"},
     ]
     chain_usage = {
-        "acctlead": {"exempt": True},
+        "acctlead": {"exempt": True, "reachability": USAGE_REACHABILITY_LIVE},
         "acctfallback": {"status": "allowed", "5h_util": 0.2, "5h_reset": 2000,
                          "7d_util": 0.2, "7d_reset": 3000, "fable_ok": True,
                          "fable_7d_oi_util": 0.2, "fable_7d_oi_reset": 3000},
@@ -1585,7 +1634,8 @@ def _self_test():
 
     fallback_backoff_usage = {
         **chain_usage,
-        "acctlead": {"exempt": True, "backoff_until": now + 60},
+        "acctlead": {"exempt": True, "reachability": USAGE_REACHABILITY_LIVE,
+                     "backoff_until": now + 60},
     }
     with _StubLedger(chain_accounts, [fallback_full]):
         backed_off_fallback = claim(
@@ -1644,8 +1694,10 @@ def _self_test():
           available_account_slots([{**sol12[0], "available": False}], [], ["sol"], now), 0)
     check("active reactive backoff contributes no sol slots",
           available_account_slots(sol12, [], ["sol"], now,
-                                  usage={"acctsol": {"exempt": True,
-                                                       "backoff_until": now + 60}}), 0)
+                                  usage={"acctsol": {
+                                      "exempt": True,
+                                      "reachability": USAGE_REACHABILITY_LIVE,
+                                      "backoff_until": now + 60}}), 0)
 
     # Reasoned claims make the telemetry's lease-conflict bucket testable without weakening the
     # historical claim-or-None API.  Same-repo package single-flight still wins before capacity.
@@ -1718,7 +1770,10 @@ def _self_test():
     check("ineligible: 5h full", usage_eligible({**fresh, "5h_util": 0.95}), False)
     check("ineligible: 7d full", usage_eligible({**fresh, "7d_util": 0.95}), False)
     check("ineligible: unknown window", usage_eligible({"status": "allowed", "5h_util": 0.1}), False)
-    check("eligible: exempt provider (codex)", usage_eligible({"exempt": True}), True)
+    # [#639] an exempt entry must CARRY its reachability; see the dedicated block below.
+    live_exempt = {"exempt": True, "reachability": USAGE_REACHABILITY_LIVE}
+    check("eligible: exempt provider (codex) with proven reachability",
+          usage_eligible(dict(live_exempt)), True)
     # [ISSUE #196] malformed base SHAPE must fail CLOSED, not fail open as eligible capacity. Each
     # of these admitted the account before the fix: a NaN window (all comparisons false, so the
     # `(1 - util) < margin` headroom test never fired), a NEGATIVE utilization (looks like excess
@@ -1739,28 +1794,59 @@ def _self_test():
     # (i) openai/codex accounts are eligible WITHOUT usage data — deleting the exempt arm turns
     # this red (the entry has no 5h/7d windows, so the fail-closed arm would reject it).
     check("exempt (openai): eligible with NO usage windows at all",
-          usage_eligible({"exempt": True}, now=now), True)
+          usage_eligible(dict(live_exempt), now=now), True)
     # (iv) the exemption must NOT leak across providers: a non-exempt (anthropic) entry with the
     # same missing windows stays ineligible.
     check("anthropic without windows still fail-closed (no cross-provider leak)",
           usage_eligible({"status": "allowed"}, now=now), False)
     # (ii) an ACTIVE backoff excludes the account; (iii) an EXPIRED one readmits it.
     check("exempt with ACTIVE backoff excluded",
-          usage_eligible({"exempt": True, "backoff_until": now + 60}, now=now), False)
+          usage_eligible({**live_exempt, "backoff_until": now + 60}, now=now), False)
     check("exempt with EXPIRED backoff eligible again",
-          usage_eligible({"exempt": True, "backoff_until": now - 1}, now=now), True)
+          usage_eligible({**live_exempt, "backoff_until": now - 1}, now=now), True)
     # (v) a forged/malformed stamp fails OPEN to no-backoff (never crashes, never starves).
     check("malformed backoff stamp fails open",
-          usage_eligible({"exempt": True, "backoff_until": "garbage"}, now=now), True)
+          usage_eligible({**live_exempt, "backoff_until": "garbage"}, now=now), True)
     # (cross-provider review r1) non-finite stamps fail OPEN — inf must not sideline forever…
     check("inf backoff stamp fails open (no indefinite sideline)",
-          usage_eligible({"exempt": True, "backoff_until": "inf"}, now=now), True)
+          usage_eligible({**live_exempt, "backoff_until": "inf"}, now=now), True)
     check("nan backoff stamp fails open",
-          usage_eligible({"exempt": True, "backoff_until": "nan"}, now=now), True)
+          usage_eligible({**live_exempt, "backoff_until": "nan"}, now=now), True)
     # a huge JSON int (10**400) makes float() RAISE OverflowError, not return inf — the forged
     # stamp must fail open to no-backoff, never abort dispatch (cross-provider review r2 f3)
     check("huge-int backoff stamp fails open (OverflowError, no dispatch abort)",
-          usage_eligible({"exempt": True, "backoff_until": 10**400}, now=now), True)
+          usage_eligible({**live_exempt, "backoff_until": 10**400}, now=now), True)
+
+    # ---- [registry #639] EXEMPTION IS NOT REACHABILITY ------------------------------------------
+    # THE defect: `{"exempt": True}` alone used to be eligible, so `acct01` — diagnosed dead
+    # (`credential-remint-required`, #596 / alert #622) and the fleet's only cross-provider review
+    # account — was handed to the allocator on every tick. Mutating the exempt arm back to
+    # unconditional-available reds the first two rows here.
+    check("[#639] exempt + credential proven DEAD is INELIGIBLE (was eligible: the live defect)",
+          usage_eligible({"exempt": True, "reachability": USAGE_REACHABILITY_DEAD}, now=now), False)
+    check("[#639] exempt with NO reachability stated at all is INELIGIBLE (unstated ⇒ refused)",
+          usage_eligible({"exempt": True}, now=now), False)
+    check("[#639] dead beats an expired backoff (it is evidence, not a TTL)",
+          usage_eligible({"exempt": True, "reachability": USAGE_REACHABILITY_DEAD,
+                          "backoff_until": now - 10_000}, now=now), False)
+    # `unproven` admits — bounded to CREDENTIAL_DEAD_MIN trials per window — because there is no
+    # independent liveness probe to break the no-dispatch/no-evidence deadlock (see the constant
+    # block above). It is an EXPLICIT producer verdict, never an absent field.
+    check("[#639] exempt + explicitly UNPROVEN reachability still admits (bounded trials)",
+          usage_eligible({"exempt": True, "reachability": USAGE_REACHABILITY_UNPROVEN}, now=now),
+          True)
+    check("[#639] an unproven exempt account is still excluded by an ACTIVE backoff",
+          usage_eligible({"exempt": True, "reachability": USAGE_REACHABILITY_UNPROVEN,
+                          "backoff_until": now + 60}, now=now), False)
+    # The admitting values are an ALLOWLIST, so every unrecognised/forged spelling fails CLOSED —
+    # including the ones that merely LOOK healthy.
+    for forged in ("LIVE", " live ", "available", "ok", True, 1, None, {}, ["live"]):
+        check(f"[#639] forged reachability {forged!r} does not admit an exempt account",
+              usage_eligible({"exempt": True, "reachability": forged}, now=now), False)
+    # The gate is scoped to the EXEMPT arm: a probed anthropic account is admitted on its windows
+    # and must not start needing a reachability stamp (that would starve the metered fleet).
+    check("[#639] a probed (non-exempt) account needs no reachability stamp",
+          usage_eligible(dict(fresh), now=now), True)
     # …and the exempt flag is STRICT: a forged truthy string must not exempt an account whose
     # entry otherwise lacks usage windows (would-be anthropic bypass).
     check("forged exempt='false' string does NOT exempt (fail-closed)",
@@ -1770,15 +1856,28 @@ def _self_test():
     # choose_account skips a backed-off exempt account and picks the free one; None when all backed off.
     OA = [{"handle": "cx1", "models": ["terra"], "max_concurrent_workers": 1, "available": True},
           {"handle": "cx2", "models": ["terra"], "max_concurrent_workers": 1, "available": True}]
-    ousage = {"cx1": {"exempt": True, "backoff_until": now + 500}, "cx2": {"exempt": True}}
+    ousage = {"cx1": {**live_exempt, "backoff_until": now + 500}, "cx2": dict(live_exempt)}
     check("choose_account skips the backed-off exempt account",
           choose_account(OA, [], ["terra"], "p", "r", now, usage=ousage), "cx2")
     check("choose_account None when every exempt account is backed off",
           choose_account(OA, [], ["terra"], "p", "r", now,
-                         usage={h: {"exempt": True, "backoff_until": now + 500} for h in ("cx1", "cx2")}),
+                         usage={h: {**live_exempt, "backoff_until": now + 500} for h in ("cx1", "cx2")}),
           None)
     check("dynamic concurrency excludes the backed-off exempt account",
           dynamic_concurrency(OA, ousage, ["terra"], now=now), 1)
+    # [#639] the same exclusion through the REAL selection call sites, not just the predicate: a dead
+    # credential must not be selectable and must not contribute capacity.
+    dead_usage = {"cx1": {"exempt": True, "reachability": USAGE_REACHABILITY_DEAD},
+                  "cx2": dict(live_exempt)}
+    check("[#639] choose_account skips the DEAD exempt account and takes the live one",
+          choose_account(OA, [], ["terra"], "p", "r", now, usage=dead_usage), "cx2")
+    check("[#639] a wholly dead exempt fleet selects NOTHING (no runner spent on a dead account)",
+          choose_account(OA, [], ["terra"], "p", "r", now,
+                         usage={h: {"exempt": True, "reachability": USAGE_REACHABILITY_DEAD}
+                                for h in ("cx1", "cx2")}), None)
+    check("[#639] a dead exempt account contributes no dynamic-concurrency capacity",
+          (dynamic_concurrency(OA, dead_usage, ["terra"], now=now),
+           available_account_slots(OA, [], ["terra"], now, usage=dead_usage)), (1, 1))
     U = [{"handle": "soon", "models": ["fable"], "max_concurrent_workers": 1, "available": True},
          {"handle": "middle", "models": ["fable"], "max_concurrent_workers": 1, "available": True},
          {"handle": "late", "models": ["fable"], "max_concurrent_workers": 1, "available": True},
