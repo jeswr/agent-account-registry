@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3881,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "92b55b41f853e08386a6dbaefba811c2e1c80e7b",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`collect_logical` emits every atomic leaf into one flat `Vec<DischargeObligation>` while discarding each `LogicalOperator`. For an `Or(A, B)` policy, a presentation need establish A or B, not both; for `Xone`, exactly-one semantics matters. Yet the API and docs describe the list as what a presentation \"would have to establish\", and the host has no rule/combinator structure from which to reconstruct the real requirement. The test `collects_obligations_nested_in_logical_constraints` uses an outer `Or` but expects both dimensions, making it vacuous with respect to the load-bearing decision semantics. Similar ambiguity exists for prohibitions: one emitted leaf alone does not make a multi-constraint prohibition fire.",
+    "file": "crates/sparq-policy/src/secprop.rs",
+    "fix_hint": "Return a structured discharge expression that preserves Atomic/And/Or/Xone nesting (and the distinction between top-level rule constraints and logical groups), or explicitly rename and document this API as a non-decisional inventory that must never be interpreted as required evidence. Add tests where AND, OR, and XONE produce distinguishable structures and show that a host can determine the valid evidence alternatives without consulting the original Policy.",
+    "severity": "major",
+    "title": "Flattening logical constraints destroys discharge semantics"
+   }
+  ],
+  "progress": null,
+  "summary": "The extraction is not sound as the advertised decision interface because it flattens logical constraints and loses the AND/OR/XONE structure that determines which evidence is actually required. The added nested-OR test only checks that both leaves are emitted, so it confirms the information loss instead of validating a usable discharge requirement. A host consuming the returned flat list cannot distinguish alternatives from jointly required properties and can therefore over-require evidence or combine leaves incorrectly.",
+  "verdict": "request_changes"
+ }
+}
