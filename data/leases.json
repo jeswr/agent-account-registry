@@ -302,16 +302,6 @@
   },
   {
    "account": "58b7c92faa5b5ca5",
-   "claim_id": "b85064a0e01d4730805563c7e0e178af",
-   "holder": "sparq-org/sparq#3027@30184307403.1",
-   "package": "sparq-algos",
-   "role": "impl",
-   "model": "opus5",
-   "issued_at": 1785032236,
-   "expires_at": 1785038536
-  },
-  {
-   "account": "58b7c92faa5b5ca5",
    "claim_id": "3cd721688b1c401f9cbb9943d4430652",
    "holder": "sparq-org/sparq#3037@dispatch-30184153187.1",
    "package": "sparq-shacl",
