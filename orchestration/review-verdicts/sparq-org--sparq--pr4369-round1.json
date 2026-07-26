@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4369,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "6d825b055dab8f9b23aa70f8800ac05114ffe2ea",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The module documentation says the A/B covers native AND wasm32 and Cargo.toml points to measure_ef_vs_block_varint as that gate, but VarintBlocks, its implementation, and measure_ef_vs_block_varint are all guarded by cfg(not(target_arch = \"wasm32\")). Consequently the advertised wasm comparison cannot be built or run, and the statement that both codecs behave the same on wasm is not tested by this harness. This leaves the measurement-gated prototype incomplete and its public claims inaccurate.",
+    "file": "crates/sparq-core/src/eliasfano.rs",
+    "fix_hint": "Provide a wasm-compatible measurement path that exercises EF, PEF, and the same varint baseline under wasm32 (using an appropriate timing/reporting mechanism), or narrow every Cargo/module/README claim to native-only and explicitly track wasm measurement as unresolved before adoption.",
+    "severity": "major",
+    "title": "Claimed wasm32 A/B harness is compiled out on wasm32"
+   },
+   {
+    "body": "The feature exposes a new public eliasfano module and multiple public types, methods, iterator types, and constants. Repository policy requires every public API change to update the corresponding skills/<surface>/SKILL.md in the same change. Updating only crates/sparq-core/README.md does not satisfy that contract, leaving agent-facing usage documentation incomplete.",
+    "file": "crates/sparq-core/src/lib.rs",
+    "fix_hint": "Update the appropriate public-surface skill (and router/reference material if needed) in this PR with feature enablement, monotonic-input requirements, encode failure conditions, and concise get/iter/next_geq examples.",
+    "severity": "major",
+    "title": "New public codec API lacks the required matching skill update"
+   }
+  ],
+  "progress": null,
+  "summary": "The Elias-Fano and partitioned successor implementations appear internally coherent, and the differential/property tests exercise the real encode/decode/seek paths. However, the change is incomplete against two explicit repository and PR claims: it adds a new public Rust API without updating the matching usage skill, and it repeatedly promises a native-and-wasm A/B harness while compiling the entire baseline and measurement test out on wasm32. Those are material public-surface and measurement-gate defects, so this round cannot approve.",
+  "verdict": "request_changes"
+ }
+}
