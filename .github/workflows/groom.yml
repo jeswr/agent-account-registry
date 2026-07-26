@@ -53,6 +53,37 @@ jobs:
       - name: Assert the ledger branch is still data-only
         run: python3 scripts/ledger-invariant.py ledger
 
+      # [OPUS-5] ROUTING-CATALOG SKEW REPORT. An account record and the target routing catalogs that
+      # must be able to route it live in DIFFERENT repositories on different merge schedules, and
+      # nothing compared them: the 2026-07-26 yield incident (a pool account whose record omitted
+      # `harness`, so every claim on it burned a lease and then died at worker.yml's fail-closed
+      # boundary) had to be diagnosed from a live log capture because no periodic check named the
+      # offending account. This step names them, every sweep.
+      #
+      # DELIBERATELY REPORT-ONLY, and deliberately in groom (the repair sweep) rather than in
+      # dispatch: the enforcing boundaries already exist and stay where they are (policy-resolve
+      # rejects an unknown model in a chain, the catalog read drops an unroutable record, worker.yml
+      # re-proves every field before a secret is exposed). A reporter wired into the dispatch hot
+      # path that could fail would be a new outage surface — which is why this is also
+      # continue-on-error: a skew report must never abort the dead-lease release that follows it.
+      # `--fail-on-skew` is the opt-in gate mode and is NOT used here.
+      #
+      # It needs no new TOKEN: the ambient token reads this repo's own account issues, and every
+      # enabled target's routing.toml is public. It DOES need PROVENANCE_SALT — privacy (locked
+      # decision 22a/22b): the report references an account only by its salted provenance
+      # fingerprint, never by handle, so without the salt in context every row collapses to one
+      # withheld marker and the report cannot identify the offending record. The salt is already
+      # read by this job (see the SECRET-EXFIL GUARD note above); no new secret is introduced.
+      - name: Report account-catalog / target-routing skew
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
+        run: |
+          set -euo pipefail
+          python3 scripts/select-and-claim.py --audit-catalog \
+            --repo "$GITHUB_REPOSITORY" --policy-file policy/repos.toml
+
       # Per-owner target token mint (issue #168): policy enables targets under TWO distinct owners
       # (sparq-org, jeswr), so a SINGLE App token scoped to one owner 404s every read and fails
       # every write on the other owner's repo — aborting the sweep before dead leases are released.

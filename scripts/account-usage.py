@@ -1017,9 +1017,12 @@ def _self_test():
     limits_usage = {"acct01": {"5h_limit": "100", "7d_limit": "700"}}
     upath = _usage_file(limits_usage)
     limits_line = "limits: 5h_limit=100 7d_limit=700"
-    valid_anthropic = ("provider: anthropic\nmodels: [haiku]\n"
+    # `harness` is a REQUIRED account-record field (2026-07-26 acct02 lease-burn regression):
+    # select-and-claim's write guard rejects a replacement body without it, so these VALID fixtures
+    # must declare it or they would assert the guard's failure path instead of the merge behaviour.
+    valid_anthropic = ("provider: anthropic\nharness: claude\nmodels: [haiku]\n"
                        "credential_format: claude-oauth-token\nsecret_ref: ACCT01_TOKEN\n")
-    valid_openai = ("provider: openai\nmodels: [sol]\n"
+    valid_openai = ("provider: openai\nharness: codex\nmodels: [sol]\n"
                     "credential_format: codex-auth-json\nsecret_ref: ACCT01_TOKEN\n")
 
     #   (i) the concurrent-overwrite regression: a provider edit lands between the bulk `list` and the
@@ -1106,7 +1109,10 @@ def _self_test():
 
     #   (xi) WRITE GUARD (#521): a selected account whose live replacement body is missing a
     #   required schema field is rejected BEFORE `gh issue edit`; no corrupt record is persisted.
-    invalid_body = ("provider: openai\nmodels: [sol]\n"
+    # Exactly ONE field short (secret_ref) so this row still discriminates the guard it was
+    # written for: without `harness` it would be rejected for the harness requirement too and would
+    # keep passing with the secret_ref check deleted.
+    invalid_body = ("provider: openai\nharness: codex\nmodels: [sol]\n"
                     "credential_format: codex-auth-json\n")
     run, edits = _fake_gh({"list": (0, json.dumps([{"number": 7, "title": "acct01"}])),
                            "view": {"7": [(invalid_body, 0)]}})
