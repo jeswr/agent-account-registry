@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 3822,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "3e6b1932a5135e001afae363e8d4764a5be4f9f0",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "This hunk deletes the `use proptest::prelude::*;`, `short_string()`, and the two `proptest!` metric-law tests \u2014 the only proptest consumers anywhere in sparq-nlq. I confirmed by grep over crates/sparq-nlq/{src,tests,examples,README.md}: after this PR the string \"proptest\" appears in exactly one place in the crate, crates/sparq-nlq/Cargo.toml:81, where it is still declared as a dev-dependency under the comment `# [GPT-5.6] sq-lxw27: metric-law coverage for deterministic dictionary ranking.`\n\nTwo consequences. (1) The dev-dependency is dead weight in sparq-nlq's dev graph \u2014 no build or CI impact (the repo has no cargo-machete/udeps gate, and proptest stays in Cargo.lock via sparq-core's own dev-dependency, so nothing goes red), but it is exactly the kind of leftover a consolidation PR should sweep. (2) More importantly, the comment is now a claim that does not trace to the code: the metric-law coverage it cites moved to crates/sparq-core/src/strdist.rs in this same PR. sparq-core's Cargo.toml is careful to document why proptest is dev-only; leaving a stale pointer in sparq-nlq undoes some of that care and will mislead the next reader into thinking sparq-nlq still owns metric-law tests.\n\nNot a correctness, soundness, test-validity, or security issue \u2014 the four tests that remain in this file all pass and the ranking assertion at line 72 still exercises the real shared `edit_distance`.",
+    "file": "crates/sparq-nlq/tests/constrain_unknown_terms.rs",
+    "fix_hint": "Drop the now-unused `proptest = \"1\"` dev-dependency and its `[GPT-5.6] sq-lxw27` comment from crates/sparq-nlq/Cargo.toml:79-81 (remove the whole `[dev-dependencies]` section if proptest is its only entry). If it is deliberately retained for imminent future proptests, retarget the comment so it no longer claims to justify metric-law coverage that now lives in crates/sparq-core/src/strdist.rs \u2014 e.g. point it at sq-lxw27's new home. Re-run `cargo test -p sparq-nlq` after the removal to confirm nothing else pulled it in.",
+    "severity": "minor",
+    "title": "Removing the last proptest usage leaves sparq-nlq's `proptest` dev-dependency unused, with a now-false justifying comment"
+   },
+   {
+    "body": "Unchanged since round 2 \u2014 repeating for the record, not re-litigating. The bullet is still the first item of the list introduced by \"All entry points take `&Graph` + `&str` and return `Result<_, String>` \u2026 The result types:\". `sparq_core::strdist::edit_distance(&str, &str) -> usize` takes no `&Graph` and returns no `Result`, and is not a result type, so the introducing sentence is false for the first entry in the list; it also displaces `QueryResult` from the head position of the list that exists to document it.\n\nPresentation only. The G2 public-api\u2192skill gate PASSES as-is (`scripts/gate-api-skill.py` reports \"G2 public-api\u2192skill: PASS\"), and the documented signature and description are accurate.",
+    "file": "skills/sparql-query/SKILL.md",
+    "fix_hint": "Move the bullet out of the result-types list \u2014 either append it after that list under its own lead-in (\"Suggestion-ranking helper (not a query entry point):\"), or relocate it to skills/data-formats/SKILL.md, the sparq-core-facing skill per the map in skills/SKILL.md. Either placement satisfies G2, so this is editorial judgement, not a gate requirement.",
+    "severity": "nit",
+    "title": "Carried over from round 2: the `edit_distance` bullet still heads the \"result types\" list whose introducing sentence does not describe it"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 3 adds exactly one thing over round 2: bench/feature-off-declarations/3822.json, the per-PR feature-OFF wasm declaration repairing the failing vectorized-feature-off leg. Verified against the mechanism: it matches the {pr, date, reason} shape in that directory's README and existing declarations (e.g. 1785.json); the gate is a set-difference on the directory listing, so a new <digits>.json satisfies it; and the reason's premise holds \u2014 crates/sparq-wasm/Cargo.toml:17 depends on sparq-core with default-features=false, so an always-compiled sparq-core addition can move feature-OFF bytes. The declaration governs INTENT only and defers size to the wasm_bundle_bytes ratchet, per the README's Scope section. The added code is purely additive and std-only, so it cannot leak a vectorized/default path \u2014 the declaration is not masking a real regression.\n\nRe-verified the substance from round 2 against the checkout, not the diff text: cargo test -p sparq-core --lib strdist = 3 passed (basics + symmetry + triangle inequality); sparq-nlq --test constrain_unknown_terms = 4 passed; sparq-kb --features query --lib = 16 passed; RUSTFLAGS=\"-D warnings\" cargo check -p sparq-core -p sparq-nlq -p sparq-kb --all-targets --all-features clean; cargo build -p sparq-core --no-default-features clean (strdist is unconditional, pure std \u2014 sound in both feature states); RUSTDOCFLAGS=\"-D warnings\" cargo doc -p sparq-core --all-features clean (no feature-gated intra-doc-link trap); scripts/gate-api-skill.py G2 PASS; scripts/check-readme-template.py 0 deviations. The consolidated fn is byte-identical to both deleted copies, and the \"\u00e9\" assertion is non-vacuous (single-codepoint U+00E9, so a byte-oriented impl returns 2 and the test goes red).\n\nOne new hygiene leftover surfaced (below); the round-2 SKILL.md nit is unaddressed. Neither is blocker/major, so the verdict stays approve. Progress is \"regressing\" only by the literal scale \u2014 a new finding above round 2's sole nit.",
+  "verdict": "approve"
+ }
+}
