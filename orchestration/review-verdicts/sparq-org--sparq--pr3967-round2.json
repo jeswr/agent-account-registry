@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3967,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "26a0fefe23bbd750cd2aca087b9ee1e3913859d6",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "cmd_provision skips create-role when the configured role already exists and only replaces its permissions policy; it never calls update-assume-role-policy or validates that the trust document permits ec2.amazonaws.com to call sts:AssumeRole. cmd_check likewise treats get-role success as sufficient. Thus an existing same-named role with an absent or wrong trust principal can be placed in the profile, pass bench_s3_profile_has_role, print provisioned/READY, and be attached by every launcher, but instances receive no role credentials and uploads fail. The current stub and tests model role/profile existence and membership only, so all 71 checks pass vacuously for this failure mode.",
+    "file": "scripts/bench/bench-s3-results.sh",
+    "fix_hint": "Make provision converge the role trust relationship, preferably by calling iam update-assume-role-policy with bench_s3_trust_policy for an existing role as well as using it at creation. Make check validate the effective trust policy permits the EC2 service principal and sts:AssumeRole (handling get-role's URL-encoded policy document correctly), or document why provision is the sole convergence authority and still ensure READY cannot overstate a manually drifted role. Extend the AWS stub with an existing role whose trust principal is wrong and assert provision repairs it and check withholds READY until repaired.",
+    "severity": "major",
+    "title": "Existing role trust policy is neither repaired nor checked"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 1's instance-profile membership defect is fixed: provision now verifies attachment after an ambiguous add-role failure, check requires the configured role, launcher arguments degrade safely, and the hermetic test exercises wrong-role and no-role profiles. The targeted test passes (71 checks). However, provisioning reuses an existing same-named IAM role without repairing or validating its EC2 trust policy, while check verifies only role existence and profile membership. A stale or unrelated role can therefore produce both the success banner and READY even though EC2 cannot assume it, recreating the channel's silent no-upload failure through a different load-bearing IAM relationship.",
+  "verdict": "request_changes"
+ }
+}
