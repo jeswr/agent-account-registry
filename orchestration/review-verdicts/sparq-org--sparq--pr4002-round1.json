@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4002,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "4d4e2f20e3da66a669a3db7e8542598a4b0bb617",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly relocates eleven cross-crate ratchet values into a zero-dependency, unpublished leaf crate and updates both each enforcing test runner and the central scoreboard to consume the same constants. The dev-dependency edges preserve shipping graphs while making changes to the floor crate propagate through the CI reverse-dependency cone. The remaining textual checks are crate-local, coverage is partitioned across exactly one of three guard mechanisms, and the new pin/non-vacuity tests preserve the intended ratchet invariants. Documentation and the residual audit are consistent with the implementation. I found no correctness, soundness, security, or vacuous-test defect in the diff. Targeted Rust tests could not be rerun in this environment because cargo is unavailable.",
+  "verdict": "approve"
+ }
+}
