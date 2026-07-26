@@ -112,16 +112,6 @@
   },
   {
    "account": "51bde6688e140866",
-   "claim_id": "0ccc5eb043f04b1da6883c7182a53744",
-   "holder": "sparq-org/sparq#2951@30212333817.1",
-   "package": "workspace",
-   "role": "ci",
-   "model": "opus5",
-   "issued_at": 1785086393,
-   "expires_at": 1785092693
-  },
-  {
-   "account": "51bde6688e140866",
    "claim_id": "30085df6f8b64658b11b45342411b8f0",
    "holder": "sparq-org/sparq#1746@30212336621.1",
    "package": "sparq-canon",
