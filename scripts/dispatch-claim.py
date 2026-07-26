@@ -5524,6 +5524,28 @@ def _self_test():
     assert trip_k["claim_calls"] == 0, trip_k
     print("  ok   #701 (k): the terminal is status:parked (machine-recoverable), never needs:user")
 
+    # (k2) [OPUS-5] registry #738 — THE SINGLE-RUNG `role:impl` CHAIN TAKES THE DECOMPOSE ARM.
+    # Removing sol from the impl fallback left `role:impl` at `["opus5"]`, so #733's
+    # `retry-other-tier` arm has no other tier to narrow TO. It must therefore take the `decompose`
+    # arm — reroute at a threshold of ONE — and must NOT dead-end (no second identical opus5
+    # dispatch, no silent defer with the evidence unspent). Driven through the REAL dispatch() call
+    # site with the impl role, not by asserting on retry_decision in isolation.
+    #
+    # MUTANT: make retry_decision return PROCEED on an emptied chain => `claim_calls` becomes 1 and
+    # the reroute API calls vanish => RED.
+    assert _no_change_routing.retry_decision(
+        ["opus5"], [nc_record("opus5", -20)], decline_now) == (_no_change_routing.DECOMPOSE, [])
+    trip_k2 = run_decline_tripwire([nc_record("opus5", -20)], role="impl",
+                                   model_chain=("opus5",))
+    assert [call[0] for call in trip_k2["api_calls"]] == ["POST", "GET", "PATCH"], trip_k2
+    assert DECLINE_ESCALATION_MARKER in trip_k2["api_calls"][0][2]["body"], trip_k2
+    assert trip_k2["api_calls"][-1][2]["labels"] == [
+        "area:dispatch", "priority:P1", "role:research", "status:deferred"], trip_k2
+    assert trip_k2["claim_calls"] == 0 and trip_k2["claimed_chains"] == [], trip_k2
+    assert "needs:user" not in json.dumps(trip_k2["api_calls"]), trip_k2
+    print("  ok   #738 (k2): a no_change on the OPUS5-ONLY impl chain decomposes on the FIRST "
+          "outcome — never a second identical opus5 dispatch, never a needs:user park")
+
     # (l) NO DEADLOCK AFTER THE REROUTE. Once the reroute for this exact evidence is receipted and
     # the issue sits on its new route, the SAME evidence must not also narrow the new route's chain
     # to nothing — that would defer the decomposition forever. The spent evidence falls through on
@@ -10603,6 +10625,44 @@ def _self_test():
     assert escalate_starved(True, {"acct01": {}}, 1) is False
     assert escalate_starved(False, {"acct01": {}}, 0) is False
     assert escalate_starved(None, {"acct01": {}}, 0) is False
+
+    # [OPUS-5] registry #738 — `role:impl` IS NOW ONE OF THOSE ROUTES, and the composition is what
+    # matters, not the predicate in isolation. Removing sol left a single-rung `["opus5"]` impl
+    # chain; without `escalate = true` an opus5 capacity outage could only defer, and defer again,
+    # forever, with nobody notified. So the LIVE routing table's `role:impl` route is resolved here
+    # and its own `escalate` value is fed into the starvation ladder.
+    #
+    # MUTANT: delete `escalate = true` from the role:impl route in orchestration/routing.toml, or
+    # from a target's, => the first assertion goes red. MUTANT: make `escalate_starved` require a
+    # multi-rung chain => the second goes red.
+    _impl_route = _POLICY_FOR_IMPL = None
+    for _r in tomllib.loads(
+            (Path(__file__).resolve().parents[1] / "orchestration" / "routing.toml")
+            .read_text(encoding="utf-8")).get("route", []):
+        if _r.get("role") == "impl" and "match_labels" not in _r:
+            _impl_route = _r
+            break
+    assert _impl_route is not None, "the live routing table declares no role:impl route"
+    assert _impl_route["model_chain"] == ["opus5"], _impl_route
+    assert _impl_route.get("escalate") is True, (
+        "role:impl is a SINGLE-RUNG chain: without escalate = true, an opus5 capacity outage is a "
+        "silent permanent stall with no counted reason and no ops alert")
+    # A starved single-rung impl route IS detected as starved (so the defer is attributable) ...
+    assert escalate_starved(_impl_route.get("escalate"), {"acct01": {}}, 0) is True
+    # ... and the FIRST such tick is TRANSIENT: no park, no human terminal, keep retrying. This is
+    # the "defer must terminate and be attributable, not park" obligation, asserted rather than
+    # assumed.
+    assert escalate_persist_decision([], "app[bot]", int(time.time()),
+                                     "<!-- sparq-worker-attempt:v1") == (False, "")
+    # ... and the counted reasons are DISTINGUISHABLE from the generic capacity defer, so a starved
+    # impl frontier cannot hide inside `no-eligible-account`.
+    assert len({"escalate-tier-starved-transient", "escalate-tier-starved",
+                "no-eligible-account"}) == 3
+    _dispatch_src = Path(__file__).resolve().read_text(encoding="utf-8")
+    for _reason in ("escalate-tier-starved-transient", "escalate-tier-starved"):
+        assert f'defer_reasons["{_reason}"]' in _dispatch_src, _reason
+    print("  ok   #738: role:impl is single-rung AND escalating; starvation defers transiently with "
+          "its own counted reason before any park")
 
     # Issue #116: a starved escalate route must NOT convert one transient usage snapshot into a
     # permanent human terminal. escalate_persist_decision separates the momentary-starved predicate

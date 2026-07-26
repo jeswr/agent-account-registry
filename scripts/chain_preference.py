@@ -215,6 +215,12 @@ def apply_preferences(labels, chain, preferences, role=None):
             # ADDING the lead is a strictly larger effect than re-ordering, so it is opt-in per
             # preference AND per role (see `inject_roles` in the module docstring). Without the
             # opt-in this declines exactly as it did before the field existed.
+            #
+            # HONESTY NOTE, found by mutating this line: `role is None` is NOT the binding guard.
+            # `None not in inject_roles` is already true for every well-formed allow-list, so
+            # deleting that half leaves behaviour identical and no assertion can see it. It is kept
+            # because it states the intent where the decision is made, but the MEMBERSHIP test is
+            # what carries the property. Same shape as the note in no_change_routing.excluded_tiers.
             if role is None or role not in inject_roles:
                 continue
             if not (requires - {lead}) <= set(chain):
@@ -340,8 +346,14 @@ def _self_test():  # noqa: C901 — a flat sequence of assertions, deliberately 
             apply_preferences({"area:gui", f"role:{other}"}, ["opus5"], inj, role=other), ["opus5"])
     # A ROLELESS issue can never inject: no role, nothing to authorise it. Reds if `role is None`
     # is dropped from the guard.
+    # ...and the EXPORTED CONTRACT for a roleless issue, which the membership test carries (see the
+    # honesty note in apply_preferences: the `role is None` half is redundant, so this row pins the
+    # BEHAVIOUR rather than that clause).
     chk("a ROLELESS issue (the [defaults] branch) can never be injected into",
         apply_preferences({"area:gui"}, ["opus5"], inj, role=None), ["opus5"])
+    for junk in (None, "", "IMPL", 7, True):
+        chk(f"a role of {junk!r} authorises no injection",
+            apply_preferences({"area:gui"}, ["opus5"], inj, role=junk), ["opus5"])
     # `requires` MINUS the lead is still enforced: a chain missing the other required model does
     # not get the lead added. Reds if the `(requires - {lead}) <= set(chain)` check is deleted.
     chk("injection still requires the REST of `requires` to be in the chain",
