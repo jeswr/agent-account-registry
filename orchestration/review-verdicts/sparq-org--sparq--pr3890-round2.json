@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3890,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "4b72d1352f33d1232b8abc3d765a48ae5e0f6fcb",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 1's graph-union defect is fixed. graph_union now preserves the non-NULL graph set contributed by either the subject map or predicate-object map, while distinguishing absent graph maps (default graph) from present maps that all evaluate NULL (no generated statement). The two new real-path tests exercise both asymmetric cases: r2rml_null_subject_graph_keeps_pom_generated_graph and r2rml_null_pom_graph_keeps_subject_generated_graph. Their expected outputs demonstrate that the surviving side's graph is retained, and the surrounding class/POM behavior is consistent with the same representation. No correctness, soundness, test-validity, or security issue remains in the reviewed diff.",
+  "verdict": "approve"
+ }
+}
