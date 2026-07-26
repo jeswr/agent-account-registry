@@ -162,16 +162,6 @@
   },
   {
    "account": "dc2d751954080e13",
-   "claim_id": "1a880673887e4624aa3a4434004505a8",
-   "holder": "sparq-org/sparq#3209@30216691650.1",
-   "package": "performance",
-   "role": "impl",
-   "model": "sol",
-   "issued_at": 1785093724,
-   "expires_at": 1785100024
-  },
-  {
-   "account": "dc2d751954080e13",
    "claim_id": "e3f7d75458484903a392236f89189e0f",
    "holder": "sparq-org/sparq#3409@30216697451.1",
    "package": "sparq-shacl",
