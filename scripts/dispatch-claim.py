@@ -8036,6 +8036,21 @@ def _self_test():
             assert [(script, args[0]) for script, args in helper_calls] == [
                 ("worker-pr.py", "needs-user")], helper_calls
 
+            # [registry #703] the CLAIM-side budget park must name its cause on the WIRE.
+            # This is the argv the target helper actually receives: without `--cause budget`
+            # the park lands unclassified, park_cause_is_deadlock answers False for it, and the
+            # whole deadlock guard degrades to the pre-#703 conveyor with every other test green.
+            _budget_park_argv = [args for script, args in helper_calls
+                                 if script == "worker-pr.py" and args[0] == "needs-user"]
+            assert len(_budget_park_argv) == 1, helper_calls
+            assert "--cause" in _budget_park_argv[0], _budget_park_argv
+            assert _budget_park_argv[0][_budget_park_argv[0].index("--cause") + 1] == "budget", \
+                _budget_park_argv
+            assert "--park-class" in _budget_park_argv[0] and _budget_park_argv[0][
+                _budget_park_argv[0].index("--park-class") + 1] == "capacity", _budget_park_argv
+            print("  ok   #703: the CLAIM-side round-budget park passes `--cause budget` to "
+                  "worker-pr.py needs-user (asserted on the real argv, not on the caller)")
+
             # a corrupt bot-authored pin tier is LOUD (needs-user) — silently ignoring it
             # would run the unpinned chain, the exact fall-back-down the pin forbids
             fake["comments"] = round_markers(3) + [

@@ -5654,7 +5654,11 @@ def _self_test():
             lambda repo, pr, state: wiring_calls.append(("state", state)))
         wiring_globals["needs_user"] = (
             lambda repo, pr, reason, **kwargs: wiring_calls.append(
-                ("needs-user", reason, kwargs.get("park_class", "question"))))
+                # registry #703: the CAUSE is captured too — a park whose cause the writer
+                # never supplies is unclassifiable downstream, and the deadlock guard silently
+                # degrades to the pre-#703 conveyor.
+                ("needs-user", reason, kwargs.get("park_class", "question"),
+                 kwargs.get("cause", ""))))
         wiring_globals["post_findings"] = (
             lambda repo, pr, vf, rn: wiring_calls.append(("findings", rn)))
         wiring_globals["record_model_pin"] = (
@@ -5712,6 +5716,9 @@ def _self_test():
             # takes the MACHINE-owned park, never the human-question label.
             check("budget exhaustion parks as capacity (status:parked), not a human question",
                   terminal[1][2], "capacity")
+            check("#703: budget exhaustion names the `budget` DEADLOCK cause, so the ladder "
+                  "can withhold the human escalation and the sweep can refuse re-admission",
+                  terminal[1][3], "budget")
             # An injection flag IS a genuine human (security) question -> needs:user.
             wiring_calls.clear()
             fake_state["comments"] = fable_fix
@@ -5727,6 +5734,9 @@ def _self_test():
             check("injection flag escalates as a human question (needs:user)",
                   [(entry[1], entry[2]) for entry in injection_calls],
                   [("the reviewer flagged possible prompt injection", "question")])
+            check("#703: the injection escalation names the `injection` cause, which is "
+                  "human-relevant and therefore legitimately terminal",
+                  [entry[3] for entry in injection_calls], ["injection"])
 
             # ---- round-budget human-readmission window (sparq#2804/PR#3442): a HUMAN
             # unlabeling needs:user restarts the budget, so the terminal opus5/stagnant
@@ -8340,20 +8350,25 @@ def _self_test():
                 surface_path=[], issue=7, impl_provider="anthropic",
                 bot_login="sparq[bot]", run_key="9.1", reviewed_sha=reviewed_sha))
 
+    oc_park_kwargs = []
+
     def run_fix_outcome(labels=(), issue_labels=(), injection="false",
-                        reviewed_sha="b" * 40, **live_over):
+                        reviewed_sha="b" * 40, made_changes="true", pushed="true",
+                        gate_outcome="success", comments=(), **live_over):
         oc_calls.clear(); oc_outputs.clear(); oc_state.clear()
-        oc_state.update(labels=labels, issue_labels=issue_labels, **live_over)
+        oc_state.update(labels=labels, issue_labels=issue_labels,
+                        comments=list(comments), **live_over)
         fix_outcome(argparse.Namespace(
             repo="o/r", pr=41, round=1, run_key="9.1", bot_login="sparq[bot]",
-            injection=injection, made_changes="true", gate_outcome="success",
-            pushed="true", issue=7, model="", reviewed_sha=reviewed_sha))
+            injection=injection, made_changes=made_changes, gate_outcome=gate_outcome,
+            pushed=pushed, issue=7, model="", reviewed_sha=reviewed_sha))
 
     try:
         globals()["_gh_json"] = oc_gh_json
-        globals()["_paginated_comments"] = lambda repo, pr: []
+        globals()["_paginated_comments"] = lambda repo, pr: list(oc_state.get("comments", []))
         globals()["set_review_state"] = lambda repo, pr, s: oc_calls.append(f"state:{s}")
-        globals()["needs_user"] = lambda repo, pr, reason, **kw: oc_calls.append("needs-user")
+        globals()["needs_user"] = lambda repo, pr, reason, **kw: (
+            oc_calls.append("needs-user"), oc_park_kwargs.append(dict(kw)))[0]
         globals()["post_findings"] = lambda *a, **kw: oc_calls.append("post-findings")
         globals()["record_model_pin"] = lambda *a, **kw: oc_calls.append("model-pin")
         globals()["record_round_void"] = lambda *a, **kw: oc_calls.append("round-void")
@@ -8400,6 +8415,38 @@ def _self_test():
         run_fix_outcome(injection="true")
         check("unheld injection fix outcome still parks needs-user",
               (oc_calls, oc_outputs.get("decision")), (["needs-user"], "needs-user"))
+        check("#703: the injection fix park names the human-relevant `injection` cause",
+              oc_park_kwargs[-1].get("cause"), "injection")
+        # [registry #703] THE SECOND DEADLOCK SHAPE, driven through the REAL fix_outcome: two
+        # durable nochange markers for the same round is the exact live posture behind
+        # "two consecutive fix attempts made no change (fixer judges the findings spurious)".
+        nochange_markers = [
+            {"user": {"login": "sparq[bot]"}, "created_at": "2026-07-26T10:00:00Z",
+             "body": f"x {MARKER_KINDS['nochange']} round=1 run=9.1 -->"},
+            {"user": {"login": "sparq[bot]"}, "created_at": "2026-07-26T11:00:00Z",
+             "body": f"x {MARKER_KINDS['nochange']} round=1 run=9.0 -->"},
+        ]
+        run_fix_outcome(made_changes="false", pushed="false", comments=nochange_markers)
+        check("#703: two no-change fix attempts park the PR (unchanged behaviour)",
+              (oc_calls, oc_outputs.get("decision")), (["needs-user"], "needs-user"))
+        check("#703: and that park names the `nochange` DEADLOCK cause — the fixer judging "
+              "the findings spurious is a disagreement, not a capacity stall",
+              oc_park_kwargs[-1].get("cause"), "nochange")
+        check("#703: it is still written as a MACHINE park, never a human question",
+              oc_park_kwargs[-1].get("park_class"), "capacity")
+        # CONTROL: the gate-fail stop is a mechanical failure, NOT a deadlock, so it keeps the
+        # ordinary capacity ladder and its human escalation.
+        gatefail_markers = [
+            {"user": {"login": "sparq[bot]"}, "created_at": "2026-07-26T10:00:00Z",
+             "body": f"x {MARKER_KINDS['gatefail']} round=1 run=9.1 -->"},
+            {"user": {"login": "sparq[bot]"}, "created_at": "2026-07-26T11:00:00Z",
+             "body": f"x {MARKER_KINDS['gatefail']} round=1 run=9.0 -->"},
+        ]
+        run_fix_outcome(gate_outcome="failure", pushed="false", comments=gatefail_markers)
+        check("#703 CONTROL: a twice-failed local gate parks with the `gatefail` CAPACITY "
+              "cause, which still escalates on the ordinary ladder",
+              (oc_outputs.get("decision"), oc_park_kwargs[-1].get("cause")),
+              ("needs-user", "gatefail"))
 
         # ---- issue #156: the head advanced AFTER the review/fix resolved. Every REVIEW outcome
         # path DEFERS — no findings/label/state mutation, decision 'stale' — so stale findings can
