@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3574,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "1c3baf7635fc3fa2f52f3f7df7e6da79989095eb",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 2 of a doc-only change adding a 'Node instantiation attribution (sq-3ul2n.10)' subsection to bench/wasm-compare/browser/README.md. The diff is unchanged from round 1; I re-verified every technical claim independently against the referenced harness rather than deferring to the prior verdict. Sequencing claim holds structurally: node-baseline.mjs completes readFile (line 47) and WebAssembly.compile (line 51), then imports both generated glue modules (lines 56-57), and only then starts the timer (line 58) around glue.default({module_or_path: module}) (line 59). Because an already-compiled WebAssembly.Module is passed rather than bytes or a URL, the wasm-bindgen --target web init path performs WebAssembly.instantiate(module, imports) with no fetch and no recompile, so the timed window genuinely contains only import-table construction, V8 instantiation, and wasm-bindgen finalisation including __wbindgen_start -- exactly as documented. The 'no TextDecoder result marshalling' claim also holds: the decoder is constructed at glue module scope during the untimed import at line 56, and the workload does not begin until line 62, after the timed section closes. The --target nodejs reasoning (same wasm module, imports, and start function; differs in module loading and byte acquisition) is accurate and is appropriately hedged with the 'unless a minimal wasm-bindgen/V8 reproducer separates the residual further' clause, so it is a judgement call rather than an overclaim. Note the generated glue (js/wasm/sparq_wasm.js) is a gitignored build artifact and was not present in the checkout, so glue behaviour was assessed from standard wasm-bindgen --target web semantics plus the harness structure; this does not weaken the attribution, which is structural -- compile is timed in a separate phase, so the instantiate phase is bounded by construction. No hard-coded performance numbers are introduced, consistent with the repo's no-perf-numbers-in-markdown rule, and \u2026 [truncated 367 chars]",
+  "verdict": "approve"
+ }
+}
