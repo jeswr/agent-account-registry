@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 4355,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "5e2bfe9f974d938b9c9428eafd887a045f62f37c",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "refuseOnCount() reads cc.expected solely from the same envelope that supplies the timing. It never loads or checks bench/<suite>/expected-rows.tsv, although the docs and generated artifact claim that committed expected rows are the authority. An envelope with an incorrect but internally consistent expected value is therefore admitted. Worse, when expected is absent, cc.all_agree === true admits the row without checking cc[engine] against the TSV count, so an inconsistent row can pass. This breaks the central fail-closed honesty invariant.",
+    "file": "site/scripts/sync-canonical-timing.mjs",
+    "fix_hint": "Load the suite's committed expected-rows data independently and compare each TSV count to it when available. In the fallback path, derive agreement from the per-engine crosscheck values (or at minimum require cc[engine] to equal the TSV count and all participating engine counts to be identical) rather than trusting all_agree alone. Add mutation tests where envelope expected disagrees with the committed file and where all_agree=true but cc[engine] differs from the TSV row.",
+    "severity": "major",
+    "title": "COUNT BEFORE TIME trusts envelope assertions instead of committed expected rows"
+   },
+   {
+    "body": "The module exposes timing_data, and timing-selfcheck.typ imports it. Any paper can likewise import timing_data and render timing_data.records.at(key).value directly, bypassing headline_timing() and all provenance rendering. This directly contradicts the stated invariant that headline_timing is the only way a timing can reach a page.",
+    "file": "site/papers/_lib/timing.typ",
+    "fix_hint": "Do not export the raw parsed data to consumers. Restructure the self-check so it can exercise a known/accessor-selected record without importing the raw dataset, and add a build-time source gate that rejects paper imports/direct json reads of the generated timing file. Update the structural test to detect raw exported bindings and direct access paths, not only key-taking function declarations.",
+    "severity": "major",
+    "title": "Public timing_data binding bypasses forced provenance"
+   },
+   {
+    "body": "The test only enumerates functions matching '#let name(key) ='. It cannot detect exported data bindings, functions with different parameter forms, aliases, or direct json reads. Consequently it passes while timing_data already provides a bare-value accessor path.",
+    "file": "site/test/paper-timing.test.mjs",
+    "fix_hint": "Replace the narrow regex assertion with tests/gates that cover the actual publication boundary: forbid raw timing-data imports and direct generated-JSON reads from registered paper sources, and ensure timing.typ exports only provenance-rendering entry points. Include a negative fixture that attempts to publish timing_data.records.at(key).value and assert the build fails.",
+    "severity": "major",
+    "title": "No-raw-accessor test is vacuous against the actual escape hatch"
+   }
+  ],
+  "progress": null,
+  "summary": "The change has two load-bearing honesty gaps. The derivation does not actually verify counts against the committed expected-rows files it claims to use; it trusts expected/all_agree fields inside the timing envelope, and the no-expected branch does not even compare the TSV row with that engine's crosscheck value. Separately, timing.typ publicly exposes timing_data, giving papers a direct raw-value path despite the claimed provenance-unavoidable API, while the structural test explicitly permits that escape hatch.",
+  "verdict": "request_changes"
+ }
+}
