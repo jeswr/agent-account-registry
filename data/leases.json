@@ -43,12 +43,12 @@
   {
    "account": "dc2d751954080e13",
    "claim_id": "2071a4073826450585afc2cb402717da",
-   "holder": "sparq-org/sparq#2592@dispatch-30212092399.1",
+   "holder": "sparq-org/sparq#2592@30212293633.1",
    "package": "site-specs",
    "role": "impl",
    "model": "sol",
-   "issued_at": 1785086299,
-   "expires_at": 1785092599
+   "issued_at": 1785086320,
+   "expires_at": 1785092620
   },
   {
    "account": "9e13ea21abf27e68",
