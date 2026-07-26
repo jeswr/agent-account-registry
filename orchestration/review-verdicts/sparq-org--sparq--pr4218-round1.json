@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4218,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "20b71dd9e88452139c6d4e3182993f2e7dba1bd4",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change consistently adds rule-level provenance without placing audit annotations in the enforcement graph. Plain grants receive deterministic RDF reification anchors, conditional grants use their existing grant nodes, identifiers are conservatively represented as literals when they could enter the reserved namespace, and refresh/retraction rebuild semantics clear stale annotations. The tests exercise the real SPARQL-visible graph shape, enforcement-view isolation, deny and conditional paths, anti-forgery handling, idempotence, retraction, and separation of distinct grants. The documentation accurately preserves the explicit N3-path limitation.",
+  "verdict": "approve"
+ }
+}
