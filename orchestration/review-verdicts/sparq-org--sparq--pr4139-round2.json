@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4139,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a7d72fd41d986ccd0d07f1b4dc4aebb32b7b8094",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior major finding. The badge now gets count-independent geometry from an invisible in-flow ghost label, while the live count is absolutely positioned and therefore cannot resize the badge or shift surrounding layout. Counts above the supported exact range degrade to the same reserved label, and the focused tests cover zero, singular/plural, digit boundaries, overflow, and non-finite inputs. The workflow refresh path remains safely limited to full mode, skips comparison during refresh, forces issue routing off, and uploads the regenerated baselines for manual review. No correctness, soundness, security, or non-vacuous-test issue remains.",
+  "verdict": "approve"
+ }
+}
