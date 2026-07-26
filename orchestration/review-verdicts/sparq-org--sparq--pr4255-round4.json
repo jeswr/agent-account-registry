@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4255,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ef757799b02e39e1fd90f5860ee63b8cfb187a37",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "CombinationBudget::new documents that if either limit is zero the pass \"simply declines everything.\" With max_combinations >= the combination count and max_intermediate_bindings == 0, combination_is_live checks the width limit only when it is about to push a merged row. If the first constrained relation has zero rows, next remains empty and the function returns Ok(false), so the caller records EmptyProvenance and SummaryPruneOutcome::Applied instead of Declined. Thus a caller using a zero intermediate budget as the documented disable/decline setting can still prune candidates and mark the BGP dead.",
+    "file": "crates/sparq-fedplan-mpc/src/combination.rs",
+    "fix_hint": "Before relation construction/enumeration, return SummaryPruneOutcome::Declined when max_intermediate_bindings is zero (using JoinTooWide is sufficient), or explicitly redefine and document zero as permitting zero-width emptiness proofs. Add a regression with max_combinations > 0, max_intermediate_bindings == 0, and a complete summary whose selected pattern relation is empty; pin the chosen contract.",
+    "severity": "major",
+    "title": "Zero intermediate budget does not always decline as documented"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 3's approved recall-safety and disclosure findings remain resolved, and the new alignment validation is fail-closed. However, round 4 exposes a new budget-contract mismatch: CombinationBudget documents that either zero limit declines everything, but a zero intermediate-binding budget can still produce an Applied result and prune combinations when a chosen complete-summary relation is empty. This does not make the quotient proof itself unsound, but it violates the public control's stated behavior and can make a caller's intended disable/decline setting prune sources. No hostile reviewer-directed instruction was detected.",
+  "verdict": "request_changes"
+ }
+}
