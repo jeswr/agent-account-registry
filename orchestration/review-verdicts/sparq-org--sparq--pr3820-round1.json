@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 3820,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d1bf518d111e833ac137270805415f760c46c329",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The `numeric` feature comment (lines 42-43) still reads: \"SCAFFOLD: the type shape + total-order/promotion-rank accessors only; the full `compare_values` / arithmetic move lands in epic Phase 2.\" That is no longer true. `crates/sparq-substrate/src/numeric.rs` ships the full tower: `Dec::checked_add/checked_sub/checked_mul/checked_div/round_to_int`, `Num::binop/neg/abs/ceil/floor/round`, `cmp_total`, `cmp_relational`, `canonical_lexical`. The package `description` on line 7 of this same file already says \"the XSD numeric value tower (Num/Dec/as_numeric + arithmetic)\", and crates/sparq-engine/Cargo.toml:409-416 records Phase 2 as landed. So the file contradicts itself. This PR is explicitly a staleness-reconciliation of this file's comments, which makes the omission conspicuous, but it is pre-existing drift rather than a regression introduced here \u2014 hence minor, not blocking.",
+    "file": "crates/sparq-substrate/Cargo.toml",
+    "fix_hint": "Drop the \"SCAFFOLD: ... lands in epic Phase 2\" sentence from the `numeric` feature comment and state what actually ships (Num/Dec + as_numeric + checked arithmetic + total/relational order), matching the wording already used in the package `description` and in crates/sparq-engine/Cargo.toml:413-416.",
+    "severity": "minor",
+    "title": "Stale 'SCAFFOLD ... arithmetic move lands in epic Phase 2' claim on the `numeric` feature contradicts the shipped code and the package description"
+   },
+   {
+    "body": "The PR correctly reframes the header to \"DEFAULT-OFF at this crate's boundary\" and admits the crate is in the feature-OFF wasm graph. But the three per-feature comments still assert the older workspace-wide framing: `numeric` (line 45) \"the lean default build links nothing\", `join` (line 54) \"the lean default build links neither\", `compare` (line 68) \"the lean default build compiles none of it\". Because sparq-engine enables all three unconditionally and sparq-wasm depends on sparq-engine unconditionally, the lean wasm build DOES compile numeric, join, and compare. Practical impact on linked crates is nil \u2014 oxrdf and rustc-hash are already direct sparq-engine deps (crates/sparq-engine/Cargo.toml:422,427) and `compare` is pure-std \u2014 but `hashbrown` (workspace 0.17) is not a direct sparq-engine dep, so `join` does introduce it into the wasm graph. Note the `overhead` comment (line 76) is unaffected and remains accurate, since no consumer enables `overhead`. Doc-only; no functional impact.",
+    "file": "crates/sparq-substrate/Cargo.toml",
+    "fix_hint": "Re-scope those three sentences to this crate's own boundary, e.g. \"a consumer that does not enable `numeric` links no oxrdf\" instead of \"the lean default build links nothing\", and note that sparq-engine enables numeric/join/compare unconditionally so they DO reach the lean wasm bundle (mirroring the accurate note already at crates/sparq-engine/Cargo.toml:417-420). Leave the `overhead` comment as-is.",
+    "severity": "minor",
+    "title": "Per-feature 'the lean default build links nothing / links neither / compiles none of it' phrasing is now misleading for `numeric`, `join`, and `compare`"
+   }
+  ],
+  "progress": null,
+  "summary": "Doc-only change: rewrites two stale comment blocks in crates/sparq-substrate/Cargo.toml. Every new claim was verified against the checkout and holds. (1) 'sparq-engine now consumes this crate unconditionally' \u2014 confirmed: crates/sparq-engine/Cargo.toml:421 has an unconditional [dependencies] entry `sparq-substrate = { ..., features = [\"numeric\", \"join\", \"compare\"] }`. (2) 'present in the feature-OFF sparq-wasm dependency graph' \u2014 confirmed: crates/sparq-wasm/Cargo.toml:18 depends on sparq-engine unconditionally under [dependencies], so the transitive edge to sparq-substrate exists with no feature enabled. (3) 'reasoner integrations enable additional substrate features' \u2014 confirmed (sparq-reason d-entail/substrate-join/substrate-compare/datalog, sparq-reason-el cdomain, sparq-conformance rif-wg-core). (4) The removed text ('Nothing in the workspace depends on it ... the wasm_bundle_bytes floor stays byte-identical') was demonstrably false \u2014 seven crates now depend on sparq-substrate \u2014 so deleting it is an honest correction, not an overclaim. (5) The 'may require a feature-off declaration' pointer names a real mechanism (scripts/check-vectorized-feature-off.py, bench/feature-off-declarations/<PR>.json). (6) `default = []` is unchanged, so no dependency resolution or build output changes; this diff cannot move any byte ratchet itself. No code, no tests, no security surface touched; no ZK/MPC or performance claim introduced. Two residual staleness items of the same class remain elsewhere in the same file and are filed as minor \u2014 they were pre-existing and are not regressions from this diff, so they do not block. No prior-round findings exist; progress is null.",
+  "verdict": "approve"
+ }
+}
