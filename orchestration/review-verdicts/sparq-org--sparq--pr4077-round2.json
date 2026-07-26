@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4077,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ba4ad30f85be086b8a7cc15b0156ff62ed04a83f",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 1's major finding is resolved: the verbatim-IRI probe is now gated by the explicit exact_dict flag, which is false after EntityLinker::build and enabled only by with_values(). The new regression test exercises the real default-off path on an unlabelled entity, while the enabled-path tests require with_values(). NlqConfig wiring and the public README/skill documentation consistently describe link_values as opt-in and subordinate to link_entities. The literal index preserves stored Literal values, datatype/language metadata, predicates, and use counts, and its tests cover the real linker and prompt-rendering paths. No correctness, soundness, security, or vacuous-test issue remains in the supplied diff.",
+  "verdict": "approve"
+ }
+}
