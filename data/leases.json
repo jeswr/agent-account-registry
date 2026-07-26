@@ -22,16 +22,6 @@
   },
   {
    "account": "dc2d751954080e13",
-   "claim_id": "c32d65c301e54b948a67eddac79e582b",
-   "holder": "review:sparq-org/sparq#3528@dispatch-30204036948.1",
-   "package": "__global__",
-   "role": "review",
-   "model": "sol",
-   "issued_at": 1785072765,
-   "expires_at": 1785076965
-  },
-  {
-   "account": "dc2d751954080e13",
    "claim_id": "b487a817cb1942cdbdd931099d2e6987",
    "holder": "fix:sparq-org/sparq#4133@dispatch-30204036948.1",
    "package": "sparq-engine",
