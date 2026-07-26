@@ -2144,6 +2144,7 @@ def _run_target_helper(script_dir, repo, script, args):
 
 
 def _pr_needs_user(script_dir, repo, pr_number, issue, reason, park_class="question",
+                   park_cause="",
                    bot_login="", head_sha="", attempt_key=""):
     """Stop the loop for a PR. `park_class` picks the label PAIR (park_policy.py ownership):
     "question" (default) -> the human-owned pair (review:needs-user on the PR, needs:user on
@@ -2161,6 +2162,11 @@ def _pr_needs_user(script_dir, repo, pr_number, issue, reason, park_class="quest
     unconditional human holds and pass neither."""
     args = ["needs-user", "--repo", repo, "--pr", str(pr_number), "--reason", reason,
             "--park-class", park_class]
+    # [registry #677] State the capacity park's cause so the park EPISODE is attributable in its
+    # own receipt. Omitted, worker-pr records `capacity-unspecified` — honest, and still a
+    # receipt, which is what closes the "a stale cause receipt stays newest forever" hole.
+    if park_cause:
+        args += ["--park-cause", park_cause]
     if bot_login:
         args += ["--bot-login", bot_login]
     if head_sha and attempt_key:
@@ -2815,34 +2821,122 @@ def starvation_unpark_body(packages):
         "linkage resolves.\n\n"
         f"The `{MACHINE_PARK_PR_LABEL}` label is removed and the PR re-enters the ordinary review "
         "lane unchanged. No review judgement was made when it was parked, and none is made now. "
-        "Human-owned holds are never touched by this sweep — if one is live, the park stands.")
+        "Human-owned holds are never touched by this sweep — if one is live, the park stands.\n\n"
+        # THE EPISODE BOUNDARY. This marker is why the park receipt above it cannot authorise a
+        # second release: starvation_park_owner refuses on any release marker at or after the
+        # receipt it is reading. Without it a stale `cause=partition` receipt would stay newest
+        # forever and release a later park applied by a different mechanism entirely.
+        f"{STARVATION_UNPARK_MARKER}")
 
 
-def starvation_park_owner(comments, labels, bot_login, machine_owned):
-    """True iff a live `review:parked` on this PR is THIS sweep's park, and therefore this
-    sweep's to release. Three independent proofs, all required:
+# The durable marker this sweep's RELEASE posts. It is what makes a park receipt bind to a park
+# EPISODE instead of living forever: once a release is on record, every receipt older than it
+# belongs to a closed episode and can never authorise another un-park.
+STARVATION_UNPARK_MARKER = "<!-- sparq-starvation-unpark:v1 -->"
+
+# worker-pr.py's capacity-ladder receipt prefix, kept as a LITERAL here for the same reason
+# GROOM_STALE_PR_MARKER is: worker-pr is a separate entry point with its own checkout root, and
+# this is a READ of a marker it already writes, never a second writer of it. Pinned against the
+# real module in the self-test so the two cannot drift.
+PARK_GENERATION_MARKER_PREFIX = "<!-- sparq-park-generation:v1"
+
+
+def _bot_receipt_instants(comments, bot_login, log=print):
+    """[(instant, body)] for the BOT's own comments, oldest first, by PARSED instant.
+
+    Ordering is by parsed instant and never by list position or raw string (the round-5 finding
+    on this file: a space-separator stamp sorts lexicographically before every `T`-form stamp of
+    the same day). An UNPARSEABLE stamp on a bot comment raises the ambiguity to the caller as
+    None, which every caller here turns into a refusal — a receipt whose age cannot be
+    established must never be used to authorise a label write."""
+    rows = []
+    for comment in comments if isinstance(comments, list) else []:
+        if not isinstance(comment, dict):
+            continue
+        login = str((comment.get("user") or {}).get("login", ""))
+        if not bot_login or login.casefold() != str(bot_login).casefold():
+            continue
+        stamp = comment.get("created_at")
+        if not _park_policy.valid_timestamp(stamp):
+            log(f"::warning::bot receipt carries an unreadable stamp {stamp!r}; the park's "
+                "episode boundary cannot be established, so the park stands")
+            return None
+        rows.append((_park_policy.parse_ts(stamp), str(comment.get("body", ""))))
+    rows.sort(key=lambda row: row[0])
+    return rows
+
+
+def starvation_park_owner(comments, labels, bot_login, machine_owned, log=print):
+    """True iff the live `review:parked` on this PR is THIS sweep's park, in the CURRENT park
+    EPISODE, and therefore this sweep's to release.
+
+    THE DEFECT THIS SHAPE EXISTS TO PREVENT (found in review of the first version, reproduced
+    end to end with production comment bodies). The first version proved ownership from the
+    NEWEST park-reason receipt alone. But `worker-pr.needs_user(park_class="capacity")` — the
+    round-budget / no_change / gatefail ladder, i.e. exactly the registry #703 mechanisms — writes
+    `review:parked` with only a `sparq-park-generation:v1` receipt and NO park-reason receipt at
+    all. So a `cause=partition` receipt from an earlier, already-released park stayed newest
+    forever and authorised releasing a park this sweep never applied. Downstream that is worse
+    than a spurious un-park: per park_ladder_decision's contract the release is neither a human
+    gesture nor an AUTO_READMIT_MARKER, so the ladder's window stays receipted, the next park call
+    returns `dedupe` before any label write, and the PR ends up un-parked AND un-parkable. Nothing
+    bound a receipt to an episode.
+
+    FIVE proofs, all required, and clauses 4 and 5 are the episode binding:
 
     1. the machine park label is live;
-    2. the NEWEST bot-authored park-reason receipt names this sweep's cause. Newest, not any —
-       a PR parked here and LATER parked by another mechanism (a review deadlock, a budget
-       exhaustion) belongs to that mechanism now, and releasing it would clear a hold this sweep
-       never applied. Only the BOT's own comments are receipts (park_policy's trust filter), so a
-       third party cannot forge the cause and talk a park open;
-    3. `machine_owned` — park_policy.label_application_machine_owned for the park label — proving
-       the latest application of that label was not made by a proven human. A human's park is a
-       human's to clear; this is the same refusal every other automatic path makes.
+    2. `machine_owned` — park_policy.label_application_machine_owned for that label — proving the
+       latest application was not made by a proven human. A human's park is a human's to clear;
+    3. the NEWEST bot-authored park-reason receipt names this sweep's cause. Only the BOT's own
+       comments are receipts (park_policy's trust filter), so a third party cannot forge a cause
+       and talk a park open;
+    4. NO release marker of this sweep's own (STARVATION_UNPARK_MARKER) is at or after that
+       receipt. This sweep's release CLOSES the episode its park opened, so a receipt that has
+       already been acted on can never authorise a second release;
+    5. NO capacity-ladder receipt (PARK_GENERATION_MARKER_PREFIX) is at or after that receipt.
+       That receipt is MANDATORY on worker-pr's capacity path — it lands even when the label write
+       is veto-suppressed, and on the terminal escalation too — so it is a reliable witness that
+       another mechanism has parked, or re-parked, since this sweep did. It covers both directions
+       the review found: a ladder park layered ON TOP of a live starvation park, and a ladder
+       re-park AFTER a starvation release.
 
-    Any ambiguity (no receipts, unreadable timeline, a different newest cause) fails toward
-    LEAVING THE PARK ALONE."""
+    Ties count as NEWER (>=), deliberately: two receipts sharing a one-second stamp is exactly the
+    ambiguous case, and the fail-closed direction is to leave the park alone.
+
+    Any ambiguity — no receipts, an unreadable comment stamp, an unreadable timeline, a different
+    newest cause — fails toward LEAVING THE PARK ALONE."""
     if MACHINE_PARK_PR_LABEL not in set(labels):
         return False
-    records = _park_policy.park_reason_records(comments, bot_login)
-    if not records:
+    if not machine_owned:
         return False
-    newest = records[-1]
-    if (newest.get("cause") if isinstance(newest, dict) else None) != STARVATION_PARK_CAUSE:
-        return False
-    return bool(machine_owned)
+    rows = _bot_receipt_instants(comments, bot_login, log=log)
+    if rows is None:
+        return False                      # an unreadable stamp is not an episode boundary
+    newest_reason_at = None
+    newest_reason_cause = None
+    for at, body in rows:
+        record = _park_policy.parse_park_reason(body, log=log)
+        if record:
+            newest_reason_at, newest_reason_cause = at, record.get("cause")
+    if newest_reason_at is None:
+        return False                      # nothing here states a cause at all
+    if newest_reason_cause != STARVATION_PARK_CAUSE:
+        return False                      # the current episode belongs to another mechanism
+    for at, body in rows:
+        if at < newest_reason_at:
+            continue
+        if STARVATION_UNPARK_MARKER in body:
+            log(f"starvation park NOT ours to release: this sweep already released the episode "
+                f"that receipt opened (release at {at.isoformat()}) — a receipt cannot authorise "
+                "a second un-park")
+            return False
+        if PARK_GENERATION_MARKER_PREFIX in body:
+            log(f"starvation park NOT ours to release: the capacity ladder receipted a park at "
+                f"{at.isoformat()}, at or after this sweep's receipt — the PR is parked by "
+                "worker-pr's budget ladder now, and releasing it would strand it un-parked AND "
+                "un-parkable (park_ladder_decision would dedupe)")
+            return False
+    return True
 
 
 def unpark_starved_partition_holder(repo, pr_number, packages, labels, unpark_pr, post_comment,
@@ -3630,7 +3724,8 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                                "with no extension left — the top fix tier has run, the latest "
                                "verdict does not grade the PR improving, and no pushed fix at "
                                "or above the pinned floor awaits re-review; a human must "
-                               "decide", park_class="capacity", bot_login=bot_login,
+                               "decide", park_class="capacity", park_cause="budget",
+                               bot_login=bot_login,
                                head_sha=head_sha, attempt_key=f"rounds={rounds}")
                 continue
             if budget["action"] == "extend-model-pin" and budget["pin"]:
@@ -3703,7 +3798,9 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                     _pr_needs_user(script_dir, repo, number, issue_number,
                                    f"{missed} consecutive fix dispatches missed for round "
                                    f"{round_number}; a human must unstick this PR",
-                                   park_class="capacity", bot_login=bot_login,
+                                   park_class="capacity",
+                                   # [registry #677] the taxonomy's own name for this cause
+                                   park_cause="dispatch-missed", bot_login=bot_login,
                                    head_sha=head_sha,
                                    attempt_key=f"missed{round_number}={missed_total}")
                     continue
@@ -3724,7 +3821,9 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                     _pr_needs_user(script_dir, repo, number, issue_number,
                                    f"{missed} consecutive fix dispatches missed for round "
                                    f"{round_number}; a human must unstick this PR",
-                                   park_class="capacity", bot_login=bot_login,
+                                   park_class="capacity",
+                                   # [registry #677] the taxonomy's own name for this cause
+                                   park_cause="dispatch-missed", bot_login=bot_login,
                                    head_sha=head_sha,
                                    attempt_key=f"missed{round_number}={missed_total}")
                     continue
@@ -10984,17 +11083,16 @@ def _starvation_sweep_self_test():
                  "impl_alias": "sol", "impl_account_h": "0" * 16,
                  "head_sha_at_open": _STARVE_SHA,
                  # MACHINE-ATTESTED stamp (registry #657/#732): admission requires a
-                 # `recorded_at_run` naming the host-side run that wrote the record. A stampless
-                 # fixture is inadmissible, which would make the crate-scoped-occupant case below
-                 # silently exercise the fail-closed `__global__` path instead of the resolvable
-                 # linkage it exists to test — i.e. it would pass for the wrong reason.
+                 # `recorded_at_run` naming the host-side run that wrote the record.
                  "recorded_at_run": "29694084610.1"}}
+    # THIS assert is what fails loudly if the stamp is ever dropped — measured: it fires before
+    # anything else, so the counterfactual below is NOT what catches a dropped stamp. It is kept
+    # only because it pins the exact refusal CONSTANT (an unstamped record must be refused under
+    # ATTESTATION_UNRECOGNISED_REASON specifically, not merged into some other reason), which the
+    # assert above cannot see. An earlier version of this file claimed the counterfactual was the
+    # thing that made a dropped stamp fail loudly; that claim was wrong and is retracted.
     assert provenance_admission_error(prov[41], 41) is None, \
         provenance_admission_error(prov[41], 41)
-    assert provenance_attestation_class(prov[41]) in MACHINE_ATTESTED_CLASSES, \
-        provenance_attestation_class(prov[41])
-    # ...and the counterfactual, so this fixture can never quietly lose its stamp again: without
-    # it the record is inadmissible and the occupant falls back to reserving the global partition.
     _unstamped = {key: value for key, value in prov[41].items() if key != "recorded_at_run"}
     assert provenance_admission_error(_unstamped, 41) == ATTESTATION_UNRECOGNISED_REASON, \
         provenance_admission_error(_unstamped, 41)
@@ -11025,9 +11123,10 @@ def _starvation_sweep_self_test():
     # busy_packages_of_pulls hard-codes the 5th element to True — and that mutant is severe: it
     # makes EVERY busy holder read as inert, so the sweep would park a live non-draft PR and free
     # nothing. This runs the production producer and the production consumer against each other.
-    def occupancy_of(row, status=None):
+    def occupancy_of(row, status=None, labels=None, provenance=None):
         rows = []
-        busy_packages_of_pulls("o/r", [row], {}, {}, status, occupancy=rows)
+        busy_packages_of_pulls("o/r", [row], labels or {}, provenance or {}, status,
+                               occupancy=rows)
         return rows
 
     inert_draft = {"number": 41, "state": "open", "draft": True, "auto_merge": None,
@@ -11045,6 +11144,35 @@ def _starvation_sweep_self_test():
         assert starvation_park_target([], 12, produced) == want_target, (row, produced)
     print("  ok   #677 starvation end-to-end: the inertness bit is PRODUCED by "
           "busy_packages_of_pulls — a live non-draft or latched holder is never selected")
+
+    # ---- THE `parked-free` ROW IS THE UN-PARK HALF'S SOLE INPUT -------------------------------
+    # A parked, provably-inert PR leaves busy_packages_of_pulls through the `parked-free` branch,
+    # and that row is the ONLY thing the un-park half ever reads. Dropping its 5th element (or
+    # letting the branch stop emitting a row at all) does not make anything reserve the wrong
+    # crate — it silently DISABLES the machine exit, which is a mutant that reds nothing unless a
+    # test walks the whole path. Both halves are asserted against the real producer here.
+    parked_inert = dict(inert_draft, labels=[{"name": MACHINE_PARK_PR_LABEL}])
+    parked_rows = occupancy_of(parked_inert)
+    assert len(parked_rows) == 1, parked_rows
+    assert parked_rows[0][0] == "parked-free", parked_rows
+    assert len(parked_rows[0]) == 5, (
+        "the parked-free occupancy row must carry the 5-element shape — it is the SOLE producer "
+        "of starvation_unpark_targets' input, so a 4-tuple silently disables the un-park half")
+    assert parked_rows[0][4] is _pull_inactivity_decision(parked_inert)[0] is True, parked_rows
+    # its area set is the one the un-park decision reads, and it must be the REAL reservation:
+    # unreadable linkage here means the PR still holds __global__, so the park must STAND...
+    assert GLOBAL_PACKAGE in parked_rows[0][2], parked_rows
+    assert starvation_unpark_targets(parked_rows, {41}) == []
+    # ...and with linkage that resolves to a real crate, the SAME producer yields the release.
+    resolved_rows = occupancy_of(
+        dict(parked_inert, head={"ref": "sparq-agent/issue-7-1-1", "sha": _STARVE_SHA,
+                                 "repo": {"full_name": "o/r"}}),
+        labels={7: ["area:crate-a"]}, provenance=prov)
+    assert resolved_rows[0][0] == "parked-free" and len(resolved_rows[0]) == 5, resolved_rows
+    assert resolved_rows[0][2] == frozenset({"crate-a"}), resolved_rows
+    assert starvation_unpark_targets(resolved_rows, {41}) == [41]
+    print("  ok   #677 parked-free arity: the un-park half's SOLE input row is produced with the "
+          "5-element shape and the REAL area set — park stands on __global__, releases on a crate")
 
     # ---- THE PLAN SEAM: v5 validation of the evidence field -----------------------------------
     base_plan = {
@@ -11086,15 +11214,37 @@ def _starvation_sweep_self_test():
 
     # ---- THE UN-PARK HALF: the machine exit for the machine's own park -----------------------
     bot = "sparq-orchestrator[bot]"
+    _minute = 0
 
-    def receipt(cause, login=bot):
+    def _stamp():
+        # distinct, ASCENDING stamps so ordering is by PARSED INSTANT and the fixtures cannot
+        # accidentally depend on list position
+        nonlocal _minute
+        _minute += 1
+        return f"2026-07-26T00:{_minute:02d}:00Z"
+
+    def receipt(cause, login=bot, at=None):
         return {"user": {"login": login},
                 "body": f"> park\n\n{_park_policy.park_reason_marker(cause)}",
-                "created_at": "2026-07-26T00:00:00Z"}
+                "created_at": at or _stamp()}
+
+    def ladder_receipt(login=bot, at=None):
+        # EXACTLY what worker-pr.needs_user(park_class="capacity") writes on the `park` action:
+        # a generation receipt and NO park-reason receipt. This is the production body shape the
+        # first version of this sweep was blind to.
+        return {"user": {"login": login},
+                "body": ("> 🤖 SPARQ agent — the autonomous review loop parked this PR: the "
+                         "review round budget is exhausted at 3 round(s)\n\n"
+                         f"{PARK_GENERATION_MARKER_PREFIX} gen=1 cutoff=none -->"),
+                "created_at": at or _stamp()}
+
+    def release_receipt(login=bot, at=None):
+        return {"user": {"login": login}, "body": starvation_unpark_body(frozenset({"crate-a"})),
+                "created_at": at or _stamp()}
 
     parked_labels = ["review:changes", MACHINE_PARK_PR_LABEL]
     ours = [receipt(STARVATION_PARK_CAUSE)]
-    # OWNERSHIP: only this sweep's own park, proven three ways.
+    # OWNERSHIP: only this sweep's own park, proven five ways.
     assert starvation_park_owner(ours, parked_labels, bot, True) is True
     assert starvation_park_owner(ours, ["review:changes"], bot, True) is False   # not parked
     assert starvation_park_owner(ours, parked_labels, bot, False) is False       # human-applied
@@ -11102,13 +11252,76 @@ def _starvation_sweep_self_test():
     assert starvation_park_owner(ours, parked_labels, "", True) is False         # untrusted
     assert starvation_park_owner(
         [receipt(STARVATION_PARK_CAUSE, login="drive-by")], parked_labels, bot, True) is False
-    # a LATER park by another mechanism takes ownership away from this sweep
+    # a LATER park by another mechanism THAT STATES ITS CAUSE takes ownership away (control case)
     assert starvation_park_owner(
         [receipt(STARVATION_PARK_CAUSE), receipt("budget")], parked_labels, bot, True) is False
     assert starvation_park_owner(
         [receipt("budget"), receipt(STARVATION_PARK_CAUSE)], parked_labels, bot, True) is True
     print("  ok   #677 un-park ownership: releases ONLY a park whose newest bot receipt names "
           "this sweep's cause AND whose label was machine-applied")
+
+    # ---- THE FAILURE DIRECTION THE FIRST VERSION GOT WRONG -----------------------------------
+    # The control case above (a later park that DOES state a cause) was the only thing modelled,
+    # so it was green for the wrong reason on the one guard whose failure direction matters most.
+    # worker-pr's capacity ladder writes review:parked with a GENERATION receipt and NO reason
+    # receipt, so a stale `cause=partition` receipt stayed newest forever.
+    #
+    # (a) the reported sequence, end to end: park here -> release here -> the LADDER re-parks.
+    resurrection = [receipt(STARVATION_PARK_CAUSE), release_receipt(), ladder_receipt()]
+    assert starvation_park_owner(resurrection, parked_labels, bot, True) is False, \
+        "a stale partition receipt must not authorise releasing a LADDER park"
+    assert starvation_unpark_targets(
+        [_starvation_row(41, packages={"crate-a"}, parked=True, decision="parked-free")],
+        {41} if starvation_park_owner(resurrection, parked_labels, bot, True) else set()) == []
+    # (b) the release marker alone closes the episode — even with no later park at all, a receipt
+    #     that has ALREADY been acted on can never authorise a second un-park.
+    assert starvation_park_owner(
+        [receipt(STARVATION_PARK_CAUSE), release_receipt()], parked_labels, bot, True) is False
+    # (c) a LADDER park layered on top of a LIVE starvation park (no release in between): the PR
+    #     is the ladder's now, and releasing it would strand it un-parked AND un-parkable.
+    assert starvation_park_owner(
+        [receipt(STARVATION_PARK_CAUSE), ladder_receipt()], parked_labels, bot, True) is False
+    # (d) ...and the ladder receipt only takes ownership when it is AT OR AFTER ours: a ladder
+    #     park from an EARLIER episode, followed by our own park, is still ours.
+    assert starvation_park_owner(
+        [ladder_receipt(), receipt(STARVATION_PARK_CAUSE)], parked_labels, bot, True) is True
+    # (e) a TIE counts as NEWER — the ambiguous case fails toward leaving the park alone.
+    tied = "2026-07-26T12:00:00Z"
+    assert starvation_park_owner(
+        [receipt(STARVATION_PARK_CAUSE, at=tied), ladder_receipt(at=tied)],
+        parked_labels, bot, True) is False
+    # (f) only the BOT's markers close an episode; a third party cannot re-open one either
+    assert starvation_park_owner(
+        [receipt(STARVATION_PARK_CAUSE), ladder_receipt(login="drive-by")],
+        parked_labels, bot, True) is True
+    # (g) an UNREADABLE bot comment stamp is no episode boundary at all -> refuse
+    assert starvation_park_owner(
+        [receipt(STARVATION_PARK_CAUSE), {"user": {"login": bot}, "body": "x",
+                                          "created_at": "not-a-timestamp"}],
+        parked_labels, bot, True) is False
+    # the literal is a READ of worker-pr's own marker — pin it so the two cannot drift
+    _wp = _load_module("registry_worker_pr_pin",
+                       Path(__file__).resolve().parent / "worker-pr.py")
+    assert PARK_GENERATION_MARKER_PREFIX == _wp.PARK_GENERATION_MARKER, (
+        PARK_GENERATION_MARKER_PREFIX, _wp.PARK_GENERATION_MARKER)
+    assert PARK_GENERATION_MARKER_PREFIX in ladder_receipt()["body"]
+    # This fixture models the PRE-#677 ladder body, which is what is on live PRs right now: a
+    # generation receipt and NO park-reason receipt. worker-pr now emits a reason receipt on that
+    # path too, so clause 3 alone would catch a FUTURE ladder park — but every capacity park
+    # already on record predates that, so clause 5 is what covers the existing population and it
+    # stays load-bearing until those PRs age out.
+    assert _park_policy.parse_park_reason(ladder_receipt()["body"]) is None, \
+        "this fixture must model the pre-#677 cause-less ladder body — that shape is the whole " \
+        "reason clause 5 exists"
+    # ...and the CURRENT worker-pr body does state a cause, which clause 3 catches on its own.
+    _wp_cause = _park_policy.park_reason_marker("budget", generation=1)
+    assert starvation_park_owner(
+        [receipt(STARVATION_PARK_CAUSE),
+         {"user": {"login": bot}, "body": f"parked\n\n{_wp_cause}",
+          "created_at": _stamp()}], parked_labels, bot, True) is False
+    print("  ok   #677 un-park EPISODE binding: a stale partition receipt cannot release a "
+          "capacity-ladder park (re-park after release, park layered on top, ties, and an "
+          "unreadable stamp all refuse)")
 
     # CAUSE RE-DERIVATION, never a timer.
     cleared = _starvation_row(41, packages={"crate-a"}, parked=True, decision="parked-free")
@@ -11200,8 +11413,22 @@ def _starvation_sweep_self_test():
         post_comment=lambda repo, number, body: trip_comments.append(body),
         log=lambda _m: None) is True
     assert trip_calls == [("add", 41), ("remove", 41)], trip_calls
-    print("  ok   #677 ROUND TRIP: park -> cause clears -> un-park, with the park's own receipt "
-          "as the proof of ownership on the way out")
+    # ...and the release CLOSES the episode using the PRODUCTION un-park body: replay the whole
+    # conversation the two halves actually posted and the sweep must no longer own the park. This
+    # is the leg that reds if the release marker is dropped from the un-park comment, which would
+    # silently disable the episode binding.
+    trip_history = [{"user": {"login": bot}, "body": trip_comments[0],
+                     "created_at": "2026-07-26T20:00:00Z"},
+                    {"user": {"login": bot}, "body": trip_comments[1],
+                     "created_at": "2026-07-26T20:05:00Z"}]
+    assert starvation_park_owner(trip_history, parked_labels, bot, True) is False, \
+        "the sweep's own release must close the episode its park opened"
+    # and a LADDER re-park after that release is still not ours
+    assert starvation_park_owner(
+        trip_history + [ladder_receipt(at="2026-07-26T21:00:00Z")],
+        parked_labels, bot, True) is False
+    print("  ok   #677 ROUND TRIP: park -> cause clears -> un-park, and the PRODUCTION un-park "
+          "body closes the episode so the receipt cannot release a later park")
 
     # ---- THE PRODUCTION CALL SITE IS ITS OWN SEAM --------------------------------------------
     # Everything above calls the two functions DIRECTLY, so all of it stays green if main()'s

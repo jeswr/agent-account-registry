@@ -794,6 +794,14 @@ PARK_CAUSES = {
     # the writer of this cause parks the PR label DIRECTLY and never routes through the
     # generation-counting escalation ladder that turns an exhausted capacity park into a question.
     "partition": PARK_CLASS_CAPACITY,
+    # The honest fallback for a capacity park whose writer did not state a narrower cause
+    # (worker-pr.needs_user(park_class="capacity") reached from a call site that passes no
+    # `park_cause`). It exists so that EVERY capacity park emits SOME park-reason receipt: a park
+    # episode with no cause receipt at all is what let a stale `cause=partition` receipt stay
+    # "newest" forever and authorise releasing a park a different mechanism had applied. An
+    # unspecified cause is deliberately NOT a lie about which mechanism parked the PR — it says
+    # exactly what is known, which is "capacity, unattributed".
+    "capacity-unspecified": PARK_CLASS_CAPACITY,
     # --- genuine human questions: terminal, human-owned --------------------------------------
     "injection": PARK_CLASS_QUESTION,         # prompt-injection flag raised on the PR
     "human-arm": PARK_CLASS_QUESTION,         # a human requested changes / asked to arm by hand
