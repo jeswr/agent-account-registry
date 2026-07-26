@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 3874,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "2b4694ae8ac4ffaa419b41d327fea2904bbe7ae3",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The profile's payoff is compile+link time, but this job's own comment states the build is already warm: \"Share the nightly differential lane's cache key: both build the exact same sparq-bench release-fast binary, and differential.yml's main-scoped nightly save keeps this warm for every PR.\" With a warm cache the `cargo build -p sparq-bench` step is near-free, while the `fuzz`/`update-fuzz`/`metamorph-driver` steps that dominate wall-clock now execute thin-LTO / codegen-units=16 code instead of fat-LTO / CGU=1. Same argument applies to differential.yml (12 shards, fixed seed windows, timeout-minutes: 45), differential-update.yml and metamorph.yml. Because these lanes fuzz a FIXED seed count rather than a time budget, slower codegen does not just cost minutes \u2014 it reduces bug-finding coverage per unit of CI time, and eats headroom against the 45/30-minute timeouts. No measurement is presented in the diff showing these particular lanes got faster. This is a cost/benefit observation, not a correctness defect: the conformance and pkg-ingest lanes (short runs, cold-ish builds) are clearly net wins.",
+    "file": ".github/workflows/fuzz.yml",
+    "fix_hint": "Either (a) keep the runtime-dominated fuzz/differential/metamorph lanes on `release` and restrict `release-fast` to the compile-dominated lanes (conformance, scoreboard, dl_suite, pkg-ingest), or (b) record a before/after wall-clock for one differential shard and one metamorph run in the PR body to show the trade is positive. If (b), note the first post-merge run pays a one-time full rebuild because `target/release-fast/` is absent from the restored cache.",
+    "severity": "minor",
+    "title": "Runtime-dominated fuzz lanes may net out slower: their build is already warm-cached, so they pay thin-LTO runtime for no build saving"
+   },
+   {
+    "body": "The new paragraph is the sole defence against the exact failure mode the design record names (\"main failure mode is someone benchmarking `release-fast` by accident\"). The consequence of a breach is silent: a perf number produced under thin-LTO/CGU=16 looks identical to a canonical one, so the dishonesty is undetectable after the fact. This repo otherwise mechanises its honesty rules (scripts/check-no-perf-numbers.py, check-privacy-claims.sh, check-new-bench-registered.py, check-vectorized-feature-off.py, ci_summary_gate.py), which makes the doc-only treatment the outlier here. Non-blocking because research/engine-performance-review.md \u00a72.2 explicitly scoped the mitigation as \"naming + the honesty guard note in AGENTS.md\" \u2014 this is a follow-up, not a deviation from the approved design. Secondary nit: the paragraph is filed under the sub-agent fan-out / EC2-execution section rather than the bench guidance the design record pointed at; it reads adjacent to the non-canonical-timings rule, so it is findable, but a reader looking up build profiles would not land there.",
+    "file": "AGENTS.md",
+    "fix_hint": "Add a ~10-line scripts/check-build-profile-honesty.py wired into the gate aggregator that greps the measured/shipping surfaces \u2014 bench.yml, bench-ec2.yml, build-matrix.yml, release.yml, publish.yml, scripts/ci-bench.sh, scripts/gather-*.sh, scripts/ec2-bench.sh, scripts/hw-bench.sh, scripts/build-dist.sh \u2014 and fails on any `release-fast` occurrence. That converts the paragraph into an enforced invariant. Consider also cross-linking the guard from the bench guidance section.",
+    "severity": "minor",
+    "title": "The load-bearing honesty guard is prose-only; nothing mechanically stops `release-fast` leaking into a measured or shipping lane"
+   },
+   {
+    "body": "The sq-25q5q comment block is hand-wrapped to roughly 80 columns, but the in-place word substitutions pushed two lines past it: \"# seconds for every sibling lane). Optimized codegen collapses that runtime; the one-\" and \"# warms the release-fast profile via `cargo run --profile release-fast`). COVERAGE IS UNCHANGED:\". The hyphenated break \"the one-\" / \"time optimized compile\" also no longer falls where the wrap intends. Content is accurate \u2014 the referenced 'Run inference suites' step at ci.yml:2474 does now use `--profile release-fast`, so the cache-warming claim still holds.",
+    "file": ".github/workflows/ci.yml",
+    "fix_hint": "Re-flow the comment block to the surrounding ~80-column width so the hyphenated \"one-/time\" break lands correctly.",
+    "severity": "nit",
+    "title": "dl_suite comment rewrap drift \u2014 two rewritten lines now overrun the surrounding hand-wrapped width"
+   }
+  ],
+  "progress": null,
+  "summary": "Mechanical build-profile split: adds [profile.release-fast] (inherits release, lto=thin, codegen-units=16) and repoints non-shipping CI lanes (W3C/inference/GeoSPARQL/Solid/ODRL/text/RSP/JSON-LD conformance + scoreboard, dl_suite, differential/update-differential/metamorph/pkg-ingest fuzzers) at it. Verified correct and complete: (1) the custom profile parses \u2014 `cargo build --profile release-fast -p <bogus>` fails only on package resolution, not on the manifest; (2) every binary-path consumer was migrated in lockstep \u2014 no `target/release/{sparq-bench,metamorph-driver,validate-pkg,sparq-conformance}` reference survives in .github/workflows (the only remaining `target/release/` hits are release.yml's Tauri bundle dir and bench/EC2 gatherer scripts that legitimately stay on `release`); (3) the honesty guard holds \u2014 bench.yml, scripts/ci-bench.sh, scripts/gather-*.sh, scripts/ec2-bench.sh, build-matrix.yml, publish.yml and vectorized-feature-off.yml all still build `release`/`release-wasm`/`python-release`, so no measured or shipped artifact moved; (4) all three `shared-key: differential-nightly` consumers (differential.yml, differential-update.yml, fuzz.yml) were converted together, so no cache thrash between profiles; (5) no soundness hazard from the codegen change \u2014 the workspace has no linkme/inventory/ctor link-time registries, `panic = \"abort\"` inheritance is identical to the prior `--release` behaviour (and Cargo forces unwind for test targets), and thin-LTO/CGU=16 cannot alter IEEE float results or the exact `==` conformance pins the dl_suite asserts. The AGENTS.md guard matches what research/engine-performance-review.md \u00a72.2 approved (naming + a doc note). Remaining notes are non-blocking: the guard is prose-only, and the runtime-dominated fuzz lanes may not net out in the profile's favour.",
+  "verdict": "approve"
+ }
+}
