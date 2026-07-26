@@ -92,16 +92,6 @@
   },
   {
    "account": "9e13ea21abf27e68",
-   "claim_id": "a977346606d04961b1a1d891b3bc551c",
-   "holder": "sparq-org/sparq#2869@30191035874.1",
-   "package": "sparq-metamorph",
-   "role": "research",
-   "model": "opus5",
-   "issued_at": 1785047171,
-   "expires_at": 1785053471
-  },
-  {
-   "account": "9e13ea21abf27e68",
    "claim_id": "5923342019734315b725da99b8c4ce80",
    "holder": "fix:sparq-org/sparq#4002@dispatch-30191293776.1",
    "package": "sparq-conformance",
