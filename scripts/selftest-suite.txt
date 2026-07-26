@@ -22,6 +22,7 @@ plan-alert.py
 plan-snapshot.py
 policy-resolve.py
 ready-issues.py
+reclass-park-holds.py
 resolve-conflicts.py
 retriage.py
 route-resolve.py

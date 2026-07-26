@@ -454,6 +454,43 @@ maintainer action (re-mint the setup-token). It is deliberately a **cooldown, no
 account may be the fleet's only cross-provider review account, and zero reviews is worse than a
 partial success rate.
 
+### Reclassifying a human hold the capacity-park defect manufactured (operator tool, #610/#620)
+
+`scripts/reclass-park-holds.py` is a **one-shot, operator-invoked, dry-run-by-default** migration
+for the residue of the fixed `MISSED_FIX_LIMIT` defect (#610): a human-owned `review:needs-user` /
+`needs:user` that a *machine capacity stop* stamped. It converts such a hold to the machine twin
+(`review:parked` / `status:parked`) so the automatic cause-recovery re-admission (#620) — which by
+design never touches a human-owned hold — can clear it normally.
+
+It is **wired into no workflow and no cron.** Weakening a human-owned safety label is a decision a
+human takes on a reviewed list, so the tool only ever *reports* unless `--apply` is passed:
+
+```bash
+python3 scripts/reclass-park-holds.py --target-repo sparq-org/sparq            # report only
+python3 scripts/reclass-park-holds.py --target-repo sparq-org/sparq --apply    # after review
+```
+
+Every PR must clear ALL of a hard evidence gate, else it is **skipped and told why**: `G0` a hold is
+in scope, `G1` the provenance-linked source issue resolves from an admissible registry record, `G2`
+the hold's latest application was made by exactly the orchestrator bot, `G3` no non-bot actor ever
+touched any park-ownership label on either surface, `G4` no non-bot comment / review / force-push /
+arm / draft-flip on either surface, `G5` a durable bot-authored **park-generation receipt** binds the
+label write, is the terminal generation, and carries the *defect* attempt counter
+`missed<round>=<lifetime>` — not a consumed round budget, not fix work that actually ran —
+corroborated against the `missed` markers themselves, `G6` the head has not advanced since the park.
+Ambiguity, an unreadable timeline, a missing receipt or a malformed record all fail toward **leaving
+the human label alone**.
+
+Two deliberate inversions relative to `park_policy.py` are documented in the module header: the
+human-touch gate disqualifies on *any* history of a human touch (not most-recent-event-wins, which
+is the rule for *applying* a park), and an actor that is not provably a bot counts as **possibly
+human** (park_policy's `unprovable ⇒ not human` is right when declining to strengthen a hold and
+exactly backwards when weakening one — so the decision never depends on the collaborator-permission
+probe succeeding).
+
+The tool can only ever ADD a machine twin and REMOVE the human hold it replaces; it never applies a
+hold, removes a machine park, arms, marks ready, merges, or comments.
+
 ## Security posture
 
 - Tokens: only in GitHub secrets (encrypted at rest, masked in logs), and only in the
