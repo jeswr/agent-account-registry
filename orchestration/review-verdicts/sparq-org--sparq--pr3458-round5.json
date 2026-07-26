@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3458,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "5f1b28a48ff8a139ef428a6995766f2435c2840d",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "validate_policy_for_n3 still checks only that prohibition action/target/assignee are present; it does not enforce exactly-one cardinality for those fields on permissions or prohibitions. The new unambiguous_operands guard covers constraint-node operands/combinators, not rule attributes. Rust parsing selects one action/target/assignee, whereas odrl-d.n3 and the prohibition strata can match any asserted value. A policy with two assignees, actions, or targets can therefore produce an N3 grant that the Rust reference path does not, contradicting the documented never-more-permissive property. The generated differential cannot catch this because generate_policy always emits exactly one value for every rule attribute.",
+    "file": "crates/sparq-solid/src/odrl_bridge.rs",
+    "fix_hint": "For every permission and prohibition rule, reject unless odrl:action, odrl:target, and odrl:assignee each have exactly one distinct object, or implement identical multi-value semantics in both paths. Add a public-path differential regression with two assignees and preferably action/target variants that demonstrates the Rust-selected value and asserts the N3 call refuses with the graph unchanged (or returns exactly the same no-grant result). Extend the generated corpus with multi-valued rule-attribute shapes.",
+    "severity": "major",
+    "title": "Multi-valued rule attributes still allow N3 authorization widening"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 5 is stagnant. The round-4 authorization-widening finding remains: validation still does not require exactly one odrl:action, odrl:target, and odrl:assignee on each permission/prohibition rule. The N3 rules existentially match every value, while the Rust policy parser/evaluator collapses these fields to one value, so a second matching value can let N3 grant where Rust does not. The new ambiguity guard applies only to constraint operands/combinators, and the generated corpus always emits one action, target, and assignee, so it does not exercise this discrepancy.",
+  "verdict": "request_changes"
+ }
+}
