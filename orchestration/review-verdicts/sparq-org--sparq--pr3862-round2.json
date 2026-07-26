@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3862,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "5c2b600bab468029fbf9b17bd3cd17d0a3ab13b0",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The dispatch branch still emits type=raw,value=${{ needs.setup.outputs.version }}, while setup.outputs.version is the unconstrained required inputs.tag. Thus workflow_dispatch with tag=latest, a stable semver tag, or a moving major.minor tag can still push and overwrite the canonical image tag. This contradicts the comments' load-bearing claim that the trigger paths are disjoint and that a developer/test build can never claim a deployment-followed tag. The added tests do not exercise adversarial input resolution and therefore remain insufficient for this safety property.",
+    "file": ".github/workflows/release.yml",
+    "fix_hint": "Before publishing, reject reserved/canonical dispatch tag forms (at minimum latest, stable semver release tags, and moving major.minor tags), or unconditionally namespace the container tag for dispatch builds, such as dev-<sanitized-version>. Extend scripts/tests/test_release_container_multiarch.py with cases that model latest, stable semver, and major.minor collisions and prove they are rejected or mapped to a noncanonical tag.",
+    "severity": "major",
+    "title": "Manual dispatch can still overwrite canonical container tags"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 2 is stagnant: the prior major finding remains unchanged. The new trigger guards suppress the explicit canonical tag entries during workflow_dispatch, but the dispatch-controlled inputs.tag is still copied unchanged through setup.outputs.version into a raw pushed image tag. A caller can therefore dispatch with latest, a stable release version, or a moving major.minor value and overwrite a deployment-followed/canonical tag. The expanded structural tests still assert only the literal YAML tag configuration and mutations; they do not validate or constrain the effective dispatch tag set for colliding inputs.",
+  "verdict": "request_changes"
+ }
+}
