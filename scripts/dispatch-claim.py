@@ -224,22 +224,24 @@ BLOCKED_BY_RE = re.compile(r"[Bb]locked-by:\s*#([0-9]+)")
 # CONTENT author's provider and is computed HERE, never through policy-resolve.resolve() (whose
 # role=review row is always [opus]); resolve() supplies account_pool/caps/gate/arm only.
 # Model policy (maintainer directive 2026-07-18): sol — the codex-side frontier model — is THE
-# reviewer of anthropic-authored content (luna is its fallback); opus5 (Opus 5, maintainer
-# directive 2026-07-24) takes the primary reviewer slot for openai-authored content that opus
-# held, with opus/fable retained as TAIL FALLBACKS only — a degradation path so an opus5
-# capacity outage parks work gracefully instead of stalling the chain. terra and
-# sonnet are DOCS-ONLY models and must NEVER appear in a review/fix chain (asserted in
-# _self_test; review-fix.yml + worker-pr.py ESCALATION_LADDERS enforce the same).
-REVIEW_CHAIN = {"anthropic": ["sol", "luna"], "openai": ["opus5", "opus", "fable"]}
+# reviewer of anthropic-authored content (luna is its fallback); opus5 (Opus 5) is the SOLE
+# anthropic tier and reviews openai-authored content.
+# [OPUS-5] 2026-07-26 ("deprecate the use of fable and opus entirely in favour of opus5"): the
+# opus/fable tail fallbacks are GONE from both tables. The degradation path they provided is
+# replaced by an EXPLICIT exit, not by silence — `_resolvable_chain` returning [] calls
+# _pr_needs_user(), so an opus5 outage parks the PR for a human instead of quietly serving it
+# from a retired model. terra and sonnet remain DOCS-ONLY and must NEVER appear in a review/fix
+# chain (asserted in _self_test; review-fix.yml + worker-pr.py ESCALATION_LADDERS enforce the
+# same). The retired aliases are asserted out of BOTH tables at import time, below.
+REVIEW_CHAIN = {"anthropic": ["sol", "luna"], "openai": ["opus5"]}
 # FIX_CHAIN is the UNPINNED allocator PREFERENCE walk (strongest tier FIRST — choose_account
 # takes the first serving account, and the frontier tier leads per the sol-first doctrine;
-# opus5 leads the anthropic walk since 2026-07-24, fable/opus as tail fallbacks).
+# the anthropic walk is opus5 ALONE since the 2026-07-26 deprecation).
 # It is deliberately the REVERSE of worker_pr.ESCALATION_LADDERS, which are capability-
-# ASCENDING (weakest first, terminal strongest LAST; opus < luna < fable < opus5 < sol —
-# opus5 is the top ANTHROPIC tier per the 2026-07-24 directive; sol keeps the global frontier
-# slot, cross-provider order unchanged) and govern
+# ASCENDING (weakest first, terminal strongest LAST; capability order luna < opus5 < sol since
+# the 2026-07-26 deprecation removed opus and fable from the order entirely) and govern
 # exhaustion escalation + pinned floors (sol r2 f2 fixed the previously inverted ladders).
-FIX_CHAIN = {"anthropic": ["opus5", "fable", "opus"], "openai": ["sol", "luna"]}
+FIX_CHAIN = {"anthropic": ["opus5"], "openai": ["sol", "luna"]}
 # Probe-exempt PROVIDERS for the require_usage hold (issue #115). Mirrors account-usage.py's
 # EXEMPT_PROVIDERS allowlist (the maintainer decision names openai): codex/openai accounts report
 # no rate-limit-header usage and are governed by reactive backoff, so a usage=None probe outage is
@@ -339,6 +341,16 @@ def _load_module(name, path):
     spec.loader.exec_module(module)
     return module
 
+
+# [OPUS-5] The deprecation register is IMPORTED, not re-declared — a second hand-maintained copy
+# of the retired-alias list is how a model returns in one of them. Asserting at MODULE SCOPE means
+# a retired alias reintroduced into either table fails on import, i.e. on the PR that does it,
+# rather than on a live dispatch tick where it would surface as a mystery needs:user park.
+_deprecated_models = _load_module(
+    "registry_deprecated_models",
+    str(Path(__file__).resolve().with_name("deprecated_models.py")))
+_deprecated_models.assert_table_clean("REVIEW_CHAIN", REVIEW_CHAIN)
+_deprecated_models.assert_table_clean("FIX_CHAIN", FIX_CHAIN)
 
 # Shared park-label policy (park_policy.py): the round-budget human-readmission window
 # (readmission_cutoff) consumed by the CLAIM review loop. Loaded at module scope, same idiom as
@@ -6091,12 +6103,12 @@ def _self_test():
     # go red. (The review of #702 measured that drifting `review_chain` left the whole enrolled
     # suite green.) Each mutant keeps the table SHAPE, so only an equality pin can see it.
     for _table, _from, _to in (
-            ("review_chain", '"anthropic": ["sol", "luna"], "openai": ["opus5", "opus", "fable"]',
-             '"anthropic": ["luna"], "openai": ["opus5", "opus", "fable"]'),
-            ("fix_chain", '"anthropic": ["opus5", "fable", "opus"], "openai": ["sol", "luna"]',
-             '"anthropic": ["opus5", "fable", "opus"], "openai": ["luna", "sol"]'),
-            ("ladders", '"anthropic": ["opus", "fable", "opus5"], "openai": ["luna", "sol"]',
-             '"anthropic": ["opus", "opus5", "fable"], "openai": ["luna", "sol"]')):
+            ("review_chain", '"anthropic": ["sol", "luna"], "openai": ["opus5"]',
+             '"anthropic": ["luna"], "openai": ["opus5"]'),
+            ("fix_chain", '"anthropic": ["opus5"], "openai": ["sol", "luna"]',
+             '"anthropic": ["opus5"], "openai": ["luna", "sol"]'),
+            ("ladders", '"anthropic": ["opus5"], "openai": ["luna", "sol"]',
+             '"anthropic": ["opus5"], "openai": ["sol", "luna"]')):
         _line = f"{_table} = {{{_from}}}"
         assert _line in _rf_live, f"the {_table} drift fixture is stale: {_line}"
         _drifted = _workflow_chains(source=_rf_live.replace(_line, f"{_table} = {{{_to}}}"))
@@ -6108,6 +6120,52 @@ def _self_test():
     print("  ok   adopt-loop L3: review-fix.yml's review_chain/fix_chain/ladders are EXECUTED out "
           "of the workflow and pinned to REVIEW_CHAIN/FIX_CHAIN/ESCALATION_LADDERS; drifting any "
           "one of the three is caught")
+
+    # L3b. [OPUS-5] THE SIXTH SITE. The input-validation model_pin ALLOWLIST is a sixth place that
+    # names the model aliases, and PR #707's L3 pin does not reach it (it slices only the resolve
+    # job's review_chain..ladders block). It was covered by NOTHING. That matters now: it is the
+    # first thing an in-flight PR's pin meets, so a bare deletion of fable/opus there would
+    # SystemExit on every tick forever for every PR that had already escalated. EXECUTE the real
+    # workflow allowlist and pin BOTH halves of its contract — legacy pins migrate, unknown pins
+    # are still rejected.
+    _PIN_ANCHOR = r"(?m)^[ \t]*legacy_pins = \{"
+    _PIN_END = r"(?m)^[ \t]*if mode == \"review\" and model_pin:"
+
+    def _workflow_pin(pin, source=None):
+        src = _review_fix_step_python(_PIN_ANCHOR, _PIN_END, "model_pin allowlist",
+                                      job="resolve", source=source)
+        ns = {"model_pin": pin, "SystemExit": SystemExit}
+        try:
+            exec(src, ns)  # noqa: S102 — repository-owned workflow source
+        except SystemExit as exc:
+            return ("rejected", str(exc))
+        return ("accepted", ns["model_pin"])
+
+    for _legacy in ("fable", "opus"):
+        assert _workflow_pin(_legacy) == ("accepted", "opus5"), (
+            "review-fix.yml's guard must MIGRATE a pre-deprecation model_pin up to opus5, not "
+            "reject it — rejecting permanently stalls every PR that escalated before "
+            "2026-07-26", _legacy, _workflow_pin(_legacy))
+    for _current in ("opus5", "sol", "luna"):
+        assert _workflow_pin(_current) == ("accepted", _current), (_current,
+                                                                   _workflow_pin(_current))
+    assert _workflow_pin("")[0] == "accepted", "an empty pin must stay legal"
+    for _bad in ("sonnet", "terra", "gpt-omega"):
+        assert _workflow_pin(_bad)[0] == "rejected", (
+            "the allowlist must still reject a non-ladder pin — the migration must not become a "
+            "hole that launders any alias into opus5", _bad)
+    # NON-VACUITY: drift the migration map in the LIVE workflow text and require the pin to see
+    # it. Without this the assertions above could pass against a stale extraction.
+    _pin_line = 'legacy_pins = {"fable": "opus5", "opus": "opus5"}'
+    assert _pin_line in _rf_live, f"the legacy-pin fixture is stale: {_pin_line}"
+    _drifted_pin = _workflow_pin("fable", source=_rf_live.replace(_pin_line, "legacy_pins = {}"))
+    assert _drifted_pin[0] == "rejected", (
+        "deleting the legacy-pin migration from review-fix.yml did NOT change the executed "
+        "allowlist — this pin is vacuous", _drifted_pin)
+    print("  ok   adopt-loop L3b: review-fix.yml's model_pin allowlist is EXECUTED out "
+          "of the workflow — legacy fable/opus pins MIGRATE to opus5 (no forever-stall on "
+          "in-flight PRs) while non-ladder pins are still rejected; deleting the migration is "
+          "caught")
 
     # ---- THE IMPL LANE. worker.yml runs the SAME mint-vs-adopt equality with its OWN two copies of
     # the reduction, and the review of #702 MEASURED that both could be reverted to the pre-#112
@@ -7119,7 +7177,7 @@ def _self_test():
             write_verdict(1, None)
             alloc = FakeAllocator()
             launched, reasons = run_items([fix_item], allocator=alloc, routing=routing_ok)
-            assert launched == 0 and alloc.chains == [["opus5", "fable", "opus"]], \
+            assert launched == 0 and alloc.chains == [["opus5"]], \
                 (launched, alloc.chains)
             assert run_items.fix_dispatch["eligible"] == 1, run_items.fix_dispatch
             assert reasons["fix:no-slot"] == 1, reasons
@@ -7132,22 +7190,22 @@ def _self_test():
                 synthetic_rounds[0].index("--round") + 1] == "1", synthetic_rounds
             fake.update(pull=live_pull(draft=True, labels=["review:changes"]), comments=[])
 
-            # ACT: base budget spent on OPUS -> extension escalates UP the ladder
-            # (opus < fable < opus5, sol r2 f2 + 2026-07-24), fable pin converged, and a chain
-            # WITHOUT opus (floor-and-above: fable + opus5);
-            # the None claim then defers with a missed marker, NOT needs-user
+            # [OPUS-5] ACT: base budget spent on a LEGACY tier (opus). Before the 2026-07-26
+            # deprecation this escalated UP the ladder and pinned `fable`. The anthropic ladder is
+            # now single-rung, so the legacy history MIGRATES to opus5 — the terminal tier — and
+            # the model-pin mechanism correctly cannot fire. The important property is that the
+            # PR still has an EXIT: it escalates to a human rather than looping or silently
+            # re-running a retired model. (Model escalation itself is still exercised on the
+            # openai ladder, which retains two tiers — see the worker-pr.py budget self-tests.)
             fake["comments"] = round_markers(3) + [
                 bot_comment(f"x {fix_model} round=1 model=opus run=1.9 -->"),
                 bot_comment(f"x {fix_model} round=2 model=opus run=2.9 -->")]
             write_verdict(3, "stagnant")
             alloc = FakeAllocator()
             run_items([fix_item], allocator=alloc, routing=routing_ok)
-            assert [(script, args[0]) for script, args in helper_calls] == [
-                ("worker-pr.py", "record-model-pin"),
-                ("worker-pr.py", "record-marker")], helper_calls
-            pin_args = helper_calls[0][1]
-            assert pin_args[pin_args.index("--tier") + 1] == "fable", pin_args
-            assert alloc.chains == [["fable", "opus5"]], alloc.chains
+            assert not any(args[0] == "record-model-pin"
+                           for script, args in helper_calls), helper_calls
+            assert alloc.chains == [], alloc.chains
 
             # DO-NOTHING flip: under budget -> no pin call, the DEFAULT fix chain is offered
             fake["comments"] = round_markers(2)
@@ -7156,7 +7214,7 @@ def _self_test():
             run_items([fix_item], allocator=alloc, routing=routing_ok)
             assert [(script, args[0]) for script, args in helper_calls] == [
                 ("worker-pr.py", "record-marker")], helper_calls
-            assert alloc.chains == [["opus5", "fable", "opus"]], alloc.chains
+            assert alloc.chains == [["opus5"]], alloc.chains
 
             # a recorded bot pin governs the chain even under budget (the floor never lowers) —
             # a fable floor offers only floor-and-above (fable + opus5; tiers below the floor
@@ -7165,14 +7223,14 @@ def _self_test():
                 bot_comment(f"z {pin_marker} round=1 tier=fable run=1.5 -->")]
             alloc = FakeAllocator()
             run_items([fix_item], allocator=alloc, routing=routing_ok)
-            assert alloc.chains == [["fable", "opus5"]], alloc.chains
+            assert alloc.chains == [["opus5"]], alloc.chains
             # ... while a NON-bot forged pin marker is inert (bot-login trust filter)
             fake["comments"] = round_markers(2) + [
                 {"user": {"login": "mallory"}, "created_at": "2026-07-30T00:00:00Z",
                  "body": f"z {pin_marker} round=1 tier=fable run=6.6 -->"}]
             alloc = FakeAllocator()
             run_items([fix_item], allocator=alloc, routing=routing_ok)
-            assert alloc.chains == [["opus5", "fable", "opus"]], alloc.chains
+            assert alloc.chains == [["opus5"]], alloc.chains
 
             # top tier (opus5, 2026-07-24) ran + latest verdict improving -> progress
             # extension (pin floor kept)
@@ -7228,7 +7286,7 @@ def _self_test():
             run_items([fix_item], allocator=alloc, routing=routing_ok)
             assert [(script, args[0]) for script, args in helper_calls] == [
                 ("worker-pr.py", "record-marker")], helper_calls
-            assert alloc.chains == [["opus5", "fable", "opus"]], alloc.chains
+            assert alloc.chains == [["opus5"]], alloc.chains
             # (2) rounds recorded AFTER the unlabel count normally: 2 post-unlabel rounds
             # (base 3) stay under budget even though the GLOBAL count (7) is at the hard cap.
             fake["comments"] = burned_era + stamped_rounds(
@@ -7238,7 +7296,7 @@ def _self_test():
             run_items([fix_item], allocator=alloc, routing=routing_ok)
             assert [(script, args[0]) for script, args in helper_calls] == [
                 ("worker-pr.py", "record-marker")], helper_calls
-            assert alloc.chains == [["opus5", "fable", "opus"]], alloc.chains
+            assert alloc.chains == [["opus5"]], alloc.chains
             # (3) a BOT unlabel does NOT reset: the full 5-round count stands and the
             # terminal park fires with the historical charge.
             fake["comments"] = burned_era
@@ -7338,7 +7396,7 @@ def _self_test():
             assert needs_user_reasons() == [], helper_calls
             assert [(script, args[0]) for script, args in helper_calls] == [
                 ("worker-pr.py", "record-marker")], helper_calls
-            assert alloc.chains == [["opus5", "fable", "opus"]], alloc.chains
+            assert alloc.chains == [["opus5"]], alloc.chains
             assert "the missed-fix budget for round 2 charges 0 of " \
                 f"{MISSED_FIX_LIMIT}" in bounce_log.getvalue(), bounce_log.getvalue()
             # (c) a re-admission grants a FRESH allowance, not an unbounded one: once the
@@ -7527,13 +7585,22 @@ def _self_test():
             assert alloc.chains == [], alloc.chains
             fake.update(pull=live_pull(draft=True, labels=["review:needs"]))
 
-            # flip-goes-red: the same posture whose latest fix ran BELOW the recorded opus5
-            # floor (a pin violation / forged marker) mints NO re-review — with the top tier
-            # already graded stagnant it is the loud terminal instead
+            # [OPUS-5] flip-goes-red: the same posture whose latest fix ran BELOW the recorded
+            # floor (a pin violation) mints NO re-review — with the top tier already graded
+            # stagnant it is the loud terminal instead.
+            #
+            # After the 2026-07-26 deprecation this case is NOT EXPRESSIBLE on the anthropic
+            # ladder: it has a single rung (opus5), so nothing can be below the floor, and a
+            # legacy `model=opus` marker MIGRATES to opus5 (= at the floor) rather than reading
+            # as a violation. Rather than delete the invariant, it is asserted here on a tier the
+            # ladder genuinely does not contain, and — for the real two-tier form — on the openai
+            # ladder in worker-pr.py's budget self-tests ("pending fix BELOW the pinned floor
+            # never extends (openai, two-tier)"). Deleting either assertion must red one of the
+            # two suites.
             fake["comments"] = round_markers(3) + [
                 bot_comment(f"x {fix_model} round=1 model=opus5 run=1.9 -->"),
                 bot_comment(f"z {pin_marker} round=1 tier=opus5 run=1.5 -->"),
-                bot_comment(f"x {fix_model} round=3 model=opus run=3.9 -->")]
+                bot_comment(f"x {fix_model} round=3 model=sonnet run=3.9 -->")]
             alloc = FakeAllocator()
             run_items([review_item], allocator=alloc, routing=routing_ok)
             assert [(script, args[0]) for script, args in helper_calls] == [
@@ -7627,7 +7694,7 @@ def _self_test():
             write_verdict(2, None, root=wiring_ledger_root)
             alloc = FakeAllocator()
             launched, reasons = run_items([fix_item], allocator=alloc, routing=routing_ok)
-            assert alloc.chains == [["opus5", "fable", "opus"]], alloc.chains
+            assert alloc.chains == [["opus5"]], alloc.chains
             # a deferring (None-claim) allocator is contention, NOT ledger rot: no lease-error,
             # ledger stays ok, and the zero-dispatch tick stays green
             assert launched == 0 and reasons["lease-error"] == 0, (launched, reasons)
@@ -7739,13 +7806,13 @@ def _self_test():
             # policy (require_usage unset) still dispatches — a non-opted-in repo is unchanged.
             alloc = FakeAllocator()
             run_items([fix_item], allocator=alloc, routing=routing_prov, usage=None)
-            assert alloc.chains == [["opus5", "fable", "opus"]], alloc.chains
+            assert alloc.chains == [["opus5"]], alloc.chains
             # (c) the hold is CONDITIONED on the OUTAGE: require_usage with a LIVE usage map
             # dispatches (usage!=None is not a probe failure).
             alloc = FakeAllocator()
             run_items([fix_item], allocator=alloc, routing=routing_prov,
                       policy=usage_gated, usage={"acct01": {"ok": True}})
-            assert alloc.chains == [["opus5", "fable", "opus"]], alloc.chains
+            assert alloc.chains == [["opus5"]], alloc.chains
             # (d) a probe-EXEMPT (codex/openai) REVIEW chain PROCEEDS despite usage=None: absent
             # usage is its expected steady state (reactive backoff), so the hold must NOT gate it.
             exempt_review = dict(fix_item, state="needs-review")
@@ -7759,9 +7826,12 @@ def _self_test():
             assert reasons["usage-probe-unavailable"] == 0, reasons
             # (e) fail-closed on an UNKNOWN provider: a chain whose alias carries no exempt
             # provider is treated as probe-gated (never silently exempted) and HOLDS.
+            # [OPUS-5] the alias here must be one the LIVE anthropic fix chain actually names,
+            # or the chain fails to resolve first and this fixture stops exercising the
+            # unknown-provider hold at all (it silently became a preclaim-defer when the chain
+            # lost its fable/opus rungs). opus5 is that alias.
             routing_unknown = {"models": {
-                "fable": {"provider": "mystery", "provider_model": "x", "harness": "claude"},
-                "opus": {"provider": "mystery", "provider_model": "y", "harness": "claude"},
+                "opus5": {"provider": "mystery", "provider_model": "x", "harness": "claude"},
             }}
             fake.update(pull=live_pull(draft=True, labels=["review:changes"]),
                         check_runs=gate_green, issue_labels=["area:crate-a"])

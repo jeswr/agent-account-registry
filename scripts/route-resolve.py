@@ -128,25 +128,39 @@ def _self_test():
     # (opus tail fallback, 2026-07-24), escalate.
     mc, ag, esc = resolve(["role:impl", "area:worker"], doc)
     chk("impl+worker -> opus5-led/escalate", (mc, ag, esc),
-        (["opus5", "opus"], "registry-reviewer", True))
+        (["opus5"], "registry-reviewer", True))
     # dispatch is a trust surface too.
     mc, ag, esc = resolve(["role:impl", "area:dispatch"], doc)
-    chk("impl+dispatch -> opus5-led/escalate", (mc, esc), (["opus5", "opus"], True))
+    chk("impl+dispatch -> opus5/escalate", (mc, esc), (["opus5"], True))
     # a NON-trust area (usage) -> plain impl -> sol-led chain (sol-first routing, 2026-07-18).
     mc, ag, esc = resolve(["role:impl", "area:usage"], doc)
-    chk("impl+usage -> sol-led", (mc[0], ag, esc), ("sol", "registry-impl", False))
-    # docs -> haiku-led.
-    chk("docs -> haiku", resolve(["role:docs", "area:docs"], doc)[0][0], "haiku")
+    chk("impl+usage -> opus5-led", (mc[0], ag, esc), ("opus5", "registry-impl", False))
+    # [OPUS-5] docs -> SOL-led (maintainer 2026-07-26: "deprecate sonnet and haiku for docs
+    # writing in favor of gpt 5.6 sol"). The second assertion is the one that reds if either
+    # cheap anthropic tier is put back into the docs chain.
+    chk("docs -> sol", resolve(["role:docs", "area:docs"], doc)[0][0], "sol")
+    chk("docs chain has no cheap anthropic tier",
+        sorted(set(resolve(["role:docs", "area:docs"], doc)[0]) & {"haiku", "sonnet"}), [])
     # [FABLE-5] frontier-tier infra authorship (standing rule 2026-07-17): ci -> sol-led
     # (sol/opus5/fable — opus5 primary anthropic tier since 2026-07-24, fable its tail
     # fallback), FRONTIER-ONLY chain — no sub-frontier model (sonnet/haiku), so
     # chain exhaustion DEFERS at the claim step (defer-not-fallback) instead of degrading tier.
     mc, ag, esc = resolve(["role:ci", "area:ci"], doc)
-    chk("ci -> frontier-only sol-first (terra is docs-only)", (mc, ag, esc),
-        (["sol", "opus5", "fable"], "registry-ci", False))
+    chk("ci -> frontier-only opus5-first (terra is docs-only)", (mc, ag, esc),
+        (["opus5", "sol"], "registry-ci", False))
     chk("ci chain has no sub-frontier tier", sorted(set(mc) & {"sonnet", "haiku"}), [])
-    # no role -> defaults (sol-led, 2026-07-18).
-    chk("no role -> defaults", resolve(["area:usage"], doc)[0][0], "sol")
+    # [OPUS-5] no role -> defaults, now OPUS5-led (maintainer 2026-07-26: opus5 is preferred over
+    # sol wherever both are viable implementors). This repo has no `area:gui`, so it carries no
+    # sol carve-out — every implementor route here takes the opus5-first default.
+    chk("no role -> defaults", resolve(["area:usage"], doc)[0][0], "opus5")
+    for _role in ("impl", "site", "ci"):
+        _mc = resolve([f"role:{_role}"], doc)[0]
+        chk(f"role:{_role} prefers opus5 over sol", _mc[0], "opus5")
+        chk(f"role:{_role} keeps sol reachable (preference, not exclusion)", "sol" in _mc, True)
+        chk(f"role:{_role} chain is cross-provider (terminates under either outage)",
+            sorted({doc["models"][m]["provider"] for m in _mc}), ["anthropic", "openai"])
+    chk("docs KEEPS its sol lead (the separate docs-writing directive)",
+        resolve(["role:docs"], doc)[0][0], "sol")
     # [#122] an AMBIGUOUS multi-role set is REJECTED, never silently routed. An earlier resolver
     # returned None for >1 role, collapsing ambiguity into the roleless case so the set fell to a
     # security/defaults route (a default-allow path for any caller that skips the planner precheck).

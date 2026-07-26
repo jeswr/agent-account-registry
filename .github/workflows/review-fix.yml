@@ -163,7 +163,20 @@ jobs:
           # the provenance-bound implementer provider in the resolve step below). terra and
           # sonnet are DOCS-ONLY models (maintainer directive 2026-07-18) and this lane is
           # never docs, so a terra/sonnet pin is rejected outright.
-          if model_pin and model_pin not in {"opus5", "fable", "opus", "sol", "luna"}:
+          #
+          # [OPUS-5] LEGACY PIN MIGRATION (maintainer directive 2026-07-26: fable + opus-4.8
+          # retired in favour of opus5). This allowlist is the FIRST thing an in-flight PR's pin
+          # meets. Simply deleting fable/opus from it would SystemExit — i.e. red the run on every
+          # tick, forever — for every PR that had already escalated before the deprecation, and
+          # the failure would be attributed to the PR rather than to the config change. So a
+          # retired tier is MIGRATED UP to its successor here, exactly as worker-pr.py's
+          # pinned_fix_floor/record_model_pin do (scripts/deprecated_models.py is the shared
+          # register). Migrating UP is safe: the fix floor may only ever rise, so a migrated pin
+          # can never re-authorize a tier the original pin forbade. Anything that is neither a
+          # current tier nor a known legacy tier is still rejected outright.
+          legacy_pins = {"fable": "opus5", "opus": "opus5"}
+          model_pin = legacy_pins.get(model_pin, model_pin)
+          if model_pin and model_pin not in {"opus5", "sol", "luna"}:
               raise SystemExit("model_pin must be empty or an escalation-ladder tier")
           if mode == "review" and model_pin:
               raise SystemExit("review mode takes no model pin")
@@ -472,8 +485,8 @@ jobs:
           # every chain where fable/opus led; the old tiers stay as TAIL FALLBACKS only, a
           # degradation path so an opus5 capacity outage parks work gracefully instead of
           # stalling the chain. Mirrors dispatch-claim.py REVIEW_CHAIN/FIX_CHAIN.
-          review_chain = {"anthropic": ["sol", "luna"], "openai": ["opus5", "opus", "fable"]}
-          fix_chain = {"anthropic": ["opus5", "fable", "opus"], "openai": ["sol", "luna"]}
+          review_chain = {"anthropic": ["sol", "luna"], "openai": ["opus5"]}
+          fix_chain = {"anthropic": ["opus5"], "openai": ["sol", "luna"]}
           # Escalation ladders in escalation order — weakest tier FIRST, STRONGEST (terminal)
           # tier LAST per the maintainer capability order opus < luna < fable < opus5 < sol
           # (2026-07-24: opus5 is the top ANTHROPIC tier; cross-provider order unchanged) — mirrors
@@ -485,7 +498,7 @@ jobs:
           # later tick instead of burning the extended round budget on the model that already
           # failed; see dispatch-claim.py). A pin outside the implementer provider's ladder
           # fails closed.
-          ladders = {"anthropic": ["opus", "fable", "opus5"], "openai": ["luna", "sol"]}
+          ladders = {"anthropic": ["opus5"], "openai": ["luna", "sol"]}
           # STRUCTURAL ENFORCEMENT (maintainer directive 2026-07-18): terra + sonnet are
           # DOCS-ONLY — review-fix has no docs lane, so their appearance in ANY chain here is a
           # policy defect. Fail closed before any claim can run on the wrong model.
