@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3858,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c66448ae18980e461d4d2c04424125a2c676bb13",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`sparq_gpu_is_still_unpublished` still checks only whether a comment-stripped line starts with `publish` and contains `false`. A valid unused key such as `publish-note = false` satisfies that predicate even if `publish = false` is removed or changed to `publish = true`. Cargo would then treat the package as publishable while this security-deferral trigger remains green, contradicting the enforcement claims in `lib.rs` and `research/threat-model.md`.",
+    "file": "crates/sparq-gpu/tests/prototype_stage_tripwire.rs",
+    "fix_hint": "Use the already-produced Cargo metadata and select the `sparq-gpu` package by workspace package identity, then require its `publish` field to be an empty array (Cargo metadata's representation of `publish = false`). Add a focused regression test or fixture proving that an absent/true `publish` setting plus an unrelated `publish-... = false` key is rejected.",
+    "severity": "major",
+    "title": "Publication tripwire still accepts unrelated manifest keys"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 3's major finding remains materially unchanged. The dependency tripwire is metadata-backed, but the publication tripwire still scans manifest text and accepts unrelated keys such as `publish-note = false`; therefore Cargo may consider `sparq-gpu` publishable while the test passes. Because the same major issue remains at the same severity, progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
