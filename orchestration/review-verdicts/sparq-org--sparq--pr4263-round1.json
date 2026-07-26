@@ -1,0 +1,44 @@
+{
+ "host_envelope": {
+  "pr": 4263,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ac053305473335c4487b1d0776122bc7c4908d13",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The canonicalisation bullet says: \"share the existing `sparq-canon` serialization and scope-canonicalisation primitives where the frozen profile permits\". No scope-canonicalisation primitive exists in the crate today \u2014 `crates/sparq-canon/src/lib.rs` exports only whole-dataset/whole-graph entry points (canonicalize_quads, canonicalize_quads_with, digest_quads_with, issue_quads, canonicalize_triples, \u2026), and the token \"scope\" does not appear anywhere in `crates/sparq-canon/src/`. The same document contradicts the new sentence twice: \u00a74 ends with \"**Gap:** there is no scope-extraction primitive. `sparq-canon` canonicalizes what it is handed; it has no notion of a node neighbourhood or an SCC\", and \u00a76 phase 2 lists \"Scope-canonicalization primitive in `sparq-canon` (feature-gated, default-off)\" as future, gate-blocked work. Describing planned work as existing is the kind of drift this record was written to prevent \u2014 a future implementer reading \u00a79 alone would expect an API that is not there.",
+    "file": "research/genai-urn-concept-verifier-design.md",
+    "fix_hint": "Reword to distinguish what exists from what is planned, e.g.: \"share the existing `sparq-canon` serialization primitives, and the scope-canonicalisation primitive planned in \u00a76 phase 2, where the frozen profile permits\u2026\".",
+    "severity": "minor",
+    "title": "\u00a79 calls sparq-canon's scope-canonicalisation primitives \"existing\"; they do not exist and \u00a74/\u00a76 say so"
+   },
+   {
+    "body": "\u00a79's PKG/vector bullet lists the reusable key as `(concept multihash, model id, model version, content version, verbalisation regime, metric, normalization, dimension)` and then asserts \"Those latter axes already exist in `EmbeddingProvenance`\". Six of the seven do (`model_id`, `model_version`, `content_version`, `verbalization`, `metric`, `normalization` \u2014 crates/sparq-vectors/src/spqv_provenance.rs:169-189), but `dimension` does not: the rustdoc at spqv_provenance.rs:162-164 states \"`dim` is NOT stored here (it is already the store's header dimension and checked there); the compatibility check folds the store dimension in\", and `to_rdf` takes `dim` as a caller-supplied parameter precisely because it is not a field (spqv_provenance.rs:287-292). The substantive argument (incompatible coordinate spaces must not collide under one concept hash) is unaffected, but the sourcing sentence is inaccurate as written.",
+    "file": "research/genai-urn-concept-verifier-design.md",
+    "fix_hint": "Amend to note that dimension is carried by the store header rather than by `EmbeddingProvenance`, and is folded in by `EmbeddingProvenance::compatible_with` at the store level \u2014 so the full key spans provenance plus the store header.",
+    "severity": "minor",
+    "title": "`dimension` is claimed to be an EmbeddingProvenance axis, but it is deliberately not stored there"
+   },
+   {
+    "body": "\u00a73.2 and \u00a77 record closure as unresolved: \"Whether the frozen profile mandates closure, and what a verifier does with a non-closed record, is open question **Q2**\", with fail-closed given only as sparq's default reading. \u00a79 now asserts \"blank-node closure must therefore be a profile invariant, not an implementation convenience\". Read as sparq's recommended answer to Q2 this is coherent and well-argued, but read in isolation it looks like the open question has been settled inside this repo \u2014 which it has not, since Kern/PSS own the profile.",
+    "file": "research/genai-urn-concept-verifier-design.md",
+    "fix_hint": "Add an explicit pointer, e.g. \"\u2026 must therefore be a profile invariant (this is sparq's recommended resolution of open question **Q2**, \u00a73.2/\u00a77 \u2014 not an agreed decision)\".",
+    "severity": "nit",
+    "title": "\u00a79 states blank-node closure \"must be a profile invariant\" without cross-referencing open question Q2"
+   },
+   {
+    "body": "\"The ZK estate remains research-grade and lacks the pending external audit.\" is an honest, correctly hedged caveat and passes the honesty posture. Elsewhere the repo consistently names the tracking gate for this claim \u2014 scripts/check-privacy-claims.sh headers it as \"sq-qhy4 (the ZK-soundness external-audit gate)\" \u2014 so a bare mention here is slightly harder to trace than the house convention. Also, the phrase \"lacks the pending external audit\" reads awkwardly.",
+    "file": "research/genai-urn-concept-verifier-design.md",
+    "fix_hint": "Reword to the canonical form, e.g. \"The ZK estate remains research-grade: the v1 verifier is not externally audited and external accredited-cryptographer sign-off is still pending (`sq-qhy4`).\"",
+    "severity": "nit",
+    "title": "ZK not-yet-audited caveat omits the sq-qhy4 gate reference used elsewhere in the repo"
+   }
+  ],
+  "progress": null,
+  "summary": "Doc-only change: adds \u00a79 \"Estate-fit verdict from the earlier KB evaluation\" (sq-y64lh / issue #3124) to research/genai-urn-concept-verifier-design.md. No crates/, tests, or gates touched, so there is no test-validity or runtime-security surface. I verified the load-bearing factual claims against the checkout: (a) the ZK description is accurate \u2014 crates/sparq-zk/src/commit.rs computes C(G) as a Poseidon2 sponge over leaves in canonical N-Quads order with a length-bearing IV for per-leaf-count domain separation, and scheme IRIs come from crate::registry (ZK_SCHEME_POSEIDON2_*); BN254/Poseidon2 is the documented field/permutation (lib.rs:6-12); (b) the .spqv graph-generation/staleness contract exists (skills/vector-search/SKILL.md:96-107); (c) \u00a79's summary of \u00a73 (whole-dataset RDFC-1.0 output cannot serve as a concept identifier) is a faithful restatement; (d) the closing paragraph is consistent with \u00a71/\u00a78 \u2014 nothing is consumed and no EmbeddingProvenance semantics are reserved ahead of the freeze. The ZK paragraph carries an explicit not-externally-audited caveat, so the privacy-claims honesty gate posture is satisfied (research/** is path-excluded from scripts/check-privacy-claims.sh in any case). No hard-coded performance numbers; the [GPT-5.6] provenance marker matches the established convention in research/. Two minor accuracy defects remain \u2014 one primitive described as \"existing\" that the same document elsewhere records as a gap, and one provenance axis (dimension) that is not in fact an EmbeddingProvenance field \u2014 plus two nits. None are blocking for a design record whose surrounding sections already state the correct position, so I approve with the findings noted for a follow-up doc pass. Completeness against the original issue #3124 ask could not be verified from the checkout (sq-y64lh is not present in .beads/issues.jsonl and no network access was used).",
+  "verdict": "approve"
+ }
+}
