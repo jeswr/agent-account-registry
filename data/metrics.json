@@ -1,43 +1,43 @@
 {
-  "generated_at": "2026-07-26T10:50:25Z",
+  "generated_at": "2026-07-26T11:20:12Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
-      "issues_open": 1260,
-      "issues_ready": 153,
-      "issues_closed_1h": 8,
-      "issues_closed_24h": 61,
-      "prs_open": 86,
-      "prs_draft": 63,
-      "prs_opened_1h": 4,
+      "issues_open": 1263,
+      "issues_ready": 148,
+      "issues_closed_1h": 10,
+      "issues_closed_24h": 64,
+      "prs_open": 85,
+      "prs_draft": 64,
+      "prs_opened_1h": 2,
       "prs_closed_1h": 0,
-      "prs_merged_1h": 8,
-      "prs_merged_24h": 63,
+      "prs_merged_1h": 10,
+      "prs_merged_24h": 66,
       "review_changes_backlog": 3,
       "needs_user_parked": 7,
       "review_lane_health": "ok",
-      "review_lane_runs_1h": 29,
-      "worker_attempts_1h": 9,
-      "worker_success_rate_1h": 0.4444,
-      "pr_open_rate": 4.0,
-      "pr_close_rate": 8.0,
-      "net_pr_flow": -4.0
+      "review_lane_runs_1h": 22,
+      "worker_attempts_1h": 10,
+      "worker_success_rate_1h": 0.2,
+      "pr_open_rate": 2.0,
+      "pr_close_rate": 10.0,
+      "net_pr_flow": -8.0
     },
     "jeswr/agent-account-registry": {
       "issues_open": 290,
       "issues_ready": 76,
-      "issues_closed_1h": 1,
+      "issues_closed_1h": 0,
       "issues_closed_24h": 13,
       "prs_open": 24,
       "prs_draft": 18,
       "prs_opened_1h": 0,
       "prs_closed_1h": 0,
       "prs_merged_1h": 0,
-      "prs_merged_24h": 12,
+      "prs_merged_24h": 11,
       "review_changes_backlog": 4,
       "needs_user_parked": 3,
       "review_lane_health": "ok",
-      "review_lane_runs_1h": 16,
+      "review_lane_runs_1h": 14,
       "worker_attempts_1h": 0,
       "worker_success_rate_1h": null,
       "pr_open_rate": 0.0,
@@ -45,5 +45,16 @@
       "net_pr_flow": 0.0
     }
   },
-  "alerts": []
+  "alerts": [
+    {
+      "target": "sparq-org/sparq",
+      "classification": "worker-failing",
+      "fire": true,
+      "summary": "worker success rate 20% < 50% floor over 2 snapshots (10 attempts this hour)",
+      "metrics": {
+        "worker_success_rate_1h": 0.2,
+        "worker_attempts_1h": 10
+      }
+    }
+  ]
 }
