@@ -269,6 +269,16 @@
    "model": "opus5",
    "issued_at": 1785091720,
    "expires_at": 1785098020
+  },
+  {
+   "account": "58b7c92faa5b5ca5",
+   "claim_id": "953fff984a134b17bc853a77f1f37c52",
+   "holder": "sparq-org/sparq#3297@dispatch-30215134269.1",
+   "package": "sparq-fedplan-mpc",
+   "role": "soundness",
+   "model": "opus5",
+   "issued_at": 1785091726,
+   "expires_at": 1785098026
   }
  ]
 }
