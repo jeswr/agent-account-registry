@@ -61,16 +61,6 @@
    "expires_at": 1785086065
   },
   {
-   "account": "dc2d751954080e13",
-   "claim_id": "8b690bedb19a4e6d9732baddec9821bf",
-   "holder": "review:jeswr/agent-account-registry#630@dispatch-30208342925.1",
-   "package": "worker",
-   "role": "review",
-   "model": "sol",
-   "issued_at": 1785080188,
-   "expires_at": 1785084388
-  },
-  {
    "account": "9e13ea21abf27e68",
    "claim_id": "f2e88d6836bd44ed8b676aa804c4fb2e",
    "holder": "fix:jeswr/agent-account-registry#665@dispatch-30208342925.1",
