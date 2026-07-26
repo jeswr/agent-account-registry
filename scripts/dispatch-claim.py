@@ -4766,6 +4766,79 @@ def _partition_seam_violations(workflow, document):
     return sorted(out)
 
 
+# [registry #703] The YAML SEAM of the park-CAUSE classification. Every deadlock this repo can
+# ever classify is written by exactly two steps of review-fix.yml's `outcome` job — the review
+# outcome (cause `budget`) and the fix outcome (cause `nochange`). Neither is reachable from the
+# python: if one is disabled with `if: false`, deleted, swallowed with `continue-on-error`, or
+# loses its `--bot-login` argument, then no park receipt is parseable, no cause is recorded, every
+# park reads UNCLASSIFIED, and the whole #703 guard degrades SILENTLY to the pre-#703 behaviour
+# with the entire python suite still green. A substring or `count(...) == N` assertion over the
+# workflow text sees none of those four mutations, which is why this table is compared against the
+# PARSED document node by node.
+_PARK_CAUSE_SEAM = {
+    "job_if": ("${{ always() && needs.claim.outputs.acquired == 'true' && "
+               "(needs.run.outputs.verdict_ok == 'success' || "
+               "needs.run.outputs.fix_done == 'success' || "
+               "needs.run.outputs.verdict_stale_reason != '') }}"),
+    "steps": (
+        {"name": "Apply the review outcome (findings, labels, escalation)",
+         "if": "${{ inputs.mode == 'review' && steps.reverify.outcome == 'success' }}",
+         "command": "review-outcome",
+         "cause": "budget"},
+        {"name": "Apply the fix outcome (host-side markers, labels, escalation)",
+         "if": "${{ inputs.mode == 'fix' && needs.run.outputs.fix_done == 'success' }}",
+         "command": "fix-outcome",
+         "cause": "nochange"},
+    ),
+}
+
+
+def _park_cause_seam_violations(document):
+    """The YAML SEAM that makes a park cause writable at all, checked STRUCTURALLY against the
+    PARSED review-fix.yml document. Returns a sorted list of violation strings; empty means
+    intact. Takes the parsed document so the self-test can mutate one node in memory and require
+    the matching violation back — the same non-vacuity protocol as _partition_seam_violations."""
+    out = []
+    job = ((document or {}).get("jobs") or {}).get("outcome")
+    if not isinstance(job, dict):
+        return ["review-fix.yml: jobs.outcome is gone, so NO park cause can ever be written"]
+    if job.get("if") != _PARK_CAUSE_SEAM["job_if"]:
+        out.append(f"review-fix.yml: jobs.outcome `if:` is not the expected acquired-and-ran "
+                   f"guard (found {job.get('if')!r}) — `if: false` or a narrowed condition "
+                   f"disables EVERY park write, and with it every park cause, silently")
+    if job.get("continue-on-error"):
+        out.append("review-fix.yml: jobs.outcome is continue-on-error — a failed park write "
+                   "would be swallowed and the PR would stall unclassified")
+    steps = job.get("steps")
+    if not isinstance(steps, list):
+        return sorted(out + ["review-fix.yml: jobs.outcome.steps is not a list"])
+    by_name = {step.get("name"): step for step in steps if isinstance(step, dict)}
+    for wanted in _PARK_CAUSE_SEAM["steps"]:
+        step = by_name.get(wanted["name"])
+        if step is None:
+            out.append(f"review-fix.yml is missing the `{wanted['name']}` step in jobs.outcome "
+                       f"— nothing else writes a `{wanted['cause']}` park, so that deadlock "
+                       f"cause becomes unrecordable and every such park reads UNCLASSIFIED")
+            continue
+        if step.get("if") != wanted["if"]:
+            out.append(f"review-fix.yml: jobs.outcome step `{wanted['name']}` `if:` is not the "
+                       f"expected mode guard (found {step.get('if')!r}) — `if: false` or an "
+                       f"inverted mode comparison skips the park write SILENTLY")
+        if step.get("continue-on-error"):
+            out.append(f"review-fix.yml: jobs.outcome step `{wanted['name']}` is "
+                       f"continue-on-error — a failed park write would be swallowed")
+        run = step.get("run") if isinstance(step.get("run"), str) else ""
+        if wanted["command"] not in run:
+            out.append(f"review-fix.yml: jobs.outcome step `{wanted['name']}` no longer invokes "
+                       f"`worker-pr.py {wanted['command']}` — the park (and its cause) is never "
+                       f"written")
+        if "--bot-login" not in run:
+            out.append(f"review-fix.yml: jobs.outcome step `{wanted['name']}` no longer passes "
+                       f"`--bot-login` — worker-pr.needs_user REFUSES every capacity park "
+                       f"without it, so no receipt and no cause marker is ever recorded")
+    return sorted(out)
+
+
 def _review_fix_step_python(anchor, end_anchor, what, job="resolve", source=None):
     """Extract a python block VERBATIM out of a review-fix.yml step's `run:` script so a
     cross-script self-test can execute the WORKFLOW's real predicate instead of a re-implemented
@@ -6581,6 +6654,75 @@ def _self_test():
     print(f"  ok   adopt-loop L6: the partition YAML seam is checked on PARSED nodes across "
           f"review-fix.yml + worker.yml, and all {len(_seam_mutants)} seam mutants "
           "(`if: false`, deleted step, deleted/re-pointed env input, deleted job output) are caught")
+
+    # ---- [registry #703] THE PARK-CAUSE YAML SEAM. The whole deadlock guard rests on a cause
+    # being RECORDED at park time, and the only two steps that can record one live in
+    # review-fix.yml's `outcome` job. Disable, delete, swallow, or de-argument either of them and
+    # every park reads UNCLASSIFIED — which the #703 taxonomy deliberately treats as "not a
+    # deadlock", so the guard degrades silently to the pre-#703 conveyor with the entire python
+    # suite still green. Each mutant edits ONE parsed node and must come back named. ----
+    assert _park_cause_seam_violations(_rf_doc) == [], _park_cause_seam_violations(_rf_doc)
+
+    def _outcome_step(document, name):
+        return next(s for s in document["jobs"]["outcome"]["steps"] if s.get("name") == name)
+
+    _review_step = "Apply the review outcome (findings, labels, escalation)"
+    _fix_step = "Apply the fix outcome (host-side markers, labels, escalation)"
+    _cause_mutants = (
+        ("the whole outcome job disabled with if: false",
+         lambda d: d["jobs"]["outcome"].__setitem__("if", "${{ false }}"),
+         "jobs.outcome `if:`"),
+        ("the outcome job swallowed with continue-on-error",
+         lambda d: d["jobs"]["outcome"].__setitem__("continue-on-error", True),
+         "jobs.outcome is continue-on-error"),
+        ("the review-outcome step disabled with if: false",
+         lambda d: _outcome_step(d, _review_step).__setitem__("if", "${{ false }}"),
+         f"step `{_review_step}` `if:`"),
+        ("the review-outcome step's mode guard inverted to the fix lane",
+         lambda d: _outcome_step(d, _review_step).__setitem__(
+             "if", "${{ inputs.mode == 'fix' && steps.reverify.outcome == 'success' }}"),
+         f"step `{_review_step}` `if:`"),
+        ("the review-outcome step DELETED",
+         lambda d: d["jobs"]["outcome"].__setitem__(
+             "steps", [s for s in d["jobs"]["outcome"]["steps"]
+                       if s.get("name") != _review_step]),
+         f"missing the `{_review_step}` step"),
+        ("the review-outcome step's --bot-login argument dropped",
+         lambda d: _outcome_step(d, _review_step).__setitem__(
+             "run", _outcome_step(d, _review_step)["run"].replace("--bot-login", "--no-such")),
+         "no longer passes `--bot-login`"),
+        ("the review-outcome step no longer invokes worker-pr.py review-outcome",
+         lambda d: _outcome_step(d, _review_step).__setitem__(
+             "run", _outcome_step(d, _review_step)["run"].replace(
+                 "review-outcome", "echo-outcome")),
+         "no longer invokes `worker-pr.py review-outcome`"),
+        ("the fix-outcome step disabled with if: false",
+         lambda d: _outcome_step(d, _fix_step).__setitem__("if", "${{ false }}"),
+         f"step `{_fix_step}` `if:`"),
+        ("the fix-outcome step swallowed with continue-on-error",
+         lambda d: _outcome_step(d, _fix_step).__setitem__("continue-on-error", True),
+         f"step `{_fix_step}` is continue-on-error"),
+        ("the fix-outcome step DELETED",
+         lambda d: d["jobs"]["outcome"].__setitem__(
+             "steps", [s for s in d["jobs"]["outcome"]["steps"] if s.get("name") != _fix_step]),
+         f"missing the `{_fix_step}` step"),
+        ("the fix-outcome step's --bot-login argument dropped",
+         lambda d: _outcome_step(d, _fix_step).__setitem__(
+             "run", _outcome_step(d, _fix_step)["run"].replace("--bot-login", "--no-such")),
+         "no longer passes `--bot-login`"),
+        ("the whole outcome job removed",
+         lambda d: d["jobs"].pop("outcome"), "jobs.outcome is gone"),
+        ("the outcome job's steps list replaced by a scalar",
+         lambda d: d["jobs"]["outcome"].__setitem__("steps", "gutted"),
+         "jobs.outcome.steps is not a list"),
+    )
+    for _label, _edit, _needle in _cause_mutants:
+        _violations = _park_cause_seam_violations(_mutate(_rf_doc, _edit))
+        assert _violations, f"park-cause YAML-seam mutant NOT caught ({_label})"
+        assert any(_needle in v for v in _violations), (_label, _needle, _violations)
+    print(f"  ok   #703: the park-CAUSE YAML seam is checked on PARSED nodes, and all "
+          f"{len(_cause_mutants)} seam mutants (`if: false`, inverted mode guard, deleted step, "
+          "continue-on-error, dropped --bot-login, dropped subcommand, removed job) are caught")
 
     # ---- [round-5 P1] CROSS-LANE SUPERSESSION (park -> sibling-launch -> UNPARK): while a
     # PR sat human-parked its crate was freed and a SIBLING claimed a lease there (an impl
