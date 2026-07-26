@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3995,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "439f4f650dc86730e1a6e810c8e8d5781583638d",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`scopedOwner` scopes a target only when `(incident.get(edge.to) ?? []).length === 1`. That condition confuses having another incident edge with being constrained by a mandatory top-level pattern. For example, with typed nodes `?a OPTIONAL-> ?b OPTIONAL-> ?c`, `?b` has two incident edges, so its type/attributes are emitted at top level and independently bind it; the second OPTIONAL is also emitted at top level rather than within the first group. Two OPTIONAL incoming edges sharing a typed target have the same escape. Negated/optional combinations likewise lose the advertised group ownership. Thus the prior round's semantic defect remains for ordinary non-leaf diagrams despite the new leaf-target tests.",
+    "file": "gui/app/src/lib/query-builder.ts",
+    "fix_hint": "Compute ownership/group nesting from mandatory reachability rather than raw incident-edge count. A node should remain inside its reaching OPTIONAL/FILTER NOT EXISTS group unless some genuinely top-level mandatory pattern binds it; dependent optional/excluded edges and their owned descendants must be emitted inside that group. Add exact serialization or result-equivalence tests for a typed OPTIONAL chain and for two optional/excluded edges sharing a typed target, asserting no target class/attribute pattern escapes to the top-level body.",
+    "severity": "major",
+    "title": "Optional or excluded target scoping still breaks for chained or shared optional patterns"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 2 fixes the invalid non-COUNT wildcard aggregates and the simple one-edge OPTIONAL/FILTER NOT EXISTS target-scoping cases, with non-vacuous serialization tests. However, the scoping fix still uses target degree == 1 as a proxy for pattern-group ownership. A target reached only through an OPTIONAL or excluded edge loses that ownership as soon as another optional/excluded edge touches it, causing its class/attribute constraints to escape to the top-level body and changing query answers. This is fewer findings than round 1, but the remaining major semantic defect still blocks approval.",
+  "verdict": "request_changes"
+ }
+}
