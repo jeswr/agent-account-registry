@@ -1,26 +1,6 @@
 {
  "leases": [
   {
-   "account": "dc2d751954080e13",
-   "claim_id": "701033430e85487e8e30f74010b6be14",
-   "holder": "sparq-org/sparq#2920@dispatch-30216390288.1",
-   "package": "sparq-vectors",
-   "role": "impl",
-   "model": "sol",
-   "issued_at": 1785093676,
-   "expires_at": 1785099976
-  },
-  {
-   "account": "dc2d751954080e13",
-   "claim_id": "88abca2516624da69a7c52d4228df74d",
-   "holder": "sparq-org/sparq#3133@dispatch-30216390288.1",
-   "package": "sparq-reason-el",
-   "role": "impl",
-   "model": "sol",
-   "issued_at": 1785093694,
-   "expires_at": 1785099994
-  },
-  {
    "account": "58b7c92faa5b5ca5",
    "claim_id": "a7f5a83e593a4fbfbcc1449bf75f1828",
    "holder": "fix:sparq-org/sparq#4238@dispatch-30218420202.1",
