@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4283,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "36dd4cca212fa2b36344341ea4a8365bf281e7b3",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The projected-CRS gate remains fail-closed while correctly admitting definitions whose WKT axis directions match proj4rs's source-axis convention. The new parser validates the complete three-character +axis value before comparing its first two directions, defaults consistently to enu, and rejects missing WKT axes, transposed axes, malformed values, and WKT/PROJ.4 disagreements. The focused tests exercise both refusal paths and real transformations for wsu across WGS84-coincident and datum-shifted definitions, with independent same-projection UTM witnesses; they also cover the registry-wide explicitly tagged set and the swu admission/non-evaluable distinction. Documentation is updated consistently. No hostile reviewer-directed instruction was present in the diff.",
+  "verdict": "approve"
+ }
+}
