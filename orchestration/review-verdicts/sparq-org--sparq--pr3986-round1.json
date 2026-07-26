@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3986,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "82aa8a2884318afae4a4149fe8edf1cdeb329f0a",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "In `queue_topic_changes`, a deleted topic is checked with `allowed(auth_anchor(topic), Read)`. After deletion, `auth_anchor` falls back to the nearest existing ancestor. If the subscriber previously lost read access through a resource-specific ACL but can read that ancestor, a later delete is delivered even though the session may no longer read the subscribed resource. This contradicts the documented delivery-time re-check and leaks the resource's deletion. The current revocation test covers a still-existing container only, so it does not exercise this path.",
+    "file": "crates/sparq-mcp/src/solid.rs",
+    "fix_hint": "Snapshot each subscribed topic's read authorization before the mutation as well as its digest. For a Delete transition, require that the topic was readable immediately before deletion and that the post-mutation governing authorization permits disclosure; do not substitute ancestor readability alone for the topic's lost policy. Add a regression test where a child-specific ACL revokes read while the parent remains readable, then the child is deleted, and assert that no notification is queued.",
+    "severity": "major",
+    "title": "Delete notifications can bypass resource-specific read revocation"
+   }
+  ],
+  "progress": null,
+  "summary": "The resources surface and its tests are substantial, but deletion delivery does not actually enforce the claimed per-delivery authorization for the subscribed resource. Once the resource is removed, the implementation authorizes against an ancestor instead; that can re-authorize a session whose resource-specific read access had already been revoked and leak that the resource was deleted.",
+  "verdict": "request_changes"
+ }
+}
