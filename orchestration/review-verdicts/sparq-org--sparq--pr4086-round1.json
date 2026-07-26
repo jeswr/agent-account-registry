@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4086,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "589a158dbfbe28290f51ceb765fb15afa2f9eeca",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The code counts input files as `shards` but never extracts or validates the `k/n` identity encoded in artifact paths. Consequently `--seed` accepts a single complete shard, any incomplete subset such as 23/24, or multiple copied artifacts for the same shard (the realpath check only catches the identical path/symlink target). It then records that partial sum as the baseline; with one file it even omits the `shards` marker. This contradicts the diff's central claim that seeding from a subset is refused/safe. The self-test explicitly demonstrates the hole by successfully seeding `ok1` alone after describing it as one shard.",
+    "file": "scripts/mutants-gate.py",
+    "fix_hint": "Parse shard identity and denominator from the artifact directory suffix (or add explicit shard metadata), group by crate, and in `seed` require exactly the unique indices 1..n with one consistent denominator. Reject missing, repeated, or conflicting shard identities; retain a clearly distinguished unsharded mode. Add tests proving that 1/24, 23/24, duplicate 1/24 under different paths, and mixed denominators are refused, while exactly one copy of every shard succeeds.",
+    "severity": "major",
+    "title": "Seeding does not verify a complete, disjoint shard set"
+   }
+  ],
+  "progress": null,
+  "summary": "The aggregation arithmetic is reasonable, but the new seeding path does not establish that the supplied artifacts form a complete, disjoint shard set. This leaves the principal dishonest-baseline failure mode open: one shard, 23/24 shards, or duplicated shard artifacts can still be accepted and committed as a whole-crate ceiling. The tests validate summing and per-artifact truncation, but do not validate shard-set completeness or uniqueness.",
+  "verdict": "request_changes"
+ }
+}
