@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 3995,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "35f7c4e802cd26ce5e777907b0427fad47334f71",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`buildSparql` emits every node's `rdf:type` triple in phase 1, before wrapping edges. When `addRelationship` creates a target typed from `sh:class`, marking that edge OPTIONAL leaves the target type triple mandatory and independently binds the target; marking it negated similarly tests NOT EXISTS against an already-bound target. This changes answers and contradicts the advertised OPTIONAL/AND-NOT semantics. The existing OPTIONAL test uses an untyped target, so it cannot catch this.",
+    "file": "gui/app/src/lib/query-builder.ts",
+    "fix_hint": "Emit constraints belonging to a walked target inside the OPTIONAL or FILTER NOT EXISTS group with its edge, or redesign the model/serializer to preserve pattern-group ownership. Add result- or serialization-level tests with `targetClass` for both OPTIONAL and negated edges, proving the complete target pattern is scoped inside the construct and absent from the top-level body.",
+    "severity": "major",
+    "title": "Target class constraints escape OPTIONAL and FILTER NOT EXISTS"
+   },
+   {
+    "body": "The aggregate variable picker always offers `*`, while the function picker offers SUM, AVG, MIN, MAX, SAMPLE, and GROUP_CONCAT. `aggregateExpression` then emits the selected pair without validation, producing non-standard queries such as `SUM(*)`, despite the README's claim that the builder emits standard SPARQL 1.1.",
+    "file": "gui/app/src/components/workbench/query-builder-tool.tsx",
+    "fix_hint": "Offer `*` only for COUNT, and when changing away from COUNT coerce an existing wildcard selection to a bound variable or surface a blocking validation state. Also defensively validate in `buildSparql`, and add a test covering a function change from COUNT(*) to SUM.",
+    "severity": "major",
+    "title": "Aggregate picker can generate invalid SUM(*) and similar expressions"
+   }
+  ],
+  "progress": null,
+  "summary": "The serializer has correctness holes in two advertised builder features. Class constraints for nodes reached by OPTIONAL or FILTER NOT EXISTS edges are emitted as unconditional top-level patterns, changing both constructs' semantics; the current OPTIONAL test uses an untyped target and does not exercise this real shape-aware path. The aggregate UI also permits `*` for every function although SPARQL only permits the wildcard in COUNT, so it can generate invalid queries such as SUM(*).",
+  "verdict": "request_changes"
+ }
+}
