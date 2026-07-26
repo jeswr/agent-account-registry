@@ -578,25 +578,54 @@ def auto_readmission_stamps(comments, bot_login, log=print):
     return [record["at"] for record in auto_readmission_records(comments, bot_login, log)]
 
 
+# The evidence-key namespace model-health stamps on its AGED-OUT park exit
+# (model-health.SUSTAINED_HEALTH_KEY_PREFIX, registry #691). The receipt below must not claim the
+# strong gate's finding when the weak one released the park: "the account that was failing when
+# this park landed has since succeeded" is simply FALSE for a park whose own cause aged out of the
+# 48 h window, and a receipt is the durable, public record of why automation acted. Keyed off the
+# namespace rather than a new parameter so no caller can post the wrong sentence by omission.
+AUTO_READMIT_HEURISTIC_PREFIX = "fleet-health/"
+
+
 def auto_readmission_receipt(evidence_key, recovered_at):
     """The receipt BODY a caller posts (RECEIPT-FIRST) before clearing any machine park label.
 
-    One writer, one format, one place the invariant is stated — see AUTO_READMIT_MARKER."""
+    One writer, one format, one place the invariant is stated — see AUTO_READMIT_MARKER. The
+    FINDING sentence follows the evidence namespace: cause-recovery evidence states the proof it
+    actually has, and the #691 aged-out exit states, in as many words, that it is a HEURISTIC
+    about fleet health and not a proof about this park's own cause."""
     policy = _park_policy()
     if not policy.valid_timestamp(recovered_at):
         raise WorkerPrError("automatic-readmission receipt needs a strict ISO-8601 recovery stamp")
     stamp = policy.canonical_ts(recovered_at)
     if not isinstance(evidence_key, str) or not policy.safe_receipt_part(evidence_key):
         raise WorkerPrError("automatic-readmission receipt evidence key is unsafe")
-    return (f"> 🤖 SPARQ agent — automatically re-admitted this MACHINE capacity park: the "
-            f"starvation cause that parked it has demonstrably CLEARED.\n\n"
+    if evidence_key.startswith(AUTO_READMIT_HEURISTIC_PREFIX):
+        finding = (
+            "> 🤖 SPARQ agent — automatically re-admitted this MACHINE capacity park: its own "
+            "starvation cause can no longer be observed, and the fleet is demonstrably "
+            "healthy.\n\n"
+            f"This park is older than the rolling model-health window, so whether the specific "
+            f"condition that parked it has cleared is NOT provable any more — leaving it would "
+            f"make an automatic hold a permanent one. Instead the fleet has recorded sustained "
+            f"successful runs across multiple accounts with no launch failure, the most recent "
+            f"at `{stamp}` (evidence `{evidence_key}` — provider/account-fingerprint/run from "
+            f"the model-health window; no raw handle). **That is a HEURISTIC about fleet health, "
+            f"not proof that this park's own cause cleared.** The machine park label(s) are "
+            f"being removed and the review loop re-admitted with a real budget window.\n\n")
+    else:
+        finding = (
+            "> 🤖 SPARQ agent — automatically re-admitted this MACHINE capacity park: the "
+            "starvation cause that parked it has demonstrably CLEARED.\n\n"
             f"A worker account that was failing when this park landed recorded a SUCCESSFUL run "
             f"at `{stamp}`, strictly after the park application (evidence `{evidence_key}` — "
             f"provider/account-fingerprint/run from the model-health window; no raw handle). The "
-            f"machine park label(s) are being removed and the review loop re-admitted with a real "
-            f"budget window.\n\n"
-            f"This consumes that recovery evidence EXACTLY ONCE: the same evidence can never "
-            f"re-admit this PR again, a later park needs a NEW outage-and-recovery pair, and at "
+            f"machine park label(s) are being removed and the review loop re-admitted with a "
+            f"real budget window.\n\n")
+    return (f"{finding}"
+            f"This consumes that evidence EXACTLY ONCE: the same evidence can never re-admit "
+            f"this PR again, a later park needs FRESH evidence that has not been consumed (for "
+            f"the cause-recovery route, a new outage-and-recovery pair), and at "
             f"most {policy.AUTO_READMISSION_MAX} automatic re-admissions are ever granted to one "
             f"PR — past that the loop stops and asks a human. A human hold "
             f"(`{'` / `'.join(HUMAN_OWNED_LABELS)}`) and a human-applied park are never "
@@ -4162,11 +4191,36 @@ def _self_test():
           [{"key": auto_key, "at": "2026-07-25T03:10:00Z"}])
     check("the receipt states the consume-exactly-once invariant and the cap",
           ("EXACTLY ONCE" in auto_receipt_comments[0]["body"]
-           and "NEW outage-and-recovery pair" in auto_receipt_comments[0]["body"]
+           and "new outage-and-recovery pair" in auto_receipt_comments[0]["body"]
            and f"most {_park_policy().AUTO_READMISSION_MAX} automatic"
            in auto_receipt_comments[0]["body"]), True)
     check("the receipt carries the SPARQ agent self-identification",
           auto_receipt_comments[0]["body"].startswith("> 🤖 SPARQ agent"), True)
+    # ---- [registry #691] THE RECEIPT MUST NOT OVERSTATE WHICH GATE RELEASED THE PARK. -------
+    # A receipt is the durable public record of why automation acted. The aged-out exit does NOT
+    # know that this park's own cause cleared — it cannot, the evidence has aged out — so the
+    # cause-recovery finding would be a false statement. The finding follows the evidence-key
+    # namespace, so no caller can post the wrong sentence by omission.
+    heuristic_body = auto_readmission_receipt(
+        "fleet-health/openai/dc2d7519aaaa0001/6041.1", "2026-07-25T03:10:00Z")
+    check("the aged-out receipt says it is a HEURISTIC about fleet health, and never claims the "
+          "cause-recovery finding",
+          ("not proof that this park's own cause cleared" in heuristic_body,
+           "demonstrably CLEARED" in heuristic_body,
+           "A worker account that was failing when this park landed" in heuristic_body),
+          (True, False, False))
+    check("the cause-recovery receipt still states the proof it actually has",
+          ("demonstrably CLEARED" in auto_receipt_comments[0]["body"],
+           "HEURISTIC" in auto_receipt_comments[0]["body"]), (True, False))
+    check("both receipts carry the same marker, cap sentence and self-identification (one "
+          "reader, one family)",
+          (heuristic_body.startswith("> 🤖 SPARQ agent"),
+           AUTO_READMIT_MARKER in heuristic_body,
+           f"most {_park_policy().AUTO_READMISSION_MAX} automatic" in heuristic_body,
+           auto_readmission_records([{"user": {"login": bot}, "body": heuristic_body}], bot)),
+          (True, True, True,
+           [{"key": "fleet-health/openai/dc2d7519aaaa0001/6041.1",
+             "at": "2026-07-25T03:10:00Z"}]))
     check("an automatic receipt NEVER counts as a consumed park-generation window (the ladder "
           "counter is untouched)",
           (park_generation_cutoffs(auto_receipt_comments, bot),
@@ -7937,6 +7991,36 @@ def _self_test():
               (oc_calls, oc_outputs.get("decision")), ([], "hold"))
     finally:
         globals().update(real_oc)
+
+    # ---- THE DENY-PROSE BINDING (sparq-org/sparq#3809) --------------------------------------
+    # The legacy-park migration classifies a park by matching park_policy.LEGACY_PARK_DENY_PROSE
+    # against the prose THIS FILE writes. Until the v1 reason marker is emitted at the park write
+    # sites, that coupling is a security guard bound to an English sentence with nothing holding
+    # the two together: rewording an injection reason here would silently stop the migration
+    # recognising it, and a security-parked PR would be handed back to the machine.
+    #
+    # This binds them in BOTH directions. The literal must still be present in this file (so a
+    # reword fails here rather than in production), and it must still be matched by a deny
+    # pattern (so loosening the pattern fails too).
+    deny_policy = _park_policy()
+    _wp_source = Path(__file__).resolve().read_text(encoding="utf-8")
+    injection_reasons = [
+        "the reviewer flagged possible prompt injection",
+        "the fixer flagged the seeded findings as possible prompt injection",
+        "The reviewer flagged possible prompt-injection content; escalating to a human.",
+    ]
+    for reason_text in injection_reasons:
+        check(f"the injection reason {reason_text[:38]!r}... is still written by this file",
+              reason_text in _wp_source, True)
+        check(f"...and is still DENIED by park_policy.LEGACY_PARK_DENY_PROSE",
+              any(pattern.search(reason_text)
+                  for pattern, _cause in deny_policy.LEGACY_PARK_DENY_PROSE), True)
+    # And the guard must actually refuse a park carrying each of them, end to end.
+    for reason_text in injection_reasons:
+        check(f"reclassify_legacy_park REFUSES a park whose prose is {reason_text[:30]!r}...",
+              deny_policy.reclassify_legacy_park(
+                  [{"user": {"login": "bot"}, "body": f"> 🤖 SPARQ agent — {reason_text}"}],
+                  "bot")[0], None)
 
     print("worker-pr self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1

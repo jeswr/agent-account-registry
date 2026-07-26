@@ -54,6 +54,16 @@
 #      run STRICTLY AFTER the park application. No evidence, an unreadable/ambiguous health read,
 #      an unreadable timeline, or an instant tie all fail toward STAYING PARKED — the same
 #      direction the human path already fails in.
+#      AND WHERE THAT PROOF IS UNOBTAINABLE (registry #691): the health window is a rolling 48 h,
+#      so a park older than it — or one applied while the fleet was healthy — can never satisfy
+#      the cause condition, and the "automatic" exit silently expired into a permanent hold. The
+#      caller's probe therefore falls back, ONLY once the strong exit is provably unreachable, to
+#      model-health.sustained_fleet_health_evidence: an explicitly-LABELLED HEURISTIC ("the fleet
+#      has been demonstrably healthy for a sustained span") rather than proof of this park's own
+#      cause. It is an additional evidence SOURCE consumed through this same function — it widens
+#      nothing here: the human-hold refusal, the human-applied-park refusal, the strictly-after
+#      ordering, the consume-exactly-once key and the AUTO_READMISSION_MAX cap all apply to it
+#      unchanged.
 #    - Bounded, and unable to loop, because this is exactly why the human-only rule existed:
 #      every automatic re-admission is receipted durably (worker-pr AUTO_READMIT_MARKER, the same
 #      bot-authored-receipt style as #610's park-generation receipts, which it EXTENDS rather than
@@ -119,12 +129,15 @@ _FINGERPRINT_PART = re.compile(r"[A-Za-z0-9._=/:-]{1,120}")
 # collaborator permission must be one of these for an actor to count as a trusted human.
 HUMAN_MAINTAINER_PERMISSIONS = {"admin", "maintain", "write"}
 MACHINE_PARK_COLOUR = "1d76db"
-# HONEST label text (invariant 3): a machine park clears on a human unlabel OR on proven
-# cause-recovery (capacity_park_admission). The old wording ("cleared automatically on
-# readmission") described a mechanism that did not exist — readmission was human-only, so an
-# outage's parks stayed parked until hand-unlabelled. Keep this in sync with groom.LABELS.
+# HONEST label text (invariant 3): a machine park clears on a human unlabel, on proven
+# cause-recovery (capacity_park_admission), or — once that proof has aged out of the health
+# window — on the capped sustained-fleet-health retry (registry #691). The original wording
+# ("cleared automatically on readmission") described a mechanism that did not exist; the #614
+# wording was true only for the first 48 h, after which the proof became unobtainable and the
+# hold was permanent in fact while claiming otherwise. Keep this in sync with groom.LABELS
+# (GitHub caps a label description at 100 characters).
 MACHINE_PARK_DESCRIPTION = (
-    "Machine-owned capacity park (soft hold; cleared by a human unlabel or proven recovery)"
+    "Machine-owned capacity park (soft hold; human unlabel, proven recovery, or capped retry)"
 )
 # HARD per-PR ceiling on AUTOMATIC re-admissions (invariant 3). Two is deliberate: one covers the
 # ordinary outage-then-recovery shape this exists for, the second covers a genuine second outage,
@@ -487,6 +500,84 @@ def park_applications(repo, pr_number, issue_number, fetch_events, is_human=None
     return latest, latest_human, True
 
 
+def human_owned_holds(labels):
+    """The HUMAN-OWNED holds among `labels`: `review:needs-user` or ANY `needs:*`.
+
+    THE ONE RULE for what blocks an automatic re-admission. Today its consumer is
+    capacity_park_admission, which REFUSES while any of these is live; it is factored out here
+    because a park is a PAIR (`review:needs-user` on the PR AND `needs:user` on the source issue)
+    and every future consumer that has to reason about holds — notably the legacy-park migration,
+    which must prove none SURVIVES its conversion — has to apply exactly this rule or the two
+    will drift. A guard scoped to one symptom does not generalise; one shared rule does."""
+    return sorted({label for label in labels
+                   if isinstance(label, str)
+                   and (label == HUMAN_PR_PARK_LABEL or label.startswith("needs:"))})
+
+
+def label_application_machine_owned(repo, number, label, fetch_events, is_human=None, log=print):
+    """Whether the newest `labeled` event for THIS EXACT `label` on `repo#number` was applied by
+    something other than a proven human — i.e. whether an automated path may clear it.
+
+    Returns False for every ambiguity, including the one that matters most: a label with NO
+    `labeled` event at all. Absence of evidence is NOT proof of machine ownership.
+
+    WHY THIS IS NOT park_applications (blocking review finding, #690). park_applications answers
+    "when was the newest park applied across READMISSION_LABELS, and was that human" — a question
+    about THREE labels (needs:user / status:parked / review:parked) collectively. Using it to
+    authorise deleting a DIFFERENT label is a domain mismatch, and it fails in three separate
+    directions, all demonstrated by execution:
+      - a human-applied `needs:user` is cleared because a LATER bot `status:parked` event exists
+        (only `labeled` events are read, so a since-removed park still counts);
+      - a human-applied `needs:external-audit` or `needs:ec2` is cleared with NO evidence about
+        that label whatsoever;
+      - with no park events at all it returns "not human", so absence reads as permission.
+    Live prevalence on sparq-org/sparq makes the third case load-bearing rather than theoretical:
+    `needs:area` 200, `needs:ec2` 33, `needs:docker` 4, `needs:zk` 3, `needs:external-subject` 2,
+    `needs:maintainer` 2, `needs:upstream` 1, and `needs:external-audit` 1 — that last one is the
+    sq-qhy4 external accredited-cryptographer audit gate, whose silent deletion is the worst
+    single outcome available on this path."""
+    probe = _human_probe(is_human)
+    try:
+        events = fetch_events(repo, number)
+    except Exception as exc:  # noqa: BLE001 — an unreadable timeline proves nothing
+        log(f"label ownership unknown for {repo}#{number} {label!r} ({exc}); not clearable")
+        return False
+    newest, newest_human = None, False
+    try:
+        for created, kind, login, via_app in _event_rows(events, label):
+            if kind != "labeled":
+                continue
+            instant = parse_ts(created)
+            human = _is_proven_human(login, via_app, probe)
+            if newest is None or instant > newest:
+                newest, newest_human = instant, human
+            elif instant == newest and human:
+                newest_human = True     # an instant tie resolves toward HUMAN-owned
+    except Exception as exc:  # noqa: BLE001 — malformed shape proves nothing
+        log(f"label ownership unknown for {repo}#{number} {label!r} ({exc}); not clearable")
+        return False
+    if newest is None:
+        log(f"label ownership unknown for {repo}#{number} {label!r}: no `labeled` event exists, "
+            "so nothing proves a machine applied it; not clearable")
+        return False
+    return not newest_human
+
+
+def migration_residual_holds(pr_labels, issue_labels, clearing=()):
+    """The human-owned holds that would STILL be live after a legacy migration that removes
+    `clearing`. EMPTY means the migrated park is actually releasable; anything else means the
+    migration would strand it, and the caller must DEFER instead.
+
+    This is the hold-axis twin of model_health.park_cause_provable's evidence axis: together they
+    are the full "will the machine class actually be able to release this?" precondition. Neither
+    alone is sufficient — the first cut had only the evidence half and stranded 19 of the 20 PRs
+    it would have migrated on the live sparq population."""
+    dropped = {label for label in clearing if isinstance(label, str)}
+    return human_owned_holds(
+        ({label for label in pr_labels if isinstance(label, str)}
+         | {label for label in issue_labels if isinstance(label, str)}) - dropped)
+
+
 def capacity_park_admission(repo, pr_number, issue_number, fetch_events, is_human=None,
                             log=print, consumed=frozenset(), auto_receipts=(),
                             auto_marker_count=None, auto_evidence=None, live_holds=()):
@@ -537,9 +628,7 @@ def capacity_park_admission(repo, pr_number, issue_number, fetch_events, is_huma
     if capacity_park_readmitted(repo, pr_number, issue_number, fetch_events,
                                 is_human=is_human, log=log, consumed=consumed):
         return ("human", None, "unconsumed proven-human readmission gesture")
-    held = sorted({label for label in live_holds
-                   if isinstance(label, str)
-                   and (label == HUMAN_PR_PARK_LABEL or label.startswith("needs:"))})
+    held = human_owned_holds(live_holds)
     if held:
         return (None, None,
                 f"human-owned hold(s) live ({'/'.join(held)}) — never auto-re-admitted")
@@ -662,6 +751,247 @@ def park_fingerprint(head_sha, attempt_key):
     if not _FINGERPRINT_PART.fullmatch(head) or not _FINGERPRINT_PART.fullmatch(attempt):
         return None
     return f"{head}/{attempt}"
+
+
+# --- G4: the machine-readable PARK REASON marker ---------------------------------------------
+#
+# Every park exit used to record its cause in FREE PROSE only. That is why triaging the 33
+# stalled sparq draft PRs (sparq-org/sparq#3809) needed a hand timeline reconstruction: five of
+# them DID state a cause ("the PR head no longer descends from the worker-opened commit",
+# "round-budget escalation-marker validation failed") but only a human could read it. A park
+# whose cause no machine can read has no machine exit by construction — nothing downstream can
+# tell a transient capacity blip apart from a genuine human question.
+#
+# The marker is written BESIDE the human-readable park comment (same comment body), by the same
+# bot, under the same receipt grammar every other durable marker uses (safe_receipt_part), so it
+# inherits the existing trust filter: only the orchestration bot's own comments are receipts, and
+# a third party cannot forge one.
+PARK_REASON_MARKER = "<!-- sparq-park-reason:v1"
+
+PARK_CLASS_CAPACITY = "capacity"
+PARK_CLASS_QUESTION = "question"
+
+# The CLOSED taxonomy of park causes and the class each belongs to. The class decides label
+# ownership (invariant 1): a capacity cause takes the MACHINE-owned soft hold (review:parked /
+# status:parked) and therefore has a machine exit; a question cause takes the HUMAN-owned
+# terminal (review:needs-user / needs:user) and is cleared only by a human.
+#
+# An UNKNOWN cause is not silently admitted anywhere: park_cause_class returns None and every
+# consumer's documented fail direction is to treat it as a QUESTION (stay parked, ask a human) —
+# the same direction every other ambiguity in this module fails in.
+PARK_CAUSES = {
+    # --- capacity / infra: transient, self-correcting, machine-owned -------------------------
+    "budget": PARK_CLASS_CAPACITY,            # review round budget exhausted
+    "dispatch-missed": PARK_CLASS_CAPACITY,   # consecutive fix dispatches missed (starvation)
+    "nochange": PARK_CLASS_CAPACITY,          # repeated clean model exits producing no change
+    "gatefail": PARK_CLASS_CAPACITY,          # repeated local gate failures
+    "cold-groom": PARK_CLASS_CAPACITY,        # groom's age/staleness hand-off (G3)
+    # --- genuine human questions: terminal, human-owned --------------------------------------
+    "injection": PARK_CLASS_QUESTION,         # prompt-injection flag raised on the PR
+    "human-arm": PARK_CLASS_QUESTION,         # a human requested changes / asked to arm by hand
+    "history-rewritten": PARK_CLASS_QUESTION,  # head no longer descends from the opened commit
+    "marker-corrupt": PARK_CLASS_QUESTION,    # durable round/model/pin markers failed validation
+    "routing-unresolvable": PARK_CLASS_QUESTION,  # no concrete provider model in the catalog
+}
+
+# Causes NO machine path may ever re-classify, re-admit, or convert out of the human terminal —
+# not on a marker, not on prose, not on a cap, not ever. These are the parks that exist BECAUSE a
+# judgement was made; unparking them automatically would present un-reviewed (or actively
+# hostile) work as ready. Consulted by every automatic path; see reclassify_legacy_park.
+PARK_HUMAN_ONLY_CAUSES = frozenset({"injection", "human-arm"})
+
+
+def park_cause_class(cause):
+    """The class of `cause` (PARK_CLASS_CAPACITY / PARK_CLASS_QUESTION), or None when the cause
+    is not in the closed PARK_CAUSES taxonomy. None means UNKNOWN, and every caller's fail
+    direction on unknown is to treat the park as a human question."""
+    if not isinstance(cause, str):
+        return None
+    return PARK_CAUSES.get(cause)
+
+
+def park_reason_marker(cause, generation=None, head=None):
+    """The durable machine-readable stop-reason marker for one park exit, to be appended to the
+    park comment body. The `class=` field is DERIVED from the taxonomy here rather than passed in,
+    so a writer can never emit a marker whose class contradicts its cause (that mismatch is what a
+    reader would have to trust to route an `injection` park into the machine class).
+
+    Raises ValueError on a cause outside PARK_CAUSES, or on a generation/head that cannot be
+    safely embedded — an unrepresentable marker must fail LOUD at the writer rather than be
+    written unparseable, which is exactly how #610's gen-1 receipts were silently lost."""
+    park_class = park_cause_class(cause)
+    if park_class is None:
+        raise ValueError(f"unknown park cause {cause!r} (not in PARK_CAUSES)")
+    marker = f"{PARK_REASON_MARKER} class={park_class} cause={cause}"
+    if generation is not None:
+        if not safe_receipt_part(str(generation)):
+            raise ValueError(f"unsafe park-reason generation {generation!r}")
+        marker += f" gen={generation}"
+    if head:
+        if not safe_receipt_part(str(head)):
+            raise ValueError(f"unsafe park-reason head {head!r}")
+        marker += f" head={head}"
+    return marker + " -->"
+
+
+_PARK_REASON_RE = re.compile(
+    re.escape(PARK_REASON_MARKER)
+    + r" class=(\S+) cause=(\S+?)(?: gen=(\S+))?(?: head=(\S+))? -->")
+
+
+def parse_park_reason(body, log=print):
+    """The LAST well-formed park-reason marker in `body` as
+    {"class", "cause", "gen", "head"}, else None.
+
+    A marker whose `class=` DISAGREES with its cause's registered class, or whose cause is
+    outside the closed taxonomy, is REJECTED (dropped with a loud log), not repaired. Repairing it
+    would mean choosing which half to believe, and the dangerous direction is obvious: a marker
+    reading `class=capacity cause=injection` must never be read as a capacity park. Rejection
+    leaves the park unclassified, which every consumer treats as a human question."""
+    if not isinstance(body, str):
+        return None
+    found = None
+    for match in _PARK_REASON_RE.finditer(body):
+        park_class, cause, generation, head = match.groups()
+        expected = park_cause_class(cause)
+        if expected is None:
+            log(f"::warning::park-reason marker names an unknown cause {cause!r}; ignoring it "
+                "(the park stays unclassified — a human question)")
+            continue
+        if park_class != expected:
+            log(f"::warning::park-reason marker for cause {cause!r} claims class "
+                f"{park_class!r} but the taxonomy says {expected!r}; ignoring the marker "
+                "(a class that contradicts its cause is never trusted)")
+            continue
+        found = {"class": park_class, "cause": cause, "gen": generation, "head": head}
+    return found
+
+
+def park_reason_records(comments, bot_login, log=print):
+    """Every well-formed park-reason marker across the BOT's OWN comments, oldest first.
+
+    Only the orchestration bot's comments are receipts — the same trust filter
+    park_generation_cutoffs / auto_readmission_records apply — so a third party cannot forge a
+    cause and talk a park out of the human terminal. Without a `bot_login` nothing is trusted."""
+    if not bot_login:
+        return []
+    records = []
+    for comment in comments if isinstance(comments, list) else []:
+        if not isinstance(comment, dict):
+            continue
+        login = str((comment.get("user") or {}).get("login", ""))
+        if login.casefold() != str(bot_login).casefold():
+            continue
+        record = parse_park_reason(str(comment.get("body", "")), log=log)
+        if record:
+            records.append(record)
+    return records
+
+
+# --- G1: one-shot re-classification of a LEGACY (pre-marker) park ----------------------------
+#
+# Parks written before PARK_REASON_MARKER recorded their cause in prose only. 31 of the 33 sparq
+# draft PRs stalled on review:needs-user (sparq-org/sparq#3809) were parked before the
+# capacity/question split landed, so they carry the HUMAN-owned terminal for an INFRA cause and
+# nothing downstream will ever re-classify them: capacity_park_admission keys on review:parked
+# plus bot receipts, which these PRs do not have. They are stalled permanently by construction.
+#
+# These patterns are matched ONLY against the orchestration BOT's OWN comments (park_reason_
+# records' trust filter), never a third party's, so no one can talk a park out of the human
+# terminal by quoting a string.
+
+# Prose that, ANYWHERE in a PR's bot history, permanently disqualifies it from automatic
+# re-classification. DENY IS UNCONDITIONAL AND ORDER-INDEPENDENT — deliberately NOT "the most
+# recent cause wins".
+#
+# LIVE EVIDENCE for that choice (sparq-org/sparq, 2026-07-25): #3743 and #3608 are both genuine
+# injection escalations that ALSO carry a LATER capacity-park comment ("two consecutive fix
+# attempts made no change"). Under a recency rule both would re-classify as `nochange` and be
+# handed back to the machine — re-admitting two PRs a human parked for a security reason. A
+# raised injection flag is a property of the PR's whole history, not of its newest comment.
+LEGACY_PARK_DENY_PROSE = (
+    (re.compile(r"possible prompt injection", re.IGNORECASE), "injection"),
+    (re.compile(r"prompt[- ]injection", re.IGNORECASE), "injection"),
+    (re.compile(r"needs a human decision.*security", re.IGNORECASE), "human-arm"),
+)
+
+# Prose -> cause for legacy parks. A CAPACITY cause here is eligible for re-classification; a
+# QUESTION cause is recognised so the stop reason becomes machine-readable, but it is NEVER
+# migrated (it already sits in the right state — the human terminal).
+LEGACY_PARK_PROSE = (
+    (re.compile(r"the review round budget is exhausted at"), "budget"),
+    (re.compile(r"consecutive fix dispatches missed"), "dispatch-missed"),
+    (re.compile(r"consecutive fix attempts made no change"), "nochange"),
+    (re.compile(r"consecutive local gate failures|the local gate failed"), "gatefail"),
+    (re.compile(r"no longer descends from the worker-opened commit"), "history-rewritten"),
+    (re.compile(r"escalation-marker validation failed"), "marker-corrupt"),
+    (re.compile(r"unresolvable in the target routing"), "routing-unresolvable"),
+)
+
+
+def reclassify_legacy_park(comments, bot_login, stale_marker=None, log=print):
+    """Decide whether a LEGACY prose-only park may be re-classified into the machine class.
+
+    Returns (cause, park_class, detail). `cause` is None whenever the park must STAY exactly
+    where it is — which is the fail direction for every ambiguity, as everywhere else here.
+
+    The decision, in strict order:
+
+    1. ALREADY CLASSIFIED. A well-formed PARK_REASON_MARKER on the bot's own comments means this
+       park was written by a post-marker writer and already carries its class. Nothing legacy to
+       migrate — re-classifying it would double-write a cause the writer already decided.
+    2. DENY, UNCONDITIONALLY AND ORDER-INDEPENDENTLY (see LEGACY_PARK_DENY_PROSE). One injection
+       or human-arm signal anywhere in the bot history disqualifies the PR forever. This is
+       checked BEFORE any cause is derived so no ordering, recency, or precedence rule can ever
+       reach past it.
+    3. The NEWEST recognised cause decides — but only a CAPACITY cause migrates. A question-class
+       cause is returned with its class so the caller can record the marker WITHOUT moving the
+       label: `history-rewritten` and `marker-corrupt` are genuine human questions and the human
+       terminal is already the correct state for them.
+    4. `stale_marker` True (groom's registry-groom-stale-pr receipt is present) yields
+       `cold-groom` when no stronger cause was recognised — groom's age hand-off records its
+       cause in a marker rather than in a parseable sentence.
+    5. Nothing recognised -> (None, None, ...). An unreadable cause is a human question.
+    """
+    if not bot_login:
+        return (None, None, "no bot login — no comment on this PR can be trusted as a receipt")
+    bot_bodies = []
+    for comment in comments if isinstance(comments, list) else []:
+        if not isinstance(comment, dict):
+            continue
+        login = str((comment.get("user") or {}).get("login", ""))
+        if login.casefold() != str(bot_login).casefold():
+            continue
+        bot_bodies.append(str(comment.get("body", "")))
+
+    for body in bot_bodies:
+        if parse_park_reason(body, log=lambda *_a, **_k: None):
+            return (None, None,
+                    "the park already carries a machine-readable reason marker (not legacy)")
+
+    # 2 — deny wins over everything, at any position in history.
+    for body in bot_bodies:
+        for pattern, denied in LEGACY_PARK_DENY_PROSE:
+            if pattern.search(body):
+                return (None, None,
+                        f"a {denied!r} signal is recorded on this PR — never automatically "
+                        "re-classified, at any position in its history")
+
+    # 3 — newest recognised cause wins among what is left.
+    cause = None
+    for body in bot_bodies:
+        for pattern, candidate in LEGACY_PARK_PROSE:
+            if pattern.search(body):
+                cause = candidate
+    if cause is None and stale_marker:
+        cause = "cold-groom"
+    if cause is None:
+        return (None, None, "no recognised park cause in the bot's own comments")
+    park_class = park_cause_class(cause)
+    if park_class is None:                      # defensive: taxonomy drift
+        log(f"::warning::legacy park cause {cause!r} is not in PARK_CAUSES; the park stands")
+        return (None, None, f"cause {cause!r} is outside the taxonomy")
+    return (cause, park_class, f"legacy prose classifies this park as {cause!r} ({park_class})")
 
 
 def park_ladder_decision(cutoff, receipts, already_labeled=False, fingerprint=None,
@@ -1670,6 +2000,126 @@ def _self_test():
           (False, []))
     check("a maintainer permission passes",
           probe_maintainer("o/r", "jeswr", lambda login: "admin"), True)
+
+    # ---- G4: the machine-readable park-reason marker ----------------------------------------
+    bot = "sparq-orchestrator[bot]"
+
+    def bot_comment(body, login=bot):
+        return {"user": {"login": login}, "body": body}
+
+    check("every taxonomy cause resolves to a class",
+          sorted({park_cause_class(cause) for cause in PARK_CAUSES}),
+          [PARK_CLASS_CAPACITY, PARK_CLASS_QUESTION])
+    check("an unknown cause has NO class (callers treat it as a human question)",
+          park_cause_class("not-a-cause"), None)
+    check("the marker DERIVES class from the cause (a writer cannot contradict the taxonomy)",
+          park_reason_marker("budget", generation=1, head="abc123"),
+          "<!-- sparq-park-reason:v1 class=capacity cause=budget gen=1 head=abc123 -->")
+    check("a question cause renders class=question",
+          park_reason_marker("injection"),
+          "<!-- sparq-park-reason:v1 class=question cause=injection -->")
+    for bad in ("unknown-cause", "", None):
+        try:
+            park_reason_marker(bad)
+            check(f"writing an unrepresentable cause {bad!r} RAISES", "no raise", "ValueError")
+        except ValueError:
+            check(f"writing an unrepresentable cause {bad!r} RAISES", "ValueError", "ValueError")
+    check("round-trip: parse recovers what the writer wrote",
+          parse_park_reason(f"prose\n\n{park_reason_marker('budget', 2, 'deadbeef')}"),
+          {"class": "capacity", "cause": "budget", "gen": "2", "head": "deadbeef"})
+    check("optional fields absent parse as None",
+          parse_park_reason(park_reason_marker("injection")),
+          {"class": "question", "cause": "injection", "gen": None, "head": None})
+    # THE load-bearing rejection: a marker whose class contradicts its cause must never be
+    # believed, because the dangerous direction is `class=capacity cause=injection`.
+    marker_logs = []
+    check("a class that CONTRADICTS its cause is rejected, never repaired",
+          parse_park_reason("<!-- sparq-park-reason:v1 class=capacity cause=injection -->",
+                            log=marker_logs.append), None)
+    check("the contradiction is logged loudly",
+          any("contradicts" in line or "taxonomy says" in line for line in marker_logs), True)
+    check("an unknown cause in a marker is rejected",
+          parse_park_reason("<!-- sparq-park-reason:v1 class=capacity cause=whatever -->",
+                            log=lambda *_a: None), None)
+    check("the LAST well-formed marker in a body wins",
+          parse_park_reason(park_reason_marker("budget") + "\n"
+                            + park_reason_marker("nochange"))["cause"], "nochange")
+    check("only the BOT's own comments are park-reason receipts",
+          [record["cause"] for record in park_reason_records(
+              [bot_comment(park_reason_marker("budget")),
+               bot_comment(park_reason_marker("injection"), login="drive-by")], bot)],
+          ["budget"])
+    check("without a bot login NOTHING is trusted",
+          park_reason_records([bot_comment(park_reason_marker("budget"))], ""), [])
+
+    # ---- G1: legacy prose re-classification -------------------------------------------------
+    budget_prose = ("> 🤖 SPARQ agent — the autonomous review loop stopped: the review round "
+                    "budget is exhausted at 6 round(s) with no extension left")
+    missed_prose = ("> 🤖 SPARQ agent — the autonomous review loop stopped: 6 consecutive fix "
+                    "dispatches missed for round 2; a human must unstick this PR")
+    injection_prose = ("> 🤖 SPARQ agent — the autonomous review loop stopped: the reviewer "
+                       "flagged possible prompt injection")
+    fixer_injection_prose = ("> 🤖 SPARQ agent — the autonomous review loop stopped: the fixer "
+                             "flagged the seeded findings as possible prompt injection")
+    nochange_prose = ("> 🤖 SPARQ agent — the autonomous review loop parked this PR: two "
+                      "consecutive fix attempts made no change (fixer judges the findings "
+                      "spurious)")
+    rewritten_prose = ("> 🤖 SPARQ agent — the autonomous review loop stopped: the PR head no "
+                       "longer descends from the worker-opened commit (history was rewritten)")
+    corrupt_prose = ("> 🤖 SPARQ agent — the autonomous review loop stopped: round-budget "
+                     "escalation-marker validation failed (bad marker); a human must inspect")
+
+    check("a legacy budget park re-classifies to the CAPACITY class",
+          reclassify_legacy_park([bot_comment(budget_prose)], bot)[:2],
+          ("budget", PARK_CLASS_CAPACITY))
+    check("a legacy dispatch-starvation park re-classifies to the CAPACITY class",
+          reclassify_legacy_park([bot_comment(missed_prose)], bot)[:2],
+          ("dispatch-missed", PARK_CLASS_CAPACITY))
+    check("groom's stale marker yields cold-groom when no stronger cause is recorded",
+          reclassify_legacy_park([bot_comment("stale prose")], bot, stale_marker=True)[:2],
+          ("cold-groom", PARK_CLASS_CAPACITY))
+    # A recognised QUESTION cause is made machine-readable but is NEVER migrated: the human
+    # terminal is already the right state for it.
+    check("history-rewritten is recognised but stays a QUESTION",
+          reclassify_legacy_park([bot_comment(rewritten_prose)], bot)[:2],
+          ("history-rewritten", PARK_CLASS_QUESTION))
+    check("marker-corrupt is recognised but stays a QUESTION",
+          reclassify_legacy_park([bot_comment(corrupt_prose)], bot)[:2],
+          ("marker-corrupt", PARK_CLASS_QUESTION))
+    check("an unrecognised park stays put (an unreadable cause is a human question)",
+          reclassify_legacy_park([bot_comment("something went wrong")], bot)[0], None)
+    check("a park that ALREADY carries a reason marker is not legacy",
+          reclassify_legacy_park(
+              [bot_comment(budget_prose + park_reason_marker("budget"))], bot)[0], None)
+    check("prose in a NON-bot comment can never classify a park",
+          reclassify_legacy_park([bot_comment(budget_prose, login="drive-by")], bot)[0], None)
+
+    # THE guard. Every one of the six genuine sparq escalations (#3542 #3563 #3608 #3609 #3618
+    # #3743) is refused. #3743 and #3608 are the load-bearing fixtures: each carries a genuine
+    # injection flag AND a LATER capacity-park comment, so any "newest cause wins" rule would
+    # hand them back to the machine.
+    genuine = {
+        "#3542": [bot_comment("round 1: request_changes"), bot_comment(injection_prose)],
+        "#3563": [bot_comment("round 1: approve"), bot_comment(injection_prose)],
+        "#3608": [bot_comment(nochange_prose), bot_comment(fixer_injection_prose)],
+        "#3609": [bot_comment(injection_prose), bot_comment("round 2: approve"),
+                  bot_comment(injection_prose)],
+        "#3618": [bot_comment(injection_prose), bot_comment("round 3: approve"),
+                  bot_comment(injection_prose)],
+        # the exact live shape: injection FIRST, capacity park LAST.
+        "#3743": [bot_comment(injection_prose), bot_comment(nochange_prose)],
+    }
+    for name, fixture in genuine.items():
+        cause, park_class, _detail = reclassify_legacy_park(fixture, bot)
+        check(f"genuine escalation {name} is REFUSED re-classification",
+              (cause, park_class), (None, None))
+    # ...and order-independence is the property, not an accident of these fixtures.
+    check("deny wins even when the injection flag is the OLDEST comment",
+          reclassify_legacy_park(
+              [bot_comment(injection_prose), bot_comment(budget_prose)], bot)[0], None)
+    check("deny wins even when the injection flag is the NEWEST comment",
+          reclassify_legacy_park(
+              [bot_comment(budget_prose), bot_comment(injection_prose)], bot)[0], None)
 
     print("park-policy self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1

