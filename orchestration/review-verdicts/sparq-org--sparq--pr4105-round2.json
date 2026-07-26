@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 4105,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "cf5d01e6931c3ea3804eff1e5d322c0a5445d8b3",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "mac_check_challenges hashes the complete value_shares() and mac_shares() vectors. In Shamir MPC, each party has only its own shares; the full vectors are centralized simulator/dealer state, not public transcript data. Broadcasting the raw vectors would reconstruct opened values and expose MAC-sharing material, while hashing binding commitments would require an actual commit/broadcast protocol and a different transcript. Consequently the code does not realize the documented jointly agreed public Fiat\u2013Shamir coin, and a real distributed implementation cannot have every party derive these coefficients as claimed. The centralized tests are vacuous with respect to this invariant because they give one MacSession access to all shares.",
+    "file": "crates/sparq-mpc/src/shamir.rs",
+    "fix_hint": "Do not claim or model a distributed public coin by hashing dealer-private full share vectors. Implement and test a concrete jointly generated challenge protocol (for example commit-then-reveal coin tossing or binding commitments to each party's fixed contributions with specified broadcast/verification and abort behavior), or retain the trusted-dealer simulation and explicitly scope both API and documentation to that trust model. Add a multi-party test in which each party derives the identical challenge using only data actually available to it.",
+    "severity": "blocker",
+    "title": "Challenge transcript is not publicly derivable by the protocol parties"
+   },
+   {
+    "body": "The stated argument is not generally true. With unchanged MACs and value-sharing deviations delta_y,j, the check deficit is -alpha times sum(chi_j * delta_y,j). Whether the weighted value deviations cancel can be tested from the public/hash-derived chi values and attacker-chosen deltas without knowing alpha. An adversary able to vary the Fiat\u2013Shamir transcript can therefore grind for such cancellation; the construction no longer has the unconditional ideal-public-coin 1/p bound asserted per protocol run. The 61-bit field also makes this a concrete computational-security question rather than the documented information-theoretic argument.",
+    "file": "research/mpc-malicious-security-design.md",
+    "fix_hint": "Replace the grinding claim with a formal argument for the precise commitment and adversary model, including who can choose which transcript components, when they become binding, retry/abort behavior, and the resulting computational bound. Ensure the protocol prevents adaptive transcript grinding before deriving chi; do not claim the ideal-coin bound until that protocol and argument are implemented and reviewed.",
+    "severity": "major",
+    "title": "Grinding argument incorrectly says testing a candidate always requires alpha"
+   },
+   {
+    "body": "The skill says every party derives the same public Fiat\u2013Shamir challenge without a trusted dealer and that grinding cannot weaken the bound. The implementation instead derives challenges inside a centralized MacSession from all private share vectors, and the grinding rationale is incomplete. Although the text retains the pending sq-qhy4 caveat, these specific operational and soundness claims do not trace to the code.",
+    "file": "skills/mpc/SKILL.md",
+    "fix_hint": "Remove or narrow these claims to the centralized simulation actually implemented. Restore distributed/public-coin and grinding-resistance claims only alongside a concrete commit/coin protocol, adversarial tests, and a soundness analysis consistent with the pending external audit.",
+    "severity": "major",
+    "title": "Public API documentation overclaims the unimplemented distributed security property"
+   }
+  ],
+  "progress": null,
+  "summary": "The new Fiat\u2013Shamir construction does not implement the claimed public coin for a distributed Shamir protocol. It hashes every party's raw value and MAC shares, although those vectors are not a public transcript and cannot be identically available to all parties without revealing secret material. The suggested real-deployment replacement\u2014hashing commitments\u2014is a different protocol and is not implemented. The accompanying tests run through the centralized dealer and therefore cannot detect this mismatch. The grinding argument is also overstated: for value-only tampering with unchanged MACs, an attacker can test alpha-independent cancellation conditions from the derived coefficients. These are soundness-critical issues on an unaudited MPC path.",
+  "verdict": "request_changes"
+ }
+}
