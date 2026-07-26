@@ -72,16 +72,6 @@
   },
   {
    "account": "58b7c92faa5b5ca5",
-   "claim_id": "c1ed92fde3d343cab3e0c5d7ae322d7d",
-   "holder": "sparq-org/sparq#3130@30192887830.1",
-   "package": "sparq-reason-el",
-   "role": "impl",
-   "model": "opus5",
-   "issued_at": 1785050967,
-   "expires_at": 1785057267
-  },
-  {
-   "account": "58b7c92faa5b5ca5",
    "claim_id": "6e0eb1a540f94d389e47b60a527a6bb5",
    "holder": "review:sparq-org/sparq#3567@dispatch-30192605906.1",
    "package": "__global__",
