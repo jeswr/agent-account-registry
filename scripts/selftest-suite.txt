@@ -1,6 +1,8 @@
 account-usage.py
 backfill-provenance.py
 broker-refresh.py
+chain_preference.py
+cross-resolver-agreement.py
 curate-frontier.py
 dashboard-gen.py
 deprecated_models.py

@@ -22,17 +22,21 @@ except ModuleNotFoundError:  # pragma: no cover
     import tomli as tomllib
 
 
-def _deprecated_models():
-    """[OPUS-5] The shared deprecation register (scripts/deprecated_models.py), imported rather
-    than re-declared."""
-    path = Path(__file__).resolve().with_name("deprecated_models.py")
-    spec = importlib.util.spec_from_file_location("registry_deprecated_models", path)
+def _sibling(module_name, filename):
+    """Import a sibling script by path — these scripts are invoked standalone, so there is no
+    package to import from, but a SHARED rule must still be imported rather than re-declared."""
+    path = Path(__file__).resolve().with_name(filename)
+    spec = importlib.util.spec_from_file_location(module_name, path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
 
 
-_DEP = _deprecated_models()
+_DEP = _sibling("registry_deprecated_models", "deprecated_models.py")
+# [OPUS-5] The chain-order preference MECHANISM — the identical module policy-resolve.py (the CLAIM
+# side) imports. The rule itself is DATA in this routing table's `[[chain_preference]]` block, so
+# PLAN and CLAIM read one declaration and cannot drift apart about what it says.
+_PREF = _sibling("registry_chain_preference", "chain_preference.py")
 
 
 def validate_catalog(doc):
@@ -94,6 +98,10 @@ def resolve(labels, doc):
     can never resolve to a security/role/defaults route regardless of a caller's own precheck.
     """
     validate_catalog(doc)   # [OPUS-5] a retired model must not even be RESOLVABLE
+    # [OPUS-5] Parsed BEFORE any route match, so a malformed declaration refuses to resolve rather
+    # than resolving to a chain CLAIM would reject. ChainPreferenceError is a ValueError, the same
+    # fail-closed class dispatch-plan already handles.
+    preferences = _PREF.parse_preferences(doc, set(doc.get("models", {})))
     labels = set(labels)
     routes = doc.get("route", [])
     # The explicit role routes declared in routing.toml (role blocks, never security blocks); the
@@ -116,6 +124,8 @@ def resolve(labels, doc):
             f"unknown role {role!r} — no matching role route in routing.toml")
 
     # Phase 1 — security-label overrides: any keyword is a substring of any label; first match wins.
+    # Returned UNMODIFIED: a chain-order preference expresses which IMPLEMENTOR is preferred and
+    # must never re-order a soundness chain. policy-resolve (CLAIM) makes the same exemption.
     for r in routes:
         kws = r.get("match_labels")
         if kws and any(k in lb for lb in labels for k in kws):
@@ -124,10 +134,12 @@ def resolve(labels, doc):
     if role is not None:
         for r in routes:
             if "match_labels" not in r and r.get("role") == role:
-                return r["model_chain"], r["agent"], bool(r.get("escalate"))
+                return (_PREF.apply_preferences(labels, r["model_chain"], preferences),
+                        r["agent"], bool(r.get("escalate")))
     # Phase 3 — defaults (no security match and no role).
     d = doc.get("defaults", {})
-    return d.get("model_chain", []), d.get("agent"), False
+    return (_PREF.apply_preferences(labels, d.get("model_chain", []), preferences),
+            d.get("agent"), False)
 
 
 def _self_test():

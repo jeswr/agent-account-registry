@@ -333,6 +333,18 @@ class DispatchError(RuntimeError):
     """A concise fail-closed error suitable for Actions logs."""
 
 
+class RouteDivergenceError(DispatchError):
+    """PLAN's planned route and CLAIM's re-derivation of it disagree.
+
+    A SUBCLASS, because the failure mode is categorically different from the other per-item
+    trust/policy failures this dispatcher tolerates. Those are situational — a stale issue, a
+    revoked token, a lost race — and clear on their own. This one is a pure function of the item's
+    labels and the target's protected routing table, so it recurs on EVERY tick with the identical
+    result: the affected issues never dispatch again. It means the two resolvers implement
+    different rules, which is an operator-visible configuration outage rather than a deferral.
+    """
+
+
 def _load_module(name, path):
     spec = importlib.util.spec_from_file_location(name, path)
     if spec is None or spec.loader is None:
@@ -3605,8 +3617,22 @@ def _route_matches(repo, item, policy_doc, routing_doc, policy_module):
         "agent": item["agent"],
         "escalate": item["escalate"],
     }
-    if any(resolved[key] != value for key, value in expected.items()):
-        raise DispatchError(f"plan route no longer matches protected routing for {repo}#{item['number']}")
+    # [OPUS-5] NAME THE DISAGREEMENT. This equality is a pure function of the item's labels and the
+    # protected routing table, so when it fails it fails IDENTICALLY on every subsequent tick: the
+    # item is deferred forever. Reporting only "route no longer matches" left the sparq #4211
+    # round-2 defect (a chain-order rule PLAN implemented and CLAIM did not) visible as nothing but
+    # a `route-policy-failed` counter. Emit the field and BOTH values so one defer line identifies
+    # the divergence, and raise a DISTINCT class so the caller can count and annotate it apart from
+    # ordinary per-item trust/policy failures.
+    divergent = {key: (value, resolved[key]) for key, value in expected.items()
+                 if resolved[key] != value}
+    if divergent:
+        detail = "; ".join(f"{key}: PLAN {plan!r} vs CLAIM {claim!r}"
+                           for key, (plan, claim) in sorted(divergent.items()))
+        raise RouteDivergenceError(
+            f"PLAN and CLAIM derive different routes for {repo}#{item['number']} "
+            f"(labels {sorted(item['labels'])}) — {detail}. This is a routing-table/resolver "
+            f"divergence, not a transient: it repeats every tick until the two resolvers agree")
     roles = sorted(label[5:] for label in item["labels"] if label.startswith("role:"))
     packages = sorted(label[5:] for label in item["labels"] if label.startswith("area:"))
     priorities = sorted(
@@ -4137,6 +4163,15 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                                   f"exhausted (generation {generation}"
                                   f"{'' if parked else ', label suppressed'})")
                             continue
+            except RouteDivergenceError as exc:
+                # [OPUS-5] Counted and annotated SEPARATELY from the situational failures below.
+                # A divergence never self-clears, so folding it into `route-policy-failed` made a
+                # permanent, whole-label-class outage indistinguishable from a handful of stale
+                # issues — the review finding on sparq PR #4211. `::error::` puts it in the run's
+                # annotations; it does not fail the tick, because the OTHER items must still go.
+                defer_reasons["route-plan-claim-divergence"] += 1
+                print(f"::error::defer {repo}#{number}: {exc}")
+                continue
             except DispatchError as exc:
                 defer_reasons["route-policy-failed"] += 1
                 print(f"defer {repo}#{number}: trust/route/policy resolution failed ({exc}); skipped")
@@ -6322,6 +6357,76 @@ def _self_test():
           "of the workflow — legacy fable/opus pins MIGRATE to opus5 (no forever-stall on "
           "in-flight PRs) while non-ladder pins are still rejected; deleting the migration is "
           "caught")
+
+    # L3c. [OPUS-5] THE SEVENTH SITE, and the one that is not in this repository at all: the
+    # TARGET-side PLAN resolver. Every layer above pins two derivations that live in the registry.
+    # This one pins the derivation that crosses the repository boundary — `dispatch-plan` running
+    # the TARGET's `route-resolve.py` versus `_route_matches` re-deriving the same route through
+    # registry-owned `policy-resolve.py`. NOTHING in either repository asserted their agreement,
+    # which is how sparq PR #4211 shipped two review rounds of a chain-order carve-out that PLAN
+    # implemented and CLAIM did not: 34 of 35 `area:gui` issues would have deferred
+    # `route-policy-failed` on every tick, permanently, behind a generic counter.
+    _agree = _load_module("registry_cross_resolver_agreement",
+                          Path(__file__).resolve().with_name("cross-resolver-agreement.py"))
+    _sparq_shaped = tomllib.loads(_agree.SPARQ_SHAPED)
+    _sparq_declared = tomllib.loads(_agree.SPARQ_SHAPED + _agree.GUI_DECLARATION)
+    for _label, _doc in (("the registry's own live routing table",
+                          tomllib.loads((Path(__file__).resolve().parents[1] / "orchestration"
+                                         / "routing.toml").read_text(encoding="utf-8"))),
+                         ("a target table with NO chain_preference", _sparq_shaped),
+                         ("a target table DECLARING the area:gui carve-out", _sparq_declared)):
+        _matrix = tuple((n, lb) for n, lb in _agree.AGREEMENT_MATRIX
+                        if all(x[5:] in {r.get("role") for r in _doc.get("route", [])}
+                               for x in lb if x.startswith("role:")))
+        _bad = _agree.compare(_doc, matrix=_matrix)
+        assert not _bad, (f"PLAN and CLAIM disagree on {_label}", _bad)
+        assert len(_matrix) >= 10, ("the agreement matrix collapsed to almost nothing, which "
+                                    "would make the assertion above pass vacuously", _label,
+                                    len(_matrix))
+    # NON-VACUITY: reproduce the #4211 defect exactly — a carve-out the PLAN resolver knows and the
+    # CLAIM resolver does not — and require the comparison to report the affected rows.
+    def _plan_only(labels, doc):
+        _chain, _agent, _esc = _agree._ROUTE.resolve(labels, doc)
+        if "area:gui" in set(labels) and {"sol", "opus5"} <= set(_chain):
+            _chain = ["sol"] + [m for m in _chain if m != "sol"]
+        return _chain, _agent, _esc
+
+    _reported = _agree.compare(_sparq_shaped, plan_resolver=_plan_only)
+    assert ("area:gui", "role:impl") in {lb for _n, lb, _p, _c in _reported}, (
+        "a PLAN-only chain-order rule was NOT reported — this agreement pin is vacuous")
+    assert not _agree.compare(_sparq_declared), (
+        "declaring the rule in the routing table must make the two resolvers agree again")
+
+    # ...and the CLAIM-side diagnostic the review asked for: a divergence must raise its OWN error
+    # class (so the tick counts it apart from situational per-item failures) and must NAME both
+    # chains, rather than surfacing as an unattributable defer counter.
+    _div_item = {"number": 3367, "labels": ["area:gui", "role:impl", "priority:P2"],
+                 "model_chain": ["sol", "opus5"], "agent": "sparq-rust-impl", "escalate": False,
+                 "role": "impl", "priority": 2, "package": "gui"}
+    _div_policy = {"repos": {"probe/target": dict(_agree.PROBE_POLICY["repos"]["probe/target"])}}
+    try:
+        _route_matches("probe/target", _div_item, _div_policy, _sparq_shaped, _agree._POLICY)
+    except RouteDivergenceError as _exc:
+        _div_msg = str(_exc)
+    else:                                                   # pragma: no cover — a caught mutant
+        _div_msg = None
+    assert _div_msg is not None, (
+        "_route_matches accepted a plan chain the protected routing does not derive")
+    assert "model_chain" in _div_msg and "['sol', 'opus5']" in _div_msg \
+        and "['opus5', 'sol']" in _div_msg and "area:gui" in _div_msg, (
+        "the divergence diagnostic must name the field, BOTH chains and the labels — without them "
+        "the operator sees only that 'the route no longer matches'", _div_msg)
+    assert isinstance(RouteDivergenceError("x"), DispatchError), (
+        "RouteDivergenceError must remain a DispatchError so the existing per-item resilience "
+        "still contains it")
+    # The SAME item against the table that DECLARES the rule resolves cleanly — so the assertion
+    # above is detecting a real divergence, not rejecting every item.
+    assert _route_matches("probe/target", _div_item, _div_policy, _sparq_declared,
+                          _agree._POLICY)["model_chain"] == ["sol", "opus5"]
+    print("  ok   adopt-loop L3c: the PLAN resolver and the CLAIM resolver derive IDENTICAL routes "
+          "over a 22-row label matrix on the live registry table and on a target table with and "
+          "without a chain_preference declaration; a PLAN-only carve-out (the sparq #4211 defect) "
+          "is reported, and a live divergence raises RouteDivergenceError naming both chains")
 
     # ---- THE IMPL LANE. worker.yml runs the SAME mint-vs-adopt equality with its OWN two copies of
     # the reduction, and the review of #702 MEASURED that both could be reverted to the pre-#112

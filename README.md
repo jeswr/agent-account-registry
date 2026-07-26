@@ -167,6 +167,36 @@ a rolling `data/cache-affinity.json`), never in the public repos.
   `match_labels` override still wins (opus + trust-surface audit; Decision 7 revised 2026-07-18) — stricter than the frontier floor,
   unchanged.
 
+- **A chain-ORDER preference belongs in the target's routing table, never in one repository's
+  resolver.** Every dispatchable route is derived **twice**: PLAN runs the *target's*
+  `scripts/route-resolve.py`, CLAIM re-derives it with registry-owned `scripts/policy-resolve.py`
+  against the target's routing table read at its **protected** default tip, and
+  `dispatch-claim._route_matches` requires **exact** equality of `model_chain` / `agent` /
+  `escalate`. A rule only one side implements is therefore not a preference that half-applies — it
+  raises `RouteDivergenceError`, the item defers `route-plan-claim-divergence`, and because the
+  comparison is a pure function of the labels and the table it defers **identically on every
+  subsequent tick**. The affected issues stop dispatching entirely. Machine-readable form —
+  `orchestration/routing.toml` in the target:
+
+  ```toml
+  [[chain_preference]]
+  labels   = ["area:gui"]      # EXACT labels; ANY one selects. Never a substring: "gui" in label
+                               # would sweep area:guide / area:guidance into the carve-out.
+  lead     = "sol"             # moved to the FRONT; every other rung keeps its relative order,
+                               # so this is PREFERENCE, NOT EXCLUSION.
+  requires = ["sol", "opus5"]  # fires only when the chain ALREADY contains all of these.
+  ```
+
+  `scripts/chain_preference.py` is the shared **mechanism**, imported by both registry resolvers
+  and hard-coding no selector. `lead` **must** appear in `requires`, which is what makes re-order
+  the only reachable effect — a preference can never inject a model into a chain that deliberately
+  excludes it (e.g. turning the single-provider, escalating `role:research` chain cross-provider).
+  Security `match_labels` routes are exempt on both sides: an implementor preference must never
+  re-order a soundness chain. Verify a target with
+  `python3 scripts/cross-resolver-agreement.py --target-root <checkout>`, which drives **both**
+  resolvers over a 22-row label matrix and reports any row they decide differently.
+  Live instance: the maintainer's 2026-07-26 `area:gui` carve-out (sparq PR #4211).
+
 ## Adding an account — step-by-step runbook (an agent can follow this verbatim)
 
 > Goal: make one more model account usable by the workers. There are **five** required steps; the
