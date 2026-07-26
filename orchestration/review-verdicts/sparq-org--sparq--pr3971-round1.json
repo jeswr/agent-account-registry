@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3971,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "6232b1cb70f6012be522cba65fd198dfcfd4f754",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The new per-invocation V2 selection is correctly feature-gated and fail-closed: flag validation occurs before loading/opening data, feature-off builds reject V2 requests, and the thread-local override encloses the real save_compressed call. The subprocess tests exercise the actual argv-to-disk path, verify file magic for both save and recompress, cover feature-off rejection and malformed usage, confirm the environment precedence rule, and compare query results across V1 and V2. The CLI documentation is updated consistently. No correctness, soundness, security, or vacuous-test issue was found in the supplied diff.",
+  "verdict": "approve"
+ }
+}
