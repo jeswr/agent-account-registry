@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3976,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "dc00caf2ea56bdde93772733bd408b3a4a6388dd",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "ParPhaseStats has public u64 timing fields, so values such as compute_nanos = u64::MAX and apply_nanos = 1 are valid inputs to this public method. `self.compute_nanos + self.apply_nanos` panics for that value in debug builds; in optimized builds it wraps to zero and the subsequent division can produce infinity. This contradicts the documented `0.0..=1.0` result and makes the API behavior build-profile-dependent. The elapsed-time accumulation can theoretically reach large values naturally too, so the method should not rely on the sum fitting in u64.",
+    "file": "crates/sparq-reason-el/src/classify.rs",
+    "fix_hint": "Compute the denominator without u64 overflow, for example by converting each operand to u128 or f64 before addition, and add a boundary test using u64::MAX that asserts a finite result within 0.0..=1.0 (and the expected ratio).",
+    "severity": "major",
+    "title": "apply_fraction can panic or violate its documented range"
+   }
+  ],
+  "progress": null,
+  "summary": "The phase instrumentation and differential tests are well scoped, but the new public apply_fraction method does not uphold its documented total, bounded behavior for all valid ParPhaseStats values. Because the timing fields are public, callers can construct values whose u64 sum overflows; debug builds panic and optimized builds can return infinity or another value outside 0.0..=1.0. Use a non-overflowing denominator before exposing this API.",
+  "verdict": "request_changes"
+ }
+}
