@@ -49,6 +49,16 @@
    "model": "opus5",
    "issued_at": 1785050918,
    "expires_at": 1785057218
+  },
+  {
+   "account": "51bde6688e140866",
+   "claim_id": "7a87235b961247ba987b180193356454",
+   "holder": "sparq-org/sparq#2777@dispatch-30192605906.1",
+   "package": "sparq-vectors",
+   "role": "impl",
+   "model": "opus5",
+   "issued_at": 1785050924,
+   "expires_at": 1785057224
   }
  ]
 }
