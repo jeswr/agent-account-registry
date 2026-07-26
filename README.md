@@ -71,6 +71,37 @@ without reaction counting. **Release** and **heartbeat** are keyed by the unique
 (idempotent). The groomer **reclaims** leases past `expires_at` (a dead/cancelled worker frees its
 slot automatically — no receipt-guessing).
 
+### The `package` partition has ONE canonical derivation (and one pinned copy)
+
+A row's `package` is the single conflict partition its lease reserves, reduced from the source
+issue's `area:*` labels: **exactly one** distinct area reserves that area, **zero or multiple**
+reserve the serializing `__global__` partition (fail-closed — over-serialize a multi-area row rather
+than free a busy sibling crate).
+
+That reduction is **`lease_schema.plan_package`**. Precisely:
+
+| deriver | how |
+|---|---|
+| `dispatch-claim.plan_package` (mints the CAS claim) | **delegates** to `lease_schema.plan_package` |
+| `review-fix.yml` `resolve` job | **calls** `dispatch_claim.plan_package` — the minter's own function object |
+| `worker.yml` self-claim shell step | **calls** `lease_schema.py --plan-package` (the CSV CLI) |
+| `worker.yml` adopt validator | **imports** `lease_schema` from the registry checkout |
+| `dispatch-plan.py:_plan_package` | the ONE genuine copy — it ships inside the target repos, which have no `lease_schema.py`, so it is **pinned by an executed agreement assertion** in `dispatch-claim.py --self-test`, not shared |
+
+So there is one canonical definition, four callers, and exactly one pinned copy. Reverting any
+caller to a private reduction — even one that agrees today — turns `dispatch-claim.py --self-test`
+red, because each pin *executes* the workflow's own code (extracted from the parsed YAML) and
+requires both that it agrees on every area shape **and** that it reaches the canonical function.
+The routing tables `review-fix.yml` re-derives inline (`review_chain` / `fix_chain` / `ladders`) are
+pinned to `dispatch-claim.REVIEW_CHAIN` / `FIX_CHAIN` / `worker-pr.ESCALATION_LADDERS` the same way.
+
+This matters because these values are derived **twice by design** — once by the dispatcher that
+mints a CAS claim, once by the review/fix (or worker) run that adopts it — and both adopt steps
+compare the two for **equality**. When `resolve` carried its own pre-#112 alphabetically-first
+reduction, every PR whose source issue held two `area:*` labels had its own dispatcher's claim
+rejected on every tick, forever: a deterministic loop that burned an account lease and a runner per
+tick and was the single largest failure class on the review lane that day.
+
 ## Selection logic (`select-and-claim`)
 
 `scripts/select-and-claim.py` (added in Phase 3) takes `(package, role, model-chain)` and returns an

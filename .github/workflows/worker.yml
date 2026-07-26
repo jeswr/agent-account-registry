@@ -405,20 +405,23 @@ jobs:
           [[ "$TIMEOUT_MINUTES" =~ ^[1-9][0-9]*$ ]]
           ttl=$((TIMEOUT_MINUTES * 60 + 900))
           holder="$TARGET_REPO#$ISSUE_NUMBER@$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
-          # Canonical lease partition (issue #133; mirrors dispatch-plan._plan_package /
-          # dispatch-claim.plan_package): EXACTLY one area reserves that area; ZERO OR MULTIPLE
-          # areas reserve the serializing __global__ partition, which the ledger excludes against
-          # every sibling. This self-claim MUST reduce identically to the dispatcher-claim adoption
-          # path below (and to the dispatcher that mints an adoptable claim), or the SAME issue
-          # reserves a different partition by entry path and a multi-area lease (e.g. "foo,bar")
-          # fails to conflict with a concurrent single-area sibling ("foo"). PACKAGES is the resolve
-          # job's sorted, de-duplicated area CSV whose values are comma-free, so a comma marks
-          # two-or-more areas. Fail-closed: over-serialize a multi-area issue, never free a busy crate.
-          if [[ -n "$PACKAGES" && "$PACKAGES" != *,* ]]; then
-            lease_package="$PACKAGES"
-          else
-            lease_package=__global__
-          fi
+          # THE canonical lease partition (issue #133 / #112), CALLED — never re-implemented here.
+          # This used to be an open-coded bash `if [[ "$PACKAGES" != *,* ]]` reduction carrying only
+          # a comment promising it "mirrors dispatch-plan._plan_package / dispatch-claim.
+          # plan_package". It was semantically correct, but the 2026-07-26 review-lane loop proved
+          # that a prose promise is not a test: the review-fix `resolve` job carried the same
+          # promise, drifted to the pre-#112 rule, and its adopt step then rejected its own
+          # dispatcher's claim on every tick forever. Reverting this line to that pre-#112 rule now
+          # turns `dispatch-claim.py --self-test` RED (adopt-loop L4), because the pin is an
+          # EXECUTED agreement against lease_schema.plan_package, not a grep.
+          # This self-claim MUST reduce identically to the dispatcher-claim adoption path below and
+          # to the dispatcher that mints an adoptable claim, or the SAME issue reserves a different
+          # partition by entry path and a multi-area lease (e.g. "foo,bar") fails to conflict with a
+          # concurrent single-area sibling ("foo"). Fail-closed: over-serialize a multi-area issue,
+          # never free a busy crate — and `set -e` fails the step if the reduction cannot be
+          # computed at all, so an unreadable registry checkout can never silently lease "".
+          lease_package="$(python3 registry/scripts/lease_schema.py --plan-package "$PACKAGES")"
+          [[ -n "$lease_package" ]] || { echo '::error::empty lease partition reduction'; exit 1; }
           set +e
           python3 registry/scripts/select-and-claim.py \
             --claim \
@@ -543,14 +546,22 @@ jobs:
           secret_ref = claim.get("secret_ref")
           pool = os.environ["ACCOUNT_POOL"].split(",")
           models = os.environ["MODELS"].split(",")
-          # Canonical lease partition (issue #133; mirrors dispatch-plan._plan_package /
-          # dispatch-claim.plan_package): EXACTLY one area -> that area; ZERO OR MULTIPLE areas ->
-          # the serializing __global__ partition. This MUST match the self-claim reduction above AND
-          # the dispatcher that minted this claim (dispatch-claim.plan_package), or a legitimate
-          # multi-area dispatcher claim (package="__global__") is rejected here while a "foo,bar"
-          # issue reserves a partition that never conflicts with a concurrent "foo" sibling.
+          # THE canonical lease partition (issue #133 / #112), IMPORTED from the registry checkout —
+          # never re-implemented here. This step compares the dispatcher's minted `package` against
+          # this re-derivation for EQUALITY, and the 2026-07-26 review-lane loop was exactly that
+          # comparison failing forever because the two sides were separate copies of one reduction
+          # held together by a comment. `lease_schema.plan_package` is the single canonical
+          # definition; `dispatch-claim.plan_package` (the minter) delegates to it, so the two sides
+          # of the equality below are the same code by construction. Deleting this import or
+          # restoring the pre-#112 `areas[0]` rule turns `dispatch-claim.py --self-test` RED
+          # (adopt-loop L5), because the pin EXECUTES this block against the canonical function.
+          import importlib.util as _ilu
+          _ls_spec = _ilu.spec_from_file_location(
+              "registry_lease_schema", os.path.join("registry", "scripts", "lease_schema.py"))
+          lease_schema = _ilu.module_from_spec(_ls_spec)
+          _ls_spec.loader.exec_module(lease_schema)
           areas = [area for area in os.environ["PACKAGES"].split(",") if area]
-          expected_package = areas[0] if len(areas) == 1 else "__global__"
+          expected_package = lease_schema.plan_package(areas)
           if account != os.environ["EXPECTED_ACCOUNT"] or account not in pool:
               raise SystemExit("dispatcher claim account is outside resolved policy")
           if model not in models:

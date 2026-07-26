@@ -384,6 +384,20 @@ jobs:
           packages = sorted(label[5:] for label in issue_labels if label.startswith("area:"))
           if any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", p) for p in packages):
               raise SystemExit("source issue has an unsafe area:* label")
+          # THE partition reduction — imported, NEVER re-implemented here (registry issue #112; the
+          # 2026-07-26 adopt loop). `package` is derived twice by design: once by the dispatcher
+          # that MINTS the CAS claim (dispatch-claim.plan_package) and once here by the run that
+          # ADOPTS it, and the adopt step below compares the two for EQUALITY. This step used to
+          # carry its own pre-#112 reduction (`packages[0] if packages else "__global__"`), so a PR
+          # whose source issue held TWO `area:*` labels was minted `__global__` and re-derived as
+          # the alphabetically-first area: the adopt step rejected its own dispatcher's claim on
+          # every tick forever (53 of 77 review-fix failures that day, most on one PR). The
+          # identical bug also under-serialized the SELF-claim path below, which leases
+          # `--package "$PACKAGE"` — a multi-area PR reserved one area and left its siblings free
+          # to co-run. `dispatch_claim` is the module loaded above, so this calls the MINTER'S OWN
+          # function object (which itself delegates to lease_schema.plan_package): the two sides of
+          # the adopt comparison are now the same code by construction, not by agreement.
+          package = dispatch_claim.plan_package(packages)
           values = {
               "head_branch": head_branch,
               "head_sha": head_sha,
@@ -397,7 +411,7 @@ jobs:
               "security": "true" if security else "false",
               "security_keywords": security_keywords_b64,
               "packages": ",".join(packages),
-              "package": packages[0] if packages else "__global__",
+              "package": package,
           }
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               for key, value in values.items():

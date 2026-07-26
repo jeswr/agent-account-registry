@@ -313,14 +313,18 @@ MAX_FAILING_LEGS = 20
 
 def plan_package(areas):
     """The single conflict partition a plan/lease row reserves for a collection of `area:*`
-    sections (registry issue #112). EXACTLY one area -> that area; ZERO OR MULTIPLE -> the
-    serializing global partition. Mirrors dispatch-plan.py:_plan_package byte-for-byte so the
-    anti-tamper package/label agreement in _route_matches holds: the old
-    alphabetically-first reduction dropped every secondary area, so a multi-area issue/PR
-    leased or dispatched onto a crate a second area already held. Fail-closed — over-serialize
-    a multi-area row rather than free a busy sibling crate."""
-    uniq = {a for a in areas if isinstance(a, str) and a}
-    return next(iter(uniq)) if len(uniq) == 1 else GLOBAL_PACKAGE
+    sections (registry issue #112) — DELEGATED to lease_schema.plan_package, which is the one
+    canonical reduction.
+
+    It used to be a local copy carrying a comment promising it "mirrors dispatch-plan.py
+    byte-for-byte". That promise held; the one it did NOT make — that review-fix.yml's `resolve`
+    job derives the same value — is the one that broke, and a prose promise is not a test. The
+    adopt step compares the dispatcher's minted `package` against resolve's re-derived `package`
+    for EQUALITY, so a third un-migrated copy turned every multi-area PR into a claim the
+    dispatcher minted and the adopter refused, forever. Sharing the function removes the drift
+    axis entirely; `_plan_package_agreement()` in the self-test pins the one copy that CANNOT
+    share it (dispatch-plan.py ships in the target repos, which have no lease_schema.py)."""
+    return _lease_schema.plan_package(areas)
 
 
 class DispatchError(RuntimeError):
@@ -349,6 +353,13 @@ _park_policy = _load_module(
 # mutation could double-dispatch a worker, which is exactly incident #559's storm class.
 _gh_retry = _load_module(
     "registry_gh_retry", Path(__file__).resolve().with_name("gh_retry.py"))
+
+# THE canonical area->package partition reduction, shared with review-fix.yml's `resolve` job and
+# worker.yml's self-claim + adopt steps (the other independent derivers of this value) so an adopt
+# step's equality check can never reject a claim this module minted. See lease_schema.plan_package
+# for the 2026-07-26 incident.
+_lease_schema = _load_module(
+    "registry_lease_schema", Path(__file__).resolve().with_name("lease_schema.py"))
 
 
 def _require_exact_fields(value, fields, where):
@@ -4453,6 +4464,147 @@ def _review_fix_workflow_values():
 _RF_ALREADY_DONE_ANCHOR = r"(?m)^[ \t]*already_done = False$"
 _RF_ALREADY_DONE_END = r"(?m)^[ \t]*#[ \t]*REGISTRY provenance"
 
+# ---- THE MINT-vs-ADOPT AGREEMENT ANCHORS (registry issue #112 / the 2026-07-26 review-lane loop).
+# Both adopt paths (review-fix.yml's `claim` job and worker.yml's `claim` job) compare a value the
+# DISPATCHER minted against a value the run RE-DERIVES, for EQUALITY. Every such value is therefore
+# a drift axis, and a prose comment promising two copies "mirror" each other is not a test: that is
+# precisely how #3528 burned ~20% of one day's review-lane capacity. Each anchor below addresses a
+# re-derivation so the self-test can EXECUTE the workflow's own code and require agreement with the
+# canonical definition. Line-anchored regexes (never indentation-bearing literals) per #584 f3.
+
+# review-fix.yml `resolve`: the `package` partition must come from THIS module's plan_package — the
+# same function object the dispatcher mints the claim with.
+_RF_PACKAGE_ANCHOR = r"(?m)^[ \t]*package = dispatch_claim\.plan_package\(packages\)$"
+_RF_PACKAGE_END = r"(?m)^[ \t]*values = \{"
+
+# review-fix.yml `policy`: the review/fix/escalation ROUTING TABLES. These are re-derived inline and
+# were held to dispatch-claim.REVIEW_CHAIN / FIX_CHAIN and worker-pr.ESCALATION_LADDERS by a comment
+# only. A drift here makes the adopt step's `model not in models` guard fire on every affected PR.
+_RF_CHAINS_ANCHOR = r"(?m)^[ \t]*review_chain = \{"
+_RF_CHAINS_END = r"(?m)^[ \t]*docs_only = \{"
+
+# worker.yml `claim`, self-claim SHELL step: the lease partition must be COMPUTED by the canonical
+# reduction's CLI, not open-coded in bash.
+_WK_SELF_PACKAGE_ANCHOR = r"(?m)^[ \t]*lease_package=.*$"
+_WK_SELF_PACKAGE_END = r"(?m)^[ \t]*set \+e$"
+_WK_SELF_PACKAGE_CALL = 'python3 registry/scripts/lease_schema.py --plan-package "$PACKAGES"'
+
+# worker.yml `claim`, adopt-validator PYTHON step: the expected partition must be IMPORTED from
+# lease_schema, so the impl lane's own mint-vs-adopt equality cannot drift the way the review
+# lane's did.
+_WK_ADOPT_PACKAGE_ANCHOR = r"(?m)^[ \t]*import importlib\.util as _ilu$"
+_WK_ADOPT_PACKAGE_END = r"(?m)^[ \t]*if account != os\.environ\[\"EXPECTED_ACCOUNT\"\]"
+_WK_ADOPT_PACKAGE_CALL = "lease_schema.plan_package(areas)"
+
+
+def _workflow_step_python(workflow, job, anchor, end_anchor, what, source=None):
+    """`_review_fix_step_python` generalised over the WORKFLOW file, so the same PARSED extraction
+    can pin worker.yml's two copies of the partition reduction (the review of #702 measured that
+    both could be reverted to the pre-#112 rule with the whole enrolled suite staying green)."""
+    import yaml  # self-test-only, same lazy import shape as resolve-conflicts.validate_syntax_blob
+    if source is None:
+        path = Path(__file__).resolve().parents[1] / ".github" / "workflows" / workflow
+        assert path.is_file(), f"{workflow} not found for the {what} pin: {path}"
+        source = path.read_text(encoding="utf-8")
+    try:
+        document = yaml.safe_load(source)
+    except yaml.YAMLError as exc:
+        raise AssertionError(
+            f"{workflow} does not parse as YAML, so the {what} pin cannot be derived: "
+            f"{exc}") from None
+    steps = (((document or {}).get("jobs") or {}).get(job) or {}).get("steps")
+    assert isinstance(steps, list), (
+        f"{workflow} exposes no jobs.{job}.steps list, so the {what} pin cannot be derived — "
+        f"if the `{job}` job was renamed, re-point the `job=` argument in dispatch-claim.py")
+    matches = [step["run"] for step in steps
+               if isinstance(step, dict) and isinstance(step.get("run"), str)
+               and re.search(anchor, step["run"])]
+    assert len(matches) == 1, (
+        f"expected EXACTLY ONE `run:` step in {workflow}'s `{job}` job to match the {what} "
+        f"anchor {anchor!r}; found {len(matches)}. The workflow's {what} was moved, renamed or "
+        f"rewritten — re-point the anchor constant in dispatch-claim.py so this cross-script pin "
+        f"keeps EXECUTING the workflow's real code instead of failing on a text address.")
+    run = matches[0]
+    begin = re.search(anchor, run)
+    end = re.search(end_anchor, run[begin.start():])
+    assert end, (
+        f"{workflow}'s {what} block starts at {anchor!r} but no longer ends at "
+        f"{end_anchor!r} — re-point the end-anchor constant in dispatch-claim.py so the extracted "
+        f"block still stops before the code that follows it.")
+    return textwrap.dedent(run[begin.start():begin.start() + end.start()])
+
+
+# The PARSED nodes that carry the partition value from the resolve job into each adopt/self-claim
+# step. Compared for EQUALITY against the parsed document, never grepped: `if: false`, a deleted
+# step, and an `env:` input re-pointed at the neighbouring `packages` output are ALL invisible to a
+# substring or `count(...) == N` assertion over the workflow text, and every one of them silently
+# disables the partition agreement rather than failing loudly.
+_PARTITION_SEAM = {
+    "review-fix.yml": {
+        "resolve_outputs": {"package": "${{ steps.pr.outputs.package }}",
+                            "packages": "${{ steps.pr.outputs.packages }}"},
+        "steps": {
+            "claim": {"if": "${{ inputs.claim_id == '' && "
+                            "needs.resolve.outputs.already_done != 'true' }}",
+                      "env": {"PACKAGE": "${{ needs.resolve.outputs.package }}"}},
+            "adopt": {"if": "${{ inputs.claim_id != '' && "
+                            "needs.resolve.outputs.already_done != 'true' }}",
+                      "env": {"PACKAGE": "${{ needs.resolve.outputs.package }}"}},
+        },
+    },
+    "worker.yml": {
+        "resolve_outputs": {"packages": "${{ steps.issue.outputs.packages }}"},
+        "steps": {
+            "claim": {"if": "${{ inputs.claim_id == '' }}",
+                      "env": {"PACKAGES": "${{ needs.resolve.outputs.packages }}"}},
+            "adopt": {"if": "${{ inputs.claim_id != '' }}",
+                      "env": {"PACKAGES": "${{ needs.resolve.outputs.packages }}"}},
+        },
+    },
+}
+
+
+def _partition_seam_violations(workflow, document):
+    """The YAML SEAM of the mint-vs-adopt partition agreement, checked STRUCTURALLY against a
+    PARSED workflow document. Returns a sorted list of violation strings; empty means intact.
+
+    Structural on purpose. The standing measured finding on this repo is that every uncaught mutant
+    lives at the YAML seam rather than in the Python, and each check below reads one specific parsed
+    node so the self-test can prove NON-VACUITY by mutating that node in memory and requiring the
+    matching violation back. Takes the parsed document (not text) so a mutant needs no round-trip."""
+    expected = _PARTITION_SEAM[workflow]
+    out = []
+    jobs = (document or {}).get("jobs") or {}
+    resolve_outputs = (jobs.get("resolve") or {}).get("outputs") or {}
+    for name, value in expected["resolve_outputs"].items():
+        if resolve_outputs.get(name) != value:
+            out.append(f"{workflow}: jobs.resolve.outputs.{name} must be {value!r} (found "
+                       f"{resolve_outputs.get(name)!r}) — the adopt step's partition agreement "
+                       f"reads it, so a re-pointed or deleted output compares the wrong value")
+    steps = (jobs.get("claim") or {}).get("steps")
+    if not isinstance(steps, list):
+        out.append(f"{workflow}: jobs.claim.steps is not a list, so the partition seam is gone")
+        return sorted(out)
+    by_id = {step.get("id"): step for step in steps if isinstance(step, dict)}
+    for step_id, wanted in expected["steps"].items():
+        step = by_id.get(step_id)
+        if step is None:
+            out.append(f"{workflow} is missing the `{step_id}` step in jobs.claim — the partition "
+                       f"reduction it carries cannot run, and NOTHING else derives it on that "
+                       f"entry path")
+            continue
+        if step.get("if") != wanted["if"]:
+            out.append(f"{workflow}: jobs.claim step `{step_id}` `if:` is not the expected "
+                       f"claim-id entry guard (found {step.get('if')!r}) — `if: false` or an "
+                       f"inverted comparison skips the partition derivation SILENTLY")
+        env = step.get("env") or {}
+        for key, value in wanted["env"].items():
+            if env.get(key) != value:
+                out.append(f"{workflow}: jobs.claim step `{step_id}` env.{key} must be {value!r} "
+                           f"(found {env.get(key)!r}) — re-pointing it at the neighbouring "
+                           f"packages/package output feeds the reduction the wrong input")
+    return sorted(out)
+
 
 def _review_fix_step_python(anchor, end_anchor, what, job="resolve", source=None):
     """Extract a python block VERBATIM out of a review-fix.yml step's `run:` script so a
@@ -4473,38 +4625,11 @@ def _review_fix_step_python(anchor, end_anchor, what, job="resolve", source=None
     installs it version+hash-locked BEFORE running the suite — so this adds no new gate dependency.
 
     `source` (the workflow text) exists so the self-test can feed a REFLOWED copy through and prove
-    the extraction survives it."""
-    import yaml  # self-test-only, same lazy import shape as resolve-conflicts.validate_syntax_blob
-    if source is None:
-        path = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "review-fix.yml"
-        assert path.is_file(), f"review-fix.yml not found for the {what} pin: {path}"
-        source = path.read_text(encoding="utf-8")
-    try:
-        document = yaml.safe_load(source)
-    except yaml.YAMLError as exc:
-        raise AssertionError(
-            f"review-fix.yml does not parse as YAML, so the {what} pin cannot be derived: "
-            f"{exc}") from None
-    steps = (((document or {}).get("jobs") or {}).get(job) or {}).get("steps")
-    assert isinstance(steps, list), (
-        f"review-fix.yml exposes no jobs.{job}.steps list, so the {what} pin cannot be derived — "
-        f"if the `{job}` job was renamed, re-point the `job=` argument in dispatch-claim.py")
-    matches = [step["run"] for step in steps
-               if isinstance(step, dict) and isinstance(step.get("run"), str)
-               and re.search(anchor, step["run"])]
-    assert len(matches) == 1, (
-        f"expected EXACTLY ONE `run:` step in review-fix.yml's `{job}` job to match the {what} "
-        f"anchor {anchor!r}; found {len(matches)}. The workflow's {what} was moved, renamed or "
-        f"rewritten — re-point the anchor constant in dispatch-claim.py so this cross-script pin "
-        f"keeps EXECUTING the workflow's real code instead of failing on a text address.")
-    run = matches[0]
-    begin = re.search(anchor, run)
-    end = re.search(end_anchor, run[begin.start():])
-    assert end, (
-        f"review-fix.yml's {what} block starts at {anchor!r} but no longer ends at "
-        f"{end_anchor!r} — re-point the end-anchor constant in dispatch-claim.py so the extracted "
-        f"block still stops before the code that follows it.")
-    return textwrap.dedent(run[begin.start():begin.start() + end.start()])
+    the extraction survives it.
+
+    Thin wrapper over `_workflow_step_python` (which generalises it over the workflow FILE so
+    worker.yml's copies of the partition reduction are pinned by the same idiom)."""
+    return _workflow_step_python("review-fix.yml", job, anchor, end_anchor, what, source=source)
 
 
 def _self_test():
@@ -5837,6 +5962,327 @@ def _self_test():
     print("  ok   #584 f3: review-fix.yml's already_done predicate is PARSED (a reflowed-equivalent "
           "workflow yields the identical block) and every missing/ambiguous anchor raises an "
           "actionable AssertionError instead of a bare ValueError")
+
+    # ---- THE 2026-07-26 REVIEW-LANE LOOP: the adopt step rejected its own dispatcher's claim on
+    # every tick because review-fix.yml's `resolve` job still carried the pre-#112 alphabetically-
+    # first `package` reduction while this module had migrated to multi-area -> __global__.
+    # sparq-org/sparq#3528 (source issue #2582: `area:ci` + `area:site`) re-failed on every tick;
+    # 53 of that day's 77 review-fix failures were this one rejection, ~20% of the review lane.
+    #
+    # `package` is not the only value derived twice on these lanes. Each layer below pins ONE
+    # mint-vs-adopt derivation by EXECUTING the workflow's own code and requiring it to agree with
+    # the canonical definition, and each proves its own non-vacuity by mutating the LIVE tree:
+    #   L1  the three Python copies of the reduction agree
+    #   L2  review-fix.yml `resolve` derives `package` through the minter's own function
+    #   L3  review-fix.yml `policy` routing TABLES agree with REVIEW_CHAIN/FIX_CHAIN/LADDERS
+    #   L4  worker.yml self-claim SHELL computes the partition via the canonical CLI
+    #   L5  worker.yml adopt validator IMPORTS the canonical reduction
+    #   L6  the YAML seam that carries the value into each of those steps, on PARSED nodes
+    # ----
+    import copy as _copy
+    _ls = _load_module("registry_lease_schema", Path(__file__).resolve().with_name(
+        "lease_schema.py"))
+    _dp = _load_module("registry_dispatch_plan", Path(__file__).resolve().with_name(
+        "dispatch-plan.py"))
+    _wf_dir = Path(__file__).resolve().parents[1] / ".github" / "workflows"
+    _rf_live = (_wf_dir / "review-fix.yml").read_text(encoding="utf-8")
+    _wk_live = (_wf_dir / "worker.yml").read_text(encoding="utf-8")
+    assert GLOBAL_PACKAGE == _ls.GLOBAL_PACKAGE == _dp.GLOBAL, (
+        GLOBAL_PACKAGE, _ls.GLOBAL_PACKAGE, _dp.GLOBAL)
+    # L1. dispatch-plan.py ships INSIDE the target repos, which have no lease_schema.py, so it is
+    # the one copy that cannot import the canonical function. Pin it by AGREEMENT instead —
+    # including the live incident's two-area row, the case the pre-#112 reduction got wrong.
+    _area_matrix = ([], ["ci"], ["site"], ["ci", "site"], ["site", "ci"], ["ci", "ci"],
+                    ["a", "b", "c"])
+    for _areas in _area_matrix:
+        _canonical = _ls.plan_package(_areas)
+        assert plan_package(_areas) == _canonical, (_areas, plan_package(_areas), _canonical)
+        assert _dp._plan_package([f"area:{a}" for a in _areas]) == _canonical, (
+            "dispatch-plan.py's target-shipped copy drifted from the canonical reduction", _areas)
+    assert _ls.plan_package(["ci", "site"]) == GLOBAL_PACKAGE, "the incident row must serialize"
+    print("  ok   adopt-loop L1: all THREE python derivations of the area->package partition agree, "
+          "the live two-area incident row (area:ci + area:site) included")
+
+    # L2. review-fix.yml's resolve job derives `package` by CALLING this module's plan_package —
+    # EXECUTED, not grepped. The extracted slice is the workflow's real line.
+    def _resolve_package(areas, source=None):
+        """Run review-fix.yml's OWN `package` derivation over `areas`."""
+        src = _review_fix_step_python(
+            _RF_PACKAGE_ANCHOR, _RF_PACKAGE_END, "resolve-job package partition derivation",
+            source=source)
+        ns = {"dispatch_claim": types.SimpleNamespace(plan_package=plan_package),
+              "packages": sorted(areas)}
+        exec(src, ns)  # noqa: S102 — repository-owned workflow source
+        return ns["package"]
+
+    for _areas in _area_matrix:
+        assert _resolve_package(_areas) == _ls.plan_package(_areas), (
+            "review-fix.yml's resolve job derives a package the dispatcher would not have minted",
+            _areas, _resolve_package(_areas), _ls.plan_package(_areas))
+    assert _resolve_package(["ci", "site"]) == GLOBAL_PACKAGE
+    # NON-VACUITY: reinstate the exact pre-#112 reduction in the workflow text and require the
+    # comparison above to go red. This is the mutant that ran in production for a day.
+    _rf_prefix_bug = _rf_live.replace(
+        "package = dispatch_claim.plan_package(packages)",
+        'package = packages[0] if packages else "__global__"')
+    assert _rf_prefix_bug != _rf_live, "the pre-#112-reduction mutant fixture is vacuous"
+    _bug_caught = None
+    try:
+        _bug_caught = ("derived", _resolve_package(["ci", "site"], source=_rf_prefix_bug))
+    except AssertionError as _exc:                 # the anchor is gone -> also a caught mutant
+        _bug_caught = ("anchor-gone", str(_exc))
+    assert _bug_caught[0] == "anchor-gone" or _bug_caught[1] != _ls.plan_package(["ci", "site"]), \
+        "the pre-#112 reduction mutant was NOT caught — this check is vacuous"
+    print("  ok   adopt-loop L2: review-fix.yml's resolve job derivation is EXECUTED and agrees "
+          "with the minter on every row; restoring the pre-#112 `packages[0]` reduction is caught")
+
+    # L3. The OTHER unpinned mint-vs-adopt derivation on the review lane: review-fix.yml's `policy`
+    # job re-derives review_chain / fix_chain / ladders inline, held to this module's REVIEW_CHAIN /
+    # FIX_CHAIN and worker-pr.ESCALATION_LADDERS by a COMMENT ("Mirrors dispatch-claim.py
+    # REVIEW_CHAIN/FIX_CHAIN") and nothing else. A drift makes the adopt step's `model not in
+    # models` guard fire on every affected PR — the identical forever-loop shape as the package
+    # drift, on a value nothing was checking. EXECUTE the workflow's tables and require agreement.
+    _wpr_chains = _load_module("registry_worker_pr_chains",
+                              Path(__file__).resolve().with_name("worker-pr.py"))
+
+    def _workflow_chains(source=None):
+        src = _review_fix_step_python(
+            _RF_CHAINS_ANCHOR, _RF_CHAINS_END, "policy-job routing tables", job="resolve",
+            source=source)
+        ns = {}
+        exec(src, ns)  # noqa: S102 — repository-owned workflow source
+        return {name: ns[name] for name in ("review_chain", "fix_chain", "ladders")}
+
+    _chains = _workflow_chains()
+    assert _chains["review_chain"] == REVIEW_CHAIN, (
+        "review-fix.yml's review_chain drifted from dispatch-claim.REVIEW_CHAIN; the dispatcher "
+        "mints a claim on a model the run then rejects", _chains["review_chain"], REVIEW_CHAIN)
+    assert _chains["fix_chain"] == FIX_CHAIN, (
+        "review-fix.yml's fix_chain drifted from dispatch-claim.FIX_CHAIN", _chains["fix_chain"],
+        FIX_CHAIN)
+    assert _chains["ladders"] == _wpr_chains.ESCALATION_LADDERS, (
+        "review-fix.yml's ladders drifted from worker-pr.ESCALATION_LADDERS; a pinned fix floor "
+        "then resolves to a chain the dispatcher never claimed against",
+        _chains["ladders"], _wpr_chains.ESCALATION_LADDERS)
+    # NON-VACUITY: drift each table in the LIVE workflow text and require the matching assertion to
+    # go red. (The review of #702 measured that drifting `review_chain` left the whole enrolled
+    # suite green.) Each mutant keeps the table SHAPE, so only an equality pin can see it.
+    for _table, _from, _to in (
+            ("review_chain", '"anthropic": ["sol", "luna"], "openai": ["opus5", "opus", "fable"]',
+             '"anthropic": ["luna"], "openai": ["opus5", "opus", "fable"]'),
+            ("fix_chain", '"anthropic": ["opus5", "fable", "opus"], "openai": ["sol", "luna"]',
+             '"anthropic": ["opus5", "fable", "opus"], "openai": ["luna", "sol"]'),
+            ("ladders", '"anthropic": ["opus", "fable", "opus5"], "openai": ["luna", "sol"]',
+             '"anthropic": ["opus", "opus5", "fable"], "openai": ["luna", "sol"]')):
+        _line = f"{_table} = {{{_from}}}"
+        assert _line in _rf_live, f"the {_table} drift fixture is stale: {_line}"
+        _drifted = _workflow_chains(source=_rf_live.replace(_line, f"{_table} = {{{_to}}}"))
+        _live_table = {"review_chain": REVIEW_CHAIN, "fix_chain": FIX_CHAIN,
+                       "ladders": _wpr_chains.ESCALATION_LADDERS}[_table]
+        assert _drifted[_table] != _live_table, (
+            f"drifting {_table} in review-fix.yml did NOT change the executed table — this "
+            f"agreement pin is vacuous", _table)
+    print("  ok   adopt-loop L3: review-fix.yml's review_chain/fix_chain/ladders are EXECUTED out "
+          "of the workflow and pinned to REVIEW_CHAIN/FIX_CHAIN/ESCALATION_LADDERS; drifting any "
+          "one of the three is caught")
+
+    # ---- THE IMPL LANE. worker.yml runs the SAME mint-vs-adopt equality with its OWN two copies of
+    # the reduction, and the review of #702 MEASURED that both could be reverted to the pre-#112
+    # rule with the entire 34-script enrolled suite staying green. Both now go through the canonical
+    # function, and both are pinned by EXECUTION. ----
+    @contextlib.contextmanager
+    def _registry_cwd():
+        """A cwd whose `registry/` is this checkout, i.e. the layout worker.yml's steps run in
+        (actions/checkout with `path: registry`). Makes the workflow's own relative
+        `registry/scripts/lease_schema.py` reference LOAD-BEARING in the test."""
+        with tempfile.TemporaryDirectory() as tmp:
+            os.symlink(Path(__file__).resolve().parents[1], os.path.join(tmp, "registry"))
+            saved = os.getcwd()
+            try:
+                os.chdir(tmp)
+                yield tmp
+            finally:
+                os.chdir(saved)
+
+    # L4. worker.yml's self-claim SHELL step. The bash `if [[ "$PACKAGES" != *,* ]]` reduction is
+    # replaced by a call to the canonical CLI, and this runs that shell with `bash` over the matrix.
+    def _worker_self_package(areas, source=None):
+        src = _workflow_step_python(
+            "worker.yml", "claim", _WK_SELF_PACKAGE_ANCHOR, _WK_SELF_PACKAGE_END,
+            "self-claim lease partition reduction", source=source)
+        assert _WK_SELF_PACKAGE_CALL in src, (
+            "worker.yml's self-claim step no longer COMPUTES the lease partition with the canonical "
+            "reduction (lease_schema.py --plan-package) — a re-implementation that agrees today is "
+            "exactly the drift axis the 2026-07-26 review-lane loop rode", src)
+        with _registry_cwd():
+            done = subprocess.run(
+                ["bash", "-c", f'set -euo pipefail\n{src}\nprintf "%s" "$lease_package"'],
+                capture_output=True, text=True,
+                env={**os.environ, "PACKAGES": ",".join(sorted(areas))})
+        assert done.returncode == 0, (done.returncode, done.stdout, done.stderr)
+        return done.stdout
+
+    for _areas in _area_matrix:
+        assert _worker_self_package(_areas) == _ls.plan_package(_areas), (
+            "worker.yml's self-claim step leases a partition the dispatcher would not have minted",
+            _areas, _worker_self_package(_areas), _ls.plan_package(_areas))
+    # NON-VACUITY, both legs of the pin:
+    #  (a) restore the EXACT pre-#112 open-coded bash reduction -> caught by the shared-code leg
+    #      (agreeing today is not the property being pinned; the defect class is "another copy");
+    #  (b) keep the canonical call but OVERRIDE its result -> caught by the executed VALUE leg, so
+    #      the agreement assertion is not carried by the substring check alone.
+    _wk_self_call_line = ('          lease_package="$(python3 registry/scripts/lease_schema.py'
+                          ' --plan-package "$PACKAGES")"\n')
+    assert _wk_self_call_line in _wk_live, "the worker.yml self-claim call fixture is stale"
+    _wk_pre112 = _wk_live.replace(
+        _wk_self_call_line,
+        '          if [[ -n "$PACKAGES" ]]; then\n'
+        '            lease_package="${PACKAGES%%,*}"\n'
+        "          else\n"
+        "            lease_package=__global__\n"
+        "          fi\n")
+    _pre112_caught = None
+    try:
+        _pre112_caught = ("value", _worker_self_package(["ci", "site"], source=_wk_pre112))
+    except AssertionError as _exc:
+        _pre112_caught = ("assertion", str(_exc))
+    assert _pre112_caught[0] == "assertion" and "canonical reduction" in _pre112_caught[1], (
+        "reverting worker.yml's self-claim reduction to the pre-#112 open-coded bash rule was NOT "
+        "caught", _pre112_caught)
+    _wk_override = _wk_live.replace(
+        _wk_self_call_line, _wk_self_call_line + '          lease_package="${PACKAGES%%,*}"\n')
+    assert _wk_override != _wk_live, "the worker.yml self-claim override fixture is stale"
+    assert _worker_self_package(["ci", "site"], source=_wk_override) != GLOBAL_PACKAGE, (
+        "overriding the canonical reduction's result in worker.yml's self-claim step was NOT "
+        "caught — the executed value agreement is vacuous")
+    print("  ok   adopt-loop L4: worker.yml's self-claim shell step computes the lease partition "
+          "through the canonical reduction (run under bash over every row); restoring the pre-#112 "
+          "open-coded bash rule and overriding the canonical result are both caught")
+
+    # L5. worker.yml's adopt validator. The `expected_package` re-derivation is executed WITH its
+    # own importlib load, out of the workflow, in the checkout layout the step really runs in — so
+    # deleting the import is a NameError here, not a runtime surprise on the impl lane.
+    def _worker_adopt_package(areas, source=None):
+        src = _workflow_step_python(
+            "worker.yml", "claim", _WK_ADOPT_PACKAGE_ANCHOR, _WK_ADOPT_PACKAGE_END,
+            "adopt-validator expected-partition derivation", source=source)
+        assert _WK_ADOPT_PACKAGE_CALL in src, (
+            "worker.yml's adopt validator no longer derives the expected partition with the "
+            "canonical lease_schema.plan_package — the impl lane's mint-vs-adopt equality is back "
+            "on two independent copies of one reduction", src)
+        ns = {"os": os}
+        saved = os.environ.get("PACKAGES")
+        with _registry_cwd():
+            try:
+                os.environ["PACKAGES"] = ",".join(sorted(areas))
+                exec(src, ns)  # noqa: S102 — repository-owned workflow source
+            finally:
+                if saved is None:
+                    os.environ.pop("PACKAGES", None)
+                else:
+                    os.environ["PACKAGES"] = saved
+        return ns["expected_package"]
+
+    for _areas in _area_matrix:
+        assert _worker_adopt_package(_areas) == _ls.plan_package(_areas), (
+            "worker.yml's adopt validator expects a partition the dispatcher would not have minted",
+            _areas, _worker_adopt_package(_areas), _ls.plan_package(_areas))
+    # NON-VACUITY, three mutants: the pre-#112 rule (the shared-code leg), a derivation that keeps
+    # the canonical call but overrides it on the incident row (the executed VALUE leg), and deleting
+    # the import (what makes the derivation SHARED rather than merely equal today).
+    _wk_adopt_pre112 = _wk_live.replace(
+        "expected_package = lease_schema.plan_package(areas)",
+        'expected_package = areas[0] if areas else "__global__"')
+    assert _wk_adopt_pre112 != _wk_live, "the worker.yml adopt pre-#112 mutant fixture is stale"
+    _adopt_caught = None
+    try:
+        _adopt_caught = ("value", _worker_adopt_package(["ci", "site"], source=_wk_adopt_pre112))
+    except AssertionError as _exc:
+        _adopt_caught = ("assertion", str(_exc))
+    assert _adopt_caught[0] == "assertion" and "canonical lease_schema" in _adopt_caught[1], (
+        "reverting worker.yml's adopt reduction to the pre-#112 rule was NOT caught", _adopt_caught)
+    _wk_adopt_override = _wk_live.replace(
+        "expected_package = lease_schema.plan_package(areas)",
+        "expected_package = lease_schema.plan_package(areas) if len(areas) != 2 else areas[0]")
+    assert _wk_adopt_override != _wk_live, "the worker.yml adopt override fixture is stale"
+    assert _worker_adopt_package(["ci", "site"], source=_wk_adopt_override) != GLOBAL_PACKAGE, (
+        "overriding the canonical reduction on the two-area row in worker.yml's adopt validator was "
+        "NOT caught — the executed value agreement is vacuous")
+    _wk_no_import = _wk_live.replace("          import importlib.util as _ilu\n", "")
+    assert _wk_no_import != _wk_live, "the worker.yml adopt import-deletion fixture is stale"
+    _no_import_caught = None
+    try:
+        _worker_adopt_package(["ci"], source=_wk_no_import)
+    except (AssertionError, NameError) as _exc:
+        _no_import_caught = f"{type(_exc).__name__}: {_exc}"
+    assert _no_import_caught, (
+        "deleting the canonical-reduction import from worker.yml's adopt validator was NOT caught")
+    print("  ok   adopt-loop L5: worker.yml's adopt validator IMPORTS the canonical reduction and "
+          "is executed in the real checkout layout; the pre-#112 rule and a deleted import are "
+          "both caught")
+
+    # L6. THE YAML SEAM, on PARSED nodes. A substring or `count(...) == N` assertion over the
+    # workflow text cannot distinguish a live step from one carrying `if: false`, cannot see a
+    # deleted step, and cannot see an `env:` input re-pointed at the neighbouring output. Every
+    # mutant below is built by editing ONE parsed node and must come back as a named violation.
+    _rf_doc = _yaml.safe_load(_rf_live)
+    _wk_doc = _yaml.safe_load(_wk_live)
+    for _wf, _doc in (("review-fix.yml", _rf_doc), ("worker.yml", _wk_doc)):
+        assert _partition_seam_violations(_wf, _doc) == [], (
+            _wf, _partition_seam_violations(_wf, _doc))
+
+    def _mutate(document, edit):
+        clone = _copy.deepcopy(document)
+        edit(clone)
+        return clone
+
+    def _step(document, step_id):
+        return next(s for s in document["jobs"]["claim"]["steps"] if s.get("id") == step_id)
+
+    def _drop_step(document, step_id):
+        document["jobs"]["claim"]["steps"] = [
+            s for s in document["jobs"]["claim"]["steps"] if s.get("id") != step_id]
+
+    _seam_mutants = (
+        ("review-fix.yml", _rf_doc, "adopt step if: false",
+         lambda d: _step(d, "adopt").__setitem__("if", "${{ false }}"), "`if:`"),
+        ("review-fix.yml", _rf_doc, "self-claim step if: false",
+         lambda d: _step(d, "claim").__setitem__("if", "${{ false }}"), "`if:`"),
+        ("review-fix.yml", _rf_doc, "adopt env.PACKAGE re-pointed at the packages CSV",
+         lambda d: _step(d, "adopt")["env"].__setitem__(
+             "PACKAGE", "${{ needs.resolve.outputs.packages }}"), "env.PACKAGE"),
+        ("review-fix.yml", _rf_doc, "self-claim env.PACKAGE deleted",
+         lambda d: _step(d, "claim")["env"].pop("PACKAGE"), "env.PACKAGE"),
+        ("review-fix.yml", _rf_doc, "resolve outputs.package re-pointed at packages",
+         lambda d: d["jobs"]["resolve"]["outputs"].__setitem__(
+             "package", "${{ steps.pr.outputs.packages }}"), "outputs.package"),
+        ("review-fix.yml", _rf_doc, "resolve outputs.package deleted",
+         lambda d: d["jobs"]["resolve"]["outputs"].pop("package"), "outputs.package"),
+        ("review-fix.yml", _rf_doc, "the adopt step deleted",
+         lambda d: _drop_step(d, "adopt"), "missing the `adopt` step"),
+        ("worker.yml", _wk_doc, "adopt step if: false",
+         lambda d: _step(d, "adopt").__setitem__("if", "${{ false }}"), "`if:`"),
+        ("worker.yml", _wk_doc, "self-claim step if: false",
+         lambda d: _step(d, "claim").__setitem__("if", "${{ false }}"), "`if:`"),
+        ("worker.yml", _wk_doc, "adopt env.PACKAGES re-pointed at the single package",
+         lambda d: _step(d, "adopt")["env"].__setitem__(
+             "PACKAGES", "${{ needs.resolve.outputs.package }}"), "env.PACKAGES"),
+        ("worker.yml", _wk_doc, "self-claim env.PACKAGES deleted",
+         lambda d: _step(d, "claim")["env"].pop("PACKAGES"), "env.PACKAGES"),
+        ("worker.yml", _wk_doc, "resolve outputs.packages deleted",
+         lambda d: d["jobs"]["resolve"]["outputs"].pop("packages"), "outputs.packages"),
+        ("worker.yml", _wk_doc, "the self-claim step deleted",
+         lambda d: _drop_step(d, "claim"), "missing the `claim` step"),
+        ("worker.yml", _wk_doc, "the whole claim job's steps list replaced by a scalar",
+         lambda d: d["jobs"]["claim"].__setitem__("steps", "gutted"), "steps is not a list"),
+    )
+    for _wf, _doc, _label, _edit, _needle in _seam_mutants:
+        _violations = _partition_seam_violations(_wf, _mutate(_doc, _edit))
+        assert _violations, f"YAML-seam mutant NOT caught ({_wf}: {_label})"
+        assert any(_needle in v for v in _violations), (_wf, _label, _needle, _violations)
+    print(f"  ok   adopt-loop L6: the partition YAML seam is checked on PARSED nodes across "
+          f"review-fix.yml + worker.yml, and all {len(_seam_mutants)} seam mutants "
+          "(`if: false`, deleted step, deleted/re-pointed env input, deleted job output) are caught")
 
     # ---- [round-5 P1] CROSS-LANE SUPERSESSION (park -> sibling-launch -> UNPARK): while a
     # PR sat human-parked its crate was freed and a SIBLING claimed a lease there (an impl
