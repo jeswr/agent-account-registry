@@ -1,26 +1,6 @@
 {
  "leases": [
   {
-   "account": "3ff9b4af73df69dc",
-   "claim_id": "e8cfc9de1427477f8eb88ae982535882",
-   "holder": "sparq-org/sparq#3124@dispatch-30212092399.1",
-   "package": "kb",
-   "role": "impl",
-   "model": "opus5",
-   "issued_at": 1785086401,
-   "expires_at": 1785092701
-  },
-  {
-   "account": "3ff9b4af73df69dc",
-   "claim_id": "aeed7ac0fd944273b8a0e61ff9ccf42c",
-   "holder": "sparq-org/sparq#3133@dispatch-30212092399.1",
-   "package": "sparq-reason-el",
-   "role": "impl",
-   "model": "opus5",
-   "issued_at": 1785086407,
-   "expires_at": 1785092707
-  },
-  {
    "account": "9e13ea21abf27e68",
    "claim_id": "3354d8a54a4a4a689cbd0abfec5e8f58",
    "holder": "sparq-org/sparq#2673@30215462694.1",
@@ -109,16 +89,6 @@
    "model": "opus5",
    "issued_at": 1785092247,
    "expires_at": 1785098547
-  },
-  {
-   "account": "3ff9b4af73df69dc",
-   "claim_id": "87dac28636d74fc7862f1e748e9c3df6",
-   "holder": "sparq-org/sparq#2639@30215828312.1",
-   "package": "deploy-demo",
-   "role": "impl",
-   "model": "opus5",
-   "issued_at": 1785092273,
-   "expires_at": 1785098573
   },
   {
    "account": "9e13ea21abf27e68",
