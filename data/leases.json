@@ -112,16 +112,6 @@
   },
   {
    "account": "dc2d751954080e13",
-   "claim_id": "2bd3d8ed2d9d4e8daf89b3e60c046781",
-   "holder": "review:sparq-org/sparq#4265@dispatch-30218784501.1",
-   "package": "site-papers",
-   "role": "review",
-   "model": "sol",
-   "issued_at": 1785097977,
-   "expires_at": 1785102177
-  },
-  {
-   "account": "dc2d751954080e13",
    "claim_id": "73d4e1c5740845e19e5026b961a3fd60",
    "holder": "review:sparq-org/sparq#4269@dispatch-30218784501.1",
    "package": "sparq-policy",
