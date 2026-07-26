@@ -1,0 +1,51 @@
+{
+ "host_envelope": {
+  "pr": 4036,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c4bba66dbd3bdc5b578baf9292ff6b5b204fc8bf",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Unchanged from round 1, re-confirmed empirically. The comment at the new test says \"A generic existential `(A,A)` link remains insufficient; this fixture specifically carries `ObjectHasSelf` provenance\", but the fixture contains no generic-existential case, so that clause is asserted by prose only. `grep hasSelf crates/sparq-reason-el/tests/rbox_differential.rs` returns exactly 2 hits, both inside this new fixture -- there is no negative witness anywhere in the rbox suite (cr10_does_not_lift_downward pins lift DIRECTION, not self-provenance). par_differential.rs:207-210 has a `:B2 sub exists s.B2` + `exists s.Self sub E` shape, but only under a par-vs-seq differential (a shared over-derivation in both engines passes) and with no role hierarchy at all.\n\nI verified the guard DOES currently hold: with `:r rdfs:subPropertyOf :s . :A sub [onProperty :r ; someValuesFrom :A] . [onProperty :s ; hasSelf true] sub :D .` the classifier reports A sub D = false. So this is a missing regression guard, not a live bug. It matters because the guard is precisely what this PR preserves: a later \"simplification\" moving the self-concept minting into add_link_rbox (so ANY (X,X) link mints exists r.Self) would be UNSOUND -- X sub exists r.X only gives some r-successor inside X, not a loop at each x -- and no test in this suite would go red.",
+    "file": "crates/sparq-reason-el/tests/rbox_differential.rs",
+    "fix_hint": "Add a sibling negative fixture next to cr10_lifts_self_restriction_to_super_role:\n\n:r rdfs:subPropertyOf :s .\n:A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r ; owl:someValuesFrom :A ] .\n[ a owl:Restriction ; owl:onProperty :s ; owl:hasSelf \"true\"^^xsd:boolean ] rdfs:subClassOf :D .\n\nthen assert_closure(&ttl, &[\"A\", \"D\"], &[]) -- A sub D must NOT be derived. That pins the provenance guard through the CR10 lift and makes the new fixture's comment true by test rather than by assertion.",
+    "severity": "minor",
+    "title": "Fixture comment claims a generic-existential negative guard that no test in the suite actually pins"
+   },
+   {
+    "body": "Unchanged from round 1, and now CONFIRMED by mutation rather than argued. The diff changes both derive_chunk (new self_links vector) and the saturate_par_inner apply loop, but the only new fixture uses Classifier::classify (sequential).\n\nI applied a realistic par-only drift mutation -- the apply loop keeps `self_links` but calls `self_concept_of(r)` for the single role plus plain `add_link_rbox`, i.e. the parallel engine loses the CRs4 super-role lift while the sequential engine keeps it -- and `cargo test -p sparq-reason-el --features par,rbox --test par_differential` still reported 19 passed / 0 failed. Nothing in the suite catches par and seq disagreeing on the new rule.\n\nThe existing cr_self_restriction_par_matches_seq does cover the self_links PLUMBING (deleting the vector entirely would diverge), but it has no `rdfs:subPropertyOf` at all, so the lift itself is untested in the par engine. Divergence risk today is structurally low (both paths call the same add_self_link_rbox), which is why this is minor rather than major -- but the file's own stated discipline (\"Positive assert so a shared miss cannot hide in the differential\", \"mutation-witnessed\") asks for the fixture.",
+    "file": "crates/sparq-reason-el/src/classify.rs",
+    "fix_hint": "Add `#[cfg(feature = \"rbox\")] fn rbox_self_restriction_super_role_par_matches_seq()` to tests/par_differential.rs reusing the new fixture's Turtle (r sub s, A sub exists r.Self, exists s.Self sub D): call assert_par_equals_seq(&ttl) and then, across THREAD_COUNTS, assert h.is_subclass_of(lk(\"A\"), lk(\"D\")) on Classifier::classify_par -- matching the existing cr_self_restriction_par_matches_seq shape so a shared miss cannot hide in the differential.",
+    "severity": "minor",
+    "title": "Parallel kernel's new super-role lift is unpinned -- a par-only drift silently passes par_differential (mutation-witnessed)"
+   },
+   {
+    "body": "Unchanged from round 1, re-confirmed empirically. add_self_link_rbox iterates role_box.super_roles(r) only, which rbox.rs:52-90 builds from told rdfs:subPropertyOf; composition-derived local reflexivity is therefore missed.\n\nConcretely, with `:s owl:propertyChainAxiom ( :r :r ) . :A sub exists r.Self . exists s.Self sub :D .`: for every x in A^I we have (x,x) in r^I, so composing the loop with itself gives (x,x) in s^I, hence A sub exists s.Self and A sub D are ENTAILED. I ran this fixture and the classifier derives A sub D = FALSE. add_link_rbox does derive the LINK (A,A) in R(s) via CR11, but exists s.Self never enters S(A), so `exists s.Self sub D` never fires.\n\nThis is SOUND (missing conclusions only), pre-existing rather than introduced, and outside the stated CR10 scope -- the README edit and the CRs4 header line both correctly say `r sub* s`, so there is no overclaim. Recording it so it is not mistaken for full EL++ self-restriction completeness under rbox.",
+    "file": "crates/sparq-reason-el/src/classify.rs",
+    "fix_hint": "Cheapest adequate fix: add one sentence to the CRs4 header comment (classify.rs:17) noting that composition-derived reflexivity (r o r sub s) does not yet mint exists s.Self, and file a bead for it. The fuller fix is to close local reflexivity under compositions where both components are known locally reflexive on X (fixpoint over compositions_first/compositions_second carrying the self-provenance).",
+    "severity": "minor",
+    "title": "CR11-composed local reflexivity is still not lifted (undocumented residual incompleteness)"
+   },
+   {
+    "body": "Unchanged from round 1. add_self_link_rbox takes 7 parameters (sat, r, x, ix, names, role_box, queue); clippy's too-many-arguments-threshold defaults to 7 and the lint fires only above it, so the allow never applies. It was evidently copied from add_link_rbox, which genuinely has 8 and carries a written justification comment above its allow (classify.rs:487-490). Cosmetic only -- an unused allow does not warn under -D warnings.",
+    "file": "crates/sparq-reason-el/src/classify.rs",
+    "fix_hint": "Drop the #[allow(clippy::too_many_arguments)] line above add_self_link_rbox; re-add it with a one-line justification only if a future parameter pushes the count past the threshold.",
+    "severity": "nit",
+    "title": "#[allow(clippy::too_many_arguments)] on add_self_link_rbox is dead"
+   },
+   {
+    "body": "Unchanged from round 1, now measured. Collapsed to one line each, `add_self_link_rbox(&mut sat, r, x, &ix, names, role_box, &mut queue);` is 88 columns at both call sites (20-space indent in saturate_inner and in the saturate_par_inner apply loop), inside the workspace max_width = 100 from rustfmt.toml, so cargo fmt would collapse them. The adjacent add_link_rbox call at line 806 is 87 columns and single-line, so the wrapping also reads as inconsistent within the same block. I could not run cargo fmt to confirm (rustfmt component not installed on this toolchain), and rustfmt.toml documents that CI runs `cargo fmt --all --check` informationally with continue-on-error, so this is not gate-blocking.",
+    "file": "crates/sparq-reason-el/src/classify.rs",
+    "fix_hint": "Collapse both add_self_link_rbox(...) calls onto one line each so the file stays clean for the deferred workspace-wide `cargo fmt --all` reformat that rustfmt.toml documents.",
+    "severity": "nit",
+    "title": "Both new call sites are hand-wrapped although they fit rustfmt's max_width"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 2 changed ONLY the README prose (commit c4bba66d, 'repair failing CI legs', +2/-3); classify.rs and rbox_differential.rs are byte-identical to round 1. None of round 1's five findings were addressed, and none were introduced -> stagnant.\n\nRe-verified CRs4 (exists r.Self in S(X), r sub* s => exists s.Self in S(X)): SOUND. rbox.rs:52-90 builds super_of as the reflexive-transitive closure of told RoleAxiom::Sub ONLY (Chain axioms go to comp_by_first/comp_by_second, never into super_of), so s in super_roles(r) really gives r^I subset s^I; with (x,x) in r^I for all x in X^I, X sub exists s.Self follows. The load-bearing provenance guard is intact: add_self_link_rbox is reachable ONLY from the has_self / self_role(d) trigger (classify.rs:260-268 seq, :810-815 par apply), never from add_link_rbox, so a generic (X,X) link from X sub exists r.X cannot mint a self-concept. Confirmed empirically: r sub s, A sub exists r.A, exists s.Self sub D yields A sub D = FALSE. Termination fine -- self_concept_of is non-minting (normal.rs:202) and add() re-queues only on a new insert. Par/seq parity holds: derive_chunk routes to self_links and the apply phase calls the SAME helper; derived_links keeps its prior value via += self_links.len().\n\nTest validity: the new fixture is NON-VACUOUS, mutation-witnessed -- replacing the super_roles(r) loop with a single self_concept_of(r) insert makes exactly cr10_lifts_self_restriction_to_super_role go RED (22 passed / 1 failed). assert_closure is exhaustive over {A,D}.\n\nGates re-run locally (cargo 1.88.0) in default, rbox, par, par+rbox and --all-features: all green, zero failures. clippy unavailable on this toolchain. No perf numbers, no ZK/MPC surface, opt-in discipline respected, README and CRs4 header both say r sub* s -- no overclaim. No blocker or major.",
+  "verdict": "approve"
+ }
+}
