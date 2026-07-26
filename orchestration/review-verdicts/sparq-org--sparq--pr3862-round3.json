@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3862,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "26db384e9d24a591d87b3e03e7ed59155be909e7",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 3 resolves the prior major finding. The workflow_dispatch path now unconditionally prefixes the setup-resolved free-form tag with `dev-`, while canonical semver, major.minor, and `latest` tags are enabled only for non-dispatch releases. This makes the dispatch and canonical namespaces structurally disjoint for the adversarial values identified in round 2. The docker job now declares the required setup dependency, and the newly wired contract test checks the effective resolved tag sets, useful dispatch output, unsupported guards, missing namespace, missing version threading, and missing dependency with non-vacuous mutation cases. No correctness, soundness, test-validity, or security issue is evident in the supplied diff.",
+  "verdict": "approve"
+ }
+}
