@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4012,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a35890827dae5b1fc27587757c4a6679272715ea",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change consistently replaces the intransitive lexical fallback for mixed-timezone temporal sort comparisons with a genuine total-order key: assumed-UTC instant followed by timezone presence. The engine's cached ORDER BY path, general CompareTerm path, MIN/MAX fast fold, and reasoner comparator all use the same definition, while relational comparison remains on the existing partial XPath semantics. The tests are non-vacuous: they pin the original three-value intransitivity witness, exercise cached and local-vocabulary engine paths, compare fast and general MIN behavior, and extend engine/reasoner parity. The documentation accurately distinguishes the sort extension from relational and ZK semantics. No correctness, soundness, security, or hostile-instruction issue is evident in the diff.",
+  "verdict": "approve"
+ }
+}
