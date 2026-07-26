@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4034,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b4799de9a607f1704c6b5845e2f4b2fc1ee273cd",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`fold_numeric_group` breaks every `cmp_total` tie with `Id`, but an `Id` is assigned by interning order, not by stable term content. Earlier strata can intern computed literals in hash-map iteration order, and separately loaded equivalent inputs can also assign the two equal-valued terms opposite IDs. Consequently MIN/MAX can emit different input terms for the same completed logical facts, and SUM/AVG can order equal-valued operands differently. This contradicts the stated invariant that the closure is a function of the completed lower strata. The tests only permute `(Id, Num)` pairs after IDs have been fixed, so they are vacuous with respect to this failure mode.",
+    "file": "crates/sparq-reason/src/datalog/eval.rs",
+    "fix_hint": "Use a stable term-content tie-break (for example datatype/language/lexical RDF-term ordering obtained from the dictionary) rather than numeric ID, or establish and prove a canonical-ID invariant before relying on IDs. Add a regression that builds equivalent dictionaries/strata with the tied terms interned in opposite orders and asserts identical emitted RDF terms and SUM/AVG values; preferably include a real multi-stratum case where an earlier aggregate mints the tied operands.",
+    "severity": "major",
+    "title": "Dictionary-ID tie-breaking does not make aggregate results derivation-order independent"
+   }
+  ],
+  "progress": null,
+  "summary": "The numeric ordering itself is coherent and the end-to-end promotion/NaN tests exercise the real aggregate path, but the new determinism guarantee is not actually achieved. Equal numeric values are ordered by dictionary ID, and IDs reflect interning order rather than RDF-term identity. In particular, earlier aggregate strata mint result IDs while iterating hash maps, so a later aggregate can select a different equal-valued input term, or fold tied operands in a different order, across otherwise equivalent evaluations. The direct permutation tests keep one dictionary and therefore cannot expose this.",
+  "verdict": "request_changes"
+ }
+}
