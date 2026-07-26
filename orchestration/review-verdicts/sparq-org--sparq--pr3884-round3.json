@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3884,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "682f3dc8c7f26e231ea3086f499d28d6b7925c6b",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`ends_operand` excludes `>` because that byte may be the greater-than operator, but `>` also terminates an IRI operand. Consequently, after scanning the first IRI in `FILTER(<http://ex/a><1&&FLTR(?o)&&?b>2)`, `prev` is `>` and the following compact `<` is treated as an IRIREF opener. Its body is IRIREF-legal through the later `>`, so the scanner skips `FLTR` and fails to suggest `FILTER`. An IRI is a valid primary expression, and SPARQL punctuation does not require whitespace, so this is another real acceptance-set mismatch in the same class as round 2. The added tests cover variable, numeric/call-ending operands and IRIs used as terms, but not an IRI operand immediately preceding less-than.",
+    "file": "crates/sparq-terse/src/diagnose.rs",
+    "fix_hint": "Track the preceding token's lexical kind (for example, IRI operand versus `>` operator) instead of only its final byte, or use the SPARQL lexer/parser context to classify `<`. Add a real-path regression for `FILTER(<http://ex/a><1&&FLTR(?o)&&?b>2)` asserting that `FLTR` survives and suggests `FILTER`, while retaining coverage for a greater-than operator followed by a genuine IRI.",
+    "severity": "major",
+    "title": "Compact less-than after an IRI operand still swallows diagnostics"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The compact variable-comparison regression is now covered, but the underlying lexical ambiguity remains unresolved. `opens_iriref` reduces the preceding token to its final byte and deliberately excludes `>` from operand endings. That makes a genuine IRI operand followed immediately by `<` look like an IRIREF opener; if a later `>` occurs, `iriref_end` swallows the intervening misspelled keyword. The round-2 correctness class therefore remains at major severity.",
+  "verdict": "request_changes"
+ }
+}
