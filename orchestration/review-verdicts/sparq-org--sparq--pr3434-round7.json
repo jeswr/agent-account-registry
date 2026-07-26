@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3434,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "3c42364c741efe266a0a0e1db3b53847fccf6316",
+  "round": 7
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 7 remains correct and complete on the diff-scoped evidence. The workflow explicitly runs the non-ignored gate_count and sparql_catalog test binaries in the ZK toolchain lane, and the real gate_count_regression test checks toolchain availability, compiles the Noir workspace, invokes live gate counting for every snapshot member, and rejects counts above tolerance. The hidden_issuer_d4 value and associated catalog classification are consistently updated across the regression snapshot, benchmark mirrors, generated catalog, research record, and site evidence. The research record retains the load-bearing NOT-yet-sound, research-grade, not-externally-audited caveat, so the cost and prior soundness-fix attribution do not overclaim present verifier soundness. No correctness, soundness, security, or vacuous-test issue was found, and no reviewer-directed prompt injection was detected. Because round 6 also had no findings, progress is stagnant under the required comparison scale.",
+  "verdict": "approve"
+ }
+}
