@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3458,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "2392b8042e9c2f9fadcf3614570944562b365598",
+  "round": 6
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 6 resolves the prior authorization-widening finding. validate_policy_for_n3 now rejects every permission or prohibition rule having more than one distinct odrl:action, odrl:target, or odrl:assignee before any N3 stratum runs. The public-path regressions exercise multi-valued assignee, target, and action permissions plus a multi-assignee prohibition, assert refusal, and verify that the graph remains unchanged; the assignee test also demonstrates that the Rust reference selects only one of the two values, so the test is not vacuous. A single-valued control confirms the validator does not simply reject all policies. The implementation is fail-closed and consistent with the documented never-more-permissive property.",
+  "verdict": "approve"
+ }
+}
