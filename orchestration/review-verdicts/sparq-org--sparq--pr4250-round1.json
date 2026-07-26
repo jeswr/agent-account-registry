@@ -1,0 +1,51 @@
+{
+ "host_envelope": {
+  "pr": 4250,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "78cbf88b45e061fa4f36d3004c06b6daead15b43",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The draft imposes conformance requirements on an \"envelope\" but never defines its byte serialization, integer/string encodings, field bounds, encrypted-literal datatype IRI, base64url variant/padding rules, or parsing/canonicalization rules. More critically, it says a DEK is wrapped to a recipient public key while defining neither a KEM/key-wrap algorithm nor the wrapped-DEK record format and key identifiers. Calling a recipient public/private key a KEK also conflates asymmetric key agreement/encapsulation with a symmetric key-encryption key. Independent implementations cannot interoperate, and algorithm ambiguity in cryptographic formats is unsafe.",
+    "file": "site/specs/e2ee-sparql.typ",
+    "fix_hint": "Define a versioned canonical wire format with exact field encodings and limits; register the encrypted-literal datatype IRI; define recipient entries and key identifiers; and select or normatively reference an authenticated KEM+KDF+AEAD/key-wrap construction (including context/domain separation and failure behavior). Use precise terms for recipient key pairs versus derived KEKs.",
+    "severity": "major",
+    "title": "The normative envelope and recipient wrapping formats are not specified"
+   },
+   {
+    "body": "Full-replica synchronization removes query-correlated fetch selection, but it does not make per-resource metadata disappear. The server still stores distinct resource identities, observes container cardinality, per-resource padded ciphertext sizes, creation/update timing, and which resources change; the draft itself acknowledges cardinality/timing in sections 4.6 and 6.2. Declaring T4 as \"aggregate volume and timing only\" and saying access leakage \"collapses\" to that is therefore inconsistent and overstates privacy.",
+    "file": "site/specs/e2ee-sparql.typ",
+    "fix_hint": "Either redefine T4 to include all server-visible per-resource/container metadata and use that definition consistently, or specify a concrete packing/reshuffling/constant-schedule mechanism that actually hides resource boundaries, cardinality, and per-resource update patterns. Do not classify ordinary full-replica resource sync as aggregate-only leakage.",
+    "severity": "major",
+    "title": "T4 incorrectly claims only aggregate volume and timing leak"
+   },
+   {
+    "body": "The tag is described only as HMAC over the \"plaintext value.\" That does not define whether equality means RDF term equality, SPARQL value equality, or lexical equality, nor how datatype IRIs, language tags, Unicode, numeric lexical variants, NaNs, timezones, and invalid lexical forms are encoded. As written, implementations can disagree and return silently wrong equality joins. It also omits a canonical MAC input and explicit predicate/dataset/version domain separation, allowing unintended cross-context correlation if keys are reused.",
+    "file": "site/specs/e2ee-sparql.typ",
+    "fix_hint": "Define the exact equality relation supported (or limit it explicitly to same-term/canonical lexical equality), a length-delimited canonical input encoding including datatype/language metadata, normalization rules, and domain separation containing at least profile/version and predicate/key-family context. Add conformance vectors covering equivalent and non-equivalent lexical forms.",
+    "severity": "major",
+    "title": "Equality tags lack canonical value semantics and domain separation"
+   },
+   {
+    "body": "The mandatory header-field table lists \"Padded plaintext length\" as a header field, but its requirement and purpose say the true plaintext length is sealed as part of the plaintext and not present in the header. These are different values and locations, leaving implementations unable to determine the required format consistently.",
+    "file": "site/specs/e2ee-sparql.typ",
+    "fix_hint": "Separate the concepts: define any cleartext padded/ciphertext length as framing metadata if needed, and define the true unpadded length as an authenticated encrypted plaintext field. Give each a distinct name and exact encoding.",
+    "severity": "major",
+    "title": "Envelope requirements contradict where true length is stored"
+   },
+   {
+    "body": "RFC 8439 defines ChaCha20-Poly1305 with the IETF 96-bit nonce; it does not define XChaCha20-Poly1305 or its 192-bit nonce construction. The draft mandates XChaCha20-Poly1305 while citing RFC 8439, so the mandatory algorithm is not actually specified and implementations may choose incompatible variants.",
+    "file": "site/specs/e2ee-sparql.typ",
+    "fix_hint": "Normatively reference a stable specification that defines XChaCha20-Poly1305 and state the exact nonce/tag/key sizes and construction identifier, or mandate RFC 8439 ChaCha20-Poly1305 and adjust the nonce-generation guidance accordingly.",
+    "severity": "major",
+    "title": "XChaCha20-Poly1305 is normatively cited to a specification that does not define it"
+   }
+  ],
+  "progress": null,
+  "summary": "The draft is candid about its audit posture and the basic CS/SE trade-off, but it is not yet complete or internally consistent enough to serve as a normative interoperability specification. Core wire and key-wrapping details are absent, the T4 leakage claim omits metadata the same document says remains visible, and the optional equality-tag construction does not define the equality relation or encoding it purports to expose. There are also concrete envelope/algorithm inconsistencies. These are correctness and security issues, not editorial nits.",
+  "verdict": "request_changes"
+ }
+}
