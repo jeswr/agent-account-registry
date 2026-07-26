@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4139,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b179a7663052cfb5615412fdcca1814bb6e4c84f",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Adding `data-vr-mask` hides the badge contents, but Playwright's mask follows the element's live bounding box. `tabular-nums` gives digits equal advance width; it does not give `9 metrics` and `10 metrics` equal total width, and the singular/plural forms also differ. Consequently the badge and flex layout remain count-dependent, so a threshold crossing can resize the pink mask and move surrounding pixels, leaving the nightly baseline susceptible to the drift this PR claims to eliminate. The explanatory comment's assertion that `tabular-nums` makes the masked box width-stable is therefore incorrect.",
+    "file": "site/src/app/benchmarks/page.tsx",
+    "fix_hint": "Give the badge a count-independent width (and centered content), sized for the supported display range, or otherwise reserve stable geometry around the dynamic value. Add a focused visual/component check using representative counts across singular and digit-width boundaries (for example 1, 9, and 10), then update the comment to describe the actual invariant.",
+    "severity": "major",
+    "title": "Masked metric badge still has data-dependent geometry"
+   }
+  ],
+  "progress": null,
+  "summary": "The CI refresh path is coherently wired: refresh is restricted to full mode, comparison and issue routing are disabled, the existing pinned-container script receives the nightly flag, and the resulting baseline directory is uploaded. However, the benchmark masking change does not establish the stability it claims. Playwright masking replaces an element's pixels but retains its current bounding-box geometry, while `tabular-nums` only equalizes glyph widths and does not make strings with different digit counts (or `metric` versus `metrics`) the same width. The badge can therefore still resize and shift adjacent layout as the dynamic count crosses a digit boundary, producing the same recurring visual drift this change says it prevents.",
+  "verdict": "request_changes"
+ }
+}
