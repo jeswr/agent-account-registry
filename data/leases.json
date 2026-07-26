@@ -31,16 +31,6 @@
    "expires_at": 1785108502
   },
   {
-   "account": "3ff9b4af73df69dc",
-   "claim_id": "22c68b048ff2458db2620984dfaa45b2",
-   "holder": "sparq-org/sparq#3135@30221685471.1",
-   "package": "sparq-acbench",
-   "role": "impl",
-   "model": "opus5",
-   "issued_at": 1785102262,
-   "expires_at": 1785108562
-  },
-  {
    "account": "51bde6688e140866",
    "claim_id": "752fe5ffbcf240a3964bf50714b004f8",
    "holder": "fix:sparq-org/sparq#4338@dispatch-30222895098.1",
