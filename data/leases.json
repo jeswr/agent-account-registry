@@ -53,12 +53,12 @@
   {
    "account": "58b7c92faa5b5ca5",
    "claim_id": "5436d678be224f7492a76712f4b47593",
-   "holder": "sparq-org/sparq#2627@dispatch-30221071302.1",
+   "holder": "sparq-org/sparq#2627@30221662265.1",
    "package": "site-papers",
    "role": "research",
    "model": "opus5",
-   "issued_at": 1785102193,
-   "expires_at": 1785108493
+   "issued_at": 1785102214,
+   "expires_at": 1785108514
   },
   {
    "account": "58b7c92faa5b5ca5",
