@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 590,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "f0bd29a71a3e0f30c625748e20a22c59c8bfdc99",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The run block still uses `set -uo pipefail` rather than `set -euo pipefail`. A nonzero exit from either `alert_route.py --self-test` or `retriage-alert.py --self-test` therefore does not stop the shell; the later command runs, and its zero exit can make the step appear successful. This leaves the production alert path able to proceed despite a detected routing or emitter regression.",
+    "file": ".github/workflows/retriage.yml",
+    "fix_hint": "Use `set -euo pipefail`, or explicitly chain/check all three commands, so either self-test failure terminates the step before the emitter runs.",
+    "severity": "major",
+    "title": "Alert preflight self-test failures are still swallowed"
+   },
+   {
+    "body": "The alert step still has `continue-on-error: true`. Although `retriage-alert.py` returns nonzero for list/create/edit/comment/close failures, GitHub converts that step failure into a tolerated outcome, allowing the alert job to complete successfully. The separate alert job already isolates the retriage sweep, so tolerating its only delivery step defeats the intended durable fail-loud signal.",
+    "file": ".github/workflows/retriage.yml",
+    "fix_hint": "Remove step-level `continue-on-error` so a hard alert delivery failure makes `retriage-alert` fail while leaving the already-completed retriage job unaffected.",
+    "severity": "major",
+    "title": "continue-on-error still hides hard alert delivery failures"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The two round-4 fail-loud defects remain unchanged. The alert step still omits errexit, so either self-test may fail without stopping the emitter, and `continue-on-error: true` still prevents a hard emitter failure from making the alert job fail. The new script's internal return-code checks and substantive self-tests do not repair the workflow-level swallowing of those failures. Progress is stagnant because both prior major findings remain at the same severity.",
+  "verdict": "request_changes"
+ }
+}
