@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4002,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b3c5976826066e5aa9131d8ecb98706b89044adf",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 2 remains clean. The diff consistently moves the foreign-runner ratchet values into a zero-dependency, unpublished leaf crate; each enforcing runner consumes that crate through a dev-dependency while the central scoreboard consumes it directly. The scoreboard and runners therefore use the same constants, and the revised guard partitions every crate-test suite among exactly one of the local, shared-crate, or library-sourced mechanisms. The shared-floor pin and non-vacuity checks are substantive, the divergence floor remains fixed at zero, crate-local textual reads are constrained against path escape, and the documentation/evidence bindings match the implementation. I found no correctness, soundness, security, or vacuous-test defect. With zero prior and zero current findings, progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
