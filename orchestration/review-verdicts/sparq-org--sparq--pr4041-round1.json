@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4041,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f53a68841b7a0b409de8c8e90bdee68b11343b51",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`is_well_formed_absolute_iri` only validates the scheme and rejects a small character blacklist. That is not sufficient to establish a well-formed RFC 3987 IRI as its contract claims. For example, `http://example.com/%ZZ` passes this predicate even though `%` must introduce two hexadecimal digits; component-specific invalid forms are likewise not checked. Because `expand.rs` now relies on this helper for JSON-LD datatype validation, authored malformed datatype IRIs can still expand successfully, contrary to the stated \u00a75.1.2 step 15.5 behavior. The added test covers only a literal space and therefore does not expose the incomplete validator.",
+    "file": "crates/sparq-jsonld/src/context/iri.rs",
+    "fix_hint": "Use a complete RFC 3987 IRI validator (or implement the required grammar, including valid percent-encoding and component constraints) rather than a blacklist. Add a regression test through the public expansion path for a malformed datatype such as `http://example.com/%ZZ`, asserting `InvalidTypedValue`, plus a nearby valid percent-encoded datatype case.",
+    "severity": "major",
+    "title": "The new well-formed IRI predicate accepts malformed IRIs"
+   }
+  ],
+  "progress": null,
+  "summary": "The negative-test runner changes and exact error-code checks are well targeted, but the new datatype-IRI validator does not implement the well-formedness guarantee claimed by the code and required by the expansion rule. It still accepts malformed absolute IRIs, so the conformance fix is incomplete beyond the single space-containing fixture.",
+  "verdict": "request_changes"
+ }
+}
