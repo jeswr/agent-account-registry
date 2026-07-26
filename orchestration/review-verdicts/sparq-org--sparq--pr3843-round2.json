@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3843,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "003d4445f6b8ac2aab5964d4cca17febf4069d61",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 5 enumerates twelve concrete, actionable units of future work, declares that none has a task record, and defers creating records until this design record is accepted. The repository contract requires future work to be captured as beads rather than left in Markdown. Calling the list a proposed decomposition does not remove the durability problem: the document relies on these items for milestone scope and dependencies, yet they have no task identities or dependency edges. Item 12 also documents a known stale deviation without a durable tracking record.",
+    "file": "research/solid-consumer-production-readiness-2026-07.md",
+    "fix_hint": "Create or deduplicate beads for the actionable items now, encode the stated dependency edges, and cite their IDs in the phased plan. If some entries are genuinely decisions rather than executable work, keep them only as open questions and remove them from the numbered work plan until accepted; at minimum, create a task record for the known stale DEVIATIONS correction.",
+    "severity": "major",
+    "title": "The phased plan remains an untracked Markdown backlog"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 2 corrects the prior conformance-count overstatement: the document now consistently distinguishes 15 executable cases from the 10 numbered scenarios they cover. However, the other major finding remains. Section 5 explicitly records twelve actionable future units with no task records and postpones creating tracking records until after acceptance. That is still an untracked Markdown backlog under the repository's beads-only task-tracking rule, regardless of the new proposal wording. Progress is improving because one of the two prior major findings was resolved, but the remaining major issue blocks approval.",
+  "verdict": "request_changes"
+ }
+}
