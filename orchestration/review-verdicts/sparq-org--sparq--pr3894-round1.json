@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3894,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "bc34515d832c94689ad3a6cdaf1bda17cf503815",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The module states that the gteq/lteq window is inclusive, but WINDOW_VECTORS only uses instants strictly inside, before, and after; an implementation that incorrectly treats either endpoint as exclusive would still pass. It also says Alice's unwindowed grant decides identically after the window closes and with no clock, but the two Alice rows use INSIDE and None\u2014there is no Alice row at AFTER. Thus a bug that incorrectly applies notAfter to every grant would also pass. This is a test-validity gap in the central invariant of the new oracle corpus.",
+    "file": "crates/sparq-wac-oracle/src/window_corpus.rs",
+    "fix_hint": "Add Carol allow rows at exactly WINDOW_NOT_BEFORE and WINDOW_NOT_AFTER, and add an Alice unwindowed row with `.at(AFTER)` (retaining the no-clock row). Ensure the all-pass test covers the expanded vector set; ideally extend the structural clock test to assert the endpoint clocks are present.",
+    "severity": "major",
+    "title": "Load-bearing boundary and unwindowed-expiry semantics are claimed but not tested"
+   }
+  ],
+  "progress": null,
+  "summary": "The new corpus exercises inside, strictly-before, strictly-after, and missing-clock behavior for the windowed recipient, and includes a useful non-vacuity/mutation witness. However, it claims to pin inclusive date-time bounds and that unwindowed grants ignore clocks after expiry without actually including either class of row. Those omissions leave load-bearing semantics untested and make the documented corpus coverage incomplete.",
+  "verdict": "request_changes"
+ }
+}
