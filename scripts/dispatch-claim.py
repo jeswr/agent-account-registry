@@ -3033,6 +3033,10 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                     continue
                 print(f"recover review {repo}#{number}: stranded residue of an interrupted "
                       "defuse/disarm — re-reviewing the current head under the round budget")
+                # The marker retraction this recovery needs to be executable at all (issue #708)
+                # happens at the LAUNCH INVARIANT below, not here: every escalation, hold and defer
+                # between this point and the dispatch must be able to stand the item down without
+                # this branch having already written to the PR.
                 # Fall through to the shared round-budget + review dispatch below.
             # Base admission (issue #164; the #81 precedent in
             # worker-pr._merge_only_carry_forward): the worker-PR invariant is base == protected
@@ -3309,6 +3313,64 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
             print(f"defer review {repo}#{number}: require_usage set but live usage is unavailable "
                   f"(probe failed) — holding the {mode} claim fail-closed")
             continue
+        # ---- ISSUE #708: THE REVIEW LANE'S LAUNCH INVARIANT, ENFORCED AND COUNTED ----------------
+        # review-fix.yml's resolve step computes `already_done = (reviewed-sha marker == head_sha)`
+        # and its `run` job is gated on `needs.claim.outputs.acquired == 'true'`, which the
+        # already_done skip step sets to false. So a mode=review dispatch whose target head is still
+        # marker-bound CANNOT run a model, by construction — it only consumes a reviewer lease, a
+        # repository/package partition and a workflow run, then reports `success`.
+        #
+        # Three live states reached this point on master with a bound marker: the `stranded`
+        # recovery (which bypasses the enumerator's guard by design — now repaired above by
+        # retracting the disproved assertion), an explicitly review:needs-labelled READY PR that
+        # CLAIM redrafts (enumerate_review_items emits it via `if not draft or not reviewed_match`),
+        # and any future state that forgets. State-by-state carve-outs are what let this go unnoticed
+        # for so long, so state the INVARIANT once, here, over every review dispatch.
+        #
+        # This is a COUNTED LANE ERROR, not a green defer. It is not capacity contention: retrying
+        # it next tick cannot succeed, so a green "deferred" would be exactly the silent accounting
+        # that hid 117 no-op runs behind `lane review: planned=12 launched=4 error=0` (issue #700 —
+        # per-stage health cannot express a missing edge BETWEEN stages). An error makes the tick
+        # recorder's `_lane_stalled` predicate able to see it and the alert ladder able to page.
+        if mode == "review":
+            if item["state"] == "stranded":
+                # The stranded posture IS the disproof of the marker's assertion: review-fix.yml's
+                # outcome job binds the marker LAST (after the lane label and the arm), so a PR that
+                # is STILL a draft and STILL unarmed cannot have completed the outcome the marker
+                # claims. Retract it — the same remedy, for the same reason, as the #560 fix-lane
+                # hand-over one lane over (whose own self-test comment already NAMES this spin).
+                # review-fix.yml's already_done predicate is left byte-identical and keeps its full
+                # strength; what changes is that the assertion it reads is now true.
+                # stranded_recover applies the #560/#584 stand-down surface (human hold, machine
+                # capacity park, review:pass) plus a tri-state arm/draft guard of its own, and this
+                # runs only AFTER every escalation/hold/defer above has declined to stand the item
+                # down — so the recovery never writes to a PR it was about to park.
+                try:
+                    _run_target_helper(script_dir, repo, "worker-pr.py", [
+                        "stranded-recover", "--repo", repo, "--pr", str(number),
+                        "--head-sha", head_sha, *(["--issue", str(issue_number)]
+                                                  if issue_number else [])])
+                except DispatchError as exc:
+                    lanes[lane]["error"] += 1
+                    defer_reasons["stranded-retract-failed"] += 1
+                    print(f"::error::defer review {repo}#{number}: the stranded recovery could "
+                          f"not retract the disproved reviewed-sha assertion ({exc}); NOT "
+                          "dispatching, because a review run on a marker-bound head exits "
+                          "already_done without running a model")
+                    continue
+                # Do NOT trust the helper's report — re-read the PR and let the invariant below
+                # adjudicate the POSTCONDITION. Every stand-down inside stranded_recover therefore
+                # converges to a loud, counted, attributed refusal instead of a silent no-op run.
+                pull = _gh_json(["api", f"repos/{repo}/pulls/{number}"])
+            bound = REVIEWED_SHA_RE.search(pull.get("body") or "")
+            if bound and bound.group(1) == head_sha:
+                lanes[lane]["error"] += 1
+                defer_reasons["review-noop-head-already-bound"] += 1
+                print(f"::error::defer review {repo}#{number}: the reviewed-sha marker already "
+                      f"names the live head {head_sha[:12]}, so review-fix.yml resolves "
+                      "already_done and SKIPS the model job — refusing to spend a reviewer lease "
+                      f"on a dispatch that cannot review anything (state={item['state']})")
+                continue
         now = int(time.time())
         # Repository-scoped prefix: package names (including __global__) are target-local.  The
         # old bare `review:` / `fix:` prefix mixed unrelated repos into one package partition and
@@ -4297,10 +4359,21 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
     print(_fix_dispatch_line(fix_dispatch))
     # Per-lane tick summary (issue #108) — coarse counts only (no issue numbers/handles). A stalled
     # review/fix lane or a failed safety disarm is visible here even when the worker lane launched.
+    # Issue #708 / #700: a planned-but-not-launched item must be ATTRIBUTED in the run output, not
+    # merely subtracted. `deferred` was previously derivable only by arithmetic, and the defer-reason
+    # histogram was rendered by the workflow's tick-health step ONLY on a zero/degraded tick — so a
+    # review lane that planned 12 and launched 4 printed no reason for the other 8 whenever another
+    # lane was productive. That is the missing edge BETWEEN stages #700 describes; print it
+    # unconditionally, from the same counters the summary file carries (coarse categories only).
+    lane_summary = _lane_summary(lanes)
     for name in DISPATCH_LANES:
         counts = lanes[name]
         print(f"lane {name}: planned={counts.get('planned', 0)} "
-              f"launched={counts.get('launched', 0)} error={counts.get('error', 0)}")
+              f"launched={counts.get('launched', 0)} "
+              f"deferred={lane_summary[name]['deferred']} "
+              f"error={counts.get('error', 0)}")
+    print("defer attribution: " + (", ".join(
+        f"{reason}={count}" for reason, count in sorted(defer_reasons.items())) or "none"))
 
     # Final summary (registry #28/#32): overwrite the early claim-start write with the real
     # launched count + defer-reason histogram + per-lane counts.
@@ -4377,7 +4450,7 @@ def _write_dispatch_summary(planned, dispatched, defer_reasons, lanes=None):
         print(f"::warning::dispatch summary write failed ({exc}); continuing")
 
 
-def _review_fix_workflow_values():
+def _review_fix_workflow_values(source=None):
     """Extract the trust-critical timeout / local-claim-TTL literals straight from
     .github/workflows/review-fix.yml so the self-test can pin the DISPATCHER TTL derivation to
     the WORKFLOW it must outlive (issue #159), not just to sibling constants in this module. A
@@ -4388,7 +4461,7 @@ def _review_fix_workflow_values():
     workflow raises AssertionError — fail closed, never a skipped check."""
     path = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "review-fix.yml"
     assert path.is_file(), f"review-fix.yml not found for TTL sync check: {path}"
-    text = path.read_text(encoding="utf-8")
+    text = path.read_text(encoding="utf-8") if source is None else source
     marker = "\njobs:\n"
     assert marker in text, "review-fix.yml has no top-level jobs: block"
     jobs_at = text.index(marker)
@@ -4431,6 +4504,7 @@ def _review_fix_workflow_values():
     release_if = re.search(r"(?m)^    if: (.+)$", release_span)
     release_needs = re.search(r"(?m)^    needs: (.+)$", release_span)
     outcome_if = re.search(r"(?m)^    if: (.+)$", outcome_span)
+    run_if = re.search(r"(?m)^    if: (.+)$", run_span)
     assert release_if and release_needs and outcome_if, "review-fix.yml if/needs not parsable"
     return {
         "resolve_s": _fixed_minutes("resolve") * 60,
@@ -4456,6 +4530,19 @@ def _review_fix_workflow_values():
             r"\}\}\"", outcome_span)),
         "release_if": release_if.group(1),
         "release_needs": release_needs.group(1),
+        # Issue #708: the two workflow facts that make this script's review-launch invariant TRUE.
+        # The dispatcher refuses to spend a reviewer lease on a head whose reviewed-sha marker is
+        # already bound BECAUSE (1) the claim job's `already_done` step writes acquired=false and
+        # (2) the run job — the only job that executes a model — is gated on acquired == 'true'.
+        # Both live in YAML that no python half can see, and a `count(...)`/substring assertion in
+        # this module would not notice either of them being edited away. Parse them, so the
+        # invariant is pinned to the workflow it is derived from.
+        "run_if": run_if.group(1) if run_if else "",
+        # Tempered so the match cannot run past the end of the already_done STEP into a sibling
+        # step that happens to write acquired=false (the rc=3 none-free branch does).
+        "claim_skips_already_done": bool(re.search(
+            r"if: \$\{\{ needs\.resolve\.outputs\.already_done == 'true' \}\}"
+            r"(?:(?!\n      - name:)[\s\S])*?acquired=false", claim_span)),
     }
 
 
@@ -4712,6 +4799,75 @@ def _self_test():
     assert "outcome" not in _wf["release_needs"], (
         "review-fix.yml release must not depend on the outcome job (#560 lease release): "
         f"{_wf['release_needs']}")
+
+    # ---- ISSUE #708: THE YAML SEAM THE REVIEW-LAUNCH INVARIANT RESTS ON -------------------------
+    # This module refuses to spend a reviewer lease on a head whose reviewed-sha marker is already
+    # bound. That refusal is only correct while review-fix.yml keeps BOTH halves of the behaviour it
+    # is derived from, and both halves are pure YAML/`run:` text that no python assertion in this
+    # module would otherwise see:
+    #   1. resolve computes `already_done = (marker == head_sha)` — executed for real below,
+    #   2. claim's already_done step writes `acquired=false`, and
+    #   3. the `run` job (the ONLY job that executes a model) is gated on acquired == 'true'.
+    # Delete (2) or (3) and the dispatcher would be refusing dispatches that WOULD have run a model
+    # — a self-inflicted starvation exactly as bad as the spin this closes. Pin them.
+    assert _wf["claim_skips_already_done"], (
+        "review-fix.yml's claim job must still write acquired=false on already_done (#708): the "
+        "dispatcher's review-launch invariant refuses marker-bound heads BECAUSE that step skips "
+        "the model")
+    assert "needs.claim.outputs.acquired == 'true'" in _wf["run_if"], (
+        "review-fix.yml's run job must stay gated on claim.acquired (#708): "
+        f"{_wf['run_if']!r}")
+    # NON-VACUITY at the seam. A substring/count assertion cannot catch `if: false`, so mutate the
+    # workflow STRUCTURALLY and require each mutant to be caught. (Measured on this project: every
+    # uncaught mutant of an earlier fix lived at the YAML seam, not in the python.)
+    _rf_text = (Path(__file__).resolve().parents[1] / ".github" / "workflows"
+                / "review-fix.yml").read_text(encoding="utf-8")
+    for _mutant, _field, _want in (
+            (_rf_text.replace(
+                "    if: ${{ needs.claim.outputs.acquired == 'true' }}\n"
+                "    runs-on: ubuntu-latest\n"
+                "    timeout-minutes: ${{ inputs.mode == 'review'",
+                "    if: ${{ always() }}\n"
+                "    runs-on: ubuntu-latest\n"
+                "    timeout-minutes: ${{ inputs.mode == 'review'"),
+             "run_if", "needs.claim.outputs.acquired == 'true'"),
+            (_rf_text.replace("printf 'acquired=false\\n' >> \"$GITHUB_OUTPUT\"\n"
+                              "          printf 'This head was already reviewed",
+                              "printf 'acquired=true\\n' >> \"$GITHUB_OUTPUT\"\n"
+                              "          printf 'This head was already reviewed"),
+             "claim_skips_already_done", True)):
+        assert _mutant != _rf_text, (
+            "the #708 YAML-seam mutation matched nothing — the anchor drifted, re-point it")
+        _mutated = _review_fix_workflow_values(source=_mutant)
+        if _field == "run_if":
+            assert _want not in _mutated[_field], (
+                "an ungated review-fix run job must FLIP the #708 seam assertion red, but the "
+                f"extractor still reported {_mutated[_field]!r}")
+        else:
+            assert _mutated[_field] is not _want, (
+                "a claim step that no longer writes acquired=false must FLIP the #708 seam "
+                "assertion red")
+    # And the predicate itself: execute review-fix.yml's REAL `already_done` block on exactly the
+    # {body, head_sha} pair this module refuses to dispatch, so the refusal is justified by the
+    # LIVE workflow rather than by a re-implemented copy that can drift from it.
+    _708_head = "e" * 40
+    _708_src = _review_fix_step_python(
+        _RF_ALREADY_DONE_ANCHOR, _RF_ALREADY_DONE_END, "already_done idempotence predicate")
+    for _708_body, _708_want, _708_why in (
+            (f"x <!-- sparq-reviewed-sha:{_708_head} -->", True,
+             "a marker-bound head resolves already_done -> the model job is skipped"),
+            (f"x <!-- sparq-reviewed-sha:{'f' * 40} -->", False,
+             "a marker naming another head is reviewable"),
+            ("<!-- sparq-reviewed-sha:none -->", False,
+             "a RETRACTED marker is reviewable — this is what stranded-recover produces"),
+            ("no marker at all", False, "an absent marker is reviewable")):
+        _708_ns = {"re": re, "mode": "review", "head_sha": _708_head,
+                   "pull": {"body": _708_body}}
+        exec(compile(_708_src, "<review-fix.yml already_done>", "exec"), _708_ns)  # noqa: S102
+        assert _708_ns["already_done"] is _708_want, (_708_why, _708_body)
+    print("  ok   #708: the review-launch invariant is pinned to review-fix.yml's LIVE "
+          "already_done predicate, its acquired=false skip, and its acquired-gated run job — "
+          "each seam mutated structurally")
     print("  ok   #560: review-fix.yml exports the defer reason, admits the staged-nothing "
           "outcome path, invokes fix-lane-defer, and still releases the fix lease "
           "unconditionally")
@@ -6926,6 +7082,18 @@ def _self_test():
 
     def fake_helper(script_dir, target_repo, script, args):
         helper_calls.append((script, args))
+        # Issue #708: worker-pr.py `stranded-recover` retracts the disproved reviewed-sha
+        # assertion on the LIVE PR body, and CLAIM re-reads the PR to confirm the postcondition
+        # rather than trusting the report. Model both: `stranded_retract` False simulates every
+        # stand-down inside stranded_recover (hold / review:pass / armed / marker-mismatch), which
+        # must converge to the loud counted refusal, never to another silent no-op dispatch.
+        if args and args[0] == "stranded-recover" and fake.get("stranded_retract", True):
+            fake["pull"] = dict(
+                fake["pull"],
+                body=wiring_worker_pr.replace_reviewed_sha(
+                    fake["pull"].get("body") or "", wiring_worker_pr.UNBOUND_REVIEWED_SHA))
+        if args and args[0] == "stranded-recover" and fake.get("stranded_retract_raises"):
+            raise DispatchError("simulated retraction failure")
 
     def live_pull(*, draft, labels=(), body="", auto_merge=None, mergeable=True,
                   base_ref="main"):
@@ -7040,11 +7208,23 @@ def _self_test():
             alloc = StrandAllocator()
             launched, reasons = run_items(
                 [stranded_item], allocator=alloc, routing=strand_routing)
-            assert helper_calls == [], helper_calls
+            # ISSUE #708: the recovery RETRACTS the disproved reviewed-sha assertion BEFORE it
+            # claims the lease. Without this call review-fix.yml's resolve step exits already_done,
+            # skips the model job and reports success — the recovery never once executed on master.
+            assert [(script, args[0]) for script, args in helper_calls] == [
+                ("worker-pr.py", "stranded-recover")], helper_calls
+            assert helper_calls[0][1] == [
+                "stranded-recover", "--repo", repo, "--pr", "41",
+                "--head-sha", sha_a, "--issue", "7"], helper_calls
             assert alloc.calls == [("review", ["sol", "luna"])], alloc.calls
             assert launched == 0 and reasons["review:no-slot"] == 1, reasons
             # repeated failed recovery: the round budget is spent (hard cap) -> loud needs-user,
-            # and no review is dispatched — terminal escalation is RESERVED for this case
+            # and no review is dispatched — terminal escalation is RESERVED for this case.
+            # Re-bind the marker first: the recovery above RETRACTED it (issue #708), and an
+            # already-retracted PR is no longer stranded at all — it re-enters as plain
+            # needs-review. This case is specifically the still-bound posture.
+            fake["pull"] = live_pull(draft=True, labels=["review:needs"],
+                                     body=f"x <!-- sparq-reviewed-sha:{sha_a} -->")
             fake["comments"] = [
                 {"user": {"login": bot}, "created_at": "2026-07-30T00:00:00Z",
                  "body": f"x {wiring_worker_pr.ROUND_MARKER} n={i} run={i}.1 -->"}
@@ -7061,6 +7241,119 @@ def _self_test():
             run_items([stranded_item], allocator=alloc, routing=strand_routing)
             assert helper_calls == [], helper_calls
             assert alloc.calls == [], alloc.calls
+
+            # ---- ISSUE #708: the review lane never spends a lease on a dispatch that cannot run a
+            # model, and every such refusal is a COUNTED, ATTRIBUTED lane error ------------------
+            # A launching allocator + a launching _run_gh, so "did a review-fix run start?" is a
+            # real observation of the production argv rather than an allocator side effect.
+            launch_runs = []
+
+            class LaunchingAllocator:
+                def __init__(self):
+                    self.calls = []
+
+                def claim(self, _repo, _package, role, chain, *_args, **_kwargs):
+                    self.calls.append((role, list(chain)))
+                    return ({"account": "acct09", "claim_id": "ab" * 16, "model": chain[0],
+                             "provider": "openai"}, "")
+
+                def release(self, *_args, **_kwargs):
+                    return True
+
+            def launching_run_gh(args, *, check=True):
+                launch_runs.append(list(args))
+                return subprocess.CompletedProcess(args, 0)
+
+            real_launch_gh = _run_gh
+            try:
+                globals()["_run_gh"] = launching_run_gh
+                os.environ["PROVENANCE_SALT"] = "pepper"
+                # (a) THE REPAIRED RECOVERY: the retraction lands, so the SAME stranded posture that
+                #     produced 117 no-op runs on master now actually launches a review run.
+                fake.update(pull=live_pull(draft=True, labels=["review:needs"],
+                                           body=f"x <!-- sparq-reviewed-sha:{sha_a} -->"),
+                            check_runs=gate_green, comments=[], stranded_retract=True)
+                alloc = LaunchingAllocator()
+                launched, reasons = run_items([stranded_item], allocator=alloc,
+                                              routing=strand_routing)
+                assert [(script, args[0]) for script, args in helper_calls] == [
+                    ("worker-pr.py", "stranded-recover")], helper_calls
+                assert launched == 1, (launched, reasons)
+                assert [arg for args in launch_runs for arg in args
+                        if arg.startswith("mode=")] == ["mode=review"], launch_runs
+                assert reasons["review-noop-head-already-bound"] == 0, reasons
+                assert _lane_summary(run_items.lanes)["review"] == {
+                    "planned": 1, "launched": 1, "deferred": 0, "error": 0}, run_items.lanes
+
+                # (b) THE STAND-DOWN: stranded_recover mutated nothing (a hold / review:pass /
+                #     armed / marker-mismatch), so the marker still names the head. review-fix.yml
+                #     would resolve already_done and skip the model, so NOTHING may be claimed or
+                #     launched — and the refusal is a counted lane ERROR with its own attribution,
+                #     not a green "deferred" that another productive lane can hide (issue #700).
+                launch_runs.clear()
+                fake.update(pull=live_pull(draft=True, labels=["review:needs"],
+                                           body=f"x <!-- sparq-reviewed-sha:{sha_a} -->"),
+                            stranded_retract=False)
+                alloc = LaunchingAllocator()
+                launched, reasons = run_items([stranded_item], allocator=alloc,
+                                              routing=strand_routing)
+                assert launched == 0 and launch_runs == [], (launched, launch_runs)
+                assert alloc.calls == [], alloc.calls          # no reviewer lease was spent
+                assert reasons["review-noop-head-already-bound"] == 1, reasons
+                assert _lane_summary(run_items.lanes)["review"] == {
+                    "planned": 1, "launched": 0, "deferred": 0, "error": 1}, run_items.lanes
+
+                # (c) THE OTHER LIVE SOURCE: a review:needs-labelled item whose head is already
+                #     marker-bound reaches the same dispatch point WITHOUT the stranded branch
+                #     (enumerate_review_items emits it via `if not draft or not reviewed_match`,
+                #     and CLAIM redrafts it). The invariant is stated over EVERY review dispatch,
+                #     so it is refused here too — no helper call, no lease, no launch.
+                launch_runs.clear()
+                needs_review_item = dict(ci_item, state="needs-review", context="")
+                fake.update(pull=live_pull(draft=True, labels=["review:needs"],
+                                           body=f"x <!-- sparq-reviewed-sha:{sha_a} -->"))
+                alloc = LaunchingAllocator()
+                launched, reasons = run_items([needs_review_item], allocator=alloc,
+                                              routing=strand_routing)
+                assert helper_calls == [], helper_calls
+                assert launched == 0 and launch_runs == [] and alloc.calls == [], launch_runs
+                assert reasons["review-noop-head-already-bound"] == 1, reasons
+
+                # (d) A FAILED retraction is a counted error and NEVER a dispatch: a review run we
+                #     cannot make reviewable must not consume a lease on the chance it works.
+                launch_runs.clear()
+                fake.update(pull=live_pull(draft=True, labels=["review:needs"],
+                                           body=f"x <!-- sparq-reviewed-sha:{sha_a} -->"),
+                            stranded_retract=False, stranded_retract_raises=True)
+                alloc = LaunchingAllocator()
+                launched, reasons = run_items([stranded_item], allocator=alloc,
+                                              routing=strand_routing)
+                assert launched == 0 and launch_runs == [] and alloc.calls == [], launch_runs
+                assert reasons["stranded-retract-failed"] == 1, reasons
+                assert _lane_summary(run_items.lanes)["review"] == {
+                    "planned": 1, "launched": 0, "deferred": 0, "error": 1}, run_items.lanes
+                fake.pop("stranded_retract_raises", None)
+                fake["stranded_retract"] = True
+
+                # (e) NON-VACUITY, and the reason the guard is worded as an invariant rather than a
+                #     state carve-out: the refusal must fire on an UNREVIEWABLE head, never on a
+                #     reviewable one. Same item, marker naming a DIFFERENT head -> launches.
+                launch_runs.clear()
+                fake.update(pull=live_pull(draft=True, labels=["review:needs"],
+                                           body=f"x <!-- sparq-reviewed-sha:{sha_b} -->"))
+                alloc = LaunchingAllocator()
+                launched, reasons = run_items([needs_review_item], allocator=alloc,
+                                              routing=strand_routing)
+                assert launched == 1 and reasons["review-noop-head-already-bound"] == 0, \
+                    (launched, reasons)
+            finally:
+                globals()["_run_gh"] = real_launch_gh
+                os.environ.pop("PROVENANCE_SALT", None)
+                fake.pop("stranded_retract", None)
+                fake.pop("stranded_retract_raises", None)
+            print("  ok   #708: the review lane retracts the assertion its stranded posture "
+                  "disproves, and refuses — loudly, counted, attributed — to spend a reviewer "
+                  "lease on any head review-fix.yml would resolve already_done")
 
             # ---- round-budget escalation (directive 2026-07-17): decide_budget replaces the
             # flat rounds>=max needs-user at CLAIM, the fix chain honours the pinned floor, and
