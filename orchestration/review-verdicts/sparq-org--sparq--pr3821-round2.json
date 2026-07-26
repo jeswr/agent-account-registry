@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 3821,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "05e8a40962d2560158c28f5f33ff468f01407c9d",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The doc (mod.rs:357) reads \"The smallest numbered `family{k}_` prefix that no existing label starts with.\" The implementation is slightly more conservative than that in one corner: a label whose digit run has leading zeros parses to the same number as its canonical form, so it burns an index that is in fact still free.\n\nVerified with an in-crate probe: `fresh_blank_prefix({\"__sk00_x\"}, \"__sk\")` returns `__sk1_`, even though no label starts with `__sk0_` (I asserted that in the probe). Under the documented wording the answer would be `__sk0_`.\n\nThis is harmless \u2014 the returned prefix is still provably fresh, which is the property the caller depends on, and erring toward a higher index can never cause a capture. It is purely a doc/implementation divergence that could mislead a later reader into thinking the returned index is minimal.\n\nFor the record, the other corner I probed is fine: a digit run that overflows `usize` (`__sk99999999999999999999999999_x`) is skipped and returns `__sk0_`, which is correct and fresh.",
+    "file": "crates/sparq-reason/src/n3/mod.rs",
+    "fix_hint": "Reword to something like \"A numbered `family{k}_` prefix that no existing label starts with; `k` is the smallest index not claimed by a `family<digits>_` label (labels with leading zeros conservatively claim their numeric value).\" No code change needed \u2014 the conservatism is the safe direction.",
+    "severity": "nit",
+    "title": "fresh_blank_prefix doc says \"smallest\", but leading-zero labels make it skip a free index"
+   },
+   {
+    "body": "Round 1 raised (as a minor, and explicitly as pre-existing rather than a regression) that `sk_prefix` is computed once at entry from the initial parsed document, so labels entering the fact set later \u2014 via `log:semantics` / `log:parsedAsN3` result formulae bound out through a variable, or via a nested `formula_closure` run computing its prefix only over its own formula \u2014 are outside the freshness proof.\n\nThe new comment at mod.rs:489-493 now states this scope limit explicitly and accurately: \"Labels ingested later through document builtins or nested closure evaluation are outside this initial-source guarantee.\" That is the honest-disclosure half of the round-1 fix hint and is why this is a nit rather than a repeat minor \u2014 the code no longer implies a guarantee it does not provide.\n\nI did not construct a triggering end-to-end counterexample this round either, so I am recording it as a documented residual, not a defect in this PR.",
+    "file": "crates/sparq-reason/src/n3/mod.rs",
+    "fix_hint": "Optional follow-up, not a change to this PR: file a bead for the ingest-side rename (apply the same rename-apart trick `stratum_blanks` already uses at the stratum boundary to blanks ingested through document builtins and nested closure runs), so the residual is tracked rather than only commented.",
+    "severity": "nit",
+    "title": "Mid-run-ingested blank labels residual is now disclosed but not tracked by a bead"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Both round-1 majors are fixed; I verified each by mutation, not by reading.\n\n(1) Vacuous stratified test \u2014 stratum 2's source is now `_:__st0___sk0_1_e` with a corrected comment. Teeth restored: pinning `fresh_carry_prefix` to a constant `\"__st0_\"` (the exact bug it pins) now makes `stratified_carried_existential_survives_a_colliding_source_label` FAIL alongside its sibling; in round 1 that same mutation left it PASSING. The derivation matches: stratum 1 mints `__sk0_1_e`, stratum 2 sees it, `taken={0}`, carry prefix moves to `__st1_`.\n\n(2) Quadratic scan \u2014 `fresh_blank_prefix` is now a single O(n) pass. Work-box measurement (NON-CANONICAL, order-of-magnitude only), adversarial `_:__sk{i}_x` minus benign `_:zz{i}_x` control, n=2k/4k/8k/16k/32k: PR head 2/4/2/13/20ms \u2014 flat. Reverting only that helper to the round-1 rescan loop gives 13/49/195/778/3179ms, delta quadrupling per doubling. Fix is real, probe is non-vacuous.\n\nThe rewrite is contract-preserving, not just faster: for any label starting with `family{k}_`, the digit run up to the first `_` parses back to exactly `k`, so that index is always taken. Non-numeric, empty and usize-overflow runs are skipped, and no such label can start with the returned canonical prefix. Corners resolve conservatively, never unsoundly.\n\nThe round-1 nit is fixed with independent teeth: a mutation keeping the minted node distinct while breaking co-reference across the two conclusion triples trips the new `parent_node == parent_object` assert specifically.\n\nFull `cargo test -p sparq-reason` green (142 lib + all integration targets). Nothing in the repo pattern-matches the `__sk`/`__st` label shape, and the user-visible shape change is in CHANGELOG. Two nits remain; neither blocks. (Clippy not installed on this toolchain; CI gates it.)",
+  "verdict": "approve"
+ }
+}
