@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3983,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "24e30c46d699cdec94a0d256cbd050046458e4de",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 2 remains correct and complete as scoped. The algebra-level SERVICE denial exhaustively descends query patterns and expression-bearing EXISTS paths before dictionary checking or execution, while explicit federation opt-in remains available. The end-to-end tests exercise the real Nlq loop, establish pre-call question rejection, fail-closed federation behavior, repair recovery, and mutation/store integrity; the focused unit tests cover benign no-op behavior and nested algebra traversal without relying on vacuous mocks. Public API documentation and the threat model accurately distinguish structural prompt hardening from prevention and explicitly record residual schema-summary, total-prompt, egress, and authorization risks. No new correctness, soundness, test-validity, or security issue is evident relative to round 1.",
+  "verdict": "approve"
+ }
+}
