@@ -44,7 +44,9 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 import textwrap
+import types
 from typing import NamedTuple
 
 HEAD_RE = re.compile(r"^sparq-agent/issue-([1-9][0-9]*)-([0-9]+)-([0-9]+)$")
@@ -482,6 +484,30 @@ query($owner: String!, $name: String!, $number: Int!) {
 }
 """
 _REVIEW_STATE_FIELDS = ("mergeQueueEntry", "autoMergeRequest", "labels")
+
+
+def query_selected_fields(query, parent):
+    """The field names selected inside `parent { ... }` in a GraphQL document. The parser demands
+    every _REVIEW_STATE_FIELDS key in the RESPONSE, and a response only carries what the QUERY
+    asked for — so deleting `mergeQueueEntry` from the document silently turns every PR into
+    "unknown" (or, with a laxer parser, "not queued"). The self-test pins document to parser."""
+    opening = re.search(re.escape(parent) + r"[^{]*\{", query)
+    if not opening:
+        return set()
+    depth, index, start = 1, opening.end(), opening.end()
+    while index < len(query) and depth:
+        depth += {"{": 1, "}": -1}.get(query[index], 0)
+        index += 1
+    if depth:
+        return set()
+    fields, level = set(), 0
+    for line in query[start:index - 1].splitlines():
+        text = line.strip()
+        name = re.match(r"([A-Za-z_][A-Za-z0-9_]*)", text)
+        if level == 0 and name:
+            fields.add(name.group(1))
+        level += text.count("{") - text.count("}")
+    return fields
 
 
 def parse_review_state(payload):
@@ -1324,10 +1350,21 @@ def _self_test():
     check("a malformed graphql body is UNKNOWN",
           review_state("sparq-org/sparq", 4185, runner=replying_runner("{not json")),
           UNKNOWN_REVIEW_STATE)
-    check("a graphql `errors` body is UNKNOWN",
-          review_state("sparq-org/sparq", 4185,
-                       runner=replying_runner('{"data":null,"errors":[{"message":"x"}]}')),
+    # A PARTIAL graphql error carries a fully-shaped `data` alongside `errors` — the discriminating
+    # fixture. A `"data": null` body would be UNKNOWN via the shape walk alone, so it would not
+    # prove the `errors` check does anything.
+    check("a graphql body with `errors` AND a well-shaped `data` is still UNKNOWN",
+          review_state("sparq-org/sparq", 4185, runner=replying_runner(
+              '{"data":{"repository":{"pullRequest":{"mergeQueueEntry":null,'
+              '"autoMergeRequest":null,"labels":{"nodes":[]}}}},'
+              '"errors":[{"message":"Something went wrong while executing your query"}]}')),
           UNKNOWN_REVIEW_STATE)
+    # The DOCUMENT must ask for exactly what the parser requires: deleting `mergeQueueEntry` from
+    # the query makes every response "partial", and the merge-queue signal disappears silently.
+    check("the graphql document selects exactly the fields the parser requires",
+          query_selected_fields(REVIEW_STATE_QUERY, "pullRequest"), set(_REVIEW_STATE_FIELDS))
+    check("  ...and the selection extractor is not vacuous (it finds the nested `state`)",
+          query_selected_fields(REVIEW_STATE_QUERY, "mergeQueueEntry"), {"state"})
     check("a payload MISSING mergeQueueEntry is UNKNOWN, never not-queued",
           parse_review_state({"data": {"repository": {"pullRequest": {
               "autoMergeRequest": None, "labels": {"nodes": []}}}}}), UNKNOWN_REVIEW_STATE)
@@ -1360,6 +1397,76 @@ def _self_test():
     check("every _ensure_draft call passes an explicit review `state=` (no default to forget)",
           [sorted(k.arg for k in call.keywords) for call in ensure_calls],
           [["no_draft_convert", "state"], ["no_draft_convert", "state"]])
+
+    # --- END TO END through backfill(): the obligation is "RECORDED but NOT drafted" -----------
+    # The unit checks above pin the predicate and the probe; this drives the REAL loop with the
+    # registry/gh boundary stubbed, so the live wiring (does backfill actually probe? does the
+    # record still get counted?) is asserted rather than assumed.
+    E2E_HEAD_QUEUED = "sparq-agent/issue-3404-16234567890-1"
+    E2E_HEAD_FRESH = "sparq-agent/issue-3405-16234567891-1"
+    e2e_logs = {"16234567890": prov_env(issue=3404, head=E2E_HEAD_QUEUED),
+                "16234567891": prov_env(issue=3405, head=E2E_HEAD_FRESH)}
+
+    def e2e_pull(number, head):
+        return {"number": number, "draft": False,
+                "head": {"ref": head, "repo": {"full_name": "sparq-org/sparq"}},
+                "user": {"login": "sparq-orchestrator[bot]"}}
+
+    def e2e_gh_json(args):
+        if "--slurp" in args:
+            return [[e2e_pull(9001, E2E_HEAD_QUEUED), e2e_pull(9002, E2E_HEAD_FRESH)]]
+        return [{"sha": "ab" * 20}]
+
+    def e2e_run_gh(args, *, check=True):
+        if list(args[:2]) == ["run", "view"]:
+            return subprocess.CompletedProcess(list(args), 0, e2e_logs.get(args[2], ""), "")
+        raise AssertionError(f"a DRY RUN must issue no mutating gh call, got {args}")
+
+    def e2e_no_write(*_args, **_kwargs):
+        raise AssertionError("a DRY RUN must never write a provenance record")
+
+    stub_worker_pr = types.SimpleNamespace(
+        LEDGER_REF="ledger", WorkerPrError=BackfillError,
+        provenance_path=lambda repo, number: f"orchestration/provenance/{number}.json",
+        _probe_registry_file=lambda repo, path, ref=None: (None, None),
+        account_hash=lambda account, salt: "deadbeefdeadbeef",
+        provenance_record=e2e_no_write)
+    e2e_state = {9001: QUEUED_ONLY, 9002: FRESH}
+    routing_toml = Path(tempfile.mkdtemp()) / "routing.toml"
+    routing_toml.write_text('[models.fable]\nprovider = "anthropic"\n', encoding="utf-8")
+    patched = ("_gh_json", "_run_gh", "_load_worker_pr", "_load_dispatch_claim", "review_state")
+    saved_globals = {name: globals()[name] for name in patched}
+    saved_salt = os.environ.get("PROVENANCE_SALT")
+    e2e_buffer = io.StringIO()
+    try:
+        globals().update(
+            _gh_json=e2e_gh_json, _run_gh=e2e_run_gh,
+            _load_worker_pr=lambda: stub_worker_pr,
+            _load_dispatch_claim=lambda: types.SimpleNamespace(
+                provenance_admission_error=lambda record, pr: None),
+            review_state=lambda repo, number, runner=None: e2e_state[number])
+        os.environ["PROVENANCE_SALT"] = "self-test-only"
+        with contextlib.redirect_stdout(e2e_buffer):
+            backfill("sparq-org/sparq", "jeswr/agent-account-registry", str(routing_toml),
+                     False)
+    finally:
+        globals().update(saved_globals)
+        if saved_salt is None:
+            os.environ.pop("PROVENANCE_SALT", None)
+        else:
+            os.environ["PROVENANCE_SALT"] = saved_salt
+    e2e = e2e_buffer.getvalue()
+    check("E2E: the QUEUED PR's provenance IS recorded",
+          "DRY-RUN #9001: would record" in e2e, True)
+    check("E2E: ...and it is NOT proposed for draft conversion (no queue eviction)",
+          "DRY-RUN #9001: would convert to draft" in e2e, False)
+    check("E2E: ...and the operator is told why",
+          "KEEP-PUBLISHED #9001: not converting to draft — it is IN THE MERGE QUEUE" in e2e, True)
+    check("E2E: the FRESH unreviewed PR is recorded AND still drafted",
+          ("DRY-RUN #9002: would record" in e2e,
+           "DRY-RUN #9002: would convert to draft" in e2e), (True, True))
+    check("E2E: BOTH records are counted — draft policy never withholds a record",
+          "backfill complete: would record 2, skipped 0, needs-human 0" in e2e, True)
 
     # --- effective ledger-first record + admission before any skip (sol #217) ------------------
     # The REAL review-loop admission function, imported — not a replica — so these red if the
