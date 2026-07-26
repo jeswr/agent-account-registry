@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 741,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "5e6e5b517eda0760c35968b7e34ff8bc860e691c",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The `item.completed` branch dispatches on `item[\"item_type\"]`, but Codex JSON item objects use `item[\"type\"]` for values such as `command_execution`, `file_change`, and `agent_message`. Consequently current-protocol tool calls and messages are silently ignored; a real run can be recorded with `probe:0` and no turn evidence despite having inspected the repository. The added fixture is non-representative because it invents `item_type`, so its passing assertion does not validate the actual protocol boundary.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Parse the actual item discriminator (`type`) and replace the fixture with captured/sanitized real `codex exec --json` event shapes. Keep an assertion that fails if real `command_execution` items are not counted.",
+    "severity": "major",
+    "title": "Current Codex item events are read from the wrong discriminator"
+   },
+   {
+    "body": "`tool_counts` starts as `{}` and is always written into `usage-telemetry.json`, even if the log is empty, every JSON line is malformed, or the protocol has changed so no recognized telemetry event is parsed. `_no_change_health_envelope` treats any dictionary, including that unconditional empty dictionary, as proof telemetry was measured and emits `probe:0`. This violates the documented and security-relevant absent-versus-zero contract: parser failure or an unknown protocol becomes the strong claim that the model used no inspection tools.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Track whether a recognized harness/protocol event stream was successfully observed and emit `tool_counts` (and therefore `probe`) only when measurement is valid. Fail closed to omission for empty, malformed, mismatched, or wholly unknown streams, and add negative tests for each case.",
+    "severity": "major",
+    "title": "Unknown or malformed telemetry is misreported as a measured zero probes"
+   }
+  ],
+  "progress": null,
+  "summary": "The new Codex telemetry path is not sound for the current item protocol and can also turn an unrecognized or malformed event stream into affirmative zero-effort evidence. The tests reproduce the implementation's assumed schema rather than the real wire shape, so they do not catch the primary failure. Because these fields are intended as trust-plane evidence distinguishing an unmeasured run from a measured zero-probe run, both problems are major and must fail closed.",
+  "verdict": "request_changes"
+ }
+}
