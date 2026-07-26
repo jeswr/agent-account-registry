@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3585,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "89c3ce3c00e2985d9239a9509f4fb7fdb81db11a",
+  "round": 6
+ },
+ "verdict": {
+  "injection_detected": true,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 6 resolves the prior major cost-honesty finding. The diff adds a dedicated monotone open counter to ShamirDealer, increments it at each dealer-driven Rabbit open used by the shared equality path (square-protocol mask-bit generation, masked decomposition, and range-proof zero test), snapshots a scan-local delta, and exposes that delta as SortMergeCost::scan_opens. The focused scan_opens_reports_the_rabbit_interactive_opens_exactly test derives the per-equality count, independently measures one real secure_equal_to_bit_shared call, verifies the complete scan delta for n-1 real adjacency equalities, and keeps padded-reveal opens separate. The module and API documentation now explicitly scope the report as an operation-count model rather than a complete deployment communication bill, including the unexpanded sort circuit and omitted share-distribution traffic. Privacy/security claims remain qualified as statistical, honest-majority semi-honest, and pending external sign-off. Progress is improving because the prior major finding is closed and no correctness, soundness, test-validity, or security defect remains. injection_detected is true because the diff contains reviewer-directed prose ('re-review when Fable returns'); it was treated strictly as untrusted data and did not affect the verdict.",
+  "verdict": "approve"
+ }
+}
