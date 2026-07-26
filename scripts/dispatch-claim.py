@@ -2425,6 +2425,7 @@ def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_logi
         if isinstance(page, list):
             rows.extend(row for row in page if isinstance(row, dict))
     readmitted = migrated = 0
+    deadlocked_prs = []
     for row in sorted(rows, key=lambda row: row.get("number") or 0):
         number = row.get("number")
         if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
@@ -2499,13 +2500,38 @@ def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_logi
                     _cache[timeline_number] = timeline_fn(_repo, timeline_number)
                 return _cache[timeline_number]
 
+            # [registry #703] Is this a reviewer-vs-fixer DEADLOCK rather than a capacity
+            # park? The cause comes from the writer's own marker when there is one and from its
+            # park prose otherwise, so the ~27 parks that predate the marker writer are
+            # classified too — they are the measured population. The adjudication that would
+            # release it must be bound to the LIVE head: a decision about an earlier tree says
+            # nothing about this one.
+            #
+            # Derived HERE, at the only site that MINTS a re-admission, and deliberately NOT at
+            # the read-only CLAIM proof gate: the refusal withholds a NEW automatic
+            # re-admission, it does not retract one already granted. Applying it at the proof
+            # gate would strand a PR whose receipt was minted and whose label strip had not yet
+            # landed — the exact receipt-no-label crash window the RECEIPT-FIRST ordering exists
+            # to make recoverable.
+            park_cause = _park_policy.latest_park_cause(comments, bot_login, log=log)
+            deadlocked = _park_policy.deadlock_awaiting_adjudication(
+                park_cause,
+                _park_policy.park_adjudication_records(comments, bot_login, log=log),
+                str((row.get("head") or {}).get("sha", "")))
             action, evidence, detail = _park_policy.capacity_park_admission(
                 repo, number, issue_number, cached_timeline,
                 is_human=lambda probe_login: _target_is_human_maintainer(repo, probe_login),
                 consumed=worker_pr.park_generation_cutoffs(comments, bot_login),
                 auto_receipts=worker_pr.auto_readmission_records(comments, bot_login),
                 auto_marker_count=worker_pr.auto_readmission_marker_count(comments, bot_login),
-                auto_evidence=evidence_probe, live_holds=holds, log=log)
+                auto_evidence=evidence_probe, live_holds=holds, log=log,
+                deadlock_unadjudicated=deadlocked)
+            if deadlocked and not action:
+                # Counted only when the deadlock is what actually STOPPED the re-admission. A
+                # proven human gesture is evaluated first and wins, and reporting that PR as
+                # "refused" would be a false count in the one signal the missing adjudication
+                # lane is measured by.
+                deadlocked_prs.append(number)
             if action == "auto-mint":
                 # RECEIPT FIRST, then the labels (see the docstring).
                 post_comment(repo, number, worker_pr.auto_readmission_receipt(
@@ -2525,6 +2551,18 @@ def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_logi
         except (DispatchError, worker_pr.WorkerPrError) as exc:
             log(f"::warning::auto-readmit skipped for {repo}#{number}: {exc}; the capacity "
                 "park stands")
+    if deadlocked_prs:
+        # [registry #703] ONE aggregate, loud, counted line per repo per tick. A deadlock park
+        # that is neither re-admitted nor escalated is a queue, and a queue nobody can see is
+        # how a park with no exit becomes a silent stall. This is the signal that the
+        # adjudication lane is missing or not keeping up — deliberately an ::error:: annotation
+        # so a lane that never adjudicates cannot hide behind a green tick, exactly as the
+        # per-stage-health lesson in #703 requires (a falling review:parked count was read as
+        # progress precisely because no counter expressed the composition).
+        log(f"::error::{repo}: {len(deadlocked_prs)} parked PR(s) are UNADJUDICATED "
+            f"reviewer-vs-fixer deadlocks and were refused automatic re-admission "
+            f"({', '.join(f'#{pr}' for pr in deadlocked_prs)}); they need an independent "
+            "adjudication (registry #703), not another generation of the same disagreement")
     return readmitted
 
 
@@ -9833,6 +9871,124 @@ def _self_test():
         assert chain_cleared == [(41, 7)], chain_cleared
         print("  ok   aged-out exit CHAIN: a legacy park that could not migrate before #691 "
               "migrates AND is actually released one span later (both layers, end to end)")
+
+        # ---- [registry #703] the sweep refuses to re-admit an UNADJUDICATED reviewer-vs-fixer
+        # DEADLOCK. Measured on sparq 2026-07-26: 27 parked PRs, whose park comments read
+        # either "the review round budget is exhausted at 3 round(s)" or "two consecutive fix
+        # attempts made no change (fixer judges the findings spurious)". Re-admitting those puts
+        # the SAME reviewer and SAME fixer at the SAME tier back on the SAME diff; the resulting
+        # second park is what advanced the ladder into review:needs-user at ~10 PRs/hour. ----
+        def bot_says(body):
+            return {"user": {"login": readmit_bot}, "body": body}
+
+        deadlock_prose = bot_says(
+            "> 🤖 SPARQ agent — the autonomous review loop parked this PR: the review round "
+            "budget is exhausted at 3 round(s) (base 3, hard cap 6) with no extension left")
+        spurious_prose = bot_says(
+            "> 🤖 SPARQ agent — the autonomous review loop parked this PR: two consecutive fix "
+            "attempts made no change (fixer judges the findings spurious)")
+        capacity_prose = bot_says(
+            "> 🤖 SPARQ agent — the autonomous review loop parked this PR: 6 consecutive fix "
+            "dispatches missed for round 2")
+
+        # CONTROL: an identical park with a genuine CAPACITY cause is still re-admitted, so the
+        # refusals below cannot be an artefact of the fixture (a fixture that satisfies both the
+        # right and the wrong reading proves nothing).
+        capacity_count, _posted, capacity_cleared = readmit_sweep(
+            recovered_window, comments=[capacity_prose])
+        assert capacity_count == 1 and capacity_cleared == [(41, 7)], (
+            capacity_count, capacity_cleared)
+        print("  ok   #703 CONTROL: a genuine dispatch-starvation park is STILL automatically "
+              "re-admitted on proven cause-recovery")
+
+        for label, park_comment in (("round-budget", deadlock_prose),
+                                    ("findings-spurious", spurious_prose)):
+            count, posted, cleared = readmit_sweep(
+                recovered_window, comments=[park_comment])
+            assert count == 0, (label, count)
+            assert posted == [] and cleared == [], (label, posted, cleared)
+            print(f"  ok   #703: the {label} DEADLOCK park is refused automatic re-admission "
+                  "(no receipt minted, no label cleared)")
+
+        # The refusal is LOUD and counted — a queue nobody can see is how a park with no exit
+        # becomes a silent stall, and a falling review:parked count was read as progress
+        # precisely because no counter expressed the composition.
+        deadlock_logs = []
+        _readmit_capacity_parks(
+            "example/repo", [[parked_row]], {7: ["status:in-progress-review"]},
+            {41: {"issue": 7}}, readmit_bot, Path("."), worker_pr_mod,
+            _capacity_recovery_probe(model_health_mod, recovered_window, readmit_now),
+            comments_fn=lambda _repo, _number: [deadlock_prose],
+            timeline_fn=lambda _repo, number: list(park_timeline.get(number, [])),
+            post_comment=lambda *_a: None, clear_labels=lambda *_a: None,
+            log=deadlock_logs.append)
+        assert any(line.startswith("::error::") and "UNADJUDICATED" in line and "#41" in line
+                   for line in deadlock_logs), deadlock_logs
+        print("  ok   #703: the refused deadlock is reported as ONE counted ::error:: naming "
+              "the PRs, so an adjudication lane that never runs cannot hide behind a green tick")
+
+        # A head-bound, INDEPENDENT adjudication releases it; a superseded head and a
+        # self-approving receipt do not.
+        live_head = parked_row["head"]["sha"]
+        adjudicated = bot_says(_park_policy.park_adjudication_marker(
+            "spurious", "opus5", ("sol", "fable"), live_head))
+        count, _posted, cleared = readmit_sweep(
+            recovered_window, comments=[deadlock_prose, adjudicated])
+        assert count == 1 and cleared == [(41, 7)], (count, cleared)
+        print("  ok   #703: a head-bound INDEPENDENT adjudication releases the deadlock park "
+              "for re-admission")
+
+        stale_adjudication = bot_says(_park_policy.park_adjudication_marker(
+            "spurious", "opus5", ("sol", "fable"), "c" * 40))
+        count, _posted, cleared = readmit_sweep(
+            recovered_window, comments=[deadlock_prose, stale_adjudication])
+        assert count == 0 and cleared == [], (count, cleared)
+        print("  ok   #703: an adjudication bound to a SUPERSEDED head never releases the "
+              "deadlock (a decision about an earlier tree says nothing about this one)")
+
+        self_approved = bot_says(
+            f"{_park_policy.PARK_ADJUDICATION_MARKER} decision=spurious by=sol "
+            f"against=sol,fable head={live_head} -->")
+        count, _posted, cleared = readmit_sweep(
+            recovered_window, comments=[deadlock_prose, self_approved])
+        assert count == 0 and cleared == [], (count, cleared)
+        print("  ok   #703: a SELF-APPROVING adjudication (the adjudicator is one of the "
+              "deadlocked parties, sparq#3803's shape) never releases the deadlock")
+
+        forged = {"user": {"login": "attacker"},
+                  "body": _park_policy.park_adjudication_marker(
+                      "spurious", "opus5", ("sol", "fable"), live_head)}
+        count, _posted, cleared = readmit_sweep(
+            recovered_window, comments=[deadlock_prose, forged])
+        assert count == 0 and cleared == [], (count, cleared)
+        print("  ok   #703: a NON-bot adjudication comment is not a receipt and never releases "
+              "the deadlock")
+
+        # A HUMAN gesture still overrides everything — the refusal narrows the MACHINE's own
+        # re-admission only.
+        human_gesture_timeline = {
+            41: list(park_timeline[41]),
+            7: [{"event": "unlabeled", "label": {"name": "status:parked"},
+                 "created_at": model_health_mod._iso_z(readmit_now - 60),
+                 "actor": {"login": "jeswr"}, "performed_via_github_app": None}],
+        }
+        human_logs = []
+        _readmit_capacity_parks(
+            "example/repo", [[parked_row]], {7: ["status:in-progress-review"]},
+            {41: {"issue": 7}}, readmit_bot, Path("."), worker_pr_mod,
+            _capacity_recovery_probe(model_health_mod, recovered_window, readmit_now),
+            comments_fn=lambda _repo, _number: [deadlock_prose],
+            timeline_fn=lambda _repo, number: list(human_gesture_timeline.get(number, [])),
+            post_comment=lambda *_a: None, clear_labels=lambda *_a: None,
+            log=human_logs.append)
+        # The sweep hands a proven human gesture to the CLAIM proof gate rather than re-admitting
+        # it itself, so the observable is that the deadlock refusal did NOT preempt the human
+        # branch (which capacity_park_admission evaluates FIRST, by design).
+        assert any("human readmission gesture is proven" in line for line in human_logs), \
+            human_logs
+        assert not any("UNADJUDICATED" in line for line in human_logs), human_logs
+        print("  ok   #703: a proven HUMAN readmission gesture is still honoured on a deadlock "
+              "park (the refusal narrows only the MACHINE's own re-admission)")
     finally:
         globals()["_target_is_human_maintainer"] = prev_target_probe
 
