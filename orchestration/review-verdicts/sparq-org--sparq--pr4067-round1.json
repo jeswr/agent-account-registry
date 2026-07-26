@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4067,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ff7393bc9f40ac5083f727775168b51958bc29d4",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new statement that \"each generation retains an independent copy of the store in memory\" contradicts the current Graph::fork implementation and the linked architecture: generations structurally share the immutable base storage and copy/retain their divergent overlays, with compaction affecting residency. This materially overstates the per-generation memory model and gives operators incorrect capacity-planning information.",
+    "file": "skills/http-server/SKILL.md",
+    "fix_hint": "Describe each retained generation as a full logical Graph snapshot, while noting that current Graph::fork structurally shares immutable base storage and that additional memory grows with divergent overlays and compaction. Keep the conservative budgeting advice, but do not claim every generation is an independent full in-memory copy.",
+    "severity": "major",
+    "title": "Time-travel generations are not independent full store copies"
+   }
+  ],
+  "progress": null,
+  "summary": "The removal of hard-coded benchmark figures is appropriate, but the replacement HTTP-server guidance introduces an inaccurate memory-model claim. Current generations are logically independent Graph snapshots while Graph::fork structurally shares the immutable indexes, dictionary base, and caches; retained generations therefore do not each retain an independent full copy of the store. Operational sizing advice should describe the actual shared-base plus divergent overlay/compaction behavior without hard-coded measurements.",
+  "verdict": "request_changes"
+ }
+}
