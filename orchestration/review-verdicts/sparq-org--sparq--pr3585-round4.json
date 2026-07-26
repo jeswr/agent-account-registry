@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3585,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "2c89693e4a220b5a4caad1e46979eb02a481f2c3",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`SortMergeCost::scan_mults` is documented as the number of secure multiplications spent in the segmented scan, including adjacency equalities, and the module says the cost report models what a real deployment pays. Yet after `secure_equal_to_bit_shared` the implementation increments `scan_mults` by only 1. Its equality circuit alone performs one multiplication for each of 60 bit equalities and another 59 in the balanced AND tree, before counting the Rabbit decompositions and range proofs. Thus every adjacency check is reported as one multiplication while executing well over one hundred, making the public modeled cost materially false and increasingly inaccurate with input size.",
+    "file": "crates/sparq-mpc/src/sort_merge_join.rs",
+    "fix_hint": "Factor explicit cost accounting out of the comparison/Rabbit primitives (or return a cost alongside the verdict) and add the actual decomposition, range-proof, per-bit-equality, and AND-tree multiplications for every adjacency equality. Alternatively rename and document the field as a higher-level operation count rather than `scan_mults`, but then do not claim it reports secure multiplications. Add a focused test that derives the expected count for a small union and fails if an equality call is counted as one multiplication.",
+    "severity": "major",
+    "title": "SortMergeCost undercounts adjacency equality by over two orders of magnitude"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 4 fixes the prior major finding: `oblivious_sort_by_secret_key` now checks the party threshold before constructing the network and invokes the existing in-protocol Rabbit range proof for every element, including singleton columns; focused tests exercise invalid and valid gate-free inputs. However, the new public `SortMergeCost::scan_mults` report materially undercounts the protocol it claims to model. Each adjacent `secure_equal_to_bit_shared` executes at least 60 per-bit multiplications plus 59 AND-tree multiplications (and additional decomposition/range-proof work), but the caller adds only 1. Since the PR presents this structure as the modeled communication cost of a real deployment, this is a correctness defect in the new public API. This is a new major finding relative to round 3, so progress is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
