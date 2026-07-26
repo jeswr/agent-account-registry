@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4226,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e9668eca93cd9609f0e0dc645fc2716d799c5f89",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 1's major oracle defect is fixed. The comparator now identifies expanded @json value objects, switches their @value subtree to recursively exact JSON array semantics, preserves object-member order insensitivity, and keeps ordinary JSON-LD property arrays unordered. The new witness test directly proves both top-level and nested @json array reorderings compare unequal, equal payloads still compare equal, JSON object key order remains insignificant, and the carve-out does not affect ordinary value arrays. I found no remaining correctness, soundness, test-validity, or security issue in the diff. The focused test could not be executed in this environment because cargo is unavailable, but the test and implementation are internally consistent on inspection.",
+  "verdict": "approve"
+ }
+}
