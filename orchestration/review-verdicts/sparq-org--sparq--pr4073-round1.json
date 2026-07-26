@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4073,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "26e01aa2bc7eeb814c9a67207231ecc29cc42d24",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The comment-only change accurately clarifies that the DBLS model table excludes NaN because NaN is represented separately as M::Nan, and that NaN is nevertheless included in the comparator's total-order transitivity coverage through transitivity_mixed_literal_kinds_incl_nan. The referenced proof exists and its domain includes M::Nan, so the documentation matches the tested model without changing behavior.",
+  "verdict": "approve"
+ }
+}
