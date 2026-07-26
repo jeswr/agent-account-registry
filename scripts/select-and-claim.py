@@ -594,6 +594,12 @@ KNOWN_CREDENTIAL_FORMATS = frozenset({
 })
 ACCOUNT_ISSUE_TITLE_RE = re.compile(r"acct[0-9]+")
 ACCOUNT_SECRET_REF_RE = re.compile(r"[A-Z][A-Z0-9_]*")
+# [OPUS-5] The provider -> harness pairing worker.yml enforces at the very last gate before a
+# secret is exposed ("claimed model has an unsupported harness"). It is asserted HERE too, at the
+# catalog read, so a record that can never route is dropped BEFORE it wins a lease — see
+# PROVIDER_HARNESS's use in _account_schema_errors below.
+PROVIDER_HARNESS = {"anthropic": "claude", "openai": "codex"}
+KNOWN_ACCOUNT_HARNESSES = frozenset(PROVIDER_HARNESS.values())
 
 
 def _account_schema_errors(account, require_models=True):
@@ -614,8 +620,32 @@ def _account_schema_errors(account, require_models=True):
         reasons.append("missing secret_ref")
     elif ACCOUNT_SECRET_REF_RE.fullmatch(secret_ref) is None:
         reasons.append("unsafe secret_ref")
-    if require_models and not account.get("models"):
-        reasons.append("missing models")
+    if require_models:
+        if not account.get("models"):
+            reasons.append("missing models")
+        # [OPUS-5] `harness` is a REQUIRED routing field of a complete record (live incident
+        # 2026-07-26). worker.yml's claim/adopt heredocs fail CLOSED on an empty or missing
+        # harness ("dispatcher claim returned an empty or missing harness") because an account
+        # must never be routed on metadata it did not declare — but this schema did not require
+        # the field, so a legacy harness-less record (acct02, minted before set-up-account.yml
+        # started emitting `harness:`) stayed in the live catalog, WON claims, and then died at
+        # that boundary AFTER the lease was spent: every claim allocated to it burned a lease and
+        # a worker run, and the operator saw a message naming neither the account nor the missing
+        # field's origin. Measured: 3/3 sampled "empty or missing harness" worker failures were
+        # that one account; 0/9 sampled failures on a harness-declaring account carried it.
+        # Requiring it here moves the rejection to the catalog read, where the drop diagnostic
+        # already names the handle and the reason and no lease has been taken yet.
+        #
+        # DELIBERATELY NOT part of the require_models=False structural predicate: that predicate
+        # only SELECTS candidate records, and narrowing it would make a harness-less record
+        # silently unselected instead of loudly dropped.
+        harness = account.get("harness")
+        if harness not in KNOWN_ACCOUNT_HARNESSES:
+            reasons.append("missing harness" if not harness else f"unknown harness {harness!r}")
+        elif provider in PROVIDER_HARNESS and harness != PROVIDER_HARNESS[provider]:
+            reasons.append(
+                f"harness {harness!r} does not match provider {provider!r} "
+                f"(expected {PROVIDER_HARNESS[provider]!r})")
     return reasons
 
 
@@ -626,8 +656,8 @@ def account_record_schema_errors(handle, body, require_models=True):
     validation boundary, and lets every writer reject an invalid replacement body before it
     reaches GitHub. ``require_models=False`` is the structural front-matter predicate: the three
     routing/credential fields are sufficient to identify a record even when its title is not an
-    ``acctNN`` handle. Full read/write validation additionally requires a usable handle and model
-    list.
+    ``acctNN`` handle. Full read/write validation additionally requires a usable handle, a model
+    list, and a `harness` that both exists and matches the record's provider.
     """
     account = _parse_account(body)
     account["handle"] = handle
@@ -1006,11 +1036,11 @@ def _self_test():
     # fixture handle ever reaches the captured stderr/stdout.
     FIXTURE_HANDLES = ("acctL", "acctC")
     issue_rows = json.dumps([
-        {"title": "acctL", "body": "provider: openai\nmodels: [terra]\nsecret_ref: L_TOKEN\n"
-         "credential_format: codex-auth-json",
+        {"title": "acctL", "body": "provider: openai\nharness: codex\nmodels: [terra]\n"
+         "secret_ref: L_TOKEN\ncredential_format: codex-auth-json",
          "labels": [{"name": "status:available"}]},
-        {"title": "acctC", "body": "provider: openai\nmodels: [terra, luna]\nsecret_ref: C_TOKEN\n"
-         "credential_format: codex-auth-json",
+        {"title": "acctC", "body": "provider: openai\nharness: codex\nmodels: [terra, luna]\n"
+         "secret_ref: C_TOKEN\ncredential_format: codex-auth-json",
          "labels": [{"name": "status:available"}]},
     ])
     real_run_fn = globals()["_run"]
@@ -1081,6 +1111,20 @@ def _self_test():
          "body": "provider: anthropic\nharness: claude\nmodels: [fable]\n"
                  "credential_format: legacy-token\nsecret_ref: BAD_TOKEN",
          "labels": [{"name": "account"}, {"name": "status:available"}]},
+        # [OPUS-5] THE 2026-07-26 REGRESSION ROW. Complete in every other field — this record
+        # passed the pre-fix schema, entered the live catalog, won claims, and then died in
+        # worker.yml's adopt heredoc ("dispatcher claim returned an empty or missing harness")
+        # AFTER the lease was spent. It must now be dropped at the read, before any claim.
+        {"title": "acct02",
+         "body": "provider: anthropic\nmodels: [opus5, sonnet, haiku]\n"
+                 "credential_format: claude-oauth-token\nsecret_ref: ACCT02_TOKEN",
+         "labels": [{"name": "status:available"}]},
+        # A declared-but-wrong harness is the same defect one step later: worker.yml's last gate
+        # rejects the (anthropic, codex) pair, so the record can never route either.
+        {"title": "acct08",
+         "body": "provider: anthropic\nharness: codex\nmodels: [opus5]\n"
+                 "credential_format: claude-oauth-token\nsecret_ref: ACCT08_TOKEN",
+         "labels": [{"name": "status:available"}]},
     ])
     globals()["_run"] = lambda args: SimpleNamespace(stdout=boundary_rows)
     boundary_log = io.StringIO()
@@ -1107,6 +1151,15 @@ def _self_test():
     check("out-of-set credential_format warning names handle and reason",
           "dropping account 'bad-credential-format': unknown credential_format 'legacy-token'"
           in boundary_log.getvalue(), True)
+    check("missing harness is dropped at parse (2026-07-26 acct02 lease-burn regression)",
+          "acct02" not in boundary_handles, True)
+    check("missing harness warning names handle and reason",
+          "dropping account 'acct02': missing harness" in boundary_log.getvalue(), True)
+    check("provider/harness mismatch is dropped at parse",
+          "acct08" not in boundary_handles, True)
+    check("provider/harness mismatch warning names handle, value and expectation",
+          "dropping account 'acct08': harness 'codex' does not match provider 'anthropic' "
+          "(expected 'claude')" in boundary_log.getvalue(), True)
 
     # ---- structural account-issue selection (issue #521 escalation tripwires) ----
     # A broad issue listing is expected: audit/work items live beside account records. Only the
@@ -1117,20 +1170,32 @@ def _self_test():
          "body": "The dispatcher and worker policy pools need an audit.\nNo account metadata here.",
          "labels": [{"name": "role:ci"}]},
         {"title": "acct21",
-         "body": "provider: openai\nmodels: [sol]\ncredential_format: codex-auth-json\n"
-                 "secret_ref: ACCT21_TOKEN",
+         "body": "provider: openai\nharness: codex\nmodels: [sol]\n"
+                 "credential_format: codex-auth-json\nsecret_ref: ACCT21_TOKEN",
          "labels": [{"name": "status:available"}]},
         {"title": "named-anthropic",
-         "body": "provider: anthropic\nmodels: [opus]\n"
+         "body": "provider: anthropic\nharness: claude\nmodels: [opus]\n"
                  "credential_format: claude-oauth-token\nsecret_ref: NAMED_ANTHROPIC_TOKEN",
          "labels": [{"name": "status:available"}]},
         {"title": "acct22",
-         "body": "provider: openai\nmodels: [sol]\ncredential_format: codex-auth-json",
+         "body": "provider: openai\nharness: codex\nmodels: [sol]\n"
+                 "credential_format: codex-auth-json",
          "labels": [{"name": "status:available"}]},
         {"title": "explicitly-marked-corrupt",
          "body": "provider: retired\nmodels: [opus]\n"
                  "credential_format: claude-oauth-token\nsecret_ref: RETIRED_TOKEN",
          "labels": [{"name": "account"}, {"name": "status:available"}]},
+        # [OPUS-5] QUANTIFIER ROW for the harness requirement: a NONSTANDARD-titled, UNLABELLED
+        # record — selected ONLY by its complete provider/credential/secret front matter — that is
+        # missing `harness`. It must be SELECTED and then dropped LOUDLY. If the harness check ever
+        # migrates into the require_models=False structural predicate, this record stops being
+        # selected at all and vanishes SILENTLY from the catalog with no drop line, which is
+        # strictly worse than the outage being fixed (a mutation that deletes the `require_models:`
+        # scoping leaves every other assertion here green — this row is what kills it).
+        {"title": "legacy-nonstandard-title",
+         "body": "provider: anthropic\nmodels: [opus5]\n"
+                 "credential_format: claude-oauth-token\nsecret_ref: LEGACY_NS_TOKEN",
+         "labels": [{"name": "status:available"}]},
     ])
     globals()["_run"] = lambda args: SimpleNamespace(stdout=mixed_rows)
     mixed_log = io.StringIO()
@@ -1148,6 +1213,10 @@ def _self_test():
           "dropping account 'acct22': missing secret_ref" in mixed_log.getvalue(), True)
     check("structural select: account-label-selected corrupt record still drops loudly",
           "dropping account 'explicitly-marked-corrupt': unknown provider 'retired'"
+          in mixed_log.getvalue(), True)
+    check("structural select: a harness-less FRONT-MATTER-selected record drops LOUDLY, "
+          "never silently unselected",
+          "dropping account 'legacy-nonstandard-title': missing harness"
           in mixed_log.getvalue(), True)
 
     mixed_leases = []
@@ -1175,18 +1244,43 @@ def _self_test():
     check("structural select: dispatcher and worker adoption resolve the same mixed-fixture pool",
           worker_pool, [account["handle"] for account in dispatcher_pool])
 
-    valid_write_body = ("provider: openai\nmodels: [sol]\n"
+    valid_write_body = ("provider: openai\nharness: codex\nmodels: [sol]\n"
                         "credential_format: codex-auth-json\nsecret_ref: ACCT23_TOKEN")
     check("account write guard accepts a schema-valid record",
           validate_account_record("acct23", valid_write_body)["secret_ref"], "ACCT23_TOKEN")
     try:
         validate_account_record(
-            "acct23", "provider: openai\nmodels: [sol]\ncredential_format: codex-auth-json")
+            "acct23", "provider: openai\nharness: codex\nmodels: [sol]\n"
+                      "credential_format: codex-auth-json")
         check("account write guard rejects an invalid record before persistence",
               "no exception", "LeaseIOError")
     except LeaseIOError as exc:
         check("account write guard rejects an invalid record before persistence",
               (type(exc).__name__, "missing secret_ref" in str(exc)), ("LeaseIOError", True))
+    # [OPUS-5] The WRITE half of the harness requirement: the broker (set-up-account.yml) already
+    # derives `harness` from the provider, so a body that omits it can only come from a legacy or
+    # hand-edited record — exactly the acct02 shape that burned leases on 2026-07-26. Rejecting it
+    # at the write boundary stops the class from being re-minted.
+    try:
+        validate_account_record(
+            "acct24", "provider: anthropic\nmodels: [opus5]\n"
+                      "credential_format: claude-oauth-token\nsecret_ref: ACCT24_TOKEN")
+        check("account write guard rejects a harness-less record (acct02 regression)",
+              "no exception", "LeaseIOError")
+    except LeaseIOError as exc:
+        check("account write guard rejects a harness-less record (acct02 regression)",
+              (type(exc).__name__, "missing harness" in str(exc)), ("LeaseIOError", True))
+    try:
+        validate_account_record(
+            "acct25", "provider: anthropic\nharness: codex\nmodels: [opus5]\n"
+                      "credential_format: claude-oauth-token\nsecret_ref: ACCT25_TOKEN")
+        check("account write guard rejects a provider/harness mismatch",
+              "no exception", "LeaseIOError")
+    except LeaseIOError as exc:
+        check("account write guard rejects a provider/harness mismatch",
+              (type(exc).__name__,
+               "harness 'codex' does not match provider 'anthropic'" in str(exc)),
+              ("LeaseIOError", True))
 
     # CLAIM SELECTION: a legacy [terra] record now serves a sol-led claim end-to-end (claim()
     # reads the catalog through read_accounts), while a customized [terra, luna] record still
