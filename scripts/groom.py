@@ -380,8 +380,9 @@ def worker_pr_provenance_enumerable(
     is_enumerable_provenance: JSON object, strict-int matching pr_number (float/bool
     excluded — 41.0 == 41 and True == 1 under lax equality), registered impl provider,
     safe-atom impl alias, positive-int issue, well-formed 40-hex head sha, salted 16-hex
-    account hash — the COMPLETE field set; see provenance_admission_error, the one function
-    every consumer calls).
+    account hash, and a MACHINE-ATTESTED ``recorded_at_run`` stamp (issue #657 — the record's
+    trust basis must be a host-side run the implementing model could not influence) — the
+    COMPLETE field set; see provenance_admission_error, the one function every consumer calls).
 
     Mirrors worker-pr.provenance_path / dispatch-claim's review lookup: the record lives at
     ``orchestration/provenance/<owner>--<name>--pr<N>.json`` in the registry checkout, which is
