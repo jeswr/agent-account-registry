@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4338,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c04833288f869eb8948670d670f4641dda7d39ae",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "For th03, q is a dict, gold_count is a dict, and gold_keys is a dict of entity lists. The `elif isinstance(q, dict) and isinstance(gold_count, dict)` branch validates only `answered != gold_count[part]`; it never calls `check_entity_gold` with `gold_keys[part]`. Consequently, each truth_bearers/info_bearers query can return arbitrary entities of the expected cardinality and validation succeeds. This violates the new claim that row-returning tasks whose gold_keys name entities check exact entity values. The end-to-end fixture returns correct th03 entities, but no same-count wrong-entity mutation covers this dispatch path.",
+    "file": "bench/fo-km/validate_tasks.py",
+    "fix_hint": "In the multi-part branch, after checking the per-part count, require a corresponding gold_keys entry and, when it is a non-empty list for a non-aggregate subquery, call `check_entity_gold(tid, arm, data, t[\"gold_keys\"][part])`. Fail on missing/mismatched part keys. Add an end-to-end mutation test replacing one th03 entity while preserving that part's row count and assert main exits non-zero without a gold_count failure.",
+    "severity": "major",
+    "title": "Multi-part entity gold values remain unchecked"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The round-2 single-list defect is fixed: row-returning list golds now compare first-column entities and have same-cardinality mutation coverage. However, the validator still leaves the analogous multi-part entity gold unchecked. th03 has dict-of-lists gold_keys and two row-returning SELECTs, but the dict-select branch compares only each part's row count. Thus either part may return an entirely wrong same-cardinality entity set and pass, contradicting the README/module claim that every row-returning entity gold is value-checked. The hermetic fake supplies real th03 keys but has no mutation test for them, so it does not expose the escape. Progress is regressing under the required scale because this is a newly identified major finding, although the prior finding itself was corrected.",
+  "verdict": "request_changes"
+ }
+}
