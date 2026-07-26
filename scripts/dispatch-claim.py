@@ -7,15 +7,20 @@
 import argparse
 import base64
 from collections import Counter
+import contextlib
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
 import re
 import subprocess
+import types
 import sys
+import urllib.parse
 import tempfile
+import textwrap
 import time
 import tomllib
 
@@ -23,8 +28,10 @@ import tomllib
 # v2 adds top-level `review_items` (the cross-provider review/fix loop) and a per-item `deferred`
 # flag (the deferred-retry path). v3 adds the zero-manual repair surface: review-item states
 # `needs-ci-fix` (red ci-summary gate on the current head) and `needs-rebase` (conflicting base)
-# with an advisory `context` field, the `stranded` escalation state ({drafted, unarmed, reviewed
-# head, green gate} has no other autonomous exit — CLAIM hands it loudly to a human), plus
+# with an advisory `context` field, the `stranded` recovery state ({drafted, unarmed, reviewed
+# head, green gate} is the residue of an interrupted defuse/disarm — CLAIM re-reviews the head
+# under the round budget, escalating to a human only after repeated failed recovery; issue #161),
+# plus
 # top-level `disarm_items` (armed-SHA-mismatch safety invariant, registry issue #42). Both
 # validators — this one and the dispatch.yml PLAN inline check — are bumped in the same commit;
 # the TARGET repo's dispatch-plan.py is untouched.
@@ -86,15 +93,100 @@ SNAPSHOT_SKIP_REASONS = {
 }
 # needs-ci-fix / needs-rebase are the zero-manual repair states: same-provider fix runs (reuse
 # mode=fix) that target red full-matrix CI legs / a conflicting base instead of review findings.
-# stranded is the loud terminal escalation for {drafted, unarmed, reviewed-sha == head, green
-# gate}: nothing else re-admits that posture (no re-review without a head advance, no ci-fix
-# without a red gate), so CLAIM re-derives it live and applies the needs-user hand-off.
+# stranded is the recovery state for {drafted, unarmed, reviewed-sha == head, green gate} — the
+# residue of an interrupted defuse/disarm that no other state re-admits (no re-review without a
+# head advance, no ci-fix without a red gate). CLAIM re-derives it live and RE-REVIEWS the head
+# under the bounded round budget, handing it to a human only after repeated failed recovery
+# (issue #161).
 REVIEW_STATES = {"needs-review", "needs-fix", "needs-ci-fix", "needs-rebase", "stranded"}
 FIX_KIND_OF_STATE = {"needs-fix": "verdict", "needs-ci-fix": "ci", "needs-rebase": "rebase"}
+# Independent per-lane tick accounting (issue #108): a productive worker launch must NEVER mask a
+# failed safety disarm or a review/fix lane that planned work but launched nothing. Each lane keeps
+# its own planned/launched/deferred/error tally so the tick-health recorder can surface a stalled
+# lane (and a safety-critical disarm error) regardless of activity in the other lanes.
+DISPATCH_LANES = ("worker", "review", "fix", "disarm")
+# Task-side half of #500: two honest no-change outcomes on one issue are a routing signal, not
+# another reason to spin the same deferred route. The marker is keyed to the two newest validated
+# ledger outcomes, so the impl -> research escalation is idempotent while a LATER research-route
+# no-change can trigger the distinct needs:user escalation.
+DECLINE_ESCALATION_MIN = 2
+DECLINE_ESCALATION_MARKER = "sparq-task-decline-escalation:v1"
+# The review-loop lane owns needs-review re-reviews and the stranded recovery re-review; every
+# other REVIEW_STATE (needs-fix / needs-ci-fix / needs-rebase) is a fix-loop launch.
+REVIEW_LANE_STATES = {"needs-review", "stranded"}
+
+
+def _review_item_lane(state):
+    """The dispatch lane a review-plan item belongs to (issue #108): the review loop (needs-review
+    plus the stranded recovery) vs the fix loop (needs-fix / needs-ci-fix / needs-rebase). Used so
+    a stalled review lane is counted apart from the fix lane and from worker launches — a worker
+    launch can otherwise mark the whole tick healthy while every review item fails forever."""
+    return "review" if state in REVIEW_LANE_STATES else "fix"
+
+
+def _new_lane_counts():
+    """A fresh per-lane accumulator: {lane: Counter(planned/launched/deferred/error)} (issue #108).
+    planned is seeded up front from the plan; the worker loop and the review/fix/disarm helpers fold
+    in launched/error as each item resolves, and deferred is derived (planned-launched-error) at
+    summary time so escalations and capacity holds are neither launches nor hard errors."""
+    return {lane: Counter() for lane in DISPATCH_LANES}
+
+
+def _fix_dispatch_line(counts):
+    """One privacy-safe, per-tick fix fan-out telemetry line (issues #448/#460).
+
+    ``eligible`` means PLAN enumerated a fix-lane item.  CLAIM may still exclude it during
+    authoritative live revalidation; those items remain visible as deferred instead of making
+    the line incorrectly report zero eligible after PLAN already surfaced work.
+    """
+    counts = counts or Counter()
+    eligible = int(counts.get("eligible", 0) or 0)
+    launched = int(counts.get("launched", 0) or 0)
+    deferred = max(0, eligible - launched)
+    reasons = sorted(
+        (key[6:], int(value)) for key, value in counts.items()
+        if key.startswith("defer:") and value
+    )
+    detail = ", ".join(f"{reason}={count}" for reason, count in reasons) or "none"
+    return (f"fix-dispatch: {eligible} eligible, {launched} launched, {deferred} deferred "
+            f"(reasons: {detail})")
+
+
+def _claim_defer_category(reason):
+    """Privacy-safe review/fix claim deferral category for the shared tick histogram.
+
+    The allocator exposes its precise single-flight/capacity reason, while the public dispatch
+    summary needs only a stable coarse category.  Keep lease ownership distinct from package
+    conflict and account capacity so a planned-but-not-launched lane is never reasonless.
+    """
+    return {
+        "pr-single-flight": "lease-held",
+        "package-single-flight": "conflict",
+        "no-account-slots": "no-slot",
+        "lane-cap": "no-slot",
+    }.get(reason or "no-account-slots", "claim-deferred")
+
+
 # Human-owned PR labels: review:needs-user is the loop's own terminal escalation; needs:user is
 # groom's parked-PR marker ("Human attention required"). EITHER parks the whole autonomous
 # surface for the PR — enumeration, repair admission, and worker-pr.py disarm all stand down.
 HUMAN_HOLD_PR_LABELS = {"review:needs-user", "needs:user"}
+# The MACHINE-owned PR-side capacity park (park_policy.py; written by worker-pr needs_user
+# park_class="capacity"): a SOFT hold, not a human terminal — excluded from active review/fix
+# enumeration while it stands, but re-admitted by a human readmission gesture (an unlabel of
+# review:parked / status:parked / needs:user on either surface, latest event wins). It is
+# deliberately NOT in HUMAN_HOLD_PR_LABELS: the enumeration carve-out below re-admits it,
+# whereas a human hold is terminal for everything autonomous.
+MACHINE_PARK_PR_LABEL = "review:parked"
+# Every label under which a PR counts as PARKED for crate occupancy (the provably-inert-DRAFT
+# carve-out): the human holds plus the machine capacity park — a capacity-parked inert draft
+# frees its crate exactly like the pre-split review:needs-user park did.
+PARKED_PR_HOLD_LABELS = HUMAN_HOLD_PR_LABELS | {MACHINE_PARK_PR_LABEL}
+# CLAIM's live busy-window revalidation also sees curator's terminal artifact posture.  Keep
+# this narrower than the union above where it matters: status:blocked is an occupancy carve-out
+# only after the raw listing row proves the PR inert; it does not redefine review-loop
+# admission globally.
+CLAIM_REVALIDATION_PARK_LABELS = PARKED_PR_HOLD_LABELS | {"status:blocked"}
 IMPL_PROVIDERS = {"anthropic", "openai"}
 SAFE_REPO = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*")
 SAFE_ATOM = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
@@ -107,12 +199,19 @@ BUSY_OR_GATED = {
     "status:deferred",
     "status:in-progress",
     "status:in-progress-review",
+    "status:parked",
     "status:untriaged",
     "trust:untrusted",
 }
 # Busy/gated set for the deferred-RETRY path: status:deferred is the retry trigger, everything
-# else still gates (locked decision 20).
-DEFERRED_GATED = BUSY_OR_GATED - {"status:deferred"}
+# else still gates (locked decision 20) — EXCEPT status:parked, the MACHINE-owned capacity park
+# (park_policy.py): a parked+deferred issue stays IN the deferred-retry lane, which is its
+# readmission hook — the same lane that re-sweeps status:deferred. The park lifts exactly when
+# the allocator grants a claim (capacity exists): the `retry` label flip strips BOTH
+# status:deferred and status:parked. Until then the escalation guards below hold it parked
+# without re-commenting, and the ordinary ready lane still gates on status:parked (no NEW
+# implementation dispatch outside this readmission path).
+DEFERRED_GATED = BUSY_OR_GATED - {"status:deferred", "status:parked"}
 # Readiness re-derivation (issue #102): PLAN computes blockers/non-dispatchability with HOSTILE
 # target code (dispatch-plan.py in the cloned target). CLAIM must independently re-prove the same
 # readiness predicate from LIVE registry-owned code before dispatch — an epic is a tracking
@@ -125,27 +224,69 @@ BLOCKED_BY_RE = re.compile(r"[Bb]locked-by:\s*#([0-9]+)")
 # CONTENT author's provider and is computed HERE, never through policy-resolve.resolve() (whose
 # role=review row is always [opus]); resolve() supplies account_pool/caps/gate/arm only.
 # Model policy (maintainer directive 2026-07-18): sol — the codex-side frontier model — is THE
-# reviewer of anthropic-authored content (luna is its fallback); opus stays lead reviewer of
-# openai-authored content (proven verdict quality + the security-surface doctrine). terra and
+# reviewer of anthropic-authored content (luna is its fallback); opus5 (Opus 5, maintainer
+# directive 2026-07-24) takes the primary reviewer slot for openai-authored content that opus
+# held, with opus/fable retained as TAIL FALLBACKS only — a degradation path so an opus5
+# capacity outage parks work gracefully instead of stalling the chain. terra and
 # sonnet are DOCS-ONLY models and must NEVER appear in a review/fix chain (asserted in
 # _self_test; review-fix.yml + worker-pr.py ESCALATION_LADDERS enforce the same).
-REVIEW_CHAIN = {"anthropic": ["sol", "luna"], "openai": ["opus", "fable"]}
+REVIEW_CHAIN = {"anthropic": ["sol", "luna"], "openai": ["opus5", "opus", "fable"]}
 # FIX_CHAIN is the UNPINNED allocator PREFERENCE walk (strongest tier FIRST — choose_account
-# takes the first serving account, and the frontier tier leads per the sol-first doctrine).
+# takes the first serving account, and the frontier tier leads per the sol-first doctrine;
+# opus5 leads the anthropic walk since 2026-07-24, fable/opus as tail fallbacks).
 # It is deliberately the REVERSE of worker_pr.ESCALATION_LADDERS, which are capability-
-# ASCENDING (weakest first, terminal strongest LAST; opus < luna < fable < sol) and govern
+# ASCENDING (weakest first, terminal strongest LAST; opus < luna < fable < opus5 < sol —
+# opus5 is the top ANTHROPIC tier per the 2026-07-24 directive; sol keeps the global frontier
+# slot, cross-provider order unchanged) and govern
 # exhaustion escalation + pinned floors (sol r2 f2 fixed the previously inverted ladders).
-FIX_CHAIN = {"anthropic": ["fable", "opus"], "openai": ["sol", "luna"]}
-# Static per-prefix lease caps (locked decision 9, caps re-raised per maintainer direction
-# 2026-07-17: codex rate limits are far from binding and 10+ parallel agents are fine; the
-# earlier 2->10 raise was lost in the review-loop deploy rebase). The `select-and-claim` CLI
-# path does not usage-gate; codex accounts are usage-EXEMPT, so this shared `review:` prefix
-# cap IS the codex slot bound, and `fix:` bounds concurrent same-provider fix agents.
-REVIEW_MAX_CONCURRENT = 10
-FIX_MAX_CONCURRENT = 8
-REVIEW_TTL = 1200   # short — a crashed reviewer must free the scarce codex slot fast
-FIX_TTL = 3600      # a fix runs the crate gate (cargo), which can be slow
+FIX_CHAIN = {"anthropic": ["opus5", "fable", "opus"], "openai": ["sol", "luna"]}
+# Probe-exempt PROVIDERS for the require_usage hold (issue #115). Mirrors account-usage.py's
+# EXEMPT_PROVIDERS allowlist (the maintainer decision names openai): codex/openai accounts report
+# no rate-limit-header usage and are governed by reactive backoff, so a usage=None probe outage is
+# their EXPECTED steady state, not a failure. Kept as an explicit allowlist, never "any non-
+# anthropic": a missing/typo provider stays on the fail-closed hold path (never silently exempted).
+PROBE_EXEMPT_PROVIDERS = frozenset({"openai"})
+# Issue #448: dispatch fan-out is bounded by the allocator's LIVE remaining account slots, not a
+# second, coarse `review:`/`fix:` lease-row constant.  The old fleet-wide 10/8 caps mixed repos and
+# providers: unrelated work could leave (for example) every sol slot idle while consuming the
+# shared prefix ceiling.  Each item still obtains its own CAS lease; per-account caps and the
+# repository/package/PR single-flight predicates remain the authoritative safety bounds.
+# Lease TTL must OUTLIVE the owning review-fix.yml workflow's worst-case wall-clock, or the
+# allocator reclaims a still-live account and two sessions race on one credential / write-back
+# (issue #159). A DISPATCHER-claimed lease (adopted by review-fix.yml's `claim` job) is created
+# BEFORE the workflow's resolve/claim/run jobs run, so the bound is every job timeout on the
+# claim -> run -> release critical path PLUS GitHub runner queue slack between jobs — NOT the run
+# job alone. The pre-#159 1200/3600 were the run-job timeout itself (25m/60m), so a lease expired
+# mid-run and the account was reclaimed while the original session was still live. Keep these job
+# bounds in sync with .github/workflows/review-fix.yml `timeout-minutes:` (the _self_test pins the
+# derivation so a silent cut below the run bound flips red).
+_WF_RESOLVE_TIMEOUT = 600    # review-fix.yml resolve job (10m)
+_WF_CLAIM_TIMEOUT = 600      # review-fix.yml claim/adopt job (10m)
+_WF_RELEASE_TIMEOUT = 600    # review-fix.yml release job — the job that frees the lease (10m)
+_WF_RUN_TIMEOUT = {"review": 1500, "fix": 3600}  # run job, per mode (25m / 60m)
+# Slack for runner queue time (the dispatch queue plus inter-job handoffs); a lease must NEVER
+# expire while its workflow can still be scheduling or running the credential-using `run` job.
+_WF_QUEUE_SLACK = 900        # 15m
+
+
+def _lease_ttl(mode):
+    """The minimum lease TTL that outlives the owning review-fix.yml workflow's worst-case
+    wall-clock (issue #159): every job timeout on the claim -> run -> release critical path plus
+    queue slack, measured from the DISPATCHER claim (before resolve runs — the longest path).
+    Fail-closed: an unknown mode takes the longest (fix) run bound, never a shorter one, so a
+    typo can only over-hold an account, never free a live one early."""
+    run = _WF_RUN_TIMEOUT.get(mode, _WF_RUN_TIMEOUT["fix"])
+    return (_WF_RESOLVE_TIMEOUT + _WF_CLAIM_TIMEOUT + run
+            + _WF_RELEASE_TIMEOUT + _WF_QUEUE_SLACK)
+
+
+REVIEW_TTL = _lease_ttl("review")   # 10+10+25+10+15 = 70m (was 20m — shorter than the 25m run job)
+FIX_TTL = _lease_ttl("fix")         # 10+10+60+10+15 = 105m (was 60m — exactly the run job, no slack)
 MISSED_FIX_LIMIT = 6  # consecutive missed fix dispatches per round before needs-user (decision 13)
+# "not probed yet" sentinel for the per-PR readmission-cutoff memo (#555 recurrence gap): the
+# cutoff's own falsy value (None = no proven human gesture) is a MEANINGFUL result, so it cannot
+# double as the not-yet-read marker.
+_UNPROBED = object()
 HEAD_REF_RE = re.compile(r"^sparq-agent/issue-([1-9][0-9]*)-")
 # Mirrors worker-pr.py REVIEWED_SHA_RE (the marker is written there; keep formats in sync).
 REVIEWED_SHA_RE = re.compile(r"<!-- sparq-reviewed-sha:([0-9a-f]{40}|none) -->")
@@ -154,9 +295,32 @@ SECURITY_KEYWORDS = ("zk", "mpc", "crypto", "auth", "e2ee")
 # CONCLUDED failure of THIS check on the CURRENT head enumerates a ci-fix; in-progress = no churn.
 CI_GATE_CHECK = "gate"
 FAILED_CONCLUSIONS = {"failure", "timed_out"}
+# A gate check-run that COMPLETED with any of these did not pass and did not cleanly fail: the
+# run was cancelled, never started, went stale, or needs a human (issue #160). None of these is
+# green and none is silently deferrable — required checks in these states will NOT merge, so each
+# must take the SAME ci-fix rerun/escalation path as a hard failure rather than collapse to
+# success. Previously only FAILED_CONCLUSIONS mapped to gate=failure and EVERY other completed
+# conclusion (cancelled/action_required/startup_failure/stale/neutral/skipped) fell through to
+# success — suppressing repair while looking merge-ready. These are the GitHub check-run
+# conclusions outside {success} ∪ FAILED_CONCLUSIONS; an UNRECOGNISED conclusion (None / hostile
+# garbage on a "completed" run) is deliberately NOT here — it degrades to gate=unknown (no ACT).
+BROKEN_CONCLUSIONS = {"cancelled", "action_required", "startup_failure", "stale",
+                      "neutral", "skipped"}
 GLOBAL_PACKAGE = "__global__"   # mirrors the target ready-engine's serializing partition
 CI_CONTEXT_MAX = 1000           # advisory failing-leg context cap (plan field + workflow input)
 MAX_FAILING_LEGS = 20
+
+
+def plan_package(areas):
+    """The single conflict partition a plan/lease row reserves for a collection of `area:*`
+    sections (registry issue #112). EXACTLY one area -> that area; ZERO OR MULTIPLE -> the
+    serializing global partition. Mirrors dispatch-plan.py:_plan_package byte-for-byte so the
+    anti-tamper package/label agreement in _route_matches holds: the old
+    alphabetically-first reduction dropped every secondary area, so a multi-area issue/PR
+    leased or dispatched onto a crate a second area already held. Fail-closed — over-serialize
+    a multi-area row rather than free a busy sibling crate."""
+    uniq = {a for a in areas if isinstance(a, str) and a}
+    return next(iter(uniq)) if len(uniq) == 1 else GLOBAL_PACKAGE
 
 
 class DispatchError(RuntimeError):
@@ -170,6 +334,21 @@ def _load_module(name, path):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+# Shared park-label policy (park_policy.py): the round-budget human-readmission window
+# (readmission_cutoff) consumed by the CLAIM review loop. Loaded at module scope, same idiom as
+# groom.py, so the per-item review sweep never re-imports it.
+_park_policy = _load_module(
+    "registry_park_policy", Path(__file__).resolve().with_name("park_policy.py"))
+
+# Shared bounded-retry mechanics for IDEMPOTENT gh reads (registry #563 adoption item 4;
+# sparq#3759 / #558 transient-red class). READ paths ONLY: _gh_json and _run_gh_target_api GETs.
+# The ledger CAS writers, `gh workflow run` dispatch realizations, label flips, and comment posts
+# keep their deliberate fail-loud single-attempt semantics (#558's own design) — a replayed
+# mutation could double-dispatch a worker, which is exactly incident #559's storm class.
+_gh_retry = _load_module(
+    "registry_gh_retry", Path(__file__).resolve().with_name("gh_retry.py"))
 
 
 def _require_exact_fields(value, fields, where):
@@ -485,10 +664,22 @@ def _sanitize_leg(name):
     return re.sub(r"[^ -~]", "?", str(name))[:120].strip()
 
 
-def interpret_check_runs(check_runs):
+# The rank instant for a check-run whose started_at cannot be parsed (round-6 finding 1):
+# the oldest representable aware instant, so unparseable data never beats a parseable stamp.
+_CHECK_RUN_EPOCH = _park_policy.parse_ts("0001-01-01T00:00:00Z")
+
+
+def interpret_check_runs(check_runs, log=print):
     """PURE interpreter for a commit's check-runs listing (hostile-tolerant: malformed input
-    degrades to gate=unknown, never a crash and never an ACT). Re-runs of the same check name are
-    superseded by the latest `started_at`. Returns {"gate", "failing_legs"} where gate is one of
+    degrades to gate=unknown, never a crash and never an ACT). Re-runs of the same check name
+    are superseded by the latest `started_at`, ordered by PARSED INSTANT
+    (park_policy.parse_ts — round-6 finding 1: the old raw-string compare read an older
+    failed gate "2026-07-23T09:00:00Z" as newer than a successful rerun spelled
+    "2026-07-23 10:00:00Z" — the space sorts before "T" — retaining the stale failure, so
+    the needs-ci-fix admission dispatched a fixer against a green head). A run with a
+    malformed/unparseable `started_at` ranks OLDEST with a loud log — unparseable data can
+    never supersede a parseable stamp (two unparseable stamps keep the old last-listed-wins
+    tie rule). Returns {"gate", "failing_legs"} where gate is one of
     failure|pending|success|missing|unknown — ONLY a concluded `failure` ever admits a ci-fix
     (an in-progress gate is deliberately not enumerated: no churn)."""
     if not isinstance(check_runs, list):
@@ -500,7 +691,16 @@ def interpret_check_runs(check_runs):
         name = run.get("name")
         if not isinstance(name, str) or not name:
             continue
-        started = str(run.get("started_at") or "")
+        started_raw = run.get("started_at")
+        try:
+            # Rank tuples order parseable (1, instant) strictly above every unparseable
+            # (0, epoch) entry, so hostile/garbage stamps can only LOSE to real ones.
+            started = (1, _park_policy.parse_ts(started_raw))
+        except ValueError:
+            started = (0, _CHECK_RUN_EPOCH)
+            log(f"::warning::check-run {_sanitize_leg(name)!r} carries an unparseable "
+                f"started_at {str(started_raw)[:64]!r} — ranked OLDEST (an unparseable "
+                "stamp never supersedes a parseable rerun)")
         prior = latest.get(name)
         if prior is None or started >= prior[0]:
             latest[name] = (started, run)
@@ -509,10 +709,23 @@ def interpret_check_runs(check_runs):
         gate = "missing"
     elif gate_entry[1].get("status") != "completed":
         gate = "pending"
-    elif gate_entry[1].get("conclusion") in FAILED_CONCLUSIONS:
-        gate = "failure"
     else:
-        gate = "success"
+        # ONLY the literal `success` conclusion is green (issue #160). A hard/transient failure
+        # OR a broken/incomplete run (cancelled, action_required, startup_failure, stale,
+        # neutral, skipped) is a concluded non-pass that takes the ci-fix rerun/escalation path.
+        # Anything unrecognised (None or hostile garbage on a "completed" run) degrades to
+        # unknown so a poisoned snapshot can only DEFER, never spuriously repair or go green.
+        # isinstance BEFORE each set membership: an unhashable JSON value ([] / {}) as the
+        # conclusion would TypeError the `in` lookup — a hostile snapshot must degrade to
+        # unknown, never crash (mirrors the plan-validation guard above).
+        conclusion = gate_entry[1].get("conclusion")
+        if conclusion == "success":
+            gate = "success"
+        elif isinstance(conclusion, str) and (conclusion in FAILED_CONCLUSIONS
+                                              or conclusion in BROKEN_CONCLUSIONS):
+            gate = "failure"
+        else:
+            gate = "unknown"
     failing = sorted({
         _sanitize_leg(name) for name, (_started, run) in latest.items()
         if name != CI_GATE_CHECK and run.get("status") == "completed"
@@ -540,7 +753,7 @@ def pr_ci_status(record):
         # unarmed, and ANY other shape (a garbage string in a hostile/degraded snapshot) is
         # UNKNOWN (None). The old isinstance() read collapsed garbage to False = unarmed —
         # fail OPEN: the busy-partition carve-out would free a crate whose latch state was
-        # unprovable. Unknown never frees (_pull_provably_inactive requires armed exactly
+        # unprovable. Unknown never frees (_pull_inactivity_decision requires armed exactly
         # False) and never proves the stranded posture.
         # [round-6 P2] ABSENCE != NULL: the bit is derived ONLY from a PRESENT auto_merge
         # field (plan-snapshot preserves field presence). A record that never carried the
@@ -685,14 +898,30 @@ def enumerate_disarm_items(repo, pulls, pr_status, provenance, bot_login=""):
     return items
 
 
-def _pull_provably_inactive(pull, status):
-    """True iff a HUMAN-PARKED worker PR provably cannot reach main on its own — the busy-
-    partition carve-out guard (round-2 P1 HELD != INACTIVE; DRAFTS ONLY since round 3;
-    COHERENT-DETAIL-CONFIRMED since round 4). Provably inactive means exactly one thing:
-    a DRAFT with no latched arm visible anywhere, CONFIRMED by a coherent newer read.
-    Draft is the loop's own defused state — the disarm path converts to draft, and GitHub
-    cancels/refuses auto-merge on drafts — and the measured frontier-collapse population
-    is exactly parked drafts (26/27 open sparq worker PRs, 2026-07-18).
+_NO_PR_DETAIL = object()
+
+
+def _pull_inactivity_decision(pull, status=_NO_PR_DETAIL):
+    """The reason-bearing #516 parked-free gate used by PLAN and CLAIM occupancy.
+
+    Returns ``(inactive, reason)``.  A post-#517 LISTING row is coherent by itself only when
+    ``draft`` is the literal boolean True and the ``auto_merge`` KEY IS PRESENT with the literal
+    value None.  If a per-PR DETAIL record exists, that newer split-snapshot read remains
+    authoritative and must itself prove the same unlatched draft posture on the listing head.
+    Any absent field required by the selected proof, malformed value, latch, non-draft bit, or
+    head disagreement fails closed to BUSY, with a stable reason that the assembler can print for
+    the row it drops. A coherent DETAIL may still prove a pre-#517 listing that lacks auto_merge.
+
+    Provably inactive means exactly one thing: a DRAFT with no latched arm visible in the
+    authoritative read.  The reasoned result is deliberately shared rather than reconstructed
+    at the logging call site: diagnostics must describe the gate decision that actually reserved
+    the crate.
+
+    This is the busy-partition carve-out guard (round-2 P1 HELD != INACTIVE; DRAFTS ONLY
+    since round 3; split-snapshot coherent since round 4). Draft is the loop's own defused state —
+    the disarm path converts to draft, GitHub cancels/refuses auto-merge on drafts, and the
+    measured frontier-collapse population is exactly parked drafts (26/27 open sparq worker PRs,
+    2026-07-18).
 
     [round-4 P1] SPLIT-SNAPSHOT RACE: the PLAN snapshot lists pulls BEFORE fetching the
     per-PR details, so the detail record (`status`, from pr_ci_status) is the NEWER of
@@ -702,33 +931,60 @@ def _pull_provably_inactive(pull, status):
     its crate while the PR could merge. The carve-out therefore frees ONLY when the
     NEWER read coherently CONFIRMS the defused draft state:
       - listing `draft` is True (non-draft/unknown never frees, unchanged), AND
-      - no latch signal anywhere: no `auto_merge` dict on a raw-REST row (defense in
-        depth; the PLAN projection drops the field) and the detail's armed bit is
-        exactly False (True is a crashed-disarm artifact; a missing bit is unknown), AND
+      - the detail's armed bit is exactly False (True is a crashed-disarm artifact; a
+        missing bit is unknown), AND
       - the detail record EXISTS and its head_sha equals the listing head (a head that
         moved between the reads means the listing row is stale — unprovable), AND
       - the detail's OWN `draft` bit is True (the pulls/N REST detail carries `draft`;
         a record without the field — the pre-round-4 snapshot shape — proves nothing).
-    Missing detail, head mismatch, or detail draft absent/False all read ACTIVE (busy,
-    fail closed): a pre-detail snapshot skip or census overflow now RESERVES a parked
-    draft's crate for that tick instead of freeing on one stale listing bit."""
-    if pull.get("draft") is not True:
-        return False                      # non-draft/unknown: never provably inactive
-    if isinstance(pull.get("auto_merge"), dict):
-        return False                      # latched arm on a raw-REST row — it may merge
+    When DETAIL is absent, a complete post-#517 listing row supplies the same coherence proof in
+    one atomic REST row.  A pre-#517 row with no ``auto_merge`` key still reserves its crate:
+    ABSENCE != NULL."""
+    listing_draft = pull.get("draft")
+    if listing_draft is False:
+        return False, "non-draft"
+    if listing_draft is not True:
+        return False, "malformed-draft"
+    head = pull.get("head")
+    head_sha = str(head.get("sha", "")) if isinstance(head, dict) else ""
+    if not SAFE_SHA.fullmatch(head_sha):
+        return False, "malformed-head"
+    if ("auto_merge" in pull and pull["auto_merge"] is not None
+            and not isinstance(pull["auto_merge"], dict)):
+        return False, "malformed-auto-merge"
+
+    if status is _NO_PR_DETAIL:
+        if "auto_merge" not in pull:
+            return False, "no-detail"    # legacy row cannot supply listing-only coherence
+        listing_arm = pull["auto_merge"]
+        if isinstance(listing_arm, dict):
+            return False, "latched"
+        return True, "listing"
+
+    # DETAIL exists and is authoritative.  In particular, never fall back to a friendly
+    # listing row when a present detail is malformed, latched, or says the PR went ready.
     if not isinstance(status, dict):
-        return False                      # no newer detail read — unconfirmable, fail closed
-    if status.get("armed") is not False:
-        return False                      # latched (crashed disarm) or unknown arm bit
-    head_sha = str((pull.get("head") or {}).get("sha", ""))
-    if not SAFE_SHA.fullmatch(head_sha) or status.get("head_sha") != head_sha:
-        return False                      # head moved between listing and detail — incoherent
-    if status.get("draft") is not True:
-        return False                      # newer read does not CONFIRM draft (absent/False)
-    return True
+        return False, "malformed-detail"
+    armed = status.get("armed")
+    if armed is True:
+        return False, "latched"
+    if armed is not False:
+        return False, "malformed-auto-merge"
+    detail_head = status.get("head_sha")
+    if not isinstance(detail_head, str) or not SAFE_SHA.fullmatch(detail_head):
+        return False, "malformed-head"
+    if detail_head != head_sha:
+        return False, "head-mismatch"
+    detail_draft = status.get("draft")
+    if detail_draft is False:
+        return False, "non-draft"
+    if detail_draft is not True:
+        return False, "malformed-draft"
+    return True, "detail"
 
 
-def busy_packages_of_pulls(repo, pulls, issue_labels, provenance, pr_status=None):
+def busy_packages_of_pulls(repo, pulls, issue_labels, provenance, pr_status=None,
+                           parked_pr_labels=None, occupancy=None):
     """PURE busy-area union for the PLAN conflict partition (registry issue #27): every open
     same-repo `sparq-agent/*` PR that can still LAND in a crate — because the review loop
     still owns it, or because a latched/unknown arm means it may merge regardless — reserves
@@ -749,16 +1005,16 @@ def busy_packages_of_pulls(repo, pulls, issue_labels, provenance, pr_status=None
     which still emits that PR as `__global__`.
 
     HELD != INACTIVE (round-2 P1 on the 2026-07-18 frontier collapse, DRAFTS-ONLY since
-    round 3, coherent-detail-confirmed since round 4): a human-parked PR —
+    round 3, listing-or-newer-detail coherent since #519): a human-parked PR —
     `review:needs-user`/`needs:user` on the PR, or `needs:*` on the provenance-linked
     source issue — frees its packages ONLY when it is a provably-inert DRAFT
-    (_pull_provably_inactive: draft with no visible latch, CONFIRMED by a head-matched
-    newer detail record whose own draft bit is True — a stale listing bit alone frees
-    nothing after the round-4 split-snapshot race). EVERY parked NON-draft stays BUSY
+    (_pull_inactivity_decision: draft with no visible latch, CONFIRMED either by the
+    post-#517 listing's present explicit-null auto_merge field or by a head-matched newer
+    detail record whose own draft bit is True). EVERY parked NON-draft stays BUSY
     unconditionally: groom parks stale non-draft PRs WITHOUT disarming, and non-draft
-    queue/arm state is not provable from the REST snapshot (the PLAN projection carries no
-    auto_merge field, and merge-queue membership is GraphQL-only per worker-pr.py's own
-    doctrine — a directly-queued PR shows no REST latch), so an unprovable park could merge
+    queue/arm state is not provable from an explicit-null REST latch alone because merge-queue
+    membership is GraphQL-only per worker-pr.py's own doctrine — a directly-queued PR shows no
+    REST latch — so an unprovable park could merge
     mid-air into a crate this partition just freed for a sibling. The measured collapse
     (26 of 27 open sparq worker PRs source-parked, ~1 plan item/tick against a 13-row
     frontier, dispatch runs 29664401328/29665207000) is still fixed: the collapse
@@ -766,6 +1022,8 @@ def busy_packages_of_pulls(repo, pulls, issue_labels, provenance, pr_status=None
     `needs:*`-gated out of the target ready engine, so freeing an inert PR's crate can
     never re-dispatch the parked issue — only siblings in the same crate."""
     busy = set()
+    hold_labels = (PARKED_PR_HOLD_LABELS if parked_pr_labels is None
+                   else set(parked_pr_labels))
     for pull in pulls:
         if not isinstance(pull, dict) or pull.get("state") != "open":
             continue
@@ -781,7 +1039,7 @@ def busy_packages_of_pulls(repo, pulls, issue_labels, provenance, pr_status=None
         }
         areas = {label[5:] for label in pr_labels
                  if isinstance(label, str) and label.startswith("area:")}
-        parked = bool(pr_labels & HUMAN_HOLD_PR_LABELS)
+        parked = bool(pr_labels & hold_labels)
         record = provenance.get(number) if isinstance(provenance, dict) else None
         if is_enumerable_provenance(record, number):
             source = (issue_labels.get(record["issue"])
@@ -798,9 +1056,16 @@ def busy_packages_of_pulls(repo, pulls, issue_labels, provenance, pr_status=None
                                            # emits this PR as `__global__` — mirror it
         else:
             areas |= {GLOBAL_PACKAGE}      # missing/invalid linkage — fail closed
-        status = pr_status.get(number) if isinstance(pr_status, dict) else None
-        if parked and _pull_provably_inactive(pull, status):
+        status = (pr_status[number]
+                  if isinstance(pr_status, dict) and number in pr_status else _NO_PR_DETAIL)
+        inactive, reason = _pull_inactivity_decision(pull, status)
+        if parked and inactive:
+            if isinstance(occupancy, list):
+                occupancy.append(("parked-free", number, frozenset(areas), reason))
             continue                      # provably inert human-parked PR — frees its crates
+        if isinstance(occupancy, list):
+            occupancy.append(("busy", number, frozenset(areas),
+                              reason if parked else "not-parked"))
         busy |= areas
     return busy
 
@@ -823,11 +1088,21 @@ def filter_busy_area_items(items, repo, pulls, issue_labels, provenance, pr_stat
     impl worker into that crate would put two lanes on one crate the moment the park lifts.
     `leases=None` (no ledger view supplied) fails toward exclusion, mirroring
     sibling_lease_conflict's ambiguity rule — callers must pass the real ledger list."""
-    busy = busy_packages_of_pulls(repo, pulls, issue_labels, provenance, pr_status)
+    occupancy = []
+    busy = busy_packages_of_pulls(
+        repo, pulls, issue_labels, provenance, pr_status, occupancy=occupancy)
     kept = []
     for item in items:
         package = item.get("package")
         if busy and (GLOBAL_PACKAGE in busy or package == GLOBAL_PACKAGE or package in busy):
+            blocker = next(
+                ((pr_number, reason)
+                 for decision, pr_number, packages, reason in occupancy
+                 if decision == "busy" and
+                 (GLOBAL_PACKAGE in packages or package == GLOBAL_PACKAGE or package in packages)),
+                ("unknown", "unknown"))
+            print(f"assembler defer #{item.get('number')}: crate {package} busy via "
+                  f"pr#{blocker[0]} [{blocker[1]}]")
             continue
         if sibling_lease_conflict(
                 repo, {f"{repo}#{item.get('number')}"},
@@ -845,7 +1120,7 @@ def live_pull_detail_stub(pull):
     the CLAIM-side busy revalidation. Unlike the PLAN snapshot's split listing->detail
     pair, a raw `/pulls?state=open` row carries head + draft + auto_merge in ONE
     response, so the row is its own head-matched "newer detail" for
-    _pull_provably_inactive — synthesizing the status from the same row encodes exactly
+    _pull_inactivity_decision — synthesizing the status from the same row encodes exactly
     that atomicity, and keeps the one strict coherence contract in one place instead of
     a key-presence side channel. Returns None (no status -> the carve-out fails closed
     to BUSY) when the row does not carry the full latch+draft surface or a well-formed
@@ -874,9 +1149,13 @@ def revalidate_items_against_live_pulls(items, repo, pull_pages, issue_labels, p
     worker PR) inside the PLAN->CLAIM window could get a sibling dispatched into a crate
     it can still merge into. Recomputes the SAME filter_busy_area_items partition over
     the live raw rows — same linkage (provenance), same hold surfaces (issue labels),
-    with each row serving as its own coherent detail via live_pull_detail_stub — and
-    returns the set of item numbers still dispatchable; the caller DEFERS the rest to
-    the next tick (the fail-closed direction: a busy re-read never launches).
+    with each row serving as its own coherent detail via live_pull_detail_stub. A raw row
+    carrying needs:user, review:needs-user, or status:blocked is ignored ONLY when that
+    same row proves a draft with an explicitly absent latch through
+    _pull_inactivity_decision; non-draft, latched, partial, and malformed rows stay busy.
+    Returns the set of item numbers still dispatchable; the caller DEFERS the rest to the
+    next tick (the fail-closed direction: a busy re-read never launches). Every parked-free
+    decision and every deferred item names its live blocking artifact in the claim log.
     [round-5 P1] `leases`/`now` feed the cross-lane lease partition inside
     filter_busy_area_items (the CLAIM caller reads the ledger-branch checkout);
     leases=None fails toward exclusion."""
@@ -891,9 +1170,35 @@ def revalidate_items_against_live_pulls(items, repo, pull_pages, issue_labels, p
             stub = live_pull_detail_stub(row)
             if stub is not None:
                 live_status[number] = stub
-    kept = filter_busy_area_items(items, repo, rows, issue_labels, provenance, live_status,
-                                  leases, now)
-    return {item["number"] for item in kept}
+    occupancy = []
+    busy = busy_packages_of_pulls(
+        repo, rows, issue_labels, provenance, live_status,
+        parked_pr_labels=CLAIM_REVALIDATION_PARK_LABELS, occupancy=occupancy)
+
+    for decision, pr_number, packages, _reason in occupancy:
+        if decision == "parked-free":
+            for package in sorted(packages):
+                print(f"claim-revalidation free: crate {package} freed via parked pr#{pr_number}")
+
+    dispatchable = set()
+    for item in items:
+        number = item["number"]
+        package = item.get("package")
+        if busy and (GLOBAL_PACKAGE in busy or package == GLOBAL_PACKAGE or package in busy):
+            blocker = next(
+                (pr_number for decision, pr_number, packages, _reason in occupancy
+                 if decision == "busy" and
+                 (GLOBAL_PACKAGE in packages or package == GLOBAL_PACKAGE or package in packages)),
+                "unknown")
+            print(f"claim-revalidation defer #{number}: crate {package} busy via pr#{blocker}")
+            continue
+        if sibling_lease_conflict(
+                repo, {f"{repo}#{number}"},
+                {package} if isinstance(package, str) else set(), leases, now):
+            print(f"claim-revalidation defer #{number}: crate {package} busy via sibling lease")
+            continue
+        dispatchable.add(number)
+    return dispatchable
 
 
 def _live_issue_labels(repo):
@@ -1030,7 +1335,7 @@ def is_enumerable_provenance(record, pr_number):
 
 
 def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, bot_login="",
-                           pr_status=None):
+                           pr_status=None, exclusions=None):
     """PURE review_items enumerator (called by the dispatch.yml PLAN step against its own data;
     unit-tested by --self-test). Fail-closed trust posture (locked decisions 1/3/11/13/19):
     - only open PRs whose head branch matches the worker pattern,
@@ -1048,8 +1353,9 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
       never landed) converges to a loud human hand-off instead of silently stalling,
     - a PR with a LIVE review/fix lease is not re-emitted (the reconciler re-emits a
       review:changes PR with NO live fix lease, so a crashed fix converges),
-    - a needs-review PR whose head equals its reviewed-sha marker is skipped (no re-review
-      without a head advance; the non-empty-diff gate runs at CLAIM time).
+    - an explicit review:needs/review:changes label is a re-entry signal even on a ready PR; for
+      an unlabeled legacy fallback only, a matching reviewed-sha still suppresses re-review. The
+      non-empty-diff gate runs at CLAIM time.
 
     `pr_status` (optional, {number: pr_ci_status(...)}) admits the zero-manual repair states over
     the SAME surface — draft or not, any non-terminal review state:
@@ -1061,9 +1367,11 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
       still in progress is NOT enumerated (no churn). A status whose head_sha disagrees with the
       live listing is stale and ignored (unknown never acts),
     - stranded: a DRAFTED, unarmed PR whose reviewed head has a concluded-GREEN gate on a clean
-      base — no other state can re-admit it, so CLAIM escalates it to a human (needs-user)
-      after its own live re-derivation. A READY (non-draft) unarmed PR in the same posture is
-      deliberately NOT stranded: that is the valid arm=false-policy terminal (human merges)."""
+      base — the residue of an interrupted defuse/disarm that no other state can re-admit. After
+      its own live re-derivation CLAIM RE-REVIEWS the current head (issue #161) under the bounded
+      round budget, escalating to a human (needs-user) only once that budget is spent by repeated
+      failed recovery. A READY (non-draft) unarmed PR in the same posture is deliberately NOT
+      stranded: that is the valid arm=false-policy terminal (human merges)."""
     live_keys = _live_holder_keys(leases, now)
     items = []
     for pull in pulls:
@@ -1075,38 +1383,85 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
         sha = str(head.get("sha", ""))
         head_repo = (head.get("repo") or {}).get("full_name")
         login = str((pull.get("user") or {}).get("login", ""))
+        # Issue #460 exclusion telemetry, GENERALIZED (park-policy defect 3): identify EVERY
+        # explicit review-loop signal (review:changes AND review:needs) BEFORE any trust/shape
+        # gate, then make every rejection of such a PR visible with its exact reason. The old
+        # review:changes-only telemetry let a PLAN print "0 review item(s)" while 13
+        # review:needs-labeled worker PRs sat excluded with ZERO logged exclusions (live
+        # 2026-07-18). The optional `exclusions` Counter aggregates reason->count so the PLAN
+        # caller can emit ONE fleet-wide summary line at completion.
+        # The snapshot projection emits label-name strings while direct REST fixtures carry
+        # objects, so accept exactly those two production shapes and ignore malformed entries.
+        labels = sorted({
+            name for label in (pull.get("labels") or [])
+            for name in [label.get("name") if isinstance(label, dict) else label]
+            if isinstance(name, str) and name
+        })
+        signalled = bool({"review:changes", "review:needs", MACHINE_PARK_PR_LABEL}
+                         & set(labels))
+
+        def exclude_signalled(reason):
+            if signalled:
+                identity = number if isinstance(number, int) and not isinstance(number, bool) \
+                    and number > 0 else "unknown"
+                print(f"review-enumeration: exclude {repo}#{identity}: {reason}")
+                if exclusions is not None:
+                    exclusions[reason] += 1
+
         if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
+            exclude_signalled("invalid PR number in snapshot")
             continue
         if pull.get("state") != "open":
+            exclude_signalled(f"snapshot state is {pull.get('state')!r}, not open")
             continue
         if not HEAD_REF_RE.match(ref):
+            exclude_signalled("head ref is not a worker branch")
             continue
         if head_repo != repo:
+            exclude_signalled("head repo is not the target repo")
             continue                      # fork head — attacker-controlled, never reviewed
         if not login.endswith("[bot]") or (bot_login and login != bot_login):
+            exclude_signalled("author is not the trusted App bot")
             continue
         record = provenance.get(number)
-        if not is_enumerable_provenance(record, number):
+        record_error = provenance_admission_error(record, number)
+        if record_error:
+            exclude_signalled(record_error)
             continue                      # missing/invalid registry provenance record — fail
                                           # closed by the ONE shared predicate (CLAIM,
                                           # review-fix.yml resolve, and groom's draft carve-out
                                           # apply the same one, so "enumerated here" and
                                           # "admitted there" cannot drift)
         impl_provider = record["impl_provider"]
-        labels = sorted({
-            label.get("name") if isinstance(label, dict) else label
-            for label in (pull.get("labels") or [])
-            if isinstance(label, (dict, str))
-        } - {None})
         if HUMAN_HOLD_PR_LABELS & set(labels):
+            exclude_signalled("PR carries a human-owned hold label")
             continue                      # terminal — human-owned, nothing autonomous re-enters
         if not SAFE_SHA.fullmatch(sha):
+            exclude_signalled("head SHA is missing or malformed")
             continue
         issue_number = record["issue"]    # a positive int — guaranteed by the predicate above
         source_labels = issue_labels.get(issue_number, [])
         if any(isinstance(label, str) and label.startswith("needs:") for label in source_labels):
+            exclude_signalled(f"source issue #{issue_number} carries a needs:* human hold")
             continue                      # the SOURCE issue is human-parked (groom/escalation) —
                                           # the whole PR surface is human-owned too
+        # MACHINE capacity park — ONE predicate, one proof gate (round-3 finding 2): a PR is
+        # capacity-parked iff EITHER machine label is live — review:parked on the PR OR
+        # status:parked on its source issue — and a parked PR is excluded from this pure
+        # snapshot walk outright. The old AND-predicate let a half-cleared pair (a
+        # veto-suppressed PR-side write, or a triage-side dismissal of one label) re-enter
+        # enumeration, and CLAIM's proof only triggered on the surviving review:parked label —
+        # so a label-free-but-still-parked PR dispatched with NO proof at all. Re-admission is
+        # now label-clearing + strict proof: a human clears the live machine label(s)
+        # (whichever are present), which re-enumerates the PR here, and CLAIM then re-proves
+        # the human gesture from the DURABLE receipts + label timelines (strict maintainer
+        # probe) before any budget/dispatch decision — receipts trigger that proof even when
+        # every label is already gone, so a label dismissal can never bypass it.
+        if MACHINE_PARK_PR_LABEL in labels or "status:parked" in source_labels:
+            exclude_signalled(
+                "machine capacity park stands (review:parked on the PR or status:parked "
+                "on the source issue)")
+            continue
         # [round-5 P1] CROSS-LANE SUPERSESSION: an (un)parked PR that reaches this point may
         # sit in a crate a SIBLING lease already owns — the park -> sibling-launch -> UNPARK
         # hole: the park freed the crate (busy-partition carve-out), an impl sibling claimed
@@ -1127,6 +1482,7 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
             print(f"exclude {repo}#{number}: superseded-until-sibling-resolves — a live "
                   "sibling lease (any lane) still holds this PR's package(s); it re-enters "
                   "when that lease releases or expires")
+            exclude_signalled("superseded until a live sibling package lease resolves")
             continue
         draft = pull.get("draft") is True
         status = pr_status.get(number) if isinstance(pr_status, dict) else None
@@ -1158,26 +1514,62 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
                 "state": state,
                 "impl_provider": impl_provider,
                 "repo": repo,
-                "package": areas[0] if areas else "__global__",
+                "package": plan_package(areas),
                 "security": _security_flagged(set(labels) | set(source_labels)),
                 "context": context[:CI_CONTEXT_MAX],
             })
 
-        # GAP-B: conflict repair FIRST and alone — CI on a conflicted base is noise.
+        # GAP-B: conflict repair FIRST and alone — CI on a conflicted base is noise. This is
+        # REVIEW-STATE-AGNOSTIC by design (issue #351, the #256 limbo): a review:pass PR is
+        # armable (decision 7 REVISED) but the arm can NEVER merge a conflicting base, so a
+        # pass verdict on a conflicting base is NOT a terminal arm-and-wait — it emits
+        # needs-rebase exactly like any other non-terminal state. The pass does NOT survive
+        # the rebase: the pushed merge advances the head and the fix outcome flips the PR to
+        # review:needs (see the repair dispatch below — "every pushed repair flips to
+        # review:needs"), so a verdict bound to the now-STALE base is re-verified against the
+        # merged-in code rather than auto-armed on content it never reviewed. (A no-op rebase
+        # that pushes nothing is guarded elsewhere and legitimately leaves the pass intact —
+        # nothing merged in, nothing to re-verify.)
         if status.get("conflicting") is True:
             if lease_free:
                 emit("needs-rebase")
+            else:
+                exclude_signalled("a live per-PR review/fix lease holds the conflict repair")
             continue
-        if draft:
-            if "review:changes" in labels:
-                if f"fix:{repo}#{number}" in live_keys:
-                    continue              # a fix run is live; the reconciler re-emits if it dies
-                emit("needs-fix")
-                continue
-            # review:needs, a provenance-backfilled pre-migration PR with no review:* label yet,
-            # or a crashed-disarm artifact still carrying review:pass while drafted (no valid
-            # flow leaves a DRAFT labelled review:pass, so re-review is the converging action).
+        # Explicit review labels are authoritative re-entry signals, independent of GitHub's
+        # draft bit.  An orchestrator/human adjudication can relabel a formerly human-owned READY
+        # worker PR back to review:changes/review:needs without creating a fresh round marker; the
+        # old `if draft:` wrapper made that valid transition invisible forever.  CLAIM safely
+        # redrafts a ready item while preserving this state before any model is launched.
+        if "review:changes" in labels:
+            if f"fix:{repo}#{number}" in live_keys:
+                exclude_signalled("a live per-PR fix lease already owns this PR")
+                continue                  # per-PR single-flight; re-emit after release/expiry
+            emit("needs-fix")
+            continue
+        if "review:needs" in labels:
+            # (review:parked no longer re-enters here: the one-predicate exclusion above
+            # excludes ANY live machine park label — round-3 finding 2. A readmitted PR
+            # arrives label-free and CLAIM re-proves the gesture from receipts + timelines.)
             if f"review:{repo}#{number}" in live_keys:
+                # Finding D: this exit was telemetry-silent — a labeled PR could sit here
+                # every tick while PLAN printed "0 review item(s)" with zero logged exclusions.
+                exclude_signalled("a live per-PR review lease already owns this PR")
+                continue                  # per-PR single-flight; re-emit after release/expiry
+            # Normal drafted flow still avoids re-reviewing an already-bound head so concluded
+            # red CI can fall through to needs-ci-fix. A READY explicit re-entry is different:
+            # the external transition itself requests that the PR be brought back into review.
+            if not draft or not reviewed_match:
+                emit("needs-review")
+                continue
+        if draft:
+            # A provenance-backfilled pre-migration PR with no review:* label yet, or a
+            # crashed-disarm artifact still carrying review:pass while drafted (no valid flow
+            # leaves a DRAFT labelled review:pass).  Unlike an explicit label re-entry, this
+            # fallback retains the reviewed-sha no-repeat guard.
+            if f"review:{repo}#{number}" in live_keys:
+                # Finding D: same silent residue as above — make the lease exclusion visible.
+                exclude_signalled("a live per-PR review lease already owns this PR")
                 continue
             if not reviewed_match:
                 emit("needs-review")
@@ -1197,8 +1589,16 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
             # head has a concluded-GREEN gate has no other autonomous exit (re-review requires a
             # head advance, ci-fix a red gate, rebase a conflict, arm a review outcome). It is
             # the residue of a defused arm whose repair trigger evaporated, or of a crashed
-            # disarm — CLAIM re-derives it live and hands it loudly to a human.
+            # disarm — CLAIM re-derives it live and RE-REVIEWS the current head under the bounded
+            # round budget (issue #161), escalating to a human only after repeated failed recovery.
             emit("stranded")
+        else:
+            # Finding D: the drafted already-reviewed fall-through — a labeled PR whose head is
+            # bound but whose gate is not a concluded failure and whose posture is not stranded
+            # exits here every tick. Name the residue instead of dropping it silently.
+            exclude_signalled(
+                "head already reviewed; no live repair trigger (gate not concluded-red, "
+                "posture not stranded)")
     items.sort(key=lambda item: (item["repo"], item["pr_number"]))
     return items
 
@@ -1212,8 +1612,14 @@ def filter_deferred_items(items, repo, leases, now):
     ]
 
 
-def _run_gh(args, *, check=True):
-    result = subprocess.run(["gh", *args], capture_output=True, text=True, check=False)
+def _run_gh(args, *, check=True, retry_transient=False):
+    # retry_transient is opt-in and READ-ONLY by policy: _gh_json (all idempotent `gh api` GETs)
+    # sets it; the direct `gh workflow run` dispatch realizations never do — an ambiguous replay
+    # there double-dispatches a worker (incident #559's class), so they stay single-attempt.
+    if retry_transient:
+        result = _gh_retry.run_gh(args)
+    else:
+        result = subprocess.run(["gh", *args], capture_output=True, text=True, check=False)
     if check and result.returncode != 0:
         operation = args[0] if args else "request"
         raise DispatchError(f"GitHub {operation} failed")
@@ -1221,7 +1627,10 @@ def _run_gh(args, *, check=True):
 
 
 def _gh_json(args):
-    result = _run_gh(args)
+    # Every _gh_json call site is an idempotent READ (issue/PR/compare/check-run/timeline reads),
+    # so transient 5xx/secondary-403/connection blips get gh_retry's bounded backoff instead of
+    # deferring the item or redding the sweep (registry #563 item 4).
+    result = _run_gh(args, retry_transient=True)
     try:
         return json.loads(result.stdout or "null")
     except json.JSONDecodeError as exc:
@@ -1241,16 +1650,46 @@ def _labels(issue):
     return sorted(set(result))
 
 
-def _issue_is_trusted(issue):
-    author = issue.get("user", {}).get("login") if isinstance(issue, dict) else None
-    association = str(issue.get("author_association", "")).upper() if isinstance(issue, dict) else ""
+def _issue_is_trusted(issue, trusted_bots, allow_actions_bot_issues=False):
+    """Fail-closed issue-author trust (registry issue #111). Honours the declared
+    `trust = "collaborators"` policy mode: an author is trusted iff its association is
+    OWNER/MEMBER/COLLABORATOR, OR its login is an EXACT member of `trusted_bots` — the
+    policy-controlled allowlist (policy `trusted_bots` unioned with the runtime-resolved worker App
+    `bot_login` at the call site). Issue #487 adds one narrow per-repo opt-in: when
+    `allow_actions_bot_issues` is true, ONLY the exact `github-actions[bot]` login is also trusted.
+    Fork-PR workflows receive read-only tokens and cannot create issues, so that login can author
+    an issue in one of our own repositories only through a workflow controlled by that repository.
+    A bare "[bot]" suffix is NEVER trusted: suffix-matching admitted any unrelated or compromised
+    GitHub App into the dispatch pipeline (the defect this closes)."""
+    if not isinstance(issue, dict):
+        return False
+    # A truthy non-dict `user` (string/list) must DENY, not raise AttributeError — the CLAIM loop
+    # catches only DispatchError, so an uncaught exception here would abort the whole dispatch.
+    user = issue.get("user")
+    author = user.get("login") if isinstance(user, dict) else None
+    association = str(issue.get("author_association", "")).upper()
     return (
         isinstance(author, str)
-        and (author.endswith("[bot]") or association in TRUSTED_ASSOCIATIONS)
+        and (association in TRUSTED_ASSOCIATIONS
+             or author in trusted_bots
+             or (allow_actions_bot_issues and author == "github-actions[bot]"))
     )
 
 
-def _linked_open_pr_issues(pages):
+def _linked_open_pr_issues(pages, repo):
+    """Issue numbers an OPEN pull request provably deduplicates, so dispatch skips relaunching a
+    worker for them. Fail-closed provenance (issue #110): a fork contributor's PR must NEVER
+    suppress an issue. Two admission paths, never "every open PR":
+      - a same-repository worker branch (`head.repo.full_name == repo` AND a
+        `sparq-agent/issue-N-*` head) is pipeline-owned provenance — only an actor with push
+        access to the target repo can create that branch ON the repo itself (a fork PR's head
+        lives on the fork, so its `head.repo` is the fork), so its worker-shaped branch ref AND
+        its closing keywords are admissible; and
+      - a trusted-collaborator PR (author_association OWNER/MEMBER/COLLABORATOR) — its body
+        closing keywords are admissible after that explicit author-association check, the same
+        gate `_issue_is_trusted` applies to issue authors.
+    Any OTHER open PR (a fork / CONTRIBUTOR / NONE author) contributes NOTHING: its branch text
+    and `Fixes #N` body are attacker-controlled and must not park an issue indefinitely."""
     if not isinstance(pages, list):
         raise DispatchError("target pull-request listing is malformed")
     linked = set()
@@ -1260,20 +1699,64 @@ def _linked_open_pr_issues(pages):
         for pull in page:
             if not isinstance(pull, dict):
                 raise DispatchError("target pull-request entry is malformed")
-            head = pull.get("head", {}).get("ref", "")
+            head = pull.get("head") or {}
+            ref = head.get("ref", "")
             body = pull.get("body") or ""
-            if not isinstance(head, str) or not isinstance(body, str):
+            if not isinstance(ref, str) or not isinstance(body, str):
                 raise DispatchError("target pull-request fields are malformed")
-            linked.update(int(number) for number in re.findall(
-                r"(?:^|/)issue-([1-9][0-9]*)-", head
-            ))
-            linked.update(int(number) for number in re.findall(
-                r"(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#([1-9][0-9]*)\b", body
-            ))
+            head_repo = (head.get("repo") or {}).get("full_name")
+            association = str(pull.get("author_association", "")).upper()
+            # A same-repo `sparq-agent/issue-N-*` head is App provenance; a fork head is not.
+            app_pr = head_repo == repo and HEAD_REF_RE.match(ref) is not None
+            if app_pr:
+                linked.update(int(number) for number in re.findall(
+                    r"(?:^|/)issue-([1-9][0-9]*)-", ref
+                ))
+            if app_pr or association in TRUSTED_ASSOCIATIONS:
+                linked.update(int(number) for number in re.findall(
+                    r"(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#([1-9][0-9]*)\b", body
+                ))
     return linked
 
 
-def _routing_at_plan_sha(repo, path, sha):
+def _protected_default_tip(repo):
+    """Independently resolve the target's PROTECTED default-branch tip in registry-owned CLAIM
+    code (registry issue #119). PLAN derives the plan's `target_sha` with `git rev-parse HEAD` in
+    the SAME checkout that just executed the hostile target planner, so a malicious target can
+    leave HEAD on an obsolete commit whose routing catalog is weaker or incompatible. CLAIM must
+    never let target-controlled data select the routing revision it trusts, so it re-resolves the
+    default branch (the branch-protected surface the routing file lives on) and reads its tip
+    straight from the GitHub API here. Fail-closed: an unreadable repo, a missing default branch, a
+    default branch that is not branch-protected, or a tip that is not a 40-hex sha raises
+    DispatchError, so the caller defers rather than routing off an unverifiable revision."""
+    meta = _gh_json(["api", f"repos/{repo}"])
+    branch = meta.get("default_branch") if isinstance(meta, dict) else None
+    if not isinstance(branch, str) or not branch:
+        raise DispatchError(f"cannot resolve default branch for {repo}")
+    ref = _gh_json(["api", f"repos/{repo}/branches/{branch}"])
+    # The routing catalog's trust rests on the default branch being branch-PROTECTED — that is the
+    # only reason CLAIM treats its tip as an authority a hostile target cannot rewrite. Prove it
+    # from the API response, not from the branch's name: accept only an explicit `protected is
+    # True`. Anything else (protected false, missing, or non-bool) means the surface is not the
+    # protected control surface we claim, so fail closed rather than route off an unprotected tip.
+    protected = ref.get("protected") if isinstance(ref, dict) else None
+    if protected is not True:
+        raise DispatchError(f"default branch for {repo} is not branch-protected")
+    commit = ref.get("commit") if isinstance(ref, dict) else None
+    sha = commit.get("sha") if isinstance(commit, dict) else None
+    if not isinstance(sha, str) or not SAFE_SHA.fullmatch(sha):
+        raise DispatchError(f"cannot resolve default-branch tip for {repo}")
+    return sha
+
+
+def _protected_routing(repo, path):
+    """Fetch the target's protected routing catalog from the default-branch tip CLAIM resolves
+    ITSELF (registry issue #119) — never from the plan's `target_sha`, which the hostile target
+    planner controls. This is the routing revision every downstream route/policy decision trusts,
+    so sourcing it from a target-selected commit let a malicious target dispatch its own issues
+    against an obsolete, weaker routing catalog. Fail-closed: an unresolvable protected tip, or a
+    missing/malformed routing file at that tip, raises DispatchError."""
+    sha = _protected_default_tip(repo)
     meta = _gh_json(["api", f"repos/{repo}/contents/{path}?ref={sha}"])
     if not isinstance(meta, dict) or meta.get("type") != "file":
         raise DispatchError(f"protected routing file is missing for {repo}")
@@ -1306,21 +1789,22 @@ def _open_blockers(repo, body):
     return still_open
 
 
-def _current_issue_matches(repo, item):
+def _current_issue_matches(repo, item, trusted_bots, allow_actions_bot_issues=False):
     issue = _gh_json(["api", f"repos/{repo}/issues/{item['number']}"])
     if not isinstance(issue, dict) or "pull_request" in issue or issue.get("state") != "open":
         return False, "issue is no longer an open issue"
     labels = _labels(issue)
     if labels != item["labels"]:
         return False, "issue labels changed after planning"
-    author = issue.get("user", {}).get("login")
+    user = issue.get("user")
+    author = user.get("login") if isinstance(user, dict) else None
     if author != item["author"]:
         return False, "issue author changed after planning"
     body = issue.get("body") or ""
     if not isinstance(body, str) or hashlib.sha256(body.encode()).hexdigest() != item["body_sha"]:
         return False, "issue body changed after planning"
-    if not _issue_is_trusted(issue):
-        return False, "issue is not maintainer/collaborator/bot authored"
+    if not _issue_is_trusted(issue, trusted_bots, allow_actions_bot_issues):
+        return False, "issue is not maintainer/collaborator/allowlisted-bot authored"
     # Issue #102: re-prove the readiness predicate in registry-owned CLAIM code rather than trusting
     # the hostile planner's frontier. `kind:epic` is a non-dispatchable tracking umbrella, and any
     # still-open `Blocked-by: #N` gates the row. Both legs apply on the normal AND deferred paths —
@@ -1406,33 +1890,655 @@ def _run_target_helper(script_dir, repo, script, args):
     return result
 
 
-def _pr_needs_user(script_dir, repo, pr_number, issue, reason):
-    args = ["needs-user", "--repo", repo, "--pr", str(pr_number), "--reason", reason]
+def _pr_needs_user(script_dir, repo, pr_number, issue, reason, park_class="question",
+                   bot_login="", head_sha="", attempt_key=""):
+    """Stop the loop for a PR. `park_class` picks the label PAIR (park_policy.py ownership):
+    "question" (default) -> the human-owned pair (review:needs-user on the PR, needs:user on
+    the source issue) for genuine human questions; "capacity" -> the machine-owned soft-hold
+    pair (review:parked on the PR, status:parked on the source issue) for capacity/decline/
+    budget-driven stops — veto-gated, receipted per readmission window, and escalating to the
+    question class after PARK_ESCALATION_GENERATIONS consumed windows (worker-pr needs_user
+    owns all of that; `bot_login` feeds its receipt parser's trust filter).
+
+    `head_sha` + `attempt_key` are the capacity park's ATTEMPT FINGERPRINT (#555 recurrence
+    gap; park_policy.park_fingerprint): the live head plus a MONOTONE counter of work
+    attempted. EVERY capacity park on this path supplies them, so an exhaustion re-derived
+    from unchanged per-PR state is skipped quietly instead of consuming the readmission window
+    a human just granted (the live sparq #3488 7-minute bounce). Question-class parks are
+    unconditional human holds and pass neither."""
+    args = ["needs-user", "--repo", repo, "--pr", str(pr_number), "--reason", reason,
+            "--park-class", park_class]
+    if bot_login:
+        args += ["--bot-login", bot_login]
+    if head_sha and attempt_key:
+        args += ["--head-sha", head_sha, "--attempt-key", attempt_key]
     if isinstance(issue, int) and issue > 0:
         args += ["--issue", str(issue)]
     _run_target_helper(script_dir, repo, "worker-pr.py", args)
 
 
+def _park_source_issue(script_dir, repo, number):
+    """Apply the machine-owned capacity park (worker-issue `--status parked`; that helper
+    enforces the sticky human-unpark veto at the write point — park_policy.py defect 2).
+    Returns True when the park LANDED and False when the veto suppressed it — the caller's
+    park comment must then be HONEST about the suppressed label (round-3 finding 1; the
+    receipt still lands exactly once, so a standing veto never induces comment spam)."""
+    result = _run_target_helper(script_dir, repo, "worker-issue.py", [
+        "status", "--repo", repo, "--issue", str(number), "--status", "parked"])
+    if "park suppressed" in (result.stdout or ""):
+        print(f"park suppressed for {repo}#{number}: sticky human unpark (or unreadable "
+              "timeline) — no park label was written this tick")
+        return False
+    return True
+
+
+def _issue_needs_user_landed(script_dir, repo, number):
+    """Apply the terminal question park (worker-issue `--status needs-user`; that helper
+    enforces the sticky human-unpark veto at the write point). Returns True when the label
+    pair LANDED and False when the veto suppressed it — the caller's terminal comment must
+    then say so (round-3 finding 1: the escalation is terminal in the durable receipts, but
+    NO label was applied — never claim a label that did not land)."""
+    result = _run_target_helper(script_dir, repo, "worker-issue.py", [
+        "status", "--repo", repo, "--issue", str(number), "--status", "needs-user"])
+    if "park suppressed" in (result.stdout or ""):
+        print(f"terminal needs:user suppressed for {repo}#{number}: sticky human unpark — "
+              "the escalation is recorded in the receipts without a label")
+        return False
+    return True
+
+
 def _run_gh_target_comment(repo, issue_or_pr, body):
+    _run_gh_target_api(
+        repo, "POST", f"repos/{repo}/issues/{issue_or_pr}/comments", {"body": body})
+
+
+def capacity_park_proof_required(labels, park_receipts):
+    """True when the CLAIM sweep must re-prove a human readmission gesture before touching a
+    worker PR: EITHER the live review:parked label OR any durable park-generation receipt
+    triggers the ONE proof gate (round-3 finding 2; round-4 finding 2). The receipt leg is
+    load-bearing for the crash window: park writers post the receipt BEFORE any label write
+    (RECEIPT-FIRST), so a crash mid-park leaves receipt-no-label — this predicate still
+    demands the proof, and a triage-side label removal can re-enumerate the PR but never
+    strip the park. Label-no-receipt is impossible by the writers' ordering."""
+    return MACHINE_PARK_PR_LABEL in labels or bool(park_receipts)
+
+
+def _run_gh_target_api(repo, method, path, input_doc=None):
+    """One target-owner issue mutation in the same token-isolated API style as every existing
+    dispatch-side target write. The registry token is never used as a fallback for another
+    owner's issue mutation."""
     token = _target_token(repo)
     if not token:
         raise DispatchError("target-scoped App token is unavailable")
-    result = subprocess.run(
-        ["gh", "api", "-X", "POST", f"repos/{repo}/issues/{issue_or_pr}/comments", "--input", "-"],
-        input=json.dumps({"body": body}), capture_output=True, text=True, check=False,
-        env={**os.environ, "GH_TOKEN": token},
-    )
+    args = ["api", "-X", method, path]
+    if input_doc is not None:
+        args += ["--input", "-"]
+    env = {**os.environ, "GH_TOKEN": token}
+    payload = json.dumps(input_doc) if input_doc is not None else None
+    if method.upper() == "GET":
+        # Idempotent target READ (issue re-reads, collaborator-permission probes): transient
+        # 5xx/secondary-403 blips get gh_retry's bounded backoff (registry #563 item 4 — the
+        # 14:42 RemoteDisconnected class; a 422 stays fatal and is never retried).
+        result = _gh_retry.run_gh(args, env=env, input=payload)
+    else:
+        # Mutations get NO transparent replay: an ambiguous transient failure cannot prove the
+        # attempt was skipped — a replayed POST duplicates comments and a replayed PATCH can
+        # repeat a label transition. Fail-loud single attempt is deliberate (#558).
+        result = subprocess.run(
+            ["gh", *args], input=payload,
+            capture_output=True, text=True, check=False, env=env,
+        )
     if result.returncode != 0:
-        raise DispatchError("target comment failed")
+        raise DispatchError("target issue mutation failed")
+    return result
+
+
+def _replace_issue_role_with_research(repo, item):
+    """Atomically replace the revalidated role:impl label with role:research.
+
+    A full labels PATCH is intentional: add-then-remove can strand the issue with two role labels,
+    while remove-then-add can strand it with none; both shapes are rejected by the planner. The
+    caller has just required the live issue labels to exactly equal this plan copy via
+    _current_issue_matches, and stops the cached claim after this mutation, so the old impl route
+    can never launch from the same plan.
+    """
+    labels = set(item["labels"])
+    if item.get("role") != "impl" or "role:impl" not in labels:
+        raise DispatchError("decline reroute no longer has exactly the impl route")
+    # Re-read immediately before the full-label replacement. The earlier claim revalidation
+    # precedes the ledger/comment reads; without this last-step check, a human needs:* label landing
+    # in that interval could be erased by our PATCH.
+    live_result = _run_gh_target_api(
+        repo, "GET", f"repos/{repo}/issues/{item['number']}")
+    try:
+        live_issue = json.loads(live_result.stdout or "null")
+    except json.JSONDecodeError as exc:
+        raise DispatchError("target issue re-read returned malformed JSON") from exc
+    if (not isinstance(live_issue, dict) or "pull_request" in live_issue
+            or live_issue.get("state") != "open"
+            or _labels(live_issue) != item["labels"]):
+        raise DispatchError("target issue changed before decline reroute; leaving it untouched")
+    desired = sorted((labels - {"role:impl"}) | {"role:research"})
+    _run_gh_target_api(
+        repo, "PATCH", f"repos/{repo}/issues/{item['number']}", {"labels": desired})
 
 
 def _pr_comments(repo, pr_number):
+    """All conversation comments of a target PR/issue (paginated). A malformed PAGE must
+    RAISE, never be silently dropped (round-3 finding 3): a discarded page could hide a
+    durable receipt (round/attempt/park-generation marker) — hiding one would un-count budget
+    rounds or un-consume an escalation-ladder window. Same fail-closed shape as
+    _issue_timeline_events.
+
+    ENTRIES are validated at read time too (round-4 finding 4): each must be a dict with the
+    user(dict)/body(str)/created_at(str) shape every counter and marker parser relies on — a
+    `[[null]]` payload passed the old page-only check and crashed the first consumer
+    (_bot_comments None.get()) with an unhandled AttributeError that ABORTED the whole CLAIM
+    sweep. A malformed entry raises exactly like a malformed page, and the raise is a
+    DispatchError — which every sweep call site already catches PER ITEM (the review/worker
+    loops' per-item `except DispatchError` and the escalate-starved inner handlers), so one
+    hostile/ghost comment now defers ONE item to its documented conservative result instead
+    of stranding the entire tick."""
     pages = _gh_json([
         "api", "--paginate", "--slurp", f"repos/{repo}/issues/{pr_number}/comments?per_page=100",
     ])
     if not isinstance(pages, list):
         raise DispatchError("target PR comments are malformed")
-    return [item for page in pages if isinstance(page, list) for item in page]
+    for page in pages:
+        if not isinstance(page, list):
+            raise DispatchError("target PR comments page is malformed")
+        for entry in page:
+            if (not isinstance(entry, dict)
+                    or not isinstance(entry.get("user"), dict)
+                    or not isinstance(entry.get("body"), str)
+                    or not isinstance(entry.get("created_at"), str)):
+                raise DispatchError("target PR comments entry is malformed")
+    return [item for page in pages for item in page]
+
+
+def _issue_timeline_events(repo, number):
+    """The FULL label timeline of an issue/PR (paginated) for the round-budget readmission
+    window. The newest events — the ones the readmission cutoff hinges on — are on the LAST
+    page, so a truncated/malformed read must RAISE rather than return a prefix — and a
+    malformed PAGE must raise for the same reason (it could hold the newest human unlabel;
+    silently dropping it would hide the exact event the window hinges on). The caller
+    (park_policy) then keeps the full historical count with a loud log line (fail toward the
+    OLD conservative budget, never a fresh one)."""
+    pages = _gh_json([
+        "api", "--paginate", "--slurp", f"repos/{repo}/issues/{number}/timeline?per_page=100",
+    ])
+    if not isinstance(pages, list):
+        raise DispatchError("target timeline is malformed")
+    for page in pages:
+        if not isinstance(page, list):
+            raise DispatchError("target timeline page is malformed")
+    return [item for page in pages for item in page]
+
+
+def _target_is_human_maintainer(repo, login):
+    """The strict maintainer probe for the readmission window / unpark veto (park-policy
+    hygiene finding; the worker-issue._is_human_maintainer pattern): TARGET collaborator
+    permission in park_policy.HUMAN_MAINTAINER_PERMISSIONS, read under the target App token
+    (the ambient registry token has no collaborator visibility there). Probe-call FAILURE
+    counts as NOT a maintainer and emits the shared distinct ::warning:: diagnostic
+    (park_policy.probe_maintainer, round-3 Opus finding); a genuine not-a-maintainer
+    permission stays quiet."""
+    def read_permission(probe_login):
+        result = _run_gh_target_api(
+            repo, "GET", f"repos/{repo}/collaborators/{probe_login}/permission")
+        payload = json.loads(result.stdout or "null")
+        if not isinstance(payload, dict):
+            raise DispatchError("collaborator permission payload is malformed")
+        return payload.get("permission")
+
+    return _park_policy.probe_maintainer(repo, login, read_permission)
+
+
+def _read_model_health_window(model_health, registry_repo, now, api=None):
+    """Read the task-decline evidence through model-health's authoritative validated reader.
+
+    Dispatch is a read-only consumer: it never calls append_record or writes the health ledger.
+    Invalid contents, a missing data-plane branch, or an unreadable API all return None after a
+    loud diagnostic; callers leave the issue deferred and MUST NOT infer an escalation.
+    """
+    try:
+        api = api or model_health.GitHubAPI(os.environ.get("GH_TOKEN", ""))
+        records, _ = model_health.read_ledger(api, registry_repo)
+        return model_health.prune(records, now)
+    except (model_health.HealthError, ValueError) as exc:
+        print("::error::dispatch decline escalation: validated model-health ledger is "
+              f"unreadable ({exc}); NO task escalation will fire")
+        return None
+
+
+def _capacity_recovery_probe(model_health, health_window, now):
+    """The recovery-evidence probe park_policy.capacity_park_admission calls with the canonical
+    stamp of the latest park application: model-health's per-account cause-recovery predicate over
+    the SAME validated health window the decline ladder and #604's auth cooldowns read (never a
+    parallel store). An unreadable window (None) or an unparseable park stamp yields no evidence,
+    which the admission reads as STAY PARKED."""
+    def probe(parked_at):
+        if health_window is None or not parked_at:
+            return None
+        parked_epoch = int(_park_policy.parse_ts(parked_at).timestamp())
+        return model_health.capacity_recovery_evidence(health_window, parked_epoch, now)
+
+    return probe
+
+
+# groom's durable age-park receipt (groom.STALE_PR_MARKER). Kept as a literal here rather than
+# imported: groom is a separate entry point with its own checkout root, and this is a READ of a
+# marker groom already writes, never a second writer of it.
+GROOM_STALE_PR_MARKER = "<!-- registry-groom-stale-pr:v1 -->"
+# How many legacy parks one tick may migrate. The migration is one-shot per PR (its own reason
+# marker is the receipt that makes reclassify_legacy_park refuse a second pass), so this only
+# paces the re-entry: 21 PRs re-entering the review lane in one tick would starve the very
+# allocator whose starvation parked most of them.
+LEGACY_PARK_MIGRATION_MAX = 5
+
+
+def _migrate_legacy_park(repo, number, issue_number, comments, labels, bot_login, provable,
+                         post_comment, convert_labels, source_labels=(),
+                         issue_hold_machine_owned=None, log=print):
+    """[G1] Re-classify ONE legacy prose-only park out of the human terminal (sparq-org/sparq#3809).
+
+    31 of the 33 stalled sparq draft PRs were parked BEFORE the capacity/question split, so they
+    carry the HUMAN-owned `review:needs-user` for an INFRA cause. capacity_park_admission keys on
+    `review:parked` plus bot receipts, which they do not have, so NOTHING will ever re-classify
+    them: they are stalled permanently by construction. This is the migration that ends that.
+
+    Returns True iff this PR was migrated. Every gate fails toward LEAVING THE PARK ALONE:
+
+    - Only a PR sitting on the human terminal is a candidate at all.
+    - The cause must be recognised from the BOT'S OWN comments, and an injection / human-arm
+      signal ANYWHERE in that history refuses the PR forever (park_policy.reclassify_legacy_park;
+      the six genuine sparq escalations are pinned as its fixtures).
+    - A QUESTION-class cause is RECORDED but never moved: the human terminal is already correct
+      for it, and the marker just makes the reason machine-readable from now on.
+    - `provable` (model_health.park_cause_provable at the conversion instant) must hold. This is
+      the gate that keeps the migration from doing HARM: capacity_recovery_evidence fixes a
+      park's cause at its application instant, so converting while the fleet is healthy produces
+      a `review:parked` PR that can NEVER prove recovery — trading a VISIBLE stall a human can
+      see and clear for a SILENT one nothing will ever clear. Not provable => defer to a later
+      tick, consuming nothing.
+
+    ONE-SHOT BY CONSTRUCTION: the reason marker this writes is itself the receipt that makes
+    reclassify_legacy_park treat the PR as no-longer-legacy, so no second migration can happen —
+    and RECEIPT-FIRST like every other park write, so a crash between the receipt and the labels
+    leaves receipt-no-label (the next tick's ordinary admission converges it), never the reverse.
+    """
+    if _park_policy.HUMAN_PR_PARK_LABEL not in labels:
+        return False
+    stale_marker = any(
+        GROOM_STALE_PR_MARKER in str(comment.get("body", ""))
+        and str((comment.get("user") or {}).get("login", "")).casefold() == bot_login.casefold()
+        for comment in comments if isinstance(comment, dict))
+    cause, park_class, detail = _park_policy.reclassify_legacy_park(
+        comments, bot_login, stale_marker=stale_marker, log=log)
+    if cause is None:
+        log(f"legacy park stands {repo}#{number}: {detail}")
+        return False
+    if park_class != _park_policy.PARK_CLASS_CAPACITY:
+        # Record the cause; never move the label. A question-class park is where it belongs.
+        post_comment(repo, number,
+                     "> 🤖 SPARQ agent — recording this park's stop reason in machine-readable "
+                     f"form. The cause is `{cause}`, which is a genuine human question: the "
+                     "`review:needs-user` hold is CORRECT and is deliberately left in place. "
+                     "This comment only makes the reason readable to automation.\n\n"
+                     f"{_park_policy.park_reason_marker(cause)}")
+        log(f"legacy park classified (not moved) {repo}#{number}: {detail}")
+        return False
+    if not provable:
+        log(f"legacy park deferred {repo}#{number}: cause {cause!r} is machine-owned, but no "
+            "starvation cause is observable at this instant, so a converted park could never "
+            "prove recovery — deferring rather than trading a visible stall for a silent one")
+        return False
+    # THE HOLD AXIS. A park is a PAIR: `review:needs-user` on the PR AND `needs:user` on the
+    # source issue. Clearing only the PR half leaves the issue half live, and
+    # capacity_park_admission refuses unconditionally on ANY live `needs:*` — so the PR would be
+    # re-classified, its recovery evidence would be minted, and it would STILL never re-admit.
+    # MEASURED on the live sparq population: 24 of the 33 source issues carry `needs:user`.
+    #
+    # The issue half may only be cleared when it is the MACHINE's own park half. If a PROVEN
+    # HUMAN applied it, it is a real human question about the ISSUE and clearing it would erase
+    # a human hold — so that PR defers instead (and an unreadable timeline defers too).
+    # The migration may clear EXACTLY ONE label: `needs:user`, the issue-side half of the park
+    # pair that the park writer itself created. Nothing else. Any OTHER `needs:*` on the source
+    # issue is somebody else's hold with its own meaning — `needs:external-audit` is the sq-qhy4
+    # external accredited-cryptographer audit gate — and the migration has no business forming an
+    # opinion about it. Those fall through to migration_residual_holds below, which DEFERS.
+    #
+    # Ownership is proven for THAT LABEL specifically (label_application_machine_owned), not
+    # inferred from the newest event across READMISSION_LABELS: authorising the deletion of one
+    # label with evidence about three different ones is a domain mismatch, and it cleared
+    # human-applied holds and treated "no events at all" as permission.
+    clearing = []
+    if _park_policy.HUMAN_PARK_LABEL in set(source_labels):
+        if issue_number and issue_hold_machine_owned is not None \
+                and issue_hold_machine_owned(issue_number, _park_policy.HUMAN_PARK_LABEL):
+            clearing = [_park_policy.HUMAN_PARK_LABEL]
+        else:
+            log(f"legacy park deferred {repo}#{number}: the source issue's "
+                f"`{_park_policy.HUMAN_PARK_LABEL}` is human-owned or unprovable — the migration "
+                "may not clear it, and leaving it would strand the PR permanently")
+            return False
+    residual = _park_policy.migration_residual_holds(
+        set(labels) - {_park_policy.HUMAN_PR_PARK_LABEL}, source_labels, clearing=clearing)
+    if residual:
+        log(f"legacy park deferred {repo}#{number}: {'/'.join(residual)} would still block "
+            "re-admission after the conversion — refusing to migrate a park into a state it "
+            "could not leave")
+        return False
+    post_comment(repo, number,
+                 "> 🤖 SPARQ agent — re-classifying this park. It was applied for the INFRA "
+                 f"cause `{cause}` before park causes were split into machine-owned and "
+                 "human-owned classes, so it landed on the human-owned `review:needs-user` "
+                 "terminal and nothing could ever re-admit it. It becomes the MACHINE-owned "
+                 f"`{MACHINE_PARK_PR_LABEL}` soft hold. BOTH halves of the park pair are "
+                 "converted — the PR label here and the machine-applied `needs:user` on the "
+                 "source issue — because either one left standing would block re-admission on "
+                 "its own. It re-admits once its starvation cause is proven recovered (and a "
+                 "human can still clear it by unlabeling). No review judgement is implied or "
+                 "changed.\n\n"
+                 f"{_park_policy.park_reason_marker(cause)}")
+    convert_labels(number, issue_number)
+    log(f"legacy park MIGRATED {repo}#{number}: {detail}")
+    return True
+
+
+def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_login, script_dir,
+                            worker_pr, evidence_probe, comments_fn=None, timeline_fn=None,
+                            post_comment=None, clear_labels=None, log=print,
+                            migration_provable=False, convert_labels=None):
+    """AUTOMATIC re-admission of MACHINE capacity parks whose starvation cause has demonstrably
+    cleared (registry #614) — the sweep that closes the structural stall: a MACHINE-owned park
+    could only ever be cleared by a HUMAN, so a capacity outage stranded every PR it parked even
+    after the outage ended. Live evidence 2026-07-25: acct01 (the fleet's only cross-provider
+    review account) failed every review with exit-class=auth (#596) and capacity-parked registry
+    PRs #587/#590/#585/#593 + issues #574/#577/#582/#572 and 6 sparq PRs; the credential fix
+    restores capacity but recovers NONE of those parks without a hand-unlabel of each one.
+
+    Runs over the LIVE pull listing CLAIM already fetched, and only ever touches a MACHINE park:
+    a PR carrying a human-owned hold on either surface, or whose LATEST park application was made
+    by a proven human, is skipped by park_policy.capacity_park_admission itself. Ordering is
+    RECEIPT-FIRST like every other park write (#610 round-4 finding 2): the durable
+    AUTO_READMIT_MARKER receipt is posted BEFORE any label is cleared, so a crash between them
+    leaves receipt-no-label — which the receipt-driven proof gate admits and this sweep converges
+    on the next tick — never label-no-receipt, which would erase the re-admission from every proof
+    surface and re-strand the PR. Every failure is PER-PR: one unreadable PR never stops the rest.
+
+    Returns the number of PRs re-admitted this tick."""
+    comments_fn = comments_fn or _pr_comments
+    timeline_fn = timeline_fn or _issue_timeline_events
+    post_comment = post_comment or _run_gh_target_comment
+    if convert_labels is None:
+        def convert_labels(pr_number, issue_number):
+            # The legacy migration writes the labels DIRECTLY rather than through worker-pr's
+            # `review-state set`, and that is deliberate: set_review_state REFUSES every
+            # automated transition away from review:needs-user (issue #138), which is exactly
+            # the guard that stops automation silently unparking a human hold. That guard is
+            # left completely intact — this path is not a general transition, it is a
+            # cause-classified, deny-gated, provability-gated, one-shot migration whose
+            # authorisation is the durable reason receipt posted immediately above it.
+            _run_gh_target_api(
+                repo, "DELETE",
+                f"repos/{repo}/issues/{pr_number}/labels/"
+                + urllib.parse.quote(_park_policy.HUMAN_PR_PARK_LABEL, safe=""))
+            _run_gh_target_api(repo, "POST", f"repos/{repo}/issues/{pr_number}/labels",
+                               {"labels": [MACHINE_PARK_PR_LABEL]})
+            if issue_number:
+                # The ISSUE half of the park pair. worker-issue's `parked` transition does NOT
+                # remove `needs:user` (its remove-set is the status:* labels only), and
+                # capacity_park_admission refuses on ANY live `needs:*` — so without this delete
+                # the migrated PR could never re-admit. Only reached once the caller has proven
+                # the hold is machine-owned; a human-applied one defers instead.
+                # ONLY `needs:user` — the half of the park pair the park writer created. Any
+                # other needs:* is somebody else's hold and deferred the migration upstream.
+                if _park_policy.HUMAN_PARK_LABEL in set(
+                        issue_labels.get(issue_number, []) if issue_number else []):
+                    _run_gh_target_api(
+                        repo, "DELETE",
+                        f"repos/{repo}/issues/{issue_number}/labels/"
+                        + urllib.parse.quote(_park_policy.HUMAN_PARK_LABEL, safe=""))
+                _run_target_helper(script_dir, repo, "worker-issue.py", [
+                    "status", "--repo", repo, "--issue", str(issue_number),
+                    "--status", "parked"])
+    if clear_labels is None:
+        def clear_labels(pr_number, issue_number):
+            # The SAME label writes a human readmission gesture triggers on the CLAIM path:
+            # review:parked -> review:needs on the PR, and status:parked cleared on the source
+            # issue. Both helpers are idempotent, so converging a crashed strip is safe.
+            _run_target_helper(script_dir, repo, "worker-pr.py", [
+                "review-state", "set", "--repo", repo, "--pr", str(pr_number),
+                "--state", "needs"])
+            if issue_number:
+                _run_target_helper(script_dir, repo, "worker-issue.py", [
+                    "status", "--repo", repo, "--issue", str(issue_number),
+                    "--status", "readmitted"])
+
+    rows = []
+    for page in pull_pages if isinstance(pull_pages, list) else []:
+        if isinstance(page, list):
+            rows.extend(row for row in page if isinstance(row, dict))
+    readmitted = migrated = 0
+    for row in sorted(rows, key=lambda row: row.get("number") or 0):
+        number = row.get("number")
+        if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
+            continue
+        if row.get("state") != "open":
+            continue
+        head = row.get("head") or {}
+        if (head.get("repo") or {}).get("full_name") != repo \
+                or not HEAD_REF_RE.match(str(head.get("ref", ""))):
+            continue                      # not a same-repo worker branch — never ours to re-admit
+        login = str((row.get("user") or {}).get("login", ""))
+        if not bot_login or login != bot_login:
+            continue                      # only the trusted App bot's own worker PRs
+        try:
+            # EVERYTHING that can fail on hostile/degraded data lives inside the per-PR try: a
+            # malformed label list, an unreadable comments page, or a failed timeline read must
+            # skip THIS PR (its park simply stands) and never abort the sweep — the whole tick's
+            # claim runs under this call.
+            labels = set(_labels(row))
+            record = provenance.get(number)
+            issue_number = record.get("issue") if isinstance(record, dict) else None
+            if not isinstance(issue_number, int) or isinstance(issue_number, bool) \
+                    or issue_number <= 0:
+                issue_number = None
+            source_labels = set(issue_labels.get(issue_number, []) if issue_number else [])
+            if MACHINE_PARK_PR_LABEL not in labels and "status:parked" not in source_labels:
+                # [G1] No machine park — but this may be a LEGACY park stranded on the human
+                # terminal for an infra cause (sparq-org/sparq#3809). Re-classify it (at most
+                # LEGACY_PARK_MIGRATION_MAX per tick) so it re-enters the machine class and
+                # inherits the exit above; it is re-admitted on a LATER tick, on its own proof,
+                # never here and never in the same breath as the conversion.
+                if migrated < LEGACY_PARK_MIGRATION_MAX and _migrate_legacy_park(
+                        repo, number, issue_number, comments_fn(repo, number), labels,
+                        bot_login, migration_provable, post_comment, convert_labels,
+                        source_labels=source_labels,
+                        # The issue-side hold may only be cleared when the MACHINE applied it.
+                        # park_applications is the same helper the admission uses to decide
+                        # ownership, so "human-owned there" and "may not clear here" cannot
+                        # drift; an unreadable timeline yields False and the PR defers.
+                        issue_hold_machine_owned=(
+                            lambda issue, label:
+                                _park_policy.label_application_machine_owned(
+                                    repo, issue, label, timeline_fn,
+                                    is_human=lambda probe: _target_is_human_maintainer(
+                                        repo, probe),
+                                    log=log)),
+                        log=log):
+                    migrated += 1
+                continue                  # no live machine park — nothing to re-admit
+            # ONE spelling of the hold rule (park_policy.human_owned_holds), shared with
+            # capacity_park_admission's own refusal and the migration precondition, so the
+            # sweep cannot drift from the admission it feeds.
+            holds = _park_policy.human_owned_holds(set(labels) | set(source_labels))
+            comments = comments_fn(repo, number)
+            # ONE timeline read per surface per PR: the admission consults the timelines several
+            # times (the human cutoff, the park applications, the ownership probe) and every read
+            # must see the SAME view anyway — a mid-decision change would mix two worlds.
+            timelines = {}
+
+            def cached_timeline(_repo, timeline_number, _cache=timelines):
+                if timeline_number not in _cache:
+                    _cache[timeline_number] = timeline_fn(_repo, timeline_number)
+                return _cache[timeline_number]
+
+            action, evidence, detail = _park_policy.capacity_park_admission(
+                repo, number, issue_number, cached_timeline,
+                is_human=lambda probe_login: _target_is_human_maintainer(repo, probe_login),
+                consumed=worker_pr.park_generation_cutoffs(comments, bot_login),
+                auto_receipts=worker_pr.auto_readmission_records(comments, bot_login),
+                auto_marker_count=worker_pr.auto_readmission_marker_count(comments, bot_login),
+                auto_evidence=evidence_probe, live_holds=holds, log=log)
+            if action == "auto-mint":
+                # RECEIPT FIRST, then the labels (see the docstring).
+                post_comment(repo, number, worker_pr.auto_readmission_receipt(
+                    evidence["key"], evidence["at"]))
+                clear_labels(number, issue_number)
+                readmitted += 1
+                log(f"auto-readmit {repo}#{number}: machine capacity park cleared — {detail}")
+            elif action == "auto-receipt":
+                clear_labels(number, issue_number)
+                readmitted += 1
+                log(f"auto-readmit {repo}#{number}: converging an already-receipted automatic "
+                    f"re-admission — {detail}")
+            else:
+                log(f"park stands {repo}#{number}: {detail}"
+                    + (" (a human readmission gesture is proven; the CLAIM proof gate owns it)"
+                       if action == "human" else ""))
+        except (DispatchError, worker_pr.WorkerPrError) as exc:
+            log(f"::warning::auto-readmit skipped for {repo}#{number}: {exc}; the capacity "
+                "park stands")
+    return readmitted
+
+
+def _issue_no_change_outcomes(model_health, records, issue):
+    """Validated, in-window no_change rows for one target issue, newest last."""
+    rows = [record for record in records
+            if record.get("exit_class") == model_health.CLASS_NO_CHANGE
+            and record.get("issue") == issue]
+    return sorted(
+        rows,
+        key=lambda record: (
+            record["ts"], record.get("run_id", ""), record.get("account", ""),
+            json.dumps(record, sort_keys=True, separators=(",", ":")),
+        ),
+    )
+
+
+def _decline_escalation_evidence(outcomes):
+    """The two newest rows plus a stable, non-sensitive marker key for exactly that escalation."""
+    evidence = outcomes[-DECLINE_ESCALATION_MIN:]
+    encoded = json.dumps(evidence, sort_keys=True, separators=(",", ":"))
+    return evidence, hashlib.sha256(encoded.encode()).hexdigest()[:16]
+
+
+def _decline_marker_action(comments, bot_login, key):
+    """Return the bot-authored action already audited for this evidence pair, if any.
+
+    Third parties cannot forge an idempotence marker: as elsewhere in the worker control plane,
+    only the orchestration bot's own durable comments are receipts.
+    """
+    pattern = re.compile(
+        rf"<!-- {re.escape(DECLINE_ESCALATION_MARKER)} key={re.escape(key)} "
+        r"action=(research|needs-user) -->"
+    )
+    actions = {
+        match.group(1)
+        for comment in comments
+        if str(comment.get("user", {}).get("login", "")).casefold() == bot_login.casefold()
+        for match in pattern.finditer(str(comment.get("body", "")))
+    }
+    if len(actions) > 1:
+        raise DispatchError("task decline escalation has conflicting audit markers")
+    return next(iter(actions), None)
+
+
+def _decline_outcome_name(record):
+    run_id = record.get("run_id") or f"ledger-ts-{record['ts']}"
+    return f"run `{run_id}` → `no_change`"
+
+
+def _escalate_repeated_declines(repo, item, outcomes, comments, bot_login, script_dir,
+                                apply_action=None, post_comment=None):
+    """Apply or reconcile one repeated-decline escalation.
+
+    Returns ``proceed`` below threshold and after a previously completed impl->research reroute;
+    every other result means the caller must stop this cached claim. The audit marker is written
+    BEFORE the label mutation so a mutation failure can be reconciled next tick without a second
+    loud comment. Conversely, a failed comment performs no label mutation and safely retries.
+    Injectable mutation/comment callables keep the --self-test tripwires on the real control flow.
+    """
+    if len(outcomes) < DECLINE_ESCALATION_MIN:
+        return "proceed"
+
+    evidence, key = _decline_escalation_evidence(outcomes)
+    marked_action = _decline_marker_action(comments, bot_login, key)
+    labels = set(item["labels"])
+
+    if apply_action is None:
+        def apply_action(action):
+            if action == "research":
+                _replace_issue_role_with_research(repo, item)
+            else:
+                # Repeated honest declines are decline-driven, not a human question: the issue
+                # takes the MACHINE-owned status:parked soft hold (park_policy.py defect 1).
+                # The durable marker keeps its historical action name "needs-user" so
+                # pre-existing escalation receipts still reconcile. worker-issue's set_status
+                # enforces the sticky human-unpark veto at the write point.
+                _run_target_helper(script_dir, repo, "worker-issue.py", [
+                    "status", "--repo", repo, "--issue", str(item["number"]),
+                    "--status", "parked",
+                ])
+    if post_comment is None:
+        post_comment = lambda body: _run_gh_target_comment(repo, item["number"], body)
+
+    if marked_action == "research":
+        # The same two impl outcomes have already caused the route swap. Permit ONLY the new
+        # research route; if the label write crashed after its marker, reconcile it and stop this
+        # stale impl claim. This is the cached-claim bypass tripwire.
+        if item.get("role") == "research" and "role:research" in labels \
+                and "role:impl" not in labels:
+            return "proceed"
+        if item.get("role") == "impl" and "role:impl" in labels:
+            apply_action("research")
+            return "rerouted"
+        raise DispatchError("recorded decline reroute conflicts with the issue's current role")
+    if marked_action == "needs-user":
+        # Reconcile a crashed label write for THIS evidence pair. Legacy needs:user parks (or a
+        # human's own needs:user) also count as already-parked — never re-park over them.
+        if "status:parked" not in labels and "needs:user" not in labels:
+            apply_action("needs-user")
+        return "parked"
+
+    action = "research" if item.get("role") == "impl" else "needs-user"
+    outcome_lines = "\n".join(
+        f"- Outcome {index}: {_decline_outcome_name(record)}"
+        for index, record in enumerate(evidence, 1)
+    )
+    if action == "research":
+        action_text = ("**Action:** swapped `role:impl` → `role:research` for architect "
+                       "decomposition. The cached implementation claim is cancelled; only the "
+                       "new research route may dispatch.")
+    else:
+        role = item.get("role") or "unknown"
+        action_text = (f"**Action:** parked this issue with the machine-owned `status:parked` "
+                       f"soft hold. It was already on the non-implementation route "
+                       f"`role:{role}`, so another automated reroute would loop. The park "
+                       "clears automatically once the decline evidence ages out of the "
+                       "model-health window and capacity exists; no human action is required "
+                       "unless it persists.")
+    marker = f"<!-- {DECLINE_ESCALATION_MARKER} key={key} action={action} -->"
+    post_comment(
+        "> 🤖 SPARQ agent — **repeated honest-decline escalation**\n\n"
+        "This issue returned without repository changes twice in the validated model-health "
+        f"window, regardless of which accounts ran it:\n\n{outcome_lines}\n\n"
+        f"{action_text}\n\n{marker}"
+    )
+    apply_action(action)
+    return "rerouted" if action == "research" else "parked"
 
 
 def record_file_path(ledger_root, registry_root, relative):
@@ -1465,7 +2571,9 @@ def latest_recorded_progress(worker_pr, registry_root, repo, number, rounds, com
         except (OSError, json.JSONDecodeError):
             document = None
         if isinstance(document, dict):
-            progress = document.get("progress")
+            # Issue #156: records are now the host envelope {host_envelope, verdict}; unwrap to
+            # the model document (a legacy bare-document record returns itself unchanged).
+            progress = worker_pr.envelope_verdict(document).get("progress")
             if progress in worker_pr.PROGRESS_VALUES:
                 return progress
     return worker_pr.round_progress(comments, bot_login).get(rounds)
@@ -1498,20 +2606,132 @@ def _resolvable_chain(chain, routing):
     return usable
 
 
+def _chain_probe_exempt(chain, routing):
+    """True iff EVERY alias in `chain` maps to a POSITIVELY probe-exempt provider in the target
+    routing catalog (issue #115) — so a wholesale usage-probe outage (usage=None) does NOT gate a
+    claim served entirely by codex/openai accounts, whose absent usage is the expected steady
+    state. Fail-closed: an empty chain, a missing routing catalog, or ANY alias whose provider is
+    absent / unknown / non-exempt makes the whole chain non-exempt, and the require_usage hold then
+    applies (a probe-gated anthropic review/fix never rides an unavailable probe)."""
+    models = routing.get("models") if isinstance(routing, dict) else None
+    if not isinstance(models, dict) or not chain:
+        return False
+    for alias in chain:
+        meta = models.get(alias)
+        provider = meta.get("provider") if isinstance(meta, dict) else None
+        if str(provider or "").strip().lower() not in PROBE_EXEMPT_PROVIDERS:
+            return False
+    return True
+
+
+def _missed_fix_budget(worker_pr, comments, bot_login, round_number, cutoff_fn, repo, number):
+    """The MISSED-FIX-dispatch budget as (charged, lifetime) counts — the #555 RECURRENCE fix
+    for the second exhaustion branch.
+
+    THE BUG: `missed` markers are durable per-round state that nothing resets, and the
+    MISSED_FIX_LIMIT capacity park read the LIFETIME count. #555 windowed the ROUND budget by
+    the human-readmission cutoff but left this counter unwindowed — so a re-admitted PR
+    re-derived "N consecutive fix dispatches missed for round R" from the very same markers on
+    the very next tick, with an UNCHANGED head and no work attempted, and (with a gen-1 receipt
+    already standing) the ladder went straight to its question-class terminal. That is the
+    observed bounce: sparq PR #3488 re-admitted 2026-07-22T16:36:56Z, re-escalated 16:44:10Z;
+    PR #3472 re-escalated seconds later with byte-identical boilerplate, five days after the
+    last commit or review round on either PR. This counter is the purest case of it: it needs
+    NO head advance and NO review round to grow — it grows purely from allocator starvation,
+    identically across every PR in a sweep.
+
+    THE FIX: the LIMIT decision charges only markers recorded at or after `cutoff` (the same
+    readmission window the round budget uses — one timeline read per PR per tick), so a human
+    readmission grants real dispatch capacity. The LIFETIME count is still returned: it is the
+    monotone axis of the park's attempt fingerprint (a window-relative count resets and would
+    read as "unchanged" across two genuinely distinct windows).
+
+    `cutoff_fn` is the PR's memoized readmission-cutoff getter, called ONLY once the LIFETIME
+    count has reached the limit — below it the decision is the same either way, exactly like the
+    round budget's `rounds >= max_rounds` gate — so no extra timeline read is spent on the
+    common case."""
+    lifetime = len(worker_pr.marker_runs(comments, bot_login, "missed", round_number))
+    if lifetime < MISSED_FIX_LIMIT:
+        return lifetime, lifetime
+    cutoff = cutoff_fn()
+    if not cutoff:
+        return lifetime, lifetime
+    charged = len(worker_pr.marker_runs_since(
+        comments, bot_login, "missed", round_number, cutoff))
+    if charged != lifetime:
+        print(f"readmission window open for {repo}#{number}: a park label was cleared at "
+              f"{cutoff} (a human unlabel or a proven automatic re-admission); the missed-fix "
+              f"budget for round {round_number} charges {charged} of {lifetime} recorded "
+              f"miss(es)")
+    return charged, lifetime
+
+
 def _dispatch_review_items(review_items, repo, policy, routing, allocator, worker_pr,
                            registry_repo, registry_root, workflow_ref, bot_login, usage, margin,
-                           defer_reasons, ledger_root=""):
+                           defer_reasons, lanes=None, ledger_root="", fix_dispatch=None):
     """Hostile re-validation + claim + launch for the review/fix loop. Every item failure SKIPS
     that item (per-item resilience, like the issue loop). `defer_reasons` is the tick's SHARED
     histogram: allocator lease errors here must fold into the same `lease-error` counter the
     issue loop uses, because _ledger_health/_ledger_rot_zeroed_dispatch (issue #28) read that
     counter — an all-review/fix tick whose claims all errored would otherwise report ledger=ok
-    and dodge the zero-dispatch fail-loud."""
+    and dodge the zero-dispatch fail-loud.
+
+    `lanes` is the tick's per-lane accumulator (issue #108). Each item's plan state selects its lane
+    (review vs fix via _review_item_lane); a launch folds into that lane's `launched` and a hard
+    failure (lease error, revalidation DispatchError, failed workflow launch) into its `error`. This
+    keeps a review/fix lane that launched NOTHING visible to the tick-health recorder even when the
+    worker lane launched — the exact masking this loop's bare launched-count return used to allow."""
+    if lanes is None:
+        lanes = _new_lane_counts()
+    if fix_dispatch is None:
+        fix_dispatch = Counter()
     launched = 0
     script_dir = Path(__file__).resolve().parent
     max_rounds = int(policy.get("max_review_rounds", 3))
+    # Issue #115: the same fail-closed usage gate the worker loop applies (a require_usage repo
+    # HOLDS on a wholesale usage-probe outage rather than dispatching ungated). Enforced per-claim
+    # below, with an explicit carve-out for a chain served entirely by probe-exempt accounts.
+    require_usage = bool(policy.get("require_usage", False))
+    # Close the preceding item's telemetry at the next iteration (and once after the loop).  This
+    # catches every pre-claim validation/policy `continue` without duplicating counters at the many
+    # already-instrumented lease/error exits.  The exact cause remains in the per-PR log line; the
+    # shared summary gets the stable coarse reason required for lane health.
+    pending_telemetry = None
+
+    def finish_pending():
+        nonlocal pending_telemetry
+        if pending_telemetry is None:
+            return
+        if (not pending_telemetry["launched"]
+                and sum(defer_reasons.values()) == pending_telemetry["reason_total"]):
+            defer_reasons[f"{pending_telemetry['lane']}:preclaim-defer"] += 1
+        if (pending_telemetry["lane"] == "fix" and not pending_telemetry["launched"]
+                and sum(value for key, value in fix_dispatch.items()
+                        if key.startswith("defer:"))
+                == pending_telemetry["fix_reason_total"]):
+            # The exact per-PR cause was printed at the rejection site. Keep the aggregate
+            # privacy-safe while ensuring an enumerated fix item can never vanish from the
+            # fleet line merely because it stopped before allocator.claim().
+            fix_dispatch["defer:preclaim-defer"] += 1
+        pending_telemetry = None
+
     for item in review_items:
+        finish_pending()
         number = item["pr_number"]
+        lane = _review_item_lane(item["state"])
+        lanes[lane]["planned"] += 1
+        if lane == "fix":
+            # Issue #460: count at the actual PLAN->CLAIM enumeration boundary, not just
+            # immediately before allocator.claim(). The old placement turned every valid
+            # live-revalidation/budget exclusion into the false `0 eligible` signal.
+            fix_dispatch["eligible"] += 1
+        pending_telemetry = {
+            "lane": lane,
+            "launched": False,
+            "reason_total": sum(defer_reasons.values()),
+            "fix_reason_total": sum(
+                value for key, value in fix_dispatch.items() if key.startswith("defer:")),
+        }
         try:
             if not bot_login:
                 print(f"defer review {repo}#{number}: bot login unavailable (no App token)")
@@ -1522,9 +2742,6 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 print(f"defer review {repo}#{number}: PR is no longer open")
                 continue
             draft = pull.get("draft") is True
-            if not draft and not repair_state:
-                print(f"defer review {repo}#{number}: PR is no longer an open draft")
-                continue
             head = pull.get("head") or {}
             head_repo = (head.get("repo") or {}).get("full_name")
             head_ref = str(head.get("ref", ""))
@@ -1572,10 +2789,64 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
             # maintainer ping) — the repair loop must never disarm/redraft/push (nor review
             # past) a PR whose work item a human explicitly owns. Live read, fail closed.
             source_issue = _gh_json(["api", f"repos/{repo}/issues/{issue_number}"])
-            if any(label.startswith("needs:") for label in _labels(source_issue)):
+            source_labels_live = _labels(source_issue)
+            if any(label.startswith("needs:") for label in source_labels_live):
                 print(f"defer review {repo}#{number}: source issue #{issue_number} is "
                       "human-owned (needs:*)")
                 continue
+            if "status:parked" in source_labels_live:
+                # The one-predicate rule (round-3 finding 2): EITHER live machine label parks
+                # the whole PR surface. PLAN already excludes on this; a status:parked read
+                # here means the park landed in the PLAN->CLAIM window — a fresh park, never
+                # a readmission candidate this tick.
+                print(f"defer review {repo}#{number}: machine capacity park stands "
+                      f"(status:parked on source issue #{issue_number})")
+                continue
+            # Comments are read ONCE here (before the park-proof gate — the durable
+            # park-generation receipts live in them) and reused by the round-budget
+            # processing below.
+            comments = _pr_comments(repo, number)
+            park_receipts = worker_pr.park_generation_cutoffs(comments, bot_login)
+            if capacity_park_proof_required(labels, park_receipts):
+                # ONE proof gate (round-3 finding 2): the trigger is the DURABLE receipt
+                # state OR a live review:parked label — never the label alone. A triage-side
+                # label dismissal leaves the receipts standing, so CLAIM still re-proves the
+                # human gesture from the label TIMELINES (strict maintainer probe;
+                # most-recent-event-wins against the park application, receipted windows
+                # consumed) before anything mutates or dispatches — a spoofed/stale label
+                # state can re-enumerate, but it can never mint budget or strip the park.
+                # Round-4 finding 2 pairs this with RECEIPT-FIRST park writers: a crash
+                # mid-park leaves receipt-no-label, which this gate still catches.
+                # The proof admits on EITHER authority (registry #614): an unconsumed
+                # proven-human readmission gesture (unchanged), or a bot-authored AUTOMATIC
+                # re-admission receipt that is newer than every park application — the durable
+                # gesture the readmission sweep left behind when it proved the starvation cause
+                # had cleared. Nothing is MINTED here (auto_evidence is not passed): this gate
+                # only reads proof, so re-admission still requires the sweep's evidence-gated,
+                # receipted decision.
+                park_action, _park_evidence, park_detail = \
+                    _park_policy.capacity_park_admission(
+                        repo, number, issue_number, _issue_timeline_events,
+                        is_human=lambda login: _target_is_human_maintainer(repo, login),
+                        consumed=park_receipts,
+                        auto_receipts=worker_pr.auto_readmission_records(comments, bot_login),
+                        auto_marker_count=worker_pr.auto_readmission_marker_count(
+                            comments, bot_login),
+                        live_holds=sorted(HUMAN_HOLD_PR_LABELS & set(labels)))
+                if not park_action:
+                    print(f"defer review {repo}#{number}: machine capacity park stands "
+                          f"(durable receipts/label; {park_detail})")
+                    continue
+                if MACHINE_PARK_PR_LABEL in labels:
+                    # Proven gesture: converge the stale PR-side park back into the loop (the
+                    # review-fix.yml admission rejects review:parked, so the strip must
+                    # precede any dispatch). set_review_state drops review:parked for
+                    # review:needs.
+                    _run_target_helper(script_dir, repo, "worker-pr.py", [
+                        "review-state", "set", "--repo", repo, "--pr", str(number),
+                        "--state", "needs"])
+                    print(f"re-admit review {repo}#{number}: {park_detail}; review:parked "
+                          "converged to review:needs")
             if opened_sha != head_sha:
                 compare = _gh_json(["api", f"repos/{repo}/compare/{opened_sha}...{head_sha}"])
                 if compare.get("status") not in {"identical", "ahead"}:
@@ -1584,6 +2855,17 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                                    "the PR head no longer descends from the worker-opened commit "
                                    "(history was rewritten); refusing autonomous review")
                     continue
+            if not draft and item["state"] in {"needs-review", "needs-fix"}:
+                # Label-driven re-entry may arrive while the PR is READY (and possibly armed).
+                # Defuse before any review/fix model runs, but preserve the externally selected
+                # review:needs/review:changes state; the historical disarm relabel-to-needs would
+                # otherwise turn a requested fix into a review during this safety transition.
+                _run_target_helper(script_dir, repo, "worker-pr.py", [
+                    "disarm", "--repo", repo, "--pr", str(number), "--when", "always",
+                    "--preserve-review-state"])
+                draft = True
+                print(f"re-enter review {repo}#{number}: safely returned the ready PR to draft "
+                      f"while preserving {item['state']}")
             fix_kind, fix_context = "verdict", ""
             if repair_state:
                 # The plan row is HOSTILE AND STALE: re-derive the repair trigger from LIVE data
@@ -1626,10 +2908,17 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 if fix_kind == "ci":
                     fix_context = item["context"][:CI_CONTEXT_MAX]
             elif item["state"] == "stranded":
-                # Loud escape from the absorbing {drafted, unarmed, reviewed head, green gate}
-                # state — re-derived LIVE before the terminal hand-off; any drift (armed again,
-                # head moved, gate red/pending, base conflicting) defers to the path that owns
-                # the new posture instead.
+                # Issue #161: the stranded posture — {drafted, unarmed, reviewed head, green
+                # gate} — is the RESIDUE of an interrupted defuse/disarm (a pipeline-owned
+                # crash), not a review verdict. Terminally parking it on a human made a
+                # pipeline crash into permanent manual work. The pipeline instead RECOVERS with
+                # its own trusted provenance: it re-reviews the current head (despite the
+                # matching reviewed-sha marker) under the SAME bounded round budget as any
+                # review, and reserves the terminal human hand-off for REPEATED failed recovery
+                # — decide_budget below escalates to needs-user only once that budget is spent.
+                # Re-derived LIVE first: any drift (armed again, head moved, gate red/pending,
+                # base conflicting) means some other path owns the new posture, so defer with NO
+                # mutation and let that path re-admit it.
                 checks = _gh_json([
                     "api",
                     f"repos/{repo}/commits/{head_sha}/check-runs"
@@ -1648,15 +2937,78 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                     print(f"defer review {repo}#{number}: the stranded posture did not "
                           "re-derive on live data")
                     continue
-                _pr_needs_user(script_dir, repo, number, issue_number,
-                               "the PR's reviewed head has a green gate but the PR is drafted "
-                               "and unarmed with nothing left for the loop to do (the residue "
-                               "of an interrupted defuse/disarm); a human must re-arm it (mark "
-                               "ready + enable auto-merge) or restart the review")
-                print(f"escalated {repo}#{number}: stranded reviewed head handed to a human")
+                print(f"recover review {repo}#{number}: stranded residue of an interrupted "
+                      "defuse/disarm — re-reviewing the current head under the round budget")
+                # Fall through to the shared round-budget + review dispatch below.
+            # Base admission (issue #164; the #81 precedent in
+            # worker-pr._merge_only_carry_forward): the worker-PR invariant is base == protected
+            # default branch (review-fix.yml resolve rejects a retarget LOUDLY; a human retarget
+            # is an explicit act that removes the PR from the loop). Enforce that same invariant
+            # HERE — BEFORE the round-budget processing below, whose needs-user and
+            # extend-model-pin actions mutate the PR (labels/comments, a durable pin marker) —
+            # so a retargeted or unresolved-base PR leaves the loop with NO mutation, failing
+            # closed rather than probing/dispatching the wrong comparison. Deliberately AFTER
+            # the repair defuse above: defusing a live auto-merge latch is the safety action and
+            # must run whatever the base says.
+            base = pull.get("base") or {}
+            base_ref = str(base.get("ref", ""))
+            default_branch = str((base.get("repo") or {}).get("default_branch", ""))
+            if (not SAFE_ATOM.fullmatch(base_ref) or not default_branch
+                    or base_ref != default_branch):
+                print(f"defer review {repo}#{number}: PR base {base_ref!r} is not the "
+                      "protected default branch (retargeted/unresolved) — refusing to "
+                      "process against the wrong base")
                 continue
-            comments = _pr_comments(repo, number)
+            # `comments` was read once above (before the park-proof gate); the round markers
+            # and receipts below parse the same snapshot.
             rounds = worker_pr.count_rounds(comments, bot_login)
+            # Human-readmission window (live defect sparq#2804/PR#3442, 2026-07-23): the budget
+            # decision below used to charge ALL historical rounds, so five rounds burned during
+            # the broken-CI era (gate-aggregator churn, phantom-leg failures, Copilot-outage
+            # stub reviews) re-parked the PR 22 minutes after the maintainer explicitly removed
+            # needs:user — the human said "keep trying" and the math ignored it. The budget
+            # instead charges only rounds recorded AFTER the latest HUMAN `unlabeled needs:user`
+            # event across the PR and its provenance-linked source issue (an explicit
+            # re-admission restarts the budget so the loop actually retries). No proven human
+            # unlabel — including a failed timeline read, which park_policy logs loudly — keeps
+            # the full historical count (never a fresh budget on unproven data). `rounds` itself
+            # stays the global count everywhere else: round numbering, the pending-fix lookup,
+            # the latest-progress read and the pin round all keep marker/verdict identity.
+            # Probed only at/above the base budget: below it decide_budget continues either way.
+            # LAZY + MEMOIZED (#555 recurrence gap): the SAME cutoff also windows the missed-fix
+            # marker budget further down, and both call sites must agree on one readmission
+            # window per PR per tick — so the timeline is read at most once, and only when a
+            # park decision actually hangs on it.
+            # [registry #614] The window is the LATER of the human gesture and any AUTOMATIC
+            # re-admission receipt on this PR. Clearing a machine park WITHOUT granting a budget
+            # window would leave the PR enumerable but permanently un-dispatchable: the missed-fix
+            # marker budget grows purely from allocator starvation, so an outage pins it and every
+            # later tick would re-derive the SAME exhausted lifetime count and quietly re-defer
+            # forever. An automatic re-admission therefore grants exactly the window a human
+            # gesture grants — bounded by the same two things that bound the re-admission itself
+            # (fresh unconsumed recovery evidence, and park_policy.AUTO_READMISSION_MAX).
+            readmission_cutoff = _UNPROBED
+
+            def _readmission_cutoff(_repo=repo, _number=number, _issue=issue_number):
+                nonlocal readmission_cutoff
+                if readmission_cutoff is _UNPROBED:
+                    readmission_cutoff = _park_policy.effective_readmission_cutoff(
+                        _park_policy.readmission_cutoff(
+                            _repo, _number, _issue, _issue_timeline_events,
+                            is_human=lambda login: _target_is_human_maintainer(_repo, login)),
+                        worker_pr.auto_readmission_stamps(comments, bot_login))
+                return readmission_cutoff
+
+            budget_rounds = rounds
+            if rounds >= max_rounds:
+                cutoff = _readmission_cutoff()
+                if cutoff:
+                    budget_rounds = worker_pr.count_rounds_since(comments, bot_login, cutoff)
+                    if budget_rounds != rounds:
+                        print(f"readmission window open for {repo}#{number}: a park label "
+                              f"was cleared at {cutoff} (a human unlabel or a proven "
+                              f"automatic re-admission); the round budget charges "
+                              f"{budget_rounds} of {rounds} recorded round(s)")
             impl_provider = record["impl_provider"]
             run_key = (f"{os.environ.get('GITHUB_RUN_ID', 'local')}."
                        f"{os.environ.get('GITHUB_RUN_ATTEMPT', '1')}")
@@ -1686,8 +3038,8 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 # no-change or gate-failed attempts, not a pushed head awaiting grading.
                 pending_fix = (round_models.get(rounds, [])
                                if item["state"] == "needs-review" else [])
-                budget = worker_pr.decide_budget(rounds, fix_models, progress, impl_provider,
-                                                 base_rounds=max_rounds,
+                budget = worker_pr.decide_budget(budget_rounds, fix_models, progress,
+                                                 impl_provider, base_rounds=max_rounds,
                                                  pending_fix_models=pending_fix,
                                                  pin_floor=pin_floor)
             except worker_pr.WorkerPrError as exc:
@@ -1696,13 +3048,30 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                                "human must inspect this PR's round/model/pin markers")
                 continue
             if budget["action"] == "needs-user":
+                # Budget-driven stop -> the MACHINE-owned soft-hold pair (finding A:
+                # review:parked on the PR + status:parked on the source issue; park_policy.py
+                # defect 1): exhaustion is not a human question, and the old unconditional
+                # review:needs-user terminally absorbed the whole PR surface (2026-07-18 mass
+                # park) and closed the readmission window forever. worker-pr needs_user owns
+                # the veto gate, the per-window receipt dedupe, and the
+                # PARK_ESCALATION_GENERATIONS question-class escalation (bot_login feeds its
+                # receipt trust filter). `budget_rounds` is the charged count —
+                # post-readmission when a human unlabeled a park label (sparq#2804/PR#3442),
+                # the full history otherwise.
+                #
+                # The park's ATTEMPT FINGERPRINT (#555 recurrence gap) is the live head plus
+                # the GLOBAL round count `rounds` — deliberately NOT the window-relative
+                # `budget_rounds`, which resets on every readmission and would therefore read
+                # as "unchanged" across two genuinely distinct windows.
                 _pr_needs_user(script_dir, repo, number, issue_number,
-                               f"the review round budget is exhausted at {rounds} round(s) "
+                               f"the review round budget is exhausted at {budget_rounds} "
+                               f"round(s) "
                                f"(base {max_rounds}, hard cap {worker_pr.HARD_CAP_ROUNDS}) "
                                "with no extension left — the top fix tier has run, the latest "
                                "verdict does not grade the PR improving, and no pushed fix at "
                                "or above the pinned floor awaits re-review; a human must "
-                               "decide")
+                               "decide", park_class="capacity", bot_login=bot_login,
+                               head_sha=head_sha, attempt_key=f"rounds={rounds}")
                 continue
             if budget["action"] == "extend-model-pin" and budget["pin"]:
                 # Converge the durable pin marker (normally recorded by the review outcome; this
@@ -1728,20 +3097,30 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
             # Privacy (locked decision 22a): provenance stores ONLY the salted account hash; a
             # raw-handle/missing hash already deferred above (provenance_admission_error).
             impl_account_h = record["impl_account_h"]
-            if item["state"] == "needs-review":
+            if item["state"] in {"needs-review", "stranded"}:
                 reviewed = REVIEWED_SHA_RE.search(pull.get("body") or "")
-                if reviewed and reviewed.group(1) == head_sha:
+                # A needs-review head that already equals its reviewed-sha marker has nothing to
+                # re-review (no head advance) and defers. The stranded RECOVERY (issue #161) is
+                # the sole, deliberate exception: it re-reviews the MATCHING head to escape the
+                # residue of an interrupted defuse/disarm — the reviewed-sha guard is bypassed
+                # for it, and the round budget above bounds how often it may retry.
+                if (item["state"] == "needs-review"
+                        and reviewed and reviewed.group(1) == head_sha
+                        and "review:needs" not in labels):
                     print(f"defer review {repo}#{number}: head already reviewed")
                     continue
-                base_branch = str((pull.get("base") or {}).get("repo", {}).get(
-                    "default_branch", "")) or "main"
-                diff = _gh_json(["api", f"repos/{repo}/compare/{base_branch}...{head_sha}"])
+                # The empty-diff / no-op-rebase probe compares against the PR's ACTUAL base
+                # ref, never the repo default branch (issue #164): a wrong-base probe reads
+                # either empty (a silent forever-defer) or non-empty vs a base the arm can never
+                # merge. The base admission ABOVE already validated base_ref as the protected
+                # default, so an empty result here really is a no-op rebase.
+                diff = _gh_json(["api", f"repos/{repo}/compare/{base_ref}...{head_sha}"])
                 if not diff.get("files"):
                     print(f"defer review {repo}#{number}: empty diff vs merge base (no-op rebase)")
                     continue
                 mode, role = "review", "review"
                 chain = _resolvable_chain(REVIEW_CHAIN[impl_provider], routing)
-                holder_prefix, cap, ttl = "review:", REVIEW_MAX_CONCURRENT, REVIEW_TTL
+                holder_namespace, ttl = "review:", REVIEW_TTL
                 round_number = rounds + 1
             elif repair_state:
                 # GAP-A/B autonomous repair (reuse mode=fix, same-provider chain). The live
@@ -1752,39 +3131,68 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 # ping-pong therefore always terminates in review:needs-user.
                 mode, role = "fix", "fix"
                 round_number = max(rounds, 1)
-                missed = worker_pr.marker_runs(comments, bot_login, "missed", round_number)
-                if len(missed) >= MISSED_FIX_LIMIT:
+                missed, missed_total = _missed_fix_budget(
+                    worker_pr, comments, bot_login, round_number, _readmission_cutoff,
+                    repo, number)
+                if missed >= MISSED_FIX_LIMIT:
+                    # Missed dispatches ARE capacity starvation (the allocator found no slot
+                    # every tick) -> the machine-owned park, never a fake human question. The
+                    # charge is WINDOWED by the readmission cutoff (#555 recurrence gap) so a
+                    # human unpark grants real dispatch capacity; the fingerprint carries the
+                    # LIFETIME count, which is monotone across windows.
                     _pr_needs_user(script_dir, repo, number, issue_number,
-                                   f"{len(missed)} consecutive fix dispatches missed for round "
-                                   f"{round_number}; a human must unstick this PR")
+                                   f"{missed} consecutive fix dispatches missed for round "
+                                   f"{round_number}; a human must unstick this PR",
+                                   park_class="capacity", bot_login=bot_login,
+                                   head_sha=head_sha,
+                                   attempt_key=f"missed{round_number}={missed_total}")
                     continue
                 chain = _resolvable_chain(fix_aliases, routing)
-                holder_prefix, cap, ttl = "fix:", FIX_MAX_CONCURRENT, FIX_TTL
+                holder_namespace, ttl = "fix:", FIX_TTL
             else:
-                if rounds < 1:
-                    print(f"defer review {repo}#{number}: review:changes with no recorded round")
-                    continue
-                missed = worker_pr.marker_runs(comments, bot_login, "missed", rounds)
-                if len(missed) >= MISSED_FIX_LIMIT:
+                # Externally relabelled review:changes is a first-class re-entry even when no
+                # bot round marker survived/exists.  Round 1 is the positive workflow round that
+                # corresponds to the clean synthetic round-0 budget posture; the trusted verdict
+                # record is still required below before a verdict-seeded fixer may run.
+                round_number = max(rounds, 1)
+                missed, missed_total = _missed_fix_budget(
+                    worker_pr, comments, bot_login, round_number, _readmission_cutoff,
+                    repo, number)
+                if missed >= MISSED_FIX_LIMIT:
+                    # Same capacity-starvation classification — and the same readmission
+                    # windowing + attempt fingerprint — as the repair-state branch above.
                     _pr_needs_user(script_dir, repo, number, issue_number,
-                                   f"{len(missed)} consecutive fix dispatches missed for round "
-                                   f"{rounds}; a human must unstick this PR")
+                                   f"{missed} consecutive fix dispatches missed for round "
+                                   f"{round_number}; a human must unstick this PR",
+                                   park_class="capacity", bot_login=bot_login,
+                                   head_sha=head_sha,
+                                   attempt_key=f"missed{round_number}={missed_total}")
                     continue
                 verdict_file = record_file_path(ledger_root, registry_root,
-                                                worker_pr.verdict_path(repo, number, rounds))
+                                                worker_pr.verdict_path(repo, number, round_number))
                 if not verdict_file.is_file():
                     _run_target_helper(script_dir, repo, "worker-pr.py", [
                         "record-marker", "--repo", repo, "--pr", str(number), "--kind", "missed",
-                        "--round", str(rounds), "--run-key",
+                        "--round", str(round_number), "--run-key",
                         f"{os.environ.get('GITHUB_RUN_ID', 'local')}."
                         f"{os.environ.get('GITHUB_RUN_ATTEMPT', '1')}",
                         "--bot-login", bot_login])
-                    print(f"defer review {repo}#{number}: round {rounds} verdict record missing")
+                    print(f"defer review {repo}#{number}: round {round_number} trusted verdict "
+                          "record missing")
                     continue
+                if rounds < 1:
+                    # Bind the recovered trusted round-1 verdict back into the durable comment
+                    # state before launching its fix. Without this synthesis the pushed fix would
+                    # be re-reviewed as round 1 and collide with the existing immutable round-1
+                    # verdict path. The budget decision above intentionally saw round 0, so this
+                    # externally adjudicated re-entry starts clean; subsequent ticks see round 1.
+                    _run_target_helper(script_dir, repo, "worker-pr.py", [
+                        "round-record", "--repo", repo, "--pr", str(number),
+                        "--round", str(round_number), "--run-key", run_key,
+                        "--head-sha", head_sha, "--bot-login", bot_login])
                 mode, role = "fix", "fix"
                 chain = _resolvable_chain(fix_aliases, routing)
-                holder_prefix, cap, ttl = "fix:", FIX_MAX_CONCURRENT, FIX_TTL
-                round_number = rounds
+                holder_namespace, ttl = "fix:", FIX_TTL
             if not chain:
                 # The inverse (or same-provider) chain cannot resolve a concrete model right now
                 # (e.g. sol/luna not yet in the target routing catalog). Never silent-queue:
@@ -1794,14 +3202,31 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                                "unresolvable in the target routing (no concrete provider model)")
                 continue
         except DispatchError as exc:
+            lanes[lane]["error"] += 1
             print(f"defer review {repo}#{number}: revalidation failed ({exc}); skipped")
             continue
+        # Issue #115 fail-closed usage hold: the worker loop already HOLDS a require_usage repo when
+        # a TOTAL usage-probe failure leaves `usage` unavailable; the review/fix loop must apply the
+        # SAME hold before its claim or a probe-gated (anthropic) review/fix silently falls to the
+        # allocator's ungated static selection during the outage. The ONLY exception is a chain
+        # served entirely by probe-exempt (codex/openai) accounts, for which usage=None is expected.
+        if usage is None and require_usage and not _chain_probe_exempt(chain, routing):
+            defer_reasons["usage-probe-unavailable"] += 1
+            print(f"defer review {repo}#{number}: require_usage set but live usage is unavailable "
+                  f"(probe failed) — holding the {mode} claim fail-closed")
+            continue
         now = int(time.time())
-        holder = f"{holder_prefix}{repo}#{number}@dispatch-" \
+        # Repository-scoped prefix: package names (including __global__) are target-local.  The
+        # old bare `review:` / `fix:` prefix mixed unrelated repos into one package partition and
+        # one fixed lane cap, so a sparq lease could suppress registry work while its provider's
+        # account slots sat idle.  The holder grammar itself is unchanged, preserving adoption and
+        # per-PR duplicate keys; only the allocator's partition scope becomes the documented repo.
+        holder_prefix = f"{holder_namespace}{repo}#"
+        holder = f"{holder_prefix}{number}@dispatch-" \
                  f"{os.environ.get('GITHUB_RUN_ID', 'local')}." \
                  f"{os.environ.get('GITHUB_RUN_ATTEMPT', '1')}"
         try:
-            claim = allocator.claim(
+            claim_result = allocator.claim(
                 registry_repo,
                 item["package"],
                 role,
@@ -1811,15 +3236,29 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 ttl=ttl,
                 account_pool=policy["account_pool"],
                 holder_prefix=holder_prefix,
-                max_holder_concurrent=cap,
                 usage=usage,
                 margin=margin,
+                # Issue #448: recompute the live remaining slots inside every CAS attempt.  N
+                # candidates therefore produce min(N, S) leases as earlier successes consume S;
+                # S=0 fails closed.  No static per-lane ceiling can strand an idle provider.
+                account_slot_bound=True,
+                return_reason=True,
             )
         except (RuntimeError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
             defer_reasons["lease-error"] += 1
+            lanes[lane]["error"] += 1
+            if mode == "fix":
+                fix_dispatch["defer:lease-error"] += 1
             print(f"defer review {repo}#{number}: lease allocation errored ({exc}); skipped")
             continue
+        # Compatibility with self-test allocators and out-of-tree allocator shims that implement
+        # the historical claim-or-None API; the real allocator returns (claim, reason) here.
+        if isinstance(claim_result, tuple) and len(claim_result) == 2:
+            claim, claim_reason = claim_result
+        else:
+            claim, claim_reason = claim_result, "no-account-slots"
         if claim is None:
+            defer_reasons[f"{lane}:{_claim_defer_category(claim_reason)}"] += 1
             if mode == "fix":
                 try:
                     _run_target_helper(script_dir, repo, "worker-pr.py", [
@@ -1828,8 +3267,43 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                         f"{os.environ.get('GITHUB_RUN_ID', 'local')}."
                         f"{os.environ.get('GITHUB_RUN_ATTEMPT', '1')}",
                         "--bot-login", bot_login])
-                except DispatchError:
-                    pass
+                except DispatchError as exc:
+                    # Issue #117 fail-closed missed-fix budget: swallowing this write left the
+                    # durable `missed` marker unrecorded, so the missed-fix budget could stay at
+                    # zero forever — the MISSED_FIX_LIMIT escalation to a human never fired and the
+                    # PR was silently stranded. A missed dispatch we cannot durably count is a
+                    # COUNTED lane error + rolling-alert defer reason, NOT a healthy defer: surface
+                    # it and do not fall through to the normal "no lease free" line, whose green
+                    # defer is exactly the signal that hid this.
+                    lanes[lane]["error"] += 1
+                    defer_reasons["missed-marker-write-failed"] += 1
+                    fix_dispatch["defer:missed-marker-write-failed"] += 1
+                    print(f"defer review {repo}#{number}: missed-fix marker write FAILED ({exc}); "
+                          "missed-fix budget unconfirmed")
+                    # Issue #165: the durable `missed` marker is the ONLY input to the
+                    # MISSED_FIX_LIMIT terminal budget, so if it can NEVER be written the budget can
+                    # never bound this PR and the counted-error/rolling-alert above is only a
+                    # PER-TICK signal — a persistent comment/API failure would defer forever without
+                    # the promised human escalation. An accounting failure we cannot durably count
+                    # is itself a terminal, hand-to-human state, so escalate DIRECTLY instead of
+                    # waiting on a budget that can no longer accrue. This is retryable, not
+                    # premature: needs-user rides the SAME target API as the failed marker, so a
+                    # broad transient outage fails this POST too and we simply defer to the next
+                    # tick — the escalation only STICKS on a record-marker-specific failure that
+                    # will not self-heal. The item is bounded the moment EITHER the marker or this
+                    # escalation is durably confirmed; until then it stays a retryable defer.
+                    try:
+                        _pr_needs_user(script_dir, repo, number, issue_number,
+                                       f"the durable missed-fix marker could not be recorded "
+                                       f"({exc}); the MISSED_FIX_LIMIT budget can no longer bound "
+                                       "this PR, so a human must unstick it")
+                    except DispatchError as esc_exc:
+                        defer_reasons["missed-escalation-failed"] += 1
+                        print(f"defer review {repo}#{number}: missed-fix human escalation ALSO "
+                              f"FAILED ({esc_exc}); retrying until the marker or escalation is "
+                              "confirmed")
+                    continue
+                fix_dispatch[f"defer:{claim_reason or 'no-account-slots'}"] += 1
             print(f"defer review {repo}#{number}: no eligible {mode} lease is free this tick")
             continue
         account = claim.get("account")
@@ -1854,7 +3328,22 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
         elif mode == "fix" and claim_provider and claim_provider != impl_provider:
             violation = "fixer provider would differ from implementer provider"
         if violation:
-            _release_failed_dispatch(allocator, registry_repo, str(claim_id or ""))
+            # Issue #118: never report the lease "released" without confirming it. A CAS
+            # conflict (or a garbage claim_id that was itself the violation) can leave the
+            # lease ACTIVE — consuming its account/package until expiry — so a failed release
+            # is a COUNTED lane error + hard `::error::`, not a green unsafe-claim defer that
+            # falsely logs recovery.
+            released = _release_failed_dispatch(allocator, registry_repo, str(claim_id or ""))
+            if not released:
+                lanes[lane]["error"] += 1
+                defer_reasons["unsafe-claim-release-failed"] += 1
+                if mode == "fix":
+                    fix_dispatch["defer:unsafe-claim-release-failed"] += 1
+                print(f"::error::review {repo}#{number}: {violation}; lease release FAILED "
+                      "(claim still active until expiry)")
+                continue
+            if mode == "fix":
+                fix_dispatch["defer:unsafe-claim"] += 1
             print(f"defer review {repo}#{number}: {violation}; released + skipped")
             continue
         result = _run_gh([
@@ -1877,17 +3366,30 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
             released = _release_failed_dispatch(allocator, registry_repo, claim_id)
             if not released:
                 print("::error::review-fix dispatch failed and its lease could not be released")
+            # A failed workflow launch is a HARD dispatch error, not capacity contention: fold it
+            # into the lane's error tally (issue #108) so an all-launch-failed review/fix lane
+            # reads planned>0/launched=0/error>0 (stalled) instead of deriving as `deferred` and
+            # dodging the tick-health recorder while another lane launched.
+            defer_reasons["dispatch-launch-failed"] += 1
+            lanes[lane]["error"] += 1
+            if mode == "fix":
+                fix_dispatch["defer:dispatch-launch-failed"] += 1
             print(f"defer review {repo}#{number}: {mode} dispatch failed; skipped")
             continue
         launched += 1
+        pending_telemetry["launched"] = True
+        lanes[lane]["launched"] += 1
+        if mode == "fix":
+            fix_dispatch["launched"] += 1
         # Privacy (locked decision 22b): public workflow logs never carry account handles.
         kind_note = "" if fix_kind == "verdict" else f"/{fix_kind}"
         print(f"dispatched {mode}{kind_note} {repo}#{number}: round={round_number}, "
               f"claim={claim_id[:8]}")
+    finish_pending()
     return launched
 
 
-def _apply_disarm_items(disarm_items, repo, script_dir, bot_login):
+def _apply_disarm_items(disarm_items, repo, script_dir, bot_login, disarm_counts=None):
     """GAP-C (registry issue #42): retract stale GitHub auto-merge latches BEFORE any fix/review
     admission each sweep. The plan rows are HOSTILE — worker-pr.py `disarm --when mismatch`
     re-derives every precondition from the LIVE API (open same-repo bot worker PR, armed OR
@@ -1896,19 +3398,33 @@ def _apply_disarm_items(disarm_items, repo, script_dir, bot_login):
     does NOT block this safety-only retraction (issue #105): --when mismatch retracts the latch
     while preserving the hold label. Failures skip the item (per-item resilience); the
     enumeration re-emits next tick until the invariant holds — including across a crash between
-    disable-auto and redraft, which mismatch mode re-enters via the ready-but-unarmed leg."""
+    disable-auto and redraft, which mismatch mode re-enters via the ready-but-unarmed leg.
+
+    `disarm_counts` (issue #108) is the disarm lane's tick accumulator: `launched` when the
+    live-revalidated retraction applied (or was a confirmed no-op), `error` when the helper RAISED,
+    `deferred` when no App token/bot identity was available to even attempt it. An `error` here is
+    safety-critical — a stale auto-merge latch that could not be retracted — so the caller surfaces
+    disarm_counts['error'] to the tick-health recorder INDEPENDENTLY of the fleet dispatch count; a
+    worker launch must never let a failed disarm read as a healthy tick."""
+    if disarm_counts is None:
+        disarm_counts = Counter()
     for item in disarm_items:
         number = item["pr_number"]
+        disarm_counts["planned"] += 1
         try:
             if not bot_login or not _target_token(repo):
+                disarm_counts["deferred"] += 1
                 print(f"defer disarm {repo}#{number}: target App token unavailable")
                 continue
             _run_target_helper(script_dir, repo, "worker-pr.py", [
                 "disarm", "--repo", repo, "--pr", str(number), "--when", "mismatch"])
+            disarm_counts["launched"] += 1
             print(f"disarm {repo}#{number}: live armed-SHA invariant re-checked and applied")
         except DispatchError as exc:
+            disarm_counts["error"] += 1
             print(f"defer disarm {repo}#{number}: {exc}; retried next tick")
             continue
+    return disarm_counts
 
 
 def _route_matches(repo, item, policy_doc, routing_doc, policy_module):
@@ -1933,7 +3449,7 @@ def _route_matches(repo, item, policy_doc, routing_doc, policy_module):
     )
     if roles != [item["role"]] or priorities != [item["priority"]]:
         raise DispatchError(f"plan labels disagree with route fields for {repo}#{item['number']}")
-    if item["package"] != (packages[0] if packages else "__global__"):
+    if item["package"] != plan_package(packages):
         raise DispatchError(f"plan package disagrees with labels for {repo}#{item['number']}")
     return resolved
 
@@ -1968,8 +3484,122 @@ def escalate_starved(escalate, usage, effective_cap):
     chain-exhaustion instead of silently starving or degrading to a weaker model. True when the
     LIVE usage probe is present and shows ZERO accounts able to serve the chain (dynamic
     concurrency 0). With no usage map the signal is unknown, so the item simply defers (the
-    require_usage fail-closed hold + usage-alert cover that case)."""
+    require_usage fail-closed hold + usage-alert cover that case).
+
+    NOTE (issue #116): this predicate only says the route is starved RIGHT NOW — a single usage
+    snapshot. Whether that momentary starvation is handed to a human is a SEPARATE, bounded
+    decision (escalate_persist_decision): transient rate-limit exhaustion is pipeline-owned and
+    refills on its own, so one zero-headroom snapshot must NOT become a permanent human terminal."""
     return bool(escalate) and usage is not None and effective_cap == 0
+
+
+# Issue #116: how long an escalate-tier route must stay CONTINUOUSLY starved before a transient
+# capacity snapshot is promoted to a loud persistent-shortage park (the machine-owned
+# status:parked — capacity starvation is never the human-question terminal needs:user;
+# park_policy.py defect 1). Rate-limit headroom is pipeline-owned and refills within minutes; a
+# bounded grace lets auto-retry recover the common case while still guaranteeing a genuinely
+# persistent starvation is alerted and parked. Measured against the first alert of the CURRENT
+# streak, so it is independent of how often the dispatcher ticks.
+ESCALATE_PERSIST_SECONDS = 30 * 60
+# Durable, privacy-safe receipt marking an escalate-tier starvation alert. Its presence + timestamp
+# ARE the persistence clock (mirroring the worker-attempt receipt idiom); it carries no PII.
+STARVE_ALERT_MARKER = "<!-- sparq-escalate-starved:v1 -->"
+# Issue #116 (round 1): durable receipt that LIVE capacity RECOVERED (effective_cap > 0) for an
+# escalate-tier issue that still carried an open starvation streak. Recovery is a genuine end of
+# continuous starvation even when it yields NO worker attempt (the allocator returned no slot, the
+# launch failed, or another pre-dispatch hold intervened), so this receipt — not a subsequent
+# attempt — is what closes the streak. Carries no PII, same idiom as the alert receipt.
+STARVE_RESET_MARKER = "<!-- sparq-escalate-recovered:v1 -->"
+
+
+def _receipt_instants(comments, bot, marker):
+    """(instant, created_at-string) pairs — instants PARSED to aware datetimes via
+    park_policy.parse_ts (round-5 finding 2: receipt ordering is by parsed instant, never raw
+    string — a space-separator spelling sorts lexicographically before every 'T' spelling of
+    a LATER time) — for comments authored by `bot` (casefolded login) that carry `marker`.
+    RAISES ValueError on a matching receipt whose created_at cannot be parsed: these receipts
+    ARE the persistence clock, and both consumers FREEZE the starvation ladder on an
+    unreadable clock (never escalate to a park, never mint a recovery receipt, on unprovable
+    time). Shared helper for the starvation-persistence + recovery-reset logic."""
+    return [
+        (_park_policy.parse_ts(c.get("created_at")), str(c.get("created_at")))
+        for c in comments
+        if str(c.get("user", {}).get("login", "")).casefold() == bot
+        and marker in str(c.get("body", ""))
+    ]
+
+
+def escalate_persist_decision(comments, bot_login, now, attempt_marker,
+                              persist_seconds=ESCALATE_PERSIST_SECONDS, log=print):
+    """Bounded-persistence gate between a TRANSIENT escalate-tier capacity snapshot and a loud
+    persistent-shortage park (issue #116). A single usage snapshot showing zero eligible accounts
+    is pipeline-owned rate-limit exhaustion that refills on its own; promoting it straight to a
+    park strands pipeline-owned work behind a wait for the same capacity. So the FIRST starved
+    tick just alerts ops with a durable STARVE_ALERT_MARKER receipt and keeps the issue
+    status:deferred (auto-retry); the machine-owned status:parked soft hold (park_policy.py —
+    capacity starvation is never the human-question terminal needs:user) is applied ONLY once
+    that alert streak has persisted at least `persist_seconds`.
+
+    The streak RESETS on a real dispatch: only starvation receipts posted (by `bot_login`) STRICTLY
+    AFTER the most recent worker attempt receipt (`attempt_marker`) count — the exact "after the
+    last failure" idiom find_maintainer_approval uses. So capacity that recovered, dispatched, then
+    starved again later begins a fresh transient streak instead of inheriting a stale age (which
+    would re-create the very bug this fixes: a new momentary snapshot reading as long-persistent).
+
+    Returns (escalate: bool, streak_started_at: str). `streak_started_at` is the oldest in-streak
+    receipt ("" when this is the first observation, i.e. no receipt yet). `escalate` is True only
+    when that oldest receipt is at least `persist_seconds` old — a bounded persistent failure,
+    never one snapshot. Ordering is by PARSED instants (park_policy.parse_ts — round-5 finding
+    2: a raw-string compare read a space-separator alert stamp as both pre-reset AND
+    past-grace, so a 60-second-old snapshot could escalate straight to a park); a receipt
+    whose stamp cannot be parsed FREEZES the ladder — (False, "") with a loud log — because an
+    unreadable clock can prove neither persistence nor recovery."""
+    bot = bot_login.casefold()
+    # The continuous-starvation streak ENDS on any durable end-of-starvation signal, not solely a
+    # worker attempt: a live-capacity RECOVERY receipt (STARVE_RESET_MARKER) closes it too (issue
+    # #116 round 1). Recovery is a real streak end even when it produced no attempt (allocator
+    # returned no slot, the launch failed, or a later pre-dispatch hold intervened), so alerts at or
+    # before the NEWER of {last attempt, last reset} are stale and must not age a later snapshot.
+    try:
+        resets = (_receipt_instants(comments, bot, attempt_marker)
+                  + _receipt_instants(comments, bot, STARVE_RESET_MARKER))
+        alerts = _receipt_instants(comments, bot, STARVE_ALERT_MARKER)
+    except ValueError as exc:
+        log(f"::warning::starvation-ladder clock unreadable ({exc}) — freezing: no "
+            "escalation on unprovable time")
+        return False, ""
+    reset_at = max((instant for instant, _stamp in resets), default=None)
+    streak = sorted((instant, stamp) for instant, stamp in alerts
+                    if reset_at is None or instant > reset_at)
+    if not streak:
+        return False, ""
+    threshold = _park_policy.parse_ts(
+        time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - persist_seconds)))
+    return streak[0][0] <= threshold, streak[0][1]
+
+
+def escalate_recovery_pending(comments, bot_login, attempt_marker, log=print):
+    """True when an escalate-tier issue carries an ACTIVE starvation alert — a STARVE_ALERT_MARKER
+    posted strictly after the latest reset/attempt receipt — so an observed live-capacity recovery
+    should now persist a STARVE_RESET_MARKER that closes the streak (issue #116 round 1). Returns
+    False once a reset (or attempt) already supersedes every alert, which keeps recovery recording to
+    ONE receipt per streak — no per-tick comment spam while capacity stays healthy. Ordering is
+    by PARSED instants (park_policy.parse_ts — round-5 finding 2: a space-separator alert
+    stamp sorts lexicographically before a 'T'-form reset stamp of an EARLIER instant, so the
+    raw-string compare read a fresh post-reset alert as already closed); an unparseable
+    receipt stamp FREEZES the ladder (False, loud log) — same fail direction as
+    escalate_persist_decision."""
+    bot = bot_login.casefold()
+    try:
+        resets = (_receipt_instants(comments, bot, attempt_marker)
+                  + _receipt_instants(comments, bot, STARVE_RESET_MARKER))
+        alerts = _receipt_instants(comments, bot, STARVE_ALERT_MARKER)
+    except ValueError as exc:
+        log(f"::warning::starvation-ladder clock unreadable ({exc}) — freezing: no "
+            "recovery receipt on unprovable time")
+        return False
+    reset_at = max((instant for instant, _stamp in resets), default=None)
+    return any(reset_at is None or instant > reset_at for instant, _stamp in alerts)
 
 
 def _load_usage():
@@ -1993,8 +3623,13 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
     allocator = _load_module("registry_select_and_claim", script_dir / "select-and-claim.py")
     worker_pr = _load_module("registry_worker_pr", script_dir / "worker-pr.py")
     worker_issue = _load_module("registry_worker_issue", script_dir / "worker-issue.py")
+    model_health = _load_module("registry_model_health", script_dir / "model-health.py")
     usage = _load_usage()
     catalog_cache = {"accounts": None}  # read the account catalog at most once, only if usage-aware
+    # The health ledger is immutable from dispatch and read at most once per tick. None is the
+    # fail-closed unreadable state; the separate flag distinguishes it from an unread cache.
+    health_window = None
+    health_window_loaded = False
     try:
         with open(plan_path, encoding="utf-8") as handle:
             plan = validate_plan(json.load(handle))
@@ -2018,6 +3653,18 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
     planned = sum(len(repository["items"]) + len(
         [e for e in plan["review_items"] if e["repo"] == repository["target_repo"]])
         for repository in plan["repositories"])
+    # Independent per-lane accounting (issue #108): each lane's iterator (the worker loop,
+    # _dispatch_review_items, _apply_disarm_items) folds its own planned/launched/error into this
+    # shared accumulator as items resolve; deferred is derived at summary time. worker+review+fix
+    # planned == the fleet `planned` above; disarm is its OWN lane (it consumes no account/lease, so
+    # it was invisible to the fleet count — the exact gap that let a failed safety disarm hide
+    # behind a worker launch). A worker launch can no longer mark the whole tick healthy while a
+    # safety disarm or an entire review/fix lane failed.
+    lanes = _new_lane_counts()
+    # Issue #448 fix-lane fan-out telemetry.  This is accumulated across every target repository
+    # and rendered once per tick, so the observable ceiling is fleet-wide rather than a sequence
+    # of ambiguous per-repo snippets.
+    fix_dispatch = Counter()
     # Per-item snapshot degradation (run 29617040167): PLAN skipped these PRs' CI/merge
     # snapshot (oversized check-run listing, failed detail read, census overflow) instead of
     # failing the sweep. Their snapshot-derived admissions already stood down at PLAN time
@@ -2032,39 +3679,87 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
     # planned>0/launched-0 summary for the workflow's always()-guarded tick recorder — instead of
     # a missing file that used to read as planned=0 and record nothing. The final write below
     # overwrites it with the real launched count + histogram.
-    _write_dispatch_summary(planned, 0, defer_reasons)
+    _write_dispatch_summary(planned, 0, defer_reasons, lanes)
     for repository in plan["repositories"]:
         repo = repository["target_repo"]
         try:
             policy = policy_module._policy_row(repo, policy_doc)
         except ValueError as exc:
             raise DispatchError(f"registry policy is invalid for {repo}") from exc
-        routing = _routing_at_plan_sha(repo, policy["routing"], repository["target_sha"])
+        # [issue #111] The exact issue-author bot allowlist: the policy-declared `trusted_bots`
+        # unioned with the RUNTIME-resolved worker App login. `bot_login` is our own orchestration
+        # App (it opens the pipeline's follow-up/groom issues), so an empty policy list still trusts
+        # it; every OTHER bot must be listed exactly. No suffix match — a stray "<x>[bot]" is denied.
+        trusted_bots = set(policy.get("trusted_bots", []))
+        if bot_login:
+            trusted_bots.add(bot_login)
+        allow_actions_bot_issues = policy["allow_actions_bot_issues"]
+        # [issue #119] Read the routing catalog from the protected default-branch tip CLAIM
+        # resolves ITSELF, NOT from repository["target_sha"]: that sha is `git rev-parse HEAD` of
+        # the checkout that ran the hostile target planner, so trusting it let target-controlled
+        # data pick an obsolete/weaker routing revision. target_sha stays an audit-only plan field.
+        routing = _protected_routing(repo, policy["routing"])
         pull_pages = _gh_json([
             "api", "--paginate", "--slurp", f"repos/{repo}/pulls?state=open&per_page=100"
         ])
-        linked_open_prs = _linked_open_pr_issues(pull_pages)
+        linked_open_prs = _linked_open_pr_issues(pull_pages, repo)
         # [round-4 P1] PLAN->CLAIM busy-window revalidation: the PLAN partition's freeing
         # decisions are minutes stale by launch time. Re-prove every item's crate against
         # the LIVE pull listing just fetched (zero extra pulls-API cost), the live issue
         # labels, and the local provenance checkouts BEFORE anything launches; an item
         # whose crate re-reads busy (a parked draft went ready, a new worker PR opened)
         # defers to the next tick instead of racing a PR that can now merge into it.
+        # ONE live view per repo per tick, shared by the busy revalidation and the capacity-park
+        # readmission sweep below (they must not disagree about the live hold/linkage state, and
+        # the issue listing is a paginated API read worth spending once).
+        live_issue_labels = _live_issue_labels(repo)
+        claim_provenance = _claim_provenance_map(repo, registry_root, ledger_root)
         live_dispatchable = revalidate_items_against_live_pulls(
-            repository["items"], repo, pull_pages, _live_issue_labels(repo),
-            _claim_provenance_map(repo, registry_root, ledger_root),
+            repository["items"], repo, pull_pages, live_issue_labels, claim_provenance,
             # [round-5 P1] the cross-lane lease partition reads the ledger-branch checkout;
             # an unreadable ledger view yields None and the partition fails toward exclusion.
             leases=_ledger_leases(ledger_root), now=int(time.time()))
 
         # Safety invariant FIRST (issue #42): stale arm latches are retracted before any fix or
-        # review admission can push onto (or re-review past) an armed, mutated head.
+        # review admission can push onto (or re-review past) an armed, mutated head. The disarm lane
+        # folds its own launched/error/deferred into `lanes` (issue #108) — an error here alerts
+        # regardless of the worker/review/fix outcome below.
         _apply_disarm_items(
             [entry for entry in plan["disarm_items"] if entry["repo"] == repo],
-            repo, script_dir, bot_login)
+            repo, script_dir, bot_login, lanes["disarm"])
+
+        # [registry #614] AUTOMATIC re-admission of MACHINE capacity parks whose starvation cause
+        # has demonstrably cleared. It runs on the LIVE listing because PLAN's pure walk excludes
+        # every parked PR outright (nothing downstream can see them), and it re-admits by doing
+        # exactly what a human gesture does — receipt FIRST, then clear the machine label(s) — so
+        # the PR re-enters the ordinary enumeration next tick with a real budget window. Skipped
+        # without the App bot login or the target token: the receipts are bot-authored and the
+        # label writes need that token, and a re-admission that cannot be receipted must not
+        # happen. An unreadable health window re-admits NOTHING (fail closed).
+        if bot_login and _target_token(repo):
+            if not health_window_loaded:
+                health_window = _read_model_health_window(
+                    model_health, registry_repo, int(time.time()))
+                health_window_loaded = True
+            if health_window is None:
+                print(f"::warning::auto-readmit skipped for {repo}: the model-health window is "
+                      "unreadable, so no capacity park can prove its cause cleared — every park "
+                      "stands (fail closed)")
+            else:
+                _now = int(time.time())
+                _readmit_capacity_parks(
+                    repo, pull_pages, live_issue_labels, claim_provenance, bot_login,
+                    script_dir, worker_pr,
+                    _capacity_recovery_probe(model_health, health_window, _now),
+                    # [G1] The legacy migration converts a park only while a starvation cause is
+                    # OBSERVABLE right now — otherwise the converted park could never prove
+                    # recovery and the migration would trade a visible stall for a silent one.
+                    migration_provable=model_health.park_cause_provable(
+                        health_window, _now, _now))
 
         for item in repository["items"]:
             number = item["number"]
+            lanes["worker"]["planned"] += 1
             if number in linked_open_prs:
                 defer_reasons["existing-pr"] += 1
                 print(f"defer {repo}#{number}: an open worker/closing PR already exists")
@@ -2072,43 +3767,206 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
             if number not in live_dispatchable:
                 # [round-4 P1] the crate freed at PLAN time re-read BUSY on the live pull
                 # state — a worker PR went active (or appeared) in the PLAN->CLAIM window.
+                # revalidate_items_against_live_pulls already emitted the single per-item
+                # artifact line naming the blocking PR/lease; do not bury it under a second,
+                # generic defer line here.
                 defer_reasons["live-busy-crate"] += 1
-                print(f"defer {repo}#{number}: its crate re-read busy on the live pull "
-                      "state (PLAN->CLAIM window)")
                 continue
             # [OPUS-4.8] Per-item resilience: a single item's trust/route/policy resolution failure
             # must SKIP that item, not abort the whole dispatch (which would strand the other ready
             # issues and mark the run failed). Global setup errors above still abort as before.
             try:
-                current, reason = _current_issue_matches(repo, item)
+                current, reason = _current_issue_matches(
+                    repo, item, trusted_bots, allow_actions_bot_issues)
                 if not current:
                     defer_reasons["stale-issue"] += 1
                     print(f"defer {repo}#{number}: {reason}")
                     continue
                 resolved = _route_matches(repo, item, policy_doc, routing, policy_module)
                 if item["deferred"]:
-                    # Deferred-retry budget (locked decision 20): re-dispatch is bounded by the
-                    # SAME durable attempt markers the worker records; exhausted -> needs-user +
-                    # a maintainer-visible comment, never another silent attempt.
+                    # #500 task-side honest-decline escalation. This runs BEFORE the ordinary
+                    # deferred-attempt budget and BEFORE allocator.claim(), so the second
+                    # no_change cannot be swallowed by generic needs-user budgeting or launch the
+                    # cached impl route. The model-health module owns validation/window pruning;
+                    # dispatch consumes its ledger READ-ONLY.
                     if not bot_login or not _target_token(repo):
                         defer_reasons["no-target-token"] += 1
                         print(f"defer {repo}#{number}: deferred retry needs the target App token")
                         continue
-                    comments = _pr_comments(repo, number)
+                    if not health_window_loaded:
+                        health_window = _read_model_health_window(
+                            model_health, registry_repo, int(time.time()))
+                        health_window_loaded = True
+                    if health_window is None:
+                        defer_reasons["decline-ledger-unreadable"] += 1
+                        print(f"::error::defer {repo}#{number}: no_change escalation evidence "
+                              "is unavailable; issue remains deferred with NO escalation")
+                        continue
+                    no_changes = _issue_no_change_outcomes(
+                        model_health, health_window, number)
+                    comments = None
+                    if len(no_changes) >= DECLINE_ESCALATION_MIN:
+                        comments = _pr_comments(repo, number)
+                        decline_result = _escalate_repeated_declines(
+                            repo, item, no_changes, comments, bot_login, script_dir)
+                        if decline_result != "proceed":
+                            defer_reasons[f"decline-{decline_result}"] += 1
+                            print(f"escalated {repo}#{number}: repeated no_change outcomes -> "
+                                  f"{decline_result}; cached {item['role']} claim cancelled")
+                            continue
+                    # Deferred-retry budget (locked decision 20): re-dispatch is bounded by the
+                    # SAME durable attempt markers the worker records; exhausted -> the
+                    # MACHINE-owned status:parked soft hold + a maintainer-visible comment,
+                    # never another silent attempt. Budget exhaustion is budget-driven, not a
+                    # human question (park_policy.py defect 1): needs:user here terminally
+                    # stripped the issue's open PR from the review loop (2026-07-18 mass park).
+                    #
+                    # Finding B + round-3 finding 1: the durable count is WINDOWED by the
+                    # human-readmission cutoff (park_policy.readmission_cutoff over the
+                    # issue's own label timeline, strict maintainer probe), and the bounded
+                    # escalation is the LABEL-INDEPENDENT ladder
+                    # (park_policy.park_ladder_decision): EVERY consumed budget window — the
+                    # initial no-cutoff window included — is receipted
+                    # (PARK_GENERATION_MARKER), generations are counted from receipts alone
+                    # (a veto-suppressed label re-apply never stalls the ladder), the
+                    # receipt-dedupe silences COMMENTS only, an unreadable timeline FREEZES
+                    # the ladder, and PARK_ESCALATION_GENERATIONS consumed windows escalate
+                    # to the QUESTION-class terminal whose needs:user write is veto-checked
+                    # with an HONEST comment when suppressed.
+                    comments = comments if comments is not None else _pr_comments(repo, number)
                     used = worker_issue.count_attempts(comments, bot_login)
                     if used >= resolved["max_attempts"]:
-                        _run_target_helper(script_dir, repo, "worker-issue.py", [
-                            "status", "--repo", repo, "--issue", str(number),
-                            "--status", "needs-user"])
-                        _run_gh_target_comment(repo, number,
-                                               f"> 🤖 SPARQ agent — deferred-retry budget "
-                                               f"exhausted ({used}/{resolved['max_attempts']} "
-                                               "attempts). "
-                                               f"@{os.environ.get('MAINTAINER_HANDLE', 'jeswr')} "
-                                               "this issue needs a human.")
-                        defer_reasons["budget-exhausted"] += 1
-                        print(f"escalated {repo}#{number}: deferred-retry budget exhausted")
-                        continue
+                        cutoff = _park_policy.readmission_cutoff(
+                            repo, number, None, _issue_timeline_events,
+                            is_human=lambda login: _target_is_human_maintainer(repo, login),
+                            on_unreadable=_park_policy.WINDOW_UNREADABLE)
+                        windowed = used
+                        if cutoff and cutoff != _park_policy.WINDOW_UNREADABLE:
+                            windowed = worker_issue.count_attempts_since(
+                                comments, bot_login, cutoff)
+                        if windowed < resolved["max_attempts"]:
+                            print(f"readmission window open for {repo}#{number}: a human "
+                                  f"unlabeled a park label at {cutoff}; the attempt budget "
+                                  f"charges {windowed} of {used} recorded attempt(s) — "
+                                  "allocation re-enabled")
+                            # fall through: the allocator + the `retry` label flip run again.
+                        else:
+                            action, window_key, generation = (
+                                _park_policy.park_ladder_decision(
+                                    cutoff,
+                                    worker_pr.park_generation_cutoffs(comments, bot_login),
+                                    already_labeled="status:parked" in item["labels"]))
+                            if action == "freeze":
+                                # Unreadable timeline: the ladder never advances on unproven
+                                # data — no window, no receipt, no label, no comment.
+                                defer_reasons["budget-exhausted"] += 1
+                                print(f"defer {repo}#{number}: deferred-retry budget "
+                                      "exhausted and the label timeline is unreadable — "
+                                      "ladder frozen (no readmission credit, no generation "
+                                      "receipt) until the timeline reads clean")
+                                continue
+                            if action == "dedupe":
+                                # This window is already receipted (its park or terminal was
+                                # recorded once, honestly): re-defer QUIETLY until a FRESH
+                                # human gesture. Dedupe covers comments/labels only — the
+                                # generation progression is already durable in the receipts.
+                                defer_reasons["budget-exhausted"] += 1
+                                print(f"defer {repo}#{number}: deferred-retry budget "
+                                      f"exhausted; window {window_key} already consumed "
+                                      "(receipted)")
+                                continue
+                            if action == "legacy-quiet":
+                                # Pre-receipt park: already status:parked, no gesture, no
+                                # receipts — stay quiet; the ladder starts counting with the
+                                # first receipted window.
+                                defer_reasons["budget-exhausted"] += 1
+                                print(f"defer {repo}#{number}: deferred-retry budget "
+                                      "exhausted; already status:parked (legacy "
+                                      "pre-receipt park)")
+                                continue
+                            if action == "terminal":
+                                # Bounded escalation: PARK_ESCALATION_GENERATIONS windows
+                                # consumed — repeated post-readmission failure IS a human
+                                # question now. RECEIPT-FIRST ordering (round-4 finding 2):
+                                # the sticky veto is PROBED first (so the receipt is honest
+                                # about a suppressed write), the durable receipt posts
+                                # SECOND, and the veto-checked needs:user write (worker-issue
+                                # set_status re-checks it at the write point) comes LAST — a
+                                # crash after the receipt leaves receipt-no-label, which the
+                                # receipt-driven ladder/proof reads cover; the old
+                                # label-first order could die label-no-receipt, and a
+                                # triage-side label removal then erased the escalation from
+                                # every durable surface.
+                                vetoed = _park_policy.park_vetoed(
+                                    repo, number, "needs:user", _issue_timeline_events,
+                                    is_human=lambda login: _target_is_human_maintainer(
+                                        repo, login))
+                                label_note = (
+                                    " Escalated as a human question (`needs:user`; the "
+                                    "label write follows this receipt)."
+                                    if not vetoed else
+                                    " The escalation is TERMINAL, but the `needs:user` "
+                                    "label write was SUPPRESSED by a standing human "
+                                    "unlabel (sticky veto) — no label was applied; this "
+                                    "receipt alone records it.")
+                                _run_gh_target_comment(
+                                    repo, number,
+                                    f"> 🤖 SPARQ agent — deferred-retry budget exhausted "
+                                    f"AGAIN after a human readmission ({windowed}/"
+                                    f"{resolved['max_attempts']} attempts since {cutoff}; "
+                                    f"generation {generation}). Repeated post-readmission "
+                                    f"failure needs a decision.{label_note} "
+                                    f"@{os.environ.get('MAINTAINER_HANDLE', 'jeswr')}: this "
+                                    "item keeps failing its attempt budget after each "
+                                    "readmission — a decision is needed, not another retry."
+                                    f"\n\n{worker_pr.PARK_GENERATION_MARKER} "
+                                    f"gen={generation} cutoff={window_key} -->")
+                                landed = (False if vetoed else
+                                          _issue_needs_user_landed(script_dir, repo, number))
+                                defer_reasons["budget-exhausted-escalated"] += 1
+                                print(f"escalated {repo}#{number}: deferred-retry budget "
+                                      f"exhausted post-readmission (generation "
+                                      f"{generation}) -> question-class terminal"
+                                      f"{'' if landed else ' (label suppressed)'}")
+                                continue
+                            # action == "park": consume this window — soft park (veto-gated
+                            # label, best-effort) + the MANDATORY receipt. The receipt
+                            # comment lands exactly once per window even when the sticky
+                            # veto suppressed the label — it IS the durable ladder and what
+                            # keeps every later tick quiet. RECEIPT-FIRST ordering (round-4
+                            # finding 2): veto probe, then the receipt, then the label write
+                            # — a crash after the receipt leaves receipt-no-label (the
+                            # ladder/proof reads key on receipts), never label-no-receipt.
+                            vetoed = _park_policy.park_vetoed(
+                                repo, number, "status:parked", _issue_timeline_events,
+                                is_human=lambda login: _target_is_human_maintainer(
+                                    repo, login))
+                            label_note = (
+                                "Parking with the machine-owned `status:parked` soft hold "
+                                "(the label write follows this receipt): the whole PR "
+                                "surface holds (no review/fix dispatch, no new "
+                                "implementation attempt) until a human readmission. "
+                                if not vetoed else
+                                "The `status:parked` label write was SUPPRESSED by a "
+                                "standing human unlabel (sticky veto); this receipt "
+                                "records the consumed budget window without a label. ")
+                            _run_gh_target_comment(
+                                repo, number,
+                                f"> 🤖 SPARQ agent — deferred-retry budget exhausted "
+                                f"({windowed}/{resolved['max_attempts']} attempts"
+                                f"{f' since the readmission at {cutoff}' if cutoff else ''}"
+                                f"). {label_note}"
+                                f"@{os.environ.get('MAINTAINER_HANDLE', 'jeswr')}: the "
+                                "attempt budget is spent — approve a retry or decide "
+                                f"the route.\n\n{worker_pr.PARK_GENERATION_MARKER} "
+                                f"gen={generation} cutoff={window_key} -->")
+                            parked = (False if vetoed else
+                                      _park_source_issue(script_dir, repo, number))
+                            defer_reasons["budget-exhausted"] += 1
+                            print(f"escalated {repo}#{number}: deferred-retry budget "
+                                  f"exhausted (generation {generation}"
+                                  f"{'' if parked else ', label suppressed'})")
+                            continue
             except DispatchError as exc:
                 defer_reasons["route-policy-failed"] += 1
                 print(f"defer {repo}#{number}: trust/route/policy resolution failed ({exc}); skipped")
@@ -2138,28 +3996,105 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                     pool_accounts, usage, model_chain=resolved["model_chain"],
                     absolute_cap=resolved["max_concurrent"], margin=margin)
                 if escalate_starved(resolved.get("escalate"), usage, effective_cap):
-                    # Security surfaces never degrade: chain-exhaustion -> needs:user, loudly.
+                    # Issue #116: a SINGLE zero-headroom usage snapshot is TRANSIENT, pipeline-owned
+                    # rate-limit exhaustion — not a semantic routing failure. Promoting it straight
+                    # to a park strands pipeline-owned work behind a wait for the same capacity to
+                    # refill. So keep the issue status:deferred (auto-retry), alert ops with a
+                    # durable receipt, and park it (machine-owned status:parked — park_policy.py)
+                    # ONLY once the starvation has PERSISTED past the bounded grace
+                    # (escalate_persist_decision). Security surfaces still never degrade to a
+                    # weaker model — the route stays deferred (undispatched) throughout; the grace
+                    # only defers the persistent-shortage park.
                     try:
-                        _run_target_helper(script_dir, repo, "worker-issue.py", [
-                            "status", "--repo", repo, "--issue", str(number),
-                            "--status", "needs-user"])
-                        _run_gh_target_comment(
-                            repo, number,
-                            "> 🤖 SPARQ agent — this task routes to the restricted "
-                            f"`{'/'.join(resolved['model_chain'])}` tier (a security/soundness "
-                            "surface, `escalate = true` in routing.toml), and NO account currently "
-                            "has usage headroom to run that tier. Escalating to a human instead of "
-                            "silently starving or degrading to a weaker model. "
-                            f"@{os.environ.get('MAINTAINER_HANDLE', 'jeswr')}: free capacity (or "
-                            "decide the route), then remove `needs:user` and re-add "
-                            "`status:ready`.")
-                        defer_reasons["escalate-tier-starved"] += 1
-                        print(f"escalated {repo}#{number}: escalate-tier has no eligible account")
+                        comments = _pr_comments(repo, number)
+                        escalate_now, since = escalate_persist_decision(
+                            comments, bot_login, now, worker_issue.ATTEMPT_MARKER)
+                        if escalate_now:
+                            # Persistent capacity starvation is CAPACITY-driven, never a human
+                            # question (park_policy.py defect 1): the machine-owned
+                            # status:parked soft hold replaces the old needs:user terminal. The
+                            # issue stays in the deferred lane, so the park lifts automatically
+                            # the moment capacity recovers (the retry flip strips it) — an
+                            # already-parked, still-starved issue just re-defers quietly.
+                            if "status:parked" in item["labels"]:
+                                defer_reasons["escalate-tier-starved"] += 1
+                                print(f"defer {repo}#{number}: escalate-tier starved since "
+                                      f"{since}; already status:parked — auto-readmits when "
+                                      "capacity recovers")
+                            elif _park_source_issue(script_dir, repo, number):
+                                _run_gh_target_comment(
+                                    repo, number,
+                                    "> 🤖 SPARQ agent — this task routes to the restricted "
+                                    f"`{'/'.join(resolved['model_chain'])}` tier (a security/"
+                                    "soundness surface, `escalate = true` in routing.toml), and "
+                                    "NO account has had usage headroom to run that tier since "
+                                    f"{since} — past the auto-retry grace, so this is a "
+                                    "persistent shortage, not a blip. Parked with the "
+                                    "machine-owned `status:parked` soft hold; it clears "
+                                    "automatically when capacity recovers (the route never "
+                                    "degrades to a weaker model). "
+                                    f"@{os.environ.get('MAINTAINER_HANDLE', 'jeswr')} (ops): "
+                                    "persistent escalate-tier capacity shortage.")
+                                defer_reasons["escalate-tier-starved"] += 1
+                                print(f"escalated {repo}#{number}: escalate-tier starved since "
+                                      f"{since} (persistent past the auto-retry grace)")
+                            else:
+                                defer_reasons["escalate-tier-starved"] += 1
+                                print(f"defer {repo}#{number}: escalate-tier starved since "
+                                      f"{since}; park suppressed by a sticky human unpark")
+                        else:
+                            # Keep it recoverable: status:deferred re-enters the deferred-retry path
+                            # every tick, so the moment capacity refills the same item dispatches
+                            # normally. Alert ops ONCE per streak (the first receipt is also the
+                            # persistence clock start) — later transient ticks stay quiet, no spam.
+                            _run_target_helper(script_dir, repo, "worker-issue.py", [
+                                "status", "--repo", repo, "--issue", str(number),
+                                "--status", "deferred"])
+                            if not since:
+                                _run_gh_target_comment(
+                                    repo, number,
+                                    "> 🤖 SPARQ agent — this task routes to the restricted "
+                                    f"`{'/'.join(resolved['model_chain'])}` tier, and no account "
+                                    "currently has usage headroom to run it. This is transient, "
+                                    "pipeline-owned rate-limit exhaustion, so the issue stays "
+                                    "`status:deferred` and auto-retries as capacity recovers — no "
+                                    "human action is needed unless it persists. "
+                                    f"@{os.environ.get('MAINTAINER_HANDLE', 'jeswr')} (ops): "
+                                    f"escalate-tier capacity is exhausted.{STARVE_ALERT_MARKER}")
+                            defer_reasons["escalate-tier-starved-transient"] += 1
+                            print(f"defer {repo}#{number}: escalate-tier starved (transient "
+                                  "capacity); status:deferred, auto-retrying until it recovers")
                     except DispatchError as exc:
                         defer_reasons["escalate-tier-starved"] += 1
                         print(f"defer {repo}#{number}: escalate-tier starved, escalation "
                               f"failed ({exc}); retried next tick")
                     continue
+                elif resolved.get("escalate"):
+                    # Issue #116 (round 1): effective_cap > 0 here — LIVE capacity RECOVERED for
+                    # this escalate-tier route. If a prior starvation streak is still open, persist a
+                    # durable recovery receipt so a LATER shortage starts a FRESH transient streak
+                    # instead of inheriting this (now-ended) streak's age. Recovery MUST be recorded
+                    # even though it produced no worker attempt — the claim below may still find no
+                    # slot or the launch may fail; the receipt, not a subsequent attempt, is what
+                    # ends "continuous starvation". Best-effort: a failed post retries next tick, and
+                    # escalate_recovery_pending caps this at one receipt per streak (no spam). Then
+                    # fall through to normal dispatch (no `continue`).
+                    try:
+                        recovery_comments = _pr_comments(repo, number)
+                        if escalate_recovery_pending(
+                                recovery_comments, bot_login, worker_issue.ATTEMPT_MARKER):
+                            _run_gh_target_comment(
+                                repo, number,
+                                "> 🤖 SPARQ agent — escalate-tier capacity has RECOVERED: an "
+                                "account now has usage headroom for the restricted "
+                                f"`{'/'.join(resolved['model_chain'])}` tier. Closing the prior "
+                                "starvation streak — normal dispatch resumes and any later shortage "
+                                f"starts a fresh grace window.{STARVE_RESET_MARKER}")
+                            print(f"recovery {repo}#{number}: escalate-tier capacity recovered; "
+                                  "starvation streak reset")
+                    except DispatchError as exc:
+                        print(f"note {repo}#{number}: escalate-tier recovery receipt failed "
+                              f"({exc}); retried next tick")
             else:
                 effective_cap = resolved["max_concurrent"]
             try:
@@ -2179,6 +4114,7 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                 )
             except (RuntimeError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
                 defer_reasons["lease-error"] += 1
+                lanes["worker"]["error"] += 1
                 print(f"defer {repo}#{number}: lease allocation errored ({exc}); skipped")
                 continue
             if claim is None:
@@ -2196,7 +4132,18 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                     or model not in resolved["model_chain"]
                     or not isinstance(claim_id, str) or not re.fullmatch(r"[0-9a-f]{32}", claim_id)
                     or secret_ref != f"{account.upper()}_TOKEN"):
-                _release_failed_dispatch(allocator, registry_repo, str(claim_id or ""))
+                # Issue #118: confirm the release before logging it. A failed release leaves
+                # the lease active until expiry, so it is a COUNTED worker-lane error + hard
+                # `::error::` rather than a green "released + skipped" that falsely claims
+                # recovery and hides the leaked account/package.
+                released = _release_failed_dispatch(allocator, registry_repo, str(claim_id or ""))
+                if not released:
+                    lanes["worker"]["error"] += 1
+                    defer_reasons["unsafe-claim-release-failed"] += 1
+                    print(f"::error::worker {repo}#{number}: allocator returned an unsafe/"
+                          "out-of-policy claim; lease release FAILED (claim still active "
+                          "until expiry)")
+                    continue
                 defer_reasons["unsafe-claim"] += 1
                 print(f"defer {repo}#{number}: allocator returned an unsafe/out-of-policy claim; released + skipped")
                 continue
@@ -2229,9 +4176,13 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                 if not released:
                     print("::error::worker dispatch failed and its lease could not be released")
                 defer_reasons["dispatch-launch-failed"] += 1
+                # Same hard-error classification as the review/fix lanes: a failed launch must
+                # not derive as `deferred` in the lane summary.
+                lanes["worker"]["error"] += 1
                 print(f"defer {repo}#{number}: worker dispatch failed; skipped")
                 continue
             dispatched += 1
+            lanes["worker"]["launched"] += 1
             kind = "deferred-retry" if item["deferred"] else "worker"
             # Privacy (locked decision 22b): public workflow logs never carry account handles.
             print(f"dispatched {kind} {repo}#{number}: model={model}, claim={claim_id[:8]}")
@@ -2244,12 +4195,20 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                 repo_review_items, repo, policy, routing, allocator, worker_pr,
                 registry_repo, registry_root, workflow_ref, bot_login, usage,
                 float(policy.get("usage_safety_margin", 0.10)),
-                defer_reasons, ledger_root=ledger_root)
+                defer_reasons, lanes=lanes, ledger_root=ledger_root,
+                fix_dispatch=fix_dispatch)
     print(f"dispatcher complete: {dispatched} worker/review/fix run(s) launched")
+    print(_fix_dispatch_line(fix_dispatch))
+    # Per-lane tick summary (issue #108) — coarse counts only (no issue numbers/handles). A stalled
+    # review/fix lane or a failed safety disarm is visible here even when the worker lane launched.
+    for name in DISPATCH_LANES:
+        counts = lanes[name]
+        print(f"lane {name}: planned={counts.get('planned', 0)} "
+              f"launched={counts.get('launched', 0)} error={counts.get('error', 0)}")
 
     # Final summary (registry #28/#32): overwrite the early claim-start write with the real
-    # launched count + defer-reason histogram.
-    _write_dispatch_summary(planned, dispatched, defer_reasons)
+    # launched count + defer-reason histogram + per-lane counts.
+    _write_dispatch_summary(planned, dispatched, defer_reasons, lanes)
 
     # Fail LOUD on ledger rot (issue #28): a tick that launched NOTHING because the lease ledger
     # errored (CAS failures, unreadable ledger, auth) is byte-identical to a genuinely empty
@@ -2282,15 +4241,33 @@ def _ledger_health(defer_reasons):
     return "error" if defer_reasons.get("lease-error", 0) else "ok"
 
 
-def _write_dispatch_summary(planned, dispatched, defer_reasons):
+def _lane_summary(lanes):
+    """Serialize the per-lane accumulator (issue #108) into the summary's `lanes` field: for every
+    lane {planned, launched, deferred, error}, with deferred DERIVED (planned-launched-error,
+    clamped at 0) so escalations and capacity holds — neither launches nor hard errors — are counted
+    without instrumenting every defer path. Coarse counts only (no issue numbers/handles)."""
+    summary = {}
+    for name in DISPATCH_LANES:
+        counts = (lanes or {}).get(name) or {}
+        planned = int(counts.get("planned", 0) or 0)
+        launched = int(counts.get("launched", 0) or 0)
+        error = int(counts.get("error", 0) or 0)
+        summary[name] = {"planned": planned, "launched": launched,
+                         "deferred": max(0, planned - launched - error), "error": error}
+    return summary
+
+
+def _write_dispatch_summary(planned, dispatched, defer_reasons, lanes=None):
     """Zero-dispatch visibility (registry #28/#32): emit a compact, privacy-safe summary
-    ({planned, dispatched, frontier_size, ledger, defer_reasons histogram}) for the CLAIM step to
-    render + record. `frontier_size` is the ready-frontier size the tick observed (== planned) and
-    `ledger` is ok|error — together they let the run summary distinguish an empty frontier from a
-    lease-ledger failure (issue #28), which both otherwise present as a green 0-dispatch tick. NO
-    issue numbers or account handles — only coarse category counts. Best-effort file write; a
-    failure here must never fail dispatch. Called at claim START (planned only — review defect #6)
-    and again at the end with the launched counts."""
+    ({planned, dispatched, frontier_size, ledger, defer_reasons histogram, lanes}) for the CLAIM
+    step to render + record. `frontier_size` is the ready-frontier size the tick observed (==
+    planned) and `ledger` is ok|error — together they let the run summary distinguish an empty
+    frontier from a lease-ledger failure (issue #28), which both otherwise present as a green
+    0-dispatch tick. `lanes` (issue #108) carries the worker/review/fix/disarm decomposition so the
+    tick-health recorder can surface a stalled lane — or a failed safety disarm — regardless of
+    activity in the other lanes. NO issue numbers or account handles — only coarse category counts.
+    Best-effort file write; a failure here must never fail dispatch. Called at claim START (planned
+    only — review defect #6) and again at the end with the launched counts."""
     summary_path = os.environ.get("DISPATCH_SUMMARY_FILE")
     if not summary_path:
         return
@@ -2298,12 +4275,171 @@ def _write_dispatch_summary(planned, dispatched, defer_reasons):
         with open(summary_path, "w", encoding="utf-8") as handle:
             json.dump({"planned": planned, "dispatched": dispatched,
                        "frontier_size": planned, "ledger": _ledger_health(defer_reasons),
-                       "defer_reasons": dict(defer_reasons)}, handle)
+                       "defer_reasons": dict(defer_reasons),
+                       "lanes": _lane_summary(lanes)}, handle)
     except OSError as exc:
         print(f"::warning::dispatch summary write failed ({exc}); continuing")
 
 
+def _review_fix_workflow_values():
+    """Extract the trust-critical timeout / local-claim-TTL literals straight from
+    .github/workflows/review-fix.yml so the self-test can pin the DISPATCHER TTL derivation to
+    the WORKFLOW it must outlive (issue #159), not just to sibling constants in this module. A
+    raised job timeout or an edited local `ttl=` that is not mirrored back into `_WF_*` /
+    REVIEW_TTL / FIX_TTL flips the asserts below red instead of silently re-expiring a still-live
+    lease. Text-parsed (no PyYAML dependency in the self-test path) but JOB-SCOPED, so a timeout
+    in a non-critical-path job is never mistaken for a critical-path one. A missing/unparsable
+    workflow raises AssertionError — fail closed, never a skipped check."""
+    path = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "review-fix.yml"
+    assert path.is_file(), f"review-fix.yml not found for TTL sync check: {path}"
+    text = path.read_text(encoding="utf-8")
+    marker = "\njobs:\n"
+    assert marker in text, "review-fix.yml has no top-level jobs: block"
+    jobs_at = text.index(marker)
+    # Top-level job headers sit at exactly two-space indent under `jobs:` with nothing after the
+    # colon; every nested key inside a job is indented four or more spaces, so this never matches
+    # a step-level `run:`/`timeout-minutes:` or an `on:`/`concurrency:` key above `jobs:`.
+    heads = [m for m in re.finditer(r"(?m)^  ([a-z_]+):$", text) if m.start() > jobs_at]
+    assert heads, "review-fix.yml exposed no job headers"
+    spans = {}
+    for i, m in enumerate(heads):
+        end = heads[i + 1].start() if i + 1 < len(heads) else len(text)
+        spans[m.group(1)] = text[m.start():end]
+
+    def _fixed_minutes(job):
+        span = spans.get(job)
+        assert span is not None, f"review-fix.yml is missing the {job} job"
+        m = re.search(r"(?m)^    timeout-minutes: (\d+)$", span)
+        assert m, f"{job} job has no plain integer timeout-minutes"
+        return int(m.group(1))
+
+    run_span = spans.get("run")
+    assert run_span is not None, "review-fix.yml is missing the run job"
+    run_m = re.search(
+        r"timeout-minutes:\s*\$\{\{[^}]*?'review'\s*&&\s*(\d+)\s*\|\|\s*(\d+)", run_span)
+    assert run_m, "run job timeout expression (review && N || M) not found"
+    claim_span = spans.get("claim")
+    assert claim_span is not None, "review-fix.yml is missing the claim job"
+    ttl_review = re.search(r'prefix="review:";[^\n]*\bttl=(\d+)', claim_span)
+    ttl_fix = re.search(r'prefix="fix:";[^\n]*\bttl=(\d+)', claim_span)
+    assert ttl_review and ttl_fix, "claim job local review/fix ttl= literals not found"
+    # Issue #560 lane-hand-over wiring, pinned to the WORKFLOW (the python halves cannot see it):
+    # the `run` job must EXPORT stage-verdict's staged/stale_reason, the `outcome` job must ADMIT
+    # the staged-nothing path (its old `if` skipped the whole job, which is why review:changes was
+    # never cleared), it must INVOKE worker-pr.py fix-lane-defer, and the `release` job that frees
+    # the `fix:<repo>#<pr>` claim must stay UNCONDITIONAL and independent of the outcome job.
+    release_span = spans.get("release")
+    assert release_span is not None, "review-fix.yml is missing the release job"
+    outcome_span = spans.get("outcome")
+    assert outcome_span is not None, "review-fix.yml is missing the outcome job"
+    release_if = re.search(r"(?m)^    if: (.+)$", release_span)
+    release_needs = re.search(r"(?m)^    needs: (.+)$", release_span)
+    outcome_if = re.search(r"(?m)^    if: (.+)$", outcome_span)
+    assert release_if and release_needs and outcome_if, "review-fix.yml if/needs not parsable"
+    return {
+        "resolve_s": _fixed_minutes("resolve") * 60,
+        "claim_s": _fixed_minutes("claim") * 60,
+        "release_s": _fixed_minutes("release") * 60,
+        "run_review_s": int(run_m.group(1)) * 60,
+        "run_fix_s": int(run_m.group(2)) * 60,
+        "local_review_ttl": int(ttl_review.group(1)),
+        "local_fix_ttl": int(ttl_fix.group(1)),
+        "run_exports_staged": "verdict_staged: ${{ steps.stage-verdict.outputs.staged }}"
+                              in run_span,
+        "run_exports_stale_reason":
+            "verdict_stale_reason: ${{ steps.stage-verdict.outputs.stale_reason }}" in run_span,
+        "outcome_if": outcome_if.group(1),
+        "outcome_hands_over": "worker-pr.py fix-lane-defer" in outcome_span,
+        # Round-2 finding 1: the hand-over must also be told WHICH head the verdict was not bound
+        # to, or it can only flip the label and the spin relocates into the review lane's
+        # already_done exit. The CLI makes --head-sha required, so a workflow that stops passing it
+        # fails the step loudly — but pin the wiring statically too, since a red step every tick is
+        # still a regression this gate should catch before merge.
+        "outcome_passes_head_sha": bool(re.search(
+            r"fix-lane-defer(?:[^\n]|\n)*?--head-sha \"\$\{\{ needs\.resolve\.outputs\.head_sha "
+            r"\}\}\"", outcome_span)),
+        "release_if": release_if.group(1),
+        "release_needs": release_needs.group(1),
+    }
+
+
+# The `already_done` idempotence predicate embedded in review-fix.yml's resolve step, addressed by
+# LINE-ANCHORED regexes rather than by exact indentation-bearing literals (#584 follow-up finding 3).
+_RF_ALREADY_DONE_ANCHOR = r"(?m)^[ \t]*already_done = False$"
+_RF_ALREADY_DONE_END = r"(?m)^[ \t]*#[ \t]*REGISTRY provenance"
+
+
+def _review_fix_step_python(anchor, end_anchor, what, job="resolve", source=None):
+    """Extract a python block VERBATIM out of a review-fix.yml step's `run:` script so a
+    cross-script self-test can execute the WORKFLOW's real predicate instead of a re-implemented
+    copy that can silently drift from it.
+
+    PARSED, not text-sliced (#584 follow-up finding 3). The previous implementation sliced the raw
+    file with two `str.index()` calls on indentation-bearing literals ("          already_done =
+    False\\n"), so ANY reflow of that YAML — re-indenting the job, changing the block-scalar style,
+    moving the step — killed the REQUIRED `gate` check with a bare `ValueError: substring not found`
+    that named neither the file, the anchor, nor what to update. Loading the YAML makes block-scalar
+    indentation the parser's problem (a `run:` scalar comes back already de-indented, so a reflow
+    that preserves the script is invisible here) and EVERY failure mode now raises an ACTIONABLE
+    AssertionError naming the anchor and the edit that fixes it.
+
+    PyYAML is already a hard dependency of the enrolled self-test suite (resolve-conflicts.py's
+    validate_syntax_blob imports it, and its --self-test exercises that path), and pr-gate.yml
+    installs it version+hash-locked BEFORE running the suite — so this adds no new gate dependency.
+
+    `source` (the workflow text) exists so the self-test can feed a REFLOWED copy through and prove
+    the extraction survives it."""
+    import yaml  # self-test-only, same lazy import shape as resolve-conflicts.validate_syntax_blob
+    if source is None:
+        path = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "review-fix.yml"
+        assert path.is_file(), f"review-fix.yml not found for the {what} pin: {path}"
+        source = path.read_text(encoding="utf-8")
+    try:
+        document = yaml.safe_load(source)
+    except yaml.YAMLError as exc:
+        raise AssertionError(
+            f"review-fix.yml does not parse as YAML, so the {what} pin cannot be derived: "
+            f"{exc}") from None
+    steps = (((document or {}).get("jobs") or {}).get(job) or {}).get("steps")
+    assert isinstance(steps, list), (
+        f"review-fix.yml exposes no jobs.{job}.steps list, so the {what} pin cannot be derived — "
+        f"if the `{job}` job was renamed, re-point the `job=` argument in dispatch-claim.py")
+    matches = [step["run"] for step in steps
+               if isinstance(step, dict) and isinstance(step.get("run"), str)
+               and re.search(anchor, step["run"])]
+    assert len(matches) == 1, (
+        f"expected EXACTLY ONE `run:` step in review-fix.yml's `{job}` job to match the {what} "
+        f"anchor {anchor!r}; found {len(matches)}. The workflow's {what} was moved, renamed or "
+        f"rewritten — re-point the anchor constant in dispatch-claim.py so this cross-script pin "
+        f"keeps EXECUTING the workflow's real code instead of failing on a text address.")
+    run = matches[0]
+    begin = re.search(anchor, run)
+    end = re.search(end_anchor, run[begin.start():])
+    assert end, (
+        f"review-fix.yml's {what} block starts at {anchor!r} but no longer ends at "
+        f"{end_anchor!r} — re-point the end-anchor constant in dispatch-claim.py so the extracted "
+        f"block still stops before the code that follows it.")
+    return textwrap.dedent(run[begin.start():begin.start() + end.start()])
+
+
 def _self_test():
+    # _run_gh_target_api MUST return the CompletedProcess on success — callers read .stdout
+    # (decline reroute re-read, #505). A missing `return result` made it fall off to None and
+    # crash the CLAIM job with AttributeError on every escalation tick (run 29982184587).
+    import subprocess as _subprocess
+    _saved_run = _subprocess.run
+    try:
+        _subprocess.run = lambda *_a, **_k: types.SimpleNamespace(returncode=0, stdout="{}", stderr="")
+        _saved_token = globals().get("_target_token")
+        globals()["_target_token"] = lambda _repo: "tok"
+        _probe = _run_gh_target_api("example/repo", "GET", "repos/example/repo/issues/1")
+        assert _probe is not None and _probe.stdout == "{}", (
+            "_run_gh_target_api must return the CompletedProcess on success")
+    finally:
+        _subprocess.run = _saved_run
+        if _saved_token is not None:
+            globals()["_target_token"] = _saved_token
+
     # STRUCTURAL ENFORCEMENT (maintainer directive 2026-07-18): terra + sonnet are DOCS-ONLY
     # models — they must never appear in any review/fix chain (review-fix.yml asserts the same
     # over its own chain tables, worker-pr.py over ESCALATION_LADDERS).
@@ -2311,6 +4447,342 @@ def _self_test():
     for name, table in (("REVIEW_CHAIN", REVIEW_CHAIN), ("FIX_CHAIN", FIX_CHAIN)):
         offenders = docs_only & {alias for chain in table.values() for alias in chain}
         assert not offenders, f"docs-only model in {name}: {sorted(offenders)}"
+
+    # Lease TTL must outlive the owning review-fix.yml workflow (issue #159): a lease that expires
+    # mid-run lets the allocator reclaim a live account, racing two sessions on one credential /
+    # write-back. Every mode's TTL must EXCEED its run-job timeout alone (the pre-#159 1200/3600 did
+    # not) and cover the whole claim -> run -> release DAG path plus queue slack. These re-derive if
+    # review-fix.yml raises a job bound; the asserts flip red if a TTL is ever cut below the bound.
+    for _mode, _run_to in _WF_RUN_TIMEOUT.items():
+        _ttl = _lease_ttl(_mode)
+        assert _ttl > _run_to, f"{_mode} lease TTL {_ttl} <= run timeout {_run_to} (issue #159)"
+        assert _ttl >= (_WF_RESOLVE_TIMEOUT + _WF_CLAIM_TIMEOUT + _run_to
+                        + _WF_RELEASE_TIMEOUT + _WF_QUEUE_SLACK), f"{_mode} TTL under DAG bound"
+    assert REVIEW_TTL == _lease_ttl("review") == 4200, REVIEW_TTL
+    assert FIX_TTL == _lease_ttl("fix") == 6300, FIX_TTL
+    # Fail-closed: an unknown mode never gets a shorter hold than the longest known mode.
+    assert _lease_ttl("bogus") >= max(_lease_ttl("review"), _lease_ttl("fix"))
+    # The asserts above only tie the derivation to THIS module's `_WF_*` mirror; on their own
+    # they stay green if review-fix.yml raises a job timeout or edits its local claim TTL without
+    # updating the mirror — the exact silent drift that re-expires a live lease (issue #159 round
+    # 1 finding). Pin the mirror to the WORKFLOW itself: parse review-fix.yml and require every
+    # critical-path job timeout AND both local claim-TTL literals to agree with what the
+    # dispatcher derives / claims. Any workflow-only change now flips these red.
+    _wf = _review_fix_workflow_values()
+    assert _wf["resolve_s"] == _WF_RESOLVE_TIMEOUT, _wf["resolve_s"]
+    assert _wf["claim_s"] == _WF_CLAIM_TIMEOUT, _wf["claim_s"]
+    assert _wf["release_s"] == _WF_RELEASE_TIMEOUT, _wf["release_s"]
+    assert _wf["run_review_s"] == _WF_RUN_TIMEOUT["review"], _wf["run_review_s"]
+    assert _wf["run_fix_s"] == _WF_RUN_TIMEOUT["fix"], _wf["run_fix_s"]
+    # The workflow's own adopt-path claim TTLs (dispatch.yml comment: kept in sync with these)
+    # must equal the dispatcher bound, or a DISPATCHER-claimed lease and a workflow self-claim
+    # would hold the same account for different windows.
+    assert _wf["local_review_ttl"] == REVIEW_TTL, _wf["local_review_ttl"]
+    assert _wf["local_fix_ttl"] == FIX_TTL, _wf["local_fix_ttl"]
+    # Issue #560 lane-hand-over wiring (see _review_fix_workflow_values). Without these the fix
+    # lane silently re-acquires the SAME deferred PR every dispatch tick: the enumerator's bucket
+    # is the review:changes label, and only this wiring clears it.
+    assert _wf["run_exports_staged"], "review-fix.yml run job must export verdict_staged (#560)"
+    assert _wf["run_exports_stale_reason"], (
+        "review-fix.yml run job must export verdict_stale_reason (#560)")
+    assert "needs.run.outputs.verdict_stale_reason != ''" in _wf["outcome_if"], (
+        "review-fix.yml outcome job must ADMIT the staged-nothing fix path (#560): "
+        f"{_wf['outcome_if']}")
+    assert _wf["outcome_hands_over"], (
+        "review-fix.yml outcome job must invoke worker-pr.py fix-lane-defer (#560)")
+    assert _wf["outcome_passes_head_sha"], (
+        "review-fix.yml outcome job must pass --head-sha to fix-lane-defer (#560 round-2 finding "
+        "1): without the disproved head the stale reviewed-sha assertion cannot be retracted and "
+        "the hand-over only RELOCATES the spin into the review lane's already_done exit")
+    # The claim/lease release must not depend on the hand-over: it frees `fix:<repo>#<pr>` on
+    # EVERY path (always() + acquired) from a job that does not `needs:` the outcome job, so a
+    # deferred fix never holds the per-PR single-flight lease into the next tick.
+    assert "always()" in _wf["release_if"] \
+        and "needs.claim.outputs.acquired == 'true'" in _wf["release_if"], _wf["release_if"]
+    assert "outcome" not in _wf["release_needs"], (
+        "review-fix.yml release must not depend on the outcome job (#560 lease release): "
+        f"{_wf['release_needs']}")
+    print("  ok   #560: review-fix.yml exports the defer reason, admits the staged-nothing "
+          "outcome path, invokes fix-lane-defer, and still releases the fix lease "
+          "unconditionally")
+
+    # #500 round-2: execute the REAL dispatch() call site for every decline-escalation tripwire.
+    # The round-1 helper-only checks could stay green if dispatch stopped calling the helper; this
+    # harness drives a deferred PLAN row through validated model-health ledger reads and captures
+    # the same target API/helper mutations production uses. Each successful assertion prints an
+    # explicit line, making --self-test output prove that all five tripwires actually executed.
+    model_health = _load_module(
+        "registry_model_health_decline_tripwire",
+        Path(__file__).resolve().parent / "model-health.py")
+    decline_now = int(time.time())
+    no_change_a = model_health.make_record(
+        "openai", "a" * 16, "codex", "no_change", "5001.1", decline_now - 20,
+        issue=500, input_tokens=10, output_tokens=2, wall_seconds=5)
+    no_change_b = model_health.make_record(
+        "openai", "b" * 16, "codex", "no_change", "5002.1", decline_now - 10,
+        issue=500, input_tokens=12, output_tokens=3, wall_seconds=6)
+
+    def run_decline_tripwire(records, role="impl", comments=(), malformed=False,
+                             unreadable=False):
+        """One complete deferred dispatch tick with fake GitHub transports and real validators."""
+        labels = sorted([
+            "area:dispatch", "priority:P1", f"role:{role}", "status:deferred",
+        ])
+        body = "Investigate and implement the dispatch boundary."
+        item = {
+            "number": 500, "priority": 1, "package": "dispatch", "role": role,
+            "model_chain": ["sol"], "agent": "registry-impl", "escalate": False,
+            "labels": labels, "author": "maintainer",
+            "body_sha": hashlib.sha256(body.encode()).hexdigest(), "deferred": True,
+        }
+        live_issue = {
+            "number": 500, "state": "open", "user": {"login": "maintainer"},
+            "author_association": "MEMBER", "labels": [{"name": label} for label in labels],
+            "body": body,
+        }
+        plan = {
+            "schema": SCHEMA, "generated_at": "2026-07-21T00:00:00Z",
+            "repositories": [{"target_repo": "example/repo", "target_sha": "a" * 40,
+                              "items": [item]}],
+            "review_items": [], "disarm_items": [], "snapshot_skips": [],
+        }
+        policy = {
+            "trusted_bots": [], "allow_actions_bot_issues": False,
+            "routing": "orchestration/routing.toml", "usage_safety_margin": 0.10,
+        }
+
+        class FakePolicy:
+            @staticmethod
+            def _policy_row(repo, document):
+                assert repo == "example/repo" and document["repos"][repo]["enabled"] is True
+                return policy
+
+            @staticmethod
+            def resolve(repo, issue_labels, policy_doc, routing_doc):
+                assert repo == "example/repo" and issue_labels == labels
+                return {
+                    "model_chain": item["model_chain"], "agent": item["agent"],
+                    "escalate": item["escalate"], "max_attempts": 9,
+                    "worker_timeout_minutes": 10, "usage_safety_margin": 0.10,
+                    "require_usage": False, "max_concurrent": 1, "account_pool": [],
+                }
+
+        class FakeAllocator:
+            def __init__(self):
+                self.claim_calls = 0
+
+            def claim(self, *_args, **_kwargs):
+                self.claim_calls += 1
+                return None
+
+            @staticmethod
+            def release(*_args, **_kwargs):
+                return True
+
+        class FakeWorkerIssue:
+            ATTEMPT_MARKER = "<!-- sparq-worker-attempt:v1 -->"
+
+            @staticmethod
+            def count_attempts(_comments, _bot_login):
+                return 0
+
+        class FakeWorkerPr:
+            pass
+
+        class FakeHealthAPI:
+            def request(self, method, path, body=None, allow_404=False,
+                        retry_conflict=False):
+                assert method == "GET" and path == model_health.ledger_read_path(
+                    "example/registry")
+                if unreadable:
+                    raise model_health.HealthError("fixture transport failed")
+                document = ({"records": [{"not": "a typed model-health record"}]}
+                            if malformed else {"records": list(records)})
+                return {
+                    "content": base64.b64encode(json.dumps(document).encode()).decode(),
+                    "sha": "deadbeef",
+                }
+
+        allocator = FakeAllocator()
+        api_calls = []
+        helper_calls = []
+        comment_reads = []
+
+        class FakeResult:
+            def __init__(self, stdout=""):
+                self.stdout = stdout
+                self.returncode = 0
+                self.stderr = ""
+
+        def fake_gh_json(args):
+            path = args[-1]
+            if path == "repos/example/repo":
+                return {"default_branch": "main"}
+            if path == "repos/example/repo/branches/main":
+                return {"protected": True, "commit": {"sha": "b" * 40}}
+            if path.startswith("repos/example/repo/contents/orchestration/routing.toml?ref="):
+                return {"type": "file", "content": base64.b64encode(b"").decode()}
+            if path == "repos/example/repo/pulls?state=open&per_page=100":
+                return [[]]
+            if path == "repos/example/repo/issues?state=open&per_page=100":
+                return [[live_issue]]
+            if path == "repos/example/repo/issues/500":
+                return live_issue
+            if path == "repos/example/repo/issues/500/comments?per_page=100":
+                comment_reads.append(path)
+                return [list(comments)]
+            raise AssertionError(f"unexpected fake gh read: {path}")
+
+        def fake_target_api(repo, method, path, input_doc=None):
+            assert repo == "example/repo"
+            api_calls.append((method, path, input_doc))
+            return FakeResult(json.dumps(live_issue) if method == "GET" else "")
+
+        def fake_target_helper(script_dir, repo, script, args):
+            helper_calls.append((script, list(args)))
+            return FakeResult()
+
+        def fake_load(name, path):
+            return {
+                "registry_policy_resolve": FakePolicy,
+                "registry_select_and_claim": allocator,
+                "registry_worker_pr": FakeWorkerPr,
+                "registry_worker_issue": FakeWorkerIssue,
+                "registry_model_health": model_health,
+            }[name]
+
+        real_globals = (
+            globals()["_load_module"], globals()["_gh_json"],
+            globals()["_run_gh_target_api"], globals()["_run_target_helper"],
+            globals()["_run_gh"], model_health.GitHubAPI,
+        )
+        env_keys = ("TARGET_GH_TOKENS", "TARGET_GH_TOKEN", "TARGET_GH_TOKEN_OWNER",
+                    "WORKER_USAGE_FILE", "DISPATCH_SUMMARY_FILE")
+        prior_env = {key: os.environ.get(key) for key in env_keys}
+        output = io.StringIO()
+        try:
+            globals()["_load_module"] = fake_load
+            globals()["_gh_json"] = fake_gh_json
+            globals()["_run_gh_target_api"] = fake_target_api
+            globals()["_run_target_helper"] = fake_target_helper
+            globals()["_run_gh"] = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("decline tripwire unexpectedly launched a workflow"))
+            model_health.GitHubAPI = lambda _token: FakeHealthAPI()
+            os.environ["TARGET_GH_TOKENS"] = json.dumps({"example": "test-token"})
+            os.environ.pop("TARGET_GH_TOKEN", None)
+            os.environ.pop("TARGET_GH_TOKEN_OWNER", None)
+            os.environ.pop("WORKER_USAGE_FILE", None)
+            with tempfile.TemporaryDirectory() as root:
+                root_path = Path(root)
+                plan_path = root_path / "plan.json"
+                policy_path = root_path / "repos.toml"
+                leases_path = root_path / "data" / "leases.json"
+                leases_path.parent.mkdir(parents=True)
+                plan_path.write_text(json.dumps(plan), encoding="utf-8")
+                policy_path.write_text(
+                    '[repos."example/repo"]\nenabled = true\n', encoding="utf-8")
+                leases_path.write_text('{"leases": []}\n', encoding="utf-8")
+                os.environ["DISPATCH_SUMMARY_FILE"] = str(root_path / "summary.json")
+                with contextlib.redirect_stdout(output):
+                    dispatch(
+                        plan_path, policy_path, "example/registry", "master", Path("."),
+                        registry_root=root, bot_login="sparq[bot]", ledger_root=root)
+        finally:
+            (globals()["_load_module"], globals()["_gh_json"],
+             globals()["_run_gh_target_api"], globals()["_run_target_helper"],
+             globals()["_run_gh"], model_health.GitHubAPI) = real_globals
+            for key, value in prior_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+        return {
+            "api_calls": api_calls, "helper_calls": helper_calls,
+            "claim_calls": allocator.claim_calls, "comment_reads": comment_reads,
+            "output": output.getvalue(),
+        }
+
+    # (a) The real dispatch call observes the SECOND validated no_change, posts the marker, swaps
+    # role:impl -> role:research, and cancels the cached impl claim before allocation.
+    trip_a = run_decline_tripwire([no_change_a, no_change_b])
+    assert [call[0] for call in trip_a["api_calls"]] == ["POST", "GET", "PATCH"], trip_a
+    assert DECLINE_ESCALATION_MARKER in trip_a["api_calls"][0][2]["body"], trip_a
+    assert trip_a["api_calls"][-1][2]["labels"] == [
+        "area:dispatch", "priority:P1", "role:research", "status:deferred"], trip_a
+    assert trip_a["helper_calls"] == [] and trip_a["claim_calls"] == 0, trip_a
+    print("  ok   decline tripwire (a): second no_change reroutes impl to research + marker")
+
+    # (b) One validated record is below threshold: no mutation/comment and the ordinary deferred
+    # claim path remains live. Lowering the threshold to one makes this assertion red.
+    trip_b = run_decline_tripwire([no_change_a])
+    assert trip_b["api_calls"] == [] and trip_b["helper_calls"] == [], trip_b
+    assert trip_b["claim_calls"] == 1, trip_b
+    print("  ok   decline tripwire (b): one no_change performs no escalation")
+
+    # (c) A repeated decline already on role:research parks and must never PATCH another
+    # research reroute. Removing the loop guard turns this red. Park-policy defect 1: the park
+    # is the MACHINE-owned status:parked capacity/decline soft hold — a capacity/decline park
+    # must NEVER write the human-question terminal needs:user.
+    trip_c = run_decline_tripwire([no_change_a, no_change_b], role="research")
+    assert [call[0] for call in trip_c["api_calls"]] == ["POST"], trip_c
+    assert len(trip_c["helper_calls"]) == 1, trip_c
+    assert trip_c["helper_calls"][0][0] == "worker-issue.py", trip_c
+    assert trip_c["helper_calls"][0][1][-2:] == ["--status", "parked"], trip_c
+    assert "needs-user" not in trip_c["helper_calls"][0][1], trip_c
+    assert trip_c["claim_calls"] == 0, trip_c
+    print("  ok   decline tripwire (c): research decline parks status:parked without reroute loop")
+
+    # (d) Poisoned and unreadable ledgers both fail closed: no target action, no cached claim, and
+    # an Actions error annotation that explicitly says escalation did not fire.
+    for bad in (run_decline_tripwire([], malformed=True),
+                run_decline_tripwire([], unreadable=True)):
+        assert bad["api_calls"] == [] and bad["helper_calls"] == [], bad
+        assert bad["claim_calls"] == 0, bad
+        assert "::error::dispatch decline escalation" in bad["output"], bad["output"]
+        assert "NO task escalation will fire" in bad["output"], bad["output"]
+    print("  ok   decline tripwire (d): malformed/unreadable ledger logs loudly and does not escalate")
+
+    # (e) Only the bot's durable marker suppresses duplicate writes. The same marker text from a
+    # third party is ignored, so the research-route escalation still comments and parks.
+    _, marker_key = _decline_escalation_evidence([no_change_a, no_change_b])
+    marker_body = (f"<!-- {DECLINE_ESCALATION_MARKER} key={marker_key} "
+                   "action=research -->")
+    bot_marked = run_decline_tripwire(
+        [no_change_a, no_change_b], role="research",
+        comments=[{"user": {"login": "sparq[bot]"}, "body": marker_body,
+                   "created_at": "2026-07-23T09:00:00Z"}])
+    assert bot_marked["api_calls"] == [] and bot_marked["helper_calls"] == [], bot_marked
+    assert bot_marked["claim_calls"] == 1, bot_marked
+    forged = run_decline_tripwire(
+        [no_change_a, no_change_b], role="research",
+        comments=[{"user": {"login": "mallory"}, "body": marker_body,
+                   "created_at": "2026-07-23T09:00:00Z"}])
+    assert [call[0] for call in forged["api_calls"]] == ["POST"], forged
+    assert len(forged["helper_calls"]) == 1 and forged["claim_calls"] == 0, forged
+    print("  ok   decline tripwire (e): bot marker is idempotent; third-party forgery is ignored")
+
+    # (f) [registry #596] `auth` is NOT a decline. A whole window of credential-outage outcomes for
+    # the SAME issue — more than DECLINE_ESCALATION_MIN of them — must perform NO escalation: no
+    # marker, no impl->research reroute, no park, and the ordinary deferred claim stays live.
+    # This is the ladder half of #596: acct01's hourly-expiring codex token produced runs of `auth` outcomes
+    # that must never read as "the model gave up on this task".
+    auth_records = [
+        model_health.make_record("openai", "a" * 16, "codex", "auth", f"600{i}.1",
+                                 decline_now - 60 + (i * 10))
+        for i in range(DECLINE_ESCALATION_MIN + 3)
+    ]
+    assert len(auth_records) > DECLINE_ESCALATION_MIN, auth_records
+    assert {r["exit_class"] for r in auth_records} == {model_health.CLASS_AUTH}, auth_records
+    trip_f = run_decline_tripwire(auth_records)
+    assert trip_f["api_calls"] == [] and trip_f["helper_calls"] == [], trip_f
+    assert trip_f["claim_calls"] == 1, trip_f
+    assert DECLINE_ESCALATION_MARKER not in trip_f["output"], trip_f["output"]
+    # The evidence selector itself is the guard: auth rows never enter the decline window, while a
+    # genuine no_change pair still does (so the ladder is not disabled, only made honest).
+    assert _issue_no_change_outcomes(model_health, auth_records, 500) == [], auth_records
+    assert len(_issue_no_change_outcomes(
+        model_health, auth_records + [no_change_a, no_change_b], 500)) == 2
+    print("  ok   decline tripwire (f): a run of auth outcomes never advances the decline ladder")
 
     fixture = {
         "schema": SCHEMA,
@@ -2389,6 +4861,26 @@ def _self_test():
         }],
     }
     assert validate_plan(fixture) is fixture
+    # issue #112: the multi-area conflict partition. plan_package reduces a collection of
+    # area:* sections to the SINGLE partition a plan/lease row reserves — exactly one area is
+    # that area, zero or multiple collapse to the serializing global partition (every assert
+    # flips if it regresses to the old alphabetically-first `sorted(areas)[0]`).
+    assert plan_package(["usage"]) == "usage"
+    assert plan_package([]) == GLOBAL_PACKAGE
+    assert plan_package(["worker", "usage"]) == GLOBAL_PACKAGE
+    assert plan_package(["usage", "usage"]) == "usage"   # duplicate collapses to one area
+    # BEHAVIORAL proof the fix closes the defect: a busy SECONDARY area must exclude a
+    # multi-area row. area-b holds a live sibling lease; the global-reserving A+B row is
+    # dropped while a disjoint single-area (area-a) row still co-runs. Under the old
+    # areas[0]="area-a" reduction the A+B row would carry package "area-a", survive the area-b
+    # lease, and double-dispatch onto B — the exact bug.
+    p112_repo = "example/repo"
+    b_lease = [{"holder": f"{p112_repo}#99@run.1", "package": "area-b", "expires_at": 600}]
+    multi_row = {"number": 5, "package": plan_package(["area-a", "area-b"]), "deferred": False}
+    solo_row = {"number": 6, "package": plan_package(["area-a"]), "deferred": False}
+    assert filter_busy_area_items([multi_row], p112_repo, [], {}, {}, leases=b_lease, now=0) == []
+    assert filter_busy_area_items(
+        [solo_row], p112_repo, [], {}, {}, leases=b_lease, now=0) == [solo_row]
     # MIXED-REPO regression (2026-07-18 outage): the assembler must emit GLOBAL
     # (repo, pr_number) order — per-repo policy order inverts it lexicographically the
     # moment a second target has review items ("jeswr/..." < "sparq-org/..."), and the
@@ -2429,21 +4921,56 @@ def _self_test():
         summary_file = os.path.join(summary_dir, "summary.json")
         prior_summary = os.environ.get("DISPATCH_SUMMARY_FILE")
         os.environ["DISPATCH_SUMMARY_FILE"] = summary_file
+        # Issue #108: a worker launch must NOT mask a failed safety disarm or a stalled review/fix
+        # lane. Feed a tick where the worker lane launched but disarm ERRORED and the review lane
+        # planned work yet launched nothing (all errored) — the summary must carry those per-lane
+        # counts distinctly so the tick-health recorder can alert regardless of the worker launch.
+        masking_lanes = _new_lane_counts()
+        masking_lanes["worker"].update({"planned": 1, "launched": 1})
+        masking_lanes["review"].update({"planned": 2, "error": 2})
+        masking_lanes["fix"].update({"planned": 1, "launched": 1})
+        masking_lanes["disarm"].update({"planned": 1, "error": 1})
         try:
             _write_dispatch_summary(5, 0, folded)
+            with open(summary_file, encoding="utf-8") as handle:
+                planned_only = json.load(handle)
+            _write_dispatch_summary(4, 2, Counter(), masking_lanes)
+            with open(summary_file, encoding="utf-8") as handle:
+                masked = json.load(handle)
         finally:
             if prior_summary is None:
                 del os.environ["DISPATCH_SUMMARY_FILE"]
             else:
                 os.environ["DISPATCH_SUMMARY_FILE"] = prior_summary
-        with open(summary_file, encoding="utf-8") as handle:
-            recorded = json.load(handle)
-    assert recorded["defer_reasons"]["snapshot-skip:check-runs-overflow"] == 1
+    assert planned_only["defer_reasons"]["snapshot-skip:check-runs-overflow"] == 1
     # Issue #28: the summary carries the ready-frontier size and lease-ledger health so a
     # 0-dispatch tick can be told apart from a ledger failure. A snapshot-skip-only tick has a
     # HEALTHY ledger (no lease-error), so ledger == "ok".
-    assert recorded["frontier_size"] == 5, recorded
-    assert recorded["ledger"] == "ok", recorded
+    assert planned_only["frontier_size"] == 5, planned_only
+    assert planned_only["ledger"] == "ok", planned_only
+    # The lanes field is always present; an unpopulated call reports all-zero lanes (never absent,
+    # so the workflow's .get never has to guess a default).
+    assert planned_only["lanes"]["disarm"] == {
+        "planned": 0, "launched": 0, "deferred": 0, "error": 0}, planned_only
+    # Issue #108 core assertion: even though the fleet DISPATCHED 2 (worker+fix launched), the
+    # disarm lane's error and the review lane's stall are preserved verbatim — the exact signals the
+    # tick-health recorder keys on to alert past a productive worker launch. Every field below flips
+    # if the per-lane accounting is dropped back to a single conflated launched count.
+    assert masked["lanes"]["disarm"]["error"] == 1, masked
+    assert masked["lanes"]["review"] == {
+        "planned": 2, "launched": 0, "deferred": 0, "error": 2}, masked
+    assert masked["lanes"]["worker"]["launched"] == 1 and masked["dispatched"] == 2, masked
+    # deferred is DERIVED (planned-launched-error, clamped): a lane with a capacity hold (no error)
+    # counts as deferred, a fully-errored lane has deferred 0, and over-count never goes negative.
+    assert _lane_summary({"review": Counter({"planned": 3, "launched": 1})})["review"] == {
+        "planned": 3, "launched": 1, "deferred": 2, "error": 0}
+    assert _lane_summary({"fix": Counter({"planned": 1, "launched": 2})})["fix"]["deferred"] == 0
+    # Every REVIEW_STATE maps to exactly one lane and the split is EXHAUSTIVE (a new state would
+    # KeyError the assertion below rather than silently land in the fix lane): needs-review + the
+    # stranded escalation are the review lane; the three fix-run states are the fix lane.
+    assert {state: _review_item_lane(state) for state in REVIEW_STATES} == {
+        "needs-review": "review", "stranded": "review",
+        "needs-fix": "fix", "needs-ci-fix": "fix", "needs-rebase": "fix"}
     # _ledger_health flips to "error" exactly when a lease-error is folded in, and stays "ok"
     # otherwise (an empty histogram or non-ledger defers must NOT masquerade as ledger rot).
     assert _ledger_health(Counter()) == "ok"
@@ -2456,9 +4983,97 @@ def _self_test():
     assert _ledger_rot_zeroed_dispatch(0, Counter()) is False
     assert _ledger_rot_zeroed_dispatch(0, Counter({"no-eligible-account": 3})) is False
     assert _ledger_rot_zeroed_dispatch(3, Counter({"lease-error": 2})) is False
-    assert _issue_is_trusted({"user": {"login": "maintainer"}, "author_association": "MEMBER"})
-    assert _issue_is_trusted({"user": {"login": "worker[bot]"}, "author_association": "NONE"})
-    assert not _issue_is_trusted({"user": {"login": "external"}, "author_association": "CONTRIBUTOR"})
+    # issue #111: EXACT allowlist trust, no "[bot]" suffix match. Every assertion flips red if the
+    # suffix shortcut is reintroduced or a trust leg is dropped.
+    allow = {"reg-app[bot]"}
+    assert _issue_is_trusted({"user": {"login": "maintainer"}, "author_association": "MEMBER"}, allow)
+    assert _issue_is_trusted({"user": {"login": "owner"}, "author_association": "OWNER"}, set())
+    assert _issue_is_trusted({"user": {"login": "reg-app[bot]"}, "author_association": "NONE"}, allow)
+    # an arbitrary bot login is DENIED even though it ends in "[bot]" (the closed defect) ...
+    assert not _issue_is_trusted({"user": {"login": "evil[bot]"}, "author_association": "NONE"}, allow)
+    # ... and with an empty allowlist NO bot is trusted by suffix
+    assert not _issue_is_trusted({"user": {"login": "worker[bot]"}, "author_association": "NONE"}, set())
+    # a non-collaborator human is never trusted; malformed shapes fail closed
+    assert not _issue_is_trusted({"user": {"login": "external"}, "author_association": "CONTRIBUTOR"}, allow)
+    assert not _issue_is_trusted({"user": None, "author_association": "MEMBER"}, allow)
+    # a truthy non-dict `user` must DENY, never raise (an AttributeError would escape the CLAIM
+    # loop's DispatchError-only handler and abort the whole dispatch)
+    assert not _issue_is_trusted({"user": "malformed", "author_association": "MEMBER"}, allow)
+    assert not _issue_is_trusted({"user": ["x"], "author_association": "OWNER"}, allow)
+    assert not _issue_is_trusted("nope", allow)
+
+    # ---- issue #119: CLAIM reads the trusted routing revision from the PROTECTED default-branch
+    # tip it resolves ITSELF, never from the plan's `target_sha` (the hostile target planner's
+    # `git rev-parse HEAD`). Drive _protected_routing through a fake GitHub reader and prove it
+    # (a) resolves the tip via the repo's own default branch, (b) reads routing AT that tip, and
+    # (c) never lets an attacker-shaped target_sha reach any fetch — every leg fails closed. ----
+    saved_gh_119 = _gh_json
+    try:
+        attacker_sha = "a" * 40           # what a hostile planner could park HEAD on
+        protected_tip = "9" * 40          # the real default-branch tip CLAIM must trust instead
+        routing_b64 = base64.b64encode(
+            b"[models.fable]\nprovider_model = \"x\"\n").decode()
+        seen_refs = []
+
+        def _fake_ok(args):
+            path = args[-1]
+            if path == "repos/example/repo":
+                return {"default_branch": "main"}
+            if path == "repos/example/repo/branches/main":
+                return {"name": "main", "commit": {"sha": protected_tip}, "protected": True}
+            if path.startswith("repos/example/repo/contents/"):
+                seen_refs.append(path)
+                return {"type": "file", "content": routing_b64}
+            raise AssertionError(f"unexpected gh path {path}")
+
+        globals()["_gh_json"] = _fake_ok
+        routing119 = _protected_routing("example/repo", "policy/routing.toml")
+        assert routing119 == {"models": {"fable": {"provider_model": "x"}}}, routing119
+        # routing was read at the INDEPENDENTLY-resolved protected tip — not the plan sha
+        assert seen_refs == [
+            f"repos/example/repo/contents/policy/routing.toml?ref={protected_tip}"], seen_refs
+        assert all(attacker_sha not in ref for ref in seen_refs), seen_refs
+        # fail-closed: a tip that is not a 40-hex sha (the exact class the old format-only check
+        # would have waved through) must DEFER, never route
+        globals()["_gh_json"] = lambda args: (
+            {"default_branch": "main"} if args[-1] == "repos/example/repo"
+            else {"commit": {"sha": "z" * 40}, "protected": True})
+        try:
+            _protected_default_tip("example/repo")
+            raise AssertionError("non-hex protected tip must fail closed")
+        except DispatchError:
+            pass
+        # fail-closed: a missing/unreadable default branch must DEFER
+        globals()["_gh_json"] = lambda args: (
+            {} if args[-1] == "repos/example/repo" else {"commit": {"sha": protected_tip}})
+        try:
+            _protected_default_tip("example/repo")
+            raise AssertionError("missing default branch must fail closed")
+        except DispatchError:
+            pass
+        # fail-closed: an UNPROTECTED default branch is not the branch-protected control surface
+        # the routing catalog's trust rests on, so its tip must be rejected even though it is a
+        # valid 40-hex sha. This assertion goes red if the `protected is True` check is removed.
+        globals()["_gh_json"] = lambda args: (
+            {"default_branch": "main"} if args[-1] == "repos/example/repo"
+            else {"commit": {"sha": protected_tip}, "protected": False})
+        try:
+            _protected_default_tip("example/repo")
+            raise AssertionError("unprotected default branch must fail closed")
+        except DispatchError:
+            pass
+        # fail-closed: a MISSING/non-bool protection field is not proof of protection either —
+        # absence must never be read as protected. Also red if the protection check is removed.
+        globals()["_gh_json"] = lambda args: (
+            {"default_branch": "main"} if args[-1] == "repos/example/repo"
+            else {"commit": {"sha": protected_tip}})
+        try:
+            _protected_default_tip("example/repo")
+            raise AssertionError("missing protection field must fail closed")
+        except DispatchError:
+            pass
+    finally:
+        globals()["_gh_json"] = saved_gh_119
 
     # ---- issue #102: CLAIM independently RE-PROVES the readiness predicate (non-dispatchable
     # epic + live blocker state) from registry-owned code, never trusting the hostile planner's
@@ -2470,7 +5085,8 @@ def _self_test():
                 "author_association": "MEMBER",
                 "labels": [{"name": name} for name in labels], "body": body}
 
-    def match_with(main_issue, blockers, item):
+    def match_with(main_issue, blockers, item, trusted_bots=frozenset(),
+                   allow_actions_bot_issues=False):
         def fake(args):
             found = re.search(r"/issues/(\d+)$", args[-1])
             if not found:
@@ -2483,7 +5099,8 @@ def _self_test():
             raise DispatchError(f"blocker #{number} unreadable")
         globals()["_gh_json"] = fake
         try:
-            return _current_issue_matches("example/repo", item)
+            return _current_issue_matches(
+                "example/repo", item, trusted_bots, allow_actions_bot_issues)
         finally:
             globals()["_gh_json"] = prev_gh_json
 
@@ -2494,11 +5111,84 @@ def _self_test():
     # baseline: a ready, non-epic, unblocked issue passes every leg
     passed, _ = match_with(ready_issue(ready_labels, plain_body), {}, item102)
     assert passed, "ready unblocked non-epic issue must claim"
+    # issue #111: the author-trust allowlist is THREADED through _current_issue_matches. An
+    # otherwise-ready issue authored by a "[bot]" login claims ONLY when that exact login is in the
+    # allowlist — an empty allowlist fails it closed (no suffix trust reaches the CLAIM gate).
+    bot_body = "bot-authored work"
+    bot_issue = {"state": "open", "user": {"login": "reg-app[bot]"}, "author_association": "NONE",
+                 "labels": [{"name": name} for name in ready_labels], "body": bot_body}
+    bot_item = dict(item102, author="reg-app[bot]",
+                    body_sha=hashlib.sha256(bot_body.encode()).hexdigest())
+    ok_bot, _ = match_with(bot_issue, {}, bot_item, {"reg-app[bot]"})
+    assert ok_bot, "allowlisted bot author must claim"
+    denied_bot, denied_reason = match_with(bot_issue, {}, bot_item, frozenset())
+    assert not denied_bot and "authored" in denied_reason, denied_reason
+    # Issue #487: an own-workflow issue is admitted ONLY behind this repository's explicit flag.
+    # These go red if the flag leg is removed, defaults permissive, or the exception is widened to
+    # unrelated bots/authors. `github-actions[bot]` is intentionally NOT in trusted_bots here, so
+    # the test exercises the new policy leg rather than the older exact allowlist.
+    actions_body = "drift scanner finding"
+    actions_issue = {
+        "state": "open", "user": {"login": "github-actions[bot]"},
+        "author_association": "NONE",
+        "labels": [{"name": name} for name in ready_labels], "body": actions_body,
+    }
+    actions_item = dict(item102, author="github-actions[bot]",
+                        body_sha=hashlib.sha256(actions_body.encode()).hexdigest())
+    actions_ok, _ = match_with(
+        actions_issue, {}, actions_item, allow_actions_bot_issues=True)
+    assert actions_ok, "actions-bot issue must claim when its repository opts in"
+    actions_off, actions_off_reason = match_with(
+        actions_issue, {}, actions_item, allow_actions_bot_issues=False)
+    assert not actions_off and "authored" in actions_off_reason, actions_off_reason
+    actions_default, actions_default_reason = match_with(actions_issue, {}, actions_item)
+    assert not actions_default and "authored" in actions_default_reason, actions_default_reason
+    outsider_body = "untrusted automation"
+    outsider_issue = {
+        "state": "open", "user": {"login": "third-party[bot]"},
+        "author_association": "NONE",
+        "labels": [{"name": name} for name in ready_labels], "body": outsider_body,
+    }
+    outsider_item = dict(item102, author="third-party[bot]",
+                         body_sha=hashlib.sha256(outsider_body.encode()).hexdigest())
+    outsider_ok, outsider_reason = match_with(
+        outsider_issue, {}, outsider_item, allow_actions_bot_issues=True)
+    assert not outsider_ok and "authored" in outsider_reason, outsider_reason
+    # a malformed nested `user` shape DENIES the item on the author leg — it must never surface as
+    # an AttributeError, which the per-item DispatchError handler would not catch (whole-run abort)
+    mal_issue = {"state": "open", "user": "malformed", "author_association": "MEMBER",
+                 "labels": [{"name": name} for name in ready_labels], "body": plain_body}
+    mal_ok, mal_reason = match_with(mal_issue, {}, item102)
+    assert not mal_ok and "author" in mal_reason, mal_reason
     # kind:epic is independently rejected even though the plan emitted it (and its labels match)
     epic_labels = sorted(ready_labels + [NON_DISPATCHABLE])
     epic_item = dict(item102, labels=epic_labels)
     epic_ok, epic_reason = match_with(ready_issue(epic_labels, plain_body), {}, epic_item)
     assert not epic_ok and "epic" in epic_reason, epic_reason
+    # Park-policy readmission semantics: status:parked GATES the ordinary ready lane (no NEW
+    # implementation dispatch on a parked issue) ...
+    parked_ready_labels = sorted(ready_labels + ["status:parked"])
+    parked_ready_ok, parked_ready_reason = match_with(
+        ready_issue(parked_ready_labels, plain_body), {},
+        dict(item102, labels=parked_ready_labels))
+    assert not parked_ready_ok and "busy or gated" in parked_ready_reason, parked_ready_reason
+    # ... while the DEFERRED-retry lane deliberately ADMITS a parked+deferred issue: that lane
+    # is the machine park's readmission hook (the retry flip strips status:parked exactly when
+    # the allocator proves capacity exists). Removing status:parked from the DEFERRED_GATED
+    # carve-out turns this red.
+    parked_deferred_labels = sorted(
+        ["area:crate-a", "priority:P1", "role:impl", "status:deferred", "status:parked"])
+    parked_deferred_ok, parked_deferred_reason = match_with(
+        ready_issue(parked_deferred_labels, plain_body), {},
+        dict(item102, labels=parked_deferred_labels, deferred=True))
+    assert parked_deferred_ok, parked_deferred_reason
+    # ... and every OTHER busy/gated label still gates the deferred lane (locked decision 20).
+    blocked_deferred_labels = sorted(parked_deferred_labels + ["status:blocked"])
+    blocked_deferred_ok, blocked_deferred_reason = match_with(
+        ready_issue(blocked_deferred_labels, plain_body), {},
+        dict(item102, labels=blocked_deferred_labels, deferred=True))
+    assert not blocked_deferred_ok and "busy or gated" in blocked_deferred_reason, \
+        blocked_deferred_reason
     # an OPEN `Blocked-by: #N` gates; the SAME body with a CLOSED blocker does not
     blk_body = "prep first\nBlocked-by: #42"
     blk_item = dict(item102, body_sha=hashlib.sha256(blk_body.encode()).hexdigest())
@@ -2534,13 +5224,35 @@ def _self_test():
     assert BLOCKED_BY_RE.findall("Blocked-by: #7 and blocked-by:#8") == ["7", "8"]
     # A DRAFT worker PR must land in linked_open_prs (dedupes issue re-dispatch) while the SAME PR
     # is separately enumerated as a review_item — the two enumerations must not fight (the issue
-    # stays busy in status:in-progress-review while the PR cycles). Linking is head-ref/body based
-    # and draft-agnostic, so this is structural; asserted here against regression.
+    # stays busy in status:in-progress-review while the PR cycles). Linking is draft-agnostic, so
+    # this is structural; asserted here against regression.
+    linked_repo = "example/repo"
     linked = _linked_open_pr_issues([[
-        {"head": {"ref": "sparq-agent/issue-7-1-1"}, "body": "", "draft": True},
-        {"head": {"ref": "topic"}, "body": "Fixes #9"},
-    ]])
-    assert linked == {7, 9}
+        # (1) same-repo App worker branch: pipeline-owned provenance, ref AND body admissible
+        # even though its author association is NONE (the App's own dedup must not need it).
+        {"head": {"ref": "sparq-agent/issue-7-1-1", "repo": {"full_name": linked_repo}},
+         "author_association": "NONE", "body": "Fixes #8", "draft": True},
+        # (2) trusted collaborator PR (from a fork): body closing keyword admissible after the
+        # explicit author-association check; its non-worker branch text contributes nothing.
+        {"head": {"ref": "topic", "repo": {"full_name": "collab/fork"}},
+         "author_association": "MEMBER", "body": "Fixes #9"},
+    ]], linked_repo)
+    assert linked == {7, 8, 9}, linked
+    # issue #110: a FORK contributor's `Fixes #N` (and a worker-SHAPED head ref on the fork) must
+    # NOT suppress any issue — deleting the head-repo/author gates flips each of these red.
+    assert _linked_open_pr_issues([[
+        {"head": {"ref": "topic", "repo": {"full_name": "mallory/fork"}},
+         "author_association": "CONTRIBUTOR", "body": "Fixes #9 closes #10"},
+    ]], linked_repo) == set()
+    assert _linked_open_pr_issues([[
+        {"head": {"ref": "sparq-agent/issue-7-1-1", "repo": {"full_name": "mallory/fork"}},
+         "author_association": "NONE", "body": ""},
+    ]], linked_repo) == set()
+    # a same-repo branch that is NOT worker-shaped, from an untrusted author, links nothing
+    assert _linked_open_pr_issues([[
+        {"head": {"ref": "issue-7-oops", "repo": {"full_name": linked_repo}},
+         "author_association": "NONE", "body": "fixes #7"},
+    ]], linked_repo) == set()
     for mutate, name in (
             (lambda d: d["repositories"][0]["items"][0].update(unknown=True), "unknown item field"),
             (lambda d: d["repositories"][0]["items"][0].pop("deferred"), "missing deferred flag"),
@@ -2609,6 +5321,143 @@ def _self_test():
              "recorded_at_run": "2.1"},
     }
     issue_labels = {7: ["area:crate-a", "role:impl"], 9: ["area:sparq-zk", "role:impl"]}
+
+    # ---- issue #460 SNAPSHOT -> WORKFLOW ROW -> ENUMERATOR end-to-end regression ----
+    # Start at plan-snapshot.py's raw document shape (a complete wrapper around the verbatim
+    # pulls-list REST row), then execute the ACTUAL field-selection block embedded in
+    # dispatch.yml. This is deliberately not a hand-built enumerate_review_items row: changing
+    # or dropping a production projection field makes this test fail at the same boundary as
+    # PLAN. PR #442 supplies the concrete live shape and its ledger provenance field set.
+    snapshot_repo = "jeswr/agent-account-registry"
+    snapshot_sha = "3" * 40
+    snapshot_doc = {"complete": True, "items": [{
+        "number": 442,
+        "state": "open",
+        "draft": False,
+        "body": "Fixes #144",
+        "labels": [{"id": 1, "name": "review:changes"}],
+        "head": {
+            "ref": "sparq-agent/issue-144-29694084610-1",
+            "sha": snapshot_sha,
+            "repo": {"full_name": snapshot_repo},
+        },
+        "user": {"login": "sparq-orchestrator[bot]", "type": "Bot"},
+    }]}
+    workflow_source = (Path(__file__).resolve().parents[1] / ".github" / "workflows"
+                       / "dispatch.yml").read_text(encoding="utf-8")
+    projection_start = workflow_source.index("              pr_snapshot = []\n")
+    projection_end = workflow_source.index(
+        '              Path(out_dir, f"pulls-{index}.json")', projection_start)
+    projection_namespace = {"pulls": snapshot_doc["items"]}
+    exec(textwrap.dedent(workflow_source[projection_start:projection_end]),
+         projection_namespace)  # noqa: S102 — repository-owned workflow source
+    snapshot_rows = projection_namespace["pr_snapshot"]
+    snapshot_provenance = {442: {
+        "pr_number": 442,
+        "head_sha_at_open": "6eb5c28aa2e9441ecd19fb8aa460bc70e2912e80",
+        "impl_provider": "anthropic",
+        "impl_alias": "opus",
+        "impl_account_h": "9e13ea21abf27e68",
+        "issue": 144,
+        "recorded_at_run": "29694084610.1",
+    }}
+    snapshot_items = enumerate_review_items(
+        snapshot_repo, snapshot_rows, snapshot_provenance, [],
+        {144: ["area:dispatch", "role:impl", "status:in-progress-review"]}, now)
+    assert [(item["pr_number"], item["state"], item["package"])
+            for item in snapshot_items] == [(442, "needs-fix", "dispatch")], snapshot_items
+
+    # Every snapshot-visible SIGNALLED PR (review:changes OR review:needs) excluded before emit
+    # names its exact reason, and the optional exclusions Counter aggregates it. Missing
+    # provenance is representative of an early trust-gate rejection; the valid twin above must
+    # remain quiet. Restoring the pre-#456 `if draft:` wrapper makes the READY twin produce zero,
+    # which is the mutation check run explicitly by issue #460's gate command.
+    excluded_log = io.StringIO()
+    excluded_counts = Counter()
+    with contextlib.redirect_stdout(excluded_log):
+        assert enumerate_review_items(
+            snapshot_repo, snapshot_rows, {}, [],
+            {144: ["area:dispatch", "role:impl"]}, now, exclusions=excluded_counts) == []
+    assert excluded_log.getvalue().strip() == (
+        "review-enumeration: exclude jeswr/agent-account-registry#442: "
+        "provenance record is not a JSON object"), excluded_log.getvalue()
+    # Park-policy defect 3 (aggregate correctness): the Counter carries the same reason with
+    # the same count as the per-item line, so PLAN's one-line summary can never read zero while
+    # a labeled worker PR was excluded.
+    assert excluded_counts == Counter({"provenance record is not a JSON object": 1}), \
+        excluded_counts
+
+    # Defect 3 core regression: a review:NEEDS-labeled PR (the state the old review:changes-only
+    # telemetry silently dropped) excluded for a human hold prints its reason AND aggregates —
+    # "0 review item(s)" can never again coexist with labeled worker PRs and zero logged
+    # exclusions.
+    needs_row = {**snapshot_rows[0], "labels": ["review:needs", "needs:user"]}
+    needs_log = io.StringIO()
+    needs_counts = Counter()
+    with contextlib.redirect_stdout(needs_log):
+        assert enumerate_review_items(
+            snapshot_repo, [needs_row], snapshot_provenance, [],
+            {144: ["area:dispatch", "role:impl"]}, now, exclusions=needs_counts) == []
+    assert needs_log.getvalue().strip() == (
+        "review-enumeration: exclude jeswr/agent-account-registry#442: "
+        "PR carries a human-owned hold label"), needs_log.getvalue()
+    assert needs_counts == Counter({"PR carries a human-owned hold label": 1}), needs_counts
+
+    # ONE park predicate (round-3 finding 2): a PR is capacity-parked iff EITHER machine
+    # label is live. status:parked on the SOURCE issue alone excludes the PR — the old
+    # AND-predicate let a half-cleared pair re-enter enumeration and (with the PR-side label
+    # gone) dispatch with NO proof at all.
+    machine_park_reason = ("machine capacity park stands (review:parked on the PR or "
+                           "status:parked on the source issue)")
+    source_park_counts = Counter()
+    source_park_log = io.StringIO()
+    with contextlib.redirect_stdout(source_park_log):
+        assert enumerate_review_items(
+            snapshot_repo, snapshot_rows, snapshot_provenance, [],
+            {144: ["area:dispatch", "role:impl", "status:parked", "status:deferred"]}, now,
+            exclusions=source_park_counts) == []
+    assert source_park_counts == Counter({machine_park_reason: 1}), source_park_counts
+    assert "machine capacity park stands" in source_park_log.getvalue()
+
+    # ... review:parked on the PR alone excludes the same way (whatever the source says) ...
+    parked_pr_row = {**snapshot_rows[0], "labels": ["review:parked"]}
+    machine_park_log = io.StringIO()
+    machine_park_counts = Counter()
+    with contextlib.redirect_stdout(machine_park_log):
+        assert enumerate_review_items(
+            snapshot_repo, [parked_pr_row], snapshot_provenance, [],
+            {144: ["area:dispatch", "role:impl", "status:parked", "status:deferred"]}, now,
+            exclusions=machine_park_counts) == []
+    assert machine_park_counts == Counter({machine_park_reason: 1}), machine_park_counts
+    assert "machine capacity park stands" in machine_park_log.getvalue()
+    half_cleared_counts = Counter()
+    with contextlib.redirect_stdout(io.StringIO()):
+        assert enumerate_review_items(
+            snapshot_repo, [parked_pr_row], snapshot_provenance, [],
+            {144: ["area:dispatch", "role:impl", "status:deferred"]}, now,
+            exclusions=half_cleared_counts) == []
+    assert half_cleared_counts == Counter({machine_park_reason: 1}), half_cleared_counts
+
+    # ... and a PR with BOTH machine labels cleared re-enumerates: CLAIM then re-proves the
+    # human gesture from the durable receipts + label timelines before any dispatch.
+    readmitted = enumerate_review_items(
+        snapshot_repo, snapshot_rows, snapshot_provenance, [],
+        {144: ["area:dispatch", "role:impl", "status:deferred"]}, now)
+    assert [(item["pr_number"], item["state"]) for item in readmitted] == \
+        [(442, "needs-fix")], readmitted
+    # A live per-PR review lease still single-flights a label-free re-entry — WITH telemetry
+    # (finding D: this exit used to be silent for labeled PRs).
+    label_free_row = {**snapshot_rows[0], "labels": ["review:needs"]}
+    lease_log = io.StringIO()
+    lease_counts = Counter()
+    with contextlib.redirect_stdout(lease_log):
+        assert enumerate_review_items(
+            snapshot_repo, [label_free_row], snapshot_provenance,
+            [{"holder": f"review:{snapshot_repo}#442@run.1", "expires_at": now + 100}],
+            {144: ["area:dispatch", "role:impl"]}, now, exclusions=lease_counts) == []
+    assert lease_counts == Counter(
+        {"a live per-PR review lease already owns this PR": 1}), lease_counts
+
     pulls = [
         pull(41, "sparq-agent/issue-7-1-1", sha_a, labels=["review:needs"]),
         # spoofed FORK head with a worker-shaped ref: must NOT be enumerated
@@ -2630,10 +5479,18 @@ def _self_test():
         provenance, [], issue_labels, now)
     assert sec and sec[0]["security"] is True
 
-    # reviewed-sha binding: a head equal to the marker is NOT re-enumerated (no advance)
-    marked = pull(41, "sparq-agent/issue-7-1-1", sha_a, labels=["review:needs"],
+    # reviewed-sha binding still suppresses the UNLABELLED legacy fallback (no advance).
+    marked = pull(41, "sparq-agent/issue-7-1-1", sha_a,
                   body=f"x <!-- sparq-reviewed-sha:{sha_a} -->")
     assert enumerate_review_items(repo, [marked], provenance, [], issue_labels, now) == []
+
+    # Issue #450 re-entry: review:needs on a READY PR is authoritative even when an old
+    # reviewed-sha marker matches. An external adjudication deliberately chose re-review; the
+    # drafted equivalent stays suppressed so red CI may enter needs-ci-fix.
+    marked_needs = pull(41, "sparq-agent/issue-7-1-1", sha_a, labels=["review:needs"],
+                        body=f"x <!-- sparq-reviewed-sha:{sha_a} -->", draft=False)
+    assert [item["state"] for item in enumerate_review_items(
+        repo, [marked_needs], provenance, [], issue_labels, now)] == ["needs-review"]
 
     # Round-budget exhaustion is deliberately NOT excluded at enumeration: CLAIM re-derives the
     # live round count and applies the terminal needs-user transition itself, so a crashed final
@@ -2650,6 +5507,251 @@ def _self_test():
     reconciled = enumerate_review_items(repo, [changes], provenance, dead_fix,
                                         issue_labels, now)
     assert reconciled and reconciled[0]["state"] == "needs-fix"
+    # Issue #450 mutation guard: a READY (non-draft) worker PR with valid provenance and an
+    # explicit changes label re-enters as a fix item. Restoring the old `if draft:` wrapper makes
+    # this disappear and flips the assertion red. Human/non-bot PRs remain outside the surface.
+    ready_changes = pull(41, "sparq-agent/issue-7-1-1", sha_a, draft=False,
+                         labels=["review:changes"])
+    assert [item["state"] for item in enumerate_review_items(
+        repo, [ready_changes], provenance, [], issue_labels, now)] == ["needs-fix"]
+    assert enumerate_review_items(
+        repo, [pull(41, "sparq-agent/issue-7-1-1", sha_a, draft=False,
+                    login="human", labels=["review:changes"])],
+        provenance, [], issue_labels, now) == []
+
+    # ---- issue #560 OWNERSHIP TRANSFER (cross-script, end-to-end, across every CI state) -----
+    # The FIX lane spun on unbound legacy verdicts: the fixer refused to stage a verdict that is
+    # not bound to the live head, deferred "to a fresh review", and left review:changes on the
+    # PR — so THIS enumerator re-admitted it as needs-fix on every ~8min dispatch tick while the
+    # review lane (keyed on review:needs) never saw it. Live 2026-07-24: sparq#3523/#3542/#3572/
+    # #3573/#3608 burned ~35 fix runs/hour that way until the labels were flipped by hand.
+    #
+    # ROUND-2 FINDING 1: a LABEL FLIP ALONE ONLY RELOCATES THAT SPIN. The production state is a
+    # COMPLETED request-changes review, so the PR body carries `sparq-reviewed-sha == head` (the
+    # marker is bound LAST in review-fix.yml's outcome job). A DRAFTED PR whose marker matches the
+    # live head is NOT re-emitted as needs-review by the block above; what happens instead depends
+    # entirely on CI — green becomes `stranded` (whose review dispatch then exits `already_done`
+    # with no work done: the same successful spin one lane over), red becomes needs-ci-fix (the fix
+    # lane again), and pending/unknown matches nothing at all, leaving NO lane owning the PR.
+    #
+    # So assert OWNERSHIP, not a label: drive the REAL post-defer PR state (labels AND reviewed-sha
+    # marker) out of worker-pr.py's projections and require, for EVERY CI state, exactly ONE item
+    # owned by the REVIEW lane. Every fixture carries the marker. The label-only counterfactual is
+    # asserted right below it, so none of this is vacuous: deleting either half of the hand-over —
+    # the label transition or the marker retraction — flips these red.
+    _worker_pr = _load_module(
+        "registry_worker_pr", Path(__file__).resolve().with_name("worker-pr.py"))
+    _bound_body = f"desc\n\n<!-- sparq-reviewed-sha:{sha_a} -->\n"
+
+    def _ci_states():
+        """The four CI postures the ownership proof must hold over. `None` is the UNKNOWN posture
+        (no snapshot at all — a degraded/absent check-run read); a stale head_sha collapses to the
+        same thing inside the enumerator."""
+        base = {"head_sha": sha_a, "conflicting": False, "armed": False, "failing_legs": []}
+        return {
+            "green": {41: {**base, "gate": "success"}},
+            "red": {41: {**base, "gate": "failure", "failing_legs": ["workspace clippy"]}},
+            "pending": {41: {**base, "gate": "pending"}},
+            "unknown": None,
+        }
+
+    # ---- #584 FOLLOW-UP FINDING 3: the `already_done` predicate is PARSED out of review-fix.yml,
+    # not text-sliced. Extract it ONCE (the old code re-sliced the raw file inside the reason loop).
+    _ad_src = _review_fix_step_python(
+        _RF_ALREADY_DONE_ANCHOR, _RF_ALREADY_DONE_END, "already_done idempotence predicate")
+    assert "already_done = False" in _ad_src and "sparq-reviewed-sha" in _ad_src, _ad_src
+    _spun = pull(41, "sparq-agent/issue-7-1-1", sha_a,
+                 labels=[_worker_pr.FIX_LANE_PR_LABEL], body=_bound_body)
+    for _ci, _status in _ci_states().items():
+        assert [item["state"] for item in enumerate_review_items(
+            repo, [_spun], provenance, [], issue_labels, now, pr_status=_status)] == \
+            ["needs-fix"], ("pre-defer lane", _ci)
+    for _reason in _worker_pr.FIX_LANE_DEFER_REASONS:
+        _action = _worker_pr.fix_lane_defer_action({_worker_pr.FIX_LANE_PR_LABEL})
+        _after = sorted(_worker_pr.fix_lane_defer_labels(
+            {_worker_pr.FIX_LANE_PR_LABEL}, _action))
+        _marker = _worker_pr.fix_lane_defer_marker_action(_action, sha_a, sha_a)
+        # The hand-over removed the fix lane's admission label AND retracted the stale marker.
+        assert _worker_pr.FIX_LANE_PR_LABEL not in _after, (_reason, _after)
+        assert _marker == "invalidate", (_reason, _marker)
+        _handed_sha = _worker_pr.UNBOUND_REVIEWED_SHA
+        _handed = pull(41, "sparq-agent/issue-7-1-1", sha_a, labels=_after,
+                       body=f"desc\n\n<!-- sparq-reviewed-sha:{_handed_sha} -->\n")
+        for _ci, _status in _ci_states().items():
+            _items = enumerate_review_items(repo, [_handed], provenance, [], issue_labels, now,
+                                            pr_status=_status)
+            _states = [item["state"] for item in _items]
+            # EXACTLY ONE lane owns the PR, and it is the REVIEW lane — the only lane that can
+            # mint the head-bound verdict the fixer refuses to run without. No CI state may leave
+            # the PR ownerless, and none may hand it back to the fix lane.
+            assert _states == ["needs-review"], (_reason, _ci, _after, _states)
+            assert _review_item_lane(_states[0]) == "review", (_reason, _ci, _states)
+            assert "needs-fix" not in _states, (_reason, _ci, _after, _states)
+        # The review lane then provably TAKES ownership at review-fix.yml's own admission
+        # boundary: execute the ACTUAL `already_done` predicate embedded in its resolve step
+        # against the post-defer body. A retained marker would make it skip without working.
+        # (Extracted via the PARSED helper — #584 follow-up finding 3 — so a reflow of that YAML
+        # can no longer red this REQUIRED gate with a bare `ValueError: substring not found`.)
+        for _body, _want in ((_bound_body, True), (_handed["body"], False)):
+            _ns = {"re": re, "mode": "review", "head_sha": sha_a, "pull": {"body": _body}}
+            exec(_ad_src, _ns)  # noqa: S102 — repository-owned workflow source
+            assert _ns["already_done"] is _want, (_reason, _want, _body)
+    # NON-VACUITY / counterfactual: the round-1 fix (flip the label, KEEP the marker) does NOT
+    # transfer ownership. It only moves the spin — green strands (whose review dispatch exits
+    # already_done), red returns to the fix lane, and pending/unknown owns nothing at all.
+    _label_only = pull(41, "sparq-agent/issue-7-1-1", sha_a,
+                       labels=[_worker_pr.REVIEW_LANE_PR_LABEL], body=_bound_body)
+    _relocated = {_ci: [item["state"] for item in enumerate_review_items(
+        repo, [_label_only], provenance, [], issue_labels, now, pr_status=_status)]
+        for _ci, _status in _ci_states().items()}
+    assert _relocated == {"green": ["stranded"], "red": ["needs-ci-fix"],
+                          "pending": [], "unknown": []}, _relocated
+    # A hold/park defers WITHOUT a lane change or a marker write (the park itself already excludes
+    # the PR from both lanes, so the spin cannot recur): review:parked keeps it out entirely.
+    _parked_after = sorted(_worker_pr.fix_lane_defer_labels(
+        {_worker_pr.FIX_LANE_PR_LABEL}, "hold"))
+    assert _parked_after == [_worker_pr.FIX_LANE_PR_LABEL], _parked_after
+    assert _worker_pr.fix_lane_defer_marker_action("hold", sha_a, sha_a) == "keep"
+    for _ci, _status in _ci_states().items():
+        assert enumerate_review_items(
+            repo, [pull(41, "sparq-agent/issue-7-1-1", sha_a, body=_bound_body,
+                        labels=_parked_after + [MACHINE_PARK_PR_LABEL])],
+            provenance, [], issue_labels, now, pr_status=_status) == [], _ci
+    # ...and finding 2's abort leaves the parked PR byte-identical on BOTH axes: the park is never
+    # converted into review:needs-user and the marker is never touched.
+    _aborted = sorted(_worker_pr.fix_lane_defer_labels(
+        {_worker_pr.FIX_LANE_PR_LABEL, MACHINE_PARK_PR_LABEL},
+        _worker_pr.FIX_LANE_ABORT_ACTION))
+    assert _aborted == [_worker_pr.FIX_LANE_PR_LABEL, MACHINE_PARK_PR_LABEL], _aborted
+    assert "review:needs-user" not in _aborted, _aborted
+    assert _worker_pr.fix_lane_defer_marker_action(
+        _worker_pr.FIX_LANE_ABORT_ACTION, sha_a, sha_a) == "keep"
+    print("  ok   #560: the unbound-verdict defer transfers OWNERSHIP to the review lane in every "
+          "CI state (label flip + stale reviewed-sha retraction; no needs-fix re-admission, no "
+          "already_done skip, no ownerless posture) and a park aborts it untouched")
+
+    # ---- #584 FOLLOW-UP FINDING 1, CROSS-SCRIPT: THE HAND-OVER MUST NOT DISARM A PASSED PR. ------
+    # The fix lane does NOT only admit review:changes: GAP-A emits `needs-ci-fix` from a
+    # concluded-RED gate on the current head alone, review-state-AGNOSTIC. So a NON-DRAFT,
+    # review:pass, ARMED PR with a red gate is routed into the FIX lane, stage-verdict finds no
+    # head-bound FIX verdict and defers — and the pre-fix hand-over retracted the reviewed-sha
+    # marker on it (action "noop": review:changes was never live). enumerate_disarm_items reads
+    # `marker != head` on an ARMED PR as a safety violation, so the very next tick would
+    # disable-auto + dequeue + REDRAFT a passed, armed, ready PR. LIVE at the time of this fix:
+    # sparq#2521 (review:pass + trust-surface, non-draft, --auto armed, `docs-quality quick-gates`
+    # genuinely failing) was the ONLY review:pass PR in the sparq repo and sat on exactly this path.
+    # The hand-over's REAL projection over this namespace drives the fixture — nothing here is
+    # hard-coded to the fixed behaviour, so a regression in worker-pr.py reaches the consequence
+    # assertion below instead of being caught by a restatement of the fix.
+    _pass_labels = {_worker_pr.PASS_LANE_PR_LABEL}
+    _pass_decided = _worker_pr.fix_lane_defer_action(_pass_labels)
+    _pass_after = sorted(_worker_pr.fix_lane_defer_labels(_pass_labels, _pass_decided))
+    _pass_marker = _worker_pr.fix_lane_defer_marker_action(_pass_decided, sha_a, sha_a)
+    _pass_body_sha = (_worker_pr.UNBOUND_REVIEWED_SHA if _pass_marker == "invalidate" else sha_a)
+
+    def _armed_pass_pull(reviewed, labels=None):
+        """The live sparq#2521 posture: non-draft, review:pass, auto-merge armed, marker `reviewed`."""
+        return pull(41, "sparq-agent/issue-7-1-1", sha_a, draft=False,
+                    labels=_pass_after if labels is None else labels,
+                    body=f"desc\n\n<!-- sparq-reviewed-sha:{reviewed} -->\n")
+
+    _armed_status = {41: {"head_sha": sha_a, "conflicting": False, "armed": True,
+                          "gate": "failure", "failing_legs": ["docs-quality quick-gates"]}}
+    # THE CONSEQUENCE, through the real projection: the post-hand-over PR must NOT be emitted for
+    # disarm. If the hand-over retracts this PR's marker, `_pass_body_sha` becomes `none` and the
+    # safety net fires — disable-auto + dequeue + REDRAFT on a passed, armed, ready PR.
+    _pass_disarm = enumerate_disarm_items(repo, [_armed_pass_pull(_pass_body_sha)], _armed_status,
+                                          provenance, bot_login=bot)
+    assert _pass_disarm == [], (
+        "the fix-lane hand-over's own projection would DISARM + REDRAFT a passed armed PR "
+        f"(marker action {_pass_marker!r} -> reviewed_sha {_pass_body_sha!r}): {_pass_disarm}")
+    assert _pass_decided == _worker_pr.FIX_LANE_PASS_ACTION, _pass_decided
+    assert _pass_after == [_worker_pr.PASS_LANE_PR_LABEL], _pass_after
+    assert _pass_marker == "keep", _pass_marker
+    # NON-VACUITY: the SAME enumerator DOES emit the PR once the marker is retracted, so the
+    # assertion above is a live property of this fixture and not a quiet no-op. This is also the
+    # exact pre-fix behaviour — the old projection took `noop` on this namespace and `noop`
+    # retracts — so the counterfactual is the history, not a straw man.
+    _would_disarm = enumerate_disarm_items(
+        repo, [_armed_pass_pull(_worker_pr.UNBOUND_REVIEWED_SHA)], _armed_status, provenance,
+        bot_login=bot)
+    assert [(item["pr_number"], item["reviewed_sha"]) for item in _would_disarm] == \
+        [(41, _worker_pr.UNBOUND_REVIEWED_SHA)], _would_disarm
+    assert _worker_pr.fix_lane_defer_marker_action("noop", sha_a, sha_a) == "invalidate"
+    # The route in: GAP-A admits this PR to the FIX lane on the red gate ALONE, with no review:changes
+    # anywhere — which is why the hand-over ever ran on it. (Asserted so a future enumerator change
+    # that stops routing passed PRs into the fix lane makes this whole block visibly moot instead of
+    # quietly vacuous.)
+    _pass_admission = [item["state"] for item in enumerate_review_items(
+        repo, [_armed_pass_pull(sha_a)], provenance, [], issue_labels, now,
+        pr_status=_armed_status)]
+    assert _pass_admission == ["needs-ci-fix"], _pass_admission
+    assert _review_item_lane("needs-ci-fix") == "fix", "needs-ci-fix must be a FIX-lane state"
+    # The DISCRIMINATION: the normal review:changes namespace still retracts (asserted above as
+    # _marker == "invalidate"), so the guard is scoped to the pass and did not disable the fix.
+    assert _worker_pr.fix_lane_defer_marker_action(
+        _worker_pr.fix_lane_defer_action({_worker_pr.FIX_LANE_PR_LABEL}), sha_a, sha_a) == \
+        "invalidate"
+    print("  ok   #584 f1: the lane hand-over stands down on review:pass — the marker survives, so "
+          "enumerate_disarm_items does NOT disarm+redraft a passed armed PR (the retracted-marker "
+          "counterfactual does), while review:changes still retracts")
+
+    # ---- #584 FOLLOW-UP FINDING 3: A REFLOW OF review-fix.yml MUST NOT RED THIS GATE WITH A BARE
+    # `ValueError: substring not found`. The old extraction addressed the block by two exact
+    # indentation-bearing literals via str.index(). Round-trip the workflow through the YAML parser
+    # to produce a REFLOWED-BUT-EQUIVALENT document (a different serialisation entirely — the old
+    # slice literal is gone from the text) and require the SAME block back. ----
+    import yaml as _yaml  # already a hard self-test-suite dependency (resolve-conflicts.py)
+    _rf_text = (Path(__file__).resolve().parents[1] / ".github" / "workflows"
+                / "review-fix.yml").read_text(encoding="utf-8")
+    _rf_reflowed = _yaml.safe_dump(_yaml.safe_load(_rf_text), default_flow_style=False, width=4096)
+    assert "          already_done = False\n" not in _rf_reflowed, \
+        "the reflow fixture is vacuous — the old text-slice literal survived it"
+    assert _review_fix_step_python(
+        _RF_ALREADY_DONE_ANCHOR, _RF_ALREADY_DONE_END, "already_done idempotence predicate",
+        source=_rf_reflowed) == _ad_src, "a reflowed-but-equivalent workflow changed the extraction"
+    # ...and when the anchor is GENUINELY gone the failure is an ACTIONABLE AssertionError naming
+    # the anchor and the edit — never a bare ValueError, and never a silent skip.
+    _rf_broken = _rf_text.replace("already_done = False", "already_done = bool(0)")
+    _rf_error = None
+    try:
+        _review_fix_step_python(_RF_ALREADY_DONE_ANCHOR, _RF_ALREADY_DONE_END,
+                                "already_done idempotence predicate", source=_rf_broken)
+    except AssertionError as _exc:
+        _rf_error = ("actionable", str(_exc))
+    except ValueError as _exc:                       # the pre-fix failure mode
+        _rf_error = ("bare-valueerror", str(_exc))
+    assert _rf_error is not None, "a missing anchor must FAIL, never pass silently"
+    assert _rf_error[0] == "actionable", _rf_error
+    assert "already_done" in _rf_error[1] and "re-point the anchor" in _rf_error[1] \
+        and "review-fix.yml" in _rf_error[1], _rf_error
+    # A second matching step (an ambiguous address) is just as loud as none.
+    _rf_dupe = _rf_text.replace("          already_done = False\n",
+                                "          already_done = False\n          already_done = False\n")
+    _rf_dupe_error = None
+    try:
+        _review_fix_step_python(_RF_ALREADY_DONE_ANCHOR, _RF_ALREADY_DONE_END,
+                                "already_done idempotence predicate", source=_rf_dupe)
+        _rf_dupe_extract = "extracted"
+    except AssertionError as _exc:
+        _rf_dupe_error, _rf_dupe_extract = str(_exc), "raised"
+    # Two anchors inside ONE step is still one matching step, so extraction succeeds — the
+    # ambiguity that must be loud is two matching STEPS.
+    assert _rf_dupe_extract == "extracted", _rf_dupe_error
+    _rf_two_steps = _yaml.safe_load(_rf_text)
+    _rf_two_steps["jobs"]["resolve"]["steps"].append(
+        {"name": "a copy of the predicate", "run": _ad_src})
+    _rf_two_error = None
+    try:
+        _review_fix_step_python(_RF_ALREADY_DONE_ANCHOR, _RF_ALREADY_DONE_END,
+                                "already_done idempotence predicate",
+                                source=_yaml.safe_dump(_rf_two_steps, width=4096))
+    except AssertionError as _exc:
+        _rf_two_error = str(_exc)
+    assert _rf_two_error and "found 2" in _rf_two_error, _rf_two_error
+    print("  ok   #584 f3: review-fix.yml's already_done predicate is PARSED (a reflowed-equivalent "
+          "workflow yields the identical block) and every missing/ambiguous anchor raises an "
+          "actionable AssertionError instead of a bare ValueError")
 
     # ---- [round-5 P1] CROSS-LANE SUPERSESSION (park -> sibling-launch -> UNPARK): while a
     # PR sat human-parked its crate was freed and a SIBLING claimed a lease there (an impl
@@ -2845,26 +5947,87 @@ def _self_test():
 
     # ---- interpret_check_runs / pr_ci_status (pure CI interpreters, GAP-A inputs) ----
     runs = [
-        {"name": "gate", "status": "completed", "conclusion": "failure", "started_at": "T2"},
+        {"name": "gate", "status": "completed", "conclusion": "failure",
+         "started_at": "2026-07-23T02:00:00Z"},
         {"name": "docs-quality", "status": "completed", "conclusion": "failure",
-         "started_at": "T1"},
-        {"name": "js", "status": "completed", "conclusion": "timed_out", "started_at": "T1"},
-        {"name": "green", "status": "completed", "conclusion": "success", "started_at": "T1"},
+         "started_at": "2026-07-23T01:00:00Z"},
+        {"name": "js", "status": "completed", "conclusion": "timed_out",
+         "started_at": "2026-07-23T01:00:00Z"},
+        {"name": "green", "status": "completed", "conclusion": "success",
+         "started_at": "2026-07-23T01:00:00Z"},
     ]
     assert interpret_check_runs(runs) == {"gate": "failure",
                                           "failing_legs": ["docs-quality", "js"]}
     # a later re-run supersedes an earlier conclusion of the same check name
     rerun = runs + [{"name": "gate", "status": "completed", "conclusion": "success",
-                     "started_at": "T3"}]
+                     "started_at": "2026-07-23T03:00:00Z"}]
     assert interpret_check_runs(rerun)["gate"] == "success"
+    # [round-6 f1] rerun supersession is by PARSED INSTANT, never raw strings: the EXACT
+    # spelling pair — an older failed gate "2026-07-23T09:00:00Z" lexicographically BEATS a
+    # newer successful rerun "2026-07-23 10:00:00Z" (space sorts before "T"), so the old
+    # string compare retained the stale failure and needs-ci-fix dispatched a fixer against
+    # a green head. Order-independent: the parsed compare wins both listing orders.
+    spelling_pair = [
+        {"name": "gate", "status": "completed", "conclusion": "failure",
+         "started_at": "2026-07-23T09:00:00Z"},
+        {"name": "gate", "status": "completed", "conclusion": "success",
+         "started_at": "2026-07-23 10:00:00Z"},
+    ]
+    assert interpret_check_runs(spelling_pair)["gate"] == "success"
+    assert interpret_check_runs(list(reversed(spelling_pair)))["gate"] == "success"
+    # ... and the inverse spelling (older space-form failure vs newer T-form success) too.
+    assert interpret_check_runs([
+        {"name": "gate", "status": "completed", "conclusion": "failure",
+         "started_at": "2026-07-23 09:00:00Z"},
+        {"name": "gate", "status": "completed", "conclusion": "success",
+         "started_at": "2026-07-23T10:00:00Z"},
+    ])["gate"] == "success"
+    # [round-6 f1] a malformed started_at ranks OLDEST with a loud log — a hostile
+    # lexicographically-huge garbage stamp must never retain a stale conclusion over a
+    # parseable rerun (unparseable never beats parseable, in either listing order).
+    ic_logs = []
+    garbage_stamped = [
+        {"name": "gate", "status": "completed", "conclusion": "failure",
+         "started_at": "zzz-later-than-everything"},
+        {"name": "gate", "status": "completed", "conclusion": "success",
+         "started_at": "2026-07-23T09:00:00Z"},
+    ]
+    assert interpret_check_runs(garbage_stamped, log=ic_logs.append)["gate"] == "success"
+    assert interpret_check_runs(list(reversed(garbage_stamped)),
+                                log=ic_logs.append)["gate"] == "success"
+    assert any("unparseable started_at" in line for line in ic_logs), ic_logs
+    # two unparseable stamps keep the deterministic last-listed-wins tie rule
+    assert interpret_check_runs([
+        {"name": "gate", "status": "completed", "conclusion": "failure",
+         "started_at": None},
+        {"name": "gate", "status": "completed", "conclusion": "success",
+         "started_at": "not-a-timestamp"},
+    ], log=ic_logs.append)["gate"] == "success"
+    # [issue #160] ONLY literal `success` is green. A COMPLETED gate whose conclusion is a
+    # broken/incomplete run (cancelled, never-started, stale, needs-a-human) is NOT green — it
+    # takes the same ci-fix rerun/escalation path as a hard failure. Pre-fix EVERY one of these
+    # fell through to gate="success", suppressing repair on a PR that required checks won't merge.
+    quiet = ic_logs.append  # absent started_at logs loudly by design; keep the suite quiet
+    for broken in ("cancelled", "action_required", "startup_failure", "stale",
+                   "neutral", "skipped"):
+        assert interpret_check_runs([{"name": "gate", "status": "completed",
+                                      "conclusion": broken}],
+                                    log=quiet)["gate"] == "failure", broken
+    # ... but an UNRECOGNISED conclusion on a "completed" run (None / hostile garbage) is NOT a
+    # known non-pass: it degrades to unknown (never ACT on a poisoned snapshot), not to failure
+    # (no spurious repair) and never to success (pre-fix bug: both collapsed to green).
+    for junk in (None, "wat", 42, [], {"x": 1}):
+        assert interpret_check_runs([{"name": "gate", "status": "completed",
+                                      "conclusion": junk}],
+                                    log=quiet)["gate"] == "unknown", junk
     assert interpret_check_runs([{"name": "gate", "status": "in_progress",
-                                  "conclusion": None}])["gate"] == "pending"
+                                  "conclusion": None}], log=quiet)["gate"] == "pending"
     assert interpret_check_runs([])["gate"] == "missing"
     assert interpret_check_runs("junk") == {"gate": "unknown", "failing_legs": []}
     assert interpret_check_runs([
         {"name": "gate", "status": "completed", "conclusion": "failure"},
         {"name": "lég\nx", "status": "completed", "conclusion": "failure"},
-    ])["failing_legs"] == ["l?g?x"]
+    ], log=quiet)["failing_legs"] == ["l?g?x"]
 
     record = {"head_sha": sha_a, "mergeable": False, "auto_merge": {"merge_method": "squash"},
               "check_runs": runs}
@@ -2921,6 +6084,44 @@ def _self_test():
     for idle_gate in ("pending", "missing", "unknown"):
         assert enumerate_review_items(repo, [starved], provenance, [], issue_labels, now,
                                       pr_status={41: status_of(sha_a, gate=idle_gate)}) == []
+    # ... but never SILENTLY (finding D): the drafted already-reviewed fall-through names its
+    # residue for signalled PRs and feeds the aggregate Counter — "0 review item(s)" can never
+    # again coexist with a labeled, bound-head worker PR and zero logged exclusions.
+    fallthrough_log = io.StringIO()
+    fallthrough_counts = Counter()
+    with contextlib.redirect_stdout(fallthrough_log):
+        assert enumerate_review_items(
+            repo, [starved], provenance, [], issue_labels, now,
+            pr_status={41: status_of(sha_a, gate="pending")},
+            exclusions=fallthrough_counts) == []
+    assert fallthrough_counts == Counter(
+        {"head already reviewed; no live repair trigger (gate not concluded-red, "
+         "posture not stranded)": 1}), fallthrough_counts
+    assert "no live repair trigger" in fallthrough_log.getvalue()
+
+    # Finding E: a malformed timeline PAGE containing (or hiding) the newest human unlabel must
+    # RAISE — park_policy then keeps the FULL budget count (its documented fail direction)
+    # instead of silently minting or missing a readmission window on a truncated view.
+    newest_unlabel_page = [{"event": "unlabeled", "label": {"name": "needs:user"},
+                            "created_at": "2026-07-23T09:18:19Z",
+                            "actor": {"login": "jeswr"}}]
+    real_timeline_json = globals()["_gh_json"]
+    globals()["_gh_json"] = lambda args: [newest_unlabel_page, "garbage-page"]
+    try:
+        try:
+            _issue_timeline_events(repo, 41)
+            raise AssertionError("malformed timeline page did not raise")
+        except DispatchError as exc:
+            assert "timeline page is malformed" in str(exc), exc
+        # ... and the readmission window consumer lands on the conservative full count.
+        cutoff_log = io.StringIO()
+        with contextlib.redirect_stdout(cutoff_log):
+            assert _park_policy.readmission_cutoff(
+                repo, 41, 7, _issue_timeline_events,
+                is_human=lambda login: login == "jeswr") is None
+        assert "timeline read failed" in cutoff_log.getvalue()
+    finally:
+        globals()["_gh_json"] = real_timeline_json
     # ... while a concluded-GREEN gate on a drafted, unarmed, reviewed head is the STRANDED
     # posture (no other autonomous exit exists) — enumerated so CLAIM can hand it to a human
     green = {41: status_of(sha_a, gate="success")}
@@ -2960,6 +6161,21 @@ def _self_test():
                   body=f"x <!-- sparq-reviewed-sha:{sha_a} -->")
     assert [item["state"] for item in enumerate_review_items(
         repo, [passed], provenance, [], issue_labels, now, pr_status=red)] == ["needs-ci-fix"]
+    # Issue #351 (the #256 limbo): a non-draft review:pass PR (decision-7 armable) on a
+    # CONFLICTING base is NOT a terminal arm-and-wait — the arm can never merge a conflicting
+    # base, so the conflict-first block emits needs-rebase REGARDLESS of the pass verdict
+    # (review-state-agnostic). GAP-B still beats GAP-A here: a red gate on the conflicted base
+    # is noise, so the pass PR emits needs-rebase, NOT needs-ci-fix. (Gating the conflict block
+    # on review state would flip this to needs-ci-fix and re-strand #256 — the mutation check.)
+    passed_conflicting = {41: status_of(sha_a, gate="failure", conflicting=True, legs=["js"])}
+    assert [(item["state"], item["context"]) for item in enumerate_review_items(
+        repo, [passed], provenance, [], issue_labels, now,
+        pr_status=passed_conflicting)] == [("needs-rebase", "")]
+    # ... and a live review/fix lease suppresses it exactly like any other repair state
+    for holder in (f"review:{repo}#41@run.1", f"fix:{repo}#41@run.1"):
+        assert enumerate_review_items(
+            repo, [passed], provenance, [{"holder": holder, "expires_at": now + 100}],
+            issue_labels, now, pr_status=passed_conflicting) == []
     # review:needs-user stays terminal for the repair states too (escalation must halt the loop)
     stopped = pull(41, "sparq-agent/issue-7-1-1", sha_a, labels=["review:needs-user"])
     assert enumerate_review_items(repo, [stopped], provenance, [], issue_labels, now,
@@ -3138,6 +6354,14 @@ def _self_test():
             return fake["pull"]
         if "/check-runs" in path:
             return {"check_runs": fake["check_runs"]}
+        if "/timeline" in path:
+            # The readmission-window probe (PR + source-issue label timelines). A missing
+            # entry serves an EMPTY timeline (no human unlabel — the full-count behaviour
+            # every pre-existing expectation assumes); timeline_error simulates a failed read.
+            if fake.get("timeline_error"):
+                raise RuntimeError("timeline unavailable")
+            match = re.search(r"/issues/(\d+)/timeline", path)
+            return [fake.get("timeline", {}).get(int(match.group(1)), [])]
         if "/issues/41/comments" in path:
             return [fake.get("comments", [])]
         if "/issues/7" in path:
@@ -3149,29 +6373,39 @@ def _self_test():
     def fake_helper(script_dir, target_repo, script, args):
         helper_calls.append((script, args))
 
-    def live_pull(*, draft, labels=(), body="", auto_merge=None, mergeable=True):
+    def live_pull(*, draft, labels=(), body="", auto_merge=None, mergeable=True,
+                  base_ref="main"):
+        # base.ref defaults to the repo default branch ("main"): the review-lane invariant
+        # (issue #164) is base == protected default; a test passes base_ref!="main" to exercise
+        # the retargeted-PR exclusion.
         return {"number": 41, "state": "open", "draft": draft, "body": body,
                 "mergeable": mergeable, "auto_merge": auto_merge,
                 "head": {"ref": "sparq-agent/issue-7-1-1", "sha": sha_a,
                          "repo": {"full_name": repo}},
-                "base": {"repo": {"default_branch": "main"}},
+                "base": {"ref": base_ref, "repo": {"default_branch": "main"}},
                 "user": {"login": bot, "type": "Bot"},
                 "labels": [{"name": name} for name in labels]}
 
-    def run_items(items, allocator=None, routing=None):
+    def run_items(items, allocator=None, routing=None, policy=None, usage=None):
         helper_calls.clear()
         reasons = Counter()
+        # Issue #108: a fresh per-lane accumulator each call; run_items.lanes exposes it for the
+        # review/fix stall assertions below without changing the (launched, reasons) return arity.
+        lanes = _new_lane_counts()
+        fix_dispatch = Counter()
         launched = _dispatch_review_items(
-            items, repo, {"max_review_rounds": 3, "account_pool": []},
+            items, repo, policy or {"max_review_rounds": 3, "account_pool": []},
             routing or {}, allocator, wiring_worker_pr, "reg/repo",
-            wiring_root, "main", bot, None, 0.10, reasons,
-            ledger_root=wiring_ledger_root)
+            wiring_root, "main", bot, usage, 0.10, reasons, lanes=lanes,
+            ledger_root=wiring_ledger_root, fix_dispatch=fix_dispatch)
+        run_items.lanes = lanes
+        run_items.fix_dispatch = fix_dispatch
         return launched, reasons
 
     ci_item = {"pr_number": 41, "head_sha": sha_a, "state": "needs-ci-fix",
                "impl_provider": "anthropic", "repo": repo, "package": "crate-a",
                "security": False, "context": "js"}
-    real_io = (_gh_json, _run_target_helper, _target_token)
+    real_io = (_gh_json, _run_target_helper, _target_token, _target_is_human_maintainer)
     with tempfile.TemporaryDirectory() as tmp:
         wiring_root = str(Path(tmp) / "registry")
         # A separate `ledger` branch checkout root (issue #96): records land there post-outage;
@@ -3186,15 +6420,28 @@ def _self_test():
             globals()["_gh_json"] = fake_gh_json
             globals()["_run_target_helper"] = fake_helper
             globals()["_target_token"] = lambda repo: "tok"
+            # The strict maintainer probe (park-policy hygiene finding): jeswr is the trusted
+            # human; bots/outsiders/unverifiable actors are not.
+            globals()["_target_is_human_maintainer"] = (
+                lambda repo, login: login == "jeswr")
             gate_red = [{"name": "gate", "status": "completed", "conclusion": "failure",
-                         "started_at": "T1"}]
+                         "started_at": "2026-07-23T01:00:00Z"}]
             gate_green = [{"name": "gate", "status": "completed", "conclusion": "success",
-                           "started_at": "T1"}]
+                           "started_at": "2026-07-23T01:00:00Z"}]
             # trigger evaporated (gate re-ran green): the ready PR is NOT defused — no mutation
             fake.update(pull=live_pull(draft=False, auto_merge={"merge_method": "squash"}),
                         check_runs=gate_green, issue_labels=["area:crate-a"])
-            run_items([ci_item])
+            launched, reasons = run_items([ci_item])
             assert helper_calls == [], helper_calls
+            # Issue #450 no-silent-defer: even a pre-claim live-trigger drift gets a coarse
+            # non-empty shared telemetry reason (the exact detail remains in the per-PR log).
+            assert launched == 0 and reasons["fix:preclaim-defer"] == 1, reasons
+            # Issue #460: this item was already ENUMERATED into the fix lane. Live trigger drift
+            # may defer it, but must not rewrite that fact as `0 eligible`; the aggregate reason
+            # stays privacy-safe while the per-PR line above carries the exact cause.
+            assert _fix_dispatch_line(run_items.fix_dispatch) == (
+                "fix-dispatch: 1 eligible, 0 launched, 1 deferred "
+                "(reasons: preclaim-defer=1)"), run_items.fix_dispatch
             # trigger still live: the ready PR IS defused (disarm --when always), exactly once
             fake["check_runs"] = gate_red
             run_items([ci_item])
@@ -3210,18 +6457,56 @@ def _self_test():
                         issue_labels=["area:crate-a"])
             run_items([ci_item])
             assert helper_calls == [], helper_calls
-            # stranded ACT: {draft, unarmed, reviewed head, green gate} -> loud needs-user
+            # stranded RECOVERY (issue #161): {draft, unarmed, reviewed head, green gate} is the
+            # residue of an interrupted defuse/disarm, so CLAIM RE-REVIEWS the current head under
+            # the bounded round budget instead of a terminal hand-off — the reviewed-sha marker
+            # matching the head (which DEFERS a plain needs-review) is bypassed for the recovery.
             stranded_item = dict(ci_item, state="stranded", context="")
             fake.update(pull=live_pull(
                 draft=True, labels=["review:needs"],
-                body=f"x <!-- sparq-reviewed-sha:{sha_a} -->"), check_runs=gate_green)
-            run_items([stranded_item])
+                body=f"x <!-- sparq-reviewed-sha:{sha_a} -->"),
+                check_runs=gate_green, comments=[])
+            strand_routing = {"models": {
+                "sol": {"provider_model": "TBD", "harness": "codex"},
+                "luna": {"provider_model": "TBD", "harness": "codex"}}}
+
+            class StrandAllocator:
+                def __init__(self):
+                    self.calls = []
+
+                def claim(self, _repo, _package, role, chain, *_args, **_kwargs):
+                    self.calls.append((role, list(chain)))
+                    return None      # no account free: the recovery review DEFERS, no hand-off
+
+                def release(self, *_args, **_kwargs):
+                    return True
+
+            # budget remaining (0 recorded rounds): the cross-provider REVIEW chain is offered and
+            # NO needs-user is applied (recovery, not escalation)
+            alloc = StrandAllocator()
+            launched, reasons = run_items(
+                [stranded_item], allocator=alloc, routing=strand_routing)
+            assert helper_calls == [], helper_calls
+            assert alloc.calls == [("review", ["sol", "luna"])], alloc.calls
+            assert launched == 0 and reasons["review:no-slot"] == 1, reasons
+            # repeated failed recovery: the round budget is spent (hard cap) -> loud needs-user,
+            # and no review is dispatched — terminal escalation is RESERVED for this case
+            fake["comments"] = [
+                {"user": {"login": bot}, "created_at": "2026-07-30T00:00:00Z",
+                 "body": f"x {wiring_worker_pr.ROUND_MARKER} n={i} run={i}.1 -->"}
+                for i in range(1, wiring_worker_pr.HARD_CAP_ROUNDS + 1)]
+            alloc = StrandAllocator()
+            run_items([stranded_item], allocator=alloc, routing=strand_routing)
             assert [(script, args[0]) for script, args in helper_calls] == [
                 ("worker-pr.py", "needs-user")], helper_calls
-            # stranded DO-NOTHING: the posture failed to re-derive (gate red again) -> defer
-            fake["check_runs"] = gate_red
-            run_items([stranded_item])
+            assert alloc.calls == [], alloc.calls
+            # stranded DO-NOTHING: the posture failed to re-derive (gate red again) -> defer,
+            # neither a review dispatch nor a hand-off
+            fake.update(check_runs=gate_red, comments=[])
+            alloc = StrandAllocator()
+            run_items([stranded_item], allocator=alloc, routing=strand_routing)
             assert helper_calls == [], helper_calls
+            assert alloc.calls == [], alloc.calls
 
             # ---- round-budget escalation (directive 2026-07-17): decide_budget replaces the
             # flat rounds>=max needs-user at CLAIM, the fix chain honours the pinned floor, and
@@ -3238,7 +6523,11 @@ def _self_test():
                     return True
 
             def bot_comment(body):
-                return {"user": {"login": bot}, "body": body}
+                # created_at postdates every fixture cutoff below, preserving the old
+                # missing-timestamp-is-charged semantics now that the validated reader
+                # (round-4 finding 4) requires the full comment shape.
+                return {"user": {"login": bot}, "body": body,
+                        "created_at": "2026-07-30T00:00:00Z"}
 
             def round_markers(count):
                 return [bot_comment(f"x {wiring_worker_pr.ROUND_MARKER} n={i} run={i}.1 -->")
@@ -3256,6 +6545,7 @@ def _self_test():
                         "impl_provider": "anthropic", "repo": repo, "package": "crate-a",
                         "security": False, "context": ""}
             routing_ok = {"models": {
+                "opus5": {"provider_model": "claude-opus-5", "harness": "claude"},
                 "fable": {"provider_model": "claude-fable-5", "harness": "claude"},
                 "opus": {"provider_model": "claude-opus-4-8", "harness": "claude"},
                 "sol": {"provider_model": "TBD", "harness": "codex"},
@@ -3266,8 +6556,31 @@ def _self_test():
             fix_model = wiring_worker_pr.FIX_MODEL_MARKER
             pin_marker = wiring_worker_pr.MODEL_PIN_MARKER
 
+            # Issue #450 CLAIM re-entry + mutation guard: an externally supplied changes label
+            # with valid provenance and NO bot round marker starts from synthetic round 0 (workflow
+            # round 1), is counted fix-eligible, and reaches the allocator. Restoring the old
+            # `if rounds < 1: continue` makes both assertions red. The trusted round-1 verdict
+            # remains mandatory input to the verdict-seeded fixer.
+            fake.update(pull=live_pull(draft=False, labels=["review:changes"]), comments=[])
+            write_verdict(1, None)
+            alloc = FakeAllocator()
+            launched, reasons = run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert launched == 0 and alloc.chains == [["opus5", "fable", "opus"]], \
+                (launched, alloc.chains)
+            assert run_items.fix_dispatch["eligible"] == 1, run_items.fix_dispatch
+            assert reasons["fix:no-slot"] == 1, reasons
+            disarm_calls = [args for script, args in helper_calls
+                            if script == "worker-pr.py" and args[0] == "disarm"]
+            assert disarm_calls and "--preserve-review-state" in disarm_calls[0], disarm_calls
+            synthetic_rounds = [args for script, args in helper_calls
+                                if script == "worker-pr.py" and args[0] == "round-record"]
+            assert synthetic_rounds and synthetic_rounds[0][
+                synthetic_rounds[0].index("--round") + 1] == "1", synthetic_rounds
+            fake.update(pull=live_pull(draft=True, labels=["review:changes"]), comments=[])
+
             # ACT: base budget spent on OPUS -> extension escalates UP the ladder
-            # (opus < fable, sol r2 f2), fable pin converged, and a chain WITHOUT opus;
+            # (opus < fable < opus5, sol r2 f2 + 2026-07-24), fable pin converged, and a chain
+            # WITHOUT opus (floor-and-above: fable + opus5);
             # the None claim then defers with a missed marker, NOT needs-user
             fake["comments"] = round_markers(3) + [
                 bot_comment(f"x {fix_model} round=1 model=opus run=1.9 -->"),
@@ -3280,7 +6593,7 @@ def _self_test():
                 ("worker-pr.py", "record-marker")], helper_calls
             pin_args = helper_calls[0][1]
             assert pin_args[pin_args.index("--tier") + 1] == "fable", pin_args
-            assert alloc.chains == [["fable"]], alloc.chains
+            assert alloc.chains == [["fable", "opus5"]], alloc.chains
 
             # DO-NOTHING flip: under budget -> no pin call, the DEFAULT fix chain is offered
             fake["comments"] = round_markers(2)
@@ -3289,45 +6602,322 @@ def _self_test():
             run_items([fix_item], allocator=alloc, routing=routing_ok)
             assert [(script, args[0]) for script, args in helper_calls] == [
                 ("worker-pr.py", "record-marker")], helper_calls
-            assert alloc.chains == [["fable", "opus"]], alloc.chains
+            assert alloc.chains == [["opus5", "fable", "opus"]], alloc.chains
 
             # a recorded bot pin governs the chain even under budget (the floor never lowers) —
-            # a fable floor offers ONLY fable (tiers below the floor are never offered) ...
+            # a fable floor offers only floor-and-above (fable + opus5; tiers below the floor
+            # are never offered) ...
             fake["comments"] = round_markers(2) + [
                 bot_comment(f"z {pin_marker} round=1 tier=fable run=1.5 -->")]
             alloc = FakeAllocator()
             run_items([fix_item], allocator=alloc, routing=routing_ok)
-            assert alloc.chains == [["fable"]], alloc.chains
+            assert alloc.chains == [["fable", "opus5"]], alloc.chains
             # ... while a NON-bot forged pin marker is inert (bot-login trust filter)
             fake["comments"] = round_markers(2) + [
-                {"user": {"login": "mallory"},
+                {"user": {"login": "mallory"}, "created_at": "2026-07-30T00:00:00Z",
                  "body": f"z {pin_marker} round=1 tier=fable run=6.6 -->"}]
             alloc = FakeAllocator()
             run_items([fix_item], allocator=alloc, routing=routing_ok)
-            assert alloc.chains == [["fable", "opus"]], alloc.chains
+            assert alloc.chains == [["opus5", "fable", "opus"]], alloc.chains
 
-            # top tier ran + latest verdict improving -> progress extension (pin floor kept)
+            # top tier (opus5, 2026-07-24) ran + latest verdict improving -> progress
+            # extension (pin floor kept)
             fake["comments"] = round_markers(4) + [
                 bot_comment(f"x {fix_model} round=1 model=opus run=1.9 -->"),
-                bot_comment(f"x {fix_model} round=3 model=fable run=3.9 -->"),
-                bot_comment(f"z {pin_marker} round=3 tier=fable run=3.9 -->")]
+                bot_comment(f"x {fix_model} round=3 model=opus5 run=3.9 -->"),
+                bot_comment(f"z {pin_marker} round=3 tier=opus5 run=3.9 -->")]
             write_verdict(4, "improving")
             alloc = FakeAllocator()
             run_items([fix_item], allocator=alloc, routing=routing_ok)
             assert [(script, args[0]) for script, args in helper_calls] == [
                 ("worker-pr.py", "record-marker")], helper_calls
-            assert alloc.chains == [["fable"]], alloc.chains
+            assert alloc.chains == [["opus5"]], alloc.chains
 
             # flip-goes-red: top tier + stagnant -> the loud terminal needs-user, no claim
             fake["comments"] = round_markers(4) + [
                 bot_comment(f"x {fix_model} round=1 model=opus run=1.9 -->"),
-                bot_comment(f"x {fix_model} round=3 model=fable run=3.9 -->")]
+                bot_comment(f"x {fix_model} round=3 model=opus5 run=3.9 -->")]
             write_verdict(4, "stagnant")
             alloc = FakeAllocator()
             run_items([fix_item], allocator=alloc, routing=routing_ok)
             assert [(script, args[0]) for script, args in helper_calls] == [
                 ("worker-pr.py", "needs-user")], helper_calls
             assert alloc.chains == [], alloc.chains
+
+            # ---- round-budget human-readmission window (live defect sparq#2804/PR#3442,
+            # 2026-07-23: the maintainer unlabeled needs:user at 09:18:19Z and the CLAIM
+            # re-derivation re-parked at 09:40:55Z on 5 broken-CI-era rounds): a HUMAN
+            # unlabel restarts the budget; bot/absent/failed reads keep the full count ----
+            def stamped_rounds(count, created, start=1):
+                return [dict(bot_comment(
+                    f"x {wiring_worker_pr.ROUND_MARKER} n={i} run={i}.1 -->"),
+                    created_at=created) for i in range(start, start + count)]
+
+            def unlabel_event(ts, login):
+                return {"event": "unlabeled", "label": {"name": "needs:user"},
+                        "created_at": ts, "actor": {"login": login}}
+
+            def needs_user_reasons():
+                return [args[args.index("--reason") + 1] for script, args in helper_calls
+                        if script == "worker-pr.py" and args[0] == "needs-user"]
+
+            burned_era = stamped_rounds(5, "2026-07-22T05:00:00Z") + [
+                dict(bot_comment(f"x {fix_model} round=4 model=opus5 run=4.9 -->"),
+                     created_at="2026-07-22T05:30:00Z")]
+            # (1) human unlabel on the SOURCE ISSUE after 5 burned rounds => effective count
+            # 0 => NO budget park; the fix chain is offered again (the missed-marker defer is
+            # the allocator saying no slot, not an escalation).
+            fake["comments"] = burned_era
+            fake["timeline"] = {7: [unlabel_event("2026-07-23T09:18:19Z", "jeswr")]}
+            write_verdict(5, "stagnant")
+            alloc = FakeAllocator()
+            run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert [(script, args[0]) for script, args in helper_calls] == [
+                ("worker-pr.py", "record-marker")], helper_calls
+            assert alloc.chains == [["opus5", "fable", "opus"]], alloc.chains
+            # (2) rounds recorded AFTER the unlabel count normally: 2 post-unlabel rounds
+            # (base 3) stay under budget even though the GLOBAL count (7) is at the hard cap.
+            fake["comments"] = burned_era + stamped_rounds(
+                2, "2026-07-23T10:00:00Z", start=6)
+            write_verdict(7, "stagnant")
+            alloc = FakeAllocator()
+            run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert [(script, args[0]) for script, args in helper_calls] == [
+                ("worker-pr.py", "record-marker")], helper_calls
+            assert alloc.chains == [["opus5", "fable", "opus"]], alloc.chains
+            # (3) a BOT unlabel does NOT reset: the full 5-round count stands and the
+            # terminal park fires with the historical charge.
+            fake["comments"] = burned_era
+            fake["timeline"] = {
+                7: [unlabel_event("2026-07-23T09:18:19Z", "sparq-orchestrator[bot]")]}
+            write_verdict(5, "stagnant")
+            alloc = FakeAllocator()
+            run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert alloc.chains == [], alloc.chains
+            assert ["exhausted at 5 round(s)" in reason
+                    for reason in needs_user_reasons()] == [True], helper_calls
+            # (4) no unlabel event anywhere => behaviour unchanged (the full count parks).
+            fake.pop("timeline", None)
+            alloc = FakeAllocator()
+            run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert alloc.chains == [], alloc.chains
+            assert ["exhausted at 5 round(s)" in reason
+                    for reason in needs_user_reasons()] == [True], helper_calls
+            # (5) a timeline read failure keeps the FULL count (the OLD conservative park —
+            # never a fresh budget on unproven data) and logs the failure LOUDLY.
+            fake["timeline_error"] = True
+            alloc = FakeAllocator()
+            probe_log = io.StringIO()
+            with contextlib.redirect_stdout(probe_log):
+                run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert alloc.chains == [], alloc.chains
+            assert ["exhausted at 5 round(s)" in reason
+                    for reason in needs_user_reasons()] == [True], helper_calls
+            assert "timeline read failed" in probe_log.getvalue(), probe_log.getvalue()
+            fake.pop("timeline_error", None)
+            # (2) wrote a LEGACY round-7 verdict; the ledger-first resolution tests below
+            # depend on the legacy round-7 copy being absent — remove the fixture residue.
+            (Path(wiring_root) / wiring_worker_pr.verdict_path(repo, 41, 7)).unlink()
+
+            # ---- #555 RECURRENCE GAP: the MISSED-FIX exhaustion branch must honour the
+            # readmission window and be IDEMPOTENT against an unchanged head.
+            #
+            # THE DEFECT (live): sparq PR #3488 was re-admitted 2026-07-22T16:36:56Z and
+            # re-escalated at 16:44:10Z — ~7 minutes later, UNCHANGED head, no work attempted;
+            # re-admitted again 19:37:39Z and re-escalated 2026-07-23T09:48:39Z. PR #3472
+            # re-escalated seven seconds after #3488's with byte-identical boilerplate, five
+            # days after the last commit or review round on either PR. `missed` markers are
+            # durable per-round state that NOTHING resets and this branch read the LIFETIME
+            # count — so the very next tick after any re-admission re-derived the same
+            # exhaustion and (with a gen-1 receipt standing) went straight to the ladder's
+            # question-class terminal. It needs no head advance and no review round to fire,
+            # which is exactly why it hit every PR in a sweep identically. ----
+            def stamped_missed(count, created, round_n, start=1):
+                return [dict(bot_comment(
+                    f"x {wiring_worker_pr.MARKER_KINDS['missed']} round={round_n} "
+                    f"run={i}.1 -->"), created_at=created)
+                    for i in range(start, start + count)]
+
+            def needs_user_flag(flag):
+                return [args[args.index(flag) + 1] for script, args in helper_calls
+                        if script == "worker-pr.py" and args[0] == "needs-user"
+                        and flag in args]
+
+            def label_event(kind, label, ts, login):
+                return {"event": kind, "label": {"name": label},
+                        "created_at": ts, "actor": {"login": login}}
+
+            # rounds=2 keeps the ROUND budget (base 3) out of the way, so the missed-fix branch
+            # is the one under test; round_number = max(rounds, 1) = 2.
+            fake.update(pull=live_pull(draft=True, labels=["review:changes"]))
+            write_verdict(2, None)
+            burned_misses = stamped_rounds(2, "2026-07-22T05:00:00Z") + stamped_missed(
+                MISSED_FIX_LIMIT, "2026-07-22T05:30:00Z", 2)
+            # (baseline, unchanged behaviour) no readmission gesture => the lifetime count
+            # parks, and the park carries its attempt fingerprint (live head + LIFETIME count).
+            fake["comments"] = burned_misses
+            fake.pop("timeline", None)
+            alloc = FakeAllocator()
+            run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert alloc.chains == [], alloc.chains
+            assert [f"{MISSED_FIX_LIMIT} consecutive fix dispatches missed for round 2"
+                    in reason for reason in needs_user_reasons()] == [True], helper_calls
+            assert needs_user_flag("--head-sha") == [sha_a], helper_calls
+            assert needs_user_flag("--attempt-key") == [
+                f"missed2={MISSED_FIX_LIMIT}"], helper_calls
+            # (e) THE 7-MINUTE BOUNCE, reproduced: the maintainer re-admits (a proven-human
+            # unlabel of the machine park at the observed 16:36:56Z) and the sweep ticks again
+            # with an UNCHANGED head and NO new work attempted. Pre-fix the lifetime count
+            # re-derived the same exhaustion and re-escalated. It must now grant REAL capacity:
+            # zero chargeable misses in the window => NO park, and the fix chain is offered
+            # again (the trailing record-marker is the allocator saying "no slot", which is a
+            # fresh miss inside the new window — not an escalation).
+            fake["timeline"] = {41: [label_event("labeled", "review:parked",
+                                                "2026-07-22T16:00:00Z",
+                                                "sparq-orchestrator[bot]"),
+                                     label_event("unlabeled", "review:parked",
+                                                "2026-07-22T16:36:56Z", "jeswr")], 7: []}
+            alloc = FakeAllocator()
+            bounce_log = io.StringIO()
+            with contextlib.redirect_stdout(bounce_log):
+                run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert needs_user_reasons() == [], helper_calls
+            assert [(script, args[0]) for script, args in helper_calls] == [
+                ("worker-pr.py", "record-marker")], helper_calls
+            assert alloc.chains == [["opus5", "fable", "opus"]], alloc.chains
+            assert "the missed-fix budget for round 2 charges 0 of " \
+                f"{MISSED_FIX_LIMIT}" in bounce_log.getvalue(), bounce_log.getvalue()
+            # (c) a re-admission grants a FRESH allowance, not an unbounded one: once the
+            # WINDOW itself accumulates MISSED_FIX_LIMIT misses the park fires again — charged
+            # on the window (6), fingerprinted on the LIFETIME count (12, monotone across
+            # windows so two genuinely distinct windows can never read as "unchanged").
+            fake["comments"] = burned_misses + stamped_missed(
+                MISSED_FIX_LIMIT, "2026-07-23T10:00:00Z", 2, start=MISSED_FIX_LIMIT + 1)
+            alloc = FakeAllocator()
+            run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert alloc.chains == [], alloc.chains
+            assert [f"{MISSED_FIX_LIMIT} consecutive fix dispatches missed for round 2"
+                    in reason for reason in needs_user_reasons()] == [True], helper_calls
+            assert needs_user_flag("--attempt-key") == [
+                f"missed2={MISSED_FIX_LIMIT * 2}"], helper_calls
+            # (3'/5') a BOT unlabel opens no window and a timeline read failure keeps the FULL
+            # count — the missed-fix budget fails in the SAME conservative direction as the
+            # round budget (never a fresh allowance on unproven data).
+            fake["comments"] = burned_misses
+            fake["timeline"] = {41: [label_event("unlabeled", "review:parked",
+                                                "2026-07-22T16:36:56Z",
+                                                "sparq-orchestrator[bot]")], 7: []}
+            alloc = FakeAllocator()
+            run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert alloc.chains == [] and needs_user_reasons(), (alloc.chains, helper_calls)
+            fake["timeline_error"] = True
+            alloc = FakeAllocator()
+            missed_probe_log = io.StringIO()
+            with contextlib.redirect_stdout(missed_probe_log):
+                run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert alloc.chains == [] and needs_user_reasons(), (alloc.chains, helper_calls)
+            assert "timeline read failed" in missed_probe_log.getvalue(), \
+                missed_probe_log.getvalue()
+            fake.pop("timeline_error", None)
+            # The ROUND-budget park on this same path also carries its fingerprint (live head +
+            # the GLOBAL round count — never the window-relative charge, which resets).
+            fake["comments"] = burned_era
+            fake.pop("timeline", None)
+            write_verdict(5, "stagnant")
+            alloc = FakeAllocator()
+            run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert ["exhausted at 5 round(s)" in reason
+                    for reason in needs_user_reasons()] == [True], helper_calls
+            assert (needs_user_flag("--head-sha"), needs_user_flag("--attempt-key")) == (
+                [sha_a], ["rounds=5"]), helper_calls
+            (Path(wiring_root) / wiring_worker_pr.verdict_path(repo, 41, 2)).unlink()
+
+            # ---- finding A CLAIM glue: a review:parked item that PLAN re-admitted on label
+            # STATE must re-prove the human gesture on the label TIMELINES here. No gesture
+            # newer than the park application => defer with NO mutation and NO claim; a
+            # proven newer gesture => the stale review:parked converges to review:needs
+            # BEFORE dispatch (review-fix.yml admission rejects review:parked). ----
+            def park_event(kind, label, ts, login):
+                return {"event": kind, "label": {"name": label},
+                        "created_at": ts, "actor": {"login": login}}
+
+            parked_claim_item = dict(fix_item, state="needs-review")
+            fake.update(pull=live_pull(draft=True, labels=["review:parked"]))
+            fake["comments"] = []
+            fake["timeline"] = {41: [park_event("labeled", "review:parked",
+                                                "2026-07-23T10:00:00Z",
+                                                "sparq-orchestrator[bot]")], 7: []}
+            alloc = FakeAllocator()
+            run_items([parked_claim_item], allocator=alloc, routing=routing_ok)
+            assert helper_calls == [], helper_calls
+            assert alloc.chains == [], alloc.chains
+            # bot gestures / stale gestures never re-admit either
+            fake["timeline"][7] = [park_event("unlabeled", "status:parked",
+                                              "2026-07-23T11:00:00Z",
+                                              "sparq-orchestrator[bot]")]
+            alloc = FakeAllocator()
+            run_items([parked_claim_item], allocator=alloc, routing=routing_ok)
+            assert helper_calls == [] and alloc.chains == [], (helper_calls, alloc.chains)
+            # a PROVEN human gesture strictly newer than the park application re-admits:
+            # the strip lands first, then the review chain is offered.
+            fake["timeline"][7] = [park_event("unlabeled", "status:parked",
+                                              "2026-07-23T11:00:00Z", "jeswr")]
+            alloc = FakeAllocator()
+            run_items([parked_claim_item], allocator=alloc, routing=routing_ok)
+            assert [(script, args[:2]) for script, args in helper_calls] == [
+                ("worker-pr.py", ["review-state", "set"])], helper_calls
+            assert "--state" in helper_calls[0][1] and "needs" in helper_calls[0][1], \
+                helper_calls
+            assert alloc.chains == [["sol", "luna"]], alloc.chains
+
+            # ---- round-3 finding 2: the proof gate triggers off the DURABLE RECEIPTS, not
+            # the live label. A triage-side dismissal of review:parked (label GONE, receipts
+            # standing, no proven-human gesture) still re-proves here — and DECLINES. ----
+            fake.update(pull=live_pull(draft=True, labels=[]))
+            fake["comments"] = [bot_comment(
+                f"parked {wiring_worker_pr.PARK_GENERATION_MARKER} gen=1 cutoff=none -->")]
+            fake["timeline"] = {
+                41: [park_event("labeled", "review:parked", "2026-07-23T10:00:00Z",
+                                "sparq-orchestrator[bot]"),
+                     park_event("unlabeled", "review:parked", "2026-07-23T10:30:00Z",
+                                "drive-by-triage")],
+                7: []}
+            alloc = FakeAllocator()
+            park_gate_log = io.StringIO()
+            with contextlib.redirect_stdout(park_gate_log):
+                run_items([parked_claim_item], allocator=alloc, routing=routing_ok)
+            assert helper_calls == [] and alloc.chains == [], (helper_calls, alloc.chains)
+            assert "machine capacity park stands (durable receipts/label" \
+                in park_gate_log.getvalue(), park_gate_log.getvalue()
+            # ... a PROVEN human gesture (newer than the park application, unconsumed) on
+            # the SOURCE issue re-admits the label-free PR — with NO strip call (nothing to
+            # strip) and the review chain offered.
+            fake["timeline"][7] = [park_event("unlabeled", "status:parked",
+                                              "2026-07-23T11:00:00Z", "jeswr")]
+            alloc = FakeAllocator()
+            run_items([parked_claim_item], allocator=alloc, routing=routing_ok)
+            assert helper_calls == [], helper_calls
+            assert alloc.chains == [["sol", "luna"]], alloc.chains
+            # ... but a gesture whose window is already CONSUMED (receipted) never
+            # re-admits: the veto-suppressed label re-apply leaves no fresh application to
+            # out-date it, so without the receipt check this stale gesture would re-admit
+            # forever.
+            fake["comments"] = [bot_comment(
+                f"parked {wiring_worker_pr.PARK_GENERATION_MARKER} gen=2 "
+                "cutoff=2026-07-23T11:00:00Z -->")]
+            alloc = FakeAllocator()
+            run_items([parked_claim_item], allocator=alloc, routing=routing_ok)
+            assert helper_calls == [] and alloc.chains == [], (helper_calls, alloc.chains)
+            # ---- the one-predicate race guard: status:parked live on the SOURCE at CLAIM
+            # defers outright (a fresh park landed in the PLAN->CLAIM window) ----
+            fake["comments"] = []
+            fake["issue_labels"] = ["area:crate-a", "status:parked"]
+            alloc = FakeAllocator()
+            run_items([parked_claim_item], allocator=alloc, routing=routing_ok)
+            assert helper_calls == [] and alloc.chains == [], (helper_calls, alloc.chains)
+            fake["issue_labels"] = ["area:crate-a"]
+            fake.pop("timeline", None)
+            fake.update(pull=live_pull(draft=True, labels=["review:changes"]))
 
             # hard cap: 6 rounds stop even with a weaker tier + an improving grade
             fake["comments"] = round_markers(6) + [
@@ -3370,17 +6960,57 @@ def _self_test():
             assert helper_calls == [], helper_calls
             assert alloc.chains == [["sol", "luna"]], alloc.chains
 
-            # flip-goes-red: the same posture whose latest fix ran BELOW the recorded fable
+            # issue #164: the SAME needs-review posture whose worker PR is RETARGETED off the
+            # protected default branch is EXCLUDED here (the review-lane invariant: base ==
+            # default). The wrong-base empty-diff probe never runs and no reviewer slot is spent
+            # on a PR the arm could never merge. Contrast the dispatch immediately above:
+            # identical comments/verdict, only base.ref differs ("release" != default "main"),
+            # yet this one defers with no claim and no mutation.
+            fake.update(pull=live_pull(draft=True, labels=["review:needs"], base_ref="release"))
+            alloc = FakeAllocator()
+            run_items([review_item], allocator=alloc, routing=routing_ok)
+            assert helper_calls == [], helper_calls
+            assert alloc.chains == [], alloc.chains
+            fake.update(pull=live_pull(draft=True, labels=["review:needs"]))
+
+            # flip-goes-red: the same posture whose latest fix ran BELOW the recorded opus5
             # floor (a pin violation / forged marker) mints NO re-review — with the top tier
             # already graded stagnant it is the loud terminal instead
             fake["comments"] = round_markers(3) + [
-                bot_comment(f"x {fix_model} round=1 model=fable run=1.9 -->"),
-                bot_comment(f"z {pin_marker} round=1 tier=fable run=1.5 -->"),
+                bot_comment(f"x {fix_model} round=1 model=opus5 run=1.9 -->"),
+                bot_comment(f"z {pin_marker} round=1 tier=opus5 run=1.5 -->"),
                 bot_comment(f"x {fix_model} round=3 model=opus run=3.9 -->")]
             alloc = FakeAllocator()
             run_items([review_item], allocator=alloc, routing=routing_ok)
             assert [(script, args[0]) for script, args in helper_calls] == [
                 ("worker-pr.py", "needs-user")], helper_calls
+            assert alloc.chains == [], alloc.chains
+
+            # ordering regression (#454 review round 1): the retargeted-base exclusion runs
+            # BEFORE the round-budget processing. Each posture below took a MUTATING budget
+            # action when base == default (asserted above: record-model-pin for the first,
+            # the terminal needs-user for the second); retargeted, both must defer with NO
+            # helper call and NO claim — a human retarget removes the PR from the loop, so
+            # the loop must not label/pin it on the way out.
+            fake.update(pull=live_pull(draft=True, labels=["review:changes"],
+                                       base_ref="release"))
+            # would-be extend-model-pin (the ACT posture above)
+            fake["comments"] = round_markers(3) + [
+                bot_comment(f"x {fix_model} round=1 model=opus run=1.9 -->"),
+                bot_comment(f"x {fix_model} round=2 model=opus run=2.9 -->")]
+            write_verdict(3, "stagnant")
+            alloc = FakeAllocator()
+            run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert helper_calls == [], helper_calls
+            assert alloc.chains == [], alloc.chains
+            # would-be terminal needs-user (the flip-goes-red posture above)
+            fake["comments"] = round_markers(4) + [
+                bot_comment(f"x {fix_model} round=1 model=opus run=1.9 -->"),
+                bot_comment(f"x {fix_model} round=3 model=opus5 run=3.9 -->")]
+            write_verdict(4, "stagnant")
+            alloc = FakeAllocator()
+            run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert helper_calls == [], helper_calls
             assert alloc.chains == [], alloc.chains
             fake.update(pull=live_pull(draft=True, labels=["review:changes"]))
 
@@ -3418,6 +7048,18 @@ def _self_test():
             write_verdict(5, "improving", root=wiring_ledger_root)
             assert latest_recorded_progress(wiring_worker_pr, wiring_root, repo, 41, 5, [],
                                             bot, ledger_root=wiring_ledger_root) == "improving"
+            # issue #156: a HOST-ENVELOPE record (the new on-disk format) is unwrapped so the
+            # nested verdict's progress grade is still read (the reader is not fooled into
+            # reading progress off the envelope top level, which would degrade to None).
+            env_rel = wiring_worker_pr.verdict_path(repo, 41, 6)
+            env_path = Path(wiring_ledger_root) / env_rel
+            env_path.parent.mkdir(parents=True, exist_ok=True)
+            env_path.write_text(json.dumps(wiring_worker_pr.verdict_envelope(
+                repo, 41, 6, "a" * 40,
+                {"verdict": "request_changes", "injection_detected": False, "summary": "s",
+                 "issues": [], "progress": "regressing"})), encoding="utf-8")
+            assert latest_recorded_progress(wiring_worker_pr, wiring_root, repo, 41, 6, [],
+                                            bot, ledger_root=wiring_ledger_root) == "regressing"
             # end-to-end CLAIM wiring on a LEDGER-ONLY provenance record: the legacy record is
             # gone (post-outage reality) and the review item still admits + defers normally
             record_file.unlink()
@@ -3431,12 +7073,152 @@ def _self_test():
             write_verdict(2, None, root=wiring_ledger_root)
             alloc = FakeAllocator()
             launched, reasons = run_items([fix_item], allocator=alloc, routing=routing_ok)
-            assert alloc.chains == [["fable", "opus"]], alloc.chains
+            assert alloc.chains == [["opus5", "fable", "opus"]], alloc.chains
             # a deferring (None-claim) allocator is contention, NOT ledger rot: no lease-error,
             # ledger stays ok, and the zero-dispatch tick stays green
             assert launched == 0 and reasons["lease-error"] == 0, (launched, reasons)
             assert _ledger_health(reasons) == "ok", reasons
             assert _ledger_rot_zeroed_dispatch(launched, reasons) is False
+            # Issue #108: a needs-fix item is the FIX lane. Capacity contention (None claim) is a
+            # DEFER, not an error — the fix lane records planned=1, launched=0, error=0, so the
+            # health recorder does NOT read it as a hard stall while accounts are simply busy.
+            assert _lane_summary(run_items.lanes)["fix"] == {
+                "planned": 1, "launched": 0, "deferred": 1, "error": 0}, run_items.lanes
+
+            # Issue #117: a FAILED durable missed-fix marker write on the None-claim path is NOT a
+            # healthy defer. Swallowing it (except DispatchError: pass) left the missed-fix budget
+            # stuck at zero forever, so the MISSED_FIX_LIMIT human escalation never fired and the PR
+            # was silently stranded. The failure must surface as a COUNTED fix-lane error + a
+            # rolling-alert defer reason, and must NOT report the normal "no lease free" defer.
+            def failing_marker_helper(script_dir, target_repo, script, args):
+                helper_calls.append((script, args))
+                if script == "worker-pr.py" and "record-marker" in args and "missed" in args:
+                    raise DispatchError("record-marker missed: target helper failed")
+
+            globals()["_run_target_helper"] = failing_marker_helper
+            try:
+                alloc = FakeAllocator()   # claim() returns None: the missed marker is attempted
+                launched, reasons = run_items([fix_item], allocator=alloc, routing=routing_ok)
+            finally:
+                globals()["_run_target_helper"] = fake_helper
+            assert launched == 0, launched
+            # the write WAS attempted (the missed record-marker call is present) ...
+            assert ("worker-pr.py", "record-marker") in [
+                (script, args[0]) for script, args in helper_calls], helper_calls
+            # ... and its failure is a counted error + rolling alert, not a silent green defer
+            assert reasons["missed-marker-write-failed"] == 1, reasons
+            assert _lane_summary(run_items.lanes)["fix"] == {
+                "planned": 1, "launched": 0, "deferred": 0, "error": 1}, run_items.lanes
+            # Issue #165: because the durable marker (the SOLE budget input) could not be written,
+            # the MISSED_FIX_LIMIT terminal can never fire — so the failure escalates DIRECTLY to a
+            # human. needs-user succeeds here (failing_marker_helper only rejects record-marker), so
+            # the PR is now bounded and the escalation is NOT re-counted as an escalation failure.
+            assert ("worker-pr.py", "needs-user") in [
+                (script, args[0]) for script, args in helper_calls], helper_calls
+            assert reasons["missed-escalation-failed"] == 0, reasons
+
+            # Issue #165: a PERSISTENT target-API outage fails the escalation POST too (same API as
+            # the failed marker). Both the marker AND the human escalation fail, so neither terminal
+            # is confirmed: the tick counts the escalation failure and the item stays a RETRYABLE
+            # defer (auto-retry until the marker or the escalation finally lands) — never silently
+            # lost, never a green "no lease free" defer that hides the unbounded PR.
+            def failing_all_helper(script_dir, target_repo, script, args):
+                helper_calls.append((script, args))
+                raise DispatchError(f"{script} {args[0]}: target helper failed")
+
+            globals()["_run_target_helper"] = failing_all_helper
+            try:
+                alloc = FakeAllocator()
+                launched, reasons = run_items([fix_item], allocator=alloc, routing=routing_ok)
+            finally:
+                globals()["_run_target_helper"] = fake_helper
+            assert launched == 0, launched
+            assert reasons["missed-marker-write-failed"] == 1, reasons
+            assert reasons["missed-escalation-failed"] == 1, reasons
+            assert _lane_summary(run_items.lanes)["fix"]["error"] == 1, run_items.lanes
+            # the human escalation WAS attempted after the marker write failed (it did not silently
+            # give up once the marker was unrecordable)
+            assert ("worker-pr.py", "needs-user") in [
+                (script, args[0]) for script, args in helper_calls], helper_calls
+
+            # regression guard: a SUCCESSFUL missed marker (default helper) stays a clean defer —
+            # no spurious error/alert/escalation when the durable marker is confirmed
+            alloc = FakeAllocator()
+            _, reasons = run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert reasons["missed-marker-write-failed"] == 0, reasons
+            assert reasons["missed-escalation-failed"] == 0, reasons
+            assert _lane_summary(run_items.lanes)["fix"]["error"] == 0, run_items.lanes
+            assert ("worker-pr.py", "needs-user") not in [
+                (script, args[0]) for script, args in helper_calls], helper_calls
+
+            # ---- issue #115: require_usage HOLDS a review/fix claim during a WHOLESALE usage-
+            # probe outage (usage=None), matching the worker loop's fail-closed hold, with an
+            # explicit carve-out for a chain served entirely by probe-exempt (codex/openai)
+            # accounts. Before the fix the review/fix loop passed usage=None straight to the
+            # allocator's UNGATED static selection, so anthropic review/fix work could start
+            # despite require_usage=true and a total probe failure. ----
+            usage_gated = {"max_review_rounds": 3, "account_pool": [], "require_usage": True}
+            # A routing catalog carrying the model `provider` field (as the live routing.toml
+            # does): anthropic models are probe-GATED, openai/codex models are probe-EXEMPT.
+            routing_prov = {"models": {
+                "opus5": {"provider": "anthropic", "provider_model": "claude-opus-5",
+                          "harness": "claude"},
+                "fable": {"provider": "anthropic", "provider_model": "claude-fable-5",
+                          "harness": "claude"},
+                "opus": {"provider": "anthropic", "provider_model": "claude-opus-4-8",
+                         "harness": "claude"},
+                "sol": {"provider": "openai", "provider_model": "TBD", "harness": "codex"},
+                "luna": {"provider": "openai", "provider_model": "TBD", "harness": "codex"},
+            }}
+            fake.update(pull=live_pull(draft=True, labels=["review:changes"]),
+                        check_runs=gate_green, issue_labels=["area:crate-a"])
+            fake["comments"] = round_markers(2)
+            write_verdict(2, None)
+            # (a) an anthropic (probe-GATED) FIX chain + usage=None + require_usage HOLDS: the
+            # claim is NEVER offered and the outage is counted, exactly like the worker loop.
+            alloc = FakeAllocator()
+            _, reasons = run_items([fix_item], allocator=alloc, routing=routing_prov,
+                                   policy=usage_gated, usage=None)
+            assert alloc.chains == [], alloc.chains
+            assert reasons["usage-probe-unavailable"] == 1, reasons
+            # (b) the hold is CONDITIONED on require_usage: the SAME outage under the default
+            # policy (require_usage unset) still dispatches — a non-opted-in repo is unchanged.
+            alloc = FakeAllocator()
+            run_items([fix_item], allocator=alloc, routing=routing_prov, usage=None)
+            assert alloc.chains == [["opus5", "fable", "opus"]], alloc.chains
+            # (c) the hold is CONDITIONED on the OUTAGE: require_usage with a LIVE usage map
+            # dispatches (usage!=None is not a probe failure).
+            alloc = FakeAllocator()
+            run_items([fix_item], allocator=alloc, routing=routing_prov,
+                      policy=usage_gated, usage={"acct01": {"ok": True}})
+            assert alloc.chains == [["opus5", "fable", "opus"]], alloc.chains
+            # (d) a probe-EXEMPT (codex/openai) REVIEW chain PROCEEDS despite usage=None: absent
+            # usage is its expected steady state (reactive backoff), so the hold must NOT gate it.
+            exempt_review = dict(fix_item, state="needs-review")
+            fake.update(pull=live_pull(draft=True, labels=["review:needs"]),
+                        check_runs=gate_green, issue_labels=["area:crate-a"])
+            fake["comments"] = round_markers(1)
+            alloc = FakeAllocator()
+            _, reasons = run_items([exempt_review], allocator=alloc, routing=routing_prov,
+                                   policy=usage_gated, usage=None)
+            assert alloc.chains == [["sol", "luna"]], alloc.chains
+            assert reasons["usage-probe-unavailable"] == 0, reasons
+            # (e) fail-closed on an UNKNOWN provider: a chain whose alias carries no exempt
+            # provider is treated as probe-gated (never silently exempted) and HOLDS.
+            routing_unknown = {"models": {
+                "fable": {"provider": "mystery", "provider_model": "x", "harness": "claude"},
+                "opus": {"provider": "mystery", "provider_model": "y", "harness": "claude"},
+            }}
+            fake.update(pull=live_pull(draft=True, labels=["review:changes"]),
+                        check_runs=gate_green, issue_labels=["area:crate-a"])
+            fake["comments"] = round_markers(2)
+            write_verdict(2, None)
+            alloc = FakeAllocator()
+            _, reasons = run_items([fix_item], allocator=alloc, routing=routing_unknown,
+                                   policy=usage_gated, usage=None)
+            assert alloc.chains == [], alloc.chains
+            assert reasons["usage-probe-unavailable"] == 1, reasons
+            fake.update(pull=live_pull(draft=True, labels=["review:changes"]))
 
             # ---- review/fix lease-error propagation (PR #258 review defect): an allocator
             # that RAISES inside the review/fix loop must land in the tick's SHARED
@@ -3453,9 +7235,246 @@ def _self_test():
             assert launched == 0 and reasons["lease-error"] == 1, (launched, reasons)
             assert _ledger_health(reasons) == "error", reasons
             assert _ledger_rot_zeroed_dispatch(launched, reasons) is True
+            # Issue #108: the SAME raise also lands in the FIX lane's error tally (launched 0,
+            # error 1) — so "every fix item fails forever" is visible per-lane even when the worker
+            # lane launched on the same tick and the fleet dispatched>0 hid the ledger-rot signal.
+            # A needs-fix plan row is the fix lane, so the review lane stays clean this tick.
+            errored = _lane_summary(run_items.lanes)
+            assert errored["fix"] == {
+                "planned": 1, "launched": 0, "deferred": 0, "error": 1}, run_items.lanes
+            assert errored["review"]["planned"] == 0, run_items.lanes
+
+            # ---- review/fix workflow-launch failure is a LANE ERROR (PR #321 review): a
+            # nonzero `gh workflow run` is a hard dispatch failure, not capacity contention.
+            # It must fold into the lane's error tally + the shared dispatch-launch-failed
+            # histogram, so an all-launch-failed fix lane reads stalled (planned>0,
+            # launched=0, error>0) instead of deriving as `deferred` and dodging the
+            # tick-health recorder while another lane launched. ----
+            class ClaimingAllocator:
+                def __init__(self):
+                    self.released = []
+
+                def claim(self, _repo, _package, _role, chain, *_args, **_kwargs):
+                    return {"account": "acct01", "claim_id": "ab" * 16,
+                            "model": chain[0], "provider": "anthropic"}
+
+                def release(self, _repo, claim_id, _now):
+                    self.released.append(claim_id)
+                    return True
+
+            gh_runs = []
+            real_run_gh = _run_gh
+
+            def fake_run_gh(args, *, check=True):
+                gh_runs.append(list(args))
+                return subprocess.CompletedProcess(args, fake_run_gh.returncode)
+
+            try:
+                globals()["_run_gh"] = fake_run_gh
+                fake_run_gh.returncode = 1
+                alloc = ClaimingAllocator()
+                launched, reasons = run_items([fix_item], allocator=alloc,
+                                              routing=routing_ok)
+                assert gh_runs and gh_runs[0][:3] == [
+                    "workflow", "run", "review-fix.yml"], gh_runs
+                assert launched == 0 and reasons["dispatch-launch-failed"] == 1, \
+                    (launched, reasons)
+                assert alloc.released == ["ab" * 16], alloc.released  # lease not leaked
+                assert _lane_summary(run_items.lanes)["fix"] == {
+                    "planned": 1, "launched": 0, "deferred": 0, "error": 1}, run_items.lanes
+                # flip-goes-green: the SAME posture with a zero-exit launch is a lane launch,
+                # not an error, and the lease stays held for the launched workflow
+                gh_runs.clear()
+                fake_run_gh.returncode = 0
+                alloc = ClaimingAllocator()
+                launched, reasons = run_items([fix_item], allocator=alloc,
+                                              routing=routing_ok)
+                assert launched == 1 and reasons["dispatch-launch-failed"] == 0, \
+                    (launched, reasons)
+                assert alloc.released == [], alloc.released
+                assert _lane_summary(run_items.lanes)["fix"] == {
+                    "planned": 1, "launched": 1, "deferred": 0, "error": 0}, run_items.lanes
+            finally:
+                globals()["_run_gh"] = real_run_gh
+
+            # ---- issue #448: one dispatch tick fans eligible fixes out to LIVE account slots ----
+            # Five distinct-package, trust-admitted fix rows over S=3 slots must launch exactly
+            # min(N,S)=3 distinct PR workflows.  This is deliberately an end-to-end test of the
+            # production _dispatch_review_items loop/lease call/gh argv, not a slice helper: a
+            # mutation that restores a one-item break or a static max_holder_concurrent=1 makes
+            # the launch-count assertion red.
+            fanout_numbers = list(range(51, 56))
+            fanout_items = []
+            fanout_pulls = {}
+            fanout_issues = {}
+            for offset, pr_number in enumerate(fanout_numbers):
+                issue_number = 700 + offset
+                head_sha = f"{pr_number:040x}"
+                fanout_pulls[pr_number] = {
+                    "number": pr_number, "state": "open", "draft": True,
+                    "body": "", "mergeable": True, "auto_merge": None,
+                    "head": {"ref": f"sparq-agent/issue-{issue_number}-1-1",
+                             "sha": head_sha, "repo": {"full_name": repo}},
+                    "base": {"ref": "main", "repo": {"default_branch": "main"}},
+                    "user": {"login": bot, "type": "Bot"},
+                    "labels": [{"name": "review:changes"},
+                               {"name": f"area:fanout-{offset}"}],
+                }
+                fanout_issues[issue_number] = {
+                    "labels": [{"name": f"area:fanout-{offset}"}]}
+                fanout_items.append({
+                    "pr_number": pr_number, "head_sha": head_sha,
+                    "state": "needs-ci-fix", "impl_provider": "openai", "repo": repo,
+                    "package": f"fanout-{offset}", "security": False, "context": "gate",
+                })
+                path = Path(wiring_root) / wiring_worker_pr.provenance_path(repo, pr_number)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps({
+                    "head_sha_at_open": head_sha, "impl_account_h": "ef" * 8,
+                    "impl_alias": "sol", "impl_provider": "openai",
+                    "issue": issue_number, "pr_number": pr_number,
+                    "recorded_at_run": "448.1",
+                }), encoding="utf-8")
+
+            def fanout_gh_json(args):
+                path = args[-1]
+                match = re.search(r"/pulls/([0-9]+)$", path)
+                if match:
+                    return fanout_pulls[int(match.group(1))]
+                if "/check-runs" in path:
+                    return {"check_runs": gate_red}
+                match = re.search(r"/issues/([0-9]+)/comments(?:\?.*)?$", path)
+                if match:
+                    return [[]]
+                match = re.search(r"/issues/([0-9]+)$", path)
+                if match:
+                    return fanout_issues[int(match.group(1))]
+                raise AssertionError(f"unexpected fan-out API read: {path}")
+
+            class SlotAllocator:
+                def __init__(self, slots, conflict_pr=None):
+                    self.slots = slots
+                    self.conflict_pr = conflict_pr
+                    self.claimed_prs = []
+                    self.calls = []
+
+                def claim(self, _registry_repo, package, role, chain, holder, *_args, **kwargs):
+                    match = re.search(r"#([0-9]+)@", holder)
+                    assert match, holder
+                    pr_number = int(match.group(1))
+                    self.calls.append((pr_number, package, role, list(chain), dict(kwargs)))
+                    # These are the load-bearing production arguments: repository-local package
+                    # partition plus the live account-slot bound, with NO coarse row cap.
+                    assert kwargs.get("holder_prefix") == f"fix:{repo}#", kwargs
+                    assert kwargs.get("account_slot_bound") is True, kwargs
+                    assert kwargs.get("max_holder_concurrent") is None, kwargs
+                    assert kwargs.get("return_reason") is True, kwargs
+                    if pr_number == self.conflict_pr:
+                        return None, "package-single-flight"
+                    if self.slots <= 0:
+                        return None, "no-account-slots"
+                    self.slots -= 1
+                    self.claimed_prs.append(pr_number)
+                    return ({"account": "acct09", "claim_id": f"{pr_number:032x}",
+                             "model": chain[0], "provider": "openai"}, "")
+
+                def release(self, *_args, **_kwargs):
+                    return True
+
+            fanout_runs = []
+
+            def successful_fanout_run(args, *, check=True):
+                fanout_runs.append(list(args))
+                return subprocess.CompletedProcess(args, 0)
+
+            def launched_prs():
+                return [int(arg.split("=", 1)[1]) for args in fanout_runs for arg in args
+                        if arg.startswith("pr_number=")]
+
+            try:
+                globals()["_gh_json"] = fanout_gh_json
+                globals()["_run_gh"] = successful_fanout_run
+                fanout_routing = {"models": {
+                    "sol": {"provider": "openai", "provider_model": "TBD",
+                            "harness": "codex"},
+                    "luna": {"provider": "openai", "provider_model": "TBD",
+                             "harness": "codex"},
+                }}
+
+                alloc = SlotAllocator(3)
+                launched, _ = run_items(fanout_items, allocator=alloc, routing=fanout_routing)
+                assert launched == min(len(fanout_items), 3) == 3, launched
+                assert launched_prs() == fanout_numbers[:3], launched_prs()
+                assert len(launched_prs()) == len(set(launched_prs())), launched_prs()
+                assert _fix_dispatch_line(run_items.fix_dispatch) == (
+                    "fix-dispatch: 5 eligible, 3 launched, 2 deferred "
+                    "(reasons: no-account-slots=2)"), run_items.fix_dispatch
+
+                # S=0 is fail-closed: every eligible item defers and no workflow is launched.
+                fanout_runs.clear()
+                alloc = SlotAllocator(0)
+                launched, _ = run_items(fanout_items, allocator=alloc, routing=fanout_routing)
+                assert launched == 0 and launched_prs() == [], (launched, launched_prs())
+                assert _fix_dispatch_line(run_items.fix_dispatch) == (
+                    "fix-dispatch: 5 eligible, 0 launched, 5 deferred "
+                    "(reasons: no-account-slots=5)"), run_items.fix_dispatch
+
+                # A first-writer-wins package conflict defers only that PR; distinct PRs still
+                # fan out, and the conflicted PR can never appear in the workflow argv.
+                fanout_runs.clear()
+                conflicted_pr = fanout_numbers[1]
+                alloc = SlotAllocator(5, conflict_pr=conflicted_pr)
+                launched, _ = run_items(fanout_items, allocator=alloc, routing=fanout_routing)
+                assert launched == 4, launched
+                assert conflicted_pr not in launched_prs(), launched_prs()
+                assert len(launched_prs()) == len(set(launched_prs())), launched_prs()
+                assert run_items.fix_dispatch["defer:package-single-flight"] == 1, \
+                    run_items.fix_dispatch
+            finally:
+                globals()["_gh_json"] = fake_gh_json
+                globals()["_run_gh"] = real_run_gh
+
+            # ---- issue #118: an unsafe/out-of-policy claim whose lease release FAILS (a CAS
+            # conflict, or the garbage claim_id that was itself the violation) is a COUNTED
+            # fix-lane error, NEVER a green "released + skipped" defer. The buggy path ignored
+            # `_release_failed_dispatch`'s boolean and logged recovery while the lease stayed
+            # active until expiry, consuming its account + package. This test is non-vacuous:
+            # under the old code BOTH branches printed "released" and left the error tally at 0,
+            # so the release_ok=False assertions below would flip red. ----
+            class UnsafeClaimAllocator:
+                def __init__(self, release_ok):
+                    self.release_ok = release_ok
+                    self.released = []
+
+                def claim(self, _repo, _package, _role, chain, *_args, **_kwargs):
+                    # account fails the acct-regex assertion -> unsafe/out-of-policy violation,
+                    # reached BEFORE any provider/salt leg, so it is mode- and env-independent.
+                    return {"account": "BADACCT", "claim_id": "cd" * 16,
+                            "model": chain[0], "provider": "anthropic"}
+
+                def release(self, _repo, claim_id, _now):
+                    self.released.append(claim_id)
+                    return self.release_ok
+
+            # release FAILS: hard `::error::` reason + counted lane error, NO launch, and NOT
+            # the plain unsafe-claim green defer.
+            alloc = UnsafeClaimAllocator(release_ok=False)
+            launched, reasons = run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert launched == 0, launched
+            assert alloc.released == ["cd" * 16], alloc.released  # release WAS attempted
+            assert reasons["unsafe-claim-release-failed"] == 1, reasons
+            assert _lane_summary(run_items.lanes)["fix"]["error"] == 1, run_items.lanes
+            # release SUCCEEDS: the SAME unsafe claim is a clean released+skipped defer with NO
+            # lane error and NO hard-error reason — proving the boolean is actually consulted.
+            alloc = UnsafeClaimAllocator(release_ok=True)
+            launched, reasons = run_items([fix_item], allocator=alloc, routing=routing_ok)
+            assert launched == 0, launched
+            assert alloc.released == ["cd" * 16], alloc.released
+            assert reasons["unsafe-claim-release-failed"] == 0, reasons
+            assert _lane_summary(run_items.lanes)["fix"]["error"] == 0, run_items.lanes
         finally:
             (globals()["_gh_json"], globals()["_run_target_helper"],
-             globals()["_target_token"]) = real_io
+             globals()["_target_token"], globals()["_target_is_human_maintainer"]) = real_io
 
     # ---- GAP-D (issue #27): busy-area union over ALL open worker PRs ----
     # Linkage parity (round-2 P2): the busy partition reads each PR's source issue from the
@@ -3627,15 +7646,88 @@ def _self_test():
     key_indent = min(len(line) - len(line.lstrip()) for line in key_lines)
     snapshot_fields = {re.match(r'\s*"([a-z_]+)"', line).group(1) for line in key_lines
                        if len(line) - len(line.lstrip()) == key_indent}
+    # Conditional-spread keys (ABSENCE != NULL fields like auto_merge, sol review on #517:
+    # a plain .get() would fabricate a proven-null from an absent upstream key, so such
+    # fields project via **({"k": pull["k"]} if "k" in pull else {}) and are pinned here).
+    snapshot_fields |= {match.group(1) for match in
+                        re.finditer(r'\*\*\(\{"([a-z_]+)"', projection.group(1))}
     assert snapshot_fields == {"number", "state", "draft", "body", "labels",
-                               "head", "user"}, snapshot_fields
+                               "head", "user", "auto_merge"}, snapshot_fields
+
+    # ---- Issue #109: the tick-health recorder must make a snapshot-skip-only tick VISIBLE.
+    # Snapshot skips fold into the defer histogram (snapshot_skip_reasons) but are NOT `planned`
+    # items, so the recorder's planned>0 gate used to record such a tick as a quiet `none`. Exec
+    # the EXACT classification block from dispatch.yml (not a re-implemented copy) so this pins the
+    # workflow's real behavior: a nonempty defer histogram with nothing dispatched is the degraded
+    # zero-dispatch class, while a genuinely empty frontier (no histogram) stays recordless. ----
+    recorder = re.search(
+        r'\n( *planned = \(summary or \{\}\)\.get\("planned", 0\).*?else "none")',
+        workflow, re.DOTALL)
+    assert recorder, "dispatch.yml lost the tick-state classification block"
+    recorder_block = textwrap.dedent(recorder.group(1))
+
+    def tick_state(summary, claim_outcome="success"):
+        # The block reads only os.environ.get (CLAIM_OUTCOME / GITHUB_STEP_SUMMARY) up to the
+        # `state` assignment; a step_summary of None skips every file write, so no real I/O runs.
+        namespace = {"summary": summary,
+                     "os": type("_os", (), {"environ":
+                                            {"CLAIM_OUTCOME": claim_outcome}})()}
+        exec(recorder_block, namespace)  # noqa: S102 — trusted workflow source, no external input
+        return namespace["state"]
+
+    # the exact defect: snapshot-skip-only tick — planned 0, nothing dispatched, but the defer
+    # histogram carries the plan-snapshot degradation -> degraded zero-dispatch, NOT a quiet `none`
+    assert tick_state({"planned": 0, "dispatched": 0,
+                       "defer_reasons": {"snapshot-skip:check-runs-overflow": 1}}) == "zero"
+    # a genuinely empty/quiet frontier (no histogram at all) still records nothing
+    assert tick_state({"planned": 0, "dispatched": 0, "defer_reasons": {}}) == "none"
+    # the pre-existing classes are unchanged by the degraded rescue
+    assert tick_state({"planned": 3, "dispatched": 0,
+                       "defer_reasons": {"existing-pr": 3}}) == "zero"
+    assert tick_state({"planned": 3, "dispatched": 2, "defer_reasons": {}}) == "ok"
+    assert tick_state(None, "failure") == "abort"
+    # a PRODUCTIVE tick that also deferred some items must NOT be hijacked to zero by `degraded`
+    # (degraded requires dispatched == 0), else every healthy tick with a single defer flips red
+    assert tick_state({"planned": 3, "dispatched": 1,
+                       "defer_reasons": {"existing-pr": 2}}) == "ok"
+
+    # ---- [issue #111, round 2] PLAN's trusted() author filter, exec'd from dispatch.yml itself
+    # (not a re-implemented copy) so these pin the workflow's REAL advisory behavior. Two pinned
+    # regressions: (1) a NONEMPTY additional policy allowlist must NOT strand the pipeline's own
+    # App bot — PLAN cannot resolve the runtime bot_login (no token), so an unlisted "[bot]"
+    # author stays an advisory over-proposal for CLAIM's exact authoritative check to settle;
+    # (2) a truthy non-dict nested `user` in the untrusted snapshot DENIES that item instead of
+    # raising the AttributeError that would abort planning for every repository. ----
+    plan_trusted_src = re.search(
+        r"\n( *def trusted\(issue, trusted_bots\):.*?)\n\s*\n *def linked_issue_numbers",
+        workflow, re.DOTALL)
+    assert plan_trusted_src, "dispatch.yml lost the PLAN trusted() author filter"
+    plan_ns = {"trusted_associations": {"OWNER", "MEMBER", "COLLABORATOR"}}
+    exec(textwrap.dedent(plan_trusted_src.group(1)), plan_ns)  # noqa: S102 — trusted workflow source
+    plan_trusted = plan_ns["trusted"]
+    own_app = {"user": {"login": "our-app[bot]"}, "author_association": "NONE"}
+    # the round-2 defect: an ADDITIONAL policy bot must not exclude the unlisted own App bot
+    assert plan_trusted(own_app, {"other[bot]"}), \
+        "nonempty allowlist strands the pipeline's own App bot at PLAN"
+    assert plan_trusted(own_app, set())
+    # exact allowlist members pass even without a "[bot]" suffix; non-collaborator humans never do
+    assert plan_trusted({"user": {"login": "machine-user"}, "author_association": "NONE"},
+                        {"machine-user"})
+    assert not plan_trusted({"user": {"login": "external"}, "author_association": "CONTRIBUTOR"},
+                            {"other[bot]"})
+    assert plan_trusted({"user": {"login": "maintainer"}, "author_association": "MEMBER"}, set())
+    # malformed shapes DENY without raising (the whole-PLAN-abort defect)
+    assert not plan_trusted({"user": "malformed", "author_association": "MEMBER"}, set())
+    assert not plan_trusted({"user": ["x"], "author_association": "OWNER"}, {"other[bot]"})
+    assert not plan_trusted({"user": None, "author_association": "NONE"}, set())
+    assert not plan_trusted("nope", set())
 
     def snapshot_row(number, ref, *, draft, labels=()):
         # EXACTLY the dispatch.yml projection: top-level keys pinned to the workflow read
         # above; labels are plain STRINGS (not {"name": ...} dicts); head/user sub-shapes
         # mirror the projection's nested selections.
         row = {"number": number, "state": "open", "draft": draft, "body": "",
-               "labels": list(labels),
+               "labels": list(labels), "auto_merge": None,
                "head": {"ref": ref, "sha": sha_a, "repo": {"full_name": repo}},
                "user": {"login": bot, "type": "Bot"}}
         assert set(row) == snapshot_fields, "fixture drifted from the workflow projection"
@@ -3652,7 +7744,7 @@ def _self_test():
     latched = {"enabled_by": {"login": bot}, "merge_method": "squash"}
     # parked DRAFT with a coherent confirming detail — the production frontier-collapse
     # population (26/27 open sparq worker PRs on 2026-07-18): provably inert, frees its
-    # crate. The detail record is REQUIRED since round 4 (see the split-race block below).
+    # crate. A present detail remains the authoritative read (see the split-race block below).
     assert busy_packages_of_pulls(repo, [parked_draft()], collapse_labels,
                                   busy_prov, {76: confirmed_draft()}) == set()
     # ... and the SAME confirmation in the production record shape end-to-end: a raw
@@ -3662,21 +7754,22 @@ def _self_test():
         {76: pr_ci_status({"head_sha": sha_a, "mergeable": True, "auto_merge": None,
                            "draft": True, "check_runs": []})}) == set()
     # parked DRAFT whose fresher PLAN detail record says the arm is still latched: a
-    # crashed-disarm artifact — busy (pr_status is the production-visible latch signal;
-    # the snapshot row itself carries no auto_merge field)
+    # crashed-disarm artifact — busy despite the listing's explicit-null latch signal
     assert busy_packages_of_pulls(repo, [parked_draft()], collapse_labels, busy_prov,
                                   {76: {"head_sha": sha_a, "armed": True}}) == {"crate-b"}
     # ---- [round-4 P1] SPLIT-SNAPSHOT RACE: the pulls LISTING (draft bit) predates the
     # per-PR detail read; a draft that flipped ready(->queued) between the two reads
     # presents as stale listing draft=True + a newer unlatched detail. The carve-out
-    # frees ONLY on a coherent, head-matched detail CONFIRMING draft — every incoherent
-    # shape below stays BUSY (fail closed). ----
-    # (a) detail record entirely ABSENT (pre-detail snapshot skip / census overflow /
-    #     PLAN handed no pr_status at all): unconfirmable — busy both call shapes
+    # frees on a coherent, head-matched DETAIL when one exists. Every incoherent present
+    # detail below stays BUSY (fail closed); only an entirely absent detail may fall back to
+    # the post-#517 listing row's atomic draft:true + present auto_merge:null proof. ----
+    # (a) detail record entirely ABSENT (pre-detail snapshot skip / census overflow): the
+    #     complete post-#517 listing is sufficient, in both no-map and empty-map call shapes
     assert busy_packages_of_pulls(repo, [parked_draft()], collapse_labels,
-                                  busy_prov) == {"crate-b"}
+                                  busy_prov) == set()
     assert busy_packages_of_pulls(repo, [parked_draft()], collapse_labels,
-                                  busy_prov, {}) == {"crate-b"}
+                                  busy_prov, {}) == set()
+    print("  ok   issue-519 tripwire (a): parked listing draft+null frees without detail")
     # (b) newer detail is NON-DRAFT-shaped (draft went ready in the window — the exact
     #     race): busy, in the hand-rolled AND the production pr_ci_status record shape
     assert busy_packages_of_pulls(
@@ -3728,11 +7821,29 @@ def _self_test():
         repo, [parked_draft()], collapse_labels, busy_prov,
         {76: pr_ci_status({"head_sha": sha_a, "mergeable": True, "auto_merge": None,
                            "draft": True, "check_runs": []})}) == set()
-    # parked DRAFT with a synthetic auto_merge dict (raw-REST defense in depth, NOT a
-    # snapshot field): same crashed-disarm artifact — busy
+    # A present malformed DETAIL is authoritative too: it cannot fall back to the friendly row.
+    assert busy_packages_of_pulls(repo, [parked_draft()], collapse_labels,
+                                  busy_prov, {76: None}) == {"crate-b"}
+    print("  ok   issue-519 tripwire (b): latched detail overrides parked listing")
+    # parked DRAFT with a latched listing: same crashed-disarm artifact — busy
     assert busy_packages_of_pulls(repo, [parked_draft(auto_merge=latched)],
                                   collapse_labels, busy_prov) == {"crate-b"}
-    # parked NON-draft in the production row shape (no auto_merge field exists): busy
+    # [round-6] the pre-#517 listing shape has no auto_merge KEY. Even with draft:true it
+    # cannot use the listing fallback: ABSENCE != NULL, and with no detail the reason is loud.
+    legacy_parked = {key: value for key, value in parked_draft().items()
+                     if key != "auto_merge"}
+    assert busy_packages_of_pulls(repo, [legacy_parked], collapse_labels,
+                                  busy_prov) == {"crate-b"}
+    assert _pull_inactivity_decision(legacy_parked) == (False, "no-detail")
+    print("  ok   issue-519 tripwire (c): absent listing auto_merge key stays busy")
+    # malformed listing latch/draft fields also fail closed instead of collapsing into null
+    assert busy_packages_of_pulls(repo, [parked_draft(auto_merge="yes")], collapse_labels,
+                                  busy_prov) == {"crate-b"}
+    assert busy_packages_of_pulls(repo, [parked_draft(auto_merge="yes")], collapse_labels,
+                                  busy_prov, {76: confirmed_draft()}) == {"crate-b"}
+    assert busy_packages_of_pulls(repo, [parked_draft(draft=None)], collapse_labels,
+                                  busy_prov) == {"crate-b"}
+    # parked NON-draft in the production row shape: busy
     assert busy_packages_of_pulls(repo, [parked_ready()],
                                   collapse_labels, busy_prov) == {"crate-b"}
     # parked NON-draft with a synthetic latch field — armed, explicitly-null, garbage:
@@ -3752,6 +7863,25 @@ def _self_test():
     # unknown DRAFT state (the projection carries the key; the API returned garbage): busy
     assert busy_packages_of_pulls(repo, [parked_ready(draft=None)], collapse_labels,
                                   busy_prov) == {"crate-b"}
+    # A draft with no park surface remains review-loop-owned and therefore busy.
+    unparked_draft = snapshot_row(76, "sparq-agent/issue-81-1-1", draft=True,
+                                  labels=["review:needs"])
+    assert busy_packages_of_pulls(repo, [unparked_draft], collapse_labels,
+                                  busy_prov) == {"crate-b"}
+    print("  ok   issue-519 tripwire (d): non-parked draft stays busy")
+
+    # The assembler consumes the reason from the SAME decision that reserved the crate.
+    assembler_output = io.StringIO()
+    with contextlib.redirect_stdout(assembler_output):
+        assembler_kept = filter_busy_area_items(
+            [frontier[1]], repo, [parked_draft()], collapse_labels, busy_prov,
+            {76: {"head_sha": sha_a, "armed": True}}, leases=[], now=now)
+    expected_assembler_log = \
+        "assembler defer #71: crate crate-b busy via pr#76 [latched]"
+    assert assembler_kept == [], assembler_kept
+    assert assembler_output.getvalue().splitlines() == [expected_assembler_log], \
+        assembler_output.getvalue()
+    print("  ok   issue-519 tripwire (e): assembler defer names artifact and gate reason")
     # source-issue parks compose the same way: issue 80 is needs:user-parked; its
     # NON-draft worker PR still reserves crate-a...
     assert busy_packages_of_pulls(
@@ -3817,6 +7947,49 @@ def _self_test():
     assert live_pull_detail_stub(live_row(76, "x", draft=True, sha="zz")) is None
     assert live_pull_detail_stub("junk") is None
 
+    # ---- [issue #509] CLAIM must apply the parked carve-out to its OWN live occupancy
+    # read, including curator's status:blocked terminal posture, without weakening the
+    # round-4/round-5 coherence guard. These are explicit mutation tripwires: deleting the
+    # carve-out makes (a) red; skipping _pull_inactivity_decision makes (b)/(c) red. ----
+    expected_free_log = "claim-revalidation free: crate crate-b freed via parked pr#76"
+    for parked_label in ("needs:user", "review:needs-user", "status:blocked"):
+        parked_output = io.StringIO()
+        with contextlib.redirect_stdout(parked_output):
+            parked_result = revalidate_items_against_live_pulls(
+                frontier, repo,
+                [[live_row(76, "sparq-agent/issue-81-1-1", draft=True,
+                           labels=[parked_label])]],
+                collapse_labels, busy_prov, leases=[], now=now)
+        assert parked_result == {70, 71, 72, 73}, (parked_label, parked_result)
+        assert expected_free_log in parked_output.getvalue(), parked_output.getvalue()
+    print("  ok   claim-revalidation tripwire (a): parked draft labels free the live crate")
+
+    needs_user_live = live_row(76, "sparq-agent/issue-81-1-1", draft=True,
+                               labels=["needs:user"])
+    expected_defer_log = "claim-revalidation defer #71: crate crate-b busy via pr#76"
+    for coherent_busy in (dict(needs_user_live, draft=False),
+                          dict(needs_user_live, auto_merge=latched)):
+        busy_output = io.StringIO()
+        with contextlib.redirect_stdout(busy_output):
+            busy_result = revalidate_items_against_live_pulls(
+                frontier, repo, [[coherent_busy]], collapse_labels, busy_prov,
+                leases=[], now=now)
+        assert busy_result == {70, 72, 73}, busy_result
+        assert expected_defer_log in busy_output.getvalue(), busy_output.getvalue()
+    print("  ok   claim-revalidation tripwire (b): non-draft or latch-visible parks stay busy")
+
+    unparked_output = io.StringIO()
+    with contextlib.redirect_stdout(unparked_output):
+        unparked_result = revalidate_items_against_live_pulls(
+            frontier, repo,
+            [[live_row(76, "sparq-agent/issue-81-1-1", draft=True,
+                       labels=["review:needs"])]],
+            collapse_labels, busy_prov, leases=[], now=now)
+    assert unparked_result == {70, 72, 73}, unparked_result
+    print("  ok   claim-revalidation tripwire (c): live unparked draft stays busy")
+    assert expected_defer_log in unparked_output.getvalue(), unparked_output.getvalue()
+    print("  ok   claim-revalidation tripwire (d): defer log names crate and blocking PR")
+
     # the revalidation recomputes the SAME partition over the live rows: a parked draft
     # (unlatched, single-read-confirmed) still frees its crate at CLAIM time...
     assert revalidate_items_against_live_pulls(
@@ -3846,6 +8019,8 @@ def _self_test():
     assert revalidate_items_against_live_pulls(
         frontier, repo, [None, ["junk"], [parked_live]], collapse_labels, busy_prov,
         leases=[], now=now) == {70, 71, 72, 73}
+    print("  ok   claim-revalidation tripwire (e): round-4/round-5 fixtures remain green")
+    print("  ok   issue-519 tripwire (f): existing issue-509/516 fixtures remain green")
 
     # the local provenance map mirrors the PLAN precedence: legacy-first, ledger wins
     with tempfile.TemporaryDirectory() as prov_tmp:
@@ -3891,8 +8066,520 @@ def _self_test():
             pass
         else:
             raise AssertionError("a malformed live issue page must fail loud")
+        # round-3 finding 3: a malformed COMMENTS page could hide a durable receipt
+        # (round/attempt/park-generation marker) — _pr_comments must RAISE, never drop it.
+        good_comment = {"user": {"login": "b[bot]"}, "body": "x",
+                        "created_at": "2026-07-23T09:00:00Z"}
+        globals()["_gh_json"] = lambda args: [[good_comment], "garbage"]
+        try:
+            _pr_comments(repo, 41)
+        except DispatchError as exc:
+            assert "comments page is malformed" in str(exc), exc
+        else:
+            raise AssertionError("a malformed PR comments page must fail loud")
+        # round-4 finding 4: ENTRY validation — [[null]] passed the old page-only check and
+        # the first consumer (_bot_comments None.get()) crashed with an AttributeError that
+        # aborted the ENTIRE claim sweep. Each malformed shape must raise DispatchError at
+        # read time (the sweep's per-item handlers then defer just that item).
+        for bad_entry in (None, "loose-string", {**good_comment, "user": None},
+                          {**good_comment, "body": None},
+                          {**good_comment, "created_at": None}):
+            globals()["_gh_json"] = lambda args: [[good_comment, bad_entry]]
+            try:
+                _pr_comments(repo, 41)
+            except DispatchError as exc:
+                assert "comments entry is malformed" in str(exc), (bad_entry, exc)
+            else:
+                raise AssertionError(f"a malformed comments entry must fail loud: {bad_entry!r}")
+        globals()["_gh_json"] = lambda args: [[good_comment]]
+        assert _pr_comments(repo, 41) == [good_comment]
     finally:
         globals()["_gh_json"] = prev_live_gh
+
+    # ---- round-4 finding 2 (the crash window, CLAIM side): the ONE proof-gate trigger is
+    # receipt-OR-label. Receipt-posted-label-missing (a park writer died between its durable
+    # receipt and its label write — the only crash residue RECEIPT-FIRST ordering permits)
+    # still requires the readmission proof; label-no-receipt is impossible by the writers'
+    # ordering (worker-pr's self-test asserts the call order), and a live label alone still
+    # gates (a pre-receipt legacy park). ----
+    assert capacity_park_proof_required([], {"2026-07-23T09:00:00Z"}) is True
+    assert capacity_park_proof_required([], {"none"}) is True
+    assert capacity_park_proof_required(["review:parked"], set()) is True
+    assert capacity_park_proof_required(["review:parked"], {"none"}) is True
+    assert capacity_park_proof_required(["review:needs"], set()) is False
+    assert capacity_park_proof_required([], set()) is False
+
+    # ---- [registry #614] the AUTOMATIC re-admission sweep: a MACHINE capacity park whose
+    # starvation cause has demonstrably cleared re-admits ITSELF, receipt-first. THE DEFECT it
+    # closes: only a HUMAN could clear a MACHINE-owned park, so the acct01 auth outage (#596)
+    # parked PRs that the credential fix could not recover — each needed a hand-unlabel. ----
+    model_health_mod = _load_module(
+        "registry_model_health_readmit", Path(__file__).resolve().parent / "model-health.py")
+    worker_pr_mod = _load_module(
+        "registry_worker_pr_readmit", Path(__file__).resolve().parent / "worker-pr.py")
+    readmit_bot = "sparq-orchestrator[bot]"
+    readmit_salt = "s3cret"
+    readmit_account = model_health_mod.account_hash("acct01", readmit_salt)
+    readmit_now = 1_800_000
+    park_epoch = readmit_now - 3600                 # the park landed an hour ago
+    park_stamp = model_health_mod._iso_z(park_epoch)
+
+    def health_record(cls, dt, run):
+        return model_health_mod.make_record("openai", readmit_account, "sol", cls, run,
+                                            readmit_now + dt)
+
+    # The live shape: the sole review account failed `auth` before the park, then recorded a
+    # SUCCESSFUL run after it (the credential fix landed).
+    recovered_window = [health_record("auth", -4000, "6001.1"),
+                        health_record("auth", -3800, "6002.1"),
+                        health_record(model_health_mod.SUCCESS, -600, "6003.1")]
+    still_broken_window = recovered_window[:2]
+    parked_row = {
+        "number": 41, "state": "open", "draft": True,
+        "user": {"login": readmit_bot},
+        "head": {"sha": "a" * 40, "ref": "sparq-agent/issue-7-abc",
+                 "repo": {"full_name": "example/repo"}},
+        "labels": [{"name": MACHINE_PARK_PR_LABEL}],
+    }
+    park_timeline = {
+        41: [{"event": "labeled", "label": {"name": MACHINE_PARK_PR_LABEL},
+              "created_at": park_stamp, "actor": {"login": readmit_bot},
+              "performed_via_github_app": None}],
+        7: [],
+    }
+
+    def readmit_sweep(window, rows=None, labels=None, comments=(), holds=None, timeline=None):
+        """Run the sweep with every GitHub seam injected; returns (count, posted, cleared)."""
+        posted, cleared = [], []
+        count = _readmit_capacity_parks(
+            "example/repo", rows if rows is not None else [[parked_row]],
+            labels if labels is not None else {7: ["status:in-progress-review"]},
+            {41: {"issue": 7}}, readmit_bot, Path("."), worker_pr_mod,
+            _capacity_recovery_probe(model_health_mod, window, readmit_now),
+            comments_fn=lambda _repo, _number: list(comments),
+            timeline_fn=lambda _repo, number: list((timeline or park_timeline).get(number, [])),
+            post_comment=lambda _repo, number, body: posted.append((number, body)),
+            clear_labels=lambda pr, issue: cleared.append((pr, issue)),
+            log=lambda _line: None)
+        return count, posted, cleared
+
+    # A(a): the machine park + a post-park success on the failing account => re-admitted ONCE,
+    # RECEIPT FIRST, and the receipt names the evidence the admission consumed.
+    prev_target_probe = globals()["_target_is_human_maintainer"]
+    globals()["_target_is_human_maintainer"] = lambda _repo, login: login == "jeswr"
+    try:
+        count, posted, cleared = readmit_sweep(recovered_window)
+        assert count == 1 and cleared == [(41, 7)], (count, cleared)
+        assert len(posted) == 1 and posted[0][0] == 41, posted
+        receipt_body = posted[0][1]
+        assert worker_pr_mod.AUTO_READMIT_MARKER in receipt_body, receipt_body
+        assert f"openai/{readmit_account}/6003.1" in receipt_body, receipt_body
+        assert "acct01" not in receipt_body, receipt_body
+        print("  ok   auto-readmit (a): proven cause-recovery re-admits a machine park, "
+              "receipt-first")
+        # A(b): the SAME evidence, now receipted, never re-admits again — and because the receipt
+        # is not superseded by a NEWER park it converges the label strip idempotently instead.
+        receipted = [{"user": {"login": readmit_bot}, "body": receipt_body}]
+        count, posted, cleared = readmit_sweep(recovered_window, comments=receipted)
+        assert count == 1 and posted == [] and cleared == [(41, 7)], (count, posted, cleared)
+        print("  ok   auto-readmit (b): a receipted re-admission consumes NO new evidence "
+              "(converge only)")
+        # ... and once a NEWER park application supersedes that receipt, the same evidence is
+        # refused outright: a fresh park needs a fresh outage-and-recovery pair.
+        superseded = {41: park_timeline[41] + [
+            {"event": "labeled", "label": {"name": MACHINE_PARK_PR_LABEL},
+             "created_at": model_health_mod._iso_z(readmit_now - 60),
+             "actor": {"login": readmit_bot}, "performed_via_github_app": None}], 7: []}
+        count, posted, cleared = readmit_sweep(recovered_window, comments=receipted,
+                                              timeline=superseded)
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        print("  ok   auto-readmit (b): the SAME evidence cannot re-earn a re-admission after a "
+              "NEW park")
+        # A(c): no post-park success => the park stands, nothing is written.
+        count, posted, cleared = readmit_sweep(still_broken_window)
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        print("  ok   auto-readmit (c): no proven recovery => the park stands, no mutation")
+        # A(d): an unreadable health window => the park stands (the probe yields no evidence).
+        count, posted, cleared = readmit_sweep(None)
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        # ... as does a malformed record inside the window.
+        poisoned = recovered_window + [dict(recovered_window[-1], exit_class="totally-new")]
+        count, posted, cleared = readmit_sweep(poisoned)
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        print("  ok   auto-readmit (d): an unreadable/ambiguous health record => the park stands")
+        # A(e): a HUMAN-owned hold on EITHER surface is never auto-re-admitted.
+        human_pr = dict(parked_row, labels=[{"name": MACHINE_PARK_PR_LABEL},
+                                            {"name": "review:needs-user"}])
+        count, posted, cleared = readmit_sweep(recovered_window, rows=[[human_pr]])
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        count, posted, cleared = readmit_sweep(
+            recovered_window, labels={7: ["status:parked", "needs:user"]})
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        print("  ok   auto-readmit (e): a human-owned hold on either surface is never "
+              "auto-re-admitted")
+        # A(e'): a park the MAINTAINER applied is human-owned — only a human clears it.
+        human_park = {41: [{"event": "labeled", "label": {"name": MACHINE_PARK_PR_LABEL},
+                            "created_at": park_stamp, "actor": {"login": "jeswr"},
+                            "performed_via_github_app": None}], 7: []}
+        count, posted, cleared = readmit_sweep(recovered_window, timeline=human_park)
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        print("  ok   auto-readmit (e): a MAINTAINER-applied park is never auto-re-admitted")
+        # A(g): the per-PR cap terminates — AUTO_READMISSION_MAX markers (well-formed or not)
+        # refuse the next re-admission even with fresh evidence.
+        capped = [{"user": {"login": readmit_bot},
+                   "body": f"x {worker_pr_mod.AUTO_READMIT_MARKER} evidence=openai/x/{i} "
+                           f"at=zzz -->"}
+                  for i in range(_park_policy.AUTO_READMISSION_MAX)]
+        count, posted, cleared = readmit_sweep(recovered_window, comments=capped)
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        print("  ok   auto-readmit (g): the per-PR automatic cap terminates the loop")
+        # Trust boundary: a NON-bot PR, a fork head, and a PR with no live machine park are all
+        # invisible to the sweep.
+        for invisible in (dict(parked_row, user={"login": "drive-by"}),
+                          dict(parked_row, head={**parked_row["head"],
+                                                 "repo": {"full_name": "fork/repo"}}),
+                          dict(parked_row, labels=[{"name": "review:needs"}]),
+                          dict(parked_row, state="closed")):
+            count, posted, cleared = readmit_sweep(recovered_window, rows=[[invisible]],
+                                                   labels={7: []})
+            assert (count, posted, cleared) == (0, [], []), (invisible, count, posted, cleared)
+        print("  ok   auto-readmit: non-bot / fork / unparked / closed PRs are invisible")
+        # A per-PR failure never stops the sweep: an unreadable comments read skips ONE PR.
+        def boom_comments(_repo, _number):
+            raise DispatchError("comments unavailable")
+
+        skipped = _readmit_capacity_parks(
+            "example/repo", [[parked_row]], {7: []}, {41: {"issue": 7}}, readmit_bot, Path("."),
+            worker_pr_mod, _capacity_recovery_probe(model_health_mod, recovered_window,
+                                                    readmit_now),
+            comments_fn=boom_comments,
+            timeline_fn=lambda _repo, number: list(park_timeline.get(number, [])),
+            post_comment=lambda *_a: None, clear_labels=lambda *_a: None, log=lambda _l: None)
+        assert skipped == 0, skipped
+        print("  ok   auto-readmit: an unreadable PR skips only itself (per-PR resilience)")
+
+        # ---- [G1] the LEGACY-PARK MIGRATION (sparq-org/sparq#3809): a park stranded on the
+        # HUMAN terminal for an INFRA cause is re-classified into the machine class, so it can
+        # inherit the exit above. 31 of the 33 stalled sparq draft PRs are in exactly this
+        # shape and NOTHING would ever re-classify them. ----
+        legacy_row = dict(parked_row, labels=[{"name": _park_policy.HUMAN_PR_PARK_LABEL}])
+        budget_body = ("> 🤖 SPARQ agent — the autonomous review loop stopped: the review round "
+                       "budget is exhausted at 6 round(s) with no extension left")
+        injection_body = ("> 🤖 SPARQ agent — the autonomous review loop stopped: the reviewer "
+                          "flagged possible prompt injection")
+        nochange_body = ("> 🤖 SPARQ agent — the autonomous review loop parked this PR: two "
+                         "consecutive fix attempts made no change")
+        rewritten_body = ("> 🤖 SPARQ agent — the autonomous review loop stopped: the PR head no "
+                          "longer descends from the worker-opened commit (history was rewritten)")
+
+        def label_event(name, login, ts=None):
+            return {"event": "labeled", "label": {"name": name},
+                    "created_at": ts or park_stamp, "actor": {"login": login},
+                    "performed_via_github_app": None}
+
+        # The issue-side half of the park pair, applied by the BOT — the real shape of all 24
+        # live source issues that carry it.
+        migrate_timeline = {41: park_timeline[41],
+                            7: [label_event("needs:user", readmit_bot)]}
+
+        def migrate_sweep(comments, provable=True, labels_row=None, issue_labels=None,
+                          timeline=None):
+            """Returns (posted_bodies, converted) for one migration pass."""
+            posted, converted = [], []
+            _readmit_capacity_parks(
+                "example/repo", [[labels_row or legacy_row]],
+                {7: list(issue_labels if issue_labels is not None else [])},
+                {41: {"issue": 7}},
+                readmit_bot, Path("."), worker_pr_mod,
+                _capacity_recovery_probe(model_health_mod, recovered_window, readmit_now),
+                comments_fn=lambda _repo, _number: [
+                    {"user": {"login": readmit_bot}, "body": body} for body in comments],
+                timeline_fn=lambda _repo, number: list(
+                    (timeline if timeline is not None else migrate_timeline).get(number, [])),
+                post_comment=lambda _repo, number, body: posted.append(body),
+                clear_labels=lambda *_a: None, log=lambda _l: None,
+                migration_provable=provable,
+                convert_labels=lambda pr, issue: converted.append((pr, issue)))
+            return posted, converted
+
+        posted, converted = migrate_sweep([budget_body])
+        assert converted == [(41, 7)], converted
+        assert len(posted) == 1 and _park_policy.PARK_REASON_MARKER in posted[0], posted
+        assert "cause=budget" in posted[0] and "class=capacity" in posted[0], posted
+        print("  ok   legacy-migration: an infra park on the human terminal is re-classified "
+              "into the machine class, receipt-first")
+
+        # THE guard: a genuine escalation is NEVER migrated — including the live sparq#3743
+        # shape, where the injection flag is OLDER than a later capacity-park comment.
+        for name, bodies in (
+                ("#3542-shape", [injection_body]),
+                ("#3743-shape", [injection_body, nochange_body]),
+                ("#3608-shape", [nochange_body, injection_body])):
+            posted, converted = migrate_sweep(bodies)
+            assert (posted, converted) == ([], []), (name, posted, converted)
+        print("  ok   legacy-migration: a genuine injection escalation is never migrated, at "
+              "any position in its history")
+
+        # A question-class cause is RECORDED but never moved — the human terminal is correct.
+        posted, converted = migrate_sweep([rewritten_body])
+        assert converted == [], converted
+        assert len(posted) == 1 and "cause=history-rewritten" in posted[0], posted
+        assert "class=question" in posted[0], posted
+        print("  ok   legacy-migration: a question-class cause is made machine-readable but "
+              "its human hold is left in place")
+
+        # THE do-no-harm gate: not provable => defer, consuming nothing. Without this the
+        # migration would convert a VISIBLE stall into a SILENT one.
+        posted, converted = migrate_sweep([budget_body], provable=False)
+        assert (posted, converted) == ([], []), (posted, converted)
+        print("  ok   legacy-migration: an unprovable park is DEFERRED, never converted into a "
+              "state it could not leave")
+
+        # ONE-SHOT: the reason marker it wrote makes the PR no longer legacy.
+        posted, converted = migrate_sweep([budget_body, budget_body
+                                           + _park_policy.park_reason_marker("budget")])
+        assert (posted, converted) == ([], []), (posted, converted)
+        print("  ok   legacy-migration: a PR that already carries a reason marker is never "
+              "migrated twice")
+
+        # An unrecognised cause, and a PR already in the machine class, are both untouched.
+        assert migrate_sweep(["something went wrong"]) == ([], []), "unrecognised cause moved"
+        assert migrate_sweep([budget_body], labels_row=parked_row)[1] == [], \
+            "a PR already in the machine class was migrated"
+        print("  ok   legacy-migration: an unrecognised cause and an already-machine park are "
+              "left alone")
+
+        # THE guard the human-terminal precondition actually exists for: a PR that is NOT PARKED
+        # AT ALL still reaches _migrate_legacy_park (it has no machine park, so the sweep's outer
+        # check lets it through) and still carries budget prose from an EARLIER, since-cleared
+        # park. Migrating it would APPLY review:parked to a live, unparked PR — parking work that
+        # nobody parked. Only a PR sitting on the human terminal is a migration candidate.
+        live_row = dict(parked_row, labels=[{"name": "review:needs"}])
+        posted, converted = migrate_sweep([budget_body], labels_row=live_row)
+        assert (posted, converted) == ([], []), (posted, converted)
+        print("  ok   legacy-migration: an UNPARKED PR carrying stale park prose is never "
+              "parked by the migration")
+
+        # ---- THE COMPOSED TEST: migrate, then re-admit the RESULTING state. ------------------
+        # A park is a PAIR (review:needs-user on the PR + needs:user on the source issue) and the
+        # first cut cleared only the PR half. Each stage passed its own fixture in isolation —
+        # migration with `{7: []}`, re-admission with `{7: ["status:in-progress-review"]}` — and
+        # the defect lived exactly in the seam they never composed. MEASURED on the live sparq
+        # population: 24 of 33 source issues carry needs:user, so 19 of 20 migrated PRs would
+        # have become permanently unreleasable. This test composes the two stages.
+        composed_pr_labels = {"review:needs-user"}
+        composed_issue_labels = {"status:deferred", "needs:user", "role:impl"}
+
+        def composed_convert(pr, issue):
+            """What the production convert_labels does, applied to the fixture state."""
+            composed_pr_labels.discard(_park_policy.HUMAN_PR_PARK_LABEL)
+            composed_pr_labels.add(MACHINE_PARK_PR_LABEL)
+            for hold in _park_policy.human_owned_holds(composed_issue_labels):
+                composed_issue_labels.discard(hold)
+            composed_issue_labels.add("status:parked")
+
+        stage1_row = dict(parked_row, labels=[{"name": n} for n in composed_pr_labels])
+        migrated_count = _readmit_capacity_parks(
+            "example/repo", [[stage1_row]], {7: sorted(composed_issue_labels)},
+            {41: {"issue": 7}}, readmit_bot, Path("."), worker_pr_mod,
+            _capacity_recovery_probe(model_health_mod, still_broken_window, readmit_now),
+            comments_fn=lambda _repo, _number: [
+                {"user": {"login": readmit_bot}, "body": budget_body}],
+            timeline_fn=lambda _repo, number: list(migrate_timeline.get(number, [])),
+            post_comment=lambda *_a: None, clear_labels=lambda *_a: None, log=lambda _l: None,
+            migration_provable=True, convert_labels=composed_convert)
+        assert migrated_count == 0, "the migration must not re-admit in the same breath"
+        assert composed_pr_labels == {MACHINE_PARK_PR_LABEL}, composed_pr_labels
+        assert "needs:user" not in composed_issue_labels, composed_issue_labels
+
+        # Stage 2 — the SAME PR, on the state stage 1 actually produced, with proven recovery.
+        stage2_row = dict(parked_row, labels=[{"name": n} for n in sorted(composed_pr_labels)])
+        composed_readmitted, composed_cleared = 0, []
+        composed_readmitted = _readmit_capacity_parks(
+            "example/repo", [[stage2_row]], {7: sorted(composed_issue_labels)},
+            {41: {"issue": 7}}, readmit_bot, Path("."), worker_pr_mod,
+            _capacity_recovery_probe(model_health_mod, recovered_window, readmit_now),
+            comments_fn=lambda _repo, _number: [],
+            timeline_fn=lambda _repo, number: list(park_timeline.get(number, [])),
+            post_comment=lambda *_a: None,
+            clear_labels=lambda pr, issue: composed_cleared.append((pr, issue)),
+            log=lambda _l: None, migration_provable=False)
+        assert composed_readmitted == 1, (composed_readmitted, sorted(composed_issue_labels))
+        assert composed_cleared == [(41, 7)], composed_cleared
+        print("  ok   legacy-migration COMPOSED: a migrated PR whose source issue carried "
+              "needs:user actually re-admits on proven recovery (both halves of the pair)")
+
+        # ...and a HUMAN-applied `needs:user` is NOT clearable: that PR defers instead.
+        posted, converted = migrate_sweep(
+            [budget_body], issue_labels=["needs:user"],
+            timeline={41: park_timeline[41], 7: [label_event("needs:user", "jeswr")]})
+        assert (posted, converted) == ([], []), (posted, converted)
+        print("  ok   legacy-migration: a HUMAN-applied issue hold is never cleared — that PR "
+              "defers rather than having a real human hold erased")
+
+        # The residual-hold precondition, on a state the fleet can actually reach: groom's
+        # age-park writes `needs:user` onto the PR ITSELF (groom.py adds it to
+        # /issues/<pr>/labels), so a PR can carry BOTH review:needs-user and needs:user. The
+        # conversion removes only review:needs-user, so the PR-side needs:user SURVIVES and
+        # would block re-admission exactly like the issue-side one did. That hold is groom's
+        # orphan/wedged-merge hand-off — a genuine human question — so the right answer is to
+        # DEFER, not to clear it. (No PR is in this state today; it is reachable, and this seam
+        # is precisely where the issue-half defect lived.)
+        groom_row = dict(parked_row, labels=[{"name": _park_policy.HUMAN_PR_PARK_LABEL},
+                                             {"name": "needs:user"}])
+        posted, converted = migrate_sweep([budget_body], labels_row=groom_row)
+        assert (posted, converted) == ([], []), (posted, converted)
+        print("  ok   legacy-migration: a hold that would SURVIVE the conversion (groom's "
+              "PR-side needs:user) defers the migration instead of stranding the PR")
+
+        # ---- the ownership proof must be ABOUT THE LABEL BEING CLEARED ----------------------
+        # Authorising a delete with evidence about a DIFFERENT label failed in three directions.
+        # Each of these was a live hole, demonstrated by execution before the fix.
+        #
+        # (i) a human-applied needs:user, with a LATER bot park event on another label. Reading
+        # the newest event across READMISSION_LABELS said "machine"; the needs:user application
+        # itself was a human's.
+        posted, converted = migrate_sweep(
+            [budget_body], issue_labels=["needs:user"],
+            timeline={41: park_timeline[41], 7: [
+                label_event("needs:user", "jeswr", model_health_mod._iso_z(readmit_now - 900)),
+                label_event("status:parked", readmit_bot,
+                            model_health_mod._iso_z(readmit_now - 60))]})
+        assert (posted, converted) == ([], []), (posted, converted)
+        print("  ok   legacy-migration: a HUMAN-applied needs:user is not clearable just because "
+              "a LATER bot park event exists on a different label")
+
+        # (ii) another party's needs:* is never touched and never reasoned about. The migration
+        # may only ever clear `needs:user`; anything else defers via the residual precondition.
+        # `needs:external-audit` is the sq-qhy4 external accredited-cryptographer audit gate —
+        # silently deleting it is the worst single outcome available on this path.
+        for foreign in ("needs:external-audit", "needs:ec2", "needs:maintainer"):
+            posted, converted = migrate_sweep(
+                [budget_body], issue_labels=["needs:user", foreign],
+                timeline={41: park_timeline[41], 7: [
+                    label_event("needs:user", readmit_bot),
+                    label_event(foreign, "jeswr")]})
+            assert (posted, converted) == ([], []), (foreign, posted, converted)
+        print("  ok   legacy-migration: a foreign needs:* (incl. the sq-qhy4 external-audit "
+              "gate) defers the migration and is never deleted")
+
+        # (iii) ABSENCE OF EVIDENCE IS NOT PROOF. A needs:user with no `labeled` event at all
+        # previously read as machine-owned, because "no park application" returned not-human.
+        posted, converted = migrate_sweep(
+            [budget_body], issue_labels=["needs:user"],
+            timeline={41: park_timeline[41], 7: []})
+        assert (posted, converted) == ([], []), (posted, converted)
+        print("  ok   legacy-migration: a needs:user with NO labeled event is not clearable "
+              "(absence of evidence is not proof of machine ownership)")
+
+        # ---- THE WRITER BINDING: exercise the PRODUCTION convert_labels ---------------------
+        # Every other test injects its own convert_labels, so the real writer — the code that
+        # actually mutates GitHub — was executed by NOTHING. That is the defect class this PR
+        # kept repeating: a test that restates the policy instead of binding the writer. Here
+        # the GitHub seams are injected the way the suite already injects
+        # _target_is_human_maintainer, convert_labels is left as None so the PRODUCTION closure
+        # runs, and the exact API calls are asserted.
+        api_calls, helper_calls = [], []
+        prev_api = globals()["_run_gh_target_api"]
+        prev_helper = globals()["_run_target_helper"]
+        globals()["_run_gh_target_api"] = (
+            lambda repo, method, path, input_doc=None: api_calls.append((method, path, input_doc))
+            or types.SimpleNamespace(stdout="{}"))
+        globals()["_run_target_helper"] = (
+            lambda script_dir, repo, script, args: helper_calls.append((script, args)))
+        try:
+            _readmit_capacity_parks(
+                "example/repo", [[legacy_row]], {7: ["needs:user", "status:deferred"]},
+                {41: {"issue": 7}}, readmit_bot, Path("."), worker_pr_mod,
+                _capacity_recovery_probe(model_health_mod, recovered_window, readmit_now),
+                comments_fn=lambda _repo, _number: [
+                    {"user": {"login": readmit_bot}, "body": budget_body}],
+                timeline_fn=lambda _repo, number: list(migrate_timeline.get(number, [])),
+                post_comment=lambda *_a: None, clear_labels=lambda *_a: None,
+                log=lambda _l: None, migration_provable=True)   # convert_labels=None => REAL
+        finally:
+            globals()["_run_gh_target_api"] = prev_api
+            globals()["_run_target_helper"] = prev_helper
+        assert api_calls == [
+            ("DELETE", "repos/example/repo/issues/41/labels/review%3Aneeds-user", None),
+            ("POST", "repos/example/repo/issues/41/labels",
+             {"labels": [MACHINE_PARK_PR_LABEL]}),
+            ("DELETE", "repos/example/repo/issues/7/labels/needs%3Auser", None),
+        ], api_calls
+        assert helper_calls == [("worker-issue.py", [
+            "status", "--repo", "example/repo", "--issue", "7", "--status", "parked"])], \
+            helper_calls
+        print("  ok   legacy-migration WRITER: the PRODUCTION convert_labels clears BOTH halves "
+              "of the park pair — asserted on the real API calls, not a fixture restatement")
+
+        # BOUNDED RE-ENTRY: one tick may migrate at most LEGACY_PARK_MIGRATION_MAX PRs. 21 PRs
+        # re-entering at once would starve the very allocator whose starvation parked most of
+        # them — the migration must not recreate its own cause.
+        # Assert the BOUND ITSELF first, before sizing any fixture from it: a per-tick pacing cap
+        # that is not small is not a pacing cap, and a fixture sized from an unbounded constant
+        # would hang instead of failing (which is how this test first went wrong).
+        assert 0 < LEGACY_PARK_MIGRATION_MAX <= 10, LEGACY_PARK_MIGRATION_MAX
+        many_rows = [dict(legacy_row, number=n,
+                          head=dict(legacy_row["head"], ref=f"sparq-agent/issue-{n}-abc"))
+                     for n in range(41, 41 + LEGACY_PARK_MIGRATION_MAX + 3)]
+        many_converted = []
+        _readmit_capacity_parks(
+            "example/repo", [many_rows], {}, {row["number"]: {"issue": 7} for row in many_rows},
+            readmit_bot, Path("."), worker_pr_mod,
+            _capacity_recovery_probe(model_health_mod, recovered_window, readmit_now),
+            comments_fn=lambda _repo, _number: [
+                {"user": {"login": readmit_bot}, "body": budget_body}],
+            timeline_fn=lambda _repo, number: list(park_timeline.get(number, [])),
+            post_comment=lambda *_a: None, clear_labels=lambda *_a: None, log=lambda _l: None,
+            migration_provable=True,
+            convert_labels=lambda pr, issue: many_converted.append(pr))
+        assert len(many_converted) == LEGACY_PARK_MIGRATION_MAX, many_converted
+        print(f"  ok   legacy-migration: one tick migrates at most "
+              f"{LEGACY_PARK_MIGRATION_MAX} parks (bounded re-entry)")
+    finally:
+        globals()["_target_is_human_maintainer"] = prev_target_probe
+
+    # ---- round-3 Opus finding: a maintainer probe-CALL failure emits the distinct loud
+    # ::warning:: diagnostic (and still fails toward not-human); a genuine not-a-maintainer
+    # permission stays quiet ----
+    prev_target_api = globals()["_run_gh_target_api"]
+    try:
+        def broken_target_api(*_args, **_kwargs):
+            raise DispatchError("target token mint failed")
+
+        globals()["_run_gh_target_api"] = broken_target_api
+        probe_out = io.StringIO()
+        with contextlib.redirect_stdout(probe_out):
+            assert _target_is_human_maintainer("example/repo", "jeswr") is False
+        assert ("::warning::maintainer probe FAILED for example/repo actor=jeswr "
+                "(DispatchError) — treating as not-human") in probe_out.getvalue(), \
+            probe_out.getvalue()
+
+        def denying_target_api(*_args, **_kwargs):
+            return types.SimpleNamespace(stdout=json.dumps({"permission": "read"}))
+
+        globals()["_run_gh_target_api"] = denying_target_api
+        probe_out = io.StringIO()
+        with contextlib.redirect_stdout(probe_out):
+            assert _target_is_human_maintainer("example/repo", "drive-by") is False
+        assert probe_out.getvalue() == "", probe_out.getvalue()
+
+        def granting_target_api(*_args, **_kwargs):
+            return types.SimpleNamespace(stdout=json.dumps({"permission": "admin"}))
+
+        globals()["_run_gh_target_api"] = granting_target_api
+        assert _target_is_human_maintainer("example/repo", "jeswr") is True
+
+        def malformed_target_api(*_args, **_kwargs):
+            return types.SimpleNamespace(stdout=json.dumps(["not", "a", "dict"]))
+
+        globals()["_run_gh_target_api"] = malformed_target_api
+        probe_out = io.StringIO()
+        with contextlib.redirect_stdout(probe_out):
+            assert _target_is_human_maintainer("example/repo", "jeswr") is False
+        assert "maintainer probe FAILED" in probe_out.getvalue(), probe_out.getvalue()
+    finally:
+        globals()["_run_gh_target_api"] = prev_target_api
 
     # deferred-retry lease filter: a live lease suppresses the retry, expiry re-admits it
     deferred_items = [{"number": 9, "deferred": True}, {"number": 7, "deferred": False}]
@@ -3917,6 +8604,27 @@ def _self_test():
     routing["models"]["sol"]["provider_model"] = "gpt-5.6-codex"
     assert _resolvable_chain(["sol"], routing) == ["sol"]
 
+    # Probe-exempt chain classification (issue #115): exempt ONLY when EVERY alias maps to a
+    # positively probe-exempt provider; anything else (mixed, unknown/missing provider, empty
+    # chain, no catalog) is non-exempt so the require_usage hold applies. Fail-closed.
+    prov_routing = {"models": {
+        "sol": {"provider": "openai", "harness": "codex"},
+        "luna": {"provider": "openai", "harness": "codex"},
+        "opus": {"provider": "anthropic", "harness": "claude"},
+        "opus5": {"provider": "anthropic", "harness": "claude"},
+        "fable": {"provider": "anthropic", "harness": "claude"},
+        "mystery": {"harness": "codex"},                 # no provider field
+        "typo": {"provider": "openia", "harness": "codex"},  # misspelled provider
+    }}
+    assert _chain_probe_exempt(["sol", "luna"], prov_routing) is True
+    assert _chain_probe_exempt(["opus", "fable"], prov_routing) is False   # anthropic gated
+    assert _chain_probe_exempt(["opus5", "opus"], prov_routing) is False   # opus5 gated too
+    assert _chain_probe_exempt(["sol", "opus"], prov_routing) is False     # mixed -> gated
+    assert _chain_probe_exempt(["sol", "mystery"], prov_routing) is False  # missing provider
+    assert _chain_probe_exempt(["sol", "typo"], prov_routing) is False     # unknown provider
+    assert _chain_probe_exempt([], prov_routing) is False                  # empty chain
+    assert _chain_probe_exempt(["sol"], {}) is False                       # no catalog
+
     # ---- CLAIM disarm application (issue #42): runs per-item-resilient and token-gated; the
     # live precondition re-derivation itself lives in worker-pr.py disarm (tested there) ----
     calls = []
@@ -3930,20 +8638,32 @@ def _self_test():
                 raise DispatchError("boom")
 
         globals()["_run_target_helper"] = fake_helper
+        disarm_counts = Counter()
         _apply_disarm_items([
             {"pr_number": 13, "head_sha": "1" * 40, "reviewed_sha": "none",
              "repo": "example/repo"},
             {"pr_number": 14, "head_sha": "1" * 40, "reviewed_sha": "none",
              "repo": "example/repo"},
-        ], "example/repo", Path("."), "reg[bot]")
+        ], "example/repo", Path("."), "reg[bot]", disarm_counts)
         # a failing item SKIPS (never aborts the sweep) and every call is the strict
         # mismatch-only mode — CLAIM never requests an unconditional disarm from the plan
         assert [args[4] for args in calls] == ["13", "14"], calls
         assert all(args[0] == "disarm" and args[-1] == "mismatch" for args in calls)
+        # Issue #108: PR 13's raise lands in the disarm lane's ERROR tally (a stale auto-merge latch
+        # that could NOT be retracted — safety-critical), while PR 14's clean retraction is a
+        # `launched`. This error MUST alert the tick regardless of worker/review/fix launches, so it
+        # is recorded per-lane rather than swallowed by a bare per-item skip.
+        assert disarm_counts["error"] == 1 and disarm_counts["launched"] == 1, disarm_counts
+        assert disarm_counts["deferred"] == 0, disarm_counts
         calls.clear()
+        # No bot identity -> DEFER with NO mutation attempted, and the disarm lane records it as
+        # `deferred` (never `error`): we could not even attempt the safety retraction this tick.
+        no_token = Counter()
         _apply_disarm_items([{"pr_number": 15, "head_sha": "1" * 40, "reviewed_sha": "none",
-                              "repo": "example/repo"}], "example/repo", Path("."), "")
-        assert calls == []            # no bot identity -> defer with NO mutation attempted
+                              "repo": "example/repo"}], "example/repo", Path("."), "", no_token)
+        assert calls == []
+        assert no_token["deferred"] == 1 and no_token["error"] == 0 \
+            and no_token["launched"] == 0, no_token
     finally:
         globals()["_run_target_helper"] = real_helper
         globals()["_target_token"] = real_token
@@ -3976,15 +8696,114 @@ def _self_test():
                 os.environ[k] = v
 
     # Escalation contract (routing.toml escalate=true, audit-2026-07-17): a security-surface item
-    # whose restricted tier has ZERO usage-eligible accounts escalates to needs:user — but ONLY on
-    # a live usage signal (no probe => defer, the require_usage hold + usage-alert own that), and
-    # NEVER for non-escalate routes (they starve fail-closed and retry next tick).
+    # whose restricted tier has ZERO usage-eligible accounts is STARVED — but ONLY on a live usage
+    # signal (no probe => defer, the require_usage hold + usage-alert own that), and NEVER for
+    # non-escalate routes (they starve fail-closed and retry next tick). Whether that momentary
+    # starvation becomes a human terminal is escalate_persist_decision's bounded call (issue #116).
     assert escalate_starved(True, {"acct01": {}}, 0) is True
     assert escalate_starved(True, {}, 0) is True            # empty-but-present map still signals
     assert escalate_starved(True, None, 0) is False         # no probe -> unknown -> defer
     assert escalate_starved(True, {"acct01": {}}, 1) is False
     assert escalate_starved(False, {"acct01": {}}, 0) is False
     assert escalate_starved(None, {"acct01": {}}, 0) is False
+
+    # Issue #116: a starved escalate route must NOT convert one transient usage snapshot into a
+    # permanent human terminal. escalate_persist_decision separates the momentary-starved predicate
+    # (escalate_starved, above) from the bounded, PERSISTENT decision to escalate to needs:user.
+    now116 = 1_800_000_000
+    attempt = "<!-- sparq-worker-attempt:v1"  # worker_issue.ATTEMPT_MARKER (durable receipt format)
+    iso116 = lambda ago: time.strftime(  # noqa: E731 — trivial epoch->ISO helper for the fixtures
+        "%Y-%m-%dT%H:%M:%SZ", time.gmtime(now116 - ago))
+    starve = lambda ago: {"user": {"login": "app[bot]"},  # noqa: E731
+                          "body": f"ops alert {STARVE_ALERT_MARKER}", "created_at": iso116(ago)}
+    # (i) FIRST observation (no prior receipt): defer + alert, never escalate. THIS is the
+    # regression the issue names — a single snapshot going straight to needs:user.
+    assert escalate_persist_decision([], "app[bot]", now116, attempt) == (False, "")
+    # (ii) a fresh alert (well within the grace) still defers — transient, keep retrying.
+    assert escalate_persist_decision([starve(60)], "app[bot]", now116, attempt) \
+        == (False, iso116(60))
+    # (iii) an alert streak that has PERSISTED past the grace escalates to a human, reporting the
+    # streak's OLDEST receipt (bounded persistent failure, not one blip).
+    persisted = [starve(ESCALATE_PERSIST_SECONDS + 120), starve(300)]
+    assert escalate_persist_decision(persisted, "app[bot]", now116, attempt) \
+        == (True, iso116(ESCALATE_PERSIST_SECONDS + 120))
+    # (iv) RECOVERY RESETS the clock: a worker attempt receipt AFTER an old alert means capacity
+    # recovered and dispatched; a later alert begins a fresh transient streak, so an old
+    # past-grace alert can no longer force an immediate terminal on the new episode.
+    recovered = [starve(ESCALATE_PERSIST_SECONDS + 600),
+                 {"user": {"login": "app[bot]"}, "body": f"{attempt} run=7 -->",
+                  "created_at": iso116(ESCALATE_PERSIST_SECONDS + 300)},
+                 starve(120)]
+    assert escalate_persist_decision(recovered, "app[bot]", now116, attempt) \
+        == (False, iso116(120))
+    # (v) only the bot's own receipts count — a spoofed alert from another login is ignored, so a
+    # third party cannot fabricate persistence to force a needs:user terminal.
+    spoof = [{"user": {"login": "someone"}, "body": STARVE_ALERT_MARKER,
+              "created_at": iso116(ESCALATE_PERSIST_SECONDS + 999)}]
+    assert escalate_persist_decision(spoof, "app[bot]", now116, attempt) == (False, "")
+    # (vi) RECOVERY WITHOUT A WORKER ATTEMPT still resets the streak (issue #116 round 1). Capacity
+    # refilled — a live-recovery receipt — but no worker started (allocator found no slot / the
+    # launch failed / a later hold intervened). An old past-grace alert BEFORE that reset is stale,
+    # so a fresh post-reset alert opens a NEW transient streak and does NOT escalate. This is the
+    # exact counterexample the attempt-only reset missed: observed recovery, then a first fresh
+    # snapshot, must not read as continuously starved.
+    reset = lambda ago: {"user": {"login": "app[bot]"},  # noqa: E731
+                         "body": f"recovered {STARVE_RESET_MARKER}", "created_at": iso116(ago)}
+    recovered_noattempt = [starve(ESCALATE_PERSIST_SECONDS + 600),
+                           reset(ESCALATE_PERSIST_SECONDS + 300),
+                           starve(120)]
+    assert escalate_persist_decision(recovered_noattempt, "app[bot]", now116, attempt) \
+        == (False, iso116(120))
+    # (vii) a reset must NOT suppress a GENUINELY persistent NEW streak: an old reset followed by a
+    # post-reset alert that has itself aged past the grace still escalates to a human (fail-closed
+    # toward the human terminal when starvation is truly continuous after recovery).
+    persisted_after_reset = [reset(ESCALATE_PERSIST_SECONDS + 900),
+                             starve(ESCALATE_PERSIST_SECONDS + 60)]
+    assert escalate_persist_decision(persisted_after_reset, "app[bot]", now116, attempt) \
+        == (True, iso116(ESCALATE_PERSIST_SECONDS + 60))
+    # (viii) escalate_recovery_pending gates the reset-receipt write: True while an alert is open,
+    # then False once a reset (or attempt) supersedes every alert — exactly one receipt per streak
+    # (no per-tick spam), and nothing to write when there was never an alert.
+    assert escalate_recovery_pending([], "app[bot]", attempt) is False
+    assert escalate_recovery_pending([starve(120)], "app[bot]", attempt) is True
+    assert escalate_recovery_pending([starve(600), reset(300)], "app[bot]", attempt) is False
+    attempt_closed = [starve(600), {"user": {"login": "app[bot]"},
+                                    "body": f"{attempt} run=9 -->", "created_at": iso116(300)}]
+    assert escalate_recovery_pending(attempt_closed, "app[bot]", attempt) is False
+    # a post-reset alert is once again an OPEN streak (recovery recurred into a new shortage).
+    assert escalate_recovery_pending(recovered_noattempt, "app[bot]", attempt) is True
+    # (ix) Round-5 finding 2: receipt ordering is by PARSED instant, never raw string. A
+    # space-separator stamp sorts lexicographically before every 'T'-form stamp of the same
+    # day, so the old string compare (a) read a 60-second-old space-form alert as already past
+    # the grace threshold — escalating one snapshot straight to a park — and (b) read a fresh
+    # space-form alert posted AFTER a 'T'-form reset as pre-reset, suppressing the recovery
+    # receipt.
+    space116 = lambda ago: {  # noqa: E731 — space-separator spelling of iso116
+        "user": {"login": "app[bot]"}, "body": f"ops alert {STARVE_ALERT_MARKER}",
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime(now116 - ago))}
+    assert escalate_persist_decision([space116(60)], "app[bot]", now116, attempt) \
+        == (False, time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime(now116 - 60)))
+    assert escalate_persist_decision([reset(300), space116(60)], "app[bot]", now116, attempt) \
+        == (False, time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime(now116 - 60)))
+    assert escalate_recovery_pending([reset(300), space116(60)], "app[bot]", attempt) is True
+    # a genuinely persistent space-form streak still escalates (instants, not spellings).
+    assert escalate_persist_decision(
+        [space116(ESCALATE_PERSIST_SECONDS + 120)], "app[bot]", now116, attempt) \
+        == (True, time.strftime("%Y-%m-%d %H:%M:%SZ",
+                                time.gmtime(now116 - ESCALATE_PERSIST_SECONDS - 120)))
+    # (x) an unparseable receipt stamp FREEZES the starvation ladder loudly: no escalation, no
+    # recovery receipt, on unprovable time.
+    bad_clock = [{"user": {"login": "app[bot]"}, "body": f"x {STARVE_RESET_MARKER}",
+                  "created_at": "not-a-timestamp"},
+                 starve(ESCALATE_PERSIST_SECONDS + 120)]
+    freeze_logs = []
+    assert escalate_persist_decision(bad_clock, "app[bot]", now116, attempt,
+                                     log=freeze_logs.append) == (False, "")
+    assert any("clock unreadable" in line and "freezing" in line for line in freeze_logs)
+    freeze_logs = []
+    assert escalate_recovery_pending(bad_clock, "app[bot]", attempt,
+                                     log=freeze_logs.append) is False
+    assert any("clock unreadable" in line and "freezing" in line for line in freeze_logs)
 
     print("dispatch-claim self-test PASSED")
 

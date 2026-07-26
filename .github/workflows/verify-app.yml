@@ -8,9 +8,19 @@ on:
 permissions:
   contents: read
 
+# Manual-only diagnostic; singleton so a double manual fire queues instead of interleaving
+# two App-token mint probes (#559 concurrency-hygiene audit; registry #563 item 1).
+concurrency:
+  group: verify-app-singleton
+  cancel-in-progress: false
+
 jobs:
   verify:
     runs-on: ubuntu-latest
+    # SECRET-EXFIL GUARD (issue #101): reads REGISTRY_ADMIN_APP_ID/KEY, which live in the
+    # `dispatch-secrets` environment (deployment-branch policy: default branch only) — full
+    # rationale on the `claim` job in dispatch.yml.
+    environment: dispatch-secrets
     steps:
       - name: Identify the stored App + its installations
         env:

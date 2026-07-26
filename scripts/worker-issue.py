@@ -5,6 +5,7 @@
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -14,7 +15,44 @@ import sys
 import tempfile
 
 
+def _park_policy():
+    """The shared park-label policy module (machine/human ownership + the sticky human-unpark
+    veto). Loaded lazily so only the park transitions pay the import."""
+    spec = importlib.util.spec_from_file_location(
+        "registry_park_policy", Path(__file__).resolve().with_name("park_policy.py"))
+    if spec is None or spec.loader is None:
+        raise WorkerIssueError("cannot load shared park policy")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _worker_pr():
+    """The sibling PR-control module, loaded lazily (same pattern as _park_policy). Used ONLY for
+    is_credential_outage — the single shared definition of "this exit class is a credential/capacity
+    outage, so no round or attempt was spent" (registry #596). Keeping ONE definition is the point:
+    a second copy here would drift from the review-round path it must agree with."""
+    spec = importlib.util.spec_from_file_location(
+        "registry_worker_pr", Path(__file__).resolve().with_name("worker-pr.py"))
+    if spec is None or spec.loader is None:
+        raise WorkerIssueError("cannot load the sibling worker-pr module")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 ATTEMPT_MARKER = "<!-- sparq-worker-attempt:v1"
+# [registry #596] CREDENTIAL-OUTAGE attempt void — the task-side mirror of
+# worker-pr.ROUND_VOID_MARKER. The attempt receipt is posted BEFORE the model launches (it is the
+# last budget gate), so a launch that dies on the worker ACCOUNT's credential — acct01's codex
+# OAuth access token expires hourly and the fleet stores a static snapshot of it — used to burn a
+# full attempt from the bounded deferred-retry budget without the model ever running. Enough of
+# those and the issue reaches status:parked as if the model had declined the task, which inverts the
+# park policy: a credential outage is not a decline. worker.yml records this marker for the SAME run
+# key the receipt used once the exit class is known, and count_attempts subtracts it.
+#
+# Bot-authored only, like every other durable marker: a third party cannot forge one to mint budget.
+ATTEMPT_VOID_MARKER = "<!-- sparq-worker-attempt-void:v1"
 # Maintainer-approval convention (issue #31): a HUMAN maintainer approves a retry by commenting
 # the word "approved" on the issue AFTER the worker's most recent attempt receipt. The trusted
 # human set is derived the same way the triage trust-gate derives it — repo collaborator
@@ -26,6 +64,7 @@ BUSY_OR_GATED = {
     "status:deferred",
     "status:in-progress",
     "status:in-progress-review",
+    "status:parked",
     "status:untriaged",
     "trust:untrusted",
 }
@@ -33,9 +72,14 @@ LABEL_COLOURS = {
     "status:in-progress": "fbca04",
     "status:in-progress-review": "c5def5",
     "status:deferred": "d4c5f9",
+    "status:parked": "1d76db",
     "status:ready": "0e8a16",
     "needs:user": "b60205",
 }
+# The park transitions and the label each one applies. `needs:user` is HUMAN-owned (genuine
+# human questions only); `status:parked` is the MACHINE-owned capacity/decline/budget soft hold
+# (see park_policy.py). Both are gated by the sticky human-unpark veto in set_status.
+PARK_STATUS_LABELS = {"needs-user": "needs:user", "parked": "status:parked"}
 
 
 class WorkerIssueError(RuntimeError):
@@ -46,17 +90,101 @@ def body_sha(body):
     return hashlib.sha256((body or "").encode("utf-8")).hexdigest()
 
 
-def count_attempts(comments, bot_login):
+def _attempt_run_keys(body):
+    """The run keys carried by the attempt receipts in one comment body."""
+    return set(re.findall(re.escape(ATTEMPT_MARKER) + r" run=(\S+) -->", body))
+
+
+def attempt_voids(comments, bot_login):
+    """The set of run keys whose attempt was VOIDED as a credential outage (registry #596) and so
+    must NOT be charged against the deferred-retry budget. Bot-authored only, like every marker
+    parser here — a third party's comment can never un-charge an attempt."""
     bot = bot_login.casefold()
-    return sum(
-        1
-        for comment in comments
-        if str(comment.get("user", {}).get("login", "")).casefold() == bot
-        and ATTEMPT_MARKER in str(comment.get("body", ""))
-    )
+    voided = set()
+    pattern = re.escape(ATTEMPT_VOID_MARKER) + r" run=(\S+) -->"
+    for comment in comments:
+        if str(comment.get("user", {}).get("login", "")).casefold() != bot:
+            continue
+        voided.update(re.findall(pattern, str(comment.get("body", ""))))
+    return voided
 
 
-def find_maintainer_approval(comments, bot_login, is_human_maintainer):
+def count_attempts(comments, bot_login):
+    """Durable worker attempts CHARGED to the budget. A receipt whose run was voided as a
+    credential outage (registry #596 — the model never launched, so no attempt was spent) is
+    subtracted; a receipt with no run key at all is a legacy/degenerate form and stays charged
+    (the fail direction is always toward CHARGING)."""
+    bot = bot_login.casefold()
+    voided = attempt_voids(comments, bot_login)
+    charged = 0
+    for comment in comments:
+        if str(comment.get("user", {}).get("login", "")).casefold() != bot:
+            continue
+        body = str(comment.get("body", ""))
+        if ATTEMPT_MARKER not in body:
+            continue
+        keys = _attempt_run_keys(body)
+        if keys and keys <= voided:
+            continue
+        charged += 1
+    return charged
+
+
+def count_attempts_since(comments, bot_login, since, log=print):
+    """Durable worker attempts charged to the DEFERRED-RETRY budget after a human readmission.
+
+    Mirrors worker-pr.count_rounds_since: `since` is the readmission cutoff
+    (park_policy.readmission_cutoff — the latest proven-human unlabel of a park label), and
+    only attempt receipts recorded at or after it are charged, so a human's explicit
+    re-admission gesture actually re-enables allocation instead of the full historical count
+    exiting the tick forever. Fail direction (toward the OLD conservative full count, never a
+    fresh budget on unproven data): a falsy `since` charges everything (plain count_attempts),
+    and so does an UNPARSEABLE `since`, loudly; a receipt without a created_at is CHARGED; a
+    receipt whose created_at cannot be parsed is CHARGED with a loud log (round-4 finding 3 +
+    round-5 finding 2: the window compare is over PARSED aware datetimes —
+    park_policy.parse_ts — never raw strings, because an equally-valid spelling like the
+    space-separator "2026-07-23 10:30:00Z" VALIDATES yet sorts lexicographically before
+    "2026-07-23T09:00:00Z", so the old string compare read a post-cutoff receipt as
+    pre-cutoff and silently un-charged it; unprovable time always counts AGAINST the budget,
+    exactly like the missing-timestamp case); an instant tie with the cutoff is CHARGED."""
+    if not since:
+        return count_attempts(comments, bot_login)
+    parse_ts = _park_policy().parse_ts
+    try:
+        since_instant = parse_ts(since)
+    except ValueError:
+        log(f"::warning::readmission cutoff {since!r} is not a parseable timestamp — the "
+            "attempt budget keeps the FULL historical count (never a fresh budget on "
+            "unproven data)")
+        return count_attempts(comments, bot_login)
+    bot = bot_login.casefold()
+    # Void subtraction is GLOBAL, exactly as in worker-pr.count_rounds_since (registry #596): a
+    # credential-outage attempt is uncharged whichever side of the readmission cutoff it landed on.
+    voided = attempt_voids(comments, bot_login)
+    charged = 0
+    for comment in comments:
+        if (str(comment.get("user", {}).get("login", "")).casefold() != bot
+                or ATTEMPT_MARKER not in str(comment.get("body", ""))):
+            continue
+        keys = _attempt_run_keys(str(comment.get("body", "")))
+        if keys and keys <= voided:
+            continue
+        created = comment.get("created_at")
+        if isinstance(created, str) and created:
+            try:
+                created_instant = parse_ts(created)
+            except ValueError:
+                log(f"::warning::attempt receipt carries a malformed created_at {created!r} "
+                    "— CHARGED against the attempt budget (unprovable time can never "
+                    "authorize exhausted work)")
+            else:
+                if created_instant < since_instant:
+                    continue
+        charged += 1
+    return charged
+
+
+def find_maintainer_approval(comments, bot_login, is_human_maintainer, log=print):
     """Return the approving comment, or None when the retry must fail closed.
 
     Evidence of maintainer approval (issue #31) is a comment by a HUMAN maintainer whose body
@@ -69,15 +197,32 @@ def find_maintainer_approval(comments, bot_login, is_human_maintainer):
     collaborator probe all pass; only the App attribution field betrays that no human typed it.
     `is_human_maintainer(login)` supplies the trusted-set probe so this stays pure and
     self-testable.
+
+    Staleness ordering is over PARSED aware datetimes (park_policy.parse_ts — round-5
+    finding 2), never raw strings: a space-separator receipt stamp sorts lexicographically
+    before every 'T'-form stamp of the same day, so the old string compare could read a
+    PRE-failure approval as post-failure (blessing a run the maintainer never saw fail). Fail
+    directions, both closed: an attempt receipt whose created_at cannot be parsed makes
+    "strictly after the last failure" unprovable for EVERY candidate — no approval stands
+    (loud log); an approval whose created_at cannot be parsed can never prove it postdates
+    the failure — that comment never approves.
     """
     bot = bot_login.casefold()
-    last_failure = max(
-        (str(comment.get("created_at", ""))
-         for comment in comments
-         if str(comment.get("user", {}).get("login", "")).casefold() == bot
-         and ATTEMPT_MARKER in str(comment.get("body", ""))),
-        default="",
-    )
+    parse_ts = _park_policy().parse_ts
+    last_failure = None
+    for comment in comments:
+        if (str(comment.get("user", {}).get("login", "")).casefold() != bot
+                or ATTEMPT_MARKER not in str(comment.get("body", ""))):
+            continue
+        try:
+            stamp = parse_ts(comment.get("created_at"))
+        except ValueError:
+            log(f"::warning::attempt receipt carries an unparseable created_at "
+                f"{comment.get('created_at')!r} — approval evidence cannot be proven to "
+                "postdate the last failure; the retry fails closed")
+            return None
+        if last_failure is None or stamp > last_failure:
+            last_failure = stamp
     for comment in comments:
         user = comment.get("user", {}) or {}
         login = str(user.get("login", ""))
@@ -89,9 +234,13 @@ def find_maintainer_approval(comments, bot_login, is_human_maintainer):
             continue
         if not APPROVAL_RE.search(str(comment.get("body", ""))):
             continue
-        # ISO-8601 UTC timestamps compare lexicographically; an approval at-or-before the last
-        # attempt receipt is stale — it blessed a run that has since failed.
-        if str(comment.get("created_at", "")) <= last_failure:
+        # An approval at-or-before the last attempt receipt is stale — it blessed a run that
+        # has since failed. Unprovable approval time never blesses anything.
+        try:
+            approved_at = parse_ts(comment.get("created_at"))
+        except ValueError:
+            continue
+        if last_failure is not None and approved_at <= last_failure:
             continue
         if is_human_maintainer(login):
             return comment
@@ -101,12 +250,21 @@ def find_maintainer_approval(comments, bot_login, is_human_maintainer):
 def _is_human_maintainer(repo, login):
     # Same derivation as the triage-issue trust-gate: collaborator permission probe. The
     # trust-gate's extra exact-match entry is the registry App bot, which is excluded here by
-    # design — approval must come from a human. Probe failure counts as "not a maintainer".
-    result = _run_gh(
-        ["api", f"repos/{repo}/collaborators/{login}/permission", "--jq", ".permission"],
-        check=False,
-    )
-    return result.returncode == 0 and result.stdout.strip() in HUMAN_MAINTAINER_PERMISSIONS
+    # design — approval must come from a human. Probe-call FAILURE counts as "not a
+    # maintainer" and emits the shared distinct ::warning:: diagnostic
+    # (park_policy.probe_maintainer, round-3 Opus finding); a genuine not-a-maintainer
+    # permission stays quiet.
+    def read_permission(probe_login):
+        result = _run_gh(
+            ["api", f"repos/{repo}/collaborators/{probe_login}/permission",
+             "--jq", ".permission"],
+            check=False,
+        )
+        if result.returncode != 0:
+            raise WorkerIssueError(f"permission probe exited {result.returncode}")
+        return result.stdout.strip()
+
+    return _park_policy().probe_maintainer(repo, login, read_permission)
 
 
 def _run_gh(args, *, input_text=None, check=True):
@@ -139,7 +297,31 @@ def _paginated(repo, issue, resource):
     ])
     if not isinstance(pages, list):
         raise WorkerIssueError(f"GitHub API returned malformed {resource}")
-    return [item for page in pages if isinstance(page, list) for item in page]
+    for page in pages:
+        # A malformed PAGE must RAISE, never be silently dropped: for the timeline it could
+        # hold the newest human unlabel (the exact event the park veto and the readmission
+        # window hinge on), so the caller's documented fail direction must apply instead
+        # (veto => suppress the park; budget/readmission => the full historical count).
+        if not isinstance(page, list):
+            raise WorkerIssueError(f"GitHub API returned a malformed {resource} page")
+        for entry in page:
+            # Round-4 finding 4: ENTRIES are validated at read time too — a [[null]] payload
+            # passed the page-only check and crashed the first consumer mid-decision. A
+            # non-dict entry (any resource), or a comment without the user(dict)/body(str)/
+            # created_at(str) shape every counter relies on, raises exactly like a malformed
+            # page: the caller's documented conservative fail direction applies (the budget
+            # keeps its full count, the veto suppresses the park, the workflow step fails
+            # loud) instead of an unhandled crash past the validation boundary. Timeline
+            # entries keep the dict-only check here; park_policy._event_rows enforces the
+            # per-event shape downstream with the same raise-not-drop rule.
+            if not isinstance(entry, dict):
+                raise WorkerIssueError(f"GitHub API returned a malformed {resource} entry")
+            if resource == "comments" and (
+                    not isinstance(entry.get("user"), dict)
+                    or not isinstance(entry.get("body"), str)
+                    or not isinstance(entry.get("created_at"), str)):
+                raise WorkerIssueError("GitHub API returned a malformed comments entry")
+    return [item for page in pages for item in page]
 
 
 def _write_outputs(values):
@@ -154,9 +336,54 @@ def _write_outputs(values):
             output.write(f"{key}={text}\n")
 
 
+def _readmission_cutoff(repo, issue):
+    """The deferred-retry budget's human-readmission cutoff, derived WORKER-SIDE from the
+    live label timeline via the SAME park_policy.readmission_cutoff helper (strict maintainer
+    probe, most-recent-event-wins, latest proven-human unlabel of any READMISSION_LABELS)
+    that CLAIM used to grant the readmission (round-4 finding 1).
+
+    DELIBERATELY re-derived here, never threaded through the dispatch payload / claim record:
+    every other worker admission guard re-derives its evidence live at the last step
+    (reverify re-checks author/body/labels/trust, the selected-model step re-checks routing
+    equality against the protected catalog) — a caller-supplied cutoff would be the ONE
+    budget input the worker takes on faith, letting any workflow_dispatch caller mint fresh
+    budget, and it would freeze the evidence at CLAIM time. The durable evidence (the label
+    timeline) is readable under the same target App token this budget check already holds.
+    Skew between CLAIM and this check is safe in both directions: a human gesture landing
+    after CLAIM only widens the window on proven evidence, and an unreadable timeline yields
+    None = the FULL historical count (the conservative side — CLAIM freezes its ladder on
+    the same unreadable view)."""
+    policy = _park_policy()
+    return policy.readmission_cutoff(
+        repo, issue, None, lambda fetch_repo, number: _paginated(fetch_repo, number, "timeline"),
+        is_human=lambda login: _is_human_maintainer(repo, login))
+
+
+def _windowed_attempts(repo, issue, comments, bot_login, max_attempts):
+    """The attempt count CHARGED to the budget: the plain lifetime count below the budget
+    line, the readmission-windowed count at/above it (round-4 finding 1 — the windowed-vs-
+    lifetime split brain). CLAIM grants a readmission on the WINDOWED count
+    (dispatch-claim's deferred lane); the old worker-side re-check used the UNWINDOWED
+    lifetime count, so the launched retry declared itself exhausted, ran no model, the final
+    re-park was vetoed by the very unlabel that granted the readmission, status:ready
+    persisted, and every tick relaunched a no-op workflow forever. The cutoff is probed only
+    once the lifetime count is exhausted, exactly like CLAIM."""
+    used = count_attempts(comments, bot_login)
+    if used < max_attempts:
+        return used
+    cutoff = _readmission_cutoff(repo, issue)
+    if not cutoff:
+        return used
+    charged = count_attempts_since(comments, bot_login, cutoff)
+    if charged < used:
+        print(f"readmission window open: a human unlabeled a park label at {cutoff}; the "
+              f"attempt budget charges {charged} of {used} recorded attempt(s)")
+    return charged
+
+
 def attempt_check(repo, issue, max_attempts, bot_login):
     comments = _paginated(repo, issue, "comments")
-    used = count_attempts(comments, bot_login)
+    used = _windowed_attempts(repo, issue, comments, bot_login, max_attempts)
     values = {"used": used, "exhausted": used >= max_attempts}
     _write_outputs(values)
     print(f"worker attempts used: {used}/{max_attempts}")
@@ -164,7 +391,12 @@ def attempt_check(repo, issue, max_attempts, bot_login):
 
 def record_attempt(repo, issue, max_attempts, bot_login, run_key):
     comments = _paginated(repo, issue, "comments")
-    used = count_attempts(comments, bot_login)
+    # The recorder is the LAST budget gate before the model launches; it must apply the same
+    # readmission window as attempt_check (round-4 finding 1) or a readmitted retry admitted
+    # by the check dies here with "exhausted before model launch". Attempt numbering restarts
+    # inside a readmission window by design: the budget is windowed, and the receipt's
+    # identity is the run key, not the number.
+    used = _windowed_attempts(repo, issue, comments, bot_login, max_attempts)
     exact_marker = f"{ATTEMPT_MARKER} run={run_key} -->"
     for comment in comments:
         if (str(comment.get("user", {}).get("login", "")).casefold() == bot_login.casefold()
@@ -186,6 +418,51 @@ def record_attempt(repo, issue, max_attempts, bot_login, run_key):
     )
     _write_outputs({"number": number})
     print(f"worker attempt recorded: {number}/{max_attempts}")
+
+
+def void_attempt_on_outage(repo, issue, bot_login, run_key, exit_class):
+    """[registry #596] Un-charge THIS run's attempt receipt when the model launch died on the
+    worker account's credential/capacity (auth / rate-limit / session-limit / billing). The class
+    gate is worker-pr.is_credential_outage — ONE definition shared by both the review-round and the
+    task-attempt path, so the two can never drift.
+
+    Called from worker.yml right after the exit class is captured (the model step's own job): the
+    later `final_state` job cannot do it because the attempt budget is re-read by the NEXT tick's
+    dispatch, and by then the receipt is already charged.
+
+    A non-outage class is a NO-OP: the attempt stays charged, so the bounded-crash accounting for
+    `setup`/`unknown`/timeouts is untouched. Idempotent per run key.
+
+    DELIBERATELY NOT applied to find_maintainer_approval's staleness anchor: that is a human-CONSENT
+    surface ("did the maintainer see the failure being retried?"), not a budget. Leaving a voided
+    attempt as the anchor fails CLOSED — it can only require a fresh human approval, never admit a
+    run the maintainer did not bless."""
+    outage = _worker_pr().is_credential_outage(exit_class)
+    _write_outputs({"voided": "true" if outage else "false"})
+    if not outage:
+        print(f"exit class {str(exit_class or '')!r} is not a credential outage — this worker "
+              "attempt stays CHARGED against the deferred-retry budget")
+        return False
+    comments = _paginated(repo, issue, "comments")
+    marker = f"{ATTEMPT_VOID_MARKER} run={run_key} -->"
+    for comment in comments:
+        if (str(comment.get("user", {}).get("login", "")).casefold() == bot_login.casefold()
+                and marker in str(comment.get("body", ""))):
+            print(f"worker attempt already voided (run {run_key})")
+            return True
+    cls = str(exit_class).strip().lower()
+    body = (
+        f"> 🤖 SPARQ agent — this worker attempt was VOIDED: the model launch failed on the "
+        f"worker account's credential/capacity (`exit-class={cls}`) before the model ran, so it "
+        "is NOT charged against the deferred-retry budget and is NOT a model decline "
+        f"(registry #596).\n\n{marker}"
+    )
+    _gh_json(
+        ["api", "-X", "POST", f"repos/{repo}/issues/{issue}/comments", "--input", "-"],
+        input_doc={"body": body},
+    )
+    print(f"worker attempt voided (run {run_key}, exit-class={cls})")
+    return True
 
 
 def reverify(repo, issue, expected_author, expected_body_sha, trust_gate, bot_login, issue_file):
@@ -276,20 +553,57 @@ def set_status(repo, issue, status):
     # cross-provider review loop — the issue completes only when the review-fix ARM path fires.
     # `retry`: the dispatcher re-enumerates a deferred issue (deferred-retry, locked decision 20)
     # — status:deferred is stripped and status:ready restored so the worker's reverify passes.
+    # `retry` also clears `status:parked`: the deferred-retry dispatch IS the machine park's
+    # readmission — reaching it proves capacity exists (the allocator granted a claim), so the
+    # soft hold lifts exactly then.
+    # `parked`: the MACHINE-owned capacity/decline/budget park (park_policy.py). Unlike
+    # `needs-user` it is a SOFT hold cleared by a human readmission gesture (or the `retry`
+    # flip) rather than a terminal question — but it DOES park the whole PR surface while it
+    # stands (round-3 finding 2, the one-predicate rule): a PR is capacity-parked iff EITHER
+    # machine label is live (review:parked on the PR OR status:parked on the source), so
+    # enumerate_review_items excludes on it and CLAIM re-proves any readmission from the
+    # durable receipts + label timelines.
+    # `needs-user` stays reserved for genuine human questions and supersedes a machine park.
     # NOTE (issue #31): status:ready written here is dispatchability only, never maintainer
     # approval — the reverify third-party path demands separate human evidence.
     transitions = {
         "in-progress": ({"status:in-progress"}, {"status:ready", "status:deferred"}),
         "in-progress-review": ({"status:in-progress-review"},
                                {"status:ready", "status:in-progress", "status:deferred"}),
-        "retry": ({"status:ready"}, {"status:deferred"}),
+        "retry": ({"status:ready"}, {"status:deferred", "status:parked"}),
         "deferred": ({"status:deferred"},
                      {"status:ready", "status:in-progress", "status:in-progress-review"}),
         "needs-user": ({"needs:user", "status:deferred"},
-                       {"status:ready", "status:in-progress", "status:in-progress-review"}),
-        "complete": (set(), {"status:in-progress", "status:in-progress-review", "status:deferred"}),
+                       {"status:ready", "status:in-progress", "status:in-progress-review",
+                        "status:parked"}),
+        "parked": ({"status:parked", "status:deferred"},
+                   {"status:ready", "status:in-progress", "status:in-progress-review"}),
+        # `readmitted`: the SOURCE-ISSUE half of re-admitting a MACHINE capacity park on a
+        # PR-backed issue (registry #614 — the automatic cause-recovery path writes exactly what a
+        # human's unlabel gesture leads CLAIM to write). It CLEARS status:parked/status:deferred
+        # and restores the in-progress-review posture the open worker PR is actually in. It applies
+        # NO park label, so it is not veto-gated: the sticky human-unpark veto guards park
+        # APPLICATION, and clearing a machine park points the same way a human unpark does.
+        # Deliberately NOT `retry`, whose status:ready is the IMPLEMENTATION-dispatch posture —
+        # wrong for an issue whose worker PR is already open and cycling through review.
+        "readmitted": ({"status:in-progress-review"},
+                       {"status:parked", "status:deferred", "status:ready",
+                        "status:in-progress"}),
+        "complete": (set(), {"status:in-progress", "status:in-progress-review",
+                             "status:deferred", "status:parked"}),
     }
     add, remove = transitions[status]
+    park_label = PARK_STATUS_LABELS.get(status)
+    if park_label and _park_policy().park_vetoed(
+            repo, issue, park_label, lambda r, n: _paginated(r, n, "timeline"),
+            is_human=lambda login: _is_human_maintainer(repo, login)):
+        # Sticky human unpark (park_policy.py): a PROVEN human (the same strict
+        # _is_human_maintainer probe as retry approval — an unverifiable actor never counts)
+        # removed this park label more recently than any application (or the timeline could
+        # not be read, which must never park). The veto helper already logged the loud
+        # "park suppressed:" line; mutate NOTHING.
+        print(f"target issue state UNCHANGED: {status} park suppressed for {repo}#{issue}")
+        return
     for label in sorted(add):
         _ensure_label(repo, label)
     if add:
@@ -369,10 +683,190 @@ def _self_test():
         {"user": {"login": "someone"}, "body": ATTEMPT_MARKER},
     ]
     assert count_attempts(fake, "sparq[bot]") == 2
+
+    # count_attempts_since (deferred-retry readmission window): only receipts at/after the
+    # cutoff are charged; missing timestamps and exact ties stay CHARGED (fail toward the full
+    # count, never a fresh budget on unproven data); no cutoff = the plain full count.
+    stamped = [
+        {"user": {"login": "sparq[bot]"}, "created_at": "2026-07-20T00:00:00Z",
+         "body": f"x {ATTEMPT_MARKER} run=1 -->"},
+        {"user": {"login": "sparq[bot]"}, "created_at": "2026-07-23T10:00:00Z",
+         "body": f"x {ATTEMPT_MARKER} run=2 -->"},
+        {"user": {"login": "someone"}, "created_at": "2026-07-23T10:00:00Z",
+         "body": f"x {ATTEMPT_MARKER} run=3 -->"},
+    ]
+    assert count_attempts_since(stamped, "sparq[bot]", "2026-07-23T09:00:00Z") == 1
+    assert count_attempts_since(stamped, "sparq[bot]", None) == 2
+    assert count_attempts_since(stamped, "sparq[bot]", "2026-07-23T10:00:00Z") == 1  # tie charged
+    unstamped = [{"user": {"login": "sparq[bot]"}, "body": f"x {ATTEMPT_MARKER} run=4 -->"}]
+    assert count_attempts_since(stamped + unstamped, "sparq[bot]",
+                                "2026-07-24T00:00:00Z") == 1  # no created_at stays charged
+    # Round-4 finding 3: a NON-ISO created_at sorting lexicographically BEFORE any real
+    # cutoff ("0000-..." < "2026-...") must be CHARGED with a loud log, never silently
+    # omitted — the old bare `created < since` skip let a malformed stamp drop a receipt
+    # from the charged budget and authorize exhausted work.
+    ts_logs = []
+    garbage_stamped = [{"user": {"login": "sparq[bot]"}, "created_at": "0000-not-a-timestamp",
+                        "body": f"x {ATTEMPT_MARKER} run=5 -->"}]
+    assert count_attempts_since(garbage_stamped, "sparq[bot]", "2026-07-23T09:00:00Z",
+                                log=ts_logs.append) == 1
+    assert any("malformed created_at" in line and "CHARGED" in line for line in ts_logs)
+    quiet_logs = []
+    assert count_attempts_since(stamped, "sparq[bot]", "2026-07-23T09:00:00Z",
+                                log=quiet_logs.append) == 1
+    assert quiet_logs == []  # well-formed stamps never warn
+    # Round-5 finding 2: the window compare is over PARSED instants, never raw strings. A
+    # space-separator stamp VALIDATES yet sorts lexicographically before every 'T'-form stamp
+    # of the same day — the old string compare read this post-cutoff attempt as pre-cutoff
+    # and silently un-charged it (budget minting, no warning).
+    space_receipt = [{"user": {"login": "sparq[bot]"}, "created_at": "2026-07-23 10:30:00Z",
+                      "body": f"x {ATTEMPT_MARKER} run=6 -->"}]
+    quiet_logs = []
+    assert count_attempts_since(space_receipt, "sparq[bot]", "2026-07-23T09:00:00Z",
+                                log=quiet_logs.append) == 1
+    assert quiet_logs == []  # a well-formed spelling variant charges quietly
+    offset_receipt = [{"user": {"login": "sparq[bot]"},
+                       "created_at": "2026-07-20T00:00:00+00:00",
+                       "body": f"x {ATTEMPT_MARKER} run=7 -->"}]
+    assert count_attempts_since(offset_receipt, "sparq[bot]", "2026-07-23T09:00:00Z") == 0
+    tie_receipt = [{"user": {"login": "sparq[bot]"},
+                    "created_at": "2026-07-23T09:00:00+00:00",
+                    "body": f"x {ATTEMPT_MARKER} run=8 -->"}]
+    assert count_attempts_since(tie_receipt, "sparq[bot]", "2026-07-23T09:00:00Z") == 1
+    naive_receipt = [{"user": {"login": "sparq[bot]"}, "created_at": "2026-07-20T00:00:00",
+                      "body": f"x {ATTEMPT_MARKER} run=9 -->"}]
+    ts_logs = []
+    assert count_attempts_since(naive_receipt, "sparq[bot]", "2026-07-23T09:00:00Z",
+                                log=ts_logs.append) == 1  # naive = unorderable = charged
+    assert any("malformed created_at" in line and "CHARGED" in line for line in ts_logs)
+    ts_logs = []
+    assert count_attempts_since(stamped, "sparq[bot]", "not-a-timestamp",
+                                log=ts_logs.append) == 2  # unparseable cutoff => full count
+    assert any("not a parseable timestamp" in line and "FULL historical count" in line
+               for line in ts_logs)
+    # ---- [registry #596] a CREDENTIAL-OUTAGE attempt is NOT charged to the retry budget ---------
+    # The attempt receipt is posted BEFORE the model launches, so a launch that died on acct01's
+    # hourly-expiring codex access token (`worker-live: model-exit-class=auth`) used to burn a full
+    # attempt and walk the issue to status:parked as if the model had declined the task.
+    bot = "sparq[bot]"
+    voided_pair = [
+        {"user": {"login": bot}, "body": f"x {ATTEMPT_MARKER} run=1 -->"},
+        {"user": {"login": bot}, "body": f"x {ATTEMPT_MARKER} run=2 -->"},
+        {"user": {"login": bot}, "body": f"y {ATTEMPT_VOID_MARKER} run=2 -->"},
+    ]
+    assert attempt_voids(voided_pair, bot) == {"2"}
+    assert count_attempts(voided_pair, bot) == 1        # run=2 subtracted
+    assert count_attempts_since(voided_pair, bot, None) == 1
+    # A void only cancels its EXACT run key, and only a BOT-authored one counts.
+    assert count_attempts(voided_pair + [
+        {"user": {"login": bot}, "body": f"y {ATTEMPT_VOID_MARKER} run=99 -->"}], bot) == 1
+    assert count_attempts([
+        {"user": {"login": bot}, "body": f"x {ATTEMPT_MARKER} run=1 -->"},
+        {"user": {"login": "mallory"}, "body": f"y {ATTEMPT_VOID_MARKER} run=1 -->"}], bot) == 1
+    # Void subtraction also applies inside the readmission window (global, like worker-pr).
+    windowed_void = [
+        {"user": {"login": bot}, "created_at": "2026-07-23T10:00:00Z",
+         "body": f"x {ATTEMPT_MARKER} run=w1 -->"},
+        {"user": {"login": bot}, "created_at": "2026-07-23T10:05:00Z",
+         "body": f"y {ATTEMPT_VOID_MARKER} run=w1 -->"},
+    ]
+    assert count_attempts_since(windowed_void, bot, "2026-07-23T09:00:00Z") == 0
+
+    def simulate_attempts(exit_classes, max_attempts=3):
+        """Replay one worker run per exit class on ONE issue through the REAL control path:
+        record_attempt (pre-model, the last budget gate) then void_attempt_on_outage (post-model,
+        class-gated). Returns (charged_attempts, voided_outputs, posted_bodies)."""
+        store, outputs, posted = [], [], []
+        saved = (globals()["_paginated"], globals()["_gh_json"], globals()["_write_outputs"],
+                 globals()["_readmission_cutoff"])
+        globals()["_paginated"] = lambda repo, issue, resource: list(store)
+        globals()["_readmission_cutoff"] = lambda repo, issue: None
+
+        def fake_gh_json(args, input_doc=None):
+            body = (input_doc or {}).get("body", "")
+            posted.append(body)
+            store.append({"user": {"login": bot}, "body": body})
+            return {}
+
+        globals()["_gh_json"] = fake_gh_json
+        globals()["_write_outputs"] = lambda values: (
+            outputs.append(values["voided"]) if "voided" in values else None)
+        try:
+            for index, cls in enumerate(exit_classes, start=1):
+                run_key = f"{7000 + index}.1"
+                record_attempt("o/r", 5, max_attempts, bot, run_key)
+                void_attempt_on_outage("o/r", 5, bot, run_key, cls)
+        finally:
+            (globals()["_paginated"], globals()["_gh_json"], globals()["_write_outputs"],
+             globals()["_readmission_cutoff"]) = saved
+        return count_attempts(list(store), bot), outputs, posted
+
+    charged, outs, bodies = simulate_attempts(["auth"])
+    assert charged == 0, charged                       # the outage attempt is not charged
+    assert outs == ["true"], outs
+    assert any("exit-class=auth" in b and "registry #596" in b for b in bodies), bodies
+    # A genuine no-change/failed-but-ran attempt STILL charges — the budget/park ladder is intact.
+    assert simulate_attempts(["no_change"])[0] == 1
+    assert simulate_attempts(["success"])[0] == 1
+    # DOCUMENTED #596 DECISION: rate-limit is non-chargeable, exactly like auth.
+    assert simulate_attempts(["rate-limit"])[0] == 0
+    # #614's HOST-SIDE credential pre-flight classes. This is the task-side half of the #604/#614
+    # allow-list gap the retro-review found: `void-attempt` reads the RAW class, and model-health's
+    # fold onto auth/transient happens LATER in the model_health job — so until the drift lock in
+    # worker-pr.CREDENTIAL_OUTAGE_EXIT_CLASSES these CHARGED an attempt (and, on a final attempt,
+    # parked the issue) for a failure that happened before the model container existed.
+    for preflight_class in ("credential-remint-required", "credential-refresh-transient"):
+        pf_charged, pf_outs, pf_bodies = simulate_attempts([preflight_class])
+        assert pf_charged == 0, (preflight_class, pf_charged)
+        assert pf_outs == ["true"], (preflight_class, pf_outs)
+        assert any(f"exit-class={preflight_class}" in b for b in pf_bodies), pf_bodies
+    # The budget consequence, end to end: three host-side pre-flight failures against
+    # max_attempts=3 leave the attempt budget UNSPENT instead of exhausting it.
+    assert simulate_attempts(["credential-remint-required"] * 3)[0] == 0
+    assert simulate_attempts(["credential-refresh-transient"] * 3)[0] == 0
+    # ...but an UNATTRIBUTABLE failure still charges, so the bounded-crash accounting survives.
+    assert simulate_attempts(["unknown"])[0] == 1
+    assert simulate_attempts(["setup"])[0] == 1
+    # The live mixed window: two credential outages around one real attempt charge EXACTLY one.
+    mixed_charged, mixed_outs, _ = simulate_attempts(["auth", "no_change", "auth"])
+    assert mixed_charged == 1, mixed_charged
+    assert mixed_outs == ["true", "false", "true"], mixed_outs
+    # Budget consequence: three auth-class runs against max_attempts=3 leave the budget UNSPENT,
+    # where charging them exhausted it and parked the issue.
+    assert simulate_attempts(["auth", "auth", "auth"])[0] == 0
+    assert simulate_attempts(["no_change", "no_change", "no_change"])[0] == 3
+    # Idempotent: voiding the same run twice posts ONE void comment (not one per re-run).
+    once_store, once_posted = [], []
+    saved_pag, saved_json, saved_out = (globals()["_paginated"], globals()["_gh_json"],
+                                        globals()["_write_outputs"])
+    try:
+        globals()["_paginated"] = lambda repo, issue, resource: list(once_store)
+        globals()["_write_outputs"] = lambda values: None
+
+        def once_gh_json(args, input_doc=None):
+            body = (input_doc or {}).get("body", "")
+            once_posted.append(body)
+            once_store.append({"user": {"login": bot}, "body": body})
+            return {}
+
+        globals()["_gh_json"] = once_gh_json
+        assert void_attempt_on_outage("o/r", 5, bot, "8001.1", "auth") is True
+        assert void_attempt_on_outage("o/r", 5, bot, "8001.1", "auth") is True
+        assert len(once_posted) == 1, once_posted
+        assert void_attempt_on_outage("o/r", 5, bot, "8002.1", "unknown") is False
+        assert len(once_posted) == 1, once_posted   # a non-outage class posts nothing at all
+    finally:
+        (globals()["_paginated"], globals()["_gh_json"],
+         globals()["_write_outputs"]) = saved_pag, saved_json, saved_out
+
     assert body_sha("task") == hashlib.sha256(b"task").hexdigest()
     assert set(LABEL_COLOURS) == {"status:in-progress", "status:in-progress-review",
-                                  "status:deferred", "status:ready", "needs:user"}
+                                  "status:deferred", "status:parked", "status:ready",
+                                  "needs:user"}
     assert "status:in-progress-review" in BUSY_OR_GATED
+    # The machine park gates worker admission exactly like every other busy status: reverify
+    # fails closed on a parked issue, so no NEW implementation dispatch survives a park.
+    assert "status:parked" in BUSY_OR_GATED
 
     # Maintainer-approval evidence for the reverify third-party retry (issue #31).
     maintainers = lambda login: login == "jeswr"  # noqa: E731 — trivial trusted-set stub
@@ -453,6 +947,36 @@ def _self_test():
     after_both = {**human_after, "created_at": "2026-07-13T00:00:00Z"}
     assert find_maintainer_approval([failure, human_after, failure2], "sparq[bot]", maintainers) is None
     assert find_maintainer_approval([failure2, human_after, failure], "sparq[bot]", maintainers) is None
+
+    # (ix) Round-5 finding 2: staleness ordering is over PARSED instants, never raw strings.
+    # A space-separator approval stamp AFTER the failure by instant sorts lexicographically
+    # BEFORE the failure's 'T'-form stamp — it must still approve.
+    space_approval = {**human_after, "created_at": "2026-07-10 12:00:00Z"}
+    assert find_maintainer_approval(
+        [failure, space_approval], "sparq[bot]", maintainers) is space_approval
+    # A space-separator RECEIPT stamp sorts before a 'T'-form approval of an EARLIER instant:
+    # the old string compare accepted that PRE-failure approval (blessing a run the
+    # maintainer never saw fail); the instant compare rejects it as stale.
+    space_failure = {**failure, "created_at": "2026-07-11 08:00:00Z"}
+    pre_failure_approval = {**human_after, "created_at": "2026-07-11T07:00:00Z"}
+    assert find_maintainer_approval(
+        [space_failure, pre_failure_approval], "sparq[bot]", maintainers) is None
+    # A +00:00 approval tying the Z-spelled receipt INSTANT is stale (strict at-or-before,
+    # across spellings).
+    offset_tie = {**human_after, "created_at": "2026-07-10T00:00:00+00:00"}
+    assert find_maintainer_approval([failure, offset_tie], "sparq[bot]", maintainers) is None
+    # An attempt receipt with an unparseable stamp makes "strictly after the last failure"
+    # unprovable for every candidate: the retry fails closed, loudly.
+    approval_logs = []
+    bad_failure = {**failure, "created_at": "not-a-timestamp"}
+    assert find_maintainer_approval([bad_failure, human_after], "sparq[bot]", maintainers,
+                                    log=approval_logs.append) is None
+    assert any("unparseable created_at" in line and "fails closed" in line
+               for line in approval_logs)
+    # An approval with an unparseable (or naive) stamp can never prove it postdates the
+    # failure — that comment never approves.
+    bad_approval = {**human_after, "created_at": "2026-07-11T00:00:00"}
+    assert find_maintainer_approval([failure, bad_approval], "sparq[bot]", maintainers) is None
     assert find_maintainer_approval(
         [failure, human_after, failure2, after_both], "sparq[bot]", maintainers) is after_both
 
@@ -495,6 +1019,258 @@ def _self_test():
             assert json.loads(issue_file.read_text(encoding="utf-8")) == item
         finally:
             globals().update(saved)
+
+    # (x) set_status park transitions (park-policy defects 1+2): real set_status wiring with the
+    # GitHub seams patched; the recorded label POSTs/DELETEs prove which park label lands and
+    # that the sticky human-unpark veto suppresses the whole mutation.
+    import contextlib
+    import io
+
+    class _Result:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    posts, deletes, timeline = [], [], []
+
+    def fake_run_gh(args, *, input_text=None, check=True):
+        if args[1] == "-X" and args[2] == "DELETE":
+            deletes.append(args[3])
+        result = _Result()
+        if "/collaborators/" in str(args[1]):
+            # The strict maintainer probe (_is_human_maintainer): jeswr is a repo admin,
+            # everyone else is not — the park veto only honours PROVEN humans.
+            result.stdout = "admin" if "/collaborators/jeswr/" in args[1] else "none"
+        return result
+
+    def fake_gh_json(args, *, input_doc=None):
+        if input_doc is not None and "labels" in input_doc:
+            posts.append(input_doc["labels"])
+        return {}
+
+    def fake_paginated(repo, issue, resource):
+        assert resource == "timeline"
+        return list(timeline)
+
+    park_seams = {"_run_gh": fake_run_gh, "_gh_json": fake_gh_json, "_paginated": fake_paginated}
+    saved = {name: globals()[name] for name in park_seams}
+    globals().update(park_seams)
+    try:
+        def park_event(kind, label, ts, login):
+            return {"event": kind, "label": {"name": label},
+                    "created_at": ts, "actor": {"login": login}}
+
+        # (x-i) a CAPACITY park writes status:parked (+ status:deferred) — NEVER needs:user.
+        set_status("o/r", 9, "parked")
+        assert posts == [["status:deferred", "status:parked"]], posts
+        assert all("needs:user" not in labels for labels in posts), posts
+        assert any(path.endswith("labels/status:ready") for path in deletes), deletes
+        # (x-ii) sticky human unpark: bot labeled < human unlabeled => the veto suppresses the
+        # ENTIRE park transition (no add, no remove) and says so loudly.
+        posts.clear(); deletes.clear()
+        timeline[:] = [
+            park_event("labeled", "status:parked", "2026-07-18T10:00:00Z", "sparq[bot]"),
+            park_event("unlabeled", "status:parked", "2026-07-18T11:00:00Z", "jeswr"),
+        ]
+        vetoed_out = io.StringIO()
+        with contextlib.redirect_stdout(vetoed_out):
+            set_status("o/r", 9, "parked")
+        assert posts == [] and deletes == [], (posts, deletes)
+        assert "park suppressed" in vetoed_out.getvalue(), vetoed_out.getvalue()
+        # (x-iii) human unlabeled < bot labeled (a NEWER application supersedes) => no veto, the
+        # park proceeds.
+        timeline.append(
+            park_event("labeled", "status:parked", "2026-07-18T12:00:00Z", "sparq[bot]"))
+        set_status("o/r", 9, "parked")
+        assert posts == [["status:deferred", "status:parked"]], posts
+        # (x-iv) a timeline read failure NEVER parks (fail open only toward NOT parking) and is
+        # logged loudly.
+        posts.clear(); deletes.clear()
+
+        def broken_paginated(repo, issue, resource):
+            raise WorkerIssueError("timeline unavailable")
+
+        globals()["_paginated"] = broken_paginated
+        broken_out = io.StringIO()
+        with contextlib.redirect_stdout(broken_out):
+            set_status("o/r", 9, "needs-user")
+        assert posts == [] and deletes == [], (posts, deletes)
+        assert "timeline read failed" in broken_out.getvalue(), broken_out.getvalue()
+        globals()["_paginated"] = fake_paginated
+        # (x-v) the human-question park still lands when no veto exists, and it SUPERSEDES a
+        # machine park (status:parked is removed alongside the busy statuses).
+        timeline.clear()
+        set_status("o/r", 9, "needs-user")
+        assert posts == [["needs:user", "status:deferred"]], posts
+        assert any(path.endswith("labels/status:parked") for path in deletes), deletes
+        # (x-vi) readmission: the deferred-retry `retry` flip clears the machine park.
+        posts.clear(); deletes.clear()
+        set_status("o/r", 9, "retry")
+        assert posts == [["status:ready"]], posts
+        assert any(path.endswith("labels/status:parked") for path in deletes), deletes
+        assert any(path.endswith("labels/status:deferred") for path in deletes), deletes
+        # (x-vi-b) [registry #614] `readmitted`: the source-issue half of re-admitting a MACHINE
+        # capacity park on a PR-BACKED issue. It clears status:parked/status:deferred and restores
+        # in-progress-review — NOT status:ready, which would put the issue back in the
+        # IMPLEMENTATION-dispatch lane while its worker PR is open. It applies no park label, so
+        # a standing human unlabel cannot suppress it (clearing a park points the same way).
+        posts.clear(); deletes.clear()
+        timeline[:] = [
+            park_event("labeled", "status:parked", "2026-07-25T02:19:49Z", "sparq[bot]"),
+            park_event("unlabeled", "status:parked", "2026-07-25T05:00:00Z", "jeswr"),
+        ]
+        set_status("o/r", 9, "readmitted")
+        assert posts == [["status:in-progress-review"]], posts
+        assert any(path.endswith("labels/status:parked") for path in deletes), deletes
+        assert any(path.endswith("labels/status:deferred") for path in deletes), deletes
+        assert all("status:ready" not in labels for labels in posts), posts
+        # (x-vii) STRICT human probe (park-policy hygiene finding): an unlabel by an actor the
+        # collaborator probe cannot confirm as a maintainer mints NO veto — the park proceeds.
+        posts.clear(); deletes.clear()
+        timeline[:] = [
+            park_event("labeled", "status:parked", "2026-07-18T10:00:00Z", "sparq[bot]"),
+            park_event("unlabeled", "status:parked", "2026-07-18T11:00:00Z", "drive-by"),
+        ]
+        set_status("o/r", 9, "parked")
+        assert posts == [["status:deferred", "status:parked"]], posts
+    finally:
+        globals().update(saved)
+
+    # (xi) malformed timeline PAGE (finding E): a non-list page could hold the newest human
+    # unlabel, so _paginated must RAISE — the veto then suppresses the park (its documented
+    # fail direction) instead of parking over an invisible human unpark.
+    good_page = [{"event": "unlabeled", "label": {"name": "status:parked"},
+                  "created_at": "2026-07-23T09:00:00Z", "actor": {"login": "jeswr"}}]
+
+    def malformed_page_gh_json(args, *, input_doc=None):
+        return [good_page, "not-a-list-page"]
+
+    saved_json = globals()["_gh_json"]
+    globals()["_gh_json"] = malformed_page_gh_json
+    try:
+        try:
+            _paginated("o/r", 9, "timeline")
+            raise AssertionError("malformed timeline page did not raise")
+        except WorkerIssueError as exc:
+            assert "malformed timeline page" in str(exc), exc
+        # Round-4 finding 4: ENTRY validation — [[null]] passed the page-only check and
+        # crashed the first consumer (None.get()) mid-decision. A non-dict entry raises for
+        # every resource; a comment entry additionally needs the user/body/created_at shape.
+        globals()["_gh_json"] = lambda args, *, input_doc=None: [[None]]
+        for resource in ("timeline", "comments"):
+            try:
+                _paginated("o/r", 9, resource)
+                raise AssertionError(f"[[null]] {resource} entry did not raise")
+            except WorkerIssueError as exc:
+                assert f"malformed {resource} entry" in str(exc), exc
+        good_comment = {"user": {"login": "sparq[bot]"}, "body": "x",
+                        "created_at": "2026-07-23T09:00:00Z"}
+        for bad in ({**good_comment, "user": None}, {**good_comment, "body": None},
+                    {**good_comment, "created_at": None}):
+            globals()["_gh_json"] = lambda args, *, input_doc=None: [[good_comment, bad]]
+            try:
+                _paginated("o/r", 9, "comments")
+                raise AssertionError(f"malformed comment entry did not raise ({bad!r})")
+            except WorkerIssueError as exc:
+                assert "malformed comments entry" in str(exc), exc
+        globals()["_gh_json"] = lambda args, *, input_doc=None: [[good_comment]]
+        assert _paginated("o/r", 9, "comments") == [good_comment]
+    finally:
+        globals()["_gh_json"] = saved_json
+
+    # (xii) round-4 finding 1 (windowed-vs-lifetime split brain), the FULL sequence: CLAIM
+    # grants a readmission on the windowed count -> the WORKER-side budget check must derive
+    # the SAME cutoff (park_policy.readmission_cutoff over the live timeline, strict
+    # maintainer probe) and charge the windowed count -> the model actually runs (attempt
+    # recording succeeds instead of "exhausted before model launch"). Real attempt_check/
+    # record_attempt wiring with only the GitHub seams patched.
+    seq_state = {"comments": [], "timeline": []}
+    seq_posts = []
+
+    class _SeqResult:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def seq_run_gh(args, *, input_text=None, check=True):
+        result = _SeqResult()
+        if "/collaborators/" in str(args[1]):
+            result.stdout = "admin" if "/collaborators/jeswr/" in args[1] else "none"
+        return result
+
+    def seq_gh_json(args, *, input_doc=None):
+        if input_doc is not None and "body" in input_doc:
+            seq_posts.append(input_doc["body"])
+        return {}
+
+    def seq_paginated(repo, issue, resource):
+        return list(seq_state[resource if resource in seq_state else "comments"])
+
+    seq_seams = {"_run_gh": seq_run_gh, "_gh_json": seq_gh_json, "_paginated": seq_paginated}
+    saved_seq = {name: globals()[name] for name in seq_seams}
+    saved_output = os.environ.get("GITHUB_OUTPUT")
+    globals().update(seq_seams)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            def budget_outputs():
+                output_file = Path(tmp) / "outputs.txt"
+                output_file.write_text("", encoding="utf-8")
+                os.environ["GITHUB_OUTPUT"] = str(output_file)
+                attempt_check("o/r", 9, 2, "sparq[bot]")
+                return dict(line.split("=", 1) for line in
+                            output_file.read_text(encoding="utf-8").splitlines())
+
+            receipt = {"user": {"login": "sparq[bot]"}, "created_at": "2026-07-20T00:00:00Z",
+                       "body": f"x {ATTEMPT_MARKER} run=1 -->"}
+            receipt2 = {**receipt, "created_at": "2026-07-21T00:00:00Z",
+                        "body": f"x {ATTEMPT_MARKER} run=2 -->"}
+            seq_state["comments"] = [receipt, receipt2]  # lifetime budget of 2 is spent
+            park_applied = {"event": "labeled", "label": {"name": "status:parked"},
+                            "created_at": "2026-07-21T12:00:00Z",
+                            "actor": {"login": "sparq-orchestrator[bot]"}}
+            human_readmit = {"event": "unlabeled", "label": {"name": "status:parked"},
+                             "created_at": "2026-07-22T09:00:00Z",
+                             "actor": {"login": "jeswr"}}
+            # (xii-a) NO gesture: the lifetime count stands — exhausted, and the recorder
+            # refuses the launch (the pre-fix behaviour below the budget line is unchanged).
+            seq_state["timeline"] = [park_applied]
+            assert budget_outputs() == {"used": "2", "exhausted": "true"}
+            try:
+                record_attempt("o/r", 9, 2, "sparq[bot]", "77.1")
+                raise AssertionError("exhausted recorder did not refuse the launch")
+            except WorkerIssueError as exc:
+                assert "exhausted before model launch" in str(exc), exc
+            assert seq_posts == []
+            # (xii-b) THE SEQUENCE: a proven-human unlabel (the same gesture CLAIM granted
+            # the readmission on) => the worker-side count is WINDOWED (both receipts predate
+            # the cutoff) => attempt-check admits the run and the recorder posts the attempt
+            # receipt — the model actually runs instead of the no-op relaunch loop.
+            seq_state["timeline"] = [park_applied, human_readmit]
+            assert budget_outputs() == {"used": "0", "exhausted": "false"}
+            record_attempt("o/r", 9, 2, "sparq[bot]", "77.1")
+            assert len(seq_posts) == 1 and f"{ATTEMPT_MARKER} run=77.1 -->" in seq_posts[0]
+            assert "attempt 1/2" in seq_posts[0]  # numbering restarts inside the window
+            # (xii-c) an UNVERIFIABLE gesture (bot unlabel) opens no window: still exhausted.
+            bot_unlabel = {**human_readmit, "actor": {"login": "sparq-orchestrator[bot]"}}
+            seq_state["timeline"] = [park_applied, bot_unlabel]
+            seq_posts.clear()
+            assert budget_outputs() == {"used": "2", "exhausted": "true"}
+            # (xii-d) an UNREADABLE timeline keeps the FULL count (fail toward exhaustion —
+            # CLAIM freezes its ladder on the same view; no fresh budget on unproven data).
+            def raising_paginated(repo, issue, resource):
+                if resource == "timeline":
+                    raise WorkerIssueError("timeline unavailable")
+                return list(seq_state["comments"])
+
+            globals()["_paginated"] = raising_paginated
+            assert budget_outputs() == {"used": "2", "exhausted": "true"}
+            globals()["_paginated"] = seq_paginated
+    finally:
+        globals().update(saved_seq)
+        if saved_output is None:
+            os.environ.pop("GITHUB_OUTPUT", None)
+        else:
+            os.environ["GITHUB_OUTPUT"] = saved_output
     print("worker-issue self-test PASSED")
 
 
@@ -514,6 +1290,16 @@ def main():
     record.add_argument("--bot-login", required=True)
     record.add_argument("--run-key", required=True)
 
+    # [registry #596] Un-charge this run's attempt when the launch died on the account credential.
+    # The class gate lives in worker-pr.is_credential_outage (pure + self-tested), NOT in a workflow
+    # `if:` expression, so the non-chargeable rule is testable and shared with the review path.
+    avoid = subparsers.add_parser("void-attempt", parents=[common])
+    avoid.add_argument("--bot-login", required=True)
+    avoid.add_argument("--run-key", required=True)
+    avoid.add_argument("--exit-class", required=True,
+                       help="worker-live.sh exit class for THIS run; only a credential-outage "
+                            "class voids the attempt (every other value is a no-op)")
+
     trust = subparsers.add_parser("reverify", parents=[common])
     trust.add_argument("--expected-author", required=True)
     trust.add_argument("--expected-body-sha", required=True)
@@ -523,7 +1309,8 @@ def main():
 
     status = subparsers.add_parser("status", parents=[common])
     status.add_argument("--status", choices=("in-progress", "in-progress-review", "retry",
-                                             "deferred", "needs-user", "complete"),
+                                             "deferred", "needs-user", "parked", "readmitted",
+                                             "complete"),
                         required=True)
 
     receipt = subparsers.add_parser("claim-receipt", parents=[common])
@@ -546,6 +1333,9 @@ def main():
             attempt_check(args.repo, args.issue, args.max_attempts, args.bot_login)
         elif args.command == "record-attempt":
             record_attempt(args.repo, args.issue, args.max_attempts, args.bot_login, args.run_key)
+        elif args.command == "void-attempt":
+            void_attempt_on_outage(args.repo, args.issue, args.bot_login, args.run_key,
+                                   args.exit_class)
         elif args.command == "reverify":
             reverify(args.repo, args.issue, args.expected_author, args.expected_body_sha,
                      args.trust_gate, args.bot_login, args.issue_file)

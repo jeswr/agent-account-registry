@@ -35,6 +35,10 @@ jobs:
     if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # SECRET-EXFIL GUARD (issue #101): reads PROVENANCE_SALT, which lives in the `dispatch-secrets`
+    # environment (deployment-branch policy: default branch only) — full rationale on the `claim`
+    # job in dispatch.yml. Complements (does not replace) the in-file ref guard above.
+    environment: dispatch-secrets
     permissions:
       contents: write   # ledger-branch record PUTs via github.token
       actions: read     # worker run-log reads (the identity source)

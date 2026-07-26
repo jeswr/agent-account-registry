@@ -1,4 +1,4 @@
-# [OPUS-4.8] Registry self-management: issue triage + untrusted-input quarantine for
+# Registry self-management: issue triage + untrusted-input quarantine for
 # jeswr/agent-account-registry. Mirrors the sparq target's .github/workflows/triage-issue.yml
 # trust-gate pattern: on a new/edited issue, trust-gate by the AUTHOR's repo permission with an
 # EXACT-MATCH trust for jeswr (the maintainer) and for the registry orchestrator App bot login; a
@@ -57,21 +57,39 @@ jobs:
             *) echo "trusted=0" >> "$GITHUB_OUTPUT" ;;
           esac
 
+      # PR #595 finding 5: the QUARANTINE labels are a TRUST BOUNDARY, so their write is fail-loud.
+      # It used to carry `|| true`: a failed edit left third-party content with NO trust:untrusted
+      # and NO status:untriaged while the job reported success — silently un-quarantined, and
+      # invisible to retriage (which only revisits status:untriaged). The edit now fails the step
+      # (`set -e`, no `|| true`) and a post-read PROVES both labels landed before the step goes
+      # green. Only the courtesy NOTIFICATION stays best-effort — it is not a state transition, and
+      # it emits a ::warning rather than vanishing. scripts/triage.py --self-test statically
+      # asserts this shape so the `|| true` cannot come back on the label write.
       - name: Quarantine + notify (untrusted author)
         if: steps.trust.outputs.trusted != '1'
         run: |
-          set -uo pipefail
-          gh issue edit "$NUM" -R "$REPO" --add-label trust:untrusted --add-label status:untriaged || true
+          set -euo pipefail
+          gh issue edit "$NUM" -R "$REPO" --add-label trust:untrusted --add-label status:untriaged
+          post=$(python3 scripts/gh_retry.py read issue view "$NUM" -R "$REPO" --json labels \
+            --jq '[.labels[].name]|join(",")')
+          for required in trust:untrusted status:untriaged; do
+            case ",$post," in
+              *",$required,"*) : ;;
+              *) echo "::error title=quarantine #$NUM::$required did NOT land (labels now: $post) — refusing to report success on an un-quarantined third-party issue"; exit 1 ;;
+            esac
+          done
           gh issue comment "$NUM" -R "$REPO" \
-            --body "> 🤖 SPARQ agent — this issue is from a non-collaborator, so it is **quarantined** (\`trust:untrusted\`) and its content is not acted on. A maintainer can approve it by adding a 👍 reaction." || true
+            --body "> 🤖 SPARQ agent — this issue is from a non-collaborator, so it is **quarantined** (\`trust:untrusted\`) and its content is not acted on. A maintainer can approve it by adding a 👍 reaction." \
+            || echo "::warning title=quarantine #$NUM::the quarantine notice comment failed to post; the quarantine LABELS are verified in place, so the issue is not acted on"
 
+      # `--apply` owns the whole read -> plan -> mutate sequence FAIL-CLOSED (registry #582).
+      # It replaces the previous per-label `gh issue edit ... || true` loops, which applied the
+      # role ADD and the role STRIP independently and swallowed both failures: the add of the
+      # non-existent `role:soundness` failed, the strip of `role:impl` succeeded, and the issue
+      # landed `status:ready` with NO role — silently undispatchable and unrecoverable. The applier
+      # now adds + VERIFIES the replacement role label before stripping anything, and re-reads the
+      # issue afterwards to assert exactly one `role:*` survives. NO `|| true`: an invariant or
+      # post-condition failure must turn this step RED, not strand an issue quietly.
       - name: Static triage (trusted author)
         if: steps.trust.outputs.trusted == '1'
-        run: |
-          set -euo pipefail
-          labels=$(gh issue view "$NUM" -R "$REPO" --json labels --jq '[.labels[].name]|join(",")')
-          out=$(python3 scripts/triage.py --labels "$labels" --type task)
-          add=$(printf '%s\n' "$out" | sed -n 's/^ADD: //p')
-          rem=$(printf '%s\n' "$out" | sed -n 's/^REMOVE: //p')
-          for l in $add; do gh issue edit "$NUM" -R "$REPO" --add-label "$l" || true; done
-          for l in $rem; do gh issue edit "$NUM" -R "$REPO" --remove-label "$l" || true; done
+        run: python3 scripts/triage.py --apply --repo "$REPO" --number "$NUM" --type task
