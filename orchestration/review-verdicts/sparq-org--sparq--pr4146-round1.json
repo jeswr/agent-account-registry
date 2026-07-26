@@ -1,0 +1,44 @@
+{
+ "host_envelope": {
+  "pr": 4146,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d9ca55efa47e627c9d8f054a330c7265d3724221",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The comment claims \"A completed request alone is not a sufficient startup barrier: the connection can still be truncated while reading its body.\" The old barrier (`Ok(_) => { ready = true; break; }`) never read a body, so it could not have failed that way. Under HTTP/1.1, `send()` resolves only after status+headers are parsed, which already implies the server accept loop and router are live (in the --http3 path `sparq_server::serve` is only reached after `bind_http3_endpoint` succeeds, main.rs:1134-1186; a pre-serve connection sitting in the kernel backlog yields EOF, i.e. an `Err`, which the old loop already retried). The requests that DO read a body with `?` are `h1_request` (http3.rs:160-168, driven from the case loop at http3.rs:319) and the websocket/h3 steps -- all after the barrier and none retried. So the diff adds ~50-75ms and two probes without addressing the described failure mode: if the flake was a truncated body it can still occur, now at line 168 with a bare error rather than the barrier's diagnostic path.",
+    "file": "crates/sparq-server/tests/http3.rs",
+    "fix_hint": "Either (a) fix it where it manifests -- wrap the body-reading requests in a small bounded retry helper (or fail with the server-stderr diagnostic used by the barrier), or (b) if the intent really is a stronger barrier, gate on the condition the test then asserts: loop until a probe returns a success status AND carries the expected `alt-svc: h3=\":<port>\"` header, which is only layered once the QUIC endpoint is bound (main.rs:1139-1141). Then correct the comment to state what the barrier actually proves. If the underlying flake is instead reqwest reusing a server-closed pooled connection, the honest fix is a fresh client / `Connection: close` on the asserted requests, not a consecutive-probe count.",
+    "severity": "major",
+    "title": "Barrier hardened at a call site that cannot exhibit the described truncation; the real body-read sites stay unprotected"
+   },
+   {
+    "body": "`Ok(response) => if response.bytes().await.is_ok()` counts a 404 or 503 as ready; only transport-level failure resets the counter. Two lines later the test hard-asserts `health.version() == HTTP_11` and that `alt-svc` equals `h3=\":{udp_port}\"; ma=86400` (http3.rs:258-268). Since the alt-svc layer is installed from the successfully bound QUIC endpoint, its presence is the exact, deterministic readiness signal available here, and the status check is free. Pre-existing behaviour, but this diff is the one touching the predicate and had the chance to make it meaningful rather than counting successes.",
+    "file": "crates/sparq-server/tests/http3.rs",
+    "fix_hint": "Require `response.status().is_success()` and `response.headers().contains_key(\"alt-svc\")` before incrementing, then reuse that final response for the h1 assertions instead of issuing a fresh `/health` GET at http3.rs:258.",
+    "severity": "minor",
+    "title": "Readiness probe accepts any HTTP status and ignores alt-svc, the precondition asserted immediately after"
+   },
+   {
+    "body": "reqwest pools connections by default, so all three probes most likely traverse the same keep-alive connection back-to-back; three reads on one connection say little more than one did, which is why the count reads as a delay rather than a check. Separately, the `Err(_) => consecutive_ready = 0` arm discards the error, so the failure path still reports only \"server did not become ready: {stderr}\" -- on a real regression the reviewer loses whether probes were refused, timed out, or truncated, which is precisely the signal needed to diagnose this class of flake.",
+    "file": "crates/sparq-server/tests/http3.rs",
+    "fix_hint": "Capture the last probe failure (`let mut last_err = None;` set in the `Err` arm and on the `bytes()` failure branch) and include it in the returned error message alongside the server stderr. If consecutive independent connections are genuinely wanted, build the probe client with `.pool_max_idle_per_host(0)`.",
+    "severity": "minor",
+    "title": "Pooled keep-alive connection weakens \"3 consecutive\"; probe error still dropped from the failure diagnostic"
+   },
+   {
+    "body": "The 25ms sleep now runs after every iteration rather than only after a failure. Combined with the 3-success requirement this adds a floor of ~50ms plus two extra round trips to every run of this test, and the worst case before the hard failure grows to ~2.5s plus request time. Negligible in isolation, but it is the whole observable effect of the diff, which supports treating it as a timing band-aid.",
+    "file": "crates/sparq-server/tests/http3.rs",
+    "fix_hint": "Keep the sleep on the retry path only (or make it conditional on not having just succeeded) once the barrier gates on a real condition rather than a repeat count.",
+    "severity": "nit",
+    "title": "Sleep moved outside the match adds unconditional latency on the happy path"
+   }
+  ],
+  "progress": null,
+  "summary": "Test-only change to the startup readiness barrier in the h3/h1 parity test. The new loop is internally correct (bounded at 100 iterations, `break` before the sleep so no extra delay on success, and the post-loop guard `consecutive_ready < 3` is consistent with the only way the loop can exit early). But the rationale in the added comment does not hold for the code it changes, and the change therefore does not plausibly fix the flake it claims to: under HTTP/1.1 `reqwest::RequestBuilder::send()` already resolves only after the server has written status+headers, so the OLD barrier (`Ok(_) => break`) already proved the router was serving. The old barrier could not fail on a truncated body, because it never read one. The truncation the comment describes surfaces at `h1_request`'s `let body = response.bytes().await?;` (http3.rs:168, reached from the case loop at http3.rs:319) and in the websocket/h3 steps -- all AFTER the barrier and all unprotected. The practical effect of the diff is ~50-75ms of extra delay plus two extra probes, i.e. a sleep in disguise, not a stronger readiness signal. Secondary gaps: the probe still accepts ANY status (a 404/5xx counts as ready), it does not gate on the `alt-svc` header that the immediately-following assertion (http3.rs:260-268) depends on -- and which the server only layers on after the QUIC endpoint binds (main.rs:1134-1141), making it the natural deterministic readiness condition; and reqwest connection pooling means the three \"consecutive\" probes most likely reuse one keep-alive connection, so consecutiveness proves little about steady-state acceptance. The failure diagnostic also still drops the probe error, so a genuine flake reports only \"server did not become ready\" plus server stderr. No product code, soundness, or security surface is touched; no perf claim; no ZK/MPC claim. The concern is completeness and the accuracy of the stated diagnosis, not risk.",
+  "verdict": "request_changes"
+ }
+}
