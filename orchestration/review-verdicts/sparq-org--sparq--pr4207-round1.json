@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4207,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "cd781eed3a6408dbf79812c0f38ae1e4382672b7",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "ConceptUrn::parse passes the entire untrusted NSS body to base58btc_decode before parse_multihash can enforce the supported digest sizes. base58btc_decode performs repeated big-integer multiplication across the growing output for every character and also uses out.insert(0, ...) while extending it, so a very long valid-base58 string consumes quadratic CPU (and unbounded memory). This parser is explicitly intended as a guard on received records before indexing, making remotely supplied URNs part of the expected threat surface. The eventual multihash rejection does not mitigate the work already performed.",
+    "file": "crates/sparq-canon/src/concept.rs",
+    "fix_hint": "Impose a small, documented encoded-length limit before multibase decoding, derived from the largest supported full multihash (SHA-512: code varint + length varint + 64 bytes) and the least dense supported alphabet, or decode with a strict output cap and abort as soon as it is exceeded. Add a regression test that an oversized base58btc NSS is rejected before expensive decoding/allocation.",
+    "severity": "major",
+    "title": "Unbounded base58btc input permits quadratic ingestion-time denial of service"
+   }
+  ],
+  "progress": null,
+  "summary": "The verifier's core recompute-and-compare behavior and known-answer/mutation tests are substantial, but the public parser processes an unbounded attacker-controlled multibase body before the multihash length is validated. In particular, base58btc decoding is quadratic, creating a straightforward CPU and memory denial-of-service at the intended pre-index ingestion boundary.",
+  "verdict": "request_changes"
+ }
+}
