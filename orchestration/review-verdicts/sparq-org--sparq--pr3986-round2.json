@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3986,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "5175e3b42494329e7e5fb59a1f54e2bb9dae5445",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior major finding. The implementation now snapshots each subscribed topic's own read authorization immediately before every mutating tool call and requires that snapshot for Delete delivery, while separately checking the surviving authorization anchor after deletion. This prevents a readable parent from re-granting disclosure after a child-specific ACL revoked access. The new regression test exercises the real path: it subscribes while the child is readable, installs a child-specific write-only ACL while confirming the parent remains readable, deletes the child through SPARQL Update, and asserts that no notification is queued. The documented delivery behavior matches the implementation.",
+  "verdict": "approve"
+ }
+}
