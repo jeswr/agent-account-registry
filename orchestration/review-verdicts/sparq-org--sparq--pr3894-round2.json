@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3894,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "79fdc9cc920881bc02fa1291fc1bfd719f7a030b",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 1's load-bearing test gap is fixed. WINDOW_VECTORS now includes allow rows at both exact inclusive endpoints and an allow row for Alice's unwindowed grant after the window closes, while retaining the no-clock case. The structural tests explicitly require both endpoint clocks and their allow expectations, and require Alice's inside/after/none clock set, so those cases cannot silently disappear or change expectation. The all-pass test exercises the real built store and the existing mutation witness preserves non-vacuity. The optional dependency remains behind the default-off odrl-bridge feature, and the expanded session grouping correctly keys all four session fields. No correctness, soundness, test-validity, or security issue remains in the diff.",
+  "verdict": "approve"
+ }
+}
