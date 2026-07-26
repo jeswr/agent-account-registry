@@ -11643,10 +11643,27 @@ def _starvation_sweep_self_test():
     assert starvation_park_owner(
         [receipt(STARVATION_PARK_CAUSE), ladder_receipt(login="drive-by")],
         parked_labels, bot, True) is True
-    # (g) an UNREADABLE bot comment stamp is no episode boundary at all -> refuse
+    # (g) an UNREADABLE bot comment stamp is no episode boundary at all -> refuse, loudly
+    _stamp_logs = []
     assert starvation_park_owner(
         [receipt(STARVATION_PARK_CAUSE), {"user": {"login": bot}, "body": "x",
                                           "created_at": "not-a-timestamp"}],
+        parked_labels, bot, True, log=_stamp_logs.append) is False
+    assert any("unreadable stamp" in line for line in _stamp_logs), _stamp_logs
+    # (h) ORDER IS BY PARSED INSTANT, never by list position. Two reason receipts delivered out
+    #     of chronological order: the CHRONOLOGICALLY newest (budget) must win, so the park is
+    #     not ours. Reading them in list order would take `partition` as newest and release a
+    #     budget park. This is the fixture that discriminates the sort — every other fixture
+    #     here is already in ascending order, so the sort is a no-op for them.
+    assert starvation_park_owner(
+        [receipt("budget", at="2026-07-26T09:00:00Z"),
+         receipt(STARVATION_PARK_CAUSE, at="2026-07-26T08:00:00Z")],
+        parked_labels, bot, True) is False, \
+        "the newest reason receipt must be chosen by PARSED INSTANT, not by list position"
+    # ...and the same pair in the other list order agrees, which is the point of ordering at all
+    assert starvation_park_owner(
+        [receipt(STARVATION_PARK_CAUSE, at="2026-07-26T08:00:00Z"),
+         receipt("budget", at="2026-07-26T09:00:00Z")],
         parked_labels, bot, True) is False
     # the literal is a READ of worker-pr's own marker — pin it so the two cannot drift
     _wp = _load_module("registry_worker_pr_pin",
