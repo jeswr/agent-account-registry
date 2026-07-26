@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3442,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "8d265665bd142acad14331ecbb794fd6736ce958",
+  "round": 6
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`witness_abox` still inserts all canonical instances into one `Graph` and keeps named-node/literal constants shared. Therefore the stated disjointness and canonical-database argument is invalid: a retained CQ may join a fact from dropped disjunct D's instance with a fact from another disjunct's instance through a shared constant and reproduce D's projected tuple. For example, dropped D `{ ?x :p :c }`, retained E `{ ?x :p :c . :c :q ?z }`, and retained F `{ :c :q ?x }` let E recover D's frozen `?x` using D's `p` fact and F's `q` fact, although D is not contained in E or F. The new tests do not exercise this constant-bridge masking.",
+    "file": "crates/sparq-reason-ql/examples/ql_npd_requiem_bench.rs",
+    "fix_hint": "Evaluate raw and minimised UCQs separately on each original/raw disjunct's own canonical database, or otherwise isolate canonical instances so cross-instance joins through shared constants cannot occur. Add the D/E/F shared-IRI bridge regression and assert that the wrongly dropped D is detected. Revise the disjointness claims in this file and `research/gap-reason-ql-2026-07.md` to describe only the guarantee actually implemented.",
+    "severity": "major",
+    "title": "Unioned canonical instances still mask wrongly dropped disjuncts"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 6 does not address round 5's major soundness finding. `witness_abox` still unions every query/disjunct canonical instance into one graph while preserving named-node and literal constants, yet the code and documentation still infer that frozen terms are disjoint and that any wrongly dropped disjunct must change the result set. Shared constants permit cross-instance joins, so a retained CQ can reconstruct the dropped disjunct's projected witness tuple using facts from multiple canonical instances. The added tests cover variable-only joins, FILTER/VALUES refusal, and DNF Join handling, but not the shared-constant bridge counterexample. Because the benchmark continues to advertise this witness check as an equivalence-before-timing invariant, the gate remains incomplete. Progress is stagnant: the same major issue remains at the same severity.",
+  "verdict": "request_changes"
+ }
+}
