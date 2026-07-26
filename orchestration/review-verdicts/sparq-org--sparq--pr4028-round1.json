@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4028,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "7bf9f1335782dd50cbd2ffe89b52272657e43326",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "bench/parse carries its own [workspace] table, so neither `cargo clippy --workspace` nor the workspace nextest archive ever reaches it (ci.yml:1217 states this explicitly for the sibling bench/dict). That is precisely why bench/parse was left pinned to hdt 0.4 while crates/sparq-hdt moved to 0.7 \u2014 the harness stopped building and nothing failed. This PR fixes the current instance but leaves the detection gap open: the next sparq-hdt dependency bump can re-break the benchmark oracle the same way, and it will again only surface when someone tries to run the harness.\n\nbench/dict already has the pattern for this (ci.yml, 'bench/dict standalone selftest (clippy + invariant checks)'), so the precedent and the cost profile (debug build, warm rust-cache) are established.",
+    "file": "bench/parse/Cargo.toml",
+    "fix_hint": "Add a step alongside the existing bench/dict lane in .github/workflows/ci.yml:\n\n      - name: bench/parse standalone build (dep-drift gate)\n        run: cargo clippy --manifest-path bench/parse/Cargo.toml --locked --all-targets -- -D warnings\n\n`--locked` is the load-bearing flag \u2014 it catches both the manifest/lock drift and the two-versions-of-hdt resolution failure this PR is fixing. If wiring CI is out of scope for a dependency-alignment PR, file it as a bead/self-improvement issue rather than dropping it.",
+    "severity": "minor",
+    "title": "No CI lane compiles bench/parse, so this dependency drift broke silently and can regress again"
+   },
+   {
+    "body": "The PR's stated rationale is to keep the benchmark on the same upstream release as sparq-hdt. bench/parse still pins `bzip2 = \"0.4\"` while crates/sparq-hdt pins `bzip2 = \"0.6\"`, so `cargo build` in bench/parse compiles both (observed: `bzip2 v0.6.1` and `bzip2 v0.4.4` in the same build).\n\nThis is NOT a correctness problem today: bench-hdt-zip only uses bzip2 to author the `.bz2` fixture and then hands raw bytes to `sparq_hdt::load_reader` (main.rs:1105-1126), so no bzip2 type ever crosses the crate boundary \u2014 unlike the `hdt::Hdt` value that did. It is a build-time duplication and a latent divergence between the compressor writing the fixture and the decompressor under test.",
+    "file": "bench/parse/Cargo.toml",
+    "fix_hint": "Bump to `bzip2 = \"0.6\"` in bench/parse/Cargo.toml to match crates/sparq-hdt, re-run `cargo check --locked --all-targets` in bench/parse to refresh the lock, and smoke `bench-hdt-zip` on a generated fixture to confirm the `.bz2` round-trip still decodes. Purely optional for this PR.",
+    "severity": "nit",
+    "title": "bzip2 stays at 0.4 while the crate under test (sparq-hdt) is on 0.6 \u2014 same class of divergence this PR is closing"
+   }
+  ],
+  "progress": null,
+  "summary": "Two-line dependency realignment in the standalone bench/parse harness (own [workspace] table, so zero production/workspace impact) plus the regenerated Cargo.lock. It moves the benchmark's upstream HDT oracle from `hdt 0.4 (sophia)` to `hdt 0.7 (default-features=false, features=[\"nt\"])`, exactly matching crates/sparq-hdt's own dependency + dev-dependency pins.\n\nThis fixes a real break, not a cosmetic bump: sparq-hdt already depends on hdt 0.7, so with bench pinned at 0.4 the graph resolved two semver-incompatible `hdt` crates and `sparq_hdt::graph_from_hdt(&upstream_hdt)` (main.rs:905, :982, :992, :1095) could not type-check; the old lock also contained only hdt 0.4.0, i.e. it was stale against sparq-hdt's manifest. The `nt` feature is what `gen_hdt` needs for `Hdt::read_nt` (main.rs:872), and `Hdt::write`/`Hdt::read` remain available on the lean read path.\n\nVerified empirically at the PR head:\n- `cargo check --all-targets` in bench/parse: clean, single unified `hdt v0.7.3`.\n- `cargo check --locked --all-targets`: clean and the working tree stays clean, so the committed Cargo.lock is consistent with the manifests (no drift, all new entries are registry+crates.io with checksums).\n- Smoke ran the real path: `gen 200` -> `gen-hdt` -> `bench-hdt`. The archive builds via the nt writer and the correctness gate in bench_hdt (main.rs:903-909, direct vs upstream triple-count and distinct-term asserts) passes on 1592 triples. Those asserts are non-vacuous \u2014 they compare two independently-decoded graphs and panic before printing any number.\n\nLock churn is entirely the expected consequence: sophia/rio/sucds and their duplicate digest/sha2/generic-array stacks drop out; qwt/ahash/hashbrown 0.14/oxttl and hdt's wasm- and bin-only transitives (wasm-bindgen, clap, env_logger) come in. All bench-only; sparq-hdt already carries hdt 0.7 in the production graph, so the shipped dependency surface is unchanged.\n\nThe manifest comments are accurate \u2014 the \"same upstre\u2026 [truncated 224 chars]",
+  "verdict": "approve"
+ }
+}
