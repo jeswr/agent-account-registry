@@ -93,12 +93,12 @@
   {
    "account": "dc2d751954080e13",
    "claim_id": "a5942050c9d042ab98db511694ca3c7b",
-   "holder": "sparq-org/sparq#2392@dispatch-30216390288.1",
+   "holder": "sparq-org/sparq#2392@30216658407.1",
    "package": "sparq-crdt",
    "role": "impl",
    "model": "sol",
-   "issued_at": 1785093649,
-   "expires_at": 1785099949
+   "issued_at": 1785093670,
+   "expires_at": 1785099970
   },
   {
    "account": "dc2d751954080e13",
