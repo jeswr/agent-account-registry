@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4245,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "45906a86d833a089b559274e53b8d668824b32ae",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 2 confirms the prior approval. The six cache slots are indexed consistently with the fieldless Perm discriminants; SPO remains an allocation-free alias while other projections are lazily sorted and binary-searched. apply_delta invalidates every materialized projection before any non-empty mutation, including pending-insertion retraction, and cloned OnceLock values remain valid for their cloned added vectors. The tests exercise real scan and estimate paths across planner-selected permutations, warm non-SPO caches, then witness both growth and shrink invalidation against rebuilt stores; they are not vacuous. Heap accounting includes materialized projection capacities, and the feature-off declaration accurately records the always-compiled wasm impact. No correctness, soundness, security, or test-validity defect was found.",
+  "verdict": "approve"
+ }
+}
