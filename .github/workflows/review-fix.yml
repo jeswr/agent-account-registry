@@ -747,9 +747,12 @@ jobs:
             --expected-holder-prefix "$prefix$TARGET_REPO#$PR_NUMBER@" > "$RUNNER_TEMP/adopt.json"
           inspect_rc=$?
           set -e
+          validate_rc=0
           if [[ "$inspect_rc" -ne 0 ]]; then
             printf 'transient\n' > "$ADOPT_REJECT_FILE"
-          elif ! python3 - "$RUNNER_TEMP/adopt.json" <<'PY'
+          else
+          set +e
+          python3 - "$RUNNER_TEMP/adopt.json" <<'PY'
           import hashlib
           import json
           import os
@@ -835,7 +838,15 @@ jobs:
           # Privacy (locked decision 22b): public workflow logs never carry account handles.
           print(f"dispatcher lease adopted: model={model}, claim={claim_id[:8]}")
           PY
-          then
+          validate_rc=$?
+          set -e
+          fi
+          # ONE shared recovery path for BOTH rejection sources. Deliberately not an `elif` chain:
+          # attaching this block to the validator's branch alone would leave the UNINSPECTABLE-claim
+          # path with no release, no outputs and a silent exit 0 — the same silent-drop shape this
+          # whole change exists to remove. shell_recovery_reached() in the self-test executes this
+          # script for both sources and asserts the release actually runs.
+          if [[ "$inspect_rc" -ne 0 || "$validate_rc" -ne 0 ]]; then
             # FAIL-LOUD default: an absent or unrecognised class escalates. Never silently retry.
             reject_class="$(tr -d '\r\n' < "$ADOPT_REJECT_FILE")"
             case "$reject_class" in

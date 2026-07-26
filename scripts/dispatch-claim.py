@@ -6272,6 +6272,117 @@ def _self_test():
           "job, a dropped `always()`, a re-pointed env input, a deleted job, a dropped output, a "
           "gutted park step and a restored `|| true`")
 
+    # L5. THE SHELL SEAM, EXECUTED. L1-L4 pin the Python and the parsed YAML; neither can see whether
+    # the step's SHELL actually reaches the recovery block. It caught a real self-inflicted bug during
+    # this change: writing the two rejection sources as `if inspect-failed ... elif ! validator` left
+    # the recovery attached to the validator branch ALONE, so an uninspectable claim exited 0 with no
+    # release, no outputs and no signal — the exact silent-drop shape being removed. So run the real
+    # script, with `select-and-claim.py` stubbed, and assert on the CALLS it makes.
+    _STUB = (
+        "#!/usr/bin/env python3\n"
+        "import os, sys\n"
+        "with open(os.environ['STUB_CALLS'], 'a', encoding='utf-8') as h:\n"
+        "    h.write(' '.join(sys.argv[1:]) + '\\n')\n"
+        "if '--inspect' in sys.argv:\n"
+        "    rc = int(os.environ.get('STUB_INSPECT_RC', '0'))\n"
+        "    if rc == 0:\n"
+        "        sys.stdout.write(os.environ['STUB_INSPECT_JSON'])\n"
+        "    sys.exit(rc)\n"
+        "if '--release' in sys.argv:\n"
+        "    sys.exit(int(os.environ.get('STUB_RELEASE_RC', '0')))\n"
+        "sys.exit(9)\n")
+
+    def _run_adopt_shell(claim=None, env=None, inspect_rc=0, release_rc=0, script=None):
+        """Execute review-fix.yml's REAL adopt step, with select-and-claim.py stubbed. Returns
+        (exit_code, outputs, calls, stdout)."""
+        src = _adopt_shell if script is None else script
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "registry", "scripts"))
+            os.makedirs(os.path.join(tmp, "runnertemp"))
+            with open(os.path.join(tmp, "registry", "scripts", "select-and-claim.py"),
+                      "w", encoding="utf-8") as handle:
+                handle.write(_STUB)
+            calls_path = os.path.join(tmp, "calls")
+            out_path = os.path.join(tmp, "github_output")
+            open(calls_path, "w", encoding="utf-8").close()
+            open(out_path, "w", encoding="utf-8").close()
+            shell_env = {
+                **os.environ, **_good_env, **(env or {}),
+                "STUB_CALLS": calls_path, "STUB_INSPECT_RC": str(inspect_rc),
+                "STUB_RELEASE_RC": str(release_rc),
+                "STUB_INSPECT_JSON": json.dumps({**_good_claim, **(claim or {})}),
+                "GITHUB_OUTPUT": out_path,
+                "RUNNER_TEMP": os.path.join(tmp, "runnertemp"),
+                "GITHUB_REPOSITORY": "jeswr/agent-account-registry",
+                "TARGET_REPO": "sparq-org/sparq", "PR_NUMBER": "3528",
+                "GH_TOKEN": "stub",
+            }
+            proc = _subprocess.run(["bash", "-c", src], cwd=tmp, env=shell_env,
+                                   capture_output=True, text=True, check=False)
+            with open(calls_path, encoding="utf-8") as handle:
+                calls = handle.read()
+            with open(out_path, encoding="utf-8") as handle:
+                outputs = dict(line.split("=", 1)
+                               for line in handle.read().splitlines() if "=" in line)
+        return proc.returncode, outputs, calls, proc.stdout + proc.stderr
+
+    # (a) A SUCCESSFUL adoption publishes the lease and releases NOTHING.
+    _rc, _o, _calls, _log = _run_adopt_shell()
+    assert _rc == 0 and _o.get("acquired") == "true", (_rc, _o, _log)
+    assert "--release" not in _calls, ("a successful adoption must not release its own lease", _calls)
+    assert "adopt_reject_class" not in _o, _o
+    # (b) THE UNINSPECTABLE CLAIM (the bug this layer caught): defers WITHOUT failing, and the
+    # release still runs. An `elif`-attached recovery block makes every assertion on this line fail.
+    _rc, _o, _calls, _log = _run_adopt_shell(inspect_rc=1)
+    _uninspectable = ("the UNINSPECTABLE-claim path did not reach the shared recovery block: it "
+                      "must release the lease, publish adopt_reject_class=transient/acquired=false "
+                      "and exit 0. An empty outputs dict here means the recovery block is gated on "
+                      "the validator's result alone (the `elif` shape) and the claim race is being "
+                      "silently dropped with the lease still held.",
+                      _rc, _o, _calls, _log)
+    assert _rc == 0, _uninspectable
+    assert _o.get("adopt_reject_class") == "transient", _uninspectable
+    assert _o.get("acquired") == "false" and _o.get("lease_released") == "true", _uninspectable
+    assert "--release" in _calls, ("the uninspectable-claim path MUST still return the lease; an "
+                                  "unreleased lease strands a scarce account slot", _calls)
+    # (c) THE INCIDENT, end to end through the shell: a package disagreement releases, reports
+    # `disagreement`, and FAILS the job so the escalation job's `if:` fires.
+    _rc, _o, _calls, _log = _run_adopt_shell({"package": "ci"})
+    assert _rc == 1 and _o.get("adopt_reject_class") == "disagreement", (_rc, _o, _log)
+    assert _o.get("acquired") == "false" and "--release" in _calls, (_o, _calls)
+    assert "secret_ref" not in _o and "account" not in _o, ("a rejected adoption must publish no "
+                                                            "usable credential reference", _o)
+    # (d) The `infra` class releases and reds, but is NOT the escalating class (no park).
+    _rc, _o, _calls, _log = _run_adopt_shell({"provider": ""})
+    assert _rc == 1 and _o.get("adopt_reject_class") == "infra", (_rc, _o, _log)
+    assert "--release" in _calls, _calls
+    # (e) A FAILED release is reported, never swallowed — and does not change the class's exit.
+    _rc, _o, _calls, _log = _run_adopt_shell({"package": "ci"}, release_rc=1)
+    assert _rc == 1 and _o.get("lease_released") == "false", (_rc, _o, _log)
+    assert "::error::" in _log and "stranded" in _log, _log
+    # (f) FAIL-LOUD default, end to end: an unrecognised class in the file escalates. Mutate the
+    # class the shell writes for the racy path and require the `case` default to take over.
+    _bogus = _adopt_shell.replace("printf 'transient\\n' > \"$ADOPT_REJECT_FILE\"",
+                                  "printf 'bogus\\n' > \"$ADOPT_REJECT_FILE\"")
+    assert _bogus != _adopt_shell, "the unknown-class fixture is vacuous"
+    _rc, _o, _calls, _log = _run_adopt_shell(inspect_rc=1, script=_bogus)
+    assert _rc == 1 and _o.get("adopt_reject_class") == "disagreement", (
+        "an unrecognised rejection class must ESCALATE, not silently retry", _rc, _o, _log)
+    # (g) NON-VACUITY of (b): drop the inspect source from the shared recovery guard — precisely the
+    # bug that shipped for a moment during this change — and require (b) to go red.
+    _elif_bug = _adopt_shell.replace(
+        'if [[ "$inspect_rc" -ne 0 || "$validate_rc" -ne 0 ]]; then',
+        'if [[ "$validate_rc" -ne 0 ]]; then')
+    assert _elif_bug != _adopt_shell, "the shared-recovery mutant fixture is vacuous"
+    _rc, _o, _calls, _log = _run_adopt_shell(inspect_rc=1, script=_elif_bug)
+    assert not ("--release" in _calls and _o.get("adopt_reject_class") == "transient"), (
+        "dropping the inspect source from the shared recovery guard changed NOTHING, so check (b) "
+        "is vacuous", _rc, _o, _calls)
+    print("  ok   adopt-loop L5: the adopt step's real SHELL is EXECUTED with a stubbed allocator — "
+          "success releases nothing, BOTH rejection sources release the lease and publish their "
+          "class, a failed release is reported not swallowed, an unknown class escalates, and "
+          "dropping either source from the shared recovery guard is caught")
+
     # ---- [round-5 P1] CROSS-LANE SUPERSESSION (park -> sibling-launch -> UNPARK): while a
     # PR sat human-parked its crate was freed and a SIBLING claimed a lease there (an impl
     # lease — a prefix the review lane's partition never checks). The moment the human
