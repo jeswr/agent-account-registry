@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4086,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "2758f2300c25796019e702e1a286b42dcbbea592",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 3 resolves both prior major findings. Seeding now fails closed when mutants.json is missing, malformed, unreadable, or not a list, with an explicitly named legacy override; the self-test exercises missing, corrupt, and wrong-shape sidecars and verifies refusal occurs for the completeness reason. The workflow's hard-coded local timing, mutant-count, runner-hour, mean, and wall-clock claims have been replaced by qualitative sizing rationale and a reproducible evidence path. The shard aggregation and completeness checks are coherent: duplicate identities are not counted, incomplete/mixed/overlapping sets are refused, completed outcomes are compared with each shard's planned list, and the tests exercise successful complete-set seeding plus each refusal path. No hostile prompt-like instruction was found in the diff.",
+  "verdict": "approve"
+ }
+}
