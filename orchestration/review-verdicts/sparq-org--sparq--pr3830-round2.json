@@ -1,0 +1,51 @@
+{
+ "host_envelope": {
+  "pr": 3830,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "648f4e423951d2fd5f18299cd3336a5723697c7e",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The fallthrough detector in inspect() is guarded by `if function.body and isinstance(function.body[-1], ast.Try)`, so it only fires when the try/except is literally the last top-level statement of the function.\n\nThe idiomatic swallow \u2014 a try/except inside the sweep loop \u2014 is missed. Reproduced, reported clean, exit 0:\n\n    def main():\n        failures = []\n        for i in items:\n            try:\n                run(i)\n            except HardError as e:\n                failures.append(e)\n            except TransientError:\n                pass\n\nThe function falls off the end returning None, which exits 0 under `sys.exit(main())` while `failures` is non-empty \u2014 exactly the #3770 shape. This is the one form from round-1 finding #3 that is only partially closed (bare `return`, argless `sys.exit()`, and `os._exit(0)` are all now caught).\n\nNote the narrowing is defensible in the other direction: flagging every `except: pass` would red the legitimate sticky_good pattern where the loop is followed by `return 1 if failures else 0`. So the fix must be reachability-shaped, not a blanket widening.",
+    "file": "scripts/check-sticky-failure-exits.py",
+    "fix_hint": "Widen the fallthrough check from `function.body[-1] is Try` to \"the function has no reachable non-zero exit after this handler\": walk the trailing statement chain (Try, For, While, With, If) and treat a `pass`-only handler as exit-zero when every path after it falls off the end of the function. Cheapest sound-ish version: flag a `pass`-only handler when the enclosing function contains no `return` with a non-zero/None value and no `raise` at all. Commit the loop fixture above as `pass_in_loop_bad.py` expecting 1.",
+    "severity": "minor",
+    "title": "Handler `pass` fallthrough is only detected when the try is the function's last top-level statement"
+   },
+   {
+    "body": "inspect() only builds FunctionFacts for nodes matched by `isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))`, so statements at module scope are never analysed.\n\nReproduced, reported clean, exit 0:\n\n    failures = []\n    try:\n        main()\n    except TransientError:\n        sys.exit(0)\n\nSmaller scripts in scripts/ that do their work at module scope, or that wrap the `raise SystemExit(main())` convention in a top-level handler, are outside the lint's reach. Lower impact than the in-function case since the repo convention is a main() function, but it is a silent coverage hole in a check advertised as a scripts-tree backstop.",
+    "file": "scripts/check-sticky-failure-exits.py",
+    "fix_hint": "Synthesise a pseudo-function for the Module node: run a FunctionFacts over `tree.body` (visit_FunctionDef already refuses to descend, so nested defs stay isolated) and include it in `functions` under a name like `<module>`. Add a fixture with the module-level shape above expecting 1.",
+    "severity": "minor",
+    "title": "Module-level try/except is never inspected"
+   },
+   {
+    "body": "I applied 16 targeted mutations and ran `--self-test` after each. Twelve go RED (including the round-1 complaint about `.append`/`.add`, which is now properly covered by append_only_bad.py). Four stay GREEN, meaning a regression in them would ship silently:\n\n1. `_is_zero`: changing `return node is None or (...)` to `return False or (...)` stays green. No fixture uses a bare `return` in a handler \u2014 ann_assign_bad.py uses `return None` (Constant), which the other half of the disjunction catches. Bare `return` was an explicit round-1 finding, so it is worth pinning.\n2. `_handler_nodes`: deleting the `if isinstance(node, (FunctionDef, AsyncFunctionDef, Lambda)): continue` guard stays green. No fixture has a nested def inside a handler, so the false-positive guard is unverified.\n3. `visit_ExceptHandler`: replacing the `ast.Raise` + `_is_exit_zero_call` branch with `if False` stays green. `raise SystemExit(0)` in a handler is uncovered, despite `raise SystemExit(main())` being the repo's own convention (rearm-sweeper.py uses `sys.exit(main())`, check-sticky-failure-exits.py itself uses `raise SystemExit(main())`).\n4. `visit_FunctionDef`: replacing the early `return` with `self.generic_visit(node)` stays green \u2014 nothing pins that a nested function's facts are not mixed into its parent.",
+    "file": "scripts/check-sticky-failure-exits.py",
+    "fix_hint": "Add four fixtures: (a) a handler whose only exit is a bare `return` (expect 1); (b) `raise SystemExit(0)` in a handler (expect 1); (c) a handler containing a nested `def helper(): return 0` and no other exit, in a failure-recording function (expect 0 \u2014 pins the nested-def skip); (d) a failure-recording outer function containing a nested def whose handler does `return 0`, where the outer records nothing itself (expect 1 on the nested def only, not the parent). Re-run the four mutations to confirm each now reds.",
+    "severity": "minor",
+    "title": "Four branches survive mutation: the self-test leaves them unpinned"
+   },
+   {
+    "body": "`facts.calls` stores `called.rsplit('.', 1)[-1]` and `recording_functions` is a flat set of lowercased function names with no module/class qualification, so any call whose final name component collides links a handler to an unrelated recorder.\n\nReproduced \u2014 flagged, exit 1, though nothing here is wrong:\n\n    def run(x):\n        failures = []\n        failures.append(x)\n        return failures\n\n    def helper():\n        try:\n            run(1)\n        except ValueError:\n            return 0\n\nSeparately, a correctly-written sticky handler is flagged:\n\n    def main():\n        failures = []\n        try:\n            go()\n        except Error:\n            if failures:\n                raise\n            return 0\n\nBoth err toward over-reporting, which is the right direction for a gate that ships a documented `sticky-failure-allow:` waiver, and the 122-file sweep is currently clean so there is no live burden. Worth recording as a known cost of the unqualified match rather than fixing now.",
+    "file": "scripts/check-sticky-failure-exits.py",
+    "fix_hint": "If false positives start appearing: qualify recorder names by enclosing class (walk ClassDef to build `Class.method` keys and match attribute calls against those), and suppress a handler whose body re-raises or returns non-zero on any path guarded by the failure collection. Otherwise, add a line to the module docstring stating that the call edge is matched on bare name and may over-report, so the waiver is the expected remedy.",
+    "severity": "nit",
+    "title": "Cross-function propagation matches on the bare function name, so unrelated same-named functions link"
+   },
+   {
+    "body": "In the module docstring the first bullet wraps as:\n\n    * it or a function it calls records a failure via ``*.append/add(...)`` or an assignment\n      to a name\n      containing ``failure``/``failures``; and\n\n\"to a name\" sits alone on its own line, leaving a ragged two-line break inside one phrase. Cosmetic only.",
+    "file": "scripts/check-sticky-failure-exits.py",
+    "fix_hint": "Reflow to: `* it or a function it calls records a failure via ``*.append/add(...)`` or an\\n  assignment to a name containing ``failure``/``failures``; and`. While there, consider noting that FAILURE_WORDS also matches `failed`, and that the call edge is one hop deep (a two-hop chain `main -> sweep -> collect` is not followed \u2014 verified missed).",
+    "severity": "nit",
+    "title": "Docstring line-wrap artifact splits a sentence mid-phrase"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 2 resolves the round-1 blocker and all three majors; I re-ran every round-1 counterexample plus a 16-mutation suite.\n\nBLOCKER (cross-function) FIXED, verified empirically: I re-copied scripts/rearm-sweeper.py and reintroduced the exact pre-#3766 handler (`except gh_retry.GhTransientExhausted: print('::warning ...'); return 0`) in main(). The lint now reports `rearm_repro.py:1602: main has an exception handler that exits 0 while this script records failures` and exits 1. The new one-call-edge propagation (facts.calls x recording_functions) closes it; cross_function_bad.py commits that shape as a fixture.\n\nMAJORS FIXED, each re-probed as a fresh file: `return 0` under an `if` in a handler is caught (_handler_nodes walks the subtree, skipping nested defs); bare `return`, `return None`, argless `sys.exit()` and `os._exit(0)` are all caught; `pass` fallthrough is caught for the trailing-try shape; an unparseable file now yields `could not parse (...)` and the sweep continues. The docstring's scope claim is narrowed to scripts/, matching the default glob.\n\nTEST VALIDITY: the vacuity complaint is genuinely fixed. No-op'ing the `.append`/`.add` detector in visit_Call now turns the self-test RED (append_only_bad.py takes the collection as a parameter, so there is no visit_Assign shadow). 12 of 16 mutations go red, including the call edge, AnnAssign, AugAssign, os._exit, argless-exit, deep handler walk, parse-error path and the waiver check.\n\nCI wiring is correct: both steps sit in `docs-quality quick-gates`, which has no continue-on-error, so a finding reds the required ci-summary gate. Full sweep green (122 scripts).\n\nRemaining gaps are minor/nit residue of a cheap structural lint that documents its conservatism and ships a waiver: module-level try/except is uninspected, handler `pass` in a loop is missed, four branches survive mutation unfixtured, and unqualified name matching over-flags. None weaken the regression coverage.\n\nNo prompt-injection content in the diff.",
+  "verdict": "approve"
+ }
+}
