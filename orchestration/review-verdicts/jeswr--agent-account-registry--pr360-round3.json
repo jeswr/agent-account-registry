@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 360,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "9b153e26e65cf1e2871ac790f1ea569a97a03df9",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`live_leases` is loaded once before iterating and is not the remote ledger state used by `allocator.claim`. The new helper and comments explicitly acknowledge that a sibling lease committed after this snapshot\u2014including an earlier claim in the same loop\u2014is invisible, while the allocator continues to check only same-prefix leases. Consequently review/fix and implementation claims for one repository/package can still both succeed. The added wiring test changes the checkout between separate `run_items` calls, proving only snapshot detection; it does not exercise a contender committing after the initial snapshot and therefore cannot detect the unresolved claim-time race.",
+    "file": "scripts/dispatch-claim.py",
+    "fix_hint": "Enforce repository/package cross-lane exclusion inside select-and-claim's SHA-bound CAS transaction using the live remote ledger for every claim path. Add a contention test where mixed-lane contenders share one crate, both begin from the same initial snapshot, and the second claim observes and rejects the first claim committed after that snapshot.",
+    "severity": "major",
+    "title": "Cross-lane exclusion still uses a stale snapshot instead of claim-time CAS state"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round-2 soundness issue remains materially unchanged. This revision adds a second checkout-snapshot check and non-vacuous tests for leases already visible in that snapshot, but it explicitly leaves the required claim-time invariant unenforced. `live_leases` is loaded once before the loop, while claims are committed remotely by CAS and the allocator still serializes only same-prefix leases. Therefore a foreign-lane claim committed after the snapshot, including an earlier claim in the same dispatch loop, can coexist on the same repository/package. The wiring test rewrites the local checkout between separate `run_items` calls, so it cannot fail when the actual post-snapshot contention race remains open. Because cross-lane exclusion is still not enforced atomically against the live ledger state, the change remains incomplete and unsound.",
+  "verdict": "request_changes"
+ }
+}
