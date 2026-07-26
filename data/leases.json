@@ -1,16 +1,6 @@
 {
  "leases": [
   {
-   "account": "51bde6688e140866",
-   "claim_id": "aaad80acaacc4931b7f763b1616eb3a8",
-   "holder": "sparq-org/sparq#2360@dispatch-30215134269.1",
-   "package": "workspace",
-   "role": "impl",
-   "model": "opus5",
-   "issued_at": 1785091668,
-   "expires_at": 1785097968
-  },
-  {
    "account": "58b7c92faa5b5ca5",
    "claim_id": "5adcd9b3d8ff4e8885387a8a1355e3a6",
    "holder": "sparq-org/sparq#2552@dispatch-30215134269.1",
@@ -149,6 +139,16 @@
    "model": "sol",
    "issued_at": 1785097956,
    "expires_at": 1785102156
+  },
+  {
+   "account": "dc2d751954080e13",
+   "claim_id": "2bd3d8ed2d9d4e8daf89b3e60c046781",
+   "holder": "review:sparq-org/sparq#4265@dispatch-30218784501.1",
+   "package": "site-papers",
+   "role": "review",
+   "model": "sol",
+   "issued_at": 1785097977,
+   "expires_at": 1785102177
   }
  ]
 }
