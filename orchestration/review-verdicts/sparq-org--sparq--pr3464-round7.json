@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3464,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "33beb55b9351a256c9a9d6fe33db8c4f2ff85a2f",
+  "round": 7
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The module says \"Forward secrecy is per-message via the ephemeral key.\" This is false for the implemented ephemeral-static X25519 sealed-box shape. A recorded WrappedSecret contains ephemeral_pub; if the recipient's long-term StaticSecret is later compromised, an attacker can run X25519(recipient_sk, ephemeral_pub), derive the same wrap key, and decrypt the historical ciphertext. This is an honesty-sensitive cryptographic overclaim in an externally unaudited surface.",
+    "file": "crates/sparq-e2ee-ng/src/wrap.rs",
+    "fix_hint": "Remove the forward-secrecy claim and describe the actual property narrowly: a fresh ephemeral sender key and nonce are used per message, but compromise of the recipient private key compromises previously recorded wraps. Make the same correction in skills/e2ee-ng/SKILL.md, which repeats the claim.",
+    "severity": "major",
+    "title": "Ephemeral-static wrapping does not provide forward secrecy"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 7 regresses from round 6's clean review because the public wrapping documentation makes a false forward-secrecy claim. The construction is ephemeral-static X25519: each ciphertext carries the ephemeral public key, so later compromise of the recipient's long-term static secret allows recomputing every recorded ECDH shared secret and decrypting past wraps. Fresh sender ephemeral keys provide sender-side key independence, but not forward secrecy against recipient-key compromise. The implementation itself can remain, but the security claim must be corrected everywhere it appears.",
+  "verdict": "request_changes"
+ }
+}
