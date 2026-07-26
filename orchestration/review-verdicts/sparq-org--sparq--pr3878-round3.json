@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3878,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f97d890ad0f427184060f02027aa339fcdfee6e9",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 3 remains correct and complete as scoped. The allocator wrapper delegates alloc/dealloc/realloc to System with unchanged arguments, counts only successful allocation outcomes, retains the old count after failed realloc, and is confined to the wasm-only global registration. Admission arithmetic saturates and the exported setter rejects negative and non-finite ceilings. The wasm integration test exercises the real exported request path, demonstrates a clean HTTP 507 under the configured ceiling, restores the ceiling, and verifies the same instance remains usable. Documentation consistently limits the guarantee to sustained pressure, explicitly identifies transient overshoot and DELETE-driven re-admission as unproven, and the unsafe register/snapshot updates match the four new sites. No hostile reviewer-directed instruction appears in the diff.",
+  "verdict": "approve"
+ }
+}
