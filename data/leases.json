@@ -82,16 +82,6 @@
   },
   {
    "account": "9e13ea21abf27e68",
-   "claim_id": "70e9ef68819d4b4fa61a2c93e358c663",
-   "holder": "review:sparq-org/sparq#4199@dispatch-30214062244.1",
-   "package": "site-specs",
-   "role": "review",
-   "model": "opus5",
-   "issued_at": 1785089811,
-   "expires_at": 1785094011
-  },
-  {
-   "account": "9e13ea21abf27e68",
    "claim_id": "bcbec99b41704763b45127e701b3bd68",
    "holder": "review:sparq-org/sparq#4201@dispatch-30214062244.1",
    "package": "ci-fragments",
