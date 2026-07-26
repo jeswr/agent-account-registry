@@ -580,7 +580,8 @@ def migration_residual_holds(pr_labels, issue_labels, clearing=()):
 
 def capacity_park_admission(repo, pr_number, issue_number, fetch_events, is_human=None,
                             log=print, consumed=frozenset(), auto_receipts=(),
-                            auto_marker_count=None, auto_evidence=None, live_holds=()):
+                            auto_marker_count=None, auto_evidence=None, live_holds=(),
+                            deadlock_unadjudicated=False):
     """Whether a MACHINE capacity park may be re-admitted now, and on WHOSE authority
     (invariant 3). Returns (action, evidence, detail), where `evidence` is None or
     {"key", "at"} — the recovery event's durable identity plus its canonical recovery stamp, i.e.
@@ -622,9 +623,15 @@ def capacity_park_admission(repo, pr_number, issue_number, fetch_events, is_huma
     returning {"key", "recovered_at"} or None; pass None (the CLAIM proof gate) to evaluate the
     human + already-receipted paths WITHOUT minting anything.
 
+    `deadlock_unadjudicated` (registry #703, derived by the caller via
+    deadlock_awaiting_adjudication) refuses the AUTOMATIC path outright for a proven
+    reviewer-vs-fixer deadlock that carries no head-bound adjudication receipt. A human gesture
+    still wins — it is checked first — so this narrows only the machine's own re-admission.
+
     EVERY ambiguity fails toward staying parked: an unreadable timeline, an unreadable/absent
     health record, a probe that raises, an unsafe evidence key, a recovery that is not STRICTLY
-    after the park (a tie included), a human-owned label, a human-applied park, and the cap."""
+    after the park (a tie included), a human-owned label, a human-applied park, the cap, and an
+    unadjudicated deadlock."""
     if capacity_park_readmitted(repo, pr_number, issue_number, fetch_events,
                                 is_human=is_human, log=log, consumed=consumed):
         return ("human", None, "unconsumed proven-human readmission gesture")
@@ -632,6 +639,25 @@ def capacity_park_admission(repo, pr_number, issue_number, fetch_events, is_huma
     if held:
         return (None, None,
                 f"human-owned hold(s) live ({'/'.join(held)}) — never auto-re-admitted")
+    if deadlock_unadjudicated:
+        # registry #703. Checked AFTER the human gesture (a human may always override) and
+        # BEFORE the timeline/probe reads, so a refused deadlock costs no API calls, consumes NO
+        # recovery evidence, and mints NO receipt — it is simply not re-admitted.
+        #
+        # The re-admission exists for a CAPACITY park, whose cause demonstrably cleared. A
+        # deadlock's cause is a disagreement, and fleet-capacity recovery is no evidence at all
+        # that it cleared: re-admitting on it puts the SAME reviewer and the SAME fixer at the
+        # SAME tier back on the SAME diff, which reproduces the disagreement, burns another
+        # round budget and another three account leases, and parks again — and it is that second
+        # park which advances the generation ladder toward the human terminal. So the
+        # re-admission is not merely ineffective here, it is the mechanism that feeds the
+        # escalation (#701's retry-an-unchanged-configuration error; #500's decline must be
+        # REROUTED, not re-deferred).
+        log(f"automatic readmission REFUSED for {repo}#{pr_number}: this is an UNADJUDICATED "
+            "reviewer-vs-fixer deadlock, not a capacity park — re-admitting it would replay the "
+            "same disagreement at the same tier and advance the ladder toward a human hold; it "
+            "needs an independent adjudication, not another generation")
+        return (None, None, "unadjudicated reviewer-vs-fixer deadlock — adjudication required")
     latest_park, human_park, readable = park_applications(
         repo, pr_number, issue_number, fetch_events, is_human=is_human, log=log)
     if not readable:
@@ -792,7 +818,47 @@ PARK_CAUSES = {
     "history-rewritten": PARK_CLASS_QUESTION,  # head no longer descends from the opened commit
     "marker-corrupt": PARK_CLASS_QUESTION,    # durable round/model/pin markers failed validation
     "routing-unresolvable": PARK_CLASS_QUESTION,  # no concrete provider model in the catalog
+    # --- adjudicated deadlocks: the ONLY machine-writable route out of a deadlock ------------
+    "undecidable": PARK_CLASS_QUESTION,       # an independent adjudicator ran and could NOT
+                                              # decide the reviewer-vs-fixer disagreement
+    "premise-wrong": PARK_CLASS_QUESTION,     # an independent adjudicator judged the PR's own
+                                              # premise wrong (close honestly / re-file)
 }
+
+# --- registry #703: a reviewer-vs-fixer DEADLOCK is not a capacity park ----------------------
+#
+# `review:parked` is documented as the machine-recoverable CAPACITY class, but the two causes
+# below are not capacity at all: the loop DID iterate and terminated in a disagreement. Measured
+# on sparq 2026-07-26 — 27 parked PRs, whose park comments read either "the review round budget
+# is exhausted at 3 round(s)" (preceded by `cross-provider review round 3: request_changes`) or
+# "two consecutive fix attempts made no change (fixer judges the findings spurious)". Both are
+# the SAME situation: the reviewer says "change this", the fixer says "cannot / should not", and
+# nobody decides who is right.
+#
+# Two consequences follow, and this module enforces both:
+#
+# (1) The generation ladder must not carry a deadlock into the HUMAN terminal. Measured over
+#     2026-07-26 15:15-15:45 UTC, `review:parked` fell 27 -> 19 while `review:needs-user` rose
+#     14 -> 19 on the SAME PRs — 5 PRs in 30 minutes, #3683 and #2493 on their SECOND park
+#     exactly as PARK_ESCALATION_GENERATIONS prescribes, i.e. ~10 PRs/hour converted into
+#     permanent maintainer backlog, each having burned two round budgets and six account leases.
+#     Escalating a CAPACITY park to a human after two windows is reasonable (the fleet genuinely
+#     cannot proceed). Escalating a machine-decidable disagreement there is a category error:
+#     a PR whose only history is "reviewer and fixer disagreed" has nothing for the maintainer to
+#     decide that an adjudicator could not. So park_ladder_decision NEVER returns "terminal" for
+#     a deadlock cause — it returns "await-adjudication" instead.
+#
+# (2) Re-admitting an UNADJUDICATED deadlock is a guaranteed-wasted generation: the same
+#     reviewer and the same fixer at the same tier reproduce the same disagreement, burn another
+#     round budget and another three leases, and park again — and that second park is what
+#     ADVANCES the ladder toward the human terminal. So the re-admission (capacity_park_admission)
+#     refuses an unadjudicated deadlock outright. Same lesson as #701 (retrying an unchanged
+#     configuration yields the same nothing) and #500 (a decline is REROUTED, not re-deferred).
+#
+# The exit is an ADJUDICATION receipt (see PARK_ADJUDICATION_MARKER below), never a timeout:
+# "reviewer overruled" must be a reasoned finding with evidence, because a vacuous override
+# merges the exact defect the reviewer was pointing at.
+PARK_DEADLOCK_CAUSES = frozenset({"budget", "nochange"})
 
 # Causes NO machine path may ever re-classify, re-admit, or convert out of the human terminal —
 # not on a marker, not on prose, not on a cap, not ever. These are the parks that exist BECAUSE a
@@ -808,6 +874,19 @@ def park_cause_class(cause):
     if not isinstance(cause, str):
         return None
     return PARK_CAUSES.get(cause)
+
+
+def park_cause_is_deadlock(cause):
+    """True iff `cause` names a reviewer-vs-fixer DEADLOCK (registry #703) rather than a genuine
+    capacity/infra stall.
+
+    The fail direction is deliberately the OPPOSITE of park_cause_class's: an unknown or absent
+    cause is NOT a deadlock. Every guard keyed on this function either withholds a human
+    escalation or refuses a re-admission, so answering "deadlock" on unproven data would strand a
+    genuine capacity park in a class that has no capacity exit. Unknown therefore keeps EXACTLY
+    the pre-#703 behaviour (escalate on the ladder, re-admit on recovery evidence), and only a
+    park whose cause is positively proven a deadlock is treated as one."""
+    return isinstance(cause, str) and cause in PARK_DEADLOCK_CAUSES
 
 
 def park_reason_marker(cause, generation=None, head=None):
@@ -886,6 +965,151 @@ def park_reason_records(comments, bot_login, log=print):
         if record:
             records.append(record)
     return records
+
+
+# --- registry #703: the ADJUDICATION receipt -------------------------------------------------
+#
+# The one durable artefact that resolves a reviewer-vs-fixer deadlock. It is the ONLY thing that
+# lets a deadlock park be re-admitted or escalated, so its trust properties carry the whole
+# guarantee:
+#
+# - INDEPENDENCE. `by=` (the adjudicating model alias) must not appear in `against=` (the aliases
+#   of the refused review and of the fix that refused it). An adjudicator that is one of the two
+#   parties is SELF-APPROVAL — it happened on sparq#3803 on 2026-07-26 and voided a verdict — so
+#   a receipt that fails this test is REJECTED, not repaired. Rejection leaves the deadlock
+#   unadjudicated, which is the fail direction every other ambiguity in this module takes.
+# - HEAD-BINDING. `head=` binds the adjudication to the exact head it examined. A deadlock is
+#   resolved for THAT tree only; a later push must be adjudicated again. Consumers compare
+#   `head` against the live head themselves — an adjudication of a superseded head is exactly how
+#   a stale verdict merges (#4220's load-bearing property, applied to the same axis here).
+# - CLOSED DECISION SET. Anything outside PARK_ADJUDICATION_DECISIONS is rejected, so a drifted
+#   or hostile writer cannot invent an outcome whose meaning no consumer agreed to.
+# - BOT-ONLY. park_adjudication_records applies the same bot_login trust filter as every other
+#   receipt family here, so a third party cannot talk a park out of its class by quoting a string.
+#
+# "Reviewer overruled" is therefore always a recorded, attributed, head-bound decision by a named
+# third model — never a timeout, and never the fixer's own say-so.
+PARK_ADJUDICATION_MARKER = "<!-- sparq-park-adjudication:v1"
+
+# decision -> what the consumer may do with it.
+#   "spurious"      the reviewer's findings do not survive scrutiny; the fixer was right. The
+#                   review state may be cleared and the PR allowed to arm.
+#   "escalate-impl" the findings are REAL and the fix tier was too weak: escalate (or decompose)
+#                   the IMPLEMENTATION rather than re-running the tier that already failed.
+#   "premise-wrong" the PR's own premise is wrong: close it honestly and re-file the underlying
+#                   issue if it still matters.
+#   "undecidable"   the adjudicator ran and could not decide. This — and only this — is what
+#                   legitimately reaches a human, and it is DIFFERENT information from
+#                   "not yet tried".
+PARK_ADJUDICATION_DECISIONS = {
+    "spurious": PARK_CLASS_CAPACITY,
+    "escalate-impl": PARK_CLASS_CAPACITY,
+    "premise-wrong": PARK_CLASS_QUESTION,
+    "undecidable": PARK_CLASS_QUESTION,
+}
+
+# Decisions that end the loop at a human. Kept as its own name so a consumer cannot re-derive it
+# from the class table and get it subtly wrong.
+PARK_ADJUDICATION_TERMINAL = frozenset({"premise-wrong", "undecidable"})
+
+_PARK_ADJUDICATION_RE = re.compile(
+    re.escape(PARK_ADJUDICATION_MARKER)
+    + r" decision=(\S+) by=(\S+) against=(\S+) head=(\S+) -->")
+
+
+def park_adjudication_marker(decision, by, against, head):
+    """The durable machine-readable adjudication receipt for ONE deadlock.
+
+    Raises ValueError on anything unrepresentable or non-independent — an adjudication that
+    cannot be written truthfully must fail LOUD at the writer rather than be written in a shape
+    readers reject (that is how #610's gen-1 receipts were silently lost), and a writer must
+    never be able to mint a self-approval that a reader would then have to catch."""
+    if decision not in PARK_ADJUDICATION_DECISIONS:
+        raise ValueError(f"unknown adjudication decision {decision!r}")
+    parties = tuple(against or ())
+    if not parties:
+        raise ValueError("an adjudication must name the parties it was independent OF")
+    for part in (by, *parties):
+        if not safe_receipt_part(str(part)) or "," in str(part):
+            raise ValueError(f"unsafe adjudication alias {part!r}")
+    if str(by) in {str(part) for part in parties}:
+        raise ValueError(
+            f"adjudicator {by!r} is one of the deadlocked parties — that is self-approval")
+    if not safe_receipt_part(str(head)):
+        raise ValueError(f"unsafe adjudication head {head!r}")
+    return (f"{PARK_ADJUDICATION_MARKER} decision={decision} by={by} "
+            f"against={','.join(str(part) for part in parties)} head={head} -->")
+
+
+def parse_park_adjudication(body, log=print):
+    """The LAST well-formed, INDEPENDENT adjudication receipt in `body`, else None.
+
+    A receipt naming an unknown decision, or whose adjudicator is one of the parties it claims to
+    have adjudicated between, is dropped with a loud log — never repaired. Repairing would mean
+    choosing which half to believe, and the dangerous direction is obvious: a receipt reading
+    `by=sol against=sol,opus5` must never clear the very review that `sol` refused."""
+    if not isinstance(body, str):
+        return None
+    found = None
+    for match in _PARK_ADJUDICATION_RE.finditer(body):
+        decision, by, against, head = match.groups()
+        if decision not in PARK_ADJUDICATION_DECISIONS:
+            log(f"::warning::adjudication receipt names an unknown decision {decision!r}; "
+                "ignoring it (the deadlock stays unadjudicated)")
+            continue
+        parties = tuple(part for part in against.split(",") if part)
+        if not parties:
+            log("::warning::adjudication receipt names no deadlocked parties; ignoring it "
+                "(an adjudication that cannot show independence proves nothing)")
+            continue
+        if by in parties:
+            log(f"::warning::adjudication receipt claims adjudicator {by!r} decided a deadlock "
+                f"it was itself a party to ({against!r}); ignoring it — that is self-approval")
+            continue
+        found = {"decision": decision, "by": by, "against": parties, "head": head,
+                 "class": PARK_ADJUDICATION_DECISIONS[decision]}
+    return found
+
+
+def park_adjudication_records(comments, bot_login, log=print):
+    """Every well-formed INDEPENDENT adjudication receipt across the BOT's OWN comments, oldest
+    first. Without a `bot_login` nothing is trusted (the same filter park_reason_records uses)."""
+    if not bot_login:
+        return []
+    records = []
+    for comment in comments if isinstance(comments, list) else []:
+        if not isinstance(comment, dict):
+            continue
+        login = str((comment.get("user") or {}).get("login", ""))
+        if login.casefold() != str(bot_login).casefold():
+            continue
+        record = parse_park_adjudication(str(comment.get("body", "")), log=log)
+        if record:
+            records.append(record)
+    return records
+
+
+def deadlock_awaiting_adjudication(cause, adjudications, head=""):
+    """True iff this park is a PROVEN deadlock with no usable adjudication for the CURRENT head.
+
+    `cause` is the park's machine-readable cause (park_reason_records / latest_park_cause);
+    `adjudications` are the trusted receipts (park_adjudication_records); `head` is the PR's live
+    head SHA.
+
+    Fail direction, stated explicitly because it is the opposite of most guards in this module:
+    an unknown cause answers False (see park_cause_is_deadlock) and an unknown head answers True
+    for a proven deadlock. That pairing is deliberate — refusing to classify an unproven park as
+    a deadlock preserves its existing capacity exit, while refusing to honour an adjudication we
+    cannot bind to the live head preserves the review bar. Neither direction ever clears a review
+    state on missing data."""
+    if not park_cause_is_deadlock(cause):
+        return False
+    if not head:
+        return True                       # cannot bind an adjudication to an unknown head
+    for record in reversed(list(adjudications or [])):
+        if isinstance(record, dict) and record.get("head") == head:
+            return False
+    return True
 
 
 # --- G1: one-shot re-classification of a LEGACY (pre-marker) park ----------------------------
@@ -994,8 +1218,46 @@ def reclassify_legacy_park(comments, bot_login, stale_marker=None, log=print):
     return (cause, park_class, f"legacy prose classifies this park as {cause!r} ({park_class})")
 
 
+def latest_park_cause(comments, bot_login, log=print):
+    """The park cause currently on record for a PR, or None when none is proven.
+
+    Markers first (the writer's own classification), prose second so the ~27 parks that predate
+    the marker writer are classified too — they are the population registry #703 measured, and a
+    deadlock guard that only saw future parks would fix nothing this week.
+
+    LEGACY_PARK_DENY_PROSE dominates unconditionally and order-independently, exactly as in
+    reclassify_legacy_park and for the same live reason (sparq #3743 / #3608 carry a genuine
+    injection escalation AND a later capacity-park comment): a raised injection flag is a
+    property of the PR's whole history, not of its newest comment, and such a park must never be
+    reclassified as a machine-decidable deadlock. Prose is read ONLY from the bot's own comments,
+    so a third party cannot mint a cause by quoting a sentence."""
+    if not bot_login:
+        return None
+    marker_records = park_reason_records(comments, bot_login, log=log)
+    if marker_records:
+        return marker_records[-1].get("cause")
+    bot_bodies = []
+    for comment in comments if isinstance(comments, list) else []:
+        if not isinstance(comment, dict):
+            continue
+        login = str((comment.get("user") or {}).get("login", ""))
+        if login.casefold() != str(bot_login).casefold():
+            continue
+        bot_bodies.append(str(comment.get("body", "")))
+    for body in bot_bodies:
+        for pattern, _denied in LEGACY_PARK_DENY_PROSE:
+            if pattern.search(body):
+                return None
+    cause = None
+    for body in bot_bodies:
+        for pattern, candidate in LEGACY_PARK_PROSE:
+            if pattern.search(body):
+                cause = candidate
+    return cause
+
+
 def park_ladder_decision(cutoff, receipts, already_labeled=False, fingerprint=None,
-                         consumed_fingerprints=frozenset()):
+                         consumed_fingerprints=frozenset(), cause=None):
     """The ONE label-independent capacity-park escalation ladder (round-3 finding 1), shared
     by the deferred-issue lane (dispatch-claim) and the worker-PR lane (worker-pr needs_user).
     `cutoff` is readmission_cutoff(..., on_unreadable=WINDOW_UNREADABLE); `receipts` is the
@@ -1016,6 +1278,16 @@ def park_ladder_decision(cutoff, receipts, already_labeled=False, fingerprint=No
       generation consumed). See below for why this is what makes readmission mean anything.
     - ("legacy-quiet", None, None): a pre-receipt park (label live, no gesture, no receipts)
       — stay quiet; generation accounting starts with the first receipted window.
+    - ("await-adjudication", window_key, generation): PARK_ESCALATION_GENERATIONS windows
+      consumed, BUT `cause` names a proven reviewer-vs-fixer deadlock (PARK_DEADLOCK_CAUSES,
+      registry #703). The escalation to the human terminal is WITHHELD — a disagreement two
+      models had is not a question only a human can answer, and escalating it there is the
+      category error that converted ~10 PRs/hour into permanent maintainer backlog. The caller
+      consumes the window and receipts it exactly as for "park" (so the accounting is unchanged
+      and honest), keeps the MACHINE-owned label, and records that the park is awaiting
+      adjudication — which is different information from "not yet tried". `cause` defaults to
+      None, and an unknown cause is NOT a deadlock, so every pre-#703 caller keeps its exact
+      previous behaviour.
     - ("terminal", window_key, generation): PARK_ESCALATION_GENERATIONS windows consumed —
       escalate to the question class. The terminal label write must consult the sticky veto
       and the comment must be HONEST when the write was suppressed (never claim a label that
@@ -1073,6 +1345,17 @@ def park_ladder_decision(cutoff, receipts, already_labeled=False, fingerprint=No
         return ("legacy-quiet", None, None)
     generation = len(receipts) + 1
     if cutoff and generation >= PARK_ESCALATION_GENERATIONS:
+        # registry #703: the generation ladder escalates a CAPACITY park to a human after
+        # PARK_ESCALATION_GENERATIONS consumed windows, which is right — the fleet genuinely
+        # cannot proceed and only a human can supply what is missing. A DEADLOCK park has no
+        # such property: nothing about "the reviewer and the fixer disagreed" is a question only
+        # a human can answer, and the measured composition (5 PRs in 30 minutes, ~10/hour) turns
+        # this one `return` into a machine for manufacturing permanent maintainer backlog. So a
+        # proven deadlock stops here and awaits adjudication instead. It reaches a human only
+        # through an adjudication receipt that says `undecidable` or `premise-wrong` — both of
+        # which are QUESTION-class causes and therefore never take this capacity branch at all.
+        if park_cause_is_deadlock(cause):
+            return ("await-adjudication", window_key, generation)
         return ("terminal", window_key, generation)
     return ("park", window_key, generation)
 
