@@ -81,16 +81,6 @@
    "expires_at": 1785096121
   },
   {
-   "account": "dc2d751954080e13",
-   "claim_id": "7c7eadc27e244765aa25ba51e8984e3c",
-   "holder": "review:sparq-org/sparq#3894@dispatch-30214390427.1",
-   "package": "sparq-wac-oracle",
-   "role": "review",
-   "model": "sol",
-   "issued_at": 1785090282,
-   "expires_at": 1785094482
-  },
-  {
    "account": "9e13ea21abf27e68",
    "claim_id": "8d2bfbf840824c13b96011aba9ae836f",
    "holder": "review:sparq-org/sparq#4185@dispatch-30214390427.1",
