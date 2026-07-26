@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4354,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ecdf3eb04dae531b333b735998fb4d0e0d908882",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The document commits a full table of work-box byte counts, microsecond timings, ratios, percentages, and noise estimates, then repeats derived figures throughout the findings and disposition. The repository contract explicitly prohibits hard-coded performance numbers in Markdown and says work-box timings are non-canonical. Labeling them advisory/non-canonical does not make committing them compliant. These values can also become stale while continuing to look authoritative.",
+    "file": "research/numerics-sparsify-measured.md",
+    "fix_hint": "Remove the numeric table and all derived hard-coded magnitudes (including percentages, ratios, microseconds, spread, and exact byte/capacity observations). Keep the qualitative negative conclusion, methodology, reproducible commands, result-equivalence evidence, and a pointer to generated benchmark artifacts if such artifacts are available through the approved benchmark workflow.",
+    "severity": "major",
+    "title": "Committed Markdown contains prohibited hard-coded work-box performance numbers"
+   }
+  ],
+  "progress": null,
+  "summary": "The feature implementation and cross-arm correctness test are plausibly sound, but the change violates the repository's explicit evidence policy by committing hard-coded, non-canonical work-box performance measurements to Markdown. The caveats do not cure that prohibition. Remove the recorded timings and derived numeric comparisons, retaining only the qualitative measured conclusion and reproducible harness.",
+  "verdict": "request_changes"
+ }
+}
