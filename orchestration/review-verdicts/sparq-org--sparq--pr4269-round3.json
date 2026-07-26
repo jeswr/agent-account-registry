@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4269,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "5aeca4a398950af865445aad25fb394139e6ecf8",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new rustdoc says everything outside the equality scope has no N3 counterpart and that an unsupported construct on a permission \"merely produces no grant.\" That is false for collection-valued targets/assignees: `odrl-d.n3` joins target and assignee by exact IRI, so a permission naming a PartyCollection or AssetCollection can grant a request naming that same collection IRI. Only the Rust oracle's membership expansion lacks an N3 counterpart. The corrected SKILL explicitly documents this exception, so the purported cross-crate oracle contract now contradicts it.",
+    "file": "crates/sparq-policy/src/eval.rs",
+    "fix_hint": "Replace the blanket permission statement with the same split used in the SKILL: unsupported permission constraints and `odrl:use` produce no grant, while collection-valued target/assignee fields retain exact-IRI matching but lack membership expansion. Keep the existing prohibition and unconditional-refusal rules distinct.",
+    "severity": "major",
+    "title": "Oracle rustdoc still claims every out-of-scope permission is inert"
+   },
+   {
+    "body": "The landed-state section says an out-of-scope construct on a permission yields no grant. As written, that covers structural collection membership, which the same PR's SKILL correctly identifies as an exact-match subset rather than an inert permission. Since this section is meant to reconcile the design with what actually landed, the blanket wording materially misstates the implemented envelope.",
+    "file": "research/odrl-n3-compiled-rules.md",
+    "fix_hint": "Narrow the no-grant statement to unsupported constraints and `odrl:use`, then add a concise exact-IRI-only exception for PartyCollection/AssetCollection targets and assignees whose membership expansion is Rust-only.",
+    "severity": "major",
+    "title": "Landed-state reconciliation repeats the false blanket permission behavior"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The SKILL now correctly distinguishes exact-IRI collection matches from missing collection-membership expansion, resolving the prior finding there. However, the newly added oracle rustdoc and landed-state design text repeat the same overbroad rule-kind claim: they say everything outside the narrow equivalence scope (or any out-of-scope construct) on a permission produces no grant. Collection-valued target/assignee structure is outside exact equivalence, yet the N3 rules can still grant when the request names the collection IRI exactly; only member expansion is absent. Because these texts are presented as the cross-crate contract and design reconciliation, the caller-facing contract remains materially false. This is materially the same major finding as round 2, so progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
