@@ -2,36 +2,6 @@
  "leases": [
   {
    "account": "dc2d751954080e13",
-   "claim_id": "1385eb104ffb4120be8b1007030bbf13",
-   "holder": "sparq-org/sparq#2781@dispatch-30183855242.1",
-   "package": "sparq-bench",
-   "role": "ci",
-   "model": "sol",
-   "issued_at": 1785031723,
-   "expires_at": 1785038023
-  },
-  {
-   "account": "51bde6688e140866",
-   "claim_id": "a4f0fd9a73564ba9af4b7b92fc30866d",
-   "holder": "sparq-org/sparq#2868@dispatch-30183855242.1",
-   "package": "sparq-metamorph",
-   "role": "research",
-   "model": "opus5",
-   "issued_at": 1785031733,
-   "expires_at": 1785038033
-  },
-  {
-   "account": "488920c2efe2b3fb",
-   "claim_id": "9cc6630c38d44eb0a6baaa2d422f0b2d",
-   "holder": "sparq-org/sparq#3080@dispatch-30183855242.1",
-   "package": "sparq-geo",
-   "role": "impl",
-   "model": "opus5",
-   "issued_at": 1785031779,
-   "expires_at": 1785038079
-  },
-  {
-   "account": "dc2d751954080e13",
    "claim_id": "c52dd6adef54408c9c6f636b19228181",
    "holder": "sparq-org/sparq#3027@dispatch-30184356904.1",
    "package": "sparq-algos",
@@ -119,6 +89,16 @@
    "model": "opus5",
    "issued_at": 1785037861,
    "expires_at": 1785044161
+  },
+  {
+   "account": "dc2d751954080e13",
+   "claim_id": "74f0fac1d6524cb9859c1a5135afe177",
+   "holder": "review:sparq-org/sparq#3464@dispatch-30186818229.1",
+   "package": "sparq-e2ee-ng",
+   "role": "review",
+   "model": "sol",
+   "issued_at": 1785038245,
+   "expires_at": 1785042445
   }
  ]
 }
