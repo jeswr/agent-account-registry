@@ -929,14 +929,34 @@ def audit_catalog(repo, policy_text, fetch=_fetch_target_routing, retired_aliase
 
 
 def format_catalog_audit(dropped, skew, catalogs):
-    """The operator-facing report. One line per offending pair, each naming what is wrong."""
+    """The operator-facing report, and the audit's ONE output boundary. One line per offending
+    pair, each naming what is wrong.
+
+    PRIVACY (locked decision 22a/22b, the same rule the legacy-shape diagnostic ~60 lines above
+    obeys): this report is emitted by a 15-minute `groom` cron into logs that are not private, so
+    an account is referenced ONLY by its salted provenance fingerprint via `_diag_account_ref` —
+    the shared `sha256(handle + ':' + PROVENANCE_SALT)[:16]` convention (worker-pr.py
+    account_hash), which operators can correlate with provenance records. A raw handle NEVER
+    reaches these lines. "The handles are already enumerable from public issue titles" is an
+    argument for changing the policy, not for a new writer deviating from it: this cron would add
+    18+ handle mentions per sweep to logs that currently carry none.
+
+    The reference must stay USEFUL as well as safe — an operator has to know WHICH record is
+    skewed — so it is a stable, per-handle-distinct fingerprint, not an opaque counter. When the
+    salt is absent every reference collapses to one withheld marker, which would silently make the
+    report unreadable, so that case says so ONCE, loudly, at the top.
+    """
     lines = [f"catalog audit: {len(catalogs)} target routing catalog(s) read: "
              f"{', '.join(sorted(catalogs)) or 'NONE'}"]
+    if (dropped or skew) and not os.environ.get("PROVENANCE_SALT", ""):
+        lines.append("catalog audit: WARNING — PROVENANCE_SALT is unset, so every account "
+                     "reference below is withheld and the rows cannot be told apart; re-run with "
+                     "the salt in context to identify the offending records")
     for handle, reasons in dropped:
-        lines.append(f"catalog audit: account {handle!r} is NOT in the live pool: "
-                     f"{'; '.join(reasons)}")
+        lines.append(f"catalog audit: account {_diag_account_ref(handle)} is NOT in the live "
+                     f"pool: {'; '.join(reasons)}")
     for handle, model, reason in skew:
-        subject = f"account {handle!r} model {model!r}" if handle else "policy"
+        subject = f"account {_diag_account_ref(handle)} model {model!r}" if handle else "policy"
         lines.append(f"catalog audit: {subject} {reason}")
     if not dropped and not skew:
         lines.append("catalog audit: no skew — every live account record is routable by every "
@@ -1527,15 +1547,49 @@ def _self_test():
           (e2e_dropped, sorted({(h, m) for h, m, _ in e2e_skew}), sorted(e2e_catalogs)),
           ([("acct31", ["missing harness"])], [("acct30", "fable"), ("acct30", "ghost")],
            ["o/enabled:r/one.toml"]))
+    AUDIT_HANDLES = ("acct30", "acct31")
+    e2e_report = format_catalog_audit(e2e_dropped, e2e_skew, e2e_catalogs)
+    ref30, ref31 = _diag_account_ref("acct30"), _diag_account_ref("acct31")
     check("audit report names every offending pair on its own line",
-          [line for line in format_catalog_audit(e2e_dropped, e2e_skew, e2e_catalogs)
-           if "acct30' model 'ghost'" in line or "acct31' is NOT in the live pool" in line],
-          ["catalog audit: account 'acct31' is NOT in the live pool: missing harness",
-           f"catalog audit: account 'acct30' model 'ghost' {SKEW_UNKNOWN}"])
+          [line for line in e2e_report
+           if f"{ref30} model 'ghost'" in line or f"{ref31} is NOT in the live pool" in line],
+          [f"catalog audit: account {ref31} is NOT in the live pool: missing harness",
+           f"catalog audit: account {ref30} model 'ghost' {SKEW_UNKNOWN}"])
     check("audit report says 'no skew' ONLY when there is none",
           ["no skew" in " ".join(format_catalog_audit([], [], {"a": {}})),
-           "no skew" in " ".join(format_catalog_audit(e2e_dropped, e2e_skew, e2e_catalogs))],
+           "no skew" in " ".join(e2e_report)],
           [True, False])
+
+    # ---- PRIVACY (locked decision 22a/22b): the audit report is emitted by a 15-minute cron into
+    # logs that are not private. NEGATIVE assertion in the same shape as the legacy-shape
+    # normalization rows above: NO raw account handle may appear ANYWHERE in the report, and the
+    # salted reference must still be USEFUL — per-handle distinct and stable — or the operator
+    # cannot tell which record is skewed. Reverting the report to `{handle!r}` turns the first row
+    # red; replacing the fingerprint with an opaque counter turns the distinct/stable rows red.
+    check("PRIVACY NEGATIVE: no raw account handle appears anywhere in the audit report",
+          [h for h in AUDIT_HANDLES if h in " ".join(e2e_report)], [])
+    check("PRIVACY: the audit reference is the shared salted provenance fingerprint",
+          ref30, "hash=" + hashlib.sha256(
+              f"acct30:{os.environ['PROVENANCE_SALT']}".encode()).hexdigest()[:16])
+    check("PRIVACY: distinct accounts get DISTINCT references (the report stays usable)",
+          ref30 != ref31, True)
+    check("PRIVACY: the same account gets a STABLE reference across rows and sweeps",
+          _diag_account_ref("acct30"), ref30)
+    salt_held = os.environ.pop("PROVENANCE_SALT", None)
+    try:
+        withheld_report = format_catalog_audit(e2e_dropped, e2e_skew, e2e_catalogs)
+        clean_saltless = format_catalog_audit([], [], {"a": {}})
+    finally:
+        if salt_held is not None:
+            os.environ["PROVENANCE_SALT"] = salt_held
+    check("PRIVACY: a salt-less run withholds the reference rather than falling back to the handle",
+          ([h for h in AUDIT_HANDLES if h in " ".join(withheld_report)],
+           "PROVENANCE_SALT unset" in " ".join(withheld_report)), ([], True))
+    check("PRIVACY: a salt-less run SAYS the rows cannot be told apart (never silently "
+          "unreadable)",
+          sum(1 for line in withheld_report if "PROVENANCE_SALT is unset" in line), 1)
+    check("PRIVACY: a salt-less run with NOTHING to report adds no spurious warning",
+          [line for line in clean_saltless if "PROVENANCE_SALT is unset" in line], [])
 
     # The CLI contract, driven through main() exactly as groom.yml drives it: the default REPORTS
     # (exit 0 — a skew row must never take the sweep down), and the opt-in gate mode exits
@@ -1555,21 +1609,27 @@ def _self_test():
             globals()["_run"] = fake_run
             sys.argv = ["select-and-claim.py", "--audit-catalog", "--policy-file",
                         str(policy_path), *extra_argv]
-            buf = io.StringIO()
+            buf, err_buf = io.StringIO(), io.StringIO()
             try:
-                with contextlib.redirect_stdout(buf):
+                # BOTH streams: the groom step's stderr lands in the same log as its stdout, so a
+                # handle leaked on stderr is exactly as exposed as one on stdout.
+                with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err_buf):
                     rc = main()
             finally:
                 globals()["_run"] = saved_run
                 sys.argv = saved_argv
-        return rc, buf.getvalue()
+        return rc, buf.getvalue() + err_buf.getvalue()
 
     skewed_json = json.dumps(audit_issues)
     clean_toml = '[models.opus5]\nprovider = "anthropic"\nharness = "claude"\n'
     rc_report, report_text = _audit_cli([], skewed_json, clean_toml)
     check("audit CLI: the default REPORTS skew and still exits 0 (never takes the sweep down)",
-          (rc_report, "acct30' model 'ghost'" in report_text,
-           "acct31' is NOT in the live pool" in report_text), (0, True, True))
+          (rc_report, f"{ref30} model 'ghost'" in report_text,
+           f"{ref31} is NOT in the live pool" in report_text), (0, True, True))
+    # The leak test that matters is over the WHOLE pipeline's real output — the exact bytes the
+    # groom step writes, stdout AND stderr — not just the formatter's return value.
+    check("PRIVACY NEGATIVE: no raw account handle reaches the audit CLI's real stdout/stderr",
+          [h for h in AUDIT_HANDLES if h in report_text], [])
     rc_gate, _ = _audit_cli(["--fail-on-skew"], skewed_json, clean_toml)
     check("audit CLI: --fail-on-skew exits non-zero on the SAME skewed input",
           rc_gate, 1)
@@ -1617,6 +1677,12 @@ def _self_test():
               ("scripts/select-and-claim.py" in seam_step["run"],
                "--policy-file policy/repos.toml" in seam_step["run"]),
               (True, True))
+        # Privacy + usefulness at the SEAM: without PROVENANCE_SALT in the step env every account
+        # reference collapses to one withheld marker, so the report is safe but useless. Dropping
+        # the env line is invisible to every Python assertion above.
+        check("YAML seam: the audit step is given PROVENANCE_SALT (or its rows cannot be told "
+              "apart)",
+              "PROVENANCE_SALT" in (seam_step.get("env") or {}), True)
         # `if: false` (or any literal-false condition) on the step or its job silently un-wires the
         # audit while every substring assertion above stays green. Only an ABSENT condition passes.
         check("YAML seam: neither the audit step nor its job is if:-disabled",

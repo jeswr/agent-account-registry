@@ -68,12 +68,17 @@ jobs:
       # continue-on-error: a skew report must never abort the dead-lease release that follows it.
       # `--fail-on-skew` is the opt-in gate mode and is NOT used here.
       #
-      # It needs no new credential: the ambient token reads this repo's own account issues, and
-      # every enabled target's routing.toml is public.
+      # It needs no new TOKEN: the ambient token reads this repo's own account issues, and every
+      # enabled target's routing.toml is public. It DOES need PROVENANCE_SALT — privacy (locked
+      # decision 22a/22b): the report references an account only by its salted provenance
+      # fingerprint, never by handle, so without the salt in context every row collapses to one
+      # withheld marker and the report cannot identify the offending record. The salt is already
+      # read by this job (see the SECRET-EXFIL GUARD note above); no new secret is introduced.
       - name: Report account-catalog / target-routing skew
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
+          PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
         run: |
           set -euo pipefail
           python3 scripts/select-and-claim.py --audit-catalog \
