@@ -182,16 +182,6 @@
   },
   {
    "account": "3ff9b4af73df69dc",
-   "claim_id": "bb369a9dafbc4b5f88039845549b38cd",
-   "holder": "sparq-org/sparq#3252@30184311248.1",
-   "package": "sparq-terse",
-   "role": "impl",
-   "model": "opus5",
-   "issued_at": 1785032239,
-   "expires_at": 1785038539
-  },
-  {
-   "account": "3ff9b4af73df69dc",
    "claim_id": "94704ace883e4482846d9fb8cab4066d",
    "holder": "fix:sparq-org/sparq#3434@dispatch-30184153187.1",
    "package": "sparq-zk",
