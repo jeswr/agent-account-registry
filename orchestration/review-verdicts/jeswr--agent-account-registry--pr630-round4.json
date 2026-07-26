@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 630,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "9b82aef1d50465f4b41277190b69d89491ab992d",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "The prior execution-context blocker is resolved. Live reverification now runs in the separate publish job, where no target-controlled code has executed, and its verifier, driver, and dynamically loaded policy sibling are all rebound to pre-model SHA-256 outputs before execution. Publication additionally requires a non-empty positive attestation emitted only after reverify returns successfully. The earlier pre-shell LD_PRELOAD persistence path from the hostile gate runner therefore no longer reaches the verifier process. The claim receipt ordering and newest-receipt check are fail-closed, including malformed timestamps, ties, missing ownership, foreign supersession, and the pre-attempt race. The added tests exercise accepting and rejecting paths and the real rendered verification block, so they are non-vacuous. No blocker or major issue remains in the diff.",
+  "verdict": "approve"
+ }
+}
