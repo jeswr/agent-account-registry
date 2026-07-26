@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3886,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "3b0503a58553c59619a7735155f43e5fbac4c217",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "In `ChangeRelay::pump`, a `SinkError::Permanent` from `deliver` is stored in `failure`, but `self.fail(seq, e)` is not called until after `self.sink.flush()` and `write_cursor(...)`. If flushing returns an error, `pump` returns the flush error instead; if accepted prefix records exist and cursor persistence fails, it returns `RelayError::Cursor`. In both cases the original permanent refusal is lost and `self.poisoned` may remain unset (certainly so for a retryable flush error or cursor error). A later call can therefore invoke the sink again even though the documented contract says every permanent refusal poisons the live relay immediately and all later pumps fail closed.",
+    "file": "crates/sparq-serve/src/change_sink.rs",
+    "fix_hint": "Poison the relay as soon as `deliver` returns `SinkError::Permanent`, while still retaining the original failure and completing any required prefix flush/cursor bookkeeping. Define deterministic error precedence so later flush/cursor errors cannot erase the poisoned state. Add a real-path test where a sink accepts a prefix, permanently rejects the next record, and then either returns a retryable flush error or the cursor write fails; assert `is_poisoned()` and that the next `pump` returns `RelayError::Poisoned` without another delivery attempt.",
+    "severity": "major",
+    "title": "Permanent delivery failures can be masked without poisoning the relay"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 3 regresses from the clean prior round: the relay does not reliably poison itself when `deliver` returns a permanent error. After recording that failure, `pump` performs `flush` and cursor persistence before calling `fail` on the original error. Either intervening operation can return early, masking the permanent refusal and leaving the relay armed, contrary to the public fail-closed contract. The tests cover permanent refusal only when both later operations succeed, so they do not exercise this state-transition edge.",
+  "verdict": "request_changes"
+ }
+}
