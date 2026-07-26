@@ -72,16 +72,6 @@
   },
   {
    "account": "9e13ea21abf27e68",
-   "claim_id": "ce319b3f64a34c75926d129ec363ae3d",
-   "holder": "review:sparq-org/sparq#4074@dispatch-30214625138.1",
-   "package": "gui",
-   "role": "review",
-   "model": "opus5",
-   "issued_at": 1785090743,
-   "expires_at": 1785094943
-  },
-  {
-   "account": "9e13ea21abf27e68",
    "claim_id": "76f3cf63ea4d4c81bbb3848b22f24c42",
    "holder": "fix:sparq-org/sparq#4218@dispatch-30214625138.1",
    "package": "sparq-policy",
