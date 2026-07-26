@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4086,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "6d9de50615aec8ab434c6891f0db27d78728175d",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "completeness() returns planned=None not only for legacy artifacts but also when mutants.json is missing, corrupt, unreadable, or the wrong shape, and seed() then accepts the outcomes without any completeness check. A timed-out artifact copied without mutants.json is therefore accepted as a whole run\u2014the exact dishonest-baseline failure this change claims to prevent. The self-test explicitly requires this unsafe behavior for t3. This also contradicts the new ci.yml and baseline prose saying --seed refuses a truncated run; it only refuses one when valid sidecar evidence happens to be present.",
+    "file": "scripts/mutants-gate.py",
+    "fix_hint": "Fail closed in --seed when completeness cannot be established: record missing/invalid mutants.json as a seed refusal, while allowing --check to remain backward-compatible if desired. If a legacy escape hatch is necessary, make it explicit and loudly named, and update all claims accordingly. Replace the t3 acceptance assertion with missing, malformed, and wrong-shape sidecar refusal tests.",
+    "severity": "major",
+    "title": "Seeding still fails open when planned-mutant evidence is unavailable"
+   },
+   {
+    "body": "The new comments publish exact mutant counts, per-mutant seconds, runner-hours, means, and derived wall-clock ranges from a four-CPU/session box. The reviewer contract explicitly prohibits hard-coded performance numbers and says work-box/session-box timings are non-canonical. These figures will also stale as the crate and runner environment change, while appearing authoritative in the workflow.",
+    "file": ".github/workflows/ci.yml",
+    "fix_hint": "Remove the exact timing/count/range claims from the workflow. Keep a qualitative sizing rationale and point to a reproducible generated artifact or tracked measurement record if evidence is needed; describe the 24-way split as an operational initial value to be retuned from nightly results, without presenting local timings as canonical.",
+    "severity": "major",
+    "title": "Workflow hard-codes non-canonical work-box performance measurements"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 2 fixes the prior shard-set defect: seeding now validates identities, uniqueness, denominators, and completeness, with non-vacuous tests for the previously reported cases. However, truncation safety still fails open whenever mutants.json is absent, malformed, unreadable, or not a list; the self-test explicitly blesses that path even though the workflow comments and baseline documentation claim truncated runs are refused. The diff also embeds session-box timing/count measurements despite the repository rule that such figures are non-canonical and must not be hard-coded. Because these are new findings relative to round 1, progress is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
