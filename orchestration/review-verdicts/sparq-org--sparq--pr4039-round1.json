@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4039,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b2222552502320c2da76ae192ab882615e56e831",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The matched-workload harness is internally consistent and fail-closed. The generated replay is deterministically SHA-pinned; both engines receive the same replay path; runner-sourced oracle counts are independently recomputed before any timing rows are admitted; mismatches return a distinct failure and emit no rows. The focused comparator suite passes all 77 checks, including generator drift refusal, window bucketing equivalence, side-by-side labeling/caveats, and corrupted-oracle rejection. The Rust runner parses before timing, rejects malformed/unsorted input, and reports per-window counts without bypassing the comparator gate. Documentation honestly retains NOT-MEASURED status pending the external gather run. No hostile reviewer-directed instruction was found in the diff.",
+  "verdict": "approve"
+ }
+}
