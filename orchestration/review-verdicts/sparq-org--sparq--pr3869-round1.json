@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3869,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "1975821370a1e122b0d63e96a2eaeec6cdac911b",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The new opt-in matrix leg correctly targets the workspace crate's sole default-off feature, enables the feature set required to compile and run its gated tests, and keeps test execution enabled for this MPC-sensitive surface. The corresponding gate-critical leg-name golden is updated with the exact emitted check name. No correctness, soundness, security, or test-validity issue is apparent in the diff.",
+  "verdict": "approve"
+ }
+}
