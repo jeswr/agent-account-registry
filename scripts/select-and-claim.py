@@ -2347,6 +2347,40 @@ def _self_test():
            account_slot_cap(W_TAPPED, w_usage(0.85), now=W_NOW, margin=0.15),
            account_slot_cap({"handle": "x", "max_concurrent_workers": "junk"}, None)), (4, 0, 0))
 
+    # -- CALL SITE 0b: the WIRING through claim(). Testing `choose_account` directly proves the
+    # selection LOGIC; it does not prove `claim()` still hands it `run_seconds`. That distinction is
+    # exactly what let an earlier mutant ("claim() stops threading run_seconds") survive a green
+    # suite. Drive real claim() over a stubbed catalog + ledger, with usage whose ONLY problem is a
+    # burn rate too fast to finish the run: it must be refused THROUGH claim, and admitted when the
+    # same account burns slowly.
+    W_CAT = json.dumps([
+        {"title": "acct91", "body": "provider: anthropic\nmodels: [opus5]\nsecret_ref: ACCT91_TOKEN\n"
+                                    "credential_format: claude-oauth-token\nmax_concurrent_workers: 4",
+         "labels": [{"name": "status:available"}]},
+    ])
+    _saved_run = globals()["_run"]
+    _saved_rl, _saved_wl = globals()["_read_ledger"], globals()["_write_ledger"]
+    globals()["_run"] = lambda args: SimpleNamespace(stdout=W_CAT)
+    globals()["_read_ledger"] = lambda repo: ([], "sha0")
+    globals()["_write_ledger"] = lambda repo, leases, sha, msg: True
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            _fast = claim("o/r", "p", "impl", ["opus5"], "o/r#1@run", W_NOW,
+                          usage={"acct91": fast_burn}, margin=0.15, run_seconds=5400)
+            _slow = claim("o/r", "p", "impl", ["opus5"], "o/r#2@run", W_NOW,
+                          usage={"acct91": slow_burn}, margin=0.15, run_seconds=5400)
+            _norun = claim("o/r", "p", "impl", ["opus5"], "o/r#3@run", W_NOW,
+                           usage={"acct91": fast_burn}, margin=0.15)
+    finally:
+        globals()["_run"] = _saved_run
+        globals()["_read_ledger"], globals()["_write_ledger"] = _saved_rl, _saved_wl
+    check("F1 wiring: claim() REFUSES an account projected to run dry mid-worker",
+          _fast, None)
+    check("F1 wiring: claim() ADMITS the same account at a survivable burn rate",
+          _slow and _slow["account"], "acct91")
+    check("F1 wiring: without run_seconds the projection is off (utilisation taper only)",
+          _norun and _norun["account"], "acct91")
+
     # -- CALL SITE 1: dynamic_concurrency must CONSUME the taper. Two accounts, both eligible, both
     # cap=4: a fresh one and a nearly-tapped one. Summing flat caps gives 8; summing adaptive_slots
     # gives 4+1. Reverting that one line to `int(a.get("max_concurrent_workers", 4))` makes this red.
