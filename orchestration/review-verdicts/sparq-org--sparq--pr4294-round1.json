@@ -1,0 +1,44 @@
+{
+ "host_envelope": {
+  "pr": 4294,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "86fa7106aa724c7a90495dda5cfab26cb842882a",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "read_output accepts any Python float, including `nan`. In validate_float, `abs(nan - r) > bound` is false, so an actual output containing NaN for every expected vertex passes validation. This makes the load-bearing correctness gate unsound and is not covered by the gate self-test.",
+    "file": "bench/graphalytics/gx.py",
+    "fix_hint": "Reject non-finite reference and actual values with `math.isfinite` before applying the tolerance comparison, and add self-tests proving NaN and both infinities are rejected.",
+    "severity": "major",
+    "title": "PageRank validator accepts NaN as a valid result"
+   },
+   {
+    "body": "For both sparq and competitor legs, the captured runner log is printed before gate_and_record is called. Those logs contain `metric_us algo=...`, so a red validation result still exposes its timing. This directly contradicts the stated invariant that validation occurs before any timing is reported and that a red row has no timing printed.",
+    "file": "bench/graphalytics/run.sh",
+    "fix_hint": "Parse and retain timing internally, run validation first, and only print the timing/log lines after a successful gate. On mismatch, print diagnostics with all timing lines filtered or never emitted.",
+    "severity": "major",
+    "title": "The harness prints algorithm timings before validation"
+   },
+   {
+    "body": "The adapter correctly labels igraph PageRank as converged, but run.sh passes the same Graphalytics fixed-sweep reference used for sparq into gate_and_record. No converged reference is generated or selected. The comments and README claim the igraph row is gated against a converged reference, so the implemented competitor comparison is incomplete and ordinarily produces a semantic mismatch rather than the documented validated row.",
+    "file": "scripts/bench-adapters/graph_analytics_adapter.py",
+    "fix_hint": "Either generate and clearly identify an independent converged oracle for the igraph row, or classify igraph PageRank as an incomparable feature/semantic gap and remove the claim that it is validated against a converged reference. Do not compare it to the fixed-sweep output.",
+    "severity": "major",
+    "title": "igraph PageRank is validated against the fixed-iteration reference, not a converged reference"
+   },
+   {
+    "body": "The N-Triples scratch path is always `/tmp/sparq-graphalytics-{name}.nt` and File::create follows existing symlinks. Concurrent runs of the same dataset can truncate or read each other's file, invalidating results; on a shared machine, an attacker can pre-create a symlink and cause the runner to overwrite another writable file. The drop cleanup does not prevent either problem.",
+    "file": "crates/sparq-algos/examples/graphalytics.rs",
+    "fix_hint": "Create a private unique temporary file/directory atomically (for example with tempfile, or create_new plus a securely unique name and restrictive permissions), keep its handle/path scoped to the run, and add a concurrency-oriented test or check.",
+    "severity": "major",
+    "title": "Predictable shared /tmp file permits races and symlink overwrite"
+   }
+  ],
+  "progress": null,
+  "summary": "The harness has several correctness defects in its load-bearing validation and reporting paths. Most seriously, PageRank validation accepts NaN values, timings are printed before validation despite the central validate-before-report claim, and the igraph PageRank leg is checked against the wrong reference semantics. The Rust runner also uses a predictable shared temporary pathname, creating concurrency corruption and symlink-overwrite risk.",
+  "verdict": "request_changes"
+ }
+}
