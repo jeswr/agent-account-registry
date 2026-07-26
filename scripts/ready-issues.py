@@ -151,25 +151,68 @@ def ready_candidates(issues, log=None):
     return cands
 
 
-def compute_ready(issues, in_progress_packages=None, log=None):
+def _artifact_name(artifact):
+    """How a package HOLDER is named in a conflict-attribution line. The readiness input carries
+    issues only (PRs are filtered upstream); a pre-seeded `in_progress_packages` entry has no
+    artifact behind it and says so rather than inventing one."""
+    if artifact is None:
+        return "preseeded occupancy"
+    return f"issue#{artifact.get('number', '?')}"
+
+
+def compute_ready(issues, in_progress_packages=None, log=None, conflict_log=None):
     """Conflict-free, priority-ordered, FAIL-CLOSED ready frontier (one-per-package concurrency
-    width). This is NOT the count of drainable work — see ready_candidates() for that."""
+    width). This is NOT the count of drainable work — see ready_candidates() for that.
+
+    `conflict_log`, when supplied, receives ONE attribution line per candidate the PACKAGE
+    partition dropped: `conflict #N: area A held by issue#M`. Package serialization drops are
+    transient by design, which is why `exclusion_reason` deliberately does not report them — but
+    per-tick telemetry needs to know WHICH area is serialising the frontier and WHO holds it
+    (`scripts/dispatch-telemetry.py`, Gate A of the crate-region-parallelism record). Same sink
+    shape as the sparq target's readiness engine, so the shared dispatcher can attribute both
+    targets identically. Supplying the sink NEVER changes the frontier — asserted by --self-test.
+    """
     taken = set(in_progress_packages or ())
+    holders = {pkg: None for pkg in taken}
     for it in issues:
         if str(it.get("state", "OPEN")).upper() != "OPEN":
             continue
         L = labels_of(it)
         if "status:in-progress" in L or "status:in-progress-review" in L:
-            taken |= packages_of(L)
+            for pkg in packages_of(L):
+                holders.setdefault(pkg, it)
+                taken.add(pkg)
+
+    def held_by(pkgs):
+        """The (area, holder) blocking `pkgs`, or None. Mirrors the three conditions below exactly:
+        a GLOBAL reservation blocks everything; an overlapping package blocks; and a cross-cutting
+        candidate cannot co-run with ANY reserved package."""
+        if GLOBAL in taken:
+            return GLOBAL, holders.get(GLOBAL)
+        overlap = pkgs & taken
+        if overlap:
+            area = sorted(overlap)[0]
+            return area, holders.get(area)
+        if GLOBAL in pkgs and taken:
+            area = sorted(taken)[0]
+            return area, holders.get(area)
+        return None
+
     cands = ready_candidates(issues, log=log)
     ready = []
     for _p, _n, it, pkgs in cands:
-        if GLOBAL in taken:                  # cross-cutting work in flight -> nothing else co-runs
-            break
-        if pkgs & taken:                     # package conflict
+        # The pre-fix loop `break`-ed once GLOBAL was taken. held_by() returns GLOBAL for every
+        # remaining candidate in that state, so the frontier is byte-identical while each dropped
+        # candidate still gets its attribution line (a `break` would have silently un-attributed
+        # every candidate after the first cross-cutting reservation).
+        blocker = held_by(pkgs)
+        if blocker is not None:
+            if conflict_log is not None:
+                conflict_log(f"conflict #{it.get('number', '?')}: area {blocker[0]} held by "
+                             f"{_artifact_name(blocker[1])}")
             continue
-        if GLOBAL in pkgs and taken:         # cross-cutting can't co-run with any package in flight
-            continue
+        for pkg in pkgs:
+            holders.setdefault(pkg, it)
         taken |= pkgs
         ready.append(it)
     return ready
@@ -262,6 +305,44 @@ def _self_test():
           exclusion_reason({"priority:P1", "role:impl"}), "no status:ready attestation")
     check("exclusion_reason: an area-less set is still enumerable (it reserves __global__)",
           exclusion_reason({"status:ready", "priority:P1", "role:impl"}), None)
+    # ---- Gate A telemetry: PACKAGE-serialization drops are ATTRIBUTABLE to the holding area ----
+    # `exclusion_reason` deliberately omits these (they are transient), so without a sink the
+    # dispatcher cannot say WHICH area is serialising the frontier — the exact quantity Gate A of
+    # research/crate-region-parallelism.md asks for. Supplying the sink must not move the frontier.
+    conflicts = []
+    with_sink = compute_ready(F, conflict_log=conflicts.append)
+    check("conflict_log NEVER changes the frontier (attribution is observation only)",
+          [i["number"] for i in with_sink], [i["number"] for i in compute_ready(F)])
+    # #1 is held by `worker` (#2 took it). #11 is CROSS-CUTTING: it cannot co-run with ANY reserved
+    # package, so — as in the sparq engine — it is attributed to the deterministic first reserved
+    # area rather than to a fabricated `__global__` holder.
+    check("every package-serialized candidate gets ONE attribution line naming area + holder",
+          sorted(conflicts),
+          ["conflict #11: area dispatch held by issue#3",
+           "conflict #1: area worker held by issue#2"])
+    # NON-VACUOUS: #1 is dropped ONLY because #2 took `worker`; on a board where #2 is absent it is
+    # on the frontier and emits nothing.
+    solo = []
+    check("a candidate with a free package emits no conflict line",
+          ([i["number"] for i in compute_ready(
+              [iss(1, R + ["priority:P2", "area:worker"])], conflict_log=solo.append)], solo),
+          ([1], []))
+    # The GLOBAL reservation must attribute EVERY later candidate, not just the first: the pre-fix
+    # loop `break`-ed there, which would have left the rest silently un-attributed.
+    after_global = []
+    compute_ready([iss(30, R + ["priority:P0"]),
+                   iss(31, R + ["priority:P1", "area:usage"]),
+                   iss(32, R + ["priority:P2", "area:docs"])], conflict_log=after_global.append)
+    check("a cross-cutting reservation attributes EVERY later candidate, not just the first",
+          sorted(after_global),
+          ["conflict #31: area __global__ held by issue#30",
+           "conflict #32: area __global__ held by issue#30"])
+    preseeded = []
+    compute_ready([iss(33, R + ["priority:P1", "area:usage"])],
+                  in_progress_packages={"usage"}, conflict_log=preseeded.append)
+    check("a pre-seeded reservation with no artifact behind it says so, never invents a holder",
+          preseeded, ["conflict #33: area usage held by preseeded occupancy"])
+
     check("flatten pages drops PRs", _flatten_pages(
         [[{"number": 1}, {"number": 2, "pull_request": {}}], [{"number": 3}], "junk", [None]]),
         [{"number": 1}, {"number": 3}])

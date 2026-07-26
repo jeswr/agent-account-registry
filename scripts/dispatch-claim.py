@@ -4392,6 +4392,17 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
         raise DispatchError("worker workflow ref is missing or unsafe")
 
     dispatched = 0
+    # [Gate A telemetry] PER-TARGET worker-lane accounting. `lanes` is fleet-wide, and `dispatched`
+    # additionally folds in review/fix launches, so neither can be compared against a target's
+    # frontier width. This map is the REALISED half of the planned-vs-realised distinction the
+    # crate-region-parallelism Gate A criterion is written against; dispatch-telemetry.py joins it
+    # onto the PLAN-side census. Coarse counts only — no issue numbers, no account handles.
+    worker_by_repo = {}
+
+    def _count_repo(repo_name, key):
+        row = worker_by_repo.setdefault(repo_name, {"planned": 0, "launched": 0})
+        row[key] += 1
+
     # Zero-dispatch visibility (registry #28/#32): count the ready items the PLAN carried and, per
     # tick, WHY each was NOT launched. A tick that PLANNED work but launched NOTHING is a health
     # signal (capacity/access/lease contention, not an empty backlog); the CLAIM step records it +
@@ -4425,7 +4436,7 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
     # planned>0/launched-0 summary for the workflow's always()-guarded tick recorder — instead of
     # a missing file that used to read as planned=0 and record nothing. The final write below
     # overwrites it with the real launched count + histogram.
-    _write_dispatch_summary(planned, 0, defer_reasons, lanes)
+    _write_dispatch_summary(planned, 0, defer_reasons, lanes, by_repo=worker_by_repo)
     for repository in plan["repositories"]:
         repo = repository["target_repo"]
         try:
@@ -4604,6 +4615,7 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
         for item in repository["items"]:
             number = item["number"]
             lanes["worker"]["planned"] += 1
+            _count_repo(repo, "planned")
             if number in linked_open_prs:
                 defer_reasons["existing-pr"] += 1
                 print(f"defer {repo}#{number}: an open worker/closing PR already exists")
@@ -5081,6 +5093,7 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                 continue
             dispatched += 1
             lanes["worker"]["launched"] += 1
+            _count_repo(repo, "launched")
             kind = "deferred-retry" if item["deferred"] else "worker"
             # Privacy (locked decision 22b): public workflow logs never carry account handles.
             print(f"dispatched {kind} {repo}#{number}: model={model}, claim={claim_id[:8]}")
@@ -5117,7 +5130,7 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
 
     # Final summary (registry #28/#32): overwrite the early claim-start write with the real
     # launched count + defer-reason histogram + per-lane counts.
-    _write_dispatch_summary(planned, dispatched, defer_reasons, lanes)
+    _write_dispatch_summary(planned, dispatched, defer_reasons, lanes, by_repo=worker_by_repo)
 
     # Fail LOUD on ledger rot (issue #28): a tick that launched NOTHING because the lease ledger
     # errored (CAS failures, unreadable ledger, auth) is byte-identical to a genuinely empty
@@ -5166,15 +5179,35 @@ def _lane_summary(lanes):
     return summary
 
 
-def _write_dispatch_summary(planned, dispatched, defer_reasons, lanes=None):
+def _by_repo_summary(by_repo):
+    """[Gate A telemetry] Normalise the per-target worker-lane counts for the summary file.
+
+    `launched` is CLAMPED to `planned`: the realised count must never exceed the rows the lane
+    actually saw, or a corrupted counter would manufacture a passing Gate A ratio. Coarse counts
+    only, keyed by `owner/repo`."""
+    out = {}
+    for repo, counts in (by_repo or {}).items():
+        if not isinstance(repo, str) or not isinstance(counts, dict):
+            continue
+        planned = int(counts.get("planned", 0) or 0)
+        launched = int(counts.get("launched", 0) or 0)
+        out[repo] = {"planned": max(0, planned), "launched": max(0, min(launched, planned))}
+    return out
+
+
+def _write_dispatch_summary(planned, dispatched, defer_reasons, lanes=None, by_repo=None):
     """Zero-dispatch visibility (registry #28/#32): emit a compact, privacy-safe summary
-    ({planned, dispatched, frontier_size, ledger, defer_reasons histogram, lanes}) for the CLAIM
+    ({planned, dispatched, frontier_size, ledger, defer_reasons histogram, lanes, by_repo}) for the
+    CLAIM
     step to render + record. `frontier_size` is the ready-frontier size the tick observed (==
     planned) and `ledger` is ok|error — together they let the run summary distinguish an empty
     frontier from a lease-ledger failure (issue #28), which both otherwise present as a green
     0-dispatch tick. `lanes` (issue #108) carries the worker/review/fix/disarm decomposition so the
     tick-health recorder can surface a stalled lane — or a failed safety disarm — regardless of
     activity in the other lanes. NO issue numbers or account handles — only coarse category counts.
+    `by_repo` (Gate A telemetry) carries the PER-TARGET worker-lane {planned, launched} split that
+    neither `lanes` (fleet-wide) nor `dispatched` (worker+review+fix) can express, so realised
+    dispatches can be compared against that target's own frontier width.
     Best-effort file write; a failure here must never fail dispatch. Called at claim START (planned
     only — review defect #6) and again at the end with the launched counts."""
     summary_path = os.environ.get("DISPATCH_SUMMARY_FILE")
@@ -5185,7 +5218,8 @@ def _write_dispatch_summary(planned, dispatched, defer_reasons, lanes=None):
             json.dump({"planned": planned, "dispatched": dispatched,
                        "frontier_size": planned, "ledger": _ledger_health(defer_reasons),
                        "defer_reasons": dict(defer_reasons),
-                       "lanes": _lane_summary(lanes)}, handle)
+                       "lanes": _lane_summary(lanes),
+                       "by_repo": _by_repo_summary(by_repo)}, handle)
     except OSError as exc:
         print(f"::warning::dispatch summary write failed ({exc}); continuing")
 
@@ -6298,6 +6332,19 @@ def _self_test():
     assert _lane_summary({"review": Counter({"planned": 3, "launched": 1})})["review"] == {
         "planned": 3, "launched": 1, "deferred": 2, "error": 0}
     assert _lane_summary({"fix": Counter({"planned": 1, "launched": 2})})["fix"]["deferred"] == 0
+    # [Gate A telemetry] the PER-TARGET worker split rides the same summary file. It must survive
+    # the masking fixture above (a summary without it silently zeroes every realised-dispatch
+    # count downstream), and `launched` is CLAMPED to `planned` so a corrupted counter can never
+    # manufacture a passing realised/frontier ratio.
+    assert "by_repo" in masked, masked
+    assert _by_repo_summary({"o/t": {"planned": 3, "launched": 1}}) == {
+        "o/t": {"planned": 3, "launched": 1}}
+    assert _by_repo_summary({"o/t": {"planned": 1, "launched": 9}}) == {
+        "o/t": {"planned": 1, "launched": 1}}
+    assert _by_repo_summary({"o/t": {"planned": -5, "launched": -5}}) == {
+        "o/t": {"planned": 0, "launched": 0}}
+    assert _by_repo_summary({7: {"planned": 1}, "o/t": "junk"}) == {}
+    assert _by_repo_summary(None) == {}
     # Every REVIEW_STATE maps to exactly one lane and the split is EXHAUSTIVE (a new state would
     # KeyError the assertion below rather than silently land in the fix lane): needs-review + the
     # stranded escalation are the review lane; the three fix-run states are the fix lane.

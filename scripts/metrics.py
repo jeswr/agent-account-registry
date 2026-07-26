@@ -50,7 +50,15 @@
 #         # derived:
 #         "pr_open_rate": float,      # PRs opened / hr (from prs_opened_1h, or the ring delta)
 #         "pr_close_rate": float,     # PRs closed+merged / hr
-#         "net_pr_flow": float        # open_rate - close_rate (>0 => backlog growing)
+#         "net_pr_flow": float,       # open_rate - close_rate (>0 => backlog growing)
+#         # PUBLISHED SNAPSHOT ONLY (not carried on the ring rows): the per-tick dispatch
+#         # telemetry read off ledger:data/dispatch-telemetry.json — Gate A of
+#         # research/crate-region-parallelism.md §8 made evaluable without a human running a
+#         # script. `status` is explicit: ok | stale | no-record | unavailable.
+#         "dispatch": {"status": str, "frontier_width": int, "realised_dispatches": int,
+#                      "conflict_deferrals": int, "conflict_by_area": {area: int},
+#                      "census": {bucket: int}, "census_unclassified": int,
+#                      "realisation_rate": float | null, "gate_a": {open, reason, ...}}
 #       }, ...
 #     },
 #     "alerts": [ {target, classification, fire, summary, metrics:{...}}, ... ]
@@ -621,6 +629,109 @@ def _ready_count(repo, kind, token, open_issues=None):
     return len(_ready_issues_module().ready_candidates(prepared))
 
 
+def _dispatch_telemetry_module():
+    """Import the shared dispatch-telemetry.py helpers (dashed filename => importlib, cached)."""
+    cached = getattr(_dispatch_telemetry_module, "_mod", None)
+    if cached is not None:
+        return cached
+    import importlib.util
+    here = os.path.dirname(os.path.abspath(__file__))
+    spec = importlib.util.spec_from_file_location(
+        "registry_dispatch_telemetry", os.path.join(here, "dispatch-telemetry.py"))
+    if spec is None or spec.loader is None:
+        raise MetricsError("cannot load dispatch-telemetry helpers")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    _dispatch_telemetry_module._mod = module
+    return module
+
+
+# A dispatch tick runs roughly every 10 minutes. Anything older than this on the feed is reporting
+# a DEAD dispatcher's last good tick, which is worse than reporting nothing — so it is labelled.
+DISPATCH_STALE_SECONDS = int(os.environ.get("REGISTRY_DISPATCH_STALE_SECONDS", "2700"))
+
+
+def dispatch_panel(records, repo, now, stale_after=DISPATCH_STALE_SECONDS):
+    """PURE: the per-target dispatch-telemetry panel published on the public metrics feed.
+
+    Surfaces the three quantities Gate A of research/crate-region-parallelism.md §8 is written
+    against — `frontier_width`, `realised_dispatches`, `conflict_deferrals` (attributed by held
+    area) — plus the population census and the evaluated gate, so the gate stops requiring a human
+    to run `ready-issues.py --diagnose` by hand every tick.
+
+    `status` is explicit and never optimistic: `no-record` when this target has never reported,
+    `stale` when the newest tick predates `stale_after` (a dead dispatcher must not present its last
+    good tick as current), `ok` otherwise. `realisation_rate` is null on an empty frontier — a tick
+    with nothing to dispatch says nothing about whether the frontier is the ceiling.
+    """
+    telemetry = _dispatch_telemetry_module()
+    rows = [r for r in (records or []) if isinstance(r, dict) and r.get("repo") == repo]
+    if not rows:
+        return {"status": "no-record"}
+    latest = telemetry.latest_by_repo(rows).get(repo, {})
+    age = int(now) - int(latest.get("ts", 0) or 0)
+    width = int(latest.get("frontier_width", 0) or 0)
+    realised = int(latest.get("realised_dispatches", 0) or 0)
+    return {
+        "status": "stale" if age > stale_after else "ok",
+        "tick_age_seconds": age,
+        "frontier_width": width,
+        "realised_dispatches": realised,
+        "unrealised_rows": int(latest.get("unrealised_rows", 0) or 0),
+        "planned_rows": int(latest.get("planned_rows", 0) or 0),
+        "conflict_deferrals": int(latest.get("conflict_deferrals", 0) or 0),
+        "conflict_by_area": dict(latest.get("conflict_by_area") or {}),
+        "candidates": int(latest.get("candidates", 0) or 0),
+        "census": dict(latest.get("census") or {}),
+        "census_unclassified": int(latest.get("census_unclassified", 0) or 0),
+        "attribution": latest.get("attribution", "unavailable"),
+        "realisation_rate": round(realised / width, 4) if width > 0 else None,
+        "gate_a": telemetry.gate_a_state(rows, repo),
+    }
+
+
+def read_dispatch_telemetry(api, registry_repo):
+    """Read the dispatch-telemetry ring off the ledger branch. ONE contents GET per metrics run.
+
+    FAIL-SOFT by design, and this is the one place in this file that is: the metrics run must keep
+    publishing throughput even when the telemetry ring is missing or malformed. The cost of that
+    choice is paid honestly — the panel then reads `unavailable`, never a fabricated zero, and a
+    zero here would be indistinguishable from a genuinely idle dispatcher.
+    """
+    telemetry = _dispatch_telemetry_module()
+    try:
+        result = api.request(
+            "GET",
+            f"/repos/{registry_repo}/contents/{telemetry.LEDGER_PATH}?ref={LEDGER_REF}",
+            allow_404=True)
+    except MetricsError as exc:
+        print(f"::warning::metrics: dispatch telemetry unreadable ({exc})")
+        return None
+    if result is None:
+        return None
+    try:
+        document = json.loads(
+            base64.b64decode("".join(str(result.get("content", "")).split()),
+                             validate=True).decode())
+        return telemetry.validate_ledger(document)
+    except (ValueError, TypeError, UnicodeDecodeError) as exc:
+        print(f"::warning::metrics: dispatch telemetry is malformed ({exc})")
+        return None
+
+
+def attach_dispatch_panels(snapshot, records, now):
+    """Fold one dispatch panel onto every collected target. PURE.
+
+    `records is None` means the ring could not be read at all — every panel says `unavailable`
+    rather than `no-record`, because "we could not look" and "the dispatcher has never reported"
+    are different failures and collapsing them hides an outage.
+    """
+    for repo, metrics in (snapshot.get("targets") or {}).items():
+        metrics["dispatch"] = ({"status": "unavailable"} if records is None
+                               else dispatch_panel(records, repo, now))
+    return snapshot
+
+
 def _ready_issues_module():
     """Import the shared ready-issues.py engine (dashed filename => importlib, cached)."""
     cached = getattr(_ready_issues_module, "_mod", None)
@@ -1146,6 +1257,12 @@ def run(policy_path, token_map, registry_token, registry_repo, maintainer, do_al
     alerts = evaluate_alerts(snapshot, history, thresholds_by_target)
     snapshot_out = {k: v for k, v in snapshot.items() if k != "_ts"}
     snapshot_out["alerts"] = alerts
+    # Gate A on the public feed. ONE extra contents GET per metrics run; the dispatcher already
+    # wrote the record, so nothing is recomputed and no per-PR detail is fetched here — the cost
+    # objection that kept the conflict-resolver census out of metrics.py does not apply. Attached
+    # AFTER the ring append on purpose: the dispatch-telemetry ledger is already the time series, so
+    # duplicating a census onto all MAX_SNAPSHOTS ring rows would only inflate that blob.
+    attach_dispatch_panels(snapshot_out, read_dispatch_telemetry(api, registry_repo), now)
 
     if do_alert:
         # Recoveries are computed ONLY for targets actually collected this tick (skipped targets
@@ -1200,6 +1317,67 @@ def main():
 # =============================================================================================
 # self-tests (gh stubbed): metric computation, rate derivation, each alert rule, dedupe
 # =============================================================================================
+def _test_dispatch_panel(chk):
+    """The Gate A panel on the public feed (research/crate-region-parallelism.md §8).
+
+    The point of publishing it is that the gate becomes evaluable without a human running a script,
+    so the assertions below pin (a) that the three quantities actually reach the feed, (b) that an
+    empty or stale signal is LABELLED rather than presented as a healthy zero, and (c) the wiring —
+    a panel builder nothing calls is the same silent hole as no panel at all.
+    """
+    def rec(ts, width, realised, **extra):
+        base = {"ts": ts, "run_id": f"{ts}.1", "repo": "sparq-org/sparq",
+                "frontier_width": width, "realised_dispatches": realised,
+                "planned_rows": width, "unrealised_rows": width - realised,
+                "conflict_deferrals": 362,
+                "conflict_by_area": {"bench": 36, "ci": 33},
+                "candidates": 372, "census": {"frontier": width, "unclassified": 0},
+                "census_unclassified": 0, "attribution": "exact"}
+        base.update(extra)
+        return base
+
+    now = 10_000
+    fresh = [rec(now - 60 * i, 10, 3) for i in range(20)]
+    panel = dispatch_panel(fresh, "sparq-org/sparq", now)
+    chk("[gate-a feed] the three Gate A quantities reach the published feed",
+        (panel["frontier_width"], panel["realised_dispatches"], panel["conflict_deferrals"],
+         panel["conflict_by_area"]["bench"]), (10, 3, 362, 36))
+    chk("[gate-a feed] the realisation rate and the gate verdict are computed for the reader",
+        (panel["realisation_rate"], panel["gate_a"]["open"], panel["gate_a"]["threshold"]),
+        (0.3, False, 0.8))
+    chk("[gate-a feed] a healthy sustained window OPENS the gate on the feed",
+        dispatch_panel([rec(now - 60 * i, 10, 9) for i in range(20)],
+                       "sparq-org/sparq", now)["gate_a"]["open"], True)
+    chk("[gate-a feed] an empty frontier yields a NULL rate, never a fabricated 0.0",
+        dispatch_panel([rec(now, 0, 0)], "sparq-org/sparq", now)["realisation_rate"], None)
+    # A dead dispatcher must not present its last good tick as current.
+    chk("[gate-a feed] a stale ring is LABELLED stale, not published as healthy",
+        (lambda p: (p["status"], p["frontier_width"]))(
+            dispatch_panel([rec(now - 99_999, 10, 9)], "sparq-org/sparq", now)), ("stale", 10))
+    chk("[gate-a feed] a target that has never reported says so",
+        dispatch_panel(fresh, "other/repo", now), {"status": "no-record"})
+    # "could not read the ring" and "the dispatcher never reported" are DIFFERENT failures.
+    unreadable = attach_dispatch_panels(
+        {"targets": {"sparq-org/sparq": {}, "jeswr/agent-account-registry": {}}}, None, now)
+    chk("[gate-a feed] an unreadable ring is `unavailable`, distinct from `no-record`",
+        {r: m["dispatch"]["status"] for r, m in unreadable["targets"].items()},
+        {"sparq-org/sparq": "unavailable", "jeswr/agent-account-registry": "unavailable"})
+    attached = attach_dispatch_panels({"targets": {"sparq-org/sparq": {}}}, fresh, now)
+    chk("[gate-a feed] every collected target gets a panel",
+        attached["targets"]["sparq-org/sparq"]["dispatch"]["status"], "ok")
+    # WIRING: run() must attach the panel to the PUBLISHED snapshot. A builder nothing calls is the
+    # same silent hole as no builder — and it must NOT ride the ring rows (blob growth).
+    source = "\n".join(line for line in
+                       open(os.path.abspath(__file__), encoding="utf-8").read().splitlines()
+                       if not line.lstrip().startswith("#"))
+    body = source[source.index("def run("):source.index("def main(")]
+    chk("[gate-a feed] run() attaches the panel to the PUBLISHED snapshot, after the ring append",
+        ("attach_dispatch_panels(snapshot_out" in body,
+         "read_dispatch_telemetry(api, registry_repo)" in body,
+         body.index("append_snapshot(") < body.index("attach_dispatch_panels(")),
+        (True, True, True))
+
+
 def _self_test():
     ok = True
 
@@ -1230,6 +1408,7 @@ def _self_test():
     _test_publish_cas_and_wiring(chk)
     _test_upsert_dedupe(chk)
     _test_policy_and_readiness(chk)
+    _test_dispatch_panel(chk)
     print("metrics self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 
