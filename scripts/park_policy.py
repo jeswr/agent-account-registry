@@ -54,6 +54,16 @@
 #      run STRICTLY AFTER the park application. No evidence, an unreadable/ambiguous health read,
 #      an unreadable timeline, or an instant tie all fail toward STAYING PARKED — the same
 #      direction the human path already fails in.
+#      AND WHERE THAT PROOF IS UNOBTAINABLE (registry #691): the health window is a rolling 48 h,
+#      so a park older than it — or one applied while the fleet was healthy — can never satisfy
+#      the cause condition, and the "automatic" exit silently expired into a permanent hold. The
+#      caller's probe therefore falls back, ONLY once the strong exit is provably unreachable, to
+#      model-health.sustained_fleet_health_evidence: an explicitly-LABELLED HEURISTIC ("the fleet
+#      has been demonstrably healthy for a sustained span") rather than proof of this park's own
+#      cause. It is an additional evidence SOURCE consumed through this same function — it widens
+#      nothing here: the human-hold refusal, the human-applied-park refusal, the strictly-after
+#      ordering, the consume-exactly-once key and the AUTO_READMISSION_MAX cap all apply to it
+#      unchanged.
 #    - Bounded, and unable to loop, because this is exactly why the human-only rule existed:
 #      every automatic re-admission is receipted durably (worker-pr AUTO_READMIT_MARKER, the same
 #      bot-authored-receipt style as #610's park-generation receipts, which it EXTENDS rather than
@@ -119,12 +129,15 @@ _FINGERPRINT_PART = re.compile(r"[A-Za-z0-9._=/:-]{1,120}")
 # collaborator permission must be one of these for an actor to count as a trusted human.
 HUMAN_MAINTAINER_PERMISSIONS = {"admin", "maintain", "write"}
 MACHINE_PARK_COLOUR = "1d76db"
-# HONEST label text (invariant 3): a machine park clears on a human unlabel OR on proven
-# cause-recovery (capacity_park_admission). The old wording ("cleared automatically on
-# readmission") described a mechanism that did not exist — readmission was human-only, so an
-# outage's parks stayed parked until hand-unlabelled. Keep this in sync with groom.LABELS.
+# HONEST label text (invariant 3): a machine park clears on a human unlabel, on proven
+# cause-recovery (capacity_park_admission), or — once that proof has aged out of the health
+# window — on the capped sustained-fleet-health retry (registry #691). The original wording
+# ("cleared automatically on readmission") described a mechanism that did not exist; the #614
+# wording was true only for the first 48 h, after which the proof became unobtainable and the
+# hold was permanent in fact while claiming otherwise. Keep this in sync with groom.LABELS
+# (GitHub caps a label description at 100 characters).
 MACHINE_PARK_DESCRIPTION = (
-    "Machine-owned capacity park (soft hold; cleared by a human unlabel or proven recovery)"
+    "Machine-owned capacity park (soft hold; human unlabel, proven recovery, or capped retry)"
 )
 # HARD per-PR ceiling on AUTOMATIC re-admissions (invariant 3). Two is deliberate: one covers the
 # ordinary outage-then-recovery shape this exists for, the second covers a genuine second outage,

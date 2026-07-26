@@ -2116,14 +2116,58 @@ def _capacity_recovery_probe(model_health, health_window, now):
     stamp of the latest park application: model-health's per-account cause-recovery predicate over
     the SAME validated health window the decline ladder and #604's auth cooldowns read (never a
     parallel store). An unreadable window (None) or an unparseable park stamp yields no evidence,
-    which the admission reads as STAY PARKED."""
+    which the admission reads as STAY PARKED.
+
+    THE LAYER THAT BINDS (registry #691). This is where a park's machine exit is actually decided
+    — capacity_park_admission consumes whatever this returns, and everything else (the migration
+    precondition below, the label writes, the receipts) is downstream of it. It offers exactly two
+    exits, STRONGEST FIRST, and the order is the safety property:
+
+      1. capacity_recovery_evidence — GENUINE evidence that THIS park's own starvation cause
+         cleared. Always tried first, and if it fires nothing else is consulted.
+      2. If it did not fire but park_cause_provable says the park's cause is STILL OBSERVABLE, the
+         strong exit is REACHABLE and this probe returns None on purpose: a park that can still
+         earn a real proof must WAIT for it, never be released on a weaker one. Substituting the
+         proxy here would silently downgrade every ordinary capacity park.
+      3. Only once the strong exit is UNREACHABLE — the park's cause has aged out of the window,
+         or the park was applied while the fleet was healthy — does the labelled
+         sustained_fleet_health_evidence HEURISTIC apply (registry #691). Without it those parks
+         have no machine exit at all: measured 2026-07-25, all 32 sparq legacy parks deferred on
+         exactly that condition, and a hold with no machine exit turns a transient outage into a
+         permanent stall.
+
+    Both exits return the SAME evidence shape and are consumed by the SAME admission, so both
+    inherit — unchanged, and this is deliberate rather than incidental — the unconditional refusal
+    on any human-owned hold or human-applied park, the strictly-after-the-park ordering check, the
+    consumed-exactly-once evidence key, and the AUTO_READMISSION_MAX cap."""
     def probe(parked_at):
         if health_window is None or not parked_at:
             return None
         parked_epoch = int(_park_policy.parse_ts(parked_at).timestamp())
-        return model_health.capacity_recovery_evidence(health_window, parked_epoch, now)
+        evidence = model_health.capacity_recovery_evidence(health_window, parked_epoch, now)
+        if evidence is not None:
+            return evidence
+        if model_health.park_cause_provable(health_window, parked_epoch, now):
+            return None                 # the real proof can still arrive — wait for it
+        return model_health.sustained_fleet_health_evidence(health_window, parked_epoch, now)
 
     return probe
+
+
+def _legacy_migration_provable(model_health, health_window, now):
+    """The legacy-park migration precondition, as ONE named production function so the self-test
+    binds the expression main() actually evaluates instead of restating it.
+
+    It must agree with _capacity_recovery_probe about what "releasable" means — if it is wider,
+    the migration converts parks into a class that cannot release them (the exact harm
+    park_cause_provable exists to prevent); if it is narrower, parks stall on the human terminal
+    forever (registry #691). model_health.park_exit_reachable is the disjunction of exactly the
+    two exits the probe offers, in the same order, which is how the two are kept from drifting.
+
+    An unreadable window (None) defers the migration, consuming nothing."""
+    if health_window is None:
+        return False
+    return model_health.park_exit_reachable(health_window, now, now)
 
 
 # groom's durable age-park receipt (groom.STALE_PR_MARKER). Kept as a literal here rather than
@@ -2155,12 +2199,14 @@ def _migrate_legacy_park(repo, number, issue_number, comments, labels, bot_login
       the six genuine sparq escalations are pinned as its fixtures).
     - A QUESTION-class cause is RECORDED but never moved: the human terminal is already correct
       for it, and the marker just makes the reason machine-readable from now on.
-    - `provable` (model_health.park_cause_provable at the conversion instant) must hold. This is
-      the gate that keeps the migration from doing HARM: capacity_recovery_evidence fixes a
-      park's cause at its application instant, so converting while the fleet is healthy produces
-      a `review:parked` PR that can NEVER prove recovery — trading a VISIBLE stall a human can
-      see and clear for a SILENT one nothing will ever clear. Not provable => defer to a later
-      tick, consuming nothing.
+    - `provable` (_legacy_migration_provable => model_health.park_exit_reachable at the
+      conversion instant) must hold. This is the gate that keeps the migration from doing HARM:
+      converting a park into a machine class that cannot release it trades a VISIBLE stall a
+      human can see and clear for a SILENT one nothing will ever clear. It holds when EITHER
+      exit is reachable — the park's own starvation cause is still observable (the strong,
+      genuine-evidence exit), or the health ledger is readable and the fleet is presently healthy
+      (the labelled aged-out heuristic, registry #691). Neither => defer to a later tick,
+      consuming nothing.
 
     ONE-SHOT BY CONSTRUCTION: the reason marker this writes is itself the receipt that makes
     reclassify_legacy_park treat the PR as no-longer-legacy, so no second migration can happen —
@@ -2189,9 +2235,10 @@ def _migrate_legacy_park(repo, number, issue_number, comments, labels, bot_login
         log(f"legacy park classified (not moved) {repo}#{number}: {detail}")
         return False
     if not provable:
-        log(f"legacy park deferred {repo}#{number}: cause {cause!r} is machine-owned, but no "
-            "starvation cause is observable at this instant, so a converted park could never "
-            "prove recovery — deferring rather than trading a visible stall for a silent one")
+        log(f"legacy park deferred {repo}#{number}: cause {cause!r} is machine-owned, but the "
+            "machine class has NO exit that could open for it right now (neither an observable "
+            "starvation cause nor a readable, presently-healthy fleet) — deferring rather than "
+            "trading a visible stall for a silent one")
         return False
     # THE HOLD AXIS. A park is a PAIR: `review:needs-user` on the PR AND `needs:user` on the
     # source issue. Clearing only the PR half leaves the issue half live, and
@@ -2237,9 +2284,13 @@ def _migrate_legacy_park(repo, number, issue_number, comments, labels, bot_login
                  f"`{MACHINE_PARK_PR_LABEL}` soft hold. BOTH halves of the park pair are "
                  "converted — the PR label here and the machine-applied `needs:user` on the "
                  "source issue — because either one left standing would block re-admission on "
-                 "its own. It re-admits once its starvation cause is proven recovered (and a "
-                 "human can still clear it by unlabeling). No review judgement is implied or "
-                 "changed.\n\n"
+                 "its own. It re-admits once its starvation cause is proven recovered, or — if "
+                 "that cause has aged out of the health window and can no longer be proven — "
+                 "once the fleet has been demonstrably healthy for a sustained period, which is "
+                 "a labelled heuristic rather than proof of this park's own cause. Either exit "
+                 "is capped at two automatic re-admissions, after which a human decides. A "
+                 "human can still clear it by unlabeling at any time. No review judgement is "
+                 "implied or changed.\n\n"
                  f"{_park_policy.park_reason_marker(cause)}")
     convert_labels(number, issue_number)
     log(f"legacy park MIGRATED {repo}#{number}: {detail}")
@@ -3751,11 +3802,13 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                     repo, pull_pages, live_issue_labels, claim_provenance, bot_login,
                     script_dir, worker_pr,
                     _capacity_recovery_probe(model_health, health_window, _now),
-                    # [G1] The legacy migration converts a park only while a starvation cause is
-                    # OBSERVABLE right now — otherwise the converted park could never prove
-                    # recovery and the migration would trade a visible stall for a silent one.
-                    migration_provable=model_health.park_cause_provable(
-                        health_window, _now, _now))
+                    # [G1] The legacy migration converts a park only when the machine class it is
+                    # converting INTO has an exit that can actually open for it — otherwise the
+                    # migration would trade a visible stall for a silent one. ONE named function
+                    # (registry #691) so this call site and the admission probe above cannot
+                    # drift apart.
+                    migration_provable=_legacy_migration_provable(
+                        model_health, health_window, _now))
 
         for item in repository["items"]:
             number = item["number"]
