@@ -72,16 +72,6 @@
   },
   {
    "account": "51bde6688e140866",
-   "claim_id": "15b1d915009a4520906e4fc058d3743f",
-   "holder": "sparq-org/sparq#2513@30217771000.1",
-   "package": "sparq-reason-ql",
-   "role": "research",
-   "model": "opus5",
-   "issued_at": 1785095575,
-   "expires_at": 1785101875
-  },
-  {
-   "account": "51bde6688e140866",
    "claim_id": "bdb6d0c43abf45cc996405d01523311c",
    "holder": "sparq-org/sparq#3752@30217788715.1",
    "package": "sparq-geo",
