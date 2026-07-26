@@ -12,16 +12,6 @@
   },
   {
    "account": "9e13ea21abf27e68",
-   "claim_id": "86f806dabd294969869e2ead956fa33a",
-   "holder": "review:sparq-org/sparq#4109@dispatch-30200632884.1",
-   "package": "sparq-geo",
-   "role": "review",
-   "model": "opus5",
-   "issued_at": 1785066488,
-   "expires_at": 1785070688
-  },
-  {
-   "account": "9e13ea21abf27e68",
    "claim_id": "e600c477b57a459eb3d12d7725171dfd",
    "holder": "sparq-org/sparq#3167@30201041712.1",
    "package": "sparq-metamorph",
