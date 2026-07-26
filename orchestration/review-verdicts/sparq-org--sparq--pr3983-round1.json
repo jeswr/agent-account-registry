@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3983,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "582ab308fa57fa8b5b5a6cbb08addfb94bb032e8",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change is correct and complete as scoped. The algebra-level SERVICE denial walks all query forms, nested graph patterns, and expression-bearing EXISTS paths before execution; mutation remains unreachable through parse_query. The end-to-end tests exercise the real Nlq loop, verify pre-call question rejection, fail-closed federation handling, explicit opt-in behavior, repair recovery, and store integrity rather than relying only on helper-level assertions. Prompt transformations preserve benign fixtures and the documentation honestly distinguishes structural hardening from prevention, records residual schema-card and total-prompt gaps, and updates the matching public-surface skill.",
+  "verdict": "approve"
+ }
+}
