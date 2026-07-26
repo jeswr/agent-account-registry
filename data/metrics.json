@@ -1,33 +1,33 @@
 {
-  "generated_at": "2026-07-26T08:05:11Z",
+  "generated_at": "2026-07-26T08:32:17Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
-      "issues_open": 1250,
-      "issues_ready": 176,
-      "issues_closed_1h": 10,
-      "issues_closed_24h": 48,
-      "prs_open": 89,
-      "prs_draft": 64,
-      "prs_opened_1h": 10,
+      "issues_open": 1257,
+      "issues_ready": 169,
+      "issues_closed_1h": 7,
+      "issues_closed_24h": 50,
+      "prs_open": 91,
+      "prs_draft": 66,
+      "prs_opened_1h": 11,
       "prs_closed_1h": 0,
-      "prs_merged_1h": 10,
-      "prs_merged_24h": 49,
-      "review_changes_backlog": 2,
+      "prs_merged_1h": 7,
+      "prs_merged_24h": 51,
+      "review_changes_backlog": 5,
       "needs_user_parked": 7,
       "review_lane_health": "ok",
-      "review_lane_runs_1h": 36,
-      "worker_attempts_1h": 30,
-      "worker_success_rate_1h": 0.3333,
-      "pr_open_rate": 10.0,
-      "pr_close_rate": 10.0,
-      "net_pr_flow": 0.0
+      "review_lane_runs_1h": 37,
+      "worker_attempts_1h": 26,
+      "worker_success_rate_1h": 0.4231,
+      "pr_open_rate": 11.0,
+      "pr_close_rate": 7.0,
+      "net_pr_flow": 4.0
     },
     "jeswr/agent-account-registry": {
-      "issues_open": 292,
+      "issues_open": 291,
       "issues_ready": 76,
-      "issues_closed_1h": 0,
-      "issues_closed_24h": 16,
+      "issues_closed_1h": 1,
+      "issues_closed_24h": 17,
       "prs_open": 24,
       "prs_draft": 18,
       "prs_opened_1h": 0,
@@ -50,20 +50,10 @@
       "target": "sparq-org/sparq",
       "classification": "worker-failing",
       "fire": true,
-      "summary": "worker success rate 33% < 50% floor over 2 snapshots (30 attempts this hour)",
+      "summary": "worker success rate 42% < 50% floor over 2 snapshots (26 attempts this hour)",
       "metrics": {
-        "worker_success_rate_1h": 0.3333,
-        "worker_attempts_1h": 30
-      }
-    },
-    {
-      "target": "jeswr/agent-account-registry",
-      "classification": "ready-starved",
-      "fire": true,
-      "summary": "ready frontier 76 > 30 but 0 issues closed over 2 snapshots \u2014 the drain has stalled",
-      "metrics": {
-        "issues_ready": 76,
-        "issues_closed_1h": 0
+        "worker_success_rate_1h": 0.4231,
+        "worker_attempts_1h": 26
       }
     }
   ]
