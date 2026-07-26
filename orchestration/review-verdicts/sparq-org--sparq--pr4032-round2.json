@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4032,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "77f16c946067c229af698331870c56c0b35fdbf8",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The round-1 finding is still present. The test constructs `v1` directly with `TripleStore::from_triples_compressed`, while `encode_emit` intentionally consults `SPARQ_EMIT_FORMAT` when no thread-local override is active. If the test process starts with that variable set to `v2`, the default-V1 assertion fails despite correct production behavior, so the test does not isolate the no-override invariant from ambient configuration.",
+    "file": "crates/sparq-core/src/store.rs",
+    "fix_hint": "Construct the V1 store inside `with_emit_format(EmitFormat::V1, || TripleStore::from_triples_compressed(...))`, while retaining the explicit V2 override for the V2 store.",
+    "severity": "minor",
+    "title": "Default-V1 assertion still depends on ambient SPARQ_EMIT_FORMAT"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The implementation remains correct and complete as scoped: the in-memory compressed constructor now uses the shared emit-policy entry point, the feature-off path still compiles to V1, the test exercises real construction and scan/estimate paths for both formats, and the public-surface documentation matches the change. The sole round-1 issue remains unchanged: the test's purported default-V1 construction can inherit SPARQ_EMIT_FORMAT=v2 from the process environment. This is a minor test-isolation weakness rather than a production correctness defect, so approval remains appropriate. Progress is stagnant because the same minor finding persists at the same severity.",
+  "verdict": "approve"
+ }
+}
