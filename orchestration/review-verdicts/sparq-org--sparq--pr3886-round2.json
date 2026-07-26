@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3886,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "8ae1ab807d62237703477baaf62e34904ec69e44",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior major finding. `ChangeRelay::pump` now persists the candidate cursor before adopting it in `acked_through_seq`, so a cursor-write error leaves the live relay aligned with the durable cursor. The added integration test exercises the real relay and durable log path, forces cursor persistence to fail by replacing the cursor parent directory with a regular file, verifies the in-memory watermark remains unchanged, repairs the path, and confirms the same relay re-delivers the entire batch before a restart recovers the newly persisted watermark. The change is opt-in, dependency-free, and its documentation matches the implemented at-least-once and fail-closed boundaries.",
+  "verdict": "approve"
+ }
+}
