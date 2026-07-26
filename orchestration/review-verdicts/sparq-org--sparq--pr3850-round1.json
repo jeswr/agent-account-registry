@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3850,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "66b374073cb20f8935a75ab40551055f62d10657",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The documentation-only change consistently reconciles stale comments in the untouched vendored ontology files with the existing namespace and licensing resolutions. It clearly distinguishes vendored files from sparq-authored provenance and extension files, preserves the stated byte-for-byte provenance policy, identifies the concrete stale references, and does not introduce a security or soundness claim beyond the scope already documented. No executable behavior or testable code path is changed.",
+  "verdict": "approve"
+ }
+}
