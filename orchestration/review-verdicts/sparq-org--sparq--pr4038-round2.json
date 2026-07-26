@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4038,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "001420111b802681b8fd15c7722cc2db8f0eec2a",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior major finding. The design record now explicitly replaces the unsound reduced-value MAC recomputation with the implementation's independent input-MAC construction, derives the coordinated-deviation check equation, rejects the former route, and retains the research-grade/no-external-audit caveat. The added test exercises value-only, MAC-only, and both-reduction deviations through the production carry construction and confirms that the resulting consistent degree-t codewords evade Reed-Solomon checking but fail the MAC check. The documentation and code now agree on the load-bearing invariant. No blocker or major correctness, soundness, test-validity, or security issue remains in the diff.",
+  "verdict": "approve"
+ }
+}
