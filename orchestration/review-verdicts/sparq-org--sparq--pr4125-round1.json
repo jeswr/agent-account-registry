@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4125,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f215e9ff2774e8436c14255d9847d10b26b2f623",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The new DISTINCT, aggregate-partition, and ordered-differential oracles are internally consistent with their documented scope. DISTINCT correctly uses set union after projection and strengthens to multiset equality only for SELECT DISTINCT *, where branch mappings remain disjoint. Aggregate checking fails closed on malformed shape, non-integer/promoted cells, engine errors, and i128 overflow; its additive and boundness laws are exercised on the real engine and by targeted cardinality, value, and boundness mutants. Ordered comparison delegates to the existing run-wise comparator and tests both a cross-key reversal and a permitted within-tie permutation. Query construction reuses the existing branch-filter implementation, and the new verdict kinds have wire-format coverage. No hostile reviewer-directed instruction was found in the diff.",
+  "verdict": "approve"
+ }
+}
