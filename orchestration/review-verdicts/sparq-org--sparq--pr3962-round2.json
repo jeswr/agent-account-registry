@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3962,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "1d169c6d8a487d6ec3378c53fab22af0b2ecde8a",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 fixes the prior major finding. `resolve_lazy` now performs lexical resolution first, verifies an attached vector store against the graph before invoking the embedder, and only then embeds and searches. The stale-store regression test exercises the real `terse_to_sparql_with` path and asserts both `StaleStore` and zero embedder calls; complementary tests cover lexical success, no-store failure, and exactly one call when vector fallback runs. The freshness check is centralized, and `resolve_vector` has only the validated call site. No new correctness, soundness, test-validity, or security issue is evident in the diff.",
+  "verdict": "approve"
+ }
+}
