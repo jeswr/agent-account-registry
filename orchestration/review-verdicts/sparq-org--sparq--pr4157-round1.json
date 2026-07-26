@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4157,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "6cfd9e776dc98c3f1d9e85d65ec9901465d5e0c6",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The changed gate in exec.rs runs only when `left_b.rows.len() >= PAR_THRESHOLD` (50,000), but `armed_but_unexhausted_budget_does_not_perturb_the_hash_strategy` creates only 200 correlations and merely proves selection of the HASH anti-join strategy (>64), which is independent of rayon fan-out. `a_cancelled_query_over_the_antijoin_reports_the_canonical_reason` uses the small q06 fixture and starts already cancelled, so it can return the same canonical error from an earlier generic budget check without reaching the anti-join, much less the new worker check. Thus the tests are vacuous with respect to the regression this PR claims to fix.",
+    "file": "crates/sparq-engine/tests/theta_antijoin.rs",
+    "fix_hint": "Add an anti-vacuous regression that crosses the actual 50,000-left-row threshold and proves the parallel theta-antijoin verdict branch fired. Trigger cancellation or expiry after evaluation has entered that branch (using deterministic test-only synchronization/instrumentation if necessary), assert the canonical error, and assert that probing is abandoned before all left-row verdicts are evaluated. Keep an answer-equivalence assertion for an unexhausted budget on that same parallel branch.",
+    "severity": "major",
+    "title": "Tests do not exercise the parallel verdict-loop budget gate"
+   }
+  ],
+  "progress": null,
+  "summary": "The implementation is plausible, but the load-bearing regression is not tested on the path being changed. The new worker-side budget check exists only in the rayon verdict branch selected when the left input has at least 50,000 rows. The new hash-strategy fixture has only 200 surviving correlations, and the cancellation test uses the much smaller q06 fixture with the cancellation flag already set. Consequently neither test demonstrates that cancellation or timeout is observed inside the parallel verdict loop; the already-cancelled query may also fail at an earlier operator-entry check. This leaves the claimed cooperativeness fix unverified on the real path.",
+  "verdict": "request_changes"
+ }
+}
