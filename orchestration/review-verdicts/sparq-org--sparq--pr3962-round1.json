@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3962,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "25023fcd93fee5958a90e28f1e29c3365cb8a95a",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`resolve_lazy` calls `embed(phrase)` as soon as `self.store` is `Some`, but `resolve_vector` performs `store.check_graph(self.graph)` only afterward. With a stale store, vector resolution cannot actually run and returns `StaleStore`, yet arbitrary caller embedding work (including a model/network request and disclosure of the phrase) has already happened. This contradicts the new documented contract that embedding occurs only when vector fallback can actually fire and misses the same cost/side-effect rationale enforced for lexical and no-store paths.",
+    "file": "crates/sparq-terse/src/resolve.rs",
+    "fix_hint": "Validate the attached store against the graph before invoking `embed`, then proceed to embedding and search only for a usable store. Preserve the same `StaleStore` error details, preferably by factoring the validation so it is not inconsistently duplicated. Extend the existing stale-store test in `crates/sparq-terse/tests/v_resolution.rs` with a call counter and assert that the embedder is not consulted.",
+    "severity": "major",
+    "title": "Stale vector store is checked only after the embedder runs"
+   }
+  ],
+  "progress": null,
+  "summary": "The lexical-success and no-store cases are correctly made lazy and the new tests exercise those paths. However, the implementation still invokes the caller's potentially network-backed embedder before validating that the attached vector store is usable. A stale store therefore incurs the very model/network call that the new contract says occurs only when vector fallback can actually fire. The existing stale-store test does not assert this call behavior, leaving the gap untested.",
+  "verdict": "request_changes"
+ }
+}
