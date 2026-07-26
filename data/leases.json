@@ -69,6 +69,16 @@
    "model": "sol",
    "issued_at": 1785069329,
    "expires_at": 1785073529
+  },
+  {
+   "account": "dc2d751954080e13",
+   "claim_id": "6e31606f6e5b4993a45ba1ab7113d644",
+   "holder": "review:sparq-org/sparq#4125@dispatch-30202071532.1",
+   "package": "sparq-metamorph",
+   "role": "review",
+   "model": "sol",
+   "issued_at": 1785069333,
+   "expires_at": 1785073533
   }
  ]
 }
