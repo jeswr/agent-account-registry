@@ -1,0 +1,51 @@
+{
+ "host_envelope": {
+  "pr": 4036,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "df6f3fd7d6da88c5db9f74ace934ce84a3882598",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The test comment states \"A generic existential `(A,A)` link remains insufficient; this fixture specifically carries `ObjectHasSelf` provenance\", but the fixture contains no generic-existential case, so that claim is unasserted. Grepping the rbox suite confirms there is no negative witness anywhere in tests/rbox_differential.rs pinning it (cr10_does_not_lift_downward covers lift direction, not self-provenance). par_differential.rs:207 has a `:B2 \u2291 \u2203s.B2` + `\u2203s.Self \u2291 E` shape, but only under a par-vs-seq differential (a shared miss/overderivation in both engines passes) and with no role hierarchy. This matters because the guard is exactly what the new code preserves: a later 'simplification' that moved the self-concept minting into add_link_rbox (so any (X,X) link mints \u2203r.Self) would be UNSOUND \u2014 X \u2291 \u2203r.X only gives some r-successor inside X, not a loop at each x \u2014 and no test in this suite would go red.",
+    "file": "crates/sparq-reason-el/tests/rbox_differential.rs",
+    "fix_hint": "Add a sibling negative fixture to rbox_differential.rs, e.g. `:r rdfs:subPropertyOf :s . :A rdfs:subClassOf [ owl:onProperty :r ; owl:someValuesFrom :A ] . [ a owl:Restriction ; owl:onProperty :s ; owl:hasSelf \"true\"^^xsd:boolean ] rdfs:subClassOf :D .` and assert_closure(&ttl, &[\"A\", \"D\"], &[]) \u2014 A \u2291 D must NOT be derived. That pins the provenance guard through the CR10 lift, complementing the positive case.",
+    "severity": "minor",
+    "title": "New fixture's comment claims a generic-existential negative guard it does not actually test"
+   },
+   {
+    "body": "derive_chunk and the saturate_par_inner apply loop both change, but the only new test uses Classifier::classify (sequential). Under the combined par+rbox leg, cr_self_restriction_par_matches_seq does exercise the new self_links plumbing differentially \u2014 dropping chunk.self_links entirely would make par miss A \u2291 D / A \u2291 F while seq derives them, so the differential fails. What is NOT pinned is the new super-role lifting in the par engine: that fixture has no `r rdfs:subPropertyOf s`. Divergence risk is structurally low (the apply phase calls the same add_self_link_rbox), which is why this is minor rather than major, but the file's own stated discipline (\"Positive assert so a shared miss cannot hide in the differential\", \"mutation-witnessed\") points at adding one.",
+    "file": "crates/sparq-reason-el/src/classify.rs",
+    "fix_hint": "Add `#[cfg(feature = \"rbox\")] fn rbox_self_restriction_super_role_par_matches_seq()` to tests/par_differential.rs reusing the new fixture's Turtle (r \u2291 s, A \u2291 \u2203r.Self, \u2203s.Self \u2291 D): call assert_par_equals_seq(&ttl) plus a positive `h.is_subclass_of(lk(\"A\"), lk(\"D\"))` assertion across THREAD_COUNTS, matching the existing cr_self_restriction_par_matches_seq shape.",
+    "severity": "minor",
+    "title": "Parallel kernel change has no fixture pinning the new lifting (only the plumbing is covered)"
+   },
+   {
+    "body": "add_self_link_rbox iterates role_box.super_roles(r) only, so composition-derived local reflexivity is missed. With a transitive role or chain `r \u2218 r \u2291 s` and X \u2291 \u2203r.Self: for every x \u2208 X^I, (x,x) \u2208 r^I, so composing the loop with itself gives (x,x) \u2208 s^I, hence X \u2291 \u2203s.Self is entailed. add_link_rbox will derive the LINK (X,X) \u2208 R(s) via CR11, but \u2203s.Self never enters S(X), so an axiom `\u2203s.Self \u2291 D` does not fire. Sound (missing conclusions only), pre-existing rather than introduced, and outside the stated CR10 scope \u2014 the README edit and the CRs4 header line both correctly say `r \u2291* s`, so this is not an overclaim. Worth recording so it is not mistaken for full EL++ self-restriction completeness under rbox.",
+    "file": "crates/sparq-reason-el/src/classify.rs",
+    "fix_hint": "Either extend add_self_link_rbox to close local reflexivity under compositions where both components are known locally reflexive on X (fixpoint over compositions_first/compositions_second with the self-provenance carried), or \u2014 cheaper and adequate \u2014 add one sentence to the CRs4 header comment noting that composition-derived reflexivity (r \u2218 r \u2291 s) does not yet mint \u2203s.Self, and file a bead for it.",
+    "severity": "minor",
+    "title": "CR11-composed local reflexivity is still not lifted (undocumented residual incompleteness)"
+   },
+   {
+    "body": "add_self_link_rbox takes 7 parameters (sat, r, x, ix, names, role_box, queue); clippy::too_many_arguments has a default threshold of 8, so the lint does not fire and the allow is dead. It was presumably copied from add_link_rbox, which genuinely has 8 and carries a written justification comment above its allow. Cosmetic only \u2014 an unused allow does not warn under -D warnings.",
+    "file": "crates/sparq-reason-el/src/classify.rs",
+    "fix_hint": "Drop the #[allow(clippy::too_many_arguments)] line from add_self_link_rbox; add it back with a one-line justification only if a future parameter pushes the count to 8.",
+    "severity": "nit",
+    "title": "#[allow(clippy::too_many_arguments)] on add_self_link_rbox is unnecessary"
+   },
+   {
+    "body": "`add_self_link_rbox(&mut sat, r, x, &ix, names, role_box, &mut queue);` is ~89 columns at both call sites (20-space indent in saturate_inner, same in the saturate_par_inner apply loop), inside the workspace max_width = 100 from rustfmt.toml, so cargo fmt would collapse each to a single line. The adjacent add_link_rbox calls are single-line, so the wrapping also reads as inconsistent. I could not run cargo fmt to confirm (the rustfmt component is not installed on this toolchain), and CI runs `cargo fmt --all --check` informationally with continue-on-error, so this is not gate-blocking.",
+    "file": "crates/sparq-reason-el/src/classify.rs",
+    "fix_hint": "Collapse both add_self_link_rbox(...) calls onto one line each so the file stays clean for the deferred workspace-wide cargo fmt --all reformat that rustfmt.toml documents.",
+    "severity": "nit",
+    "title": "Both new call sites are hand-wrapped although they fit rustfmt's max_width"
+   }
+  ],
+  "progress": null,
+  "summary": "CRs4 (\u2203r.Self \u2208 S(X), r \u2291* s \u21d2 \u2203s.Self \u2208 S(X)) is a genuine entailment and is implemented soundly. Soundness argument checks out against the saturation invariant: the trigger is the has_self branch, which fires only when the minted self-concept enters S(X), i.e. T \u22a8 X \u2291 \u2203r.Self; since r^I \u2286 s^I for every s \u2208 super_roles(r) (rbox.rs builds the reflexive-transitive closure of told rdfs:subPropertyOf only), (x,x) \u2208 s^I for all x \u2208 X^I, hence X \u2291 \u2203s.Self. Crucially the new helper is invoked ONLY from the self-concept trigger, never from add_link_rbox, so the load-bearing guard 'a generic (X,X) link from X \u2291 \u2203r.X must not mint \u2203r.Self' is preserved. Termination is fine: self_concept_of is non-minting and `add` only re-queues on a genuinely new insert, so the recursive re-entry via the queue is idempotent. Sequential and parallel paths stay in step \u2014 derive_chunk routes the conclusion to the new self_links vector and the sequential apply phase calls the SAME add_self_link_rbox, and derived_links keeps its old value by adding self_links.len(). Derived has #[derive(Default)], so the cfg'd field needs no initializer change. Verified locally: builds clean in default, par, rbox and --all-features states; `cargo test -p sparq-reason-el --features rbox --test rbox_differential` = 23 passed and `--features par,rbox --test par_differential` = 19 passed. The new fixture is non-vacuous by construction: `\u2203s.Self \u2291 D` normalises to Sub(self_s, D), a concept inclusion that is NOT in exists_sub, so CR4 cannot fire off the CR10-lifted (A,A) \u2208 R(s) link, and A is not a nominal so CRs3 cannot fire either \u2014 without the fix A \u2291 D is unreachable. README/module-header claims match the code (CR10 only, no overclaim); no perf numbers, no ZK/MPC surface, opt-in feature discipline respected. Remaining findings are hardening only: two absent witness fixtures, one documented-scope incompleteness, and two cosmetics. No blocker or major.",
+  "verdict": "approve"
+ }
+}
