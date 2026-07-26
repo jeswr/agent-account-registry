@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4030,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a330dee23a0bb543da3718f48a9ddb0a077866bd",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change is a research-only design record and is internally consistent with its stated scope. It clearly distinguishes schema emission from execution, corrects the dependency premise to include GraphView metadata access, treats SHACL-to-GraphQL projection as lossy, identifies naming and execution-hardening risks, preserves opt-in/core-lean expectations, and avoids unverified performance claims. Its source references for the public model/view surface, absent presentation metadata, fallible property-path conversion, and lack of an existing GraphQL endpoint are consistent with the checkout. No implementation or public API is changed, so implementation tests are not required by this PR.",
+  "verdict": "approve"
+ }
+}
