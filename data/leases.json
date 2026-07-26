@@ -62,16 +62,6 @@
   },
   {
    "account": "dc2d751954080e13",
-   "claim_id": "9aa22a9b51fe44049792cad77d307d98",
-   "holder": "sparq-org/sparq#2832@30212319867.1",
-   "package": "trust",
-   "role": "impl",
-   "model": "sol",
-   "issued_at": 1785086369,
-   "expires_at": 1785092669
-  },
-  {
-   "account": "dc2d751954080e13",
    "claim_id": "db05a24d0c2b4e17bc2d0df4f8bbaea2",
    "holder": "sparq-org/sparq#2871@30212323294.1",
    "package": "ci-fragments",
