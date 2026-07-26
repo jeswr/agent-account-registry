@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3901,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f24aac94e0059a75adb14a36b1fd1341fdaf442c",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "In `assert_datatype_property_restriction_refused`, both cfg-selected `matches!(result, ...)` expressions match `result` by value. Because `Result<Ontology, ExtractError>` is non-Copy, this consumes `result`; the following `assert!` then tries to format `result` with `{:?}`, causing E0382 (use of moved value). Consequently the extract integration test target cannot compile in either feature state, including the load-bearing `dl_datatypes` lane.",
+    "file": "crates/sparq-reason-dl/tests/extract.rs",
+    "fix_hint": "Match by reference, e.g. `matches!(&result, Err(ExtractError::Unclassifiable(_)))` and the analogous `DataConstruct` arm, so `result` remains available for the diagnostic. Run the extract integration test with default features and with `--features dl_datatypes`.",
+    "severity": "major",
+    "title": "Feature-dependent refusal helper uses a moved Result"
+   }
+  ],
+  "progress": null,
+  "summary": "The concrete-domain implementation is extensively documented and has meaningful end-to-end tests, but the feature-enabled extract test target does not compile because a helper consumes its Result before formatting it in the assertion failure message. This blocks the required feature-on test lane.",
+  "verdict": "request_changes"
+ }
+}
