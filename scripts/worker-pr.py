@@ -224,7 +224,30 @@ SAFE_ALIAS_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 # provider ladder is REJECTED (hostile-input surface: a forged marker must never select an
 # arbitrary provider_model — concrete ids are still resolved from protected target routing by
 # alias).
-ESCALATION_LADDERS = {"anthropic": ["opus", "fable", "opus5"], "openai": ["luna", "sol"]}
+def _load_sibling_module(name, filename):
+    """Load a sibling script by path. The scripts/ dir is not a package and several filenames are
+    hyphenated, so a plain `import` is not available."""
+    spec = importlib.util.spec_from_file_location(
+        name, Path(__file__).resolve().with_name(filename))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+ESCALATION_LADDERS = {"anthropic": ["opus5"], "openai": ["luna", "sol"]}
+# [OPUS-5] 2026-07-26: the anthropic ladder lost its `opus` and `fable` rungs to the deprecation,
+# leaving ONE rung. Consequences, both deliberate:
+#   * `pinned_fix_chain("anthropic", "opus5") == ["opus5"]` — still terminates.
+#   * `decide_budget` can no longer mint an `extend-model-pin` on the anthropic side: with no tier
+#     ABOVE opus5, a stagnant opus5 fix goes straight to `needs-user`. That is the correct
+#     fail-closed exit (a human looks at it) rather than a silent extra round on a retired model.
+# The register is IMPORTED, never re-declared — see scripts/deprecated_models.py for why history
+# reads migrate up instead of raising.
+_deprecated = _load_sibling_module("registry_deprecated_models", "deprecated_models.py")
+assert_no_deprecated = _deprecated.assert_no_deprecated
+migrate_tier = _deprecated.migrate_tier
+migrate_tiers = _deprecated.migrate_tiers
+_deprecated.assert_table_clean("ESCALATION_LADDERS", ESCALATION_LADDERS)
 PROGRESS_VALUES = ("improving", "stagnant", "regressing")
 HARD_CAP_ROUNDS = 6  # absolute bound on review rounds across BOTH extension mechanisms
 REVIEWED_SHA_RE = re.compile(r"<!-- sparq-reviewed-sha:([0-9a-f]{40}|none) -->")
@@ -760,7 +783,13 @@ def pinned_fix_floor(comments, bot_login, provider):
     floor = None
     for comment in _bot_comments(comments, bot_login):
         for match in pattern.finditer(str(comment.get("body", ""))):
-            tier = match.group(2)
+            # [OPUS-5] a marker written BEFORE the 2026-07-26 deprecation names `opus`/`fable`.
+            # Migrate it up to opus5 rather than raising: raising here would permanently stall
+            # every in-flight PR that had escalated, and the floor may only ever rise, so the
+            # migrated tier cannot re-authorize anything the original pin forbade. A marker
+            # naming a genuinely unknown tier still raises (fail closed) — migrate_tier passes
+            # unknown values through unchanged.
+            tier = migrate_tier(match.group(2))
             if tier not in ladder:
                 raise WorkerPrError("recorded model pin is not a ladder member for this provider")
             if floor is None or ladder.index(tier) > ladder.index(floor):
@@ -773,6 +802,7 @@ def pinned_fix_chain(provider, floor):
     first. Tiers below the floor are never offered to the allocator — see the defer-not-fallback
     rationale on decide_budget."""
     ladder = ESCALATION_LADDERS.get(provider)
+    floor = migrate_tier(floor)   # [OPUS-5] accept a pre-deprecation floor; see pinned_fix_floor
     if not ladder or floor not in ladder:
         raise WorkerPrError("model pin must be a ladder member for its provider")
     return ladder[ladder.index(floor):]
@@ -842,16 +872,26 @@ def decide_budget(rounds_used, per_round_models, latest_progress, provider,
         # declared cap — the existing bug continued at round 6 with base_rounds=8. Reject the
         # misconfiguration fail-closed rather than silently honouring a base the cap forbids.
         raise WorkerPrError("base_rounds must not exceed the absolute hard cap")
-    models = sorted(set(per_round_models))
+    # [OPUS-5] MIGRATE BEFORE VALIDATING. These three inputs are HISTORY read back off the PR
+    # (recorded fix-round models, pending fix markers, the pinned floor). After the 2026-07-26
+    # deprecation an in-flight PR whose earlier rounds ran on `opus` or `fable` carries markers
+    # naming tiers the ladder no longer has — validating those raw would raise here on EVERY tick
+    # and stall a PR that was healthy before the config change. Mapping them UP to opus5 is safe:
+    # the floor may only ever rise, so a migrated rung can never lower a pin or re-authorize a
+    # tier the pin forbade. New CONFIG naming a retired tier is still rejected (assert_table_clean
+    # on ESCALATION_LADDERS above) — only history migrates.
+    models = sorted(set(migrate_tiers(per_round_models)))
     for model in models:
         if model not in ladder:
             raise WorkerPrError("a recorded fix-round model is not a ladder member")
-    pending = sorted(set(pending_fix_models))
+    pending = sorted(set(migrate_tiers(pending_fix_models)))
     for model in pending:
         if model not in ladder:
             raise WorkerPrError("a pending fix-round model is not a ladder member")
-    if pin_floor is not None and pin_floor not in ladder:
-        raise WorkerPrError("pin_floor must be a ladder member for its provider")
+    if pin_floor is not None:
+        pin_floor = migrate_tier(pin_floor)
+        if pin_floor not in ladder:
+            raise WorkerPrError("pin_floor must be a ladder member for its provider")
     if latest_progress is not None and latest_progress not in PROGRESS_VALUES:
         raise WorkerPrError("latest_progress must be improving, stagnant, regressing, or None")
     # The absolute hard cap is evaluated BEFORE the base-budget continuation (issue #163): were
@@ -1692,6 +1732,7 @@ def record_model_pin(repo, pr_number, round_n, tier, provider, run_key, bot_logi
     """Durably pin the fix-model floor after a budget extension (idempotent: an existing
     equal-or-higher recorded floor wins — the floor only ever moves UP the ladder)."""
     ladder = ESCALATION_LADDERS.get(provider)
+    tier = migrate_tier(tier)   # [OPUS-5] a caller carrying a pre-deprecation tier converges up
     if not ladder or tier not in ladder:
         raise WorkerPrError("model pin tier must be a ladder member for its provider")
     comments = _paginated_comments(repo, pr_number)
@@ -5217,22 +5258,26 @@ def _self_test():
     # Mechanism 1 — model escalation, precedence over progress (it resets the quality question).
     # Direction (sol r2 f2): the ladder escalates UPWARD per opus < luna < fable < sol —
     # exhaustion on the WEAK tier pins the STRONG tier, never the reverse.
-    check("exhaustion on opus pins fable (escalates UP)", budget(3, ["opus"], "stagnant"),
-          {"action": "extend-model-pin", "pin": "fable"})
-    check("model pin outranks improving progress", budget(3, ["opus"], "improving"),
-          {"action": "extend-model-pin", "pin": "fable"})
+    # [OPUS-5] 2026-07-26: the anthropic ladder is SINGLE-RUNG (opus/fable retired). There is no
+    # tier above opus5, so mechanism 1 can no longer fire on the anthropic side — a legacy `opus`
+    # history MIGRATES to opus5 (the terminal tier) and therefore falls through to mechanism 2.
+    # This is the behaviour change the deprecation causes; it is asserted, not assumed.
+    check("legacy opus history migrates to the terminal tier -> no model pin, stagnant stops",
+          budget(3, ["opus"], "stagnant"), {"action": "needs-user", "pin": None})
+    check("legacy opus history + improving progress-extends (no tier above to pin)",
+          budget(3, ["opus"], "improving"), {"action": "extend-progress", "pin": None})
+    check("legacy fable history migrates to the terminal tier too",
+          budget(3, ["fable"], "stagnant"), {"action": "needs-user", "pin": None})
+    check("a legacy opus+fable history collapses to ONE terminal rung, not two",
+          budget(3, ["opus", "fable"], "improving"), {"action": "extend-progress", "pin": None})
     check("exhaustion on luna pins sol (escalates UP)",
           budget(3, ["luna"], None, provider="openai"),
           {"action": "extend-model-pin", "pin": "sol"})
-    # opus5 is the top anthropic tier (2026-07-24): fable exhaustion now escalates UP to it.
-    check("exhaustion on fable pins opus5 (escalates UP, 2026-07-24)",
-          budget(3, ["fable"], "stagnant"),
-          {"action": "extend-model-pin", "pin": "opus5"})
     # Mechanism 2 — progress extension once the top tier has run (or nothing is recorded)
     check("opus5 + improving extends on progress (terminal tier)",
           budget(3, ["opus5"], "improving"),
           {"action": "extend-progress", "pin": None})
-    check("opus+fable+opus5 + improving is progress-only",
+    check("a mixed legacy+current history is progress-only",
           budget(4, ["opus", "fable", "opus5"], "improving"),
           {"action": "extend-progress", "pin": None})
     check("no fix record + improving extends", budget(3, [], "improving"),
@@ -5243,11 +5288,20 @@ def _self_test():
     check("pending pinned-floor fix authorizes its re-review",
           budget(3, ["opus", "fable"], "stagnant", pending=["fable"], pin="fable"),
           {"action": "extend-pending-review", "pin": None})
+    # [OPUS-5] the same posture written with CURRENT tiers — proves the re-review authorization
+    # does not depend on the retired aliases surviving.
+    check("pending opus5 fix at an opus5 floor authorizes its re-review",
+          budget(3, ["opus5"], "stagnant", pending=["opus5"], pin="opus5"),
+          {"action": "extend-pending-review", "pin": None})
     check("no pending fix in the same posture stops (flip side)",
           budget(3, ["opus", "fable", "opus5"], "stagnant"),
           {"action": "needs-user", "pin": None})
-    check("pending fix BELOW the pinned floor never extends",
-          budget(3, ["opus", "fable", "opus5"], "stagnant", pending=["opus"], pin="fable"),
+    # [OPUS-5] the below-floor case is no longer expressible on the ANTHROPIC ladder (one rung
+    # means nothing can be below the floor), so it is asserted on the openai ladder, which still
+    # has two tiers. Losing the anthropic form must not lose the invariant.
+    check("pending fix BELOW the pinned floor never extends (openai, two-tier)",
+          budget(3, ["luna", "sol"], "stagnant", pending=["luna"], pin="sol",
+                 provider="openai"),
           {"action": "needs-user", "pin": None})
     check("unpinned pending fix authorizes (floor is the ladder bottom)",
           budget(3, ["opus"], None, pending=["opus"]),
@@ -5280,8 +5334,8 @@ def _self_test():
           {"action": "needs-user", "pin": None})
     check("hard cap stops past 6", budget(7, ["fable"], "improving"),
           {"action": "needs-user", "pin": None})
-    check("round 5 still extends under the cap", budget(5, ["opus"], None)["action"],
-          "extend-model-pin")
+    check("round 5 still extends under the cap (openai still has a tier above luna)",
+          budget(5, ["luna"], None, provider="openai")["action"], "extend-model-pin")
     # openai two-tier ladder: SOL is terminal — mechanism 2 only once sol has run
     check("openai sol + stagnant stops (never pins DOWN to luna)",
           budget(3, ["sol"], "stagnant", provider="openai"),
@@ -5345,13 +5399,23 @@ def _self_test():
         {"user": {"login": "mallory"},
          "body": f"z {MODEL_PIN_MARKER} round=3 tier=fable run=6.6 -->"},
     ]
-    check("pinned floor reads the bot marker (forged higher pin ignored)",
-          pinned_fix_floor(pin_comments, bot, "anthropic"), "opus")
-    check("highest recorded floor wins",
+    # [OPUS-5] a PRE-DEPRECATION marker (tier=opus) migrates UP to opus5 instead of raising.
+    # Without this, every in-flight PR that had ever escalated would raise on every tick.
+    check("a pre-deprecation pin marker migrates up, it does not raise",
+          pinned_fix_floor(pin_comments, bot, "anthropic"), "opus5")
+    check("the forged non-bot pin is STILL ignored after migration",
+          pinned_fix_floor([{"user": {"login": "mallory"},
+                             "body": f"z {MODEL_PIN_MARKER} round=3 tier=opus run=6.6 -->"}],
+                           bot, "anthropic"), None)
+    check("highest recorded floor wins (both legacy tiers collapse onto opus5)",
           pinned_fix_floor(pin_comments + [
               {"user": {"login": bot},
                "body": f"z {MODEL_PIN_MARKER} round=4 tier=fable run=4.1 -->"}], bot,
-              "anthropic"), "fable")
+              "anthropic"), "opus5")
+    check("a CURRENT-tier marker still reads straight through",
+          pinned_fix_floor([{"user": {"login": bot},
+                             "body": f"z {MODEL_PIN_MARKER} round=1 tier=opus5 run=1.1 -->"}],
+                           bot, "anthropic"), "opus5")
     try:
         pinned_fix_floor([{"user": {"login": bot},
                            "body": f"z {MODEL_PIN_MARKER} round=1 tier=gpt-omega run=1.1 -->"}],
@@ -5364,10 +5428,14 @@ def _self_test():
           pinned_fix_chain("openai", "luna"), ["luna", "sol"])
     check("pinned chain at the terminal tier", pinned_fix_chain("anthropic", "opus5"),
           ["opus5"])
-    check("pinned fable floor keeps opus5 above it (2026-07-24)",
-          pinned_fix_chain("anthropic", "fable"), ["fable", "opus5"])
-    check("pinned chain at the bottom is the whole ladder",
-          pinned_fix_chain("anthropic", "opus"), ["opus", "fable", "opus5"])
+    # [OPUS-5] a legacy floor migrates to the terminal tier; the chain still TERMINATES.
+    check("a legacy fable floor migrates to the terminal opus5 chain",
+          pinned_fix_chain("anthropic", "fable"), ["opus5"])
+    check("a legacy opus floor migrates to the terminal opus5 chain",
+          pinned_fix_chain("anthropic", "opus"), ["opus5"])
+    check("every anthropic pinned chain is non-empty (it must still terminate)",
+          [bool(pinned_fix_chain("anthropic", t)) for t in ("opus", "fable", "opus5")],
+          [True, True, True])
     check("openai pinned chain at its terminal tier", pinned_fix_chain("openai", "sol"),
           ["sol"])
     try:
@@ -5525,12 +5593,13 @@ def _self_test():
                           "body": f"x {FIX_MODEL_MARKER} round=1 model=fable run=1.1 -->"}]
             opus5_fix = [{"user": {"login": bot},
                           "body": f"x {FIX_MODEL_MARKER} round=1 model=opus5 run=1.1 -->"}]
-            check("outcome model extension pins + stays changes",
-                  outcome("stagnant", opus_fix),
-                  [("findings", 3), ("pin", "fable"), ("state", "changes")])
-            check("outcome fable exhaustion pins opus5 (2026-07-24)",
-                  outcome("stagnant", fable_fix),
-                  [("findings", 3), ("pin", "opus5"), ("state", "changes")])
+            # [OPUS-5] both legacy fix-model markers migrate onto the terminal tier, so a
+            # stagnant outcome escalates to a HUMAN rather than minting another round on a
+            # retired model. The exit exists — it is just needs-user, not a further pin.
+            check("outcome: a legacy opus fix migrates to terminal -> human escalation",
+                  [e[0] for e in outcome("stagnant", opus_fix)], ["findings", "needs-user"])
+            check("outcome: a legacy fable fix migrates to terminal -> human escalation",
+                  [e[0] for e in outcome("stagnant", fable_fix)], ["findings", "needs-user"])
             check("outcome progress extension stays changes without a pin",
                   outcome("improving", opus5_fix), [("findings", 3), ("state", "changes")])
             terminal = outcome("stagnant", opus5_fix)
