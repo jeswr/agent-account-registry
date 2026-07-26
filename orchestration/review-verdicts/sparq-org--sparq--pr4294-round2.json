@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4294,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "2cc91f8733d55554487ff06636d5ddf7dbda2bef",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves all four prior major findings. The PageRank validator now rejects non-finite reference and actual values, with self-tests for NaN and both infinities. Runner and adapter logs are captured and timing lines are withheld on errors, red gates, and semantic gaps. igraph PageRank is explicitly classified as an untimed SEMANTIC-GAP rather than checked against the fixed-iteration oracle. The Rust runner now uses atomically claimed, owner-only unique scratch directories and includes concurrency, cleanup, permissions, and symlink-refusal tests. The changes are internally consistent with the benchmark documentation and preserve fail-closed behavior for conformant algorithms.",
+  "verdict": "approve"
+ }
+}
