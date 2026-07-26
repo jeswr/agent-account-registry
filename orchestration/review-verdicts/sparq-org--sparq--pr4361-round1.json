@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4361,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "3de422bd87794d5a1ba365f38c722ef38a66c2e4",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The combined abox+cdomain path is sound as scoped. Exact-numeric DataPropertyAssertion literals are collected only for the real ABox decoding path, minted through the same canonical point-range registry as TBox ranges, and internalized as the valid consequence {a} \u2291 \u2203q.{v}; unsupported literals remain counted skips. The emit cutoff preserves all relevant containment axioms because newly appended ABox ranges are singleton points and cannot properly contain a distinct non-empty canonical range. Feature isolation is preserved, and the focused tests exercise positive range propagation, negative non-containment, concept deduplication, inconsistency detection, deferral, and the TBox-only path.",
+  "verdict": "approve"
+ }
+}
