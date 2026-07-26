@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3884,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "8a66658b691bf9574b177024b584b7d9afdd6c1e",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "In `scan_bare_words`, every `<` unconditionally enters the IRIREF-skipping branch. In SPARQL, `<` is also a comparison operator. For example, `SELECT ?s WHERE { ?s ?p ?o FILTER(?o < 1) FLTR(?o) }` reaches the parse-failure diagnostic, but the scanner starts at the comparison operator and advances to end-of-input because there is no later `>`, so it never reports `FLTR`. With a later greater-than comparison it instead swallows everything through that operator. This is a common query shape and contradicts the public claim that the scan finds bare words near SPARQL keywords while ignoring actual IRIs.",
+    "file": "crates/sparq-terse/src/diagnose.rs",
+    "fix_hint": "Distinguish IRIREF starts from comparison operators using lexical context consistent with the SPARQL lexer, rather than treating every `<` as an IRI. Add an integration-level regression test containing a valid `<` comparison followed by `FLTR`, asserting that `CanaryFailed.suggestions` still contains `FILTER`; also cover a query with both `<` and `>` comparison operators.",
+    "severity": "major",
+    "title": "Less-than operators swallow the remainder of the query"
+   }
+  ],
+  "progress": null,
+  "summary": "The diagnostic remains fail-closed and the integration test verifies that the emitted query is not rewritten. However, the new lexer conflates SPARQL's less-than comparison operator with the start of an IRIREF. This causes a common valid expression before a misspelled keyword to hide that typo from the diagnostic, so the advertised bare-word scan is incomplete on ordinary query text.",
+  "verdict": "request_changes"
+ }
+}
