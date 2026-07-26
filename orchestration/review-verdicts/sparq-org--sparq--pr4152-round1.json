@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4152,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "2db28a77a77c86313cadbb220a80487b9cbfa77c",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new production path is still documented as \"malicious-secure\" and \"malicious-with-abort\", but the added witness demonstrates that auth_mul accepts a tampered second operand and creates a MAC consistent with the wrong product. This is not only a residual integrity gap in an unrelated intermediate: auth_secret_is_zero calls session.auth_mul(v, &auth_mask), placing its supposedly nonzero masking value in exactly that vulnerable second slot. Replacing that mask with a valid sharing of zero makes a nonzero recompose_diff produce an authenticated zero product, so the range proof can accept corrupted recovered bits. The final verdict MAC check cannot detect a wrong value whose MAC was adopted along the way. The honest-path tests and sampled first-operand tamper tests do not cover this adversarial composition.",
+    "file": "crates/sparq-mpc/src/auth_disclose.rs",
+    "fix_hint": "Do not route the public malicious-with-abort API through this chain until MacSession has multiplication-gate verification that binds both operands (the Chida-style fix already identified in the diff), with a real end-to-end adversarial test that tampers a second operand in the decomposition and the zero-test mask and proves the pipeline aborts. Until then, retain the previous production implementation/range bound or expose this only under an explicitly non-malicious research API; documentation caveats alone are insufficient.",
+    "severity": "blocker",
+    "title": "Production malicious path relies on a multiplication primitive known to adopt adversarial inputs"
+   }
+  ],
+  "progress": null,
+  "summary": "The Rabbit arithmetic appears internally consistent for honest execution, and the full-width differential/range tests exercise the production path. However, this cannot ship as the production \"malicious-secure\"/\"malicious-with-abort\" path while its own witness proves that auth_mul accepts adversarial changes to second operands. That weakness reaches the load-bearing range check: auth_secret_is_zero multiplies the recomposition difference by an authenticated mask in the second operand slot, so a malicious party that substitutes a zero sharing there can make a nonzero difference open as zero with a consistent MAC. In combination with an adopted gate tamper that produces incorrect but MAC-consistent recovered bits, the range guard can be bypassed and an incorrect verdict can reach the final checked open. Merely documenting the limitation does not make the security contract sound.",
+  "verdict": "request_changes"
+ }
+}
