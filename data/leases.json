@@ -141,16 +141,6 @@
    "expires_at": 1785037258
   },
   {
-   "account": "488920c2efe2b3fb",
-   "claim_id": "5f7a9dca31e14f82ba2810c75598f464",
-   "holder": "sparq-org/sparq#3387@30183694656.1",
-   "package": "sparq-gpu",
-   "role": "impl",
-   "model": "opus5",
-   "issued_at": 1785030970,
-   "expires_at": 1785037270
-  },
-  {
    "account": "9e13ea21abf27e68",
    "claim_id": "3c3706d934af42bd978481c3129b790d",
    "holder": "fix:jeswr/agent-account-registry#310@dispatch-30183710737.1",
