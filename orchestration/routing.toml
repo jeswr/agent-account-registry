@@ -107,8 +107,9 @@ escalate = true
 # ---------------------------------------------------------------------------------------------------
 # ROLE ROUTES. OPUS 5 is the primary code-writer (maintainer directive 2026-07-26: "Opus5 should
 # be prioritised over sol on all tasks for which they are both possible implementors; except for
-# GUI work where sol should remain prioritised"). sol remains the cross-provider fallback, so an
-# Anthropic outage does not stall implementation.
+# GUI work where sol should remain prioritised"). sol remains the cross-provider fallback on those
+# routes, so an Anthropic outage does not stall them. `role:impl` is the ONE EXCEPTION since
+# 2026-07-26: sol was removed from it outright on the registry #738 measurement (see that route).
 #
 # These chains LED WITH SOL until 2026-07-26, under the 2026-07-18 "credit abundance" directive
 # taken during a high-sol-availability window. That steer never expired, and because
@@ -122,10 +123,46 @@ escalate = true
 #
 # docs -> sol-led (the separate docs-writing directive); role=docs is still the ONLY surface where
 # the docs-only alias terra/sonnet may appear — policy-resolve.py rejects them in any other route.
+
+# [OPUS-5] `role:impl` IS OPUS5-ONLY SINCE 2026-07-26 — sol was REMOVED, not demoted.
+#
+# MAINTAINER DECISION 2026-07-26, taken on the measurement in registry #738: "Remove sol from impl
+# fallback." This is a change from PREFERENCE to EXCLUSION and it applies to `role:impl` ONLY. The
+# standing 2026-07-26 directive ("Opus5 prioritised over sol on all tasks where both are possible
+# implementors; except GUI work where sol remains prioritised") still governs every other route, so
+# `role:site` / `role:ci` / `role:perf` keep sol as a fallback and `role:docs` keeps its sol LEAD.
+#
+# WHAT WAS MEASURED (registry #738, `worker.yml`, n=74 runs in a 3h24m window, labels reconstructed
+# as-of each run's timestamp):
+#   * `role:impl` first-attempt yield — the SAME route, the same agent brief, the same prompt —
+#     sol 7/40 = 18%, opus5 12/14 = 86%.
+#   * 4 of 4 issues where a sol run left the tree unchanged and opus5 later ran THAT SAME issue,
+#     opus5 produced a PR (sparq#2411, #2639, #3110, #3210). No counterexample either way.
+#   * Every issue-side axis (body length, epic origin, priority, named paths) has ~4x less
+#     explanatory power than the model axis; opus5 converted 6/7 on its shortest-body quartile,
+#     median body length 26 characters.
+#   * Budget exhaustion is REFUTED as the cause: the longest no-diff model step in the window was
+#     177s against a 90-minute worker timeout. sol stops VOLUNTARILY, at ~60s median.
+#
+# WHY EXCLUSION AND NOT MERELY SECOND PLACE. `select-and-claim.choose_account` walks `model_chain`
+# IN ORDER and takes the first AVAILABLE account, so a second rung is not a tie-break — it is what
+# serves the request whenever the first rung's accounts are busy. opus5 holds an account ~17 min per
+# run and sol clears in ~1 min, so during any dispatch burst the low-yield rung served the majority
+# of `role:impl` work. Ordering could not fix that; only removing the rung can.
+#
+# THE EXIT (the same shape `role:research` uses, and for the same reason). A single-rung chain with
+# no `escalate` has NO exit: on an opus5 capacity outage the item defers, and defers again, with no
+# human ever notified. So this route escalates. `escalate = true` is consumed by
+# `dispatch-claim.escalate_starved` + `escalate_persist_decision`: the FIRST starved tick counts
+# `escalate-tier-starved-transient`, keeps the issue `status:deferred` and auto-retries; only
+# CONTINUOUS starvation past ESCALATE_PERSIST_SECONDS is promoted to the MACHINE-owned
+# `status:parked` soft hold, which lifts by itself when capacity returns. It is never `needs:user`
+# — capacity starvation is not a human question (park_policy.py defect 1).
 [[route]]
 role = "impl"
-model_chain = ["opus5", "sol"]
+model_chain = ["opus5"]
 agent = "registry-impl"
+escalate = true
 
 # [FABLE-5] STANDING RULE — UI/front-end ownership (maintainer decision 2026-07-17): UI/front-end
 # surfaces route to the openai/codex model chain (original-builder ownership: GPT-5.6 codex built

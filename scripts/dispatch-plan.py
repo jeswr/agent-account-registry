@@ -170,14 +170,16 @@ def _self_test():
 
     R = ["status:ready"]
 
-    # a non-trust impl issue (area:usage) -> sol-led chain (sol-first routing, 2026-07-18),
-    # no escalate.
+    # [OPUS-5] a non-trust impl issue (area:usage) -> OPUS5-ONLY + escalate (maintainer decision
+    # 2026-07-26, registry #738: "Remove sol from impl fallback"). The WHOLE chain is asserted, not
+    # its head: the planner row is what CLAIM compares for exact equality, so a demoted-not-removed
+    # sol must red here too.
     impl = compute_ready([iss(1, R + ["priority:P1", "role:impl", "area:usage"])])
     p_impl = plan_dispatch(impl, doc)
     chk("impl -> single row", len(p_impl), 1)
     row = p_impl[0]
-    chk("impl row", (row["role"], row["model_chain"][0], row["agent"], row["escalate"]),
-        ("impl", "opus5", "registry-impl", False))
+    chk("impl row", (row["role"], row["model_chain"], row["agent"], row["escalate"]),
+        ("impl", ["opus5"], "registry-impl", True))
     chk("impl package", row["package"], "usage")
 
     # a TRUST-SURFACE issue (area:worker) -> opus5-led (opus tail fallback, 2026-07-24) +

@@ -226,6 +226,23 @@ lead     = "sol"
 requires = ["sol", "opus5"]
 """
 
+# [OPUS-5] registry #738 / the OPUS5-ONLY `role:impl` chain. `role = "impl"` moved from
+# `["opus5", "sol"]` to `["opus5"]` + `escalate = true` (measured: sol 18% vs opus5 86% in-cell
+# first-attempt yield, n=74). That edit DISARMS the re-order-only carve-out — a `["opus5"]` chain
+# does not contain `sol`, so the `requires` condition declines and GUI impl work silently becomes
+# opus5-only, the exact inversion PR #4211 fixed. The fixtures below pin BOTH halves: that the
+# collision is real, and that `inject_roles` closes it identically on both resolvers.
+SPARQ_IMPL_TWO_RUNG = 'role = "impl"\nmodel_chain = ["opus5", "sol"]\nagent = "sparq-rust-impl"'
+SPARQ_IMPL_OPUS5_ONLY = ('role = "impl"\nmodel_chain = ["opus5"]\n'
+                         'agent = "sparq-rust-impl"\nescalate = true')
+GUI_DECLARATION_INJECT = """
+[[chain_preference]]
+labels       = ["area:gui"]
+lead         = "sol"
+requires     = ["sol", "opus5"]
+inject_roles = ["impl"]
+"""
+
 # The security-route exemption is UNOBSERVABLE while the soundness chain is single-model: the
 # `requires` condition declines it for an unrelated reason, so applying the preference to the
 # security branch is a mutation no assertion can see. This variant makes the soundness chain
@@ -297,6 +314,154 @@ def _self_test():  # noqa: C901 — a flat sequence of assertions
         chain(xsec, ("area:gui", "role:impl")), ["sol", "opus5"])
     chk("PLAN and CLAIM agree on every matrix row for the cross-provider-security table",
         compare(xsec), [])
+
+    # (3c) [OPUS-5] THE OPUS5-ONLY `role:impl` CHAIN (registry #738) AND ITS COLLISION WITH THE
+    # CARVE-OUT. Both halves are asserted, because the first is the defect and the second is the fix
+    # and a table can only ship one of them.
+    assert SPARQ_IMPL_TWO_RUNG in SPARQ_SHAPED, \
+        "the impl-route fixture is stale — it no longer edits the impl route"
+    _single = SPARQ_SHAPED.replace(SPARQ_IMPL_TWO_RUNG, SPARQ_IMPL_OPUS5_ONLY, 1)
+    single_reorder = tomllib.loads(_single + GUI_DECLARATION)
+    single_inject = tomllib.loads(_single + GUI_DECLARATION_INJECT)
+    chk("the fixture edit really produced a single-rung escalating impl route",
+        [(r.get("model_chain"), r.get("escalate")) for r in single_reorder["route"]
+         if r.get("role") == "impl"], [(["opus5"], True)])
+    # THE COLLISION, as a test rather than as prose: with the re-order-only declaration the carve-out
+    # goes INERT and GUI impl work resolves opus5-only. Both resolvers agree — which is exactly why
+    # nothing in the pipeline would have reported it.
+    chk("re-order-only declaration + a ['opus5'] impl chain DISARMS the carve-out (both sides "
+        "agree on the WRONG answer, so agreement alone could never have caught this)",
+        (chain(single_reorder, ("area:gui", "role:impl")),
+         _plan(_ROUTE.resolve, ("area:gui", "role:impl"), single_reorder)[1][0]),
+        (["opus5"], ["opus5"]))
+    # THE FIX: `inject_roles` restores sol-first for GUI impl work, on BOTH resolvers.
+    chk("inject_roles restores SOL-FIRST for area:gui + role:impl at CLAIM",
+        chain(single_inject, ("area:gui", "role:impl")), ["sol", "opus5"])
+    chk("...and at PLAN", _plan(_ROUTE.resolve, ("area:gui", "role:impl"),
+                                single_inject)[1][0], ["sol", "opus5"])
+    chk("...and opus5 stays reachable behind sol (preference, not exclusion)",
+        "opus5" in chain(single_inject, ("area:gui", "role:impl")), True)
+    chk("...and the carve-out still never re-routes the AGENT",
+        _claim(("area:gui", "role:impl"), single_inject)[1][1], "sparq-rust-impl")
+    chk("PLAN and CLAIM agree on EVERY matrix row for the single-rung + inject_roles table",
+        compare(single_inject), [])
+    chk("PLAN and CLAIM agree on every matrix row for the single-rung re-order-only table too "
+        "(the collision is a WRONG answer, not a divergence)", compare(single_reorder), [])
+    # The injection is scoped to `role:impl` and to `area:gui`: nothing else may grow a rung.
+    chk("role:research keeps its single-provider escalating chain under the inject declaration",
+        (chain(single_inject, ("area:gui", "role:research")),
+         _claim(("area:gui", "role:research"), single_inject)[1][2]), (["opus5"], True))
+    chk("a plain (non-gui) role:impl issue is NOT given sol back",
+        chain(single_inject, ("area:sparq-core", "role:impl")), ["opus5"])
+    for _near in (("area:guide", "role:impl"), ("area:guidance", "role:impl"),
+                  ("area:site", "role:impl"), ("dashboard", "role:impl")):
+        chk(f"{_near[0]} + role:impl is NOT given sol back (exact selector, under injection too)",
+            chain(single_inject, _near), ["opus5"])
+    chk("a security surface under area:gui is still returned unmodified",
+        chain(single_inject, ("area:gui", "area:sparq-zk", "role:impl")), ["opus5"])
+    # A declaration that tried to inject into an authorship-pinned escalating role is REFUSED, and
+    # refused IDENTICALLY by both resolvers — so the prohibition cannot become a one-sided rule.
+    banned = tomllib.loads(_single + GUI_DECLARATION_INJECT.replace(
+        'inject_roles = ["impl"]', 'inject_roles = ["impl", "research"]', 1))
+    chk("inject_roles naming an authorship-pinned role makes CLAIM refuse",
+        _claim(("area:gui", "role:impl"), banned)[0], "refused")
+    chk("...and PLAN refuse identically, so the two still AGREE (fail-closed on BOTH sides)",
+        compare(banned), [])
+
+    # (3d) [OPUS-5] THE DOCS-ONLY BOUND ON INJECTION, AND — the load-bearing half — ITS SYMMETRY.
+    #
+    # `policy-resolve._reject_docs_only` enforces the 2026-07-18 docs-only directive over
+    # STATICALLY DECLARED chains. `inject_roles` writes the lead into the chain AFTER that, so
+    # before the parse-time bound a table could lead `role:impl` with `terra` and BOTH resolvers
+    # would return `['terra', 'opus5']` — agreeing, so every check in this file passed. The bound
+    # lives in the SHARED `chain_preference` module for exactly that reason: PLAN
+    # (`route-resolve.py`) has no docs-only rule of its own, so a CLAIM-only fix would trade a
+    # silent bypass for a permanent `route-policy-failed` defer.
+    docs_attack = tomllib.loads(_single + GUI_DECLARATION_INJECT.replace(
+        'lead         = "sol"\nrequires     = ["sol", "opus5"]',
+        'lead         = "terra"\nrequires     = ["terra", "opus5"]', 1))
+    assert docs_attack["chain_preference"][0]["lead"] == "terra", \
+        "the docs-only attack fixture is stale — it no longer declares a docs-only lead"
+    chk("a docs-only lead injected into role:impl makes CLAIM refuse",
+        _claim(("area:gui", "role:impl"), docs_attack)[0], "refused")
+    chk("...and makes PLAN refuse", _plan(_ROUTE.resolve, ("area:gui", "role:impl"),
+                                          docs_attack)[0], "refused")
+    chk("...so PLAN and CLAIM still AGREE on EVERY matrix row (a one-sided refusal here would be "
+        "a permanent per-tick route-policy-failed defer, not a closed hole)",
+        compare(docs_attack), [])
+    # WHY a one-sided refusal is unconstructible, asserted rather than left to inspection: BOTH
+    # sides' refusal is raised by the SAME `ChainPreferenceError` from the SAME shared module —
+    # PLAN propagates it, CLAIM re-raises it as a PolicyError whose `__cause__` is that very error.
+    def _refusal_origin():
+        try:
+            _ROUTE.resolve(["area:gui", "role:impl"], copy.deepcopy(docs_attack))
+        except Exception as exc:  # noqa: BLE001 — the TYPE is the assertion
+            plan_origin = type(exc).__name__
+        else:
+            plan_origin = "ROUTED"
+        try:
+            _POLICY.resolve(PROBE_REPO, ["area:gui", "role:impl"], PROBE_POLICY,
+                            copy.deepcopy(docs_attack))
+        except Exception as exc:  # noqa: BLE001
+            claim_origin = type(exc.__cause__).__name__ if exc.__cause__ else type(exc).__name__
+        else:
+            claim_origin = "ROUTED"
+        return plan_origin, claim_origin
+
+    chk("both refusals originate in the SHARED parse-time module — which is WHY a split is "
+        "unconstructible, rather than merely absent from today's fixtures",
+        _refusal_origin(), ("ChainPreferenceError", "ChainPreferenceError"))
+    # THE SWEEP. Every (lead, inject_roles) shape, decided by BOTH resolvers. The first row is the
+    # symmetry property; the second pins WHICH shapes are refused, so a mutant that deletes the
+    # bound reds here (the docs-only-into-non-docs rows become "routed") instead of passing because
+    # both sides agreed on the wrong answer.
+    def _both(lead, requires, inject_roles):
+        decl = f'\n[[chain_preference]]\nlabels = ["area:gui"]\nlead = "{lead}"\n' \
+               f'requires = {json.dumps(requires)}\n'
+        if inject_roles is not None:
+            decl += f'inject_roles = {json.dumps(inject_roles)}\n'
+        doc = tomllib.loads(_single + decl)
+        role_labels = ("area:gui", "role:docs") if inject_roles == ["docs"] \
+            else ("area:gui", "role:impl")
+        return (_plan(_ROUTE.resolve, role_labels, doc)[0], _claim(role_labels, doc)[0],
+                compare(doc))
+
+    sweep = {
+        "terra lead -> role:impl": ("terra", ["terra", "opus5"], ["impl"]),
+        "sonnet lead -> role:impl": ("sonnet", ["sonnet", "opus5"], ["impl"]),
+        "terra lead -> role:impl AND role:docs": ("terra", ["terra", "opus5"], ["docs", "impl"]),
+        "terra lead -> role:docs only": ("terra", ["terra", "opus5"], ["docs"]),
+        "terra lead, NO inject_roles (re-order only)": ("terra", ["terra", "opus5"], None),
+        "sol lead -> role:impl (THE LIVE SHAPE)": ("sol", ["sol", "opus5"], ["impl"]),
+        "sol lead, NO inject_roles": ("sol", ["sol", "opus5"], None),
+    }
+    outcomes = {name: _both(*args) for name, args in sweep.items()}
+    chk("SYMMETRY: for every (lead, inject_roles) shape, PLAN and CLAIM reach the SAME outcome — "
+        "one resolver refusing while the other accepts is not merely absent, it is impossible "
+        "because the refusal is decided by the one module they share",
+        sorted(name for name, (plan, claim, _rows) in outcomes.items() if plan != claim), [])
+    chk("...and no shape produces a matrix disagreement on any other row either",
+        sorted(name for name, (_p, _c, rows) in outcomes.items() if rows), [])
+    chk("...and the REFUSED set is exactly the docs-only-lead-into-a-non-docs-role shapes (this is "
+        "the row that reds if the parse-time bound is deleted)",
+        sorted(name for name, (plan, _c, _r) in outcomes.items() if plan == "refused"),
+        sorted(["terra lead -> role:impl", "sonnet lead -> role:impl",
+                "terra lead -> role:impl AND role:docs"]))
+    # NON-VACUITY of the accepted rows: they must actually ROUTE, and route to the intended chain.
+    chk("the LIVE sol declaration is untouched by the bound — still sol-first at CLAIM and PLAN",
+        (chain(single_inject, ("area:gui", "role:impl")),
+         _plan(_ROUTE.resolve, ("area:gui", "role:impl"), single_inject)[1][0]),
+        (["sol", "opus5"], ["sol", "opus5"]))
+    docs_legit = tomllib.loads(_single + GUI_DECLARATION_INJECT.replace(
+        'lead         = "sol"\nrequires     = ["sol", "opus5"]\ninject_roles = ["impl"]',
+        'lead         = "terra"\nrequires     = ["terra", "opus5"]\ninject_roles = ["docs"]', 1))
+    docs_legit["route"] = [({**r, "model_chain": ["opus5"]} if r.get("role") == "docs" else r)
+                           for r in docs_legit["route"]]
+    chk("a docs-only lead injected into role:docs ROUTES, identically on both sides (the bound is "
+        "the _reject_docs_only exemption mirrored, not a ban on docs-only leads)",
+        (chain(docs_legit, ("area:gui", "role:docs")),
+         _plan(_ROUTE.resolve, ("area:gui", "role:docs"), docs_legit)[1][0]),
+        (["terra", "opus5"], ["terra", "opus5"]))
 
     # (4) NON-VACUITY OF THE HARNESS ITSELF. Give PLAN a resolver that knows a rule CLAIM does not
     # — the exact sparq #4211 shape, a carve-out implemented only in the target's Python — and the
