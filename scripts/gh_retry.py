@@ -18,10 +18,10 @@ Retry policy (all callers inherit it):
     Retry-After-bearing 403s, network timeouts, and connection-reset/EOF drops;
   * NEVER retried: 401/404/422, permission/credential 403s, gh usage/flag errors, and — for
     anything that is NOT an idempotent read — every failure, transient or not;
-  * STATUSLESS reads ARE retried (registry #736; see `classify_read_failure`): when the status
+  * STATUSLESS reads ARE retried (registry #748; see `classify_read_failure`): when the status
     cannot be recovered at all, an IDEMPOTENT READ retries rather than fails closed.
 
-STATUS RECOVERY (registry #736 — the defect that made #729's own retry vacuous). MEASURED on
+STATUS RECOVERY (registry #748 — the defect that made #729's own retry vacuous). MEASURED on
 `gh 2.94.0`: for any response with a JSON content-type and an EMPTY or TRUNCATED body, gh prints a
 bare ``unexpected end of JSON input`` and DISCARDS the status — 403/404/429/500/502/503 are
 byte-identical on that path, so a status regex sees nothing and a text-table classifier sees no
@@ -111,7 +111,7 @@ _TRANSIENT_TEXT = (
 )
 _SECONDARY_403 = ("secondary rate limit", "abuse detection", "retry-after", "retry later")
 # Statusless failures that retrying CANNOT fix: gh usage/flag errors and "no credential configured".
-# Everything ELSE that is statusless is retried on a read (registry #736) — this table exists so a
+# Everything ELSE that is statusless is retried on a read (registry #748) — this table exists so a
 # typo'd flag does not cost four jittered attempts, NOT to decide availability questions.
 _FATAL_TEXT = (
     "unknown flag", "unknown shorthand flag", "unknown command", "unknown subcommand",
@@ -127,7 +127,7 @@ _MESSAGE_STATUS_RE = re.compile(r"HTTP[ :]*([1-5]\d\d)\b|\(HTTP ([1-5]\d\d)\)")
 def is_transient_stderr(text):
     """Conservative transient classifier for `gh` CLI stderr. Fatal classes short-circuit.
 
-    Unchanged by registry #736 and deliberately so: callers that only want a LABEL for a failure
+    Unchanged by registry #748 and deliberately so: callers that only want a LABEL for a failure
     (worker-pr's `class=`, groom's domain predicate) keep the historical answer, and the widened
     read-scoped decision lives in `classify_read_failure`."""
     raw = text or ""
@@ -142,7 +142,7 @@ def is_transient_stderr(text):
 
 
 # ---------------------------------------------------------------------------------------------------
-# Registry #736: STATUS RECOVERY off gh's debug channel, and the read-scoped classifier.
+# Registry #748: STATUS RECOVERY off gh's debug channel, and the read-scoped classifier.
 GH_DEBUG_MODE = "api"                       # the gh debug mode that prints the response status line
 SCOPE_REFUSED_MARKER = "GH-RETRY-SCOPE-REFUSED"   # a non-read reached run_gh: 1 attempt, no replay
 BLIND_READ_MARKER = "GH-RETRY-BLIND-READ"         # retried a read whose status we could NOT recover
@@ -167,7 +167,7 @@ def debug_env(env=None):
 
     Ambient `GH_DEBUG` can only WIDEN this, never disable it. That direction is load-bearing at the
     YAML seam: a job- or workflow-level `GH_DEBUG: ""` (or any other mode) would otherwise silently
-    restore the exact statusless blindness registry #736 fixes, and nothing would go red."""
+    restore the exact statusless blindness registry #748 fixes, and nothing would go red."""
     merged = dict(os.environ if env is None else env)
     modes = [mode for mode in re.split(r"[,\s]+", merged.get("GH_DEBUG") or "") if mode]
     if GH_DEBUG_MODE not in modes:
@@ -209,7 +209,7 @@ def trace_status(text):
 def failure_status(message, trace=None):
     """The HTTP status of a failed `gh` call: gh's own message when it printed one, else recovered
     from the debug trace. None means the status is genuinely unrecoverable — the shape registry
-    #736 is about."""
+    #748 is about."""
     match = _MESSAGE_STATUS_RE.search(message or "")
     if match:
         return match.group(1) or match.group(2)
@@ -219,7 +219,7 @@ def failure_status(message, trace=None):
 def classify_read_failure(message, status=None):
     """Classify a FAILED IDEMPOTENT READ. Returns `(retry: bool, reason: str)`.
 
-    The retry DIRECTION for an unrecoverable status is the whole point of registry #736, and it is
+    The retry DIRECTION for an unrecoverable status is the whole point of registry #748, and it is
     justified by a one-directional asymmetry that holds only for reads: retrying a permanent 404
     costs four bounded, jittered attempts to reach the same loud failure, whereas NOT retrying a
     transient 502 costs a provenance record, a `__global__` lane reservation and a human
@@ -340,7 +340,7 @@ def run_gh(args, *, env=None, input=None, attempts=MAX_ATTEMPTS,
             return result
         if attempt < attempts:
             if reason == "statusless":
-                # Counted, greppable signal that we retried BLIND. Registry #736's deeper defect was
+                # Counted, greppable signal that we retried BLIND. Registry #748's deeper defect was
                 # not the missing retry, it was that a whole error class could report `attempts=1/5`
                 # with nobody able to see it; every caller of this layer now emits a line when the
                 # status could not be recovered, so the class is visible on its first occurrence.
@@ -442,7 +442,7 @@ def read_cli(args, runner=None, out=None, err=None):
 
 
 # ---------------------------------------------------------------------------------------------------
-# Registry #736: the stderr shapes `gh` ACTUALLY emits, captured from gh 2.94.0 against a local
+# Registry #748: the stderr shapes `gh` ACTUALLY emits, captured from gh 2.94.0 against a local
 # server that reproduces each response shape (and against api.github.com for the authenticated
 # ones). `retry` is the required verdict for an IDEMPOTENT READ; None for `status` means gh printed
 # no status anywhere. This table exists so the classifier is checked against the tool's real output
@@ -660,14 +660,14 @@ def _self_test():
         check(f"read CLI refuses {' '.join(argv) or '(empty)'}", (refused, code), (True, 2))
     check("a refused call never reached gh", mutating.calls, [])
 
-    # ---- registry #736: STATUSLESS read failures, status recovery, and the scope boundary --------
+    # ---- registry #748: STATUSLESS read failures, status recovery, and the scope boundary --------
     # G1 — THE mutant that matters. `unexpected end of JSON input` with no status anywhere is the
     # exact byte-for-byte shape that shipped broken in #729 (`http=unknown class=permanent
     # attempts=1/5` on 4/4 real failures). On an idempotent read it must now be RETRIED.
     _STATUSLESS = "unexpected end of JSON input"
-    check("#736 a STATUSLESS 'unexpected end of JSON input' is RETRYABLE on an idempotent read",
+    check("#748 a STATUSLESS 'unexpected end of JSON input' is RETRYABLE on an idempotent read",
           classify_read_failure(_STATUSLESS), (True, "statusless"))
-    check("#736 the pre-fix conservative classifier still says NO to it "
+    check("#748 the pre-fix conservative classifier still says NO to it "
           "(so the two classifiers are genuinely different and the widening is the fix)",
           is_transient_stderr(_STATUSLESS), False)
 
@@ -684,10 +684,10 @@ def _self_test():
         subprocess.run = _statusless_then_ok
         result = run_gh(["api", "repos/o/r/pulls/4308"], sleep=lambda a, r=None: sleeps.append(a),
                         log=logged.append)
-        check("#736 a statusless read failure is RETRIED and then SUCCEEDS "
+        check("#748 a statusless read failure is RETRIED and then SUCCEEDS "
               "(the #729 vacuity: this used to be 1 attempt)",
               (result.returncode, len(calls), sleeps, result.gh_attempts), (0, 3, [1, 2], 3))
-        check("#736 retrying BLIND emits the counted GH-RETRY-BLIND-READ signal for every caller "
+        check("#748 retrying BLIND emits the counted GH-RETRY-BLIND-READ signal for every caller "
               "of this layer, naming the endpoint",
               (len([line for line in logged if BLIND_READ_MARKER in line]),
                all("repos/o/r/pulls/4308" in line for line in logged)), (2, True))
@@ -708,7 +708,7 @@ def _self_test():
 
             subprocess.run = _traced
             traced = run_gh(["api", "repos/o/r/pulls/7"], sleep=lambda a, r=None: sleeps.append(a))
-            check(f"#736 the status recovered from the DEBUG channel is used ({label}) — "
+            check(f"#748 the status recovered from the DEBUG channel is used ({label}) — "
                   f"and it is the only thing that escapes the trace",
                   (len(calls), traced.gh_http_status, traced.gh_retry_reason, traced.stderr),
                   (want_calls, want_status, want_reason, _STATUSLESS))
@@ -724,7 +724,7 @@ def _self_test():
 
         subprocess.run = _refused
         refusal = run_gh(["api", "repos/o/r/pulls/7"], sleep=lambda a, r=None: sleeps.append(a))
-        check("#736 a genuine permanent refusal is STILL refused in one attempt and stays "
+        check("#748 a genuine permanent refusal is STILL refused in one attempt and stays "
               "DISTINGUISHABLE from the statusless class",
               (len(calls), sleeps, refusal.gh_http_status, refusal.gh_retry_reason),
               (1, [], "404", "refused-http-404"))
@@ -738,7 +738,7 @@ def _self_test():
 
         subprocess.run = _usage
         usage = run_gh(["api", "repos/o/r", "--jsonn"], sleep=lambda a, r=None: None)
-        check("#736 a gh USAGE error is not retried even though it is statusless",
+        check("#748 a gh USAGE error is not retried even though it is statusless",
               (len(calls), usage.gh_retry_reason), (1, "usage-error"))
 
         # G5 — the SCOPE boundary: a non-read that reaches run_gh gets exactly ONE attempt (today's
@@ -760,7 +760,7 @@ def _self_test():
 
             subprocess.run = _flaky_write
             written = run_gh(argv, sleep=lambda a, r=None: sleeps.append(a), log=logged.append)
-            check(f"#736 run_gh REFUSES to replay {' '.join(argv[:3])} — one attempt, counted",
+            check(f"#748 run_gh REFUSES to replay {' '.join(argv[:3])} — one attempt, counted",
                   (len(calls), sleeps, written.gh_read_scoped,
                    any(SCOPE_REFUSED_MARKER in line for line in logged)),
                   (1, [], False, True))
@@ -771,27 +771,27 @@ def _self_test():
     # UNREDACTED Authorization line and a response body. These run logs are PUBLIC and unrecoverable
     # once written, so the guarantee must be structural, not a dependency on gh's own redaction.
     scrubbed = scrub_debug_trace(DEBUG_TRACE_SAMPLE)
-    check("#736 scrub_debug_trace keeps ONLY gh's own diagnostic",
+    check("#748 scrub_debug_trace keeps ONLY gh's own diagnostic",
           scrubbed, "unexpected end of JSON input")
-    check("#736 NO credential material, header, or response body survives the scrub "
+    check("#748 NO credential material, header, or response body survives the scrub "
           "(asserted even though gh 2.94.0 redacts Authorization itself)",
           ("SENTINELTOKEN" in scrubbed, "Authorization" in scrubbed,
            "secret-response-body" in scrubbed, "X-Github-Request-Id" in scrubbed,
            "api.github.com" in scrubbed),
           (False, False, False, False, False))
-    check("#736 the status is STILL recovered from the very trace that was scrubbed away",
+    check("#748 the status is STILL recovered from the very trace that was scrubbed away",
           (trace_status(DEBUG_TRACE_SAMPLE), failure_status(scrubbed, DEBUG_TRACE_SAMPLE)),
           ("502", "502"))
-    check("#736 trace_status takes the LAST response (redirects/pagination end on the deciding one)",
+    check("#748 trace_status takes the LAST response (redirects/pagination end on the deciding one)",
           trace_status("< HTTP/2.0 301 Moved\n< HTTP/1.1 502 Bad Gateway\n"), "502")
     # If a gh upgrade ever drops the `* Request took` terminator, the block-based drop above loses
     # its anchor — the body must STILL not survive. A public run log is unrecoverable once written,
     # so this direction is not allowed to depend on gh keeping its output format.
     truncated_trace = DEBUG_TRACE_SAMPLE.replace("* Request took 987.59µs\n", "")
-    check("#736 a trace with NO terminator still leaks nothing (format-change safety)",
+    check("#748 a trace with NO terminator still leaks nothing (format-change safety)",
           (scrub_debug_trace(truncated_trace), trace_status(truncated_trace)),
           ("unexpected end of JSON input", "502"))
-    check("#736 the body-ish filter is scoped to DEBUG streams only — a plain gh message is never "
+    check("#748 the body-ish filter is scoped to DEBUG streams only — a plain gh message is never "
           "mangled", (scrub_debug_trace("unexpected end of JSON input"),
                       scrub_debug_trace('  {"message": "x"} not a trace')),
           ("unexpected end of JSON input", '{"message": "x"} not a trace'))
@@ -802,9 +802,9 @@ def _self_test():
     for ambient, want in (({}, "api"), ({"GH_DEBUG": ""}, "api"), ({"GH_DEBUG": "oauth"},
                                                                   "oauth,api"),
                           ({"GH_DEBUG": "api"}, "api"), ({"GH_DEBUG": "false"}, "false,api")):
-        check(f"#736 debug_env forces the api mode on regardless of ambient {ambient!r}",
+        check(f"#748 debug_env forces the api mode on regardless of ambient {ambient!r}",
               debug_env({**ambient}).get("GH_DEBUG"), want)
-    check("#736 debug_env preserves the rest of the caller's env",
+    check("#748 debug_env preserves the rest of the caller's env",
           debug_env({"GH_TOKEN": "t"}).get("GH_TOKEN"), "t")
 
     # G8 — registry #731, fixed here because this PR's whole retry-direction justification rests on
@@ -835,21 +835,21 @@ def _self_test():
     # lacked: it could not notice that the one shape it omitted was the only one that occurs.
     corpus_status = [(label, failure_status(text), want_status)
                      for label, text, want_status, _retry in OBSERVED_GH_FAILURES]
-    check("#736 every MEASURED gh failure shape recovers exactly the status it printed "
+    check("#748 every MEASURED gh failure shape recovers exactly the status it printed "
           "(None where gh printed none)",
           [row for row in corpus_status if row[1] != row[2]], [])
     corpus_verdicts = [(label, classify_read_failure(text, failure_status(text))[0], want)
                        for label, text, _status, want in OBSERVED_GH_FAILURES]
-    check("#736 every MEASURED gh failure shape is classified as the read policy requires",
+    check("#748 every MEASURED gh failure shape is classified as the read policy requires",
           [row for row in corpus_verdicts if row[1] != row[2]], [])
     unretried_statusless = [label for label, text, status, _want in OBSERVED_GH_FAILURES
                             if status is None and failure_status(text) is None
                             and not classify_read_failure(text)[0]
                             and not any(m in text.lower() for m in _FATAL_TEXT)]
-    check("#736 INVARIANT: no statusless, non-usage failure shape is ever refused on a read — the "
+    check("#748 INVARIANT: no statusless, non-usage failure shape is ever refused on a read — the "
           "rule that makes an omitted table entry harmless",
           unretried_statusless, [])
-    check("#736 the corpus actually EXERCISES the statusless class (an empty corpus would pass "
+    check("#748 the corpus actually EXERCISES the statusless class (an empty corpus would pass "
           "the invariant above vacuously)",
           len([1 for _l, text, status, _w in OBSERVED_GH_FAILURES
                if status is None and failure_status(text) is None]) >= 8, True)

@@ -1375,7 +1375,7 @@ def _gh_error_detail(result):
     worked" from "this PR does not exist". The excerpt crosses a PUBLIC sink (run logs + ops-alert
     issue bodies), so it is redacted (issue #135) and length-capped.
 
-    Registry #736: the status now comes from `gh_retry` FIRST (`GhResult.gh_http_status`), which
+    Registry #748: the status now comes from `gh_retry` FIRST (`GhResult.gh_http_status`), which
     recovers it from the `GH_DEBUG=api` response line when gh's own message swallowed it — the exact
     case that made #729 report `http=unknown class=permanent attempts=1/5` on 4/4 real failures.
     `class`/`reason` are the READ policy's verdict (`gh_retry.classify_read_failure`), so the log
@@ -1457,7 +1457,7 @@ def _gh_read_with_retry(args, *, env=None):
     result = gh_retry.run_gh(listed, env=merged_env, sleep=_sleep)
     # gh_retry counts the attempts it actually spent; the sleep hook can only see the retries it was
     # asked to perform, so prefer the layer's own count (they agree, and disagreeing would mean the
-    # loop returned without sleeping — exactly the shape registry #736 is about).
+    # loop returned without sleeping — exactly the shape registry #748 is about).
     return result, getattr(result, "gh_attempts", attempts[0])
 
 
@@ -1465,7 +1465,7 @@ def _gh_read_with_retry(args, *, env=None):
 # and PR (or head branch) so the loss is ATTRIBUTABLE from the run log alone — the previous silent
 # shape is what made the ~4.8% rate invisible until it was reconstructed from 200 runs by hand.
 PROVENANCE_READ_FAILURE_MARKER = "PROVENANCE-READ-FAILED"
-# Registry #736. The DEEPER defect behind #729 was not the missing retry: it was that the retry layer
+# Registry #748. The DEEPER defect behind #729 was not the missing retry: it was that the retry layer
 # could report `attempts=1/5` for an entire error class and nobody could see it until four run logs
 # were read by hand. This marker is the standing detector for that shape — a provenance read that
 # failed WITHOUT a recoverable status and WITHOUT being retried. Under the current classifier it is
@@ -1483,7 +1483,7 @@ def _retry_vacuity_alarm(*, status, attempts, retryable, endpoint):
     return (f"{PROVENANCE_RETRY_VACUITY_MARKER} endpoint={endpoint} attempts={attempts}"
             f"/{gh_retry.MAX_ATTEMPTS} — the read failed with NO recoverable HTTP status and was "
             f"NOT retried, so the bounded-retry budget is vacuous for this error class "
-            f"(registry #736: this is the #729 regression signature, not a transient outage)")
+            f"(registry #748: this is the #729 regression signature, not a transient outage)")
 
 
 def _provenance_read(args, *, target_repo, subject, env=None):
@@ -4617,7 +4617,7 @@ def provenance_workflow_seam_report():
         "step_has_gh_token": "GH_TOKEN" in ((step or {}).get("env") or {}),
         "job_needs_publish": "publish" in (job.get("needs") or []),
         "job_permissions": job.get("permissions"),
-        # Registry #736: status recovery rides on `GH_DEBUG` containing `api` in gh's child env.
+        # Registry #748: status recovery rides on `GH_DEBUG` containing `api` in gh's child env.
         # `gh_retry.debug_env` is widen-only so an ambient value cannot DISABLE it, but a
         # `GH_DEBUG:` pinned at the workflow/job/step level is still the seam where someone would
         # try, and `scripts/pat-validity.py` already establishes the strip-GH_DEBUG idiom in this
@@ -5736,7 +5736,7 @@ def _self_test():
                [d["pr_number"] for d in _stored()]),
               (None, 3, [1], [42]))
 
-        # ---- registry #736: the shape that made #729's own retry VACUOUS ------------------------
+        # ---- registry #748: the shape that made #729's own retry VACUOUS ------------------------
         # MEASURED on gh 2.94.0 against a local server: for any >=400 response with a JSON
         # content-type and an empty/truncated body, gh prints THIS and nothing else — 403/404/429/
         # 500/502/503 are byte-identical. It is what all four real failures (sparq #4300/#4308/
@@ -5745,7 +5745,7 @@ def _self_test():
 
         # GUARD 10 — THE discriminating mutant. Narrow the classifier back and this goes red.
         err = _run_prov([_STATUSLESS, _STATUSLESS, _OK])
-        check("#736 a STATUSLESS 'unexpected end of JSON input' on the idempotent provenance GET "
+        check("#748 a STATUSLESS 'unexpected end of JSON input' on the idempotent provenance GET "
               "is RETRIED and then SUCCEEDS (this is the exact shape that shipped broken)",
               (err, len(prov_state["calls"]), prov_state["slept"],
                [d["pr_number"] for d in _stored()]),
@@ -5763,14 +5763,14 @@ def _self_test():
         blind_marker = next((line for line in prov_state["printed"]
                              if PROVENANCE_READ_FAILURE_MARKER in line
                              and not line.startswith("::")), "")
-        check("#736 an exhausted statusless read burns the FULL budget and is reported as "
+        check("#748 an exhausted statusless read burns the FULL budget and is reported as "
               "transient/statusless, not as a permanent refusal",
               (isinstance(err, WorkerPrError), len(prov_state["calls"]),
                f"attempts={gh_retry.MAX_ATTEMPTS}/{gh_retry.MAX_ATTEMPTS}" in blind_marker,
                "class=transient" in blind_marker, "reason=statusless" in blind_marker,
                "http=unknown" in blind_marker, prov_state["store"]),
               (True, gh_retry.MAX_ATTEMPTS, True, True, True, True, {}))
-        check("#736 the vacuity alarm does NOT fire when the retry layer did retry "
+        check("#748 the vacuity alarm does NOT fire when the retry layer did retry "
               "(no cry-wolf on a genuine exhausted-budget failure)",
               [line for line in prov_state["printed"]
                if PROVENANCE_RETRY_VACUITY_MARKER in line], [])
@@ -5783,7 +5783,7 @@ def _self_test():
                            f"unexpected end of JSON input")
 
         err = _run_prov([_traced("502 Bad Gateway"), _traced("502 Bad Gateway"), _OK])
-        check("#736 a 502 recovered from the DEBUG channel is retried and the marker reports "
+        check("#748 a 502 recovered from the DEBUG channel is retried and the marker reports "
               "http=502 instead of http=unknown",
               (err, len(prov_state["calls"]), [d["pr_number"] for d in _stored()]),
               (None, 3, [42]))
@@ -5791,7 +5791,7 @@ def _self_test():
         traced_marker = next((line for line in prov_state["printed"]
                               if PROVENANCE_READ_FAILURE_MARKER in line
                               and not line.startswith("::")), "")
-        check("#736 a 404 recovered from the DEBUG channel is REFUSED in one attempt and reports "
+        check("#748 a 404 recovered from the DEBUG channel is REFUSED in one attempt and reports "
               "the real status — the statusless retry does not swallow genuine refusals",
               (isinstance(err, WorkerPrError), len(prov_state["calls"]), prov_state["slept"],
                "http=404" in traced_marker, "class=permanent" in traced_marker,
@@ -5817,23 +5817,23 @@ def _self_test():
             "step summary": summary_file.read_text(encoding="utf-8"),
             "ops-alert body": "\n".join(f"{t}\n{b}" for t, b in prov_state["alerts"]),
         }
-        check("#736 the fixture really does carry credential + body material "
+        check("#748 the fixture really does carry credential + body material "
               "(a guard over an empty fixture proves nothing)",
               (sentinel in leaky_stream, body_sentinel in leaky_stream,
                "Authorization" in leaky_stream), (True, True, True))
-        check("#736 NO credential material, request/response header, or response body reaches ANY "
+        check("#748 NO credential material, request/response header, or response body reaches ANY "
               "public sink (raised error, run log, ::error annotation, step summary, ops alert)",
               sorted(name for name, text in sinks.items()
                      if sentinel in text or body_sentinel in text or "Authorization" in text
                      or "X-Github-Request-Id" in text), [])
-        check("#736 and the status is STILL recovered from the trace that was scrubbed away",
+        check("#748 and the status is STILL recovered from the trace that was scrubbed away",
               ("http=502" in sinks["stdout log + ::error annotation"],
                "class=transient" in sinks["stdout log + ::error annotation"]), (True, True))
-        check("#736 every sink is NON-EMPTY (an all-empty sink set would satisfy the leak guard "
+        check("#748 every sink is NON-EMPTY (an all-empty sink set would satisfy the leak guard "
               "vacuously)",
               sorted(name for name, text in sinks.items() if not text.strip()), [])
 
-        # GUARD 14 — the VACUITY DETECTOR itself. Re-narrow the classifier to the pre-#736
+        # GUARD 14 — the VACUITY DETECTOR itself. Re-narrow the classifier to the pre-#748
         # behaviour (which is exactly what shipped) and the run must now SHOUT
         # `PROVENANCE-RETRY-VACUOUS`, on the FIRST occurrence, instead of quietly logging
         # `attempts=1/5` for a whole error class.
@@ -5841,7 +5841,7 @@ def _self_test():
         try:
             gh_retry.classify_read_failure = (
                 lambda message, status=None: (gh_retry.is_transient_stderr(message or ""),
-                                              "pre-736-conservative"))
+                                              "pre-748-conservative"))
             err = _run_prov([_STATUSLESS])
         finally:
             gh_retry.classify_read_failure = real_classify
@@ -5851,12 +5851,12 @@ def _self_test():
         vac_annotation = next((line for line in prov_state["printed"]
                                if line.startswith("::error") and PROVENANCE_RETRY_VACUITY_MARKER
                                in line), "")
-        check("#736 INVERTING the classifier back to the shipped behaviour reproduces the 1-attempt "
+        check("#748 INVERTING the classifier back to the shipped behaviour reproduces the 1-attempt "
               "failure AND trips the vacuity detector (log line + ::error annotation)",
               (isinstance(err, WorkerPrError), len(prov_state["calls"]),
                f"attempts=1/{gh_retry.MAX_ATTEMPTS}" in vac_line, bool(vac_annotation)),
               (True, 1, True, True))
-        check("#736 the vacuity alarm is a pure predicate: blind+unretried fires, and each of the "
+        check("#748 the vacuity alarm is a pure predicate: blind+unretried fires, and each of the "
               "three exits (status recovered / retried / classified retryable) silences it",
               (bool(_retry_vacuity_alarm(status=None, attempts=1, retryable=False,
                                          endpoint="repos/o/r/pulls/7")),
@@ -5900,7 +5900,7 @@ def _self_test():
                 refused = "retried"
             except WorkerPrError:
                 refused = "refused"
-            # A POSITIVE named check per shape: the pre-#736 loop only emitted a check when a
+            # A POSITIVE named check per shape: the pre-#748 loop only emitted a check when a
             # mutation slipped THROUGH, so deleting a shape from this list went unnoticed.
             check(f"#677/#731 retry layer REFUSES the mutation {' '.join(argv[:3])}",
                   refused, "refused")
@@ -5993,7 +5993,7 @@ def _self_test():
           "401 that no retry can clear)", seam["step_has_gh_token"], True)
     check("#677 YAML seam: the retried read runs in the job that executes NO target code",
           (seam["job_needs_publish"], seam["job_permissions"]), (True, {"contents": "write"}))
-    check("#736 YAML seam: NO workflow, job or step pins GH_DEBUG — status recovery depends on it "
+    check("#748 YAML seam: NO workflow, job or step pins GH_DEBUG — status recovery depends on it "
           "reaching gh's child env, and this is the seam where a pin would silently restore the "
           "statusless blindness with nothing going red",
           seam["gh_debug_env_sites"], [])
@@ -6002,14 +6002,14 @@ def _self_test():
         "env:\n  GH_DEBUG: ''\njobs:\n"
         "  a:\n    env:\n      GH_DEBUG: ''\n    steps:\n      - run: x\n"
         "      - run: y\n        env:\n          GH_DEBUG: ''\n", encoding="utf-8")
-    check("#736 YAML seam: the GH_DEBUG scanner FINDS a pin at each of the three levels "
+    check("#748 YAML seam: the GH_DEBUG scanner FINDS a pin at each of the three levels "
           "(an always-empty scanner would satisfy the emptiness check above vacuously)",
           sorted(_workflow_gh_debug_sites(seam_probe)),
           ["probe.yml:a", "probe.yml:a:step1", "probe.yml:workflow"])
-    check("#736 YAML seam: the scanner reads the LIVE workflow tree, not an empty directory",
+    check("#748 YAML seam: the scanner reads the LIVE workflow tree, not an empty directory",
           len(list((Path(__file__).resolve().parents[1] / ".github" / "workflows").glob("*.yml")))
           >= 5, True)
-    check("#736 and even a pinned GH_DEBUG cannot disable recovery: debug_env is widen-only",
+    check("#748 and even a pinned GH_DEBUG cannot disable recovery: debug_env is widen-only",
           (gh_retry.debug_env({"GH_DEBUG": ""})["GH_DEBUG"],
            gh_retry.debug_env({"GH_DEBUG": "false"})["GH_DEBUG"]), ("api", "false,api"))
 
