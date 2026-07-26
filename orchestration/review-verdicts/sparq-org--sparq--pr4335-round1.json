@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4335,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "80b043f1e2fcd50df27e560b8accee4748f4e394",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The streaming recovery implementation preserves the existing framing, torn-tail, checksum, record-order, duplicate-detection, and truncation behavior while replacing the whole-log allocation with one reused payload buffer. The differential tests compare the streaming and buffered scanners across intact and structurally torn inputs, verify fail-closed checksum handling and error offsets for both interior and final-record corruption, and exercise the claimed memory-bound property. No correctness, soundness, security, or vacuous-test issue is apparent in the supplied diff.",
+  "verdict": "approve"
+ }
+}
