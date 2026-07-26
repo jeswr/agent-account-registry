@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2501,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "5685a928f262f0c45e28c74a51cd9375fc5fb08e",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The exact round-3 blocker remains: the README says the limits and timeout provide \"the worst-case bound for embedded deployments.\" Cooperative cancellation/deadlines take effect only at an executor poll, and the added tests and skill explicitly acknowledge that index-answerable and tiny early-exit paths may finish before the first poll. Moreover, max_bytes accounts an estimated query working set rather than total process or window-materialisation memory. The skill repeats the same material overclaim as \"the embedded-deployment bound\" and describes a wall-clock bound even though it later states the polling limitation. A deadline checked cooperatively is not a strict wall-clock cap.",
+    "file": "crates/sparq-rsp/README.md",
+    "fix_hint": "Replace the README's worst-case-bound sentence and the corresponding claim in skills/streaming-rsp/SKILL.md with precise cooperative-limit wording. State that cancellation/timeouts apply at the next executor poll; max_bytes limits executor-accounted estimated working-set bytes, not total process or window-materialisation memory; and some bounded-work paths may complete before polling. Describe with_window_timeout as installing a refreshed per-evaluation deadline, not as strictly capping wall-clock duration.",
+    "severity": "major",
+    "title": "Public documentation still falsely promises a worst-case deployment bound"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 4 is stagnant. The prior major honesty issue remains unchanged in the README, which still calls cooperative executor budgets and a timeout \"the worst-case bound for embedded deployments.\" The skill now repeats the overclaim as an \"embedded-deployment bound\" and calls the relative deadline a wall-clock bound, despite correctly admitting later that polling is coarse and some paths complete before any poll. These APIs limit executor-accounted work only when polled; max_bytes is not total process/window-materialisation memory, and the timeout is not a strict wall-clock cap. The implementation and tests otherwise appear to exercise real budgeted prepared-query paths, but the public guarantees must be corrected before approval.",
+  "verdict": "request_changes"
+ }
+}
