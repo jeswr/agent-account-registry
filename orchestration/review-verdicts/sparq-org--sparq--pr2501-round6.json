@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 2501,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "6a3e9551bf6d03b7d7fe424c1e72f97f44b12546",
+  "round": 6
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 6 is improving. The sole round-5 major finding is resolved: `ContinuousQuery::with_budget` now accurately documents cooperative polling, unchecked no-poll/early-completion paths, executor-accounted estimated bytes, absolute deadlines, and the non-strict nature of refreshed per-evaluation timeouts. The delegated rustdoc on the other continuous-query forms points to this corrected contract. The implementation consistently derives one effective budget per SELECT, CONSTRUCT, ASK, or multi-window tick and uses the corresponding budget-aware prepared-query entry point. The focused tests exercise real evaluator paths for row, cancellation, deadline-composition, overflow, and timeout behavior rather than merely inspecting configuration. No instruction-like hostile content was detected in the diff.",
+  "verdict": "approve"
+ }
+}
