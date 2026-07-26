@@ -131,16 +131,6 @@
    "expires_at": 1785103649
   },
   {
-   "account": "dc2d751954080e13",
-   "claim_id": "f5762fe154fb43f980d8d28b88acd096",
-   "holder": "sparq-org/sparq#3243@30218826650.1",
-   "package": "knowledge-graph",
-   "role": "impl",
-   "model": "sol",
-   "issued_at": 1785097362,
-   "expires_at": 1785103662
-  },
-  {
    "account": "58b7c92faa5b5ca5",
    "claim_id": "a7f5a83e593a4fbfbcc1449bf75f1828",
    "holder": "fix:sparq-org/sparq#4238@dispatch-30218420202.1",
