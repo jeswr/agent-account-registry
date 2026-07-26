@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 634,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "128b231c7219ae5a59cd48cfb45fbfd12b3a4895",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "validate_plan_artifact() still delegates to validate_plan(), which checks emitted repos against plan[\"repositories\"], but both are controlled by the hostile PLAN artifact. The self-test explicitly proves that changing an item's repo to o/unplanned is accepted once the same artifact also declares o/unplanned. A compromised producer can likewise fabricate many unique review/disarm rows inside declared repositories, consuming the 2,000-row queue. Schema, ordering, duplicate, character-class, and head checks do not authenticate origin or independently bound legitimate emissions. Drain-time live revalidation happens after the contents:write enqueue and therefore cannot prevent queue pollution or capacity denial.",
+    "file": "scripts/task-queue.py",
+    "fix_hint": "Before projection or any CAS write, bind the artifact to trusted data outside the artifact: require its repository manifest to exactly match protected enabled policy or another authenticated workflow input, and independently derive or strictly bound legitimate emissions from authenticated live state. Add mutation-sensitive zero-write tests that reject jointly changing repositories plus item.repo and reject many fabricated unique rows within an otherwise allowed repository, while retaining a genuine-plan commit control.",
+    "severity": "major",
+    "title": "PLAN enqueue validation still proves only artifact self-consistency"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round-4 trust-boundary finding remains unresolved at major severity. The contents:write enqueue job still authenticates the hostile PLAN artifact only with dispatch-claim.py's validate_plan(), whose repository membership, item count, and contents are all supplied by that same artifact. A compromised PLAN producer can therefore add a repository to both repositories and review_items/disarm_items, or fabricate many unique emissions within an admitted repository, and enqueue them successfully. The added tests continue to treat jointly adding o/unplanned to the artifact manifest as a positive control, and there is still no independent protected-policy/live-state binding or strict independently authenticated emission bound before the ledger CAS write. Later drain revalidation cannot undo queue pollution or capacity exhaustion. Progress is stagnant because the same major issue remains with the same trust model.",
+  "verdict": "request_changes"
+ }
+}
