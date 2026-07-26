@@ -2773,9 +2773,12 @@ print(", ".join(v for v in m.NO_CHANGE_REASONS if v != "unspecified"))' "$SCRIPT
   #     detection (not just deleting it) turns this red.
   local _rm_body _lift_at _detect_at
   _rm_body=$(sed -n '/^run_model() {/,/^}/p' "$SCRIPT_DIR/worker-live.sh")
-  _lift_at=$(grep -n '_lift_no_diff_declaration' <<< "$_rm_body" | head -n1 | cut -d: -f1)
+  # `|| true` on both: a DELETED call must be reported as a named MISORDERED failure, not abort the
+  # whole suite via `set -e` on grep's exit 1 — an abort here would also skip every later check,
+  # which is how one deletion hides a second defect. (Measured: the first draft did exactly that.)
+  _lift_at=$(grep -n '_lift_no_diff_declaration' <<< "$_rm_body" | head -n1 | cut -d: -f1 || true)
   _detect_at=$(grep -n 'git status --porcelain=v1 --untracked-files=all' <<< "$_rm_body" \
-    | head -n1 | cut -d: -f1)
+    | head -n1 | cut -d: -f1 || true)
   chk "run_model lifts the no-diff declaration BEFORE it detects changes" \
     "$([[ -n "$_lift_at" && -n "$_detect_at" && "$_lift_at" -lt "$_detect_at" ]] \
       && echo before || echo "MISORDERED($_lift_at,$_detect_at)")" "before"

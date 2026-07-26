@@ -30,7 +30,11 @@ FAIL-CLOSED, THE THREE DIRECTIONS THAT MATTER:
     and dispatch's own guard leaves such an issue deferred with no escalation at all.
   * A record whose `model_alias` is absent or empty EXCLUDES NOTHING. An unattributable outcome
     cannot prove which tier already failed, so it must not silently retire a tier from the chain.
-    Termination does not depend on it (see below).
+    Termination does not depend on it (see below). MEASURED CAVEAT: the guard inside
+    `excluded_tiers` is not what binds this — `retry_decision`'s chain filter is (a junk alias can
+    never match a well-formed chain entry). Mutating the `excluded_tiers` guard alone leaves
+    `retry_decision` unchanged; both are asserted separately in the self-test, and the note is here
+    rather than implied so nobody reads that guard as the load-bearing one.
 
 TERMINATION (bounded escalation, machine-recoverable terminal). Two independent bounds:
 
@@ -289,11 +293,31 @@ def _self_test():
 
     # ---- GUARD: an UNATTRIBUTABLE outcome retires no tier (fail-closed direction). Model-health
     # allows an EMPTY model_alias, so this row shape is reachable in the live ledger.
+    #
+    # HONESTY NOTE, found by mutating this very guard: deleting `isinstance(alias, str) and alias`
+    # from excluded_tiers leaves retry_decision's OUTPUT unchanged, because the chain filter at the
+    # top of retry_decision already drops non-string/empty chain entries, so a junk alias in the
+    # excluded set can never match a real one. TWO guards therefore assert one property, and the
+    # CHAIN FILTER is the one that binds. Both are named below: the first pair pins the binding
+    # guard, the second pins excluded_tiers' own exported contract (which would otherwise report a
+    # tier that never ran).
     for alias in ("", None, 5, True):
         chk(f"a no_change with model_alias {alias!r} retires no tier",
             retry_decision(chain, [row(alias, now - 60)], now), (PROCEED, chain))
     chk("...and an unattributable row cannot empty the chain",
         retry_decision(["opus5"], [row("", now - 60)], now), (PROCEED, ["opus5"]))
+    # THE BINDING GUARD: a malformed chain entry is dropped before it can be "excluded" or offered.
+    chk("a malformed chain entry is never offered for dispatch",
+        retry_decision(["opus5", "", None, 7, "sol"], [row("opus5", now - 60)], now),
+        (RETRY_OTHER_TIER, ["sol"]))
+    chk("...and an all-malformed chain decomposes rather than dispatching junk",
+        retry_decision(["", None], [row("opus5", now - 60)], now), (DECOMPOSE, []))
+    # THE EXPORTED CONTRACT of excluded_tiers: it names tiers PROVEN to have run, nothing else.
+    chk("excluded_tiers reports only attributable aliases",
+        excluded_tiers([row("", now - 60), row(None, now - 60), row(5, now - 60),
+                        row(True, now - 60), row("sol", now - 60)], now), {"sol"})
+    chk("excluded_tiers on wholly unattributable evidence is EMPTY, not a junk set",
+        excluded_tiers([row("", now - 60), row(None, now - 60)], now), set())
 
     # ---- GUARD: the narrowing has a MACHINE EXIT — stale evidence stops excluding its tier.
     chk("evidence older than the horizon no longer excludes its tier",
