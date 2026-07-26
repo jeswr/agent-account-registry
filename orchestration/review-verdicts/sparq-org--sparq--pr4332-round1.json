@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4332,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "392b824cbb0cf745c755ab32da7fd602f5c36021",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change consistently aligns contributor-facing documentation with the existing non-blocking rustfmt CI behavior and makes the informational check report its formatter version. The reproducibility claim is supported by the repository's pinned rust-toolchain.toml, which specifies both a fixed channel and the rustfmt component. No correctness, security, soundness, or test-validity issue is introduced by this documentation/workflow-only diff.",
+  "verdict": "approve"
+ }
+}
