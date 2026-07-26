@@ -19,6 +19,16 @@
    "model": "sol",
    "issued_at": 1785027833,
    "expires_at": 1785034133
+  },
+  {
+   "account": "dc2d751954080e13",
+   "claim_id": "2716d91f0416491db42e9b446a23e70e",
+   "holder": "sparq-org/sparq#3770@dispatch-30182065250.1",
+   "package": "ci",
+   "role": "ci",
+   "model": "sol",
+   "issued_at": 1785027837,
+   "expires_at": 1785034137
   }
  ]
 }
