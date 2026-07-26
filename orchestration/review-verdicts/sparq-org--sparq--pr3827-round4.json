@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 3827,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "91634dddd51764a7da4689565c48bc2579686b34",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "This PR advances the runtime base of the root Dockerfile to sha256:fccdbb0a547c14e23fcf4ce8ad62ca5d43b4faae8d22cd292f490fef9946c96e (confirmed to be the digest gcr.io/distroless/cc-debian12:nonroot resolves to right now). But crates/sparq-lws-core/Dockerfile:27 pins the same tag at the OLD digest sha256:b0ae8e989418b458e0f25489bc3be523718938a2b70864cc0f6a00af1ddbd985 and is untouched.\n\nThat file is not dead weight: .github/workflows/lws-container.yml:89-94 builds it with docker/build-push-action, push: true, platforms: linux/amd64,linux/arm64, and publishes it to ghcr.io/sparq-org/sparq-lws-core with semver plus :latest tags, with provenance mode=max and sbom: true. So a second consumer-facing image continues to ship on the base layer this PR just deliberately moved off.\n\nThe new comment states the refresh rule as 'Refresh the digest when :nonroot advances with base-layer/security updates.' Applying that rule to one of the two Dockerfiles that share the pin defeats its purpose and leaves the two published runtimes on divergent bases, which also weakens the D-4.2 'trusted base images' story for the lws image.",
+    "file": "Dockerfile",
+    "fix_hint": "Bump crates/sparq-lws-core/Dockerfile:27 to the same @sha256:fccdbb0a547c14e23fcf4ce8ad62ca5d43b4faae8d22cd292f490fef9946c96e in this PR so the two runtime pins stay in lockstep. If the lws image is intentionally held back, say so in a comment on that line and in the PR body; otherwise consider a small CI check (or a cargo-deny/scorecard-adjacent script) asserting that every `FROM gcr.io/distroless/cc-debian12:nonroot@sha256:` in the repo carries an identical digest, so the next refresh cannot half-land.",
+    "severity": "major",
+    "title": "Digest bump is incomplete: crates/sparq-lws-core/Dockerfile still pins the superseded :nonroot digest"
+   },
+   {
+    "body": "The replacement comment block above the runtime FROM is 5 comment lines where the old one was 3, so the FROM moved 76 -> 78 (correctly updated here on line 35) and EVERY instruction below it moved by the same +2. compliance/cis/evidence.md:56 still reads\n\n  #  Dockerfile:84:  COPY --from=builder .../sparq-server /usr/local/bin/sparq-server\n\nbut `grep -nE '^COPY ' Dockerfile` on this PR head returns 86 for that line (57 for the builder `COPY . .`, which is above the FROM and therefore unaffected).\n\nThis matters more than ordinary doc drift because the surrounding block is presented as the literal, reproducible output of a grep an auditor is invited to re-run. A number that no longer reproduces makes the evidence pack self-refuting on exactly the control (D-4.3 / D-4.9, minimal image and COPY-not-ADD) it is offered as proof for. The regression is introduced by this diff -- the cite was correct before the comment grew.",
+    "file": "compliance/cis/evidence.md",
+    "fix_hint": "Update compliance/cis/evidence.md:56 from Dockerfile:84 to Dockerfile:86. Re-run the greps quoted in this file and reconcile every remaining line cite below the runtime FROM in one pass, rather than only the FROM lines.",
+    "severity": "major",
+    "title": "Evidence transcript now misstates the COPY line: Dockerfile:84 is really 86 after the +2 comment growth"
+   },
+   {
+    "body": "Same +2 shift as above, plus pre-existing drift the diff walks past while editing the very same rows:\n\n- D-4.3 (line 27) cites the runtime COPY as `Dockerfile:84`; it is now 86.\n- D-4.9 (line 33) cites `Dockerfile:57`, `:84`; the second should be 86.\n- D-4.1 (line 25) is rewritten by this diff and still cites the ENTRYPOINT as `Dockerfile:104`; `grep -n '^ENTRYPOINT' Dockerfile` returns 125. The non-root conclusion is correct -- I confirmed the amd64 config blob has User=65532 -- only the locator is wrong.\n- The section header (line 21) asserts the Dockerfile was 'read in full, lines 1-106'; `wc -l Dockerfile` is 126.\n\nThe ENTRYPOINT and 'lines 1-106' cites predate this PR, so they are not a regression, but the D-4.1 row was re-authored here and a compliance table whose stated job is line-exact evidence should not carry locators that miss by 20+ lines.",
+    "file": "compliance/cis/controls.md",
+    "fix_hint": "In compliance/cis/controls.md: change `Dockerfile:84` -> `:86` in D-4.3 and D-4.9, `Dockerfile:104` -> `:125` in D-4.1, and 'lines 1-106' -> 'lines 1-126' in the Part A header. Verify with: grep -nE '^(FROM|COPY|RUN|ENV|VOLUME|EXPOSE|HEALTHCHECK|ENTRYPOINT) ' Dockerfile; wc -l Dockerfile.",
+    "severity": "minor",
+    "title": "Stale Dockerfile line cites left in rows this diff touched (COPY :84 -> 86; ENTRYPOINT :104 -> 125; header 'lines 1-106' -> 126)"
+   }
+  ],
+  "progress": null,
+  "summary": "Base-image digest refresh for the runtime stage plus the compliance-doc citations that quote it. The core change VERIFIES CLEAN against the live registry: sha256:fccdbb0a...96e resolves (HTTP 200) and is byte-identical to the digest that gcr.io/distroless/cc-debian12:nonroot currently resolves to; it is an OCI image index carrying linux/amd64, linux/arm64/v8, arm/v7, s390x and ppc64le, so the new comment's \"multi-platform OCI index used by Buildx for the amd64 and arm64 release images\" claim is accurate against release.yml (platforms: linux/amd64,linux/arm64). The amd64 child manifest's config blob has User=65532, so the CIS D-4.1 non-root claim and the D-4.2 digest-pin claim both still hold. No secrets, no injected instructions in the diff.\n\nTwo things make the change incomplete rather than wrong.\n\n(1) The repo ships a SECOND published container, crates/sparq-lws-core/Dockerfile:27 (pushed multi-arch to ghcr.io/sparq-org/sparq-lws-core by lws-container.yml), which pins the SAME :nonroot tag at the OLD b0ae8e98... digest and was not bumped. If this refresh is motivated by base-layer/security updates \u2014 the stated rationale in the new comment \u2014 that image keeps shipping the superseded base, and the two runtimes silently diverge.\n\n(2) The new comment block is two lines longer than the one it replaces, so every Dockerfile instruction below the FROM shifted by +2. The FROM cites were re-numbered 76 -> 78, but the sibling COPY cites were not: compliance/cis/evidence.md:56 and compliance/cis/controls.md D-4.3 / D-4.9 still say Dockerfile:84 while the COPY --from=builder line is now at 86. evidence.md presents that block as the reproducible output of `grep -nE '^FROM ' Dockerfile`-style commands, so a re-running auditor gets a different number than the evidence pack asserts.",
+  "verdict": "request_changes"
+ }
+}
