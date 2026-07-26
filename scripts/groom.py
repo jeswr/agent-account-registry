@@ -5612,7 +5612,7 @@ def _self_test() -> int:
             "`posture != 'latched'` conjunct refuses to release, so the failure direction is a "
             "delayed drain and never a mid-air merge",
             (outcome.changed, len(outcome.deferred),
-             "auto-merge latch still live" in outcome.deferred[0],
+             any("auto-merge latch still live" in item for item in outcome.deferred),
              phase_exit_failure(outcome) is not None),
             (0, 1, True, True),
         )
@@ -5621,7 +5621,7 @@ def _self_test() -> int:
             "#684 round-2 (R2): an UNREADABLE latch is not an absent latch — deferral, no "
             "retraction claimed",
             (outcome.changed, len(outcome.deferred),
-             "merge-latch state is unknown" in outcome.deferred[0]),
+             any("merge-latch state is unknown" in item for item in outcome.deferred)),
             (0, 1, True),
         )
         outcome = _reconcile(candidates=(), deferrals=("owner/repo#90: bad",))

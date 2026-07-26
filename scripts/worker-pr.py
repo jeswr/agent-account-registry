@@ -6111,6 +6111,39 @@ def _self_test():
               "no release trigger, so NO latch read and NO retraction",
               park_order, [("receipt",)])
 
+        # STRUCTURAL, and deliberately so. Hoisting the issue-side `needs:user` write back OUT of
+        # the park callback (while leaving the disarm branch correct) is a BEHAVIOURALLY EQUIVALENT
+        # mutant — same call order, same failure behaviour — so no runtime assertion can catch it,
+        # and I checked by executing it rather than assuming. It is still the arrangement that
+        # produced this defect: a release-trigger write sitting at statement level next to the
+        # disarm is one refactor away from being reordered, which is precisely how the vetoed path
+        # came to write `needs:user` with an empty latch journal. So the placement is pinned by AST:
+        # EVERY `set_status(..., "needs-user")` in needs_user must be lexically inside a nested
+        # function — i.e. inside a park callback that only `disarm_before_park` invokes.
+        import ast as _park_ast
+        import inspect as _park_inspect
+
+        def _release_trigger_writes(tree, inside_callback):
+            found = []
+            for node in _park_ast.iter_child_nodes(tree):
+                if isinstance(node, (_park_ast.FunctionDef, _park_ast.AsyncFunctionDef)):
+                    found += _release_trigger_writes(node, True)
+                    continue
+                if (isinstance(node, _park_ast.Call)
+                        and getattr(node.func, "attr", "") == "set_status"
+                        and any(isinstance(arg, _park_ast.Constant)
+                                and arg.value == "needs-user" for arg in node.args)):
+                    found.append(inside_callback)
+                found += _release_trigger_writes(node, inside_callback)
+            return found
+
+        park_trigger_writes = _release_trigger_writes(
+            _park_ast.parse(_park_inspect.getsource(needs_user)).body[0], False)
+        check("#684 round-2: EVERY issue-side needs:user write in needs_user is lexically inside a "
+              "park CALLBACK — the only thing that invokes those is disarm_before_park, so a "
+              "release trigger cannot be reordered ahead of the retraction by a later edit",
+              (len(park_trigger_writes), set(park_trigger_writes)), (2, {True}))
+
         # --- THE HAZARD ITSELF: a latch that cannot be retracted must leave the PR
         # UNPARKED-AND-ARMED (still reserving its crates), never parked-and-armed. This is the
         # assertion that goes red if the disarm is made "success-path only" — i.e. if a failed
