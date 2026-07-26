@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4152,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e8bb10a9db5e11bb152c321bfdffe62e9113a7a0",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new witness `a_zeroed_zero_test_mask_defeats_the_range_proof_and_flips_the_verdict` confirms the round-1 blocker on an end-to-end replay: corrupting a recovered bit and zeroing the range-proof mask makes the pipeline return `Ok(true)` for a false predicate. The production `malicious_threshold_over_sum` still uses the same vulnerable `auth_verify_value_in_range_rabbit`/`auth_secret_is_zero` composition, and the public `malicious_disclose_threshold_verdict` still routes to it. Documentation now describes the failure honestly, but an integrity API that knowingly returns a wrong verdict under its named adversarial setting is not sound-as-scoped. This is the same blocker as round 1, not a lower-severity residual.",
+    "file": "crates/sparq-mpc/src/auth_disclose.rs",
+    "fix_hint": "Keep this chain off the public production `malicious_disclose_threshold_verdict` path until `MacSession` verifies multiplication gates in a way that binds both operands, and add a real production-path adversarial test proving the exploit aborts. Alternatively, restore the previous sound production implementation/range bound and place Rabbit behind an explicitly semi-honest or experimental API whose name and type-level surface cannot be mistaken for malicious security; documentation caveats on the existing malicious-named drop-in API are insufficient containment.",
+    "severity": "blocker",
+    "title": "Known wrong-verdict path remains exposed as the production malicious disclosure API"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 2 accurately documents and tests the round-1 exploit, but it does not remediate or contain it. The public production function remains named `malicious_disclose_threshold_verdict`, remains the drop-in path, and now routes through a circuit that the added end-to-end witness proves can return an attacker-selected wrong verdict instead of aborting. Caveats improve honesty, but they do not make an actively exploitable integrity path correct or safe to ship as this API. The prior blocker therefore remains materially unchanged.",
+  "verdict": "request_changes"
+ }
+}
