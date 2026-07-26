@@ -31,16 +31,6 @@
    "expires_at": 1785085520
   },
   {
-   "account": "51bde6688e140866",
-   "claim_id": "0aecac3154e845b2813c21b13b8e6712",
-   "holder": "fix:sparq-org/sparq#3858@dispatch-30207783987.1",
-   "package": "sparq-gpu",
-   "role": "fix",
-   "model": "opus5",
-   "issued_at": 1785079226,
-   "expires_at": 1785085526
-  },
-  {
    "account": "dc2d751954080e13",
    "claim_id": "3b89eb574b43424cbbe50c2f1fa1f8ed",
    "holder": "fix:sparq-org/sparq#4146@dispatch-30207783987.1",
