@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4250,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f9bd3bd7b7a006c774464f0fc51ec38a06f493ff",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The literal envelope defines graph_id as an absolute IRI or zero length for the default graph, while RDF 1.1 datasets can use a blank node as a graph name. The later skolemization requirement covers only protected triple subjects, not graph names. A conforming client therefore has no specified behavior for a valid named graph with a blank-node name: using its serialization-local blank-node label makes AAD unstable across round trips, while independently skolemizing it can produce incompatible AAD and undecryptable literals.",
+    "file": "site/specs/e2ee-sparql.typ",
+    "fix_hint": "Either restrict Profile SE explicitly to datasets whose named-graph names are IRIs and require refusal before sealing otherwise, or require blank-node graph names to be skolemized to stable absolute IRIs before sealing under a specified ownership/stability rule. Add a cross-implementation vector or refusal test for a blank-node graph name.",
+    "severity": "major",
+    "title": "Literal AAD does not define valid blank-node graph names"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 3 fixes both round-2 blockers: RDF identifiers now have one exact-code-point UTF-8 encoding with explicit absolute-IRI, length, and default-graph rules, and equality-tag inputs no longer normalize lexical forms or datatype IRIs. One completeness/interoperability defect remains: RDF 1.1 datasets permit blank nodes as graph names, but the literal envelope only defines graph_id for an absolute IRI or the default graph and gives no rejection or skolemization rule for a blank-node graph name. Different clients may improvise unstable blank-node labels or incompatible skolemization, making protected literals fail authentication after interchange. Because this is a newly identified major finding, progress is regressing under the required comparison scale, despite the prior findings being repaired.",
+  "verdict": "request_changes"
+ }
+}
