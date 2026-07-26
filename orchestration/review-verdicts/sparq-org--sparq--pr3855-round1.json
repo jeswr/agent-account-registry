@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3855,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "1121792d3ca38412f2d9d26778e664302c13beda",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The diff contains only rustfmt-style line wrapping and struct-literal formatting in existing MPC tests. It does not change executable behavior, assertions, test inputs, security properties, public APIs, or claims. The reformatted assertions and iterator closures remain semantically identical, so the change is correct and complete as scoped.",
+  "verdict": "approve"
+ }
+}
