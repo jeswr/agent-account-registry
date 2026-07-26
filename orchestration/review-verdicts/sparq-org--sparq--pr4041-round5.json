@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4041,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "9353a196d6a66f5755368ebe14988dd529bdab60",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The IPvFuture `literal_ok` branch still validates its tail with `is_iunreserved`, whose definition includes RFC 3987 `ucschar`. IPvFuture is inherited from RFC 3986 and restricts its tail to ASCII `unreserved / sub-delims / \":\"`; RFC 3987 does not widen that production. Consequently `http://[v1.\u03c0]/datatype` is still accepted by `is_well_formed_absolute_iri` and can pass authored datatype validation despite being malformed. This is materially identical to the round-4 major finding.",
+    "file": "crates/sparq-jsonld/src/context/iri.rs",
+    "fix_hint": "Add an ASCII RFC 3986 `unreserved` predicate and use it only for the IPvFuture tail. Add `http://[v1.\u03c0]/datatype` to `MALFORMED`, retain an adjacent valid case such as `http://[v7.host]/datatype`, and add a public expansion regression expecting `InvalidTypedValue` for the malformed datatype.",
+    "severity": "major",
+    "title": "IPvFuture validation still accepts non-ASCII host characters"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 5 is stagnant. The round-4 major finding remains unchanged: the IPvFuture tail is still checked with RFC 3987 `is_iunreserved`, which admits non-ASCII `ucschar`, although RFC 3986 IPvFuture permits only ASCII `unreserved / sub-delims / \":\"`. The malformed non-ASCII IPvFuture and public expansion-path regression are still absent, so `http://[v1.\u03c0]/datatype` remains accepted as a datatype IRI.",
+  "verdict": "request_changes"
+ }
+}
