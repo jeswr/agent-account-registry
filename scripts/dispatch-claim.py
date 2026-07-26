@@ -2179,6 +2179,28 @@ GROOM_STALE_PR_MARKER = "<!-- registry-groom-stale-pr:v1 -->"
 # paces the re-entry: 21 PRs re-entering the review lane in one tick would starve the very
 # allocator whose starvation parked most of them.
 LEGACY_PARK_MIGRATION_MAX = 5
+# How many machine capacity parks one tick may RE-ADMIT (registry #698, found reviewing #697).
+#
+# THE BOUND WAS PROVEN FOR THE WRONG POPULATION. There are TWO paths into this sweep's label
+# writes, and only one of them was paced:
+#   * the MIGRATION path — a PR with no live machine park — is capped by LEGACY_PARK_MIGRATION_MAX
+#     above, for the stated reason that "21 PRs re-entering the review lane in one tick would
+#     starve the very allocator whose starvation parked most of them"; and
+#   * the RE-ADMISSION path — a PR that ALREADY carries `review:parked`, or whose source issue
+#     carries `status:parked` — had NO ceiling at all. It is fed by the migration, by the review
+#     loop's own capacity parks, and by hand.
+# That reason applies to the second path identically: a re-admission is exactly the same re-entry
+# into exactly the same lane. MEASURED on the live sparq population while reviewing #697: 9 PRs
+# sat on `review:parked` with no human hold, none of them reachable by the migration path, and
+# #697's aged-out exit mints for all 9 against the live ledger — so without this they would all
+# have re-entered on the FIRST tick after merge.
+#
+# Same value as the migration cap because it is the same lane and the same reason; deliberately
+# a SEPARATE constant because the two populations are independent and either may need tuning
+# alone. A re-admission deferred by this ceiling consumes NOTHING (the evidence probe is not even
+# called), the sweep walks PRs in ascending number order so the drain is deterministic rather
+# than starving, and each deferred park is simply re-admitted on a later tick.
+AUTO_READMISSION_PER_TICK_MAX = 5
 
 
 def _migrate_legacy_park(repo, number, issue_number, comments, labels, bot_login, provable,
@@ -2421,6 +2443,16 @@ def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_logi
                         log=log):
                     migrated += 1
                 continue                  # no live machine park — nothing to re-admit
+            # PACING, the second half of the bound (registry #698). Checked BEFORE the timeline
+            # and comment reads so a paced tick is also a cheap one, and before the evidence
+            # probe so a deferred park consumes NO evidence and mints NO receipt — it is simply
+            # re-admitted on a later tick.
+            if readmitted >= AUTO_READMISSION_PER_TICK_MAX:
+                log(f"auto-readmit deferred {repo}#{number}: this tick has already re-admitted "
+                    f"{readmitted} park(s) (cap {AUTO_READMISSION_PER_TICK_MAX}) — the park "
+                    "stands until the next tick so the re-entry cannot starve the allocator "
+                    "whose starvation parked most of them")
+                continue
             # ONE spelling of the hold rule (park_policy.human_owned_holds), shared with
             # capacity_park_admission's own refusal and the migration precondition, so the
             # sweep cannot drift from the admission it feeds.
@@ -8733,6 +8765,38 @@ def _self_test():
         assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
         print("  ok   aged-out exit: its evidence is consumed EXACTLY ONCE — the same "
               "fleet-health key cannot re-earn a re-admission after a new park")
+
+        # (4b) BOUNDED RE-ENTRY, THE OTHER PATH (registry #698). The migration cap paces only
+        # PRs with NO live machine park; a PR ALREADY on `review:parked` never reaches it, so the
+        # re-admission path had no ceiling at all and the herd bound was proven for the wrong
+        # population. MEASURED while reviewing #697: 9 live sparq PRs sat in exactly that state,
+        # unreachable by the migration, and the aged-out exit mints for all 9 — they would have
+        # re-entered the review lane in ONE tick. Assert the BOUND ITSELF, then size the fixture
+        # from a LITERAL so lowering the ceiling cannot shrink the fixture with it.
+        assert 0 < AUTO_READMISSION_PER_TICK_MAX <= 10, AUTO_READMISSION_PER_TICK_MAX
+        herd_rows = [dict(parked_row, number=n,
+                          head=dict(parked_row["head"], ref=f"sparq-agent/issue-{n}-abc"))
+                     for n in range(60, 60 + AUTO_READMISSION_PER_TICK_MAX + 4)]
+        herd_cleared = []
+        herd_count = _readmit_capacity_parks(
+            "example/repo", [herd_rows], {}, {row["number"]: {"issue": 7} for row in herd_rows},
+            readmit_bot, Path("."), worker_pr_mod,
+            _capacity_recovery_probe(model_health_mod, healthy_window, readmit_now),
+            comments_fn=lambda _repo, _number: [],
+            timeline_fn=lambda _repo, number: list(
+                aged_timeline[41] if number != 7 else []),
+            post_comment=lambda *_a: None,
+            clear_labels=lambda pr, issue: herd_cleared.append(pr),
+            log=lambda _l: None, migration_provable=False)
+        assert herd_count == AUTO_READMISSION_PER_TICK_MAX, (herd_count, herd_cleared)
+        assert len(herd_cleared) == AUTO_READMISSION_PER_TICK_MAX, herd_cleared
+        # ...and the drain is DETERMINISTIC, not starving: ascending PR order, so the parks this
+        # tick deferred are the ones the next tick reaches first.
+        assert herd_cleared == sorted(herd_cleared) == [
+            row["number"] for row in herd_rows[:AUTO_READMISSION_PER_TICK_MAX]], herd_cleared
+        print(f"  ok   aged-out exit: one tick RE-ADMITS at most "
+              f"{AUTO_READMISSION_PER_TICK_MAX} parks in ascending order — the re-admission "
+              f"path is paced too, not just the migration path")
 
         # (5) STRICTLY NARROWER THAN THE DENY. A human-owned hold on either surface still
         # refuses, unconditionally, on the aged-out path.

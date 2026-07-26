@@ -99,6 +99,11 @@ CLASS_ZERO_DISPATCH = "zero-dispatch"  # dispatch planned >0 but launched 0 (fle
 # never written to the ledger. This is the fail-closed backstop behind the workflow change that
 # stopped interpolating this string into `run:` shell source.
 VALID_RECORD_PROVIDERS = frozenset({"anthropic", "openai", "fleet"})
+# The PSEUDO-provider: `fleet` is not a worker account, it is the fleet-wide dispatch signal, and
+# its records carry a FIXED sentinel account hash rather than a salted handle. Named here because
+# any predicate that counts DISTINCT ACCOUNTS as a proxy for "more than one real account" has to
+# exclude it or the dispatcher itself satisfies the count (review of PR #697).
+FLEET_PSEUDO_PROVIDER = "fleet"
 
 # raw worker-live.sh exit-class -> decision class
 _EXIT_CLASS_MAP = {
@@ -992,9 +997,22 @@ def _account_newest(window):
 #    not proven. Requiring a SUCCESS inside the last hour is what makes "the fleet works" a
 #    present-tense claim. (Measured: the live ledger contains a 4.6 h silent gap; during it this
 #    predicate correctly yields nothing.)
-#  * >=6 SUCCESSES from >=2 DISTINCT ACCOUNTS. One account succeeding proves that account works,
-#    not that the fleet does; 2 mirrors OUTAGE_MIN_ACCOUNTS. Measured over the last 6 h: 47
-#    successes across 3 accounts.
+#  * >=6 SUCCESSES from >=2 DISTINCT REAL ACCOUNTS. One account succeeding proves that account
+#    works, not that the fleet does. Measured over the last 6 h: 47 successes across 3 accounts.
+#    THE `fleet` PSEUDO-PROVIDER IS EXCLUDED FROM THE DISTINCT-ACCOUNT COUNT (review of PR #697).
+#    It writes its records under a FIXED sentinel hash (sha256("fleet-zero-dispatch")[:16]) which
+#    is a valid `account` value like any other, so without this exclusion ONE real account plus
+#    the dispatcher clears a floor whose entire stated purpose is that one account is not a
+#    fleet. Counterexample against the first cut, by execution: 6 successes / 2 distinct
+#    `account` values / 1 distinct REAL account minted `{"cause": "aged-out"}`. Live prevalence
+#    makes it load-bearing rather than theoretical: 43 of today's 200 records are `fleet`
+#    successes. Its successes still count toward MIN_SUCCESSES and toward freshness — a `fleet`
+#    success means the allocator PLANNED AND LAUNCHED work, which is genuine evidence about the
+#    dispatch starvation these parks are mostly made of; it simply is not a second ACCOUNT.
+#    NOTE the floor is deliberately NOT described as mirroring OUTAGE_MIN_ACCOUNTS: the two
+#    cannot be symmetric, because the recorder refuses any `fleet` record outside
+#    {zero-dispatch, success}, so the pseudo-provider can inflate the HEALTH side and by
+#    construction never the OUTAGE side.
 #  * ZERO LAUNCH_FAIL_CLASSES IN THE SPAN, and NO account whose NEWEST record in the WHOLE window
 #    is a launch failure. The first says nothing broke during the proven-healthy stretch; the
 #    second catches the account that failed just BEFORE the span and has been silent since (its
@@ -1056,8 +1074,10 @@ def sustained_fleet_health_evidence(records, parked_at, now):
          comment: an under-covered window cannot honestly claim a full span of health);
       3. no LAUNCH_FAIL_CLASSES record inside the span, no account whose newest record in the
          window is a launch failure, and no ACTIVE auth cooldown (_fleet_health_ok);
-      4. at least SUSTAINED_HEALTH_MIN_SUCCESSES success records inside the span from at least
-         SUSTAINED_HEALTH_MIN_ACCOUNTS distinct accounts; and
+      4. at least SUSTAINED_HEALTH_MIN_SUCCESSES success records inside the span, from at least
+         SUSTAINED_HEALTH_MIN_ACCOUNTS distinct REAL accounts — the `fleet` pseudo-provider's
+         fixed sentinel hash is excluded from the DISTINCT count (it is the dispatcher, not a
+         second account) while its successes still count toward the total; and
       5. the NEWEST of those successes is within SUSTAINED_HEALTH_FRESH_SECONDS of `now` — the
          fleet works in the present tense, not merely at some point in the span.
     The newest qualifying success anchors the evidence (ties broken by account fingerprint then
@@ -1094,7 +1114,8 @@ def sustained_fleet_health_evidence(records, parked_at, now):
                  if record["exit_class"] == SUCCESS and record["ts"] > span_start]
     if len(successes) < SUSTAINED_HEALTH_MIN_SUCCESSES:
         return None
-    if len({record["account"] for record in successes}) < SUSTAINED_HEALTH_MIN_ACCOUNTS:
+    if len({record["account"] for record in successes
+            if record["provider"] != FLEET_PSEUDO_PROVIDER}) < SUSTAINED_HEALTH_MIN_ACCOUNTS:
         return None
     anchor = max(successes,
                  key=lambda r: (r["ts"], r["account"], r.get("run_id") or ""))
@@ -3202,6 +3223,32 @@ def _self_test():
             h_base + [rec("openai", "codex01", SUCCESS, dt=7 * 3600 - 300 - 600 * k, run=f"o{k}")
                       for k in range(8)],
             aged_park, h_now), None)
+    # THE `fleet` PSEUDO-PROVIDER IS NOT A SECOND ACCOUNT (review of PR #697). It writes under a
+    # FIXED sentinel hash, so counting raw `account` values let ONE real account plus the
+    # dispatcher clear a floor that exists precisely to require more than one real account.
+    # Demonstrated by execution against the first cut, and live-prevalent: 43 of today's 200
+    # records are `fleet` successes. Delete the provider filter and this goes red.
+    fleet_sentinel = hashlib.sha256(b"fleet-zero-dispatch").hexdigest()[:16]
+
+    def fleet_rec(cls, dt, run):
+        return make_record(FLEET_PSEUDO_PROVIDER, fleet_sentinel, "", cls, run, now + dt)
+
+    one_real_plus_fleet = (
+        h_base
+        + [rec("openai", "codex01", SUCCESS, dt=7 * 3600 - 300 - 600 * k, run=f"p{k}")
+           for k in range(3)]
+        + [fleet_rec(SUCCESS, 7 * 3600 - 600 - 600 * k, f"q{k}") for k in range(3)])
+    chk("the `fleet` PSEUDO-account is not a second real account: one real account plus the "
+        "dispatcher does NOT clear the distinct-account floor",
+        sustained_fleet_health_evidence(one_real_plus_fleet, aged_park, h_now), None)
+    # ...but its successes still COUNT toward the total, because a `fleet` success means the
+    # allocator planned AND launched work — genuine evidence about the dispatch starvation these
+    # parks are mostly made of. Two real accounts + fleet must still fire.
+    chk("a `fleet` success still counts toward MIN_SUCCESSES once two REAL accounts are present",
+        bool(sustained_fleet_health_evidence(
+            h_base + h_wins[:4] + [fleet_rec(SUCCESS, 7 * 3600 - 900 - 600 * k, f"u{k}")
+                                   for k in range(2)],
+            aged_park, h_now)), True)
     # GUARD: freshness. SILENCE IS NOT HEALTH — the same six successes, all early in the span.
     stale = h_base + [rec("openai", "codex01", SUCCESS, dt=3700 + 60 * k, run=f"e{k}")
                       for k in range(3)] \
