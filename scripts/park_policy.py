@@ -96,9 +96,14 @@
 #    for the same reason registry #604 exists: a compensating action that lives in its own
 #    workflow step is reachable only from the path whose `if:` selects it (there, the `outcome`
 #    job was gated on `verdict_ok == 'success'`, so an `auth` exit skipped it entirely and the
-#    charge stood forever). Here there is no path that applies the label without passing through
-#    the disarm, on the success path or any failure path, because applying the label IS calling
-#    through it.
+#    charge stood forever). Here no MACHINE PARK PATH applies its label without passing through the
+#    disarm, on the success path or any failure path, because applying the label IS calling through
+#    it. ROUND-2 CORRECTION: the earlier wording said "no path", full stop, and that was wrong —
+#    the state #683 releases on is LABEL STATE, and a human applying `needs:user` (or #686's
+#    post-arm `review:*` convergence) is a producer with no call path to hook. The write side is
+#    therefore "a machine park is never the CAUSE of parked-and-armed"; the read-side reconciler in
+#    groom (`collect_park_disarm_candidates`) is what converges the states machines did not write.
+#    See the scope note on invariant 4 below.
 """Machine/human park-label ownership + the sticky human-unpark veto (one shared helper)."""
 
 import argparse
@@ -1121,6 +1126,33 @@ def probe_maintainer(repo, login, read_permission, log=print):
 
 
 # ---- invariant 4: disarm-on-park (issue #684) -------------------------------------------------
+#
+# SCOPE, STATED EXACTLY (round-2 review correction). This primitive establishes:
+#
+#     for every park path that CALLS it, the auto-merge latch is provably gone before that
+#     path's park artifacts land.
+#
+# It does NOT establish "a parked PR is never merge-capable", and the earlier wording here implied
+# it did. That claim is not reachable from the write side at all: #683's crate-release valve
+# (`dispatch-claim.busy_packages_of_pulls`) is a predicate over LABEL STATE with two disjuncts —
+# PARKED_PR_HOLD_LABELS on the PR, or any `needs:*` on the linked source issue — and the producers
+# of that state include HUMANS (`needs:user` is literally the "human attention required" label) and
+# issue #686's post-arm convergence of an ambiguous `review:*` namespace. A write-path enumeration,
+# however exhaustive, cannot cover a producer that is not a code path.
+#
+# The complementary half therefore lives on the READ side: `groom.collect_park_disarm_candidates` /
+# `_execute_park_disarm_actions` reconcile whatever label state exists — whoever wrote it — to a
+# retracted latch, through this same primitive. Together the properties are:
+#
+#     write side (here):  a machine park is never the CAUSE of a parked-and-armed PR.
+#     read  side (groom): a parked-and-armed PR converges to parked-and-unarmed, one sweep.
+#
+# Neither half alone is the invariant, and the pair is a CONVERGENCE property, not an
+# instantaneous one: between a human's label and the next groom sweep a PR can be parked and
+# latched. #683's `parked AND posture != 'latched'` predicate is what makes that window safe rather
+# than merely brief — it declines to release a latched PR's crates — so the two changes compose:
+# this pair removes the STALL that predicate would otherwise cause, and that predicate covers the
+# window this pair cannot close.
 
 # The two GitHub-side auto-merge latch forms, in the ONLY safe retraction order. `dequeue` first:
 # a merge-queue entry is the latch that is already executing, and worker-pr's disarm() has pinned
@@ -1168,8 +1200,10 @@ def disarm_before_park(repo, number, latch_state, retract, park, log=print):
 
     THE ORDERING IS THE POINT (module invariant 4). `park` is a zero-argument callback that
     applies the park label(s); it is invoked by this function and nowhere else on any park path,
-    so there is no arrangement of workflow `if:` conditions, exception handlers, or early returns
-    that can make a label land while a latch survives. If anything here fails, `park` is NEVER
+    so no arrangement of workflow `if:` conditions, exception handlers, or early returns can make
+    THIS PATH's label land while a latch survives. That is a per-call-path property and nothing
+    wider — see the scope note on invariant 4 above for what it does not establish, and for the
+    read-side reconciler that covers the rest. If anything here fails, `park` is NEVER
     called and ParkDisarmError propagates: the PR is left UNPARKED-AND-ARMED, which is the prior,
     known-safe state (an unparked PR still reserves its crate partitions, so no sibling can be
     handed the crate underneath it). The forbidden state is PARKED-AND-ARMED, which is exactly
