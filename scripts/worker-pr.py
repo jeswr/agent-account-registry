@@ -41,6 +41,21 @@ if _retry_spec is None or _retry_spec.loader is None:
 ledger_retry = importlib.util.module_from_spec(_retry_spec)
 _retry_spec.loader.exec_module(ledger_retry)
 
+# The fleet-shared bounded-retry layer for IDEMPOTENT READS (registry #563 adoption item 4).
+# worker-pr.py was the LAST registry caller not using it, and that gap is measured: over a 200-run
+# `worker.yml` sample (2026-07-26 02:51Z -> 17:21Z) ~4.8% of publishing runs lost their provenance
+# record to a SINGLE un-retried `repos/<target>/pulls/<N>` read — the live re-verification GET in
+# provenance_record, which runs BEFORE any registry PUT. A PR published without a provenance record
+# fails closed to `__global__` in dispatch-claim.busy_packages_of_pulls and reserves every crate,
+# which starved the worker lane four times on 2026-07-26 (sparq #3641/#4185/#4212/#4222) and needed
+# a human to park the holder each time. See _gh_read_with_retry for the hard scope rule: READS only.
+_gh_retry_spec = importlib.util.spec_from_file_location(
+    "registry_gh_retry", Path(__file__).resolve().parent / "gh_retry.py")
+if _gh_retry_spec is None or _gh_retry_spec.loader is None:
+    raise RuntimeError("cannot load shared gh retry policy")
+gh_retry = importlib.util.module_from_spec(_gh_retry_spec)
+_gh_retry_spec.loader.exec_module(gh_retry)
+
 REVIEW_LABELS = ("review:needs", "review:changes", "review:pass", "review:needs-user",
                  "review:parked")
 LABEL_COLOURS = {
@@ -224,7 +239,30 @@ SAFE_ALIAS_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 # provider ladder is REJECTED (hostile-input surface: a forged marker must never select an
 # arbitrary provider_model — concrete ids are still resolved from protected target routing by
 # alias).
-ESCALATION_LADDERS = {"anthropic": ["opus", "fable", "opus5"], "openai": ["luna", "sol"]}
+def _load_sibling_module(name, filename):
+    """Load a sibling script by path. The scripts/ dir is not a package and several filenames are
+    hyphenated, so a plain `import` is not available."""
+    spec = importlib.util.spec_from_file_location(
+        name, Path(__file__).resolve().with_name(filename))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+ESCALATION_LADDERS = {"anthropic": ["opus5"], "openai": ["luna", "sol"]}
+# [OPUS-5] 2026-07-26: the anthropic ladder lost its `opus` and `fable` rungs to the deprecation,
+# leaving ONE rung. Consequences, both deliberate:
+#   * `pinned_fix_chain("anthropic", "opus5") == ["opus5"]` — still terminates.
+#   * `decide_budget` can no longer mint an `extend-model-pin` on the anthropic side: with no tier
+#     ABOVE opus5, a stagnant opus5 fix goes straight to `needs-user`. That is the correct
+#     fail-closed exit (a human looks at it) rather than a silent extra round on a retired model.
+# The register is IMPORTED, never re-declared — see scripts/deprecated_models.py for why history
+# reads migrate up instead of raising.
+_deprecated = _load_sibling_module("registry_deprecated_models", "deprecated_models.py")
+assert_no_deprecated = _deprecated.assert_no_deprecated
+migrate_tier = _deprecated.migrate_tier
+migrate_tiers = _deprecated.migrate_tiers
+_deprecated.assert_table_clean("ESCALATION_LADDERS", ESCALATION_LADDERS)
 PROGRESS_VALUES = ("improving", "stagnant", "regressing")
 HARD_CAP_ROUNDS = 6  # absolute bound on review rounds across BOTH extension mechanisms
 REVIEWED_SHA_RE = re.compile(r"<!-- sparq-reviewed-sha:([0-9a-f]{40}|none) -->")
@@ -760,7 +798,13 @@ def pinned_fix_floor(comments, bot_login, provider):
     floor = None
     for comment in _bot_comments(comments, bot_login):
         for match in pattern.finditer(str(comment.get("body", ""))):
-            tier = match.group(2)
+            # [OPUS-5] a marker written BEFORE the 2026-07-26 deprecation names `opus`/`fable`.
+            # Migrate it up to opus5 rather than raising: raising here would permanently stall
+            # every in-flight PR that had escalated, and the floor may only ever rise, so the
+            # migrated tier cannot re-authorize anything the original pin forbade. A marker
+            # naming a genuinely unknown tier still raises (fail closed) — migrate_tier passes
+            # unknown values through unchanged.
+            tier = migrate_tier(match.group(2))
             if tier not in ladder:
                 raise WorkerPrError("recorded model pin is not a ladder member for this provider")
             if floor is None or ladder.index(tier) > ladder.index(floor):
@@ -773,6 +817,7 @@ def pinned_fix_chain(provider, floor):
     first. Tiers below the floor are never offered to the allocator — see the defer-not-fallback
     rationale on decide_budget."""
     ladder = ESCALATION_LADDERS.get(provider)
+    floor = migrate_tier(floor)   # [OPUS-5] accept a pre-deprecation floor; see pinned_fix_floor
     if not ladder or floor not in ladder:
         raise WorkerPrError("model pin must be a ladder member for its provider")
     return ladder[ladder.index(floor):]
@@ -842,16 +887,26 @@ def decide_budget(rounds_used, per_round_models, latest_progress, provider,
         # declared cap — the existing bug continued at round 6 with base_rounds=8. Reject the
         # misconfiguration fail-closed rather than silently honouring a base the cap forbids.
         raise WorkerPrError("base_rounds must not exceed the absolute hard cap")
-    models = sorted(set(per_round_models))
+    # [OPUS-5] MIGRATE BEFORE VALIDATING. These three inputs are HISTORY read back off the PR
+    # (recorded fix-round models, pending fix markers, the pinned floor). After the 2026-07-26
+    # deprecation an in-flight PR whose earlier rounds ran on `opus` or `fable` carries markers
+    # naming tiers the ladder no longer has — validating those raw would raise here on EVERY tick
+    # and stall a PR that was healthy before the config change. Mapping them UP to opus5 is safe:
+    # the floor may only ever rise, so a migrated rung can never lower a pin or re-authorize a
+    # tier the pin forbade. New CONFIG naming a retired tier is still rejected (assert_table_clean
+    # on ESCALATION_LADDERS above) — only history migrates.
+    models = sorted(set(migrate_tiers(per_round_models)))
     for model in models:
         if model not in ladder:
             raise WorkerPrError("a recorded fix-round model is not a ladder member")
-    pending = sorted(set(pending_fix_models))
+    pending = sorted(set(migrate_tiers(pending_fix_models)))
     for model in pending:
         if model not in ladder:
             raise WorkerPrError("a pending fix-round model is not a ladder member")
-    if pin_floor is not None and pin_floor not in ladder:
-        raise WorkerPrError("pin_floor must be a ladder member for its provider")
+    if pin_floor is not None:
+        pin_floor = migrate_tier(pin_floor)
+        if pin_floor not in ladder:
+            raise WorkerPrError("pin_floor must be a ladder member for its provider")
     if latest_progress is not None and latest_progress not in PROGRESS_VALUES:
         raise WorkerPrError("latest_progress must be improving, stagnant, regressing, or None")
     # The absolute hard cap is evaluated BEFORE the base-budget continuation (issue #163): were
@@ -1183,6 +1238,48 @@ def decide_fix(injection, made_changes, gate_ok, pushed, nochange_runs, gatefail
 
 
 # ---- GitHub I/O ----------------------------------------------------------------------------------
+# gh prints the HTTP status in two shapes: `HTTP 404: Not Found` and `gh: Not Found (HTTP 404)`.
+# Both are matched so a caller (and a human reading a run log) can tell a transient 5xx / secondary
+# rate-limit 403 apart from a genuine 404 / permission refusal.
+_GH_STATUS_RE = re.compile(r"HTTP[ :]*([1-5]\d\d)\b|\(HTTP ([1-5]\d\d)\)")
+_GH_STDERR_EXCERPT_MAX = 200
+
+
+def _gh_error_detail(result):
+    """Observable classification of a FAILED `gh` invocation: the HTTP status (when gh printed one),
+    whether gh_retry classifies the stderr as TRANSIENT, and a redacted single-line stderr excerpt.
+
+    Registry #677 comment 5: `_run_gh` discarded `gh`'s stderr entirely, so a transient 5xx, a
+    secondary-rate-limit 403 and a genuine 404/permission refusal all reached the operator as the
+    single opaque line `GitHub API request failed for repos/<o>/<r>/pulls/<N>`. That is why ~4.8% of
+    provenance losses went unnoticed for a month: the log could not distinguish "retry would have
+    worked" from "this PR does not exist". The excerpt crosses a PUBLIC sink (run logs + ops-alert
+    issue bodies), so it is redacted (issue #135) and length-capped."""
+    text = (getattr(result, "stderr", "") or getattr(result, "stdout", "") or "").strip()
+    match = _GH_STATUS_RE.search(text)
+    status = (match.group(1) or match.group(2)) if match else None
+    excerpt = _redact_public_text(" ".join(text.split()))[:_GH_STDERR_EXCERPT_MAX]
+    return {
+        "status": status,
+        "transient": gh_retry.is_transient_stderr(text),
+        "excerpt": excerpt,
+        "exit": getattr(result, "returncode", None),
+    }
+
+
+def _gh_error_message(args, result, *, attempts=1):
+    """The fail-LOUD message for a failed `gh` call. Keeps the historical
+    `GitHub API request failed for <endpoint>` prefix (log greps and backfill-provenance.py's
+    operator guidance key on it) and APPENDS the status/class/attempts/stderr that used to be
+    thrown away."""
+    endpoint = args[1] if len(args) > 1 else "request"
+    detail = _gh_error_detail(result)
+    return (f"GitHub API request failed for {endpoint} "
+            f"(exit={detail['exit']} http={detail['status'] or 'unknown'} "
+            f"class={'transient' if detail['transient'] else 'permanent'} "
+            f"attempts={attempts}): {detail['excerpt'] or 'no stderr'}")
+
+
 def _run_gh(args, *, input_text=None, check=True, env=None):
     merged_env = None
     if env:
@@ -1190,7 +1287,7 @@ def _run_gh(args, *, input_text=None, check=True, env=None):
     result = subprocess.run(["gh", *args], input=input_text, capture_output=True, text=True,
                             check=False, env=merged_env)
     if check and result.returncode != 0:
-        raise WorkerPrError(f"GitHub API request failed for {args[1] if len(args) > 1 else 'request'}")
+        raise WorkerPrError(_gh_error_message(args, result))
     return result
 
 
@@ -1201,6 +1298,93 @@ def _gh_json(args, *, input_doc=None, env=None):
         return json.loads(raw or "null")
     except json.JSONDecodeError as exc:
         raise WorkerPrError("GitHub API returned malformed JSON") from exc
+
+
+def _gh_read_with_retry(args, *, env=None):
+    """Run ONE idempotent `gh` READ through the fleet-shared bounded-retry layer.
+
+    Returns `(CompletedProcess, attempts_used)` — the caller keeps its own returncode handling and
+    fail-loud error type exactly as with `_run_gh(check=False)`; only the loop/sleep mechanics are
+    delegated (gh_retry's contract).
+
+    HARD SCOPE RULE, enforced STRUCTURALLY rather than by convention: `gh_retry.read_cli_reject` is
+    the same predicate the shell entrypoint uses, and it admits only read verbs / `gh api` GETs with
+    no request body. A mutation routed here is REFUSED, never retried — an ambiguous transient
+    failure does not prove GitHub skipped a write, so replaying one could duplicate a comment,
+    repeat a state transition, or write a second provenance record."""
+    listed = list(args)
+    reason = gh_retry.read_cli_reject(listed)
+    if reason:
+        raise WorkerPrError(f"refusing to retry a non-read gh call: {reason}")
+    merged_env = {**os.environ, **env} if env else None
+    attempts = [1]
+
+    def _sleep(attempt, retry_after=None):
+        attempts[0] = attempt + 1
+        gh_retry.sleep_backoff(attempt, retry_after)
+
+    result = gh_retry.run_gh(listed, env=merged_env, sleep=_sleep)
+    return result, attempts[0]
+
+
+# Stable, greppable marker for a provenance read that never resolved. Emitted with the target repo
+# and PR (or head branch) so the loss is ATTRIBUTABLE from the run log alone — the previous silent
+# shape is what made the ~4.8% rate invisible until it was reconstructed from 200 runs by hand.
+PROVENANCE_READ_FAILURE_MARKER = "PROVENANCE-READ-FAILED"
+
+
+def _provenance_read(args, *, target_repo, subject, env=None):
+    """The provenance path's ONE idempotent-read primitive: bounded retry on transient classes, and
+    a COUNTED, ATTRIBUTABLE fail-loud on exhaustion or refusal.
+
+    Registry #677: a worker that cannot record provenance publishes a PR that reserves `__global__`
+    and stalls the whole fleet, so this failure must never be a log line nobody reads. On failure it
+    emits FOUR observable, machine-consumable artifacts before raising:
+
+      1. the stable `PROVENANCE-READ-FAILED` log line naming repo + PR/branch + http status + class
+         + attempts — the same run-log substrate `scripts/backfill-provenance.py` already reads;
+      2. an Actions `::error` annotation, which the checks API counts and attributes to the run;
+      3. a `$GITHUB_STEP_SUMMARY` row, durable on the run itself and needing no extra permission;
+      4. a deduped ops-alert issue when — and ONLY when — an alert route is configured. It is NOT
+         configured on worker.yml's `provenance` job today (no `REGISTRY_REPO`/`ALERT_TOKEN`, and
+         that job deliberately holds no `issues: write` beside `PROVENANCE_SALT`), exactly like
+         `_registry_put_file`'s existing terminal alert. Artifacts 1-3 are the ones that fire there.
+
+    It does NOT weaken the fail-closed rule downstream: a PR whose record is absent still takes
+    `__global__` in dispatch-claim.busy_packages_of_pulls."""
+    result, attempts = _gh_read_with_retry(args, env=env)
+    if result.returncode == 0:
+        try:
+            return json.loads(result.stdout or "null")
+        except json.JSONDecodeError as exc:
+            raise WorkerPrError("GitHub API returned malformed JSON") from exc
+    detail = _gh_error_detail(result)
+    klass = "transient" if detail["transient"] else "permanent"
+    endpoint = args[1] if len(args) > 1 else "request"
+    summary = (f"{PROVENANCE_READ_FAILURE_MARKER} repo={target_repo} {subject} "
+               f"endpoint={endpoint} http={detail['status'] or 'unknown'} class={klass} "
+               f"attempts={attempts}/{gh_retry.MAX_ATTEMPTS}")
+    print(f"worker-pr: {summary}", flush=True)
+    print(f"::error title=provenance read failed::{summary} — no provenance record will be "
+          f"written for this PR, so it will reserve the __global__ partition until backfilled",
+          flush=True)
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary_path:
+        try:
+            with open(summary_path, "a", encoding="utf-8") as handle:
+                handle.write(f"- `{summary}`\n")
+        except OSError as exc:  # best-effort — never mask the operational error below
+            print(f"step-summary write failed (non-fatal): {exc}", file=sys.stderr)
+    _ops_alert(*_alert_route(),
+               f"⚠️ Worker provenance read failing — {target_repo}",
+               f"> 🤖 SPARQ agent — `{summary}`.\n\n"
+               f"The live re-verification read failed, so **no provenance record was written**. "
+               f"That PR is invisible to the review sweep and reserves the `__global__` partition "
+               f"in `dispatch-claim.busy_packages_of_pulls` until `scripts/backfill-provenance.py` "
+               f"recovers it. Last API error: {detail['excerpt'] or 'no stderr'}\n\n"
+               f"`class=transient` means the bounded retry budget was exhausted (availability); "
+               f"`class=permanent` means GitHub refused (404/permission) and retrying cannot help.")
+    raise WorkerPrError(_gh_error_message(args, result, attempts=attempts))
 
 
 def _paginated_comments(repo, pr_number):
@@ -1692,6 +1876,7 @@ def record_model_pin(repo, pr_number, round_n, tier, provider, run_key, bot_logi
     """Durably pin the fix-model floor after a budget extension (idempotent: an existing
     equal-or-higher recorded floor wins — the floor only ever moves UP the ladder)."""
     ladder = ESCALATION_LADDERS.get(provider)
+    tier = migrate_tier(tier)   # [OPUS-5] a caller carrying a pre-deprecation tier converges up
     if not ladder or tier not in ladder:
         raise WorkerPrError("model pin tier must be a ladder member for its provider")
     comments = _paginated_comments(repo, pr_number)
@@ -2117,7 +2302,14 @@ def provenance_record(registry_repo, target_repo, pr_number, head_sha, impl_prov
     if not re.fullmatch(r"[0-9a-f]{16}", impl_account_h or ""):
         raise WorkerPrError("impl_account_h must be a 16-hex salted account hash")
     if verify_bot_login:
-        pull = _gh_json(["api", f"repos/{target_repo}/pulls/{pr_number}"])
+        # Registry #677: THE read that lost ~4.8% of provenance records. It is an idempotent GET
+        # that runs BEFORE any registry PUT, so a bounded retry on transient classes is safe and
+        # changes nothing about what is accepted — every verification below is unchanged, and an
+        # exhausted retry or a genuine refusal still raises rather than recording anything.
+        pull = _provenance_read(["api", f"repos/{target_repo}/pulls/{pr_number}"],
+                                target_repo=target_repo, subject=f"pr={pr_number}")
+        if not isinstance(pull, dict):
+            raise WorkerPrError("GitHub API returned a malformed pull request")
         if pull.get("state") != "open":
             raise WorkerPrError("provenance target PR is not open")
         if str((pull.get("user") or {}).get("login", "")) != verify_bot_login:
@@ -2258,8 +2450,13 @@ def reconcile_provenance(registry_repo, target_repo, head_branch, impl_provider,
     if not re.fullmatch(r"sparq-agent/issue-[1-9][0-9]*-[A-Za-z0-9._-]+", head_branch or ""):
         raise WorkerPrError("reconcile head branch is unsafe")
     owner = target_repo.split("/", 1)[0]
-    pulls = _gh_json([
-        "api", f"repos/{target_repo}/pulls?head={owner}:{head_branch}&state=open&per_page=100"])
+    # Same class, same job, same consequence (registry #677): an un-retried blip on THIS idempotent
+    # listing GET also ends the run with no record and a `__global__`-reserving PR. Routed through
+    # the same primitive so the fix is at the layer that binds — every read on the provenance path
+    # — rather than only at the one line the 8-record audit happened to sample.
+    pulls = _provenance_read(
+        ["api", f"repos/{target_repo}/pulls?head={owner}:{head_branch}&state=open&per_page=100"],
+        target_repo=target_repo, subject=f"branch={head_branch}")
     pr_number = select_reconcilable_pr(pulls, target_repo, verify_bot_login, issue, head_branch)
     if pr_number is None:
         print(f"reconcile: no open bot PR on {head_branch}; nothing to record")
@@ -4199,6 +4396,51 @@ def fix_outcome(args):
 
 
 # ---- self-test ------------------------------------------------------------------------------------
+# ---- registry #677: the WORKFLOW seam behind the provenance read ---------------------------------
+def _workflow_yaml(name):
+    import yaml
+    path = Path(__file__).resolve().parents[1] / ".github" / "workflows" / name
+    if not path.is_file():
+        raise WorkerPrError(f"{name} not found for the workflow-seam check: {path}")
+    return yaml.safe_load(path.read_text(encoding="utf-8"))
+
+
+def provenance_retry_budget_seconds(reads=2):
+    """Worst-case wall time the provenance path can spend inside the bounded-retry layer plus the
+    registry CAS deadline, derived from gh_retry's and this module's OWN constants — never a
+    hard-coded number. `reads` is the number of idempotent GETs on the path (reconcile's listing +
+    provenance_record's verification). The workflow's `timeout-minutes` MUST admit this: a job
+    cancelled mid-backoff reproduces exactly the missing record the retry exists to prevent, so
+    raising MAX_ATTEMPTS without raising the timeout must go red rather than ship."""
+    per_read = sum(gh_retry.backoff_ceiling(attempt) + gh_retry.JITTER
+                   for attempt in range(1, gh_retry.MAX_ATTEMPTS))
+    return reads * per_read + _REGISTRY_CAS_DEADLINE_S
+
+
+def provenance_workflow_seam_report():
+    """Structural findings about the LIVE worker.yml `provenance` job, each asserted by the
+    self-test. Read off PARSED YAML nodes: a substring or `count(...) == N` assertion over workflow
+    text cannot see `if: false`, `continue-on-error: true`, a deleted step, a re-pointed script
+    path, or a timeout too short for the retry budget — and on this project every uncaught mutant
+    has lived at exactly that seam."""
+    job = _workflow_yaml("worker.yml")["jobs"]["provenance"]
+    step = next((s for s in (job.get("steps") or [])
+                 if "reconcile-provenance" in str(s.get("run") or "")), None)
+    run = str((step or {}).get("run") or "")
+    return {
+        "invokes_reconcile": bool(re.search(r"worker-pr\.py\s+reconcile-provenance", run)),
+        "script_path": next((tok for tok in run.split() if tok.endswith("worker-pr.py")), None),
+        "step_if": (step or {}).get("if"),
+        "step_continue_on_error": (step or {}).get("continue-on-error"),
+        "job_if_always": "always()" in str(job.get("if") or ""),
+        "timeout_minutes": job.get("timeout-minutes"),
+        "retry_budget_seconds": provenance_retry_budget_seconds(),
+        "step_has_gh_token": "GH_TOKEN" in ((step or {}).get("env") or {}),
+        "job_needs_publish": "publish" in (job.get("needs") or []),
+        "job_permissions": job.get("permissions"),
+    }
+
+
 def _self_test():
     ok = True
 
@@ -5049,11 +5291,17 @@ def _self_test():
     # the same issue must RAISE, and the exact branch must still record. Monkeypatched I/O —
     # no network, no registry writes.
     prov_docs = []
-    real_prov = {name: globals()[name] for name in ("_gh_json", "_registry_put_file")}
+    real_prov = {name: globals()[name]
+                 for name in ("_gh_read_with_retry", "_registry_put_file")}
     prov_pull = {"state": "open", "user": {"login": bot},
                  "head": {"ref": branch, "sha": "a" * 40, "repo": {"full_name": repo}}}
+
+    def _ok_read(args, **kwargs):
+        return subprocess.CompletedProcess(["gh", *args], 0,
+                                           stdout=json.dumps(prov_pull), stderr=""), 1
+
     try:
-        globals()["_gh_json"] = lambda a, **k: json.loads(json.dumps(prov_pull))
+        globals()["_gh_read_with_retry"] = _ok_read
         globals()["_registry_put_file"] = (
             lambda _repo, _path, document, _msg, volatile_fields=frozenset():
             prov_docs.append(document) or True)
@@ -5072,6 +5320,319 @@ def _self_test():
     finally:
         for name, real in real_prov.items():
             globals()[name] = real
+
+    # ---- registry #677: the GENERATOR of missing provenance records ------------------------------
+    # Measured: ~4.8% of publishing runs lost their record on the live re-verification READ in
+    # provenance_record, which had NO retry and DISCARDED gh's stderr, so a transient 5xx was
+    # indistinguishable from a genuine 404. Every guard below is exercised through the REAL code
+    # path — `subprocess.run` and `gh_retry.sleep_backoff` are the only stubs, so gh_retry's loop,
+    # the transient classifier, the attempt counter, the marker line and the alert all run for real.
+    prov_state = {}
+
+    def _prov_env(script):
+        """Install a scripted `gh` and capture every observable side effect of the read path."""
+        prov_state.clear()
+        prov_state.update(calls=[], slept=[], printed=[], alerts=[], store={}, script=list(script))
+
+        def fake_run(cmd, **kwargs):
+            prov_state["calls"].append(list(cmd))
+            rc, out, err = prov_state["script"][min(len(prov_state["calls"]) - 1,
+                                                    len(prov_state["script"]) - 1)]
+            return subprocess.CompletedProcess(cmd, rc, stdout=out, stderr=err)
+
+        def fake_put(_registry, path, document, _message, volatile_fields=frozenset()):
+            """The REAL idempotency contract of _registry_put_file, in-memory: it stores the same
+            SERIALIZED bytes and adjudicates a repeat write with the production
+            _registry_record_equivalent — so this stand-in cannot drift from the write path, and a
+            record that differs on an identifying field still fails closed."""
+            body = json.dumps(document, indent=1, sort_keys=True) + "\n"
+            existing = prov_state["store"].get(path)
+            if existing is not None:
+                if _registry_record_equivalent(existing, document, volatile_fields):
+                    return False  # already recorded — idempotent success, no rewrite
+                raise WorkerPrError(f"registry file {path} already exists with different content")
+            prov_state["store"][path] = body
+            return True
+
+        return fake_run, fake_put
+
+    def _stored():
+        """Every provenance record the in-memory registry holds, parsed."""
+        return [json.loads(text) for text in prov_state["store"].values()]
+
+    _PULL_JSON = json.dumps(prov_pull)
+    _T503 = (1, "", "gh: Service Unavailable (HTTP 503)")
+    _T403_RATE = (1, "", "HTTP 403: You have exceeded a secondary rate limit")
+    _P403_PERM = (1, "", "HTTP 403: Resource not accessible by integration")
+    _P404 = (1, "", "gh: Not Found (HTTP 404)")
+    _OK = (0, _PULL_JSON, "")
+
+    real_io = {name: globals()[name] for name in ("_registry_put_file", "_ops_alert")}
+    real_subprocess_run, real_sleep = subprocess.run, gh_retry.sleep_backoff
+
+    def _run_prov(script, *, fn=None):
+        """Run one provenance_record (or `fn`) against the scripted gh, returning the raised
+        WorkerPrError (or None) with every side effect left in `prov_state` — including the
+        captured stdout, which is where the counted/attributable failure evidence lands."""
+        fake_run, fake_put = _prov_env(script)
+        subprocess.run = fake_run
+        globals()["_registry_put_file"] = fake_put
+        captured = io.StringIO()
+        raised = None
+        try:
+            with contextlib.redirect_stdout(captured):
+                (fn or (lambda: provenance_record(
+                    "o/registry", repo, 42, "", "anthropic", "opus", "ab" * 8, 7, "10.1",
+                    verify_bot_login=bot, verify_head_branch=branch)))()
+        except WorkerPrError as exc:
+            raised = exc
+        prov_state["printed"] = captured.getvalue().splitlines()
+        return raised
+
+    try:
+        gh_retry.sleep_backoff = lambda attempt, retry_after=None: prov_state["slept"].append(
+            attempt)
+        globals()["_ops_alert"] = (
+            lambda alert_repo, alert_token, title, body:
+            prov_state["alerts"].append((title, body)))
+
+        # GUARD 1 — a TRANSIENT failure on the verification read is retried, and then succeeds.
+        # This is the whole point of the change: 4 of ~84 publishing runs/hour used to die here.
+        err = _run_prov([_T503, _T503, _OK])
+        check("#677 a TRANSIENT failure on the provenance read is RETRIED and then SUCCEEDS",
+              (err, len(prov_state["calls"]), prov_state["slept"],
+               [d["pr_number"] for d in _stored()]),
+              (None, 3, [1, 2], [42]))
+
+        # GUARD 2 — an EXHAUSTED retry is a COUNTED, ATTRIBUTABLE failure naming the PR, never a
+        # silent skip, and NOTHING is recorded.
+        summary_file = Path(tempfile.mkdtemp()) / "step-summary.md"
+        summary_file.write_text("", encoding="utf-8")
+        os.environ["GITHUB_STEP_SUMMARY"] = str(summary_file)
+        try:
+            err = _run_prov([_T503])
+        finally:
+            os.environ.pop("GITHUB_STEP_SUMMARY", None)
+        step_summary = summary_file.read_text(encoding="utf-8")
+        marker = next((line for line in prov_state["printed"]
+                       if PROVENANCE_READ_FAILURE_MARKER in line and not line.startswith("::")), "")
+        annotation = next((line for line in prov_state["printed"]
+                           if line.startswith("::error ")), "")
+        check("#677 an EXHAUSTED retry fails LOUD, records NOTHING, and burns the whole budget",
+              (isinstance(err, WorkerPrError), len(prov_state["calls"]), prov_state["store"]),
+              (True, gh_retry.MAX_ATTEMPTS, {}))
+        check("#677 the exhausted-retry failure NAMES the PR and is CLASSIFIED and COUNTED",
+              (f"repo={repo}" in marker, "pr=42" in marker, "class=transient" in marker,
+               "http=503" in marker,
+               f"attempts={gh_retry.MAX_ATTEMPTS}/{gh_retry.MAX_ATTEMPTS}" in marker),
+              (True, True, True, True, True))
+        check("#677 the failure is ATTRIBUTABLE in four machine-readable places "
+              "(log marker, ::error annotation, step summary, ops alert)",
+              (PROVENANCE_READ_FAILURE_MARKER in marker,
+               "pr=42" in annotation,
+               PROVENANCE_READ_FAILURE_MARKER in step_summary and "pr=42" in step_summary,
+               [t for t, _b in prov_state["alerts"]] == [f"⚠️ Worker provenance read failing — {repo}"],
+               any("pr=42" in b for _t, b in prov_state["alerts"])),
+              (True, True, True, True, True))
+        check("#677 the raised error carries the status and the stderr gh used to DISCARD",
+              ("http=503" in str(err), "class=transient" in str(err),
+               "Service Unavailable" in str(err),
+               str(err).startswith(f"GitHub API request failed for repos/{repo}/pulls/42")),
+              (True, True, True, True))
+
+        # GUARD 3 — a GENUINE 404 refusal is still refused, is NOT retried, and is DISTINGUISHABLE
+        # from the transient class. Retrying a 404 would burn five slow attempts to reach the same
+        # verdict; conflating it with a 503 is exactly what hid this defect for a month.
+        err = _run_prov([_P404])
+        marker404 = next((line for line in prov_state["printed"]
+                          if PROVENANCE_READ_FAILURE_MARKER in line and not line.startswith("::")),
+                         "")
+        check("#677 a GENUINE 404 refusal is refused, unretried, and class=permanent",
+              (isinstance(err, WorkerPrError), len(prov_state["calls"]), prov_state["slept"],
+               "class=permanent" in marker404, "http=404" in marker404, prov_state["store"]),
+              (True, 1, [], True, True, {}))
+
+        # GUARD 4 — the sharpest discrimination: TWO 403s, same status code, opposite classes.
+        # A substring check on the status alone cannot tell these apart; the class must.
+        err_rate = _run_prov([_T403_RATE, _T403_RATE, _OK])
+        rate_calls = len(prov_state["calls"])
+        err_perm = _run_prov([_P403_PERM])
+        perm_marker = next((line for line in prov_state["printed"]
+                            if PROVENANCE_READ_FAILURE_MARKER in line
+                            and not line.startswith("::")), "")
+        check("#677 a secondary-rate-limit 403 is TRANSIENT but a permission 403 is PERMANENT",
+              (err_rate, rate_calls, isinstance(err_perm, WorkerPrError),
+               len(prov_state["calls"]), "class=permanent" in perm_marker),
+              (None, 3, True, 1, True))
+
+        # A read that SUCCEEDS but returns a non-object payload must fail CLOSED as a WorkerPrError
+        # (which every caller already degrades to its documented conservative result), never crash
+        # mid-decision on `None.get`.
+        try:
+            err = _run_prov([(0, "null", "")])
+        except Exception as exc:  # noqa: BLE001 — a crash here is itself the finding
+            err = exc
+        check("#677 a 200-but-malformed pull payload fails CLOSED, never crashes mid-decision",
+              (type(err).__name__, prov_state["store"]), ("WorkerPrError", {}))
+
+        # GUARD 5 — the WRITE stays idempotent across a retry. The retry is on the READ only; a
+        # rerun of the whole job (including a rerun whose read is retried) must find its own
+        # byte-identical record and treat it as already-recorded, never write a second or
+        # conflicting one.
+        fake_run, fake_put = _prov_env([_T503, _OK])
+        subprocess.run = fake_run
+        globals()["_registry_put_file"] = fake_put
+        shared_store = prov_state["store"]
+        written = []
+        with contextlib.redirect_stdout(io.StringIO()):
+            for attempt_key in ("10.1", "10.1", "10.2"):
+                # Each pass re-arms the SAME transient-then-success read script, i.e. every write
+                # in this loop is preceded by a retried read — the exact sequence the fix creates.
+                prov_state["script"], prov_state["calls"] = [_T503, _OK], []
+                provenance_record("o/registry", repo, 42, "", "anthropic", "opus", "ab" * 8, 7,
+                                  attempt_key, verify_bot_login=bot, verify_head_branch=branch)
+                written.append(len(shared_store))
+        check("#677 the WRITE stays idempotent across a retried read: 3 runs (incl. a rerun whose "
+              "volatile run key differs) leave exactly ONE record, the FIRST one",
+              (written, len(shared_store),
+               [d["recorded_at_run"] for d in _stored()]),
+              ([1, 1, 1], 1, ["10.1"]))
+        # ...and the retry has NOT made the write permissive: a record that differs on an
+        # IDENTIFYING field (the implementer alias) is still refused, never silently rewritten.
+        prov_state["script"], prov_state["calls"] = [_T503, _OK], []
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                provenance_record("o/registry", repo, 42, "", "anthropic", "sol", "ab" * 8, 7,
+                                  "10.1", verify_bot_login=bot, verify_head_branch=branch)
+        except WorkerPrError:
+            check("#677 a DIVERGENT record still fails closed after a retried read",
+                  (len(shared_store),
+                   json.loads(shared_store[provenance_path(repo, 42)])["impl_alias"]),
+                  (1, "opus"))
+        else:
+            check("#677 a DIVERGENT record still fails closed after a retried read",
+                  "written", "refused")
+
+        # GUARD 6 — the reconcile listing read is on the SAME path with the SAME consequence and
+        # goes through the SAME primitive. (Scoping the fix to only the one line the audit sampled
+        # would leave this one generating the identical `__global__` holder.)
+        listing = json.dumps([{**prov_pull, "number": 42}])
+        err = _run_prov([(1, "", "HTTP 502: Bad Gateway"), (0, listing, ""), (0, _PULL_JSON, "")],
+                        fn=lambda: reconcile_provenance(
+                            "o/registry", repo, branch, "anthropic", "opus", "ab" * 8, 7, "10.1",
+                            bot))
+        check("#677 the reconcile LISTING read is retried through the same primitive",
+              (err, len(prov_state["calls"]), prov_state["slept"],
+               [d["pr_number"] for d in _stored()]),
+              (None, 3, [1], [42]))
+    finally:
+        subprocess.run = real_subprocess_run
+        gh_retry.sleep_backoff = real_sleep
+        for name, real in real_io.items():
+            globals()[name] = real
+
+    # GUARD 7 — the retry layer is READS-ONLY BY CONSTRUCTION. gh_retry's hard scope rule: an
+    # ambiguous transient failure does not prove GitHub skipped a write, so a replayed mutation
+    # could duplicate a comment, repeat a state transition, or write a second provenance record.
+    # The refusal is structural (gh_retry.read_cli_reject), not a convention.
+    reached = []
+    real_subprocess_run = subprocess.run
+    try:
+        subprocess.run = lambda cmd, **kwargs: reached.append(list(cmd)) or (
+            subprocess.CompletedProcess(cmd, 0, stdout="{}", stderr=""))
+        for argv in (["api", "-X", "PUT", "repos/o/r/contents/x"],
+                     ["api", "--method", "PATCH", "repos/o/r/pulls/7"],
+                     ["api", "repos/o/r/issues/7/labels", "-f", "labels[]=x"],
+                     ["pr", "merge", "7"], ["issue", "comment", "7", "-R", "o/r", "--body", "x"],
+                     ["pr", "ready", "7", "-R", "o/r"]):
+            try:
+                _gh_read_with_retry(argv)
+            except WorkerPrError:
+                continue
+            check(f"#677 retry layer REFUSES the mutation {' '.join(argv[:3])}",
+                  "retried", "refused")
+        check("#677 the bounded-retry layer is READS-ONLY by construction "
+              "(no mutation ever reached gh)", reached, [])
+        subprocess.run = lambda cmd, **kwargs: reached.append(list(cmd)) or (
+            subprocess.CompletedProcess(cmd, 0, stdout="{}", stderr=""))
+        result, attempts = _gh_read_with_retry(["api", "repos/o/r/pulls/7"])
+        check("#677 an idempotent GET IS admitted by the retry layer",
+              (result.returncode, attempts, len(reached)), (0, 1, 1))
+    finally:
+        subprocess.run = real_subprocess_run
+
+    # GUARD 8 — `_run_gh`'s message surfaces the exit status, the HTTP status, the class and the
+    # stderr it used to throw away, for EVERY caller (writes included), while keeping the historic
+    # `GitHub API request failed for <endpoint>` prefix that log greps key on.
+    real_subprocess_run = subprocess.run
+    try:
+        subprocess.run = lambda cmd, **kwargs: subprocess.CompletedProcess(
+            cmd, 1, stdout="", stderr="HTTP 503: upstream unavailable")
+        try:
+            _run_gh(["api", "repos/o/r/pulls/7"])
+        except WorkerPrError as exc:
+            raised = str(exc)
+        else:
+            raised = "(did not raise)"
+    finally:
+        subprocess.run = real_subprocess_run
+    check("#677 _run_gh RAISES the CLASSIFIED message, not the opaque pre-#677 one",
+          (raised.startswith("GitHub API request failed for repos/o/r/pulls/7"),
+           "exit=1" in raised, "http=503" in raised, "class=transient" in raised,
+           "upstream unavailable" in raised),
+          (True, True, True, True, True))
+    failed_put = subprocess.CompletedProcess(
+        ["gh"], 1, stdout="", stderr="HTTP 503: upstream unavailable")
+    message = _gh_error_message(["api", "repos/o/r/contents/p"], failed_put, attempts=3)
+    check("#677 _run_gh surfaces exit/http/class/stderr instead of discarding them",
+          (message.startswith("GitHub API request failed for repos/o/r/contents/p"),
+           "exit=1" in message, "http=503" in message, "class=transient" in message,
+           "attempts=3" in message, "upstream unavailable" in message),
+          (True, True, True, True, True, True))
+    check("#677 an unclassifiable failure reports http=unknown, never a fabricated status",
+          "http=unknown" in _gh_error_message(
+              ["api", "x"], subprocess.CompletedProcess(["gh"], 128, stdout="", stderr="boom")),
+          True)
+    # The excerpt crosses a PUBLIC sink (run log + ops-alert issue body): raw account handles and
+    # emails must never ride out on it (issue #135).
+    leaky = subprocess.CompletedProcess(
+        ["gh"], 1, stdout="",
+        stderr="HTTP 403: acct07 (bot@example.com) is not permitted")
+    check("#677 the surfaced stderr excerpt is REDACTED for the public sink",
+          ("acct07" not in _gh_error_message(["api", "x"], leaky),
+           "bot@example.com" not in _gh_error_message(["api", "x"], leaky),
+           "[redacted-account]" in _gh_error_message(["api", "x"], leaky)),
+          (True, True, True))
+    check("#677 the excerpt is single-line and length-capped (a GITHUB_OUTPUT/annotation sink "
+          "must never take a multiline blob)",
+          (("\n" not in _gh_error_detail(subprocess.CompletedProcess(
+              ["gh"], 1, stdout="", stderr="a\nb\nc"))["excerpt"]),
+           len(_gh_error_detail(subprocess.CompletedProcess(
+               ["gh"], 1, stdout="", stderr="x " * 500))["excerpt"]) <= _GH_STDERR_EXCERPT_MAX),
+          (True, True))
+
+    # GUARD 9 — the YAML SEAM, structurally on parsed nodes. A substring or `count(...) == N`
+    # assertion over workflow text does not catch `if: false`, `continue-on-error: true`, a deleted
+    # step, or a timeout too short for the retry budget to complete in — and the measured finding on
+    # this project is that every uncaught mutant lives at exactly that seam.
+    seam = provenance_workflow_seam_report()
+    check("#677 YAML seam: the provenance step INVOKES worker-pr.py reconcile-provenance "
+          "(the call site the retry lives behind)",
+          (seam["invokes_reconcile"], seam["script_path"]),
+          (True, "registry/scripts/worker-pr.py"))
+    check("#677 YAML seam: the provenance step is UNCONDITIONAL and cannot exit-zero-swallow "
+          "a provenance failure",
+          (seam["step_if"], seam["step_continue_on_error"], seam["job_if_always"]),
+          (None, None, True))
+    check("#677 YAML seam: the job's timeout ADMITS the whole bounded-retry budget "
+          "(raising MAX_ATTEMPTS without raising the timeout goes RED here)",
+          (seam["timeout_minutes"] * 60 >= seam["retry_budget_seconds"],
+           seam["retry_budget_seconds"] > 0),
+          (True, True))
+    check("#677 YAML seam: the read is AUTHENTICATED (an unauthenticated read is a permanent "
+          "401 that no retry can clear)", seam["step_has_gh_token"], True)
+    check("#677 YAML seam: the retried read runs in the job that executes NO target code",
+          (seam["job_needs_publish"], seam["job_permissions"]), (True, {"contents": "write"}))
 
     verdict = {"verdict": "request_changes", "injection_detected": False, "summary": "s",
                "issues": [{"severity": "major", "file": "src/a.rs", "title": "t", "body": "b",
@@ -5217,22 +5778,26 @@ def _self_test():
     # Mechanism 1 — model escalation, precedence over progress (it resets the quality question).
     # Direction (sol r2 f2): the ladder escalates UPWARD per opus < luna < fable < sol —
     # exhaustion on the WEAK tier pins the STRONG tier, never the reverse.
-    check("exhaustion on opus pins fable (escalates UP)", budget(3, ["opus"], "stagnant"),
-          {"action": "extend-model-pin", "pin": "fable"})
-    check("model pin outranks improving progress", budget(3, ["opus"], "improving"),
-          {"action": "extend-model-pin", "pin": "fable"})
+    # [OPUS-5] 2026-07-26: the anthropic ladder is SINGLE-RUNG (opus/fable retired). There is no
+    # tier above opus5, so mechanism 1 can no longer fire on the anthropic side — a legacy `opus`
+    # history MIGRATES to opus5 (the terminal tier) and therefore falls through to mechanism 2.
+    # This is the behaviour change the deprecation causes; it is asserted, not assumed.
+    check("legacy opus history migrates to the terminal tier -> no model pin, stagnant stops",
+          budget(3, ["opus"], "stagnant"), {"action": "needs-user", "pin": None})
+    check("legacy opus history + improving progress-extends (no tier above to pin)",
+          budget(3, ["opus"], "improving"), {"action": "extend-progress", "pin": None})
+    check("legacy fable history migrates to the terminal tier too",
+          budget(3, ["fable"], "stagnant"), {"action": "needs-user", "pin": None})
+    check("a legacy opus+fable history collapses to ONE terminal rung, not two",
+          budget(3, ["opus", "fable"], "improving"), {"action": "extend-progress", "pin": None})
     check("exhaustion on luna pins sol (escalates UP)",
           budget(3, ["luna"], None, provider="openai"),
           {"action": "extend-model-pin", "pin": "sol"})
-    # opus5 is the top anthropic tier (2026-07-24): fable exhaustion now escalates UP to it.
-    check("exhaustion on fable pins opus5 (escalates UP, 2026-07-24)",
-          budget(3, ["fable"], "stagnant"),
-          {"action": "extend-model-pin", "pin": "opus5"})
     # Mechanism 2 — progress extension once the top tier has run (or nothing is recorded)
     check("opus5 + improving extends on progress (terminal tier)",
           budget(3, ["opus5"], "improving"),
           {"action": "extend-progress", "pin": None})
-    check("opus+fable+opus5 + improving is progress-only",
+    check("a mixed legacy+current history is progress-only",
           budget(4, ["opus", "fable", "opus5"], "improving"),
           {"action": "extend-progress", "pin": None})
     check("no fix record + improving extends", budget(3, [], "improving"),
@@ -5243,11 +5808,20 @@ def _self_test():
     check("pending pinned-floor fix authorizes its re-review",
           budget(3, ["opus", "fable"], "stagnant", pending=["fable"], pin="fable"),
           {"action": "extend-pending-review", "pin": None})
+    # [OPUS-5] the same posture written with CURRENT tiers — proves the re-review authorization
+    # does not depend on the retired aliases surviving.
+    check("pending opus5 fix at an opus5 floor authorizes its re-review",
+          budget(3, ["opus5"], "stagnant", pending=["opus5"], pin="opus5"),
+          {"action": "extend-pending-review", "pin": None})
     check("no pending fix in the same posture stops (flip side)",
           budget(3, ["opus", "fable", "opus5"], "stagnant"),
           {"action": "needs-user", "pin": None})
-    check("pending fix BELOW the pinned floor never extends",
-          budget(3, ["opus", "fable", "opus5"], "stagnant", pending=["opus"], pin="fable"),
+    # [OPUS-5] the below-floor case is no longer expressible on the ANTHROPIC ladder (one rung
+    # means nothing can be below the floor), so it is asserted on the openai ladder, which still
+    # has two tiers. Losing the anthropic form must not lose the invariant.
+    check("pending fix BELOW the pinned floor never extends (openai, two-tier)",
+          budget(3, ["luna", "sol"], "stagnant", pending=["luna"], pin="sol",
+                 provider="openai"),
           {"action": "needs-user", "pin": None})
     check("unpinned pending fix authorizes (floor is the ladder bottom)",
           budget(3, ["opus"], None, pending=["opus"]),
@@ -5280,8 +5854,8 @@ def _self_test():
           {"action": "needs-user", "pin": None})
     check("hard cap stops past 6", budget(7, ["fable"], "improving"),
           {"action": "needs-user", "pin": None})
-    check("round 5 still extends under the cap", budget(5, ["opus"], None)["action"],
-          "extend-model-pin")
+    check("round 5 still extends under the cap (openai still has a tier above luna)",
+          budget(5, ["luna"], None, provider="openai")["action"], "extend-model-pin")
     # openai two-tier ladder: SOL is terminal — mechanism 2 only once sol has run
     check("openai sol + stagnant stops (never pins DOWN to luna)",
           budget(3, ["sol"], "stagnant", provider="openai"),
@@ -5345,13 +5919,23 @@ def _self_test():
         {"user": {"login": "mallory"},
          "body": f"z {MODEL_PIN_MARKER} round=3 tier=fable run=6.6 -->"},
     ]
-    check("pinned floor reads the bot marker (forged higher pin ignored)",
-          pinned_fix_floor(pin_comments, bot, "anthropic"), "opus")
-    check("highest recorded floor wins",
+    # [OPUS-5] a PRE-DEPRECATION marker (tier=opus) migrates UP to opus5 instead of raising.
+    # Without this, every in-flight PR that had ever escalated would raise on every tick.
+    check("a pre-deprecation pin marker migrates up, it does not raise",
+          pinned_fix_floor(pin_comments, bot, "anthropic"), "opus5")
+    check("the forged non-bot pin is STILL ignored after migration",
+          pinned_fix_floor([{"user": {"login": "mallory"},
+                             "body": f"z {MODEL_PIN_MARKER} round=3 tier=opus run=6.6 -->"}],
+                           bot, "anthropic"), None)
+    check("highest recorded floor wins (both legacy tiers collapse onto opus5)",
           pinned_fix_floor(pin_comments + [
               {"user": {"login": bot},
                "body": f"z {MODEL_PIN_MARKER} round=4 tier=fable run=4.1 -->"}], bot,
-              "anthropic"), "fable")
+              "anthropic"), "opus5")
+    check("a CURRENT-tier marker still reads straight through",
+          pinned_fix_floor([{"user": {"login": bot},
+                             "body": f"z {MODEL_PIN_MARKER} round=1 tier=opus5 run=1.1 -->"}],
+                           bot, "anthropic"), "opus5")
     try:
         pinned_fix_floor([{"user": {"login": bot},
                            "body": f"z {MODEL_PIN_MARKER} round=1 tier=gpt-omega run=1.1 -->"}],
@@ -5364,10 +5948,14 @@ def _self_test():
           pinned_fix_chain("openai", "luna"), ["luna", "sol"])
     check("pinned chain at the terminal tier", pinned_fix_chain("anthropic", "opus5"),
           ["opus5"])
-    check("pinned fable floor keeps opus5 above it (2026-07-24)",
-          pinned_fix_chain("anthropic", "fable"), ["fable", "opus5"])
-    check("pinned chain at the bottom is the whole ladder",
-          pinned_fix_chain("anthropic", "opus"), ["opus", "fable", "opus5"])
+    # [OPUS-5] a legacy floor migrates to the terminal tier; the chain still TERMINATES.
+    check("a legacy fable floor migrates to the terminal opus5 chain",
+          pinned_fix_chain("anthropic", "fable"), ["opus5"])
+    check("a legacy opus floor migrates to the terminal opus5 chain",
+          pinned_fix_chain("anthropic", "opus"), ["opus5"])
+    check("every anthropic pinned chain is non-empty (it must still terminate)",
+          [bool(pinned_fix_chain("anthropic", t)) for t in ("opus", "fable", "opus5")],
+          [True, True, True])
     check("openai pinned chain at its terminal tier", pinned_fix_chain("openai", "sol"),
           ["sol"])
     try:
@@ -5525,12 +6113,13 @@ def _self_test():
                           "body": f"x {FIX_MODEL_MARKER} round=1 model=fable run=1.1 -->"}]
             opus5_fix = [{"user": {"login": bot},
                           "body": f"x {FIX_MODEL_MARKER} round=1 model=opus5 run=1.1 -->"}]
-            check("outcome model extension pins + stays changes",
-                  outcome("stagnant", opus_fix),
-                  [("findings", 3), ("pin", "fable"), ("state", "changes")])
-            check("outcome fable exhaustion pins opus5 (2026-07-24)",
-                  outcome("stagnant", fable_fix),
-                  [("findings", 3), ("pin", "opus5"), ("state", "changes")])
+            # [OPUS-5] both legacy fix-model markers migrate onto the terminal tier, so a
+            # stagnant outcome escalates to a HUMAN rather than minting another round on a
+            # retired model. The exit exists — it is just needs-user, not a further pin.
+            check("outcome: a legacy opus fix migrates to terminal -> human escalation",
+                  [e[0] for e in outcome("stagnant", opus_fix)], ["findings", "needs-user"])
+            check("outcome: a legacy fable fix migrates to terminal -> human escalation",
+                  [e[0] for e in outcome("stagnant", fable_fix)], ["findings", "needs-user"])
             check("outcome progress extension stays changes without a pin",
                   outcome("improving", opus5_fix), [("findings", 3), ("state", "changes")])
             terminal = outcome("stagnant", opus5_fix)
@@ -5891,8 +6480,6 @@ def _self_test():
             unlabel("review:parked", "2026-07-22T16:36:56Z")]
         park_route_calls.clear()
         park_route_comments.clear()
-        import contextlib
-        import io
         bounce_log = io.StringIO()
         with contextlib.redirect_stdout(bounce_log):
             needs_user("o/r", 41, "budget spent", issue=7, park_class="capacity",

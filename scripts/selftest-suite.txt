@@ -1,8 +1,11 @@
 account-usage.py
 backfill-provenance.py
 broker-refresh.py
+chain_preference.py
+cross-resolver-agreement.py
 curate-frontier.py
 dashboard-gen.py
+deprecated_models.py
 dispatch-claim.py
 dispatch-plan.py
 dispatch-secrets-guard.py
@@ -10,9 +13,9 @@ gh_retry.py
 grant-account.py
 groom-alert.py
 groom.py
+lease_schema.py
 ledger-invariant.py
 ledger_retry.py
-lease_schema.py
 metrics.py
 migrate-secrets.sh
 model-health.py

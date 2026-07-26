@@ -177,14 +177,14 @@ def _self_test():
     chk("impl -> single row", len(p_impl), 1)
     row = p_impl[0]
     chk("impl row", (row["role"], row["model_chain"][0], row["agent"], row["escalate"]),
-        ("impl", "sol", "registry-impl", False))
+        ("impl", "opus5", "registry-impl", False))
     chk("impl package", row["package"], "usage")
 
     # a TRUST-SURFACE issue (area:worker) -> opus5-led (opus tail fallback, 2026-07-24) +
     # escalate (security override beats role).
     sec = compute_ready([iss(2, R + ["priority:P0", "role:impl", "area:worker"])])
     row = plan_dispatch(sec, doc)[0]
-    chk("worker -> opus5-led", row["model_chain"], ["opus5", "opus"])
+    chk("worker -> opus5 only", row["model_chain"], ["opus5"])
     chk("worker -> reviewer/escalate", (row["agent"], row["escalate"]),
         ("registry-reviewer", True))
     chk("worker role stays declared", row["role"], "impl")
@@ -192,7 +192,9 @@ def _self_test():
     # a docs issue -> its route (haiku-led).
     docs = compute_ready([iss(3, R + ["priority:P2", "role:docs", "area:docs"])])
     row = plan_dispatch(docs, doc)[0]
-    chk("docs -> haiku", row["model_chain"][0], "haiku")
+    chk("docs -> sol", row["model_chain"][0], "sol")
+    chk("docs row has no cheap anthropic tier",
+        sorted(set(row["model_chain"]) & {"haiku", "sonnet"}), [])
 
     # package-conflict pair -> only the higher-priority one is planned.
     pair = compute_ready([

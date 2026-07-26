@@ -30,16 +30,11 @@ provider = "anthropic"
 harness = "claude"
 provider_model = "claude-sonnet-4-6"
 credential_format = "claude-oauth-token"
-[models.opus]
-provider = "anthropic"
-harness = "claude"
-provider_model = "claude-opus-4-8"
-credential_format = "claude-oauth-token"
-[models.fable]
-provider = "anthropic"
-harness = "claude"
-provider_model = "claude-fable-5"
-credential_format = "claude-oauth-token"
+# DEPRECATED 2026-07-26 (maintainer: "deprecate the use of fable and opus entirely in favour of
+# opus5"): [models.opus] (claude-opus-4-8) and [models.fable] (claude-fable-5) were REMOVED from
+# this catalog. opus5 is the sole anthropic tier. Enforced, not conventional — scripts/
+# policy-resolve.py rejects an unknown model in any chain, and scripts/deprecated-models.py is the
+# shared register that dispatch-claim / worker-pr / review-fix are all pinned against.
 [models.opus5]
 provider = "anthropic"
 harness = "claude"
@@ -78,7 +73,7 @@ provider_model = "gpt-5.6-luna"        # Second codex tier (opus<luna<fable<opus
 credential_format = "codex-auth-json"
 
 [defaults]
-model_chain = ["sol", "opus5", "fable", "opus"]
+model_chain = ["opus5", "sol"]
 agent = "registry-impl"
 
 # ---------------------------------------------------------------------------------------------------
@@ -105,20 +100,31 @@ match_labels = [
   "dispatch", "worker", "set-up-account", "review-loop", "groom",
   "zk", "mpc", "crypto", "auth", "e2ee", "security",
 ]
-model_chain = ["opus5", "opus"]
+model_chain = ["opus5"]
 agent = "registry-reviewer"
 escalate = true
 
 # ---------------------------------------------------------------------------------------------------
-# ROLE ROUTES. Sol (GPT-5.6, the codex-side frontier model) is the primary code-writer
-# (maintainer directive 2026-07-18, credit abundance); opus5-led anthropic tiers (opus5, then
-# fable/opus as tail fallbacks — directive 2026-07-24) are the cross-provider
-# fallback so an OpenAI outage does not stall implementation. docs -> haiku-led (cheap;
-# the ONLY surface where the docs-only aliases terra/sonnet may appear —
-# policy-resolve.py rejects them in any non-docs route).
+# ROLE ROUTES. OPUS 5 is the primary code-writer (maintainer directive 2026-07-26: "Opus5 should
+# be prioritised over sol on all tasks for which they are both possible implementors; except for
+# GUI work where sol should remain prioritised"). sol remains the cross-provider fallback, so an
+# Anthropic outage does not stall implementation.
+#
+# These chains LED WITH SOL until 2026-07-26, under the 2026-07-18 "credit abundance" directive
+# taken during a high-sol-availability window. That steer never expired, and because
+# select-and-claim.choose_account walks `model_chain` IN ORDER and takes the first available
+# account, a sol-first literal won every route on every tick regardless of later availability.
+# The mechanism was the chain ORDER, not a heuristic — hence the fix is the order.
+#
+# THE `area:gui` CARVE-OUT DOES NOT APPLY HERE: this repo has no `area:gui` (its UI surface is
+# `area:dashboard` -> role:site). The maintainer scoped the carve-out to "area:gui work" only, so
+# this repo's site/dashboard route takes the opus5-first default. Flagged in the PR body.
+#
+# docs -> sol-led (the separate docs-writing directive); role=docs is still the ONLY surface where
+# the docs-only alias terra/sonnet may appear — policy-resolve.py rejects them in any other route.
 [[route]]
 role = "impl"
-model_chain = ["sol", "opus5", "fable", "opus"]
+model_chain = ["opus5", "sol"]
 agent = "registry-impl"
 
 # [FABLE-5] STANDING RULE — UI/front-end ownership (maintainer decision 2026-07-17): UI/front-end
@@ -130,7 +136,7 @@ agent = "registry-impl"
 # unions ALL match_labels keywords, so UI keywords there would human-arm every UI PR.
 [[route]]
 role = "site"
-model_chain = ["sol", "opus5", "fable", "opus"]
+model_chain = ["opus5", "sol"]
 agent = "registry-impl"
 
 # [FABLE-5] STANDING RULE — frontier-tier CI/infrastructure authorship (maintainer decision
@@ -152,17 +158,25 @@ agent = "registry-impl"
 # into each target's routing.toml (sparq-org/sparq carries it, PR #3422).
 [[route]]
 role = "ci"
-model_chain = ["sol", "opus5", "fable"]
+model_chain = ["opus5", "sol"]
 agent = "registry-ci"
 
+# [OPUS-5] research was ["opus5", "fable", "opus"] until 2026-07-26. Retiring the two tail rungs
+# left a ONE-RUNG chain with no `escalate` — i.e. no exit at all: on an opus5 capacity outage the
+# item could only defer forever, with no human ever notified. Deprecating a fallback has to come
+# with an exit, so research now escalates like the other single-rung chains.
 [[route]]
 role = "research"
-model_chain = ["opus5", "fable", "opus"]
+model_chain = ["opus5"]
 agent = "registry-researcher"
+escalate = true
 
+# [OPUS-5] docs KEEPS its sol lead — that is the separate 2026-07-26 docs-writing directive
+# ("deprecate sonnet and haiku for docs writing in favor of gpt 5.6 sol"), not the implementor
+# preference below. haiku led this chain until 2026-07-26.
 [[route]]
 role = "docs"
-model_chain = ["haiku", "opus5", "fable"]
+model_chain = ["sol", "opus5"]
 agent = "registry-docs"
 
 # Review / soundness: Opus-5-led (opus-4.8 tail fallback, directive 2026-07-24 — the fallback is a
@@ -172,12 +186,12 @@ agent = "registry-docs"
 # so a `role:review`/`role:soundness` issue resolves + so policy-resolve escalate is set.
 [[route]]
 role = "review"
-model_chain = ["opus5", "opus"]
+model_chain = ["opus5"]
 agent = "registry-reviewer"
 escalate = true
 
 [[route]]
 role = "soundness"
-model_chain = ["opus5", "opus"]
+model_chain = ["opus5"]
 agent = "registry-reviewer"
 escalate = true

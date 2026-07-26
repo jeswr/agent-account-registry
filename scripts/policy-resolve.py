@@ -15,12 +15,31 @@ disabled, malformed, or ambiguously labelled repositories/roles fail closed.
 """
 import argparse
 import copy
+import importlib.util
 import re
 import pathlib
 import json
 from pathlib import Path, PurePosixPath
 import sys
 import tomllib
+
+
+def _import_sibling(module_name, filename):
+    """Import a sibling script by path. These scripts are invoked standalone (and loaded by
+    dispatch-claim via importlib), so there is no package to import from — but a SHARED rule must
+    still be imported rather than re-declared (the #715 idiom)."""
+    path = Path(__file__).resolve().with_name(filename)
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+# [OPUS-5] The CHAIN-ORDER PREFERENCE mechanism, imported — never re-declared. The rule itself
+# (which labels, which lead) lives in the TARGET's protected routing table, so PLAN's resolver and
+# this CLAIM-side resolver read the same declaration and cannot disagree about it.
+_chain_preference = _import_sibling("registry_chain_preference", "chain_preference.py")
+ChainPreferenceError = _chain_preference.ChainPreferenceError
 
 
 POLICY_PATH = "policy/repos.toml"
@@ -321,7 +340,16 @@ def _validated_routing(routing_doc):
             if role not in DOCS_ROLES:
                 _reject_docs_only(value[0], f"{where} (role {role!r})")
             role_routes[role] = value
-    return default_value, security_routes, role_routes
+    # [OPUS-5] Chain-order preferences, declared BY THE TARGET in its protected routing table and
+    # validated here against that table's own [models] catalog. A malformed declaration is raised
+    # as a PolicyError so every caller keeps ONE fail-closed error class: silently ignoring it
+    # would make CLAIM resolve a chain PLAN did not plan — which is not a lost preference but a
+    # permanent per-item defer.
+    try:
+        preferences = _chain_preference.parse_preferences(routing_doc, set(models))
+    except ChainPreferenceError as exc:
+        raise PolicyError(f"routing chain_preference is invalid: {exc}") from exc
+    return default_value, security_routes, role_routes, preferences
 
 
 def resolve(target_repo, role_or_labels, policy_doc, routing_doc):
@@ -332,7 +360,7 @@ def resolve(target_repo, role_or_labels, policy_doc, routing_doc):
     """
     policy = _policy_row(target_repo, policy_doc)
     labels = _normalise_labels(role_or_labels)
-    defaults, security_routes, role_routes = _validated_routing(routing_doc)
+    defaults, security_routes, role_routes, preferences = _validated_routing(routing_doc)
 
     roles = sorted({label[5:] for label in labels if label.startswith("role:")})
     if any(not role for role in roles):
@@ -348,9 +376,15 @@ def resolve(target_repo, role_or_labels, policy_doc, routing_doc):
         if any(keyword in label for label in labels for keyword in keywords):
             routed = value
             break
-    if routed is None:
+    if routed is not None:
+        # A SECURITY surface is returned UNMODIFIED. An implementor-preference rule must never
+        # re-order a soundness chain: `area:gui` + `area:sparq-zk` is a ZK issue first. This
+        # matches the target-side resolver, which also returns its security route untouched.
+        model_chain, agent, escalate = routed
+    else:
         routed = role_routes[role] if role is not None else defaults
-    model_chain, agent, escalate = routed
+        model_chain, agent, escalate = routed
+        model_chain = _chain_preference.apply_preferences(labels, model_chain, preferences)
 
     return {
         "target_repo": target_repo,
@@ -388,7 +422,7 @@ def routing_security_keywords(target_repo, policy_file=POLICY_PATH, target_root=
     """
     policy = _policy_row(target_repo, _load_toml(policy_file, "policy file"))
     routing_file = Path(target_root).joinpath(*PurePosixPath(policy["routing"]).parts)
-    _, security_routes, _ = _validated_routing(_load_toml(routing_file, "routing file"))
+    _, security_routes, _, _ = _validated_routing(_load_toml(routing_file, "routing file"))
     keywords = set()
     for match_keywords, _value in security_routes:
         keywords.update(match_keywords)
@@ -710,6 +744,97 @@ agent = "docs-agent"
         rejects("structurally invalid routing yields NO keyword set (fail closed)",
                 "routing defaults table is required",
                 lambda: routing_security_keywords("o/r", tmp_policy, tmp_target))
+    # ---- [OPUS-5] CHAIN-ORDER PREFERENCES (sparq PR #4211 / the area:gui carve-out).
+    # THIS resolver is the CLAIM side. PLAN runs the TARGET's route-resolve.py and
+    # dispatch-claim._route_matches then demands EXACT equality of the chain, so a preference this
+    # resolver does not implement is a permanent `route-policy-failed` defer for every issue it
+    # selects — 34 of sparq's 35 open `area:gui` issues, on every tick, forever. The rule is read
+    # from the TARGET's protected routing table (data), never hard-coded here.
+    pref_routing = copy.deepcopy(routing)
+    pref_routing["models"]["opus5"] = {"provider": "anthropic"}
+    pref_routing["models"]["sol"] = {"provider": "openai"}
+    pref_routing["defaults"]["model_chain"] = ["opus5", "sol"]
+    pref_routing["route"][0]["model_chain"] = ["opus5", "sol"]        # role = impl
+    pref_routing["route"][1]["model_chain"] = ["opus5"]               # the security override
+    pref_routing["route"].append({"role": "research", "model_chain": ["opus5"],
+                                  "agent": "research-agent", "escalate": True})
+    pref_routing["route"].append({"role": "perf", "model_chain": ["opus5", "sol"],
+                                  "agent": "impl-agent"})
+    pref_routing["route"].append({"role": "site", "model_chain": ["opus5", "sol"],
+                                  "agent": "site-agent"})
+    pref_routing["chain_preference"] = [
+        {"labels": ["area:gui"], "lead": "sol", "requires": ["sol", "opus5"]}]
+
+    def pref_chain(labels):
+        return resolve("sparq-org/sparq", labels, policy, pref_routing)["model_chain"]
+
+    check("area:gui + role:impl -> SOL-first at CLAIM (the 33-issue case)",
+          pref_chain(["area:gui", "role:impl", "priority:P2"]), ["sol", "opus5"])
+    check("area:gui + role:perf -> SOL-first at CLAIM (the 34th issue)",
+          pref_chain(["area:gui", "role:perf"]), ["sol", "opus5"])
+    check("area:gui with NO role -> defaults, SOL-first",
+          pref_chain(["area:gui", "priority:P2"]), ["sol", "opus5"])
+    check("PREFERENCE, NOT EXCLUSION: opus5 stays reachable behind sol",
+          "opus5" in pref_chain(["area:gui", "role:impl"]), True)
+    check("the carve-out re-orders the chain and NEVER re-routes the agent",
+          resolve("sparq-org/sparq", ["area:gui", "role:impl"], policy, pref_routing)["agent"],
+          "impl-agent")
+    check("area:gui + role:research is UNTOUCHED (both-implementors condition declines, so a "
+          "single-provider escalating route is not silently made cross-provider)",
+          (pref_chain(["area:gui", "role:research"]),
+           resolve("sparq-org/sparq", ["area:gui", "role:research"], policy,
+                   pref_routing)["escalate"]),
+          (["opus5"], True))
+    check("area:gui + a SECURITY surface -> soundness route, UNMODIFIED",
+          (pref_chain(["area:gui", "role:impl", "area:sparq-zk"]),
+           resolve("sparq-org/sparq", ["area:gui", "role:impl", "area:sparq-zk"], policy,
+                   pref_routing)["agent"]),
+          (["opus5"], "security-agent"))
+    # ...AND THE SAME EXEMPTION WITH A CROSS-PROVIDER SOUNDNESS CHAIN. Found by mutation: with
+    # today's single-model security chain (["opus5"]) the `requires` condition declines anyway, so
+    # applying the preference to the security branch was an UNDETECTABLE mutation — the exemption
+    # was defence-in-depth with no red test, exactly the shape a reviewer flagged as "worth an
+    # assertion if a security route ever becomes cross-provider". This fixture makes it one now,
+    # rather than after some future edit makes the soundness lane cross-provider.
+    xprov_sec = copy.deepcopy(pref_routing)
+    xprov_sec["route"][1]["model_chain"] = ["opus5", "sol"]
+    check("a CROSS-PROVIDER security route is STILL returned unmodified under area:gui (the "
+          "exemption is the ROUTE CLASS, not an accident of that chain being single-model)",
+          resolve("sparq-org/sparq", ["area:gui", "role:impl", "area:sparq-zk"], policy,
+                  xprov_sec)["model_chain"], ["opus5", "sol"])
+    check("...and the same table still applies the preference on the ROLE branch, so the check "
+          "above is an exemption and not a dead fixture",
+          resolve("sparq-org/sparq", ["area:gui", "role:impl"], policy,
+                  xprov_sec)["model_chain"], ["sol", "opus5"])
+    for outside in ("area:site", "area:site-specs", "area:site-papers", "area:sitemap",
+                    "surface:frontend", "dashboard", "area:guide", "area:guidance"):
+        check(f"{outside} is OUTSIDE the carve-out (opus5-first)",
+              pref_chain([outside, "role:impl"]), ["opus5", "sol"])
+    check("a plain crate area is unaffected", pref_chain(["area:sparq-core", "role:impl"]),
+          ["opus5", "sol"])
+    # THE SAFE-TO-DEPLOY-FIRST PROPERTY, asserted rather than asserted-in-prose: against a routing
+    # table with NO declaration this resolver returns exactly what it returned before this change,
+    # which is what makes landing the registry side ahead of the target side a strict no-op.
+    no_decl = copy.deepcopy(pref_routing)
+    del no_decl["chain_preference"]
+    check("NO declaration in the target's table -> the pre-change chain, unchanged",
+          resolve("sparq-org/sparq", ["area:gui", "role:impl"], policy, no_decl)["model_chain"],
+          ["opus5", "sol"])
+    # Fail-closed: a malformed declaration must REFUSE, not resolve past it. A dropped preference
+    # is precisely a PLAN/CLAIM divergence.
+    bad_pref = copy.deepcopy(pref_routing)
+    bad_pref["chain_preference"] = [
+        {"labels": ["area:gui"], "lead": "sol", "requires": ["opus5"]}]
+    rejects("a lead outside requires REFUSES to resolve (it could INJECT a model)",
+            "chain_preference is invalid",
+            lambda: resolve("sparq-org/sparq", ["area:gui", "role:impl"], policy, bad_pref))
+    ghost_pref = copy.deepcopy(pref_routing)
+    ghost_pref["chain_preference"] = [
+        {"labels": ["area:gui"], "lead": "ghost", "requires": ["ghost"]}]
+    rejects("a preference naming an uncatalogued model REFUSES to resolve",
+            "chain_preference is invalid",
+            lambda: resolve("sparq-org/sparq", ["area:gui", "role:impl"], policy, ghost_pref))
+
     check("pure core leaves fixtures unchanged",
           policy == policy_before and routing == routing_before, True)
     print("policy-resolve self-test", "PASSED" if ok else "FAILED")
