@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3822,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "4fd3ba8b7d743afe809a5135ac8ce0c7f2686137",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The bullet is inserted as the FIRST item of the list introduced by: \"All entry points take `&Graph` + `&str` and return `Result<_, String>` (parse + eval errors are `String`). The result types:\". `edit_distance(&str, &str) -> usize` is neither an entry point of that shape nor a result type \u2014 it takes no `&Graph` and returns no `Result` \u2014 so a reader following the introducing sentence gets a claim that does not hold for the first entry in the list. It also displaces `QueryResult`, which is what that list exists to document, from the head position.\n\nThis is presentation only: the gate is satisfied, the signature and description are accurate, and there is no correctness or soundness impact. Flagging it because the surrounding text is otherwise precise about what each list documents.",
+    "file": "skills/sparql-query/SKILL.md",
+    "fix_hint": "Move the bullet out of the result-types list \u2014 e.g. add a one-line \"Helpers\" bullet group after that list, or append it at the end under its own lead-in such as \"Suggestion-ranking helper (not a query entry point):\". Alternatively consider whether the sparq-core surface is better documented in `skills/data-formats/SKILL.md` (the sparq-core-facing skill per the map in `skills/SKILL.md`); either location satisfies G2, so this is a placement judgement call, not a gate requirement.",
+    "severity": "nit",
+    "title": "New `edit_distance` bullet is filed under the \"result types\" list, whose introducing sentence does not describe it"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 2 addresses all three round-1 findings, and I re-verified each against the checkout rather than taking the diff's word for it. (1) The blocking G2 public-api\u2192skill gate now PASSES: `python3 scripts/gate-api-skill.py` reports \"G2 public-api\u2192skill: PASS\" with the new `skills/sparql-query/SKILL.md` entry for `sparq_core::strdist::edit_distance` in the same PR. (2) The reversed crate-private decision is now recorded: the new module doc states the helper \"was promoted from crate-private copies to a shared public API so dictionary-suggestion implementations across the workspace cannot drift\", which is exactly the missing rationale. (3) The metric-law proptests moved to live WITH the function: `cargo test -p sparq-core --lib strdist` now runs 3 tests (basics + symmetry + triangle inequality), all green, so validating sparq-core in isolation exercises the laws. The code itself is unchanged from round 1 and remains a byte-identical consolidation of the three deleted copies (correct two-rolling-row Levenshtein; correct empty-input early returns; char-based, so the `edit_distance(\"\u00e9\", \"e\") == 1` assertion is non-vacuous \u2014 I re-confirmed the literal is NFC U+00E9, a byte-oriented impl would return 2 and the test would go red). Verification run: sparq-core strdist 3 passed; sparq-nlq constrain_unknown_terms 4 passed; sparq-kb --features query --lib 16 passed; `cargo build -p sparq-core --no-default-features` clean (strdist is pure-std and unconditional, sound in both feature states); `RUSTFLAGS=\"-D warnings\" cargo check -p sparq-core -p sparq-nlq -p sparq-kb --all-targets --all-features` clean (the retained `use sparq_core::strdist::edit_distance` in the nlq integration test is still used at line 72, so no unused-import warning); `RUSTDOCFLAGS=\"-D warnings\" cargo doc -p sparq-core --all-features` clean (no feature-gated intra-doc-link trap); `scripts/check-readme-template.py` 0 deviations. Grep finds no stale reference to the deleted `constrain/dista\u2026 [truncated 124 chars]",
+  "verdict": "approve"
+ }
+}
