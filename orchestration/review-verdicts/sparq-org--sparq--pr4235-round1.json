@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4235,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "8e8e570f925ce2ed47c7163057dd73c7eb77bf0d",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly enforces the documented differential-corpus invariant before materialization, using the same canonical rendering and namespace predicate as normalization. The focused tests cover all four prohibited subject namespaces, legal predicate/object use, exact normalization alignment, offender counting, and the real closure-loader path. The README and module documentation accurately describe the behavior, and no correctness, soundness, security, or test-validity defect was found.",
+  "verdict": "approve"
+ }
+}
