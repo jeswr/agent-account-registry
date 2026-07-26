@@ -52,16 +52,6 @@
   },
   {
    "account": "51bde6688e140866",
-   "claim_id": "137c7cbd3af144c28125e9cbd2a17ff9",
-   "holder": "review:sparq-org/sparq#4098@dispatch-30204876348.1",
-   "package": "sparq-server",
-   "role": "review",
-   "model": "opus5",
-   "issued_at": 1785074411,
-   "expires_at": 1785078611
-  },
-  {
-   "account": "51bde6688e140866",
    "claim_id": "241b54fd94ea4f8f98d4ecf7becb0eb7",
    "holder": "review:sparq-org/sparq#4109@dispatch-30204876348.1",
    "package": "sparq-geo",
