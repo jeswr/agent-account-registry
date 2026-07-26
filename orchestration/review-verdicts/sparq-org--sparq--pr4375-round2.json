@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4375,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "1c8b0f33146a78ffd57c52c2693215e390e4f7d9",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "SV-ND-4 normatively says a service MUST NOT disclose anything further about an unreadable descriptor, including its provenance record, through the service description or any other surface. SV-DESC-1 defines vector dimension as part of that provenance record. But the SV-OPT-4 note and the open-questions section explicitly state that an eligible requester can recover the declared dimension by sweeping literal-vector dimensions, and that this revision accepts the channel. Those statements cannot all hold: the query-result oracle is an 'other surface' disclosing a fact SV-ND-4 expressly protects. An implementation following the accepted zero-solutions behavior can therefore violate a MUST NOT while behaving exactly as the draft otherwise prescribes.",
+    "file": "site/specs/solid-vector-api.typ",
+    "fix_hint": "Revise SV-ND-4 so its normative exception covers both the existence bit and declared dimension observable through vec: query behavior, while continuing to prohibit direct disclosure of the descriptor IRI/content and other descriptor facts. Update the relationship summary and the assertion's conformance wording consistently. Alternatively, keep SV-ND-4's current prohibition and require descriptor readability (or another specified defense) before literal-vector queries can expose dimension-dependent behavior.",
+    "severity": "major",
+    "title": "SV-ND-4 forbids the dimension oracle that the draft explicitly accepts"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 2 explicitly resolves the prior finding by abandoning full bound-index existence non-disclosure for requesters with eligible entries, and it adds a matching conformance scenario. However, the revised normative boundary is internally inconsistent about disclosure of the index dimension. SV-ND-4 forbids revealing the unreadable descriptor's provenance record through any surface, while SV-DESC-1 makes vector dimension part of that provenance record; elsewhere the draft explicitly accepts that a requester can recover that dimension by sweeping literal-vector lengths. The intended exception must be reflected in the normative assertion, not only acknowledged in notes and open issues.",
+  "verdict": "request_changes"
+ }
+}
