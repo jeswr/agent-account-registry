@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 3824,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "6cbf2712a4f6f05c37f42ab8f398aa7e2b77b85b",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The rejection loop covers inf, infinity, Infinity, INFINITY, nan, NAN but not the signed spellings Rust also accepts (e.g. '-Infinity', '+inf', '-nan'). The new whitelist does reject them (I verified old(\"-Infinity\")=Some(-inf) vs new(\"-Infinity\")=None), so this is only a gap in regression coverage, not in behaviour \u2014 a future refactor that re-loosened the predicate for signs would not be caught by this test.",
+    "file": "crates/sparq-conformance/src/inference/entail.rs",
+    "fix_hint": "Add \"-Infinity\", \"+inf\", \"-nan\" to the first array in parse_xsd_float_rejects_non_xsd_rust_spellings.",
+    "severity": "nit",
+    "title": "Rejection list omits '-Infinity' / '+inf', the signed Rust spellings"
+   },
+   {
+    "body": "The second loop checks parse_xsd_float(lex).is_some() for INF/+INF/-INF/NaN/1/-1.5/2E+3 but never checks the value, so a predicate change that made every accepted lexical parse to the wrong magnitude (or that swapped +INF/-INF) would still pass. The values are already covered indirectly by value_equality_across_lexical_forms, so this is low-value hardening.",
+    "file": "crates/sparq-conformance/src/inference/entail.rs",
+    "fix_hint": "Assert concrete values for the finite cases, e.g. assert_eq!(parse_xsd_float(\"2E+3\"), Some(2000.0)) and assert_eq!(parse_xsd_float(\"-INF\"), Some(f64::NEG_INFINITY)), keeping is_some() only for the NaN case.",
+    "severity": "nit",
+    "title": "Acceptance half of the test asserts only is_some(), not the parsed value"
+   }
+  ],
+  "progress": null,
+  "summary": "Replaces the old blacklist in parse_xsd_float (reject 'x'/'X', trailing f/F/d/D, substring \"inf\") with a whitelist of the only bytes that can occur in an XSD float/double numeric lexical form ([0-9], '+', '-', '.', 'e', 'E'), keeping the special values INF/+INF/-INF/NaN in the preceding match arms. This is a real soundness fix, not a cosmetic one: Rust's f64 FromStr is case-insensitive for inf/infinity/nan, so the old case-sensitive `contains(\"inf\")` blacklist let 'Infinity', 'INFINITY', '-Infinity', 'nan' and 'NAN' through as valid xsd:float/xsd:double values. I confirmed that empirically by compiling both the old and new predicates side by side: old(\"Infinity\")=Some(inf), old(\"nan\")=Some(NaN), while new(...)=None for both; all legal forms ('1', '.5', '1.', '1e5', '2E+3', '+INF', '1e10000') are unchanged. The whitelist is a correct characterisation of the lexical space rather than a heuristic: Rust's Number grammar (Digit+ | Digit+ '.' Digit* | Digit* '.' Digit+, optional ('e'|'E') Sign? Digit+) and XSD's noDecimalPtNumeral/decimalPtNumeral/scientificNotationNumeral coincide exactly once the alphabet is restricted to those bytes, so there is neither over-acceptance nor under-acceptance, and non-ASCII bytes and whitespace-padded lexicals are rejected too. Empty string still falls through to a failing parse. Both callers are the xsd:float and xsd:double arms of xsd_value (entail.rs:398,403); no other call sites exist, so the stricter behaviour is confined to D-entailment value mapping, where an ill-formed float correctly becomes an inconsistency. The new unit test is non-vacuous: 4 of its 6 rejection cases (Infinity, INFINITY, nan, NAN) returned Some under the pre-diff code, so it goes red on revert, and it pins both parse_xsd_float and the xsd_value float/double surface. cargo test -p sparq-conformance --lib inference::entail passes (5/5). Only nits remain.",
+  "verdict": "approve"
+ }
+}
