@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4022,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d6300ac08356a49d838d27c055b134291451605e",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 3 remains correct and complete. The preset constructors consistently distinguish documentation-derived conventions from caller-supplied configurations, and confirmed_live() promotes only the concrete configuration on which it is invoked. The opt-in probe performs a real SELECT through HttpSparqlEngine, requires parsed solution results, and promotes the same configuration only after that exchange. The focused request-construction and provenance tests exercise the relevant behavior without vacuous mocks. No correctness, soundness, security, or test-validity issue was found.",
+  "verdict": "approve"
+ }
+}
