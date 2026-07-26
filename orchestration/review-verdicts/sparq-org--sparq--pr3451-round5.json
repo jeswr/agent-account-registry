@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3451,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "cc059df7e25482a522e131cc5cca77d342d937c0",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`is_utc_datetime_lexical` remains a structural check only. Inputs such as `2026-99-99T99:99:99Z`, `2026-02-30T00:00:00Z`, and invalid leap days pass even though `parse_request` and the public documentation promise rejection of malformed UTC `xsd:dateTime` values. The accepted lexical is interpolated into every status and certification validity FILTER, leaving the load-bearing boundary dependent on downstream engine behavior. `utc_datetime_lexical_validation_is_strict` still lacks calendar and clock range cases, so the prior finding is not resolved.",
+    "file": "crates/sparq-trust/src/expression.rs",
+    "fix_hint": "Validate the complete UTC `xsd:dateTime` value, including Gregorian month/day and leap-year rules plus hour/minute/second ranges, while requiring the explicit `Z` form. Prefer a standards-compliant parser and canonicalize the validated value before interpolation. Add regressions for invalid month/day and leap day, invalid hour/minute/second, and valid leap-day and fractional-second values.",
+    "severity": "major",
+    "title": "UTC dateTime validation still accepts impossible dates and times"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 5 is stagnant: the round-4 major finding remains unchanged. The UTC dateTime validator still checks only layout, digits, optional fractional syntax, and a trailing Z; it does not validate Gregorian calendar dates or clock ranges. Consequently impossible values are still accepted at the documented fail-closed request boundary and interpolated into the status/certification FILTERs. The strictness test still covers only syntax and timezone cases, not invalid month/day/leap-day/hour/minute/second values.",
+  "verdict": "request_changes"
+ }
+}
