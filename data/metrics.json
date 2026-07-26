@@ -1,32 +1,32 @@
 {
-  "generated_at": "2026-07-26T05:39:22Z",
+  "generated_at": "2026-07-26T06:00:22Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
-      "issues_open": 1206,
-      "issues_ready": 210,
+      "issues_open": 1224,
+      "issues_ready": 201,
       "issues_closed_1h": 4,
-      "issues_closed_24h": 42,
-      "prs_open": 76,
-      "prs_draft": 56,
-      "prs_opened_1h": 1,
+      "issues_closed_24h": 43,
+      "prs_open": 84,
+      "prs_draft": 64,
+      "prs_opened_1h": 10,
       "prs_closed_1h": 0,
       "prs_merged_1h": 4,
-      "prs_merged_24h": 43,
-      "review_changes_backlog": 3,
+      "prs_merged_24h": 44,
+      "review_changes_backlog": 4,
       "needs_user_parked": 7,
       "review_lane_health": "ok",
-      "review_lane_runs_1h": 20,
-      "worker_attempts_1h": 22,
-      "worker_success_rate_1h": 0.0455,
-      "pr_open_rate": 1.0,
+      "review_lane_runs_1h": 22,
+      "worker_attempts_1h": 37,
+      "worker_success_rate_1h": 0.2703,
+      "pr_open_rate": 10.0,
       "pr_close_rate": 4.0,
-      "net_pr_flow": -3.0
+      "net_pr_flow": 6.0
     },
     "jeswr/agent-account-registry": {
       "issues_open": 289,
       "issues_ready": 76,
-      "issues_closed_1h": 1,
+      "issues_closed_1h": 0,
       "issues_closed_24h": 20,
       "prs_open": 24,
       "prs_draft": 18,
@@ -37,7 +37,7 @@
       "review_changes_backlog": 4,
       "needs_user_parked": 3,
       "review_lane_health": "ok",
-      "review_lane_runs_1h": 14,
+      "review_lane_runs_1h": 12,
       "worker_attempts_1h": 0,
       "worker_success_rate_1h": null,
       "pr_open_rate": 0.0,
@@ -45,5 +45,16 @@
       "net_pr_flow": 0.0
     }
   },
-  "alerts": []
+  "alerts": [
+    {
+      "target": "sparq-org/sparq",
+      "classification": "worker-failing",
+      "fire": true,
+      "summary": "worker success rate 27% < 50% floor over 2 snapshots (37 attempts this hour)",
+      "metrics": {
+        "worker_success_rate_1h": 0.2703,
+        "worker_attempts_1h": 37
+      }
+    }
+  ]
 }
