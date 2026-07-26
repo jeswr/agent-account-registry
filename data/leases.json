@@ -122,16 +122,6 @@
   },
   {
    "account": "f79434c3ffba014f",
-   "claim_id": "038035e96d07482cad34283c02c534aa",
-   "holder": "sparq-org/sparq#3209@30221696470.1",
-   "package": "performance",
-   "role": "impl",
-   "model": "opus5",
-   "issued_at": 1785102283,
-   "expires_at": 1785108583
-  },
-  {
-   "account": "f79434c3ffba014f",
    "claim_id": "311cef5d297a4848870afbf2de2e61ab",
    "holder": "sparq-org/sparq#4284@30221702238.1",
    "package": "sparq-geo",
