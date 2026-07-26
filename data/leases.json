@@ -22,16 +22,6 @@
   },
   {
    "account": "51bde6688e140866",
-   "claim_id": "b2295d0609c44ddb8936d5280406b1b1",
-   "holder": "sparq-org/sparq#2835@30192881885.1",
-   "package": "bench",
-   "role": "impl",
-   "model": "opus5",
-   "issued_at": 1785050958,
-   "expires_at": 1785057258
-  },
-  {
-   "account": "51bde6688e140866",
    "claim_id": "ba6eddd1df2a4e5fb4560e0aa9968b29",
    "holder": "sparq-org/sparq#2674@30193679332.1",
    "package": "sparq-zk-compose",
