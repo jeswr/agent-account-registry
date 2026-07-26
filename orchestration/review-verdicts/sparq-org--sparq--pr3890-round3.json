@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3890,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "0726f0409bc10efcf72c12b835da1568f5456a73",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "build_join_index treats parent_cols.is_empty() as an unconditional cross product, and JoinIndex::lookup returns that entire parent-subject list for every child row. Under R2RML, join conditions may be omitted when the child and parent triples maps use the same logical table; the referencing object must then be the parent subject generated from that same current row, not every parent subject. For example, a self-reference over rows 1 and 2 should emit row1->row1 and row2->row2, but this code emits all four pairs. Omitting conditions for different logical tables should not silently acquire this non-standard meaning.",
+    "file": "crates/sparq-cli/src/tabular.rs",
+    "fix_hint": "Represent the omitted-condition same-logical-table case separately and evaluate the parent subject map on the current child row (or otherwise retain row correspondence). Reject a referencing object map with no join conditions when the logical tables differ. Replace r2rml_join_no_conditions_is_cross_product with a real-path same-table test that has at least two rows and asserts only row-correlated objects, plus a failure test for different tables without rr:joinCondition.",
+    "severity": "major",
+    "title": "Omitted join conditions incorrectly produce a cross product"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The graph-union correction from round 2 remains sound, but the referencing-object-map implementation still gives the wrong semantics to an omitted rr:joinCondition. R2RML permits omission when the child and parent triples maps have the same logical table; in that case the parent subject map is evaluated against the current child row. The implementation instead indexes every parent subject and emits a cross product, and it also accepts omission across different logical tables. This can silently generate spurious relationships. Because this is a newly identified major correctness issue after a clean prior round, progress is regressing.",
+  "verdict": "request_changes"
+ }
+}
