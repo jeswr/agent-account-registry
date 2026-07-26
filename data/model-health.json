@@ -5,14 +5,6 @@
    "provider": "openai",
    "account": "dc2d751954080e13",
    "model_alias": "sol",
-   "exit_class": "success",
-   "run_id": "30184553345.1"
-  },
-  {
-   "ts": 1785032869,
-   "provider": "openai",
-   "account": "dc2d751954080e13",
-   "model_alias": "sol",
    "exit_class": "no_change",
    "run_id": "30184541902.1",
    "input_tokens": 178941,
@@ -1707,6 +1699,14 @@
    "model_alias": "",
    "exit_class": "success",
    "run_id": "30189980322.1"
+  },
+  {
+   "ts": 1785045415,
+   "provider": "anthropic",
+   "account": "f79434c3ffba014f",
+   "model_alias": "opus5",
+   "exit_class": "success",
+   "run_id": "30189749075.1"
   }
  ]
 }
