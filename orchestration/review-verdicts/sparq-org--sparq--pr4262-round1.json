@@ -1,0 +1,65 @@
+{
+ "host_envelope": {
+  "pr": 4262,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "5dfadab6c00ff0f85251da1f9c8cbdda5ef786f8",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "I ran the repo's own gate against this diff:\n\n  $ python3 scripts/gate-new-crate.py --dry-run --changed-files <diff>\n  G1 new-crate-completeness: FAIL\n    crates/sparq-wrapper-gen is a new crate but is missing:\n      - a README at crates/sparq-wrapper-gen/README.md (added in the same PR)\n    crates/sparq-wrapper-shacl ... missing README\n    crates/sparq-wrapper-integration ... missing README\n\nThis gate runs WITHOUT `--advisory` in CI (.github/workflows/flow-on-gates.yml:157: `python3 scripts/gate-new-crate.py --base \"$GATE_BASE_REF\"`), so it exits 1 and blocks the merge. `publish = false` is set on all three crates, which correctly exempts them from the registered-benchmark (a) and SKILL.md (c) requirements, but the gate's rule (b) is explicit that the README is still required for a stub: \"The README (b) is still required (a stub still needs a one-line 'what/why' README).\"\n\nThe same applies to crates/sparq-wrapper-shacl/Cargo.toml and crates/sparq-wrapper-integration/Cargo.toml.",
+    "file": "crates/sparq-wrapper-gen/Cargo.toml",
+    "fix_hint": "Add `crates/<x>/README.md` for each of the three new crates. Because they are `publish = false`, `scripts/check-readme-template.py` allows the short form instead of the full template: a <=30-line README carrying the literal `<!-- internal-stub -->` HTML comment directive, with a one-line what/why. Then re-run `python3 scripts/gate-new-crate.py --dry-run --changed-files <files>` and `python3 scripts/check-readme-template.py --enforce` and confirm both pass.",
+    "severity": "blocker",
+    "title": "G1 new-crate-completeness gate fails: all three new crates ship without a README.md"
+   },
+   {
+    "body": "`proposed/mod.rs` gains five new `pub mod` declarations (async_events, async_node, async_store, graph_scope_events, json) and `crates/sparq-wrapper/Cargo.toml` gains five matching features. That is a public-surface change. Running the gate:\n\n  $ python3 scripts/gate-api-skill.py --dry-run --changed-files <diff>\n  G2 public-api->skill: FAIL\n    These changed files are a public surface, but NO skills/**/SKILL.md was edited in the same PR:\n      - crates/sparq-wrapper/src/proposed/mod.rs\n\nAdding files under `skills/rdf-wrapper/references/` does not satisfy the gate - it requires an edit to a `SKILL.md` itself. Independently of the gate, this leaves real doc drift: `skills/rdf-wrapper/SKILL.md:70-75` enumerates the crate's features and still lists only proposed-distinct, -cardinality, -codecs, -graph-scope, -observe, -typed-focus. After this PR the crate has five more, so that list is incomplete/wrong.",
+    "file": "crates/sparq-wrapper/src/proposed/mod.rs",
+    "fix_hint": "Edit `skills/rdf-wrapper/SKILL.md`: extend the feature list at lines 70-75 with the five new `proposed-*` features and note that they are reserved/empty placeholders (no API yet), so a reader is not misled into trying to import from them. Alternatively, if the maintainer judges no doc change is warranted, apply the `skill-not-needed` label with a justification in the PR body - the gate accepts that escape hatch. Re-run `python3 scripts/gate-api-skill.py` to confirm.",
+    "severity": "blocker",
+    "title": "G2 public-api->skill gate fails: 5 new pub modules/features, SKILL.md not updated and now stale"
+   },
+   {
+    "body": "`docs/proposed/cardinality.md` says:\n\n  Reserved implementation: `src/proposed/cardinality.rs`.\n\nBut that module is landed, working code - 232 lines implementing `LiveMappedCollection`, `CardinalityViewError`, `required`/`optional` mapped views (its own header: \"Explicit mapped cardinalities and a live write-through collection... a Rust port of the unlanded rdfjs/wrapper arity proposal in issue #8\"). The same misdescription applies to the four sibling files added by this PR:\n  - docs/proposed/codecs.md          -> codecs.rs is 250 lines\n  - docs/proposed/graph_scope.md     -> graph_scope.rs is 356 lines\n  - docs/proposed/observe.md         -> observe.rs is 499 lines\n  - docs/proposed/typed_focus.md     -> typed_focus.rs is 417 lines\n\nThis PR proves it knows the difference: the parallel files it adds under `skills/rdf-wrapper/references/` DO distinguish them - cardinality/codecs/graph_scope/observe/typed_focus say \"The implementation is isolated behind the default-off ... feature\", while the genuinely-empty async_events/async_node/async_store/graph_scope_events/json say \"Reserved for a future implementation\". The docs/ set applies the \"Reserved\" wording uniformly and is therefore wrong for half its entries, contradicting its own sibling set inside a single commit. This is exactly the honesty/doc-drift class the repo's maintenance rules exist to prevent.",
+    "file": "crates/sparq-wrapper/docs/proposed/cardinality.md",
+    "fix_hint": "Mirror the wording the PR already uses under skills/rdf-wrapper/references/: for the five implemented modules change \"Reserved implementation: `src/proposed/X.rs`.\" to something accurate such as \"Implementation: `src/proposed/X.rs` (landed, gated behind the default-off `proposed-X` feature).\" Keep \"Reserved\" only for async_events, async_node, async_store, graph_scope_events and json, which really are empty.",
+    "severity": "major",
+    "title": "New doc stubs describe five ALREADY-IMPLEMENTED modules as \"Reserved implementation\""
+   },
+   {
+    "body": "`sparq-wrapper-gen`, `sparq-wrapper-shacl` and `sparq-wrapper-integration` are added as permanent workspace members, but each contains only a Cargo.toml with an empty `[dependencies]` section and a three-line `src/lib.rs` holding nothing but `//!` doc comments. Nothing in the tree depends on them - `crates/sparq-wrapper/Cargo.toml` does not reference any of them - and they export no items, so no code can consume them.\n\nEvery workspace member is compiled, clippy'd, doc'd and gate-checked on every CI run, and each one now permanently owes the artifacts G1 demands. Reserving names via three empty compiled crates is future-work scaffolding: per CLAUDE.md, \"Tasks / TODOs / future work -> a bead (`bd`), never a markdown TODO/TODO.md/checklist\" - the same principle argues against empty placeholder crates, which are a heavier and longer-lived form of the same TODO. A bead per planned seam records the intent at zero build cost and with no gate debt.\n\nI verified they at least compile: `cargo check -p sparq-wrapper-gen -p sparq-wrapper-shacl -p sparq-wrapper-integration` succeeds. The concern is scope/hygiene, not breakage.",
+    "file": "Cargo.toml",
+    "fix_hint": "Preferred: drop the three empty crates from this PR and record each planned seam as a bead (`bd create`), creating the crate in the PR that actually implements it. If the maintainer specifically wants the names reserved now, keep them but justify that in the PR body and satisfy G1 (internal-stub README each), and state in each README what will land and which bead tracks it.",
+    "severity": "major",
+    "title": "Three empty crates added to the workspace with no API, no dependents, and no consumer"
+   },
+   {
+    "body": "`proposed-graph-scope-events`, `proposed-async-store`, `proposed-async-node`, `proposed-async-events` and `proposed-json` each gate a module whose entire content is three lines of `//!` doc comment. Turning any of them on changes nothing observable: the module appears in rustdoc as an empty page and exports no items.\n\nThis also enlarges the `--all-features` matrix (docs.rs is configured `all-features = true` at line 15) for zero functional gain. Note the crate already carries a precedent worth not extending: `proposed-distinct` (line 21) has existed with no `src/proposed/distinct.rs` module at all.\n\nThere are no tests in this PR. That is not a vacuous-test finding - nothing testable was added - but it does mean nothing here is verified beyond \"it compiles\".",
+    "file": "crates/sparq-wrapper/Cargo.toml",
+    "fix_hint": "Introduce each `proposed-*` feature in the PR that lands its implementation and its tests, rather than up front. If the placeholders are kept deliberately, say so in the feature comments (the file already uses that convention at lines 30 and 32, e.g. `# [SONNET-4.6] sq-1rg2q.1: reserved, empty until <bead> lands.`) so a reader is not misled into enabling a no-op feature.",
+    "severity": "minor",
+    "title": "Five new cargo features gate modules that are empty, so enabling them is a no-op"
+   },
+   {
+    "body": "This PR creates two brand-new documentation trees, 10 files each, every file 4 lines long:\n  - crates/sparq-wrapper/docs/proposed/*.md\n  - skills/rdf-wrapper/references/*.md\n\nNeither is reachable. I grepped the tree: no file outside `crates/sparq-wrapper/docs/proposed/` mentions that path, and `skills/rdf-wrapper/SKILL.md` contains zero occurrences of `references/`. `skills/rdf-wrapper/references/` is also the only `references/` directory in the whole `skills/` tree, so it follows no existing convention that would make it discoverable implicitly.\n\nEach file's content is a restatement of what the Cargo.toml feature name and the module doc-comment already say (\"Feature: `proposed-json` (default off)\"), so as written they add no information a reader could not get faster from the source. Unreferenced stub docs tend to become the drift the repo's doc-quality gates exist to catch.",
+    "file": "skills/rdf-wrapper/references/json.md",
+    "fix_hint": "Either (a) link them - add a short index/section in `skills/rdf-wrapper/SKILL.md` pointing at `references/`, which would also help satisfy the G2 gate above; or (b) drop the stubs and let the module-level rustdoc be the single source of truth until each proposal actually lands, adding the reference page in the PR that has real content to put in it. Whichever you choose, apply it consistently to both trees rather than keeping two parallel unreferenced sets.",
+    "severity": "minor",
+    "title": "20 new markdown stubs are orphaned - nothing links to either new docs directory"
+   },
+   {
+    "body": "The existing declarations were ordered alphabetically (cardinality, codecs, graph_scope, observe, typed_focus). The new entries insert `async_events`, `async_node` and `async_store` AFTER `cardinality` (lines 13-18), so the list now reads cardinality, async_events, async_node, async_store, codecs, ... `graph_scope_events` and `json` are placed correctly. Purely cosmetic - rustfmt does not reorder `mod` items and no lint fires - but it makes the list harder to scan and to keep in sync with the feature list in Cargo.toml.",
+    "file": "crates/sparq-wrapper/src/proposed/mod.rs",
+    "fix_hint": "Move the three `async_*` blocks (with their `#[cfg]` attributes) above the `proposed-cardinality` block so the file stays alphabetical.",
+    "severity": "nit",
+    "title": "New module declarations break the file's alphabetical ordering"
+   }
+  ],
+  "progress": null,
+  "summary": "PR #4262 adds 3 empty workspace crates (sparq-wrapper-gen/-shacl/-integration), 5 empty default-off `proposed-*` features gating 5 three-line empty modules in sparq-wrapper, and 20 four-line markdown stubs. The new crates do compile (verified via `cargo check -p sparq-wrapper-gen -p sparq-wrapper-shacl -p sparq-wrapper-integration`). However the change is incomplete and will fail two REQUIRED merge gates, both of which I executed against this diff:\n\n1. `scripts/gate-new-crate.py` (G1, run non-advisory at .github/workflows/flow-on-gates.yml:157) FAILS: all three new crates lack the mandatory `README.md`. `publish = false` exempts a stub from the bench and SKILL requirements but NOT from the README (see the gate docstring rule (b)).\n2. `scripts/gate-api-skill.py` (G2) FAILS: `crates/sparq-wrapper/src/proposed/mod.rs` is a public surface and no `skills/**/SKILL.md` was edited. `skills/rdf-wrapper/SKILL.md:70-75` still lists only the 6 pre-existing features and is now stale w.r.t. the 5 added ones.\n\nThere is also a documentation-honesty defect: the new `crates/sparq-wrapper/docs/proposed/{cardinality,codecs,graph_scope,observe,typed_focus}.md` each say \"Reserved implementation\", but those modules are fully implemented (232-499 lines). This PR's own sibling files under `skills/rdf-wrapper/references/` correctly distinguish landed (\"The implementation is isolated behind...\") from reserved (\"Reserved for a future implementation...\"), so the docs/ set contradicts the references/ set within one commit.\n\nNo hostile or instruction-like content was found in the diff; it is entirely Cargo manifests, empty module doc-comments, and markdown stubs.\n\nThere are no tests in this PR, and nothing testable was added (every new module and crate is empty), so there is no vacuous-test concern - but equally no verification. No security impact: no new dependency, no unsafe, no network/crypto surface.",
+  "verdict": "request_changes"
+ }
+}
