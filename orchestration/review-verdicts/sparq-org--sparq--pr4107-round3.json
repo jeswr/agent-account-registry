@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4107,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a501d58bc11f5b5b5d2447c3b9604f6214e44372",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new coverage lane is Linux-only (`if: runner.os == 'Linux'`), and the ledger correctly says \"on Linux\". But the macOS and Windows bullets still describe only the webview and the bundler step as the untested surface \u2014 they now also compile `hdt,federation,odrl` for the first time on a real tag, with no CI compile anywhere. Impact is small: those rows are `soft: true` (release.yml:308-310), so a failure is non-fatal and the release still ships the Linux bundles plus attestation. Worth one clause so the ledger stays a complete honesty record rather than a Linux-complete one.",
+    "file": ".github/workflows/release.yml",
+    "fix_hint": "Extend the existing bullets, e.g.:\n\n  #   * macOS rows: WKWebView ships with the OS; the .dmg/.app bundle AND the hdt/federation/odrl\n  #     feature compile are documented-untested (these rows are soft, so a failure is non-fatal).\n\nand the equivalent clause on the Windows bullet.",
+    "severity": "nit",
+    "title": "Ledger does not note that macOS/Windows rows compile the new feature set for the first time on the tag"
+   },
+   {
+    "body": "`load_hdt` -> `sparq_hdt::load` -> `to_loaded_document` (gui/src-tauri/src/engine.rs:336-341) is now type-checked by the clippy step but run by no test; the only hdt test (engine.rs:539) is `#[cfg(not(feature = \"hdt\"))]` and is compiled out in exactly this state. This is no longer a correctness defect in the diff \u2014 the step name and comment now say exactly this, which is what round 2 asked for \u2014 so it is recorded as residual scope, not a blocker.",
+    "file": ".github/workflows/gui.yml",
+    "fix_hint": "Optional follow-up bead: add a positive test under `#[cfg(feature = \"hdt\")]` in gui/src-tauri/src/engine.rs using a small fixture `.hdt` (crates/sparq-hdt test data), asserting `load_approved_path(..., \"hdt\", ...)` returns a LoadedDocument with the expected quad count and `format == \"hdt\"`.",
+    "severity": "nit",
+    "title": "Feature-on hdt path is still executed by no test"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 3 resolves the round-2 blocker and the round-2 major, and closes both minors and the nit.\n\nBlocker (fixed): the new gui.yml lane no longer enables `custom-protocol`. That was the whole failure mode \u2014 the `tauri-build` job never exports `gui/app/out` (gitignored, absent from a fresh checkout), and `custom-protocol` flips tauri's codegen out of dev mode so `tauri::generate_context!()` embeds `frontendDist` at compile time and hard-errors. The new steps run `cargo clippy --all-targets --features hdt,federation,odrl -- -D warnings` and `cargo test --features hdt,federation,odrl`, neither of which touches the asset-embedding path. The in-comment rationale (gui.yml:550-552) states the invariant correctly. `hdt` is therefore compiled in CI for the first time \u2014 the original round-1 root problem.\n\nMajor (fixed): release.yml's PROVEN vs DOCUMENTED-UNTESTED ledger no longer claims \"proven green\". It now scopes the claim precisely \u2014 debug mode, Linux only, ADVISORY (non-gating) \u2014 and adds the two facts the prior wording hid: that the release profile (LTO, codegen-units=1) is first exercised on the tag, and that `custom-protocol` is only ever compiled by jobs that first export gui/app/out. I verified \"ADVISORY (non-gating)\" is accurate rather than inferred: the job is declared in .github/advisory-registry.json:112, which is the authoritative mechanism since #3773.\n\nMinors/nit (fixed): the advisory status is now disclosed in the ledger; the test step is renamed \"Test (federation + ODRL under desktop features)\" with a comment stating HDT is compile-covered only, so it no longer implies hdt behaviour is tested; and `if: runner.os == 'Linux'` keeps the fourth permutation off the four non-Linux rows.\n\nRelease-side mechanics check out: `cargo tauri build --features` is additive and tauri-cli injects `custom-protocol` itself (documented at gui/src-tauri/Cargo.toml:83), so the bundle still embeds frontendDist. The three features resolve to pure-Rust optional\u2026 [truncated 324 chars]",
+  "verdict": "approve"
+ }
+}
