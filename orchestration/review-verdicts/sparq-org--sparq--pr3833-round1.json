@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3833,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "fca3bae140be8ac0053e4608bd20324b142883a3",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly replaces reliance on Kani cover reachability with merge-blocking assertions. The full static corpus walk asserts that at least one genuine evader exists and validates every flagged evader, while the named witness assertions pin the intended percent-encoded-dot case and its fail-closed expectation. The witness is present with the asserted shape, the corpus has 10 entries within the existing unwind bound of 20, and the supplementary cover is accurately described as non-gating. No correctness, soundness, test-validity, or security defect is evident in the diff.",
+  "verdict": "approve"
+ }
+}
