@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3858,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "3d3d44ff0c2aba8631eea52ff59258ba8a4a6005",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`sparq_gpu_is_still_unpublished` accepts any comment-stripped line whose trimmed text starts with `publish` and contains `false`; it does not verify the Cargo package `publish` field. For example, removing `publish = false` and adding the valid-but-unused manifest key `publish-note = false` makes this test pass while Cargo falls back to the default publishable state. A manifest containing `publish = true` plus such a line also passes. This contradicts the new lib.rs and threat-model claim that publication is an enforced trigger, leaving the security-model deferral capable of silently rotting.",
+    "file": "crates/sparq-gpu/tests/prototype_stage_tripwire.rs",
+    "fix_hint": "Inspect the crate's parsed Cargo metadata rather than manifest substrings. Cargo metadata exposes `packages[].publish`; select the `sparq-gpu` package and require that field to be an empty array (Cargo's representation of `publish = false`). Add a regression fixture or helper-level test proving that an absent/true publication setting plus an unrelated `publish-... = false` key is rejected.",
+    "severity": "major",
+    "title": "Publication tripwire can be bypassed by an unrelated manifest key"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 2's dependency-detection defect is fixed: Cargo metadata now enumerates actual workspace members and resolved dependency identities, with a real fixture covering quoted keys, renames, target/dev/build dependencies, and a member outside crates/*. However, the companion publication tripwire remains a textual heuristic and can report the crate as unpublished when Cargo considers it publishable. Because this is a new major finding even though the prior finding was resolved, progress is regressing.",
+  "verdict": "request_changes"
+ }
+}
