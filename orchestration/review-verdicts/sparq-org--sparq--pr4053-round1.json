@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4053,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "4706c56d4de3ba8c6030d55e33b0b8d47923d094",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "ScoreBudget::TopK sorts every input score, truncates to k, and only then calls collect_scores, which filters non-finite values. In descending total_cmp order, NaN and +inf can occupy the selected prefix. For example, TopK(1) over [NaN, 1.0] can return an empty map instead of retaining the finite 1.0 score. This violates the documented claims that non-finite scores are dropped and TopK retains the k highest-scoring nodes, and can silently remove entities that should receive injected ranking scores.",
+    "file": "crates/sparq-algos/src/ranking.rs",
+    "fix_hint": "Exclude non-finite entries before sorting/truncating (for example, build the ranked vector from enumerate().filter(|(_, score)| score.is_finite())), then truncate and collect. Add a TopK regression test containing NaN and infinities that asserts the map retains min(k, finite_count) highest finite scores and excludes all non-finite entries.",
+    "severity": "major",
+    "title": "TopK truncates before dropping non-finite scores"
+   }
+  ],
+  "progress": null,
+  "summary": "The dictionary-id adapter and cross-crate composition tests are generally well scoped, but the TopK path applies its budget before removing non-finite scores. Because f64::total_cmp orders NaN and positive infinity ahead of ordinary finite values in descending order, invalid entries can consume the retained slots and then be discarded, causing valid highest-scoring entities to be omitted and producing fewer than k entries even when at least k finite scores exist. The existing non-finite test exercises only ScoreBudget::All, so it does not cover this load-bearing interaction.",
+  "verdict": "request_changes"
+ }
+}
