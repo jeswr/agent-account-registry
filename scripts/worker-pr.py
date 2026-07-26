@@ -5442,6 +5442,16 @@ def _self_test():
                len(prov_state["calls"]), "class=permanent" in perm_marker),
               (None, 3, True, 1, True))
 
+        # A read that SUCCEEDS but returns a non-object payload must fail CLOSED as a WorkerPrError
+        # (which every caller already degrades to its documented conservative result), never crash
+        # mid-decision on `None.get`.
+        try:
+            err = _run_prov([(0, "null", "")])
+        except Exception as exc:  # noqa: BLE001 — a crash here is itself the finding
+            err = exc
+        check("#677 a 200-but-malformed pull payload fails CLOSED, never crashes mid-decision",
+              (type(err).__name__, prov_state["store"]), ("WorkerPrError", {}))
+
         # GUARD 5 — the WRITE stays idempotent across a retry. The retry is on the READ only; a
         # rerun of the whole job (including a rerun whose read is retried) must find its own
         # byte-identical record and treat it as already-recorded, never write a second or
@@ -5531,6 +5541,23 @@ def _self_test():
     # GUARD 8 — `_run_gh`'s message surfaces the exit status, the HTTP status, the class and the
     # stderr it used to throw away, for EVERY caller (writes included), while keeping the historic
     # `GitHub API request failed for <endpoint>` prefix that log greps key on.
+    real_subprocess_run = subprocess.run
+    try:
+        subprocess.run = lambda cmd, **kwargs: subprocess.CompletedProcess(
+            cmd, 1, stdout="", stderr="HTTP 503: upstream unavailable")
+        try:
+            _run_gh(["api", "repos/o/r/pulls/7"])
+        except WorkerPrError as exc:
+            raised = str(exc)
+        else:
+            raised = "(did not raise)"
+    finally:
+        subprocess.run = real_subprocess_run
+    check("#677 _run_gh RAISES the CLASSIFIED message, not the opaque pre-#677 one",
+          (raised.startswith("GitHub API request failed for repos/o/r/pulls/7"),
+           "exit=1" in raised, "http=503" in raised, "class=transient" in raised,
+           "upstream unavailable" in raised),
+          (True, True, True, True, True))
     failed_put = subprocess.CompletedProcess(
         ["gh"], 1, stdout="", stderr="HTTP 503: upstream unavailable")
     message = _gh_error_message(["api", "repos/o/r/contents/p"], failed_put, attempts=3)
