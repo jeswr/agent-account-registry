@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 4146,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "45277e3af0e8913ad5947286dd8eb51422e986f8",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The barrier now breaks only when `alt_svc == Some(expected_alt_svc.as_str())` (http3.rs:243-245) and stores that exact response in `health`. The immediately following `assert_eq!` on `health.headers().get(\"alt-svc\")` (http3.rs:270-277) therefore re-checks the predicate that selected the response, so it is dead: it can never fire, and its message (\"the h1 GET response must advertise the successfully bound QUIC port\") no longer describes a live check. The property is still enforced - a wrong or absent alt-svc now fails via the readiness timeout, and last_probe_failure carries the observed value - so no coverage is lost, but the failure mode is worse: instead of an immediate, crisp assertion diff you get ~2.5s of spinning and a \"server did not become ready\" error. This is a direct consequence of round 1's own fix hint (reuse the probe response), so it is a fair trade, but it should be a deliberate one rather than an accident.",
+    "file": "crates/sparq-server/tests/http3.rs",
+    "fix_hint": "Either drop the now-tautological assert_eq and rely on the barrier (updating the surrounding comment to say the alt-svc contract is enforced by the readiness gate), or keep an independent observation by asserting alt-svc on a second, freshly issued GET so the steady-state h1 response - not just the first one that happened to satisfy the gate - is checked. If the assert is kept as-is, a one-line comment noting it restates the barrier condition would stop a future reader from trusting it as independent coverage.",
+    "severity": "minor",
+    "title": "The alt-svc assert_eq after the loop can no longer fail - it is implied by the loop's exit condition"
+   },
+   {
+    "body": "In the --http3 path, `tcp_app` is the only router ever passed to `sparq_server::serve`, and it is built with the alt-svc layer after the QUIC bind (main.rs:1139-1141), so any successful HTTP/1.1 response from this server already implied a bound endpoint. The new predicate makes that reliance explicit and self-documenting - a genuine robustness and diagnostic win - but it does not gate on anything the old `Ok(_)` could not already witness, so it is not established that this fixes the flake the PR targets. If the underlying flake is a truncated or reset body rather than a delayed accept loop, it still surfaces unprotected at `h1_request`'s `response.bytes().await?` (http3.rs:168, driven from the case loop at http3.rs:327-328) and in the h3/websocket steps, none of which retry. Flagged as minor, not major: round 1 offered this as an acceptable alternative remedy and the code and comment are now honest about what the barrier proves.",
+    "file": "crates/sparq-server/tests/http3.rs",
+    "fix_hint": "No change required to land this. If the flake recurs, the next step is to harden where it manifests rather than the barrier: wrap the body-reading requests in the same bounded retry helper (extract the probe loop into a small `async fn wait_for(...)` and reuse it), or surface the server stderr diagnostic on those failures too, so a genuine regression reports which step truncated instead of a bare reqwest error.",
+    "severity": "minor",
+    "title": "Barrier is stricter but, in this configuration, not demonstrably stronger; the body-reading call sites remain unprotected"
+   },
+   {
+    "body": "Every iteration of the 100-iteration loop assigns `last_probe_failure` on both non-breaking paths (the status/alt-svc mismatch branch at http3.rs:247-248 and the `Err` arm at http3.rs:251), and the loop is entered unconditionally. So by the time the `else` block runs, `last_probe_failure` is always `Some`, and the `.unwrap_or(\"no probe completed\")` fallback at http3.rs:264 can never be observed. Harmless, but it reads as if a no-probe-completed state exists.",
+    "file": "crates/sparq-server/tests/http3.rs",
+    "fix_hint": "Leave it (it is a cheap guard against future refactors that add an early-continue), or drop the fallback and format the Option directly - e.g. `{last_probe_failure:?}` - so the message cannot imply a state the loop cannot reach.",
+    "severity": "nit",
+    "title": "\"no probe completed\" fallback is unreachable"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 2 addresses the round-1 major by taking that finding's own option (b): the barrier now gates on the condition the test actually asserts (2xx status AND alt-svc == h3=\":<udp_port>\"; ma=86400) instead of on a bare Ok/consecutive-success count, and the misleading comment claiming the old barrier could fail on a truncated body is gone. The replacement comment is accurate and I verified it against the checkout: sparq_http3::alt_svc_layer is applied to tcp_app only after bind_http3_endpoint succeeds (crates/sparq-server/src/main.rs:1134-1141), so alt-svc presence really does witness a bound QUIC endpoint. Round-1 minor #3 (dropped probe error) is fixed: both the transport-error arm and the status/alt-svc mismatch arm record last_probe_failure, which is now interpolated into the failure message alongside server stderr. The 3-consecutive-probe count is gone, so the connection-pooling objection and the unconditional-latency nit are moot (the sleep is still after the match, but the success path breaks before reaching it). The final GET is replaced by reusing the probe response, removing a redundant round trip. Correctness: the loop is bounded (100 x 25ms + request time); the `let Some(health) = health else` guard matches the only early exit; and borrowing `response.headers()` into `alt_svc` then moving `response` in the then-branch is accepted by NLL (alt_svc is dead there, live only in the else-branch) - confirmed by compiling a standalone reproduction. Formatting is not a hard gate (rustfmt.toml documents cargo fmt --check as informational) and non-inlined format args are pervasive here, so neither is a concern. No product code, no soundness/security surface, no perf or ZK/MPC claim. Remaining findings are minor/nit only: the alt-svc assert_eq is now implied by the loop exit condition, the diff still does not protect the body-reading call sites, and one error-message fallback is unreachable. None of these make the change incorrect, so this approves.",
+  "verdict": "approve"
+ }
+}
