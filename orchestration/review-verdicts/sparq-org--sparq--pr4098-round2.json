@@ -1,0 +1,51 @@
+{
+ "host_envelope": {
+  "pr": 4098,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "57e765fc06b44bee9d796b4a2a75785710824581",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new block is placed after the `binary GOO` / `worst-case-optimal (LFTJ)` label is chosen and gates only on `patterns.len() >= 3 && crate::dp::active().is_some()` \u2014 not on `bgp_uses_binary(&patterns)`.\n\nDPccp is only reachable on the binary path: `eval_flat_conjunctive` (exec.rs:4858) dispatches `bgp_uses_binary(patterns)` -> `eval_bgp_binary`, and the `#[cfg(feature = \"dp-planner\")] if let Some(cfg) = crate::dp::active()` / `eval_bgp_dp` block lives inside `eval_bgp_binary` (exec.rs:6953). A cyclic BGP takes the `else` arm (`eval_bgp` -> LFTJ) and never touches `dp::plan`.\n\nSo for a cyclic 3+-pattern BGP the explain-json operator label and the ANALYZE trace label read `BGP [worst-case-optimal (LFTJ)] (3 patterns, 0 filters) [DPccp may execute; displayed tree is a greedy replay, not an execution record]` \u2014 where DPccp definitively cannot execute, and the displayed order is an LFTJ global variable order, not a greedy replay at all. Both halves of the sentence are wrong on that shape.\n\nexplain.rs gets this right by construction: the LFTJ branch returns early at explain.rs:289-313, so the note is only written in the binary branch. exec.rs::trace_label lacks the equivalent guard.\n\nThis errs toward over-warning rather than hiding a divergence, which is why it is minor rather than major \u2014 but the whole point of the change is honest disclosure, so an inaccurate disclosure undercuts it.",
+    "file": "crates/sparq-engine/src/exec.rs",
+    "fix_hint": "Add the dispatch guard to the condition in exec.rs::trace_label so it matches explain.rs's scoping:\n\n    if bgp_uses_binary(&patterns) && patterns.len() >= 3 && crate::dp::active().is_some() { ... }\n\n(`bgp_uses_binary` is already in scope in this module and is the exact predicate `eval_flat_conjunctive` uses at exec.rs:4858.) Optionally also tie the `>= 3` literal to dp's own gate rather than duplicating it, so the two cannot drift.",
+    "severity": "minor",
+    "title": "trace_label appends the DPccp note to cyclic (LFTJ) BGPs where DPccp cannot run, and calls the LFTJ tree a \"greedy replay\""
+   },
+   {
+    "body": "Both new tests only assert the note is PRESENT on a DP-eligible BGP. `accept_header_requests_explain` asserts the greedy label for the 2-pattern JOIN_QUERY with `contains`, which passes whether or not the note is also emitted.\n\nAs a result the condition guarding the note (`patterns.len() >= 3`, and the missing `bgp_uses_binary` check above) has no test that goes red when the note is emitted too widely \u2014 which is exactly the failure mode present in exec.rs today.",
+    "file": "crates/sparq-server/tests/explain_metrics.rs",
+    "fix_hint": "Add one assertion that the note is absent where DPccp cannot apply: `assert!(!body.contains(\"DPccp may execute\"))` for the 2-pattern JOIN_QUERY, and ideally for a 3-pattern CYCLIC (triangle) BGP once the exec.rs guard is fixed. Both are cheap additions to the existing spawned-server tests.",
+    "severity": "nit",
+    "title": "No negative test pins the ABSENCE of the DPccp note, so over-disclosure regressions are unguarded"
+   },
+   {
+    "body": "`dp-planner` gets crates/sparq-server/tests/dp_planner_default.rs and `algebra-rewrite` gets crates/sparq-server/tests/algebra_rewrite_default.rs, both of which fail to compile if the forwarding edge to sparq-engine is broken. `antijoin-static-decline`, added to the default set in the same commit, has no equivalent witness, so silently dropping `antijoin-static-decline = [\"sparq-engine/antijoin-static-decline\"]` (or the default-set entry) would not be caught by any server-side test \u2014 while the README and SKILL would keep claiming CLI parity.",
+    "file": "crates/sparq-server/Cargo.toml",
+    "fix_hint": "Either add a matching one-test tripwire (same shape as dp_planner_default.rs, gated `#![cfg(feature = \"antijoin-static-decline\")]`, referencing whatever engine symbol the feature exposes), or note explicitly in the feature comment that this edge is covered only by the engine's `sparq-engine (antijoin-static-decline)` feature-matrix leg.",
+    "severity": "nit",
+    "title": "Newly-defaulted antijoin-static-decline has no forwarding tripwire, unlike its two siblings"
+   },
+   {
+    "body": "Line 5 reads \"This file is gated on the server feature so deliberate lean builds remain valid\", while the actual attribute is `#![cfg(feature = \"dp-planner\")]`. \"the server feature\" reads as the `server` feature, which is a different (and also real) feature of this crate. The very next sentence gets it right (\"Removing `dp-planner` from `default` therefore silently skips it\"), so this is only wording.",
+    "file": "crates/sparq-server/tests/dp_planner_default.rs",
+    "fix_hint": "Say \"gated on the server's `dp-planner` forwarding feature\" to match the sibling algebra_rewrite_default.rs phrasing.",
+    "severity": "nit",
+    "title": "Module doc says the file is \"gated on the server feature\" but the gate is dp-planner"
+   },
+   {
+    "body": "The SKILL blockquote defers the actual fix (\"Until DP-aware explain rendering lands, EXPLAIN labels a DP-eligible BGP as a greedy replay\") without a tracking id, and neither the README bullet nor the Cargo.toml comment references one. AGENTS.md/CLAUDE.md hygiene puts future work in a bead, and every other deferral in these files carries an `sq-*` / `#NNNN` reference. I could not verify from the checkout whether a bead exists (`bd` is unavailable here), so this may already be satisfied off-diff.",
+    "file": "skills/http-server/SKILL.md",
+    "fix_hint": "Append the bead id, e.g. \"Until DP-aware explain rendering lands (sq-XXXX), ...\", in skills/http-server/SKILL.md and mirror it in the crates/sparq-server/Cargo.toml `dp-planner` comment.",
+    "severity": "nit",
+    "title": "\"Until DP-aware explain rendering lands\" cites no bead for the deferred real fix"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Both round-1 majors are resolved and locally verified.\n\n(1) EXPLAIN/plan divergence: the PR takes option (b) from the prior fix_hint \u2014 disclosure rather than DP-aware rendering. explain.rs:324 writes a NOTE scoped to the binary-BGP branch, and exec.rs trace_label appends \"[DPccp may execute; displayed tree is a greedy replay, not an execution record]\", which reaches both the ANALYZE text trace (exec.rs:4605) and the explain-json operator labels (explain_json.rs:257/:265 via trace_label_pub). Two new server tests pin this under the DEFAULT feature set with a 3-pattern DP-eligible BGP, closing the round-1 CI blind spot (JOIN_QUERY was 2 patterns, below dp::plan's >=3 gate). Verified: `cargo test -p sparq-server --test explain_metrics` 11/11 pass; the assertions target the exact new strings, so they go red if the note is dropped \u2014 not vacuous.\n\n(2) Parity overclaim: `antijoin-static-decline` joins the server default set, making the plan-affecting set exactly {dp-planner, algebra-rewrite, antijoin-static-decline} \u2014 identical to sparq-cli/Cargo.toml:146. The CLI's default set (mmap, mimalloc, dict-spill, jsonld) and its other engine-forwarding features are not plan-affecting, so the claim now holds; the wording is also tightened from \"same plans\" to the checkable \"join ordering and rewrite/anti-join evaluation ordering\".\n\nMinors 3/4 are fixed by rewording (the tripwire doc discloses that a default-set removal silently skips it and that only the forwarding edge is enforced; the test doc no longer claims DP acceptance). Minor 5 is documented in Cargo.toml/README/SKILL, noting accurately that DP enumeration does not poll QueryBudget: dp.rs has no deadline check and http.rs:6617's `timeout + TIMEOUT_GRACE` returns 503 without aborting the blocking task, so a bounded-CPU residual remains, now disclosed.\n\nDPccp stays order-only on a commutative/associative natural join; both feature states compile warning-free; no existing label assertion breaks. Findings below are minor/nit.",
+  "verdict": "approve"
+ }
+}
