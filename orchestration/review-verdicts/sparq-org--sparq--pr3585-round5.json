@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3585,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "7134111447c4fbfbb3ae5fcb5a10877943e59deb",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The module claims SortMergeCost reports what a real deployment pays and says each adjacency equality contributes its full bit-decomposition circuit. However, scan_mults is only the delta of ShamirDealer::mult_count, which explicitly counts degree_reduce rounds and excludes masked-product opens used by Rabbit solved-bit and zero-test/range-proof machinery. SortMergeCost::opens counts only padded-reveal opens, so the omitted interactive Rabbit work is not reported anywhere. The focused test merely proves scan_mults exceeds the equality-fold floor; it does not account for or assert the full decomposition/range-proof communication. Thus the public modeled communication cost remains materially incomplete, despite no longer treating equality as one multiplication.",
+    "file": "crates/sparq-mpc/src/sort_merge_join.rs",
+    "fix_hint": "Either add explicit counters/costs for every interactive operation used by Rabbit decomposition and range proofs (including masked-product opens) and include them in SortMergeCost, with a focused exact/derived test, or narrow all module/API claims so the structure is clearly only a degree-reduction-round counter rather than what a real deployment pays. If narrowing, expose the omitted scan opens separately so the communication model is complete.",
+    "severity": "major",
+    "title": "Cost report still omits interactive Rabbit work from the segmented scan"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 5 improves the implementation by replacing the one-per-equality tally with a dealer counter, but it does not fully resolve round 4's major cost-honesty finding. The public module still says SortMergeCost reports what a real deployment pays, while scan_mults now counts only successful degree_reduce rounds and deliberately omits the Rabbit decomposition/range-proof masked-product opens. Those interactive operations are part of every adjacency equality, yet they are neither included in scan_mults nor represented by another scan-cost field (opens counts only padded reveal). The new test validates only a lower bound on the narrowed counter, so it cannot establish the advertised full communication cost. This is materially the same major finding at the same severity, so progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
