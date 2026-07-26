@@ -1914,7 +1914,7 @@ def _run_target_helper(script_dir, repo, script, args):
 
 
 def _pr_needs_user(script_dir, repo, pr_number, issue, reason, park_class="question",
-                   bot_login="", head_sha="", attempt_key=""):
+                   bot_login="", head_sha="", attempt_key="", cause=""):
     """Stop the loop for a PR. `park_class` picks the label PAIR (park_policy.py ownership):
     "question" (default) -> the human-owned pair (review:needs-user on the PR, needs:user on
     the source issue) for genuine human questions; "capacity" -> the machine-owned soft-hold
@@ -1928,9 +1928,17 @@ def _pr_needs_user(script_dir, repo, pr_number, issue, reason, park_class="quest
     attempted. EVERY capacity park on this path supplies them, so an exhaustion re-derived
     from unchanged per-PR state is skipped quietly instead of consuming the readmission window
     a human just granted (the live sparq #3488 7-minute bounce). Question-class parks are
-    unconditional human holds and pass neither."""
+    unconditional human holds and pass neither.
+
+    `cause` (registry #703) is the park's MACHINE-READABLE stop reason from the closed
+    park_policy.PARK_CAUSES taxonomy. It is what lets the re-admission sweep tell a
+    reviewer-vs-fixer DEADLOCK (`budget`, `nochange`) apart from a genuine capacity stall, and
+    what keeps a deadlock out of the human terminal. Every park written on this path names one:
+    a park whose cause no machine can read has, by construction, no machine exit."""
     args = ["needs-user", "--repo", repo, "--pr", str(pr_number), "--reason", reason,
             "--park-class", park_class]
+    if cause:
+        args += ["--cause", cause]
     if bot_login:
         args += ["--bot-login", bot_login]
     if head_sha and attempt_key:
@@ -2959,7 +2967,8 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                     # Rewritten history — the worker-opened commit is no longer an ancestor.
                     _pr_needs_user(script_dir, repo, number, issue_number,
                                    "the PR head no longer descends from the worker-opened commit "
-                                   "(history was rewritten); refusing autonomous review")
+                                   "(history was rewritten); refusing autonomous review",
+                                   cause="history-rewritten")
                     continue
             if not draft and item["state"] in {"needs-review", "needs-fix"}:
                 # Label-driven re-entry may arrive while the PR is READY (and possibly armed).
@@ -3155,7 +3164,8 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
             except worker_pr.WorkerPrError as exc:
                 _pr_needs_user(script_dir, repo, number, issue_number,
                                f"round-budget escalation-marker validation failed ({exc}); a "
-                               "human must inspect this PR's round/model/pin markers")
+                               "human must inspect this PR's round/model/pin markers",
+                               cause="marker-corrupt")
                 continue
             if budget["action"] == "needs-user":
                 # Budget-driven stop -> the MACHINE-owned soft-hold pair (finding A:
@@ -3181,7 +3191,10 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                                "verdict does not grade the PR improving, and no pushed fix at "
                                "or above the pinned floor awaits re-review; a human must "
                                "decide", park_class="capacity", bot_login=bot_login,
-                               head_sha=head_sha, attempt_key=f"rounds={rounds}")
+                               head_sha=head_sha, attempt_key=f"rounds={rounds}",
+                               # registry #703: exhausting the round budget after repeated
+                               # request_changes IS the reviewer-vs-fixer deadlock.
+                               cause="budget")
                 continue
             if budget["action"] == "extend-model-pin" and budget["pin"]:
                 # Converge the durable pin marker (normally recorded by the review outcome; this
@@ -3255,7 +3268,11 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                                    f"{round_number}; a human must unstick this PR",
                                    park_class="capacity", bot_login=bot_login,
                                    head_sha=head_sha,
-                                   attempt_key=f"missed{round_number}={missed_total}")
+                                   attempt_key=f"missed{round_number}={missed_total}",
+                                   # Genuine dispatch STARVATION, not a disagreement: the
+                                   # ordinary capacity ladder and its recovery evidence still
+                                   # apply (registry #703 narrows only the deadlock causes).
+                                   cause="dispatch-missed")
                     continue
                 chain = _resolvable_chain(fix_aliases, routing)
                 holder_namespace, ttl = "fix:", FIX_TTL
@@ -3276,7 +3293,11 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                                    f"{round_number}; a human must unstick this PR",
                                    park_class="capacity", bot_login=bot_login,
                                    head_sha=head_sha,
-                                   attempt_key=f"missed{round_number}={missed_total}")
+                                   attempt_key=f"missed{round_number}={missed_total}",
+                                   # Genuine dispatch STARVATION, not a disagreement: the
+                                   # ordinary capacity ladder and its recovery evidence still
+                                   # apply (registry #703 narrows only the deadlock causes).
+                                   cause="dispatch-missed")
                     continue
                 verdict_file = record_file_path(ledger_root, registry_root,
                                                 worker_pr.verdict_path(repo, number, round_number))
@@ -3309,7 +3330,8 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 # hand to a human.
                 _pr_needs_user(script_dir, repo, number, issue_number,
                                f"the {mode} model chain for a {impl_provider}-implemented PR is "
-                               "unresolvable in the target routing (no concrete provider model)")
+                               "unresolvable in the target routing (no concrete provider model)",
+                               cause="routing-unresolvable")
                 continue
         except DispatchError as exc:
             lanes[lane]["error"] += 1
@@ -3464,7 +3486,8 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                         _pr_needs_user(script_dir, repo, number, issue_number,
                                        f"the durable missed-fix marker could not be recorded "
                                        f"({exc}); the MISSED_FIX_LIMIT budget can no longer bound "
-                                       "this PR, so a human must unstick it")
+                                       "this PR, so a human must unstick it",
+                                       cause="marker-corrupt")
                     except DispatchError as esc_exc:
                         defer_reasons["missed-escalation-failed"] += 1
                         print(f"defer review {repo}#{number}: missed-fix human escalation ALSO "
