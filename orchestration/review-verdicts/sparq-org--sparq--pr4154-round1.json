@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4154,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f452b5152b5722c8a1b868cb21f06f71d757e3b5",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Sections 2.1\u20132.4 commit numerous absolute timings, per-operation nanosecond estimates, speedups, and derived Amdahl figures from a shared 4-vCPU work box. Although the document repeatedly labels them NON-CANONICAL, the repository contract explicitly prohibits hard-coded performance numbers in Markdown and treats work-box timings as non-canonical. The prose also uses these measurements as the principal evidence for the B \u2192 C \u2192 D sequencing, so this is substantive rather than incidental formatting.",
+    "file": "research/el-e4-concurrent-saturation.md",
+    "fix_hint": "Remove the absolute work-box timing tables and derived fixed timing figures from this Markdown file. Preserve reproducibility commands and deterministic counters, and express the conclusion qualitatively. If retaining raw measurements is necessary, store them in an appropriate generated/machine-readable benchmark artifact excluded from outward documentation, then have the record reference the methodology and non-timing invariants without embedding fixed performance numbers.",
+    "severity": "major",
+    "title": "Work-box performance numbers are hard-coded into Markdown"
+   }
+  ],
+  "progress": null,
+  "summary": "The design record is unusually explicit about its evidence limits and makes no production-code change, but it violates the repository's review contract by committing extensive work-box performance measurements as hard-coded Markdown figures. The non-canonical labels prevent overclaiming, yet they do not satisfy the standing prohibition on hard-coded performance numbers in Markdown. Move raw timing data to a generated or machine-readable artifact and keep only qualitative conclusions or reproducible counter-based evidence in the research record.",
+  "verdict": "request_changes"
+ }
+}
