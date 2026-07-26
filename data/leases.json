@@ -99,6 +99,16 @@
    "model": "sol",
    "issued_at": 1785091213,
    "expires_at": 1785097513
+  },
+  {
+   "account": "dc2d751954080e13",
+   "claim_id": "6f0d919c6bbb42a4a98d71bf05fc925d",
+   "holder": "fix:sparq-org/sparq#4201@dispatch-30214791935.1",
+   "package": "ci-fragments",
+   "role": "fix",
+   "model": "sol",
+   "issued_at": 1785091219,
+   "expires_at": 1785097519
   }
  ]
 }
