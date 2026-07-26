@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4271,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "59538ef2742e55fd657f2743f9c364c70f546a95",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new rustdoc says each backend's output was verified with an \"independent strict single-member decoder,\" but the relevant test helper uses `flate2::read::GzDecoder`. As the new text itself notes for flate2's CRC implementation, flate2 selects its implementation from the active backend features; the decoder therefore uses zlib-rs when testing zlib-rs and zlib-ng when testing zlib-ng. Single-member strictness is useful, but it does not make this an implementation-independent interoperability check. This overstates the evidence behind the RFC 1952, flush-boundary, and combined-CRC claims.",
+    "file": "crates/sparq-parse/src/lib.rs",
+    "fix_hint": "Either add a genuinely independent decoder check for artifacts produced separately under each backend (for example, checked fixtures decoded by a different gzip implementation, with feature-specific generation made explicit), or accurately reword the statement to say the output was round-tripped through flate2's strict single-member decoder and avoid claiming independent verification.",
+    "severity": "major",
+    "title": "Validation is incorrectly described as using an independent decoder"
+   }
+  ],
+  "progress": null,
+  "summary": "The backend-selection documentation is generally coherent, but it overstates the independence of the validation used to support the format-invariant claim. The existing strict single-member helper decodes through flate2, whose implementation switches with the same feature as the encoder; it is therefore not an independent decoder for either backend.",
+  "verdict": "request_changes"
+ }
+}
