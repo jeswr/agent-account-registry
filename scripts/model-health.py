@@ -144,6 +144,26 @@ _EXIT_CLASS_MAP = {
 LAUNCH_FAIL_CLASSES = frozenset({CLASS_AUTH, CLASS_BILLING, CLASS_LIMIT, CLASS_TRANSIENT})
 # The classes that count toward the PERSISTENT burst (transient-for-persistence).
 PERSISTENCE_CLASSES = frozenset({CLASS_TRANSIENT, CLASS_UNKNOWN})
+# The starvation causes a MACHINE CAPACITY PARK can be attributed to, for the automatic
+# re-admission gate ONLY (capacity_recovery_evidence). Deliberately a SEPARATE set from
+# LAUNCH_FAIL_CLASSES, which drives provider-outage and backoff decisions and must not change.
+#
+# WHY zero-dispatch belongs here and nowhere else (sparq-org/sparq#3809). The park class this
+# gate exists to release includes DISPATCH STARVATION — "N consecutive fix dispatches missed",
+# which dispatch-claim parks as a capacity park precisely because the allocator found no slot.
+# That cause is recorded, on the `fleet` pseudo-account, as `zero-dispatch` (dispatch planned >0
+# but launched 0), and its recovery is recorded as a `success` on that same pseudo-account. But
+# `zero-dispatch` is not a LAUNCH failure, so condition 1 below rejected it and a
+# dispatch-starvation park could never prove its cause had cleared — the automatic re-admission
+# could only ever fire for an account-credential outage.
+#
+# MEASURED against the live ledger (2026-07-25, 200 records): the fleet account carried 36
+# zero-dispatch records and 43 successes, and was excluded by condition 1 alone — it satisfied
+# the recovery and cooldown conditions already. Every other condition (a success strictly after
+# BOTH the park and the account's own last failure, and no active auth cooldown) applies to
+# zero-dispatch unchanged, so this widens WHICH outage can be proven recovered, never HOW
+# strictly recovery must be proven.
+PARK_STARVATION_CLASSES = LAUNCH_FAIL_CLASSES | frozenset({CLASS_ZERO_DISPATCH})
 
 # The full set of decision classes a stored record's `exit_class` may hold: every fold TARGET of
 # _EXIT_CLASS_MAP (SUCCESS/zero-dispatch are among its values). make_record only ever writes a
@@ -796,9 +816,11 @@ def capacity_recovery_evidence(records, parked_at, now):
 
     The predicate, exactly (an account qualifies iff ALL of these hold):
       1. its NEWEST record at or before `parked_at` (epoch seconds of the park application) is a
-         LAUNCH-FAIL class — auth/billing/limit/transient — i.e. that account WAS failing when the
-         park landed, with no interleaved success between the failure and the park. This is what
-         makes the evidence specific to the park's cause instead of "the fleet looks healthy now";
+         PARK-STARVATION class — auth/billing/limit/transient, or `zero-dispatch` (the fleet
+         pseudo-account's dispatch-starvation signal; see PARK_STARVATION_CLASSES) — i.e. that
+         account WAS failing, or the allocator WAS starved, when the park landed, with no
+         interleaved success between the failure and the park. This is what makes the evidence
+         specific to the park's cause instead of "the fleet looks healthy now";
       2. it has recorded a `success` strictly after BOTH `parked_at` and its own LAST launch
          failure in the window — the earliest such run is the recovery event. Requiring the
          success to out-date the last failure is what keeps a FLAPPING account from claiming
@@ -839,7 +861,7 @@ def capacity_recovery_evidence(records, parked_at, now):
         account = record["account"]
         if record["ts"] <= parked_at:
             cause[account] = record      # newest record at/before the park application
-        if record["exit_class"] in LAUNCH_FAIL_CLASSES:
+        if record["exit_class"] in PARK_STARVATION_CLASSES:
             last_fail[account] = record["ts"]
     recovery = {}
     for record in window:
@@ -852,7 +874,7 @@ def capacity_recovery_evidence(records, parked_at, now):
         (record["ts"], account, record)
         for account, record in recovery.items()
         if account in cause
-        and cause[account]["exit_class"] in LAUNCH_FAIL_CLASSES
+        and cause[account]["exit_class"] in PARK_STARVATION_CLASSES
         and account not in cooldowns
     ]
     if not candidates:
@@ -2795,6 +2817,35 @@ def _self_test():
         capacity_recovery_evidence(
             [rec("openai", "codex01", CLASS_SETUP, dt=0, run="f1"),
              rec("openai", "codex01", SUCCESS, dt=200, run="s1")], parked, now + 300), None)
+    # ---- DISPATCH STARVATION is a park cause too (sparq-org/sparq#3809) ----------------------
+    # The park class this gate exists to release includes "N consecutive fix dispatches missed",
+    # whose recorded cause is `zero-dispatch` on the fleet pseudo-account, NOT a launch failure.
+    # Before this, such a park could never prove its cause cleared and stayed parked forever
+    # (MEASURED: every capacity park in production logged "no recorded recovery of the park's
+    # starvation cause" on every tick since the automatic path shipped).
+    starved_then_dispatched = [rec("fleet", "fleet01", CLASS_ZERO_DISPATCH, dt=0, run="z1"),
+                               rec("fleet", "fleet01", SUCCESS, dt=200, run="d1")]
+    chk("a DISPATCH-STARVATION park proves recovery when dispatch launches again",
+        (capacity_recovery_evidence(starved_then_dispatched, parked, now + 300)
+         or {}).get("cause"), CLASS_ZERO_DISPATCH)
+    chk("zero-dispatch is a park starvation cause but NOT a provider-outage launch failure",
+        (CLASS_ZERO_DISPATCH in PARK_STARVATION_CLASSES,
+         CLASS_ZERO_DISPATCH in LAUNCH_FAIL_CLASSES), (True, False))
+    chk("every launch-fail class remains a park starvation cause",
+        LAUNCH_FAIL_CLASSES <= PARK_STARVATION_CLASSES, True)
+    # The widening changes WHICH outage can be proven recovered, never HOW strictly: every other
+    # condition applies to zero-dispatch unchanged.
+    chk("a still-starved fleet (no post-park dispatch) yields NO evidence",
+        capacity_recovery_evidence(starved_then_dispatched[:1], parked, now + 300), None)
+    chk("a dispatch success BEFORE the park proves nothing",
+        capacity_recovery_evidence(
+            [rec("fleet", "fleet01", CLASS_ZERO_DISPATCH, dt=0, run="z1"),
+             rec("fleet", "fleet01", SUCCESS, dt=50, run="d1")], parked, now + 300), None)
+    chk("a FLAPPING fleet (starved again after the success) yields NO evidence",
+        capacity_recovery_evidence(
+            starved_then_dispatched
+            + [rec("fleet", "fleet01", CLASS_ZERO_DISPATCH, dt=250, run="z2")],
+            parked, now + 300), None)
 
     # ---- prune / window bound ---------------------------------------------------------------
     many = [rec("anthropic", "acct01", CLASS_TRANSIENT, dt=i) for i in range(MAX_RECORDS + 50)]
