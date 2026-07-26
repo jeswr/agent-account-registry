@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 3843,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "66ed00236fc4e3a3af1d8aa4e85607768443835a",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The P1-2 table says the endpoint has \u201c15/15 in-class scenarios,\u201d but the referenced manifest has 15 executable cases covering only scenarios 2\u20138 and 11\u201313; scenarios 1, 9, 10, and 14\u201316 are out of class. Several scenarios intentionally have multiple cases. Thus 15 is a case count, not a scenario count, and \u201c15/15 scenarios\u201d materially overstates the breadth of conformance behind the recommendation that P1 has substantially landed.",
+    "file": "research/solid-consumer-production-readiness-2026-07.md",
+    "fix_hint": "State precisely that 15 executable query-semantics cases pass and identify that they cover 10 of the draft's 16 numbered scenarios, with the remaining 6 delegated out of class. Audit every later \u201c15/15\u201d occurrence and reserve \u201cscenario\u201d for the numbered spec scenarios.",
+    "severity": "major",
+    "title": "AC-SPARQL cases are incorrectly described as 15/15 in-class scenarios"
+   },
+   {
+    "body": "Section 5 labels eleven items \u201cfuture beads\u201d and says none is started, while the repository contract requires future work to be created as beads rather than left as Markdown TODOs. The document also says the stale deviation comment \u201cis captured as a follow-up\u201d without identifying a bead or issue. As written, the proposed milestone has no durable task-graph identity, dependencies, or evidence that the follow-ups were actually captured.",
+    "file": "research/solid-consumer-production-readiness-2026-07.md",
+    "fix_hint": "Create beads for the actionable items (deduplicating existing work first), encode the stated dependencies with bd, and replace each plan entry/follow-up assertion with its bead ID. If this document is intentionally only a proposal, remove claims that work is captured and avoid calling the list \u201cfuture beads\u201d until records exist.",
+    "severity": "major",
+    "title": "The phased plan creates an untracked Markdown backlog"
+   }
+  ],
+  "progress": null,
+  "summary": "The reconciliation is well sourced overall, but it contains a material conformance-count overstatement and turns eleven unstarted tasks into a Markdown backlog despite the repository's beads-only tracking rule. Those defects undermine the document's central readiness/sequencing conclusions and must be corrected before approval.",
+  "verdict": "request_changes"
+ }
+}
