@@ -1914,7 +1914,7 @@ def _run_target_helper(script_dir, repo, script, args):
 
 
 def _pr_needs_user(script_dir, repo, pr_number, issue, reason, park_class="question",
-                   bot_login="", head_sha="", attempt_key=""):
+                   bot_login="", head_sha="", attempt_key="", cause=""):
     """Stop the loop for a PR. `park_class` picks the label PAIR (park_policy.py ownership):
     "question" (default) -> the human-owned pair (review:needs-user on the PR, needs:user on
     the source issue) for genuine human questions; "capacity" -> the machine-owned soft-hold
@@ -1928,9 +1928,17 @@ def _pr_needs_user(script_dir, repo, pr_number, issue, reason, park_class="quest
     attempted. EVERY capacity park on this path supplies them, so an exhaustion re-derived
     from unchanged per-PR state is skipped quietly instead of consuming the readmission window
     a human just granted (the live sparq #3488 7-minute bounce). Question-class parks are
-    unconditional human holds and pass neither."""
+    unconditional human holds and pass neither.
+
+    `cause` (registry #703) is the park's MACHINE-READABLE stop reason from the closed
+    park_policy.PARK_CAUSES taxonomy. It is what lets the re-admission sweep tell a
+    reviewer-vs-fixer DEADLOCK (`budget`, `nochange`) apart from a genuine capacity stall, and
+    what keeps a deadlock out of the human terminal. Every park written on this path names one:
+    a park whose cause no machine can read has, by construction, no machine exit."""
     args = ["needs-user", "--repo", repo, "--pr", str(pr_number), "--reason", reason,
             "--park-class", park_class]
+    if cause:
+        args += ["--cause", cause]
     if bot_login:
         args += ["--bot-login", bot_login]
     if head_sha and attempt_key:
@@ -2417,6 +2425,7 @@ def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_logi
         if isinstance(page, list):
             rows.extend(row for row in page if isinstance(row, dict))
     readmitted = migrated = 0
+    deadlocked_prs = []
     for row in sorted(rows, key=lambda row: row.get("number") or 0):
         number = row.get("number")
         if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
@@ -2491,13 +2500,38 @@ def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_logi
                     _cache[timeline_number] = timeline_fn(_repo, timeline_number)
                 return _cache[timeline_number]
 
+            # [registry #703] Is this a reviewer-vs-fixer DEADLOCK rather than a capacity
+            # park? The cause comes from the writer's own marker when there is one and from its
+            # park prose otherwise, so the ~27 parks that predate the marker writer are
+            # classified too — they are the measured population. The adjudication that would
+            # release it must be bound to the LIVE head: a decision about an earlier tree says
+            # nothing about this one.
+            #
+            # Derived HERE, at the only site that MINTS a re-admission, and deliberately NOT at
+            # the read-only CLAIM proof gate: the refusal withholds a NEW automatic
+            # re-admission, it does not retract one already granted. Applying it at the proof
+            # gate would strand a PR whose receipt was minted and whose label strip had not yet
+            # landed — the exact receipt-no-label crash window the RECEIPT-FIRST ordering exists
+            # to make recoverable.
+            park_cause = _park_policy.latest_park_cause(comments, bot_login, log=log)
+            deadlocked = _park_policy.deadlock_awaiting_adjudication(
+                park_cause,
+                _park_policy.park_adjudication_records(comments, bot_login, log=log),
+                str((row.get("head") or {}).get("sha", "")))
             action, evidence, detail = _park_policy.capacity_park_admission(
                 repo, number, issue_number, cached_timeline,
                 is_human=lambda probe_login: _target_is_human_maintainer(repo, probe_login),
                 consumed=worker_pr.park_generation_cutoffs(comments, bot_login),
                 auto_receipts=worker_pr.auto_readmission_records(comments, bot_login),
                 auto_marker_count=worker_pr.auto_readmission_marker_count(comments, bot_login),
-                auto_evidence=evidence_probe, live_holds=holds, log=log)
+                auto_evidence=evidence_probe, live_holds=holds, log=log,
+                deadlock_unadjudicated=deadlocked)
+            if deadlocked and not action:
+                # Counted only when the deadlock is what actually STOPPED the re-admission. A
+                # proven human gesture is evaluated first and wins, and reporting that PR as
+                # "refused" would be a false count in the one signal the missing adjudication
+                # lane is measured by.
+                deadlocked_prs.append(number)
             if action == "auto-mint":
                 # RECEIPT FIRST, then the labels (see the docstring).
                 post_comment(repo, number, worker_pr.auto_readmission_receipt(
@@ -2517,6 +2551,18 @@ def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_logi
         except (DispatchError, worker_pr.WorkerPrError) as exc:
             log(f"::warning::auto-readmit skipped for {repo}#{number}: {exc}; the capacity "
                 "park stands")
+    if deadlocked_prs:
+        # [registry #703] ONE aggregate, loud, counted line per repo per tick. A deadlock park
+        # that is neither re-admitted nor escalated is a queue, and a queue nobody can see is
+        # how a park with no exit becomes a silent stall. This is the signal that the
+        # adjudication lane is missing or not keeping up — deliberately an ::error:: annotation
+        # so a lane that never adjudicates cannot hide behind a green tick, exactly as the
+        # per-stage-health lesson in #703 requires (a falling review:parked count was read as
+        # progress precisely because no counter expressed the composition).
+        log(f"::error::{repo}: {len(deadlocked_prs)} parked PR(s) are UNADJUDICATED "
+            f"reviewer-vs-fixer deadlocks and were refused automatic re-admission "
+            f"({', '.join(f'#{pr}' for pr in deadlocked_prs)}); they need an independent "
+            "adjudication (registry #703), not another generation of the same disagreement")
     return readmitted
 
 
@@ -2959,7 +3005,8 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                     # Rewritten history — the worker-opened commit is no longer an ancestor.
                     _pr_needs_user(script_dir, repo, number, issue_number,
                                    "the PR head no longer descends from the worker-opened commit "
-                                   "(history was rewritten); refusing autonomous review")
+                                   "(history was rewritten); refusing autonomous review",
+                                   cause="history-rewritten")
                     continue
             if not draft and item["state"] in {"needs-review", "needs-fix"}:
                 # Label-driven re-entry may arrive while the PR is READY (and possibly armed).
@@ -3155,7 +3202,8 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
             except worker_pr.WorkerPrError as exc:
                 _pr_needs_user(script_dir, repo, number, issue_number,
                                f"round-budget escalation-marker validation failed ({exc}); a "
-                               "human must inspect this PR's round/model/pin markers")
+                               "human must inspect this PR's round/model/pin markers",
+                               cause="marker-corrupt")
                 continue
             if budget["action"] == "needs-user":
                 # Budget-driven stop -> the MACHINE-owned soft-hold pair (finding A:
@@ -3181,7 +3229,10 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                                "verdict does not grade the PR improving, and no pushed fix at "
                                "or above the pinned floor awaits re-review; a human must "
                                "decide", park_class="capacity", bot_login=bot_login,
-                               head_sha=head_sha, attempt_key=f"rounds={rounds}")
+                               head_sha=head_sha, attempt_key=f"rounds={rounds}",
+                               # registry #703: exhausting the round budget after repeated
+                               # request_changes IS the reviewer-vs-fixer deadlock.
+                               cause="budget")
                 continue
             if budget["action"] == "extend-model-pin" and budget["pin"]:
                 # Converge the durable pin marker (normally recorded by the review outcome; this
@@ -3255,7 +3306,11 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                                    f"{round_number}; a human must unstick this PR",
                                    park_class="capacity", bot_login=bot_login,
                                    head_sha=head_sha,
-                                   attempt_key=f"missed{round_number}={missed_total}")
+                                   attempt_key=f"missed{round_number}={missed_total}",
+                                   # Genuine dispatch STARVATION, not a disagreement: the
+                                   # ordinary capacity ladder and its recovery evidence still
+                                   # apply (registry #703 narrows only the deadlock causes).
+                                   cause="dispatch-missed")
                     continue
                 chain = _resolvable_chain(fix_aliases, routing)
                 holder_namespace, ttl = "fix:", FIX_TTL
@@ -3276,7 +3331,11 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                                    f"{round_number}; a human must unstick this PR",
                                    park_class="capacity", bot_login=bot_login,
                                    head_sha=head_sha,
-                                   attempt_key=f"missed{round_number}={missed_total}")
+                                   attempt_key=f"missed{round_number}={missed_total}",
+                                   # Genuine dispatch STARVATION, not a disagreement: the
+                                   # ordinary capacity ladder and its recovery evidence still
+                                   # apply (registry #703 narrows only the deadlock causes).
+                                   cause="dispatch-missed")
                     continue
                 verdict_file = record_file_path(ledger_root, registry_root,
                                                 worker_pr.verdict_path(repo, number, round_number))
@@ -3309,7 +3368,8 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 # hand to a human.
                 _pr_needs_user(script_dir, repo, number, issue_number,
                                f"the {mode} model chain for a {impl_provider}-implemented PR is "
-                               "unresolvable in the target routing (no concrete provider model)")
+                               "unresolvable in the target routing (no concrete provider model)",
+                               cause="routing-unresolvable")
                 continue
         except DispatchError as exc:
             lanes[lane]["error"] += 1
@@ -3464,7 +3524,8 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                         _pr_needs_user(script_dir, repo, number, issue_number,
                                        f"the durable missed-fix marker could not be recorded "
                                        f"({exc}); the MISSED_FIX_LIMIT budget can no longer bound "
-                                       "this PR, so a human must unstick it")
+                                       "this PR, so a human must unstick it",
+                                       cause="marker-corrupt")
                     except DispatchError as esc_exc:
                         defer_reasons["missed-escalation-failed"] += 1
                         print(f"defer review {repo}#{number}: missed-fix human escalation ALSO "
@@ -4702,6 +4763,79 @@ def _partition_seam_violations(workflow, document):
                 out.append(f"{workflow}: jobs.claim step `{step_id}` env.{key} must be {value!r} "
                            f"(found {env.get(key)!r}) — re-pointing it at the neighbouring "
                            f"packages/package output feeds the reduction the wrong input")
+    return sorted(out)
+
+
+# [registry #703] The YAML SEAM of the park-CAUSE classification. Every deadlock this repo can
+# ever classify is written by exactly two steps of review-fix.yml's `outcome` job — the review
+# outcome (cause `budget`) and the fix outcome (cause `nochange`). Neither is reachable from the
+# python: if one is disabled with `if: false`, deleted, swallowed with `continue-on-error`, or
+# loses its `--bot-login` argument, then no park receipt is parseable, no cause is recorded, every
+# park reads UNCLASSIFIED, and the whole #703 guard degrades SILENTLY to the pre-#703 behaviour
+# with the entire python suite still green. A substring or `count(...) == N` assertion over the
+# workflow text sees none of those four mutations, which is why this table is compared against the
+# PARSED document node by node.
+_PARK_CAUSE_SEAM = {
+    "job_if": ("${{ always() && needs.claim.outputs.acquired == 'true' && "
+               "(needs.run.outputs.verdict_ok == 'success' || "
+               "needs.run.outputs.fix_done == 'success' || "
+               "needs.run.outputs.verdict_stale_reason != '') }}"),
+    "steps": (
+        {"name": "Apply the review outcome (findings, labels, escalation)",
+         "if": "${{ inputs.mode == 'review' && steps.reverify.outcome == 'success' }}",
+         "command": "review-outcome",
+         "cause": "budget"},
+        {"name": "Apply the fix outcome (host-side markers, labels, escalation)",
+         "if": "${{ inputs.mode == 'fix' && needs.run.outputs.fix_done == 'success' }}",
+         "command": "fix-outcome",
+         "cause": "nochange"},
+    ),
+}
+
+
+def _park_cause_seam_violations(document):
+    """The YAML SEAM that makes a park cause writable at all, checked STRUCTURALLY against the
+    PARSED review-fix.yml document. Returns a sorted list of violation strings; empty means
+    intact. Takes the parsed document so the self-test can mutate one node in memory and require
+    the matching violation back — the same non-vacuity protocol as _partition_seam_violations."""
+    out = []
+    job = ((document or {}).get("jobs") or {}).get("outcome")
+    if not isinstance(job, dict):
+        return ["review-fix.yml: jobs.outcome is gone, so NO park cause can ever be written"]
+    if job.get("if") != _PARK_CAUSE_SEAM["job_if"]:
+        out.append(f"review-fix.yml: jobs.outcome `if:` is not the expected acquired-and-ran "
+                   f"guard (found {job.get('if')!r}) — `if: false` or a narrowed condition "
+                   f"disables EVERY park write, and with it every park cause, silently")
+    if job.get("continue-on-error"):
+        out.append("review-fix.yml: jobs.outcome is continue-on-error — a failed park write "
+                   "would be swallowed and the PR would stall unclassified")
+    steps = job.get("steps")
+    if not isinstance(steps, list):
+        return sorted(out + ["review-fix.yml: jobs.outcome.steps is not a list"])
+    by_name = {step.get("name"): step for step in steps if isinstance(step, dict)}
+    for wanted in _PARK_CAUSE_SEAM["steps"]:
+        step = by_name.get(wanted["name"])
+        if step is None:
+            out.append(f"review-fix.yml is missing the `{wanted['name']}` step in jobs.outcome "
+                       f"— nothing else writes a `{wanted['cause']}` park, so that deadlock "
+                       f"cause becomes unrecordable and every such park reads UNCLASSIFIED")
+            continue
+        if step.get("if") != wanted["if"]:
+            out.append(f"review-fix.yml: jobs.outcome step `{wanted['name']}` `if:` is not the "
+                       f"expected mode guard (found {step.get('if')!r}) — `if: false` or an "
+                       f"inverted mode comparison skips the park write SILENTLY")
+        if step.get("continue-on-error"):
+            out.append(f"review-fix.yml: jobs.outcome step `{wanted['name']}` is "
+                       f"continue-on-error — a failed park write would be swallowed")
+        run = step.get("run") if isinstance(step.get("run"), str) else ""
+        if wanted["command"] not in run:
+            out.append(f"review-fix.yml: jobs.outcome step `{wanted['name']}` no longer invokes "
+                       f"`worker-pr.py {wanted['command']}` — the park (and its cause) is never "
+                       f"written")
+        if "--bot-login" not in run:
+            out.append(f"review-fix.yml: jobs.outcome step `{wanted['name']}` no longer passes "
+                       f"`--bot-login` — worker-pr.needs_user REFUSES every capacity park "
+                       f"without it, so no receipt and no cause marker is ever recorded")
     return sorted(out)
 
 
@@ -6521,6 +6655,75 @@ def _self_test():
           f"review-fix.yml + worker.yml, and all {len(_seam_mutants)} seam mutants "
           "(`if: false`, deleted step, deleted/re-pointed env input, deleted job output) are caught")
 
+    # ---- [registry #703] THE PARK-CAUSE YAML SEAM. The whole deadlock guard rests on a cause
+    # being RECORDED at park time, and the only two steps that can record one live in
+    # review-fix.yml's `outcome` job. Disable, delete, swallow, or de-argument either of them and
+    # every park reads UNCLASSIFIED — which the #703 taxonomy deliberately treats as "not a
+    # deadlock", so the guard degrades silently to the pre-#703 conveyor with the entire python
+    # suite still green. Each mutant edits ONE parsed node and must come back named. ----
+    assert _park_cause_seam_violations(_rf_doc) == [], _park_cause_seam_violations(_rf_doc)
+
+    def _outcome_step(document, name):
+        return next(s for s in document["jobs"]["outcome"]["steps"] if s.get("name") == name)
+
+    _review_step = "Apply the review outcome (findings, labels, escalation)"
+    _fix_step = "Apply the fix outcome (host-side markers, labels, escalation)"
+    _cause_mutants = (
+        ("the whole outcome job disabled with if: false",
+         lambda d: d["jobs"]["outcome"].__setitem__("if", "${{ false }}"),
+         "jobs.outcome `if:`"),
+        ("the outcome job swallowed with continue-on-error",
+         lambda d: d["jobs"]["outcome"].__setitem__("continue-on-error", True),
+         "jobs.outcome is continue-on-error"),
+        ("the review-outcome step disabled with if: false",
+         lambda d: _outcome_step(d, _review_step).__setitem__("if", "${{ false }}"),
+         f"step `{_review_step}` `if:`"),
+        ("the review-outcome step's mode guard inverted to the fix lane",
+         lambda d: _outcome_step(d, _review_step).__setitem__(
+             "if", "${{ inputs.mode == 'fix' && steps.reverify.outcome == 'success' }}"),
+         f"step `{_review_step}` `if:`"),
+        ("the review-outcome step DELETED",
+         lambda d: d["jobs"]["outcome"].__setitem__(
+             "steps", [s for s in d["jobs"]["outcome"]["steps"]
+                       if s.get("name") != _review_step]),
+         f"missing the `{_review_step}` step"),
+        ("the review-outcome step's --bot-login argument dropped",
+         lambda d: _outcome_step(d, _review_step).__setitem__(
+             "run", _outcome_step(d, _review_step)["run"].replace("--bot-login", "--no-such")),
+         "no longer passes `--bot-login`"),
+        ("the review-outcome step no longer invokes worker-pr.py review-outcome",
+         lambda d: _outcome_step(d, _review_step).__setitem__(
+             "run", _outcome_step(d, _review_step)["run"].replace(
+                 "review-outcome", "echo-outcome")),
+         "no longer invokes `worker-pr.py review-outcome`"),
+        ("the fix-outcome step disabled with if: false",
+         lambda d: _outcome_step(d, _fix_step).__setitem__("if", "${{ false }}"),
+         f"step `{_fix_step}` `if:`"),
+        ("the fix-outcome step swallowed with continue-on-error",
+         lambda d: _outcome_step(d, _fix_step).__setitem__("continue-on-error", True),
+         f"step `{_fix_step}` is continue-on-error"),
+        ("the fix-outcome step DELETED",
+         lambda d: d["jobs"]["outcome"].__setitem__(
+             "steps", [s for s in d["jobs"]["outcome"]["steps"] if s.get("name") != _fix_step]),
+         f"missing the `{_fix_step}` step"),
+        ("the fix-outcome step's --bot-login argument dropped",
+         lambda d: _outcome_step(d, _fix_step).__setitem__(
+             "run", _outcome_step(d, _fix_step)["run"].replace("--bot-login", "--no-such")),
+         "no longer passes `--bot-login`"),
+        ("the whole outcome job removed",
+         lambda d: d["jobs"].pop("outcome"), "jobs.outcome is gone"),
+        ("the outcome job's steps list replaced by a scalar",
+         lambda d: d["jobs"]["outcome"].__setitem__("steps", "gutted"),
+         "jobs.outcome.steps is not a list"),
+    )
+    for _label, _edit, _needle in _cause_mutants:
+        _violations = _park_cause_seam_violations(_mutate(_rf_doc, _edit))
+        assert _violations, f"park-cause YAML-seam mutant NOT caught ({_label})"
+        assert any(_needle in v for v in _violations), (_label, _needle, _violations)
+    print(f"  ok   #703: the park-CAUSE YAML seam is checked on PARSED nodes, and all "
+          f"{len(_cause_mutants)} seam mutants (`if: false`, inverted mode guard, deleted step, "
+          "continue-on-error, dropped --bot-login, dropped subcommand, removed job) are caught")
+
     # ---- [round-5 P1] CROSS-LANE SUPERSESSION (park -> sibling-launch -> UNPARK): while a
     # PR sat human-parked its crate was freed and a SIBLING claimed a lease there (an impl
     # lease — a prefix the review lane's partition never checks). The moment the human
@@ -7832,6 +8035,21 @@ def _self_test():
             run_items([fix_item], allocator=alloc, routing=routing_ok)
             assert [(script, args[0]) for script, args in helper_calls] == [
                 ("worker-pr.py", "needs-user")], helper_calls
+
+            # [registry #703] the CLAIM-side budget park must name its cause on the WIRE.
+            # This is the argv the target helper actually receives: without `--cause budget`
+            # the park lands unclassified, park_cause_is_deadlock answers False for it, and the
+            # whole deadlock guard degrades to the pre-#703 conveyor with every other test green.
+            _budget_park_argv = [args for script, args in helper_calls
+                                 if script == "worker-pr.py" and args[0] == "needs-user"]
+            assert len(_budget_park_argv) == 1, helper_calls
+            assert "--cause" in _budget_park_argv[0], _budget_park_argv
+            assert _budget_park_argv[0][_budget_park_argv[0].index("--cause") + 1] == "budget", \
+                _budget_park_argv
+            assert "--park-class" in _budget_park_argv[0] and _budget_park_argv[0][
+                _budget_park_argv[0].index("--park-class") + 1] == "capacity", _budget_park_argv
+            print("  ok   #703: the CLAIM-side round-budget park passes `--cause budget` to "
+                  "worker-pr.py needs-user (asserted on the real argv, not on the caller)")
 
             # a corrupt bot-authored pin tier is LOUD (needs-user) — silently ignoring it
             # would run the unpinned chain, the exact fall-back-down the pin forbids
@@ -9810,6 +10028,124 @@ def _self_test():
         assert chain_cleared == [(41, 7)], chain_cleared
         print("  ok   aged-out exit CHAIN: a legacy park that could not migrate before #691 "
               "migrates AND is actually released one span later (both layers, end to end)")
+
+        # ---- [registry #703] the sweep refuses to re-admit an UNADJUDICATED reviewer-vs-fixer
+        # DEADLOCK. Measured on sparq 2026-07-26: 27 parked PRs, whose park comments read
+        # either "the review round budget is exhausted at 3 round(s)" or "two consecutive fix
+        # attempts made no change (fixer judges the findings spurious)". Re-admitting those puts
+        # the SAME reviewer and SAME fixer at the SAME tier back on the SAME diff; the resulting
+        # second park is what advanced the ladder into review:needs-user at ~10 PRs/hour. ----
+        def bot_says(body):
+            return {"user": {"login": readmit_bot}, "body": body}
+
+        deadlock_prose = bot_says(
+            "> 🤖 SPARQ agent — the autonomous review loop parked this PR: the review round "
+            "budget is exhausted at 3 round(s) (base 3, hard cap 6) with no extension left")
+        spurious_prose = bot_says(
+            "> 🤖 SPARQ agent — the autonomous review loop parked this PR: two consecutive fix "
+            "attempts made no change (fixer judges the findings spurious)")
+        capacity_prose = bot_says(
+            "> 🤖 SPARQ agent — the autonomous review loop parked this PR: 6 consecutive fix "
+            "dispatches missed for round 2")
+
+        # CONTROL: an identical park with a genuine CAPACITY cause is still re-admitted, so the
+        # refusals below cannot be an artefact of the fixture (a fixture that satisfies both the
+        # right and the wrong reading proves nothing).
+        capacity_count, _posted, capacity_cleared = readmit_sweep(
+            recovered_window, comments=[capacity_prose])
+        assert capacity_count == 1 and capacity_cleared == [(41, 7)], (
+            capacity_count, capacity_cleared)
+        print("  ok   #703 CONTROL: a genuine dispatch-starvation park is STILL automatically "
+              "re-admitted on proven cause-recovery")
+
+        for label, park_comment in (("round-budget", deadlock_prose),
+                                    ("findings-spurious", spurious_prose)):
+            count, posted, cleared = readmit_sweep(
+                recovered_window, comments=[park_comment])
+            assert count == 0, (label, count)
+            assert posted == [] and cleared == [], (label, posted, cleared)
+            print(f"  ok   #703: the {label} DEADLOCK park is refused automatic re-admission "
+                  "(no receipt minted, no label cleared)")
+
+        # The refusal is LOUD and counted — a queue nobody can see is how a park with no exit
+        # becomes a silent stall, and a falling review:parked count was read as progress
+        # precisely because no counter expressed the composition.
+        deadlock_logs = []
+        _readmit_capacity_parks(
+            "example/repo", [[parked_row]], {7: ["status:in-progress-review"]},
+            {41: {"issue": 7}}, readmit_bot, Path("."), worker_pr_mod,
+            _capacity_recovery_probe(model_health_mod, recovered_window, readmit_now),
+            comments_fn=lambda _repo, _number: [deadlock_prose],
+            timeline_fn=lambda _repo, number: list(park_timeline.get(number, [])),
+            post_comment=lambda *_a: None, clear_labels=lambda *_a: None,
+            log=deadlock_logs.append)
+        assert any(line.startswith("::error::") and "UNADJUDICATED" in line and "#41" in line
+                   for line in deadlock_logs), deadlock_logs
+        print("  ok   #703: the refused deadlock is reported as ONE counted ::error:: naming "
+              "the PRs, so an adjudication lane that never runs cannot hide behind a green tick")
+
+        # A head-bound, INDEPENDENT adjudication releases it; a superseded head and a
+        # self-approving receipt do not.
+        live_head = parked_row["head"]["sha"]
+        adjudicated = bot_says(_park_policy.park_adjudication_marker(
+            "spurious", "opus5", ("sol", "fable"), live_head))
+        count, _posted, cleared = readmit_sweep(
+            recovered_window, comments=[deadlock_prose, adjudicated])
+        assert count == 1 and cleared == [(41, 7)], (count, cleared)
+        print("  ok   #703: a head-bound INDEPENDENT adjudication releases the deadlock park "
+              "for re-admission")
+
+        stale_adjudication = bot_says(_park_policy.park_adjudication_marker(
+            "spurious", "opus5", ("sol", "fable"), "c" * 40))
+        count, _posted, cleared = readmit_sweep(
+            recovered_window, comments=[deadlock_prose, stale_adjudication])
+        assert count == 0 and cleared == [], (count, cleared)
+        print("  ok   #703: an adjudication bound to a SUPERSEDED head never releases the "
+              "deadlock (a decision about an earlier tree says nothing about this one)")
+
+        self_approved = bot_says(
+            f"{_park_policy.PARK_ADJUDICATION_MARKER} decision=spurious by=sol "
+            f"against=sol,fable head={live_head} -->")
+        count, _posted, cleared = readmit_sweep(
+            recovered_window, comments=[deadlock_prose, self_approved])
+        assert count == 0 and cleared == [], (count, cleared)
+        print("  ok   #703: a SELF-APPROVING adjudication (the adjudicator is one of the "
+              "deadlocked parties, sparq#3803's shape) never releases the deadlock")
+
+        forged = {"user": {"login": "attacker"},
+                  "body": _park_policy.park_adjudication_marker(
+                      "spurious", "opus5", ("sol", "fable"), live_head)}
+        count, _posted, cleared = readmit_sweep(
+            recovered_window, comments=[deadlock_prose, forged])
+        assert count == 0 and cleared == [], (count, cleared)
+        print("  ok   #703: a NON-bot adjudication comment is not a receipt and never releases "
+              "the deadlock")
+
+        # A HUMAN gesture still overrides everything — the refusal narrows the MACHINE's own
+        # re-admission only.
+        human_gesture_timeline = {
+            41: list(park_timeline[41]),
+            7: [{"event": "unlabeled", "label": {"name": "status:parked"},
+                 "created_at": model_health_mod._iso_z(readmit_now - 60),
+                 "actor": {"login": "jeswr"}, "performed_via_github_app": None}],
+        }
+        human_logs = []
+        _readmit_capacity_parks(
+            "example/repo", [[parked_row]], {7: ["status:in-progress-review"]},
+            {41: {"issue": 7}}, readmit_bot, Path("."), worker_pr_mod,
+            _capacity_recovery_probe(model_health_mod, recovered_window, readmit_now),
+            comments_fn=lambda _repo, _number: [deadlock_prose],
+            timeline_fn=lambda _repo, number: list(human_gesture_timeline.get(number, [])),
+            post_comment=lambda *_a: None, clear_labels=lambda *_a: None,
+            log=human_logs.append)
+        # The sweep hands a proven human gesture to the CLAIM proof gate rather than re-admitting
+        # it itself, so the observable is that the deadlock refusal did NOT preempt the human
+        # branch (which capacity_park_admission evaluates FIRST, by design).
+        assert any("human readmission gesture is proven" in line for line in human_logs), \
+            human_logs
+        assert not any("UNADJUDICATED" in line for line in human_logs), human_logs
+        print("  ok   #703: a proven HUMAN readmission gesture is still honoured on a deadlock "
+              "park (the refusal narrows only the MACHINE's own re-admission)")
     finally:
         globals()["_target_is_human_maintainer"] = prev_target_probe
 

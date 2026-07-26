@@ -2944,7 +2944,7 @@ def stranded_recover(repo, pr_number, proven_head, issue=None):
 # ---- terminal escalation + arm --------------------------------------------------------------------
 def needs_user(repo, pr_number, reason, issue=None, alert_repo=None, alert_token=None,
                maintainer=None, park_class="question", bot_login="", head_sha="",
-               attempt_key=""):
+               attempt_key="", cause=""):
     """Loop stop: park labels on BOTH surfaces, an explanatory comment, and an ops-alert-style
     registry ping. The PR stays DRAFT.
 
@@ -2989,8 +2989,38 @@ def needs_user(repo, pr_number, reason, issue=None, alert_repo=None, alert_token
     consumes, driving the ladder to its question-class terminal minutes after the readmission
     and making the whole readmission mechanism (and any human unpark) inert — the live
     sparq #3488 / #3472 bounce. Omitting either component (unknown head, no counter) claims no
-    idempotence and behaves exactly as before."""
+    idempotence and behaves exactly as before.
+
+    `cause` (registry #703) is the park's MACHINE-READABLE stop reason from the closed
+    park_policy.PARK_CAUSES taxonomy. Until now the live writer recorded its cause in PROSE only
+    — park_reason_marker was written exclusively by the legacy migration — so every park this
+    function wrote arrived downstream unclassified and the re-admission could not tell a
+    reviewer-vs-fixer DEADLOCK apart from a capacity stall. The marker is emitted beside the
+    generation receipt in the SAME comment, under the same trust filter. An empty cause keeps the
+    pre-#703 behaviour exactly (prose only); a cause outside the taxonomy RAISES at the writer
+    rather than being written unparseable."""
     handle = maintainer or os.environ.get("MAINTAINER_HANDLE", "jeswr")
+    if cause:
+        # Validated ONCE, up front, and not merely where the marker is built: the capacity path
+        # returns early on freeze/dedupe/unchanged, so a drifted cause would otherwise sit
+        # undetected until the one tick that happens to reach the marker.
+        _cause_class = _park_policy().park_cause_class(cause)
+        if _cause_class is None:
+            raise WorkerPrError(
+                f"park cause {cause!r} is outside the closed park_policy.PARK_CAUSES taxonomy")
+        # registry #703, behaviour 4: `review:needs-user` must require a HUMAN-RELEVANT cause.
+        # A reviewer-vs-fixer deadlock is machine-decidable, so routing one into the human
+        # terminal is a category error — and it is the exact error that converted ~10 PRs/hour
+        # into permanent maintainer backlog. The QUESTION class is the human terminal, so a
+        # deadlock cause arriving with a non-capacity park_class is a caller bug and fails LOUD
+        # here rather than quietly parking a machine problem on the maintainer. (An adjudicator
+        # that genuinely cannot decide reports `undecidable`, a QUESTION-class cause, and that
+        # is the supported route to a human.)
+        if _park_policy().park_cause_is_deadlock(cause) and park_class != "capacity":
+            raise WorkerPrError(
+                f"park cause {cause!r} is a reviewer-vs-fixer deadlock and may not be written "
+                f"as a {park_class!r}-class park: the human terminal requires a human-relevant "
+                "cause (registry #703)")
     if park_class == "capacity":
         policy = _park_policy()
         probe = lambda login: _is_human_maintainer(repo, login)  # noqa: E731
@@ -3017,7 +3047,8 @@ def needs_user(repo, pr_number, reason, issue=None, alert_repo=None, alert_token
         action, window_key, generation = policy.park_ladder_decision(
             cutoff, receipts, fingerprint=fingerprint,
             consumed_fingerprints={record["fingerprint"] for record in records
-                                   if record["fingerprint"]})
+                                   if record["fingerprint"]},
+            cause=cause)
         if action == "freeze":
             print(f"capacity park frozen for {repo}#{pr_number}: the label timeline is "
                   "unreadable — no receipt, no label, no comment this run (the escalation "
@@ -3042,6 +3073,60 @@ def needs_user(repo, pr_number, reason, issue=None, alert_repo=None, alert_token
                              f"cutoff={window_key}"
                              f"{f' head={head_sha} attempt={attempt_key}' if fingerprint else ''}"
                              " -->")
+        if cause:
+            # Emitted for EVERY consumed window (park, await-adjudication and terminal alike),
+            # in the same comment as the generation receipt, so the classification and the
+            # accounting can never disagree about which window they describe. park_reason_marker
+            # DERIVES class= from the taxonomy, so a writer cannot mint `class=capacity
+            # cause=injection`.
+            generation_marker += "\n" + policy.park_reason_marker(
+                cause, generation=generation, head=head_sha or None)
+        if action == "await-adjudication":
+            # registry #703. The ladder would have escalated to the human terminal here, but the
+            # park's cause is a PROVEN reviewer-vs-fixer deadlock, and "the reviewer and the
+            # fixer disagreed" is not a question only a human can answer. The window is still
+            # CONSUMED and receipted (the accounting is unchanged and honest — this is not a
+            # free retry), the MACHINE-owned label stands, and the comment records that the stop
+            # is awaiting adjudication, which is different information from "not yet tried".
+            #
+            # This deliberately leaves the PR parked rather than handing it to the maintainer:
+            # measured on sparq 2026-07-26, the alternative converted ~10 PRs/hour into
+            # permanent maintainer backlog, each having burned two round budgets and six account
+            # leases, and none of them carried a question a human was better placed to answer.
+            parked = not policy.park_vetoed(repo, pr_number, MACHINE_PARK_PR_LABEL,
+                                            _issue_timeline, is_human=probe)
+            label_note = ("" if parked else
+                          "\n\nNOTE: the `review:parked` label write was SUPPRESSED by a "
+                          "standing human unlabel (sticky veto); this receipt records the "
+                          "consumed budget window without a label.")
+            _comment(repo, pr_number,
+                     f"> 🤖 SPARQ agent — the autonomous review loop parked this PR: {reason}\n\n"
+                     f"This is a **reviewer-vs-fixer deadlock** (cause `{cause}`), not a "
+                     f"capacity stall and not a human question: the loop ran, the reviewer kept "
+                     f"requesting changes or the fixer judged the findings spurious, and nobody "
+                     f"adjudicated. {generation} budget window(s) have been consumed. The "
+                     f"escalation to `review:needs-user` is deliberately WITHHELD (registry "
+                     f"#703) — an independent adjudicator, not the maintainer, is what this "
+                     f"needs. It stays a DRAFT, keeps `{MACHINE_PARK_PR_LABEL}`, and will NOT "
+                     f"be automatically re-admitted until an adjudication is recorded, because "
+                     f"re-running the same reviewer and the same fixer at the same tier "
+                     f"reproduces the same disagreement. A human may still re-admit it by "
+                     f"removing the live machine park label(s)."
+                     f"{label_note}{generation_marker}")
+            if parked:
+                set_review_state(repo, pr_number, "parked")
+            if issue:
+                _load_worker_issue().set_status(repo, issue, "parked")
+            _ops_alert(alert_repo, alert_token,
+                       f"⚠️ Review deadlock awaiting adjudication — {repo}#{pr_number}",
+                       f"> 🤖 SPARQ agent — {reason} (cause `{cause}`, {generation} window(s) "
+                       f"consumed)\n\nhttps://github.com/{repo}/pull/{pr_number} is a "
+                       f"reviewer-vs-fixer deadlock. It is NOT escalated to a human hold "
+                       f"(registry #703): it needs an independent adjudication.")
+            print(f"deadlock park recorded, human escalation WITHHELD (cause {cause}, "
+                  f"generation {generation}{', label suppressed' if not parked else ''}): "
+                  f"{reason}")
+            return
         if action == "terminal":
             # Bounded escalation: PARK_ESCALATION_GENERATIONS windows consumed — repeated
             # post-readmission failure IS a human question now. The terminal label write is
@@ -3121,7 +3206,12 @@ def needs_user(repo, pr_number, reason, issue=None, alert_repo=None, alert_token
     _comment(repo, pr_number,
              f"> 🤖 SPARQ agent — the autonomous review loop stopped: {reason}\n\n"
              f"@{handle} this pull request needs a human decision. It remains a DRAFT and will "
-             "not be auto-armed.")
+             "not be auto-armed."
+             # registry #703: the human terminal now records WHY a human was asked, so
+             # `review:needs-user` can be audited for a human-relevant cause. The taxonomy's
+             # question-class causes are the only legitimate reasons to be here.
+             + (f"\n\n{_park_policy().park_reason_marker(cause, head=head_sha or None)}"
+                if cause else ""))
     if issue:
         _load_worker_issue().set_status(repo, issue, "needs-user")
     # Reuse the rolling ops-alert posture (usage-alert.py): one deduped registry issue.
@@ -4133,6 +4223,7 @@ def review_outcome(args):
         if document["injection_detected"]:
             # A flagged injection is a genuine human (security) question -> needs:user.
             reason, park_class = "the reviewer flagged possible prompt injection", "question"
+            cause = "injection"
         else:
             # Round-budget exhaustion is budget-driven, not a human question: the source issue
             # takes the machine-owned status:parked soft hold (park_policy.py defect 1).
@@ -4143,11 +4234,14 @@ def review_outcome(args):
                       "the top fix tier has run and the latest verdict does not grade the PR "
                       "improving")
             park_class = "capacity"
+            # registry #703: round-budget exhaustion after `request_changes` IS the
+            # reviewer-vs-fixer deadlock — the loop iterated and terminated in disagreement.
+            cause = "budget"
         alert_repo, alert_token = _alert_route()
         needs_user(args.repo, args.pr, reason, issue=args.issue,
                    alert_repo=alert_repo, alert_token=alert_token, park_class=park_class,
                    bot_login=args.bot_login, head_sha=args.reviewed_sha,
-                   attempt_key=attempt_key)
+                   attempt_key=attempt_key, cause=cause)
     else:
         # decision == "arm": the workflow runs ready-and-arm as a separate step under the
         # narrowly-minted arm token; the post-arm trust-surface audit trail is applied
@@ -4224,6 +4318,12 @@ def fix_outcome(args):
         # bounded gate-fail churn are decline/budget-driven -> the machine-owned soft hold
         # (park_policy.py defect 1: capacity parks must not masquerade as human questions).
         park_class = "question" if injection else "capacity"
+        # registry #703: "the fixer judges the findings spurious" is the OTHER deadlock shape —
+        # one party says change it, the other says it should not be changed, and nobody decides.
+        # A repeated LOCAL GATE failure is not a deadlock: it is a mechanical failure with a
+        # machine cause, so it keeps the ordinary capacity ladder.
+        cause = ("injection" if injection else
+                 "nochange" if not made_changes else "gatefail")
         alert_repo, alert_token = _alert_route()
         # Attempt fingerprint (#555 recurrence gap): a no-change fix and a failed local gate
         # both leave the head WHERE IT WAS, so the head alone could never distinguish "the
@@ -4234,7 +4334,8 @@ def fix_outcome(args):
                    alert_repo=alert_repo, alert_token=alert_token, park_class=park_class,
                    bot_login=args.bot_login, head_sha=args.reviewed_sha,
                    attempt_key=(f"nochange{args.round}={nochange_runs}" if not made_changes
-                                else f"gatefail{args.round}={gatefail_runs}"))
+                                else f"gatefail{args.round}={gatefail_runs}"),
+                   cause=cause)
     else:
         print("fix outcome: staying in review:changes (retried next sweep tick)")
 
@@ -5553,7 +5654,11 @@ def _self_test():
             lambda repo, pr, state: wiring_calls.append(("state", state)))
         wiring_globals["needs_user"] = (
             lambda repo, pr, reason, **kwargs: wiring_calls.append(
-                ("needs-user", reason, kwargs.get("park_class", "question"))))
+                # registry #703: the CAUSE is captured too — a park whose cause the writer
+                # never supplies is unclassifiable downstream, and the deadlock guard silently
+                # degrades to the pre-#703 conveyor.
+                ("needs-user", reason, kwargs.get("park_class", "question"),
+                 kwargs.get("cause", ""))))
         wiring_globals["post_findings"] = (
             lambda repo, pr, vf, rn: wiring_calls.append(("findings", rn)))
         wiring_globals["record_model_pin"] = (
@@ -5611,6 +5716,9 @@ def _self_test():
             # takes the MACHINE-owned park, never the human-question label.
             check("budget exhaustion parks as capacity (status:parked), not a human question",
                   terminal[1][2], "capacity")
+            check("#703: budget exhaustion names the `budget` DEADLOCK cause, so the ladder "
+                  "can withhold the human escalation and the sweep can refuse re-admission",
+                  terminal[1][3], "budget")
             # An injection flag IS a genuine human (security) question -> needs:user.
             wiring_calls.clear()
             fake_state["comments"] = fable_fix
@@ -5626,6 +5734,9 @@ def _self_test():
             check("injection flag escalates as a human question (needs:user)",
                   [(entry[1], entry[2]) for entry in injection_calls],
                   [("the reviewer flagged possible prompt injection", "question")])
+            check("#703: the injection escalation names the `injection` cause, which is "
+                  "human-relevant and therefore legitimately terminal",
+                  [entry[3] for entry in injection_calls], ["injection"])
 
             # ---- round-budget human-readmission window (sparq#2804/PR#3442): a HUMAN
             # unlabeling needs:user restarts the budget, so the terminal opus5/stagnant
@@ -5910,6 +6021,109 @@ def _self_test():
                    bot_login=bot)
         check("(j) the receipted gen-2 terminal re-defers quietly — the loop TERMINATES",
               (park_route_calls, park_route_comments), ([], []))
+
+        # ---- [registry #703] a reviewer-vs-fixer DEADLOCK never reaches the human terminal.
+        # The (c)-(e) ladder run VERBATIM, once per cause, so the ONLY difference between the
+        # control and the subject is the cause string — a fixture that satisfied both the right
+        # and the wrong reading would show up as both runs agreeing. ----
+        def ladder_to_generation_two(cause):
+            """Run the real (c)/(e) sequence and return (gen1_calls, gen1_body,
+            gen2_calls, gen2_body). The 08:00 human unlabels are the sparq#2804 'keep trying'
+            era, so the gen-2 human-label writes are veto-suppressed exactly as in (e)."""
+            park_route_state["timelines"] = {
+                41: [unlabel("review:needs-user", "2026-07-23T08:00:00Z")],
+                7: [unlabel("needs:user", "2026-07-23T08:00:00Z")],
+            }
+            park_route_state["comments"] = []
+            park_route_calls.clear()
+            park_route_comments.clear()
+            needs_user("o/r", 41, "budget spent", issue=7, park_class="capacity",
+                       bot_login=bot, cause=cause)
+            gen1_calls, gen1_body = list(park_route_calls), park_route_comments[-1]
+            park_route_state["timelines"][41].append(
+                labeled("review:parked", "2026-07-23T08:30:00Z"))
+            park_route_state["timelines"][7].append(
+                labeled("status:parked", "2026-07-23T08:30:00Z"))
+            park_route_state["comments"] = [{"user": {"login": bot}, "body": gen1_body}]
+            park_route_state["timelines"][41].append(
+                unlabel("review:parked", "2026-07-23T09:00:00Z"))
+            park_route_calls.clear()
+            park_route_comments.clear()
+            needs_user("o/r", 41, "budget spent again", issue=7, park_class="capacity",
+                       bot_login=bot, cause=cause)
+            return gen1_calls, gen1_body, list(park_route_calls), park_route_comments[-1]
+
+        # CONTROL: a genuine capacity cause still escalates at gen 2, exactly as (e) asserts.
+        _c1_calls, _c1_body, control_calls, control_body = ladder_to_generation_two(
+            "dispatch-missed")
+        check("#703 CONTROL: a dispatch-starvation park STILL reaches the gen-2 human terminal",
+              control_calls, [("receipt",), ("issue-status-vetoed", 7, "needs-user")])
+        check("#703 CONTROL: and its terminal comment still asks the maintainer to decide",
+              "needs a human decision" in control_body, True)
+
+        for deadlock_cause in ("budget", "nochange"):
+            gen1_calls, gen1_body, gen2_calls, gen2_body = ladder_to_generation_two(
+                deadlock_cause)
+            check(f"#703: the gen-1 {deadlock_cause} park still lands, receipt first",
+                  gen1_calls,
+                  [("receipt",), ("pr-state", "parked"), ("issue-status", 7, "parked")])
+            check(f"#703: the {deadlock_cause} park records a machine-readable cause marker "
+                  "(before this, the live writer recorded its cause in PROSE only)",
+                  _park_policy().parse_park_reason(gen1_body),
+                  {"class": "capacity", "cause": deadlock_cause, "gen": "1", "head": None})
+            # The PR-side review:parked write is veto-suppressed here (the fresh 09:00 gesture
+            # was a human unlabel of that very label — the sticky veto, unchanged by #703), so
+            # the observable writes are the receipt and the issue-side machine park. What
+            # matters is what is ABSENT: neither surface receives the human terminal.
+            check(f"#703: at gen 2 the {deadlock_cause} DEADLOCK keeps the MACHINE park",
+                  gen2_calls, [("receipt",), ("issue-status", 7, "parked")])
+            check(f"#703: at gen 2 the {deadlock_cause} DEADLOCK writes the human terminal on "
+                  "NEITHER surface (this is the ~10 PRs/hour conveyor being cut)",
+                  [call for call in gen2_calls if "needs-user" in repr(call)], [])
+            check(f"#703: the gen-2 {deadlock_cause} comment is HONEST about the suppressed "
+                  "label write",
+                  "`review:parked` label write was SUPPRESSED" in gen2_body, True)
+            check(f"#703: the gen-2 {deadlock_cause} comment says the human escalation is "
+                  "WITHHELD, which is different information from 'not yet tried'",
+                  "escalation to `review:needs-user` is deliberately WITHHELD" in gen2_body,
+                  True)
+            check(f"#703: the gen-2 {deadlock_cause} comment never asks the maintainer to "
+                  "decide",
+                  "needs a human decision" in gen2_body, False)
+            check("#703: withholding the escalation still CONSUMES and receipts the window "
+                  "(this is not a free retry)",
+                  f"{PARK_GENERATION_MARKER} gen=2 cutoff=2026-07-23T09:00:00Z -->"
+                  in gen2_body, True)
+
+        # The human terminal requires a HUMAN-RELEVANT cause: a deadlock cause routed at the
+        # question class is a caller bug and must fail LOUD rather than quietly parking a
+        # machine-decidable disagreement on the maintainer.
+        for deadlock_cause in ("budget", "nochange"):
+            try:
+                needs_user("o/r", 41, "x", issue=7, park_class="question",
+                           bot_login=bot, cause=deadlock_cause)
+                check(f"#703: a {deadlock_cause} cause may not be written as a human question",
+                      "no error", "raised")
+            except WorkerPrError:
+                check(f"#703: a {deadlock_cause} cause may not be written as a human question",
+                      "raised", "raised")
+        for question_cause in ("injection", "undecidable", "premise-wrong"):
+            park_route_state["timelines"] = {}
+            park_route_calls.clear()
+            needs_user("o/r", 41, "x", issue=7, park_class="question", bot_login=bot,
+                       cause=question_cause)
+            check(f"#703: the human-relevant cause {question_cause!r} still reaches the human "
+                  "terminal",
+                  park_route_calls[0], ("pr-state", "needs-user"))
+        try:
+            needs_user("o/r", 41, "x", issue=7, park_class="capacity", bot_login=bot,
+                       cause="not-a-cause")
+            check("#703: a cause outside the closed taxonomy fails loud at the writer",
+                  "no error", "raised")
+        except WorkerPrError:
+            check("#703: a cause outside the closed taxonomy fails loud at the writer",
+                  "raised", "raised")
+
         # (i) an unreadable timeline FREEZES the ladder: no receipt, no label, no comment.
         def raising_park_timeline(_repo, _number):
             raise WorkerPrError("timeline unavailable")
@@ -8136,20 +8350,25 @@ def _self_test():
                 surface_path=[], issue=7, impl_provider="anthropic",
                 bot_login="sparq[bot]", run_key="9.1", reviewed_sha=reviewed_sha))
 
+    oc_park_kwargs = []
+
     def run_fix_outcome(labels=(), issue_labels=(), injection="false",
-                        reviewed_sha="b" * 40, **live_over):
+                        reviewed_sha="b" * 40, made_changes="true", pushed="true",
+                        gate_outcome="success", comments=(), **live_over):
         oc_calls.clear(); oc_outputs.clear(); oc_state.clear()
-        oc_state.update(labels=labels, issue_labels=issue_labels, **live_over)
+        oc_state.update(labels=labels, issue_labels=issue_labels,
+                        comments=list(comments), **live_over)
         fix_outcome(argparse.Namespace(
             repo="o/r", pr=41, round=1, run_key="9.1", bot_login="sparq[bot]",
-            injection=injection, made_changes="true", gate_outcome="success",
-            pushed="true", issue=7, model="", reviewed_sha=reviewed_sha))
+            injection=injection, made_changes=made_changes, gate_outcome=gate_outcome,
+            pushed=pushed, issue=7, model="", reviewed_sha=reviewed_sha))
 
     try:
         globals()["_gh_json"] = oc_gh_json
-        globals()["_paginated_comments"] = lambda repo, pr: []
+        globals()["_paginated_comments"] = lambda repo, pr: list(oc_state.get("comments", []))
         globals()["set_review_state"] = lambda repo, pr, s: oc_calls.append(f"state:{s}")
-        globals()["needs_user"] = lambda repo, pr, reason, **kw: oc_calls.append("needs-user")
+        globals()["needs_user"] = lambda repo, pr, reason, **kw: (
+            oc_calls.append("needs-user"), oc_park_kwargs.append(dict(kw)))[0]
         globals()["post_findings"] = lambda *a, **kw: oc_calls.append("post-findings")
         globals()["record_model_pin"] = lambda *a, **kw: oc_calls.append("model-pin")
         globals()["record_round_void"] = lambda *a, **kw: oc_calls.append("round-void")
@@ -8196,6 +8415,38 @@ def _self_test():
         run_fix_outcome(injection="true")
         check("unheld injection fix outcome still parks needs-user",
               (oc_calls, oc_outputs.get("decision")), (["needs-user"], "needs-user"))
+        check("#703: the injection fix park names the human-relevant `injection` cause",
+              oc_park_kwargs[-1].get("cause"), "injection")
+        # [registry #703] THE SECOND DEADLOCK SHAPE, driven through the REAL fix_outcome: two
+        # durable nochange markers for the same round is the exact live posture behind
+        # "two consecutive fix attempts made no change (fixer judges the findings spurious)".
+        nochange_markers = [
+            {"user": {"login": "sparq[bot]"}, "created_at": "2026-07-26T10:00:00Z",
+             "body": f"x {MARKER_KINDS['nochange']} round=1 run=9.1 -->"},
+            {"user": {"login": "sparq[bot]"}, "created_at": "2026-07-26T11:00:00Z",
+             "body": f"x {MARKER_KINDS['nochange']} round=1 run=9.0 -->"},
+        ]
+        run_fix_outcome(made_changes="false", pushed="false", comments=nochange_markers)
+        check("#703: two no-change fix attempts park the PR (unchanged behaviour)",
+              (oc_calls, oc_outputs.get("decision")), (["needs-user"], "needs-user"))
+        check("#703: and that park names the `nochange` DEADLOCK cause — the fixer judging "
+              "the findings spurious is a disagreement, not a capacity stall",
+              oc_park_kwargs[-1].get("cause"), "nochange")
+        check("#703: it is still written as a MACHINE park, never a human question",
+              oc_park_kwargs[-1].get("park_class"), "capacity")
+        # CONTROL: the gate-fail stop is a mechanical failure, NOT a deadlock, so it keeps the
+        # ordinary capacity ladder and its human escalation.
+        gatefail_markers = [
+            {"user": {"login": "sparq[bot]"}, "created_at": "2026-07-26T10:00:00Z",
+             "body": f"x {MARKER_KINDS['gatefail']} round=1 run=9.1 -->"},
+            {"user": {"login": "sparq[bot]"}, "created_at": "2026-07-26T11:00:00Z",
+             "body": f"x {MARKER_KINDS['gatefail']} round=1 run=9.0 -->"},
+        ]
+        run_fix_outcome(gate_outcome="failure", pushed="false", comments=gatefail_markers)
+        check("#703 CONTROL: a twice-failed local gate parks with the `gatefail` CAPACITY "
+              "cause, which still escalates on the ordinary ladder",
+              (oc_outputs.get("decision"), oc_park_kwargs[-1].get("cause")),
+              ("needs-user", "gatefail"))
 
         # ---- issue #156: the head advanced AFTER the review/fix resolved. Every REVIEW outcome
         # path DEFERS — no findings/label/state mutation, decision 'stale' — so stale findings can
@@ -8436,6 +8687,14 @@ def main():
     # just granted. Optional: omitting either claims no idempotence (pre-fix behaviour).
     nuser.add_argument("--head-sha", default="")
     nuser.add_argument("--attempt-key", default="")
+    # registry #703: the park's MACHINE-READABLE stop reason, from the closed
+    # park_policy.PARK_CAUSES taxonomy. Optional (an omitted cause keeps the pre-#703
+    # prose-only behaviour) but load-bearing when present: it is what lets the re-admission
+    # tell a reviewer-vs-fixer DEADLOCK apart from a capacity stall, and what stops a deadlock
+    # being escalated into the human terminal. `choices` is deliberately the taxonomy itself so
+    # a drifted caller fails at argparse rather than at the marker writer.
+    nuser.add_argument("--cause", default="",
+                       choices=("", *sorted(_park_policy().PARK_CAUSES)))
 
     dis = subparsers.add_parser("disarm", parents=[common])
     dis.add_argument("--when", choices=("mismatch", "always"), required=True)
@@ -8584,7 +8843,8 @@ def main():
             needs_user(args.repo, args.pr, args.reason, issue=args.issue,
                        alert_repo=alert_repo, alert_token=alert_token,
                        park_class=args.park_class, bot_login=args.bot_login,
-                       head_sha=args.head_sha, attempt_key=args.attempt_key)
+                       head_sha=args.head_sha, attempt_key=args.attempt_key,
+                       cause=args.cause)
         elif args.command == "disarm":
             disarm(args.repo, args.pr, args.when,
                    preserve_review_state=args.preserve_review_state)
