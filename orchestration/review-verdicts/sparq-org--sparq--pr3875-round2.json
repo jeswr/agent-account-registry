@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3875,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "dd2549176995cc09595e653bb13058cb185081fa",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 1's major finding is resolved honestly: the implementation and all associated documentation now explicitly mark the peer install, bundle bytes, and ratio as floating, non-reproducible, point-in-time, and non-canonical. Resolved package versions and hashes are consistently described as provenance rather than a reproducible recipe, and the envelope now emits `reproducible: false`. The absence/failure paths preserve an absent peer-byte column instead of fabricating a value, and the comparison clearly discloses both builtin stubbing and the SHACL capability mismatch. No blocker or major correctness, soundness, test-validity, or security issue remains in the supplied diff.",
+  "verdict": "approve"
+ }
+}
