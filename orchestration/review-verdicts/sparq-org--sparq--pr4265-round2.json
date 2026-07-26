@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4265,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "0fd11a23033b72a4d4b03a24a912aab531fafb83",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves both prior major findings. The paper now scopes the end-to-end constraint-shape evidence to ordered result IDs on the default pre-filter plan, and separately identifies the cost-layer forced-strategy test as the evidence for hit-and-score equivalence across both physical plans; it no longer claims byte-identical end-to-end serialization or a cross-product of shapes and strategies. The artifact statement is likewise narrowed to the enumerated headline values and boolean records, while explicitly acknowledging that prose, architectural, novelty, and answer-contract scoping claims remain review-checked and can drift. The revised exact-versus-approximate path distinction agrees with the implementation: filtered vec: requests use the complete-pool costed tie-break path, while the approximate over-fetch seam is not called by the rewrite. No hostile reviewer-directed instruction was detected in the diff.",
+  "verdict": "approve"
+ }
+}
