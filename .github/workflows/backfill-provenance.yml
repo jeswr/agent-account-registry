@@ -1,9 +1,13 @@
 # Manual recovery for worker PRs missing their registry provenance record — the #96 outage
 # population (worker succeeded, the provenance job's protected-master write failed) and any
 # pre-migration stragglers. Runs scripts/backfill-provenance.py, which reconstructs the
-# implementer identity ONLY from trusted run-log lines (the historical claim line, or the
-# failed provenance job's own env echo — job-prefix-anchored so model output can never forge
-# it) and writes records to the `ledger` data-plane branch. DRY RUN unless apply=true.
+# implementer identity ONLY from trusted run-log lines — the failed provenance job's own command
+# and env echoes (REQUIRED, and bound to this PR by `--pr` or `HEAD_BRANCH`), corroborated by the
+# claim job's lease line — job-prefix-anchored so model output can never forge it, and writes
+# records to the `ledger` data-plane branch. Both worker.yml invocation shapes are read (#712).
+# A PR it cannot resolve is reported with a SPECIFIC reason (log unreadable / no anchored source /
+# sources disagree / partial evidence / binding mismatch / author mismatch) and left fail-closed
+# invisible — the reasons are distinct because the responses are. DRY RUN unless apply=true.
 name: backfill-provenance
 run-name: backfill-provenance ${{ inputs.target_repo }} apply=${{ inputs.apply }}
 
