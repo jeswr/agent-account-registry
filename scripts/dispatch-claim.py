@@ -1004,23 +1004,45 @@ def busy_packages_of_pulls(repo, pulls, issue_labels, provenance, pr_status=None
     record whose source issue is absent from the open-issue map mirrors the enumerator,
     which still emits that PR as `__global__`.
 
-    HELD != INACTIVE (round-2 P1 on the 2026-07-18 frontier collapse, DRAFTS-ONLY since
-    round 3, listing-or-newer-detail coherent since #519): a human-parked PR —
-    `review:needs-user`/`needs:user` on the PR, or `needs:*` on the provenance-linked
-    source issue — frees its packages ONLY when it is a provably-inert DRAFT
-    (_pull_inactivity_decision: draft with no visible latch, CONFIRMED either by the
-    post-#517 listing's present explicit-null auto_merge field or by a head-matched newer
-    detail record whose own draft bit is True). EVERY parked NON-draft stays BUSY
-    unconditionally: groom parks stale non-draft PRs WITHOUT disarming, and non-draft
-    queue/arm state is not provable from an explicit-null REST latch alone because merge-queue
-    membership is GraphQL-only per worker-pr.py's own doctrine — a directly-queued PR shows no
-    REST latch — so an unprovable park could merge
-    mid-air into a crate this partition just freed for a sibling. The measured collapse
-    (26 of 27 open sparq worker PRs source-parked, ~1 plan item/tick against a 13-row
-    frontier, dispatch runs 29664401328/29665207000) is still fixed: the collapse
-    population is parked DRAFTS, and those free. The parked SOURCE issue itself stays
-    `needs:*`-gated out of the target ready engine, so freeing an inert PR's crate can
-    never re-dispatch the parked issue — only siblings in the same crate."""
+    A PARKED PR RESERVES NO CRATES [OPUS-5][issue #677, maintainer option (a)] — parking IS the
+    statement that the PR is not in flight, so a park frees its packages UNCONDITIONALLY,
+    at the moment the park is applied. Park surfaces are unchanged: `review:needs-user` /
+    `needs:user` / `review:parked` on the PR (plus `status:blocked` on CLAIM's live re-read),
+    or any `needs:*` on the provenance-linked source issue.
+
+    WHAT THIS REPLACED, AND WHY (read this before narrowing it again). Rounds 2-6 required
+    `parked AND provably-inert-DRAFT` (_pull_inactivity_decision below). That conjunct made
+    the release valve depend on a SECOND workflow having drafted the PR — and groom's defuse
+    phase selects only HUMAN holds (`needs:user` / `review:needs-user`), so a MACHINE
+    capacity park (`review:parked`, written non-draft by worker-pr needs_user
+    park_class="capacity") was never drafted, therefore never inactive, therefore never
+    released. Live outage 2026-07-25 (issue #677): sparq#3628, `review:parked` + non-draft +
+    bot-authored + 14h stale, held the serializing `__global__` partition and deferred EVERY
+    issue for hours at a ready frontier of 76 — `PLAN complete: 0 issue item(s)`. Parking the
+    holder just promoted the next one. A release valve that only opens when a different cron
+    gets round to it is not a release valve.
+
+    KNOWN COST, STATED PLAINLY (issue #677 asks the maintainer to weigh exactly this): the
+    dropped conjunct also carried the round-4/5/6 LATCH proof. A parked PR that still has
+    auto-merge latched — or is a merge-queue member, which is GraphQL-only and shows NO REST
+    latch (worker-pr.py _merge_queue_state, issue #69) — now frees its crate and can merge
+    mid-air into a package this partition just handed to a sibling. Neither park writer
+    disarms: worker-pr.needs_user only assumes "it remains a DRAFT", and groom's age-park
+    labels stale NON-draft PRs without touching the latch. The remaining guards are the
+    cross-lane LEASE partition in filter_busy_area_items / sibling_lease_conflict (a live
+    impl/review/fix lease still reserves the package, and an absent ledger fails closed) and
+    enumerate_disarm_items (which retracts an armed-SHA-mismatched latch even on held PRs).
+    Those cover an actively-running lane; they do NOT cover a latched park whose lease has
+    already expired. _pull_inactivity_decision is therefore still CALLED and its reason is
+    recorded on the parked-free occupancy row (and printed by the CLAIM free log) so the
+    posture that was released — `latched`, `non-draft`, `listing`, ... — stays visible in
+    the diagnostics; it simply no longer gates the release.
+
+    The measured 2026-07-18 collapse (26 of 27 open sparq worker PRs source-parked, ~1 plan
+    item/tick against a 13-row frontier, dispatch runs 29664401328/29665207000) stays fixed a
+    fortiori. The parked SOURCE issue itself stays `needs:*`-gated out of the target ready
+    engine, so freeing a parked PR's crate can never re-dispatch the parked issue — only
+    siblings in the same crate."""
     busy = set()
     hold_labels = (PARKED_PR_HOLD_LABELS if parked_pr_labels is None
                    else set(parked_pr_labels))
@@ -1058,14 +1080,19 @@ def busy_packages_of_pulls(repo, pulls, issue_labels, provenance, pr_status=None
             areas |= {GLOBAL_PACKAGE}      # missing/invalid linkage — fail closed
         status = (pr_status[number]
                   if isinstance(pr_status, dict) and number in pr_status else _NO_PR_DETAIL)
-        inactive, reason = _pull_inactivity_decision(pull, status)
-        if parked and inactive:
+        # [issue #677] The inactivity decision is still computed, but ONLY for its reason
+        # string: it is the diagnostic that names the posture a park released (`latched`,
+        # `non-draft`, `listing`, `detail`, ...) on the parked-free occupancy row. The
+        # boolean deliberately no longer gates the release — see the docstring's KNOWN COST.
+        _inactive, reason = _pull_inactivity_decision(pull, status)
+        if parked:
             if isinstance(occupancy, list):
                 occupancy.append(("parked-free", number, frozenset(areas), reason))
-            continue                      # provably inert human-parked PR — frees its crates
+            continue                      # a parked PR reserves no crates (issue #677)
+        # Only UNPARKED PRs reach here, so the busy reason is the constant it always was for
+        # them; the string is unchanged for every row that still reserves.
         if isinstance(occupancy, list):
-            occupancy.append(("busy", number, frozenset(areas),
-                              reason if parked else "not-parked"))
+            occupancy.append(("busy", number, frozenset(areas), "not-parked"))
         busy |= areas
     return busy
 
@@ -1175,10 +1202,15 @@ def revalidate_items_against_live_pulls(items, repo, pull_pages, issue_labels, p
         repo, rows, issue_labels, provenance, live_status,
         parked_pr_labels=CLAIM_REVALIDATION_PARK_LABELS, occupancy=occupancy)
 
-    for decision, pr_number, packages, _reason in occupancy:
+    for decision, pr_number, packages, reason in occupancy:
         if decision == "parked-free":
             for package in sorted(packages):
-                print(f"claim-revalidation free: crate {package} freed via parked pr#{pr_number}")
+                # [issue #677] The trailing posture is the _pull_inactivity_decision reason for
+                # the SAME row that was released. It no longer gates the release, so printing it
+                # is the only remaining way to see WHAT was let go — in particular a `latched`
+                # or `non-draft` park, the postures rounds 4-6 used to hold busy.
+                print(f"claim-revalidation free: crate {package} freed via parked "
+                      f"pr#{pr_number} [{reason}]")
 
     dispatchable = set()
     for item in items:
@@ -7710,18 +7742,17 @@ def _self_test():
                               labels=["needs:user", "area:crate-d"])],
         collapse_labels, busy_prov, {78: confirmed_draft()}, leases=[], now=now) == frontier
 
-    # ---- [round-3 P1, drafts-only] HELD != INACTIVE: a human-parked PR frees its crates
-    # ONLY when it is a provably-inert DRAFT. Round 2 also freed a parked NON-draft on an
-    # explicit `auto_merge: null` listing read — unsound twice over (round-3 P1s):
-    # (1) the PLAN snapshot projection DROPS auto_merge, so that branch was UNREACHABLE in
-    # production and its fixtures were synthetic; (2) REST `auto_merge: null` cannot prove
-    # a non-draft inert anyway — merge-queue membership is GraphQL-only (worker-pr.py
-    # _merge_queue_state, issue #69: a directly-queued PR shows NO REST latch).
+    # ---- [issue #677] A PARKED PR RESERVES NO CRATES. Supersedes the rounds-2-6
+    # `parked AND provably-inert-DRAFT` conjunct: the drafting half depended on groom's
+    # defuse phase, which selects HUMAN holds only, so a MACHINE `review:parked` PR was
+    # never drafted and never released (live outage sparq#3628 -> 0 plan items for hours).
+    # The `_pull_inactivity_decision` postures below are now DIAGNOSTIC (they name what a
+    # park released) rather than gating; the predicate keeps its own unit assertions, and
+    # the busy side keeps every unparked fixture exactly as rounds 2-6 pinned it.
     # SNAPSHOT-SHAPE PARITY: the fixtures below are built in the workflow's EXACT
     # field-selected row shape, with the projection key set read from dispatch.yml itself
     # so fixture and projection cannot silently drift apart again. Rows carrying a
-    # synthetic latch field are explicitly labeled as such and exist to prove a non-draft
-    # stays busy EVEN IF a latch field were present. ----
+    # synthetic latch field are explicitly labeled as such. ----
     workflow = (Path(__file__).resolve().parent.parent
                 / ".github" / "workflows" / "dispatch.yml").read_text(encoding="utf-8")
     projection = re.search(r"pr_snapshot\.append\(\{\n(.*?)\n\s*\}\)", workflow, re.DOTALL)
@@ -7827,157 +7858,241 @@ def _self_test():
                                  labels=["review:needs-user"]), **synthetic)
 
     latched = {"enabled_by": {"login": bot}, "merge_method": "squash"}
-    # parked DRAFT with a coherent confirming detail — the production frontier-collapse
-    # population (26/27 open sparq worker PRs on 2026-07-18): provably inert, frees its
-    # crate. A present detail remains the authoritative read (see the split-race block below).
-    assert busy_packages_of_pulls(repo, [parked_draft()], collapse_labels,
-                                  busy_prov, {76: confirmed_draft()}) == set()
+
+    def partition(rows, status=None, labels=None):
+        """(busy set, [(decision, pr, posture)]) — the crates reserved AND the occupancy
+        decision that reserved or released each row. Asserting BOTH is what keeps
+        _pull_inactivity_decision non-vacuous now that its boolean no longer gates the
+        release: its reason is the recorded posture, so a mutation inside it still goes red
+        here even though the free/busy split above it reads only `parked` (issue #677)."""
+        occ = []
+        reserved = busy_packages_of_pulls(repo, rows, collapse_labels if labels is None
+                                          else labels, busy_prov, status, occupancy=occ)
+        return reserved, [(decision, number, posture)
+                          for decision, number, _packages, posture in occ]
+
+    # ---- [issue #677] (a) THE INVARIANT: a parked PR reserves no crates, in EVERY posture
+    # rounds 2-6 enumerated. Each row below names the posture that was released, which is
+    # the _pull_inactivity_decision reason for that same row. ----
+    # parked DRAFT with a coherent confirming detail — the 2026-07-18 frontier-collapse
+    # population (26/27 open sparq worker PRs): freed then, freed now.
+    assert partition([parked_draft()], {76: confirmed_draft()}) == \
+        (set(), [("parked-free", 76, "detail")])
     # ... and the SAME confirmation in the production record shape end-to-end: a raw
     # plan-snapshot detail record interpreted by pr_ci_status carries the draft bit.
-    assert busy_packages_of_pulls(
-        repo, [parked_draft()], collapse_labels, busy_prov,
-        {76: pr_ci_status({"head_sha": sha_a, "mergeable": True, "auto_merge": None,
-                           "draft": True, "check_runs": []})}) == set()
-    # parked DRAFT whose fresher PLAN detail record says the arm is still latched: a
-    # crashed-disarm artifact — busy despite the listing's explicit-null latch signal
-    assert busy_packages_of_pulls(repo, [parked_draft()], collapse_labels, busy_prov,
-                                  {76: {"head_sha": sha_a, "armed": True}}) == {"crate-b"}
-    # ---- [round-4 P1] SPLIT-SNAPSHOT RACE: the pulls LISTING (draft bit) predates the
-    # per-PR detail read; a draft that flipped ready(->queued) between the two reads
-    # presents as stale listing draft=True + a newer unlatched detail. The carve-out
-    # frees on a coherent, head-matched DETAIL when one exists. Every incoherent present
-    # detail below stays BUSY (fail closed); only an entirely absent detail may fall back to
-    # the post-#517 listing row's atomic draft:true + present auto_merge:null proof. ----
+    assert partition([parked_draft()],
+                     {76: pr_ci_status({"head_sha": sha_a, "mergeable": True,
+                                        "auto_merge": None, "draft": True,
+                                        "check_runs": []})}) == \
+        (set(), [("parked-free", 76, "detail")])
+    # parked DRAFT whose fresher PLAN detail says the arm is STILL LATCHED. Rounds 4-6 held
+    # this busy (a crashed-disarm artifact that could merge mid-air). Under #677 the park
+    # alone frees it and the released posture is named `latched` — this assertion IS the
+    # residual-risk surface the issue asks the maintainer to weigh, kept explicit rather
+    # than deleted, so narrowing the rule back to `parked and not latched` flips exactly here.
+    assert partition([parked_draft()], {76: {"head_sha": sha_a, "armed": True}}) == \
+        (set(), [("parked-free", 76, "latched")])
+    # ---- [round-4 P1] SPLIT-SNAPSHOT RACE fixtures: the pulls LISTING (draft bit) predates
+    # the per-PR detail read. The postures the coherence guard distinguishes are unchanged
+    # and still pinned one by one; what changed is that a PARKED row frees in all of them. ----
     # (a) detail record entirely ABSENT (pre-detail snapshot skip / census overflow): the
-    #     complete post-#517 listing is sufficient, in both no-map and empty-map call shapes
-    assert busy_packages_of_pulls(repo, [parked_draft()], collapse_labels,
-                                  busy_prov) == set()
-    assert busy_packages_of_pulls(repo, [parked_draft()], collapse_labels,
-                                  busy_prov, {}) == set()
-    print("  ok   issue-519 tripwire (a): parked listing draft+null frees without detail")
-    # (b) newer detail is NON-DRAFT-shaped (draft went ready in the window — the exact
-    #     race): busy, in the hand-rolled AND the production pr_ci_status record shape
-    assert busy_packages_of_pulls(
-        repo, [parked_draft()], collapse_labels, busy_prov,
-        {76: {"head_sha": sha_a, "armed": False, "draft": False}}) == {"crate-b"}
-    assert busy_packages_of_pulls(
-        repo, [parked_draft()], collapse_labels, busy_prov,
-        {76: pr_ci_status({"head_sha": sha_a, "mergeable": True, "auto_merge": None,
-                           "draft": False, "check_runs": []})}) == {"crate-b"}
-    # (c) detail's draft field ABSENT (the pre-round-4 record shape): proves nothing — busy
-    assert busy_packages_of_pulls(
-        repo, [parked_draft()], collapse_labels, busy_prov,
-        {76: {"head_sha": sha_a, "armed": False}}) == {"crate-b"}
-    assert busy_packages_of_pulls(
-        repo, [parked_draft()], collapse_labels, busy_prov,
-        {76: pr_ci_status({"head_sha": sha_a, "mergeable": True, "auto_merge": None,
-                           "check_runs": []})}) == {"crate-b"}
+    #     complete post-#517 listing supplies the posture, in no-map and empty-map shapes
+    assert partition([parked_draft()]) == (set(), [("parked-free", 76, "listing")])
+    assert partition([parked_draft()], {}) == (set(), [("parked-free", 76, "listing")])
+    print("  ok   issue-519 tripwire (a): parked listing draft+null posture is `listing`")
+    # (b) newer detail is NON-DRAFT-shaped (draft went ready in the window), hand-rolled AND
+    #     in the production pr_ci_status record shape
+    assert partition([parked_draft()],
+                     {76: {"head_sha": sha_a, "armed": False, "draft": False}}) == \
+        (set(), [("parked-free", 76, "non-draft")])
+    assert partition([parked_draft()],
+                     {76: pr_ci_status({"head_sha": sha_a, "mergeable": True,
+                                        "auto_merge": None, "draft": False,
+                                        "check_runs": []})}) == \
+        (set(), [("parked-free", 76, "non-draft")])
+    # (c) detail's draft field ABSENT (the pre-round-4 record shape): proves nothing
+    assert partition([parked_draft()], {76: {"head_sha": sha_a, "armed": False}}) == \
+        (set(), [("parked-free", 76, "malformed-draft")])
+    assert partition([parked_draft()],
+                     {76: pr_ci_status({"head_sha": sha_a, "mergeable": True,
+                                        "auto_merge": None, "check_runs": []})}) == \
+        (set(), [("parked-free", 76, "malformed-draft")])
     # (d) HEAD-MISMATCHED detail (the head moved between the reads: the listing row —
-    #     including its draft bit — is stale): busy even though the detail says draft
-    assert busy_packages_of_pulls(
-        repo, [parked_draft()], collapse_labels, busy_prov,
-        {76: confirmed_draft(sha_b)}) == {"crate-b"}
-    # (e) unknown/garbage arm bit on an otherwise-confirming detail: busy (only an
-    #     explicit armed=False frees; absent is unknown, never inert)
-    assert busy_packages_of_pulls(
-        repo, [parked_draft()], collapse_labels, busy_prov,
-        {76: {"head_sha": sha_a, "draft": True}}) == {"crate-b"}
-    assert busy_packages_of_pulls(
-        repo, [parked_draft()], collapse_labels, busy_prov,
-        {76: {"head_sha": sha_a, "armed": None, "draft": True}}) == {"crate-b"}
-    # [round-5 P2] the production record shape end-to-end: a GARBAGE auto_merge string in
-    # the raw detail is UNKNOWN through pr_ci_status (armed=None), so the parked draft
-    # stays BUSY — the old isinstance read collapsed it to unarmed and FREED the crate
-    assert busy_packages_of_pulls(
-        repo, [parked_draft()], collapse_labels, busy_prov,
-        {76: pr_ci_status({"head_sha": sha_a, "mergeable": True, "auto_merge": "garbage",
-                           "draft": True, "check_runs": []})}) == {"crate-b"}
-    # [round-6 P2] ABSENCE != NULL end-to-end: a detail with a matching head and a
-    # confirming draft:true but NO auto_merge field AT ALL must NOT prove the PR inactive —
-    # armed reads UNKNOWN through pr_ci_status and the parked draft stays BUSY (the old
-    # detail.get() plumbing collapsed absence to explicit-null=unarmed and freed the crate)
-    assert busy_packages_of_pulls(
-        repo, [parked_draft()], collapse_labels, busy_prov,
-        {76: pr_ci_status({"head_sha": sha_a, "mergeable": True, "draft": True,
-                           "check_runs": []})}) == {"crate-b"}
-    # ... while the EXPLICIT-null + draft-coherent detail still frees (the carve-out's
-    # one legitimate free path is unchanged by the presence-preservation)
-    assert busy_packages_of_pulls(
-        repo, [parked_draft()], collapse_labels, busy_prov,
-        {76: pr_ci_status({"head_sha": sha_a, "mergeable": True, "auto_merge": None,
-                           "draft": True, "check_runs": []})}) == set()
-    # A present malformed DETAIL is authoritative too: it cannot fall back to the friendly row.
-    assert busy_packages_of_pulls(repo, [parked_draft()], collapse_labels,
-                                  busy_prov, {76: None}) == {"crate-b"}
-    print("  ok   issue-519 tripwire (b): latched detail overrides parked listing")
-    # parked DRAFT with a latched listing: same crashed-disarm artifact — busy
-    assert busy_packages_of_pulls(repo, [parked_draft(auto_merge=latched)],
-                                  collapse_labels, busy_prov) == {"crate-b"}
-    # [round-6] the pre-#517 listing shape has no auto_merge KEY. Even with draft:true it
-    # cannot use the listing fallback: ABSENCE != NULL, and with no detail the reason is loud.
+    #     including its draft bit — is stale)
+    assert partition([parked_draft()], {76: confirmed_draft(sha_b)}) == \
+        (set(), [("parked-free", 76, "head-mismatch")])
+    # (e) unknown/garbage arm bit on an otherwise-confirming detail (absent is UNKNOWN, and
+    #     unknown is still never mistaken for unarmed — the tri-state read is intact)
+    assert partition([parked_draft()], {76: {"head_sha": sha_a, "draft": True}}) == \
+        (set(), [("parked-free", 76, "malformed-auto-merge")])
+    assert partition([parked_draft()],
+                     {76: {"head_sha": sha_a, "armed": None, "draft": True}}) == \
+        (set(), [("parked-free", 76, "malformed-auto-merge")])
+    # [round-5 P2] production record shape end-to-end: a GARBAGE auto_merge string is UNKNOWN
+    # through pr_ci_status (armed=None), never collapsed to unarmed
+    assert partition([parked_draft()],
+                     {76: pr_ci_status({"head_sha": sha_a, "mergeable": True,
+                                        "auto_merge": "garbage", "draft": True,
+                                        "check_runs": []})}) == \
+        (set(), [("parked-free", 76, "malformed-auto-merge")])
+    # [round-6 P2] ABSENCE != NULL end-to-end: a matching head + draft:true but NO auto_merge
+    # field at all reads UNKNOWN, not explicit-null
+    assert partition([parked_draft()],
+                     {76: pr_ci_status({"head_sha": sha_a, "mergeable": True, "draft": True,
+                                        "check_runs": []})}) == \
+        (set(), [("parked-free", 76, "malformed-auto-merge")])
+    # A present malformed DETAIL is authoritative too: it never falls back to the friendly row.
+    assert partition([parked_draft()], {76: None}) == \
+        (set(), [("parked-free", 76, "malformed-detail")])
+    print("  ok   issue-519 tripwire (b): every incoherent detail posture is still named")
+    # parked DRAFT with a latched LISTING: the listing-side latch read is intact
+    assert partition([parked_draft(auto_merge=latched)]) == \
+        (set(), [("parked-free", 76, "latched")])
+    # [round-6] the pre-#517 listing shape has no auto_merge KEY: ABSENCE != NULL, and with
+    # no detail the posture is loud. The predicate itself is asserted directly here.
     legacy_parked = {key: value for key, value in parked_draft().items()
                      if key != "auto_merge"}
-    assert busy_packages_of_pulls(repo, [legacy_parked], collapse_labels,
-                                  busy_prov) == {"crate-b"}
+    assert partition([legacy_parked]) == (set(), [("parked-free", 76, "no-detail")])
     assert _pull_inactivity_decision(legacy_parked) == (False, "no-detail")
-    print("  ok   issue-519 tripwire (c): absent listing auto_merge key stays busy")
-    # malformed listing latch/draft fields also fail closed instead of collapsing into null
-    assert busy_packages_of_pulls(repo, [parked_draft(auto_merge="yes")], collapse_labels,
-                                  busy_prov) == {"crate-b"}
-    assert busy_packages_of_pulls(repo, [parked_draft(auto_merge="yes")], collapse_labels,
-                                  busy_prov, {76: confirmed_draft()}) == {"crate-b"}
-    assert busy_packages_of_pulls(repo, [parked_draft(draft=None)], collapse_labels,
-                                  busy_prov) == {"crate-b"}
-    # parked NON-draft in the production row shape: busy
-    assert busy_packages_of_pulls(repo, [parked_ready()],
-                                  collapse_labels, busy_prov) == {"crate-b"}
-    # parked NON-draft with a synthetic latch field — armed, explicitly-null, garbage:
-    # ALL busy (round 2 freed the null one; non-draft is now unconditional)
-    assert busy_packages_of_pulls(repo, [parked_ready(auto_merge=latched)],
-                                  collapse_labels, busy_prov) == {"crate-b"}
-    assert busy_packages_of_pulls(repo, [parked_ready(auto_merge=None)],
-                                  collapse_labels, busy_prov) == {"crate-b"}
-    assert busy_packages_of_pulls(repo, [parked_ready(auto_merge="yes")],
-                                  collapse_labels, busy_prov) == {"crate-b"}
+    print("  ok   issue-519 tripwire (c): absent listing auto_merge key posture is `no-detail`")
+    # malformed listing latch/draft fields never collapse into null
+    assert partition([parked_draft(auto_merge="yes")]) == \
+        (set(), [("parked-free", 76, "malformed-auto-merge")])
+    assert partition([parked_draft(auto_merge="yes")], {76: confirmed_draft()}) == \
+        (set(), [("parked-free", 76, "malformed-auto-merge")])
+    assert partition([parked_draft(draft=None)]) == \
+        (set(), [("parked-free", 76, "malformed-draft")])
+    # ---- THE #677 WEDGE ITSELF: a parked NON-DRAFT. Every row below was BUSY before this
+    # change, and every one of them is the shape that starved the scheduler. ----
+    assert partition([parked_ready()]) == (set(), [("parked-free", 76, "non-draft")])
+    # parked NON-draft with a synthetic latch field — armed, explicitly-null, garbage
+    assert partition([parked_ready(auto_merge=latched)]) == \
+        (set(), [("parked-free", 76, "non-draft")])
+    assert partition([parked_ready(auto_merge=None)]) == \
+        (set(), [("parked-free", 76, "non-draft")])
+    assert partition([parked_ready(auto_merge="yes")]) == \
+        (set(), [("parked-free", 76, "non-draft")])
     # directly-queued-shaped NON-draft: NO REST latch visible ANYWHERE — synthetic
-    # auto_merge:null AND an agreeing unarmed detail record, exactly how a merge-queue
-    # member can present over REST (membership is GraphQL-only): busy
-    assert busy_packages_of_pulls(repo, [parked_ready(auto_merge=None)], collapse_labels,
-                                  busy_prov,
-                                  {76: {"head_sha": sha_a, "armed": False}}) == {"crate-b"}
-    # unknown DRAFT state (the projection carries the key; the API returned garbage): busy
-    assert busy_packages_of_pulls(repo, [parked_ready(draft=None)], collapse_labels,
-                                  busy_prov) == {"crate-b"}
-    # A draft with no park surface remains review-loop-owned and therefore busy.
+    # auto_merge:null AND an agreeing unarmed detail, exactly how a merge-queue member can
+    # present over REST (membership is GraphQL-only). Rounds 3-6 held this busy for that
+    # reason; #677 frees it, and this row is the second half of the stated residual risk.
+    assert partition([parked_ready(auto_merge=None)],
+                     {76: {"head_sha": sha_a, "armed": False}}) == \
+        (set(), [("parked-free", 76, "non-draft")])
+    # unknown DRAFT state (the projection carries the key; the API returned garbage)
+    assert partition([parked_ready(draft=None)]) == \
+        (set(), [("parked-free", 76, "malformed-draft")])
+    # ---- THE OTHER HALF OF THE INVARIANT, and the guard against over-reading it: an
+    # UNPARKED PR still reserves its crates in EVERY posture, inert-looking or not. Deleting
+    # the `parked` test (freeing on inactivity alone, or unconditionally) goes red here. ----
     unparked_draft = snapshot_row(76, "sparq-agent/issue-81-1-1", draft=True,
                                   labels=["review:needs"])
-    assert busy_packages_of_pulls(repo, [unparked_draft], collapse_labels,
-                                  busy_prov) == {"crate-b"}
-    print("  ok   issue-519 tripwire (d): non-parked draft stays busy")
+    # a provably-INERT unparked draft (draft + explicit-null latch) is still review-loop-owned
+    assert partition([unparked_draft]) == ({"crate-b"}, [("busy", 76, "not-parked")])
+    assert partition([unparked_draft], {76: confirmed_draft()}) == \
+        ({"crate-b"}, [("busy", 76, "not-parked")])
+    # ... as is an unparked NON-draft, latched or not
+    assert partition([snapshot_row(76, "sparq-agent/issue-81-1-1", draft=False,
+                                   labels=["review:needs"])]) == \
+        ({"crate-b"}, [("busy", 76, "not-parked")])
+    assert partition([dict(snapshot_row(76, "sparq-agent/issue-81-1-1", draft=False,
+                                        labels=["review:needs"]), auto_merge=latched)]) == \
+        ({"crate-b"}, [("busy", 76, "not-parked")])
+    print("  ok   issue-519 tripwire (d): non-parked PRs stay busy in every posture")
 
-    # The assembler consumes the reason from the SAME decision that reserved the crate.
+    # The assembler names the artifact and the gate reason from the SAME occupancy decision
+    # that reserved the crate. Only UNPARKED rows reserve now, so `not-parked` is the reason
+    # a deferred row carries — byte-identical to what an unparked row always printed.
     assembler_output = io.StringIO()
     with contextlib.redirect_stdout(assembler_output):
         assembler_kept = filter_busy_area_items(
-            [frontier[1]], repo, [parked_draft()], collapse_labels, busy_prov,
+            [frontier[1]], repo, [unparked_draft], collapse_labels, busy_prov,
             {76: {"head_sha": sha_a, "armed": True}}, leases=[], now=now)
     expected_assembler_log = \
-        "assembler defer #71: crate crate-b busy via pr#76 [latched]"
+        "assembler defer #71: crate crate-b busy via pr#76 [not-parked]"
     assert assembler_kept == [], assembler_kept
     assert assembler_output.getvalue().splitlines() == [expected_assembler_log], \
         assembler_output.getvalue()
+    # ... and the PARKED twin of that very row is NOT deferred at all (no log line, item kept)
+    parked_assembler_output = io.StringIO()
+    with contextlib.redirect_stdout(parked_assembler_output):
+        parked_assembler_kept = filter_busy_area_items(
+            [frontier[1]], repo, [parked_draft()], collapse_labels, busy_prov,
+            {76: {"head_sha": sha_a, "armed": True}}, leases=[], now=now)
+    assert parked_assembler_kept == [frontier[1]], parked_assembler_kept
+    assert parked_assembler_output.getvalue() == "", parked_assembler_output.getvalue()
     print("  ok   issue-519 tripwire (e): assembler defer names artifact and gate reason")
-    # source-issue parks compose the same way: issue 80 is needs:user-parked; its
-    # NON-draft worker PR still reserves crate-a...
+
+    # ---- [OPUS-5][issue #677] THE LIVE WEDGE, END TO END. Reproduction of sparq#3628 as it
+    # presented on 2026-07-25: MACHINE-parked via `review:parked`, NON-draft, bot-authored,
+    # stale, provenance-linked to a source issue carrying NO `area:*` label — so it reserved
+    # the SERIALIZING `__global__` partition and every issue in the repo deferred against it
+    # regardless of its own crate (`PLAN complete: 0 issue item(s)` for hours at a ready
+    # frontier of 76). Nothing could ever release it: groom's defuse selects HUMAN holds only,
+    # so `review:parked` was never drafted, therefore never inactive, therefore never freed.
+    #
+    # INVARIANT: a parked PR reserves no crates. The three mutations this pins:
+    #   * restore `parked and inactive`   -> wedged() reserves __global__ again -> red here
+    #   * release on `inactive` alone     -> unwedged() (unparked) frees        -> red here
+    #   * release unconditionally         -> unwedged() (unparked) frees        -> red here
+    arealess_labels = {**collapse_labels, 88: ["role:impl"]}   # source issue, NO area:*
+    wedge_prov = {**busy_prov, 3628: busy_record(3628, 88)}
+
+    def wedge_row(*, parked=True, draft=False):
+        return snapshot_row(3628, "sparq-agent/issue-88-1-1", draft=draft,
+                            labels=["trust-surface"] + (["review:parked"] if parked else
+                                                        ["review:needs"]))
+
+    wedge_occupancy = []
+    assert busy_packages_of_pulls(repo, [wedge_row()], arealess_labels, wedge_prov,
+                                  occupancy=wedge_occupancy) == set()
+    assert wedge_occupancy == \
+        [("parked-free", 3628, frozenset({GLOBAL_PACKAGE}), "non-draft")], wedge_occupancy
+    # the whole 4-crate frontier survives — pre-#677 this collapsed to [] on `__global__`
+    wedge_output = io.StringIO()
+    with contextlib.redirect_stdout(wedge_output):
+        wedge_kept = filter_busy_area_items(frontier, repo, [wedge_row()], arealess_labels,
+                                            wedge_prov, leases=[], now=now)
+    assert wedge_kept == frontier, wedge_kept
+    assert wedge_output.getvalue() == "", wedge_output.getvalue()
+    # ... and CLAIM's live re-read agrees (both sides of the PLAN->CLAIM window)
+    assert revalidate_items_against_live_pulls(
+        frontier, repo, [[dict(wedge_row(), auto_merge=None)]], arealess_labels,
+        wedge_prov, leases=[], now=now) == {70, 71, 72, 73}
+    # THE PARK IS LOAD-BEARING: strip `review:parked` from the identical row and the
+    # serializing partition re-collapses the whole frontier, naming the artifact.
+    unwedge_output = io.StringIO()
+    with contextlib.redirect_stdout(unwedge_output):
+        unwedge_kept = filter_busy_area_items(frontier, repo, [wedge_row(parked=False)],
+                                              arealess_labels, wedge_prov, leases=[], now=now)
+    assert unwedge_kept == [], unwedge_kept
+    assert unwedge_output.getvalue().splitlines() == [
+        f"assembler defer #{item['number']}: crate {item['package']} busy via "
+        f"pr#3628 [not-parked]" for item in frontier], unwedge_output.getvalue()
+    # ... in the DRAFT posture too, so "release on inactivity alone" cannot pass either
+    assert busy_packages_of_pulls(repo, [wedge_row(parked=False, draft=True)],
+                                  arealess_labels, wedge_prov) == {GLOBAL_PACKAGE}
+    # ... and the parked DRAFT twin frees exactly like the parked non-draft (the park, not
+    # the draft bit, is what releases)
+    assert busy_packages_of_pulls(repo, [wedge_row(draft=True)], arealess_labels,
+                                  wedge_prov) == set()
+    print("  ok   issue-677: a parked PR reserves no crates (sparq#3628 __global__ wedge)")
+    # SOURCE-ISSUE parks compose the same way, and are the SECOND park surface the #677
+    # invariant has to cover: issue 80 is needs:user-parked, so its worker PR frees crate-a
+    # whether the PR itself is a draft or not (pre-#677 the NON-draft twin reserved it).
     assert busy_packages_of_pulls(
         repo, [snapshot_row(75, "sparq-agent/issue-80-1-1", draft=False,
                             labels=["review:needs"])],
-        collapse_labels, busy_prov) == {"crate-a"}
-    # ...while its detail-confirmed parked-DRAFT twin frees it
+        collapse_labels, busy_prov) == set()
     assert busy_packages_of_pulls(
         repo, [snapshot_row(75, "sparq-agent/issue-80-1-1", draft=True,
                             labels=["review:needs"])],
         collapse_labels, busy_prov, {75: confirmed_draft()}) == set()
+    # ... and the same PR whose source issue is NOT parked (issue 82) still reserves.
+    assert busy_packages_of_pulls(
+        repo, [snapshot_row(77, "sparq-agent/issue-82-1-1", draft=False,
+                            labels=["review:needs"])],
+        collapse_labels, busy_prov) == {"crate-c"}
 
     # ---- [round-2 P2] LINKAGE PARITY: when the branch-derived and provenance-derived
     # source issues differ, the busy result must mirror the enumerator's classification in
@@ -8002,10 +8117,15 @@ def _self_test():
                                   busy_prov, {86: confirmed_draft()}) == set()
     assert enumerate_review_items(repo, [cross_parked], busy_prov, [],
                                   collapse_labels, now) == []
-    # ... and the SAME divergent-linkage PR with the arm latched stays busy on the
-    # provenance-linked crate (P1's HELD != INACTIVE composes with P2's parity)
+    # ... and the SAME divergent-linkage PR with the arm latched ALSO frees now (the park is
+    # read off the PROVENANCE-linked issue 80, so #677's release applies; pre-#677 the latch
+    # kept crate-a reserved). Parity itself is what is pinned: the crate that would have been
+    # reserved is the provenance-linked crate-a, never the branch-derived crate-c.
+    latched_cross_occupancy = []
     assert busy_packages_of_pulls(repo, [dict(cross_parked, auto_merge=latched)],
-                                  collapse_labels, busy_prov) == {"crate-a"}
+                                  collapse_labels, busy_prov,
+                                  occupancy=latched_cross_occupancy) == set()
+    assert latched_cross_occupancy == [("parked-free", 86, frozenset({"crate-a"}), "latched")]
 
     # ---- [round-4 P1] CLAIM-side PLAN->CLAIM revalidation over the LIVE pull listing ----
     def live_row(number, ref, *, draft, auto_merge=None, labels=(), sha=sha_a):
@@ -8032,10 +8152,11 @@ def _self_test():
     assert live_pull_detail_stub(live_row(76, "x", draft=True, sha="zz")) is None
     assert live_pull_detail_stub("junk") is None
 
-    # ---- [issue #509] CLAIM must apply the parked carve-out to its OWN live occupancy
-    # read, including curator's status:blocked terminal posture, without weakening the
-    # round-4/round-5 coherence guard. These are explicit mutation tripwires: deleting the
-    # carve-out makes (a) red; skipping _pull_inactivity_decision makes (b)/(c) red. ----
+    # ---- [issue #509, re-pinned for #677] CLAIM applies the SAME park release to its OWN
+    # live occupancy read, including curator's status:blocked terminal posture. The free log
+    # now carries the released POSTURE, which is the _pull_inactivity_decision reason for the
+    # same row — deleting the release makes (a) red; short-circuiting the reason plumbing
+    # makes the posture assertions in (a)/(b) red. ----
     expected_free_log = "claim-revalidation free: crate crate-b freed via parked pr#76"
     for parked_label in ("needs:user", "review:needs-user", "status:blocked"):
         parked_output = io.StringIO()
@@ -8046,22 +8167,29 @@ def _self_test():
                            labels=[parked_label])]],
                 collapse_labels, busy_prov, leases=[], now=now)
         assert parked_result == {70, 71, 72, 73}, (parked_label, parked_result)
-        assert expected_free_log in parked_output.getvalue(), parked_output.getvalue()
+        assert f"{expected_free_log} [detail]" in parked_output.getvalue(), \
+            parked_output.getvalue()
     print("  ok   claim-revalidation tripwire (a): parked draft labels free the live crate")
 
+    # [issue #677] the postures CLAIM used to hold BUSY — a parked row re-read NON-draft, and
+    # a parked row with the arm re-latched — now free, and the free log NAMES which one it
+    # was. This is the CLAIM-side half of the residual risk recorded on the PLAN side above:
+    # `[latched]` here is a row that could still merge into the crate just released.
     needs_user_live = live_row(76, "sparq-agent/issue-81-1-1", draft=True,
                                labels=["needs:user"])
     expected_defer_log = "claim-revalidation defer #71: crate crate-b busy via pr#76"
-    for coherent_busy in (dict(needs_user_live, draft=False),
-                          dict(needs_user_live, auto_merge=latched)):
+    for coherent_busy, posture in ((dict(needs_user_live, draft=False), "non-draft"),
+                                   (dict(needs_user_live, auto_merge=latched), "latched")):
         busy_output = io.StringIO()
         with contextlib.redirect_stdout(busy_output):
             busy_result = revalidate_items_against_live_pulls(
                 frontier, repo, [[coherent_busy]], collapse_labels, busy_prov,
                 leases=[], now=now)
-        assert busy_result == {70, 72, 73}, busy_result
-        assert expected_defer_log in busy_output.getvalue(), busy_output.getvalue()
-    print("  ok   claim-revalidation tripwire (b): non-draft or latch-visible parks stay busy")
+        assert busy_result == {70, 71, 72, 73}, (posture, busy_result)
+        assert f"{expected_free_log} [{posture}]" in busy_output.getvalue(), \
+            busy_output.getvalue()
+        assert expected_defer_log not in busy_output.getvalue(), busy_output.getvalue()
+    print("  ok   claim-revalidation tripwire (b): non-draft/latched parks free and say so")
 
     unparked_output = io.StringIO()
     with contextlib.redirect_stdout(unparked_output):
@@ -8080,20 +8208,23 @@ def _self_test():
     assert revalidate_items_against_live_pulls(
         frontier, repo, [[parked_live]], collapse_labels, busy_prov, leases=[], now=now) \
         == {70, 71, 72, 73}
-    # ...the EXACT round-4 window race — the same PR re-read NON-draft (went ready
-    # between PLAN and CLAIM) — re-reserves crate-b and defers item 71...
-    assert revalidate_items_against_live_pulls(
-        frontier, repo, [[dict(parked_live, draft=False)]], collapse_labels,
-        busy_prov, leases=[], now=now) == {70, 72, 73}
-    # ...a re-latched arm on the live row re-reserves the same way...
-    assert revalidate_items_against_live_pulls(
-        frontier, repo, [[dict(parked_live, auto_merge=latched)]], collapse_labels,
-        busy_prov, leases=[], now=now) == {70, 72, 73}
-    # ...[round-5 P2] a GARBAGE auto_merge shape on the live row is UNKNOWN — busy, exactly
-    # like the latched row (the old isinstance read collapsed it to unarmed and freed)...
-    assert revalidate_items_against_live_pulls(
-        frontier, repo, [[dict(parked_live, auto_merge="garbage")]], collapse_labels,
-        busy_prov, leases=[], now=now) == {70, 72, 73}
+    # ...and so do the three postures the round-4/round-5 window race used to re-reserve:
+    # re-read NON-draft, re-latched arm, and a GARBAGE auto_merge shape (still read as
+    # UNKNOWN, never as unarmed — the tri-state is intact, it just no longer gates).
+    for released in (dict(parked_live, draft=False),
+                     dict(parked_live, auto_merge=latched),
+                     dict(parked_live, auto_merge="garbage")):
+        assert revalidate_items_against_live_pulls(
+            frontier, repo, [[released]], collapse_labels, busy_prov,
+            leases=[], now=now) == {70, 71, 72, 73}, released
+    # ...while an UNPARKED live row in each of those same postures still reserves crate-b.
+    for reserved in (live_row(76, "sparq-agent/issue-81-1-1", draft=False,
+                              labels=["review:needs"]),
+                     live_row(76, "sparq-agent/issue-81-1-1", draft=True,
+                              labels=["review:needs"], auto_merge=latched)):
+        assert revalidate_items_against_live_pulls(
+            frontier, repo, [[reserved]], collapse_labels, busy_prov,
+            leases=[], now=now) == {70, 72, 73}, reserved
     # ...a brand-new LIVE worker PR invisible to the PLAN reserves its crate...
     assert revalidate_items_against_live_pulls(
         frontier, repo,
