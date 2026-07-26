@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4034,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a867c0e57088e43bbb3242905e75525299d7f6bf",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 1's major determinism defect is resolved. Equal numeric values are now tied by stable RDF literal content (datatype, lexical form, then language) rather than dictionary ID, while exact duplicate terms remain interchangeable. The SUM/AVG sort and MIN/MAX selection therefore no longer depend on interning order. The added tests directly reverse interning order across fresh dictionaries, compare emitted RDF terms rather than IDs, exercise promotion-sensitive tied operands, and include a real multi-stratum aggregate case with minted terms. The implementation, documentation, and tests are consistent, and no correctness, soundness, test-validity, or security issue remains in the diff.",
+  "verdict": "approve"
+ }
+}
