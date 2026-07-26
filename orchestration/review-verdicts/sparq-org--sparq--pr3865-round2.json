@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3865,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "053c93cb8348820aa42415943474696373a1e738",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_measurement_stem()` claims an injective rendering, but its non-plain branch combines a lossy slug with only the first 12 hex characters of SHA-256. Distinct complete subject terms with the same slug can share that 48-bit prefix, producing the same measurement resource and recreating the multiple-`dqv:computedOn`/conflicting-`dqv:value` corruption from round 1. The new test checks a few examples, not the claimed invariant.",
+    "file": "crates/sparq-kb/ingest/yamlld_compile.py",
+    "fix_hint": "Use a genuinely reversible Turtle-safe encoding of the complete subject term, or include the full cryptographic digest and describe the identity as collision-resistant rather than injective. If exact injectivity is required by the data model, prefer reversible encoding. Update the docstrings/tests so they assert the property actually provided.",
+    "severity": "major",
+    "title": "Truncated digest does not make measurement IRI minting injective"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 2 addresses the obvious cross-prefix collision and adds a useful regression test, but the promised injective identity is still not achieved. Non-plain subjects are distinguished only by a 12-hex-character (48-bit) truncated SHA-256 digest after a lossy slug, so distinct accepted subject terms can still mint the same measurement IRI and silently merge measurements. Because the prior major graph-corruption class remains, progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
