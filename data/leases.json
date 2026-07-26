@@ -62,16 +62,6 @@
   },
   {
    "account": "dc2d751954080e13",
-   "claim_id": "f9d0e9b8f8f64915a9d798fb1e5438aa",
-   "holder": "review:jeswr/agent-account-registry#587@dispatch-30195613309.1",
-   "package": "set-up-account",
-   "role": "review",
-   "model": "sol",
-   "issued_at": 1785056954,
-   "expires_at": 1785061154
-  },
-  {
-   "account": "dc2d751954080e13",
    "claim_id": "3cc47ca37e4c4e329fb84d976107474e",
    "holder": "review:jeswr/agent-account-registry#590@dispatch-30195613309.1",
    "package": "groom",
