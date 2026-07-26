@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4204,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "3bc470bec7faa706789bb959afd7479ae40bfe90",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The README calls `--check` the reproducibility gate and says it enforces byte identity, snapshot agreement, unknown-family rejection, and related-work/metric guards, but this PR only adds the command and documentation. There is no test or CI invocation of it anywhere in the checkout. Thus all load-bearing guarantees depend on a contributor remembering to run the script manually; stale or hand-edited generated artifacts and an unclassified new snapshot member can merge undetected. The script passes when invoked now, but that does not make the regression protection non-vacuous.",
+    "file": "bench/zk-compose/scripts/constraint_pack.py",
+    "fix_hint": "Add an automated repository test or CI/docs-quality step that runs `bench/zk-compose/scripts/constraint_pack.py --check`, and ensure that gate runs when the snapshot, generator, or either generated artifact changes.",
+    "severity": "major",
+    "title": "The reproducibility check is not wired into an automated gate"
+   }
+  ],
+  "progress": null,
+  "summary": "The generator currently reproduces both committed artifacts and its snapshot joins are internally consistent, and the ZK/security caveats are appropriately explicit. However, the new anti-drift and reproducibility guarantees are only implemented as an opt-in command: no test or CI gate in the diff invokes `constraint_pack.py --check`. Consequently the claimed fail-closed coverage and byte-identity acceptance criterion can silently regress or the generated artifacts can become stale without any repository gate failing.",
+  "verdict": "request_changes"
+ }
+}
