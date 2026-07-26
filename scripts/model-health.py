@@ -1148,18 +1148,38 @@ def sustained_health_exit_reachable(records, now):
     """True when the aged-out exit above CAN open for a park applied now — the MIGRATION-side
     twin of sustained_fleet_health_evidence, and never a grant.
 
-    It asks the reachability question only: is the health ledger readable, is the fleet OBSERVED
-    working right now (a success inside SUSTAINED_HEALTH_FRESH_SECONDS), and is nothing currently
-    broken (_fleet_health_ok)? If so, SUSTAINED_HEALTH_SPAN_SECONDS more of the same state
-    satisfies the evidence gate, so converting a park into the machine class gives it a real exit
-    rather than a silent one. The span/coverage/count conditions are deliberately NOT required
-    here: they are what the park then has to WAIT for, not what makes the exit reachable.
+    It asks the reachability question only: is the health ledger readable, does it COVER the span
+    the evidence gate will have to claim, is the fleet OBSERVED working right now (a success
+    inside SUSTAINED_HEALTH_FRESH_SECONDS), and is nothing currently broken (_fleet_health_ok)?
 
-    Fails toward False on every ambiguity (unreadable/empty window, a stale or absent success, a
-    live cooldown, an account sitting on a launch failure), exactly like park_cause_provable."""
+    WHICH OF THE EVIDENCE GATE'S CONDITIONS BELONG HERE, AND WHY (review round 3 of PR #697 — I
+    got this wrong, and the correction is the useful part). The gate has three conditions this
+    twin might omit, and the test is NOT "is it required?" but "can a park WAIT for it?":
+      * SPAN — WAITABLE. It is a clock property: the park ages into it by doing nothing. Omitted.
+      * COUNT (successes / distinct real accounts) — WAITABLE. Successes accumulate while the
+        fleet keeps working, which is exactly what the freshness probe below has just observed.
+        Omitted.
+      * COVERAGE — **NOT WAITABLE, AND THIS IS THE WHOLE POINT.** Coverage is
+        MAX_RECORDS / record-rate: a property of the LEDGER'S RETENTION, not of elapsed time.
+        Waiting never improves it, and a BUSIER fleet makes it strictly worse. Omitting it made
+        this predicate fail OPEN: at a measured 62 rec/h (coverage 3.2 h) it returned True while
+        sustained_fleet_health_evidence returned None at +1, +2, +4 AND +8 spans — so the
+        migration would convert a park into a class with BOTH exits shut. That is verbatim the
+        harm park_exit_reachable exists to prevent: a VISIBLE stall a human can clear traded for
+        a SILENT one nothing will ever clear. REQUIRED here.
+    THE GENERAL RULE, because this was the third instance of one reasoning error in this PR:
+    "condition X is deliberately not required here" is a claim about EVERY path that consumes the
+    predicate. Establish waitability for X specifically, on each path — never generalise it from
+    a sibling condition that happens to be waitable.
+
+    Fails toward False on every ambiguity (unreadable/empty window, a window too short to cover
+    the span, a stale or absent success, a live cooldown, an account sitting on a launch
+    failure), exactly like park_cause_provable."""
     window = _readable_window(records, now)
     if window is None:
         return False
+    if window[0]["ts"] > now - SUSTAINED_HEALTH_SPAN_SECONDS:
+        return False                    # the ledger cannot supply the span; waiting never fixes it
     if not _fleet_health_ok(window, now):
         return False
     return any(record["exit_class"] == SUCCESS
@@ -3262,6 +3282,25 @@ def _self_test():
             h_base + h_wins[:4] + [fleet_rec(SUCCESS, 7 * 3600 - 900 - 600 * k, f"u{k}")
                                    for k in range(2)],
             aged_park, h_now)), True)
+    # ...and it may also ANCHOR freshness on its own. This half was documented intent but
+    # untested (review round 3 of PR #697 caught it as a surviving mutant). It is deliberate and
+    # live-reachable: a `fleet` success means the allocator PLANNED AND LAUNCHED work, which is a
+    # present-tense claim about the dispatch starvation these parks are mostly made of. Here the
+    # two REAL accounts' successes are all older than SUSTAINED_HEALTH_FRESH_SECONDS, so the only
+    # fresh success — and therefore the anchor, the key and the stamp — is the dispatcher's.
+    fleet_anchored = (
+        h_base
+        + [rec("openai", "codex01", SUCCESS, dt=7 * 3600 - 3700 - 600 * k, run=f"v{k}")
+           for k in range(2)]
+        + [rec("anthropic", "acct02", SUCCESS, dt=7 * 3600 - 4000 - 600 * k, run=f"x{k}")
+           for k in range(2)]
+        + [fleet_rec(SUCCESS, 7 * 3600 - 300 - 60 * k, f"y{k}") for k in range(2)])
+    fleet_ev = sustained_fleet_health_evidence(fleet_anchored, aged_park, h_now)
+    chk("a `fleet` success may ANCHOR freshness alone when every real account's success is older "
+        "(the dispatcher launching work IS a present-tense health claim)",
+        ((fleet_ev or {}).get("key"), (fleet_ev or {}).get("provider")),
+        (f"{SUSTAINED_HEALTH_KEY_PREFIX}/{FLEET_PSEUDO_PROVIDER}/{fleet_sentinel}/y0",
+         FLEET_PSEUDO_PROVIDER))
     # GUARD: freshness. SILENCE IS NOT HEALTH — the same six successes, all early in the span.
     stale = h_base + [rec("openai", "codex01", SUCCESS, dt=3700 + 60 * k, run=f"e{k}")
                       for k in range(3)] \
@@ -3316,6 +3355,34 @@ def _self_test():
     chk("neither exit reachable => the migration still defers (an unreadable ledger)",
         [park_exit_reachable([], h_now, h_now),
          park_exit_reachable(stale, h_now, h_now)], [False, False])
+    # THE BUSY-LEDGER FAIL-OPEN (review round 3 of PR #697). COVERAGE is not waitable: it is
+    # MAX_RECORDS / record-rate, so a park can never age into it and a busier fleet makes it
+    # worse. Omitting it from the reachability twin let the migration convert a park into a class
+    # whose evidence gate returns None FOREVER — measured None at +1, +2, +4 and +8 spans on a
+    # 62 rec/h window. This fixture is that window: MAX_RECORDS perfectly healthy successes
+    # across two real accounts, arriving fast enough that the retained window covers only ~3.2 h.
+    busy_rate_gap = 3600.0 / 62.1
+    busy = sorted(
+        (rec("openai" if i % 2 else "anthropic", "codex01" if i % 2 else "acct02", SUCCESS,
+             dt=int(7 * 3600 - i * busy_rate_gap), run=f"b{i}") for i in range(MAX_RECORDS)),
+        key=lambda r: r["ts"])
+    busy_coverage_h = round((h_now - busy[0]["ts"]) / 3600.0, 2)
+    chk("the busy-ledger fixture really is under-covered (the fixture, not the guard, is what "
+        "makes this case real)",
+        (busy_coverage_h < SUSTAINED_HEALTH_SPAN_SECONDS / 3600, len(busy)),
+        (True, MAX_RECORDS))
+    chk("a fleet HEALTHY but too BUSY to cover the span makes the aged-out exit UNREACHABLE — "
+        "the migration must not convert a park whose exit can never open",
+        (sustained_fleet_health_evidence(busy, aged_park, h_now),
+         sustained_health_exit_reachable(busy, h_now),
+         park_exit_reachable(busy, h_now, h_now)), (None, False, False))
+    # ...and it stays shut however long the park waits, which is what makes it a SILENT stall
+    # rather than a delay. Delete the coverage check in the twin and this pair goes red.
+    chk("waiting does not open it: the same rate yields no evidence at +1 and +4 spans",
+        [sustained_fleet_health_evidence(
+            [dict(r, ts=r["ts"] + k * SUSTAINED_HEALTH_SPAN_SECONDS) for r in busy],
+            h_now, h_now + k * SUSTAINED_HEALTH_SPAN_SECONDS) for k in (1, 4)],
+        [None, None])
     # THE AGREEMENT INVARIANT. The migration precondition and the admission probe must not drift:
     # a park the migration converts NOW must actually be releasable LATER. Simulate it — convert
     # at h_now (reachable above), then run the window forward one span with the same health.
