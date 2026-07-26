@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4022,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "1ec54a7c44dfe27757ef687e9fef108e93355f88",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves both prior major findings. All preset constructors, including Blazegraph, now return UpstreamDocs rather than claiming arbitrary caller-supplied endpoints were contacted. The live probe now performs a real SELECT exchange, requires parsed solution results, and only then returns that same concrete configuration through confirmed_live(); focused unit tests also pin constructor provenance and per-configuration promotion. The API cannot technically prevent a caller from invoking confirmed_live() prematurely, but its naming and documentation consistently define it as an explicit post-exchange attestation rather than automatic validation, so this is not a correctness defect in the scoped provenance model.",
+  "verdict": "approve"
+ }
+}
