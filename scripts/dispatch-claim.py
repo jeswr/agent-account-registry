@@ -2644,6 +2644,131 @@ def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_logi
     return readmitted
 
 
+# [registry #677] How many partition-starvation parks ONE tick may UN-park, per repository. The
+# park side is capped at 1 because each park changes the measured condition; the un-park side is
+# capped at the same value the ordinary capacity re-admission uses, for the same stated reason —
+# a whole cohort re-entering the review lane in one tick starves the allocator that parked most of
+# them. An un-park deferred by this ceiling writes nothing and is simply retried next tick.
+STARVATION_UNPARKS_PER_TICK_MAX = AUTO_READMISSION_PER_TICK_MAX
+
+# The park cause this sweep owns. It is written into the park receipt and re-read before any
+# un-park, so the un-park half can only ever release what the PARK half applied.
+STARVATION_PARK_CAUSE = "partition"
+
+
+def starvation_unpark_targets(occupancy, owned, log=print):
+    """PURE. The PRs whose partition-starvation park has demonstrably STOPPED being necessary.
+
+    A park with no machine exit is the failure this whole change exists to remove (registry #703),
+    so the sweep is SYMMETRIC: the same tick that can park a holder also releases every park it
+    made whose cause has cleared. Both halves read the SAME live occupancy.
+
+    - `owned` is the set of PR numbers whose LATEST park application is a machine park carrying
+      this sweep's own cause receipt. It is the caller's job to prove that (bot-authored marker +
+      machine-owned label application); nothing else is ever released here. A park applied by a
+      human, or by another mechanism for another reason, is not this sweep's to clear.
+    - THE CAUSE IS RE-DERIVED, NEVER TIMED. The occupancy rows are produced by the real
+      busy_packages_of_pulls over the live pull listing, and a park is released only when that
+      PR's re-derived area set NO LONGER CONTAINS `__global__` — i.e. it would not seize the
+      serializing partition if it were un-parked right now. A timed release would put the holder
+      straight back and re-stall the lane on the very next tick, which is worse than the park.
+
+    Returns at most STARVATION_UNPARKS_PER_TICK_MAX PR numbers in ascending order."""
+    released = []
+    for row in occupancy if isinstance(occupancy, list) else []:
+        if not isinstance(row, tuple) or len(row) < 5:
+            continue
+        _decision, pr_number, packages, _reason, _inactive = row[:5]
+        if not isinstance(pr_number, int) or isinstance(pr_number, bool) or pr_number <= 0:
+            continue
+        if pr_number not in (owned or ()):
+            continue                      # not a park this sweep applied
+        if GLOBAL_PACKAGE in packages:
+            log(f"starvation park stands pr#{pr_number}: it still reserves "
+                f"`{GLOBAL_PACKAGE}` — un-parking would re-stall the lane on the next tick")
+            continue
+        released.append(pr_number)
+    released.sort()
+    if len(released) > STARVATION_UNPARKS_PER_TICK_MAX:
+        log(f"starvation un-park paced: {len(released)} park(s) are releasable; taking "
+            f"{STARVATION_UNPARKS_PER_TICK_MAX} this tick, the rest on later ticks")
+        released = released[:STARVATION_UNPARKS_PER_TICK_MAX]
+    return released
+
+
+def starvation_unpark_body(packages):
+    """The un-park comment. It names the condition that cleared, so the label change reads as a
+    closed loop rather than a mystery."""
+    reserved = ", ".join(f"`{package}`" for package in sorted(packages)) or "nothing"
+    return (
+        "> 🤖 **SPARQ agent** — un-parking. The condition this PR was parked for has cleared.\n\n"
+        f"It was parked because it reserved the serializing `{GLOBAL_PACKAGE}` crate partition "
+        "while the issue lane was fully starved behind it. Re-derived against the live pull "
+        f"listing on this tick, it now reserves {reserved} and **not** `{GLOBAL_PACKAGE}` — "
+        "usually because its registry provenance record has since been recorded, so its area "
+        "linkage resolves.\n\n"
+        f"The `{MACHINE_PARK_PR_LABEL}` label is removed and the PR re-enters the ordinary review "
+        "lane unchanged. No review judgement was made when it was parked, and none is made now. "
+        "Human-owned holds are never touched by this sweep — if one is live, the park stands.")
+
+
+def starvation_park_owner(comments, labels, bot_login, machine_owned):
+    """True iff a live `review:parked` on this PR is THIS sweep's park, and therefore this
+    sweep's to release. Three independent proofs, all required:
+
+    1. the machine park label is live;
+    2. the NEWEST bot-authored park-reason receipt names this sweep's cause. Newest, not any —
+       a PR parked here and LATER parked by another mechanism (a review deadlock, a budget
+       exhaustion) belongs to that mechanism now, and releasing it would clear a hold this sweep
+       never applied. Only the BOT's own comments are receipts (park_policy's trust filter), so a
+       third party cannot forge the cause and talk a park open;
+    3. `machine_owned` — park_policy.label_application_machine_owned for the park label — proving
+       the latest application of that label was not made by a proven human. A human's park is a
+       human's to clear; this is the same refusal every other automatic path makes.
+
+    Any ambiguity (no receipts, unreadable timeline, a different newest cause) fails toward
+    LEAVING THE PARK ALONE."""
+    if MACHINE_PARK_PR_LABEL not in set(labels):
+        return False
+    records = _park_policy.park_reason_records(comments, bot_login)
+    if not records:
+        return False
+    newest = records[-1]
+    if (newest.get("cause") if isinstance(newest, dict) else None) != STARVATION_PARK_CAUSE:
+        return False
+    return bool(machine_owned)
+
+
+def unpark_starved_partition_holder(repo, pr_number, packages, labels, unpark_pr, post_comment,
+                                    log=print):
+    """Release ONE partition-starvation park. Returns True iff the label was removed.
+
+    Refusals, all failing toward LEAVING THE PARK IN PLACE:
+    - the machine park label is not live (nothing to release; idempotent against its own output);
+    - ANY human-owned hold is live. Un-parking is strictly `review:parked` -> normal and must
+      never promote a PR past a human decision, so a live `review:needs-user` / `needs:*` stops
+      this dead. This sweep removes exactly ONE label and never any other.
+
+    RECEIPT-FIRST, matching the park half: the explanation lands before the label change, so a
+    crash between them leaves an explained PR that is still parked — the next tick converges it —
+    never a silent label change."""
+    live = set(labels)
+    if MACHINE_PARK_PR_LABEL not in live:
+        log(f"starvation un-park skipped {repo}#{pr_number}: no live "
+            f"`{MACHINE_PARK_PR_LABEL}`")
+        return False
+    held = _park_policy.human_owned_holds(live)
+    if held:
+        log(f"starvation un-park REFUSED {repo}#{pr_number}: human-owned hold(s) live "
+            f"({'/'.join(held)}) — a machine never un-parks past a human decision")
+        return False
+    post_comment(repo, pr_number, starvation_unpark_body(packages))
+    unpark_pr(pr_number)
+    log(f"starvation un-park APPLIED {repo}#{pr_number}: the `{GLOBAL_PACKAGE}` reservation is "
+        f"gone (now {sorted(packages)}), so `{MACHINE_PARK_PR_LABEL}` is removed")
+    return True
+
+
 def starvation_park_body(repo, pr_number, deferred, issue_url):
     """The park comment for a partition-starvation park. Modelled on the hand-written comments on
     sparq-org/sparq#4185 and #4212, because the reader of this comment is the PR's author and the
@@ -2673,12 +2798,19 @@ def starvation_park_body(repo, pr_number, deferred, issue_url):
         "inactive PR releases its crate reservation — that release is the entire purpose of this "
         "label here. It is **not** `needs:user`, it is not a terminal human hold, and this sweep "
         "never writes one.\n\n"
-        "## How it comes back\n\n"
-        "Automatically, through the ordinary capacity-park re-admission sweep — the same path "
-        "every machine park uses. No human gesture is required. A human can also simply remove "
-        f"the label at any time; a human un-park is sticky and this sweep will not undo it.\n\n"
+        "## How it comes back — automatically\n\n"
+        "The same sweep un-parks it. On every dispatch tick this PR's area set is re-derived "
+        f"against the live pull listing; the moment it no longer reserves `{GLOBAL_PACKAGE}` "
+        "(normally as soon as its registry provenance record is recorded, so its area linkage "
+        "resolves) the label is removed and an un-park comment is posted. **No human gesture is "
+        "required, and the un-park is proven from the re-derived reservation, never a timer.** "
+        "A human can also simply remove the label at any time; a human un-park is sticky and "
+        "this sweep will not undo it.\n\n"
         f"Mechanism, and the work to stop this happening at all: {issue_url}\n\n"
-        f"{_park_policy.park_reason_marker('partition')}")
+        # THE ATTRIBUTABLE REASON. This receipt is not decoration: the un-park half re-reads it to
+        # prove the park it is about to release is one this sweep applied, so without it the
+        # release could never be scoped and the park would have no machine exit at all.
+        f"{_park_policy.park_reason_marker(STARVATION_PARK_CAUSE)}")
 
 
 def park_starved_partition_holder(repo, pr_number, deferred, labels, park_pr, post_comment,
@@ -4155,6 +4287,56 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
         # are parked, whether parking them would free anything — is RE-PROVEN against the live
         # occupancy computed moments ago, so a stale or hostile plan can make this look for a
         # starvation but never name the PR that gets parked.
+        #
+        # SYMMETRIC BY CONSTRUCTION. The un-park half runs FIRST and unconditionally — before the
+        # park half, and regardless of whether the lane is starved this tick. A park-only sweep
+        # would industrialise the exact mistake this replaces: a hold whose stated exit condition
+        # nothing enforces, converging on the maintainer's desk (registry #703). Both halves read
+        # the SAME `live_occupancy`, so "would this PR seize the partition right now" has one
+        # answer per tick, not two.
+        if bot_login and _target_token(repo):
+            _owned = set()
+            for _row in live_occupancy:
+                _n = _row[1]
+                if not isinstance(_n, int) or isinstance(_n, bool) or _n <= 0:
+                    continue
+                if GLOBAL_PACKAGE in _row[2]:
+                    continue              # still a holder — cheapest refusal first, and it
+                    # keeps the comment/timeline reads off every un-releasable park
+                try:
+                    _live = next(
+                        (row for page in pull_pages if isinstance(page, list) for row in page
+                         if isinstance(row, dict) and row.get("number") == _n), None)
+                    if _live is None or MACHINE_PARK_PR_LABEL not in set(_labels(_live)):
+                        continue
+                    if starvation_park_owner(
+                            _pr_comments(repo, _n), _labels(_live), bot_login,
+                            _park_policy.label_application_machine_owned(
+                                repo, _n, MACHINE_PARK_PR_LABEL, _issue_timeline_events,
+                                is_human=lambda probe: _target_is_human_maintainer(repo, probe))):
+                        _owned.add(_n)
+                except DispatchError as exc:
+                    print(f"::warning::starvation un-park skipped {repo}#{_n}: {exc}; the park "
+                          "stands")
+            for _release in starvation_unpark_targets(live_occupancy, _owned):
+                try:
+                    _live = next(
+                        (row for page in pull_pages if isinstance(page, list) for row in page
+                         if isinstance(row, dict) and row.get("number") == _release), None)
+                    _packages = next((row[2] for row in live_occupancy
+                                      if row[1] == _release), frozenset())
+                    if _live is not None:
+                        unpark_starved_partition_holder(
+                            repo, _release, _packages, _labels(_live),
+                            unpark_pr=lambda number: _run_gh_target_api(
+                                repo, "DELETE",
+                                f"repos/{repo}/issues/{number}/labels/"
+                                + urllib.parse.quote(MACHINE_PARK_PR_LABEL, safe="")),
+                            post_comment=_run_gh_target_comment)
+                except DispatchError as exc:
+                    print(f"::warning::starvation un-park FAILED {repo}#{_release}: {exc}; the "
+                          "park stands and the next tick retries")
+
         starved = next((entry["deferred"] for entry in plan["partition_starvation"]
                         if entry["repo"] == repo), 0)
         starvation_target = starvation_park_target(
@@ -10545,6 +10727,108 @@ def _starvation_sweep_self_test():
     assert validate_plan(unsorted) is not None
     print("  ok   #677 plan seam: v5 validates partition_starvation strictly and refuses v4")
 
+    # ---- THE UN-PARK HALF: the machine exit for the machine's own park -----------------------
+    bot = "sparq-orchestrator[bot]"
+
+    def receipt(cause, login=bot):
+        return {"user": {"login": login},
+                "body": f"> park\n\n{_park_policy.park_reason_marker(cause)}",
+                "created_at": "2026-07-26T00:00:00Z"}
+
+    parked_labels = ["review:changes", MACHINE_PARK_PR_LABEL]
+    ours = [receipt(STARVATION_PARK_CAUSE)]
+    # OWNERSHIP: only this sweep's own park, proven three ways.
+    assert starvation_park_owner(ours, parked_labels, bot, True) is True
+    assert starvation_park_owner(ours, ["review:changes"], bot, True) is False   # not parked
+    assert starvation_park_owner(ours, parked_labels, bot, False) is False       # human-applied
+    assert starvation_park_owner([], parked_labels, bot, True) is False          # no receipt
+    assert starvation_park_owner(ours, parked_labels, "", True) is False         # untrusted
+    assert starvation_park_owner(
+        [receipt(STARVATION_PARK_CAUSE, login="drive-by")], parked_labels, bot, True) is False
+    # a LATER park by another mechanism takes ownership away from this sweep
+    assert starvation_park_owner(
+        [receipt(STARVATION_PARK_CAUSE), receipt("budget")], parked_labels, bot, True) is False
+    assert starvation_park_owner(
+        [receipt("budget"), receipt(STARVATION_PARK_CAUSE)], parked_labels, bot, True) is True
+    print("  ok   #677 un-park ownership: releases ONLY a park whose newest bot receipt names "
+          "this sweep's cause AND whose label was machine-applied")
+
+    # CAUSE RE-DERIVATION, never a timer.
+    cleared = _starvation_row(41, packages={"crate-a"}, parked=True, decision="parked-free")
+    still_global = _starvation_row(41, packages={GLOBAL_PACKAGE}, parked=True,
+                                   decision="parked-free")
+    assert starvation_unpark_targets([cleared], {41}) == [41]
+    assert starvation_unpark_targets([still_global], {41}) == []
+    assert starvation_unpark_targets(
+        [_starvation_row(41, packages={GLOBAL_PACKAGE, "crate-a"}, parked=True)], {41}) == []
+    assert starvation_unpark_targets([cleared], set()) == []          # not ours to release
+    assert starvation_unpark_targets([cleared], {99}) == []
+    assert starvation_unpark_targets(None, {41}) == []
+    print("  ok   #677 un-park cause: a park is released ONLY when its re-derived area set no "
+          "longer contains __global__ — a still-holding PR stays parked")
+
+    # BOUNDED + deterministic.
+    many_parked = [_starvation_row(n, packages={"crate-a"}, parked=True, decision="parked-free")
+                   for n in (90, 12, 55, 71, 33, 44, 27)]
+    owned_all = {row[1] for row in many_parked}
+    released = starvation_unpark_targets(many_parked, owned_all)
+    assert len(released) == STARVATION_UNPARKS_PER_TICK_MAX
+    assert released == sorted(released) == [12, 27, 33, 44, 55]
+    assert starvation_unpark_targets(list(reversed(many_parked)), owned_all) == released
+    print(f"  ok   #677 un-park bound: 7 releasable parks yield exactly "
+          f"{STARVATION_UNPARKS_PER_TICK_MAX} per tick, lowest-first, order-independently")
+
+    # THE WRITE: exactly one label removed, receipt first, never past a human hold.
+    def run_unpark(labels):
+        removed, comments, logs = [], [], []
+        applied = unpark_starved_partition_holder(
+            "o/r", 41, frozenset({"crate-a"}), labels,
+            unpark_pr=lambda number: removed.append(number),
+            post_comment=lambda repo, number, body: comments.append((repo, number, body)),
+            log=logs.append)
+        return applied, removed, comments, logs
+
+    applied, removed, comments, _ = run_unpark(parked_labels)
+    assert (applied, removed) == (True, [41])
+    assert [(r, n) for r, n, _ in comments] == [("o/r", 41)]
+    unpark_body = comments[0][2]
+    assert unpark_body.startswith("> 🤖 **SPARQ agent** — un-parking.")
+    assert "`crate-a`" in unpark_body and GLOBAL_PACKAGE in unpark_body
+    assert applied is True
+    for hold in (_park_policy.HUMAN_PARK_LABEL, _park_policy.HUMAN_PR_PARK_LABEL):
+        applied, removed, comments, logs = run_unpark(parked_labels + [hold])
+        assert (applied, removed, comments) == (False, [], []), hold
+        assert any("human-owned hold" in line for line in logs), logs
+    applied, removed, comments, logs = run_unpark(["review:changes"])
+    assert (applied, removed, comments) == (False, [], [])
+    print("  ok   #677 un-park write: removes ONLY review:parked, receipt-first, and refuses "
+          "outright while any human-owned hold is live")
+
+    # ROUND TRIP: park under the starvation condition, clear the cause, un-park. This fails if
+    # EITHER half is deleted — the park half must produce the receipt the un-park half reads.
+    trip_calls, trip_comments = [], []
+    assert park_starved_partition_holder(
+        "o/r", 41, 9, ["review:needs"],
+        park_pr=lambda number: trip_calls.append(("add", number)),
+        post_comment=lambda repo, number, body: trip_comments.append(body),
+        log=lambda _m: None) is True
+    trip_receipt = {"user": {"login": bot}, "body": trip_comments[-1],
+                    "created_at": "2026-07-26T00:00:00Z"}
+    # the park's OWN receipt is what proves ownership on the way back out
+    assert starvation_park_owner([trip_receipt], parked_labels, bot, True) is True
+    # while the cause stands, the round trip does NOT complete
+    assert starvation_unpark_targets([still_global], {41}) == []
+    # once the area set resolves, it does
+    assert starvation_unpark_targets([cleared], {41}) == [41]
+    assert unpark_starved_partition_holder(
+        "o/r", 41, frozenset({"crate-a"}), parked_labels,
+        unpark_pr=lambda number: trip_calls.append(("remove", number)),
+        post_comment=lambda repo, number, body: trip_comments.append(body),
+        log=lambda _m: None) is True
+    assert trip_calls == [("add", 41), ("remove", 41)], trip_calls
+    print("  ok   #677 ROUND TRIP: park -> cause clears -> un-park, with the park's own receipt "
+          "as the proof of ownership on the way out")
+
     # ---- THE PRODUCTION CALL SITE IS ITS OWN SEAM --------------------------------------------
     # Everything above calls the two functions DIRECTLY, so all of it stays green if main()'s
     # call site is deleted, guarded away, or re-pointed at the human terminal — the functions
@@ -10562,6 +10846,29 @@ def _starvation_sweep_self_test():
     assert 'plan["partition_starvation"]' in _dispatch_src, \
         "main()'s dispatch loop no longer reads the plan's starvation evidence, so `deferred` " \
         "is always 0 and the sweep can never fire"
+    # The UN-PARK half is the machine exit. A park-only sweep industrialises exactly the failure
+    # it replaces (registry #703), so its absence from the loop is a blocking defect, not a
+    # missing nicety.
+    for required, why in (
+        ("starvation_unpark_targets(", "nothing ever releases a starvation park"),
+        ("unpark_starved_partition_holder(", "releasable parks are selected and then left alone"),
+        ("starvation_park_owner(", "the un-park half cannot tell its OWN parks from anyone "
+                                   "else's, so it would either release nothing or release "
+                                   "parks it did not apply"),
+    ):
+        assert required in _dispatch_src, \
+            f"main()'s dispatch loop no longer calls {required} — {why}"
+    _unpark_write = re.search(
+        r"unpark_pr=lambda number: _run_gh_target_api\(\s*repo, \"DELETE\","
+        r"(?:.|\n)*?urllib\.parse\.quote\(([A-Za-z_]+), safe=\"\"\)", _dispatch_src)
+    assert _unpark_write and _unpark_write.group(1) == "MACHINE_PARK_PR_LABEL", (
+        "the un-park's production label DELETE must target MACHINE_PARK_PR_LABEL "
+        f"(found {_unpark_write.group(1) if _unpark_write else None!r}) — this sweep must never "
+        "be able to remove a human-owned hold")
+    assert _dispatch_src.index("starvation_unpark_targets(") \
+        < _dispatch_src.index("starvation_park_target("), \
+        "the un-park half must run BEFORE the park half in the tick, so a tick that releases a " \
+        "holder re-measures the lane before deciding whether to park another"
     # The label the production call site actually writes. The injected `park_pr` in the tests
     # above cannot see this, so without it the sweep could be re-pointed at `needs:user` and the
     # whole suite would stay green.
