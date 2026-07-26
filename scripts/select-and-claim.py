@@ -793,6 +793,157 @@ def read_accounts(repo):
     return accounts
 
 
+# ---- routing-catalog consistency audit (issue: cross-repo model skew) --------------------------
+# [OPUS-5] THE GENERAL DEFECT behind the 2026-07-26 incident: an account record and the routing
+# catalogs that must be able to route it live in DIFFERENT repositories on different merge
+# schedules, and nothing compared them. Two failure shapes follow, and both had to be diagnosed
+# from a live log capture because no periodic check named the offending pair:
+#
+#   (a) the record is not routable AT ALL — a required field is missing or contradicts its
+#       provider, so the catalog read drops it (or, before this fix, the worker's fail-closed
+#       boundary rejected it after a lease was already spent);
+#   (b) the record names a model ALIAS that no enabled target's `[models]` catalog defines, or
+#       defines with contradictory metadata — so a claim minted on that (account, model) pair dies
+#       at worker.yml's "claimed model is missing from protected target routing" / strict routing
+#       equality gate, again after the lease is spent.
+#
+# This audit REPORTS both, naming the offending pairs; it never becomes a new enforcement path.
+# The enforcing boundaries stay exactly where they are (policy-resolve rejects an unknown model in
+# a chain, the catalog read drops an invalid record, worker.yml re-proves everything before a
+# secret is exposed) — a reporter that started failing dispatch would be a new outage surface, and
+# the brief for this work explicitly asks for the offending pairs rather than a hard stop.
+SKEW_UNKNOWN = "names a model no enabled target routing catalog defines"
+SKEW_RETIRED = "names a RETIRED model alias"
+SKEW_UNREADABLE = "target routing catalog could not be read"
+
+
+def _retired_aliases():
+    """The shared deprecation register (scripts/deprecated_models.py), IMPORTED rather than
+    re-declared — two hand-maintained copies of a deprecation list is exactly how a retired model
+    returns in one of them. Lazy: the workflow-side importers of this module load it by path from
+    the registry checkout, and the audit is the only caller."""
+    from pathlib import Path
+    path = Path(__file__).resolve().with_name("deprecated_models.py")
+    spec = importlib.util.spec_from_file_location("registry_deprecated_models", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.DEPRECATED_ALIASES
+
+
+def dropped_account_records(issues):
+    """Pure. ``[(handle, [reason, ...]), ...]`` for every SELECTED account record the catalog
+    parse boundary rejects — i.e. every account silently absent from the live pool, with the
+    reason. Capacity lost this way is otherwise invisible until a claim starves."""
+    dropped = []
+    for issue in select_account_issues(issues):
+        handle = str(issue.get("title") or "").strip()
+        reasons = account_record_schema_errors(handle, issue.get("body"))
+        if reasons:
+            dropped.append((handle, reasons))
+    return sorted(dropped)
+
+
+def routing_catalog_skew(accounts, catalogs, retired_aliases=frozenset(), unreadable=()):
+    """Pure. ``[(handle, model, reason), ...]`` for every (account, model alias) pair that no
+    supplied routing catalog can route.
+
+    ``catalogs`` is ``{source_label: {alias: {provider, harness, credential_format, ...}}}``.
+    ``unreadable`` is the source labels whose catalog could not be read — reported as rows of
+    their own so a fetch failure can never be mistaken for "no skew found".
+    """
+    rows = [("", "", f"{SKEW_UNREADABLE}: {source}") for source in sorted(unreadable)]
+    for account in sorted(accounts, key=lambda a: str(a.get("handle"))):
+        handle = str(account.get("handle"))
+        declared = {field: account.get(field)
+                    for field in ("provider", "harness", "credential_format")}
+        for model in account.get("models") or []:
+            if model in retired_aliases:
+                rows.append((handle, model, SKEW_RETIRED))
+            hits = {source: table[model] for source, table in sorted(catalogs.items())
+                    if isinstance(table, dict) and isinstance(table.get(model), dict)}
+            if not hits:
+                rows.append((handle, model, SKEW_UNKNOWN))
+                continue
+            for source, spec in hits.items():
+                for field, own in declared.items():
+                    routed = spec.get(field)
+                    if routed and own and routed != own:
+                        rows.append((handle, model,
+                                     f"{source} routes it with {field}={routed!r} but the account "
+                                     f"record declares {own!r}"))
+    return rows
+
+
+def enabled_policy_targets(policy_text):
+    """Pure. ``[(repo, routing_path), ...]`` for every ENABLED target in a repos.toml document."""
+    import tomllib
+    policy = tomllib.loads(policy_text)
+    targets = []
+    for repo, row in sorted((policy.get("repos") or {}).items()):
+        if isinstance(row, dict) and row.get("enabled") and isinstance(row.get("routing"), str):
+            targets.append((repo, row["routing"]))
+    return targets
+
+
+def _fetch_target_routing(repo, path):
+    """Read one target's routing.toml at its default branch through the authenticated CLI."""
+    return _run(["gh", "api", f"repos/{repo}/contents/{path}",
+                 "-H", "Accept: application/vnd.github.raw"]).stdout
+
+
+def collect_routing_catalogs(targets, fetch=_fetch_target_routing):
+    """``({source_label: models_table}, [unreadable_source, ...])`` over enabled targets."""
+    import tomllib
+    catalogs, unreadable = {}, []
+    for repo, path in targets:
+        source = f"{repo}:{path}"
+        try:
+            models = tomllib.loads(fetch(repo, path)).get("models")
+        except Exception:                                  # noqa: BLE001 - reported, never raised
+            unreadable.append(source)
+            continue
+        if not isinstance(models, dict):
+            unreadable.append(source)
+            continue
+        catalogs[source] = models
+    return catalogs, unreadable
+
+
+def audit_catalog(repo, policy_text, fetch=_fetch_target_routing, retired_aliases=frozenset(),
+                  issues=None):
+    """Report account-catalog / target-routing skew. Returns ``(dropped, skew, catalogs)``."""
+    if issues is None:
+        issues = json.loads(_run(["gh", "issue", "list", "-R", repo, "--state", "open",
+                                  "--limit", "500", "--json", "title,body,labels"]).stdout or "[]")
+    dropped = dropped_account_records(issues)
+    accounts = []
+    for issue in select_account_issues(issues):
+        account = _parse_account(issue.get("body"))
+        account["handle"] = str(issue.get("title") or "").strip()
+        if not account_record_schema_errors(account["handle"], issue.get("body")):
+            accounts.append(normalize_legacy_models(account))
+    catalogs, unreadable = collect_routing_catalogs(enabled_policy_targets(policy_text), fetch)
+    skew = routing_catalog_skew(accounts, catalogs, retired_aliases=retired_aliases,
+                                unreadable=unreadable)
+    return dropped, skew, catalogs
+
+
+def format_catalog_audit(dropped, skew, catalogs):
+    """The operator-facing report. One line per offending pair, each naming what is wrong."""
+    lines = [f"catalog audit: {len(catalogs)} target routing catalog(s) read: "
+             f"{', '.join(sorted(catalogs)) or 'NONE'}"]
+    for handle, reasons in dropped:
+        lines.append(f"catalog audit: account {handle!r} is NOT in the live pool: "
+                     f"{'; '.join(reasons)}")
+    for handle, model, reason in skew:
+        subject = f"account {handle!r} model {model!r}" if handle else "policy"
+        lines.append(f"catalog audit: {subject} {reason}")
+    if not dropped and not skew:
+        lines.append("catalog audit: no skew — every live account record is routable by every "
+                     "enabled target catalog it names")
+    return lines
+
+
 def claim(repo, package, role, model_chain, holder, now, ttl=3600, retries=6,
           account_pool=None, holder_prefix="", max_holder_concurrent=None, usage=None,
           margin=SAFETY_MARGIN, account_slot_bound=False, return_reason=False):
@@ -1304,6 +1455,177 @@ def _self_test():
     check("fresh claim returns the plain account handle",
           legacy_claim and legacy_claim["account"], "acctL")
     check("customized [terra, luna] does NOT serve a sol-only claim", customized_claim, None)
+
+    # ---- ROUTING-CATALOG CONSISTENCY AUDIT (the general defect behind the 2026-07-26 incident) --
+    # An account record and the catalogs that must be able to route it live in different repos on
+    # different merge schedules. These rows pin the four skew shapes plus the two ways an audit can
+    # lie: reading an empty union as "clean", and swallowing a fetch failure.
+    audit_issues = [
+        {"title": "not-an-account", "body": "just a work item\n", "labels": [{"name": "role:ci"}]},
+        {"title": "acct30",
+         "body": "provider: anthropic\nharness: claude\nmodels: [opus5, ghost, fable]\n"
+                 "credential_format: claude-oauth-token\nsecret_ref: ACCT30_TOKEN",
+         "labels": [{"name": "status:available"}]},
+        {"title": "acct31",   # the acct02 shape: complete except `harness`
+         "body": "provider: anthropic\nmodels: [opus5]\n"
+                 "credential_format: claude-oauth-token\nsecret_ref: ACCT31_TOKEN",
+         "labels": [{"name": "status:available"}]},
+    ]
+    check("audit: a harness-less record is reported as NOT in the live pool, with the reason",
+          dropped_account_records(audit_issues), [("acct31", ["missing harness"])])
+    check("audit: a healthy record and a non-account issue produce no dropped row",
+          [handle for handle, _ in dropped_account_records(audit_issues[:2])], [])
+
+    ANTH = {"provider": "anthropic", "harness": "claude",
+            "credential_format": "claude-oauth-token"}
+    acct30 = {"handle": "acct30", "models": ["opus5", "ghost", "fable"], **ANTH}
+    two_catalogs = {"a/a:r.toml": {"opus5": dict(ANTH)},
+                    "b/b:r.toml": {"opus5": dict(ANTH), "fable": dict(ANTH)}}
+    skew = routing_catalog_skew([acct30], two_catalogs, retired_aliases=frozenset({"fable"}))
+    check("audit: an alias NO catalog defines is reported, naming the account and the model",
+          [(h, m) for h, m, r in skew if r == SKEW_UNKNOWN], [("acct30", "ghost")])
+    check("audit: an alias only ONE catalog defines is NOT reported unknown (union, not "
+          "intersection)",
+          [(h, m) for h, m, r in skew if r == SKEW_UNKNOWN and m == "fable"], [])
+    check("audit: a RETIRED alias is reported even while a catalog still defines it",
+          [(h, m) for h, m, r in skew if r == SKEW_RETIRED], [("acct30", "fable")])
+    check("audit: a routable, current alias produces no row", [r for h, m, r in skew if m == "opus5"], [])
+    disagree = routing_catalog_skew(
+        [acct30], {"a/a:r.toml": {"opus5": {**ANTH, "harness": "codex"}}})
+    check("audit: a catalog whose metadata contradicts the record is reported with source, "
+          "field and BOTH values",
+          [r for h, m, r in disagree if m == "opus5"],
+          ["a/a:r.toml routes it with harness='codex' but the account record declares 'claude'"])
+    check("audit: an UNREADABLE catalog is a row of its own (a fetch failure can never read as "
+          "'no skew')",
+          routing_catalog_skew([], {}, unreadable=["c/c:r.toml"]),
+          [("", "", f"{SKEW_UNREADABLE}: c/c:r.toml")])
+    check("audit: a fully routable pool reports nothing",
+          routing_catalog_skew([{"handle": "acct32", "models": ["opus5"], **ANTH}],
+                               {"a/a:r.toml": {"opus5": dict(ANTH)}}), [])
+
+    audit_policy = ('[repos."o/enabled"]\nenabled = true\nrouting = "r/one.toml"\n\n'
+                    '[repos."o/disabled"]\nenabled = false\nrouting = "r/two.toml"\n')
+    check("audit: only ENABLED targets contribute a routing catalog",
+          enabled_policy_targets(audit_policy), [("o/enabled", "r/one.toml")])
+    bad_catalogs, bad_unreadable = collect_routing_catalogs(
+        [("o/a", "r.toml"), ("o/b", "r.toml"), ("o/c", "r.toml")],
+        fetch=lambda repo, path: {
+            "o/a": '[models.opus5]\nprovider = "anthropic"\n',
+            "o/b": "this is not toml {{{",
+            "o/c": '[defaults]\nagent = "x"\n',        # parses, but has no [models] table
+        }[repo])
+    check("audit: an unparseable or models-less target catalog is REPORTED unreadable, "
+          "not raised and not silently empty",
+          (sorted(bad_catalogs), bad_unreadable),
+          (["o/a:r.toml"], ["o/b:r.toml", "o/c:r.toml"]))
+    e2e_dropped, e2e_skew, e2e_catalogs = audit_catalog(
+        "o/r", audit_policy, issues=audit_issues,
+        fetch=lambda repo, path: '[models.opus5]\nprovider = "anthropic"\nharness = "claude"\n',
+        retired_aliases=frozenset({"fable"}))
+    check("audit end-to-end: the harness-less record is dropped and the skew rows name the pairs",
+          (e2e_dropped, sorted({(h, m) for h, m, _ in e2e_skew}), sorted(e2e_catalogs)),
+          ([("acct31", ["missing harness"])], [("acct30", "fable"), ("acct30", "ghost")],
+           ["o/enabled:r/one.toml"]))
+    check("audit report names every offending pair on its own line",
+          [line for line in format_catalog_audit(e2e_dropped, e2e_skew, e2e_catalogs)
+           if "acct30' model 'ghost'" in line or "acct31' is NOT in the live pool" in line],
+          ["catalog audit: account 'acct31' is NOT in the live pool: missing harness",
+           f"catalog audit: account 'acct30' model 'ghost' {SKEW_UNKNOWN}"])
+    check("audit report says 'no skew' ONLY when there is none",
+          ["no skew" in " ".join(format_catalog_audit([], [], {"a": {}})),
+           "no skew" in " ".join(format_catalog_audit(e2e_dropped, e2e_skew, e2e_catalogs))],
+          [True, False])
+
+    # The CLI contract, driven through main() exactly as groom.yml drives it: the default REPORTS
+    # (exit 0 — a skew row must never take the sweep down), and the opt-in gate mode exits
+    # non-zero. Both are asserted on the SAME skewed input, so neither can pass by accident.
+    import tempfile
+    from pathlib import Path as _CliPath
+
+    def _audit_cli(extra_argv, issues_json, routing_toml):
+        def fake_run(args):
+            if "issue" in args:
+                return SimpleNamespace(stdout=issues_json)
+            return SimpleNamespace(stdout=routing_toml)
+        saved_run, saved_argv = globals()["_run"], sys.argv
+        with tempfile.TemporaryDirectory() as cli_td:
+            policy_path = _CliPath(cli_td) / "repos.toml"
+            policy_path.write_text(audit_policy, encoding="utf-8")
+            globals()["_run"] = fake_run
+            sys.argv = ["select-and-claim.py", "--audit-catalog", "--policy-file",
+                        str(policy_path), *extra_argv]
+            buf = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(buf):
+                    rc = main()
+            finally:
+                globals()["_run"] = saved_run
+                sys.argv = saved_argv
+        return rc, buf.getvalue()
+
+    skewed_json = json.dumps(audit_issues)
+    clean_toml = '[models.opus5]\nprovider = "anthropic"\nharness = "claude"\n'
+    rc_report, report_text = _audit_cli([], skewed_json, clean_toml)
+    check("audit CLI: the default REPORTS skew and still exits 0 (never takes the sweep down)",
+          (rc_report, "acct30' model 'ghost'" in report_text,
+           "acct31' is NOT in the live pool" in report_text), (0, True, True))
+    rc_gate, _ = _audit_cli(["--fail-on-skew"], skewed_json, clean_toml)
+    check("audit CLI: --fail-on-skew exits non-zero on the SAME skewed input",
+          rc_gate, 1)
+    rc_clean, clean_text = _audit_cli(
+        ["--fail-on-skew"],
+        json.dumps([{"title": "acct33",
+                     "body": "provider: anthropic\nharness: claude\nmodels: [opus5]\n"
+                             "credential_format: claude-oauth-token\nsecret_ref: ACCT33_TOKEN",
+                     "labels": [{"name": "status:available"}]}]),
+        clean_toml)
+    check("audit CLI: --fail-on-skew exits 0 on a clean pool (the gate mode is not always-red)",
+          (rc_clean, "no skew" in clean_text), (0, True))
+    rc_unreadable, unreadable_text = _audit_cli(["--fail-on-skew"], skewed_json, "not toml {{{")
+    check("audit CLI: --fail-on-skew fails CLOSED when a target catalog cannot be read",
+          (rc_unreadable, SKEW_UNREADABLE in unreadable_text), (1, True))
+    saved_argv = sys.argv
+    try:
+        sys.argv = ["select-and-claim.py", "--audit-catalog"]
+        with contextlib.redirect_stderr(io.StringIO()):
+            rc_no_policy = main()
+    finally:
+        sys.argv = saved_argv
+    check("audit CLI: --audit-catalog without --policy-file is a usage error, not a silent pass",
+          rc_no_policy, 2)
+
+    # ---- THE YAML SEAM for the audit (measured repo lesson: every uncaught mutant lives here).
+    # A pure function nothing CALLS is a vacuous guard, and `if: false` / a renamed flag / a
+    # dropped call site are all invisible to the Python assertions above. Assert the wiring
+    # STRUCTURALLY against the parsed workflow, and fail CLOSED if the workflow, the job, or the
+    # step cannot be found — "zero steps matched" must never read as a pass.
+    try:
+        import yaml  # lazy, self-test only: a hard self-test-suite dependency already
+        from pathlib import Path as _Path
+        groom_path = (_Path(__file__).resolve().parent.parent / ".github" / "workflows" / "groom.yml")
+        groom_doc = yaml.safe_load(groom_path.read_text(encoding="utf-8"))
+        groom_jobs = groom_doc.get("jobs") or {}
+        audit_steps = [(job_name, job, step)
+                       for job_name, job in groom_jobs.items()
+                       for step in (job.get("steps") or [])
+                       if "--audit-catalog" in str(step.get("run", ""))]
+        check("YAML seam: groom.yml has exactly one step invoking --audit-catalog",
+              len(audit_steps), 1)
+        seam_job_name, seam_job, seam_step = audit_steps[0]
+        check("YAML seam: the audit step runs THIS script with the policy file",
+              ("scripts/select-and-claim.py" in seam_step["run"],
+               "--policy-file policy/repos.toml" in seam_step["run"]),
+              (True, True))
+        # `if: false` (or any literal-false condition) on the step or its job silently un-wires the
+        # audit while every substring assertion above stays green. Only an ABSENT condition passes.
+        check("YAML seam: neither the audit step nor its job is if:-disabled",
+              ("if" in seam_step, "if" in seam_job), (False, False))
+        check("YAML seam: the audit step is not conditioned away by a job-level skip",
+              (seam_job_name in groom_jobs, bool(seam_job.get("steps"))), (True, True))
+    except Exception as exc:                       # noqa: BLE001 - fail CLOSED, never skip
+        check(f"YAML seam: groom.yml audit wiring is inspectable ({type(exc).__name__}: {exc})",
+              False, True)
 
     # DYNAMIC-CONCURRENCY ACCOUNTING: dispatch-claim.py feeds read_accounts output straight into
     # dynamic_concurrency, so the normalized legacy record counts capacity for a sol chain
@@ -2318,9 +2640,31 @@ def main():
                     help="required holder prefix when inspecting a dispatcher claim")
     ap.add_argument("--ttl", type=int, default=3600, help="lease lifetime in seconds")
     ap.add_argument("--repo", default="jeswr/agent-account-registry")
+    ap.add_argument("--audit-catalog", action="store_true",
+                    help="report account-record / target-routing catalog skew (reports, never "
+                         "blocks dispatch)")
+    ap.add_argument("--policy-file", default="",
+                    help="repos.toml whose ENABLED targets supply the routing catalogs to audit")
+    ap.add_argument("--fail-on-skew", action="store_true",
+                    help="exit non-zero when --audit-catalog reports anything (gate use)")
     args = ap.parse_args()
     if args.self_test:
         return _self_test()
+    if args.audit_catalog:
+        if not args.policy_file:
+            print("catalog audit requires --policy-file", file=sys.stderr)
+            return 2
+        with open(args.policy_file, encoding="utf-8") as handle:
+            policy_text = handle.read()
+        dropped, skew, catalogs = audit_catalog(
+            args.repo, policy_text, retired_aliases=_retired_aliases())
+        for line in format_catalog_audit(dropped, skew, catalogs):
+            print(line)
+        # Reporting is the contract: a skew row must not take dispatch down (see the
+        # routing-catalog audit header). --fail-on-skew is the opt-in gate mode. An UNREADABLE
+        # catalog is a skew row too, so the gate mode fails closed on a fetch failure rather than
+        # reading "no skew found" off an empty audit.
+        return 1 if args.fail_on_skew and (dropped or skew) else 0
     if args.validate_account_record:
         if not args.account_handle:
             print("account record write rejected: --account-handle is required", file=sys.stderr)
