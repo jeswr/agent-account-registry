@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4005,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b2e28fc5cf876eab01c639fcb8a1c34b32eade8e",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 3 finds no correctness, soundness, test-validity, or security issue. The semantics selector keeps the DIRECT and RDF-BASED-only slices disjoint, and the new public report arm accurately identifies each slice. The offline canary exercises both selector directions through the real parse/extract/render/re-extract path with exact nonzero counts, while the corpus test pins every accounting bucket and requires zero fidelity violations. Documentation consistently limits exhaustiveness to eligible, recognized-check-kind cases and explicitly excludes untagged or unrecognized cases. Compared with round 2, the result is materially unchanged: no findings remain.",
+  "verdict": "approve"
+ }
+}
