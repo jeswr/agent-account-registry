@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3884,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f2a7d2841eec8594b0626f7c8e86363556188c0e",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`iriref_end` treats any `<` followed by only IRIREF-permitted bytes up to a later `>` as an IRI, but that condition is not sufficient to distinguish an IRIREF from operators. For example, in compact tokenization such as `FILTER(?a<1&&FLTR(?o)&&?b>2)`, the bytes from `<` through `>` contain none of the excluded IRIREF characters, so the scanner skips the entire span and fails to report `FLTR`. SPARQL punctuation/operators delimit these tokens without requiring whitespace. This is the same correctness class as round 1, and the new tests only cover spaced comparisons that return `None` at the first space.",
+    "file": "crates/sparq-terse/src/diagnose.rs",
+    "fix_hint": "Use actual lexical context (or the SPARQL lexer) to decide whether `<` starts IRIREF rather than validating only the candidate body. Add an integration regression using compact comparisons on both sides of `FLTR`, such as `FILTER(?a<1&&FLTR(?o)&&?b>2)`, and assert the `FILTER` suggestion is present while genuine IRIREFs remain ignored.",
+    "severity": "major",
+    "title": "Compact comparison expressions are still swallowed as IRIREFs"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round-1 defect is narrowed but not eliminated. `iriref_end` now recognizes spaced `<` comparisons, yet it still identifies `<...>` solely from the characters through the next `>`, without lexical context. Compact SPARQL expressions can therefore be mistaken for IRIREFs and hide a misspelled keyword. The added integration test exercises only comparisons containing spaces, so it does not cover this remaining acceptance-set mismatch.",
+  "verdict": "request_changes"
+ }
+}
