@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4052,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "161456bab70d12cac99217ad7bc5e1675bba1e3d",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "Doc-only change to research/change-based-test-selection.md: replaces the stale \"Deferred (proceed-and-document)\" paragraph about the \u00a76.1 selection-bug alarm with a two-line \"Shipped (sq-va7at, PR #1526)\" note. This is a pure honesty-reconciliation edit, and every factual claim it makes verifies against the repository.\n\nVerification performed:\n- Attribution: `git log` confirms commit 56e08c7f \"ci(selection): nightly change-based-selection bug alarm (sq-va7at) (#1526)\", so both the bead id and the PR number are correct; the doc update simply lands late.\n- \"correlates failed nightly jobs with suspect landed PRs\": .github/workflows/selection-alarm.yml fires via workflow_run only when the CI run concluded `failure` on a `schedule`/`workflow_dispatch` event on main, and scripts/ci_selection_alarm.py `correlate()` intersects failed-job crate tokens with the per-commit skip sets replayed over the since-last-green-nightly window. Claim holds.\n- \"auto-files a deduplicated issue\": `create_issue()` files via `gh issue create`; dedup is a stable `<!-- selection-alarm-key: ... -->` body marker exact-matched against open issues. I specifically checked the dedup path for the classic label mismatch (search label not applied at creation): BASE_LABELS = [\"selection-alarm\", \"auto\"] and `open_issue_exists()` lists `--label selection-alarm`, so the search set and the filed set agree. No silent dedup failure.\n- Test validity: scripts/tests/test_ci_selection_alarm.py runs 17 tests, all green locally. They are non-vacuous \u2014 they exercise the real `correlate()`/`job_crate_tokens()` logic, include a substring-collision guard (sparq-core must not match sparq-core-foo), a non-spam property (empty skip set \u21d2 no finding), an infra-lane-failure-is-not-triaged case, fail-loud exits on replay error / empty failed-jobs set, and a regex pinned against the real ci.yml shard job name. Wired into CI via docs-quality.yml.\n- Consistency: grepped the whole file for defer/follow-up/al\u2026 [truncated 634 chars]",
+  "verdict": "approve"
+ }
+}
