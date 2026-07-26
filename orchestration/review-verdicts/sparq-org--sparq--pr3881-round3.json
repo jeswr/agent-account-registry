@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3881,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f2aefb639276141764de20097a79841f5fdf5646",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 3 resolves the prior major finding. DischargeExpr::Other now retains the complete Constraint, including left operand, operator, and right operand. The added tests are non-vacuous: they distinguish branches sharing a left operand but differing in operator or right operand, and the XONE test evaluates the returned tree without consulting the original Policy. The extraction preserves logical structure and deontic context, remains read-only, excludes unsupported duty constraints explicitly, and makes appropriately caveated, negative-only ZK security claims. No correctness, soundness, test-validity, or security issue remains in the supplied diff.",
+  "verdict": "approve"
+ }
+}
