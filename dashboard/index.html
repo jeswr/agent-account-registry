@@ -22,6 +22,18 @@
     <div id="warning" class="warning" role="alert" hidden></div>
 
     <main>
+      <section id="throughput-section" aria-labelledby="throughput-heading" hidden>
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Backlog vs drain</p>
+            <h2 id="throughput-heading">Throughput</h2>
+          </div>
+          <p id="throughput-time" class="freshness"></p>
+        </div>
+        <div id="throughput-alerts" class="alert-stack" aria-live="polite"></div>
+        <div id="throughput-targets" class="throughput-grid" aria-live="polite"></div>
+      </section>
+
       <section aria-labelledby="fleet-heading">
         <div class="section-heading">
           <div>

