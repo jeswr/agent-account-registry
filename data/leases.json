@@ -82,16 +82,6 @@
   },
   {
    "account": "dc2d751954080e13",
-   "claim_id": "f486716f68b94c3fa6f188d390fe7bf9",
-   "holder": "review:sparq-org/sparq#3990@dispatch-30192930637.1",
-   "package": "sparq-geo",
-   "role": "review",
-   "model": "sol",
-   "issued_at": 1785051521,
-   "expires_at": 1785055721
-  },
-  {
-   "account": "dc2d751954080e13",
    "claim_id": "7f05c2b749ed498bb3ca0d04e0a3c53f",
    "holder": "review:sparq-org/sparq#3995@dispatch-30192930637.1",
    "package": "gui",
