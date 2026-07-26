@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4375,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d32482b70355fdccac9420b23429a5492c2f5089",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "SV-ND-2 requires a request whose bound index is unreadable or absent to be indistinguishable, and SV-DISC-3 hides the index/features when the requester cannot read the descriptor. However, the eligible-entry definition and SV-AUTH-1 consider only source-resource readability, currency, and active-graph membership; neither requires the bound descriptor to be readable. Thus a requester who can read /notes/a but not the descriptor receives neighbours when an index is bound and zero solutions under SV-IDX-5 when none is bound. This violates the stated existence-non-disclosure invariant through the ordinary result set, independently of the acknowledged wrong-dimension oracle.",
+    "file": "site/specs/solid-vector-api.typ",
+    "fix_hint": "Choose and specify one coherent rule. The conservative fix is to make descriptor readability a prerequisite for using the bound index: when the descriptor is unreadable, evaluate every vec: pattern over an empty eligible set, and add a conformance scenario covering a readable indexed source plus an unreadable descriptor. Alternatively, explicitly abandon unreadable-index existence non-disclosure and revise SV-ND-2, SV-DISC-3, the abstract/security claims, and related examples consistently.",
+    "severity": "major",
+    "title": "Unreadable bound indexes remain directly observable through query results"
+   }
+  ],
+  "progress": null,
+  "summary": "The draft has a security-significant internal contradiction in its index-existence non-disclosure model. It hides an unreadable descriptor from service discovery and requires an unreadable bound index to be observationally equivalent to no index, but candidate eligibility depends only on each entry's source resource, currency, and active-graph membership. A requester who cannot read the descriptor but can read an indexed source can therefore issue a vec: query and distinguish a bound index (non-empty results) from no bound index (SV-IDX-5 requires zero results). The draft itself discusses only the narrower dimension oracle and does not resolve this more direct oracle.",
+  "verdict": "request_changes"
+ }
+}
