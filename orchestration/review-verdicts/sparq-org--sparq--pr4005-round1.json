@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4005,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "bdfd6e0b1c8864e3809b93339c5cf349a1c1758c",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new text says \"The corpus is now exhaustively covered,\" but the same diff states that one of the 493 TestCase nodes is untagged. collect_cases_for selects only DIRECT or RDF-BASED cases, excludes Rejected cases, and additionally requires a recognized check kind or ProfileIdentificationTest typing. Those omitted cases/documents are not measured by either round-trip arm. The disjointness canary proves that the two selected semantic slices do not overlap; it does not prove that their union covers the entire export corpus.",
+    "file": "skills/inference/SKILL.md",
+    "fix_hint": "Narrow the claim to exhaustive coverage of eligible, non-rejected cases sanctioned as DIRECT or RDF-BASED, or add a separately pinned accounting/test for every excluded category and only call the full export exhaustive if all ontology-document slots are actually covered.",
+    "severity": "major",
+    "title": "Exhaustive corpus coverage claim is contradicted by the selection logic"
+   }
+  ],
+  "progress": null,
+  "summary": "The RDF-BASED-only selector and its offline canary correctly exercise the intended disjointness, but the documentation overstates the resulting coverage. The diff itself records an untagged test case, while collect_cases_for also excludes rejected cases and cases lacking the recognized check/profile kinds. Therefore the claim that the corpus is now exhaustively covered does not follow from the implementation or tests.",
+  "verdict": "request_changes"
+ }
+}
