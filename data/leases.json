@@ -39,6 +39,16 @@
    "model": "fable",
    "issued_at": 1785039254,
    "expires_at": 1785045554
+  },
+  {
+   "account": "dc2d751954080e13",
+   "claim_id": "84f919564a3846a7b6f2d0c33c07f35e",
+   "holder": "review:jeswr/agent-account-registry#587@dispatch-30187396464.1",
+   "package": "set-up-account",
+   "role": "review",
+   "model": "sol",
+   "issued_at": 1785039680,
+   "expires_at": 1785043880
   }
  ]
 }
