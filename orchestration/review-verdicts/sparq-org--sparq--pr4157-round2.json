@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4157,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "9d43274b8c6d318362aeaa874573f7f935fe80e4",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior major finding. The new feature-gated regression constructs 50,001 surviving left rows, verifies the theta anti-join fired with the hash strategy, establishes an exact one-probe-per-row baseline, arms cancellation from inside the residual function on the 256th probe, asserts the canonical cancellation error, and verifies that probing stops well before the full baseline. It also runs an unexhausted budget over the same threshold-crossing branch and checks both answer equivalence and complete verdict evaluation. The implementation polls a captured budget snapshot before each parallel verdict and propagates the matching canonical reason through the Result collection, while retaining ordered serial output construction and the serial cooperative loop below the threshold. No correctness, soundness, test-validity, or security issue remains in the supplied diff.",
+  "verdict": "approve"
+ }
+}
