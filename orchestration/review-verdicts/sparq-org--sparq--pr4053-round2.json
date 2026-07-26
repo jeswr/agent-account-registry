@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4053,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "5505e33c60a38dd18f720fbdd3c42f0a31dd78fb",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 1's major TopK defect is fixed. The TopK path now removes every non-finite score before sorting and truncation, so invalid values cannot consume retained slots; the resulting map contains min(k, finite_count) entries and preserves the highest finite scores with deterministic node-index tie-breaking. The added regression test exercises the previously failing interaction with NaN and positive infinity in the top-ranked positions, checks multiple budgets including budgets above the finite count, and separately covers negative infinity. The existing finite TopK test continues to verify selection of distinct highest ranks and preservation of original score values. No correctness, soundness, security, or test-validity issues remain in the supplied diff.",
+  "verdict": "approve"
+ }
+}
