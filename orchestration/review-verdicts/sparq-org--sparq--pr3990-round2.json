@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3990,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "35ef9e56e43d08e8bf61a2ea7d09988cb7a83038",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The document says the 72.22%/143 result predates the comparator fixes, has not been re-derived, and is provisional, yet the main table presents 72.22% as sparq's comparable score and the summary ranks sparq as 2nd of 9 on the same-artifact/same-scoring axis. The old SRX parser dropped entity references and the old GML normalizer was lossy, so the corrected pass/fail set is unknown. Moreover, the new bounded normalizer is deliberately not the upstream canonicalizer, making the unqualified 'SAME requirements-weighted scoring' claim unsupported without differential evidence. A caveat below the headline does not make the ranking reproducible or correct.",
+    "file": "research/gap-conformance-cross-engine-2026-07.md",
+    "fix_hint": "Re-run all configurations with the corrected comparator and update the score, matrix, requirement breakdown, ranking, and claims from that run. If that cannot be done in this PR, retain the harness but remove the numeric sparq row, ranking, DONE/comparable verdict, and gap arithmetic; report the run as pending. Also qualify comparator equivalence unless a differential check against the upstream harness establishes that the bounded normalizer produces the same decisions on the benchmark corpus.",
+    "severity": "major",
+    "title": "The comparison and ranking still rely on a known-invalid pre-fix score"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 2 fixes the cache-integrity defect and makes the XML normalizer fallible with substantially better tests, so the review is improving. However, the PR still publishes and ranks a 72.22% result that it explicitly says was produced by the old broken comparator and has not been re-derived. Calling that result directly comparable and using it to move the scoreboard from NOT-COMPARABLE to BEHIND is not supported by the corrected harness.",
+  "verdict": "request_changes"
+ }
+}
