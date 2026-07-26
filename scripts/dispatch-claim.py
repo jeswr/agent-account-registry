@@ -10982,9 +10982,22 @@ def _starvation_sweep_self_test():
 
     prov = {41: {"pr_number": 41, "issue": 7, "impl_provider": "anthropic",
                  "impl_alias": "sol", "impl_account_h": "0" * 16,
-                 "head_sha_at_open": _STARVE_SHA}}
+                 "head_sha_at_open": _STARVE_SHA,
+                 # MACHINE-ATTESTED stamp (registry #657/#732): admission requires a
+                 # `recorded_at_run` naming the host-side run that wrote the record. A stampless
+                 # fixture is inadmissible, which would make the crate-scoped-occupant case below
+                 # silently exercise the fail-closed `__global__` path instead of the resolvable
+                 # linkage it exists to test — i.e. it would pass for the wrong reason.
+                 "recorded_at_run": "29694084610.1"}}
     assert provenance_admission_error(prov[41], 41) is None, \
         provenance_admission_error(prov[41], 41)
+    assert provenance_attestation_class(prov[41]) in MACHINE_ATTESTED_CLASSES, \
+        provenance_attestation_class(prov[41])
+    # ...and the counterfactual, so this fixture can never quietly lose its stamp again: without
+    # it the record is inadmissible and the occupant falls back to reserving the global partition.
+    _unstamped = {key: value for key, value in prov[41].items() if key != "recorded_at_run"}
+    assert provenance_admission_error(_unstamped, 41) == ATTESTATION_UNRECOGNISED_REASON, \
+        provenance_admission_error(_unstamped, 41)
     rows = [{"number": 900, "package": "crate-a", "deferred": False},
             {"number": 901, "package": "crate-b", "deferred": False}]
     starvation = {}
