@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 741,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "c4dfafc48a7b95f11908ea51cbfb74cf1ffa33d7",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The Claude parser sets `recognised = True` for every known `assistant` event, but only examines blocks inside `if isinstance(content, list)`. If `message` is absent/malformed or `content` is absent, an object, or another unexpected shape, `unclassified` remains false. A following known `result` therefore satisfies all three measurement gates and emits an empty tool-count map, which the envelope turns into `probe:0`, even though the malformed assistant record may be a changed tool-bearing schema. Additionally, a block whose known tool discriminator has a missing or non-string `name` is counted as `other`; that also loses whether it was an inspecting tool while retaining a confident zero. The new renamed-block test does not cover either malformed container/name path.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "For every Claude `assistant` event, require `message` to be an object and `content` to be a list; otherwise set `unclassified = True`. For each known tool-bearing block, require the protocol's tool-name field to be a valid string before classifying it; malformed/missing names must invalidate measurement rather than become `other`. Add negative fixtures for missing/non-list assistant content and for a `tool_use` block with a missing/non-string name, each followed by `result`; both must omit `probe`, while the existing complete tool-free fixture must continue to emit `probe:0`.",
+    "severity": "major",
+    "title": "Malformed Claude assistant payloads can still fabricate probe zero"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round-2 lifecycle, unknown-discriminator, and truncation cases are now handled with meaningful positive and negative tests, but the absent-versus-zero contract is still not fully fail-closed. In the Claude branch, a recognized `assistant` event is considered classified when `message.content` is missing or is not a list; likewise a recognized tool-bearing block with a missing/non-string `name` is folded into `other`. Either malformed shape can hide a repository-inspecting call and, when followed by `result`, publish `probe:0`. This is materially the same remaining major issue as round 2 at the same severity, so progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
