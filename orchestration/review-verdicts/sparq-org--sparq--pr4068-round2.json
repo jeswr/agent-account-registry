@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4068,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "4ec84350324f78d38fa37b229cf01a577ce12407",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior major test-validity gap. The differential now canonicalizes and compares complete solution multisets, including every projected binding and duplicate multiplicity, while retaining the order-sensitive oracle for ORDER BY. The focused aggregate-value and path-endpoint mutation tests demonstrate that same-cardinality wrong answers are rejected, and the category coverage test confirms that the value oracle actually runs for all applicable generated categories. The deliberate LIMIT/OFFSET and blank-node skips are explicit and consistent with nondeterministic row choice and implementation-defined blank-node labels.",
+  "verdict": "approve"
+ }
+}
