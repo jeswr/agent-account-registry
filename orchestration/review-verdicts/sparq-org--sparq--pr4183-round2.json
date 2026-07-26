@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 4183,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b02047308096dc0017e09b6b2121b7256394ec96",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "\u00a77.4 (as rewritten by this PR) says two things stay open under sq-tu4e: issuer-key binding, and \"the unanalysed recursive-admission termination risk (\u00a77.1 C'/D')\". \u00a77.6 \u2014 the section that tells a skeptic what to attack first \u2014 now lists only \"the remaining freshness / issuer-key limits from `sq-tu4e`\". The termination risk is silently absent, and \"freshness\" is listed as a remaining limit even though this PR settles it (Rust-side per-request check, \u00a77.1 B'), so the one item that is genuinely resolved is named and the one that is genuinely open is not.\n\nThis is the same class of scan-level overclaim the round-1 major flagged in \u00a77.4, just moved one section down: a reader who uses \u00a77.6 as the checklist will not see the unanalysed recursive/unbound-join admission termination risk that P8 is supposed to bound.",
+    "file": "research/solid-trust-graph-authz-design.md",
+    "fix_hint": "Align \u00a77.6 with \u00a77.4, e.g. \"...the remaining issuer-key binding and unanalysed recursive-admission termination limits from `sq-tu4e`...\" and drop \"freshness\" from the open list (or keep it explicitly as a settled scoping note rather than an open problem).",
+    "severity": "minor",
+    "title": "\u00a77.6 skeptic's list of remaining sq-tu4e open problems drops the termination risk that \u00a77.4 says is still open"
+   },
+   {
+    "body": "\u00a73.5 was correctly amended to state that the conflict witness alone is not enough \u2014 \"A second positive rule must join that witness against the policy structure and derive the prohibition for each specific (principal, target, mode) grant that consumed the disputed attribute\" \u2014 because deny-overrides subtracts access tuples, not attribute-level facts.\n\n\u00a77.1 F' still compresses this to \"A positive join over two disagreeing issuer-tagged facts derives a conflict/prohibition witness, and existing deny-overrides defeats the competing grant without NAF.\" The slash in \"conflict/prohibition\" is the only trace of the two-rule structure. \u00a76.0 and \u00a77.4 both got the fuller \"routed to an access-tuple prohibition\" phrasing in this PR, so \u00a77.1 F' is the one summary left at the pre-fix altitude \u2014 and it is the summary a reviewer auditing the concessions reads. As written it reads as though deny-overrides picks up an attribute-level conflict fact directly, which authindex.rs does not do.",
+    "file": "research/solid-trust-graph-authz-design.md",
+    "fix_hint": "Mirror the \u00a76.0/\u00a77.4 wording: \"...derives a conflict witness, which a second positive rule routes to a prohibition on the specific (principal, target, mode) grants that consumed the disputed attribute; the existing Rust-side deny-overrides subtraction then defeats the competing grant without NAF.\"",
+    "severity": "minor",
+    "title": "\u00a77.1 F' omits the conflict-witness -> (principal, target, mode) routing step that \u00a73.5 makes load-bearing"
+   },
+   {
+    "body": "The untouched first sentence of \u00a73.5 reads \"The derivation stratum inherits ACP's normative **deny-overrides** for the *access* decision\". Two paragraphs later the new text correctly says \"Deny-overrides is Rust-side post-materialisation set subtraction over those access tuples (`authindex.rs`), not subtraction over attribute-level conflict facts.\"\n\nBoth sentences now sit in the same section saying incompatible things about where deny-overrides lives. The round-1 fix_hint asked for this phrase to be corrected as well; the new paragraph got it right but the older sentence was left, so the section is internally inconsistent for a reader who stops at the first paragraph. Purely editorial \u2014 the technical conclusion in the new paragraph is the correct one and matches the code.",
+    "file": "research/solid-trust-graph-authz-design.md",
+    "fix_hint": "Reword the opening to \"The access decision inherits ACP's normative deny-overrides (applied Rust-side after materialisation, \u00a73.5 below), but the *admission* of contradictory *facts* needs its own rule.\"",
+    "severity": "nit",
+    "title": "\u00a73.5's retained opening still attributes deny-overrides to \"the derivation stratum\", contradicting the corrected paragraph below it"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 2 of the doc-only change to research/solid-trust-graph-authz-design.md. Both round-1 majors are fixed and I re-verified the fixes against the checkout rather than taking them on trust.\n\nMajor 1 (sq-tu4e falsely labelled RESOLVED): \u00a77.4 now reads \"PARTIALLY RESOLVED (conflict reachability only)\" and explicitly enumerates what stays open under the bead \u2014 issuer-key binding (the LIVE forgery vector gated on P2/sq-pfae.3) and the unanalysed recursive-admission termination risk (\u00a77.1 C'/D'). The bead is still status=open in .beads/issues.jsonl, which is now the correct state for a partially-resolved bead. \u00a77.1 D' (the forgery vector, ~line 2210 of the file) is untouched and still reads as an active attack surface, so the scan-the-summary overclaim is gone.\n\nMajor 2 (\u00a76.0 PoC hooks contradicting \u00a73.5): the hook now says \"deny-on-disagreement -> RESOLVED in \u00a73.5 as a positive conflict witness routed to an access-tuple prohibition plus deny-overrides \u2014 implement it, do not omit it\", mirroring the sibling sq-xc4y style, and acceptance case (v) \"two trusted issuers attesting contradictory values for an attribute consumed by a grant\" was added to the adversarial negative set.\n\nBoth round-1 minors are addressed: \u00a73.5 now names the routing obligation (\"A second positive rule must join that witness against the policy structure and derive the prohibition for each specific (principal, target, mode) grant\") and correctly describes deny-overrides as Rust-side post-materialisation set subtraction (matches authindex.rs:463-465, `\u222a allow \u2216 \u222a deny`), and it names log:notEqualTo with the term-vs-value caveat plus math:notEqualTo. The round-1 nit is fixed: \u00a77.1 C' and \u00a73.5 now acknowledge materialize.rs:191's three-stratum reason_n3_stratified.\n\nLoad-bearing engine claims re-verified: incremental.rs rejects guard predicates derived by any rule (\"negation over derived predicate {p} (not input-stratified)\"); reason_n3_stratified's rustdoc confirms it is the sound\u2026 [truncated 212 chars]",
+  "verdict": "approve"
+ }
+}
