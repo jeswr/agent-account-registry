@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4265,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "8d2c83e9a16b0d2e4e6301c80123cc8a824e3d4d",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The paper says the invariant is machine-checked \"across both physical plans\" and that filtered results are \"byte-identical\" to post-filtered results. However, the cited `filtered_equals_postfilter_and_is_subset` test uses the default cost model with a 3-of-6 mask, which selects only the pre-filter branch at the inclusive 50% crossover. It then projects results through `iris()` and compares only node IRI strings, discarding scores and the rest of the serialized result. Thus the cited test does not support either the both-branches claim or the byte-identical-result claim. Direct cost-layer tests elsewhere do not make this end-to-end, per-constraint-shape evidence table true.",
+    "file": "site/papers/filtered-ann.typ",
+    "fix_hint": "Either narrow the prose/table/evidence claims to ordered candidate-ID equivalence on the exercised pre-filter path, or add real end-to-end tests that force both `Strategy::PreFilter` and `Strategy::PostFilter` for each claimed constraint shape and compare the complete observable result (including scores/serialization if retaining \"byte-identical\"). Bind the evidence records to those tests.",
+    "severity": "major",
+    "title": "Answer-safety evidence does not exercise both physical plans or byte-identical results"
+   },
+   {
+    "body": "The artifact section says \"every claim in this paper is a build-time citation of a committed record\" and therefore \"the artifact and the paper cannot drift apart.\" Many claims are prose/architectural or novelty assertions rather than evidence-ledger lookups, and the answer-safety record itself cannot validate the stronger byte-identical/both-plan wording noted above. Build-time binding of selected numeric and boolean records does not make every paper claim drift-proof.",
+    "file": "site/papers/filtered-ann.typ",
+    "fix_hint": "Restrict the statement to the measured headline values and explicitly enumerated boolean records that the evidence verifier binds to committed sources. Avoid claiming that every paper claim, or the paper as a whole, cannot drift from the implementation.",
+    "severity": "major",
+    "title": "Artifact availability makes a broader drift-proof claim than the evidence system supports"
+   }
+  ],
+  "progress": null,
+  "summary": "The revision improves the path scoping and correctly separates the exact SPARQL rewrite from the unwired approximate traversal, but it still overstates what the cited answer-safety test establishes. The load-bearing evidence test compares only projected IRIs and exercises the default pre-filter branch at the 50% crossover; it does not establish byte-identical results or end-to-end equivalence across both physical plans as the paper repeatedly claims.",
+  "verdict": "request_changes"
+ }
+}
