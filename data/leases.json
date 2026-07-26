@@ -92,16 +92,6 @@
   },
   {
    "account": "dc2d751954080e13",
-   "claim_id": "53e052530b364fd19128ee62f54e6ec2",
-   "holder": "review:sparq-org/sparq#4338@dispatch-30222345752.1",
-   "package": "knowledge-graph",
-   "role": "review",
-   "model": "sol",
-   "issued_at": 1785103921,
-   "expires_at": 1785108121
-  },
-  {
-   "account": "dc2d751954080e13",
    "claim_id": "fdc1b62f20494f85942ceddf492f310b",
    "holder": "review:sparq-org/sparq#4343@dispatch-30222345752.1",
    "package": "sparq-geo",
