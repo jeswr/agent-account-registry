@@ -82,16 +82,6 @@
   },
   {
    "account": "51bde6688e140866",
-   "claim_id": "a13a1d89214e41fba19de2ed17c28d7b",
-   "holder": "sparq-org/sparq#2883@30217082254.1",
-   "package": "zk-xpath",
-   "role": "soundness",
-   "model": "opus5",
-   "issued_at": 1785094401,
-   "expires_at": 1785100701
-  },
-  {
-   "account": "51bde6688e140866",
    "claim_id": "15b1d915009a4520906e4fc058d3743f",
    "holder": "sparq-org/sparq#2513@30217771000.1",
    "package": "sparq-reason-ql",
