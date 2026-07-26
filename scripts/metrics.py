@@ -1881,6 +1881,75 @@ def _run_publish_kick(script, *, metrics_result, last_run_age=60):
     return proc.returncode, calls, proc.stdout + proc.stderr
 
 
+# [OPUS-5] round-2 review: the ONE grammar of job-level `if:` this repo's publish chain uses.
+# Anchored and single-comparison on purpose — see _eval_job_if for why an unmodelled rewrite must
+# raise rather than be waved through.
+_JOB_IF_COMPARISON = re.compile(
+    r"^needs\.([A-Za-z0-9_-]+)\.(result|outputs\.[A-Za-z0-9_.-]+)\s*(==|!=)\s*'([^']*)'$")
+
+
+def _eval_job_if(expr, needs):
+    """EVALUATE a job-level `if:` against a hypothetical `needs` context. -> bool.
+
+    Round-2 review finding (mutants A and C): the wiring assertions here matched job conditions by
+    SUBSTRING, which is polarity-blind by construction. `==` -> `!=` on the publish gate made the
+    dashboard publish only when the dedupe decided to SKIP — the freshness fix becoming a freshness
+    outage — and every check in the repo stayed green. Deletion was caught; inversion was not. So
+    the gate is now evaluated over the outcomes that matter instead of pattern-matched.
+
+    `expr is None` models GitHub's default for a job with `needs:` and no `if:` — an implicit
+    `success()` over the needed jobs. That is what makes dropping `if: always()` visible here.
+
+    Only `always()`, a boolean literal, `success()`, and ONE
+    `needs.<job>.(result|outputs.<key>) (==|!=) '<literal>'` comparison are modelled. Anything else
+    raises: a gate rewritten into a form this harness cannot reason about must fail LOUDLY rather
+    than silently stop being checked, which is the failure mode that produced this function."""
+    def _success():
+        return all((ctx or {}).get("result") == "success" for ctx in needs.values())
+
+    if expr is None:
+        return _success()
+    if isinstance(expr, bool):  # `if: false` parses as a YAML boolean, not the string "false"
+        return expr
+    text = str(expr).strip()
+    if text.startswith("${{") and text.endswith("}}"):
+        text = text[3:-2].strip()
+    if text == "always()":
+        return True
+    if text in ("true", "false"):
+        return text == "true"
+    if text == "success()":
+        return _success()
+    match = _JOB_IF_COMPARISON.match(text)
+    if not match:
+        raise MetricsError(
+            f"unmodelled job `if:` expression {expr!r} — this harness only evaluates the restricted "
+            "grammar the publish chain uses, and an expression it cannot evaluate is an UNCHECKED "
+            "polarity on a surface that cannot be reviewed at runtime (round-2 mutants A and C). "
+            "Extend _eval_job_if deliberately, or keep the gate in the modelled grammar.")
+    job, field, operator, want = match.groups()
+    context = needs.get(job)
+    if context is None:
+        raise MetricsError(
+            f"job `if:` reads needs.{job}, which is not among the modelled needs {sorted(needs)} — "
+            "a gate that names a job it does not depend on always reads the empty string")
+    if field == "result":
+        got = context.get("result", "")
+    else:
+        got = (context.get("outputs") or {}).get(field.split(".", 1)[1], "")
+    return (got == want) if operator == "==" else (got != want)
+
+
+def _job_step(job, step_id):
+    """The parsed step mapping with `id: step_id` inside a parsed job. Fails closed."""
+    found = [step for step in (job.get("steps") or []) if step.get("id") == step_id]
+    if len(found) != 1:
+        raise MetricsError(
+            f"expected exactly one step with `id: {step_id}`, found {len(found)} — refusing to "
+            "assert against a step that cannot be located")
+    return found[0]
+
+
 def _test_publish_cas_and_wiring(chk):
     snapshot = {"generated_at": "2026-07-21T00:00:00Z", "schema_version": 1,
                 "targets": {}, "alerts": []}
@@ -1991,6 +2060,55 @@ def _test_publish_cas_and_wiring(chk):
          "needs.publish-decision.outputs.publish" in str(dash["jobs"]["probe"].get("if", "")),
          dash["jobs"]["build"].get("needs"), dash["jobs"]["deploy"].get("needs")),
         ("publish-decision", True, "probe", "build"))
+
+    # --- THE YAML `if:` SEAM (round-2 review, mutants A and C) ------------------------------
+    # The assertion above catches DELETION of the gate and nothing else: it is a substring test, so
+    # `== 'true'` -> `!= 'true'` survived it, and the dashboard would then publish only when the
+    # dedupe decided to SKIP. `if: always()` on the kick job was pinned by nothing at all, so
+    # deleting it survived too — and with the NEW `needs: metrics` edge that silently kills the
+    # mutual cron-delivery keepalive on exactly the failure path it exists for (the 2026-07-22
+    # stall). Both mutants live one level ABOVE the executed shell bodies, on a surface no runtime
+    # check can reach. So each condition is pinned EXACTLY and then EVALUATED.
+    publish_gate = dash["jobs"]["probe"].get("if")
+    chk("the publish gate is the EXACT positive polarity (an inverted dedupe publishes only when it "
+        "decided to skip — the freshness fix becoming a freshness outage)",
+        str(publish_gate).strip(), "needs.publish-decision.outputs.publish == 'true'")
+    chk("...and the gate is EVALUATED, not merely matched: publish=true runs the chain, "
+        "publish=false skips it, and an absent output skips (fail-closed if the decision job itself "
+        "dies — one cron of no publish, never a wedge)",
+        tuple(_eval_job_if(publish_gate,
+                           {"publish-decision": {"result": "success", "outputs": outputs}})
+              for outputs in ({"publish": "true"}, {"publish": "false"}, {})),
+        (True, False, False))
+    chk("no OTHER job in the publish chain carries a condition of its own — a second gate anywhere "
+        "on publish-decision/build/deploy (`if: false` being the cheapest) stops the site "
+        "publishing while every dedupe assertion above stays green",
+        {job: dash["jobs"][job].get("if") for job in ("publish-decision", "build", "deploy")},
+        {"publish-decision": None, "build": None, "deploy": None})
+    chk("...and neither EXECUTED step body is itself conditional — a step-level `if:` would leave "
+        "this harness exercising a body production can skip",
+        (_job_step(dash["jobs"]["publish-decision"], "publish-decision").get("if"),
+         _job_step(coll["jobs"]["dashboard-publish"], "dashboard-publish").get("if")),
+        (None, None))
+    keepalive_gate = coll["jobs"]["dashboard-publish"].get("if")
+    chk("the kick job runs even when the metrics job FAILS: `needs: metrics` is NEW here, so "
+        "without `always()` the mutual cron-delivery keepalive dies on precisely the failure path "
+        "it was built for (2026-07-22: dashboard 44+ min overdue, nothing kicked it)",
+        str(keepalive_gate).strip(), "always()")
+    chk("...evaluated across every metrics-job outcome, so DELETING the condition (leaving GitHub's "
+        "implicit success()) or pinning it false goes red here, not in production",
+        {result: _eval_job_if(keepalive_gate, {"metrics": {"result": result}})
+         for result in ("success", "failure", "cancelled", "skipped")},
+        {"success": True, "failure": True, "cancelled": True, "skipped": True})
+    unmodelled = False
+    try:
+        _eval_job_if("github.event_name == 'schedule' && needs.publish-decision.result == 'success'",
+                     {"publish-decision": {"result": "success"}})
+    except MetricsError:
+        unmodelled = True
+    chk("a gate rewritten outside the modelled grammar RAISES rather than silently stopping being "
+        "checked — the evaluator above must not be the next thing that fails open", unmodelled, True)
+
     chk("cron-keepalive is NEVER gated by the dedupe — the liveness mesh that revives every other "
         "scheduled workflow must run on every scheduled fire, publish or skip",
         ("needs" in dash["jobs"]["cron-keepalive"], "if" in dash["jobs"]["cron-keepalive"]),
