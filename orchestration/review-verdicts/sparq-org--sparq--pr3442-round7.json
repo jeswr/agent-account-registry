@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3442,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b0d1e3803c191c98211e4a4a5245d85987518bbe",
+  "round": 7
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 7 resolves the prior major soundness finding. The witness construction now returns one Graph per canonical disjunct and run_gather compares raw and minimised UCQs independently on every isolated database, preventing joins through shared IRI/literal constants across instances. The load-bearing regression isolated_witness_detects_constant_bridge_masking reproduces the former false agreement on the unioned graph and demonstrates a mismatch with isolated graphs using the exact D/E/F shared-constant counterexample from round 6. The surrounding claims now accurately identify isolation as load-bearing, and FILTER/VALUES remain fail-closed to avoid modifier-induced vacuity. No correctness, soundness, test-validity, or security issue remains in the supplied diff.",
+  "verdict": "approve"
+ }
+}
