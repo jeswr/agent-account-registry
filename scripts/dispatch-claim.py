@@ -6003,6 +6003,29 @@ def _self_test():
     print("  ok   adopt-loop L1: all THREE python derivations of the area->package partition agree, "
           "the live two-area incident row (area:ci + area:site) included")
 
+    # L1b. AGREEMENT IS NOT DELEGATION. Every assertion above is satisfied by a private copy that
+    # happens to agree today — the exact prose-promise mechanism this incident came from — so the
+    # MINTER, the one caller whose delegation is not carried by an executed workflow anchor
+    # (L2/L4/L5 carry the other three), gets a shared-CODE leg: swap the canonical function object
+    # out from under it and the minter's result MUST follow. A re-inlined copy cannot observe the
+    # swap. This is the pin the README's "even one that agrees today" sentence promises.
+    _pp_sentinel = "__delegation-probe__"
+    _pp_real = _lease_schema.plan_package
+    try:
+        _lease_schema.plan_package = lambda areas: _pp_sentinel
+        _pp_observed = plan_package(["ci"])
+    finally:
+        _lease_schema.plan_package = _pp_real
+    assert _pp_observed == _pp_sentinel, (
+        "dispatch-claim.plan_package must DELEGATE to lease_schema.plan_package, not re-implement "
+        "it: replacing the canonical function object did not change the minter's result "
+        f"(got {_pp_observed!r}), so this is a private copy that merely AGREES today — the drift "
+        "axis that produced the 2026-07-26 adopt loop")
+    assert plan_package(["ci"]) == "ci" and plan_package(["ci", "site"]) == GLOBAL_PACKAGE, \
+        "the canonical lease_schema.plan_package must be restored after the delegation probe"
+    print("  ok   adopt-loop L1b: dispatch-claim.plan_package (the MINTER) reaches the canonical "
+          "reduction by SHARED CODE — a private-but-agreeing copy is caught, not just a drifted one")
+
     # L2. review-fix.yml's resolve job derives `package` by CALLING this module's plan_package —
     # EXECUTED, not grepped. The extracted slice is the workflow's real line.
     def _resolve_package(areas, source=None):

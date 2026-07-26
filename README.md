@@ -88,10 +88,21 @@ That reduction is **`lease_schema.plan_package`**. Precisely:
 | `worker.yml` adopt validator | **imports** `lease_schema` from the registry checkout |
 | `dispatch-plan.py:_plan_package` | the ONE genuine copy — it ships inside the target repos, which have no `lease_schema.py`, so it is **pinned by an executed agreement assertion** in `dispatch-claim.py --self-test`, not shared |
 
-So there is one canonical definition, four callers, and exactly one pinned copy. Reverting any
-caller to a private reduction — even one that agrees today — turns `dispatch-claim.py --self-test`
-red, because each pin *executes* the workflow's own code (extracted from the parsed YAML) and
-requires both that it agrees on every area shape **and** that it reaches the canonical function.
+So there is one canonical definition, four callers, and exactly one pinned copy. Reverting any of the
+**four callers** to a private reduction — even one that agrees today — turns
+`dispatch-claim.py --self-test` red, because every caller carries a **shared-code** leg and not just
+a value-agreement leg (value agreement is exactly what a private-but-agreeing copy also satisfies):
+
+* the three **workflow** callers are *executed* out of the parsed YAML, and must both agree on every
+  area shape **and** still contain the canonical call — re-inlining the rule removes the anchor, so
+  the extraction fails with `found 0` instead of silently testing a copy;
+* the **minter**'s delegation is probed directly: the self-test swaps `lease_schema.plan_package`
+  out for a sentinel and requires `dispatch-claim.plan_package`'s result to follow it, which only
+  shared code can do (`adopt-loop L1b`).
+
+The fifth row, `dispatch-plan.py`, is the exception and is **agreement-pinned, not shared** — it
+ships where `lease_schema.py` does not exist. A private copy *there* is caught only if it disagrees
+on one of the exercised area shapes, which is weaker than the four callers above.
 The routing tables `review-fix.yml` re-derives inline (`review_chain` / `fix_chain` / `ladders`) are
 pinned to `dispatch-claim.REVIEW_CHAIN` / `FIX_CHAIN` / `worker-pr.ESCALATION_LADDERS` the same way.
 
