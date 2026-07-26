@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 3990,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c0fcf44d05cb6e5a58e6746d8b18a0f3403d3791",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The script exits immediately when verify_tree \"$OUT\" succeeds, before checking the tarball hash. verify_tree checks only directory/file counts and one nonempty dataset file, so a stale, locally edited, or otherwise corrupted extracted corpus is silently accepted and scored. This contradicts the stated hard pin and can make the recorded result irreproducible.",
+    "file": "bench/geo/gsb.sh",
+    "fix_hint": "Tie the extracted tree to the verified archive: always validate the cached tarball before accepting OUT and store/check a marker containing the verified digest, or hash a manifest of the extracted benchmark files. Re-extract whenever that proof is absent or mismatched. Add a script-level test showing that a count-preserving edit to OUT is rejected or rebuilt.",
+    "severity": "major",
+    "title": "Cached extracted benchmark bypasses the SHA-256 pin"
+   },
+   {
+    "body": "canonical_xml is described as equivalent to the benchmark's C14N over the corpus, but it implements a lossy ad-hoc serializer. In particular Event::Empty emits only an opening tag, attributes/text are written without XML escaping, namespace handling is lexical rather than canonical, and malformed XML returns a partial string instead of failing. The only test covers indentation and text whitespace, so it does not establish the claimed corpus equivalence. Incorrect normalization can produce false passes or false failures and invalidate the published score.",
+    "file": "crates/sparq-geo/examples/gsb_compliance.rs",
+    "fix_hint": "Use a standards-compliant canonicalization implementation matching the upstream comparator, or prove and implement an explicitly bounded corpus comparator after inspecting every benchmark GML shape. Make normalization fallible and treat malformed literals as non-matches. Add fixtures for empty elements, reordered attributes/namespaces, escaped attribute/text content, and malformed XML, plus a differential test against the upstream expected normalization.",
+    "severity": "major",
+    "title": "The GML comparator is not equivalent to canonical XML"
+   }
+  ],
+  "progress": null,
+  "summary": "The benchmark runner is not yet reliable enough to support the newly published 72.22% compliance claim. The gather script trusts an already-extracted tree without verifying it against the pinned archive, and the purported GML canonicalizer is not XML C14N and even serializes empty elements incorrectly. Either defect can change pass/fail outcomes while the documentation presents the comparator and artifact as faithful and pinned.",
+  "verdict": "request_changes"
+ }
+}
