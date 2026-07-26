@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3870,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "2a3a36ad54678755bbf5f90a787e93b827b53e40",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The README's opening contract still says the crate computes the complete subsumption lattice of an EL ontology. That is contradicted by the same README's later statement that nominal completeness is only claimed for safe usage and by the feature-dependent concrete-domain/RBox scope. The relevant audit record likewise describes skipped-axiom accounting and feature-dependent CR7-CR11 support, not unconditional completeness. The round-2 CLI caveats and real skipped-concrete-domain test fix the CLI presentation, but they do not cure this crate-level public promise. The inference skill also retains a bottom-line sentence saying to use sparq-reason-el for the complete class hierarchy, which can be read independently of its earlier caveats.",
+    "file": "crates/sparq-reason-el/README.md",
+    "fix_hint": "Qualify the README introduction exactly as the repaired CLI docs do: complete for the recognised fragment in the enabled feature set, under a regular RBox, with the nominal limitation stated. In skills/inference/SKILL.md, replace the remaining 'For the complete class hierarchy use sparq-reason-el' wording with 'For the hierarchy of the recognised fragment...' or restate the same feature/regularity boundary in that sentence. Keep the existing end-to-end concrete-domain skip test.",
+    "severity": "major",
+    "title": "Public reasoner docs still promise an unqualified complete EL lattice"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 2 substantially narrows and tests the CLI-facing completeness claim: the command help, CLI README, and primary inference-skill guidance now consistently scope completeness to the recognised fragment under a regular RBox, and the concrete-domain skip test exercises the real binary. One major honesty defect remains in changed public documentation: the sparq-reason-el README still opens with an unconditional complete-lattice promise, despite its own later feature/nominal limitations, and the inference skill still directs readers to that crate for the complete hierarchy without restating the boundary. This is the same prior-round claim-scope class but in fewer locations, so progress is improving.",
+  "verdict": "request_changes"
+ }
+}
