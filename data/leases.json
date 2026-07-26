@@ -112,16 +112,6 @@
   },
   {
    "account": "488920c2efe2b3fb",
-   "claim_id": "af158f26abc6469ebc8e684de7f90d9b",
-   "holder": "sparq-org/sparq#3242@30215854225.1",
-   "package": "knowledge-graph",
-   "role": "impl",
-   "model": "opus5",
-   "issued_at": 1785092317,
-   "expires_at": 1785098617
-  },
-  {
-   "account": "488920c2efe2b3fb",
    "claim_id": "5056250377454dc4ae089f54c4abcc09",
    "holder": "sparq-org/sparq#3297@30215856335.1",
    "package": "sparq-fedplan-mpc",
