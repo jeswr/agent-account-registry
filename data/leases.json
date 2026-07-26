@@ -63,12 +63,12 @@
   {
    "account": "51bde6688e140866",
    "claim_id": "ae81c01c26e6470b826d6e5a1e8ef56c",
-   "holder": "sparq-org/sparq#2783@dispatch-30192605906.1",
+   "holder": "sparq-org/sparq#2783@30192878650.1",
    "package": "sparq-core",
    "role": "impl",
    "model": "opus5",
-   "issued_at": 1785050928,
-   "expires_at": 1785057228
+   "issued_at": 1785050951,
+   "expires_at": 1785057251
   },
   {
    "account": "51bde6688e140866",
