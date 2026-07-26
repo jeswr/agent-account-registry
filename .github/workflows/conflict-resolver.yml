@@ -114,7 +114,7 @@ jobs:
           )"
           export TARGET_GH_TOKENS
           python3 scripts/resolve-conflicts.py --self-test
-          # --stuck-grace-hours is the MACHINE EXIT from the single-attempt state (issue #755):
+          # --stuck-grace-hours is the MACHINE EXIT from the single-attempt state (issue #753):
           # a lone recorded attempt on a head nobody pushes to can never reach the two-distinct-
           # head escalation, so after this many hours it escalates itself to needs:user.
           # --no-exit-threshold 0 reds the run the moment any conflicting PR is left in a state

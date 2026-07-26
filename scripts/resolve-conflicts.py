@@ -49,7 +49,7 @@ SAFE_BRANCH = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*")
 SAFE_SHA = re.compile(r"[0-9a-f]{40}")
 MAX_API_PAGES = 50
 DEFAULT_REBASE_CAP = 5
-# Issue #755. The two-distinct-head escalation is the ONLY exit from a recorded conflict attempt,
+# Issue #753. The two-distinct-head escalation is the ONLY exit from a recorded conflict attempt,
 # and a second distinct head exists only if somebody PUSHES to the branch. An abandoned worker PR
 # therefore parks in `head already has a recorded conflict attempt` FOREVER: no label, no
 # escalation, no error, so a run that skipped it is byte-identical to a run that had nothing to do.
@@ -838,7 +838,7 @@ class ConflictResolver:
                     repo, detail, comments, prior_conflicting_files(comments, self.bot_login)
                 )
                 return
-            # THE MACHINE EXIT (issue #755). One attempt, head unmoved. The two-distinct-head
+            # THE MACHINE EXIT (issue #753). One attempt, head unmoved. The two-distinct-head
             # rule can never fire here on its own, so bound the wait on the clock instead: inside
             # the grace window the author may still push; past it, this is the same conclusion the
             # second failed attempt would reach — a human must resolve it.
@@ -1398,7 +1398,7 @@ def _self_test():
         (["callback", "retry", "final-pass"], 1, [((0.1,), {})], True),
     )
 
-    # (k) THE MACHINE EXIT (issue #755). ONE recorded attempt on a head nobody ever pushes to was
+    # (k) THE MACHINE EXIT (issue #753). ONE recorded attempt on a head nobody ever pushes to was
     # a hold with NO exit: the two-distinct-head escalation cannot fire without a second head, so
     # the sweep re-skipped those PRs ~3x/hour forever — unlabelled, uncounted, and invisible to
     # every label-driven lane. Inside the grace window that wait is correct (the author may still
