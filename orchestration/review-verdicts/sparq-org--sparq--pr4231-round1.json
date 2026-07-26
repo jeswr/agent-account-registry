@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4231,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "eee2c90baf9862f7bee6ace07fff1c84daa111bf",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The classic-script bundle is correctly added to the build and package guardrail, derives the external wasm URL synchronously from document.currentScript, preserves an explicit configureWasm override, and stubs the browser-incompatible Node filesystem import. The tests exercise the generated non-module artifact with the real wasm engine, verify lazy URL resolution and actual inference, compare the exported surface with the ESM entry, and guard against embedding the wasm payload. The README accurately documents the shipped layout and browser-only scope.",
+  "verdict": "approve"
+ }
+}
