@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4342,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a3af2a2fdedbc775873a0343f2c93cdb9d3f993b",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly extends cooperative budget enforcement through SELECT-JSON serialization. The serial path checks periodically and performs a sticky final gate before emitting the closing JSON suffix; the parallel path uses the thread-local budget snapshot in Rayon workers and performs the authoritative on-thread gate before closing the response. Thus cancellation or timeout cannot yield a syntactically complete truncated response. The added test is non-vacuous: cancellation is raised only by the first sink invocation, proving the pre-serialization check passed, and it covers both below-threshold and default-feature parallel-sized results while also checking byte-identical success output. Documentation matches the streamed-response caveat and the existing fail-closed design.",
+  "verdict": "approve"
+ }
+}
