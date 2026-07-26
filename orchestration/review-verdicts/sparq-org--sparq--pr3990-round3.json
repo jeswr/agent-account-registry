@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3990,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "893882ae2193a5ab6bb19e96b1fe2b4da42d0f88",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 3 resolves the prior major finding. The research record now states that all four configurations were re-run end-to-end after the SRX entity-reference and bounded XML-normalizer fixes, identifies the corrected run as the source of the 72.22%/143 result, and no longer claims bit-identical comparator equivalence. It quantifies the remaining GML-comparator exposure, weakens the rank to 2nd-or-3rd where that uncertainty matters, and shows that the behind-the-leader conclusion remains valid across the stated bound. The added comparator tests exercise entity preservation, malformed-input fail-closed behavior, escaping, empty elements, ordering, and non-vacuous inequality cases; the cache self-test exercises the real script and rejects count-preserving edits, missing proofs, and mismatched pins. No new correctness, soundness, test-validity, or security issue is evident in the diff.",
+  "verdict": "approve"
+ }
+}
