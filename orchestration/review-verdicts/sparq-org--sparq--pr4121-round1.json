@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4121,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "23617d8320fe216f3f85993baed1dcab43b99e5f",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The fully-hidden revocation path is coherently bound end to end: the circuit opens both issuer-signed commitments, proves membership in the relying party-derived accepted-set root, enforces the version floor and unset status bit, while the verifier reconstructs all public inputs from its own policy and canonical verification key. Structural mode checks fail closed, mixed/unbound modes are rejected, and the tests include real bb prove/verify coverage plus forged-anchor, revoked-bit, replay, serialization, exact-member, and witness-consistency cases. Privacy and soundness claims consistently retain the research-grade / not externally audited (sq-qhy4) caveat and explicitly document the re-blinding limitation.",
+  "verdict": "approve"
+ }
+}
