@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4238,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "aee1e865810eb8793b3713387e0aea4249fe57ef",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 1's major finding is resolved. `client_accepts_trailers` now parses q parameters case-insensitively, accepts only well-formed strictly positive qvalues, and conservatively rejects zero or malformed qvalues. The focused negotiation test covers q=0 spellings, whitespace and list positions, malformed values, and positive controls. The truncation state machine still preserves the load-bearing invariant by withholding the JSON-closing chunk until `Done`, dropping it on failure or worker disappearance, and using either a negotiated trailer or a body-frame error. The real-router and real-socket tests exercise genuine mid-stream truncation and include an uncapped anti-vacuity control. No new correctness, soundness, test-validity, security, or instruction-injection issue is evident in the diff.",
+  "verdict": "approve"
+ }
+}
