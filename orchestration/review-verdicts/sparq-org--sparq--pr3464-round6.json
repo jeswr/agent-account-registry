@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3464,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "4bcd0653d8fea9241995e165551ad13d83f3ad9b",
+  "round": 6
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 6 remains correct and complete on the supplied diff-scoped evidence. The capability validation consistently enforces publisher public-key presence iff publish authority is granted, verifies that the publisher secret derives the authenticated public key, and exercises both public and secret decode paths with non-vacuous reverse-mismatch tests. The previously accepted Drop-based zeroization coverage remains intact for both raw private-key seed variants. Canonical CBOR validation, capability separation, authenticated envelopes, recipient wrapping, epoch transitions, opt-in crate isolation, and the explicit external-audit/production-use limitations remain fail-closed and honestly scoped. No blocker, major, minor, or nit finding is evident relative to round 5.",
+  "verdict": "approve"
+ }
+}
