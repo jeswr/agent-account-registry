@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4252,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "9872db967f927875ccd281c558e4449417980263",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 2 remains correct and complete on the reviewed ZK dateTime/date value-lane scope. The added generated benchmark/catalog artifacts consistently register the new member and retain the gap for unsupported time/duration and the external-audit caveat. The Rust builder, manifest, dispatch, serialization, verifier reconstruction, Noir ABI, and relation agree on public/private input ordering and signed-epoch semantics. The focused tests exercise the real host wiring and, when nargo is present, real witness solving for honest pre/post-epoch cases plus lying verdict, sign-flip, and cross-lane rejection; the Noir unit tests independently cover range, negative-zero, operator, and binding failures. Claims remain explicitly research-grade, INV-VL-downgraded, and not externally audited under sq-qhy4. No hostile review-directed instruction was detected in the diff. Prior round had no findings and this round introduces none, so progress is stagnant by the required scale.",
+  "verdict": "approve"
+ }
+}
