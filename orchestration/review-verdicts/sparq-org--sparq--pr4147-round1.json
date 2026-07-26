@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4147,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "5cecda3498193565443fc59c5a9c52e614e7b618",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change is sound and fail-closed as scoped. The fixed-shape derivation path now rejects owl:sameAs in every antecedent or conclusion predicate slot using the verifier-recomputed, normalized IRI encoding, and the end-to-end test exercises a genuinely shape-valid and grounded rdfs7 case that would otherwise pass. The new canonicalisation relation binds its private graph witness to public commitments, requires a well-founded unique-member forest, anchors every non-root merge to a committed owl:sameAs edge in either orientation, and anchors the rewritten row to an active committed source slot. The host mirror matches those load-bearing checks. Forge tests cover unjustified merges, broken representatives, forward parents, duplicate members, non-class rows, and padding-slot sources. Claims consistently state that the feature is research-grade, externally unaudited, unmeasured, and not manifest-dispatched; no unsupported privacy, cost, completeness, or production-soundness claim is introduced.",
+  "verdict": "approve"
+ }
+}
