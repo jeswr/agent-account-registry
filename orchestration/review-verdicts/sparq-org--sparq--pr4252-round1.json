@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4252,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "5a262652c81a94a9870c7c9d40c4e91e6f25f61f",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The new opt-in dateTime/date dual-leaf member is internally consistent with the \u00a713 design: host builders use the existing strict encoders for both operands, split signed field hooks without modular assumptions, compute the disclosed verdict rather than accepting it, and serialize public/private inputs in the Noir ABI order. The circuit range-checks the private magnitude, rejects negative zero, rebinds sign, lane constant, and lexical component to operand_enc, and reuses the established signed verdict. Verifier reconstruction and circuit-id derivation cover the new variant, dispatch classifies it as value-lane-only, and the focused tests exercise real host/circuit cross-vectors including pre-epoch order, lying verdicts, sign flips, lane swaps, malformed lexicals, and wire ordering. The in-circuit test skips when nargo is unavailable, but equivalent Noir unit tests are included and the gated path invokes the real witness generator when present. Claims consistently retain the INV-VL downgrade and external-audit caveat (sq-qhy4), and the feature remains off by default.",
+  "verdict": "approve"
+ }
+}
