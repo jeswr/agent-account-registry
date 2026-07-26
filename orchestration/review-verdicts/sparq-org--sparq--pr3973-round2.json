@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3973,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d11e6d11cd80b4610476747f80da185dc6c3835f",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 2 finds no actionable correctness, soundness, security, or test-validity defect. The boolean builder derives the verdict, pins the xsd:boolean datatype constant, and reuses the existing u64 relation consistently with boolean hooks 0/1. Tests cover the full truth table, host/member leaf rebinding, bidirectional datatype-lane separation, fail-closed input and dispatch behavior, serialization/layout, and real witness acceptance/rejection when nargo is available; the feature-matrix leg exercises the gated suite. Public documentation preserves the INV-VL, CR-G8/sq-qhy4, and external-audit caveats. Relative to round 1, the findings remain materially unchanged at zero, so progress is stagnant.",
+  "verdict": "approve"
+ }
+}
