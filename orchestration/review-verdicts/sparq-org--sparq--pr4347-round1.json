@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4347,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "4403d5767a345f046550ee1289ae42eac1b805b1",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The tag-push cadence guard is correctly placed in the shared setup dependency, uses a full-history checkout, passes the resolved tag through an environment variable, excludes only the tag being cut, suppresses the pre-existing already-tagged no-op path, and still consults crates.io. The structural and real-repository tests exercise the discriminating refusal/allow cases, malformed-tag fail-closed behavior, registry fallback, workflow dependency coverage, and the release caveat. The ZK/MPC release language is appropriately negative and explicitly preserves the pending external-audit and semi-honest-only limitations.",
+  "verdict": "approve"
+ }
+}
