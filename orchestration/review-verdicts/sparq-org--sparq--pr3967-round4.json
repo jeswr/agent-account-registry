@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3967,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d9a44169c24d6d9c0d9edf603886ca2528790373",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "bench_s3_trust_allows_ec2 returns success upon finding any matching Allow statement, without evaluating an overriding Deny or a Condition that excludes the launched instances. When python3 is unavailable, any occurrence of ec2.amazonaws.com passes, including a Deny statement or a statement with the wrong action. cmd_check then says the policy lets EC2 call sts:AssumeRole and reports READY, while scripts/bench/README.md promises READY only when EC2 can actually assume the role. Merely documenting the helper as a partial drift detector does not make those externally visible readiness claims true. The round-3 counterexamples also remain untested.",
+    "file": "scripts/bench/bench-s3-results.sh",
+    "fix_hint": "Because provision owns and overwrites this role, fail closed unless the parsed trust document is equivalent to the canonical bench_s3_trust_policy, or implement the relevant IAM Deny and Condition semantics. If no real JSON parser is available, withhold READY instead of using a substring test. Add hermetic cases for Allow plus overriding Deny, Allow with an incompatible Condition, and the no-python path; all must make check return nonzero and omit READY.",
+    "severity": "major",
+    "title": "Trust check still reports READY for policies that can deny EC2 assumption"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 4 leaves the round-3 load-bearing trust-validation defect unchanged. bench_s3_trust_allows_ec2 still accepts the first matching Allow without accounting for an overriding Deny or an incompatible Condition, and its no-python branch still accepts any document containing the EC2 service substring. The new comments now acknowledge that this is only a partial drift detector, but cmd_check and the README continue to make the stronger claim that READY means the trust policy actually lets EC2 assume the role. The added tests cover only wrong/missing principals and do not exercise the previously requested Deny, Condition, or no-parser counterexamples. This is materially the same major finding, so progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
