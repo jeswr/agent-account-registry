@@ -10801,6 +10801,23 @@ def _starvation_sweep_self_test():
         assert any("human-owned hold" in line for line in logs), logs
     applied, removed, comments, logs = run_unpark(["review:changes"])
     assert (applied, removed, comments) == (False, [], [])
+    # RECEIPT-FIRST on this half too: a crash between the two must leave an explained PR that is
+    # STILL PARKED (the next tick converges it), never a silent label change nobody can account
+    # for — which is the mystery-label failure registry #703 is about.
+    unpark_order = []
+
+    def exploding_unpark(number):
+        unpark_order.append("label")
+        raise DispatchError("label delete failed")
+
+    try:
+        unpark_starved_partition_holder(
+            "o/r", 41, frozenset({"crate-a"}), parked_labels, unpark_pr=exploding_unpark,
+            post_comment=lambda repo, number, b: unpark_order.append("comment"),
+            log=lambda _m: None)
+    except DispatchError:
+        pass
+    assert unpark_order == ["comment", "label"], unpark_order
     print("  ok   #677 un-park write: removes ONLY review:parked, receipt-first, and refuses "
           "outright while any human-owned hold is live")
 
@@ -10852,12 +10869,16 @@ def _starvation_sweep_self_test():
     for required, why in (
         ("starvation_unpark_targets(", "nothing ever releases a starvation park"),
         ("unpark_starved_partition_holder(", "releasable parks are selected and then left alone"),
-        ("starvation_park_owner(", "the un-park half cannot tell its OWN parks from anyone "
-                                   "else's, so it would either release nothing or release "
-                                   "parks it did not apply"),
     ):
         assert required in _dispatch_src, \
             f"main()'s dispatch loop no longer calls {required} — {why}"
+    # The ownership proof must GATE the release, not merely be present. `if True or owner(...)`
+    # leaves the call in the source and releases every park in sight, so a presence-only pin is
+    # a test that passes for the wrong reason.
+    assert re.search(r"(?m)^\s*if starvation_park_owner\($", _dispatch_src), \
+        "main()'s un-park half no longer GATES on starvation_park_owner — a short-circuited or " \
+        "inverted condition would release parks this sweep never applied, including parks " \
+        "another mechanism is relying on"
     _unpark_write = re.search(
         r"unpark_pr=lambda number: _run_gh_target_api\(\s*repo, \"DELETE\","
         r"(?:.|\n)*?urllib\.parse\.quote\(([A-Za-z_]+), safe=\"\"\)", _dispatch_src)
