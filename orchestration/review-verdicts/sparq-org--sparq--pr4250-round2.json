@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4250,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "5d05d0874f65779199781246e32bb994d1dcb438",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The literal envelope length-prefixes graph_id, subject_id, and predicate_id, but never defines the octets represented by those identifiers. RDF IRIs admit multiple textual spellings, the default graph needs an unambiguous representation, and the document simultaneously requires NFC for IRIs while the resource envelope says identity spelling is preserved exactly. Independent clients can therefore compute different AAD for the same triple, making ciphertext undecryptable after interchange or serialization. Length prefixes remove boundary ambiguity but do not define RDF-term serialization.",
+    "file": "site/specs/e2ee-sparql.typ",
+    "fix_hint": "Define a single canonical byte encoding for each AAD RDF component, including absolute-IRI handling, Unicode/percent-encoding policy, the default-graph sentinel, and explicit bounds. Reconcile that rule with the resource_id rule, and add cross-implementation vectors for equivalent-looking IRI spellings and the default graph.",
+    "severity": "major",
+    "title": "Literal AAD leaves RDF term identifiers without a canonical byte encoding"
+   },
+   {
+    "body": "Section 5.5.1 says tags are equal if and only if the plaintext literals are the same RDF term, but it NFC-normalizes lexical forms and datatype IRIs before MAC input. RDF literal lexical forms are strings whose code-point sequences participate in term identity; canonically equivalent composed and decomposed Unicode strings can therefore be distinct RDF terms while producing the same tag here. The same normalization can collapse distinct IRI spellings. A server-side same-term rewrite can consequently produce false-positive joins, contradicting the stated relation and the no-silent-wrong-answer rule.",
+    "file": "site/specs/e2ee-sparql.typ",
+    "fix_hint": "For actual RDF term equality, MAC the exact RDF lexical form and datatype IRI code-point encoding (while applying only the RDF-defined language-tag comparison rule), with no NFC normalization. Alternatively define a distinct normalized equality relation and prohibit presenting it as sameTerm. Add a conformance vector using NFC- and NFD-distinct lexical forms and datatype IRIs.",
+    "severity": "major",
+    "title": "NFC-normalized equality tags do not implement RDF term equality"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 2 materially addresses all five prior findings: it defines concrete resource/key/literal envelopes and HPKE wrapping, corrects T4, separates ciphertext and true plaintext lengths, uses a distinct XChaCha reference, and substantially specifies equality tags. Two interoperability/correctness defects remain in the new canonicalization details. The literal-envelope AAD does not define how RDF identifiers become bytes, and the equality-tag relation is claimed to be RDF term identity even though NFC normalization merges distinct RDF lexical forms. Progress is improving because the prior set has been reduced and substantially repaired, but these remaining issues can cause independent implementations to authenticate or join differently and therefore still block approval.",
+  "verdict": "request_changes"
+ }
+}
