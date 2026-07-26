@@ -1,0 +1,51 @@
+{
+ "host_envelope": {
+  "pr": 4062,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "98aab353be541ca64801955bf997f861f23af337",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`handleBrowse` unconditionally calls `onIngest(result)`. `pickTextFiles` resolves to an EMPTY `IngestResult` when the user cancels \u2014 the FSA branch returns `emptyResult()` on `AbortError` (file-ingest.ts:206) and `pickViaInput` returns `emptyResult()` from its `cancel` listener (file-ingest.ts:160). `onIngestWebFiles` (import-drawer.tsx:234-248) is not a no-op for an empty result: it always runs `setFileStatuses({})` and `setFeedback(null)`. So after a user imports files and then opens Browse and presses Escape, the per-file status badges and the result banner disappear with no action taken.\n\nThe replaced code had exactly this guard: clicking `inputRef` fired no `change` event on cancel, and `handleInputChange` additionally returns early on `fileArr.length === 0` (import-drawer.tsx:645). Removing the hidden-input hop dropped the guard with it.\n\nRelated, lower impact: on any engine that does not fire the `cancel` event on `<input type=file>`, the `pickViaInput` promise never settles, so the awaited `handleBrowse` hangs and the dynamically created input is never removed from the DOM. That is pre-existing library behaviour, but this consumer is now newly exposed to it.",
+    "file": "gui/app/src/components/workbench/import-drawer.tsx",
+    "fix_hint": "Guard the call, mirroring the handler it replaces:\n\n```ts\nconst result = await pickTextFiles({ ... });\nif (result.accepted.length === 0 && result.rejected.length === 0) return;\nonIngest(result);\n```\n\nAlternatively make `onIngestWebFiles` itself no-op on an empty result (skip the `setFileStatuses({})` / `setFeedback(null)` resets when both lists are empty), which fixes the cancel path for every caller rather than just this one.",
+    "severity": "major",
+    "title": "Cancelling the picker now wipes per-file import statuses and the feedback banner"
+   },
+   {
+    "body": "Passing `accept: WEB_RDF_ACCEPT` routes the browse path through `matchesAccept` in `readFiles`, so a non-listed extension becomes a `rejected` entry with \"unsupported file type\". The other two ingest paths in this same pane \u2014 `handleInputChange` and `handleDrop` \u2014 both call `readFilesWithDecompress`, which applies NO extension filter, and the `<input accept=...>` attribute is only a soft dialog hint (users can switch to \"All files\").\n\n`WEB_RDF_ACCEPT` (import-drawer.tsx:103-106) is a strict subset of what `FORMAT_OPTIONS` in `rdf-format.ts` recognises: `.turtle`, `.ntriples`, `.nquads`, and `.json-ld` are all valid `guessFormat` inputs but are missing from the accept list. The result is that the same file imports fine by drag-and-drop and is rejected by Browse \u2014 a behaviour split that did not exist before this PR, since Browse previously delegated to the unfiltered input handler.",
+    "file": "gui/app/src/components/workbench/import-drawer.tsx",
+    "fix_hint": "Pick one contract for the pane. Either (a) drop `accept` from the `pickTextFiles` call so Browse keeps the previous permissive behaviour (the picker `types` filter still needs `accept`, so instead pass `accept` only for the dialog hint and filter nothing \u2014 currently not separable, so this means threading a `filter?: boolean`), or (b) extend `WEB_RDF_ACCEPT` to cover every extension in `FORMAT_OPTIONS` (`.turtle`, `.ntriples`, `.nquads`, `.json-ld`) and apply the same filter to `readFilesWithDecompress` so drop, input, and browse agree.",
+    "severity": "minor",
+    "title": "Browse now hard-rejects extensions the drop and input paths still accept"
+   },
+   {
+    "body": "`readFiles` gains a new branch (`opts.readFile ? await opts.readFile(file) : await file.text()`) and no test exercises it. There is no `file-ingest.test.ts` in the repo at all, and the Playwright specs drive the stable `[data-web-file-input]` via `setInputFiles` rather than the Browse button, so nothing verifies the PR's core claim that Browse now decompresses. A regression that silently reverts to `file.text()` \u2014 which corrupts compressed payloads, the exact bug sq-1y04h fixed \u2014 would not be caught.\n\nThe adjacent `file-decompress.test.ts` shows the unit-test idiom is already established for this area, so the coverage gap is a choice rather than a constraint.",
+    "file": "gui/app/src/lib/file-ingest.ts",
+    "fix_hint": "Add `gui/app/src/lib/file-ingest.test.ts` with at least: (1) `readFile` is used instead of `File.text()` when supplied \u2014 assert the accepted `text` is the reader's return value and that `file.text()` was not consulted; (2) a `readFile` that rejects produces a `rejected` entry, not a thrown exception; (3) `readFile` is not called for a file that fails the `accept` filter. A fake `File` with a stubbed `text()` is enough \u2014 no DOM needed for `readFiles` via `readDroppedFiles`.",
+    "severity": "minor",
+    "title": "No test covers the new `readFile` option"
+   },
+   {
+    "body": "`readFilesWithDecompress` surfaces the raw error from `maybeDecompressFile` as the rejection reason (import-drawer.tsx:604-607). The new browse path goes through `readFiles`, whose catch wraps it: `could not be read: ${errorMessage(err)}` (file-ingest.ts:117). A corrupt `.zst` therefore reads as \"could not be read: <codec message>\" when picked via Browse and as \"<codec message>\" when dropped, for the identical file and identical failure. Since both lists render into the same `rejected` UI, the inconsistency is user-visible.",
+    "file": "gui/app/src/components/workbench/import-drawer.tsx",
+    "fix_hint": "Normalise by having `readFilesWithDecompress` use the same `could not be read: ` prefix, or \u2014 better, and in the spirit of this PR \u2014 delete `readFilesWithDecompress` and have `handleInputChange` / `handleDrop` also go through the library with the same `readFile` closure, so all three paths share one wording.",
+    "severity": "minor",
+    "title": "Decompression error messages are now double-prefixed on the browse path only"
+   },
+   {
+    "body": "After this change the pane has two implementations of \"decompress then take the text\": the inline `readFile` closure in `handleBrowse` and `readFilesWithDecompress` used by the input and drop handlers. They already drift (error wording, extension filtering \u2014 see the other findings). The `readFile` hook this PR adds is precisely the seam that would let `handleDrop` call `readDroppedFiles(e.dataTransfer, { accept, readFile })` and `handleInputChange` call a shared helper, deleting the local copy and the ~30 lines of hand-rolled `DataTransferItemList` walking at import-drawer.tsx:684-703 that duplicate `readDroppedFiles`.",
+    "file": "gui/app/src/components/workbench/import-drawer.tsx",
+    "fix_hint": "Hoist the reader to a module-level `const decompressReader = async (file: File) => (await maybeDecompressFile(file)).text;`, then reuse it from all three handlers and drop `readFilesWithDecompress` plus the duplicated drop-item extraction in favour of `readDroppedFiles`. Can reasonably be a follow-up bead rather than a blocker on this PR.",
+    "severity": "nit",
+    "title": "The decompress-aware reader is now duplicated in two places"
+   }
+  ],
+  "progress": null,
+  "summary": "Directionally right: the optional `readFile` hook lets `pickTextFiles` keep the File System Access path while routing bytes through `maybeDecompressFile`, replacing the \"click our own hidden input\" workaround. The library edit is minimal and correct \u2014 default `file.text()` preserved, a reader failure still becomes a rejection rather than an exception, so the no-silent-drop invariant holds \u2014 and the README matches the new API.\n\nBut the consumer rewrite drops a guard the replaced path had. The old `handleBrowse` clicked `inputRef`, so a cancelled picker fired no `change` event, and `handleInputChange` also bailed on `fileArr.length === 0`. The new code awaits `pickTextFiles`, which resolves to an empty result on cancel (AbortError branch at file-ingest.ts:206; `cancel` listener at :160), then unconditionally calls `onIngest`. `onIngestWebFiles` always runs `setFileStatuses({})` and `setFeedback(null)`, so pressing Escape in the picker silently clears the per-file import status badges and the result banner \u2014 a deterministic, user-visible regression on the exact path this PR touches.\n\nSecondary: passing `accept: WEB_RDF_ACCEPT` makes browse HARD-reject extensions the drop handler and stable input still accept (both use `readFilesWithDecompress`, which applies no extension filter). `.turtle` / `.ntriples` / `.nquads` / `.json-ld` are recognised by `FORMAT_OPTIONS` in `rdf-format.ts` but absent from `WEB_RDF_ACCEPT`, so the same file imports by drag-and-drop yet is rejected by Browse. Rejection wording also diverges (`readFiles` prefixes `could not be read: `; `readFilesWithDecompress` does not).\n\nNo tests accompany the change: there is no `file-ingest` unit test file at all and no e2e drives the Browse button with a compressed file, so the PR's central claim (Browse now decompresses) is unverified, even though `file-decompress.test.ts` shows the idiom is available.",
+  "verdict": "request_changes"
+ }
+}
