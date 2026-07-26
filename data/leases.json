@@ -2,16 +2,6 @@
  "leases": [
   {
    "account": "9e13ea21abf27e68",
-   "claim_id": "7c3af6b509e242f7bc6fa017bfc77f56",
-   "holder": "sparq-org/sparq#2868@30199872634.1",
-   "package": "sparq-metamorph",
-   "role": "research",
-   "model": "opus5",
-   "issued_at": 1785064712,
-   "expires_at": 1785071012
-  },
-  {
-   "account": "9e13ea21abf27e68",
    "claim_id": "d95c1f4c0c3d48a69da604fa7489cb67",
    "holder": "sparq-org/sparq#2992@30199874965.1",
    "package": "sparq-zk-compose",
