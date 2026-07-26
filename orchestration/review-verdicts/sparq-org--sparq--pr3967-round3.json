@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3967,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c4886929e1ea90763fc64a717948ec07857bc64a",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "bench_s3_trust_allows_ec2 returns success when it finds any matching Allow statement, without evaluating an overriding Deny or a Condition that excludes the launched instances. Its no-python fallback is weaker still: any occurrence of ec2.amazonaws.com passes, even in a Deny statement or alongside the wrong Action. cmd_check then prints that the policy \u201clets\u201d EC2 assume the role and reports READY. This contradicts the README's claim that READY is based on a trust policy that actually lets EC2 call sts:AssumeRole, and permits manually drifted policy state to recreate the silent no-credentials/no-upload failure. Provision now writes a safe exact policy, but check is explicitly used as the readiness/drift check and must not overstate arbitrary effective policy documents.",
+    "file": "scripts/bench/bench-s3-results.sh",
+    "fix_hint": "Either make check fail closed unless the trust document is exactly equivalent to the canonical bench_s3_trust_policy (the simplest fit because provision owns and overwrites this role), or implement the relevant IAM Deny/Condition semantics. Remove the substring fallback or fail closed when Python/another real JSON parser is unavailable. Add hermetic cases for an Allow plus overriding Deny, an Allow constrained by an incompatible Condition, and the no-python path; each must withhold READY.",
+    "severity": "major",
+    "title": "Trust check can still report READY for a role EC2 cannot assume"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 3 repairs the prior provisioning defect: an existing role is now converged with update-assume-role-policy, and the hermetic test proves the wrong-principal case is repaired before check becomes READY. However, the check-side trust predicate still knowingly accepts policies that do not actually permit EC2 assumption, despite the README and READY message claiming that stronger guarantee. This is materially the same load-bearing trust-validation finding at the same severity, so progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
