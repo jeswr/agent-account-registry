@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3635,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "51ed422026659823cb50b7e5c69b224c12cc2b38",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "axis_exceeds compares against total + total * BUDGET_REL_TOL, so for every positive total it deliberately accepts a representable spent + charge that is greater than total but within the relative 1e-12 allowance. This is smaller than the prior absolute slack and fixes delta_total = 0, but it still contradicts the documented rule that a charge exceeding either total is refused fail-closed and the claimed basic-composition bound. The added small-delta test charges exactly 1e-13 and then attempts a whole second 1e-13; it does not exercise a just-over-budget value inside the relative allowance.",
+    "file": "crates/sparq-mpc/src/dp_output.rs",
+    "fix_hint": "Do not add a positive acceptance tolerance to the configured delta total. Implement a conservative comparison/accounting representation that cannot authorize cumulative delta above the configured total (for example exact/fixed-point accounting with validated conversion, or a deliberately upward-rounded charge/downward-rounded remainder). Add a regression test whose cumulative delta is representably just above a positive total by less than total * 1e-12 and assert refusal without mutation. If epsilon rounding accommodation is retained, document and justify it separately rather than applying the same overspend rule to cryptographic failure probability.",
+    "severity": "major",
+    "title": "Relative tolerance still authorizes spend above the configured privacy budget"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 5 is stagnant: the fixed absolute 1e-12 allowance was replaced by a relative allowance, which correctly closes the zero-delta hole and greatly reduces the magnitude of possible overspend, but it does not satisfy the prior round's requested fail-closed invariant. axis_exceeds still authorizes spent + charge values strictly above the configured total whenever the excess is at most total * 1e-12. The new tests cover a zero total and an exact tiny-total boundary, but no just-over-boundary charge within the new relative slack. Because the public documentation claims basic sequential composition and fail-closed refusal above either total, knowingly authorizing any positive excess remains a major correctness issue.",
+  "verdict": "request_changes"
+ }
+}
