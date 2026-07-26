@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4068,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "df1c57e85fcd8d263a82298bf511a674023187e6",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "run() reduces the Oxigraph result to oxi_count() and the sparq result to query(...).len(), with a special sequence comparison only for ORDER BY. For the newly added path, aggregate, subquery, VALUES, and BIND surfaces, the load-bearing output is often the binding value rather than cardinality. A path implementation returning the wrong endpoints, COUNT/MIN/MAX returning wrong values, or BIND/VALUES/subquery binding the wrong term can preserve the exact row count and therefore pass every new CI window. The aggregate generator explicitly includes bare COUNT(*) and grouped aggregate projections whose values are not made observable by HAVING, despite the comment claiming aggregate values are covered. The new unit tests only prove both engines accept queries and that at least 25% of a category is non-empty; they do not test equality of solution multisets.",
+    "file": "crates/sparq-bench/src/fuzz.rs",
+    "fix_hint": "Canonicalize and compare the complete solution multiset from Oxigraph and sparq for all order-insensitive generated queries, preserving duplicates and all projected bindings; retain the dedicated sequence comparison for ORDER BY. Add a focused test with an intentionally same-cardinality but wrong binding/result value to demonstrate that the oracle fails. If full binding comparison is not currently possible, constrain every generated shape so each computed value affects cardinality and remove shapes such as bare COUNT(*) or aggregate projections whose values are otherwise invisible.",
+    "severity": "major",
+    "title": "New categories compare only row counts, missing same-cardinality wrong answers"
+   }
+  ],
+  "progress": null,
+  "summary": "The expanded generator adds useful syntax coverage, but its cross-engine oracle still compares only result cardinality for every new category. That cannot substantiate the stated wrong-answer differential: incorrect projected or bound values, wrong path endpoints, incorrect aggregate values, and mis-bound subquery/VALUES results can all have the same row count as Oxigraph and pass. The added tests establish parse/evaluation and coarse non-emptiness, not result equivalence, so this is a major test-validity gap.",
+  "verdict": "request_changes"
+ }
+}
