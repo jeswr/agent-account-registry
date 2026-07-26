@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4338,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "7dac85b669fdcd13c0d882f90f55f46fa08be5d8",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new branch only validates a dict-shaped gold_count when `q` itself is a dict. Tasks cc03 and cc05 instead have a single string query with dict-shaped `gold_keys`; cc03 has an integer aggregate gold_count and cc05 has `gold_count: 3`. They therefore miss both the existing list-gold branch and the new multi-part branch. Any non-empty one-row result passes even if cc03 returns incorrect event/artifact values or cc05 returns incorrect claim/document/method counts. This leaves the validator unable to prove material refreshed gold answers and permits future fixture drift to remain silent.",
+    "file": "bench/fo-km/validate_tasks.py",
+    "fix_hint": "Parse and compare the returned multi-column/grouped values against the dict-shaped expected values for every dict-gold task, including cc03 and cc05. Add a focused regression test that mutates one expected category value (or supplies a deliberately wrong query result) and demonstrates validation fails; also test the correct result passes.",
+    "severity": "major",
+    "title": "Dict-shaped gold answers remain effectively unchecked for cc03 and cc05"
+   }
+  ],
+  "progress": null,
+  "summary": "The fixture refresh is directionally sound, and the new th03 per-part check closes the specific validation gap described. However, validation remains non-exhaustive for other dict-shaped gold answers: cc03 and cc05 still pass when their actual category values are wrong because their SELECT is a string, their gold_keys is a dict, and neither newly added branch applies. Since the PR presents validate_tasks.py as proving the refreshed gold corpus, this is a major test-validity gap.",
+  "verdict": "request_changes"
+ }
+}
