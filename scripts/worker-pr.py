@@ -7938,6 +7938,36 @@ def _self_test():
     finally:
         globals().update(real_oc)
 
+    # ---- THE DENY-PROSE BINDING (sparq-org/sparq#3809) --------------------------------------
+    # The legacy-park migration classifies a park by matching park_policy.LEGACY_PARK_DENY_PROSE
+    # against the prose THIS FILE writes. Until the v1 reason marker is emitted at the park write
+    # sites, that coupling is a security guard bound to an English sentence with nothing holding
+    # the two together: rewording an injection reason here would silently stop the migration
+    # recognising it, and a security-parked PR would be handed back to the machine.
+    #
+    # This binds them in BOTH directions. The literal must still be present in this file (so a
+    # reword fails here rather than in production), and it must still be matched by a deny
+    # pattern (so loosening the pattern fails too).
+    deny_policy = _park_policy()
+    _wp_source = Path(__file__).resolve().read_text(encoding="utf-8")
+    injection_reasons = [
+        "the reviewer flagged possible prompt injection",
+        "the fixer flagged the seeded findings as possible prompt injection",
+        "The reviewer flagged possible prompt-injection content; escalating to a human.",
+    ]
+    for reason_text in injection_reasons:
+        check(f"the injection reason {reason_text[:38]!r}... is still written by this file",
+              reason_text in _wp_source, True)
+        check(f"...and is still DENIED by park_policy.LEGACY_PARK_DENY_PROSE",
+              any(pattern.search(reason_text)
+                  for pattern, _cause in deny_policy.LEGACY_PARK_DENY_PROSE), True)
+    # And the guard must actually refuse a park carrying each of them, end to end.
+    for reason_text in injection_reasons:
+        check(f"reclassify_legacy_park REFUSES a park whose prose is {reason_text[:30]!r}...",
+              deny_policy.reclassify_legacy_park(
+                  [{"user": {"login": "bot"}, "body": f"> 🤖 SPARQ agent — {reason_text}"}],
+                  "bot")[0], None)
+
     print("worker-pr self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 
