@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3980,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "8d180598e8a9da3907214206846b14d2435e3385",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior major finding. The new ListTable records nodes that assert rdf:rest without rdf:first, fold_rights treats those nodes as collection-shaped, and well_formed_list consequently rejects them rather than folding them as ordinary scalar values. The added prohibition regression test exercises the real parse_policy_str path with a sibling permission and verifies refusal, while the permission-side and well-formed-list tests guard both parity and over-refusal. The shared table also preserves the existing logical-combinator handling. No new correctness, soundness, security, or test-validity issue is evident in the diff.",
+  "verdict": "approve"
+ }
+}
