@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4255,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c9a344030708499fe5a800c67b91bf6665f82ad4",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The quotient deliberately maps IRIs without an extractable scheme://authority (for example urn:isbn:123 and relative IRIs) to QuotientTerm::OpaqueIri containing the complete original IRI. Nevertheless, the module threat model says a summary does not reveal individual IRIs because they are collapsed to authority. The README and MPC skill repeat that unqualified claim. A published summary can therefore disclose an individual opaque IRI verbatim, contradicting the privacy/leakage description on this MPC-adjacent surface.",
+    "file": "crates/sparq-fedplan-mpc/src/quotient.rs",
+    "fix_hint": "State consistently in quotient.rs, README.md, and skills/mpc/SKILL.md that authority-bearing IRIs are collapsed, but authority-less/relative IRIs are retained verbatim and disclosed. Alternatively, change the quotient to map such IRIs to a non-identifying common class, then add a recall-safety test for joins and bound constants involving opaque IRIs.",
+    "severity": "major",
+    "title": "Threat model falsely claims summaries never reveal individual IRIs"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 1's selection-alignment and arithmetic-overflow findings are addressed with fail-closed validation, checked multiplication, and focused regressions. However, the new public documentation makes a privacy-sensitive claim that the representation does not uphold: IRIs without an extractable authority are stored verbatim as OpaqueIri, while several threat-model passages say individual IRIs are not revealed. Because this is a newly identified honesty issue on an MPC-adjacent surface, progress is regressing.",
+  "verdict": "request_changes"
+ }
+}
