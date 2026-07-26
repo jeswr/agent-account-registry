@@ -43,12 +43,12 @@
   {
    "account": "9e13ea21abf27e68",
    "claim_id": "56bfd540b41d4cb9b386f618245d9b8e",
-   "holder": "sparq-org/sparq#3392@dispatch-30195166302.1",
+   "holder": "sparq-org/sparq#3392@30195374193.1",
    "package": "docs",
    "role": "docs",
    "model": "haiku",
-   "issued_at": 1785055876,
-   "expires_at": 1785062176
+   "issued_at": 1785055895,
+   "expires_at": 1785062195
   }
  ]
 }
