@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3865,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "62c1b71f50658b67edd8436e28e1596033941387",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`measurement_iri()` discards everything through the first colon. Consequently `kb:item` and `ex:item` both mint `kb:meas-item-conf`. If both appear as confidence-bearing Findings or Sources, the output merges their measurements, yielding a single resource with multiple `dqv:computedOn` and potentially conflicting `dqv:value` triples. The compiler accepts CURIEs generally, so this is a silent graph-corruption case rather than an impossible input. The same helper is imported by `ingest_pkg.py`, broadening the impact.",
+    "file": "crates/sparq-kb/ingest/yamlld_compile.py",
+    "fix_hint": "Mint from an injective, Turtle-safe encoding of the complete subject term (for example a stable hash or escaped full CURIE), not only its local part. Add an end-to-end test with two confidence-bearing nodes such as `kb:item` and `ex:item`, asserting distinct measurement IRIs and exactly one computedOn/value/metric tuple per measurement.",
+    "severity": "major",
+    "title": "Measurement IRIs collide for subjects with different prefixes"
+   }
+  ],
+  "progress": null,
+  "summary": "The DQV projection works for the repository's current kb:-prefixed subjects, but the new measurement IRI minting is not injective over the compiler's accepted CURIE identifiers. Distinct subjects with the same local part are silently collapsed into one measurement resource, contradicting the helper's documented `(subject, metric)` identity and potentially associating one measurement with multiple subjects and values.",
+  "verdict": "request_changes"
+ }
+}
