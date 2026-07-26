@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3990,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "422bf31eb434a449dd98a49227cf0f1dce52985f",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 5 finds no correctness, soundness, test-validity, or security defect. The cache proof binds reuse to the pinned tarball digest and a deterministic path-and-content digest, while the hermetic self-test exercises the real script through valid reuse and rejection of a count-preserving edit, missing proof, and wrong pin. The benchmark runner keeps its comparator claim explicitly bounded: unsupported or malformed GML falls back to verbatim comparison, entity references and escaping are preserved, and focused non-vacuous tests distinguish semantic changes from the formatting differences intentionally folded. The research record accurately limits comparator uncertainty to the GML-bearing requirements and avoids overclaiming the resulting rank. Relative to round 4, the approved state and empty finding set are materially unchanged.",
+  "verdict": "approve"
+ }
+}
