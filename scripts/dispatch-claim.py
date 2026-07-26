@@ -1296,6 +1296,72 @@ def _ledger_leases(ledger_root):
     return leases if isinstance(leases, list) else None
 
 
+# --- provenance ATTESTATION CLASSES (issue #657) --------------------------------------------------
+# The trust BASIS an implementer-provenance record rests on, derived ONLY from the shape of its
+# `recorded_at_run` stamp.
+#
+# MACHINE-ATTESTED (admissible) — the stamp names a GitHub Actions run that wrote the record
+# HOST-SIDE, in a job that executes no target code and that the implementing model could not
+# influence:
+#   "<run>.<attempt>"              worker.yml's dedicated `provenance` job, after publish
+#   "backfill:<run>.<attempt>"     backfill-provenance.yml / scripts/backfill-provenance.py
+#
+# SELF-ATTESTED (recognised, NAMED, and REFUSED here) — the record was written by an actor holding
+# a registry credential (an orchestrator, or a maintainer running a script by hand), i.e. by
+# something that may ALSO have authored the diff:
+#   "orchestrator:<run>.<attempt>"
+# The review lane resolves the REVIEWER by inverting this record's `impl_provider`. In a
+# self-attested record that field is an assertion by the implementer about itself, so admitting
+# the class would let a record choose its own reviewer's provider — silently collapsing the
+# cross-provider inversion into a same-provider review that still LOOKS cross-provider. It is
+# refused under its OWN diagnostic (never the generic malformed-stamp one) so that an audit can
+# tell which trust basis every record rests on, and so a future admission path for the class has a
+# discriminator that already exists in the schema and in every consumer.
+#
+# HONEST SCOPE — this taxonomy is a fail-closed hardening plus the distinguishability primitive,
+# NOT an anti-forgery guarantee: an actor with registry write can simply write a machine-shaped
+# stamp instead. The property that survives a forged provider declaration is not encoded here; it
+# is "never read the declared provider to pick the reviewer". See
+# research/657-orchestrator-pr-admission.md.
+PROVENANCE_ATTESTATION_STAMPS = (
+    ("worker-run", re.compile(r"\d+\.\d+")),
+    ("backfill", re.compile(r"backfill:\d+\.\d+")),
+    ("orchestrator", re.compile(r"orchestrator:\d+\.\d+")),
+)
+MACHINE_ATTESTED_CLASSES = frozenset({"worker-run", "backfill"})
+# Consumer-facing refusal reasons (CLAIM defer lines, review-fix.yml SystemExit). Named constants
+# because the self-test pins them: collapsing the two into one reason destroys exactly the
+# audit distinction — "nobody stamped this" vs "an actor holding a registry credential stamped its
+# own work" — that this class exists to preserve.
+ATTESTATION_UNRECOGNISED_REASON = (
+    "provenance attestation stamp is missing or malformed (recorded_at_run must name the "
+    "host-side run that wrote the record)")
+
+
+def attestation_not_machine_reason(attestation):
+    """The refusal reason for a RECOGNISED but self-attested provenance class."""
+    return (f"provenance record is {attestation}-attested, not machine-attested (the review "
+            "loop admits only records written host-side by a run the implementing model could "
+            "not influence)")
+
+
+def provenance_attestation_class(record):
+    """Return the ATTESTATION CLASS of provenance ``record`` — the trust basis its implementer
+    identity rests on — or None when it carries no stamp in a recognised shape.
+
+    Derived ONLY from `recorded_at_run`, matched FULL-STRING against the closed
+    PROVENANCE_ATTESTATION_STAMPS table; a missing, wrong-typed, malformed, or unknown-prefix
+    stamp is None (fail closed). Never raises: like provenance_admission_error this runs inside
+    the PLAN/groom walk, where an exception aborts the whole run instead of parking one orphan."""
+    stamp = record.get("recorded_at_run") if isinstance(record, dict) else None
+    if not isinstance(stamp, str):
+        return None
+    for name, pattern in PROVENANCE_ATTESTATION_STAMPS:
+        if pattern.fullmatch(stamp):
+            return name
+    return None
+
+
 def provenance_admission_error(record, pr_number):
     """Return why a PARSED provenance record for target PR ``pr_number`` is NOT admissible by
     the review loop, or None when it passes EVERY record-shape requirement of EVERY consumer.
@@ -1312,7 +1378,12 @@ def provenance_admission_error(record, pr_number):
       the ``repos/<repo>/issues/<issue>`` read crash the run into the lease-expiry retry loop),
     - well-formed 40-hex ``head_sha_at_open`` (CLAIM ancestry check, review-fix.yml resolve),
     - salted 16-hex ``impl_account_h`` (locked decision 22a; CLAIM reviewer!=implementer
-      assertion, review-fix.yml resolve).
+      assertion, review-fix.yml resolve),
+    - a MACHINE-ATTESTED ``recorded_at_run`` stamp (issue #657): the record must have been
+      written host-side by a run the implementing model could not influence. See
+      PROVENANCE_ATTESTATION_STAMPS. Until #657 this field was never inspected at admission, so
+      a record carrying no stamp at all — or a hand-written one — was admitted at FULL worker-run
+      trust and its self-declared ``impl_provider`` chose the reviewer.
 
     EVERY consumer calls this ONE function — enumerate_review_items (PLAN), the CLAIM record
     re-read below, review-fix.yml's resolve step (imports this module from the registry
@@ -1347,6 +1418,17 @@ def provenance_admission_error(record, pr_number):
     opened_sha = record.get("head_sha_at_open")
     if not isinstance(opened_sha, str) or not SAFE_SHA.fullmatch(opened_sha):
         return "provenance head sha is malformed"
+    # ATTESTATION BASIS (issue #657), last so every field diagnostic above keeps its exact text.
+    # Two SEPARATE refusals on purpose — an unrecognised stamp and a recognised-but-self-attested
+    # one are different audit facts, and the second is the discriminator a future admission path
+    # for orchestrator-authored PRs will key on. Measured on the live `ledger` branch 2026-07-26:
+    # 350 records, 349 machine-attested (`<run>.<attempt>` / `backfill:...`), 1 hand-stamped
+    # `human:30209757201.1` — which this refuses, on an already-MERGED PR (sparq#4185).
+    attestation = provenance_attestation_class(record)
+    if attestation is None:
+        return ATTESTATION_UNRECOGNISED_REASON
+    if attestation not in MACHINE_ATTESTED_CLASSES:
+        return attestation_not_machine_reason(attestation)
     return None
 
 
@@ -6712,6 +6794,93 @@ def _self_test():
         == "provenance record does not match this PR"
     assert provenance_admission_error({**provenance[41], "impl_provider": []}, 41) \
         == "provenance implementer provider is invalid"
+
+    # ---- provenance ATTESTATION CLASS: the trust BASIS a record rests on (issue #657) ----------
+    # Before this, `recorded_at_run` was the ONE provenance field admission never inspected. A
+    # record with no stamp at all, or a hand-written one, was admitted at FULL worker-run trust —
+    # and the review lane resolves the REVIEWER by inverting that record's `impl_provider`, so a
+    # self-attested record could choose its own reviewer's provider and yield a same-provider
+    # review that still looks cross-provider.
+    assert provenance_attestation_class(provenance[41]) == "worker-run", \
+        "a bare '<run>.<attempt>' stamp is worker.yml's host-side provenance job"
+    assert provenance_attestation_class(
+        {**provenance[41], "recorded_at_run": "backfill:29572728300.1"}) == "backfill", \
+        "backfill-provenance.py's host-side stamp is machine-attested too"
+    assert provenance_attestation_class(
+        {**provenance[41], "recorded_at_run": "orchestrator:30209757201.1"}) == "orchestrator", \
+        "the self-attested class is RECOGNISED (so an audit can name it), not merely malformed"
+    # Fail closed on every non-shape. `human:30209757201.1` is the REAL live stamp of the one
+    # hand-written record on the ledger branch (sparq#4185, already merged): an ad-hoc stamp is
+    # NOT silently promoted to a class.
+    for _bad_stamp in ("human:30209757201.1", "30209757201", "30209757201.", ".1",
+                       "backfill:abc.1", "backfill:1.1.1", "orchestrator:", "orchestrator:1",
+                       "1.1 ", " 1.1", "worker-run", "", "x1.1", "1.1x", None, 1.1, 11, True,
+                       [], {}, ["1.1"]):
+        assert provenance_attestation_class(
+            {**provenance[41], "recorded_at_run": _bad_stamp}) is None, repr(_bad_stamp)
+    assert provenance_attestation_class(
+        {key: value for key, value in provenance[41].items()
+         if key != "recorded_at_run"}) is None, "an ABSENT stamp is no trust basis at all"
+    # Never raises on a malformed record: this runs inside the PLAN/groom walk, where an
+    # exception aborts the whole run instead of parking the one orphan.
+    for _junk in ("not-a-dict", None, [], 7):
+        assert provenance_attestation_class(_junk) is None, repr(_junk)
+    # ADMISSION, through the SAME parity battery every other field check uses — the predicate
+    # refuses AND the enumerator refuses to emit the PR. Deleting either attestation check in
+    # provenance_admission_error reds these.
+    assert _rejected_everywhere(
+        {key: value for key, value in provenance[41].items() if key != "recorded_at_run"})
+    assert _rejected_everywhere({**provenance[41], "recorded_at_run": "human:30209757201.1"})
+    assert _rejected_everywhere({**provenance[41], "recorded_at_run": ""})
+    assert _rejected_everywhere({**provenance[41], "recorded_at_run": 11})
+    # A SELF-DECLARED record cannot buy admission by naming its own trust class — the
+    # orchestrator class is recognised precisely so it can be REFUSED by name (issue #657's
+    # fail-closed requirement; registry #681 was rejected for resting on forgeable evidence).
+    assert _rejected_everywhere(
+        {**provenance[41], "recorded_at_run": "orchestrator:30209757201.1"})
+    # ...and the two refusals stay DISTINCT. Collapsing them into one reason destroys the audit
+    # distinction between "nobody stamped this" and "an actor holding a registry credential
+    # stamped its own work" — the distinction the whole class exists to record.
+    assert provenance_admission_error(
+        {**provenance[41], "recorded_at_run": "human:30209757201.1"}, 41) \
+        == ATTESTATION_UNRECOGNISED_REASON
+    assert provenance_admission_error(
+        {**provenance[41], "recorded_at_run": "orchestrator:30209757201.1"}, 41) \
+        == attestation_not_machine_reason("orchestrator")
+    assert ATTESTATION_UNRECOGNISED_REASON != attestation_not_machine_reason("orchestrator")
+    assert "orchestrator-attested" in attestation_not_machine_reason("orchestrator")
+    # ...and this must NOT de-admit the live population. Measured on the `ledger` branch
+    # 2026-07-26: 350 records, 349 in exactly these two machine shapes, 1 `human:` (merged PR).
+    assert provenance_admission_error(
+        {**provenance[41], "recorded_at_run": "backfill:29572728300.1"}, 41) is None
+    assert provenance_admission_error(
+        {**provenance[41], "recorded_at_run": "30212384278.1"}, 41) is None
+    assert MACHINE_ATTESTED_CLASSES == {"worker-run", "backfill"}, \
+        "widening the machine-attested set is an admission change and must be reviewed as one"
+
+    # YAML SEAM: the attestation checks live in provenance_admission_error, so they are only
+    # load-bearing on the path that actually runs a model against a PR if review-fix.yml's
+    # resolve step both CALLS that function and DIES on its result. Asserted against the PARSED
+    # workflow (a reflow cannot make it vacuous) and mutation-proven immediately below — the
+    # measured lesson is that uncaught mutants live at the YAML seam, not in the Python.
+    _RF_ADMISSION_ANCHOR = (
+        r"(?m)^[ \t]*admission_error = dispatch_claim\.provenance_admission_error\(")
+    _RF_ADMISSION_END = r"(?m)^[ \t]*impl_provider = record\["
+    _rf_admission = _review_fix_step_python(
+        _RF_ADMISSION_ANCHOR, _RF_ADMISSION_END, "provenance admission consumption")
+    assert "raise SystemExit(admission_error)" in _rf_admission, \
+        ("review-fix.yml's resolve step must FAIL CLOSED on the shared admission predicate; "
+         "without the raise, every check in provenance_admission_error — the #657 attestation "
+         f"basis included — is vacuous on the review path. Extracted:\n{_rf_admission}")
+    # The seam assertion is only worth its line count if it actually reds. Remove the raise from
+    # a COPY of the workflow and prove the extraction no longer satisfies it.
+    _rf_no_raise = _rf_text.replace("raise SystemExit(admission_error)",
+                                    "admission_error = None")
+    assert _rf_no_raise != _rf_text, "the seam mutation fixture no longer matches the workflow"
+    assert "raise SystemExit(admission_error)" not in _review_fix_step_python(
+        _RF_ADMISSION_ANCHOR, _RF_ADMISSION_END, "provenance admission consumption",
+        source=_rf_no_raise), \
+        "the seam assertion is VACUOUS — it passes with the fail-closed raise deleted"
 
     # ---- interpret_check_runs / pr_ci_status (pure CI interpreters, GAP-A inputs) ----
     runs = [

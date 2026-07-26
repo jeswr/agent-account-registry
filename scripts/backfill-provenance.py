@@ -1035,7 +1035,11 @@ def _self_test():
     # schema and this gate ever drift apart.
     admission = _load_dispatch_claim().provenance_admission_error
     valid_record = {"pr_number": 41, "impl_provider": "anthropic", "impl_alias": "fable",
-                    "impl_account_h": "ab" * 8, "issue": 7, "head_sha_at_open": "ab" * 20}
+                    "impl_account_h": "ab" * 8, "issue": 7, "head_sha_at_open": "ab" * 20,
+                    # Machine-attested stamp (issue #657) — this is the shape THIS script writes
+                    # (`backfill:<run>.<attempt>`, see `run_key` below), and the shared admission
+                    # predicate now requires a recognised host-side trust basis.
+                    "recorded_at_run": "backfill:29572728300.1"}
     check("valid matching record admits (skip allowed)",
           existing_record_admission_error(json.dumps(valid_record), 41, admission), None)
     check("undecodable record body never counts as recorded",
