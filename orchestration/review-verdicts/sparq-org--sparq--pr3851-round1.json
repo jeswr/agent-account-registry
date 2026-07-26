@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3851,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "17f06abb2c641c9e36d14381435e28c105828007",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The redundant serde_json dev-dependency is safely removed because sparq-lws-core already declares serde_json as an unconditional normal dependency, which remains available to test and example targets. The accompanying audit note is consistent with the manifest evidence: the listed serde derive edges exist, and sparq-engine/sparq-vectors retain necessary dev edges beside optional normal dependencies. No correctness, soundness, security, or test-validity issue is introduced by this documentation-and-manifest cleanup.",
+  "verdict": "approve"
+ }
+}
