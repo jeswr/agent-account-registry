@@ -1,46 +1,6 @@
 {
  "leases": [
   {
-   "account": "58b7c92faa5b5ca5",
-   "claim_id": "2a4a988ead4b464baa08e756d8972df9",
-   "holder": "sparq-org/sparq#2654@dispatch-30189574952.1",
-   "package": "sparq-reason",
-   "role": "impl",
-   "model": "opus5",
-   "issued_at": 1785044375,
-   "expires_at": 1785050675
-  },
-  {
-   "account": "58b7c92faa5b5ca5",
-   "claim_id": "9fa04be4246a45169e96acb5aa2760c0",
-   "holder": "sparq-org/sparq#2675@dispatch-30189574952.1",
-   "package": "sparq-lws-core",
-   "role": "impl",
-   "model": "opus5",
-   "issued_at": 1785044380,
-   "expires_at": 1785050680
-  },
-  {
-   "account": "f79434c3ffba014f",
-   "claim_id": "8bf44e98bf474b09aecc51df6f0ea4ce",
-   "holder": "sparq-org/sparq#2765@dispatch-30189574952.1",
-   "package": "sparq-core",
-   "role": "impl",
-   "model": "opus5",
-   "issued_at": 1785044397,
-   "expires_at": 1785050697
-  },
-  {
-   "account": "f79434c3ffba014f",
-   "claim_id": "285f422a4727404ba265cd3b1239b411",
-   "holder": "sparq-org/sparq#3037@dispatch-30189574952.1",
-   "package": "sparq-shacl",
-   "role": "research",
-   "model": "opus5",
-   "issued_at": 1785044405,
-   "expires_at": 1785050705
-  },
-  {
    "account": "9e13ea21abf27e68",
    "claim_id": "0938cedb88c84e8ca3a219ca8eb57c1c",
    "holder": "fix:sparq-org/sparq#4012@dispatch-30191816878.1",
