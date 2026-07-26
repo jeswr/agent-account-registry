@@ -102,16 +102,6 @@
   },
   {
    "account": "dc2d751954080e13",
-   "claim_id": "2ae23194d19849f58e16c26b0de5876e",
-   "holder": "review:sparq-org/sparq#4335@dispatch-30222345752.1",
-   "package": "sparq-crdt",
-   "role": "review",
-   "model": "sol",
-   "issued_at": 1785103916,
-   "expires_at": 1785108116
-  },
-  {
-   "account": "dc2d751954080e13",
    "claim_id": "53e052530b364fd19128ee62f54e6ec2",
    "holder": "review:sparq-org/sparq#4338@dispatch-30222345752.1",
    "package": "knowledge-graph",
