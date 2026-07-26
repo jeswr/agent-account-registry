@@ -45,6 +45,20 @@ write_output() {
 # withheld model log into $WORKER_ROOT/usage-telemetry.json + the run summary. NEVER any transcript
 # content — tool names come from a fixed allowlist and every value is numeric. Best-effort: a
 # telemetry failure must never fail (or change the exit class of) the model run.
+#
+# [#738 M1] Until now `num_turns`/`tool_counts` were extracted from CLAUDE's stream-json events
+# ONLY, so every codex row in the health ledger carried an EMPTY tool_counts and a null turn count.
+# That made the one question a `no_change` actually poses — did the model investigate and then
+# decline, or decline without looking at the repo at all? — unanswerable for the codex tier, which
+# is where nearly all `no_change` outcomes land. The codex branch below closes that, mapping codex's
+# own protocol event types onto the SAME fixed allowlist vocabulary, so the two harnesses produce
+# one comparable document. Two asymmetries are real and must not be papered over:
+#   * codex has NO `Read` tool — it reads files through the shell — so `tool_counts.Read` is
+#     structurally 0 for codex and "did it look?" must be asked of the PROBE total (Read + Bash +
+#     Glob + Grep; see _no_change_health_envelope), never of `Read` alone.
+#   * `num_turns` is NOT comparable across harnesses: claude reports assistant turns in its result
+#     event, while `codex exec` is normally a single codex "turn" containing many tool calls.
+# Values stay counts of HOST-PARSED protocol events, so no model-authored text can ride along.
 _extract_usage_telemetry() {
   local model_log=$1 harness=$2 worker_root=$3 wall_seconds=$4
   local out="$worker_root/usage-telemetry.json"
@@ -55,10 +69,20 @@ import sys
 
 log_path, harness, out_path, wall_raw = sys.argv[1:]
 TOOL_ALLOWLIST = ("Read", "Bash", "Edit", "Write", "Glob", "Grep", "WebFetch", "WebSearch", "Task")
+# codex protocol event -> the SAME allowlist vocabulary. Both codex --json shapes are mapped: the
+# legacy `{"msg":{"type":...}}` events and the newer `item.completed` items. Anything unmapped is
+# not a tool call and is ignored (an unknown TOOL-shaped event would land in "other" only via the
+# explicit mcp entries below — the keys here are protocol constants, never model-chosen strings).
+CODEX_MSG_TOOLS = {"exec_command_begin": "Bash", "patch_apply_begin": "Edit",
+                   "web_search_begin": "WebSearch", "mcp_tool_call_begin": "other"}
+CODEX_ITEM_TOOLS = {"command_execution": "Bash", "file_change": "Edit",
+                    "web_search": "WebSearch", "mcp_tool_call": "other"}
 usage = {}
 cost = None
 turns = None
 tool_counts = {}
+codex_agent_messages = 0
+codex_turn_events = 0
 try:
     wall_seconds = int(wall_raw)
 except ValueError:
@@ -111,6 +135,15 @@ for line in text.splitlines():
                     tool_counts[key] = tool_counts.get(key, 0) + 1
     elif kind == "turn.completed":  # newer codex --json turn events
         take_usage(event.get("usage"))
+        codex_turn_events += 1
+    elif kind == "item.completed":  # newer codex --json per-item events (one per tool call)
+        item = event.get("item")
+        if isinstance(item, dict):
+            codex_key = CODEX_ITEM_TOOLS.get(str(item.get("item_type", "")))
+            if codex_key:
+                tool_counts[codex_key] = tool_counts.get(codex_key, 0) + 1
+            elif item.get("item_type") == "agent_message":
+                codex_agent_messages += 1
     message = event.get("msg")
     if isinstance(message, dict):  # codex --json token_count events (last wins = cumulative)
         info = message.get("info")
@@ -119,6 +152,19 @@ for line in text.splitlines():
             take_usage(info.get("total_token_usage"))
         elif message.get("type") == "token_count":
             take_usage(message)
+        # Legacy codex --json tool events. `*_begin` (not `*_end`) is counted so a command the
+        # model started but that never returned still shows the model DID look.
+        codex_key = CODEX_MSG_TOOLS.get(str(message.get("type", "")))
+        if codex_key:
+            tool_counts[codex_key] = tool_counts.get(codex_key, 0) + 1
+        elif message.get("type") == "agent_message":
+            codex_agent_messages += 1
+
+if turns is None:
+    # codex emits no cumulative `num_turns`. Per-assistant-message events are the closer analogue
+    # of claude's count; `turn.completed` is the fallback (and is normally 1 for `codex exec`, so
+    # it says little on its own — the probe total is the cross-harness-comparable number).
+    turns = codex_agent_messages or codex_turn_events or None
 
 document = {"harness": harness, "usage": usage, "wall_seconds": wall_seconds,
             "total_cost_usd": cost,
@@ -191,6 +237,34 @@ if isinstance(usage, dict):
 wall = document.get("wall_seconds") if isinstance(document, dict) else None
 if isinstance(wall, int) and not isinstance(wall, bool) and 0 <= wall <= 7 * 24 * 3600:
     fields.append(("wall", wall))
+
+
+def counted(value):
+    return isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 1_000_000
+
+
+# [#738 M1] The two counts that make a `no_change` diagnosable instead of merely visible.
+#
+# `probe` is the number of tool calls that INSPECTED the repository — Read/Bash/Glob/Grep. It is
+# deliberately NOT the total tool count: every worker run may write .worker-no-diff.json and
+# .worker-followups.jsonl, so Edit/Write is >0 even for a model that declared defeat without
+# opening a single file, and a total would hide exactly the case worth seeing. `probe == 0` on a
+# no_change means the model decided from the prompt alone; `probe` large means it investigated and
+# then declined, which is a different problem with a different fix. Read/Bash/Glob/Grep is also the
+# harness-symmetric set: codex's only inspection channel is the shell, which lands in Bash.
+#
+# ABSENT vs ZERO is load-bearing here, so `probe` is emitted whenever tool_counts was parsed at all
+# (an empty dict is a real zero) and omitted only when telemetry is missing entirely — otherwise
+# "we could not measure" would read as "the model never looked".
+turns = document.get("num_turns") if isinstance(document, dict) else None
+if counted(turns):
+    fields.append(("turns", turns))
+tool_counts = document.get("tool_counts") if isinstance(document, dict) else None
+if isinstance(tool_counts, dict):
+    probe = sum(count for tool, count in tool_counts.items()
+                if tool in ("Read", "Bash", "Glob", "Grep") and counted(count))
+    if counted(probe):
+        fields.append(("probe", probe))
 # This is a protocol boundary, not a display string. Keep the producer locked to
 # model-health.py's exact ``no-change-v1 key:value,key:value`` grammar: ASCII-decimal values,
 # comma separators, and no whitespace inside the payload.
@@ -2536,9 +2610,9 @@ print(d["usage"]["input_tokens"], d["usage"]["cache_creation_input_tokens"],
       d["wall_seconds"], d["total_cost_usd"], d["num_turns"],
       d["tool_counts"].get("Read"), d["tool_counts"].get("Bash"), d["tool_counts"].get("other"))')" \
     "120 900 4000 77 83 0.0421 3 1 2 1"
-  chk "no-change handoff contains only issue + numeric usage/wall fields" \
+  chk "no-change handoff contains only issue + numeric usage/wall/effort fields" \
     "$(_no_change_health_envelope "$tmp/usage-telemetry.json" 503)" \
-    "no-change-v1 issue:503,input:120,output:77,wall:83"
+    "no-change-v1 issue:503,input:120,output:77,wall:83,turns:3,probe:3"
 
   # --- health-record producer/relay contract (#512 escalation): exercise the THREE live
   # producer shapes against model-health.py itself, not a parallel grammar. The stateful fake
@@ -2699,11 +2773,21 @@ PY
   chk "telemetry withholds transcript" \
     "$(grep -c 'SECRET-TRANSCRIPT-CONTENT' "$tmp/usage-telemetry.json" || true)" "0"
 
-  # --- telemetry: codex --json fixture (token_count events, last wins) ---
+  # --- telemetry: codex --json fixture (token_count events, last wins; LEGACY msg protocol).
+  # [#738 M1] The tool/turn events are the point: before this, codex rows carried an EMPTY
+  # tool_counts and a null num_turns, so a `no_change` from the codex tier was undiagnosable.
+  # NON-VACUITY: delete the CODEX_MSG_TOOLS lookup and the counts below collapse to 0/none. ---
   cat > "$tmp/codex.log" <<'LOG'
 {"id":"1","msg":{"type":"task_started"}}
 {"id":"2","msg":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":4,"output_tokens":5}}}}
-{"id":"3","msg":{"type":"token_count","info":{"total_token_usage":{"input_tokens":50,"cached_input_tokens":30,"output_tokens":22}}}}
+{"id":"3","msg":{"type":"exec_command_begin","command":["bash","-lc","cat CODEX-SECRET-TRANSCRIPT"],"cwd":"/workspace"}}
+{"id":"4","msg":{"type":"exec_command_end","exit_code":0,"stdout":"CODEX-SECRET-TRANSCRIPT"}}
+{"id":"5","msg":{"type":"exec_command_begin","command":["bash","-lc","rg TODO"],"cwd":"/workspace"}}
+{"id":"6","msg":{"type":"patch_apply_begin","changes":{"CODEX-SECRET-TRANSCRIPT":{}}}}
+{"id":"7","msg":{"type":"mcp_tool_call_begin","invocation":{"server":"s","tool":"CODEX-SECRET-TRANSCRIPT"}}}
+{"id":"8","msg":{"type":"agent_message","message":"CODEX-SECRET-TRANSCRIPT"}}
+{"id":"9","msg":{"type":"agent_message","message":"CODEX-SECRET-TRANSCRIPT"}}
+{"id":"10","msg":{"type":"token_count","info":{"total_token_usage":{"input_tokens":50,"cached_input_tokens":30,"output_tokens":22}}}}
 LOG
   GITHUB_STEP_SUMMARY='' _extract_usage_telemetry "$tmp/codex.log" codex "$tmp" 71 >/dev/null
   chk "codex telemetry fields" "$(python3 -c '
@@ -2712,6 +2796,64 @@ d = json.load(open("'"$tmp"'/usage-telemetry.json"))
 print(d["usage"]["input_tokens"], d["usage"]["cache_read_input_tokens"],
       d["usage"]["output_tokens"], d["wall_seconds"])')" \
     "50 30 22 71"
+  chk "codex tool calls and turns are counted in the SAME vocabulary as claude" \
+    "$(python3 -c '
+import json
+d = json.load(open("'"$tmp"'/usage-telemetry.json"))
+print(d["num_turns"], d["tool_counts"].get("Bash"), d["tool_counts"].get("Edit"),
+      d["tool_counts"].get("other"), d["tool_counts"].get("Read"))')" \
+    "2 2 1 1 None"
+  chk "codex telemetry withholds transcript (commands, stdout, patch paths, messages)" \
+    "$(grep -c 'CODEX-SECRET-TRANSCRIPT' "$tmp/usage-telemetry.json" || true)" "0"
+
+  # The NEWER codex --json shape (thread/turn/item events) must count identically.
+  cat > "$tmp/codex-items.log" <<'LOG'
+{"type":"thread.started","thread_id":"t"}
+{"type":"item.completed","item":{"item_type":"command_execution","command":"cat CODEX-SECRET-TRANSCRIPT"}}
+{"type":"item.completed","item":{"item_type":"command_execution","command":"ls"}}
+{"type":"item.completed","item":{"item_type":"command_execution","command":"ls"}}
+{"type":"item.completed","item":{"item_type":"file_change","changes":[]}}
+{"type":"item.completed","item":{"item_type":"reasoning","text":"CODEX-SECRET-TRANSCRIPT"}}
+{"type":"turn.completed","usage":{"input_tokens":9,"cached_input_tokens":2,"output_tokens":3}}
+LOG
+  GITHUB_STEP_SUMMARY='' _extract_usage_telemetry "$tmp/codex-items.log" codex "$tmp" 12 >/dev/null
+  chk "the newer codex item/turn protocol counts the same way" \
+    "$(python3 -c '
+import json
+d = json.load(open("'"$tmp"'/usage-telemetry.json"))
+print(d["num_turns"], d["tool_counts"].get("Bash"), d["tool_counts"].get("Edit"),
+      d["usage"]["output_tokens"])')" \
+    "1 3 1 3"
+  chk "newer-protocol telemetry withholds transcript too" \
+    "$(grep -c 'CODEX-SECRET-TRANSCRIPT' "$tmp/usage-telemetry.json" || true)" "0"
+
+  # THE MEASUREMENT THIS EXISTS FOR (#738): a codex `no_change` that declared defeat without
+  # opening ANYTHING must be distinguishable in the ledger from one that investigated first.
+  # Before this change both produced a byte-identical envelope. `probe:0` is that distinction, and
+  # it must be EMITTED, not omitted as falsy — the whole finding rests on absent != zero.
+  cat > "$tmp/codex-idle.log" <<'LOG'
+{"id":"1","msg":{"type":"task_started"}}
+{"id":"2","msg":{"type":"agent_message","message":"escalating: no failing acceptance test exists"}}
+{"id":"3","msg":{"type":"token_count","info":{"total_token_usage":{"input_tokens":140000,"cached_input_tokens":130000,"output_tokens":900}}}}
+LOG
+  GITHUB_STEP_SUMMARY='' _extract_usage_telemetry "$tmp/codex-idle.log" codex "$tmp" 37 >/dev/null
+  chk "a codex run that never opened a file reports probe:0, not a missing field" \
+    "$(_no_change_health_envelope "$tmp/usage-telemetry.json" 77)" \
+    "no-change-v1 issue:77,input:140000,output:900,wall:37,turns:1,probe:0"
+  chk "...and the ledger that CONSUMES it stores that zero" \
+    "$(python3 -c 'import importlib.util,sys
+s=importlib.util.spec_from_file_location("mh",sys.argv[1]);m=importlib.util.module_from_spec(s)
+s.loader.exec_module(m)
+p=m._parse_no_change_envelope(sys.argv[2])
+print(p["probe_tool_calls"], p["num_turns"])' \
+      "$SCRIPT_DIR/model-health.py" \
+      "$(_no_change_health_envelope "$tmp/usage-telemetry.json" 77)")" \
+    "0 1"
+  # Absent telemetry must NOT masquerade as "the model never looked".
+  printf '{}' > "$tmp/codex-no-telemetry.json"
+  chk "missing telemetry omits probe entirely (unmeasured is not zero)" \
+    "$(_no_change_health_envelope "$tmp/codex-no-telemetry.json" 77)" \
+    "no-change-v1 issue:77"
 
   # --- reset-hint extraction: CLOSED grammar for every persisted hint (cross-provider r2
   # finding 1) — a time form is kept, but raw tail text (e.g. an account handle echoed by the

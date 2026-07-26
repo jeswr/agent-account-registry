@@ -545,6 +545,20 @@ Two halves, both in `scripts/no_change_routing.py` (the single declaration; `wor
   the reason rides the existing sanitized `no-change-v1` envelope as its **vocabulary index**, never
   as text, so nothing model-authored can reach the public ledger or an alert body. Absent, malformed,
   or out-of-vocabulary ⇒ `unspecified`, which is the value the router treats as *no signal*.
+- **`num_turns` / `probe_tool_calls` (#738).** The reason is the model's *claim*; these two are the
+  host's *observation*, counted by `worker-live._extract_usage_telemetry` from harness protocol
+  events (never from model text) and carried on the same numeric envelope. `probe_tool_calls` counts
+  only the calls that **inspected the repository** — `Read`/`Bash`/`Glob`/`Grep`, deliberately not
+  the total, since every run may write `.worker-no-diff.json` and `.worker-followups.jsonl` and so
+  has a nonzero `Edit`/`Write` count even when it opened nothing. `probe_tool_calls == 0` on a
+  `no_change` is therefore "declared defeat from the prompt alone", which is a different failure with
+  a different fix than "investigated, then declined" — and **absent ≠ zero**, so the field is emitted
+  whenever telemetry parsed and omitted only when it did not. Two asymmetries are load-bearing when
+  reading it: codex has **no `Read` tool** (it reads through the shell, landing in `Bash`), so the
+  probe *total* is the cross-harness question and `Read` alone is not; and `num_turns` is **not**
+  comparable across harnesses, since `codex exec` is normally one codex turn containing many calls.
+  Until #738 both fields were extracted from claude's stream only, so every codex row — the tier
+  serving most `role:impl` dispatches — carried an empty `tool_counts` and a null turn count.
 - **The decision**, taken in `dispatch()` on the deferred-retry path **before `allocator.claim()`**
   picks a model (the claim is what would otherwise walk the resolved chain from its head again):
   dispatch on an **untried** tier of the same chain, or — when no untried tier remains, or the
