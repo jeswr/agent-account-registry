@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4075,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c459bcf0627a75c9094d97ad7f2e007f1e1ba367",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "stratify_edges indexes stratum[b] / stratum[h] directly (lines 259-266) with no validation that edge endpoints are < n_nodes. Called from stratify() this is safe, because every index is produced by the `ix` interner and is therefore < nodes.len(). But the doc-comment explicitly presents this as the 'dialect-neutral' fixpoint core, and the design record (research/gpt56-decomp-rules-substrate-2026-07.md:76-80, step 5 sq-pi2k0) plans a second caller in n3::compiled that will build its own dependency graph. A caller that mis-sizes n_nodes relative to its edge vectors gets an index-out-of-bounds panic rather than the Err(String) the signature advertises, which is the wrong posture for a fail-closed checker seam. No behaviour is wrong today; this is contract hygiene ahead of the second adopter.",
+    "file": "crates/sparq-reason/src/datalog/stratify.rs",
+    "fix_hint": "Add a `# Panics` section to the doc-comment stating that every edge endpoint must be < n_nodes, or make it fail-closed with a cheap debug_assert! plus an early `if pos_edges.iter().chain(neg_edges).any(|&(b, h)| b >= n_nodes || h >= n_nodes) { return Err(...) }` guard (one pass over the edge lists, negligible next to the fixpoint).",
+    "severity": "minor",
+    "title": "stratify_edges panics on an out-of-range node index; no # Panics contract for the advertised reusable core"
+   },
+   {
+    "body": "The extraction is covered transitively (the 10 stratify_* tests plus eval_rejects_non_stratifiable_program / incr_new_rejects_non_stratifiable all pass verbatim, which is the gate the design record names), so this is not a vacuous-test problem. But the new seam's contract \u2014 the positive edge being non-strict (head >= body) versus the negative edge being strict (head > body), and the rejection bound \u2014 is now only exercised through the Program->graph adapter. Once the N3 front-end becomes a second caller, a regression in the core would be attributed to whichever dialect happened to notice it first.",
+    "file": "crates/sparq-reason/src/datalog/stratify.rs",
+    "fix_hint": "Add two small direct tests against stratify_edges: (1) a positive chain plus a positive cycle 0->1->2->0 yields all-zero strata (non-strict, no rejection); (2) a single negative self-loop (0,0) with n_nodes=1 returns Err containing the name_of(0) string, and a negative chain 0->1->2 returns strata [0,1,2]. Both go red on flipping non-strict/strict or on transposing the tuple order.",
+    "severity": "minor",
+    "title": "No direct unit test pins the extracted stratify_edges contract"
+   }
+  ],
+  "progress": null,
+  "summary": "Pure, behaviour-preserving extraction of the Ullman stratum-raising fixpoint out of datalog::stratify into a dialect-neutral stratify_edges(n_nodes, pos_edges, neg_edges, name_of), exactly as specified in research/gpt56-decomp-rules-substrate-2026-07.md step 1. I verified the risky part \u2014 the edge-tuple direction flip from (head, body, neg) to (body, head) split across two vectors \u2014 case by case: body-atom edges, co-head mutual edges, TypeAny<->Class couplings (both directions, gated on any_is_head) and Top<->concrete couplings (both directions, gated on top_is_head) all transpose to identical constraints (stratum[h] >= stratum[b] (+1 for negative)). The iteration-order change (all positive edges then all negative per round, instead of interleaved insertion order) does not alter the outcome: this is chaotic iteration over a monotone constraint system, so it converges to the same least fixpoint, never overshoots it (so no spurious rejection - a stratifiable program's lfp max stratum is <= n_nodes-1, keeping req <= n_nodes), and a negative cycle still grows without bound until req > n_nodes trips the rejection. Removing the req > n check from the positive loop is safe: that branch was unreachable since positive req = stratum[b] <= n_nodes. Termination is preserved (strata are bounded until the error fires, and each changed round raises at least one stratum). Empirically: cargo test -p sparq-reason --features datalog is green (all 10 stratify_* tests including the error-naming test, 215 lib tests, plus the incr/n3 stratified integration suites), and the default feature-off state still builds (the module is cfg'd out, so the new pub(crate) fn cannot become dead code). No public API surface change (pub(crate)), so no README/SKILL.md sync obligation. Two minor, non-blocking notes recorded below. No prompt-injection content in the diff.",
+  "verdict": "approve"
+ }
+}
