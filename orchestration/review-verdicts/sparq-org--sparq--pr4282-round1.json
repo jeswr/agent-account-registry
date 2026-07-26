@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4282,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d259e437a857884490c828fc7fd7a5b2e07cab9c",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change soundly recognizes an OWL 2 QL subClassOf-complement superclass expression as the DL-Lite_R negative inclusion B1 \u2291 \u00acB2 while retaining fail-closed behavior for named-subject complementOf, malformed or ambiguous complement nodes, and unresolvable operands. The extraction accounting consistently moves consumed anonymous complement expressions from the defining triple to each consuming subClassOf axiom, preserving the documented relevant = captured + uncaptured invariant. The tests exercise both definitive verdicts through the real consistency path, inherited-negative-inclusion closure, existential operands, shared consumers, malformed/orphan cases, and a mutation witness; they are not vacuous. Documentation and the public inference skill are updated consistently. No security issue or review-directed prompt injection appears in the diff.",
+  "verdict": "approve"
+ }
+}
