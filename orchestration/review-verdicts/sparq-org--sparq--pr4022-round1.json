@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4022,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d6a33c6f9d8d998c0ee4f3ae80157ee810c3fc6c",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "EndpointConfig::blazegraph assigns PresetEvidence::LiveInstance for every caller-supplied base URL and namespace, although the documentation says only one Wikidata deployment was probed. Thus EndpointConfig::blazegraph(\"http://localhost:9999/blazegraph\", \"kb\") claims that this local configuration was confirmed by an actual exchange even when it was never contacted. That contradicts PresetEvidence's per-config semantics and the README claim that provenance helps rule out misconfiguration.",
+    "file": "crates/sparq-metamorph/src/driver.rs",
+    "fix_hint": "Keep the preset documentation-derived by default. Provide an explicit API that marks the specific successfully probed configuration as live-confirmed, or model evidence as evidence for the preset convention rather than for the concrete config and name/document it accordingly.",
+    "severity": "major",
+    "title": "Blazegraph presets falsely claim arbitrary endpoints were live-confirmed"
+   },
+   {
+    "body": "The module says this test is the step that turns UpstreamDocs into LiveInstance, but probe() only sends a query and returns (). It does not produce, persist, or verify any promoted configuration, and the ignored tests can also return successfully without probing when environment variables are absent. Consequently the test cannot support the provenance guarantee introduced by this PR.",
+    "file": "crates/sparq-metamorph/tests/preset_live_conformance.rs",
+    "fix_hint": "Make the live-validation path return or construct a configuration whose evidence is LiveInstance only after a successful exchange, and test that transition. If evidence is intentionally static documentation metadata, remove the promotion claim and redesign the enum/docs so they do not imply per-endpoint validation.",
+    "severity": "major",
+    "title": "The live probe does not perform the documented evidence promotion"
+   }
+  ],
+  "progress": null,
+  "summary": "The preset request-shape tests are useful, but the new provenance model is unsound: every Blazegraph configuration is labeled LiveInstance regardless of which endpoint was actually tested, while the advertised live probe neither validates that evidence at construction time nor promotes a configuration after success. This defeats the stated purpose of preventing endpoint misconfiguration from masquerading as an engine bug.",
+  "verdict": "request_changes"
+ }
+}
