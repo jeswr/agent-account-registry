@@ -223,12 +223,12 @@
   {
    "account": "9e13ea21abf27e68",
    "claim_id": "bad56a856dbb448e800e1935bb82f0ce",
-   "holder": "sparq-org/sparq#2642@dispatch-30184573196.1",
+   "holder": "sparq-org/sparq#2642@30184758712.1",
    "package": "sparq-wrapper",
    "role": "research",
    "model": "opus5",
-   "issued_at": 1785033229,
-   "expires_at": 1785039529
+   "issued_at": 1785033258,
+   "expires_at": 1785039558
   },
   {
    "account": "dc2d751954080e13",
