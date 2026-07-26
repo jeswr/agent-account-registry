@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 4132,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "41f62e418f27ba441c4f598e74ae58abd528dad6",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The head comment at src/expand.rs:880-884 keeps the load-bearing citation (\"W3C expand/0122-out retains `\\\"@id\\\": null`\") but drops two clauses that main already carried: the manifest note that the result \"will not be valid JSON-LD\" (which is why a null @id is legitimate rather than a bug) and \"and the reference processors\" (the jsonld.js corroboration). Since the net source change of this PR is exactly this comment, the diff is a small documentation regression against main rather than an improvement. It gains only the `see context::iri` pointer, which is genuinely useful.",
+    "file": "crates/sparq-jsonld/src/expand.rs",
+    "fix_hint": "Keep the `see context::iri` addition and restore the two dropped clauses, e.g. \"... precedent (W3C expand/0122-out retains `\\\"@id\\\": null`, its manifest noting the result \\\"will not be valid JSON-LD\\\") and the reference processors.\" \u2014 or leave the comment as main had it and let the new integration tests be the whole of the diff.",
+    "severity": "nit",
+    "title": "Doc comment is trimmed relative to main: loses the expand/0122 manifest gloss and the reference-processor corroboration"
+   },
+   {
+    "body": "src/expand.rs:1437-1440 and :1455-1458 expand `Json::Obj(vec![(\"@id\".to_string(), Json::Str(...))])` from one line into a four-line form with a trailing comma. Both original lines fit inside the workspace `max_width = 100` (rustfmt.toml), so `cargo fmt --check` would want them back on one line, and the reformat adds diff noise to hunks that have no semantic change. The CI `lint` fmt check is informational (continue-on-error) per the rustfmt.toml header, so this is cosmetic only. Note: rustfmt and clippy components are not installed in this toolchain (1.88.0), so neither could be executed to confirm.",
+    "file": "crates/sparq-jsonld/src/expand.rs",
+    "fix_hint": "Revert both asserts to their single-line form so the only content in these hunks is the intended comment/assertion change.",
+    "severity": "nit",
+    "title": "Unit-test asserts reformatted to a multi-line vec entry that rustfmt would collapse back"
+   },
+   {
+    "body": "The `assert!(!matches!(..))` guard and the comment recording the original `unwrap_or_default()` empty-string-@id bug are deleted at src/expand.rs:1443-1447. The guard itself was strictly redundant \u2014 the surviving `assert_eq!(..., Json::Obj(vec![(\"@id\", json_null())]))` already excludes an empty-string @id \u2014 so no coverage is lost. What is lost is the recorded history of that specific bug; the src doc comment (\"never emitted as an empty-string `@id` or an empty `{}`\") still states the constraint, so the tripwire for a future refactor is weaker but not absent. Flagging only because round 1 raised it and it is the one item not addressed either way.",
+    "file": "crates/sparq-jsonld/src/expand.rs",
+    "fix_hint": "Optionally add a short clause to the surviving assert message or the doc comment naming the `unwrap_or_default()` origin, e.g. \"a null IRI expansion must remain an explicit null @id (never the empty-string @id of the original unwrap_or_default bug)\".",
+    "severity": "nit",
+    "title": "Removed empty-string-@id guard and its bug history; the src comment is now the only record"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 2 resolves every blocker and major from round 1 by reverting the behavioural change entirely and keeping only regression coverage. Verified at PR head: `git diff main...HEAD` touches only crates/sparq-jsonld/src/expand.rs (comment reflow + unit-test reformat) and crates/sparq-jsonld/tests/expand.rs (three tests). expand_value again returns `Json` and produces the spec-literal `{\"@id\": null}` on both the `@type:@id` (src/expand.rs:888) and `@type:@vocab` (src/expand.rs:892) paths via `map_or_else(json_null, Json::Str)`, identical to main, so the \u00a75.3.2 divergence and the internal inconsistency with the `@id`-keyword path are gone. The step 13.8.3.7.3-5 `if let Some(reexpanded)` guard is gone too: prepend_value + the `@value` check at src/expand.rs:816-823 are unconditional, so the spec-mandated invalid value object abort fires again.\n\nThe new tests are non-vacuous and pass (`cargo test -p sparq-jsonld`: id_coercion_keyword_shaped_scalar_and_arrays_retain_null_id, nulled_term_under_id_and_vocab_coercion_is_pinned, property_index_null_re_expansion_on_value_object_errors all ok; whole crate green). They use the real helpers (assert_expands compares canonicalised expansions; assert_error uses expect_err + code equality), and they pin exactly the three behaviours round 1 showed diverging under the old code: scalar vs [\"@kw\"] vs mixed-array now all retain the null @id; a term bound to null is covered under both @id (vocab=false, stays relative \"nt\") and @vocab (null mapping -> {\"@id\": null}); and the property-index case errors for BOTH a keyword-shaped and a non-keyword index token, so the two cannot silently diverge again. Since round 1 empirically observed the opposite outcomes ([], no error) under the previous head, these assertions demonstrably discriminate the two implementations.\n\nOnly nits remain: the retained comment is slightly thinner than main's, two unit-test asserts were reformatted away from rustfmt's one-line form (fmt is informa\u2026 [truncated 186 chars]",
+  "verdict": "approve"
+ }
+}
