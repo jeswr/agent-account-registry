@@ -243,14 +243,38 @@ def build_record(repo, run_id, frontier, dispatch, now):
         value = source.get(key, 0)
         return int(value) if isinstance(value, int) and value >= 0 else 0
 
+    def _areas(key):
+        value = frontier.get(key)
+        return ({str(k): int(v) for k, v in value.items() if isinstance(v, int) and v > 0}
+                if isinstance(value, dict) else {})
+
     planned_rows = _n(dispatch, "planned")
     realised = min(_n(dispatch, "launched"), planned_rows)
     frontier_width = _n(frontier, "frontier_width")
-    areas = frontier.get("conflict_by_area")
-    areas = {str(k): int(v) for k, v in areas.items()
-             if isinstance(v, int) and v > 0} if isinstance(areas, dict) else {}
+    areas = _areas("conflict_by_area")
     census_doc = frontier.get("census")
     census_doc = census_doc if isinstance(census_doc, dict) else {}
+    # THE DISPATCH CHAIN, as disjoint legs that add up. The gap between "the frontier was wide" and
+    # "nothing launched" is where the real bottleneck lives (measured: run 30222895098 dropped 30
+    # rows at the assemble leg and ended `lane worker: planned=0 launched=0`, with no counter
+    # anywhere on it), so each leg is named and the residual is carried explicitly rather than
+    # absorbed. `route_rejections` is the frontier rows plan_dispatch refused (ambiguous/unknown
+    # role) — derived, never assumed zero.
+    before_assemble = _n(frontier, "plan_rows_before_assemble")
+    assembler_deferrals = _n(frontier, "assembler_deferrals")
+    entering = frontier_width + _n(frontier, "deferred_retry_width")
+    chain = {
+        "frontier_and_retry_rows": entering,
+        "route_rejections": max(0, entering - before_assemble) if before_assemble else 0,
+        "assembler_deferrals": assembler_deferrals,
+        "claim_deferrals": max(0, before_assemble - assembler_deferrals - planned_rows)
+                           if before_assemble else 0,
+        "realised_dispatches": realised,
+        "unrealised_planned_rows": planned_rows - realised,
+    }
+    chain["unaccounted"] = entering - (
+        chain["route_rejections"] + chain["assembler_deferrals"] + chain["claim_deferrals"]
+        + chain["realised_dispatches"] + chain["unrealised_planned_rows"])
     return {
         "ts": int(now),
         "run_id": str(run_id),
@@ -264,6 +288,10 @@ def build_record(repo, run_id, frontier, dispatch, now):
         "unrealised_rows": planned_rows - realised,
         "conflict_deferrals": _n(frontier, "conflict_deferrals"),
         "conflict_by_area": areas,
+        "plan_rows_before_assemble": before_assemble,
+        "assembler_deferrals": assembler_deferrals,
+        "assembler_by_area": _areas("assembler_by_area"),
+        "chain": chain,
         "census": {str(k): int(v) for k, v in (census_doc.get("buckets") or {}).items()
                    if isinstance(v, int)},
         "census_total": _n(census_doc, "total"),
@@ -287,6 +315,8 @@ def render_log_line(record):
         f"realised_dispatches={record.get('realised_dispatches', 0)} "
         f"unrealised_rows={record.get('unrealised_rows', 0)} "
         f"conflict_deferrals={record.get('conflict_deferrals', 0)} "
+        f"assembler_deferrals={record.get('assembler_deferrals', 0)} "
+        f"chain_unaccounted={(record.get('chain') or {}).get('unaccounted', 0)} "
         f"census_total={record.get('census_total', 0)} "
         f"census_unclassified={record.get('census_unclassified', 0)} "
         f"attribution={record.get('attribution', 'unavailable')}"
@@ -599,9 +629,19 @@ def _workflow_block(path, step_id, marker):
     return source
 
 
-def _workflow_step_text(path, step_id):
-    """The RAW yaml of the ONE step with `id: <step_id>`, for asserting its `if:`/env wiring."""
-    lines = Path(path).read_text(encoding="utf-8").split("\n")
+def _workflow_step_text(path, step_id, strip_comments=False):
+    """The yaml of the ONE step with `id: <step_id>`, for asserting its `if:`/env/path wiring.
+
+    `strip_comments=True` drops `#` lines FIRST. This is load-bearing, not tidiness: the artifact
+    upload step's own comment names `frontier-census.json`, so a substring check over the raw step
+    stayed green after the path line was deleted — a claim in a comment satisfying a wiring check,
+    the same vacuity class dispatch-plan.py already guards against. Measured: mutant M9 survived
+    until this argument existed.
+    """
+    text = Path(path).read_text(encoding="utf-8")
+    if strip_comments:
+        text = "\n".join(line for line in text.split("\n") if not line.lstrip().startswith("#"))
+    lines = text.split("\n")
     ids = [i for i, line in enumerate(lines) if line.strip() == f"id: {step_id}"]
     if len(ids) != 1:
         raise AssertionError(f"expected one workflow step `id: {step_id}`, found {len(ids)}")
@@ -695,6 +735,37 @@ def _self_test():   # noqa: C901 — one flat assertion table, deliberately
         sorted(k for k in ("frontier_width", "realised_dispatches", "conflict_deferrals",
                            "conflict_by_area") if k in rec),
         ["conflict_by_area", "conflict_deferrals", "frontier_width", "realised_dispatches"])
+    # ---- the dispatch CHAIN adds up leg by leg -------------------------------------------------
+    # This is the shape of the real measured failure: a wide frontier, everything eaten at the
+    # assemble leg, `lane worker: planned=0 launched=0`, and no counter anywhere on the loss.
+    measured = build_record("sparq-org/sparq", "99.1", dict(
+        frontier_doc, frontier_width=32, deferred_retry_width=0,
+        plan_rows_before_assemble=30, assembler_deferrals=30,
+        assembler_by_area={"sparq-core": 12, "ci": 18}), {"planned": 0, "launched": 0}, 100)
+    chk("[chain-sum] the legs partition the frontier — the loss cannot hide between two counters",
+        (measured["chain"]["route_rejections"], measured["chain"]["assembler_deferrals"],
+         measured["chain"]["claim_deferrals"], measured["chain"]["realised_dispatches"],
+         measured["chain"]["unaccounted"]), (2, 30, 0, 0, 0))
+    chk("[chain-sum] every leg sums back to the rows that entered the chain",
+        sum(v for k, v in measured["chain"].items() if k != "frontier_and_retry_rows"),
+        measured["chain"]["frontier_and_retry_rows"])
+    mixed = build_record("o/t", "99.1", dict(
+        frontier_doc, frontier_width=10, deferred_retry_width=2,
+        plan_rows_before_assemble=12, assembler_deferrals=4), {"planned": 6, "launched": 5}, 100)
+    chk("[chain-sum] a CLAIM-side defer is its own leg, not folded into unrealised",
+        (mixed["chain"]["claim_deferrals"], mixed["chain"]["unrealised_planned_rows"],
+         mixed["chain"]["unaccounted"], sum(
+             v for k, v in mixed["chain"].items() if k != "frontier_and_retry_rows")),
+        (2, 1, 0, 12))
+    chk("[chain-sum] a target with no assemble leg reported leaves a VISIBLE residual",
+        (lambda c: (c["assembler_deferrals"], c["unaccounted"]))(
+            build_record("o/t", "99.1", dict(frontier_doc, frontier_width=10,
+                                             deferred_retry_width=0),
+                         {"planned": 0, "launched": 0}, 100)["chain"]), (0, 10))
+    chk("[chain-sum] the brace-free log line carries the assemble leg and the residual",
+        ("assembler_deferrals=30" in render_log_line(measured),
+         "chain_unaccounted=0" in render_log_line(measured),
+         "{" in render_log_line(measured)), (True, True, False))
     # tick_records keeps a census-only repo (the exact silent-improvement failure).
     ticks = tick_records({"repositories": {"a/b": frontier_doc, "c/d": frontier_doc}},
                          {"by_repo": {"a/b": {"planned": 4, "launched": 4}}}, "99.1", 100)
@@ -893,6 +964,42 @@ def _self_test():   # noqa: C901 — one flat assertion table, deliberately
     chk("[YAML seam] a fully-free board records zero conflict deferrals",
         (everything["frontier_width"], everything["conflict_deferrals"]), (8, 0))
 
+    # The ASSEMBLE leg — the one the measured run actually died at — is likewise EXECUTED.
+    assemble_block = _workflow_block(workflow, "assemble", "assembler-census")
+
+    class _StubClaim:
+        """Stands in for the registry `dispatch-claim` module: keeps only the first item."""
+
+        @staticmethod
+        def filter_deferred_items(items, *_a, **_k):
+            return list(items)
+
+        @staticmethod
+        def filter_busy_area_items(items, *_a, **kwargs):
+            kwargs.get("starvation", {})["kept"] = 1
+            return list(items)[:1]
+
+    assembler_census = {}
+    assemble_ns = {
+        "repository": {"items": [{"number": 1, "package": "sparq-core"},
+                                 {"number": 2, "package": "ci"},
+                                 {"number": 3, "package": "ci"},
+                                 {"number": 4, "package": None}]},
+        "repo": "o/t", "claim_mod": _StubClaim(), "leases": [], "now": 0, "pulls": [],
+        "issue_labels": {}, "provenance": {}, "pr_status": {}, "starvation": {},
+        "assembler_census": assembler_census}
+    exec(assemble_block, assemble_ns)   # noqa: S102 — the workflow block, executed on purpose
+    chk("[YAML seam] the EXECUTED assemble block counts the rows the busy-area filter ate",
+        assembler_census.get("o/t"),
+        {"plan_rows_before_assemble": 4, "assembler_deferrals": 3,
+         "assembler_by_area": {"ci": 2, "__unknown__": 1}, "plan_rows": 1})
+    chk("[YAML seam] ...and it still applies the real filter (the items list is REPLACED)",
+        [item["number"] for item in assemble_ns["repository"]["items"]], [1])
+    assemble_yaml = Path(workflow).read_text(encoding="utf-8")
+    chk("[YAML seam] PLAN merges the assemble leg into the census CLAIM will read",
+        ('census_doc.setdefault("repositories", {}).setdefault(' in assemble_yaml,
+         "assembler_census.items()" in assemble_yaml), (True, True))
+
     claim_step = _workflow_step_text(workflow, "dispatch-telemetry")
     chk("[YAML seam] the CLAIM call site runs the recorder, always(), and cannot fail the tick",
         ("scripts/dispatch-telemetry.py" in claim_step and " record" in claim_step,
@@ -900,10 +1007,18 @@ def _self_test():   # noqa: C901 — one flat assertion table, deliberately
          "continue-on-error: true" in claim_step,
          "--frontier" in claim_step, "--summary" in claim_step, "--run-id" in claim_step),
         (True, True, True, True, True, True))
-    plan_yaml = Path(workflow).read_text(encoding="utf-8")
-    chk("[YAML seam] PLAN uploads the census beside the plan so CLAIM can read it",
-        ("frontier-census.json" in plan_yaml,
-         plan_yaml.count("frontier-census.json") >= 3), (True, True))
+    # SCOPED to the upload step, not the whole file: the filename appears in several places, so a
+    # whole-file search survives deleting it from the artifact path — which silently starves CLAIM.
+    upload_step = _workflow_step_text(workflow, "upload-plan", strip_comments=True)
+    chk("[YAML seam] the artifact upload step itself carries the census beside the plan",
+        ("frontier-census.json" in upload_step, "plan.json" in upload_step,
+         "if-no-files-found: error" in upload_step), (True, True, True))
+    claim_download = _workflow_step_text(workflow, "download-plan", strip_comments=True)
+    chk("[YAML seam] ...and CLAIM downloads it to the path the recorder is pointed at",
+        ("path: plan" in claim_download,
+         "plan/frontier-census.json" in _workflow_step_text(
+             workflow, "dispatch-telemetry", strip_comments=True)),
+        (True, True))
 
     print("dispatch-telemetry self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1

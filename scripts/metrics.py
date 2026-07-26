@@ -681,6 +681,11 @@ def dispatch_panel(records, repo, now, stale_after=DISPATCH_STALE_SECONDS):
         "planned_rows": int(latest.get("planned_rows", 0) or 0),
         "conflict_deferrals": int(latest.get("conflict_deferrals", 0) or 0),
         "conflict_by_area": dict(latest.get("conflict_by_area") or {}),
+        # The assemble leg is where the loss was actually measured; publishing the chain is what
+        # turns "nothing dispatched" into an attributable answer on the feed itself.
+        "assembler_deferrals": int(latest.get("assembler_deferrals", 0) or 0),
+        "assembler_by_area": dict(latest.get("assembler_by_area") or {}),
+        "chain": dict(latest.get("chain") or {}),
         "candidates": int(latest.get("candidates", 0) or 0),
         "census": dict(latest.get("census") or {}),
         "census_unclassified": int(latest.get("census_unclassified", 0) or 0),
@@ -1354,6 +1359,15 @@ def _test_dispatch_panel(chk):
     chk("[gate-a feed] a stale ring is LABELLED stale, not published as healthy",
         (lambda p: (p["status"], p["frontier_width"]))(
             dispatch_panel([rec(now - 99_999, 10, 9)], "sparq-org/sparq", now)), ("stale", 10))
+    chained = dispatch_panel(
+        [rec(now, 32, 0, assembler_deferrals=30, assembler_by_area={"ci": 18, "sparq-core": 12},
+             chain={"frontier_and_retry_rows": 32, "route_rejections": 2,
+                    "assembler_deferrals": 30, "claim_deferrals": 0, "realised_dispatches": 0,
+                    "unrealised_planned_rows": 0, "unaccounted": 0})],
+        "sparq-org/sparq", now)
+    chk("[gate-a feed] the feed says WHERE the frontier was lost, not just that it was",
+        (chained["assembler_deferrals"], chained["assembler_by_area"]["ci"],
+         chained["chain"]["unaccounted"], chained["realisation_rate"]), (30, 18, 0, 0.0))
     chk("[gate-a feed] a target that has never reported says so",
         dispatch_panel(fresh, "other/repo", now), {"status": "no-record"})
     # "could not read the ring" and "the dispatcher never reported" are DIFFERENT failures.

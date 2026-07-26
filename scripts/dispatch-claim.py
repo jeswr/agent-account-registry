@@ -6345,6 +6345,27 @@ def _self_test():
         "o/t": {"planned": 0, "launched": 0}}
     assert _by_repo_summary({7: {"planned": 1}, "o/t": "junk"}) == {}
     assert _by_repo_summary(None) == {}
+    # CALL-SITE SEAM (source-level). The normalizer above is pure and stays green even if the
+    # dispatch loop never CALLS it — and a missing `_count_repo(repo, "launched")` would make
+    # `realised_dispatches` permanently 0, i.e. Gate A permanently closed on a fabricated number.
+    # That is the marquee guard of this change, so pin the pairing: every fleet-lane worker
+    # increment is immediately mirrored into the per-target map.
+    _dispatch_src = inspect.getsource(dispatch)
+    for _lane_key in ("planned", "launched"):
+        _paired = (f'lanes["worker"]["{_lane_key}"] += 1\n'
+                   f'            _count_repo(repo, "{_lane_key}")')
+        assert _dispatch_src.count(f'lanes["worker"]["{_lane_key}"] += 1') == 1, _lane_key
+        assert _paired in _dispatch_src, (
+            f'the worker-lane {_lane_key} increment is not mirrored into the per-target Gate A '
+            f'map — realised dispatches would read as 0 forever')
+    assert _dispatch_src.count('_write_dispatch_summary(') == 2, (
+        "expected exactly the early and the final summary write")
+    # BOTH writes, not just one: the early write happens before any launch, so if only IT carries
+    # the map the final write silently overwrites the realised counts with nothing (mutant M15c
+    # survived a plain `in` check until this was a count).
+    assert _dispatch_src.count('by_repo=worker_by_repo') == 2, (
+        "every _write_dispatch_summary call must hand over the per-target worker map — the final "
+        "write is the one that carries the realised dispatches")
     # Every REVIEW_STATE maps to exactly one lane and the split is EXHAUSTIVE (a new state would
     # KeyError the assertion below rather than silently land in the fix lane): needs-review + the
     # stranded escalation are the review lane; the three fix-run states are the fix lane.

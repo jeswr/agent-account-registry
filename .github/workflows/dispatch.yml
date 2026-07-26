@@ -461,7 +461,7 @@ jobs:
                   candidate_numbers = {
                       row[1] for row in candidates_fn(ready_input, log=lambda _line: None)}
                   reasons_by_number = {
-                      row["number"]: reason_fn(set(row["labels"]), row["open_blockers"])
+                      row["number"]: reason_fn(set(row["labels"]), row.get("open_blockers", 0))
                       for row in ready_input}
                   conflict_total = max(0, len(candidate_numbers) - len(frontier_numbers))
               conflict_by_area, _attributed = telemetry.parse_conflict_areas(
@@ -597,6 +597,10 @@ jobs:
         run: python3 registry/scripts/ledger-invariant.py registry-ledger
 
       - name: Assemble and validate the v2 plan (registry code only, no tokens, local data)
+        # `id:` so scripts/dispatch-telemetry.py --self-test can locate this step and EXECUTE
+        # the `assembler-census` block below against stubs (the YAML seam is where vacuity
+        # lives in this repo — every uncaught mutant of an 18-mutant run lived at one).
+        id: assemble
         run: |
           set -euo pipefail
           python3 - "$RUNNER_TEMP" "$RUNNER_TEMP/plan.json" <<'PY'
@@ -644,6 +648,8 @@ jobs:
           # never park a holder on an empty backlog.
           partition_starvation = []
           review_exclusions = Counter()
+          # [Gate A telemetry] per-repo accounting for the busy-area/lease assemble filter.
+          assembler_census = {}
           for index, repository in enumerate(intermediate["repositories"]):
               repo = repository["target_repo"]
               owner, name = repo.split("/", 1)
@@ -751,10 +757,41 @@ jobs:
               # [registry #677] `starvation` is filled BY the filter, at the branch that makes
               # each drop decision — never recounted afterwards from a different view.
               starvation = {}
+              # >>> assembler-census — EXTRACTED AND EXECUTED by
+              # `scripts/dispatch-telemetry.py --self-test`. This is the leg where the frontier
+              # actually dies. MEASURED on run 30222895098: 30 rows dropped here and the tick ended
+              # `lane worker: planned=0 launched=0`. The pre-existing `frontier_size` field cannot
+              # see it — it is literally assigned the POST-filter `planned` count, so the whole loss
+              # sits between "the frontier was wide" and "nothing was planned" with no counter on
+              # it. Each lost row is attributed to the package it was holding out for. Pure
+              # bookkeeping over lists this step already has: no extra call, no API request.
+              # Inputs: `repository`, `repo`, `claim_mod`, `leases`, `now`, `pulls`,
+              # `issue_labels`, `provenance`, `pr_status`, `starvation`, `assembler_census`.
+              packages_before = {item["number"]: item.get("package")
+                                 for item in repository["items"]}
               repository["items"] = claim_mod.filter_busy_area_items(
                   claim_mod.filter_deferred_items(repository["items"], repo, leases, now),
                   repo, pulls, issue_labels, provenance, pr_status, leases, now,
                   starvation=starvation)
+              kept_numbers = {item["number"] for item in repository["items"]}
+              dropped_by_area = {}
+              for dropped_number, dropped_package in packages_before.items():
+                  if dropped_number not in kept_numbers:
+                      key = str(dropped_package) if dropped_package else "__unknown__"
+                      dropped_by_area[key] = dropped_by_area.get(key, 0) + 1
+              assembler_census[repo] = {
+                  "plan_rows_before_assemble": len(packages_before),
+                  "assembler_deferrals": len(packages_before) - len(kept_numbers),
+                  "assembler_by_area": dropped_by_area,
+                  "plan_rows": len(kept_numbers),
+              }
+              print("assembler-census " + " ".join([
+                  repo,
+                  "plan_rows_before_assemble=" + str(len(packages_before)),
+                  "assembler_deferrals=" + str(len(packages_before) - len(kept_numbers)),
+                  "plan_rows=" + str(len(kept_numbers)),
+              ]))
+              # <<< assembler-census
               # Recorded ONLY for a genuinely starved lane: nothing survived AND rows were dropped
               # behind the serializing partition. A healthy or empty lane records nothing, so the
               # sweep on the CLAIM side has no starvation to act on at all.
@@ -824,9 +861,29 @@ jobs:
               f"{reason}={count}" for reason, count in sorted(review_exclusions.items()))
           print(f"review-enumeration excluded {sum(review_exclusions.values())} labeled "
                 f"worker PR(s): {exclusion_detail or 'none'}")
+          # [Gate A telemetry] Merge the assemble-leg counters into the PLAN census the readiness
+          # step wrote, so CLAIM receives ONE document describing the whole
+          # frontier -> plan-rows -> realised chain. Best-effort: a telemetry merge failure must
+          # never fail PLAN, and a census the merge could not reach simply carries no assemble leg
+          # (which the record then shows as a null leg, not as a zero).
+          census_path = Path(out_dir, "frontier-census.json")
+          try:
+              census_doc = json.loads(census_path.read_text(encoding="utf-8"))
+              for census_repo, counters in assembler_census.items():
+                  census_doc.setdefault("repositories", {}).setdefault(
+                      census_repo, {}).update(counters)
+              census_path.write_text(
+                  json.dumps(census_doc, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          except (OSError, ValueError) as exc:
+              print(f"::warning::dispatch telemetry: assemble-leg merge failed ({exc})")
           PY
 
       - name: Upload immutable plan artifact (pinned)
+        # `id:` so scripts/dispatch-telemetry.py --self-test can assert THIS step still carries the
+        # frontier census: dropping the path is silent (CLAIM then reads a missing file and records
+        # nothing), and a whole-file substring search does not see it because the filename appears
+        # elsewhere in this workflow.
+        id: upload-plan
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: dispatch-plan-${{ github.run_id }}-${{ github.run_attempt }}
@@ -995,6 +1052,9 @@ jobs:
       issues: write   # write: upsert the rolling worker-availability alert issue (usage-alert.py)
     steps:
       - name: Download PLAN artifact (pinned)
+        # `id:` so the telemetry self-test can pin that the census lands where the recorder reads it
+        # (`plan/frontier-census.json`) — the artifact now carries two files, not one.
+        id: download-plan
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: dispatch-plan-${{ github.run_id }}-${{ github.run_attempt }}
