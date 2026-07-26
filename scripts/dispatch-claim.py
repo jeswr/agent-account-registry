@@ -313,14 +313,18 @@ MAX_FAILING_LEGS = 20
 
 def plan_package(areas):
     """The single conflict partition a plan/lease row reserves for a collection of `area:*`
-    sections (registry issue #112). EXACTLY one area -> that area; ZERO OR MULTIPLE -> the
-    serializing global partition. Mirrors dispatch-plan.py:_plan_package byte-for-byte so the
-    anti-tamper package/label agreement in _route_matches holds: the old
-    alphabetically-first reduction dropped every secondary area, so a multi-area issue/PR
-    leased or dispatched onto a crate a second area already held. Fail-closed — over-serialize
-    a multi-area row rather than free a busy sibling crate."""
-    uniq = {a for a in areas if isinstance(a, str) and a}
-    return next(iter(uniq)) if len(uniq) == 1 else GLOBAL_PACKAGE
+    sections (registry issue #112) — DELEGATED to lease_schema.plan_package, which is the one
+    canonical reduction.
+
+    It used to be a local copy carrying a comment promising it "mirrors dispatch-plan.py
+    byte-for-byte". That promise held; the one it did NOT make — that review-fix.yml's `resolve`
+    job derives the same value — is the one that broke, and a prose promise is not a test. The
+    adopt step compares the dispatcher's minted `package` against resolve's re-derived `package`
+    for EQUALITY, so a third un-migrated copy turned every multi-area PR into a claim the
+    dispatcher minted and the adopter refused, forever. Sharing the function removes the drift
+    axis entirely; _plan_package_agreement() in the self-test pins the one copy that CANNOT share
+    it (dispatch-plan.py ships in the target repos, which have no lease_schema.py)."""
+    return _lease_schema.plan_package(areas)
 
 
 class DispatchError(RuntimeError):
@@ -349,6 +353,12 @@ _park_policy = _load_module(
 # mutation could double-dispatch a worker, which is exactly incident #559's storm class.
 _gh_retry = _load_module(
     "registry_gh_retry", Path(__file__).resolve().with_name("gh_retry.py"))
+
+# THE canonical area->package partition reduction, shared with review-fix.yml's `resolve` job (the
+# ONLY other independent deriver of this value) so the adopt step's equality check can never reject
+# a claim this module minted. See lease_schema.plan_package for the 2026-07-26 incident.
+_lease_schema = _load_module(
+    "registry_lease_schema", Path(__file__).resolve().with_name("lease_schema.py"))
 
 
 def _require_exact_fields(value, fields, where):
