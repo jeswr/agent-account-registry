@@ -1056,13 +1056,24 @@ def sustained_fleet_health_evidence(records, parked_at, now):
          comment: an under-covered window cannot honestly claim a full span of health);
       3. no LAUNCH_FAIL_CLASSES record inside the span, no account whose newest record in the
          window is a launch failure, and no ACTIVE auth cooldown (_fleet_health_ok);
-      4. at least SUSTAINED_HEALTH_MIN_SUCCESSES success records inside the span, strictly after
-         `parked_at`, from at least SUSTAINED_HEALTH_MIN_ACCOUNTS distinct accounts; and
+      4. at least SUSTAINED_HEALTH_MIN_SUCCESSES success records inside the span from at least
+         SUSTAINED_HEALTH_MIN_ACCOUNTS distinct accounts; and
       5. the NEWEST of those successes is within SUSTAINED_HEALTH_FRESH_SECONDS of `now` — the
          fleet works in the present tense, not merely at some point in the span.
     The newest qualifying success anchors the evidence (ties broken by account fingerprint then
-    run id) so the answer is deterministic, and `recovered_at` is therefore always strictly after
-    `parked_at` — which is what capacity_park_admission independently re-checks.
+    run id) so the answer is deterministic. Every counted success is strictly after `parked_at`
+    BY CONSTRUCTION rather than by a separate test — condition 1 already forces
+    `parked_at <= span_start` and condition 4 only counts records after `span_start` — and
+    capacity_park_admission re-checks the ordering independently anyway. A redundant
+    `ts > parked_at` clause here would be a guard no input could ever exercise.
+
+    HONESTY NOTE on the no-active-cooldown clause of condition 3: it is DELIBERATELY REDUNDANT
+    with the no-launch-failure-in-span clause. An active auth cooldown lasts
+    AUTH_COOLDOWN_SECONDS, so it always implies an `auth` record inside a span this long, which
+    the earlier clause has already refused. It is kept for the same reason
+    capacity_recovery_evidence keeps its deliberately-overlapping condition 3 (both are cheap,
+    neither is relied on alone, and it would survive a future narrowing of LAUNCH_FAIL_CLASSES) —
+    but it is NOT an independently reachable guard and the self-test does not pretend it is.
 
     Records stamped implausibly far in the FUTURE are skipped exactly as elsewhere, so a
     forged-future success can neither anchor this evidence nor manufacture freshness."""
@@ -1080,8 +1091,7 @@ def sustained_fleet_health_evidence(records, parked_at, now):
     if not _fleet_health_ok(window, now):
         return None
     successes = [record for record in window
-                 if record["exit_class"] == SUCCESS
-                 and record["ts"] > span_start and record["ts"] > parked_at]
+                 if record["exit_class"] == SUCCESS and record["ts"] > span_start]
     if len(successes) < SUSTAINED_HEALTH_MIN_SUCCESSES:
         return None
     if len({record["account"] for record in successes}) < SUSTAINED_HEALTH_MIN_ACCOUNTS:
@@ -3122,6 +3132,142 @@ def _self_test():
             for window in ([rec("openai", "codex01", cls, dt=0, run="f1"),
                             rec("openai", "codex01", SUCCESS, dt=200, run="s1")]
                            for cls in sorted(PARK_STARVATION_CLASSES))), True)
+
+    # ---- [registry #691] THE AGED-OUT PARK EXIT ---------------------------------------------
+    # The gap the two predicates above leave: a park whose own cause is UNOBTAINABLE (older than
+    # the 48 h window, or applied while the fleet was healthy) has no machine exit at all, so a
+    # transient outage becomes a permanent stall. sustained_fleet_health_evidence is the LABELLED
+    # HEURISTIC that gives it one. Every check below is a guard whose deletion or inversion makes
+    # a NAMED line here go red.
+    h_now = now + 7 * 3600                          # the instant the predicate is evaluated
+    h_span_start = h_now - SUSTAINED_HEALTH_SPAN_SECONDS
+    aged_park = now - WINDOW_SECONDS - 1            # the #691 shape: older than the whole window
+    # COVERAGE ANCHOR: one record older than the span, so the window reaches back as far as the
+    # health claim does. It sits OUTSIDE the span, so it is never counted as span evidence.
+    h_base = [rec("fleet", "fleet01", SUCCESS, dt=0, run="z0")]
+    # Six successes across two accounts, ending 5 minutes before the evaluation instant.
+    h_wins = ([rec("openai", "codex01", SUCCESS, dt=7 * 3600 - 300 - 600 * k, run=f"s{k}")
+               for k in range(3)]
+              + [rec("anthropic", "acct02", SUCCESS, dt=7 * 3600 - 600 - 600 * k, run=f"t{k}")
+                 for k in range(3)])
+    healthy = h_base + h_wins
+    aged_evidence = sustained_fleet_health_evidence(healthy, aged_park, h_now)
+    ah2 = account_hash("acct02", salt)
+    chk("a park whose cause aged out is released by SUSTAINED fleet health (the #691 liveness "
+        "fix): the anchor is the newest success",
+        (aged_evidence or {}).get("key"), f"fleet-health/openai/{ah}/s0")
+    chk("the aged-out evidence is namespaced, labelled `aged-out`, and stamped at the anchor",
+        ((aged_evidence or {}).get("cause"), (aged_evidence or {}).get("recovered_at")),
+        (SUSTAINED_HEALTH_CAUSE, _iso_z(now + 7 * 3600 - 300)))
+    chk("the aged-out evidence key carries NO raw handle and is receipt-safe",
+        ("codex01" in (aged_evidence or {}).get("key", ""),
+         bool(re.fullmatch(r"[A-Za-z0-9._=/:-]{1,120}", (aged_evidence or {}).get("key", "")))),
+        (False, True))
+    chk("the recovery stamp is strictly after the park application (by construction — condition "
+        "1 forces parked_at <= span_start and only post-span_start successes are counted)",
+        (now + 7 * 3600 - 300) > aged_park, True)
+    # zero-dispatch is DELIBERATELY not ill health: the allocator finding nothing to launch fires
+    # constantly in normal operation (measured: 34 of the live ledger's 200 records). Widen
+    # _fleet_health_ok from LAUNCH_FAIL_CLASSES to PARK_STARVATION_CLASSES and this goes red —
+    # and the predicate becomes unsatisfiable in production, which is a stall dressed as a guard.
+    chk("a zero-dispatch tick INSIDE the span does not refuse the aged-out exit",
+        bool(sustained_fleet_health_evidence(
+            healthy + [rec("fleet", "fleet01", CLASS_ZERO_DISPATCH, dt=7 * 3600 - 2000,
+                           run="z9")],
+            aged_park, h_now)), True)
+    # GUARD: a LAUNCH FAILURE INSIDE THE SPAN. Delete the span clause of _fleet_health_ok and
+    # this goes red. One `auth` is below AUTH_COOLDOWN_MIN, so this exercises the span clause
+    # alone, not the (deliberately redundant) cooldown clause.
+    chk("a single launch failure INSIDE the proven span refuses the aged-out exit",
+        sustained_fleet_health_evidence(
+            healthy + [rec("openai", "codex01", CLASS_AUTH, dt=7 * 3600 - 4000, run="f9")],
+            aged_park, h_now), None)
+    # GUARD: an account that failed just BEFORE the span and never came back. Its failure is
+    # outside the span, so only the newest-record-per-account clause catches it.
+    chk("an account still SITTING on a launch failure (failed before the span, silent since) "
+        "refuses the aged-out exit",
+        sustained_fleet_health_evidence(
+            healthy + [rec("anthropic", "acct09", CLASS_LIMIT, dt=1200, run="f8")],
+            aged_park, h_now), None)
+    # GUARD: the positive-evidence counts. ASSERT THE BOUNDS THEMSELVES FIRST, then size every
+    # fixture from a LITERAL. A fixture sized from the constant under test shrinks with the
+    # constant and keeps passing when the floor is lowered — the mutant survives (measured: it
+    # did, on the first cut of this very test).
+    chk("the positive-evidence floors are the documented ones",
+        (SUSTAINED_HEALTH_MIN_SUCCESSES, SUSTAINED_HEALTH_MIN_ACCOUNTS), (6, 2))
+    chk("FIVE successes in the span refuses the exit (the floor is 6)",
+        sustained_fleet_health_evidence(h_base + h_wins[:5], aged_park, h_now), None)
+    chk("EIGHT successes from ONE account refuses the exit (the floor is 2 distinct accounts)",
+        sustained_fleet_health_evidence(
+            h_base + [rec("openai", "codex01", SUCCESS, dt=7 * 3600 - 300 - 600 * k, run=f"o{k}")
+                      for k in range(8)],
+            aged_park, h_now), None)
+    # GUARD: freshness. SILENCE IS NOT HEALTH — the same six successes, all early in the span.
+    stale = h_base + [rec("openai", "codex01", SUCCESS, dt=3700 + 60 * k, run=f"e{k}")
+                      for k in range(3)] \
+        + [rec("anthropic", "acct02", SUCCESS, dt=3900 + 60 * k, run=f"g{k}") for k in range(3)]
+    chk("a fleet that succeeded early in the span and went SILENT refuses the exit "
+        "(freshness: health is a present-tense claim)",
+        sustained_fleet_health_evidence(stale, aged_park, h_now), None)
+    chk("a FORGED FUTURE success cannot manufacture that freshness",
+        sustained_fleet_health_evidence(
+            stale + [rec("openai", "codex01", SUCCESS, dt=7 * 3600 + 4000, run="fut")],
+            aged_park, h_now), None)
+    # GUARD: coverage. Drop the anchor and the window no longer reaches back as far as the claim.
+    chk("a window that does not COVER the span it would claim refuses the exit "
+        "(no claiming six healthy hours from four observed ones)",
+        sustained_fleet_health_evidence(h_wins, aged_park, h_now), None)
+    # GUARD: the park must be older than the span — a fresh park is the STRONG gate's business.
+    chk("a park younger than the span is refused here (the cause-recovery gate owns it)",
+        sustained_fleet_health_evidence(healthy, h_span_start + 1, h_now), None)
+    chk("a park exactly at the span boundary is admitted (the bound is <=, not <)",
+        bool(sustained_fleet_health_evidence(healthy, h_span_start, h_now)), True)
+    # GUARD: fail closed on every ambiguity, exactly like the gate it sits beside.
+    chk("an unreadable / empty / malformed window and an unusable park stamp all refuse",
+        [sustained_fleet_health_evidence([], aged_park, h_now),
+         sustained_fleet_health_evidence("nope", aged_park, h_now),
+         sustained_fleet_health_evidence(healthy + [{"account": "x"}], aged_park, h_now),
+         sustained_fleet_health_evidence(healthy, None, h_now),
+         sustained_fleet_health_evidence(healthy, float("inf"), h_now)],
+        [None, None, None, None, None])
+    # ---- the MIGRATION-side reachability twins ----------------------------------------------
+    chk("the aged-out exit is REACHABLE while the fleet is observed healthy",
+        sustained_health_exit_reachable(healthy, h_now), True)
+    chk("it is NOT reachable on an unreadable/empty window, a stale fleet, or an account "
+        "sitting on a launch failure",
+        [sustained_health_exit_reachable([], h_now),
+         sustained_health_exit_reachable(healthy + [{"account": "x"}], h_now),
+         sustained_health_exit_reachable(stale, h_now),
+         sustained_health_exit_reachable(
+             healthy + [rec("anthropic", "acct09", CLASS_LIMIT, dt=1200, run="f8")], h_now)],
+        [False, False, False, False])
+    # park_exit_reachable is the disjunction the migration asks. Each disjunct alone suffices,
+    # and neither being available defers the migration exactly as before #691.
+    strong_only = [rec("openai", "codex01", CLASS_AUTH, dt=7 * 3600 - 60, run="a1")]
+    chk("the STRONG exit alone makes a park reachable (an observable cause, unhealthy fleet)",
+        (park_cause_provable(strong_only, h_now, h_now),
+         sustained_health_exit_reachable(strong_only, h_now),
+         park_exit_reachable(strong_only, h_now, h_now)), (True, False, True))
+    chk("the AGED-OUT exit alone makes a park reachable (healthy fleet, no observable cause) — "
+        "this is precisely the case that could not migrate before #691",
+        (park_cause_provable(healthy, h_now, h_now),
+         sustained_health_exit_reachable(healthy, h_now),
+         park_exit_reachable(healthy, h_now, h_now)), (False, True, True))
+    chk("neither exit reachable => the migration still defers (an unreadable ledger)",
+        [park_exit_reachable([], h_now, h_now),
+         park_exit_reachable(stale, h_now, h_now)], [False, False])
+    # THE AGREEMENT INVARIANT. The migration precondition and the admission probe must not drift:
+    # a park the migration converts NOW must actually be releasable LATER. Simulate it — convert
+    # at h_now (reachable above), then run the window forward one span with the same health.
+    later = h_now + SUSTAINED_HEALTH_SPAN_SECONDS
+    continued = healthy + [
+        rec("openai", "codex01", SUCCESS, dt=13 * 3600 - 300 - 600 * k, run=f"c{k}")
+        for k in range(3)] + [
+        rec("anthropic", "acct02", SUCCESS, dt=13 * 3600 - 600 - 600 * k, run=f"d{k}")
+        for k in range(3)]
+    chk("a park the migration converts on a reachable exit IS released one span later "
+        "(precondition and admission agree end to end)",
+        bool(sustained_fleet_health_evidence(continued, h_now, later)), True)
 
     # ---- prune / window bound ---------------------------------------------------------------
     many = [rec("anthropic", "acct01", CLASS_TRANSIENT, dt=i) for i in range(MAX_RECORDS + 50)]
