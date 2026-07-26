@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 4203,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "78dcaeb0f74361886b1c4e5afbf3796a5bdf54b8",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The diff adds a genuinely new behaviour at eval.rs:1805 and eval.rs:1825: `if !meta.is_deactivated()` now suppresses a QualifiedMinCount / QualifiedMaxCount result when the causing count statement carries `{| sh:deactivated true |}`. Before this PR such an annotation was ignored for qualified counts, so this is a behaviour change, not a refactor.\n\nThe added test `per_statement_overrides_apply_to_qualified_count_causing_statement` only exercises the severity and message overrides; neither `is_deactivated()` branch is covered by any test in tests/constraints.rs (the existing `per_statement_deactivate_suppresses_only_that_constraint` covers a different component). The suppression path is therefore only verified by inspection, and a future refactor that dropped the guard would keep the whole suite green.",
+    "file": "crates/sparq-shacl/src/eval.rs",
+    "fix_hint": "Extend the new test (or add a sibling) with a shape such as `sh:qualifiedValueShape [ sh:nodeKind sh:IRI ] ; sh:qualifiedMinCount 2 {| sh:deactivated true |} ; sh:qualifiedMaxCount 0 .` over `ex:n ex:p ex:value .` and assert exactly one result, whose `source_component` ends with `QualifiedMaxCountConstraintComponent` \u2014 i.e. the deactivated min statement is suppressed while the sibling max statement still fires. That pins independence in the deactivation direction the same way the current test pins it in the severity/message direction.",
+    "severity": "minor",
+    "title": "New per-statement deactivation branch for qualified counts is untested"
+   },
+   {
+    "body": "`attach_component_meta` (model.rs:941-943) now unconditionally allocates three `vec![ComponentMeta::default(); shape.components.len()]` instead of one, before the `shape_has_reified_statement` short-circuit at model.rs:947 gets a chance to return. The two new vectors are dense (one entry per component) but meaningful for a single component variant, so for a typical shapes graph \u2014 where `Component::Qualified` is rare and reified annotations rarer still \u2014 this triples the parse-time meta allocation for zero benefit, against a function whose own doc comment advertises that the common un-annotated case short-circuits.\n\nParse-time only, so no query-path cost, and `ComponentMeta::default()` is cheap; flagging it because the surrounding code is explicitly written to avoid exactly this kind of eager work.",
+    "file": "crates/sparq-shacl/src/model.rs",
+    "fix_hint": "Either allocate the two qualified vectors lazily (leave them empty and only size them once a `Component::Qualified` is actually seen and `shape_has_reified_statement` returned true \u2014 eval.rs already tolerates a short vector via `.get(comp_idx).unwrap_or_default()`), or drop the parallel-vector shape entirely and store the two metas inline on the `Component::Qualified { .. }` variant, which removes the index-alignment obligation as well.",
+    "severity": "nit",
+    "title": "Two extra dense meta vectors allocated for every shape, including shapes with no Qualified component"
+   },
+   {
+    "body": "The PR's stated principle is that the annotation on the statement that CAUSED a result should be selected. It covers the two count statements, but `component_source_triple` still returns `None` for `Component::Qualified` (model.rs:1000, the `_ => None` arm), so `component_meta[i]` for a qualified component stays default forever. A `{| sh:deactivated true |}` or `{| sh:message \u2026 |}` written on `sh:qualifiedValueShape` (or on `sh:qualifiedValueShapesDisjoint`) is therefore still accepted by the parser and silently dropped.\n\nThis is a pre-existing gap rather than a regression introduced here, and arguably the count statements are the correct causing statements for both result kinds, so it is not blocking. Worth recording so the remaining half of the surface is not assumed covered.",
+    "file": "crates/sparq-shacl/src/model.rs",
+    "fix_hint": "Out of scope for this PR \u2014 capture it as a bead or a `gh issue create --label self-improvement` noting that per-statement annotations on the non-count qualified parameters are parsed but inert, and decide deliberately whether SHACL 1.2 semantics make `sh:qualifiedValueShape` a causing statement for the two qualified-cardinality components at all. If it is decided they are inert by design, say so in the doc comment on `qualified_min_meta` / `qualified_max_meta` (model.rs:392-396) so the omission reads as intentional.",
+    "severity": "nit",
+    "title": "Annotations on sh:qualifiedValueShape / sh:qualifiedValueShapesDisjoint remain silently ignored"
+   }
+  ],
+  "progress": null,
+  "summary": "The change is correct and index-safe. `Component::Qualified` is built from two distinct reifiable statements (sh:qualifiedMinCount / sh:qualifiedMaxCount), and `component_source_triple` returns None for it, so before this PR a `{| sh:severity \u2026 |}` / `{| sh:message \u2026 |}` on either count statement was silently dropped. The two new vectors are sized in `attach_component_meta` (model.rs:941-943) and padded in the sh:expression second pass (model.rs:824-830), which are the only two sites that push components after sizing \u2014 every other `components.push` runs inside `parse_shape` before `attach_component_meta` is called at model.rs:920, so the parallel-vector invariant holds. In eval.rs the index used is `comp_idx`, which is exactly the `i` passed at eval.rs:835, and the `.get(comp_idx).cloned().unwrap_or_default()` fallback makes a drift degrade to \"un-annotated\" rather than panic or mis-select. The save/restore around `self.active_meta.replace(meta)` is correct (`Option::replace` returns the prior Option) and is a no-op for the previous behaviour, because a Qualified component's `component_meta[i]` was always the default, so `active_meta` was already `None` on entry to the arm; the sq-1jemy caller-meta transparency is untouched since `validate_shape` already took the caller's meta. `reified_meta` reconstructs the triple term the same way as the existing path, so lookup semantics are unchanged.\n\nThe new test is non-vacuous: pre-change the min result would carry the shape severity (Violation) and the max result would fall back to `effective_messages`' default message, so both assertions would fail. Verified empirically: `cargo test -p sparq-shacl --all-features` is fully green (58/58 in tests/constraints.rs, 198/198 lib, all other targets), so no existing per-statement, W3C or qualified-count test regressed.\n\nNo security or soundness concern; no ZK/MPC/perf claim in the diff. Remaining points are non-blocking: one new branch (the per-statement deact\u2026 [truncated 166 chars]",
+  "verdict": "approve"
+ }
+}
