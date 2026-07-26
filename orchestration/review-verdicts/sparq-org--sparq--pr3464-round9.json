@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3464,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ff990bb52bf512a534cbf1c236783a367e8ae786",
+  "round": 9
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 8's delegation defect is resolved. PublicGrant now carries max_epoch as a distinct canonical field (wire key 17), includes it in signing_bytes/cap_id, decodes it fail-closed, and rejects a ceiling below the grant's exact epoch. delegate preserves the parent's exact epoch and epoch-specific topic, inherits an omitted parent ceiling, rejects widening an existing ceiling, and signs the resulting bound. The focused delegation test exercises the real encode/decode/signature path, confirms epoch/topic preservation, verifies round-trip authentication, detects max_epoch tampering, and covers both below-scope and re-delegation widening failures. The research-grade/external-audit caveats remain explicit. No hostile reviewer-directed instruction was found in the diff.",
+  "verdict": "approve"
+ }
+}
