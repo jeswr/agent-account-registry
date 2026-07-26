@@ -2767,6 +2767,139 @@ def fix_lane_defer(repo, pr_number, stale_reason, proven_head, issue=None):
                     "applied": applied})
 
 
+# ---- stranded recovery: retract the reviewed-sha assertion the stranded posture disproves --------
+#
+# ISSUE #708 / THE REVIEW LANE'S NO-OP DISPATCH LOOP. `stranded` (dispatch-claim.enumerate_review_
+# items) is the recovery state for {DRAFTED, UNARMED, reviewed-sha == head, concluded-GREEN gate,
+# clean base} — the residue of an interrupted defuse/disarm. Its recovery action is "RE-review the
+# current head despite the matching marker" (issue #161), and dispatch-claim bypasses its own
+# already-reviewed guard for exactly that state.
+#
+# review-fix.yml does NOT have that carve-out. Its resolve step computes
+#     already_done = marker == head_sha
+# unconditionally, so EVERY stranded dispatch resolves, claims (or adopts) an account lease, runs
+# the `Skip an already-reviewed head` step, releases the lease, SKIPS the model job entirely — and
+# reports the whole run `success`. The recovery has therefore never once executed; the item is
+# re-planned and re-dispatched on every dispatch tick, forever, consuming a scarce reviewer lease
+# and its repository/package partition each time.
+#
+# MEASURED on master, 2026-07-26 12:00-17:10 UTC: 160 mode=review dispatches, 117 (73%) never ran a
+# model (the `Run` job's conclusion was `skipped`); 91 of those reported the workflow conclusion
+# `success`; five PRs accounted for 114 of the 117. In the 17:00 tick the review lane planned 12
+# items, "launched" 4, and exactly ONE of those four ran a model.
+#
+# This is the identical spin the #560 fix-lane hand-over closed one lane over, and dispatch-claim's
+# own #560 self-test comment already NAMES it ("green becomes `stranded` (whose review dispatch then
+# exits `already_done` with no work done: the same successful spin one lane over)"). The remedy is
+# the same, for the same reason, and it is NOT a weakening of the idempotence guard:
+#
+#   The marker is an ASSERTION — "a review of this exact head completed end-to-end". review-fix.yml's
+#   outcome job binds it LAST, after the lane label and the arm. A PR that is still a DRAFT, still
+#   UNARMED, and still carrying a matching marker is the registry's own proof that the outcome did
+#   NOT complete end-to-end. The assertion is FALSE, and it is exactly the false part that suppresses
+#   re-review. Writing UNBOUND_REVIEWED_SHA restores the marker's invariant (marker == head IFF a
+#   completed review outcome exists for that head). review-fix.yml's already_done predicate is left
+#   BYTE-IDENTICAL and keeps its full strength.
+#
+# The stand-down surface is the #560 surface, for the #560 reasons: a human hold, the machine
+# capacity park, or `review:pass` owns the PR and this recovery mutates NOTHING for any of them.
+# Two guards are added on top, because the stranded posture is *specifically* about arm state:
+#   * ARMED (a live auto_merge object) or NON-DRAFT — retracting the marker on an armed PR is what
+#     makes enumerate_disarm_items disarm + dequeue + redraft it (#584 follow-up finding 1). The
+#     stranded posture asserts armed is EXPLICITLY False, so an armed re-read means the posture
+#     evaporated between dispatch-claim's live re-derivation and this write: stand down.
+#   * the marker must NAME the head being recovered — a marker naming some other sha is already
+#     stale to the enumerator (re-review is already admitted) or belongs to a newer completed
+#     review this recovery has said nothing about.
+# Every one of those is decided BEFORE the first write, so "mutates nothing" is literally true of
+# each stand-down, and all reads happen AFTER the caller's own live re-derivation so a guard landing
+# in that window still wins.
+STRANDED_RECOVERY_ACTIONS = ("retract", "hold", "pass-hold", "armed-hold", "marker-mismatch")
+STRANDED_RECOVERY_QUIET_ACTIONS = ("hold", "pass-hold", "armed-hold", "marker-mismatch")
+
+
+def stranded_recovery_action(live_review, holds, armed, draft, live_marker, proven_head):
+    """PURE: what the stranded recovery must do, given the LIVE `review:*` label set, the LIVE hold
+    set (human holds + machine parks), the LIVE tri-state arm bit, the LIVE draft bit, the LIVE
+    reviewed-sha marker, and `proven_head` — the head whose stranded posture dispatch-claim
+    re-derived on live data.
+
+    - "hold" — a human hold or the machine capacity park is live: mutate NOTHING. A recovery is not
+      a park adjudication, and a park already excludes the PR from both lanes.
+    - "pass-hold" — `review:pass` is live: mutate NOTHING (#584 follow-up finding 1). The pass IS
+      the verdict; there is nothing for the review lane to produce, and retracting the marker of a
+      passed PR is precisely what disarms and re-drafts it.
+    - "armed-hold" — the PR is ARMED, is NOT a draft, or its arm bit is UNKNOWN: mutate NOTHING.
+      `armed` is tri-state exactly as in dispatch_claim.stranded_live — only an explicit False may
+      act, so a garbage/absent auto_merge shape never authorises the most destructive write in the
+      pipeline.
+    - "marker-mismatch" — the marker does not name `proven_head`: mutate NOTHING. Re-review is
+      either already admitted, or the marker belongs to a newer completed review.
+    - "retract" otherwise: write UNBOUND_REVIEWED_SHA so the review lane can actually run the model
+      this dispatch already paid a lease for.
+    """
+    if set(holds):
+        return "hold"
+    if PASS_LANE_PR_LABEL in set(live_review):
+        return "pass-hold"
+    if armed is not False or draft is not True:
+        return "armed-hold"
+    if live_marker != proven_head:
+        return "marker-mismatch"
+    return "retract"
+
+
+def stranded_recover(repo, pr_number, proven_head, issue=None):
+    """Issue #708: retract the reviewed-sha assertion a re-derived `stranded` posture disproves, so
+    the review lane's own recovery dispatch can run a model instead of exiting `already_done`.
+
+    Called from dispatch-claim.py's CLAIM step immediately after `stranded_live` re-derives the
+    posture and immediately BEFORE the review lease is claimed. The caller does NOT trust this
+    command's report: it re-reads the PR and refuses to spend a reviewer lease unless the marker
+    provably no longer names the head (so every stand-down below converges to a loud, counted,
+    attributed defer rather than to another silent no-op run).
+
+    Fails closed on a malformed `proven_head`, and is idempotent: once the marker is already
+    `none`, `stranded_recovery_action` returns "marker-mismatch" and nothing is written (and
+    set_reviewed_sha itself issues no PATCH for an already-canonical marker)."""
+    if not re.fullmatch(r"[0-9a-f]{40}", proven_head or ""):
+        raise WorkerPrError(
+            "stranded recovery requires the 40-hex --head-sha whose stranded posture was "
+            "re-derived live; without it the retraction cannot be targeted (refusing to touch "
+            "anything)")
+    holds = live_human_holds(repo, pr_number, issue)
+    parks = live_machine_parks(repo, pr_number, issue)
+    live_review = _live_review_labels(repo, pr_number)
+    pull = _gh_json(["api", f"repos/{repo}/pulls/{pr_number}"])
+    live_auto = pull.get("auto_merge")
+    armed = True if isinstance(live_auto, dict) else False if live_auto is None else None
+    draft = pull.get("draft")
+    live_marker = reviewed_sha_of(pull.get("body") or "")
+    action = stranded_recovery_action(
+        live_review, sorted(set(holds) | set(parks)), armed, draft, live_marker, proven_head)
+    if action in STRANDED_RECOVERY_QUIET_ACTIONS:
+        detail = {
+            "hold": f"live hold(s) {sorted(set(holds) | set(parks))} own the PR",
+            "pass-hold": f"{PASS_LANE_PR_LABEL} is live (review namespace "
+                         f"{sorted(live_review)}) — the pass IS the verdict, and retracting a "
+                         "passed PR's marker disarms and re-drafts it",
+            "armed-hold": f"the PR is not a provably UNARMED draft (armed={armed!r}, "
+                          f"draft={draft!r}) — the stranded posture evaporated",
+            "marker-mismatch": f"the reviewed-sha marker {live_marker or 'absent'!r} does not "
+                               f"name the recovered head {proven_head[:12]}",
+        }[action]
+        print(f"stranded recovery: NOTHING written for {repo}#{pr_number} — {detail}")
+        _write_outputs({"action": action, "marker": "keep"})
+        return
+    print(f"stranded recovery: {repo}#{pr_number} is a DRAFTED, UNARMED PR whose reviewed-sha "
+          f"marker still asserts {proven_head[:12]} was reviewed end-to-end, yet no completed "
+          "review outcome exists for it (the outcome job binds the marker LAST, after the lane "
+          f"label and the arm) — retracting the assertion to '{UNBOUND_REVIEWED_SHA}' so the "
+          "recovery re-review actually runs instead of exiting already_done with no work done")
+    set_reviewed_sha(repo, pr_number, UNBOUND_REVIEWED_SHA)
+    _write_outputs({"action": action, "marker": "invalidate"})
+
+
 # ---- terminal escalation + arm --------------------------------------------------------------------
 def needs_user(repo, pr_number, reason, issue=None, alert_repo=None, alert_token=None,
                maintainer=None, park_class="question", bot_login="", head_sha="",
@@ -6940,6 +7073,50 @@ def _self_test():
         check("#560 f1: an unknown action fails closed in the marker projection",
               "raised", "raised")
 
+    # ---- ISSUE #708: the STRANDED recovery must retract the assertion its posture disproves -----
+    # The stranded posture IS the disproof: review-fix.yml's outcome job binds the reviewed-sha
+    # marker LAST (after the lane label and the arm), so a DRAFTED, UNARMED PR still carrying a
+    # marker equal to its head cannot have had a completed review outcome. Without the retraction
+    # the recovery dispatch resolves, takes a reviewer lease, exits `already_done`, skips the model
+    # and reports `success` — measured 117 of 160 mode=review dispatches on 2026-07-26.
+    _s_head, _s_other = "c" * 40, "d" * 40
+    check("#708: a drafted, unarmed, marker-bound PR is retracted",
+          stranded_recovery_action(set(), [], False, True, _s_head, _s_head), "retract")
+    check("#708: a human hold stands the recovery down",
+          stranded_recovery_action(set(), ["needs:user"], False, True, _s_head, _s_head), "hold")
+    check("#708: the machine capacity park stands the recovery down",
+          stranded_recovery_action({MACHINE_PARK_PR_LABEL}, [MACHINE_PARK_PR_LABEL], False, True,
+                                   _s_head, _s_head), "hold")
+    check("#708: review:pass stands the recovery down (the pass IS the verdict)",
+          stranded_recovery_action({PASS_LANE_PR_LABEL}, [], False, True, _s_head, _s_head),
+          "pass-hold")
+    # The arm bit is TRI-STATE exactly as in dispatch_claim.stranded_live: only an explicit False
+    # authorises the retraction, because a retracted marker on an armed PR is what makes
+    # enumerate_disarm_items disable-auto + dequeue + REDRAFT it (#584 follow-up finding 1).
+    check("#708: an ARMED PR is never retracted",
+          stranded_recovery_action(set(), [], True, True, _s_head, _s_head), "armed-hold")
+    check("#708: an UNKNOWN arm bit is never retracted",
+          stranded_recovery_action(set(), [], None, True, _s_head, _s_head), "armed-hold")
+    check("#708: a NON-DRAFT PR is never retracted",
+          stranded_recovery_action(set(), [], False, False, _s_head, _s_head), "armed-hold")
+    check("#708: an unknown draft bit is never retracted",
+          stranded_recovery_action(set(), [], False, None, _s_head, _s_head), "armed-hold")
+    check("#708: a marker naming ANOTHER head is left alone",
+          stranded_recovery_action(set(), [], False, True, _s_other, _s_head), "marker-mismatch")
+    check("#708: an already-retracted marker writes nothing (idempotent)",
+          stranded_recovery_action(set(), [], False, True, UNBOUND_REVIEWED_SHA, _s_head),
+          "marker-mismatch")
+    check("#708: an absent marker writes nothing",
+          stranded_recovery_action(set(), [], False, True, None, _s_head), "marker-mismatch")
+    # Ordering: a hold/pass wins over EVERY other consideration, and the arm guard wins over the
+    # marker check — so no quiet action can ever be reached via a path that already wrote.
+    check("#708: a hold wins over an armed, marker-mismatched PR",
+          stranded_recovery_action({PASS_LANE_PR_LABEL}, ["needs:user"], True, False, _s_other,
+                                   _s_head), "hold")
+    check("#708: every non-retract action is declared quiet",
+          sorted(set(STRANDED_RECOVERY_ACTIONS) - {"retract"}),
+          sorted(STRANDED_RECOVERY_QUIET_ACTIONS))
+
     # ---- #584 FOLLOW-UP FINDING 1: a review:pass PR IS NOT THE FIX LANE'S TO HAND OVER ----------
     # The fix lane admits on FIVE states and only `needs-fix` keys on review:changes;
     # enumerate_review_items also emits `needs-ci-fix` from a concluded-RED gate alone (GAP-A,
@@ -8162,6 +8339,18 @@ def main():
                          help="the source issue (its needs:*/status:parked labels are part of the "
                               "hold surface)")
 
+    # Issue #708: the stranded recovery's marker retraction (see stranded_recover). Same required
+    # --head-sha discipline as fix-lane-defer, for the same reason: an untargeted retraction is the
+    # most destructive write in the pipeline, so a missing value fails loudly rather than degrading.
+    srec = subparsers.add_parser("stranded-recover", parents=[common])
+    srec.add_argument("--head-sha", required=True,
+                      help="the 40-hex head whose stranded posture was re-derived live; its "
+                           "disproved reviewed-sha assertion is retracted so the recovery "
+                           "re-review actually runs a model")
+    srec.add_argument("--issue", type=int,
+                      help="the source issue (its needs:*/status:parked labels are part of the "
+                           "hold surface)")
+
     nuser = subparsers.add_parser("needs-user", parents=[common])
     nuser.add_argument("--reason", required=True)
     nuser.add_argument("--issue", type=int)
@@ -8319,6 +8508,8 @@ def main():
         elif args.command == "fix-lane-defer":
             fix_lane_defer(args.repo, args.pr, args.stale_reason, args.head_sha,
                            issue=args.issue)
+        elif args.command == "stranded-recover":
+            stranded_recover(args.repo, args.pr, args.head_sha, issue=args.issue)
         elif args.command == "needs-user":
             alert_repo, alert_token = _alert_route()
             needs_user(args.repo, args.pr, args.reason, issue=args.issue,
