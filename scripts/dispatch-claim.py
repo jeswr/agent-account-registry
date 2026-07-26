@@ -10,6 +10,7 @@ from collections import Counter
 import contextlib
 import hashlib
 import importlib.util
+import inspect
 import io
 import json
 import os
@@ -10280,7 +10281,382 @@ def _self_test():
                                      log=freeze_logs.append) is False
     assert any("clock unreadable" in line and "freezing" in line for line in freeze_logs)
 
+    _starvation_sweep_self_test()
+
     print("dispatch-claim self-test PASSED")
+
+
+# ---- [registry #718/#677] THE STARVED-PLAN MACHINE EXIT ------------------------------------
+# Every guard below has a NAMED test that goes RED when the guard is deleted or inverted. The
+# discriminating fixtures are the ones where the sweep must do NOTHING: a healthy plan, an empty
+# backlog, an already-parked holder, an ACTIVE holder whose park would free nothing, and a holder
+# that reserves real crates instead of the serializing partition. A sweep that fires on those is
+# strictly worse than the hand-parking it replaces, because it costs review progress and buys no
+# throughput.
+_STARVE_SHA = "c" * 40
+
+
+def _starvation_row(number, *, packages, parked=False, inactive=True, decision="busy"):
+    """One occupancy row in the exact 5-tuple shape busy_packages_of_pulls appends."""
+    return (decision, number, frozenset(packages),
+            "detail" if parked else "not-parked", inactive)
+
+
+def _starvation_sweep_self_test():
+    item = {"number": 900, "package": "crate-a", "deferred": False}
+    holder = _starvation_row(41, packages={GLOBAL_PACKAGE})
+
+    # ---- TRIGGER: fires only on the measured starvation --------------------------------------
+    logs = []
+    assert starvation_park_target([], 12, [holder], log=logs.append) == 41
+    assert any("planned 0 item(s)" in line and "parking pr#41" in line for line in logs), logs
+    print("  ok   #718 starvation sweep: a starved lane behind an inert __global__ holder "
+          "selects exactly that holder")
+
+    # A HEALTHY plan is the guard the brief calls out by name: over-parking costs real review
+    # progress, so ANY planned item must stand the sweep down. Deleting the `if planned_items`
+    # clause reds HERE.
+    assert starvation_park_target([item], 12, [holder]) is None
+    assert starvation_park_target([item], 0, [holder]) is None
+    print("  ok   #718 starvation sweep: NEVER fires while the plan is healthy (>=1 planned item)")
+
+    # An EMPTY backlog is not starvation. Deleting the `deferred <= 0` clause reds HERE — and
+    # this is the case that would otherwise park a holder for no throughput at all.
+    assert starvation_park_target([], 0, [holder]) is None
+    assert starvation_park_target([], -1, [holder]) is None
+    assert starvation_park_target([], True, [holder]) is None      # bool is not a count
+    assert starvation_park_target([], "12", [holder]) is None      # unreadable count
+    print("  ok   #718 starvation sweep: an EMPTY backlog (0 deferred rows) parks nobody")
+
+    # ---- CANDIDATE SELECTION: each declining clause, one at a time ----------------------------
+    # already parked -> idempotence. Re-running the sweep against its own output selects nobody.
+    assert starvation_park_target(
+        [], 12, [_starvation_row(41, packages={GLOBAL_PACKAGE}, parked=True)]) is None
+    # parked AND inert -> busy_packages_of_pulls already freed it (decision `parked-free`)
+    assert starvation_park_target(
+        [], 12, [_starvation_row(41, packages={GLOBAL_PACKAGE}, parked=True,
+                                 decision="parked-free")]) is None
+    print("  ok   #718 starvation sweep: an ALREADY-PARKED holder is never re-parked (idempotent)")
+
+    # ACTIVE holder -> parking it would write a label and free NOTHING (busy_packages_of_pulls
+    # frees only `parked AND inactive`). Deleting the `inactive is not True` clause reds HERE.
+    assert starvation_park_target(
+        [], 12, [_starvation_row(41, packages={GLOBAL_PACKAGE}, inactive=False)]) is None
+    assert starvation_park_target(
+        [], 12, [_starvation_row(41, packages={GLOBAL_PACKAGE}, inactive=None)]) is None
+    print("  ok   #718 starvation sweep: an ACTIVE holder — whose park would free NOTHING — "
+          "is never parked")
+
+    # a holder of REAL crates is not a __global__ holder: parking it does not unstarve the lane.
+    assert starvation_park_target(
+        [], 12, [_starvation_row(41, packages={"crate-a", "crate-b"})]) is None
+    # a malformed occupancy row is not evidence to act on
+    assert starvation_park_target([], 12, [("busy", 41, frozenset({GLOBAL_PACKAGE}))]) is None
+    assert starvation_park_target([], 12, ["junk"]) is None
+    assert starvation_park_target([], 12, None) is None
+    assert starvation_park_target(
+        [], 12, [_starvation_row(0, packages={GLOBAL_PACKAGE})]) is None
+    print("  ok   #718 starvation sweep: crate-only holders and malformed occupancy rows are "
+          "not candidates")
+
+    # ---- BOUND: at most ONE per tick, deterministically -------------------------------------
+    many = [_starvation_row(n, packages={GLOBAL_PACKAGE}) for n in (77, 41, 63)]
+    assert STARVATION_PARKS_PER_TICK_MAX == 1
+    assert starvation_park_target([], 12, many) == 41
+    assert starvation_park_target([], 12, list(reversed(many))) == 41
+    print("  ok   #718 starvation sweep: THREE eligible holders yield exactly ONE target, the "
+          "lowest-numbered, order-independently")
+
+    # ---- THE WRITE: the exact mutation set, and what it must never contain --------------------
+    def run_park(labels, *, vetoed=None):
+        calls, comments, logs = [], [], []
+        applied = park_starved_partition_holder(
+            "o/r", 41, 12, labels,
+            park_pr=lambda number: calls.append(("label", number)),
+            post_comment=lambda repo, number, body: comments.append((repo, number, body)),
+            vetoed=vetoed, log=logs.append)
+        return applied, calls, comments, logs
+
+    applied, calls, comments, _ = run_park(["review:needs"])
+    assert applied is True
+    assert calls == [("label", 41)], calls
+    assert [(repo, number) for repo, number, _ in comments] == [("o/r", 41)], comments
+    body = comments[0][2]
+    # THE non-negotiable: this is a capacity action, and registry #703 documents how parks become
+    # a conveyor into the terminal human hold. Inverting the label constant reds HERE.
+    assert MACHINE_PARK_PR_LABEL in body
+    for terminal in (_park_policy.HUMAN_PARK_LABEL, _park_policy.HUMAN_PR_PARK_LABEL,
+                     _park_policy.MACHINE_PARK_LABEL):
+        assert terminal not in str(calls), (terminal, calls)
+    assert f"**not** `{_park_policy.HUMAN_PARK_LABEL}`" in body, body
+    assert _park_policy.park_reason_marker("partition") in body
+    assert _park_policy.park_cause_class("partition") == _park_policy.PARK_CLASS_CAPACITY
+    assert "not a review judgement" in body and "un-park" in body
+    print("  ok   #718 starvation park: writes review:parked + ONE receipt and NOTHING else — "
+          "never needs:user, review:needs-user or status:parked")
+
+    # RECEIPT-FIRST: a crash between the two leaves an explained PR with no label, never a
+    # mysterious label with no explanation.
+    order = []
+
+    def exploding_label(number):
+        order.append("label")
+        raise DispatchError("label write failed")
+
+    try:
+        park_starved_partition_holder(
+            "o/r", 41, 12, ["review:needs"], park_pr=exploding_label,
+            post_comment=lambda repo, number, b: order.append("comment"), log=lambda _m: None)
+    except DispatchError:
+        pass
+    assert order == ["comment", "label"], order
+    print("  ok   #718 starvation park: RECEIPT-FIRST — the comment lands before the label")
+
+    # ---- THE REFUSALS on the write path ------------------------------------------------------
+    applied, calls, comments, logs = run_park(["review:needs", MACHINE_PARK_PR_LABEL])
+    assert (applied, calls, comments) == (False, [], [])
+    assert any("already carries" in line for line in logs), logs
+    for hold in (_park_policy.HUMAN_PARK_LABEL, _park_policy.HUMAN_PR_PARK_LABEL):
+        applied, calls, comments, logs = run_park(["review:needs", hold])
+        assert (applied, calls, comments) == (False, [], []), hold
+        assert any("human-owned hold" in line for line in logs), logs
+    applied, calls, comments, logs = run_park(["review:needs"], vetoed=lambda number: True)
+    assert (applied, calls, comments) == (False, [], [])
+    assert any("un-parked this PR" in line for line in logs), logs
+    print("  ok   #718 starvation park: refuses an already-parked PR, a human-owned hold, and a "
+          "sticky human unpark veto — writing nothing in each case")
+
+    # ---- THE MEASUREMENT filter_busy_area_items hands the plan --------------------------------
+    def busy_pull(number, ref, labels):
+        return {"number": number, "state": "open", "draft": False, "auto_merge": None,
+                "labels": [{"name": name} for name in labels],
+                "head": {"ref": ref, "sha": _STARVE_SHA, "repo": {"full_name": "o/r"}}}
+
+    prov = {41: {"pr_number": 41, "issue": 7, "impl_provider": "anthropic",
+                 "impl_alias": "sol", "impl_account_h": "0" * 16,
+                 "head_sha_at_open": _STARVE_SHA}}
+    assert provenance_admission_error(prov[41], 41) is None, \
+        provenance_admission_error(prov[41], 41)
+    rows = [{"number": 900, "package": "crate-a", "deferred": False},
+            {"number": 901, "package": "crate-b", "deferred": False}]
+    starvation = {}
+    with contextlib.redirect_stdout(io.StringIO()):
+        # a holder with unreadable linkage reserves __global__ -> both rows deferred by IT
+        kept = filter_busy_area_items(
+            rows, "o/r", [busy_pull(41, "sparq-agent/issue-7-1-1", ["review:needs"])],
+            {}, {}, leases=[], now=0, starvation=starvation)
+    assert kept == [] and starvation == {"deferred": 2, "kept": 0}, starvation
+    # ... and with the SAME holder carrying a real crate label plus a readable source issue, the
+    # partition is NOT global, so nothing it defers is starvation evidence.
+    narrow = {}
+    with contextlib.redirect_stdout(io.StringIO()):
+        kept = filter_busy_area_items(
+            rows, "o/r", [busy_pull(41, "sparq-agent/issue-7-1-1",
+                                    ["review:needs", "area:crate-a"])],
+            {7: ["area:crate-a"]}, prov, leases=[], now=0, starvation=narrow)
+    assert [row["number"] for row in kept] == [901], kept
+    assert narrow == {"deferred": 0, "kept": 1}, narrow
+    print("  ok   #718 starvation evidence: only drops caused by a __global__ OCCUPANT count; a "
+          "crate-scoped occupant records ZERO deferred")
+
+    # ---- THE PLAN SEAM: v5 validation of the evidence field -----------------------------------
+    base_plan = {
+        "schema": SCHEMA, "generated_at": "2026-07-26T00:00:00Z",
+        "repositories": [{"target_repo": "o/r", "target_sha": "a" * 40, "items": []}],
+        "review_items": [], "disarm_items": [], "snapshot_skips": [],
+        "partition_starvation": [{"repo": "o/r", "deferred": 4}],
+    }
+    assert validate_plan(json.loads(json.dumps(base_plan))) is not None
+    for mutate, why in (
+        (lambda d: d.pop("partition_starvation"), "field deleted"),
+        (lambda d: d.update(partition_starvation={}), "not a list"),
+        (lambda d: d.update(partition_starvation=[{"repo": "o/r"}]), "missing deferred"),
+        (lambda d: d.update(partition_starvation=[{"repo": "o/r", "deferred": 0}]), "zero"),
+        (lambda d: d.update(partition_starvation=[{"repo": "o/r", "deferred": True}]), "bool"),
+        (lambda d: d.update(partition_starvation=[{"repo": "o/r", "deferred": "4"}]), "string"),
+        (lambda d: d.update(partition_starvation=[{"repo": "x/y", "deferred": 4}]), "unplanned"),
+        (lambda d: d.update(partition_starvation=[{"repo": "o/r", "deferred": 4},
+                                                  {"repo": "o/r", "deferred": 5}]), "duplicate"),
+        (lambda d: d.update(schema="registry-dispatch-plan/v4"), "the v4 schema is refused"),
+    ):
+        candidate = json.loads(json.dumps(base_plan))
+        mutate(candidate)
+        try:
+            validate_plan(candidate)
+        except DispatchError:
+            continue
+        raise AssertionError(f"validate_plan accepted a v5 plan it must reject: {why}")
+    # the ONE production sort, so the workflow never sorts inline
+    unsorted = json.loads(json.dumps(base_plan))
+    unsorted["repositories"].append(
+        {"target_repo": "a/b", "target_sha": "b" * 40, "items": []})
+    unsorted["partition_starvation"] = [{"repo": "o/r", "deferred": 4},
+                                        {"repo": "a/b", "deferred": 2}]
+    assert [entry["repo"] for entry in
+            normalize_plan_order(unsorted)["partition_starvation"]] == ["a/b", "o/r"]
+    assert validate_plan(unsorted) is not None
+    print("  ok   #718 plan seam: v5 validates partition_starvation strictly and refuses v4")
+
+    # ---- THE PRODUCTION CALL SITE IS ITS OWN SEAM --------------------------------------------
+    # Everything above calls the two functions DIRECTLY, so all of it stays green if main()'s
+    # call site is deleted, guarded away, or re-pointed at the human terminal — the functions
+    # would be perfect and unreachable, which is the exact vacuity class this repo keeps
+    # measuring. main() is not callable from here, so these are SOURCE-LEVEL assertions and are
+    # labelled as such rather than dressed up as behavioural coverage. Same technique the
+    # `migration_provable=` call-site pin above uses.
+    _dispatch_src = inspect.getsource(dispatch)
+    assert "starvation_park_target(" in _dispatch_src, \
+        "main()'s dispatch loop no longer CALLS starvation_park_target — the starved-plan sweep " \
+        "is unreachable and every test above is vacuous"
+    assert "park_starved_partition_holder(" in _dispatch_src, \
+        "main()'s dispatch loop no longer CALLS park_starved_partition_holder — the sweep " \
+        "selects a holder and then does nothing"
+    assert 'plan["partition_starvation"]' in _dispatch_src, \
+        "main()'s dispatch loop no longer reads the plan's starvation evidence, so `deferred` " \
+        "is always 0 and the sweep can never fire"
+    # The label the production call site actually writes. The injected `park_pr` in the tests
+    # above cannot see this, so without it the sweep could be re-pointed at `needs:user` and the
+    # whole suite would stay green.
+    _park_write = re.search(
+        r"park_pr=lambda number: _run_gh_target_api\((?:.|\n)*?\{\"labels\": \[([A-Za-z_]+)\]\}",
+        _dispatch_src)
+    assert _park_write and _park_write.group(1) == "MACHINE_PARK_PR_LABEL", (
+        "the starvation park's production label write must be MACHINE_PARK_PR_LABEL "
+        f"(found {_park_write.group(1) if _park_write else None!r}) — registry #703: this action "
+        "must never become a conveyor into the human terminal")
+    # ...and it must not route through the escalating capacity-park ladder either.
+    _sweep_block = _dispatch_src[_dispatch_src.index("starvation_park_target("):]
+    _sweep_block = _sweep_block[:_sweep_block.index("for item in repository[\"items\"]")]
+    for forbidden in ("_pr_needs_user", "_park_source_issue", "_issue_needs_user_landed"):
+        assert forbidden not in _sweep_block, (
+            f"the starvation sweep must not call {forbidden}: those paths write the human "
+            "terminal or count park generations toward it")
+    print("  ok   #718 call-site seam (source-level): the production loop CALLS the sweep, reads "
+          "the plan evidence, and writes MACHINE_PARK_PR_LABEL — never the human terminal")
+
+    # ---- THE YAML SEAM: structural, on PARSED nodes ------------------------------------------
+    _starvation_yaml_seam_self_test()
+
+
+# The PARSED dispatch.yml nodes the starved-plan sweep depends on. Compared for equality against
+# the parsed document, never grepped: `if: false`, a deleted step, and a re-pointed `id:` are all
+# invisible to a substring or `count(...) == N` assertion over the workflow text, and each one
+# silently disables the sweep rather than failing loudly. The standing MEASURED finding on this
+# repo is that every uncaught mutant lives at this seam, not in the Python.
+_STARVATION_SEAM_JOB = "plan"
+_STARVATION_ASSEMBLE_ANCHOR = r"(?m)^\s*partition_starvation = \[\]$"
+_STARVATION_ASSEMBLE_END = r"(?m)^\s*review_exclusions = Counter\(\)$"
+_STARVATION_CLAIM_STEP = "claim"
+
+
+def _starvation_seam_violations(document):
+    """Structural violations of the starved-plan seam in a PARSED dispatch.yml. Empty == intact."""
+    out = []
+    jobs = (document or {}).get("jobs") or {}
+    plan_steps = (jobs.get(_STARVATION_SEAM_JOB) or {}).get("steps")
+    if not isinstance(plan_steps, list):
+        out.append("dispatch.yml: jobs.plan.steps is not a list — the starvation evidence is "
+                   "not produced at all")
+        return sorted(out)
+    assemble = [step for step in plan_steps
+                if isinstance(step, dict) and isinstance(step.get("run"), str)
+                and "partition_starvation" in step["run"]]
+    if len(assemble) != 1:
+        out.append(f"dispatch.yml: expected EXACTLY ONE jobs.plan `run:` step to build "
+                   f"`partition_starvation`; found {len(assemble)} — the PLAN half of the "
+                   "starved-plan sweep was moved, split or deleted")
+        return sorted(out)
+    step = assemble[0]
+    if step.get("if") is not None:
+        out.append(f"dispatch.yml: the plan-assembly step carries an `if:` ({step['if']!r}) — "
+                   "`if: false` (or any condition) would skip the starvation evidence SILENTLY "
+                   "and the sweep would simply never fire")
+    run = step["run"]
+    for fragment, why in (
+        ("starvation=starvation",
+         "filter_busy_area_items is no longer asked for the measurement"),
+        ('"partition_starvation": partition_starvation',
+         "the measurement never reaches the plan artifact"),
+        ('"registry-dispatch-plan/v5"',
+         "the plan is not stamped with the schema that carries the evidence"),
+        ('starvation.get("kept") == 0',
+         "the healthy-plan guard is gone from the PLAN half — evidence would be recorded for "
+         "a lane that planned work"),
+        ('starvation.get("deferred", 0) > 0',
+         "the empty-backlog guard is gone from the PLAN half"),
+    ):
+        if fragment not in run:
+            out.append(f"dispatch.yml: the plan-assembly step lost {fragment!r} — {why}")
+    claim_steps = (jobs.get(_STARVATION_CLAIM_STEP) or {}).get("steps")
+    if not isinstance(claim_steps, list):
+        out.append("dispatch.yml: jobs.claim.steps is not a list — the sweep has no runner")
+        return sorted(out)
+    by_id = {step.get("id"): step for step in claim_steps if isinstance(step, dict)}
+    claim = by_id.get("claim")
+    if claim is None:
+        out.append("dispatch.yml: jobs.claim has no `claim` step — dispatch-claim.py, which "
+                   "carries the sweep, is not invoked")
+    elif "dispatch-claim.py" not in str(claim.get("run", "")):
+        out.append("dispatch.yml: the `claim` step no longer runs dispatch-claim.py, so the "
+                   "starved-plan sweep never executes")
+    return sorted(out)
+
+
+def _starvation_yaml_seam_self_test():
+    import yaml  # self-test-only, same lazy import as _workflow_step_python
+    path = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "dispatch.yml"
+    live = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert _starvation_seam_violations(live) == [], _starvation_seam_violations(live)
+
+    def mutant(edit):
+        document = yaml.safe_load(path.read_text(encoding="utf-8"))
+        edit(document)
+        return _starvation_seam_violations(document)
+
+    def assemble_step(document):
+        return next(step for step in document["jobs"]["plan"]["steps"]
+                    if isinstance(step.get("run"), str)
+                    and "partition_starvation" in step["run"])
+
+    def drop_fragment(fragment):
+        def edit(document):
+            step = assemble_step(document)
+            step["run"] = step["run"].replace(fragment, "")
+        return edit
+
+    seam_mutants = {
+        "assemble step guarded by if: false":
+            lambda d: assemble_step(d).__setitem__("if", "${{ false }}"),
+        "assemble step deleted":
+            lambda d: d["jobs"]["plan"].__setitem__(
+                "steps", [s for s in d["jobs"]["plan"]["steps"]
+                          if not (isinstance(s.get("run"), str)
+                                  and "partition_starvation" in s["run"])]),
+        "plan steps replaced by a scalar":
+            lambda d: d["jobs"]["plan"].__setitem__("steps", "nope"),
+        "the filter is no longer asked for the measurement":
+            drop_fragment("starvation=starvation"),
+        "the measurement never reaches the artifact":
+            drop_fragment('"partition_starvation": partition_starvation,'),
+        "the plan is stamped v4 again":
+            drop_fragment('"registry-dispatch-plan/v5"'),
+        "the PLAN-half healthy-plan guard is deleted":
+            drop_fragment('starvation.get("kept") == 0'),
+        "the PLAN-half empty-backlog guard is deleted":
+            drop_fragment('starvation.get("deferred", 0) > 0'),
+        "the claim step is deleted":
+            lambda d: d["jobs"]["claim"].__setitem__(
+                "steps", [s for s in d["jobs"]["claim"]["steps"] if s.get("id") != "claim"]),
+        "the claim step no longer runs dispatch-claim.py":
+            lambda d: next(s for s in d["jobs"]["claim"]["steps"]
+                           if s.get("id") == "claim").__setitem__("run", "echo hi"),
+        "claim steps replaced by a scalar":
+            lambda d: d["jobs"]["claim"].__setitem__("steps", "nope"),
+    }
+    survivors = [name for name, edit in seam_mutants.items() if not mutant(edit)]
+    assert not survivors, f"dispatch.yml seam mutants NOT caught: {survivors}"
+    print(f"  ok   #718 YAML seam: all {len(seam_mutants)} structural dispatch.yml mutants are "
+          "caught as named violations")
 
 
 def main():
