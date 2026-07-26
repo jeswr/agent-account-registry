@@ -72,16 +72,6 @@
   },
   {
    "account": "9e13ea21abf27e68",
-   "claim_id": "2745635d6bfe4dd58cf0c7263764e793",
-   "holder": "sparq-org/sparq#2588@30219167704.1",
-   "package": "sparq-engine",
-   "role": "impl",
-   "model": "opus5",
-   "issued_at": 1785097917,
-   "expires_at": 1785104217
-  },
-  {
-   "account": "9e13ea21abf27e68",
    "claim_id": "22efa1ed92344c99b158073d44819bc3",
    "holder": "sparq-org/sparq#2392@30219172919.1",
    "package": "sparq-crdt",
