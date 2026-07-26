@@ -1,0 +1,44 @@
+{
+ "host_envelope": {
+  "pr": 4097,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "3844f80b4366911c0b7dc64be4401a89c43129aa",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "parse_xsd_f32 hand-copies the specials table and the ASCII byte filter from sparq_core::parse_xsd_f64 (crates/sparq-core/src/lib.rs:662-672). I diffed the two bodies this round: they are still character-for-character the same rule, and the new anti-drift loop pins the 27 listed lexicals. The residual risk is unchanged and small \u2014 a future edit that only diverges on a lexical outside the pinned list would slip through. Maintainability, not correctness.",
+    "file": "crates/sparq-substrate/src/numeric.rs",
+    "fix_hint": "Optional follow-up bead: hoist the shared acceptance rule into sparq-core (e.g. a small `xsd_float_lexical(v) -> Option<XsdSpecialOrPlain>` helper or a macro) and have both parsers dispatch through it, differing only in the final v.parse::<f64>() vs v.parse::<f32>() and the special constants. The differential test then becomes belt-and-braces.",
+    "severity": "nit",
+    "title": "Acceptance predicate is still duplicated from sparq-core; parity holds by test, not by construction (carried from round 2)"
+   },
+   {
+    "body": "Still false after this round: crates/sparq-reason/src/dtype.rs:461 says \"delegate to the shared substrate parse_xsd_f32 (which in turn calls parse_xsd_f64 -> sparq_core)\", and dtype.rs:1645 says \"delegates to parse_xsd_f32 (which itself calls parse_xsd_f64)\". After this PR parse_xsd_f32 no longer calls parse_xsd_f64; it only shares its acceptance set. The code and the parity test they document are correct (I ran float_dtype_key_parity_with_substrate_parse_xsd_f32 green), so this is comment-only staleness. Anchored on numeric.rs because the schema requires a diff path; the text to change lives in dtype.rs.",
+    "file": "crates/sparq-substrate/src/numeric.rs",
+    "fix_hint": "Drop the two parentheticals, or rewrite as \"which shares sparq_core's XSD acceptance set but rounds directly at f32 precision\". Cheap to fold into this PR; otherwise a doc-sync bead.",
+    "severity": "nit",
+    "title": "Two comments in sparq-reason/src/dtype.rs still describe parse_xsd_f32 as calling parse_xsd_f64 (unfixed from round 2)"
+   },
+   {
+    "body": "numeric.rs:390-393 \u2014 Num::Dec(d) => d.lexical().parse::<f32>() allocates on every mixed decimal x float binop, where the previous self.f64() as f32 was allocation-free. Repeated only so it is not lost: the accuracy gain is real (rounding the exact decimal lexical straight to f32 is correctly rounded; going via d.f64() double-rounds) and the path is uncommon, so I am not asking for a revert. Noted because the repo carries a performance-dominance mandate. The expect() is unreachable: Dec::lexical only emits [-]digits[.digits].",
+    "file": "crates/sparq-substrate/src/numeric.rs",
+    "fix_hint": "Follow-up bead, not this PR. If the Dec x Float path ever shows in a profile, compute the correctly-rounded f32 from (mant, scale) directly, or write! into a fixed-size stack buffer (a Dec lexical is bounded by ~40 mantissa digits plus scale).",
+    "severity": "nit",
+    "title": "promoted_f32's Dec branch still heap-allocates a String on the arithmetic path (carried from round 1/2)"
+   },
+   {
+    "body": "numeric.rs:800 measures 104 columns; rustfmt.toml pins max_width = 100. rustfmt.toml documents that CI runs cargo fmt --all --check informationally (continue-on-error) pending the deferred workspace reformat, and clippy is the hard gate, so nothing fails today; the equivalent line in sparq-core is long too, so it is consistent with its source. Noted only so the eventual flip of fmt to a hard gate is not a surprise. (rustfmt and clippy components are not installed on this toolchain, so neither could be run locally.)",
+    "file": "crates/sparq-substrate/src/numeric.rs",
+    "fix_hint": "Optional: bind `let plain = |c: u8| c.is_ascii_digit() || matches!(c, b'+' | b'-' | b'.' | b'e' | b'E');` above the match and use `_ if v.bytes().all(plain) =>`. Equally fine to leave it to the deferred workspace-wide cargo fmt --all.",
+    "severity": "nit",
+    "title": "The new filter guard line is 104 columns, over rustfmt max_width = 100 (unfixed from round 2)"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 3's only delta is bench/feature-off-declarations/4097.json (the CI-unblocking declaration); the runtime diff is byte-identical to round 2. I re-verified from scratch.\n\nDeclaration: valid JSON, name matches the gate's ^\\d+\\.(json|md)$ (scripts/check-vectorized-feature-off.py), fields match its README. Its claim is TRUE \u2014 sparq-engine/Cargo.toml:421 enables substrate's numeric feature unconditionally and sparq-wasm depends on sparq-engine, so numeric.rs is always-compiled into the feature-OFF bundle. Not masking a vectorized leak: no engine/vectorized code in the diff.\n\nCorrectness, re-checked empirically with rustc: the witness is genuine \u2014 (i as f64) as f32 = 0x5e800000 while both i as f32 and \"4611686293305294849\".parse::<f32>() = 0x5e800001, so float_promotion_and_parse_are_single_rounded goes RED on pre-PR code (non-vacuous; it does route through binop rank==2 -> promoted_f32).\n\nAcceptance parity: parse_xsd_f32's specials + byte filter are character-for-character sparq_core::parse_xsd_f64's rule (lib.rs:662-672), and Rust FromStr acceptance is identical for f32/f64 across the pinned matrix plus overflow/underflow extremes I ran (1e400, 1e-400, 1e40). This matters because the core numeric cache gates BOTH xsd:float and xsd:double on parse_xsd_f64 (lib.rs:736), so the new loop guards exactly the sq-9781x cache-vs-evaluator seam.\n\nJKey seam checked for a new over-pairing hole: the cache still stores the un-narrowed f64 image for xsd:float (untouched), and eqjoin never consumes the FILTER, so key collisions are removed by the verbatim exact recheck. No new wrong-answer path.\n\nTests run: sparq-substrate --features numeric 66/66 green; sparq-reason --all-features dtype green incl. float_dtype_key_parity_with_substrate_parse_xsd_f32. clippy/rustfmt are absent here, so those gates stay CI-only.\n\nStagnant: the PR advanced operationally but none of round 2's four nits were addressed and no new ones appeared. All findings are nits; nothing blocks merge.",
+  "verdict": "approve"
+ }
+}
