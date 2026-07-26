@@ -1,33 +1,33 @@
 {
-  "generated_at": "2026-07-26T14:04:33Z",
+  "generated_at": "2026-07-26T14:30:11Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
-      "issues_open": 1278,
-      "issues_ready": 142,
+      "issues_open": 1281,
+      "issues_ready": 139,
       "issues_closed_1h": 4,
-      "issues_closed_24h": 71,
-      "prs_open": 86,
-      "prs_draft": 66,
-      "prs_opened_1h": 1,
+      "issues_closed_24h": 72,
+      "prs_open": 87,
+      "prs_draft": 65,
+      "prs_opened_1h": 2,
       "prs_closed_1h": 0,
       "prs_merged_1h": 4,
-      "prs_merged_24h": 72,
-      "review_changes_backlog": 2,
+      "prs_merged_24h": 73,
+      "review_changes_backlog": 1,
       "needs_user_parked": 7,
       "review_lane_health": "ok",
-      "review_lane_runs_1h": 17,
-      "worker_attempts_1h": 4,
-      "worker_success_rate_1h": 0.25,
-      "pr_open_rate": 1.0,
+      "review_lane_runs_1h": 15,
+      "worker_attempts_1h": 6,
+      "worker_success_rate_1h": 0.3333,
+      "pr_open_rate": 2.0,
       "pr_close_rate": 4.0,
-      "net_pr_flow": -3.0
+      "net_pr_flow": -2.0
     },
     "jeswr/agent-account-registry": {
-      "issues_open": 289,
+      "issues_open": 292,
       "issues_ready": 76,
-      "issues_closed_1h": 1,
-      "issues_closed_24h": 12,
+      "issues_closed_1h": 0,
+      "issues_closed_24h": 11,
       "prs_open": 24,
       "prs_draft": 18,
       "prs_opened_1h": 0,
@@ -37,7 +37,7 @@
       "review_changes_backlog": 4,
       "needs_user_parked": 3,
       "review_lane_health": "ok",
-      "review_lane_runs_1h": 12,
+      "review_lane_runs_1h": 10,
       "worker_attempts_1h": 0,
       "worker_success_rate_1h": null,
       "pr_open_rate": 0.0,
@@ -50,10 +50,10 @@
       "target": "sparq-org/sparq",
       "classification": "worker-failing",
       "fire": true,
-      "summary": "worker success rate 25% < 50% floor over 2 snapshots (4 attempts this hour)",
+      "summary": "worker success rate 33% < 50% floor over 2 snapshots (6 attempts this hour)",
       "metrics": {
-        "worker_success_rate_1h": 0.25,
-        "worker_attempts_1h": 4
+        "worker_success_rate_1h": 0.3333,
+        "worker_attempts_1h": 6
       }
     }
   ]
