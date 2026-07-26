@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 310,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "ee3201519037c9d2e640828db345341f0048f6f9",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "The round-3 blocker is resolved. Both actions/create-github-app-token invocations in the hostile-code worker job now set skip-token-revoke: true, preventing the action from registering a credential-bearing post-job revoker that would execute after the gate. The new structural guard is scoped to the worker job and fails closed for both an explicit false value and an absent input. Its mutation checks are non-vacuous: they alter both live worker mints and require exactly two detections, while the publish-job control demonstrates that clean-job mints are deliberately outside the scan. No trust check is weakened, and the diff introduces no new credential exposure or permissive fallback.",
+  "verdict": "approve"
+ }
+}
