@@ -1,0 +1,44 @@
+{
+ "host_envelope": {
+  "pr": 3868,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "4a625492cad4b9ae3a5726a3aa992da412e12428",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "env_values() only pairs a name with a value when the value is on the immediately following line (lines[index + 1]). If anything sits between them, the variable never enters the map, so both the sensitive-name check and the expected-value check silently skip it.\n\nProven on a copy outside the repo. This manifest fragment:\n\n    - name: SOLID_SERVER_DPOP_SK\n      # demo signing key\n      value: \"AAAAC3NzaC1lZDI1NTE5SUPERSECRETKEY\"\n\nstill produced `deploy/demo manifests: OK`, exit 0. The bash belt-and-braces regex does not catch it either, because it keys on password/token/etc. appearing as the YAML key, which here is `value`.\n\nThis is much narrower than the round-1 defect: the canonical shape is now caught, and the check is CI-gated so a regression reds the merge queue. But an author who documents a variable with an inline comment silently loses the guarantee, and a skipped pinned variable would also stop being enforced without any signal.",
+    "file": "deploy/demo/check.sh",
+    "fix_hint": "Make the pairing tolerant of interleaved comments and blank lines: after matching `- name:`, scan forward while the next line is blank or a comment, and stop at the next `- ` item or a dedent. Alternatively assert that every name found in the file appears in the resulting map, and fail on any name whose value could not be resolved, so an unparsed entry is loud rather than skipped. Add a fifth case to check-self-test.sh using the comment-between-name-and-value fixture above so the fix is pinned red-on-wrong.",
+    "severity": "minor",
+    "title": "Secret scan misses a sensitive env var when any line separates `- name:` from `value:`"
+   },
+   {
+    "body": "expect_rejected redirects both stdout and stderr to /dev/null and only inspects the exit status. A mutation that trips an unrelated assertion, or a check.sh that fails for an environmental reason such as a missing python3, would satisfy every case. I confirmed by hand that all four mutations currently fail for the intended reason, but nothing in the test pins that, so the coupling can drift silently.\n\nThe baseline-passes direction is covered, since the CI step runs check.sh before check-self-test.sh in the same block.",
+    "file": "deploy/demo/check-self-test.sh",
+    "fix_hint": "Give expect_rejected a second argument holding an expected substring of the failure message and assert it, e.g. capture output with `out=\"$(bash \"${demo_dir}/check.sh\" ... 2>&1)\" || true` then `grep -Fq \"${expected_msg}\" <<<\"${out}\"`. Pass messages such as 'must use secretKeyRef' and 'expected SOLID_SERVER_TRUSTED_PROXY'.",
+    "severity": "nit",
+    "title": "expect_rejected accepts any non-zero exit, so a wrong-reason rejection would still pass"
+   },
+   {
+    "body": "The loop asserting minScale, maxScale, cpu-throttling and tcpSocket uses unguarded `grep -Fq` under `set -euo pipefail`. If one fails the script exits 1 printing nothing, unlike every other assertion in the file which emits a specific message. In CI that surfaces as a red step with empty output, which is needlessly hard to diagnose.",
+    "file": "deploy/demo/check.sh",
+    "fix_hint": "Wrap each in the same if/echo/exit form already used for the forbidden-variable loop, or iterate over a list of patterns and report the first missing one by name, for example `if ! grep -Fq \"${pattern}\" \"${manifest}\"; then echo \"${manifest}: missing ${pattern}\" >&2; exit 1; fi`.",
+    "severity": "nit",
+    "title": "Bare grep -Fq annotation assertions fail silently under set -e with no diagnostic"
+   },
+   {
+    "body": "The quick-gates job already runs `shellcheck scripts/ci-free-disk.sh scripts/tests/test_ci_free_disk.sh` a few steps below the new Demo deployment manifests step, but deploy/demo/check.sh and deploy/demo/check-self-test.sh are not included. Both are non-trivial bash using set -euo pipefail, traps, arrays and a heredoc, which is precisely the surface shellcheck is good at. check-self-test.sh also relies on GNU `sed -i` and the `1i\\` continuation form, which is fine on the Linux runner but worth having linted.",
+    "file": ".github/workflows/docs-quality.yml",
+    "fix_hint": "Add deploy/demo/check.sh and deploy/demo/check-self-test.sh to the existing shellcheck invocation in the same job, or add `shellcheck deploy/demo/*.sh` to the new step.",
+    "severity": "nit",
+    "title": "New shell scripts are not shellcheck'd although the same job shellchecks its other scripts"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 2 closes every round-1 finding, and I verified the fixes empirically rather than by reading them. On copies outside the repo I re-ran all four mutations: injecting - name: SOLID_SERVER_DPOP_SK / value: \"AAAA...\" now exits 1 with \"sensitive environment variable must use secretKeyRef\"; flipping SOLID_SERVER_TRUSTED_PROXY 1->0 exits 1 with \"expected SOLID_SERVER_TRUSTED_PROXY='1', got '0'\"; rewriting the digest to :latest exits 1 on the immutable-digest rule; deleting serviceAccountName exits 1. Each rejects for the correct reason, not incidentally, so the guards are non-vacuous. env_values() now builds a real {name: value} map and asserts an expected dict, which is exactly what the decoupled greps could not do.\n\nThe pins are not fictional: all eight pinned variables are genuinely read by the server (rate_limit.rs for PER_IP/BURST/TRUSTED_PROXY, body_limit.rs for MAX_BODY_BYTES, overload.rs for REQUEST_TIMEOUT_SECS, main.rs for AUDIENCE/SEED_DEMO/PSS_SPARQ_BACKEND). SOLID_SERVER_DPOP_SK is read by pop/sk/mod.rs, so the secret fixture is realistic.\n\nRound-1 minors are addressed: manifests ship digest placeholders that check.sh enforces (64-hex or placeholder, :latest rejected); the README renders into mktemp -d with a cleanup trap instead of .rendered-demo/; the CSS probe moves to failureThreshold 12 / timeout 3 (~120s); a dedicated sparq-demo-sa is set on both services with the default-compute account explicitly rejected; and the check is wired into docs-quality.yml quick-gates, documented as \"every HARD gate\". I ran the documented render pipeline end-to-end and the check passes on the rendered output.\n\nOne residual secret-scan gap remains, proven but narrow, plus small robustness nits. None are blockers: the control now fires on the canonical shape it previously missed entirely.",
+  "verdict": "approve"
+ }
+}
