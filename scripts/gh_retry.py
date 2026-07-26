@@ -151,8 +151,14 @@ BLIND_READ_MARKER = "GH-RETRY-BLIND-READ"         # retried a read whose status 
 # follows the LAST such block. Response BODIES are printed inside a block, unprefixed, so keeping
 # only the post-block tail drops them too — see scrub_debug_trace.
 _TRACE_END_RE = re.compile(r"^\* Request took .*$", re.M)
-_TRACE_LINE_RE = re.compile(r"^[*<>](?:$| )")
+_TRACE_LINE_RE = re.compile(r"^[*<>](?:$| )", re.M)
 _TRACE_STATUS_RE = re.compile(r"^< HTTP/[0-9.]+[ ]+([1-5]\d\d)\b", re.M)
+# Belt-and-braces for a gh format change: response BODIES are printed unprefixed, so if gh ever
+# stops emitting the `* Request took` terminator the block-based drop below would leave one behind.
+# gh's own one-line diagnostics never start with a JSON/indent character, so dropping these can only
+# ever cost log detail, never correctness — and the direction of that trade is not negotiable when
+# the sink is a public run log.
+_BODYISH_LINE_RE = re.compile(r"^(?:[\s{}\[\]\"]|$)")
 
 
 def debug_env(env=None):
@@ -185,7 +191,10 @@ def scrub_debug_trace(text):
     for match in _TRACE_END_RE.finditer(raw):
         end = match
     tail = raw[end.end():] if end else raw
-    kept = [line for line in tail.splitlines() if not _TRACE_LINE_RE.match(line)]
+    traced = end is not None or bool(_TRACE_LINE_RE.search(raw))
+    kept = [line for line in tail.splitlines()
+            if not _TRACE_LINE_RE.match(line)
+            and not (traced and _BODYISH_LINE_RE.match(line))]
     return "\n".join(kept).strip()
 
 
@@ -775,6 +784,17 @@ def _self_test():
           ("502", "502"))
     check("#736 trace_status takes the LAST response (redirects/pagination end on the deciding one)",
           trace_status("< HTTP/2.0 301 Moved\n< HTTP/1.1 502 Bad Gateway\n"), "502")
+    # If a gh upgrade ever drops the `* Request took` terminator, the block-based drop above loses
+    # its anchor — the body must STILL not survive. A public run log is unrecoverable once written,
+    # so this direction is not allowed to depend on gh keeping its output format.
+    truncated_trace = DEBUG_TRACE_SAMPLE.replace("* Request took 987.59µs\n", "")
+    check("#736 a trace with NO terminator still leaks nothing (format-change safety)",
+          (scrub_debug_trace(truncated_trace), trace_status(truncated_trace)),
+          ("unexpected end of JSON input", "502"))
+    check("#736 the body-ish filter is scoped to DEBUG streams only — a plain gh message is never "
+          "mangled", (scrub_debug_trace("unexpected end of JSON input"),
+                      scrub_debug_trace('  {"message": "x"} not a trace')),
+          ("unexpected end of JSON input", '{"message": "x"} not a trace'))
 
     # G7 — GH_DEBUG can only be WIDENED by the environment, never disabled. This is the YAML seam:
     # a job-level `GH_DEBUG: ""` would otherwise silently restore statusless blindness with nothing
