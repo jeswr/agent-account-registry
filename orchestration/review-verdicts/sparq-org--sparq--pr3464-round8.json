@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3464,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "1fb0651c3f3e82801739fc3ab3bdf4d44f500d5b",
+  "round": 8
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Delegation::max_epoch is documented as a narrowing bound, but delegate maps it directly into PublicGrant.epoch. PublicGrant.epoch is the grant's exact epoch and is paired with an epoch-specific topic; the child otherwise copies parent.topic unchanged. Thus delegating max_epoch=5 from an epoch-7 parent produces a grant claiming epoch 5 while carrying the epoch-7 topic. No authenticated max-epoch field exists in signing_entries, so the requested constraint is not actually encoded as a distinct bound. The roundtrip test asserts this inconsistent Epoch(5), making the test validate the bug rather than the intended invariant.",
+    "file": "crates/sparq-e2ee-ng/src/capability.rs",
+    "fix_hint": "Represent maximum epoch as a distinct canonical, signed public-grant field (with decode/validation and a deliberate wire allocation), while retaining the parent's exact epoch/topic scope; then test round-trip authentication and narrowing of that field. If the wire format is not ready to allocate such a field, remove max_epoch from Delegation for this slice and reject/defer that constraint rather than overloading PublicGrant.epoch. Update the test so it proves the child's epoch/topic remain consistent.",
+    "severity": "major",
+    "title": "Delegation encodes max_epoch by corrupting the grant's exact epoch scope"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 8 fixes round 7's forward-secrecy overclaim: both wrap.rs and the public skill now accurately state that recipient-key compromise exposes recorded wraps. However, the delegation implementation introduces a different major correctness issue. Delegation::max_epoch is not represented as its own authenticated constraint; delegate instead overwrites the child grant's exact epoch while retaining the parent's epoch-specific topic. The test blesses a child at epoch 5 with the epoch-7 topic. This does not implement the design's optional maximum-epoch bound and can produce internally inconsistent grants. Because this is a new major finding after the prior finding was fixed, progress is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
