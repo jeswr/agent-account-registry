@@ -11,16 +11,6 @@
    "expires_at": 1785057247
   },
   {
-   "account": "9e13ea21abf27e68",
-   "claim_id": "226f5a7a43b24f069baa7603af800e13",
-   "holder": "fix:sparq-org/sparq#3990@dispatch-30193753052.1",
-   "package": "sparq-geo",
-   "role": "fix",
-   "model": "opus5",
-   "issued_at": 1785053146,
-   "expires_at": 1785059446
-  },
-  {
    "account": "dc2d751954080e13",
    "claim_id": "c082f218d6cc441c81aad8eb3b35456c",
    "holder": "sparq-org/sparq#2651@30194231360.1",
