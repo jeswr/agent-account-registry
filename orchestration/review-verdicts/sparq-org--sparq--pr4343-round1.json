@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4343,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "5719c92b95512563e05f2715a8d53f042a863d76",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change is documentation plus a real fail-closed regression test; it does not alter reprojection behavior. The new test exercises the public lookup and conversion paths for all eight empty-WKT entries and correctly pins their refusal. The verification record supplies a reproducible registry comparison, distinguishes empty from non-empty no-AXIS entries, avoids licensing an unsupported coordinate swap, and keeps the residual unverifiable cases explicitly scoped. The claims are consistent with the existing axis gate and the embedded definitions.",
+  "verdict": "approve"
+ }
+}
