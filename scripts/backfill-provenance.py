@@ -155,24 +155,33 @@ CLAIM_ENV_KEYS = ("EXPECTED_ACCOUNT",)
 # `reconcile-provenance` invocation passes identity through runner ENV and has no `--pr` at all,
 # binding the PR by its deterministic `HEAD_BRANCH`. A field resolves from whichever shape is
 # present; if both are present they must agree (a per-field set, so a conflict is DISAGREE).
+PROV_ACCOUNT_ENV_RE = _env_echo(_PROV_JOB, "WORKER_IMPL_ACCOUNT", _ACCT_V)
+PROV_ALIAS_ARG_RE = _arg_echo(_PROV_JOB, "--impl-alias", _ALIAS_V)
+PROV_ALIAS_ENV_RE = _env_echo(_PROV_JOB, "IMPL_ALIAS", _ALIAS_V)
+# The PROVIDER is run-bound (sol r3): deriving it from TODAY's mutable routing lets a routing
+# remap flip a historical anthropic run to openai and defeat the cross-provider gate.
+PROV_PROVIDER_ARG_RE = _arg_echo(_PROV_JOB, "--impl-provider", _PROVIDER_V)
+PROV_PROVIDER_ENV_RE = _env_echo(_PROV_JOB, "IMPL_PROVIDER", _PROVIDER_V)
+# The exact App-bot author the job REQUIRED (sol r4): accepting any *[bot] would record a
+# provenance job that failed VALIDATION (hostile worker pointed it at another bot's PR) as if it
+# were the #96 write outage.
+PROV_BOTLOGIN_ARG_RE = _arg_echo(_PROV_JOB, "--verify-bot-login", _BOTLOGIN_V)
+PROV_BOTLOGIN_ENV_RE = _env_echo(_PROV_JOB, "VERIFY_BOT_LOGIN", _BOTLOGIN_V)
+PROV_TARGET_ARG_RE = _arg_echo(_PROV_JOB, "--target-repo", _REPO_V)
+PROV_ISSUE_ARG_RE = _arg_echo(_PROV_JOB, "--issue", _NUM_V)
+PROV_PR_ARG_RE = _arg_echo(_PROV_JOB, "--pr", _NUM_V)
+PROV_HEAD_BRANCH_ENV_RE = _env_echo(_PROV_JOB, "HEAD_BRANCH", _BRANCH_V)
+
 PROV_JOB_FIELDS = {
-    "account": (_env_echo(_PROV_JOB, "WORKER_IMPL_ACCOUNT", _ACCT_V),),
-    "alias": (_arg_echo(_PROV_JOB, "--impl-alias", _ALIAS_V),
-              _env_echo(_PROV_JOB, "IMPL_ALIAS", _ALIAS_V)),
-    # The PROVIDER is run-bound (sol r3): deriving it from TODAY's mutable routing lets a routing
-    # remap flip a historical anthropic run to openai and defeat the cross-provider gate.
-    "provider": (_arg_echo(_PROV_JOB, "--impl-provider", _PROVIDER_V),
-                 _env_echo(_PROV_JOB, "IMPL_PROVIDER", _PROVIDER_V)),
-    # The exact App-bot author the job REQUIRED (sol r4): accepting any *[bot] would record a
-    # provenance job that failed VALIDATION (hostile worker pointed it at another bot's PR) as
-    # if it were the #96 write outage.
-    "bot_login": (_arg_echo(_PROV_JOB, "--verify-bot-login", _BOTLOGIN_V),
-                  _env_echo(_PROV_JOB, "VERIFY_BOT_LOGIN", _BOTLOGIN_V)),
-    "target_repo": (_arg_echo(_PROV_JOB, "--target-repo", _REPO_V),),
-    "issue": (_arg_echo(_PROV_JOB, "--issue", _NUM_V),),
+    "account": (PROV_ACCOUNT_ENV_RE,),
+    "alias": (PROV_ALIAS_ARG_RE, PROV_ALIAS_ENV_RE),
+    "provider": (PROV_PROVIDER_ARG_RE, PROV_PROVIDER_ENV_RE),
+    "bot_login": (PROV_BOTLOGIN_ARG_RE, PROV_BOTLOGIN_ENV_RE),
+    "target_repo": (PROV_TARGET_ARG_RE,),
+    "issue": (PROV_ISSUE_ARG_RE,),
     # --- PR binding: at least one of these two is required (see _PR_BINDING_FIELDS) ---
-    "pr": (_arg_echo(_PROV_JOB, "--pr", _NUM_V),),
-    "head_branch": (_env_echo(_PROV_JOB, "HEAD_BRANCH", _BRANCH_V),),
+    "pr": (PROV_PR_ARG_RE,),
+    "head_branch": (PROV_HEAD_BRANCH_ENV_RE,),
 }
 _REQUIRED_FIELDS = ("account", "alias", "provider", "bot_login", "target_repo", "issue")
 # Either binding is sufficient and BOTH are equally strong. `--pr` names the PR number directly;
@@ -629,11 +638,14 @@ def worker_yaml_shape_report():
     replayed = _render_job_section(prov["name"], prov_step)
     # Replay the claim job's env echo plus the RUNTIME line its own `print(...)` emits — the
     # format string is lifted out of the workflow, so changing the phrase reds this.
-    printed = re.search(r'print\(f"((?:dispatcher lease adopted|lease claimed): model=)\{model\}',
-                        claim_run)
+    # BOTH claim paths are live — the self-claim step prints `lease claimed: model=…` and the
+    # dispatcher-adopt step prints `dispatcher lease adopted: model=…`. Each phrase must still be
+    # in the workflow, or half the corroborating source dies silently.
+    phrases = [p for p in ("lease claimed: model=", "dispatcher lease adopted: model=")
+               if f'print(f"{p}{{model}}' in claim_run]
     claim_replay = "".join(_render_job_section(claim["name"], s) for s in claim["steps"])
-    if printed:
-        claim_replay += _log_line(claim["name"], f"{printed.group(1)}fable, claim=abcd1234")
+    for phrase in phrases:
+        claim_replay += _log_line(claim["name"], f"{phrase}fable, claim=abcd1234")
     return {
         "prov_job_anchored": anchors(prov["name"]) == (True, False),
         "claim_job_anchored": anchors(claim["name"]) == (False, True),
@@ -641,7 +653,7 @@ def worker_yaml_shape_report():
         "prov_env_keys": set(PROV_ENV_KEYS) <= set(prov_step.get("env") or {}),
         "claim_env_keys": set(CLAIM_ENV_KEYS) <= {k for s in claim["steps"]
                                                   for k in (s.get("env") or {})},
-        "claim_prints_model": bool(printed),
+        "claim_prints_model": phrases,
         "reconcile_has_no_pr_arg": not re.search(r"--pr(?![A-Za-z0-9_-])",
                                                  str(prov_step.get("run") or "")),
         "replayed_identity": provenance_job_identity_from_log(replayed),
@@ -729,9 +741,27 @@ def _self_test():
         '\x1b[0m')
     check("SGR-wrapped claim SOURCE echo yields no model (echo != output)",
           CLAIM_MODEL_RE.findall(claim_source_echo), [])
-    check("...and an SGR-wrapped env-echo lookalike yields no account",
-          CLAIM_ACCOUNT_RE.findall(
-              _log_line(claim_job, "\x1b[36;1m  EXPECTED_ACCOUNT: acct0fx9\x1b[0m")), [])
+    # The discriminating case: a `run:` HEREDOC BODY line whose text BEGINS with the phrase and
+    # carries a LITERAL alias. The runner SGR-wraps it exactly like any other script line, so only
+    # refusing the wrapper tells this script SOURCE apart from the job's runtime output.
+    for wrapper, rendering in (("\x1b", "raw-ESC"), ("^[", "caret-sanitized")):
+        check(f"a {rendering} SGR-wrapped heredoc line with a LITERAL alias is not runtime output",
+              CLAIM_MODEL_RE.findall(_log_line(
+                  claim_job,
+                  f"{wrapper}[36;1m  dispatcher lease adopted: model=fable{wrapper}[0m")), [])
+        check(f"...and a {rendering} SGR-wrapped `IMPL_ALIAS: fable` source line is not an env "
+              "echo",
+              PROV_ALIAS_ENV_RE.findall(_log_line(
+                  prov_job, f"{wrapper}[36;1m  IMPL_ALIAS: fable{wrapper}[0m")), [])
+    # An env echo is read as a WHOLE line or not at all. Catalog-controlled values reach this job
+    # (worker.yml treats them as hostile — issue #199), so an alias of `fable junk` must refuse
+    # rather than silently record the prefix `fable` as the implementer.
+    check("an env echo with trailing content is refused, not truncated to its prefix",
+          PROV_ALIAS_ENV_RE.findall(
+              _log_line(prov_job, "  IMPL_ALIAS: fable junk")), [])
+    check("...and the same value on a clean line does match",
+          PROV_ALIAS_ENV_RE.findall(_log_line(prov_job, "  IMPL_ALIAS: fable")),
+          ["fable"])
     check("no claim line", claim_from_log("nothing here"), None)
     check("half a claim source is no corroboration (account only)",
           claim_from_log(_log_line(claim_job, "  EXPECTED_ACCOUNT: acct0fx1")), None)
@@ -875,6 +905,22 @@ def _self_test():
     check("an otherwise complete section with NO PR binding is INCOMPLETE, never accepted",
           code_of(provenance_job_identity_from_log(
               prov_env().replace(f"  HEAD_BRANCH: {HEAD}\n", ""))), REASON_INCOMPLETE)
+    # EVERY required field is individually load-bearing: dropping any ONE of them from an
+    # otherwise complete, correctly PR-bound section must still refuse. Without this, emptying
+    # the required set records a HALF-BOUND identity and no test notices.
+    def without_line(text, marker):
+        """Drop the WHOLE log line carrying `marker`, and report how many were dropped — a
+        no-op replace would make the assertion below pass for the wrong reason."""
+        kept = [ln for ln in text.splitlines(keepends=True) if marker not in ln]
+        return "".join(kept), len(text.splitlines()) - len(kept)
+
+    for field, marker in (("account", "WORKER_IMPL_ACCOUNT:"), ("alias", "IMPL_ALIAS:"),
+                          ("provider", "IMPL_PROVIDER:"), ("bot_login", "VERIFY_BOT_LOGIN:"),
+                          ("target_repo", "--target-repo"), ("issue", "--issue")):
+        without, dropped = without_line(prov_env(), marker)
+        check(f"dropping the required field {field!r} refuses (never a half-bound identity)",
+              (dropped, code_of(provenance_job_identity_from_log(without))),
+              (1, REASON_INCOMPLETE))
 
     # --- REAL archived worker-run logs (issue #712 ask 4) --------------------------------------
     # Byte-exact line subsets of two REAL `gh run view --log` outputs — no line was edited, only
@@ -900,8 +946,14 @@ def _self_test():
           ("acct2css", "opus", "anthropic"))
     check("REAL log: the claim job corroborates again (it returned None on every live run)",
           claim_from_log(real["pr4185-env-shape"]), ("acct01", "sol"))
+    # `gh run view --log` CARET-SANITIZES the runner's SGR controls: the real bytes are the two
+    # characters `^[`, not a raw ESC. Filtering on "\x1b" here would select ZERO lines and the
+    # assertion below would pass vacuously — accept either rendering.
     real_source_only = "".join(
-        line for line in real["pr4185-env-shape"].splitlines(keepends=True) if "\x1b" in line)
+        line for line in real["pr4185-env-shape"].splitlines(keepends=True)
+        if "\x1b[" in line or "^[[" in line)
+    check("REAL log: the SGR-wrapped SOURCE lines are actually PRESENT in the fixture",
+          real_source_only.count("dispatcher lease adopted"), 1)
     check("REAL log: the SGR-wrapped print() SOURCE line contributes no model match",
           CLAIM_MODEL_RE.findall(real_source_only), [])
     check("  ...while the runtime output line in the same REAL log does",
@@ -923,8 +975,9 @@ def _self_test():
     check("worker.yml provenance step still exports every identity env key this parser reads",
           shape["prov_env_keys"], True)
     check("worker.yml claim job still exports EXPECTED_ACCOUNT", shape["claim_env_keys"], True)
-    check("worker.yml claim job still PRINTS the adopted-model line", shape["claim_prints_model"],
-          True)
+    check("worker.yml claim job still PRINTS both live claim phrases",
+          shape["claim_prints_model"],
+          ["lease claimed: model=", "dispatcher lease adopted: model="])
     check("worker.yml reconcile invocation still has NO --pr (so HEAD_BRANCH must bind)",
           shape["reconcile_has_no_pr_arg"], True)
     check("REPLAYED straight from worker.yml, the provenance job's own log section parses",
