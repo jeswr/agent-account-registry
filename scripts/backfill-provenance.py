@@ -2,9 +2,12 @@
 # One-shot provenance backfill for worker PRs opened BEFORE registry provenance recording
 # existed. Without a record those open, unarmed, bot-authored PRs are fail-closed INVISIBLE to
 # the review loop forever; this writes the missing orchestration/provenance/ files AND converts
-# each PR to DRAFT (pre-migration PRs were opened non-draft, and both review gates hard-require
-# draft — recording alone would leave them invisible). Idempotent: an existing record is never
-# touched, an already-draft PR is left alone. Default is a DRY RUN — pass --apply to write.
+# each PR that has NOT YET BEEN THROUGH REVIEW to DRAFT (pre-migration PRs were opened non-draft,
+# and both review gates hard-require draft — recording alone would leave them invisible).
+# Recording and draft conversion are INDEPENDENT actions (issue #726): a PR that is queued to
+# merge, auto-merge-armed or already `review:pass` is recorded but NEVER touched, because drafting
+# it would evict it from the merge queue / discard a completed review. Idempotent: an existing
+# record is never touched, an already-draft PR is left alone. DRY RUN unless --apply.
 """backfill-provenance — reconstruct implementer provenance for pre-existing worker PRs.
 
 Identity source (the ONLY one): the worker RUN. The head branch embeds the registry run id
@@ -30,13 +33,20 @@ prints a handle either.
 """
 
 import argparse
+import ast
+import contextlib
 import importlib.util
+import inspect
+import io
 import json
 import os
 from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
+import textwrap
+import types
 from typing import NamedTuple
 
 HEAD_RE = re.compile(r"^sparq-agent/issue-([1-9][0-9]*)-([0-9]+)-([0-9]+)$")
@@ -402,15 +412,185 @@ def existing_record_admission_error(body, pr_number, admission_error):
     return admission_error(record, pr_number)
 
 
-def _ensure_draft(target_repo, number, is_draft, apply_changes):
-    """Convert a pre-migration non-draft PR to draft (both review gates require draft==True).
-    Runs independently of record recording so a partially-failed earlier pass converges."""
+# --- DRAFT CONVERSION: the property is "not yet through review", NOT "is not a draft" (#726) ---
+# The old predicate was simply `if is_draft: return`, i.e. it drafted EVERY non-draft worker PR.
+# That is right for a freshly published worker PR — publish-never-arms is what keeps an unreviewed
+# PR from merging, and both review gates hard-require draft==True, so a non-draft unreviewed PR is
+# invisible. It INVERTS for a PR that has already been through review: converting a PR that is in
+# the merge queue EVICTS it from the queue, and converting an armed PR un-arms a merge that already
+# passed. A single backfill pass would have destroyed three in-flight merges (sparq#3894/#4074/
+# #4185) to fix a partition problem.
+#
+# THE DISCRIMINATING CASE: `autoMergeRequest` reads NULL for a PR that is already IN the queue
+# (GitHub consumes the auto-merge request when it enqueues). An arm-only check therefore misses
+# exactly the population at risk. Merge-queue membership is queried EXPLICITLY via GraphQL
+# `mergeQueueEntry` — see `review_state`.
+#
+# FAILURE DIRECTION: on an unreadable/malformed review-state probe we SKIP the conversion. Not
+# converting is a no-op relative to the pre-backfill state (the PR was already non-draft and is
+# not armed by us, so nothing can merge that could not merge before) and the next pass converges;
+# converting on unknown state is irreversible eviction of a live merge. Records are still written
+# either way — the two actions are independent.
+REVIEW_PASS_LABEL = "review:pass"
+
+QUEUE_QUEUED = "queued"
+QUEUE_NOT_QUEUED = "not-queued"
+QUEUE_UNKNOWN = "unknown"
+
+DRAFT_SKIP_ALREADY = "already-draft"
+DRAFT_SKIP_QUEUED = "in-merge-queue"
+DRAFT_SKIP_ARMED = "auto-merge-armed"
+DRAFT_SKIP_REVIEW_PASS = "review-passed"
+DRAFT_SKIP_QUEUE_UNKNOWN = "review-state-unknown"
+DRAFT_SKIP_OPERATOR = "no-draft-convert"
+
+DRAFT_SKIP_GUIDANCE = {
+    DRAFT_SKIP_ALREADY: "already a draft",
+    DRAFT_SKIP_QUEUED: "it is IN THE MERGE QUEUE; drafting would evict it from the queue",
+    DRAFT_SKIP_ARMED: "auto-merge is armed; drafting would un-arm a merge that passed review",
+    DRAFT_SKIP_REVIEW_PASS: f"it carries `{REVIEW_PASS_LABEL}`; drafting would discard a "
+                            "completed review",
+    DRAFT_SKIP_QUEUE_UNKNOWN: "its live review state could not be read, so whether drafting would "
+                              "evict a queued merge is UNKNOWN — rerun once the probe succeeds",
+    DRAFT_SKIP_OPERATOR: "--no-draft-convert was passed (record-only pass)",
+}
+
+
+class ReviewState(NamedTuple):
+    """The live signals that say a PR has ALREADY been through review. `queue_state` is one of
+    the QUEUE_* constants; UNKNOWN means the probe failed and nothing here may be trusted."""
+
+    queue_state: str
+    is_armed: bool
+    has_review_pass: bool
+
+
+# The sentinel for "not probed / not readable". UNKNOWN, never NOT_QUEUED, so that a caller which
+# forgets to probe skips the conversion instead of evicting a queued PR.
+UNKNOWN_REVIEW_STATE = ReviewState(QUEUE_UNKNOWN, False, False)
+
+# `mergeQueueEntry` is the ONLY signal that reports queue membership; REST's `auto_merge` and
+# GraphQL's `autoMergeRequest` are both null once a PR is enqueued. All three fields come from one
+# query so there is a single failure mode to reason about.
+REVIEW_STATE_QUERY = """
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      mergeQueueEntry { state }
+      autoMergeRequest { enabledAt }
+      labels(first: 100) { nodes { name } }
+    }
+  }
+}
+"""
+_REVIEW_STATE_FIELDS = ("mergeQueueEntry", "autoMergeRequest", "labels")
+
+
+def query_selected_fields(query, parent):
+    """The field names selected inside `parent { ... }` in a GraphQL document. The parser demands
+    every _REVIEW_STATE_FIELDS key in the RESPONSE, and a response only carries what the QUERY
+    asked for — so deleting `mergeQueueEntry` from the document silently turns every PR into
+    "unknown" (or, with a laxer parser, "not queued"). The self-test pins document to parser."""
+    opening = re.search(re.escape(parent) + r"[^{]*\{", query)
+    if not opening:
+        return set()
+    depth, index, start = 1, opening.end(), opening.end()
+    while index < len(query) and depth:
+        depth += {"{": 1, "}": -1}.get(query[index], 0)
+        index += 1
+    if depth:
+        return set()
+    fields, level = set(), 0
+    for line in query[start:index - 1].splitlines():
+        text = line.strip()
+        name = re.match(r"([A-Za-z_][A-Za-z0-9_]*)", text)
+        if level == 0 and name:
+            fields.add(name.group(1))
+        level += text.count("{") - text.count("}")
+    return fields
+
+
+def parse_review_state(payload):
+    """A ReviewState from a `gh api graphql` response body, or UNKNOWN_REVIEW_STATE when the
+    payload is absent, errored, or not exactly the shape asked for. Deliberately strict: a
+    partially-rendered payload must not read as "not queued"."""
+    if not isinstance(payload, dict) or payload.get("errors"):
+        return UNKNOWN_REVIEW_STATE
+    node = payload.get("data")
+    for key in ("repository", "pullRequest"):
+        if not isinstance(node, dict):
+            return UNKNOWN_REVIEW_STATE
+        node = node.get(key)
+    if not isinstance(node, dict) or not set(_REVIEW_STATE_FIELDS) <= set(node):
+        return UNKNOWN_REVIEW_STATE
+    entry, auto, labels = (node[key] for key in _REVIEW_STATE_FIELDS)
+    if entry is not None and not isinstance(entry, dict):
+        return UNKNOWN_REVIEW_STATE
+    if auto is not None and not isinstance(auto, dict):
+        return UNKNOWN_REVIEW_STATE
+    nodes = labels.get("nodes") if isinstance(labels, dict) else None
+    if not isinstance(nodes, list):
+        return UNKNOWN_REVIEW_STATE
+    names = {label.get("name") for label in nodes if isinstance(label, dict)}
+    return ReviewState(QUEUE_QUEUED if entry is not None else QUEUE_NOT_QUEUED,
+                       auto is not None, REVIEW_PASS_LABEL in names)
+
+
+def review_state(target_repo, number, runner=None):
+    """Probe the live review state of one PR. Never raises: every failure is UNKNOWN, which the
+    predicate treats as "do not touch draft state"."""
+    runner = runner or _run_gh
+    owner, _, name = str(target_repo).partition("/")
+    if not owner or not name:
+        return UNKNOWN_REVIEW_STATE
+    result = runner(["api", "graphql", "-f", f"query={REVIEW_STATE_QUERY}",
+                     "-F", f"owner={owner}", "-F", f"name={name}", "-F", f"number={int(number)}"],
+                    check=False)
+    if result.returncode != 0:
+        return UNKNOWN_REVIEW_STATE
+    try:
+        payload = json.loads(result.stdout or "null")
+    except json.JSONDecodeError:
+        return UNKNOWN_REVIEW_STATE
+    return parse_review_state(payload)
+
+
+def draft_skip_reason(is_draft, state, no_draft_convert=False):
+    """Why the draft conversion must be SKIPPED for this PR (a DRAFT_SKIP_* code), or None when
+    it must happen. `state` is a ReviewState."""
     if is_draft:
+        return DRAFT_SKIP_ALREADY
+    if no_draft_convert:
+        return DRAFT_SKIP_OPERATOR
+    if state.queue_state == QUEUE_QUEUED:
+        return DRAFT_SKIP_QUEUED
+    if state.is_armed:
+        return DRAFT_SKIP_ARMED
+    if state.has_review_pass:
+        return DRAFT_SKIP_REVIEW_PASS
+    if state.queue_state != QUEUE_NOT_QUEUED:
+        # UNKNOWN, or any value this function was never taught: fail toward the no-op.
+        return DRAFT_SKIP_QUEUE_UNKNOWN
+    return None
+
+
+def _ensure_draft(target_repo, number, is_draft, apply_changes, *, state,
+                  no_draft_convert=False, runner=None):
+    """Convert a not-yet-reviewed non-draft PR to draft (both review gates require draft==True).
+    Runs independently of record recording so a partially-failed earlier pass converges, and
+    REFUSES on any PR that has already been through review (issue #726). `state` is REQUIRED —
+    there is no default, so no call site can silently skip the merge-queue probe."""
+    runner = runner or _run_gh
+    reason = draft_skip_reason(is_draft, state, no_draft_convert)
+    if reason is not None:
+        if reason != DRAFT_SKIP_ALREADY:
+            print(f"KEEP-PUBLISHED #{number}: not converting to draft — "
+                  f"{DRAFT_SKIP_GUIDANCE[reason]}")
         return True
     if not apply_changes:
         print(f"DRY-RUN #{number}: would convert to draft (review gates require draft)")
         return True
-    undo = _run_gh(["pr", "ready", str(number), "-R", target_repo, "--undo"], check=False)
+    undo = runner(["pr", "ready", str(number), "-R", target_repo, "--undo"], check=False)
     if undo.returncode != 0:
         print(f"WARN #{number}: could not convert to draft — run "
               f"`gh pr ready {number} -R {target_repo} --undo` manually")
@@ -419,7 +599,7 @@ def _ensure_draft(target_repo, number, is_draft, apply_changes):
     return True
 
 
-def backfill(target_repo, registry_repo, routing_file, apply_changes):
+def backfill(target_repo, registry_repo, routing_file, apply_changes, no_draft_convert=False):
     worker_pr = _load_worker_pr()
     admission_error = _load_dispatch_claim().provenance_admission_error
     import tomllib
@@ -452,6 +632,11 @@ def backfill(target_repo, registry_repo, routing_file, apply_changes):
         if not login.endswith("[bot]"):
             continue
         is_draft = pull.get("draft") is True
+        # Probe the LIVE review state only for an actual draft-conversion candidate (an
+        # already-draft PR is never converted, so its state cannot change any outcome and the
+        # query would be wasted). The unprobed value is UNKNOWN, not NOT_QUEUED, so removing the
+        # `is_draft` short-circuit would skip conversions rather than evict queued PRs.
+        state = UNKNOWN_REVIEW_STATE if is_draft else review_state(target_repo, number)
         issue, run_id, attempt = parsed
         record_path = worker_pr.provenance_path(target_repo, number)
         # Post-outage records live on the `ledger` data-plane branch (issue #96); pre-outage
@@ -477,7 +662,8 @@ def backfill(target_repo, registry_repo, routing_file, apply_changes):
                 print(f"skip #{number}: provenance already recorded")
                 # Still reconcile the draft state (an earlier pass may have crashed between
                 # the two).
-                _ensure_draft(target_repo, number, is_draft, apply_changes)
+                _ensure_draft(target_repo, number, is_draft, apply_changes, state=state,
+                              no_draft_convert=no_draft_convert)
                 continue
             needs_human += 1
             print(f"NEEDS-HUMAN #{number}: an existing provenance record is present but NOT "
@@ -543,7 +729,10 @@ def backfill(target_repo, registry_repo, routing_file, apply_changes):
                   f"account_h={impl_account_h} issue=#{issue} opened={opened_sha[:8]} "
                   f"({run_key})")
             written += 1
-        _ensure_draft(target_repo, number, is_draft, apply_changes)
+        # Recording is DONE by this point and its count is already banked: draft conversion is an
+        # INDEPENDENT action whose outcome can never withhold a provenance record (issue #726).
+        _ensure_draft(target_repo, number, is_draft, apply_changes, state=state,
+                      no_draft_convert=no_draft_convert)
     mode = "recorded" if apply_changes else "would record"
     print(f"backfill complete: {mode} {written}, skipped {skipped}, "
           f"needs-human {needs_human}")
@@ -675,6 +864,7 @@ def backfill_workflow_seam_report():
     workflow = _workflow("backfill-provenance.yml")
     # PyYAML parses a bare `on:` key as the boolean True.
     triggers = workflow.get("on") if "on" in workflow else workflow.get(True)
+    inputs = (((triggers or {}).get("workflow_dispatch") or {}).get("inputs") or {})
     job = workflow["jobs"]["backfill"]
     steps = job["steps"]
     step = next((s for s in steps if "backfill-provenance.py" in str(s.get("run") or "")), None)
@@ -682,6 +872,10 @@ def backfill_workflow_seam_report():
     guard = str(job.get("if") or "")
     self_at = run.find("backfill-provenance.py --self-test")
     invoke_at = run.find('backfill-provenance.py "${args[@]}"')
+    # The WRONG-INPUT seam: `NO_DRAFT_CONVERT: ${{ inputs.apply }}` is valid YAML, lints clean, and
+    # silently turns an apply run into a record-only run (or vice versa). Assert the exact
+    # expression each env name is bound to, not merely that the name appears.
+    step_env = {k: str(v) for k, v in ((step or {}).get("env") or {}).items()}
     return {
         "job_ref_guarded": "github.ref ==" in guard and "default_branch" in guard,
         "job_environment": job.get("environment"),
@@ -692,9 +886,14 @@ def backfill_workflow_seam_report():
         "self_test_before_backfill": 0 <= self_at < invoke_at,
         "apply_is_conditional": bool(
             re.search(r'\[\[\s*"\$APPLY"\s*==\s*"true"\s*\]\].*args\+=\(--apply\)', run)),
-        "dispatch_default_is_dry_run":
-            (((triggers or {}).get("workflow_dispatch") or {}).get("inputs") or {})
-            .get("apply", {}).get("default"),
+        "dispatch_default_is_dry_run": inputs.get("apply", {}).get("default"),
+        # --- issue #726: the record-only lever -------------------------------------------------
+        "no_draft_convert_is_conditional": bool(
+            re.search(r'\[\[\s*"\$NO_DRAFT_CONVERT"\s*==\s*"true"\s*\]\].*'
+                      r'args\+=\(--no-draft-convert\)', run)),
+        "no_draft_convert_default": inputs.get("no_draft_convert", {}).get("default"),
+        "step_env_bindings": {key: step_env.get(key)
+                              for key in ("TARGET_REPO", "APPLY", "NO_DRAFT_CONVERT")},
     }
 
 
@@ -1021,6 +1220,16 @@ def _self_test():
           seam["self_test_before_backfill"], True)
     check("--apply is added only under the APPLY conditional", seam["apply_is_conditional"], True)
     check("workflow_dispatch defaults to a DRY RUN", seam["dispatch_default_is_dry_run"], False)
+    check("--no-draft-convert is added only under the NO_DRAFT_CONVERT conditional",
+          seam["no_draft_convert_is_conditional"], True)
+    check("no_draft_convert defaults to false (the predicate, not the flag, is the fix)",
+          seam["no_draft_convert_default"], False)
+    # The wrong-input seam: binding NO_DRAFT_CONVERT to `inputs.apply` lints clean and silently
+    # inverts an apply run. Assert the exact expression, not the mere presence of the name.
+    check("each workflow env name is bound to ITS OWN dispatch input (wrong-input seam)",
+          seam["step_env_bindings"],
+          {"TARGET_REPO": "${{ inputs.target_repo }}", "APPLY": "${{ inputs.apply }}",
+           "NO_DRAFT_CONVERT": "${{ inputs.no_draft_convert }}"})
     check("two-page slurped listing flattens (sol r5)",
           flatten_pull_pages([[{"number": 1}], [{"number": 2}, {"number": 3}]]),
           [{"number": 1}, {"number": 2}, {"number": 3}])
@@ -1029,6 +1238,235 @@ def _self_test():
     check("empty slurp is an empty list", flatten_pull_pages([]), [])
     check("forged worker-job lines alone resolve nothing", code_of(ident(forged)),
           REASON_NO_SOURCE)
+
+    # --- ISSUE #726: drafting must never EVICT a queued / armed / reviewed PR ------------------
+    # The old predicate drafted every non-draft worker PR. Applying that pass would have converted
+    # sparq#3894/#4074/#4185 while they sat in the merge queue, which EVICTS them — three live
+    # merges destroyed to fix a partition problem. THE DISCRIMINATING CASE is the queued one:
+    # `autoMergeRequest` is NULL for an enqueued PR, so an arm-only check reds none of its own
+    # tests and still evicts. Every fixture below is either REAL captured bytes or an explicit
+    # ReviewState, and each of the four obligations has its own named check.
+
+    # REAL `gh api graphql` response bodies, captured 2026-07-26 against sparq-org/sparq. Not
+    # hand-written: the null `autoMergeRequest` on a QUEUED PR is the property under test, and a
+    # synthetic fixture is exactly how one would accidentally assume it away.
+    REAL_QUEUED = ('{"data":{"repository":{"pullRequest":{"mergeQueueEntry":{"state":'
+                   '"AWAITING_CHECKS"},"autoMergeRequest":null,"labels":{"nodes":[{"name":'
+                   '"area:bench"},{"name":"review:pass"}]}}}}}')          # sparq#4185
+    REAL_ARMED = ('{"data":{"repository":{"pullRequest":{"mergeQueueEntry":null,'
+                  '"autoMergeRequest":{"enabledAt":"2026-07-26T02:44:31Z"},"labels":{"nodes":'
+                  '[{"name":"area:deps"},{"name":"review:pass"},{"name":"area:ci"},{"name":'
+                  '"area:docs"},{"name":"area:sparq-trust"},{"name":"trust-surface"}]}}}}}')
+    REAL_FRESH = ('{"data":{"repository":{"pullRequest":{"mergeQueueEntry":null,'
+                  '"autoMergeRequest":null,"labels":{"nodes":[{"name":"review:needs"}]}}}}}')
+    check("REAL queued-PR payload parses as QUEUED — and its autoMergeRequest is NULL, which is "
+          "why an arm-only check misses it",
+          parse_review_state(json.loads(REAL_QUEUED)),
+          ReviewState(QUEUE_QUEUED, False, True))
+    check("REAL armed-but-not-queued payload parses as armed + not queued",
+          parse_review_state(json.loads(REAL_ARMED)),
+          ReviewState(QUEUE_NOT_QUEUED, True, True))
+    check("REAL fresh worker-PR payload parses as not queued, not armed, no review:pass",
+          parse_review_state(json.loads(REAL_FRESH)),
+          ReviewState(QUEUE_NOT_QUEUED, False, False))
+
+    # The four states, named exactly as the obligations. `review:pass` alone is deliberately
+    # separated from the queued state: if the queued fixture also carried review:pass, a
+    # review:pass-ONLY implementation would satisfy it and the queue branch would be vacuous.
+    QUEUED_ONLY = ReviewState(QUEUE_QUEUED, False, False)
+    ARMED_ONLY = ReviewState(QUEUE_NOT_QUEUED, True, False)
+    REVIEW_PASS_ONLY = ReviewState(QUEUE_NOT_QUEUED, False, True)
+    FRESH = ReviewState(QUEUE_NOT_QUEUED, False, False)
+    check("a QUEUED PR is not drafted, with autoMergeRequest null AND no review:pass "
+          "(an arm-only OR label-only check fails HERE)",
+          draft_skip_reason(False, QUEUED_ONLY), DRAFT_SKIP_QUEUED)
+    check("an ARMED-but-not-queued PR is not drafted",
+          draft_skip_reason(False, ARMED_ONLY), DRAFT_SKIP_ARMED)
+    check("a review:pass non-draft PR is not drafted",
+          draft_skip_reason(False, REVIEW_PASS_ONLY), DRAFT_SKIP_REVIEW_PASS)
+    check("a FRESH unreviewed non-draft worker PR IS still drafted (original behaviour survives)",
+          draft_skip_reason(False, FRESH), None)
+    check("an already-draft PR is left alone", draft_skip_reason(True, FRESH),
+          DRAFT_SKIP_ALREADY)
+    check("an UNREADABLE review state is not drafted (unknown != safe to evict)",
+          draft_skip_reason(False, UNKNOWN_REVIEW_STATE), DRAFT_SKIP_QUEUE_UNKNOWN)
+    check("a queue_state this predicate was never taught is not drafted either",
+          draft_skip_reason(False, ReviewState("something-new", False, False)),
+          DRAFT_SKIP_QUEUE_UNKNOWN)
+    check("--no-draft-convert suppresses the conversion for a fresh PR too",
+          draft_skip_reason(False, FRESH, no_draft_convert=True), DRAFT_SKIP_OPERATOR)
+    check("...and --no-draft-convert is NOT what protects a queued PR (the predicate is)",
+          draft_skip_reason(False, QUEUED_ONLY, no_draft_convert=False), DRAFT_SKIP_QUEUED)
+    check("every draft-skip reason carries its own operator guidance",
+          sorted(DRAFT_SKIP_GUIDANCE) == sorted({DRAFT_SKIP_ALREADY, DRAFT_SKIP_QUEUED,
+                                                 DRAFT_SKIP_ARMED, DRAFT_SKIP_REVIEW_PASS,
+                                                 DRAFT_SKIP_QUEUE_UNKNOWN, DRAFT_SKIP_OPERATOR}),
+          True)
+
+    # BEHAVIOURAL: the eviction is `gh pr ready <n> --undo`. Assert the COMMAND, not the reason —
+    # a predicate that returns the right code but still shells out would pass every check above.
+    issued = []
+
+    def recording_runner(args, *, check=True):
+        issued.append(list(args))
+        return subprocess.CompletedProcess(list(args), 0, "", "")
+
+    def issued_for(state, *, is_draft=False, apply_changes=True, no_draft_convert=False):
+        issued.clear()
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            _ensure_draft("sparq-org/sparq", 4185, is_draft, apply_changes, state=state,
+                          no_draft_convert=no_draft_convert, runner=recording_runner)
+        return list(issued), buffer.getvalue()
+
+    undo_cmd = ["pr", "ready", "4185", "-R", "sparq-org/sparq", "--undo"]
+    check("APPLY on a QUEUED PR issues NO `gh pr ready --undo` (the eviction command)",
+          issued_for(QUEUED_ONLY)[0], [])
+    check("APPLY on an ARMED PR issues no eviction command", issued_for(ARMED_ONLY)[0], [])
+    check("APPLY on a review:pass PR issues no eviction command",
+          issued_for(REVIEW_PASS_ONLY)[0], [])
+    check("APPLY on an UNKNOWN-state PR issues no eviction command",
+          issued_for(UNKNOWN_REVIEW_STATE)[0], [])
+    check("APPLY on a FRESH unreviewed PR DOES issue the draft conversion (unchanged behaviour)",
+          issued_for(FRESH)[0], [undo_cmd])
+    check("--no-draft-convert suppresses even the fresh-PR conversion",
+          issued_for(FRESH, no_draft_convert=True)[0], [])
+    # The DRY-RUN line the issue was raised from: "DRY-RUN #4185: would convert to draft".
+    check("DRY RUN no longer proposes converting a QUEUED PR",
+          "would convert to draft" in issued_for(QUEUED_ONLY, apply_changes=False)[1], False)
+    check("...and still proposes it for a FRESH unreviewed PR",
+          "would convert to draft" in issued_for(FRESH, apply_changes=False)[1], True)
+
+    # `review_state` never raises and never reports NOT_QUEUED on a bad probe — a raise would
+    # abort the whole recovery, and a NOT_QUEUED would evict.
+    def failing_runner(args, *, check=True):
+        return subprocess.CompletedProcess(list(args), 1, "", "gh: HTTP 502")
+
+    def replying_runner(body):
+        return lambda args, *, check=True: subprocess.CompletedProcess(list(args), 0, body, "")
+
+    check("a FAILED graphql probe is UNKNOWN, never not-queued",
+          review_state("sparq-org/sparq", 4185, runner=failing_runner), UNKNOWN_REVIEW_STATE)
+    check("a malformed graphql body is UNKNOWN",
+          review_state("sparq-org/sparq", 4185, runner=replying_runner("{not json")),
+          UNKNOWN_REVIEW_STATE)
+    # A PARTIAL graphql error carries a fully-shaped `data` alongside `errors` — the discriminating
+    # fixture. A `"data": null` body would be UNKNOWN via the shape walk alone, so it would not
+    # prove the `errors` check does anything.
+    check("a graphql body with `errors` AND a well-shaped `data` is still UNKNOWN",
+          review_state("sparq-org/sparq", 4185, runner=replying_runner(
+              '{"data":{"repository":{"pullRequest":{"mergeQueueEntry":null,'
+              '"autoMergeRequest":null,"labels":{"nodes":[]}}}},'
+              '"errors":[{"message":"Something went wrong while executing your query"}]}')),
+          UNKNOWN_REVIEW_STATE)
+    # The DOCUMENT must ask for exactly what the parser requires: deleting `mergeQueueEntry` from
+    # the query makes every response "partial", and the merge-queue signal disappears silently.
+    check("the graphql document selects exactly the fields the parser requires",
+          query_selected_fields(REVIEW_STATE_QUERY, "pullRequest"), set(_REVIEW_STATE_FIELDS))
+    check("  ...and the selection extractor is not vacuous (it finds the nested `state`)",
+          query_selected_fields(REVIEW_STATE_QUERY, "mergeQueueEntry"), {"state"})
+    check("a payload MISSING mergeQueueEntry is UNKNOWN, never not-queued",
+          parse_review_state({"data": {"repository": {"pullRequest": {
+              "autoMergeRequest": None, "labels": {"nodes": []}}}}}), UNKNOWN_REVIEW_STATE)
+    check("a null pullRequest is UNKNOWN",
+          parse_review_state({"data": {"repository": {"pullRequest": None}}}),
+          UNKNOWN_REVIEW_STATE)
+    check("a malformed target repo is UNKNOWN without any request",
+          review_state("not-a-repo", 4185, runner=failing_runner), UNKNOWN_REVIEW_STATE)
+    check("the REAL queued payload round-trips through review_state's transport too",
+          review_state("sparq-org/sparq", 4185, runner=replying_runner(REAL_QUEUED)),
+          ReviewState(QUEUE_QUEUED, False, True))
+    # The unprobed sentinel must be UNKNOWN: `backfill` skips the probe for an already-draft PR,
+    # and if the is_draft short-circuit were ever removed a NOT_QUEUED sentinel would evict.
+    check("the unprobed sentinel is UNKNOWN, so a lost is_draft short-circuit cannot evict",
+          UNKNOWN_REVIEW_STATE.queue_state, QUEUE_UNKNOWN)
+
+    # RECORDING AND DRAFTING ARE INDEPENDENT: every `_ensure_draft` call in `backfill` is a bare
+    # expression statement, so its result can never gate (or withhold) a provenance record. Two
+    # call sites — the already-recorded reconcile and the post-write one; a third, unreviewed one
+    # reds this.
+    backfill_tree = ast.parse(textwrap.dedent(inspect.getsource(backfill)))
+    ensure_calls = [n for n in ast.walk(backfill_tree) if isinstance(n, ast.Call)
+                    and getattr(n.func, "id", "") == "_ensure_draft"]
+    bare_calls = [n.value for n in ast.walk(backfill_tree) if isinstance(n, ast.Expr)
+                  and isinstance(n.value, ast.Call)
+                  and getattr(n.value.func, "id", "") == "_ensure_draft"]
+    check("every _ensure_draft call in backfill() is a bare statement — drafting can never "
+          "withhold a record",
+          (len(ensure_calls), len(bare_calls)), (2, 2))
+    check("every _ensure_draft call passes an explicit review `state=` (no default to forget)",
+          [sorted(k.arg for k in call.keywords) for call in ensure_calls],
+          [["no_draft_convert", "state"], ["no_draft_convert", "state"]])
+
+    # --- END TO END through backfill(): the obligation is "RECORDED but NOT drafted" -----------
+    # The unit checks above pin the predicate and the probe; this drives the REAL loop with the
+    # registry/gh boundary stubbed, so the live wiring (does backfill actually probe? does the
+    # record still get counted?) is asserted rather than assumed.
+    E2E_HEAD_QUEUED = "sparq-agent/issue-3404-16234567890-1"
+    E2E_HEAD_FRESH = "sparq-agent/issue-3405-16234567891-1"
+    e2e_logs = {"16234567890": prov_env(issue=3404, head=E2E_HEAD_QUEUED),
+                "16234567891": prov_env(issue=3405, head=E2E_HEAD_FRESH)}
+
+    def e2e_pull(number, head):
+        return {"number": number, "draft": False,
+                "head": {"ref": head, "repo": {"full_name": "sparq-org/sparq"}},
+                "user": {"login": "sparq-orchestrator[bot]"}}
+
+    def e2e_gh_json(args):
+        if "--slurp" in args:
+            return [[e2e_pull(9001, E2E_HEAD_QUEUED), e2e_pull(9002, E2E_HEAD_FRESH)]]
+        return [{"sha": "ab" * 20}]
+
+    def e2e_run_gh(args, *, check=True):
+        if list(args[:2]) == ["run", "view"]:
+            return subprocess.CompletedProcess(list(args), 0, e2e_logs.get(args[2], ""), "")
+        raise AssertionError(f"a DRY RUN must issue no mutating gh call, got {args}")
+
+    def e2e_no_write(*_args, **_kwargs):
+        raise AssertionError("a DRY RUN must never write a provenance record")
+
+    stub_worker_pr = types.SimpleNamespace(
+        LEDGER_REF="ledger", WorkerPrError=BackfillError,
+        provenance_path=lambda repo, number: f"orchestration/provenance/{number}.json",
+        _probe_registry_file=lambda repo, path, ref=None: (None, None),
+        account_hash=lambda account, salt: "deadbeefdeadbeef",
+        provenance_record=e2e_no_write)
+    e2e_state = {9001: QUEUED_ONLY, 9002: FRESH}
+    routing_toml = Path(tempfile.mkdtemp()) / "routing.toml"
+    routing_toml.write_text('[models.fable]\nprovider = "anthropic"\n', encoding="utf-8")
+    patched = ("_gh_json", "_run_gh", "_load_worker_pr", "_load_dispatch_claim", "review_state")
+    saved_globals = {name: globals()[name] for name in patched}
+    saved_salt = os.environ.get("PROVENANCE_SALT")
+    e2e_buffer = io.StringIO()
+    try:
+        globals().update(
+            _gh_json=e2e_gh_json, _run_gh=e2e_run_gh,
+            _load_worker_pr=lambda: stub_worker_pr,
+            _load_dispatch_claim=lambda: types.SimpleNamespace(
+                provenance_admission_error=lambda record, pr: None),
+            review_state=lambda repo, number, runner=None: e2e_state[number])
+        os.environ["PROVENANCE_SALT"] = "self-test-only"
+        with contextlib.redirect_stdout(e2e_buffer):
+            backfill("sparq-org/sparq", "jeswr/agent-account-registry", str(routing_toml),
+                     False)
+    finally:
+        globals().update(saved_globals)
+        if saved_salt is None:
+            os.environ.pop("PROVENANCE_SALT", None)
+        else:
+            os.environ["PROVENANCE_SALT"] = saved_salt
+    e2e = e2e_buffer.getvalue()
+    check("E2E: the QUEUED PR's provenance IS recorded",
+          "DRY-RUN #9001: would record" in e2e, True)
+    check("E2E: ...and it is NOT proposed for draft conversion (no queue eviction)",
+          "DRY-RUN #9001: would convert to draft" in e2e, False)
+    check("E2E: ...and the operator is told why",
+          "KEEP-PUBLISHED #9001: not converting to draft — it is IN THE MERGE QUEUE" in e2e, True)
+    check("E2E: the FRESH unreviewed PR is recorded AND still drafted",
+          ("DRY-RUN #9002: would record" in e2e,
+           "DRY-RUN #9002: would convert to draft" in e2e), (True, True))
+    check("E2E: BOTH records are counted — draft policy never withholds a record",
+          "backfill complete: would record 2, skipped 0, needs-human 0" in e2e, True)
 
     # --- effective ledger-first record + admission before any skip (sol #217) ------------------
     # The REAL review-loop admission function, imported — not a replica — so these red if the
@@ -1090,11 +1528,16 @@ def main():
                         help="target routing TOML (a local checkout path)")
     parser.add_argument("--apply", action="store_true",
                         help="actually write records + draft conversions (default: dry run)")
+    parser.add_argument("--no-draft-convert", action="store_true",
+                        help="record provenance ONLY; never touch draft state. Belt-and-braces "
+                             "over the review-state predicate, which already refuses to draft a "
+                             "queued/armed/review:pass PR (issue #726)")
     args = parser.parse_args()
     if args.self_test:
         return _self_test()
     try:
-        backfill(args.target_repo, args.registry_repo, args.routing_file, args.apply)
+        backfill(args.target_repo, args.registry_repo, args.routing_file, args.apply,
+                 no_draft_convert=args.no_draft_convert)
     except BackfillError as exc:
         print(f"backfill-provenance: {exc}", file=sys.stderr)
         return 1
