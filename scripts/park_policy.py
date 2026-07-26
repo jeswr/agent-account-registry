@@ -786,7 +786,7 @@ PARK_CAUSES = {
     "nochange": PARK_CLASS_CAPACITY,          # repeated clean model exits producing no change
     "gatefail": PARK_CLASS_CAPACITY,          # repeated local gate failures
     "cold-groom": PARK_CLASS_CAPACITY,        # groom's age/staleness hand-off (G3)
-    # The dispatcher's own crate-partition starvation (registry #718/#677): this PR is holding the
+    # The dispatcher's own crate-partition starvation (registry #677): this PR is holding the
     # serializing `__global__` partition, the issue lane planned NOTHING behind it, and parking it
     # provably frees that partition. It is a SCHEDULING action about the fleet, not a judgement
     # about the diff — which is exactly what makes it capacity-class. It must NEVER be allowed to
@@ -2020,7 +2020,7 @@ def _self_test():
           [PARK_CLASS_CAPACITY, PARK_CLASS_QUESTION])
     check("an unknown cause has NO class (callers treat it as a human question)",
           park_cause_class("not-a-cause"), None)
-    # registry #718: the dispatcher's crate-partition starvation park. It is a CAPACITY action
+    # registry #677: the dispatcher's crate-partition starvation park. It is a CAPACITY action
     # (a scheduling decision about the fleet, never a judgement about the diff), so it must land
     # on the MACHINE-owned soft hold and inherit the machine exit. If this ever flipped to the
     # question class the sweep would start writing `needs:user` — the terminal human hold

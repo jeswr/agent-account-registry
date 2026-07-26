@@ -531,7 +531,7 @@ jobs:
           review_items = []
           disarm_items = []
           snapshot_skips = []
-          # [registry #718] Per-repo starvation evidence for the CLAIM-side self-healing sweep:
+          # [registry #677] Per-repo starvation evidence for the CLAIM-side self-healing sweep:
           # how many READY issue rows the busy partition dropped behind a `__global__` occupant.
           # CLAIM cannot recompute this — the plan carries only the SURVIVORS, so without it
           # "planned == 0" cannot be told apart from "the backlog is empty", and the sweep must
@@ -642,7 +642,7 @@ jobs:
               # sibling lease (impl `<repo>#<issue>`, `review:`/`fix:`) on an item's package
               # defers it — the lanes share ONE crate-ownership view (the same ledger the
               # enumerator's superseded-until-sibling-resolves exclusion reads).
-              # [registry #718] `starvation` is filled BY the filter, at the branch that makes
+              # [registry #677] `starvation` is filled BY the filter, at the branch that makes
               # each drop decision — never recounted afterwards from a different view.
               starvation = {}
               repository["items"] = claim_mod.filter_busy_area_items(
