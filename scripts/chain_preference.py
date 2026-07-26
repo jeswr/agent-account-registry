@@ -83,6 +83,47 @@ The narrowing is deliberate and it is what keeps the original invariant's PURPOS
   there is nothing to check against the allow-list, and fail-closed means decline.
 * `requires` is still enforced, minus the lead itself — so a route must still offer everything else
   the preference depends on before its lead is added.
+* THE INJECTED LEAD IS STILL SUBJECT TO THE ROUTING TABLE'S TIER RULES. Today that means the
+  DOCS-ONLY rule (`DOCS_ONLY_MODELS`, below): a docs-only alias may be injected only into
+  `DOCS_ROLES`. See the next section — this bound was MISSING from the first cut of `inject_roles`
+  and is the reason the mechanism is not merely "re-ordering with extra steps".
+
+WHY INJECTION NEEDS THE TIER RULES RE-APPLIED AND RE-ORDERING DOES NOT
+----------------------------------------------------------------------
+`policy-resolve._reject_docs_only` enforces the 2026-07-18 directive ("terra / sonnet are docs-only")
+over the STATICALLY DECLARED `model_chain` of the defaults branch, of every `match_labels` route and
+of every non-`DOCS_ROLES` role route, at validation time, fail-closed.
+
+RE-ORDERING is bounded by that control for free: its precondition is `lead in chain`, so it can only
+ever permute a chain the control already accepted, and a permutation cannot introduce a model. That
+is why the original `lead in requires` invariant was quietly load-bearing for a control nobody had
+connected to it: a target CANNOT write `terra` into a non-docs route, because the registry refuses
+the table.
+
+INJECTION writes into the chain AFTER validation, so it is a strictly LARGER authority than the #730
+justification ("the target already writes `model_chain`, order included") covers — that argument is
+true for order and for which catalogued models a route names, and false for a model the registry
+would have refused. Without the bound below, a declaration reading
+
+    [[chain_preference]]
+    labels = ["area:gui"]; lead = "terra"; requires = ["terra", "opus5"]; inject_roles = ["impl"]
+
+resolves `role:impl` to `['terra', 'opus5']` on BOTH sides — so PLAN and CLAIM AGREE and
+`cross-resolver-agreement.py` reports nothing. That is the same no-symptom class `inject_roles` was
+written to close, re-created one layer up by the mechanism that closes it.
+
+The bound is applied at PARSE time, in THIS module, for two reasons:
+
+* PARSE, not resolve. A bad declaration must be refused when the table is READ. Declining the
+  injection at resolve time instead would let the table parse clean and silently produce a
+  different chain at dispatch — indistinguishable from a `requires` miss, and exactly the
+  "silently never fires" failure mode.
+* THIS module, not `policy-resolve`. `_reject_docs_only` is a CLAIM-side rule; `route-resolve.py`
+  (the PLAN side) has no docs-only rule at all. This module is the ONLY code both resolvers
+  execute, so it is the only seam where a refusal is guaranteed to be SYMMETRIC. Enforcing the
+  bound in `policy-resolve` alone would make CLAIM refuse while PLAN routed — not a closed hole
+  but a permanent per-tick `route-policy-failed` defer, i.e. the dispatch outage this whole module
+  exists to prevent.
 """
 
 # The REQUIRED key set of a `[[chain_preference]]` table.
@@ -97,6 +138,23 @@ OPTIONAL_PREFERENCE_FIELDS = frozenset({"inject_roles"})
 # adding a cross-provider rung would convert that visible stall into a silent hop to another
 # provider. Refused at PARSE time, so the prohibition cannot be bypassed by declaring it.
 INJECT_FORBIDDEN_ROLES = frozenset({"research", "review", "soundness"})
+# DOCS-ONLY model aliases (maintainer directive 2026-07-18): terra + sonnet may appear ONLY in a
+# docs-role route.
+#
+# THIS IS THE ONE DEFINITION. `policy-resolve.DOCS_ONLY_MODELS` / `.DOCS_ROLES` are ALIASES of these
+# very objects, not copies — asserted BY IDENTITY in that module's self-test, so re-declaring them
+# there reds. Two hand-maintained copies of one tier rule is the drift class registry #707/#712
+# exists to prevent, and here it would be worse than the usual case: the copies would sit either
+# side of the exact seam this bound closes, so adding a third docs-only alias to one of them would
+# silently re-open the injection bypass with nothing able to observe it.
+#
+# The MECHANISM owns them rather than the CLAIM-side validator because the mechanism is the only
+# code BOTH resolvers run — see "WHY INJECTION NEEDS THE TIER RULES RE-APPLIED" in the docstring.
+DOCS_ONLY_MODELS = frozenset({"terra", "sonnet"})
+# The roles whose routes may legitimately carry a docs-only alias — i.e. exactly the roles
+# `policy-resolve._reject_docs_only` exempts. A docs-only lead may name these in `inject_roles`,
+# and nothing else.
+DOCS_ROLES = frozenset({"docs"})
 
 
 class ChainPreferenceError(ValueError):
@@ -166,6 +224,28 @@ def parse_preferences(routing_doc, model_catalog):
                 f"could INJECT {lead!r} into a chain that deliberately excludes it (e.g. turning a "
                 f"single-provider escalating route into a cross-provider one) for EVERY role, "
                 f"instead of only the roles `inject_roles` names")
+        if lead in DOCS_ONLY_MODELS:
+            # THE TIER BOUND THE INJECTION AUTHORITY WAS MISSING (see the docstring section "WHY
+            # INJECTION NEEDS THE TIER RULES RE-APPLIED AND RE-ORDERING DOES NOT").
+            #
+            # `lead` is the ONLY model `apply_preferences` can ever add to a chain — the re-order
+            # arm returns a permutation and the inject arm prepends exactly `lead` — so bounding
+            # `lead` bounds the whole mechanism. The condition is the exact COMPLEMENT of
+            # `_reject_docs_only`'s exemption (`if role not in DOCS_ROLES`), and the `role` this
+            # allow-list is checked against at resolve time is the SAME role that decides that
+            # exemption, so the two controls cannot disagree about which routes are docs routes.
+            #
+            # A docs-only lead with NO `inject_roles` stays legal: that is re-ordering, which can
+            # only permute a chain `_reject_docs_only` already accepted.
+            outside = sorted(set(inject_roles) - DOCS_ROLES)
+            if outside:
+                raise ChainPreferenceError(
+                    f"{where}: lead {lead!r} is a DOCS-ONLY alias (maintainer directive "
+                    f"2026-07-18) and may be injected only into role(s) "
+                    f"{', '.join(sorted(DOCS_ROLES))} — inject_roles names {', '.join(outside)}, "
+                    f"which would place a docs-only model in a route that "
+                    f"policy-resolve._reject_docs_only refuses outright, and would do so where "
+                    f"PLAN and CLAIM AGREE so no divergence check could see it")
         unknown_models = sorted({lead, *requires} - set(model_catalog))
         if unknown_models:
             raise ChainPreferenceError(
@@ -243,8 +323,12 @@ def preference_labels(preferences):
 def preference_inject_roles(preferences):
     """The union of every `inject_roles` entry — the audit surface for "where may a chain GROW".
 
-    Consumers assert this against the routing table's declared role routes, so an `inject_roles`
-    naming a role that does not exist is caught as the typo it is rather than silently never firing.
+    A consumer MAY assert this against its routing table's declared role routes, so that an
+    `inject_roles` naming a role that does not exist is caught as the typo it is rather than
+    silently never firing. sparq's resolver does; THIS repository's resolvers do not (a typo'd
+    `inject_roles = ["imple"]` parses clean here and never fires). Stated rather than implied,
+    because the earlier wording claimed the assertion as a property of the mechanism when it is a
+    property of one consumer.
     """
     return sorted({role for _labels, _lead, _requires, inject in preferences for role in inject})
 
@@ -392,6 +476,75 @@ def _self_test():  # noqa: C901 — a flat sequence of assertions, deliberately 
             "must also appear in requires",
             one({"labels": ["area:gui"], "lead": "sol", "requires": ["opus5"],
                     "inject_roles": ["impl"]}))
+
+    # ---- [OPUS-5] THE DOCS-ONLY TIER BOUND ON INJECTION.
+    # Injection is the one arm that can put a model into a chain the routing table never declared,
+    # so `policy-resolve._reject_docs_only` — which only ever inspected STATICALLY DECLARED chains —
+    # is re-applied to the lead here, at PARSE time, in the module BOTH resolvers run.
+    chk("the docs-only tier rule is defined HERE, and this module is what both resolvers share "
+        "(policy-resolve aliases these objects; see its identity assertion)",
+        (sorted(DOCS_ONLY_MODELS), sorted(DOCS_ROLES)), (["sonnet", "terra"], ["docs"]))
+    for docs_model in sorted(DOCS_ONLY_MODELS):
+        for target_role in ("impl", "perf", "site", "ci", "gui"):
+            rejects(f"a DOCS-ONLY lead {docs_model!r} injected into role:{target_role} is REFUSED "
+                    f"at parse time (it would lead a route _reject_docs_only refuses outright, and "
+                    f"PLAN and CLAIM would AGREE on it)",
+                    "is a DOCS-ONLY alias",
+                    one({"labels": ["area:gui"], "lead": docs_model,
+                            "requires": [docs_model, "opus5"], "inject_roles": [target_role]}))
+        rejects(f"...and a MIXED allow-list is refused too — naming {'docs'!r} does not license "
+                f"the non-docs entries alongside it",
+                "is a DOCS-ONLY alias",
+                one({"labels": ["area:docs"], "lead": docs_model,
+                        "requires": [docs_model, "opus5"], "inject_roles": ["docs", "impl"]}))
+    # ...and the two shapes that stay LEGAL, so the bound is a bound and not a ban. Without these
+    # rows a mutant that refuses EVERY docs-only lead would pass.
+    docs_inject = parse_preferences(
+        {"chain_preference": [{"labels": ["area:docs"], "lead": "terra",
+                               "requires": ["terra", "opus5"], "inject_roles": ["docs"]}]}, catalog)
+    chk("a docs-only lead injected into role:docs is ACCEPTED (the exemption _reject_docs_only "
+        "already grants the docs route, mirrored here)",
+        apply_preferences({"area:docs", "role:docs"}, ["opus5"], docs_inject, role="docs"),
+        ["terra", "opus5"])
+    reorder_only_docs = parse_preferences(
+        {"chain_preference": [{"labels": ["area:docs"], "lead": "terra",
+                               "requires": ["terra", "opus5"]}]}, catalog)
+    chk("a docs-only lead with NO inject_roles is ACCEPTED — re-ordering can only permute a chain "
+        "_reject_docs_only already accepted, so it needs no bound",
+        apply_preferences({"area:docs", "role:docs"}, ["opus5", "terra"], reorder_only_docs,
+                          role="docs"), ["terra", "opus5"])
+    chk("...and that same re-order-only declaration CANNOT reach a non-docs chain (no lead in it, "
+        "no inject_roles authorising one)",
+        apply_preferences({"area:docs", "role:impl"}, ["opus5"], reorder_only_docs, role="impl"),
+        ["opus5"])
+    chk("a NON-docs lead is unaffected by the bound",
+        sorted(preference_inject_roles(inj)), ["impl"])
+    # THE PROPERTY, ENUMERATED RATHER THAN ARGUED. For EVERY declaration this module accepts, no
+    # docs-only alias may reach a NON-docs role's chain. This is the row that reds if the parse-time
+    # refusal is deleted: the attack declaration then parses and the injection fires.
+    leaked = []
+    reached_docs = False
+    for probe_lead in sorted(DOCS_ONLY_MODELS | {"sol"}):
+        for probe_roles in (None, ["impl"], ["docs"], ["docs", "impl"], ["perf"], ["gui"]):
+            entry = {"labels": ["area:gui"], "lead": probe_lead,
+                     "requires": [probe_lead, "opus5"]}
+            if probe_roles is not None:
+                entry["inject_roles"] = list(probe_roles)
+            try:
+                probe = parse_preferences({"chain_preference": [entry]}, catalog)
+            except ChainPreferenceError:
+                continue
+            for probe_role in ("impl", "perf", "docs", "ci", "gui", None):
+                out = apply_preferences({"area:gui", f"role:{probe_role}"}, ["opus5"], probe,
+                                        role=probe_role)
+                if probe_role in DOCS_ROLES and set(out) & DOCS_ONLY_MODELS:
+                    reached_docs = True
+                if probe_role not in DOCS_ROLES and set(out) & DOCS_ONLY_MODELS:
+                    leaked.append((probe_lead, probe_roles, probe_role, out))
+    chk("NO declaration this module ACCEPTS can place a docs-only alias in a non-docs role's chain",
+        leaked, [])
+    chk("...and the sweep above is NOT vacuous: it did observe a docs-only alias legitimately "
+        "entering a role:docs chain", reached_docs, True)
 
     # ---- FAIL-CLOSED VALIDATION. Every one of these would otherwise be a silent PLAN/CLAIM split.
     def parsed(entry, cat=catalog):

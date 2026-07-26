@@ -310,6 +310,44 @@ escalate = true
     chk("no security + no matching role -> defaults",
         resolve(["area:usage"], reordered), (["fable"], "default-agent", False))
 
+    # ---- [OPUS-5] THE DOCS-ONLY BOUND ON `inject_roles`, ON THE PLAN SIDE.
+    # THIS resolver has NO docs-only rule of its own: `_reject_docs_only` is a CLAIM-side
+    # (policy-resolve) control over statically declared chains. That is precisely why the bound on
+    # the INJECTED lead lives in the SHARED `chain_preference` module — enforcing it only on the
+    # CLAIM side would make CLAIM refuse while PLAN routed, which `_route_matches` turns into a
+    # permanent per-tick `route-policy-failed` defer rather than a closed hole. These rows assert
+    # PLAN refuses the identical declaration, so the two sides cannot split.
+    _pref_doc = _copy.deepcopy(doc)
+    _pref_doc["route"] = [r for r in _pref_doc["route"] if "match_labels" not in r]
+    _attack = _copy.deepcopy(_pref_doc)
+    _attack["chain_preference"] = [{"labels": ["area:gui"], "lead": "terra",
+                                    "requires": ["terra", "opus5"], "inject_roles": ["impl"]}]
+    raises("PLAN refuses a DOCS-ONLY lead injected into role:impl, at parse time — the same "
+           "refusal the CLAIM-side resolver gives, from the same shared module",
+           _PREF.ChainPreferenceError,
+           lambda: resolve(["area:gui", "role:impl"], _attack))
+    raises("...and refuses it for an issue the selector does NOT even match, because a bad "
+           "DECLARATION is refused when the table is READ, not when an issue happens to select it",
+           _PREF.ChainPreferenceError,
+           lambda: resolve(["area:usage", "role:impl"], _attack))
+    _docs_ok = _copy.deepcopy(_pref_doc)
+    _docs_ok["chain_preference"] = [{"labels": ["area:gui"], "lead": "terra",
+                                     "requires": ["terra", "opus5"], "inject_roles": ["docs"]}]
+    _docs_ok["route"] = [({**r, "model_chain": ["opus5"]} if r.get("role") == "docs" else r)
+                         for r in _docs_ok["route"]]
+    chk("...but a docs-only lead injected into role:docs still RESOLVES at PLAN (the bound mirrors "
+        "the _reject_docs_only EXEMPTION, so it is not a blanket ban)",
+        resolve(["area:gui", "role:docs"], _docs_ok)[0], ["terra", "opus5"])
+    # THE LIVE SHAPE sparq SHIPS: `lead = "sol"` + `inject_roles = ["impl"]`. Unchanged by the bound.
+    _live_shape = _copy.deepcopy(_pref_doc)
+    _live_shape["chain_preference"] = [{"labels": ["area:gui"], "lead": "sol",
+                                        "requires": ["sol", "opus5"], "inject_roles": ["impl"]}]
+    chk("the LIVE area:gui carve-out (lead = sol, inject_roles = [impl]) still injects sol-first "
+        "into the single-rung impl chain at PLAN",
+        resolve(["area:gui", "role:impl"], _live_shape)[0], ["sol", "opus5"])
+    chk("...and a non-gui impl issue is still OPUS5-ONLY under that same declaration",
+        resolve(["area:usage", "role:impl"], _live_shape)[0], ["opus5"])
+
     print("route-resolve self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 

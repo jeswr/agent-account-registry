@@ -368,6 +368,101 @@ def _self_test():  # noqa: C901 — a flat sequence of assertions
     chk("...and PLAN refuse identically, so the two still AGREE (fail-closed on BOTH sides)",
         compare(banned), [])
 
+    # (3d) [OPUS-5] THE DOCS-ONLY BOUND ON INJECTION, AND — the load-bearing half — ITS SYMMETRY.
+    #
+    # `policy-resolve._reject_docs_only` enforces the 2026-07-18 docs-only directive over
+    # STATICALLY DECLARED chains. `inject_roles` writes the lead into the chain AFTER that, so
+    # before the parse-time bound a table could lead `role:impl` with `terra` and BOTH resolvers
+    # would return `['terra', 'opus5']` — agreeing, so every check in this file passed. The bound
+    # lives in the SHARED `chain_preference` module for exactly that reason: PLAN
+    # (`route-resolve.py`) has no docs-only rule of its own, so a CLAIM-only fix would trade a
+    # silent bypass for a permanent `route-policy-failed` defer.
+    docs_attack = tomllib.loads(_single + GUI_DECLARATION_INJECT.replace(
+        'lead         = "sol"\nrequires     = ["sol", "opus5"]',
+        'lead         = "terra"\nrequires     = ["terra", "opus5"]', 1))
+    assert docs_attack["chain_preference"][0]["lead"] == "terra", \
+        "the docs-only attack fixture is stale — it no longer declares a docs-only lead"
+    chk("a docs-only lead injected into role:impl makes CLAIM refuse",
+        _claim(("area:gui", "role:impl"), docs_attack)[0], "refused")
+    chk("...and makes PLAN refuse", _plan(_ROUTE.resolve, ("area:gui", "role:impl"),
+                                          docs_attack)[0], "refused")
+    chk("...so PLAN and CLAIM still AGREE on EVERY matrix row (a one-sided refusal here would be "
+        "a permanent per-tick route-policy-failed defer, not a closed hole)",
+        compare(docs_attack), [])
+    # WHY a one-sided refusal is unconstructible, asserted rather than left to inspection: BOTH
+    # sides' refusal is raised by the SAME `ChainPreferenceError` from the SAME shared module —
+    # PLAN propagates it, CLAIM re-raises it as a PolicyError whose `__cause__` is that very error.
+    def _refusal_origin():
+        try:
+            _ROUTE.resolve(["area:gui", "role:impl"], copy.deepcopy(docs_attack))
+        except Exception as exc:  # noqa: BLE001 — the TYPE is the assertion
+            plan_origin = type(exc).__name__
+        else:
+            plan_origin = "ROUTED"
+        try:
+            _POLICY.resolve(PROBE_REPO, ["area:gui", "role:impl"], PROBE_POLICY,
+                            copy.deepcopy(docs_attack))
+        except Exception as exc:  # noqa: BLE001
+            claim_origin = type(exc.__cause__).__name__ if exc.__cause__ else type(exc).__name__
+        else:
+            claim_origin = "ROUTED"
+        return plan_origin, claim_origin
+
+    chk("both refusals originate in the SHARED parse-time module — which is WHY a split is "
+        "unconstructible, rather than merely absent from today's fixtures",
+        _refusal_origin(), ("ChainPreferenceError", "ChainPreferenceError"))
+    # THE SWEEP. Every (lead, inject_roles) shape, decided by BOTH resolvers. The first row is the
+    # symmetry property; the second pins WHICH shapes are refused, so a mutant that deletes the
+    # bound reds here (the docs-only-into-non-docs rows become "routed") instead of passing because
+    # both sides agreed on the wrong answer.
+    def _both(lead, requires, inject_roles):
+        decl = f'\n[[chain_preference]]\nlabels = ["area:gui"]\nlead = "{lead}"\n' \
+               f'requires = {json.dumps(requires)}\n'
+        if inject_roles is not None:
+            decl += f'inject_roles = {json.dumps(inject_roles)}\n'
+        doc = tomllib.loads(_single + decl)
+        role_labels = ("area:gui", "role:docs") if inject_roles == ["docs"] \
+            else ("area:gui", "role:impl")
+        return (_plan(_ROUTE.resolve, role_labels, doc)[0], _claim(role_labels, doc)[0],
+                compare(doc))
+
+    sweep = {
+        "terra lead -> role:impl": ("terra", ["terra", "opus5"], ["impl"]),
+        "sonnet lead -> role:impl": ("sonnet", ["sonnet", "opus5"], ["impl"]),
+        "terra lead -> role:impl AND role:docs": ("terra", ["terra", "opus5"], ["docs", "impl"]),
+        "terra lead -> role:docs only": ("terra", ["terra", "opus5"], ["docs"]),
+        "terra lead, NO inject_roles (re-order only)": ("terra", ["terra", "opus5"], None),
+        "sol lead -> role:impl (THE LIVE SHAPE)": ("sol", ["sol", "opus5"], ["impl"]),
+        "sol lead, NO inject_roles": ("sol", ["sol", "opus5"], None),
+    }
+    outcomes = {name: _both(*args) for name, args in sweep.items()}
+    chk("SYMMETRY: for every (lead, inject_roles) shape, PLAN and CLAIM reach the SAME outcome — "
+        "one resolver refusing while the other accepts is not merely absent, it is impossible "
+        "because the refusal is decided by the one module they share",
+        sorted(name for name, (plan, claim, _rows) in outcomes.items() if plan != claim), [])
+    chk("...and no shape produces a matrix disagreement on any other row either",
+        sorted(name for name, (_p, _c, rows) in outcomes.items() if rows), [])
+    chk("...and the REFUSED set is exactly the docs-only-lead-into-a-non-docs-role shapes (this is "
+        "the row that reds if the parse-time bound is deleted)",
+        sorted(name for name, (plan, _c, _r) in outcomes.items() if plan == "refused"),
+        sorted(["terra lead -> role:impl", "sonnet lead -> role:impl",
+                "terra lead -> role:impl AND role:docs"]))
+    # NON-VACUITY of the accepted rows: they must actually ROUTE, and route to the intended chain.
+    chk("the LIVE sol declaration is untouched by the bound — still sol-first at CLAIM and PLAN",
+        (chain(single_inject, ("area:gui", "role:impl")),
+         _plan(_ROUTE.resolve, ("area:gui", "role:impl"), single_inject)[1][0]),
+        (["sol", "opus5"], ["sol", "opus5"]))
+    docs_legit = tomllib.loads(_single + GUI_DECLARATION_INJECT.replace(
+        'lead         = "sol"\nrequires     = ["sol", "opus5"]\ninject_roles = ["impl"]',
+        'lead         = "terra"\nrequires     = ["terra", "opus5"]\ninject_roles = ["docs"]', 1))
+    docs_legit["route"] = [({**r, "model_chain": ["opus5"]} if r.get("role") == "docs" else r)
+                           for r in docs_legit["route"]]
+    chk("a docs-only lead injected into role:docs ROUTES, identically on both sides (the bound is "
+        "the _reject_docs_only exemption mirrored, not a ban on docs-only leads)",
+        (chain(docs_legit, ("area:gui", "role:docs")),
+         _plan(_ROUTE.resolve, ("area:gui", "role:docs"), docs_legit)[1][0]),
+        (["terra", "opus5"], ["terra", "opus5"]))
+
     # (4) NON-VACUITY OF THE HARNESS ITSELF. Give PLAN a resolver that knows a rule CLAIM does not
     # — the exact sparq #4211 shape, a carve-out implemented only in the target's Python — and the
     # comparison MUST report it. Without this the whole harness could be a function that returns

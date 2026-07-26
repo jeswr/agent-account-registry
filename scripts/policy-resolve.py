@@ -54,9 +54,16 @@ TRUST_MODES = {"collaborators"}
 # carrying one is a routing-document defect and fails CLOSED at validation time — structural
 # enforcement for ROUTING (sol r2 f3), mirroring the review-loop exclusion in worker-pr.py
 # ESCALATION_LADDERS / dispatch-claim.py REVIEW_CHAIN+FIX_CHAIN / review-fix.yml.
-DOCS_ONLY_MODELS = frozenset({"terra", "sonnet"})
+#
+# [OPUS-5] IMPORTED, never re-declared. `chain_preference` re-applies this same rule to an INJECTED
+# chain lead — the one thing that can put a model into a resolved chain that `_reject_docs_only`
+# below never saw, because injection happens AFTER validation. Two copies of the list would put the
+# CLAIM-side control and the injection bound either side of the very seam the bound closes: add a
+# third docs-only alias to one copy and the bypass silently returns. The self-test asserts these are
+# the SAME objects, so re-declaring them here reds.
+DOCS_ONLY_MODELS = _chain_preference.DOCS_ONLY_MODELS
 # Roles whose routes may legitimately carry the docs-only aliases.
-DOCS_ROLES = frozenset({"docs"})
+DOCS_ROLES = _chain_preference.DOCS_ROLES
 POLICY_FIELDS = {
     "enabled",
     "routing",
@@ -838,6 +845,56 @@ agent = "docs-agent"
     rejects("a preference naming an uncatalogued model REFUSES to resolve",
             "chain_preference is invalid",
             lambda: resolve("sparq-org/sparq", ["area:gui", "role:impl"], policy, ghost_pref))
+    # ---- [OPUS-5] THE DOCS-ONLY BOUND ON `inject_roles`, END TO END THROUGH resolve().
+    # `_reject_docs_only` above inspects STATICALLY DECLARED chains only. `inject_roles` writes the
+    # lead into the chain AFTER that validation, so without the parse-time bound in
+    # chain_preference a table could lead `role:impl` with `terra` — a route the very same
+    # `_reject_docs_only` refuses outright when it is DECLARED — and, because the target's PLAN
+    # resolver reads the identical declaration, both sides would AGREE on it and no divergence
+    # check would fire. Asserted here, on the CLAIM side, and mirrored in route-resolve (PLAN) and
+    # cross-resolver-agreement (symmetry).
+    check("the docs-only tier rule is the SAME OBJECT as the shared mechanism's, not a second copy "
+          "(re-declaring it here would let the two drift either side of the injection bound)",
+          (DOCS_ONLY_MODELS is _chain_preference.DOCS_ONLY_MODELS,
+           DOCS_ROLES is _chain_preference.DOCS_ROLES), (True, True))
+    docs_lead = copy.deepcopy(pref_routing)
+    docs_lead["models"]["terra"] = {"provider": "openai"}
+    docs_lead["route"][0]["model_chain"] = ["opus5"]      # role = impl, single-rung (registry #738)
+    statically_declared = copy.deepcopy(docs_lead)
+    statically_declared["route"][0]["model_chain"] = ["terra", "opus5"]
+    rejects("BASELINE — a STATICALLY declared docs-only lead on role:impl is refused (this is the "
+            "control `inject_roles` must not be able to route around)", "docs-only",
+            lambda: resolve("sparq-org/sparq", ["role:impl"], policy, statically_declared))
+    injected = copy.deepcopy(docs_lead)
+    injected["chain_preference"] = [{"labels": ["area:gui"], "lead": "terra",
+                                     "requires": ["terra", "opus5"], "inject_roles": ["impl"]}]
+    rejects("an INJECTED docs-only lead on role:impl is refused too, at PARSE time — the same "
+            "outcome as the statically declared form, which is the whole point",
+            "chain_preference is invalid",
+            lambda: resolve("sparq-org/sparq", ["area:gui", "role:impl"], policy, injected))
+    rejects("...and the table is refused for EVERY issue that reads it, not only the selected "
+            "ones — a bad DECLARATION is a table defect, not a per-issue routing surprise",
+            "chain_preference is invalid",
+            lambda: resolve("sparq-org/sparq", ["area:sparq-core", "role:impl"], policy, injected))
+    docs_target = copy.deepcopy(docs_lead)
+    docs_target["chain_preference"] = [{"labels": ["area:gui"], "lead": "terra",
+                                        "requires": ["terra", "opus5"], "inject_roles": ["docs"]}]
+    docs_target["route"][2]["model_chain"] = ["opus5"]    # the docs role route, single-rung
+    check("a docs-only lead injected into role:docs still RESOLVES (the bound is the "
+          "_reject_docs_only exemption, mirrored — not a blanket ban on docs-only leads)",
+          resolve("sparq-org/sparq", ["area:gui", "role:docs"], policy,
+                  docs_target)["model_chain"], ["terra", "opus5"])
+    # THE LIVE DECLARATION IS UNTOUCHED. `lead = "sol"` + `inject_roles = ["impl"]` is the shape
+    # sparq ships for the area:gui carve-out; the bound must not perturb it.
+    live_shape = copy.deepcopy(docs_lead)
+    live_shape["chain_preference"] = [{"labels": ["area:gui"], "lead": "sol",
+                                       "requires": ["sol", "opus5"], "inject_roles": ["impl"]}]
+    check("the LIVE area:gui declaration (lead = sol) resolves sol-first, unchanged by the bound",
+          (resolve("sparq-org/sparq", ["area:gui", "role:impl"], policy,
+                   live_shape)["model_chain"],
+           resolve("sparq-org/sparq", ["area:sparq-core", "role:impl"], policy,
+                   live_shape)["model_chain"]),
+          (["sol", "opus5"], ["opus5"]))
 
     check("pure core leaves fixtures unchanged",
           policy == policy_before and routing == routing_before, True)
