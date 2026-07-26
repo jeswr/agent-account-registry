@@ -151,16 +151,6 @@
    "expires_at": 1785098617
   },
   {
-   "account": "488920c2efe2b3fb",
-   "claim_id": "862ffec39bfe4696bd518dacef9b778c",
-   "holder": "review:sparq-org/sparq#4201@dispatch-30215542531.1",
-   "package": "ci-fragments",
-   "role": "review",
-   "model": "opus5",
-   "issued_at": 1785092325,
-   "expires_at": 1785096525
-  },
-  {
    "account": "9e13ea21abf27e68",
    "claim_id": "a0d2fb21753146aebe94db8693f25372",
    "holder": "fix:sparq-org/sparq#3436@dispatch-30215867662.1",
