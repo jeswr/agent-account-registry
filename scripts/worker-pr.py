@@ -2955,6 +2955,14 @@ def needs_user(repo, pr_number, reason, issue=None, alert_repo=None, alert_token
                          f"{label_note}{generation_marker}")
                 if not vetoed:
                     set_review_state(repo, pr_number, "needs-user")
+                # ROUND-2 REVIEW, blocking finding 1. This write is INSIDE the callback because it
+                # is a release trigger in its own right: #683's predicate frees a PR's crates on
+                # `needs:*` on the LINKED SOURCE ISSUE (dispatch-claim busy_packages_of_pulls,
+                # disjunct D2), and worker-issue.PARK_STATUS_LABELS maps "needs-user" -> the
+                # literal `needs:user`. It used to sit AFTER the disarm branch, so the vetoed path
+                # wrote it with no latch read at all.
+                if issue:
+                    _load_worker_issue().set_status(repo, issue, "needs-user")
 
             # #684 PARK PATH 1 of 3 (capacity ladder terminal). The latch retraction is ordered
             # AFTER the veto probe and BEFORE every durable park artifact — the RECEIPT included,
@@ -2965,15 +2973,25 @@ def needs_user(repo, pr_number, reason, issue=None, alert_repo=None, alert_token
             # QUIETLY forever, leaving the PR permanently unparked-and-armed with no retry. This
             # way a ParkDisarmError leaves NOTHING written — no comment, no receipt, no label, no
             # generation consumed — so the next tick retries the whole park cleanly.
-            # A VETOED park writes no PR label, so it releases no crate and needs no disarm:
-            # retracting an arm on a PR a human has just explicitly unparked would be the machine
-            # overriding the human, which is what invariant 2 exists to prevent.
-            if vetoed:
+            # ROUND-2 REVIEW, blocking finding 1 — the previous rule here was WRONG. It read: "a
+            # VETOED park writes no PR label, so it releases no crate and needs no disarm". That is
+            # a non-sequitur, because the PR label is not the only release trigger: the issue-side
+            # `needs:user` above is disjunct D2 of the same predicate, and the two vetoes sit on
+            # DIFFERENT surfaces with DIFFERENT timelines (the PR veto probes `review:needs-user`
+            # on the PR; worker-issue's probes `needs:user` on the ISSUE). A human who unparks only
+            # the PR — the normal gesture — trips the first and not the second, so the old branch
+            # wrote `needs:user` to the source issue with ZERO latch reads and ZERO retractions.
+            # The rule is therefore over the WRITES ATTEMPTED, not over one surface's veto: disarm
+            # whenever any release trigger may land. Only a fully label-less park — PR veto standing
+            # AND no linked issue — skips it, because then nothing frees a crate.
+            # When both vetoes turn out to stand we will have disarmed without any label landing.
+            # That is the safe direction and it is deliberate: an unparked-and-UNARMED PR still
+            # reserves its crates and a human can re-arm it, whereas a parked-and-ARMED PR merges
+            # into a crate the partition has already handed to a sibling.
+            if vetoed and not issue:
                 apply_terminal_park()
             else:
                 disarm_before_park(repo, pr_number, apply_terminal_park)
-            if issue:
-                _load_worker_issue().set_status(repo, issue, "needs-user")
             _ops_alert(alert_repo, alert_token,
                        f"⚠️ Review loop needs a human — {repo}#{pr_number}",
                        f"> 🤖 SPARQ agent — {reason} (readmitted and exhausted "
@@ -3041,10 +3059,15 @@ def needs_user(repo, pr_number, reason, issue=None, alert_repo=None, alert_token
                  f"> 🤖 SPARQ agent — the autonomous review loop stopped: {reason}\n\n"
                  f"@{handle} this pull request needs a human decision. It remains a DRAFT and "
                  "will not be auto-armed.")
+        # ROUND-2 REVIEW: inside the callback for the same reason as path 1 — `needs:user` on the
+        # source issue is release-trigger disjunct D2, so it belongs on the proven-disarmed side of
+        # the primitive rather than merely after it. This path always disarmed (no veto probe), so
+        # the ordering was already correct; putting the write here makes it ASSERTED by the same
+        # ordered journal instead of true by statement adjacency.
+        if issue:
+            _load_worker_issue().set_status(repo, issue, "needs-user")
 
     disarm_before_park(repo, pr_number, apply_question_park)
-    if issue:
-        _load_worker_issue().set_status(repo, issue, "needs-user")
     # Reuse the rolling ops-alert posture (usage-alert.py): one deduped registry issue.
     _ops_alert(alert_repo, alert_token,
                f"⚠️ Review loop needs a human — {repo}#{pr_number}",
@@ -5639,6 +5662,13 @@ def _self_test():
                 park_route_calls.append(("issue-status-vetoed", issue, status))
                 return
             park_route_calls.append(("issue-status", issue, status))
+            # ROUND-2 REVIEW: the issue-side write goes into the ORDERED latch journal too, not
+            # only into park_route_calls. `needs:user` on the source issue is release-trigger
+            # disjunct D2, so "did a proven disarm precede it" has to be a red assertion. Before
+            # this, park_order recorded PR-side artifacts only, and the whole vetoed path could
+            # write a release trigger with an EMPTY latch journal while every test stayed green.
+            if label is not None:
+                park_order.append(("ISSUE-PARK-LABEL", issue, label))
 
     # Round-4 finding 2 (RECEIPT-FIRST): the _comment mock records into the SAME ordered call
     # list as the label writes, so every capacity-park expectation below asserts the CALL
@@ -5972,18 +6002,21 @@ def _self_test():
               "gone BEFORE review:parked lands",
               park_order,
               [("latch-read", 41), ("retract", "disable-auto", "PR_node41"),
-               ("latch-read", 41), ("receipt",), ("PR-PARK-LABEL", "parked")])
+               ("latch-read", 41), ("receipt",), ("PR-PARK-LABEL", "parked"),
+               ("ISSUE-PARK-LABEL", 7, "status:parked")])
         park_capacity(queued=True, auto=True)
         check("#684 path 2/3 (capacity park): a MERGE-QUEUE member is dequeued first, then "
               "un-armed, then parked",
               park_order,
               [("latch-read", 41), ("retract", "dequeue", "PR_node41"),
                ("retract", "disable-auto", "PR_node41"), ("latch-read", 41),
-               ("receipt",), ("PR-PARK-LABEL", "parked")])
+               ("receipt",), ("PR-PARK-LABEL", "parked"),
+               ("ISSUE-PARK-LABEL", 7, "status:parked")])
         # The idempotent case is the common one: an unarmed PR costs ONE read, no mutation.
         park_capacity()
         check("#684 path 2/3 (capacity park): an unarmed PR parks after one read, no mutation",
-              park_order, [("latch-read", 41), ("receipt",), ("PR-PARK-LABEL", "parked")])
+              park_order, [("latch-read", 41), ("receipt",), ("PR-PARK-LABEL", "parked"),
+                           ("ISSUE-PARK-LABEL", 7, "status:parked")])
 
         # --- PARK PATH 3 of 3: the question-class park (review:needs-user, unconditional) ---
         park_question(auto=True)
@@ -5991,10 +6024,12 @@ def _self_test():
               "review:needs-user lands",
               park_order,
               [("latch-read", 41), ("retract", "disable-auto", "PR_node41"),
-               ("latch-read", 41), ("PR-PARK-LABEL", "needs-user"), ("receipt",)])
+               ("latch-read", 41), ("PR-PARK-LABEL", "needs-user"), ("receipt",),
+               ("ISSUE-PARK-LABEL", 7, "needs:user")])
         park_question()
         check("#684 path 3/3 (question park): an unarmed PR parks after one read, no mutation",
-              park_order, [("latch-read", 41), ("PR-PARK-LABEL", "needs-user"), ("receipt",)])
+              park_order, [("latch-read", 41), ("PR-PARK-LABEL", "needs-user"), ("receipt",),
+                           ("ISSUE-PARK-LABEL", 7, "needs:user")])
 
         # --- PARK PATH 1 of 3: the capacity-ladder TERMINAL escalation ---
         # Drive the ladder to its terminal generation: a human readmission window plus one
@@ -6016,7 +6051,65 @@ def _self_test():
               "the terminal review:needs-user lands",
               park_order,
               [("latch-read", 41), ("retract", "disable-auto", "PR_node41"),
-               ("latch-read", 41), ("receipt",), ("PR-PARK-LABEL", "needs-user")])
+               ("latch-read", 41), ("receipt",), ("PR-PARK-LABEL", "needs-user"),
+               ("ISSUE-PARK-LABEL", 7, "needs:user")])
+
+        # --- ROUND-2 REVIEW, BLOCKING FINDING 1: the PR-side-VETOED terminal park -------------
+        # The reviewer's counterexample, made a test. The old branch read "a VETOED park writes no
+        # PR label, so it releases no crate and needs no disarm" — but the very next statement
+        # wrote `needs:user` to the SOURCE ISSUE, which is release-trigger disjunct D2 of the same
+        # #683 predicate. The two vetoes sit on DIFFERENT surfaces with DIFFERENT timelines, so a
+        # human who unparks only the PR (the normal gesture) trips the PR veto and NOT the issue
+        # one, and the machine then wrote a release trigger with an empty latch journal.
+        #
+        # THE FIXTURE DISCRIMINATES, which the pre-existing (e)/(j) fixtures did not: they unlabel
+        # `review:needs-user` on PR 41 **and** `needs:user` on issue 7, so BOTH writes are
+        # suppressed and the case passes under the wrong reading too. Here ONLY the PR is
+        # unparked, so the issue write genuinely lands.
+        arm_park_latch(auto=True)
+        park_route_state["timelines"] = {
+            # The sticky human unpark of the TERMINAL label is dated BEFORE the review:parked
+            # unlabel on purpose: it vetoes the PR-side `review:needs-user` write without moving
+            # the ladder's readmission window (still 16:36:56Z), so the ladder still reaches its
+            # gen-2 terminal exactly as in the test above.
+            41: [labeled("review:parked", "2026-07-22T16:00:00Z"),
+                 unlabel("review:needs-user", "2026-07-22T16:20:00Z"),
+                 unlabel("review:parked", "2026-07-22T16:36:56Z")],
+            7: [],   # ...and NOTHING on the issue, so `needs:user` there is NOT vetoed
+        }
+        park_route_state["comments"] = [
+            {"user": {"login": bot},
+             "body": f"x {PARK_GENERATION_MARKER} gen=1 cutoff={PARK_WINDOW_NONE} -->"}]
+        park_route_calls.clear()
+        park_route_comments.clear()
+        needs_user("o/r", 41, "budget spent again", issue=7, park_class="capacity",
+                   bot_login=bot)
+        check("#684 round-2 (PR-side-vetoed terminal): the PR label IS suppressed — the fixture "
+              "reaches the branch under test",
+              [call for call in park_route_calls if call[0] == "pr-state"], [])
+        check("#684 round-2 (PR-side-vetoed terminal): the issue-side needs:user DOES land here, "
+              "so the fixture discriminates (both-surfaces-vetoed fixtures prove nothing)",
+              ("issue-status", 7, "needs-user") in park_route_calls, True)
+        check("#684 round-2 (PR-side-vetoed terminal): a PR-side-VETOED park still retracts the "
+              "latch and PROVES it gone BEFORE writing needs:user to the SOURCE ISSUE — the "
+              "release trigger #683 consumes on its second disjunct",
+              park_order,
+              [("latch-read", 41), ("retract", "disable-auto", "PR_node41"),
+               ("latch-read", 41), ("receipt",), ("ISSUE-PARK-LABEL", 7, "needs:user")])
+        # ...and a park that writes NO release trigger on EITHER surface still does no latch work:
+        # retracting an arm from a PR a human unparked, when nothing frees a crate, would be the
+        # machine overriding the human for no safety gain.
+        arm_park_latch(auto=True)
+        park_route_state["comments"] = [
+            {"user": {"login": bot},
+             "body": f"x {PARK_GENERATION_MARKER} gen=1 cutoff={PARK_WINDOW_NONE} -->"}]
+        park_route_calls.clear()
+        park_route_comments.clear()
+        needs_user("o/r", 41, "budget spent again", issue=None, park_class="capacity",
+                   bot_login=bot)
+        check("#684 round-2 (fully label-less terminal): PR veto standing AND no linked issue => "
+              "no release trigger, so NO latch read and NO retraction",
+              park_order, [("receipt",)])
 
         # --- THE HAZARD ITSELF: a latch that cannot be retracted must leave the PR
         # UNPARKED-AND-ARMED (still reserving its crates), never parked-and-armed. This is the
@@ -6125,11 +6218,14 @@ def _self_test():
         park_route_calls.clear()
         arm_park_latch(auto=True)
         needs_user("o/r", 41, "budget spent", issue=7, park_class="capacity", bot_login=bot)
-        check("#684: a sticky-veto-SUPPRESSED park applies no PR label and therefore performs "
-              "NO retraction (the machine never disarms a PR the human just unparked)",
+        check("#684: a sticky-veto-SUPPRESSED capacity park applies no PR label and therefore "
+              "performs NO retraction (the machine never disarms a PR the human just unparked). "
+              "ROUND-2: its issue-side write is `status:parked`, which is NOT a `needs:*` label "
+              "and so is NOT a #683 release trigger — that is why THIS path still skips the "
+              "disarm while the TERMINAL path above no longer can",
               ([entry for entry in park_order if entry[0] != "receipt"],
                any(call[0] == "pr-state" for call in park_route_calls)),
-              ([], False))
+              ([("ISSUE-PARK-LABEL", 7, "status:parked")], False))
         park_route_state["timelines"].clear()
         park_route_state["comments"] = []
         arm_park_latch()
