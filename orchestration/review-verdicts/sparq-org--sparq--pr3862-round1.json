@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3862,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "74aa3dbd4619d627af84ca75f77bb1e2fb44046e",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The dispatch branch emits `type=raw,value=${{ needs.setup.outputs.version }}` and `setup.outputs.version` is the unconstrained required `inputs.tag`. Therefore a manual dispatch with `tag=latest` still pushes `:latest`; values such as `1.2` or an existing release version can likewise overwrite canonical tags. This contradicts the new comments and the load-bearing guarantee that developer/test dispatches cannot claim a tag followed by deployments. The structural test only proves the explicit canonical tag entries are gated; it never validates the effective dispatch tag set for adversarial/colliding input.",
+    "file": ".github/workflows/release.yml",
+    "fix_hint": "Validate the dispatch input before any publishing jobs run and reject reserved/canonical forms (at minimum `latest`, stable semver tags, and moving major.minor tags), or namespace dispatch images unconditionally (for example `dev-${resolved/sanitized-version}`) so user input cannot equal a canonical tag. Extend `scripts/tests/test_release_container_multiarch.py` to pin that validation/namespace and include mutation or fixture cases for `latest` and a stable semver/major.minor collision.",
+    "severity": "major",
+    "title": "Manual dispatch can still overwrite canonical container tags"
+   }
+  ],
+  "progress": null,
+  "summary": "The trigger gating removes the explicit `latest` tag on manual dispatch, but it does not enforce the claimed safety property because the dispatch-provided version is copied into a raw image tag without validation. A caller can supply `latest`, `1.2`, or another canonical/moving tag and overwrite exactly the deployment-followed tag this change intends to protect. The added contract test only checks YAML strings and therefore passes despite this semantic hole.",
+  "verdict": "request_changes"
+ }
+}
