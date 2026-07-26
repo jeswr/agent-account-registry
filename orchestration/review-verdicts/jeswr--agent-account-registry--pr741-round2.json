@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 741,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "d497e64b37d08d0045f85eebc0d67bc2063b9753",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`measured` becomes true on generic events such as `thread.started`, `item.started`, `turn.completed`, or legacy `task_started`, independently of whether the item/message schema was understood. Unknown `item.completed.item.type` values and unknown legacy `msg.type` values are then silently ignored. Thus a partially changed protocol such as `thread.started` followed by an item whose renamed discriminator/tool kind is not in the maps, or a truncated stream containing only startup events, produces `tool_counts: {}` and the envelope emits `probe:0`. This is still the round-1 absent-versus-zero failure: recognizing the outer stream does not prove that every possible inspection call was measurable.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Only assert a measured zero after a complete stream whose relevant item/message records were all classified. Maintain explicit known tool and known non-tool event/item sets, invalidate measurement on any unknown or malformed item/message discriminator, and require an appropriate terminal event. Count started current-protocol commands if completion is not guaranteed, or otherwise treat an unmatched start as unmeasured. Add negative tests where known lifecycle events surround an unknown/renamed command item and where the stream ends after startup/item.started; both must omit `probe`, while a complete tool-free stream must still emit `probe:0`.",
+    "severity": "major",
+    "title": "Generic lifecycle events still turn unknown tool telemetry into probe zero"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 1's item discriminator defect is fixed with a representative current-protocol fixture, and wholly empty, malformed, foreign-harness, and wholly unknown streams now omit probe telemetry. However, the absent-versus-zero contract still fails under partial protocol drift or a truncated Codex stream: merely seeing a generic outer lifecycle event marks the run measured, while unknown or incomplete item/message payloads are silently ignored. That can still publish probe:0 despite an unmeasured command. One of the two prior major findings therefore remains in narrower form; progress is improving, but the trust-plane evidence is not yet sound enough to approve.",
+  "verdict": "request_changes"
+ }
+}
