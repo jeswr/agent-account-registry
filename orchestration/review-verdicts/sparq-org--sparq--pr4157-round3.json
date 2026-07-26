@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4157,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "3537a0ace33f67f3c2f9f9e518dbf2cb3851e082",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 3 remains correct and complete. The implementation preserves the existing budget-reason priority by making `Limits::hit` delegate to `Limits::why`, polls the captured snapshot before each parallel theta anti-join verdict, propagates the canonical error instead of producing a guessed or partial result, and fuses the serial verdict with its cooperative output loop. The regression is non-vacuous: it proves the hash strategy fired above the parallel threshold, establishes exactly one residual probe per left row, triggers cancellation from inside the residual, checks the canonical error and early abandonment, and separately verifies full answer/probe equivalence under an unexhausted budget. The added feature-off declaration accurately identifies the always-compiled serial-path/codegen changes and makes no unsupported byte claim. No instruction-like prompt injection was found in the diff.",
+  "verdict": "approve"
+ }
+}
