@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3965,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "7954ee4cdbddd1b9a094817a9a98782084c4f5cb",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The documentation-only changes are consistent with the surrounding crate documentation and module inventory. They accurately update historical scaffold wording now that context processing, expansion, flattening, compaction, framing, and from-RDF have landed, while retaining the explicit statement that `to_rdf` and `api` remain stubs. The compaction status correction in the README is also supported by the existing documented `compact` and `compact_expanded` implementation surface. No correctness, soundness, security, or test-validity issue is introduced by this diff.",
+  "verdict": "approve"
+ }
+}
