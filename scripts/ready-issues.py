@@ -36,6 +36,9 @@ BUSY_STATUS = {"status:in-progress", "status:in-progress-review", "status:blocke
 # an epic is a tracking umbrella (its children are the work) — never dispatchable.
 NON_DISPATCHABLE = "kind:epic"
 GLOBAL = "__global__"  # the cross-cutting partition (serializes against everything)
+# [OPUS-5 issue #688] Historical, behaviour-preserving frontier width: exactly one in-flight issue
+# per `area:` package. Also the fail-closed floor for a policy-supplied width.
+DEFAULT_PACKAGE_WIDTH = 1
 _PRIO = re.compile(r"^priority:P([0-4])$")   # only P0..P4 are valid
 _PKG = re.compile(r"^area:(.+)$")
 _ROLE = re.compile(r"^role:.+$")
@@ -151,26 +154,68 @@ def ready_candidates(issues, log=None):
     return cands
 
 
-def compute_ready(issues, in_progress_packages=None, log=None):
-    """Conflict-free, priority-ordered, FAIL-CLOSED ready frontier (one-per-package concurrency
-    width). This is NOT the count of drainable work — see ready_candidates() for that."""
-    taken = set(in_progress_packages or ())
+def compute_ready(issues, in_progress_packages=None, log=None, package_width=DEFAULT_PACKAGE_WIDTH):
+    """Conflict-free, priority-ordered, FAIL-CLOSED ready frontier. This is NOT the count of
+    drainable work — see ready_candidates() for that.
+
+    [OPUS-5 issue #688] `package_width` is the number of issues that may be in flight PER
+    `area:<section>` package. It defaults to 1, which is the historical exactly-one-per-package
+    serialization, byte-for-byte — so an unset width changes nothing anywhere.
+
+    WHY THIS KNOB EXISTS, and — precisely — WHAT IT DOES NOT DO. Measured on the registry: 12
+    drainable candidates spread over only 3 distinct areas collapse to a frontier of 3, so
+    `max_concurrent` was never the limiter and raising it alone is inert. Width widens THIS layer,
+    the PLAN frontier, and nothing else.
+
+    IT IS NOT, ON ITS OWN, A THROUGHPUT LEVER (review finding F2 — an earlier version of this
+    docstring claimed it converted drainable backlog into concurrent work; that was wrong). The
+    binding constraint sits one layer DOWN, at the lease layer: `select-and-claim.partition_available`
+    refuses a second live lease on the same package, and `dispatch-claim.filter_busy_area_items`
+    drops any item whose package already has an in-flight worker PR or live lease. With width 2 the
+    frontier grows from 3 to 6 and the three extra rows are then refused with `package-single-flight`
+    — a MEASURED net gain of ZERO additional concurrent workers. Width only becomes a throughput
+    lever once the lease-layer partition is widened by the same bound (tracked in #692); until then
+    every target is deliberately configured at width 1 and this parameter is prepared, not enabled.
+
+    THE COST, honestly. One-per-package exists because two agents in the same area tend to edit the
+    same file, and this repo's areas map onto very large single scripts. Width > 1 therefore trades
+    merge conflicts for throughput; it is deliberately a per-target policy knob (see
+    `policy/repos.toml`) rather than a raised default, and the repo already runs a conflict
+    resolver for the collisions it does produce. The GLOBAL (cross-cutting, area-less) partition is
+    NEVER widened — it exists precisely to serialize against everything, so widening it would be
+    incoherent regardless of policy.
+    """
+    try:
+        width = int(package_width)
+    except (TypeError, ValueError):
+        width = DEFAULT_PACKAGE_WIDTH        # unparseable policy -> the SAFE historical behaviour
+    width = max(DEFAULT_PACKAGE_WIDTH, width)  # fail-closed floor: never narrower than 1
+    counts = {}
     for it in issues:
         if str(it.get("state", "OPEN")).upper() != "OPEN":
             continue
         L = labels_of(it)
         if "status:in-progress" in L or "status:in-progress-review" in L:
-            taken |= packages_of(L)
+            for pkg in packages_of(L):
+                counts[pkg] = counts.get(pkg, 0) + 1
+    for pkg in (in_progress_packages or ()):
+        counts[pkg] = counts.get(pkg, 0) + 1
+
+    def full(pkg):
+        """A package is closed to new work at its width — the GLOBAL partition always at 1."""
+        return counts.get(pkg, 0) >= (DEFAULT_PACKAGE_WIDTH if pkg == GLOBAL else width)
+
     cands = ready_candidates(issues, log=log)
     ready = []
     for _p, _n, it, pkgs in cands:
-        if GLOBAL in taken:                  # cross-cutting work in flight -> nothing else co-runs
+        if full(GLOBAL) and counts.get(GLOBAL, 0):  # cross-cutting in flight -> nothing else co-runs
             break
-        if pkgs & taken:                     # package conflict
+        if any(full(pkg) for pkg in pkgs):   # package conflict (at width)
             continue
-        if GLOBAL in pkgs and taken:         # cross-cutting can't co-run with any package in flight
+        if GLOBAL in pkgs and counts:        # cross-cutting can't co-run with any package in flight
             continue
-        taken |= pkgs
+        for pkg in pkgs:
+            counts[pkg] = counts.get(pkg, 0) + 1
         ready.append(it)
     return ready
 
@@ -262,6 +307,43 @@ def _self_test():
           exclusion_reason({"priority:P1", "role:impl"}), "no status:ready attestation")
     check("exclusion_reason: an area-less set is still enumerable (it reserves __global__)",
           exclusion_reason({"status:ready", "priority:P1", "role:impl"}), None)
+    # ---- [OPUS-5 issue #688] PACKAGE WIDTH: the frontier lever ------------------------------------
+    # The default MUST be byte-for-byte the historical one-per-package serialization, and a widened
+    # package MUST actually admit more work — otherwise "raise the ceiling" is inert on a
+    # package-clustered backlog. Deleting the width plumbing collapses the first two to the same
+    # list; widening GLOBAL breaks the serialization guarantee the partition exists to provide.
+    check("default width is exactly the historical one-per-package frontier",
+          [i["number"] for i in compute_ready(F)], [i["number"] for i in compute_ready(F, package_width=1)])
+    check("width=2 admits a SECOND issue from the same package (1 joins 2 on `worker`)",
+          [i["number"] for i in compute_ready(F, package_width=2)], [2, 3, 12, 1])
+    check("width only ever GROWS the frontier (it is a superset of width=1)",
+          set(i["number"] for i in compute_ready(F)) <=
+          set(i["number"] for i in compute_ready(F, package_width=3)), True)
+    check("width never exceeds the drainable candidate set",
+          len(compute_ready(F, package_width=99)) <= len(ready_candidates(F, log=lambda _l: None)),
+          True)
+    # The GLOBAL partition is the cross-cutting serializer — widening it would be incoherent.
+    wide_global = [iss(11, R + ["priority:P0"]), iss(12, R + ["priority:P1", "area:groom"])]
+    check("GLOBAL partition is NEVER widened, whatever the policy says",
+          [i["number"] for i in compute_ready(wide_global, package_width=9)], [11])
+    check("two area-less issues never co-run even at a wide width",
+          [i["number"] for i in compute_ready(
+              [iss(30, R + ["priority:P0"]), iss(31, R + ["priority:P1"])], package_width=9)], [30])
+    # An in-progress issue consumes width, so a widened package still respects live work.
+    busy = [iss(40, R + ["priority:P1", "area:worker", "status:in-progress"]),
+            iss(41, R + ["priority:P1", "area:worker"]),
+            iss(42, R + ["priority:P2", "area:worker"])]
+    check("in-progress work CONSUMES width (width=2 leaves room for exactly one more)",
+          [i["number"] for i in compute_ready(busy, package_width=2)], [41])
+    check("in_progress_packages argument consumes width too",
+          [i["number"] for i in compute_ready(
+              [iss(43, R + ["priority:P1", "area:worker"]), iss(44, R + ["priority:P2", "area:worker"])],
+              in_progress_packages=["worker"], package_width=2)], [43])
+    # FAIL-CLOSED: junk policy must degrade to the SAFE narrow default, never to an unbounded width.
+    check("a junk / zero / negative width fails closed to the historical width of 1",
+          [[i["number"] for i in compute_ready(F, package_width=w)]
+           for w in (0, -5, "nonsense", None, 1.9)],
+          [[2, 3, 12]] * 5)
     check("flatten pages drops PRs", _flatten_pages(
         [[{"number": 1}, {"number": 2, "pull_request": {}}], [{"number": 3}], "junk", [None]]),
         [{"number": 1}, {"number": 3}])

@@ -442,6 +442,79 @@ def _self_test():
          "#19, #20 (+10 more)" in _truncated, "#21" in _truncated),
         (True, True, False))
 
+    # ---- [OPUS-5 issue #688] THE FRONTIER-WIDTH CALL SITE, EXECUTED ------------------------------
+    # This is the YAML seam, and it is where vacuity lives: the width branch and the TypeError
+    # fallback are workflow python that no unit test would otherwise reach. Deleting `package_width`
+    # from the call, inverting `if width > 1`, or dropping the except-TypeError arm each makes a
+    # NAMED row below go red — none of them would disturb a substring assertion.
+    width_block = _workflow_block(
+        os.path.join(_root, ".github", "workflows", "dispatch.yml"), "readiness", "frontier-width")
+
+    class _WidthPlanner:
+        """Stub target planner. `supports_width=False` models a target whose readiness engine
+        PREDATES the parameter — the real cross-repo hazard, since each target carries its own copy
+        and passing an unsupported kwarg would TypeError out of that target's whole dispatch."""
+
+        def __init__(self, supports_width=True):
+            self.calls = []
+            self._supports = supports_width
+
+        def compute_ready(self, issues, package_width=None):
+            if package_width is not None and not self._supports:
+                raise TypeError("compute_ready() got an unexpected keyword argument 'package_width'")
+            self.calls.append(package_width)
+            return list(issues)
+
+    def _run_width(width, supports_width=True):
+        planner = _WidthPlanner(supports_width)
+        namespace = {"dispatch": planner, "readiness_input": [{"number": 1}],
+                     "ready_input": [{"number": 1}], "repo": "o/t",
+                     "frontier_width": {"o/t": width}}
+        text = _captured(lambda: exec(width_block, namespace))  # noqa: S102 — workflow block
+        return text, planner.calls, namespace.get("ready")
+
+    _text, _calls, _frontier = _run_width(3)
+    chk("[#688] a widened target PASSES package_width through to the readiness engine",
+        (_calls, _frontier, _text.strip()), ([3], [{"number": 1}], ""))
+    _text, _calls, _frontier = _run_width(1)
+    chk("[#688] width 1 takes the ORIGINAL call path (no kwarg at all — byte-for-byte unchanged)",
+        (_calls, _text.strip()), ([None], ""))
+    # The cross-repo compatibility hazard: an older target engine must DEGRADE to the narrow
+    # frontier with a warning, never take that target's dispatch down.
+    _text, _calls, _frontier = _run_width(3, supports_width=False)
+    chk("[#688] an older target engine falls back to the narrow frontier and says so LOUDLY",
+        ("::warning::o/t: readiness engine does not support package_width" in _text,
+         _calls, _frontier),
+        (True, [None], [{"number": 1}]))
+    # A target absent from the width map is width 1 — the safe default, never an unbounded frontier.
+    planner = _WidthPlanner()
+    _captured(lambda: exec(width_block, {"dispatch": planner, "ready_input": [], "repo": "o/absent",
+                                         "frontier_width": {}}))  # noqa: S102
+    chk("[#688] a target with no policy width defaults to the one-per-package frontier",
+        planner.calls, [None])
+
+    # The REGISTRY-CODE width validation that runs BEFORE any target code sees the value. Review
+    # flagged it as defence-in-depth that survived being replaced with `if False:` — so execute it.
+    validate_block = _workflow_block(
+        os.path.join(_root, ".github", "workflows", "dispatch.yml"), "policy-extract",
+        "width-validate")
+
+    def _validate(row):
+        ns = {"row": row, "repo": "o/t", "MAX_WIDTH": 8, "widths": {}}
+        try:
+            exec(validate_block, ns)  # noqa: S102 — workflow block
+        except SystemExit as exc:
+            return f"REFUSED: {exc}"
+        return ns["widths"].get("o/t")
+
+    chk("[#688] the workflow width validation ACCEPTS the in-range values",
+        [_validate(r) for r in ({}, {"package_width": 1}, {"package_width": 8}, "not-a-table")],
+        [1, 1, 8, 1])
+    chk("[#688] ...and REFUSES every out-of-range or wrong-typed value (bounded BOTH sides)",
+        [str(_validate({"package_width": bad})).startswith("REFUSED")
+         for bad in (0, -1, 9, 1000, "2", True, 1.5, None)],
+        [True] * 8)
+
     # issue #112: a MULTI-area issue reserves the serializing GLOBAL partition, NOT the
     # alphabetically-first area — else a busy secondary area (here 'worker') could not exclude
     # it and it would double-dispatch. A single-area issue still reserves just that area.

@@ -129,17 +129,22 @@ jobs:
       # "[bot]" authors stay an over-proposal for CLAIM's exact check to settle (PLAN holds no
       # token, so it can never resolve the pipeline's own App bot login itself).
       - name: Extract the policy trusted-bot allowlist (registry code, pre-target)
+        # `id:` so dispatch-plan.py's self-test can locate this step and EXECUTE the
+        # width-validation block below (review: it was defence-in-depth that survived being
+        # replaced with `if False:` — an untested guard is not a guard).
+        id: policy-extract
         run: |
           set -euo pipefail
           python3 - "$RUNNER_TEMP/dispatch-targets/repos.txt" \
                     registry-snapshot/policy/repos.toml \
-                    "$RUNNER_TEMP/trusted-bots.json" <<'PY'
+                    "$RUNNER_TEMP/trusted-bots.json" \
+                    "$RUNNER_TEMP/frontier-width.json" <<'PY'
           import json
           from pathlib import Path
           import sys
           import tomllib
 
-          repos_path, policy_path, out_path = sys.argv[1:]
+          repos_path, policy_path, out_path, width_path = sys.argv[1:]
           repos = Path(repos_path).read_text(encoding="utf-8").splitlines()
           with open(policy_path, "rb") as handle:
               policy = tomllib.load(handle)
@@ -147,6 +152,13 @@ jobs:
           if not isinstance(rows, dict):
               raise SystemExit("registry policy has no repos table")
           allowlist = {}
+          # [OPUS-5 issue #688] Per-target FRONTIER WIDTH, extracted here for the same reason the
+          # bot allowlist is: the planner step runs TARGET-supplied code and must never read the
+          # registry policy itself. Validated by REGISTRY code before any target code sees it, and
+          # bounded on both sides — a junk/absent/over-large value degrades to the historical
+          # one-per-package frontier, which is the narrow (safe) direction.
+          MAX_WIDTH = 8
+          widths = {}
           for repo in repos:
               if not repo:
                   continue
@@ -156,7 +168,15 @@ jobs:
                       or any(not isinstance(bot, str) or not bot.strip() for bot in bots)):
                   raise SystemExit(f"trusted_bots for {repo} must be a list of non-empty strings")
               allowlist[repo] = sorted(set(bots))
+              # >>> width-validate — EXECUTED by scripts/dispatch-plan.py --self-test.
+              width = row.get("package_width", 1) if isinstance(row, dict) else 1
+              if isinstance(width, bool) or not isinstance(width, int) or not (1 <= width <= MAX_WIDTH):
+                  raise SystemExit(
+                      f"package_width for {repo} must be an integer in [1, {MAX_WIDTH}]")
+              widths[repo] = width
+              # <<< width-validate
           Path(out_path).write_text(json.dumps(allowlist), encoding="utf-8")
+          Path(width_path).write_text(json.dumps(widths), encoding="utf-8")
           PY
 
       - name: Clone protected public targets without credentials
@@ -201,6 +221,10 @@ jobs:
           # this is pure registry data, never influenced by the target repo being planned.
           trusted_bots_map = json.loads(
               Path(out_dir, "trusted-bots.json").read_text(encoding="utf-8"))
+          # [OPUS-5 issue #688] Per-target frontier width, from the same registry-code extraction
+          # step and validated there. Same provenance rule: registry data only.
+          frontier_width = json.loads(
+              Path(out_dir, "frontier-width.json").read_text(encoding="utf-8"))
 
           def snapshot(kind, index):
               # Written by the authenticated registry-inline snapshot step (this step deliberately
@@ -335,7 +359,31 @@ jobs:
                   or (row["number"] not in linked
                       and trusted(details[row["number"]][0], repo_trusted_bots))
               ]
-              ready = dispatch.compute_ready(ready_input)
+              # [OPUS-5 issue #688] FRONTIER WIDTH. The frontier — not `max_concurrent` — is what
+              # actually bounds parallelism on a package-clustered backlog, so this is the knob that
+              # converts drainable backlog into concurrent work. Two safety properties matter here:
+              #  (1) width 1 takes the ORIGINAL call path verbatim, so an un-widened target is
+              #      byte-for-byte unchanged; and
+              #  (2) `compute_ready` is TARGET-supplied code that may predate the parameter (each
+              #      target carries its own copy of the readiness engine). Passing an unsupported
+              #      kwarg would TypeError and take down that target's whole dispatch, so an older
+              #      engine falls back to the narrow frontier with a warning instead of failing.
+              #      Narrower is the safe direction: it dispatches less, never more.
+              # >>> frontier-width — EXECUTED by scripts/dispatch-plan.py --self-test. These two
+              # `if`s are workflow python: the width branch and the TypeError fallback are exactly
+              # the kind of call-site logic that no unit test reaches, so they are extracted and
+              # run against stub planners rather than pattern-matched (#597 r2 lesson).
+              width = frontier_width.get(repo, 1)
+              if width > 1:
+                  try:
+                      ready = dispatch.compute_ready(ready_input, package_width=width)
+                  except TypeError:
+                      print(f"::warning::{repo}: readiness engine does not support package_width; "
+                            f"falling back to the one-per-package frontier")
+                      ready = dispatch.compute_ready(ready_input)
+              else:
+                  ready = dispatch.compute_ready(ready_input)
+              # <<< frontier-width
               # Issue #225: a `status:ready` issue carrying NO role:* label is dropped by the
               # readiness engine (has_role) BEFORE any plan row exists — it shows up in no plan,
               # no diagnostic, and never drains. 117 accumulated before a human noticed. Report

@@ -3326,6 +3326,11 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 # S=0 fails closed.  No static per-lane ceiling can strand an idle provider.
                 account_slot_bound=True,
                 return_reason=True,
+                # [F1] Wind the review/fix lane down per account as well. `.get` because this
+                # helper is also driven with partial policy rows: an ABSENT timeout disables only
+                # the PROJECTION factor, leaving the utilisation taper in force — degraded, never
+                # un-tapered, and never an exception on a lane that must keep draining.
+                run_seconds=(policy.get("worker_timeout_minutes") or 0) * 60 or None,
             )
         except (RuntimeError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
             defer_reasons["lease-error"] += 1
@@ -4077,9 +4082,15 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                     catalog_cache["accounts"] = allocator.read_accounts(registry_repo)
                 pool = set(resolved["account_pool"])
                 pool_accounts = [a for a in catalog_cache["accounts"] if a["handle"] in pool]
+                # [OPUS-5 issue #688] `run_seconds` turns on the PROJECTED-BURN half of the
+                # wind-down: an account is refused new work once its window is projected to run dry
+                # before a worker of this length could finish. The worker TIMEOUT is deliberately
+                # used as the run-length estimate — it is the wall-clock upper bound the dispatcher
+                # actually guarantees, so it errs toward refusing, which is the safe direction.
                 effective_cap = allocator.dynamic_concurrency(
                     pool_accounts, usage, model_chain=resolved["model_chain"],
-                    absolute_cap=resolved["max_concurrent"], margin=margin)
+                    absolute_cap=resolved["max_concurrent"], margin=margin,
+                    run_seconds=resolved["worker_timeout_minutes"] * 60)
                 if escalate_starved(resolved.get("escalate"), usage, effective_cap):
                     # Issue #116: a SINGLE zero-headroom usage snapshot is TRANSIENT, pipeline-owned
                     # rate-limit exhaustion — not a semantic routing failure. Promoting it straight
@@ -4196,6 +4207,9 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                     max_holder_concurrent=effective_cap,
                     usage=usage,
                     margin=margin,
+                    # [F1] The taper must bind PER ACCOUNT at selection, not only as the
+                    # fleet-wide `effective_cap` above — same run-length estimate as that cap.
+                    run_seconds=resolved["worker_timeout_minutes"] * 60,
                 )
             except (RuntimeError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
                 defer_reasons["lease-error"] += 1

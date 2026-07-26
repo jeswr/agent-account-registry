@@ -664,6 +664,29 @@ def main():
         probed = _probe_account(account, secrets)
         if probed is None:
             continue  # fail-closed omit: unknown provider / bad secret_ref / no token / failed probe
+        # [OPUS-5 issue #688] Join the REACTIVE rate-limit backoff onto PROBED (anthropic) entries
+        # too. This closes a live hole: a 429 on an anthropic worker already wrote a `transient`
+        # model-health record and `account_backoffs` already derived a hold from it, but the
+        # backoff overlay was gated on `_is_exempt_provider`, so nothing ever applied it to the
+        # anthropic side. The account kept being handed out at full width until its UTILISATION
+        # eventually climbed — which, for a secondary/burst rate limit, it may never do.
+        #
+        # The quota probe stays authoritative for headroom; this only ADDS a hold, and only while
+        # one is active. Fail-open on a malformed record is inherited from `_apply_backoff` and is
+        # deliberate: the probe's own fail-closed omission is the backstop for anthropic, so a
+        # corrupt ledger must not be able to starve the metered provider.
+        if salt:
+            if health is None:
+                try:
+                    mh = _load_model_health(script_dir)
+                    health = _load_health_state(mh, now)
+                except Exception:
+                    print("::warning::account-usage: model-health module unavailable — probed "
+                          "accounts admitted WITHOUT rate-limit backoff this tick (fail-open)",
+                          file=sys.stderr)
+                    mh, health = None, {"backoffs": {}, "credentials": {}}
+            if mh is not None:
+                probed = _apply_backoff(probed, health["backoffs"].get(mh.account_hash(handle, salt)))
         usage[handle] = probed
     json.dump(usage, sys.stdout)
     return 0
@@ -1302,6 +1325,38 @@ def _self_test_ledgergate(chk):
     sub("[#639] an all-exempt fleet needs no token, and is still not assumed reachable",
         (code, snapshot), (0, {"acctexempt": {"exempt": True,
                                              "reachability": REACHABILITY_UNPROVEN}}))
+
+    # (a2) [OPUS-5 issue #688] THE METERED BACKOFF JOIN, driven through real main(). A 429 on an
+    # ANTHROPIC worker writes a `transient` health record and `account_backoffs` derives a hold from
+    # it — but the overlay used to be stamped onto EXEMPT entries only, so the probed side never
+    # carried it and dispatch kept the account at full width. The consumer half (usage_eligible
+    # honouring the stamp) is asserted in select-and-claim's suite; THIS is the producer half, and
+    # without it deleting the join leaves every other suite green.
+    probed_hash = mh.account_hash(probed_account["handle"], e2e_salt)
+
+    def probed_record(exit_class, offset, run):
+        return {"ts": stamp - offset, "provider": "anthropic", "account": probed_hash,
+                "model_alias": "haiku", "exit_class": exit_class, "run_id": run}
+
+    limited = [probed_record(mh.CLASS_TRANSIENT, 60, "rl1")]
+    code, snapshot, err = run_main(records=limited)
+    entry = snapshot.get(probed_account["handle"], {})
+    sub("[#688] a rate-limited ANTHROPIC account carries the backoff stamp (the join)",
+        (code, entry.get("status"), isinstance(entry.get("backoff_until"), int),
+         entry.get("backoff_until", 0) > stamp),
+        (0, "allowed", True, True))
+    sub("[#688] ...and the allocator therefore refuses it despite ample quota headroom",
+        (allocator.usage_eligible(dict(entry), now=stamp),
+         allocator.usage_eligible(dict(entry), now=entry.get("backoff_until", 0) + 1)),
+        (False, True))
+    # No rate-limit record => no stamp at all. Without this the assertion above could pass on an
+    # entry that carried a backoff unconditionally.
+    code, clean_snapshot, err = run_main(records=[probed_record(mh.SUCCESS, 60, "ok1")])
+    sub("[#688] a healthy anthropic account carries NO backoff stamp (the join is conditional)",
+        ("backoff_until" in clean_snapshot.get(probed_account["handle"], {}),
+         allocator.usage_eligible(dict(clean_snapshot.get(probed_account["handle"], {})),
+                                  now=stamp)),
+        (False, True))
 
     # (b) THE BEHAVIOURAL HEART: a probe-exempt account whose credential is KNOWN DEAD is INELIGIBLE.
     # `acct01` is live in this state right now (`credential-remint-required`, #596 / alert #622) and is

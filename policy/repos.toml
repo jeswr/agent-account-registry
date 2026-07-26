@@ -95,7 +95,15 @@ routing = "orchestration/routing.toml"
 # and a future enrolment can never be handed `acct03`/`acct06` and inherit their lease history,
 # provenance records or salted fingerprints.
 account_pool = ["acct01", "acct02", "acct04", "acct2css", "acct3css", "acct4css", "acct05", "acct07"]
+# [OPUS-5 issue #688] DELIBERATELY UNCHANGED at 40, and that is a finding rather than an omission.
+# 40 already equals the whole measured pool (7 anthropic x 4 = 28, plus the codex account's 12 slots), so
+# it is not the binding limiter and raising it would be a placebo. On the 2026-07-25 snapshot sparq
+# had 1118 open issues but only 10 DRAINABLE (`ready_candidates`) and a frontier of 7 — the limiter
+# is TRIAGE STARVATION (issues never reaching status:ready + priority + role), which no concurrency
+# knob can fix. package_width stays at the historical 1 for the same reason it does on the registry
+# row below: width > 1 is inert until the LEASE-layer partition is widened too (#692).
 max_concurrent = 40
+package_width = 1
 worker_timeout_minutes = 90
 gate_profile = "crate-scoped"
 arm_auto_merge = true         # arming now actually happens — ONLY in the review-fix approve path
@@ -140,7 +148,34 @@ routing = "orchestration/routing.toml"   # THIS repo's own routing (self-managed
 # and a future enrolment can never be handed `acct03`/`acct06` and inherit their lease history,
 # provenance records or salted fingerprints.
 account_pool = ["acct01", "acct02", "acct04", "acct2css", "acct3css", "acct4css", "acct05", "acct07"]
-max_concurrent = 3            # SMALL: the trust plane drains slowly + conservatively
+# [OPUS-5 issue #688] 3 -> 8, TOGETHER WITH package_width below. Measured, not guessed:
+#   * The binding limiter here was NEVER this number. On the 2026-07-25 snapshot the registry had
+#     285 open issues -> 12 DRAINABLE (`ready_candidates`) -> a frontier of 3 (`compute_ready`),
+#     because those 12 clustered into only 3 distinct areas (review-loop 5, dispatch 5, workflows 2)
+#     and the frontier admits one issue per area. max_concurrent was 3 and the frontier was 3, so
+#     raising max_concurrent ALONE would have changed precisely nothing.
+#   * This is HEADROOM ONLY, and the honest reason it is not more than that: the binding constraint
+#     sits BELOW the frontier, at the LEASE layer. `select-and-claim.partition_available` refuses a
+#     second live lease on an `area:` package outright, and `dispatch-claim.filter_busy_area_items`
+#     drops any item whose package already has an in-flight worker PR or live lease. So concurrent
+#     registry workers are bounded by DISTINCT AREAS (3 on that snapshot) no matter what this number
+#     says. 8 stops the static ceiling from masking the adaptive controller once the lease layer is
+#     widened; it does not by itself add a single concurrent worker today.
+#   * Pool capacity is nowhere near binding: the 7 available in-pool anthropic accounts carry
+#     max_concurrent_workers = 4 each = 28 slots (the codex account adds 12 slots on top). 8 is a
+#     quarter of the anthropic pool — deliberately conservative for the trust plane.
+#   * Safe to raise ONLY because the wind-down half ships with it: the tapered per-account grant is
+#     now the bound at the SELECTION site as well as in the aggregate sums, so a higher static
+#     ceiling can no longer push a full complement of workers into a window about to run dry.
+max_concurrent = 8
+# In-flight issues permitted per `area:` package. Held at 1 — the historical serialization — and
+# that is DELIBERATE, not an oversight. Width > 1 here is currently INERT: it widens the PLAN
+# frontier, but every extra row is then refused at the lease layer with `package-single-flight`, so
+# the measured net gain is ZERO additional concurrent workers. Raising it is only meaningful
+# together with a bounded widening of the lease-layer partition, which trades the repo's current
+# HARD "two workers never touch the same package" guarantee for merge conflicts — a posture change
+# that belongs in its own reviewed change, not bundled into a rate-limit PR. Tracked in #692.
+package_width = 1
 worker_timeout_minutes = 30   # python self-tests + actionlint are fast (no cargo build)
 gate_profile = "registry-selftest"  # python --self-test suite + bash -n + actionlint (see worker-live.sh)
 arm_auto_merge = true         # allow_auto_merge is enabled live (B1); the FINAL arm click on a

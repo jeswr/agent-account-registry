@@ -49,6 +49,11 @@ POLICY_FIELDS = {
     "max_attempts",
     "trust",
 }
+# [OPUS-5 issue #688] Hard upper bound on the per-package frontier width. The frontier's
+# one-per-package rule is a merge-conflict guard, so width is a THROUGHPUT-vs-CONFLICT dial, not a
+# free parameter: a bounded ceiling keeps a policy typo (or an over-eager future tuning pass) from
+# turning the guard off altogether while still allowing a real, measured widening.
+MAX_PACKAGE_WIDTH = 8
 # [OPUS-4.8] Optional usage-aware-dispatch controls (default off / 0.10 -> backward compatible):
 #   require_usage       = bool  — when true, a TOTAL usage-probe failure HOLDS the repo (fail-closed)
 #                                 rather than falling back to the ungated static cap.
@@ -88,7 +93,8 @@ POLICY_FIELDS = {
 # collector does its own strict validation of their contents.
 OPTIONAL_POLICY_FIELDS = {"require_usage", "usage_safety_margin", "max_review_rounds",
                           "review_queue_ttl_minutes", "cross_provider_fallback", "security_paths",
-                          "trusted_bots", "allow_actions_bot_issues", "throughput", "readiness"}
+                          "trusted_bots", "allow_actions_bot_issues", "throughput", "readiness",
+                          "package_width"}
 
 
 # Slots whose underlying account is dead and which must never appear in an account_pool again.
@@ -200,6 +206,14 @@ def _policy_row(target_repo, policy_doc):
         margin = row["usage_safety_margin"]
         if not isinstance(margin, (int, float)) or isinstance(margin, bool) or not (0.0 <= margin < 1.0):
             raise PolicyError(f"usage_safety_margin for {target_repo!r} must be a float in [0, 1)")
+    # [OPUS-5 issue #688] package_width: in-flight issues permitted per `area:` package. Bounded
+    # ABOVE as well as below — an unbounded width would silently disable the conflict-avoidance the
+    # frontier exists to provide, and a typo'd 1000 must be rejected loudly, not obeyed.
+    if "package_width" in row:
+        width = row["package_width"]
+        if not _positive_int(width) or width > MAX_PACKAGE_WIDTH:
+            raise PolicyError(
+                f"package_width for {target_repo!r} must be a positive integer <= {MAX_PACKAGE_WIDTH}")
     for field in ("max_review_rounds", "review_queue_ttl_minutes"):
         if field in row and not _positive_int(row[field]):
             raise PolicyError(f"{field} for {target_repo!r} must be a positive integer")
@@ -362,6 +376,7 @@ def resolve(target_repo, role_or_labels, policy_doc, routing_doc):
         "gate_profile": policy["gate_profile"],
         "arm_auto_merge": policy["arm_auto_merge"],
         "max_concurrent": policy["max_concurrent"],
+        "package_width": int(policy.get("package_width", 1)),
         "require_usage": bool(policy.get("require_usage", False)),
         "usage_safety_margin": float(policy.get("usage_safety_margin", 0.10)),
         "max_review_rounds": int(policy.get("max_review_rounds", 3)),
@@ -628,6 +643,27 @@ agent = "docs-agent"
         check("usage_safety_margin range validated", "accepted", "rejected")
     except PolicyError:
         check("usage_safety_margin range validated", "rejected", "rejected")
+    # ---- [OPUS-5 issue #688] package_width: the frontier lever, bounded on BOTH sides ------------
+    def _width_policy(line):
+        return tomllib.loads('[repos."o/r"]\nenabled=true\nrouting="r.toml"\naccount_pool=["acct01"]\n'
+                             'max_concurrent=1\nworker_timeout_minutes=30\ngate_profile="lint-only"\n'
+                             'arm_auto_merge=false\nmax_attempts=1\ntrust="collaborators"\n' + line)
+    check("package_width defaults to the historical one-per-package frontier",
+          resolve("o/r", "impl", _width_policy(""), routing)["package_width"], 1)
+    check("package_width is overridable",
+          resolve("o/r", "impl", _width_policy("package_width=4\n"), routing)["package_width"], 4)
+    check("package_width at the ceiling is accepted",
+          resolve("o/r", "impl", _width_policy(f"package_width={MAX_PACKAGE_WIDTH}\n"),
+                  routing)["package_width"], MAX_PACKAGE_WIDTH)
+    # BOTH bounds must be enforced. An UPPER bound is the one that matters most here: the frontier's
+    # one-per-package rule is a merge-conflict guard, so an unbounded width silently disables it.
+    for bad_width, why in ((0, "zero"), (-2, "negative"), (MAX_PACKAGE_WIDTH + 1, "over the ceiling"),
+                           (1000, "wildly over the ceiling"), ("2", "a string"), (True, "a bool")):
+        try:
+            resolve("o/r", "impl", _width_policy(f"package_width={json.dumps(bad_width)}\n"), routing)
+            check(f"package_width rejects {why}", "accepted", "rejected")
+        except PolicyError:
+            check(f"package_width rejects {why}", "rejected", "rejected")
     secure = resolve("sparq-org/sparq", ["role:impl", "area:sparq-zk"], policy, routing)
     check("security label overrides role", (secure["model_chain"], secure["agent"],
                                              secure["escalate"]),
