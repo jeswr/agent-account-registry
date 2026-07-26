@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4241,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "613fe46b86c011ed708c0c46f51e015c3364937d",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The additive canned query correctly restricts asserted bridge triples to pkg: subjects, the three intended bridge predicates, and http://schema.org/ objects, and it is registered in ALL. The focused test exercises the real unclosed load/query path, checks representative rows spanning subclass and closeMatch bridges, and verifies every returned row stays within the selected source and facade namespaces. The ontology and research-note changes are documentation-only and remain consistent with the unchanged bridge axioms. No correctness, soundness, security, or vacuous-test issue is evident in the diff.",
+  "verdict": "approve"
+ }
+}
