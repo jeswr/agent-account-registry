@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 3827,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "4cd55014cfc6c394d70652f28af9ba699bd17bc2",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Lines 73-75 introduce: 'SHA-pinned to the multi-platform OCI index (Scorecard PinnedDependencies), so Buildx can select the amd64 or arm64 runtime.' Read against the removed line, this asserts that the change is what makes multi-arch selection possible.\n\nVerified against the registry, it is not:\n  - OLD sha256:b0ae8e989418b458e0f25489bc3be523718938a2b70864cc0f6a00af1ddbd985 -> Content-Type application/vnd.oci.image.index.v1+json, manifests for linux/amd64, linux/arm64 v8, linux/arm v7, linux/s390x, linux/ppc64le.\n  - NEW sha256:fccdbb0a547c14e23fcf4ce8ad62ca5d43b4faae8d22cd292f490fef9946c96e -> the same five platforms.\n  - The unchanged builder pin rust:1.88-slim-bookworm@sha256:38bc5a86... is also a multi-platform index.\n\nSo Buildx could already select amd64/arm64 before this PR, and release.yml's existing platforms: linux/amd64,linux/arm64 build was not blocked by the old pin. The comment will mislead the next maintainer into believing a single-arch pin bug existed and was fixed here, and it obscures the actual reason the digest moved (the :nonroot tag advanced; 17 of 18 layers are unchanged, only the base OS layer was refreshed).",
+    "file": "Dockerfile",
+    "fix_hint": "Rewrite the comment to describe what actually changed, e.g.:\n\n  # SHA-pinned for supply-chain integrity (Scorecard PinnedDependencies). The pinned digest\n  # is the multi-platform OCI index, so Buildx selects the amd64/arm64 runtime (release.yml\n  # builds both). Refresh this digest when :nonroot advances (base-layer/CVE updates) --\n  # re-pin from `crane digest gcr.io/distroless/cc-debian12:nonroot`.\n  # Tag: gcr.io/distroless/cc-debian12:nonroot\n\nDrop the 'so Buildx can select' clause from the justification for THIS bump (it describes a\nstanding property of both the old and new pin, not a change), and state the real reason for the\nbump in the PR body: routine base-image refresh to the current :nonroot digest.",
+    "severity": "major",
+    "title": "Comment states a false rationale: the previous pin was ALREADY a multi-platform OCI index"
+   },
+   {
+    "body": "A base-image digest bump is a supply-chain-relevant edit, but neither the diff nor the comment records how sha256:fccdbb0a... was resolved or what it addresses. Reviewers currently have to hit the registry themselves (as I did) to confirm the digest is genuinely the :nonroot tag and not, say, the :latest (root) variant -- gcr.io/distroless/cc-debian12:latest currently resolves to sha256:e8e7ee4b..., a different image whose user is root, and a copy-paste slip there would silently drop the nonroot posture the rest of this Dockerfile assumes.",
+    "file": "Dockerfile",
+    "fix_hint": "In the PR body (not the Dockerfile), paste the resolution command and its output, e.g. `crane digest gcr.io/distroless/cc-debian12:nonroot` -> sha256:fccdbb0a..., plus a one-line note that User=65532 and the Env are unchanged versus the previous pin. That gives the next reviewer a cheap way to re-verify the tag/variant is right.",
+    "severity": "minor",
+    "title": "No recorded provenance for the new digest (how it was obtained / what it fixes)"
+   }
+  ],
+  "progress": null,
+  "summary": "The digest change itself is CORRECT and safe. I verified sha256:fccdbb0a...96e live against gcr.io: it is the digest the `gcr.io/distroless/cc-debian12:nonroot` tag currently resolves to; it is an OCI image index (amd64, arm64/v8, arm/v7, s390x, ppc64le); its amd64 config keeps User=65532, the same Env (PATH + SSL_CERT_FILE), no entrypoint; and 17 of its 18 layers are byte-identical to the old image with only the base OS layer refreshed. So this is a clean, minimal base-image refresh with no posture change, and it does not break the distroless/nonroot/HEALTHCHECK assumptions in the rest of the Dockerfile.\n\nThe problem is the comment introduced alongside it. The new text claims the pin is now 'SHA-pinned to the multi-platform OCI index ... so Buildx can select the amd64 or arm64 runtime', which implies the prior pin was not multi-platform and that arch selection was broken. That is false: the OLD digest sha256:b0ae8e98...985 is itself an application/vnd.oci.image.index.v1+json listing the same five platforms (amd64, arm64/v8, arm/v7, s390x, ppc64le). I also checked the unchanged builder pin rust:1.88-slim-bookworm@sha256:38bc5a86... \u2014 likewise a multi-platform index. Nothing about this PR enables or fixes multi-arch selection; release.yml's linux/amd64,linux/arm64 buildx job already worked.\n\nNet effect: the only durable record of WHY the digest moved is an inaccurate one, and the real reason (a routine base-layer/CVE refresh to the current :nonroot tag) is nowhere in the diff. In a repo whose contract is that every claim traces to what the code actually does, that is a defect worth fixing before merge. No security or correctness objection to the digest itself.",
+  "verdict": "request_changes"
+ }
+}
