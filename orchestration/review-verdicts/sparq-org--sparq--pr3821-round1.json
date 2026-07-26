@@ -1,0 +1,44 @@
+{
+ "host_envelope": {
+  "pr": 3821,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "32dca8b6d4956391cc3908e5629d71a71b929f75",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Minted existentials change shape from `__sk1_e` to `__sk0_1_e`. `crates/sparq-reason/tests/n3_collect_stratified.rs:258-271` (`stratified_carried_existential_survives_a_colliding_source_label`) hard-codes the OLD shape: its stratum-2 source is `_:__st0___sk1_e`, chosen because that was exactly the label a FIXED `__st0_` carry rename would have produced for stratum 1's minted `_:e`. After this PR the carried label is `__st1___sk0_1_e`, so the source label no longer names the collision and the test passes for the wrong reason.\n\nProved empirically in an out-of-tree copy: with `fresh_carry_prefix` pinned to a constant `\"__st0_\"` (the bug the test exists to catch), `stratified_carried_blank_survives_a_colliding_source_label` FAILS (still has teeth) while `stratified_carried_existential_survives_a_colliding_source_label` PASSES. Its comment (\"`_:e` skolemized to `__sk1_e`\") is now false, so the next reader is also misled.\n\nSecondary: the minted-label shape is user-visible in closure output and no CHANGELOG entry accompanies it.",
+    "file": "crates/sparq-reason/src/n3/mod.rs",
+    "fix_hint": "Update the stratum-2 source in that test to the label a fixed rename would now produce \u2014 `_:__st0___sk0_1_e` \u2014 and correct the comment to say `__sk0_1_e`. Verified out-of-tree: with that label the test PASSES at PR head and FAILS under a pinned `__st0_` carry rename, i.e. its teeth are restored. Better still, make it shape-independent (assert against the label actually observed in stratum 1's output) so the next mint-format change cannot defang it silently.",
+    "severity": "major",
+    "title": "Label-format change silently makes the existing stratified-existential regression test vacuous"
+   },
+   {
+    "body": "`fresh_blank_prefix` (mod.rs:358-367) scans the whole label set per candidate `k` (`seen.iter().any(|l| l.starts_with(&prefix))`). A document whose blank labels are `__sk0_x .. __skN_x` forces N iterations over an N-element set \u2014 O(n^2). Before this PR that loop ran only in `reason_n3_stratified`'s carry path; line 479 now puts it on the default path of EVERY `run_closure`, i.e. every `reason_n3` call (sparq-py lib.rs:337/550, sparq-cli, the solid WAC/ACP paths) and every nested `formula_closure` run (mod.rs:1917), which is re-entered per binding per fixpoint round.\n\nMeasured out-of-tree (release, work box \u2014 NON-CANONICAL, order-of-magnitude only), adversarial `_:__sk{i}_x` fillers vs a benign `_:zz{i}_x` control:\n  n= 2000: 13.6ms vs 6.7ms\n  n= 4000: 38.7ms vs 11.2ms\n  n= 8000: 136ms  vs 25.6ms\n  n=16000: 511ms  vs 63.1ms\nThe adversarial-minus-control delta quadruples per doubling (6.8 / 27.5 / 110 / 448 ms) \u2014 clean quadratic attributable to this scan. Extrapolated, a ~160k-label document costs ~45s of pure prefix scanning on document content the caller does not control.",
+    "file": "crates/sparq-reason/src/n3/mod.rs",
+    "fix_hint": "Make it one pass instead of a rescan per k: iterate `seen` once, and for each label that starts with `family`, parse the digits up to the next `_` and insert that number into a `FxHashSet<usize>`/bitset of taken indices; then return the smallest absent index. That is O(n) total and preserves the exact current contract (`no existing label starts with family{k}_`). Apply it to `fresh_carry_prefix` too, since it shares the helper.",
+    "severity": "major",
+    "title": "fresh_blank_prefix is O(k*n) and now runs on every run_closure \u2014 quadratic on attacker-shaped documents"
+   },
+   {
+    "body": "`sk_prefix` is computed once at entry (mod.rs:479) from `parsed`. Blank labels can still enter the fact set AFTER that point \u2014 e.g. a `log:semantics` / `log:parsedAsN3` result formula whose blanks are bound out through a variable (`{ ?d log:semantics ?f . ?f log:includes { ?x a :Foo } } => { ?x a :Bar }`) carries the EXTERNAL document's labels verbatim into the outer store. If that external document is itself a serialized closure containing `_:__sk0_1_e`, the outer run can mint the identical label and conflate the two nodes \u2014 the same capture this PR fixes, one level out. The same gap exists between an outer run and a nested `formula_closure` run, since each computes its prefix only over its own document.\n\nI did not construct a triggering end-to-end counterexample, and this is pre-existing (the old fixed `__sk{n}_` scheme had it too), so I am reporting it as a residual, not as a regression from this PR. The in-code comment at mod.rs:476-478 is accurate as scoped (\"every SOURCE blank label\"); the concern is only that the class is not fully closed.",
+    "file": "crates/sparq-reason/src/n3/mod.rs",
+    "fix_hint": "Either rename ingested external/nested blanks apart on entry (the same trick `stratum_blanks` already uses at the stratum boundary), or state the residual explicitly in the comment at mod.rs:476-478 \u2014 e.g. 'fresh against the parsed source; labels ingested mid-run via log:semantics/parsedAsN3 are out of scope' \u2014 and file a bead for the ingest-side rename so the gap is tracked rather than implied closed.",
+    "severity": "minor",
+    "title": "Freshness is proven only against the INITIAL parsed document, not labels ingested mid-run"
+   },
+   {
+    "body": "1. `forward_rule_existential_avoids_source_blank_label_collision` asserts only `source_node != parent_node`. It would not catch a regression where the minted node is distinct from the source node but is NOT the node bound as the `:hasParent` object (i.e. the two conclusion triples stop co-referring) \u2014 the co-reference property is what makes per-firing skolemization meaningful.\n\n2. `fresh_blank_prefix`'s doc (mod.rs:357) says 'absent from all existing labels', but the implemented predicate is stronger: no existing label may START WITH the prefix. That distinction is exactly what makes the namespace disjoint, so it is worth stating.",
+    "file": "crates/sparq-reason/src/n3/mod.rs",
+    "fix_hint": "Add `assert_eq!(parent_node, <object of the :hasParent triple>)` to pin co-reference between the two minted conclusion triples, and reword the `fresh_blank_prefix` doc to 'The smallest numbered `family{k}_` prefix that no existing label starts with.'",
+    "severity": "nit",
+    "title": "New test asserts only distinctness; helper doc under-states the predicate"
+   }
+  ],
+  "progress": null,
+  "summary": "The core fix is correct and the new test is genuinely non-vacuous: I copied the tree to /tmp, reverted the mint to the old `format!(\"__sk{sk_counter}_{l}\")`, and `forward_rule_existential_avoids_source_blank_label_collision` went RED with `left: 3 right: 3` \u2014 the exact conflation. `document_blank_labels` covers every nested Term variant (Iri/Lit/Blank/Var/Formula/List/Triple \u2014 model.rs:8-25) plus backward rules, the parser keeps `_:label` verbatim (parser.rs:689) and `intern_blank` is label-keyed (mod.rs:3158), so the minted namespace `__sk{k}_` really is disjoint from source labels. The `__st`/`__sk` family split keeps the stratified carry rename sound. Two problems block approval. (1) Changing the minted label from `__sk1_e` to `__sk0_1_e` silently DEFANGS an existing regression test that hard-codes the old shape (tests/n3_collect_stratified.rs:258-271); I proved it vacuous by pinning `fresh_carry_prefix` to a fixed `__st0_` \u2014 the sibling test fails, that one now PASSES, i.e. it no longer catches the bug it pins, and its comment is now factually wrong. (2) `fresh_blank_prefix` is O(k*n) and now runs on EVERY `run_closure` (previously only the stratified carry path), giving measured quadratic blow-up on attacker-shaped input. Both are small, mechanical fixes.",
+  "verdict": "request_changes"
+ }
+}
