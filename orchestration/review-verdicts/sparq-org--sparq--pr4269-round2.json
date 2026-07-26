@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4269,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "616f3dbe6804dbea278353974f9bc9f75150e7d1",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The section puts the odrl:use umbrella and collection membership among constructs with no N3 counterpart, then states that on a permission \"the construct simply never fires a grant.\" The rules actually match action/target/assignee IRIs exactly. Thus a permission whose action is odrl:use can emit a grant for a request whose action is exactly odrl:use; it only fails to reproduce the Rust oracle's broader umbrella match for requests such as odrl:read. The same exact-IRI subset issue applies to collection-valued structural attributes. This is a material caller-facing guarantee: being outside the equality scope does not imply that a permission is inert.",
+    "file": "skills/usage-control-policy/SKILL.md",
+    "fix_hint": "Limit the no-grant statement to unsupported permission constraints whose satisfaction the N3 strata cannot derive (for example purpose, spatial, count, xone, or unsupported operators). Describe odrl:use and PartyCollection/AssetCollection separately as exact-IRI-only on the N3 path: they may grant on an exact request match but do not implement the Rust oracle's umbrella/membership expansion. Keep the existing prohibition refusal wording.",
+    "severity": "major",
+    "title": "Out-of-scope permissions do not uniformly produce no grant"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 1's permission-versus-prohibition refusal split is now documented correctly. However, the replacement SKILL text introduces a new blanket claim that every listed Rust-only permission construct produces no N3 grant. That is false for constructs whose N3 behavior is a narrower exact match: notably an odrl:use permission can grant when the request action is exactly odrl:use, even though it does not implement the Rust oracle's umbrella semantics. The operational contract must distinguish unsupported constraints that cannot derive satisfaction from partially supported structural features that may still grant on their exact-match subset.",
+  "verdict": "request_changes"
+ }
+}
