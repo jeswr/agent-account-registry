@@ -6,8 +6,10 @@
 # (LEDGER_REF, data/metrics-history.json) so rates over time are real, evaluates the SUSTAINED
 # backlog-growth-vs-drain alert rules, and upserts ONE deduped `throughput-alert` issue per
 # (target, classification). CAS-publishes the current snapshot to ledger:`data/metrics.json`; the
-# dashboard build copies it to `site/metrics.json` in its sole Pages artifact. The offset avoids
-# same-minute ledger CAS contention with dashboard.yml (*/15) and groom.yml (7-59/15).
+# dashboard build copies it to `site/metrics.json` in its sole Pages artifact, and the
+# `dashboard-publish` job below KICKS that build as soon as the snapshot exists so the published
+# copy tracks THIS workflow's cadence instead of the sum of both (#656 follow-up). The cron offset
+# still avoids same-minute ledger CAS contention with dashboard.yml (*/15) and groom.yml (7-59/15).
 name: metrics
 
 on:
@@ -115,24 +117,73 @@ jobs:
             --alert \
             --publish
 
-  # Mutual keepalive: dashboard.yml hosts the fleet's cron-keepalive job, which makes
-  # dashboard's OWN schedule a single point of failure — when its cron delivery stalls
-  # (observed 2026-07-22: 44+ min overdue, published metrics >1h stale), nothing kicks it.
-  # This job rides metrics' independent */15 schedule and re-dispatches ONLY dashboard.yml
-  # when stale, so the two schedules cover each other; both must stall simultaneously to
-  # wedge, and any single fire of either revives the pair. No secrets, actions:write only.
-  dashboard-keepalive:
-    name: Re-dispatch a stale dashboard (mutual cron-delivery fallback)
+  # [OPUS-5] PUBLISH KICK (#656 follow-up) + the pre-existing mutual keepalive, in that order.
+  #
+  # The snapshot the metrics job just CAS-published to ledger:data/metrics.json is NOT on the site
+  # until dashboard.yml copies it into its Pages artifact. While the two ran on independent crons
+  # that copy waited for the dashboard's next fire, so the published snapshot inherited BOTH
+  # cadences (measured over the 7 days to 2026-07-25: p50 38.0 min / p90 53.7 min stale). This job
+  # kicks the dashboard the moment the snapshot exists, which is what makes the publish path
+  # CAUSAL rather than hopeful. `reason=metrics-publish` marks it as the causal leg, which the
+  # dashboard's publish-decision dedupe never skips.
+  #
+  # Chosen over an `on: workflow_run:` trigger in dashboard.yml deliberately, on two counts. (1) A
+  # workflow_run conclusion aggregates EVERY job in this workflow, so a failure in THIS job would
+  # suppress the publish of a perfectly good snapshot; `needs.metrics.result` names the one job
+  # whose success actually means "a new snapshot is on the ledger". (2) The dispatch POST is the
+  # mechanism this repo already runs in production (the staleness fallback below, and ~46% of this
+  # workflow's own runs), whereas the GitHub docs do not specify whether workflow_run fires for an
+  # upstream run that was itself started by a GITHUB_TOKEN workflow_dispatch — which is exactly how
+  # the keepalive mesh starts this workflow half the time.
+  #
+  # `needs: metrics` costs this job the metrics job's duration (~1 min) before it can fire; that is
+  # the point, and dashboard's own */15 cron still covers the case where the metrics job hangs.
+  #
+  # When metrics did NOT publish, the pre-existing MUTUAL keepalive still applies: dashboard.yml
+  # hosts the fleet's cron-keepalive job, which makes dashboard's OWN schedule a single point of
+  # failure — when its cron delivery stalls (observed 2026-07-22: 44+ min overdue, published
+  # metrics >1h stale), nothing kicks it. This job rides metrics' independent */15 schedule and
+  # re-dispatches ONLY dashboard.yml when stale, so the two schedules cover each other; both must
+  # stall simultaneously to wedge. No secrets, actions:write only.
+  dashboard-publish:
+    name: Kick the dashboard to publish the fresh snapshot (else revive a stale one)
+    needs: metrics
+    if: always()  # a FAILED metrics job must still reach the staleness keepalive below
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       actions: write
     steps:
-      - name: Dispatch dashboard.yml when its last run is stale
+      - name: Dispatch dashboard.yml for the fresh snapshot, or when its last run is stale
+        # `id:` so metrics.py's self-test can EXTRACT and EXECUTE this exact body against a
+        # hermetic gh stub: the branch polarity here (publish-kick vs staleness fallback) is
+        # invisible to `bash -n` and to actionlint.
+        id: dashboard-publish
         env:
           GH_TOKEN: ${{ github.token }}
+          METRICS_RESULT: ${{ needs.metrics.result }}
         run: |
           set -euo pipefail
+          if [ "${METRICS_RESULT}" = success ]; then
+            # A fresh snapshot is on the ledger and dashboard.yml is the only thing that can put it
+            # on the site. No live-run guard here (unlike the staleness kick below): the dashboard's
+            # singleton concurrency group queues this behind any live run, and its own
+            # publish-decision job drops the run if another has already deployed this content — so
+            # the #559 dup-dispatch storm is closed by the CONSUMER, not by guessing here.
+            # `inputs[reason]=`, NOT `reason=`. Verified against an echo server: `gh api -f
+            # reason=x` builds the FLAT body {"ref":...,"reason":"x"}, which the dispatch API does
+            # not read as an input — the run would start with an EMPTY reason, be indistinguishable
+            # from a keepalive kick, and get deduped away by the dashboard's own freshness check.
+            # The causal publish would then silently never happen, which is the exact failure this
+            # whole change exists to remove. gh's documented nesting syntax is `key[subkey]=value`.
+            gh api -X POST \
+              "repos/${GITHUB_REPOSITORY}/actions/workflows/dashboard.yml/dispatches" \
+              -f ref=master -f 'inputs[reason]=metrics-publish'
+            echo "dashboard-publish: kicked dashboard.yml for the fresh snapshot"
+            exit 0
+          fi
+          echo "dashboard-publish: metrics job result=${METRICS_RESULT} — no new snapshot was" \
+               "published; falling back to the staleness keepalive"
           now=$(date -u +%s)
           for spec in dashboard.yml:1500; do
             wf="${spec%%:*}"; limit="${spec##*:}"
