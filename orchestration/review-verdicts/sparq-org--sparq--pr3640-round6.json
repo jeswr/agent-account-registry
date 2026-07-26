@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3640,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "504c04baf7c4081dabef4e3bcb8374c0d9423db7",
+  "round": 6
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 6 resolves the prior major finding. The stage-2 pipeline description and F_share row now consistently use degree-t Shamir terminology, explicitly distinguish privacy against any t shares from reconstruction with t+1 valid shares, and retain t=floor((n-1)/2). The nearby reconstruction descriptions use the same convention. The document remains appropriately conditional about standalone/UC realization, accurately limits the secure_equal argument to a masked-opening distribution lemma, carries the match-bit leakage into F_join, and keeps the collaborative-proof path fail-closed and externally audit-gated. No new correctness, soundness, test-validity, security, or honesty issue is evident in the diff.",
+  "verdict": "approve"
+ }
+}
