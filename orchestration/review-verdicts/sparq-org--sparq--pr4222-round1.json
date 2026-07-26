@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4222,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "5930ce14cfa2a980526f2ed097edaefcff249e16",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "register_grant validates g.is_valid_at(now) only while opening and then stores only the publisher public key in TopicState.publishers. on_publish subsequently checks set membership but has no validity bound or current time, so a session (or any later auth-less session for the known topic) can continue publishing indefinitely after the signed AdmissionGrant.not_after time. This violates the documented grant-bounded admission model and makes expiration ineffective.",
+    "file": "crates/sparq-e2ee-ng-broker/src/broker.rs",
+    "fix_hint": "Store admission validity per publisher (and any other grant constraints needed for authorization), pass now into on_publish, and reject publication outside the active window. Add a behavioral test that opens with a short-lived valid grant, uploads a root, then demonstrates that a correctly signed publish after not_after fails closed; also cover replacement/overlap semantics for multiple grants.",
+    "severity": "major",
+    "title": "Publisher grant expiry is forgotten after OpenRepo"
+   },
+   {
+    "body": "on_put computes current topic usage and rejects when used + encoded_len exceeds max_topic_bytes before BlockStore::put determines whether the block is already attributed to this topic. A duplicate consumes no additional topic storage, yet it can return LimitExceeded when the topic is near its budget. That contradicts Response::Stored's idempotent duplicate semantics and the exact-byte stable-operation claim.",
+    "file": "crates/sparq-e2ee-ng-broker/src/broker.rs",
+    "fix_hint": "Detect an existing topic attribution before charging additional bytes (while retaining the intended first-seen-byte behavior), and charge quota only for a newly attributed block. Add a test that stores one block under a budget that permits exactly that block but not two, then repeats the same put and expects Stored { stored: 0, duplicate: 1 }.",
+    "severity": "major",
+    "title": "Quota check makes duplicate puts non-idempotent"
+   }
+  ],
+  "progress": null,
+  "summary": "The broker's admission state does not preserve or enforce the signed grant's validity window after OpenRepo. A publisher admitted once remains in TopicState.publishers indefinitely and can publish after its grant expires. This breaks the claimed bounded publisher-admission behavior and needs a real-path expiry test. The put path also checks quota before determining that an envelope is an existing idempotent duplicate, so a repeat of an already stored block can be rejected once the topic is near its byte ceiling, contradicting the protocol's stable idempotent-put contract.",
+  "verdict": "request_changes"
+ }
+}
