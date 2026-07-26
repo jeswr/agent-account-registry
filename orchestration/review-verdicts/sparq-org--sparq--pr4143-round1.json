@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4143,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "139ffd7581f9770cbe7284ef2e881d9fe1905000",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly makes the quoted-triples reification mode immutable construction state and applies it before both initial and mutation-triggered fallback materialization. The default constructor preserves Bridge behavior, while the feature-gated constructor selects DestructureOnly and the public documentation is updated alongside the API. The focused test exercises the real incremental fallback path, checks initial and post-insert parity against the matching from-scratch batch oracle, verifies destructuring remains active, and includes a fresh-dictionary Bridge contrast that prevents the strict-opacity assertion from being vacuous. No correctness, soundness, security, feature-gating, or documentation defect is apparent in the diff.",
+  "verdict": "approve"
+ }
+}
