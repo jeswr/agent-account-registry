@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4115,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ca75d4f7fd03ef58bdcdfb618fcf3b4c1c60021f",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "On the incremental branch, `extract_added` mutates `self.ex.names` and `resaturate` grows the saturation, but nothing updates `self.ex.report.named_classes`. The later assignment `report.report = self.ex.report` therefore only copies the pre-edit count. This contradicts the public `IncrementalReport::report` documentation, which says `named_classes` reports the live concept-index size, and `hierarchy()` propagates the same stale report. The differential helper explicitly excludes `named_classes`, so the tests cannot catch the defect. A fresh restriction-node edit is a direct witness: it mints normalization concepts while the reported count remains unchanged.",
+    "file": "crates/sparq-reason-el/src/incremental.rs",
+    "fix_hint": "After delta extraction/resaturation, set `self.ex.report.named_classes` from the current live name table (using the same count semantics as full extraction), before constructing either report/hierarchy. Extend the fresh-restriction incremental test to assert the documented live count and, where appropriate, distinguish it from a from-scratch count only because historical fresh names are retained.",
+    "severity": "major",
+    "title": "Incremental edits leave Report::named_classes stale"
+   }
+  ],
+  "progress": null,
+  "summary": "The incremental saturation path is backed by meaningful full-reclassification differentials, but the new public reporting contract is not implemented: after an incremental edit that mints concepts, `Report::named_classes` remains the value captured at initial extraction. The code and docs explicitly promise that it reflects the live concept-index size, while the tests deliberately omit this field. This makes the returned `IncrementalReport` and `ClassHierarchy` observably stale even when the hierarchy itself is correct.",
+  "verdict": "request_changes"
+ }
+}
