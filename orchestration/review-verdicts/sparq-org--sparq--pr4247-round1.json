@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4247,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "72ad23c9ec87601054381988156e21276311a68b",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new test only establishes that encode_block and encode_block_v2 emit equal bytes for the selected no-reset input. V2 decoding still takes the Format::V2 dispatch path into decode_block_v2_at and unconditionally captures first_col2 for every block before processing rows. Thus identical input bytes do not imply identical execution or prove that all extra decode cost is confined to reset_d1 rows. The same unsupported conclusion is repeated in the emit-gate rationale and the test documentation, and it is used to dismiss query cost as a blocker.",
+    "file": "crates/sparq-core/src/compress.rs",
+    "fix_hint": "Keep the deterministic size tests and decision if desired, but remove or narrow the query-cost-neutrality statements to the property actually tested: encoding differs only at reset_d1 payloads. Do not infer runtime cost from byte equality. If query-cost claims are required, support them with an appropriate benchmark or a rigorous code-level argument that accounts for format dispatch, the separate decoder, and per-block frame-origin handling.",
+    "severity": "major",
+    "title": "Byte-identical streams do not prove extra decode cost is confined to reset_d1 rows"
+   },
+   {
+    "body": "The skill says v2_stream_is_byte_identical_when_no_reset_d1 \"bounds V2's extra decode work to reset_d1 rows.\" That test observes encoded bytes only and cannot bound decoder work; the V2 decoder path has unconditional per-block work and separate dispatch regardless of whether the block contains a reset_d1 row.",
+    "file": "skills/data-formats/SKILL.md",
+    "fix_hint": "Replace the runtime-cost statement with the exact verified encoding property, or cite valid runtime evidence that includes all V2-path overhead.",
+    "severity": "major",
+    "title": "Public documentation repeats an unproven decode-cost bound"
+   }
+  ],
+  "progress": null,
+  "summary": "The deterministic encoded-size comparison is meaningful and the two tests are non-vacuous for the byte-stream properties they assert. However, the PR turns byte identity into an unsupported query-cost claim. V2 always selects a separate decoder and performs format dispatch plus unconditional per-block frame-origin capture, even when a block has no reset_d1 row. The new byte-equality test cannot measure or prove execution-cost neutrality, so the comments and public skill overstate what the evidence establishes.",
+  "verdict": "request_changes"
+ }
+}
