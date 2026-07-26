@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4255,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "acc499ba9b5e5f4feffffaff4495ac5f73c66b78",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`prune_source_combinations_with_summaries` only rejects an out-of-range `ps.pattern`; the preceding Rule-C1 check only compares lengths. A public `SelectedPrivateSources` with indices `[0, 0]` for a two-pattern BGP therefore passes, omits pattern 1, and evaluates pattern 0 twice. A reordered selection similarly produces `SourceCombination::assignment` in selection-vector order even though that field is documented as BGP-pattern order. Since `PrivatePatternSources` and `SelectedPrivateSources` are publicly constructible, this is not an unreachable state. The function's fail-closed claim is therefore false, and downstream routing can receive assignments attributed to the wrong patterns.",
+    "file": "crates/sparq-fedplan-mpc/src/combination.rs",
+    "fix_hint": "Before Rule C1/C2, require `selected.per_pattern.len() == bgp.patterns.len()` and require each entry at position `i` to have `pattern == i` (or canonicalize into a validated pattern-indexed array while rejecting duplicates/missing indices). Also validate each candidate's source index/id against `sources`, which is currently ignored. Add a regression test for duplicate indices and one for reordered indices that pins fail-closed behavior and BGP-order assignments.",
+    "severity": "major",
+    "title": "Pattern alignment is not validated before provenance evaluation"
+   },
+   {
+    "body": "The combination count is computed with `saturating_mul`, but enumeration later uses `choices.len() * rel.len()` in `Vec::with_capacity`. If the caller supplies `max_combinations == usize::MAX`, a saturated product is not rejected (`combinations > budget` is false), and the ordinary multiplication can overflow in debug builds or lead to an uncontrolled allocation failure. This contradicts the public documentation that the function never panics and weakens the stated plan-time bound.",
+    "file": "crates/sparq-fedplan-mpc/src/combination.rs",
+    "fix_hint": "Use `checked_mul` for every capacity/product calculation and decline with `TooManyCombinations` on overflow. Prefer `try_reserve` (mapped to a conservative decline/error) rather than an infallible huge `with_capacity`, and add a focused overflow-budget regression test.",
+    "severity": "minor",
+    "title": "Enumeration capacity multiplication can overflow and panic"
+   }
+  ],
+  "progress": null,
+  "summary": "The quotient evaluation itself is conservative for well-formed Phase-2 output, and the tests cover the principal join and decline paths. However, the new public function does not actually validate the selection/BGP alignment it relies on. Because the selection structs are publicly constructible, duplicate or reordered pattern indices can pass the length check, causing evaluation and returned assignments to use selection-vector order rather than BGP pattern order. That violates the documented contract and can make the provenance verdict operate on the wrong conjuncts. There is also an overflow/panic edge in combination enumeration despite the API's explicit never-panics claim.",
+  "verdict": "request_changes"
+ }
+}
