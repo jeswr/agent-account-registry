@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4366,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "0031cf85ebed72615ae24a7cfc96592b9d9e9466",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change is documentation plus a non-vacuous regression tripwire for the existing scalar revocation-reference invariant. The implementation confirms that every scan-covering attestation is resolved against the single manifest.revocation value, so distinct issuer-signed status slots fail with RevocationReferenceMismatch. The new test reaches that comparison with independently valid attestations and includes a same-slot positive control, while the documentation consistently describes the limitation as fail-closed, unchanged, research-grade, and still externally unaudited under sq-qhy4. No correctness, soundness, test-validity, or security defect was found.",
+  "verdict": "approve"
+ }
+}
