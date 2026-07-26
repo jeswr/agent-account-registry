@@ -988,11 +988,24 @@ def _account_newest(window):
 #    covered by one account's silence. Six hours means a maximally-backed-off account has had to
 #    come back and record something inside the span.
 #  * COVERAGE. The retained window must itself reach back to the start of the span. prune's
-#    MAX_RECORDS = 200 cap evicts the OLDEST records first, so on a very busy ledger the window
-#    can cover less than the span — and claiming six healthy hours from four observed ones is the
-#    exact dishonesty this predicate must not commit. Under-coverage DEFERS (it never releases);
-#    measured coverage today is 19.1 h, and 200 records would have to arrive inside 6 h (>33/h,
-#    ~3x the observed peak) to trip it.
+#    MAX_RECORDS = 200 cap evicts the OLDEST records first, so on a busy ledger the window can
+#    cover less than the span — and claiming six healthy hours from three observed ones is the
+#    exact dishonesty this predicate must not commit. Under-coverage DEFERS; it never releases.
+#
+#    KNOWN LIVE LIMITATION, MEASURED, AND NOT A HYPOTHETICAL (registry #699). Coverage >= SPAN
+#    requires the ledger's record rate to stay at or below MAX_RECORDS / SPAN = 200/6h = ~33
+#    records/h. Both sides of that line were observed on 2026-07-26 within one hour: at 11.2
+#    rec/h (200 records / 17.9 h) this predicate fired; at 61.5 rec/h (200 records / 3.25 h) it
+#    correctly refused, because covering 6 h at that rate would need ~369 records and the cap is
+#    200. An EARLIER version of this comment estimated the trip point at "~3x the observed peak"
+#    — that estimate was wrong by about 2x and the live fleet crossed it the same day.
+#    CONSEQUENCE, stated plainly rather than buried: while the fleet sustains more than ~33
+#    records/h, the aged-out exit does not open. The failure direction is the safe one and the
+#    park simply waits for a quieter window, but a PERMANENTLY busy fleet would reinstate the
+#    stall this exit exists to remove. That is a LEDGER-RETENTION bound, not a predicate bound —
+#    fixing it means a time-based retention floor in prune (or a larger MAX_RECORDS), which is a
+#    change to the shared health window every other consumer reads and is deliberately NOT made
+#    here. Tracked in registry #699.
 #  * FRESHNESS 1 h. Silence is NOT health: a fleet that recorded nothing for hours is unobserved,
 #    not proven. Requiring a SUCCESS inside the last hour is what makes "the fleet works" a
 #    present-tense claim. (Measured: the live ledger contains a 4.6 h silent gap; during it this
