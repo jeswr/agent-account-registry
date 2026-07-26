@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4005,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "6f4ebda226e7b8c86b6ba22f4b48dd451bcee41a",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior major finding. The documentation now explicitly limits exhaustiveness to the eligible slice and states that the untagged case and cases without a recognized check kind remain unmeasured, matching collect_cases_for. The RDF-BASED-only selector is disjoint from the DIRECT selector, and the offline canary exercises both inclusion and exclusion on the real round-trip path with nonzero exact counts. The corpus test separately pins all accounting buckets, preventing a silently vacuous selection when the corpus fixture is present. No correctness, soundness, test-validity, or security issue remains in the diff.",
+  "verdict": "approve"
+ }
+}
