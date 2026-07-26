@@ -1339,11 +1339,19 @@ def _provenance_read(args, *, target_repo, subject, env=None):
 
     Registry #677: a worker that cannot record provenance publishes a PR that reserves `__global__`
     and stalls the whole fleet, so this failure must never be a log line nobody reads. On failure it
-    emits (1) the stable `PROVENANCE-READ-FAILED` line naming repo + PR/branch + http status + class
-    + attempts, (2) an Actions `::error` annotation so the run's own summary counts it, and (3) a
-    deduped ops-alert issue — the machine-actionable state, listing exactly which PRs are missing a
-    record — before raising. It does NOT weaken the fail-closed rule downstream: a PR whose record
-    is absent still takes `__global__` in dispatch-claim.busy_packages_of_pulls."""
+    emits FOUR observable, machine-consumable artifacts before raising:
+
+      1. the stable `PROVENANCE-READ-FAILED` log line naming repo + PR/branch + http status + class
+         + attempts — the same run-log substrate `scripts/backfill-provenance.py` already reads;
+      2. an Actions `::error` annotation, which the checks API counts and attributes to the run;
+      3. a `$GITHUB_STEP_SUMMARY` row, durable on the run itself and needing no extra permission;
+      4. a deduped ops-alert issue when — and ONLY when — an alert route is configured. It is NOT
+         configured on worker.yml's `provenance` job today (no `REGISTRY_REPO`/`ALERT_TOKEN`, and
+         that job deliberately holds no `issues: write` beside `PROVENANCE_SALT`), exactly like
+         `_registry_put_file`'s existing terminal alert. Artifacts 1-3 are the ones that fire there.
+
+    It does NOT weaken the fail-closed rule downstream: a PR whose record is absent still takes
+    `__global__` in dispatch-claim.busy_packages_of_pulls."""
     result, attempts = _gh_read_with_retry(args, env=env)
     if result.returncode == 0:
         try:
@@ -1360,6 +1368,13 @@ def _provenance_read(args, *, target_repo, subject, env=None):
     print(f"::error title=provenance read failed::{summary} — no provenance record will be "
           f"written for this PR, so it will reserve the __global__ partition until backfilled",
           flush=True)
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary_path:
+        try:
+            with open(summary_path, "a", encoding="utf-8") as handle:
+                handle.write(f"- `{summary}`\n")
+        except OSError as exc:  # best-effort — never mask the operational error below
+            print(f"step-summary write failed (non-fatal): {exc}", file=sys.stderr)
     _ops_alert(*_alert_route(),
                f"⚠️ Worker provenance read failing — {target_repo}",
                f"> 🤖 SPARQ agent — `{summary}`.\n\n"
@@ -5391,7 +5406,14 @@ def _self_test():
 
         # GUARD 2 — an EXHAUSTED retry is a COUNTED, ATTRIBUTABLE failure naming the PR, never a
         # silent skip, and NOTHING is recorded.
-        err = _run_prov([_T503])
+        summary_file = Path(tempfile.mkdtemp()) / "step-summary.md"
+        summary_file.write_text("", encoding="utf-8")
+        os.environ["GITHUB_STEP_SUMMARY"] = str(summary_file)
+        try:
+            err = _run_prov([_T503])
+        finally:
+            os.environ.pop("GITHUB_STEP_SUMMARY", None)
+        step_summary = summary_file.read_text(encoding="utf-8")
         marker = next((line for line in prov_state["printed"]
                        if PROVENANCE_READ_FAILURE_MARKER in line and not line.startswith("::")), "")
         annotation = next((line for line in prov_state["printed"]
@@ -5404,13 +5426,14 @@ def _self_test():
                "http=503" in marker,
                f"attempts={gh_retry.MAX_ATTEMPTS}/{gh_retry.MAX_ATTEMPTS}" in marker),
               (True, True, True, True, True))
-        check("#677 the failure is ATTRIBUTABLE in three machine-readable places "
-              "(log marker, ::error annotation, ops alert)",
+        check("#677 the failure is ATTRIBUTABLE in four machine-readable places "
+              "(log marker, ::error annotation, step summary, ops alert)",
               (PROVENANCE_READ_FAILURE_MARKER in marker,
                "pr=42" in annotation,
+               PROVENANCE_READ_FAILURE_MARKER in step_summary and "pr=42" in step_summary,
                [t for t, _b in prov_state["alerts"]] == [f"⚠️ Worker provenance read failing — {repo}"],
                any("pr=42" in b for _t, b in prov_state["alerts"])),
-              (True, True, True, True))
+              (True, True, True, True, True))
         check("#677 the raised error carries the status and the stderr gh used to DISCARD",
               ("http=503" in str(err), "class=transient" in str(err),
                "Service Unavailable" in str(err),
