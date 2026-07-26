@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3934,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "5004cd3bb2b3dd8c25f1dbfa4f2450ef9df3a0d5",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The compatibility harness is coherent and complete as scoped. It pins the external CSS image, isolates all services in one loopback network namespace, validates issuer and audience configuration before startup, obtains a real CSS-issued DPoP-bound token, and exercises both the accepting path and a meaningful default-audience rejection control. The JOSE helper self-test covers canonical thumbprints, fixed-width ES256 conversion, signed bytes, required DPoP claims, and proof uniqueness. Failure accounting prevents setup failures from yielding a passing smoke, and cleanup is bounded to the directory returned by mktemp. No correctness, soundness, security, or vacuity issue requiring changes was found in the supplied diff.",
+  "verdict": "approve"
+ }
+}
