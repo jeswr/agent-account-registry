@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3899,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "7dca1b7325b275c3b730e9859a82c9132f4473f8",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The design-only change is internally consistent, explicitly refuses to implement ahead of the upstream profile/fixture freeze, and accurately limits its independence claim to the concept-definition/ingestion path rather than the shared RDFC-1.0 implementation. The cited sparq-canon APIs and their hash-profile distinction match the current source, and the proposed verifier is fail-closed, opt-in, and sequenced before indexing. The document also identifies unresolved profile choices as open questions instead of silently inventing wire semantics. No executable path or test is added, which is appropriate for the deliberately gated design deliverable.",
+  "verdict": "approve"
+ }
+}
