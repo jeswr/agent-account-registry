@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4238,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ae7344396e2e05680d4a06614c3ca8b0cd1f1846",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "client_accepts_trailers discards every parameter before checking the token, so `TE: trailers;q=0` returns true. A zero quality value means the client does not accept that transfer coding. The server consequently chooses the normal-completion trailer path instead of the deliberately failed-body path for truncation, despite the client explicitly declining trailers. This also makes the comments and wire contract's claim that trailers are sent only when negotiated inaccurate. The existing parser test covers q=0.5 but omits the load-bearing q=0 case.",
+    "file": "crates/sparq-server/src/http.rs",
+    "fix_hint": "Parse the semicolon parameters for the `trailers` token and reject it when a valid q value is zero (while handling optional whitespace and case-insensitive parameter names); add `assert!(!with(\"trailers;q=0\"))` plus whitespace/list variants. Keep malformed quality handling conservative so malformed input cannot opt into the normal trailer-ending truncation path.",
+    "severity": "major",
+    "title": "TE trailers;q=0 is incorrectly treated as trailer negotiation"
+   }
+  ],
+  "progress": null,
+  "summary": "The truncation state machine and its real-path tests substantively enforce the core invariant by withholding the JSON-closing chunk until an explicit Done marker. However, trailer negotiation is not RFC-correct: a client that explicitly assigns trailers q=0 is treated as accepting them. That changes the truncation path from a failed body to a normal body carrying a trailer the client declared unacceptable, contradicting the implementation and documentation's negotiation contract. Fix the TE parameter handling and add the missing negative test.",
+  "verdict": "request_changes"
+ }
+}
