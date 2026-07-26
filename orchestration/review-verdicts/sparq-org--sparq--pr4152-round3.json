@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4152,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "bdd61c22a4876722dabe2e8d737693e38e56949b",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 3 resolves the prior blocker by removing the misleading `malicious_disclose_threshold_verdict` public surface, exporting only the explicitly experimental `experimental_tamper_evident_disclose_threshold_verdict`, and consistently documenting that the construction is tamper-evident on opened values rather than malicious-secure. No compatibility alias preserves the old claim. The end-to-end exploit witness remains real and non-vacuous, while the API, module documentation, crate re-export, and MPC skill now disclose the wrong-verdict limitation and the required `MacSession`-level remediation. This is improving relative to round 2: the known-vulnerable implementation remains available only behind an experimental, accurately tiered surface rather than a production malicious-security claim.",
+  "verdict": "approve"
+ }
+}
