@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4041,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "7f08e72853306f69c38253eff469d2be8b17841d",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`is_well_formed_absolute_iri` contracts to recognize the RFC 3987 `IRI` production, but `is_valid_iauthority` validates bracketed IPv6 hosts by character shape only. A value such as `http://[:::]/datatype` is accepted because the literal is non-empty and every character is `:`, although it is not an RFC 3986 IPv6address. Since `expand.rs` uses this predicate to validate authored datatype IRIs, malformed datatypes of this form can still expand successfully. The doc comment explicitly calls this residual laxity out, but that does not satisfy the claimed or required well-formedness guarantee.",
+    "file": "crates/sparq-jsonld/src/context/iri.rs",
+    "fix_hint": "Parse bracketed IP literals with a complete IPv6/IPvFuture validator (including case-insensitive ABNF literal handling for `v`/`V`), or use a complete RFC 3987 parser for the full predicate. Add a public expansion-path regression asserting `InvalidTypedValue` for an invalid bracketed host such as `http://[:::]/datatype`, and a nearby valid IPv6 datatype case.",
+    "severity": "major",
+    "title": "The well-formed IRI predicate still accepts invalid IP literals"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 2 fixes the reported percent-encoding hole and adds a real public expansion-path regression, but the same major finding remains: the helper still claims to validate the RFC 3987 IRI production while deliberately accepting malformed IP-literal hosts. For example, `http://[:::]/datatype` reaches the IPv6 \"shape only\" branch, whose non-empty string consists entirely of permitted `:` characters, and is accepted even though it is not a valid IPv6address. The datatype expansion path therefore still accepts some malformed authored datatype IRIs. Because the prior completeness defect remains at major severity, progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
