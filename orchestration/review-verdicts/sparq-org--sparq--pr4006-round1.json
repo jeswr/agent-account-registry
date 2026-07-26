@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4006,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "08d370df818f83c19e78b70097d318e0fac68d7c",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change is internally consistent and complete as a bounded research/reproduction artifact. The comparator adds protocol caveats to both the envelope and every admitted timing row, while preserving existing row shapes when no caveat is supplied; the focused test exercises both populated and default-absent paths and explicitly verifies that rows exist, so it is not vacuous. The csparql2 gather script pins upstream, applies and records the declared iterator-close patch, keeps non-matching scenarios as expected evidence, and attaches the window-semantics qualification to all comparison outputs. The runner's scenario definitions, timestamp handling, SELECT-variable projection, and set-per-report-time counting align with the documented count-only purpose. Claims remain appropriately limited: the comparable surface is not widened, non-canonical timing is not presented as canonical, and the alignment/deadlock limitations are prominent and machine-readable.",
+  "verdict": "approve"
+ }
+}
