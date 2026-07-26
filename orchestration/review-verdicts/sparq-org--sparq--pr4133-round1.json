@@ -1,0 +1,58 @@
+{
+ "host_envelope": {
+  "pr": 4133,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "957c9850ef39f530c69900326f245d706f14bad3",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "exec.rs:5934-5939 states the invariant: `sfWithin(REGION, ?g)` / `sfContains(?g, REGION)` \"must not set `within_region`\", because an exact within-region certificate answers the opposite containment direction. Under `--features spatial-exact-pushdown` a wrong `within_region: true` here routes to `apply_spatial_pushdown_exact`, whose certificate (sparq-geo `within_region_literals`) returns geometries INSIDE the region \u2014 the exact complement of what the query asks \u2014 and on `AllCertified` the residual FILTER is skipped entirely, so wrong rows reach the answer.\n\nThe new test cannot see this. `SupersetProvider` implements only `candidates` and `is_indexed`; `SpatialProvider::candidates_exact` keeps its default `None` (crates/sparq-engine/src/lib.rs:626), so `apply_spatial_pushdown_exact` returns `Declined` and falls back to the superset path regardless of the `within_region` value. Flipping `within_region: false` to `true` in either new block is therefore a GREEN mutant: `calls == 1` still holds (the superset `candidates` is still the only call), and the rows still match.\n\nThis is the one property the PR's own comment calls out as the soundness reason for the change, and it is the only property with no oracle.",
+    "file": "crates/sparq-engine/tests/spatial_superset_orientations.rs",
+    "fix_hint": "Add a `#[cfg(feature = \"spatial-exact-pushdown\")]` variant of the provider that implements `candidates_exact` and returns a set that is WRONG for these orientations (e.g. `Some(vec![])`, or `Some(vec![wkt(\"FALSE_INDEXED\")])`) while also incrementing an `exact_calls` counter. Then assert `exact_calls == 0` for all three orientations \u2014 i.e. the engine never even asks for an exact certificate \u2014 and keep the row-equality assertion so a `within_region: true` mutant goes red both ways. `crates/sparq-engine/tests/spatial_exact_pushdown.rs` already has a `DiamondProvider` shaped for this; the same `serve_exact` switch can be reused.",
+    "severity": "major",
+    "title": "Test cannot detect a `within_region: true` regression \u2014 the load-bearing invariant the new comment asserts is unpinned"
+   },
+   {
+    "body": "The module doc claims \"Differential coverage for constant-region spatial FILTER orientations whose bbox pushdown is a superset only\", and the new exec.rs comment claims \"its bbox scan is a candidate SUPERSET and the residual FILTER remains authoritative\". But `candidates` returns `vec![wkt(\"TRUE_INDEXED\")]` \u2014 exactly the indexed bindings that satisfy the predicate. There is no candidate that survives the pushdown and is then REJECTED by the residual FILTER, so the authoritative-residual property is untested for these orientations.\n\nConcretely: a mutant that treated the `candidates` result as exact and skipped the residual FILTER for candidate rows would still pass. The surviving `FALSE_UNKNOWN` row (not indexed) does catch the cruder mutant that skips the residual FILTER for ALL rows, but not the one that matters for a superset contract \u2014 a bbox false positive being wrongly admitted.\n\nSince the whole justification for these new orientations is \"superset + residual is authoritative\", a test that only ever sees an exact index does not verify the claim it is named after.",
+    "file": "crates/sparq-engine/tests/spatial_superset_orientations.rs",
+    "fix_hint": "Include a bbox false positive in the candidate set: return `vec![wkt(\"TRUE_INDEXED\"), wkt(\"FALSE_INDEXED\")]` from `candidates`, and add a fifth graph row (e.g. `ex:dropped ex:geom \"FALSE_INDEXED_OUT\"`, indexed but NOT a candidate) so the `pushed_checks < posthoc_checks` assertion still holds (4 residual checks vs 5 post-hoc). The result must remain `{TRUE_INDEXED, TRUE_UNKNOWN}`, which now genuinely requires the residual FILTER to reject the `FALSE_INDEXED` candidate.",
+    "severity": "major",
+    "title": "The mock provider returns an EXACT candidate set, so the superset property the file is named for is never exercised"
+   },
+   {
+    "body": "The new bullet at exec.rs:5883-5885 says the planner recognises \"a Simple Features relation between one geometry variable and one constant geometry used directly as the FILTER, whenever intersection is necessary for the relation\". The implementation recognises exactly three IRIs: `GEOF_SF_WITHIN`, `GEOF_SF_INTERSECTS`, `GEOF_SF_CONTAINS`.\n\nIntersection is equally necessary for `sfOverlaps`, `sfCrosses`, `sfTouches` and `sfEquals` (all four require a non-empty DE-9IM intersection), none of which are recognised. The follow-up sentence \"Other topological relations ... stay post-hoc\" then directly contradicts the stated rule. The previous wording enumerated the covered and uncovered predicates explicitly and was accurate; the replacement is a generalisation the code does not implement.",
+    "file": "crates/sparq-engine/src/exec.rs",
+    "fix_hint": "Either state the implemented rule literally \u2014 e.g. \"`geof:sfWithin` / `geof:sfIntersects` / `geof:sfContains` between one geometry variable and one constant, in either operand order\" \u2014 and keep the explicit list of what stays post-hoc (`sfOverlaps/sfTouches/sfCrosses/sfEquals/sfDisjoint`), or extend `recognise_spatial` to the other intersection-necessary predicates so the doc becomes true.",
+    "severity": "minor",
+    "title": "Rewritten doc comment states a recognition rule broader than what is implemented"
+   },
+   {
+    "body": "The diff un-gates `GEOF_SF_CONTAINS` (exec.rs:5814) so it is available in the default build, and the new `variable_first` block handles `sfContains(?g, REGION)` unconditionally. But the constant-first spelling `sfContains(REGION, ?g)` remains behind `#[cfg(feature = \"spatial-exact-pushdown\")]` (exec.rs:5979-5980) and is therefore not recognised at all when the feature is off \u2014 not even as a plain bbox superset, which needs no exact-certification machinery.\n\nThe result is that `spatial-exact-pushdown`, documented in Cargo.toml as an optimisation that is \"result-identical by construction\", also silently changes which FILTER shapes get a superset pushdown. That is an odd coupling, it leaves a performance cliff on the default build, and it makes the rewritten doc comment (which is not feature-gated) inaccurate for the default configuration. Given the PR is scoped to \"the remaining constant-region orientations\", this is the one it misses.",
+    "file": "crates/sparq-engine/src/exec.rs",
+    "fix_hint": "Add `GEOF_SF_CONTAINS` to the `constant_first` predicate set with `within_region: false` as the ungated fallback, and keep the `#[cfg(feature = \"spatial-exact-pushdown\")]` arm ordered BEFORE it so the feature build still gets `within_region: true` for that shape. Alternatively hoist the whole constant-first-contains recognition out of the cfg and compute `within_region` as `cfg!`-conditional.",
+    "severity": "minor",
+    "title": "`sfContains(REGION, ?g)` is still not pushed in the default build, so the feature flag changes WHICH filters are recognised"
+   },
+   {
+    "body": "`variable_first = iri == GEOF_SF_INTERSECTS || iri == GEOF_SF_CONTAINS` (exec.rs:5942-5943). For `sfIntersects` in the `(Variable, const)` shape, the pre-existing block at exec.rs:5919-5931 \u2014 `(iri == GEOF_SF_WITHIN || iri == GEOF_SF_INTERSECTS) && cargs.len() == 2` with `(Expression::Variable(v), Some(arg))` \u2014 has already returned. The `GEOF_SF_INTERSECTS` disjunct in `variable_first` can therefore never fire.\n\nHarmless, but it makes the code read as if there are two competing recognisers for the same shape (with different `within_region` values \u2014 `iri == GEOF_SF_WITHIN` i.e. `false` above, hard-coded `false` below), which is exactly the kind of ambiguity a later reader could resolve the wrong way.",
+    "file": "crates/sparq-engine/src/exec.rs",
+    "fix_hint": "Narrow to `let variable_first = iri == GEOF_SF_CONTAINS;` and add a one-line comment noting that variable-first `sfIntersects`/`sfWithin` are already handled by the block above, or fold all four orientations into a single match on `(iri, &cargs[0], &cargs[1])` so there is exactly one recogniser per shape.",
+    "severity": "nit",
+    "title": "`variable_first` includes `GEOF_SF_INTERSECTS`, but that branch is unreachable"
+   },
+   {
+    "body": "Several constructs are hand-wrapped well inside the workspace's `max_width = 100` and would be collapsed by `cargo fmt` \u2014 e.g. the `for (iri, geometry_arg) in [(SF_INTERSECTS, 1), (SF_WITHIN, 1), (SF_CONTAINS, 0)]` array literal and both `format!` calls in `query_for`; likewise `let constant_first = ...` / `let variable_first = ...` in exec.rs. The CI `lint` job runs `cargo fmt --all --check` only informationally (continue-on-error, per rustfmt.toml), so this does not fail the gate, but it adds avoidable churn to the deferred workspace-wide reformat.",
+    "file": "crates/sparq-engine/tests/spatial_superset_orientations.rs",
+    "fix_hint": "Run `cargo fmt -p sparq-engine` and commit the result.",
+    "severity": "nit",
+    "title": "New code is not rustfmt-normalised (max_width = 100)"
+   }
+  ],
+  "progress": null,
+  "summary": "The implementation logic is sound. I verified the superset argument end-to-end: for every newly recognised orientation \u2014 sfIntersects(REGION,?g), sfWithin(REGION,?g), sfContains(?g,REGION) \u2014 Simple Features requires a non-empty interior intersection, so bbox(?g) must intersect bbox(REGION); sparq-geo's candidates() for SpatialQuery::BboxIntersects is locate_in_envelope_intersecting (crates/sparq-geo/src/index.rs:711), a genuine intersecting-envelope scan, so the candidate set is a valid superset for the 'variable contains the constant' direction too. within_region:false is correct for all three (an exact within-region certificate cannot decide containment in the other direction), and the new blocks are ordered so they do NOT shadow the pre-existing sfContains(REGION,?g) -> within_region:true arm, so there is no regression on the exact path. apply_spatial_pushdown_exact requires within_region:true, so these orientations always take the superset + residual-FILTER path.\n\nWhat blocks approval is test validity, not the algorithm. The new test's SupersetProvider does not implement candidates_exact, so it silently declines exact certification; a mutation flipping within_region to true for these orientations leaves the test GREEN under --features spatial-exact-pushdown. That is precisely the soundness invariant the new comment asserts, and nothing pins it. Separately, the provider returns candidates = {TRUE_INDEXED}, which is exactly the indexed answer set \u2014 never a proper superset \u2014 so the file's stated property ('bbox pushdown is a superset only', residual FILTER authoritative over bbox false positives) is never exercised for these orientations.\n\nThe rewritten doc comment also states a recognition rule ('whenever intersection is necessary for the relation') that is broader than the three hard-coded IRIs, and is additionally false in the default build, where sfContains(REGION,?g) is still cfg-gated off.",
+  "verdict": "request_changes"
+ }
+}
