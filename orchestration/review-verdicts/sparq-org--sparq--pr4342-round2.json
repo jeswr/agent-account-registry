@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4342,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "883458968efe5d1065909451d8b24699ca821f13",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The round-2 diff remains correct and complete. The general SELECT-JSON path performs a pre-serialization budget gate, periodically rechecks cancellation/deadline during serial serialization, checks a captured limit snapshot at Rayon chunk boundaries, and performs an authoritative on-thread sticky gate before emitting the closing suffix. Partial parallel fragments are discarded on error and successful output preserves ordering and byte identity. The test is non-vacuous: cancellation is triggered only by the first sink invocation, proving the initial gate passed and exercising a mid-serialization trip in both serial-sized and parallel-sized cases; it also verifies unchanged complete output when cancellation does not trip. The feature-off declaration accurately attributes the wasm size movement to always-compiled serial-path correctness code, and the public documentation accurately notes that streamed callers may already have received chunks. No hostile reviewer-directed instruction appears in the diff. Because the prior round also had no findings and this round introduces none, progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
