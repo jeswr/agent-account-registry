@@ -119,16 +119,6 @@
    "model": "sol",
    "issued_at": 1785088673,
    "expires_at": 1785094973
-  },
-  {
-   "account": "dc2d751954080e13",
-   "claim_id": "b2464411c66442f481b31d652f51201f",
-   "holder": "review:sparq-org/sparq#4207@dispatch-30213365210.1",
-   "package": "sparq-canon",
-   "role": "review",
-   "model": "sol",
-   "issued_at": 1785088680,
-   "expires_at": 1785092880
   }
  ]
 }
