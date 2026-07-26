@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4045,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d4cff4d49168808c03324080947dc859a39cf7b9",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`input_errors` checks that every declared encoding key exists, but never validates the result object or its status. With `odre.status == \"present\"`, replacing an encoding result with `{ \"status\": \"missing\", \"decision\": null }` or `{ \"status\": \"skipped-no-odre\", \"decision\": null }` passes the input gate. `build_report` then counts it as `skipped`, leaves report status `complete`, excludes it from the comparable set, and may exit 0 based on the remaining cases. Thus key coverage is not equivalent to the promised real-verdict coverage, and a corrupt/truncated decision record can still publish a partial agreement result.",
+    "file": "bench/ac/odre/agreement.py",
+    "fix_hint": "In `input_errors`, when ODRE is present, require every case/encoding result to have an allowed real-run status (`ok`, `odre-error`, `encoding-error`, or `encoding-unrepresentable`) and validate the required fields for that status; reject `missing`, `skipped-no-odre`, unknown statuses, and malformed/null `ok` decisions before report construction. When ODRE is absent, require every result to be `skipped-no-odre`. Add end-to-end self-test mutations for a present run containing `missing` and `skipped-no-odre` result objects and assert exit 2 with no report written.",
+    "severity": "major",
+    "title": "Present ODRE runs still accept non-result statuses as complete coverage"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 2 fixes the version-pin check and rejects absent cases, absent encoding keys, duplicate decision IDs, and unexpected decision IDs. However, the completeness gate still validates only the presence of each encoding key, not that a present ODRE run contains a real result under that key. A corrupt result whose status is `missing` or `skipped-no-odre` passes `input_errors`, is rendered as `skipped`, and can still produce a `complete` report with exit 0. This preserves the core fail-open behavior from round 1 in a narrower form. Progress is improving because one prior major finding is fully resolved and the other has been substantially narrowed, but the remaining major issue blocks approval.",
+  "verdict": "request_changes"
+ }
+}
