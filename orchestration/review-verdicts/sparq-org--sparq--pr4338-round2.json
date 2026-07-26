@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4338,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ac5b962512499d0fab1d21da9405ae3b4acc6e9e",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The list-gold branch checks only `answered != gold_count`; it never compares returned entities with `gold_keys`. A query returning any same-cardinality set therefore passes th01/th04/cc01/cc04/th06 even when every entity is wrong. This contradicts the new module/README claims that answers match the claimed gold and that no task can pass without a gold check. The new end-to-end test is vacuous for this invariant: `fake_run_factory` returns arbitrary `e0`, `e1`, ... rows for list-gold SELECTs, and `test_gold_matching_results_validate` expects that result to pass.",
+    "file": "bench/fo-km/validate_tasks.py",
+    "fix_hint": "Parse the relevant result cell(s), normalize them to the local-name representation used by `gold_keys`, and compare the returned multiset/set (as appropriate to each SELECT) with the expected list, reporting missing and unexpected values. Change the end-to-end fake to return actual gold keys, then add a mutation test replacing one returned entity with a wrong entity while preserving row count and assert validation exits non-zero.",
+    "severity": "major",
+    "title": "List-shaped gold entity values are never validated"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round-1 cc03/cc05 defect is fixed with real per-category comparisons and mutation tests, but the newly broadened claim that every gold answer is checked is still false for list-shaped gold. Those tasks compare only row count to gold_count, so an entirely wrong entity set of the same size passes; the end-to-end fake deliberately supplies arbitrary e0/e1 rows and confirms this escape. Because the refreshed fixture's large entity lists are presented as validated gold, this remains a major test-validity gap. Progress is stagnant: one major unchecked-gold class was fixed, but another materially equivalent major gap remains.",
+  "verdict": "request_changes"
+ }
+}
