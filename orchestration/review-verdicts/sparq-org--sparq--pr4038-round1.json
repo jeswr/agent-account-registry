@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4038,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a01a0ece906fcdf2e78d1caeab1ad3afc58a85d2",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new degree_reduce documentation says MacSession::auth_mul's independent `reduce([alpha*x]*[y])` computation covers Hole 2 and calls it design section 2.4 route (a). However, `research/mpc-malicious-security-design.md` section 2.4 defines route (a) as first reducing `[z]` and then computing `[alpha*z]` from that reduced `[z]` times `[alpha]`; the current code and its test explicitly label that audited construction unsound. The one relevant test, `mac_carry_soundness_distinguished_by_in_reduce_tamper`, demonstrates divergence for a value-reduce-only injected delta, but it does not establish consistency with the cited audit record or cover the full malicious behavior across both reduction rounds. This is a material soundness-documentation contradiction, not a wording nit.",
+    "file": "crates/sparq-mpc/src/shamir.rs",
+    "fix_hint": "Update the malicious-security design/audit record in the same change with a reviewed argument for the independent input-MAC construction and its adversary model, explicitly replacing/rejecting the old route (a), then ensure tests cover the load-bearing deviations allowed in that model (including coordinated behavior across both reductions). Alternatively, change the implementation and claims to match a sound audited construction. Do not describe the current construction as design section 2.4 route (a) while that section specifies `[z]*[alpha]`.",
+    "severity": "major",
+    "title": "Implemented MAC carry is misidentified as the audited route (a)"
+   }
+  ],
+  "progress": null,
+  "summary": "The documentation update overstates that the implemented multiplication is the audited design's route (a), but the cited audit record specifies the opposite MAC construction. The existing discriminator test validates only the implementation's chosen one-sided value-reduction tamper model; it does not reconcile that implementation with the audit argument. On this MPC soundness-sensitive surface, the claim cannot be approved until the audit/design record and implementation are made consistent and the applicable adversary model is justified.",
+  "verdict": "request_changes"
+ }
+}
