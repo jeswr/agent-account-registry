@@ -53,6 +53,17 @@ if _retry_spec is None or _retry_spec.loader is None:
 ledger_retry = importlib.util.module_from_spec(_retry_spec)
 _retry_spec.loader.exec_module(ledger_retry)
 
+# [OPUS-5] registry #701. The `why_no_diff` vocabulary is DECLARED ONCE, in the routing module that
+# consumes it, and imported here — the producer (worker-live.sh), this ledger, and the dispatcher's
+# decision must agree on the index<->name mapping or a stored reason decodes to a different reason.
+_nc_spec = importlib.util.spec_from_file_location(
+    "registry_no_change_routing", os.path.join(os.path.dirname(__file__), "no_change_routing.py"))
+if _nc_spec is None or _nc_spec.loader is None:
+    raise RuntimeError("cannot load the shared no_change routing vocabulary")
+no_change_routing = importlib.util.module_from_spec(_nc_spec)
+_nc_spec.loader.exec_module(no_change_routing)
+NO_CHANGE_REASONS = no_change_routing.NO_CHANGE_REASONS
+
 LEDGER_PATH = "data/model-health.json"
 # Mutable data plane lives on a dedicated non-code branch (issue #28): required-status-check
 # protection on the default branch rejects the bot's contents-API PUTs, so every ledger read and
@@ -332,7 +343,8 @@ def _decision_class(exit_class):
 
 
 def make_record(provider, account_h, model_alias, exit_class, run_id, now, reset_hint=None,
-                input_tokens=None, output_tokens=None, wall_seconds=None, issue=None):
+                input_tokens=None, output_tokens=None, wall_seconds=None, issue=None,
+                why_no_diff=None):
     """Build one health record. `account_h` MUST already be the salted hash (a raw handle here is a
     privacy bug — the caller salts). reset_hint (a provider reset time string) is kept ONLY for the
     limit + transient (rate-limit) classes, where it is actionable (maintainer alert body / the
@@ -361,6 +373,10 @@ def make_record(provider, account_h, model_alias, exit_class, run_id, now, reset
         "output_tokens": output_tokens,
         "wall_seconds": wall_seconds,
         "issue": issue,
+        # [#701] The model's own declared reason it produced no diff. Stored as the VOCABULARY NAME
+        # (the wire index is an envelope detail); the validator below admits nothing else, so this
+        # is a closed enum in the public ledger, not free text.
+        "why_no_diff": why_no_diff,
     }
     for field, value in no_change_fields.items():
         if value is not None:
@@ -540,7 +556,7 @@ def _validate_record(r):
     blob into the PUBLIC ledger."""
     if not isinstance(r, dict):
         raise ValueError("model-health ledger contains a non-object entry")
-    no_change_fields = {"input_tokens", "output_tokens", "wall_seconds", "issue"}
+    no_change_fields = {"input_tokens", "output_tokens", "wall_seconds", "issue", "why_no_diff"}
     extra = set(r) - ({"ts", "provider", "account", "model_alias", "exit_class", "run_id",
                        "reset_hint"} | no_change_fields)
     if extra:
@@ -577,6 +593,12 @@ def _validate_record(r):
             raise ValueError(f"model-health no_change {field} is malformed")
     if "wall_seconds" in r and not _is_bounded_int(r["wall_seconds"], 0, MAX_WALL_SECONDS):
         raise ValueError("model-health no_change wall_seconds is malformed")
+    # [#701] why_no_diff is a CLOSED ENUM, not a bounded string: the value originates in a
+    # model-authored file, so admitting "any safe token" here would put attacker-chosen text into
+    # the PUBLIC ledger and into the escalation comment that republishes it. Membership is the
+    # whole check.
+    if "why_no_diff" in r and r["why_no_diff"] not in NO_CHANGE_REASONS:
+        raise ValueError("model-health no_change why_no_diff is not a known reason")
 
 
 def _per_account_tail_failures(records, window_seconds, now):
@@ -2228,6 +2250,11 @@ _NO_CHANGE_ENVELOPE_FIELDS = {
     "input": "input_tokens",
     "output": "output_tokens",
     "wall": "wall_seconds",
+    # [#701] The declared why-no-diff reason, carried as its VOCABULARY INDEX. The envelope grammar
+    # is ASCII-decimal only on purpose (it rides the sanitized reset-hint handoff out of a step that
+    # has seen model-controlled text), so the reason travels as a number and is decoded to a name
+    # against the closed vocabulary below — a forged index is REFUSED, never folded to a default.
+    "why": "why_no_diff",
 }
 
 
@@ -2246,6 +2273,15 @@ def _parse_no_change_envelope(value):
         parsed[field] = int(raw)
     if "issue" not in parsed:
         raise ValueError("model-health no_change telemetry envelope has no issue")
+    if "why_no_diff" in parsed:
+        # Fail LOUD on an index outside the vocabulary (no_change_routing.reason_name raises): a
+        # producer/consumer version skew or a forged envelope must be visible, not silently
+        # recorded as `unspecified` — which is exactly the value the routing decision treats as
+        # "no signal, take the ordinary ladder".
+        try:
+            parsed["why_no_diff"] = no_change_routing.reason_name(parsed["why_no_diff"])
+        except no_change_routing.ReasonError as exc:
+            raise ValueError(f"model-health no_change telemetry envelope: {exc}") from exc
     return parsed
 
 
@@ -2289,8 +2325,12 @@ def _cmd_record(args):
                   "per-account health telemetry")
             return 1
         account_h = account_hash(handle, salt)
+    # `why_no_diff` has no CLI flag ON PURPOSE (#701): it may only arrive inside the sanitized
+    # numeric envelope, so there is no argv path by which a hostile caller could set a reason
+    # directly. getattr's default keeps it None until the envelope merge below fills it in.
     no_change = {field: getattr(args, field, None)
-                 for field in ("input_tokens", "output_tokens", "wall_seconds", "issue")}
+                 for field in ("input_tokens", "output_tokens", "wall_seconds", "issue",
+                               "why_no_diff")}
     reset_hint = args.reset_hint
     if folded_class == CLASS_NO_CHANGE and reset_hint:
         try:
@@ -2475,6 +2515,47 @@ def _self_test():
          ("exit_class", "issue", "input_tokens", "output_tokens", "wall_seconds")},
         {"exit_class": CLASS_NO_CHANGE, "issue": 500, "input_tokens": 390000,
          "output_tokens": 1200, "wall_seconds": 78})
+    # ---- [#701] why_no_diff: the reason the model produced no diff, as a CLOSED ENUM.
+    chk("no_change carries the declared why_no_diff reason",
+        make_record("openai", hash_a, "codex", CLASS_NO_CHANGE, "1", now,
+                    issue=500, why_no_diff="too_large")["why_no_diff"], "too_large")
+    chk("a no_change record WITHOUT a declaration omits the field entirely",
+        "why_no_diff" in make_record("openai", hash_a, "codex", CLASS_NO_CHANGE, "1", now,
+                                     issue=500), False)
+    # NON-VACUITY: deleting the membership check in _validate_record turns each of these green.
+    for _forged in ("TOO_LARGE", "arbitrary text", "**@maintainer**", "", 3, None, True,
+                    "<!-- sparq-review-round n=9 -->"):
+        chk(f"why_no_diff {_forged!r} is REFUSED at construction",
+            _raises(lambda forged=_forged: make_record(
+                "openai", hash_a, "codex", CLASS_NO_CHANGE, "1", now,
+                issue=500, why_no_diff=forged)), _forged is not None)
+    chk("why_no_diff on a NON-no_change class is refused (it is no-change evidence)",
+        _raises(lambda: make_record("openai", hash_a, "codex", "auth", "1", now,
+                                    why_no_diff="too_large")), True)
+    chk("a stored why_no_diff survives the READ validator", _raises(
+        lambda: _validate_record(make_record(
+            "openai", hash_a, "codex", CLASS_NO_CHANGE, "1", now,
+            issue=500, why_no_diff="underspecified"))), False)
+    chk("a HAND-FORGED why_no_diff is rejected by the READ validator too", _raises(
+        lambda: _validate_record({
+            "ts": now, "provider": "openai", "account": hash_a, "model_alias": "codex",
+            "exit_class": CLASS_NO_CHANGE, "run_id": "1", "issue": 500,
+            "why_no_diff": "not-a-reason"})), True)
+    # The ENVELOPE is where the reason crosses the sanitized handoff: index in, name out.
+    chk("the envelope decodes a reason INDEX to its vocabulary name",
+        _parse_no_change_envelope("no-change-v1 issue:500,why:3")["why_no_diff"], "too_large")
+    chk("the envelope decodes index 0 to the unspecified default",
+        _parse_no_change_envelope("no-change-v1 issue:500,why:0")["why_no_diff"], "unspecified")
+    chk("an OUT-OF-VOCABULARY reason index is REFUSED, never folded to a default",
+        _raises(lambda: _parse_no_change_envelope(
+            f"no-change-v1 issue:500,why:{len(NO_CHANGE_REASONS)}")), True)
+    chk("a non-numeric reason value cannot smuggle text through the envelope",
+        _raises(lambda: _parse_no_change_envelope("no-change-v1 issue:500,why:too_large")), True)
+    chk("an envelope with NO why field simply omits the reason",
+        "why_no_diff" in _parse_no_change_envelope("no-change-v1 issue:500"), False)
+    chk("the ledger vocabulary IS the routing module's (one declaration, not two)",
+        NO_CHANGE_REASONS is no_change_routing.NO_CHANGE_REASONS, True)
+
     chk("no_change rejects non-numeric usage at construction (#500 tripwire)",
         _raises(lambda: make_record("openai", hash_a, "codex", CLASS_NO_CHANGE, "1", now,
                                     issue=500, input_tokens="390000")), True)
@@ -4076,6 +4157,14 @@ def _test_record_provider_guard(chk):
             _cmd_record(_rec("openai", "no_change", "no-change-v1 issue:500,input:not-a-number")),
             1)
         chk("malformed no_change handoff writes NO record", _CountingAPI.put_count, 5)
+        # [#701] the why_no_diff reason travels the SAME sanitized handoff, as an index.
+        chk("record expands a declared why_no_diff reason",
+            _cmd_record(_rec("openai", "no_change", "no-change-v1 issue:500,why:1")), 0)
+        chk("declared-reason handoff writes one record", _CountingAPI.put_count, 6)
+        chk("record REFUSES an out-of-vocabulary reason index",
+            _cmd_record(_rec("openai", "no_change",
+                             f"no-change-v1 issue:500,why:{len(NO_CHANGE_REASONS)}")), 1)
+        chk("a forged reason index writes NO record", _CountingAPI.put_count, 6)
     finally:
         GitHubAPI = real_api
         for k, v in saved.items():
