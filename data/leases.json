@@ -83,12 +83,12 @@
   {
    "account": "51bde6688e140866",
    "claim_id": "d8be36e95bd5405b84b28ee45bd6d1f7",
-   "holder": "sparq-org/sparq#2603@dispatch-30216390288.1",
+   "holder": "sparq-org/sparq#2603@30216656413.1",
    "package": "site-papers",
    "role": "research",
    "model": "opus5",
-   "issued_at": 1785093646,
-   "expires_at": 1785099946
+   "issued_at": 1785093670,
+   "expires_at": 1785099970
   },
   {
    "account": "dc2d751954080e13",
