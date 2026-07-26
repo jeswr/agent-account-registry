@@ -1,0 +1,44 @@
+{
+ "host_envelope": {
+  "pr": 4076,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "8713cbb15583a0a1092418fcb6b40501c00fe0e6",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "In `thing_subclass_of_nothing_is_reported` the fixture is `owl:Thing rdfs:subClassOf owl:Nothing .` and nothing else, so the ontology contains ZERO named classes. The assertion `h.unsatisfiable_classes().is_empty()` with the message \"owl:Thing is not a named-class result\" therefore passes for the wrong reason: the list is empty because there is nothing to project, not because owl:Thing was excluded from the projection. A regression that made `classify()` emit TOP into `unsatisfiable` (e.g. if `dict_of(TOP)` ever started returning `Some`) would still be caught by this exact fixture, but the assertion as written cannot distinguish \"top excluded\" from \"no named classes exist\", which is what its message claims to pin.\n\nVerified empirically with a scratch fixture (since removed): with `:A rdfs:subClassOf :B` added, the result is `thing_unsatisfiable=true`, `unsatisfiable_classes().len()==2` (both A and B, correctly, since top-bottom collapses everything), and owl:Thing's dict id is NOT in the list. That is the behaviour the test intends to assert.\n\nNot a blocker: the load-bearing assertion (`report().thing_unsatisfiable`) IS non-vacuous -- a forced-`false` mutation of `classify.rs:585` turns this test red, and a forced-`true` mutation turns `explicit_owl_nothing_superclass_makes_class_unsatisfiable` red.",
+    "file": "crates/sparq-reason-el/tests/differential.rs",
+    "fix_hint": "Add a named class to the fixture so the exclusion is actually observable, e.g. `let ttl = format!(\"{PRE} owl:Thing rdfs:subClassOf owl:Nothing . :A rdfs:subClassOf :B .\");` then assert that `iri(&dict, \"A\")` IS in `unsatisfiable_classes()` (top-bottom collapses every named class) while the `owl:Thing` dict id is NOT -- looked up the same way `explicit_owl_thing_superclass_is_trivial_not_a_derived_subsumption` already looks up `thing`. That turns the message into a checked invariant.",
+    "severity": "minor",
+    "title": "New test's `unsatisfiable_classes().is_empty()` assertion is vacuous w.r.t. its own message"
+   },
+   {
+    "body": "Both new/updated tests use a directly asserted `owl:Thing rdfs:subClassOf owl:Nothing` (or its absence). Nothing in the diff pins the more interesting case where the clash is DERIVED by saturation -- e.g. `owl:Thing rdfs:subClassOf :P , :Q . :P owl:disjointWith :Q .` -- which is exactly the case the doc-comment describes (\"whether the SATURATION derived ...\"). Without such a test, a future change that narrowed the check to a told-axiom lookup would not be caught by this crate's differential suite.\n\nI verified the derived case does work today: that fixture yields `thing_unsatisfiable=true` with `skipped_axioms==0`. So this is a coverage gap, not a defect. `abox.rs:649` covers a related `owl:Thing owl:equivalentClass owl:Nothing` case through the realiser, but only under the `abox` feature and only via `is_inconsistent()`, not via the new default-build field.",
+    "file": "crates/sparq-reason-el/src/classify.rs",
+    "fix_hint": "Add one more case to `tests/differential.rs` next to the new test:\n\n```rust\nlet ttl = format!(\"{PRE} owl:Thing rdfs:subClassOf :P , :Q . :P owl:disjointWith :Q .\");\n// ... assert h.report().thing_unsatisfiable && h.report().skipped_axioms == 0\n```\n\nThis runs in the default feature state, so it also guards the field for builds without `abox`.",
+    "severity": "minor",
+    "title": "No test pins a DERIVED (as opposed to told) `owl:Thing \u2291 owl:Nothing`"
+   },
+   {
+    "body": "`Report` (lib.rs:102) and `Classification` (classify.rs:570) are both `pub` with all-`pub` fields and neither is `#[non_exhaustive]`. Adding `thing_unsatisfiable` is technically a semver-breaking change for any downstream that constructs either by struct literal. In-workspace this is a non-issue -- `Report` derives `Default` and the only literal construction of `Classification` is the one in `classify()` that the diff already updates -- so nothing breaks today. Flagging only because the crate keeps accreting public report fields (`emitted_role_subsumptions`, `rbox_non_regular`, `skipped_assertions`, now this), and each one repeats the exposure.",
+    "file": "crates/sparq-reason-el/src/lib.rs",
+    "fix_hint": "Optional and out of scope for this PR: mark `Report` `#[non_exhaustive]` so future field additions are non-breaking, and require callers to build it via `Report::default()` + field assignment (which is already the in-repo pattern). If done, file it as a separate bead rather than expanding this diff.",
+    "severity": "nit",
+    "title": "New public field on `Report` / `Classification` without `#[non_exhaustive]`"
+   },
+   {
+    "body": "The new\n\n```rust\nassert_eq!(\n    h.report().skipped_axioms,\n    0,\n    \"the EL axiom must be applied\"\n);\n```\n\nhas an argument list of exactly 60 characters, which is right at rustfmt's default `fn_call_width` of 60, so `cargo fmt --all --check` would likely want it on a single line (the neighbouring pre-existing multi-line `assert_eq!` in `explicit_owl_nothing_superclass_makes_class_unsatisfiable` is 62 chars and therefore legitimately split). I could not confirm -- the rustfmt component is not installed on this box. Non-blocking regardless: the rustfmt job at `.github/workflows/ci.yml:1233` is `continue-on-error: true` pending the deferred workspace-wide reformat.",
+    "file": "crates/sparq-reason-el/tests/differential.rs",
+    "fix_hint": "If you want a clean `cargo fmt --check`, collapse to `assert_eq!(h.report().skipped_axioms, 0, \"the EL axiom must be applied\");` (77 cols with indent, well under `max_width`). Otherwise leave as-is -- the gate is informational.",
+    "severity": "nit",
+    "title": "New `assert_eq!` may be collapsed by rustfmt"
+   }
+  ],
+  "progress": null,
+  "summary": "Adds Classification::thing_unsatisfiable / Report::thing_unsatisfiable surfacing the global owl:Thing \u2291 owl:Nothing clash, which the named-class projection in classify() deliberately drops (dict_of(TOP) is None, normal.rs:83). Correct and sound. The computation reuses the exact signal abox.rs:166 already uses for base_inconsistent, and is threaded through all four hierarchy_from call sites (typed Classifier::classify, its par twin, classify_graph/materialize_lattice, and the abox realiser), so every entry point reports consistently. Verified empirically: (1) mutation checks in BOTH directions go red -- forcing the value false fails thing_subclass_of_nothing_is_reported, forcing it true fails explicit_owl_nothing_superclass_makes_class_unsatisfiable, so neither assertion is vacuous; (2) with a named class present, a derived top-bottom clash correctly propagates bottom into every named class while owl:Thing stays out of unsatisfiable_classes(), exactly as the README/SKILL wording claims; (3) a DERIVED top-bottom (owl:Thing rdfs:subClassOf :P,:Q with :P owl:disjointWith :Q, no told axiom) is also detected, so the flag reads the real saturation rather than pattern-matching a told axiom. Gates run locally: cargo test -p sparq-reason-el default and --all-features both green (incl. doctests); RUSTDOCFLAGS='-D warnings' cargo doc --all-features --no-deps clean, so the feature-gated intra-doc-link trap does not fire on the new Self::unsatisfiable_classes field link. clippy and rustfmt components are absent on this box and were not run; rustfmt is informational (continue-on-error) per ci.yml:1233. Docs are honest and non-overclaiming: README and skills/inference/SKILL.md both state that unsatisfiable_classes() remains a named-class-only list excluding owl:Thing, which matches observed behaviour. No security surface, no ZK/MPC or privacy claim, no hard-coded performance numbers, no new dependency, no change to default-feature weight. Remaining findings are minor/nit only.",
+  "verdict": "approve"
+ }
+}
