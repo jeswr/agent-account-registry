@@ -385,6 +385,13 @@ _gh_retry = _load_module(
 _lease_schema = _load_module(
     "registry_lease_schema", Path(__file__).resolve().with_name("lease_schema.py"))
 
+# [OPUS-5] registry #701. THE no_change routing decision: a worker exit that produced no diff must
+# not re-dispatch the tier that produced it. Same shared-module idiom — the vocabulary and the
+# decision live in ONE place, consumed here (routing), by model-health (storage), and by
+# worker-live.sh (production).
+_no_change_routing = _load_module(
+    "registry_no_change_routing", Path(__file__).resolve().with_name("no_change_routing.py"))
+
 
 def _require_exact_fields(value, fields, where):
     if not isinstance(value, dict):
@@ -2662,7 +2669,8 @@ def _decline_outcome_name(record):
 
 
 def _escalate_repeated_declines(repo, item, outcomes, comments, bot_login, script_dir,
-                                apply_action=None, post_comment=None):
+                                apply_action=None, post_comment=None,
+                                min_outcomes=DECLINE_ESCALATION_MIN):
     """Apply or reconcile one repeated-decline escalation.
 
     Returns ``proceed`` below threshold and after a previously completed impl->research reroute;
@@ -2670,8 +2678,15 @@ def _escalate_repeated_declines(repo, item, outcomes, comments, bot_login, scrip
     BEFORE the label mutation so a mutation failure can be reconciled next tick without a second
     loud comment. Conversely, a failed comment performs no label mutation and safely retries.
     Injectable mutation/comment callables keep the --self-test tripwires on the real control flow.
+
+    `min_outcomes` (registry #701) is the threshold this call is allowed to fire at. It stays
+    DECLINE_ESCALATION_MIN for the historical "two honest declines" ladder, and drops to 1 for the
+    ONE case where a second outcome could add nothing: the resolved model chain has no tier left
+    that has not already produced a `no_change` for this issue, so the only remaining choices are
+    "run the failed tier again" or "decompose". The caller — never this function — decides that,
+    from `no_change_routing.retry_decision`.
     """
-    if len(outcomes) < DECLINE_ESCALATION_MIN:
+    if len(outcomes) < min_outcomes:
         return "proceed"
 
     evidence, key = _decline_escalation_evidence(outcomes)
@@ -4083,15 +4098,60 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                     no_changes = _issue_no_change_outcomes(
                         model_health, health_window, number)
                     comments = None
-                    if len(no_changes) >= DECLINE_ESCALATION_MIN:
+                    # [#701] THE LAYER THAT BINDS: escalate-the-tier vs decompose is decided HERE,
+                    # from the validated ledger, BEFORE allocator.claim() picks a model — because
+                    # the claim is what would otherwise walk the resolved chain from its head and
+                    # re-run the exact tier that just returned nothing. Measured 2026-07-26: the
+                    # same hard issue was retried up to 3x on the SAME model, so ~64% of worker
+                    # capacity produced no diff at all.
+                    #
+                    # `decision` is one of:
+                    #   proceed           — no attributable in-window no_change evidence; unchanged
+                    #                       behaviour, the full chain claims as before.
+                    #   retry-other-tier  — dispatch, but ONLY on chain tiers with no recent
+                    #                       no_change for this issue. A strict, order-preserving
+                    #                       subsequence, so the "claimed model must be in the
+                    #                       resolved chain" guard below and worker.yml's adopt-side
+                    #                       membership check both still hold.
+                    #   decompose         — nothing left to escalate TO (or the model declared the
+                    #                       task's SHAPE is the blocker). Fire the #500 reroute at
+                    #                       a threshold of ONE, because a second identical outcome
+                    #                       cannot inform a decision this evidence has already
+                    #                       made.
+                    #
+                    # FAIL-CLOSED, restated because both directions are load-bearing: an unreadable
+                    # health window already `continue`d above with NO escalation, so an unreadable
+                    # exit class is neither no_change nor success; and an in-window row whose
+                    # model_alias is empty retires no tier at all (it cannot prove which tier ran).
+                    nc_decision, nc_chain = _no_change_routing.retry_decision(
+                        resolved["model_chain"], no_changes, int(time.time()))
+                    decline_threshold = (
+                        1 if nc_decision == _no_change_routing.DECOMPOSE else DECLINE_ESCALATION_MIN)
+                    if len(no_changes) >= decline_threshold:
                         comments = _pr_comments(repo, number)
                         decline_result = _escalate_repeated_declines(
-                            repo, item, no_changes, comments, bot_login, script_dir)
+                            repo, item, no_changes, comments, bot_login, script_dir,
+                            min_outcomes=decline_threshold)
                         if decline_result != "proceed":
                             defer_reasons[f"decline-{decline_result}"] += 1
                             print(f"escalated {repo}#{number}: repeated no_change outcomes -> "
                                   f"{decline_result}; cached {item['role']} claim cancelled")
                             continue
+                        # `proceed` after a DECOMPOSE decision means the reroute for this exact
+                        # evidence is already applied and reconciled — the issue is on its new
+                        # route. The evidence is spent: it must not also narrow the new route's
+                        # chain to nothing, which would defer the decomposition forever. Fall
+                        # through on the FULL chain and let the (now research-side) ladder bound it.
+                        nc_decision, nc_chain = _no_change_routing.PROCEED, resolved["model_chain"]
+                    if nc_decision == _no_change_routing.RETRY_OTHER_TIER:
+                        # Narrowing, not degrading: the chain keeps routing.toml's order, so a
+                        # security/soundness route that resolved to a single frontier tier can
+                        # never fall to a weaker one — it has no other tier, so it took the
+                        # `decompose` arm above instead.
+                        print(f"reroute {repo}#{number}: a previous attempt exited no_change on "
+                              f"{sorted(set(resolved['model_chain']) - set(nc_chain))}; this "
+                              f"dispatch is restricted to {nc_chain}")
+                        resolved = dict(resolved, model_chain=list(nc_chain))
                     # Deferred-retry budget (locked decision 20): re-dispatch is bounded by the
                     # SAME durable attempt markers the worker records; exhausted -> the
                     # MACHINE-owned status:parked soft hold + a maintainer-visible comment,
@@ -4780,6 +4840,106 @@ _PARTITION_SEAM = {
 }
 
 
+# [OPUS-5] registry #701 — THE YAML SEAM of the no_change evidence path, in worker.yml.
+#
+# Everything the routing decision does is downstream of ONE wire: worker-live.sh classifies the
+# exit, the `exit-class` step lifts it (plus the no-change envelope carrying `why:<index>`) into the
+# `worker` job's outputs, and the separate no-target-code `model_health` job turns those outputs
+# into the validated ledger row that dispatch later routes on. Cut that wire anywhere and the
+# dispatcher sees NO no_change evidence — every issue looks freshly dispatchable, and the fleet goes
+# straight back to retrying the same tier. That failure is SILENT: no job goes red.
+#
+# STRUCTURAL, on PARSED nodes, for the standing measured reason: a substring or `count(...) == N`
+# assertion over the workflow TEXT cannot tell a live step from one carrying `if: false`, cannot see
+# a deleted step, and cannot see an `env:` input re-pointed at a neighbouring output. Every entry
+# below is one parsed node, and the self-test mutates each in memory and demands the violation back.
+_NO_CHANGE_SEAM = {
+    # The `worker` job must EXPORT the exit class and the (envelope-bearing) reset hint...
+    "worker_outputs": {
+        "exit_class": "${{ steps.exit-class.outputs.class }}",
+        "reset_hint": "${{ steps.exit-class.outputs.reset_hint }}",
+    },
+    # ...from a step that runs on EVERY path. `always()` is load-bearing: the classes that matter
+    # most are failures, and a success-only guard would record nothing exactly when it matters.
+    "worker_step": ("exit-class", "${{ always() && !inputs.dry_run }}"),
+    # The recorder job must be gated on the class being NON-EMPTY (never on success), must depend
+    # on `worker` for its outputs, and must feed BOTH values through as env — never inline in the
+    # `run:` shell, where provider-derived text would execute (issue #199).
+    "health_if": "${{ always() && !inputs.dry_run && needs.claim.outputs.acquired == 'true' "
+                 "&& needs.worker.outputs.exit_class != '' }}",
+    "health_needs": "worker",
+    "health_step_name": "Append the model-access health record (salted account hash only)",
+    "health_env": {
+        "EXIT_CLASS": "${{ needs.worker.outputs.exit_class }}",
+        "RESET_HINT": "${{ needs.worker.outputs.reset_hint }}",
+    },
+    # ...and the recorder must actually PASS the hint to the script that decodes the envelope.
+    "health_run_fragments": ("model-health.py record", '--exit-class "$EXIT_CLASS"',
+                             '--reset-hint "$RESET_HINT"'),
+}
+
+
+def _no_change_seam_violations(document):
+    """The #701 evidence-path seam, checked STRUCTURALLY against a PARSED worker.yml document.
+    Returns a sorted list of violation strings; empty means the wire is intact."""
+    out = []
+    jobs = (document or {}).get("jobs") or {}
+    worker_outputs = (jobs.get("worker") or {}).get("outputs") or {}
+    for name, value in _NO_CHANGE_SEAM["worker_outputs"].items():
+        if worker_outputs.get(name) != value:
+            out.append(f"worker.yml: jobs.worker.outputs.{name} must be {value!r} (found "
+                       f"{worker_outputs.get(name)!r}) — the model_health job reads it, so a "
+                       f"deleted or re-pointed output records the wrong outcome (or none)")
+    step_id, wanted_if = _NO_CHANGE_SEAM["worker_step"]
+    worker_steps = (jobs.get("worker") or {}).get("steps")
+    if not isinstance(worker_steps, list):
+        out.append("worker.yml: jobs.worker.steps is not a list, so the exit-class seam is gone")
+    else:
+        step = next((s for s in worker_steps
+                     if isinstance(s, dict) and s.get("id") == step_id), None)
+        if step is None:
+            out.append(f"worker.yml is missing the `{step_id}` step in jobs.worker — nothing else "
+                       "classifies the model exit, so no no_change evidence is ever produced")
+        elif step.get("if") != wanted_if:
+            out.append(f"worker.yml: jobs.worker step `{step_id}` `if:` is not the always()-guard "
+                       f"(found {step.get('if')!r}) — `if: false`, or a success-only guard, drops "
+                       "the exit class SILENTLY on exactly the failing runs that matter")
+    health = jobs.get("model_health")
+    if not isinstance(health, dict):
+        out.append("worker.yml is missing the `model_health` job — the exit class is never "
+                   "recorded, so the dispatcher has no no_change evidence to route on")
+        return sorted(out)
+    if health.get("if") != _NO_CHANGE_SEAM["health_if"]:
+        out.append("worker.yml: jobs.model_health `if:` is not the non-empty-exit-class guard "
+                   f"(found {health.get('if')!r}) — `if: false` or a success-only condition "
+                   "silently stops recording the failures this routes on")
+    if _NO_CHANGE_SEAM["health_needs"] not in (health.get("needs") or []):
+        out.append("worker.yml: jobs.model_health must `needs:` the worker job — without that "
+                   "edge its needs.worker.outputs.* reads are empty")
+    steps = health.get("steps")
+    step = next((s for s in steps if isinstance(s, dict)
+                 and s.get("name") == _NO_CHANGE_SEAM["health_step_name"]), None) \
+        if isinstance(steps, list) else None
+    if step is None:
+        out.append("worker.yml is missing the model_health record step — no ledger row is written")
+        return sorted(out)
+    env = step.get("env") or {}
+    for key, value in _NO_CHANGE_SEAM["health_env"].items():
+        if env.get(key) != value:
+            out.append(f"worker.yml: model_health record step env.{key} must be {value!r} (found "
+                       f"{env.get(key)!r}) — a deleted or re-pointed input records the wrong "
+                       "class, or drops the no-change envelope that carries why_no_diff")
+    run = step.get("run")
+    if not isinstance(run, str):
+        out.append("worker.yml: the model_health record step has no `run:` script")
+        return sorted(out)
+    for fragment in _NO_CHANGE_SEAM["health_run_fragments"]:
+        if fragment not in run:
+            out.append(f"worker.yml: the model_health record step no longer passes {fragment!r} — "
+                       "the exit class or the no-change envelope never reaches the ledger")
+    return sorted(out)
+
+
 def _partition_seam_violations(workflow, document):
     """The YAML SEAM of the mint-vs-adopt partition agreement, checked STRUCTURALLY against a
     PARSED workflow document. Returns a sorted list of violation strings; empty means intact.
@@ -5018,7 +5178,7 @@ def _self_test():
         issue=500, input_tokens=12, output_tokens=3, wall_seconds=6)
 
     def run_decline_tripwire(records, role="impl", comments=(), malformed=False,
-                             unreadable=False):
+                             unreadable=False, model_chain=("sol",)):
         """One complete deferred dispatch tick with fake GitHub transports and real validators."""
         labels = sorted([
             "area:dispatch", "priority:P1", f"role:{role}", "status:deferred",
@@ -5026,7 +5186,7 @@ def _self_test():
         body = "Investigate and implement the dispatch boundary."
         item = {
             "number": 500, "priority": 1, "package": "dispatch", "role": role,
-            "model_chain": ["sol"], "agent": "registry-impl", "escalate": False,
+            "model_chain": list(model_chain), "agent": "registry-impl", "escalate": False,
             "labels": labels, "author": "maintainer",
             "body_sha": hashlib.sha256(body.encode()).hexdigest(), "deferred": True,
         }
@@ -5065,9 +5225,14 @@ def _self_test():
         class FakeAllocator:
             def __init__(self):
                 self.claim_calls = 0
+                # [#701] The chain the dispatcher actually offered the allocator. THE tripwire for
+                # "a no_change never re-dispatches the tier that produced it": positional arg 3 of
+                # allocator.claim(registry_repo, package, role, model_chain, ...).
+                self.claimed_chains = []
 
-            def claim(self, *_args, **_kwargs):
+            def claim(self, *args, **_kwargs):
                 self.claim_calls += 1
+                self.claimed_chains.append(list(args[3]))
                 return None
 
             @staticmethod
@@ -5194,6 +5359,7 @@ def _self_test():
         return {
             "api_calls": api_calls, "helper_calls": helper_calls,
             "claim_calls": allocator.claim_calls, "comment_reads": comment_reads,
+            "claimed_chains": allocator.claimed_chains,
             "output": output.getvalue(),
         }
 
@@ -5278,6 +5444,122 @@ def _self_test():
     assert len(_issue_no_change_outcomes(
         model_health, auth_records + [no_change_a, no_change_b], 500)) == 2
     print("  ok   decline tripwire (f): a run of auth outcomes never advances the decline ladder")
+
+    # ---- [registry #701] NO_CHANGE MUST NOT RE-DISPATCH THE TIER THAT PRODUCED IT ---------------
+    # Measured 2026-07-26: 196 completed worker runs, 70 success / 126 failure, dominated by
+    # `no_change`, and the same hard issue retried up to 3x on the SAME model with no record of why
+    # the previous attempt produced nothing. Every tripwire below drives the REAL dispatch() call
+    # site and asserts on the chain the allocator was actually offered — a helper-only assertion
+    # would stay green if dispatch stopped consulting the decision.
+    def nc_record(alias, ts_offset, why=None, issue=500):
+        return model_health.make_record(
+            "openai" if alias in ("sol", "luna", "terra", "codex") else "anthropic",
+            "c" * 16, alias, "no_change", f"7{ts_offset:03d}.1", decline_now + ts_offset,
+            issue=issue, why_no_diff=why)
+
+    # (g) THE HEADLINE GUARD, escalate arm. One no_change on `sol` with an UNTRIED tier left: the
+    # issue still dispatches (no escalation, no park — it is not intractable yet), but the chain
+    # offered to the allocator EXCLUDES the tier that just returned nothing. Deleting the
+    # `resolved = dict(resolved, model_chain=...)` line turns the chain assertion red while the
+    # claim-count assertion stays green — which is exactly the pre-fix behaviour.
+    trip_g = run_decline_tripwire([nc_record("sol", -20)], model_chain=("opus5", "sol"))
+    assert trip_g["api_calls"] == [] and trip_g["helper_calls"] == [], trip_g
+    assert trip_g["claim_calls"] == 1, trip_g
+    assert trip_g["claimed_chains"] == [["opus5"]], trip_g["claimed_chains"]
+    assert "sol" not in trip_g["claimed_chains"][0], trip_g["claimed_chains"]
+    print("  ok   #701 (g): a no_change on `sol` re-dispatches on the UNTRIED tier, never on sol")
+
+    # (h) THE HEADLINE GUARD, decompose arm. One no_change on the ONLY tier the route has: there is
+    # nothing to escalate to, so the #500 reroute fires at a threshold of ONE — impl -> research —
+    # and the cached impl claim is cancelled. Before this change the same input produced a second,
+    # identical `sol` dispatch.
+    trip_h = run_decline_tripwire([nc_record("sol", -20)], model_chain=("sol",))
+    assert [call[0] for call in trip_h["api_calls"]] == ["POST", "GET", "PATCH"], trip_h
+    assert DECLINE_ESCALATION_MARKER in trip_h["api_calls"][0][2]["body"], trip_h
+    assert trip_h["api_calls"][-1][2]["labels"] == [
+        "area:dispatch", "priority:P1", "role:research", "status:deferred"], trip_h
+    assert trip_h["claim_calls"] == 0 and trip_h["claimed_chains"] == [], trip_h
+    print("  ok   #701 (h): a spent single-tier chain decomposes on the FIRST no_change, and "
+          "launches nothing")
+
+    # (i) why_no_diff is LOAD-BEARING, not decoration: a declared `too_large` decomposes even
+    # though an untried tier exists, because a different model does not make a task fit in one
+    # session. Removing the DECOMPOSE_REASONS check turns this into a (g)-shaped lateral retry.
+    trip_i = run_decline_tripwire([nc_record("sol", -20, why="too_large")],
+                                  model_chain=("opus5", "sol"))
+    assert [call[0] for call in trip_i["api_calls"]] == ["POST", "GET", "PATCH"], trip_i
+    assert trip_i["claim_calls"] == 0, trip_i
+    # ...while the DEFAULT (undeclared) reason must NOT: that is the fail-closed direction, and
+    # collapsing it would mark every silent failure intractable.
+    trip_i2 = run_decline_tripwire([nc_record("sol", -20)], model_chain=("opus5", "sol"))
+    assert trip_i2["claim_calls"] == 1 and trip_i2["claimed_chains"] == [["opus5"]], trip_i2
+    print("  ok   #701 (i): a declared too_large decomposes; an UNDECLARED reason does not")
+
+    # (j) AN UNREADABLE EXIT CLASS IS NEITHER no_change NOR SUCCESS. `unknown` is the fold target
+    # model-health uses when the host observed no attributable CLI exit. A whole window of them
+    # must narrow nothing, escalate nothing, and leave the FULL chain claimable.
+    unknown_records = [
+        model_health.make_record("openai", "c" * 16, "sol", "unknown", f"80{i}.1",
+                                 decline_now - 50 + (i * 10))
+        for i in range(4)
+    ]
+    assert {r["exit_class"] for r in unknown_records} == {model_health.CLASS_UNKNOWN}
+    trip_j = run_decline_tripwire(unknown_records, model_chain=("opus5", "sol"))
+    assert trip_j["api_calls"] == [] and trip_j["helper_calls"] == [], trip_j
+    assert trip_j["claim_calls"] == 1, trip_j
+    assert trip_j["claimed_chains"] == [["opus5", "sol"]], trip_j["claimed_chains"]
+    print("  ok   #701 (j): `unknown` exit classes are neither no_change nor success — full chain")
+
+    # (k) THE TERMINAL IS MACHINE-RECOVERABLE. An issue already on the non-implementation route
+    # whose only tier is spent takes the MACHINE-owned `status:parked` soft hold — never
+    # `needs:user` (registry #703: human-only parks become a conveyor onto the maintainer's desk).
+    # The park clears on its own once the evidence ages out of the health window.
+    trip_k = run_decline_tripwire([nc_record("opus5", -20)], role="research",
+                                  model_chain=("opus5",))
+    assert [call[0] for call in trip_k["api_calls"]] == ["POST"], trip_k
+    assert len(trip_k["helper_calls"]) == 1, trip_k
+    assert trip_k["helper_calls"][0][1][-2:] == ["--status", "parked"], trip_k
+    assert "needs:user" not in json.dumps(trip_k["helper_calls"]), trip_k
+    assert "needs-user" not in json.dumps(trip_k["helper_calls"]), trip_k
+    assert trip_k["claim_calls"] == 0, trip_k
+    print("  ok   #701 (k): the terminal is status:parked (machine-recoverable), never needs:user")
+
+    # (l) NO DEADLOCK AFTER THE REROUTE. Once the reroute for this exact evidence is receipted and
+    # the issue sits on its new route, the SAME evidence must not also narrow the new route's chain
+    # to nothing — that would defer the decomposition forever. The spent evidence falls through on
+    # the FULL chain, and the ladder (now research-side) is what bounds it from there.
+    _, nc_key = _decline_escalation_evidence([nc_record("opus5", -20)])
+    trip_l = run_decline_tripwire(
+        [nc_record("opus5", -20)], role="research", model_chain=("opus5",),
+        comments=[{"user": {"login": "sparq[bot]"},
+                   "body": f"<!-- {DECLINE_ESCALATION_MARKER} key={nc_key} action=research -->",
+                   "created_at": "2026-07-26T09:00:00Z"}])
+    assert trip_l["api_calls"] == [] and trip_l["helper_calls"] == [], trip_l
+    assert trip_l["claim_calls"] == 1 and trip_l["claimed_chains"] == [["opus5"]], trip_l
+    print("  ok   #701 (l): a receipted reroute does not strand the new route on an empty chain")
+
+    # (m) THE LADDER TERMINATES, driven through the REAL call site rather than argued about.
+    # Walk a THREE-rung impl chain: every tick must either dispatch on a strictly smaller chain or
+    # decompose. The bound is min(len(chain), DECLINE_ESCALATION_MIN) — the tier narrowing is not
+    # the only bound, the pre-existing #500 ladder still caps the number of no_change outcomes an
+    # issue may accumulate, and the TIGHTER of the two is what actually binds. Each dispatch runs
+    # on a tier no earlier dispatch used, so no attempt in this walk is ever an identical retry.
+    _term_chain = ("opus5", "sol", "luna")
+    _term_bound = min(len(_term_chain), DECLINE_ESCALATION_MIN)
+    _term_records, _term_dispatches, _term_tiers = [], 0, []
+    while True:
+        _trip = run_decline_tripwire(list(_term_records), model_chain=_term_chain)
+        if _trip["claim_calls"] == 0:
+            assert [call[0] for call in _trip["api_calls"]] == ["POST", "GET", "PATCH"], _trip
+            break
+        _term_dispatches += 1
+        assert _term_dispatches <= _term_bound, (_term_dispatches, _term_records)
+        _term_tiers.append(_trip["claimed_chains"][0][0])
+        _term_records.append(nc_record(_term_tiers[-1], -30 + _term_dispatches))
+    assert _term_dispatches == _term_bound, (_term_dispatches, _term_bound)
+    assert len(set(_term_tiers)) == len(_term_tiers), _term_tiers
+    print(f"  ok   #701 (m): the ladder terminates in decomposition after exactly "
+          f"{_term_dispatches} dispatches on {_term_tiers} — no tier is ever asked twice")
 
     fixture = {
         "schema": SCHEMA,
@@ -6707,6 +6989,73 @@ def _self_test():
     print(f"  ok   adopt-loop L6: the partition YAML seam is checked on PARSED nodes across "
           f"review-fix.yml + worker.yml, and all {len(_seam_mutants)} seam mutants "
           "(`if: false`, deleted step, deleted/re-pointed env input, deleted job output) are caught")
+
+    # ---- [registry #701] THE EVIDENCE-PATH YAML SEAM. The routing decision above is only as real
+    # as the wire that carries a no_change exit into the ledger. Cutting that wire fails SILENTLY:
+    # no job goes red, the dispatcher simply never sees any no_change evidence and goes straight
+    # back to retrying the same tier. Same parsed-node discipline as L6, same mutation proof. ----
+    assert _no_change_seam_violations(_wk_doc) == [], _no_change_seam_violations(_wk_doc)
+
+    def _wstep(document, job, step_id):
+        return next(s for s in document["jobs"][job]["steps"] if s.get("id") == step_id)
+
+    def _named_step(document, job, name):
+        return next(s for s in document["jobs"][job]["steps"] if s.get("name") == name)
+
+    _health_step_name = _NO_CHANGE_SEAM["health_step_name"]
+    _nc_seam_mutants = (
+        ("the exit-class step carries if: false",
+         lambda d: _wstep(d, "worker", "exit-class").__setitem__("if", "${{ false }}"), "`if:`"),
+        ("the exit-class step is gated on success only (the failures stop recording)",
+         lambda d: _wstep(d, "worker", "exit-class").__setitem__(
+             "if", "${{ steps.model.outcome == 'success' }}"), "`if:`"),
+        ("the exit-class step is deleted",
+         lambda d: d["jobs"]["worker"].__setitem__(
+             "steps", [s for s in d["jobs"]["worker"]["steps"] if s.get("id") != "exit-class"]),
+         "missing the `exit-class` step"),
+        ("jobs.worker.outputs.reset_hint deleted (the why_no_diff envelope's only path out)",
+         lambda d: d["jobs"]["worker"]["outputs"].pop("reset_hint"), "outputs.reset_hint"),
+        ("jobs.worker.outputs.exit_class re-pointed at the neighbouring reset hint",
+         lambda d: d["jobs"]["worker"]["outputs"].__setitem__(
+             "exit_class", "${{ steps.exit-class.outputs.reset_hint }}"), "outputs.exit_class"),
+        ("the model_health job carries if: false",
+         lambda d: d["jobs"]["model_health"].__setitem__("if", "${{ false }}"),
+         "model_health `if:`"),
+        ("the model_health gate is flipped to success-only",
+         lambda d: d["jobs"]["model_health"].__setitem__(
+             "if", "${{ always() && needs.worker.outputs.exit_class == 'success' }}"),
+         "model_health `if:`"),
+        ("the model_health job loses its needs edge on worker",
+         lambda d: d["jobs"]["model_health"].__setitem__("needs", ["resolve", "claim"]),
+         "must `needs:` the worker job"),
+        ("the whole model_health job is deleted",
+         lambda d: d["jobs"].pop("model_health"), "missing the `model_health` job"),
+        ("the record step is deleted",
+         lambda d: d["jobs"]["model_health"].__setitem__(
+             "steps", [s for s in d["jobs"]["model_health"]["steps"]
+                       if s.get("name") != _health_step_name]),
+         "missing the model_health record step"),
+        ("record step env.RESET_HINT deleted (why_no_diff silently stops being stored)",
+         lambda d: _named_step(d, "model_health", _health_step_name)["env"].pop("RESET_HINT"),
+         "env.RESET_HINT"),
+        ("record step env.EXIT_CLASS re-pointed at the attempt output",
+         lambda d: _named_step(d, "model_health", _health_step_name)["env"].__setitem__(
+             "EXIT_CLASS", "${{ needs.worker.outputs.outcome_attempt }}"), "env.EXIT_CLASS"),
+        ("the record step stops passing --reset-hint",
+         lambda d: _named_step(d, "model_health", _health_step_name).__setitem__(
+             "run", _named_step(d, "model_health", _health_step_name)["run"].replace(
+                 '--reset-hint "$RESET_HINT"', "")), "--reset-hint"),
+        ("the record step's run: script is gutted",
+         lambda d: _named_step(d, "model_health", _health_step_name).__setitem__("run", None),
+         "no `run:` script"),
+    )
+    for _label, _edit, _needle in _nc_seam_mutants:
+        _violations = _no_change_seam_violations(_mutate(_wk_doc, _edit))
+        assert _violations, f"#701 evidence-seam mutant NOT caught ({_label})"
+        assert any(_needle in v for v in _violations), (_label, _needle, _violations)
+    print(f"  ok   #701 (n): the no_change EVIDENCE-PATH yaml seam is checked on PARSED nodes, and "
+          f"all {len(_nc_seam_mutants)} mutants (`if: false`, success-only gate, deleted step/job/"
+          "output/needs-edge, re-pointed env input, dropped --reset-hint) are caught")
 
     # ---- [round-5 P1] CROSS-LANE SUPERSESSION (park -> sibling-launch -> UNPARK): while a
     # PR sat human-parked its crate was freed and a SIBLING claimed a lease there (an impl
