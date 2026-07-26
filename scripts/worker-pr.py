@@ -6011,6 +6011,109 @@ def _self_test():
                    bot_login=bot)
         check("(j) the receipted gen-2 terminal re-defers quietly — the loop TERMINATES",
               (park_route_calls, park_route_comments), ([], []))
+
+        # ---- [registry #703] a reviewer-vs-fixer DEADLOCK never reaches the human terminal.
+        # The (c)-(e) ladder run VERBATIM, once per cause, so the ONLY difference between the
+        # control and the subject is the cause string — a fixture that satisfied both the right
+        # and the wrong reading would show up as both runs agreeing. ----
+        def ladder_to_generation_two(cause):
+            """Run the real (c)/(e) sequence and return (gen1_calls, gen1_body,
+            gen2_calls, gen2_body). The 08:00 human unlabels are the sparq#2804 'keep trying'
+            era, so the gen-2 human-label writes are veto-suppressed exactly as in (e)."""
+            park_route_state["timelines"] = {
+                41: [unlabel("review:needs-user", "2026-07-23T08:00:00Z")],
+                7: [unlabel("needs:user", "2026-07-23T08:00:00Z")],
+            }
+            park_route_state["comments"] = []
+            park_route_calls.clear()
+            park_route_comments.clear()
+            needs_user("o/r", 41, "budget spent", issue=7, park_class="capacity",
+                       bot_login=bot, cause=cause)
+            gen1_calls, gen1_body = list(park_route_calls), park_route_comments[-1]
+            park_route_state["timelines"][41].append(
+                labeled("review:parked", "2026-07-23T08:30:00Z"))
+            park_route_state["timelines"][7].append(
+                labeled("status:parked", "2026-07-23T08:30:00Z"))
+            park_route_state["comments"] = [{"user": {"login": bot}, "body": gen1_body}]
+            park_route_state["timelines"][41].append(
+                unlabel("review:parked", "2026-07-23T09:00:00Z"))
+            park_route_calls.clear()
+            park_route_comments.clear()
+            needs_user("o/r", 41, "budget spent again", issue=7, park_class="capacity",
+                       bot_login=bot, cause=cause)
+            return gen1_calls, gen1_body, list(park_route_calls), park_route_comments[-1]
+
+        # CONTROL: a genuine capacity cause still escalates at gen 2, exactly as (e) asserts.
+        _c1_calls, _c1_body, control_calls, control_body = ladder_to_generation_two(
+            "dispatch-missed")
+        check("#703 CONTROL: a dispatch-starvation park STILL reaches the gen-2 human terminal",
+              control_calls, [("receipt",), ("issue-status-vetoed", 7, "needs-user")])
+        check("#703 CONTROL: and its terminal comment still asks the maintainer to decide",
+              "needs a human decision" in control_body, True)
+
+        for deadlock_cause in ("budget", "nochange"):
+            gen1_calls, gen1_body, gen2_calls, gen2_body = ladder_to_generation_two(
+                deadlock_cause)
+            check(f"#703: the gen-1 {deadlock_cause} park still lands, receipt first",
+                  gen1_calls,
+                  [("receipt",), ("pr-state", "parked"), ("issue-status", 7, "parked")])
+            check(f"#703: the {deadlock_cause} park records a machine-readable cause marker "
+                  "(before this, the live writer recorded its cause in PROSE only)",
+                  _park_policy().parse_park_reason(gen1_body),
+                  {"class": "capacity", "cause": deadlock_cause, "gen": "1", "head": None})
+            # The PR-side review:parked write is veto-suppressed here (the fresh 09:00 gesture
+            # was a human unlabel of that very label — the sticky veto, unchanged by #703), so
+            # the observable writes are the receipt and the issue-side machine park. What
+            # matters is what is ABSENT: neither surface receives the human terminal.
+            check(f"#703: at gen 2 the {deadlock_cause} DEADLOCK keeps the MACHINE park",
+                  gen2_calls, [("receipt",), ("issue-status", 7, "parked")])
+            check(f"#703: at gen 2 the {deadlock_cause} DEADLOCK writes the human terminal on "
+                  "NEITHER surface (this is the ~10 PRs/hour conveyor being cut)",
+                  [call for call in gen2_calls if "needs-user" in repr(call)], [])
+            check(f"#703: the gen-2 {deadlock_cause} comment is HONEST about the suppressed "
+                  "label write",
+                  "`review:parked` label write was SUPPRESSED" in gen2_body, True)
+            check(f"#703: the gen-2 {deadlock_cause} comment says the human escalation is "
+                  "WITHHELD, which is different information from 'not yet tried'",
+                  "escalation to `review:needs-user` is deliberately WITHHELD" in gen2_body,
+                  True)
+            check(f"#703: the gen-2 {deadlock_cause} comment never asks the maintainer to "
+                  "decide",
+                  "needs a human decision" in gen2_body, False)
+            check("#703: withholding the escalation still CONSUMES and receipts the window "
+                  "(this is not a free retry)",
+                  f"{PARK_GENERATION_MARKER} gen=2 cutoff=2026-07-23T09:00:00Z -->"
+                  in gen2_body, True)
+
+        # The human terminal requires a HUMAN-RELEVANT cause: a deadlock cause routed at the
+        # question class is a caller bug and must fail LOUD rather than quietly parking a
+        # machine-decidable disagreement on the maintainer.
+        for deadlock_cause in ("budget", "nochange"):
+            try:
+                needs_user("o/r", 41, "x", issue=7, park_class="question",
+                           bot_login=bot, cause=deadlock_cause)
+                check(f"#703: a {deadlock_cause} cause may not be written as a human question",
+                      "no error", "raised")
+            except WorkerPrError:
+                check(f"#703: a {deadlock_cause} cause may not be written as a human question",
+                      "raised", "raised")
+        for question_cause in ("injection", "undecidable", "premise-wrong"):
+            park_route_state["timelines"] = {}
+            park_route_calls.clear()
+            needs_user("o/r", 41, "x", issue=7, park_class="question", bot_login=bot,
+                       cause=question_cause)
+            check(f"#703: the human-relevant cause {question_cause!r} still reaches the human "
+                  "terminal",
+                  park_route_calls[0], ("pr-state", "needs-user"))
+        try:
+            needs_user("o/r", 41, "x", issue=7, park_class="capacity", bot_login=bot,
+                       cause="not-a-cause")
+            check("#703: a cause outside the closed taxonomy fails loud at the writer",
+                  "no error", "raised")
+        except WorkerPrError:
+            check("#703: a cause outside the closed taxonomy fails loud at the writer",
+                  "raised", "raised")
+
         # (i) an unreadable timeline FREEZES the ladder: no receipt, no label, no comment.
         def raising_park_timeline(_repo, _number):
             raise WorkerPrError("timeline unavailable")
