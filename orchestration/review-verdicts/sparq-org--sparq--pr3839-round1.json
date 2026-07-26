@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3839,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "6aa9e4719f8d201ddc731a65d7e99fabf7a833ce",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change consistently raises the measured RIF WG Core pass ratchet from 3 to 5 in the executable suite constant, central scoreboard source, and generated scoreboard artifact. The total floor increases by the same delta, the documented pass/skip counts sum to the 46-test denominator, and the existing real-path runner still rejects genuine failures and enforces pass >= floor. Removing the obsolete clippy allowance is correct now that the floor is nonzero. The diff contains no executable behavior change beyond strengthening the ratchet and no apparent security or soundness regression.",
+  "verdict": "approve"
+ }
+}
