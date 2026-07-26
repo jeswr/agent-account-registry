@@ -152,16 +152,6 @@
   },
   {
    "account": "3ff9b4af73df69dc",
-   "claim_id": "4ea3270ae2df4023bb1f4f0cf0e8bf6f",
-   "holder": "sparq-org/sparq#2787@30184771097.1",
-   "package": "sparq-canon",
-   "role": "research",
-   "model": "opus5",
-   "issued_at": 1785033280,
-   "expires_at": 1785039580
-  },
-  {
-   "account": "3ff9b4af73df69dc",
    "claim_id": "2e8438bbbde348da801f0081c6afeb53",
    "holder": "fix:sparq-org/sparq#3445@dispatch-30184573196.1",
    "package": "sparq-zk-compose",
