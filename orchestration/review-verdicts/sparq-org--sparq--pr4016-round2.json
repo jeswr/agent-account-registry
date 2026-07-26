@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4016,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "3a6702e9b98d8a55331b7a36abbfc7c12ffba180",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Carried over unchanged from round 1 and still only a nit. The `odrl:use` half of `sparql_query_requires_concrete_read_action` restates `unmapped_action_materializes_nothing` (test 6, same policy shape, same request), and the `odrl:read` half restates `round_trip_through_enforcement` (test 3, same `sel`, same `rows.len() == 1`). The genuinely new coverage is the two `query_as` assertions that bracket the contract: 0 rows for the unmapped `use` request and 1 row for the concrete `read` request. The round-2 additions (reason string, `mode.is_none()`, `grant_triple.is_none()`) materially raised this test's signal, so the remaining duplication is maintenance surface only, not a correctness or vacuity problem. Not blocking.",
+    "file": "crates/sparq-solid/tests/odrl_bridge.rs",
+    "fix_hint": "Optional, and reasonable to decline: keeping this as the named, greppable home of the sq-lrtc3.2 contract is defensible. If trimming is preferred, drop the `read_store` half (covered verbatim by test 3) and fold the `use`-side `query_as(...).rows.len() == 0` assertion into test 6 with a doc comment cross-referencing sq-lrtc3.2. Do not resolve it by deleting either `query_as` assertion \u2014 those two lines are the only new coverage.",
+    "severity": "nit",
+    "title": "Test 6a still overlaps tests 3 and 6; the read half is a duplicate positive control"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 2 of the doc-and-test-only PR recording the sq-lrtc3.2 decision (a SPARQL query is expressed with the standard odrl:read action; sparq mints no profile-specific query action IRI; an odrl:use request stays unmapped). Both substantive round-1 findings are fixed.\n\n(1) The round-1 MAJOR is resolved: skills/usage-control-policy/SKILL.md:303 now reads `Request::new(\"http://www.w3.org/ns/odrl/2/read\")` instead of the nonexistent `ODRL_READ` symbol. This matches the SKILL's own runnable example at SKILL.md:285 and the local `odrl(\"read\")` helper used by the test. A repo-wide grep confirms `ODRL_READ` still exists only as private consts in gui/src-tauri/src/odrl.rs:242 and crates/sparq-lws-core/src/authz/odrl.rs:44, neither of which the SKILL now references.\n\n(2) The round-1 MINOR is resolved: the new test now asserts the discriminating reason string `\"no WAC/ACP mode mapping\"`, plus `mode.is_none()` and `grant_triple.is_none()`. That string is produced only by the unmapped-action arm at crates/sparq-solid/src/odrl_bridge.rs:363-366; the deny/ambiguous arm at odrl_bridge.rs:356-358 returns `decision.unmet_constraints` and cannot contain it. Since the test is green, it empirically takes the unmapped-action path, so the documented claim (\"permitted request, but the action is unmapped\") is now genuinely pinned rather than conflated with a plain deny.\n\nVerified locally: `cargo test -p sparq-solid --features odrl-bridge --test odrl_bridge` -> 74 passed / 0 failed, including `sparql_query_requires_concrete_read_action`. `cargo doc -p sparq-solid --features odrl-bridge --no-deps` is warning-free, so the new module doc's `[Mode::Read]` intra-doc links resolve (the feature-gated doc-link trap is clear). `scripts/check-readme-template.py` reports 0 deviations across 62 READMEs; the README reflow preserves the Conditions/Deny-retraction prose verbatim and MD013 is disabled in .markdownlint-cli2.jsonc, so the long lines are house style.\n\nDoc claims trace to \u2026 [truncated 432 chars]",
+  "verdict": "approve"
+ }
+}
