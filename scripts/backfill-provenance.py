@@ -586,6 +586,11 @@ _WF_SAMPLE = {
     "needs.resolve.outputs.role": "impl",
     "needs.resolve.outputs.worker_timeout_minutes": "60",
     "steps.app-token-recon.outputs.app-slug": "sparq-orchestrator",
+    # The provenance job's review-state stamp step echoes a SECOND `--pr` — the PR the reconcile
+    # step itself resolved. It only runs when reconcile succeeded (so a record exists and backfill
+    # skips the PR), but it is in the same job section and must never collide with the identity
+    # fields, so the replay below covers EVERY step of the job, not just the reconcile one.
+    "steps.provenance.outputs.pr_number": "4242",
 }
 _WF_UNRENDERED = "<<unrendered-expression>>"
 
@@ -634,8 +639,10 @@ def worker_yaml_shape_report():
     # The model job's name is an `${{ }}` expression; every literal it can render to must be
     # unanchored, or hostile worker output could land under a trusted prefix.
     worker_names = re.findall(r"'([^']*)'", str(worker["name"])) or [str(worker["name"])]
-    # Replay the provenance job exactly as the runner would log it, straight from the workflow.
-    replayed = _render_job_section(prov["name"], prov_step)
+    # Replay the WHOLE provenance job exactly as the runner would log it, straight from the
+    # workflow — every step, so a field echoed by a NEIGHBOURING step in the same job section
+    # (the review-state stamp's `--pr`) is part of what the parser is asserted against.
+    replayed = "".join(_render_job_section(prov["name"], s) for s in prov["steps"])
     # Replay the claim job's env echo plus the RUNTIME line its own `print(...)` emits — the
     # format string is lifted out of the workflow, so changing the phrase reds this.
     # BOTH claim paths are live — the self-claim step prints `lease claimed: model=…` and the
@@ -980,11 +987,19 @@ def _self_test():
           ["lease claimed: model=", "dispatcher lease adopted: model="])
     check("worker.yml reconcile invocation still has NO --pr (so HEAD_BRANCH must bind)",
           shape["reconcile_has_no_pr_arg"], True)
-    check("REPLAYED straight from worker.yml, the provenance job's own log section parses",
+    check("REPLAYED straight from worker.yml, the WHOLE provenance job's log section parses",
           shape["replayed_identity"],
           {"account": "acct07", "alias": "fable", "provider": "anthropic",
            "bot_login": "sparq-orchestrator[bot]", "target_repo": "sparq-org/sparq",
-           "issue": 77, "head_branch": "sparq-agent/issue-77-1234567890-1"})
+           "issue": 77, "head_branch": "sparq-agent/issue-77-1234567890-1", "pr": 4242})
+    # The stamp step's `--pr` is a SECOND binding in the same section. When it agrees it is extra
+    # corroboration; when it disagrees the PR is refused — a binding is never outvoted.
+    stamped = env_log + _log_line(prov_job, '\x1b[36;1m  --pr "3459" \\\x1b[0m')
+    check("a second, AGREEING --pr binding from the stamp step still resolves", ident(stamped),
+          ("acct0fx1", "fable", "anthropic"))
+    check("a second, DISAGREEING --pr binding refuses (both bindings must hold)",
+          code_of(ident(env_log + _log_line(prov_job, '\x1b[36;1m  --pr "9999" \\\x1b[0m'))),
+          REASON_BINDING_MISMATCH)
     check("REPLAYED straight from worker.yml, the claim job corroborates",
           shape["replayed_claim"], ("acct07", "fable"))
 
