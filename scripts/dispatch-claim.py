@@ -8589,6 +8589,309 @@ def _self_test():
         assert len(many_converted) == LEGACY_PARK_MIGRATION_MAX, many_converted
         print(f"  ok   legacy-migration: one tick migrates at most "
               f"{LEGACY_PARK_MIGRATION_MAX} parks (bounded re-entry)")
+
+        # ---- [registry #691] THE AGED-OUT PARK EXIT, AT THE LAYER THAT BINDS ---------------
+        # _capacity_recovery_probe is where a park's machine exit is actually decided; the
+        # migration precondition is only a PREDICTOR of it. Every test below therefore drives
+        # the PRODUCTION probe and the PRODUCTION precondition function — nothing here restates
+        # the policy, and `migration_provable` is never hand-set to True.
+        #
+        # THE DEFECT: capacity_recovery_evidence fixes a park's cause at its APPLICATION
+        # INSTANT and the health window is a rolling 48 h, so a park older than the window has
+        # no record at or before `parked_at` at all and can never satisfy condition 1. Measured
+        # 2026-07-25: all 32 sparq legacy parks deferred with "no starvation cause is
+        # observable". Safe, but the hold was permanent while the label claimed otherwise.
+        span_secs = model_health_mod.SUSTAINED_HEALTH_SPAN_SECONDS
+        readmit_account2 = model_health_mod.account_hash("acct02", readmit_salt)
+        aged_park_epoch = readmit_now - 5 * 24 * 3600      # the live sparq shape: days old
+        aged_park_stamp = model_health_mod._iso_z(aged_park_epoch)
+
+        def hrec(provider, account, cls, dt, run):
+            return model_health_mod.make_record(provider, account, "sol", cls, run,
+                                                readmit_now + dt)
+
+        # A fleet that has been demonstrably healthy for a full span and is succeeding NOW.
+        healthy_window = (
+            # coverage anchor: the window reaches back as far as the health claim does
+            [hrec("openai", readmit_account, model_health_mod.SUCCESS, -span_secs - 600, "h0")]
+            + [hrec("openai", readmit_account, model_health_mod.SUCCESS, -300 - 600 * k,
+                    f"h{k + 1}") for k in range(3)]
+            + [hrec("anthropic", readmit_account2, model_health_mod.SUCCESS, -600 - 600 * k,
+                    f"j{k}") for k in range(3)])
+        aged_timeline = {41: [{"event": "labeled", "label": {"name": MACHINE_PARK_PR_LABEL},
+                               "created_at": aged_park_stamp, "actor": {"login": readmit_bot},
+                               "performed_via_github_app": None}], 7: []}
+        fleet_health_key = f"fleet-health/openai/{readmit_account}/h1"
+
+        # (1) THE LIVENESS FIX, end to end through the production sweep: the aged-out park is
+        # re-admitted on the labelled fleet-health heuristic, receipt-first, and the receipt
+        # names which gate released it.
+        count, posted, cleared = readmit_sweep(healthy_window, timeline=aged_timeline)
+        assert count == 1 and cleared == [(41, 7)], (count, cleared)
+        assert len(posted) == 1 and fleet_health_key in posted[0][1], posted
+        assert worker_pr_mod.AUTO_READMIT_MARKER in posted[0][1], posted
+        assert "acct01" not in posted[0][1] and "acct02" not in posted[0][1], posted
+        # HONESTY: the receipt must say what it actually knows. Claiming the strong gate's
+        # finding here — "the account that was failing when this park landed has since
+        # succeeded" — would be false for a park whose own cause aged out.
+        assert "not proof that this park's own cause cleared" in posted[0][1], posted[0][1]
+        assert "demonstrably CLEARED" not in posted[0][1], posted[0][1]
+        print("  ok   aged-out exit: a park whose own cause aged out of the health window is "
+              "re-admitted on sustained fleet health, receipt-first")
+
+        # (2) FAIL CLOSED. An unhealthy fleet, an unreadable window and a malformed record all
+        # leave the aged-out park exactly where it is. This is the direction the whole design
+        # fails in, and a liveness fix that failed open would be a worse trade than the stall.
+        unhealthy = healthy_window + [hrec("openai", readmit_account, model_health_mod.CLASS_AUTH,
+                                           -1200, "bad1")]
+        for name, window in (("a launch failure inside the proven span", unhealthy),
+                             ("an unreadable health window", None),
+                             ("a malformed health record",
+                              healthy_window + [dict(healthy_window[-1],
+                                                     exit_class="totally-new")])):
+            count, posted, cleared = readmit_sweep(window, timeline=aged_timeline)
+            assert (count, posted, cleared) == (0, [], []), (name, count, posted, cleared)
+        print("  ok   aged-out exit: an unhealthy fleet, an unreadable window and a malformed "
+              "record all DEFER — the aged-out park stands")
+
+        # (3) PRECEDENCE — the heuristic never displaces a proof that can still arrive.
+        # (3a) when the park's OWN cause is observable and has recovered, the STRONG gate mints
+        # and the key is its shape, not the proxy's.
+        strong_park_epoch = readmit_now - span_secs - 1200
+        strong_timeline = {41: [{"event": "labeled", "label": {"name": MACHINE_PARK_PR_LABEL},
+                                 "created_at": model_health_mod._iso_z(strong_park_epoch),
+                                 "actor": {"login": readmit_bot},
+                                 "performed_via_github_app": None}], 7: []}
+        strong_window = healthy_window + [
+            hrec("openai", readmit_account, model_health_mod.CLASS_AUTH, -span_secs - 1400, "x1")]
+        count, posted, cleared = readmit_sweep(strong_window, timeline=strong_timeline)
+        assert count == 1 and len(posted) == 1, (count, posted)
+        # The strong gate's earliest qualifying recovery — the coverage anchor h0, NOT the
+        # heuristic's newest-success anchor h1 — and the receipt states the proof it has.
+        assert f"evidence=openai/{readmit_account}/h0 " in posted[0][1], posted
+        assert "fleet-health" not in posted[0][1], posted
+        assert "demonstrably CLEARED" in posted[0][1], posted
+        print("  ok   aged-out exit: the STRONG cause-recovery proof is tried first and its "
+              "evidence — not the heuristic — is what gets receipted")
+        # (3b) THE ORDER IS THE SAFETY PROPERTY. Here the strong exit is REACHABLE but not yet
+        # satisfied (the fleet pseudo-account was starved before the park and has recorded no
+        # success since), while the fleet-health proxy WOULD fire on this very window. The probe
+        # must mint NOTHING. Assert the proxy would have fired, so this cannot pass vacuously.
+        fleet_hash = model_health_mod.account_hash("fleet01", readmit_salt)
+        reachable_window = healthy_window + [
+            hrec("fleet", fleet_hash, model_health_mod.CLASS_ZERO_DISPATCH,
+                 -span_secs - 1400, "z1"),
+            hrec("fleet", fleet_hash, model_health_mod.CLASS_ZERO_DISPATCH, -1000, "z2")]
+        assert model_health_mod.park_cause_provable(
+            reachable_window, strong_park_epoch, readmit_now) is True
+        assert model_health_mod.capacity_recovery_evidence(
+            reachable_window, strong_park_epoch, readmit_now) is None
+        assert model_health_mod.sustained_fleet_health_evidence(
+            reachable_window, strong_park_epoch, readmit_now) is not None
+        count, posted, cleared = readmit_sweep(reachable_window, timeline=strong_timeline)
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        print("  ok   aged-out exit: while the STRONG proof is still reachable the park WAITS "
+              "for it — the weaker heuristic is refused even though it would have fired")
+
+        # (4) BOUNDED RE-ENTRY. The heuristic is consumed through the same cap as every other
+        # automatic re-admission. Assert the BOUND ITSELF, then size the fixture from a literal
+        # (a fixture sized from the constant shrinks with it and survives a raised cap).
+        assert _park_policy.AUTO_READMISSION_MAX == 2, _park_policy.AUTO_READMISSION_MAX
+        two_markers = [{"user": {"login": readmit_bot},
+                        "body": f"x {worker_pr_mod.AUTO_READMIT_MARKER} evidence=fleet-health/o/"
+                                f"x/{i} at=zzz -->"} for i in range(2)]
+        count, posted, cleared = readmit_sweep(healthy_window, timeline=aged_timeline,
+                                               comments=two_markers)
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        count, posted, cleared = readmit_sweep(healthy_window, timeline=aged_timeline,
+                                               comments=two_markers[:1])
+        assert count == 1, count
+        print("  ok   aged-out exit: exactly AUTO_READMISSION_MAX automatic re-admissions are "
+              "available to it — the cap terminates the aged-out path too")
+        # ...and the evidence itself is consumed EXACTLY ONCE: the same fleet-health key can
+        # never re-earn a re-admission after a NEWER park application.
+        consumed = [{"user": {"login": readmit_bot},
+                     "body": worker_pr_mod.auto_readmission_receipt(
+                         fleet_health_key, model_health_mod._iso_z(readmit_now - 300))}]
+        reparked = {41: aged_timeline[41] + [
+            {"event": "labeled", "label": {"name": MACHINE_PARK_PR_LABEL},
+             "created_at": model_health_mod._iso_z(readmit_now - 60),
+             "actor": {"login": readmit_bot}, "performed_via_github_app": None}], 7: []}
+        count, posted, cleared = readmit_sweep(healthy_window, timeline=reparked,
+                                               comments=consumed)
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        print("  ok   aged-out exit: its evidence is consumed EXACTLY ONCE — the same "
+              "fleet-health key cannot re-earn a re-admission after a new park")
+
+        # (5) STRICTLY NARROWER THAN THE DENY. A human-owned hold on either surface still
+        # refuses, unconditionally, on the aged-out path.
+        human_aged = dict(parked_row, labels=[{"name": MACHINE_PARK_PR_LABEL},
+                                              {"name": "review:needs-user"}])
+        count, posted, cleared = readmit_sweep(healthy_window, rows=[[human_aged]],
+                                               timeline=aged_timeline)
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        count, posted, cleared = readmit_sweep(healthy_window, timeline=aged_timeline,
+                                               labels={7: ["status:parked", "needs:user"]})
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        human_aged_park = {41: [{"event": "labeled",
+                                 "label": {"name": MACHINE_PARK_PR_LABEL},
+                                 "created_at": aged_park_stamp, "actor": {"login": "jeswr"},
+                                 "performed_via_github_app": None}], 7: []}
+        count, posted, cleared = readmit_sweep(healthy_window, timeline=human_aged_park)
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        print("  ok   aged-out exit: a human-owned hold and a MAINTAINER-applied park refuse it "
+              "exactly as they refuse the cause-recovery path")
+
+        # ---- the MIGRATION PRECONDITION, as the production function computes it -------------
+        # Never hand-set: _legacy_migration_provable is the expression main() evaluates.
+        assert _legacy_migration_provable(model_health_mod, healthy_window, readmit_now) is True
+        assert _legacy_migration_provable(model_health_mod, None, readmit_now) is False
+        # An OBSERVED but SILENT fleet is not a healthy one, and no cause is observable either:
+        # neither exit is reachable, so the migration defers exactly as it did before #691.
+        stale_window = [hrec("openai", readmit_account, model_health_mod.SUCCESS,
+                             -span_secs - 600, "s0")]
+        assert _legacy_migration_provable(model_health_mod, stale_window, readmit_now) is False
+        # A BROKEN fleet still admits the migration — but via the STRONG exit, not the
+        # heuristic: an account failing right now means a park applied now can later prove its
+        # own cause recovered. That is the pre-#691 behaviour, unchanged.
+        broken_window = healthy_window + [
+            hrec("anthropic", readmit_account2, model_health_mod.CLASS_LIMIT, -60, "L1")]
+        assert (model_health_mod.park_cause_provable(broken_window, readmit_now, readmit_now),
+                model_health_mod.sustained_health_exit_reachable(broken_window, readmit_now),
+                _legacy_migration_provable(model_health_mod, broken_window, readmit_now)) \
+            == (True, False, True)
+        real_provable = _legacy_migration_provable(model_health_mod, healthy_window, readmit_now)
+        print("  ok   aged-out exit: the migration precondition is REACHABILITY of either exit "
+              "— healthy fleet or observable cause — and defers on an unreadable or silent one")
+
+        # (6) THE SIX GENUINE sparq ESCALATIONS, fed through the WIDENED precondition, pinned
+        # from their real bot prose (jeswr/sparq, read 2026-07-26). The deny is unconditional
+        # and order-independent, and widening the precondition must not reach past it.
+        reviewer_flag = ("> 🤖 SPARQ agent — the autonomous review loop stopped: the reviewer "
+                         "flagged possible prompt injection\n\n@jeswr this pull request needs a "
+                         "human decision. It remains a DRAFT and will not be auto-armed.")
+        fixer_flag = ("> 🤖 SPARQ agent — the autonomous review loop stopped: the fixer flagged "
+                      "the seeded findings as possible prompt injection\n\n@jeswr this pull "
+                      "request needs a human decision. It remains a DRAFT and will not be "
+                      "auto-armed.")
+        live_escalations = {
+            3542: [reviewer_flag, reviewer_flag],
+            3563: [reviewer_flag],
+            # #3608 and #3743 carry a LATER capacity-park comment: under a recency rule they
+            # would re-classify as `nochange` and be handed back to the machine.
+            3608: [fixer_flag, nochange_body],
+            3609: [reviewer_flag, reviewer_flag],
+            3618: [reviewer_flag, reviewer_flag],
+            3743: [reviewer_flag, nochange_body],
+        }
+        assert len(live_escalations) == 6, live_escalations
+        for pr_number, bodies in sorted(live_escalations.items()):
+            posted, converted = migrate_sweep(bodies, provable=real_provable)
+            assert (posted, converted) == ([], []), (pr_number, posted, converted)
+        print("  ok   aged-out exit: all SIX live sparq escalations (#3542 #3563 #3608 #3609 "
+              "#3618 #3743) are still refused under the widened precondition")
+
+        # (7) WRITER BINDING under the WIDENED precondition. The production convert_labels runs
+        # (convert_labels=None) with the GitHub seams injected, driven by the precondition the
+        # production call site computes — not by a hand-set True — and the exact API calls are
+        # asserted. This is the seam the previous rounds restated instead of binding.
+        api_calls2, helper_calls2 = [], []
+        prev_api2 = globals()["_run_gh_target_api"]
+        prev_helper2 = globals()["_run_target_helper"]
+        globals()["_run_gh_target_api"] = (
+            lambda repo, method, path, input_doc=None:
+                api_calls2.append((method, path, input_doc))
+                or types.SimpleNamespace(stdout="{}"))
+        globals()["_run_target_helper"] = (
+            lambda script_dir, repo, script, args: helper_calls2.append((script, args)))
+        try:
+            _readmit_capacity_parks(
+                "example/repo", [[legacy_row]], {7: ["needs:user", "status:deferred"]},
+                {41: {"issue": 7}}, readmit_bot, Path("."), worker_pr_mod,
+                _capacity_recovery_probe(model_health_mod, healthy_window, readmit_now),
+                comments_fn=lambda _repo, _number: [
+                    {"user": {"login": readmit_bot}, "body": budget_body}],
+                timeline_fn=lambda _repo, number: list(migrate_timeline.get(number, [])),
+                post_comment=lambda *_a: None, clear_labels=lambda *_a: None,
+                log=lambda _l: None,
+                migration_provable=_legacy_migration_provable(
+                    model_health_mod, healthy_window, readmit_now))
+        finally:
+            globals()["_run_gh_target_api"] = prev_api2
+            globals()["_run_target_helper"] = prev_helper2
+        assert api_calls2 == [
+            ("DELETE", "repos/example/repo/issues/41/labels/review%3Aneeds-user", None),
+            ("POST", "repos/example/repo/issues/41/labels",
+             {"labels": [MACHINE_PARK_PR_LABEL]}),
+            ("DELETE", "repos/example/repo/issues/7/labels/needs%3Auser", None),
+        ], api_calls2
+        assert helper_calls2 == [("worker-issue.py", [
+            "status", "--repo", "example/repo", "--issue", "7", "--status", "parked"])], \
+            helper_calls2
+        print("  ok   aged-out exit WRITER: the PRODUCTION convert_labels runs off the "
+              "PRODUCTION precondition on a healthy fleet — asserted on the real API calls")
+
+        # (8) THE WHOLE CHAIN. A legacy park that could not migrate before #691 (the fleet is
+        # healthy, so no starvation cause is observable) migrates now, and the park it becomes
+        # is ACTUALLY RELEASED one span later by the production probe. Fixing one layer above
+        # where the invariant binds is how the previous rounds failed; this composes both.
+        assert model_health_mod.park_cause_provable(
+            healthy_window, readmit_now, readmit_now) is False, \
+            "the pre-#691 precondition must be the one that blocked this park"
+        chain_pr_labels = {"review:needs-user"}
+        chain_issue_labels = {"status:deferred", "needs:user", "role:impl"}
+
+        def chain_convert(pr, issue):
+            chain_pr_labels.discard(_park_policy.HUMAN_PR_PARK_LABEL)
+            chain_pr_labels.add(MACHINE_PARK_PR_LABEL)
+            for hold in _park_policy.human_owned_holds(chain_issue_labels):
+                chain_issue_labels.discard(hold)
+            chain_issue_labels.add("status:parked")
+
+        chain_migrated = _readmit_capacity_parks(
+            "example/repo", [[dict(parked_row,
+                                   labels=[{"name": n} for n in sorted(chain_pr_labels)])]],
+            {7: sorted(chain_issue_labels)}, {41: {"issue": 7}}, readmit_bot, Path("."),
+            worker_pr_mod,
+            _capacity_recovery_probe(model_health_mod, healthy_window, readmit_now),
+            comments_fn=lambda _repo, _number: [
+                {"user": {"login": readmit_bot}, "body": budget_body}],
+            timeline_fn=lambda _repo, number: list(migrate_timeline.get(number, [])),
+            post_comment=lambda *_a: None, clear_labels=lambda *_a: None, log=lambda _l: None,
+            migration_provable=_legacy_migration_provable(
+                model_health_mod, healthy_window, readmit_now),
+            convert_labels=chain_convert)
+        assert chain_migrated == 0, "the migration must not re-admit in the same breath"
+        assert chain_pr_labels == {MACHINE_PARK_PR_LABEL}, chain_pr_labels
+        assert "needs:user" not in chain_issue_labels, chain_issue_labels
+        # One span later, with the same health continuing, the park it became is released.
+        later_now = readmit_now + span_secs
+        continued_window = healthy_window + [
+            hrec("openai", readmit_account, model_health_mod.SUCCESS,
+                 span_secs - 300 - 600 * k, f"c{k}") for k in range(3)] + [
+            hrec("anthropic", readmit_account2, model_health_mod.SUCCESS,
+                 span_secs - 600 - 600 * k, f"e{k}") for k in range(3)]
+        chain_timeline = {41: [{"event": "labeled",
+                                "label": {"name": MACHINE_PARK_PR_LABEL},
+                                "created_at": model_health_mod._iso_z(readmit_now),
+                                "actor": {"login": readmit_bot},
+                                "performed_via_github_app": None}], 7: []}
+        chain_cleared = []
+        chain_readmitted = _readmit_capacity_parks(
+            "example/repo", [[dict(parked_row,
+                                   labels=[{"name": n} for n in sorted(chain_pr_labels)])]],
+            {7: sorted(chain_issue_labels)}, {41: {"issue": 7}}, readmit_bot, Path("."),
+            worker_pr_mod,
+            _capacity_recovery_probe(model_health_mod, continued_window, later_now),
+            comments_fn=lambda _repo, _number: [],
+            timeline_fn=lambda _repo, number: list(chain_timeline.get(number, [])),
+            post_comment=lambda *_a: None,
+            clear_labels=lambda pr, issue: chain_cleared.append((pr, issue)),
+            log=lambda _l: None, migration_provable=False)
+        assert chain_readmitted == 1, (chain_readmitted, sorted(chain_issue_labels))
+        assert chain_cleared == [(41, 7)], chain_cleared
+        print("  ok   aged-out exit CHAIN: a legacy park that could not migrate before #691 "
+              "migrates AND is actually released one span later (both layers, end to end)")
     finally:
         globals()["_target_is_human_maintainer"] = prev_target_probe
 
