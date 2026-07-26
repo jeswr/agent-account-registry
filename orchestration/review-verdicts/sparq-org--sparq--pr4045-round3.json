@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4045,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c9d058143e6a32560c1c20b31cae2b143b262913",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new error-status validation calls `(result.get(\"error\") or \"\").strip()`. A corrupt result such as `{ \"status\": \"odre-error\", \"error\": 1 }` or a list-valued error raises AttributeError, bypassing the documented input-error path and its diagnostics. This remains fail-closed\u2014no report is written\u2014so it does not preserve the prior agreement-coverage vulnerability, but malformed input should be rejected deliberately rather than crashing.",
+    "file": "bench/ac/odre/agreement.py",
+    "fix_hint": "Require `isinstance(result.get(\"error\"), str)` and a non-empty stripped value before accepting an error-shaped result. Add one self-test mutation with a non-string error and assert exit 2 with no report written.",
+    "severity": "minor",
+    "title": "Non-string error fields crash the input gate instead of producing exit 2"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 3 resolves the prior major fail-open issue. For a present ODRE run, input_errors now rejects missing, skipped-no-odre, unknown, and malformed result statuses; requires allow/deny for ok results; requires error text for error-shaped results; and the end-to-end self-test proves these mutations exit 2 without writing a report. The absent-run mirror is also checked. One minor robustness issue remains: a truthy non-string error field raises AttributeError during validation rather than being reported as a controlled input error, but it still fails closed and cannot publish a partial agreement report. Progress is improving because the prior major finding is fixed and only this lower-severity input-diagnostics issue remains.",
+  "verdict": "approve"
+ }
+}
