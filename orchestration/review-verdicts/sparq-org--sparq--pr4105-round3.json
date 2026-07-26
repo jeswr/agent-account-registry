@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4105,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a96c0d574b677dcc0a7e5fa855394312e1fe30db",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "mac_check_challenges maps a uniformly distributed 128-bit prefix into F_p with `% P` and calls the result \"statistically uniform over F_p\". Unless P divides 2^128, modulo reduction is biased: some residues have one more preimage than others. The bias is negligible here (on the order of P/2^128), so it does not materially undermine the approximate 61-bit bound, but the exact wording is mathematically inaccurate on a soundness-sensitive path.",
+    "file": "crates/sparq-mpc/src/shamir.rs",
+    "fix_hint": "Say \"negligibly close to uniform\" and account for the modulo-reduction statistical distance in the bound, or use rejection sampling if exact uniformity is required.",
+    "severity": "minor",
+    "title": "Modulo reduction is not statistically uniform over F_p"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 3 materially resolves all three prior findings. The implementation and documentation now explicitly scope the Fiat\u2013Shamir transcript to the centralized trusted-dealer simulation, deny that it is a jointly derivable distributed public coin, and describe the missing commitment/coin-toss protocol. The grinding analysis now correctly distinguishes fixed-before-challenge deviations from adaptive transcript grinding and retains the research-grade, semi-honest, pending-sq-qhy4 caveats. The new mac_check_and_open path also returns only the values covered by the successful check, and the focused tests exercise batching, tamper rejection, transcript binding, randomized weighting, and the empty case. One minor mathematical wording issue remains: reduction modulo p is negligibly biased rather than exactly uniform, but this does not materially change the stated approximate soundness bound.",
+  "verdict": "approve"
+ }
+}
