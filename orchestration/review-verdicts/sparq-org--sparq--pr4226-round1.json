@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4226,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "bbbacb3e22a4dab820368354a38ba8ee15ddb5cd",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "json_ld_equal_inner makes arrays unordered whenever in_list is false. The recursion only sets in_list for a key named @list, so the value of {\"@value\": ..., \"@type\":\"@json\"} is compared with unordered-array semantics. For example, an @json payload [1,2] is considered equal to [2,1]. JSON arrays inside an @json literal retain ordinary JSON ordering, so a real compaction bug that reorders them would not fail json_literal_round_trips despite the module explicitly claiming to pin @json payload shape. This makes the central round-trip oracle unsound for one of its advertised invariants.",
+    "file": "crates/sparq-jsonld/tests/round_trip.rs",
+    "fix_hint": "Make the comparator context-aware for @json value objects: when an object has @type == @json, compare its @value subtree using exact JSON semantics (object member order insignificant, array order significant recursively). Add a witness assertion/test proving that @json payloads [1,2] and [2,1] are unequal, ideally alongside the existing round-trip case.",
+    "severity": "major",
+    "title": "Equality oracle ignores significant array order inside @json literals"
+   }
+  ],
+  "progress": null,
+  "summary": "The added coverage exercises the shipping expand/compact paths across many useful JSON-LD shapes, but its equality oracle is not sound for @json values. It treats every array outside an @list as unordered, including arrays nested inside an @json literal, although those arrays are ordinary JSON and their order is significant. Consequently the advertised losslessness test can pass after a compaction regression that reorders JSON payload arrays, contradicting the test's stated invariant and leaving a load-bearing case vacuously accepted.",
+  "verdict": "request_changes"
+ }
+}
