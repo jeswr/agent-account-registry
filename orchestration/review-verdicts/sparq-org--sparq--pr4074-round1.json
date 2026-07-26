@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 4074,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "6cfa8a78888f84a29862f565ed8f0d897139e563",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The comment's rationale (\"omitting them silently compiles the rebuild-hint stubs into shipped installers\") applies verbatim to the crate's fourth optional feature, `forms`, which is not in the list.\n\nEvidence:\n- gui/src-tauri/Cargo.toml declares `forms = [\"dep:oxrdf\", \"dep:sparq-forms\"]`, same lean-by-default rationale as hdt/federation/odrl.\n- gui/src-tauri/src/forms.rs:79-90 is the `#[cfg(not(feature = \"forms\"))]` stub returning \"Form derivation is unavailable in this build \u2014 rebuild the desktop app with `cargo build --features forms`\".\n- Forms is a user-visible workbench tool marked `tier: \"live\", built: true` (gui/app/src/data/tools.ts:138-147).\n- gui/app/src/lib/forms-bridge.ts:77-88 takes the desktop branch whenever `desktopAvailable`, and `hasNativeForms()` (gui/app/src/lib/tauri-ipc.ts:252-254) returns true for ANY Tauri runtime \u2014 it cannot see whether the cargo feature was compiled. The bridge documents that desktop NEVER falls through to the wasm path.\n\nNet effect: every installer produced by this job renders a broken Forms tool whose error text tells an end user to rebuild the app from source. Either enable `forms` or state in the comment why it is deliberately excluded (and, if excluded, note that the frontend cannot detect it, so the tool degrades to a developer-facing error rather than the intended web fallback).",
+    "file": ".github/workflows/release.yml",
+    "fix_hint": "If the exclusion is not deliberate: `--features hdt,federation,odrl,forms`, and extend the comment's capability list to mention SHACL-derived forms. If it IS deliberate (e.g. sparq-forms not release-ready), say so explicitly in the comment and file/reference a bead \u2014 plus make the frontend capability probe honest (a native `capabilities` command, or have the stub map to `null` so forms-bridge raises FormsBridgeUnavailableError instead of leaking a `cargo build` instruction to end users).",
+    "severity": "major",
+    "title": "`forms` feature omitted \u2014 shipped installers still hard-fail the live Forms tool with a rebuild hint"
+   },
+   {
+    "body": "This workflow is tag-triggered, so the new command never executes on a PR. Meanwhile .github/workflows/gui.yml only exercises two of the three feature states of the GUI crate:\n- line 533: `cargo clippy --all-targets --features federation -- -D warnings`\n- line 544: `cargo clippy --all-targets --features odrl -- -D warnings`\n\nThere is no `--features hdt` lane for gui/src-tauri anywhere, and no lane builds `hdt,federation,odrl` together, so feature-unification effects (e.g. sparq-core/sparq-engine feature merges pulled in via sparq-hdt + sparq-solid[odrl-bridge] + sparq-engine/service) are unvalidated.\n\nRisk: the x64-linux and arm64-linux rows are `soft: false` (release.yml:305-306) i.e. BLOCKING under `continue-on-error: ${{ matrix.soft }}` (line 287). A compile error in the newly-enabled feature union fails the whole release job on the first real `v*` tag \u2014 after the wasm build, npm install and frontend export have already run \u2014 and no bundles ship.\n\nThe crate's own header notes the GUI crate is excluded from the workspace gate, so nothing else covers it either.",
+    "file": ".github/workflows/release.yml",
+    "fix_hint": "Add to gui.yml, mirroring the existing federation/odrl lanes: `cargo clippy --all-targets --features hdt -- -D warnings` + `cargo test --features hdt`, and one lane that builds the exact release union (`cargo clippy --all-targets --features hdt,federation,odrl,custom-protocol -- -D warnings`) so the shipped feature combination is proven green before a tag. Keep the release command and that lane's feature list in sync (a shared env var or a comment cross-reference in both files).",
+    "severity": "major",
+    "title": "No CI lane compiles gui/src-tauri with `hdt` or with the three features combined; the blocking Linux rows are the first build"
+   },
+   {
+    "body": "The stated failure mode \u2014 silently shipping stub-only installers \u2014 is invisible in the job output: the build succeeds either way and the staging/attestation steps cannot tell the difference. A future edit that drops or misspells a feature (`cargo` does not error on an unknown feature name passed via tauri-cli in every configuration) reproduces the exact bug this PR fixes, with no gate.\n\nThe comment block also documents PROVEN vs DOCUMENTED-UNTESTED status carefully but was not updated for the new feature surface: the union build is untested on every row, including the two BLOCKING Linux rows whose \"proven green in gui.yml\" claim covers only the default/`custom-protocol` feature state (gui.yml:676, 808), not `hdt,federation,odrl`.",
+    "file": ".github/workflows/release.yml",
+    "fix_hint": "Cheapest check: after the build, assert the compiled artifact does not contain the stub strings, e.g. grep the release binary for \"rebuild the desktop app with\" and fail if present (all three stubs share that phrasing). Also amend the PROVEN/UNTESTED comment so the newly-enabled feature union is listed honestly as untested on the Linux rows rather than inheriting the old gui.yml \"proven green\" claim.",
+    "severity": "minor",
+    "title": "No post-build assertion that the bundled binary actually has the native capabilities"
+   }
+  ],
+  "progress": null,
+  "summary": "One-line change to the tag-triggered desktop release job: `cargo tauri build ... --features hdt,federation,odrl`. Direction is right \u2014 the crate defaults are intentionally lean, and without these flags the installers embed the rebuild-hint stubs (engine.rs load_hdt, federation.rs, odrl.rs). Mechanics check out: all three features exist; gui/src-tauri/Cargo.lock already pins sparq-hdt/sparq-policy/sparq-solid/ureq/hdt (no unlocked resolution at release time); ureq is rustls+platform-verifier (no new apt/OpenSSL dep); tauri-cli still adds `custom-protocol` itself, so frontendDist embedding is unaffected; federation egress is fail-closed on a user-configured allowlist (empty = refuse all).\n\nTwo problems keep it from being complete.\n\n(1) The crate has a FOURTH optional feature with the same stub discipline \u2014 `forms` (gui/src-tauri/src/forms.rs:79-90). Forms is a `tier: \"live\"`, `built: true` workbench tool (gui/app/src/data/tools.ts:138), and forms-bridge.ts:77-88 routes to the native command whenever `hasNativeForms()` is true \u2014 true in ANY Tauri shell (tauri-ipc.ts:252-254 probes only the invoke bridge, not the cargo feature) \u2014 and deliberately never falls back to wasm. So these installers hard-fail form derivation with \"rebuild the desktop app with `cargo build --features forms`\": exactly the defect the PR's own comment exists to prevent.\n\n(2) The `hdt` state of gui/src-tauri is compiled by NO CI lane (gui.yml has federation and odrl lanes only), and the three-feature union is compiled nowhere. release.yml never runs on PRs, and the two Linux rows are BLOCKING (soft:false), so a feature-unification or hdt-gated compile error is first discovered at tag time and aborts the release.",
+  "verdict": "request_changes"
+ }
+}
