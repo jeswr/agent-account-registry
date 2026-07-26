@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4274,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "43f43711c48ba05953bae0f9a8b850cade222792",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`gen_substring` comments out every `start < 1` assertion whenever sparq differs from the F&O reference, and `gen_round` similarly comments out the `-0.5` negative-zero assertion. Those are explicitly identified as cases fixed in noir_XPath and as standing regression targets, but no generated live test reaches the circuit for them. The self-expiring Rust tests only verify that sparq still has the divergence, while the injected-fault check targets string length, so all checks can remain green if noir_XPath regresses on either excluded edge.",
+    "file": "zk/xpath/differential/src/main.rs",
+    "fix_hint": "Emit live Noir assertions using the independently computed F&O expected values for recorded oracle-divergence cases, clearly label them as spec-reference rather than sparq-differential rows, and count them as live assertions. Keep the self-expiring Rust guards so the special handling is removed when sparq converges. Ensure the committed generated file contains live assertions for at least `substring(\"12345\", 0, 3)` and `round_double(-0.5)`.",
+    "severity": "major",
+    "title": "Advertised fixed circuit edges are excluded from the executable oracle"
+   }
+  ],
+  "progress": null,
+  "summary": "The harness is candid about its TCB and includes a useful real-path fault-injection check, but it omits live assertions for two of the very circuit regressions the new lane claims to cover. All start-before-one substring cases and the negative-zero rounding case are generated as comments, so `nargo test` cannot detect either circuit behavior regressing. The Rust unit tests only pin the sparq oracle's known divergence; they do not exercise noir_XPath. This makes the advertised standing regression coverage incomplete.",
+  "verdict": "request_changes"
+ }
+}
