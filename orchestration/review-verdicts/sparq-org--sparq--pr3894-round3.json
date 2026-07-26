@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3894,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "1540ad27e6b2cc8d4b7d4f0315f70e82b3a64485",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "No correctness, soundness, test-validity, or security issue is evident. The opt-in feature lane exercises the otherwise skipped window corpus; the window tests cover the real materialized store, inclusive endpoints, fail-closed no-clock behavior, unwindowed-grant isolation, and a mutation witness. Session batching now keys all four dimensions. Issuer and trusted provenance vectors exercise allow, mismatch, missing-evidence, resource-scoping, and cumulative-grant cases through the real runner. The ODRL materialization request using Alice is intentional: the conditional bridge persists Carol's recipient condition for per-session enforcement rather than requiring the materializer to be the recipient. With round 2 already clean and no new findings, progress is stagnant.",
+  "verdict": "approve"
+ }
+}
