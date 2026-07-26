@@ -3100,7 +3100,7 @@ def stranded_recover(repo, pr_number, proven_head, issue=None):
 # ---- terminal escalation + arm --------------------------------------------------------------------
 def needs_user(repo, pr_number, reason, issue=None, alert_repo=None, alert_token=None,
                maintainer=None, park_class="question", bot_login="", head_sha="",
-               attempt_key=""):
+               attempt_key="", park_cause=""):
     """Loop stop: park labels on BOTH surfaces, an explanatory comment, and an ops-alert-style
     registry ping. The PR stays DRAFT.
 
@@ -3198,6 +3198,21 @@ def needs_user(repo, pr_number, reason, issue=None, alert_repo=None, alert_token
                              f"cutoff={window_key}"
                              f"{f' head={head_sha} attempt={attempt_key}' if fingerprint else ''}"
                              " -->")
+        # EVERY CAPACITY PARK STATES ITS CAUSE (registry #677 review finding). Until this, the
+        # capacity ladder wrote `review:parked` with a generation receipt and NO park-reason
+        # receipt, so nothing on the PR said which mechanism had parked it. A reader looking for
+        # "the newest park-reason receipt" therefore saw a cause from an OLDER, already-released
+        # episode and treated the ladder's park as that mechanism's to release — un-parking a PR
+        # that park_ladder_decision would then refuse to re-park (`dedupe`), leaving it un-parked
+        # AND un-parkable. `park_cause` is the narrow cause when the caller knows it; when it does
+        # not, the receipt still lands under the honest `capacity-unspecified`, because a park
+        # episode with no cause receipt at all is the hole. `park_reason_marker` DERIVES the class
+        # from the taxonomy, so an accidental question-class cause here raises rather than
+        # mislabelling a capacity park.
+        reason_marker = "\n\n" + policy.park_reason_marker(
+            park_cause if policy.park_cause_class(park_cause) == policy.PARK_CLASS_CAPACITY
+            else "capacity-unspecified",
+            generation=generation, head=head_sha or None)
         if action == "terminal":
             # Bounded escalation: PARK_ESCALATION_GENERATIONS windows consumed — repeated
             # post-readmission failure IS a human question now. The terminal label write is
@@ -3261,7 +3276,7 @@ def needs_user(repo, pr_number, reason, issue=None, alert_repo=None, alert_token
                  f"`{MACHINE_PARK_PR_LABEL}` here and `status:parked` on the source issue "
                  f"(whichever are present; a `needs:user` unlabel on either surface also "
                  f"opens the budget window) — the budget restarts from the latest gesture."
-                 f"{label_note}{generation_marker}")
+                 f"{label_note}{generation_marker}{reason_marker}")
         if parked:
             set_review_state(repo, pr_number, "parked")
         if issue:
@@ -4303,7 +4318,9 @@ def review_outcome(args):
         needs_user(args.repo, args.pr, reason, issue=args.issue,
                    alert_repo=alert_repo, alert_token=alert_token, park_class=park_class,
                    bot_login=args.bot_login, head_sha=args.reviewed_sha,
-                   attempt_key=attempt_key)
+                   attempt_key=attempt_key,
+                   # registry #677: state the cause so the park episode is attributable.
+                   park_cause="budget")
     else:
         # decision == "arm": the workflow runs ready-and-arm as a separate step under the
         # narrowly-minted arm token; the post-arm trust-surface audit trail is applied
@@ -4390,7 +4407,9 @@ def fix_outcome(args):
                    alert_repo=alert_repo, alert_token=alert_token, park_class=park_class,
                    bot_login=args.bot_login, head_sha=args.reviewed_sha,
                    attempt_key=(f"nochange{args.round}={nochange_runs}" if not made_changes
-                                else f"gatefail{args.round}={gatefail_runs}"))
+                                else f"gatefail{args.round}={gatefail_runs}"),
+                   # registry #677: the same axis the attempt fingerprint already distinguishes.
+                   park_cause="nochange" if not made_changes else "gatefail")
     else:
         print("fix outcome: staying in review:changes (retried next sweep tick)")
 
@@ -6276,6 +6295,31 @@ def _self_test():
         check("the INITIAL window is receipted (gen=1 cutoff=none)",
               f"{PARK_GENERATION_MARKER} gen=1 cutoff={PARK_WINDOW_NONE} -->"
               in park_route_comments[-1], True)
+        # registry #677: EVERY capacity park states its cause in a park-reason receipt. Before
+        # this the ladder wrote review:parked with a generation receipt only, so nothing on the
+        # PR said which mechanism parked it and a reader looking for "the newest cause" saw one
+        # from an older, already-released episode and released the ladder's park.
+        _pp = _park_policy()
+        check("a capacity park with NO stated cause still emits an attributable reason receipt",
+              (_pp.parse_park_reason(park_route_comments[-1]) or {}).get("cause"),
+              "capacity-unspecified")
+        check("...and it is CAPACITY-class, never the human terminal",
+              (_pp.parse_park_reason(park_route_comments[-1]) or {}).get("class"),
+              _pp.PARK_CLASS_CAPACITY)
+        park_route_calls.clear()
+        needs_user("o/r", 41, "budget spent", issue=7, park_class="capacity", bot_login=bot,
+                   park_cause="budget")
+        check("a STATED capacity cause is recorded verbatim",
+              (_pp.parse_park_reason(park_route_comments[-1]) or {}).get("cause"), "budget")
+        park_route_calls.clear()
+        # A question-class cause can never be smuggled through the capacity path: the taxonomy
+        # decides the class, so the writer falls back rather than emitting class=capacity
+        # cause=injection (which parse_park_reason would reject outright anyway).
+        needs_user("o/r", 41, "budget spent", issue=7, park_class="capacity", bot_login=bot,
+                   park_cause="injection")
+        check("a QUESTION-class cause cannot be laundered through the capacity park path",
+              (_pp.parse_park_reason(park_route_comments[-1]) or {}).get("cause"),
+              "capacity-unspecified")
         # (b) question stop (default) keeps the unconditional human-owned pair.
         park_route_calls.clear()
         needs_user("o/r", 41, "human question", issue=7)
@@ -8944,6 +8988,13 @@ def main():
     # Source-issue park ownership (park_policy.py): "question" -> human-owned needs:user,
     # "capacity" -> machine-owned status:parked (capacity/decline/budget-driven stops).
     nuser.add_argument("--park-class", choices=("question", "capacity"), default="question")
+    # registry #677: the narrow cause of a capacity park, so the park EPISODE is attributable in
+    # its own receipt. Omitted -> the receipt still lands under `capacity-unspecified`; a park with
+    # no cause receipt at all is the hole this closes. Constrained to the CAPACITY half of the
+    # closed taxonomy so a CLI caller cannot mislabel a capacity park as a human question.
+    nuser.add_argument("--park-cause", default="", choices=("",) + tuple(sorted(
+        cause for cause, klass in _park_policy().PARK_CAUSES.items()
+        if klass == _park_policy().PARK_CLASS_CAPACITY)))
     # Required for capacity parks once a readmission window exists (the generation-receipt
     # parser's bot trust filter); the question class never needs it.
     nuser.add_argument("--bot-login", default="")
@@ -9102,7 +9153,8 @@ def main():
             needs_user(args.repo, args.pr, args.reason, issue=args.issue,
                        alert_repo=alert_repo, alert_token=alert_token,
                        park_class=args.park_class, bot_login=args.bot_login,
-                       head_sha=args.head_sha, attempt_key=args.attempt_key)
+                       head_sha=args.head_sha, attempt_key=args.attempt_key,
+                       park_cause=args.park_cause)
         elif args.command == "disarm":
             disarm(args.repo, args.pr, args.when,
                    preserve_review_state=args.preserve_review_state)

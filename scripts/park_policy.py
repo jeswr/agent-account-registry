@@ -786,6 +786,22 @@ PARK_CAUSES = {
     "nochange": PARK_CLASS_CAPACITY,          # repeated clean model exits producing no change
     "gatefail": PARK_CLASS_CAPACITY,          # repeated local gate failures
     "cold-groom": PARK_CLASS_CAPACITY,        # groom's age/staleness hand-off (G3)
+    # The dispatcher's own crate-partition starvation (registry #677): this PR is holding the
+    # serializing `__global__` partition, the issue lane planned NOTHING behind it, and parking it
+    # provably frees that partition. It is a SCHEDULING action about the fleet, not a judgement
+    # about the diff — which is exactly what makes it capacity-class. It must NEVER be allowed to
+    # graduate into the human terminal (registry #703: parks are a conveyor into `needs:user`), so
+    # the writer of this cause parks the PR label DIRECTLY and never routes through the
+    # generation-counting escalation ladder that turns an exhausted capacity park into a question.
+    "partition": PARK_CLASS_CAPACITY,
+    # The honest fallback for a capacity park whose writer did not state a narrower cause
+    # (worker-pr.needs_user(park_class="capacity") reached from a call site that passes no
+    # `park_cause`). It exists so that EVERY capacity park emits SOME park-reason receipt: a park
+    # episode with no cause receipt at all is what let a stale `cause=partition` receipt stay
+    # "newest" forever and authorise releasing a park a different mechanism had applied. An
+    # unspecified cause is deliberately NOT a lie about which mechanism parked the PR — it says
+    # exactly what is known, which is "capacity, unattributed".
+    "capacity-unspecified": PARK_CLASS_CAPACITY,
     # --- genuine human questions: terminal, human-owned --------------------------------------
     "injection": PARK_CLASS_QUESTION,         # prompt-injection flag raised on the PR
     "human-arm": PARK_CLASS_QUESTION,         # a human requested changes / asked to arm by hand
@@ -2012,6 +2028,18 @@ def _self_test():
           [PARK_CLASS_CAPACITY, PARK_CLASS_QUESTION])
     check("an unknown cause has NO class (callers treat it as a human question)",
           park_cause_class("not-a-cause"), None)
+    # registry #677: the dispatcher's crate-partition starvation park. It is a CAPACITY action
+    # (a scheduling decision about the fleet, never a judgement about the diff), so it must land
+    # on the MACHINE-owned soft hold and inherit the machine exit. If this ever flipped to the
+    # question class the sweep would start writing `needs:user` — the terminal human hold
+    # registry #703 says parks must not be a conveyor into.
+    check("the partition-starvation cause is CAPACITY-class (never the human terminal)",
+          park_cause_class("partition"), PARK_CLASS_CAPACITY)
+    check("the partition-starvation cause is not a human-only cause",
+          "partition" in PARK_HUMAN_ONLY_CAUSES, False)
+    check("the partition marker renders class=capacity",
+          park_reason_marker("partition"),
+          "<!-- sparq-park-reason:v1 class=capacity cause=partition -->")
     check("the marker DERIVES class from the cause (a writer cannot contradict the taxonomy)",
           park_reason_marker("budget", generation=1, head="abc123"),
           "<!-- sparq-park-reason:v1 class=capacity cause=budget gen=1 head=abc123 -->")
