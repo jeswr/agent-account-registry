@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3878,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e3cb276f8407b22d4baa2bddcb6e16c84d393ee1",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior major finding by narrowing the public and module-level claims to exactly what is demonstrated: allocator deallocations reduce the live-byte counter, while DELETE-driven re-admission is explicitly identified as unproven and lacking an end-to-end wasm32 test. The wasm integration test exercises the real exported request path and confirms a configured ceiling produces HTTP 507 without poisoning the instance; it no longer purports to prove deletion recovery. The GlobalAlloc wrapper forwards allocator arguments unchanged, accounts only successful alloc/realloc operations, preserves the old allocation count on failed realloc, and is isolated behind the documented wasm-only global registration. Admission arithmetic saturates, the JS ceiling rejects negative/non-finite values, and the public skill/README match the implementation's sustained-pressure and transient-overshoot limitations.",
+  "verdict": "approve"
+ }
+}
