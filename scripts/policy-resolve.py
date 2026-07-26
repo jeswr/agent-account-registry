@@ -790,6 +790,22 @@ agent = "docs-agent"
            resolve("sparq-org/sparq", ["area:gui", "role:impl", "area:sparq-zk"], policy,
                    pref_routing)["agent"]),
           (["opus5"], "security-agent"))
+    # ...AND THE SAME EXEMPTION WITH A CROSS-PROVIDER SOUNDNESS CHAIN. Found by mutation: with
+    # today's single-model security chain (["opus5"]) the `requires` condition declines anyway, so
+    # applying the preference to the security branch was an UNDETECTABLE mutation — the exemption
+    # was defence-in-depth with no red test, exactly the shape a reviewer flagged as "worth an
+    # assertion if a security route ever becomes cross-provider". This fixture makes it one now,
+    # rather than after some future edit makes the soundness lane cross-provider.
+    xprov_sec = copy.deepcopy(pref_routing)
+    xprov_sec["route"][1]["model_chain"] = ["opus5", "sol"]
+    check("a CROSS-PROVIDER security route is STILL returned unmodified under area:gui (the "
+          "exemption is the ROUTE CLASS, not an accident of that chain being single-model)",
+          resolve("sparq-org/sparq", ["area:gui", "role:impl", "area:sparq-zk"], policy,
+                  xprov_sec)["model_chain"], ["opus5", "sol"])
+    check("...and the same table still applies the preference on the ROLE branch, so the check "
+          "above is an exemption and not a dead fixture",
+          resolve("sparq-org/sparq", ["area:gui", "role:impl"], policy,
+                  xprov_sec)["model_chain"], ["sol", "opus5"])
     for outside in ("area:site", "area:site-specs", "area:site-papers", "area:sitemap",
                     "surface:frontend", "dashboard", "area:guide", "area:guidance"):
         check(f"{outside} is OUTSIDE the carve-out (opus5-first)",

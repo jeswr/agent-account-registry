@@ -226,6 +226,13 @@ lead     = "sol"
 requires = ["sol", "opus5"]
 """
 
+# The security-route exemption is UNOBSERVABLE while the soundness chain is single-model: the
+# `requires` condition declines it for an unrelated reason, so applying the preference to the
+# security branch is a mutation no assertion can see. This variant makes the soundness chain
+# CROSS-PROVIDER, which is the only shape in which the exemption is a real, testable rule.
+SECURITY_CROSS_PROVIDER = 'model_chain = ["opus5"]\nagent = "sparq-reviewer"'
+SECURITY_CROSS_PROVIDER_FIXED = 'model_chain = ["opus5", "sol"]\nagent = "sparq-reviewer"'
+
 
 def _self_test():  # noqa: C901 — a flat sequence of assertions
     ok = True
@@ -271,6 +278,25 @@ def _self_test():  # noqa: C901 — a flat sequence of assertions
     chk("...and NOT area:site", (chain(undeclared, ("area:site", "role:impl")),
                                  chain(declared, ("area:site", "role:impl"))),
         (["opus5", "sol"], ["opus5", "sol"]))
+
+    # (3b) THE SECURITY EXEMPTION, made observable. Against the shipped single-model soundness
+    # chain the `requires` condition declines for an unrelated reason, so "the security route is
+    # exempt" is not testable at all — mutation found that applying the preference to the security
+    # branch survives every assertion. With a CROSS-PROVIDER soundness chain the exemption becomes
+    # a real rule, on both resolvers, and both must still return it unmodified.
+    xsec = tomllib.loads((SPARQ_SHAPED + GUI_DECLARATION)
+                         .replace(SECURITY_CROSS_PROVIDER, SECURITY_CROSS_PROVIDER_FIXED, 1))
+    assert xsec["route"][0]["model_chain"] == ["opus5", "sol"], \
+        "the cross-provider security fixture is stale — it no longer edits the security route"
+    chk("a CROSS-PROVIDER security route is returned UNMODIFIED by CLAIM under area:gui",
+        chain(xsec, ("area:gui", "area:sparq-zk", "role:impl")), ["opus5", "sol"])
+    chk("...and by PLAN", _plan(_ROUTE.resolve, ("area:gui", "area:sparq-zk", "role:impl"),
+                                xsec)[1][0], ["opus5", "sol"])
+    chk("...while the SAME table still re-orders the role branch (so the two rows above are an "
+        "exemption, not a dead fixture)",
+        chain(xsec, ("area:gui", "role:impl")), ["sol", "opus5"])
+    chk("PLAN and CLAIM agree on every matrix row for the cross-provider-security table",
+        compare(xsec), [])
 
     # (4) NON-VACUITY OF THE HARNESS ITSELF. Give PLAN a resolver that knows a rule CLAIM does not
     # — the exact sparq #4211 shape, a carve-out implemented only in the target's Python — and the
