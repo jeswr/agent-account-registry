@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 3595,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "bf974de3de843cc87ff1f979fcbe8ac8b43e08bd",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "SourceSegment::check_shape only rejects rows.len() > declared_rows. It accepts, for example, rows.len() == 1, declared_rows == 2, row_count == 2 (or row_count > declared_rows). encode then emits zero padding while declaring those padded rows active. The authoritative verifier's downstream consumers use min(row_count, rows.len()), so this creates an acceptance/interpretation mismatch at exactly the new composition boundary. It also contradicts the module's fail-closed description of malformed segments.",
+    "file": "crates/sparq-mpc/src/federated.rs",
+    "fix_hint": "Reject unless row_count as usize equals rows.len(), and reject row_count as usize > declared_rows (the equality check plus the existing rows bound is sufficient but an explicit diagnostic is clearer). Add negative tests for row_count greater than rows.len() and greater than declared_rows.",
+    "severity": "major",
+    "title": "row_count is not validated against supplied and declared rows"
+   },
+   {
+    "body": "The byte-identical-to-reconstruct_public_inputs claim relies on every commitment, constant, row value, and challenge being a canonical field encoding. The authoritative implementation parses FieldHex into the field and rejects malformed/out-of-range values before serializing, while this public API accepts any [u8; 32] and hashes/emits it unchanged. A caller can therefore construct bytes that the authoritative verifier could never reconstruct, violating the stated cross-crate invariant and fail-closed security boundary.",
+    "file": "crates/sparq-mpc/src/federated.rs",
+    "fix_hint": "Use a validated newtype with a fallible constructor that rejects values outside the target field's canonical range, or validate every Word (including the challenge) before encoding/message derivation. Add a negative test using the field modulus or another non-canonical 32-byte value. If validation is intentionally deferred, narrow the public claims and make the unsafe precondition explicit in the API type/name, but a cryptographic boundary should preferably enforce it.",
+    "severity": "major",
+    "title": "Raw Word values do not enforce canonical field encoding"
+   }
+  ],
+  "progress": null,
+  "summary": "The transcript construction and holder binding are internally coherent, and the tests exercise nonce, statement, session, holder identity, ordering, duplicate-holder, and basic shape behavior. However, the new public constructor accepts a logically inconsistent scan segment: row_count is not checked against either the number of supplied rows or declared_rows. That undermines the advertised fail-closed reconstruction boundary and can bind padded zero rows as active rows. The raw Word API also does not enforce the canonical-field precondition on which the claimed equivalence to the authoritative verifier depends.",
+  "verdict": "request_changes"
+ }
+}
