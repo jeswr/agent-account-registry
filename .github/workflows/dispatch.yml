@@ -531,6 +531,12 @@ jobs:
           review_items = []
           disarm_items = []
           snapshot_skips = []
+          # [registry #718] Per-repo starvation evidence for the CLAIM-side self-healing sweep:
+          # how many READY issue rows the busy partition dropped behind a `__global__` occupant.
+          # CLAIM cannot recompute this — the plan carries only the SURVIVORS, so without it
+          # "planned == 0" cannot be told apart from "the backlog is empty", and the sweep must
+          # never park a holder on an empty backlog.
+          partition_starvation = []
           review_exclusions = Counter()
           for index, repository in enumerate(intermediate["repositories"]):
               repo = repository["target_repo"]
@@ -636,18 +642,31 @@ jobs:
               # sibling lease (impl `<repo>#<issue>`, `review:`/`fix:`) on an item's package
               # defers it — the lanes share ONE crate-ownership view (the same ledger the
               # enumerator's superseded-until-sibling-resolves exclusion reads).
+              # [registry #718] `starvation` is filled BY the filter, at the branch that makes
+              # each drop decision — never recounted afterwards from a different view.
+              starvation = {}
               repository["items"] = claim_mod.filter_busy_area_items(
                   claim_mod.filter_deferred_items(repository["items"], repo, leases, now),
-                  repo, pulls, issue_labels, provenance, pr_status, leases, now)
+                  repo, pulls, issue_labels, provenance, pr_status, leases, now,
+                  starvation=starvation)
+              # Recorded ONLY for a genuinely starved lane: nothing survived AND rows were dropped
+              # behind the serializing partition. A healthy or empty lane records nothing, so the
+              # sweep on the CLAIM side has no starvation to act on at all.
+              if starvation.get("kept") == 0 and starvation.get("deferred", 0) > 0:
+                  print(f"PARTITION STARVATION {repo}: 0 issue item(s) planned behind "
+                        f"{starvation['deferred']} row(s) deferred by a __global__ occupant")
+                  partition_starvation.append(
+                      {"repo": repo, "deferred": starvation["deferred"]})
 
           snapshot_skips.sort(key=lambda skip: (skip["repo"], skip["pr_number"]))
           document = {
-              "schema": "registry-dispatch-plan/v4",
+              "schema": "registry-dispatch-plan/v5",
               "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
               "repositories": intermediate["repositories"],
               "review_items": review_items,
               "disarm_items": disarm_items,
               "snapshot_skips": snapshot_skips,
+              "partition_starvation": partition_starvation,
           }
           # GLOBAL (repo, pr_number) order via the SHARED, self-tested helper (sol r2 on
           # #233): per-repo policy-order assembly inverts lexicographically with a second
@@ -656,9 +675,9 @@ jobs:
           # PLAN-side inline set-equality checks (CLAIM repeats a stricter independent
           # re-validation of the artifact as hostile data before any mutation).
           if set(document) != {"schema", "generated_at", "repositories", "review_items",
-                               "disarm_items", "snapshot_skips"}:
+                               "disarm_items", "snapshot_skips", "partition_starvation"}:
               raise SystemExit("plan schema top-level fields are invalid")
-          if document["schema"] != "registry-dispatch-plan/v4":
+          if document["schema"] != "registry-dispatch-plan/v5":
               raise SystemExit("plan schema version is invalid")
           expected_item_fields = {"number", "priority", "package", "role", "model_chain",
                                   "agent", "escalate", "labels", "author", "body_sha", "deferred"}
@@ -681,6 +700,9 @@ jobs:
           for item in document["snapshot_skips"]:
               if set(item) != expected_skip_fields:
                   raise SystemExit("plan snapshot skip fields are invalid")
+          for item in document["partition_starvation"]:
+              if set(item) != {"repo", "deferred"}:
+                  raise SystemExit("plan partition starvation fields are invalid")
           # Full structural validation with the same validator CLAIM uses (strictly stronger
           # than a hand-rolled inline copy, and available here because the registry is local).
           claim_mod.validate_plan(document)

@@ -43,10 +43,19 @@ import tomllib
 # (`snapshot_skips`) so one oversized PR's check-run listing defers THAT PR instead of
 # killing the whole sweep. CLAIM only COUNTS these into the dispatch-summary histogram —
 # a hostile plan can at worst inflate accounting noise, never trigger an act.
-SCHEMA = "registry-dispatch-plan/v4"
+# v4 -> v5 (registry #718/#677): the plan carries `partition_starvation` — the ONE fact about a
+# starved tick that CLAIM cannot recompute for itself. CLAIM re-reads the live pull listing, so it
+# can re-derive WHO holds the serializing `__global__` partition; what it cannot re-derive is how
+# many READY issue rows the busy partition dropped, because the plan only carries the SURVIVORS.
+# Without that count, "planned == 0" cannot be told apart from "the backlog is empty" — and parking
+# a holder on an empty backlog is pure cost. This field carries the count, and nothing else: the
+# holder itself is RE-PROVEN live at CLAIM time, so a hostile plan can at most make CLAIM look for
+# a starvation that the live state then refuses to confirm. It can never name a PR to park.
+SCHEMA = "registry-dispatch-plan/v5"
 PLAN_FIELDS = {"schema", "generated_at", "repositories", "review_items", "disarm_items",
-               "snapshot_skips"}
+               "snapshot_skips", "partition_starvation"}
 REPOSITORY_FIELDS = {"target_repo", "target_sha", "items"}
+PARTITION_STARVATION_FIELDS = {"repo", "deferred"}
 ITEM_FIELDS = {
     "number",
     "priority",
@@ -390,6 +399,10 @@ def normalize_plan_order(document):
     fixture-local sort kept the test green). Returns the document for chaining."""
     document["review_items"].sort(key=lambda item: (item["repo"], item["pr_number"]))
     document["disarm_items"].sort(key=lambda item: (item["repo"], item["pr_number"]))
+    # [registry #718] Same doctrine for the starvation evidence: ONE production sort, called by
+    # the PLAN assembler, so the deterministic order validate_plan demands is produced by the code
+    # the self-test exercises rather than by an inline workflow sort that can drift.
+    document["partition_starvation"].sort(key=lambda entry: entry["repo"])
     return document
 
 
@@ -553,6 +566,30 @@ def validate_plan(document):
         if prior_skip is not None and skip_key < prior_skip:
             raise DispatchError("plan snapshot skips are not in deterministic order")
         prior_skip = skip_key
+    # [registry #718] The starvation evidence. Validated as strictly as every other plan section
+    # because the plan is HOSTILE INPUT: it is assembled in a job that ran target planner code.
+    # It can only ever ASSERT a count for a repository the plan already carries — it names no PR,
+    # so no plan value can select the PR this evidence eventually leads CLAIM to park.
+    starvation = document["partition_starvation"]
+    if not isinstance(starvation, list):
+        raise DispatchError("plan partition_starvation must be a list")
+    prior_starved = None
+    seen_starved = set()
+    for starved_index, entry in enumerate(starvation, 1):
+        where = f"partition starvation #{starved_index}"
+        _require_exact_fields(entry, PARTITION_STARVATION_FIELDS, where)
+        repo = _safe_string(entry["repo"], SAFE_REPO, f"{where} repo")
+        if repo not in seen_repositories:
+            raise DispatchError(f"{where} repo is not a planned repository")
+        deferred = entry["deferred"]
+        if not isinstance(deferred, int) or isinstance(deferred, bool) or deferred <= 0:
+            raise DispatchError(f"{where} deferred must be a positive integer")
+        if repo in seen_starved:
+            raise DispatchError(f"plan repeats partition starvation for {repo}")
+        seen_starved.add(repo)
+        if prior_starved is not None and repo < prior_starved:
+            raise DispatchError("plan partition starvation entries are not in deterministic order")
+        prior_starved = repo
     return document
 
 
@@ -1072,17 +1109,23 @@ def busy_packages_of_pulls(repo, pulls, issue_labels, provenance, pr_status=None
         inactive, reason = _pull_inactivity_decision(pull, status)
         if parked and inactive:
             if isinstance(occupancy, list):
-                occupancy.append(("parked-free", number, frozenset(areas), reason))
+                occupancy.append(("parked-free", number, frozenset(areas), reason, inactive))
             continue                      # provably inert human-parked PR — frees its crates
         if isinstance(occupancy, list):
+            # [registry #718] The 5th element is `inactive` — the SAME _pull_inactivity_decision
+            # bit the parked-free carve-out above turns on, carried out to the caller instead of
+            # being discarded. The starvation sweep needs it and must NOT re-derive it: a second
+            # copy of "would parking this PR actually free its crates?" is exactly the
+            # mint-vs-adopt drift #707 exists to prevent. For an UN-parked PR the `reason` slot
+            # says only "not-parked", so without this the answer is unrecoverable downstream.
             occupancy.append(("busy", number, frozenset(areas),
-                              reason if parked else "not-parked"))
+                              reason if parked else "not-parked", inactive))
         busy |= areas
     return busy
 
 
 def filter_busy_area_items(items, repo, pulls, issue_labels, provenance, pr_status=None,
-                           leases=None, now=0):
+                           leases=None, now=0, starvation=None):
     """Drop plan items whose package has an in-flight worker PR (registry issue #27: the review
     loop's PRs were invisible to the busy-area partition, double-dispatching onto a busy crate).
     Global semantics mirror the target ready-engine: a global reservation blocks everything, and
@@ -1098,22 +1141,37 @@ def filter_busy_area_items(items, repo, pulls, issue_labels, provenance, pr_stat
     review/fix run on it (or any sibling) may still hold a live lease there — launching an
     impl worker into that crate would put two lanes on one crate the moment the park lifts.
     `leases=None` (no ledger view supplied) fails toward exclusion, mirroring
-    sibling_lease_conflict's ambiguity rule — callers must pass the real ledger list."""
+    sibling_lease_conflict's ambiguity rule — callers must pass the real ledger list.
+
+    [registry #718] `starvation`, when a dict is passed, is filled with the ONE measurement CLAIM
+    cannot recompute: `deferred` = how many READY issue rows this partition dropped while some
+    occupant held the serializing `__global__` package, and `kept` = how many survived. The plan
+    artifact carries only the survivors, so without this a starved tick (`kept == 0` because one
+    PR reserves all 54 crates) is indistinguishable downstream from an EMPTY BACKLOG — and the
+    self-healing sweep must never fire on an empty backlog. Counted here, at the exact branch that
+    makes the decision, rather than re-derived later from a different view."""
     occupancy = []
     busy = busy_packages_of_pulls(
         repo, pulls, issue_labels, provenance, pr_status, occupancy=occupancy)
+    global_reserved = GLOBAL_PACKAGE in busy
+    global_deferred = 0
     kept = []
     for item in items:
         package = item.get("package")
         if busy and (GLOBAL_PACKAGE in busy or package == GLOBAL_PACKAGE or package in busy):
             blocker = next(
                 ((pr_number, reason)
-                 for decision, pr_number, packages, reason in occupancy
+                 for decision, pr_number, packages, reason, *_ in occupancy
                  if decision == "busy" and
                  (GLOBAL_PACKAGE in packages or package == GLOBAL_PACKAGE or package in packages)),
                 ("unknown", "unknown"))
             print(f"assembler defer #{item.get('number')}: crate {package} busy via "
                   f"pr#{blocker[0]} [{blocker[1]}]")
+            # Only a drop that a `__global__` OCCUPANT caused is starvation evidence. An item
+            # dropped because its OWN package is `__global__`, or because a sibling holds its one
+            # crate, is the partition working as designed and no park would help it.
+            if global_reserved:
+                global_deferred += 1
             continue
         if sibling_lease_conflict(
                 repo, {f"{repo}#{item.get('number')}"},
@@ -1123,7 +1181,78 @@ def filter_busy_area_items(items, repo, pulls, issue_labels, provenance, pr_stat
                   "a live sibling lease (any lane) holds its package")
             continue
         kept.append(item)
+    if isinstance(starvation, dict):
+        starvation["deferred"] = global_deferred
+        starvation["kept"] = len(kept)
     return kept
+
+
+# [registry #718] How many `__global__` holders ONE tick may park, per target repository. One.
+# The recurrence in #677 is that parking a holder by hand simply PROMOTES the next one, so a
+# sweep that drained the whole holder set in a single tick would be exactly that mistake
+# automated — it would park PRs whose reservation was never the binding one, and each park costs
+# real review progress. One per tick converges over ticks (each park frees the partition and the
+# NEXT tick re-measures whether the lane is still starved) and never over-shoots.
+STARVATION_PARKS_PER_TICK_MAX = 1
+
+
+def starvation_park_target(planned_items, deferred, occupancy, log=print):
+    """PURE. The ONE `__global__` occupant to park because the issue lane is STARVED, or None.
+
+    This is the trigger for the self-healing sweep in registry #718/#677. It fires on the MEASURED
+    condition, never on a timer, and every clause below is load-bearing:
+
+    - `planned_items` must be EMPTY. While the lane is planning anything at all the plan is
+      healthy, and parking a holder would cost review progress to buy throughput that is already
+      flowing. This is the "do not park while healthy" guard.
+    - `deferred` must be POSITIVE. It is filter_busy_area_items' count of ready rows dropped while
+      a `__global__` occupant was reserving everything. Zero means the backlog is genuinely empty,
+      which is not starvation and must never park anybody.
+    - The occupant must be BUSY (not already parked-free), must hold `__global__`, and must be
+      UN-PARKED. An already-parked holder is skipped, which is what makes the sweep IDEMPOTENT:
+      re-running it against its own output selects nobody.
+    - The occupant must be provably INACTIVE (_pull_inactivity_decision, carried out of
+      busy_packages_of_pulls rather than re-derived). THIS IS THE CLAUSE THAT MAKES THE ACTION
+      USEFUL RATHER THAN MERELY EXPENSIVE: busy_packages_of_pulls frees a parked PR's crates only
+      when it is `parked AND inactive`, so parking an ACTIVE (non-draft, or latched, or
+      unprovable) holder writes a label, costs that PR its place in the review lane, and does not
+      free one single crate. Registry #677 measured exactly that outcome by hand. A holder whose
+      park would not demonstrably free the partition is not a candidate.
+
+    Deterministic and bounded: candidates are considered in ascending PR number and exactly one is
+    returned, so at most STARVATION_PARKS_PER_TICK_MAX == 1 holder is parked per repository per
+    tick, and two runs over the same input pick the same PR."""
+    if planned_items:
+        return None                       # the plan is HEALTHY — never park a holder
+    if not isinstance(deferred, int) or isinstance(deferred, bool) or deferred <= 0:
+        return None                       # nothing was starved (empty backlog / unreadable count)
+    candidates = []
+    for row in occupancy if isinstance(occupancy, list) else []:
+        if not isinstance(row, tuple) or len(row) < 5:
+            continue                      # an occupancy shape this function cannot read is not
+            # evidence to act on — fail toward parking NOBODY
+        decision, pr_number, packages, reason, inactive = row[:5]
+        if decision != "busy":
+            continue
+        if GLOBAL_PACKAGE not in packages:
+            continue                      # holds real crates, not the serializing partition
+        if reason != "not-parked":
+            continue                      # already parked (its park simply is not freeing it)
+        if inactive is not True:
+            continue                      # parking it would NOT free the partition
+        if not isinstance(pr_number, int) or isinstance(pr_number, bool) or pr_number <= 0:
+            continue
+        candidates.append(pr_number)
+    if not candidates:
+        log("starvation sweep: the issue lane planned 0 item(s) behind "
+            f"{deferred} partition-deferred row(s), but no UN-PARKED, provably-inert "
+            f"`{GLOBAL_PACKAGE}` holder was found — parking nobody")
+        return None
+    target = min(candidates)
+    log(f"starvation sweep: issue lane planned 0 item(s) while {deferred} ready row(s) deferred "
+        f"behind the `{GLOBAL_PACKAGE}` partition; {len(candidates)} un-parked inert holder(s) "
+        f"{sorted(candidates)} — parking pr#{target} (cap {STARVATION_PARKS_PER_TICK_MAX}/tick)")
+    return target
 
 
 def live_pull_detail_stub(pull):
@@ -1153,7 +1282,7 @@ def live_pull_detail_stub(pull):
 
 
 def revalidate_items_against_live_pulls(items, repo, pull_pages, issue_labels, provenance,
-                                        leases=None, now=0):
+                                        leases=None, now=0, occupancy=None):
     """[round-4 P1] PURE CLAIM-side re-check of the PLAN busy partition against the LIVE
     pull listing CLAIM already fetches: the PLAN artifact's freeing decisions are minutes
     old by the time an item launches, so a parked draft that went ready (or a brand-new
@@ -1169,7 +1298,13 @@ def revalidate_items_against_live_pulls(items, repo, pull_pages, issue_labels, p
     decision and every deferred item names its live blocking artifact in the claim log.
     [round-5 P1] `leases`/`now` feed the cross-lane lease partition inside
     filter_busy_area_items (the CLAIM caller reads the ledger-branch checkout);
-    leases=None fails toward exclusion."""
+    leases=None fails toward exclusion.
+
+    [registry #718] `occupancy`, when a list is passed, receives the LIVE occupancy rows this
+    function already computes. The starvation sweep acts on the live view — never on the PLAN
+    artifact's minutes-old one — and it must read the SAME view that the launch decision reads:
+    two independent derivations of "who holds `__global__`" is the drift class #707 exists to
+    prevent. Nothing here is re-derived for the sweep; the rows are simply not thrown away."""
     rows = []
     for page in pull_pages if isinstance(pull_pages, list) else []:
         if isinstance(page, list):
@@ -1181,12 +1316,12 @@ def revalidate_items_against_live_pulls(items, repo, pull_pages, issue_labels, p
             stub = live_pull_detail_stub(row)
             if stub is not None:
                 live_status[number] = stub
-    occupancy = []
+    live_occupancy = occupancy if isinstance(occupancy, list) else []
     busy = busy_packages_of_pulls(
         repo, rows, issue_labels, provenance, live_status,
-        parked_pr_labels=CLAIM_REVALIDATION_PARK_LABELS, occupancy=occupancy)
+        parked_pr_labels=CLAIM_REVALIDATION_PARK_LABELS, occupancy=live_occupancy)
 
-    for decision, pr_number, packages, _reason in occupancy:
+    for decision, pr_number, packages, _reason, *_ in live_occupancy:
         if decision == "parked-free":
             for package in sorted(packages):
                 print(f"claim-revalidation free: crate {package} freed via parked pr#{pr_number}")
@@ -1197,7 +1332,7 @@ def revalidate_items_against_live_pulls(items, repo, pull_pages, issue_labels, p
         package = item.get("package")
         if busy and (GLOBAL_PACKAGE in busy or package == GLOBAL_PACKAGE or package in busy):
             blocker = next(
-                (pr_number for decision, pr_number, packages, _reason in occupancy
+                (pr_number for decision, pr_number, packages, _reason, *_ in live_occupancy
                  if decision == "busy" and
                  (GLOBAL_PACKAGE in packages or package == GLOBAL_PACKAGE or package in packages)),
                 "unknown")
@@ -2506,6 +2641,91 @@ def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_logi
             log(f"::warning::auto-readmit skipped for {repo}#{number}: {exc}; the capacity "
                 "park stands")
     return readmitted
+
+
+def starvation_park_body(repo, pr_number, deferred, issue_url):
+    """The park comment for a partition-starvation park. Modelled on the hand-written comments on
+    sparq-org/sparq#4185 and #4212, because the reader of this comment is the PR's author and the
+    review lane, and the FIRST thing they must learn is that no review judgement was made.
+
+    It states the mechanism, the measurement that triggered it, the un-park condition, and — the
+    part a machine action must never omit — that the machine will un-park it itself."""
+    return (
+        "> 🤖 **SPARQ agent** — parking this PR to unblock the fleet. "
+        "**This is not a review judgement, and nothing is wrong with the change itself.**\n\n"
+        "## What happened\n\n"
+        f"This PR is currently reserving the serializing `{GLOBAL_PACKAGE}` crate partition — "
+        "either because its provenance/area linkage is unreadable, or because it reduces to that "
+        "partition — so it excludes against **every** crate in the workspace at once. On this "
+        f"dispatch tick the issue lane planned **0** items while **{deferred}** ready issue "
+        "row(s) were deferred behind that reservation. The worker lane was fully starved.\n\n"
+        "## Why this PR\n\n"
+        "It is the lowest-numbered open worker PR that (a) holds that partition, (b) is not "
+        "already parked, and (c) is a provably inert draft with no arm latch — so parking it "
+        "**demonstrably frees the partition**. A holder whose park would not free anything is "
+        "never selected. At most one holder is parked per tick.\n\n"
+        "## What the label means\n\n"
+        f"`{MACHINE_PARK_PR_LABEL}` is the **machine-recoverable capacity** class. A parked, "
+        "inactive PR releases its crate reservation — that release is the entire purpose of this "
+        "label here. It is **not** `needs:user`, it is not a terminal human hold, and this sweep "
+        "never writes one.\n\n"
+        "## How it comes back\n\n"
+        "Automatically, through the ordinary capacity-park re-admission sweep — the same path "
+        "every machine park uses. No human gesture is required. A human can also simply remove "
+        f"the label at any time; a human un-park is sticky and this sweep will not undo it.\n\n"
+        f"Mechanism and the durable fix: {issue_url}\n\n"
+        f"{_park_policy.park_reason_marker('partition')}")
+
+
+def park_starved_partition_holder(repo, pr_number, deferred, labels, park_pr, post_comment,
+                                  vetoed=None, log=print):
+    """Apply ONE partition-starvation park. Returns True iff the label was written.
+
+    `park_pr(pr_number)` writes the label and `post_comment(repo, pr_number, body)` posts the
+    receipt; both are injected so the self-test observes the EXACT mutation set this function
+    performs — the named test asserts that `needs:user` / `review:needs-user` / `status:parked`
+    are never among them.
+
+    The three refusals, all failing toward DOING NOTHING:
+
+    - `labels` already carries the machine park -> nothing to do (idempotence, defence in depth;
+      starvation_park_target already declines an already-parked holder).
+    - `labels` carries a HUMAN-owned hold -> a human is already holding this PR and the machine
+      has no business writing a second hold on top of it.
+    - `vetoed(pr_number)` -> park_policy's sticky human-unpark veto. A human who un-parked this PR
+      has overruled the machine, and re-parking it would be the machine overruling the human. An
+      unreadable timeline vetoes too (park_vetoed's own fail direction).
+
+    RECEIPT-FIRST, like every other park writer here (#610 round-4 finding 2): the comment lands
+    BEFORE the label. A crash between them leaves an explained PR with no label — visibly nothing
+    happened — never an unexplained label, which is the mysterious action registry #703 is about.
+
+    This function deliberately does NOT route through worker-pr's `needs-user --park-class
+    capacity` ladder. That ladder counts park generations and ESCALATES an exhausted capacity park
+    into the human `needs:user` terminal, which is precisely the conveyor registry #703 documents.
+    A scheduling action must never be able to graduate into a human question."""
+    live = set(labels)
+    if MACHINE_PARK_PR_LABEL in live:
+        log(f"starvation park skipped {repo}#{pr_number}: already carries "
+            f"`{MACHINE_PARK_PR_LABEL}`")
+        return False
+    held = _park_policy.human_owned_holds(live)
+    if held:
+        log(f"starvation park REFUSED {repo}#{pr_number}: human-owned hold(s) live "
+            f"({'/'.join(held)}) — the machine does not write a hold on top of a human's")
+        return False
+    if vetoed is not None and vetoed(pr_number):
+        log(f"starvation park REFUSED {repo}#{pr_number}: a human un-parked this PR (or the "
+            "timeline is unreadable) — the sticky unpark veto stands")
+        return False
+    post_comment(repo, pr_number, starvation_park_body(
+        repo, pr_number, deferred,
+        "https://github.com/jeswr/agent-account-registry/issues/718"))
+    park_pr(pr_number)
+    log(f"starvation park APPLIED {repo}#{pr_number}: `{MACHINE_PARK_PR_LABEL}` written to free "
+        f"the `{GLOBAL_PACKAGE}` partition ({deferred} ready row(s) were deferred behind it); "
+        "the ordinary capacity-park re-admission sweep owns its exit")
+    return True
 
 
 def _issue_no_change_outcomes(model_health, records, issue):
@@ -3870,11 +4090,15 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
         # the issue listing is a paginated API read worth spending once).
         live_issue_labels = _live_issue_labels(repo)
         claim_provenance = _claim_provenance_map(repo, registry_root, ledger_root)
+        # [registry #718] The SAME live occupancy the revalidation computes, kept for the
+        # starvation sweep below rather than re-derived from a second view.
+        live_occupancy = []
         live_dispatchable = revalidate_items_against_live_pulls(
             repository["items"], repo, pull_pages, live_issue_labels, claim_provenance,
             # [round-5 P1] the cross-lane lease partition reads the ledger-branch checkout;
             # an unreadable ledger view yields None and the partition fails toward exclusion.
-            leases=_ledger_leases(ledger_root), now=int(time.time()))
+            leases=_ledger_leases(ledger_root), now=int(time.time()),
+            occupancy=live_occupancy)
 
         # Safety invariant FIRST (issue #42): stale arm latches are retracted before any fix or
         # review admission can push onto (or re-review past) an armed, mutated head. The disarm lane
@@ -3914,6 +4138,48 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                     # drift apart.
                     migration_provable=_legacy_migration_provable(
                         model_health, health_window, _now))
+
+        # [registry #718/#677] THE MACHINE EXIT FOR A STARVED PLAN. Four times on 2026-07-26 the
+        # issue lane went to `PLAN complete: 0 issue item(s)` / `lane worker: planned=0 launched=0`
+        # while ONE un-parked PR reserved all 54 crates, and the only thing that cleared it was a
+        # human parking the holder by hand. A conservative hold with no machine exit converts a
+        # transient fault into a permanent stall (#677 point 2), so the fleet performs that same
+        # action itself — on the MEASURED condition, never a timer.
+        #
+        # `deferred` is the ONE input from the plan: how many ready rows the busy partition dropped
+        # behind a `__global__` occupant. Everything else — who holds the partition, whether they
+        # are parked, whether parking them would free anything — is RE-PROVEN against the live
+        # occupancy computed moments ago, so a stale or hostile plan can make this look for a
+        # starvation but never name the PR that gets parked.
+        starved = next((entry["deferred"] for entry in plan["partition_starvation"]
+                        if entry["repo"] == repo), 0)
+        starvation_target = starvation_park_target(
+            repository["items"], starved, live_occupancy)
+        if starvation_target is not None and bot_login and _target_token(repo):
+            try:
+                _live_row = next(
+                    (row for page in pull_pages if isinstance(page, list)
+                     for row in page
+                     if isinstance(row, dict) and row.get("number") == starvation_target), None)
+                if _live_row is None:
+                    print(f"::warning::starvation park skipped {repo}#{starvation_target}: the "
+                          "holder vanished from the live listing between the two reads")
+                elif park_starved_partition_holder(
+                        repo, starvation_target, starved, _labels(_live_row),
+                        park_pr=lambda number: _run_gh_target_api(
+                            repo, "POST", f"repos/{repo}/issues/{number}/labels",
+                            {"labels": [MACHINE_PARK_PR_LABEL]}),
+                        post_comment=_run_gh_target_comment,
+                        vetoed=lambda number: _park_policy.park_vetoed(
+                            repo, number, MACHINE_PARK_PR_LABEL, _issue_timeline_events,
+                            is_human=lambda probe: _target_is_human_maintainer(repo, probe))):
+                    defer_reasons["partition-starvation-park"] += 1
+            except DispatchError as exc:
+                # One failed park never stops the tick: the lane is already starved, and the next
+                # tick re-measures and retries. Loud, because a park that cannot be applied is the
+                # difference between a self-healing fleet and a stalled one.
+                print(f"::warning::starvation park FAILED {repo}#{starvation_target}: {exc}; the "
+                      f"`{GLOBAL_PACKAGE}` partition is still held")
 
         for item in repository["items"]:
             number = item["number"]
@@ -4911,6 +5177,7 @@ def _self_test():
             "repositories": [{"target_repo": "example/repo", "target_sha": "a" * 40,
                               "items": [item]}],
             "review_items": [], "disarm_items": [], "snapshot_skips": [],
+            "partition_starvation": [],
         }
         policy = {
             "trusted_bots": [], "allow_actions_bot_issues": False,
@@ -5224,6 +5491,10 @@ def _self_test():
             "repo": "example/repo",
             "pr_number": 48,
             "reason": "check-runs-overflow",
+        }],
+        "partition_starvation": [{
+            "repo": "example/repo",
+            "deferred": 3,
         }],
     }
     assert validate_plan(fixture) is fixture
