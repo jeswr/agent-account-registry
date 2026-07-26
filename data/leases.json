@@ -212,16 +212,6 @@
   },
   {
    "account": "dc2d751954080e13",
-   "claim_id": "9e9e285d79ae4efdb696680b45206cdd",
-   "holder": "sparq-org/sparq#2826@30184541902.1",
-   "package": "bench",
-   "role": "impl",
-   "model": "sol",
-   "issued_at": 1785032776,
-   "expires_at": 1785039076
-  },
-  {
-   "account": "dc2d751954080e13",
    "claim_id": "c52dd6adef54408c9c6f636b19228181",
    "holder": "sparq-org/sparq#3027@dispatch-30184356904.1",
    "package": "sparq-algos",
