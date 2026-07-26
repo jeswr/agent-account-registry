@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3628,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c5d1d08b1ebf3a56346e7bc06284f4cf2501b191",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 3 finds no correctness, soundness, test-validity, or security defect. The circuit recomputes each committed graph with active-count binding, rejects non-canonical graph commitment sets, constrains the selected RDFS rule and consequent, requires both private antecedents to occur in active committed slots, and enforces exact per-graph attribution. EN8 is a non-vacuous padding-membership rejection; EN9 exercises split K=2 membership and attribution; EN10-EN12 independently cover duplicate ordering, descending ordering, and attribution overstatement. The documentation consistently limits the relation to a single RDFS step over asserted committed members, explicitly says verifier wiring and saturation remain unbuilt, and retains the research-grade/not-externally-audited sq-qhy4 caveat. This is materially unchanged from round 2's clean approval, so progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
