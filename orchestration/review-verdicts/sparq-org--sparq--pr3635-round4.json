@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3635,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "85e77fc757778d9ca28646327cd989587bfbb4d3",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "PrivacyBudget::would_exceed still compares delta_spent + params.delta against delta_total + BUDGET_EPS_TOL, where BUDGET_EPS_TOL is 1e-12. Thus PrivacyBudget::new(..., 0.0), documented to refuse every non-trivial query, can accept a valid DpParams with positive delta <= 1e-12; more generally the ledger can authorize spend up to 1e-12 beyond delta_total. That absolute slack is material for cryptographic failure probabilities and breaks the claimed fail-closed basic-composition invariant. None of the added ledger-path tests covers a zero or sub-1e-12 delta budget.",
+    "file": "crates/sparq-mpc/src/dp_output.rs",
+    "fix_hint": "Remove fixed absolute tolerance from delta accounting and use a conservative comparison or representation that can never authorize delta spend above the configured total. Keep any epsilon rounding accommodation separate. Add a regression test using delta_total = 0 and a constructible DpParams with positive delta below 1e-12, plus a near-boundary small-delta composition test; both must refuse without mutating spend.",
+    "severity": "major",
+    "title": "Absolute tolerance still permits overspending small delta budgets"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 4 is stagnant: the round 3 major finding remains unchanged. PrivacyBudget::would_exceed still adds the fixed 1e-12 BUDGET_EPS_TOL to both epsilon_total and delta_total, so a zero delta budget can authorize a valid release with a positive delta at or below 1e-12, and small configured delta budgets can be overspent by the same absolute amount. The new ledger release tests use delta values of 1e-6 or larger and do not exercise this fail-closed boundary. Because the accountant still violates its documented basic-composition and zero-budget behavior on the delta axis, the change is not sound as scoped.",
+  "verdict": "request_changes"
+ }
+}
