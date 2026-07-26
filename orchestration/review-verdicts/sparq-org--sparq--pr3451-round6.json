@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3451,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "1fb5e725401b245c443618af98aa8ae93ccf85e9",
+  "round": 6
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 6 resolves the prior major finding. `is_utc_datetime_lexical` now validates month and day ranges, proleptic-Gregorian leap years, and hour/minute/second ranges after its structural UTC-only check. The focused `utc_datetime_lexical_validation_is_strict` test exercises the previously missing impossible-date and clock cases, including non-leap and century leap-year boundaries, while retaining valid leap-day and fractional-second cases. Both `parse_request` and the hand-built-request rewrite path use this validator before interpolating the instant. No new correctness, soundness, test-validity, security, or instruction-injection issue is evident in the round-6 diff.",
+  "verdict": "approve"
+ }
+}
