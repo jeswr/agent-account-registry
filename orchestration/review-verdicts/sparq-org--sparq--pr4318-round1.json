@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4318,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "0dcdbf741d78bf9a734f6bf8fe32a575c747ffa1",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`value_key` accepts arbitrary `&str` predicate and graph values, then passes them to the existing `info` encoder, which performs `u16::try_from(p.len()).expect(\"context field < 64 KiB\")`. Unlike the pre-existing callers whose context fields are fixed-size IDs, these new fields are caller-controlled RDF terms. Consequently `value_key`, `seal_literal`, `open_literal`, and `equality_tag` can abort the process instead of returning a fail-closed error when given a sufficiently long IRI. This is both a public-API correctness defect and a denial-of-service risk for clients operating on untrusted RDF.",
+    "file": "crates/sparq-e2ee-ng/src/keyschedule.rs",
+    "fix_hint": "Make the new variable-length derivation path total: either encode context lengths with a sufficiently wide fixed-width length (and update/pin the golden vectors), or make key derivation return `Result` and reject oversized fields with `Error::LimitExceeded`. Propagate that result through `seal_literal`, `open_literal`, and (with an API update) `equality_tag`. Add a test using predicate and graph strings beyond the supported bound that verifies rejection without panic.",
+    "severity": "major",
+    "title": "Public value-key derivation panics on predicate or graph strings over 65535 bytes"
+   }
+  ],
+  "progress": null,
+  "summary": "The Profile SE implementation and its disclosure posture are generally careful, but the new public key-derivation path can panic on caller-controlled RDF terms. This violates the fail-closed contract and creates a denial-of-service path in any client processing an oversized predicate or graph IRI. The tests cover ordinary and malformed ciphertext inputs but do not exercise this load-bearing input boundary.",
+  "verdict": "request_changes"
+ }
+}
