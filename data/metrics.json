@@ -1,27 +1,27 @@
 {
-  "generated_at": "2026-07-26T09:00:14Z",
+  "generated_at": "2026-07-26T09:25:06Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
-      "issues_open": 1253,
-      "issues_ready": 165,
+      "issues_open": 1251,
+      "issues_ready": 161,
       "issues_closed_1h": 7,
-      "issues_closed_24h": 55,
-      "prs_open": 88,
-      "prs_draft": 64,
-      "prs_opened_1h": 8,
+      "issues_closed_24h": 57,
+      "prs_open": 86,
+      "prs_draft": 63,
+      "prs_opened_1h": 2,
       "prs_closed_1h": 0,
       "prs_merged_1h": 7,
-      "prs_merged_24h": 56,
-      "review_changes_backlog": 2,
+      "prs_merged_24h": 58,
+      "review_changes_backlog": 3,
       "needs_user_parked": 7,
       "review_lane_health": "ok",
-      "review_lane_runs_1h": 33,
-      "worker_attempts_1h": 19,
-      "worker_success_rate_1h": 0.4211,
-      "pr_open_rate": 8.0,
+      "review_lane_runs_1h": 32,
+      "worker_attempts_1h": 12,
+      "worker_success_rate_1h": 0.1667,
+      "pr_open_rate": 2.0,
       "pr_close_rate": 7.0,
-      "net_pr_flow": 1.0
+      "net_pr_flow": -5.0
     },
     "jeswr/agent-account-registry": {
       "issues_open": 291,
@@ -37,7 +37,7 @@
       "review_changes_backlog": 4,
       "needs_user_parked": 3,
       "review_lane_health": "ok",
-      "review_lane_runs_1h": 10,
+      "review_lane_runs_1h": 12,
       "worker_attempts_1h": 0,
       "worker_success_rate_1h": null,
       "pr_open_rate": 0.0,
@@ -48,24 +48,12 @@
   "alerts": [
     {
       "target": "sparq-org/sparq",
-      "classification": "backlog-growing",
-      "fire": true,
-      "summary": "open PRs 88 > 40 and net PR flow +1.0/hr (open 8.0 > close 7.0) sustained over 2 snapshots",
-      "metrics": {
-        "prs_open": 88,
-        "net_pr_flow": 1.0,
-        "pr_open_rate": 8.0,
-        "pr_close_rate": 7.0
-      }
-    },
-    {
-      "target": "sparq-org/sparq",
       "classification": "worker-failing",
       "fire": true,
-      "summary": "worker success rate 42% < 50% floor over 2 snapshots (19 attempts this hour)",
+      "summary": "worker success rate 17% < 50% floor over 2 snapshots (12 attempts this hour)",
       "metrics": {
-        "worker_success_rate_1h": 0.4211,
-        "worker_attempts_1h": 19
+        "worker_success_rate_1h": 0.1667,
+        "worker_attempts_1h": 12
       }
     }
   ]
