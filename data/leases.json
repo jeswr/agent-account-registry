@@ -32,16 +32,6 @@
   },
   {
    "account": "9e13ea21abf27e68",
-   "claim_id": "d061dc16f20b48d682a25493b90d92b4",
-   "holder": "fix:sparq-org/sparq#4235@dispatch-30219536547.1",
-   "package": "sparq-reason-diff",
-   "role": "fix",
-   "model": "opus5",
-   "issued_at": 1785099033,
-   "expires_at": 1785105333
-  },
-  {
-   "account": "9e13ea21abf27e68",
    "claim_id": "e90ae39ee0134074a0228ab747cf8d27",
    "holder": "fix:sparq-org/sparq#4274@dispatch-30219536547.1",
    "package": "zk-xpath",
