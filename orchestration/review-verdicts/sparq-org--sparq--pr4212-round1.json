@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4212,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "43a5d8599b6176ddd7a962886ef092897eee1f3d",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new comment says HASH-BEFORE-MEMCMP is already present on EVERY DEDUP PATH and treats the requested stored 64-bit comparison as complete. But self.table is described as relying on hashbrown's 7-bit h2 tag, which can invoke the equality/string comparison for entries whose remaining 57 hash bits differ. That is not the requested full 64-bit prefilter. The new mapped_find_compares_full_hash_before_eq test exercises only the mmap path and therefore cannot support the every-path claim. As written, the change either leaves the stated requirement incomplete or materially overstates what was verified.",
+    "file": "crates/sparq-core/src/dict.rs",
+    "fix_hint": "Either implement and test a full-hash-before-equality prefilter for the in-memory/sharded/spill paths that require it, or narrow the documentation and PR scope to state precisely that only mapped_find has a full 64-bit gate and that the in-memory path intentionally retains the h2-only prefilter. If the requirement permits that tradeoff, add a test appropriate to the actual claimed invariant rather than describing the mmap-only test as pinning every dedup path.",
+    "severity": "major",
+    "title": "Full-hash prefilter is not verified on every deduplication path"
+   }
+  ],
+  "progress": null,
+  "summary": "The whole-chunk UTF-8 validation makes the new unchecked conversion sound on the shown parser paths, and the boundary-focused tests are substantive. However, the dictionary portion claims that the requested full-hash-before-string-compare invariant is already present on every deduplication path, while its own explanation shows that the ordinary in-memory HashTable path checks only hashbrown's 7-bit h2 tag before invoking equality. The added test covers only mapped_find, so it cannot substantiate the PR's broader claim or completion of that requirement.",
+  "verdict": "request_changes"
+ }
+}
