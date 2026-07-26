@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3878,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "71f2a10df092cc3b65e7558cafc8712cef349f6f",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The module and public docs claim that deleting resources releases live-byte pressure and makes the pod accept requests again, but `freed_bytes_restore_admission` proves only that directly calling `Accounting::record_dealloc` changes a synthetic counter. It does not show that an LDP DELETE drops the relevant allocations, that the backing store does not retain their capacity, or that the installed global allocator observes enough deallocation to cross the admission threshold. The wasm integration test likewise restores the ceiling manually instead of deleting data. Thus the test is vacuous with respect to the advertised load-bearing recovery behavior.",
+    "file": "crates/sparq-lws-wasm/src/memory.rs",
+    "fix_hint": "Add a wasm32 end-to-end test that stores a sufficiently large resource, chooses a ceiling based on observed live bytes so another request is refused, deletes the resource through `SolidServer::handle_request`, and demonstrates that admission is restored without raising the ceiling. If the real store retains capacity and this cannot be guaranteed, remove or narrow the deletion-restores-admission claims in `memory.rs`, README.md, and the JavaScript/Wasm skill.",
+    "severity": "major",
+    "title": "Deletion-restores-admission test bypasses the real allocation and store path"
+   }
+  ],
+  "progress": null,
+  "summary": "The allocator forwarding and basic admission arithmetic are plausible, but the central recovery claim is not established by the tests. The change publicly promises that deleting stored resources lowers the allocator's observed live-byte total and restores admission. The only test for that property manually decrements an isolated Accounting value, bypassing the store, router, global allocator, and allocator/capacity-retention behavior that determine whether deletion actually releases heap allocations. The wasm end-to-end test restores admission only by raising the ceiling. This leaves a load-bearing advertised behavior unverified and potentially false when store containers retain capacity.",
+  "verdict": "request_changes"
+ }
+}
