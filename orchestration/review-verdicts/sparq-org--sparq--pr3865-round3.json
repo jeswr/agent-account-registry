@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3865,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "76b86bb9eaf6500cbf359f5f44ec5f960ae1d214",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 3 resolves the prior major finding. Measurement stems now use a reversible UTF-8 byte encoding for every non-plain subject, with a disjoint marker separating that image from readable plain kb: locals; the shipped inverse demonstrates injectivity rather than relying on a truncated digest. Metric suffixes remain distinct, the generated names are Turtle-safe, and focused tests exercise cross-prefix separation, adversarial escaped-looking inputs, Unicode, empty/escape characters, inverse round-trips, and one measurement tuple per subject. The DQV projection also retains the original confidence value and is covered over both the compiler output and the shipped real ingest. No correctness, soundness, test-validity, or security issue remains in the diff.",
+  "verdict": "approve"
+ }
+}
