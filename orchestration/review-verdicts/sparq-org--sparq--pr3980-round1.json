@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3980,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "76dce213f8b3e277ca4626d6612679a1b4836230",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "rdf_list_cells is populated only by `?n rdf:first ?f`, and fold_rights attempts list validation only when `lists.contains_key(&key)`. Therefore a rightOperand blank node that has `rdf:rest` but no `rdf:first` is not recognized as a collection at all and is folded as a single ordinary value. This is especially unsafe for a prohibition: the unmatchable blank-node value makes the prohibition constraint unsatisfied, allowing a sibling permission and widening access. The nearby logical-combinator code already calls out and handles the analogous head-position rest-only shape, but the new rightOperand refusal path does not. This makes the public documentation's claim that malformed collection rightOperands refuse the whole parse incomplete.",
+    "file": "crates/sparq-policy/src/parse.rs",
+    "fix_hint": "Bulk-detect nodes that assert rdf:rest without rdf:first (or otherwise retain a set of collection-shaped nodes) and make fold_rights return Err when such a node is used as a rightOperand. Add a real-path regression test with a sibling permission plus a prohibition whose rightOperand head has only rdf:rest, asserting parse_policy_str returns the malformed-collection error.",
+    "severity": "major",
+    "title": "Rest-only rightOperand collection heads bypass malformed-list refusal"
+   }
+  ],
+  "progress": null,
+  "summary": "The new refusal path correctly routes malformed collection cells that have an rdf:first through well_formed_list, and the added tests cover broken tails, dangling tails, cycles, forks, both rule kinds, and the logical-constraint path. However, the implementation still misses a malformed collection head that asserts rdf:rest but no rdf:first. Such a node is absent from rdf_list_cells, so fold_rights treats it as an ordinary scalar blank node instead of refusing the policy. On a prohibition this can disable the constraint and widen authorization, contradicting the change's stated fail-closed guarantee.",
+  "verdict": "request_changes"
+ }
+}
