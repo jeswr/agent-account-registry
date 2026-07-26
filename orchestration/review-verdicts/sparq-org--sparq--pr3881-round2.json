@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3881,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "7d38e9a7424efb3281a1f20893b51801dd975006",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "DischargeExpr::Other stores only left_operand, although an ODRL atomic constraint is the full (leftOperand, operator, rightOperand) triple. For Or(secx requirement, recipient == Bob), the returned tree cannot tell whether the non-proof branch holds because Bob and Eq were discarded; two recipient constraints with different values become identical. This also prevents correct XONE evaluation. That contradicts the API/docs claim that a host can read valid alternatives without returning to Policy. The test non_secprop_alternatives_are_kept_not_pruned is vacuous for this invariant because it asserts only the retained left operand.",
+    "file": "crates/sparq-policy/src/secprop.rs",
+    "fix_hint": "Preserve the complete non-secx Constraint in Other (for example, Other(Constraint), or explicit left_operand/operator/required fields), and add a test with two non-secx branches sharing a left operand but differing in operator/right value. Demonstrate that the returned tree alone distinguishes and evaluates the alternatives, including an XONE case, without consulting Policy.",
+    "severity": "major",
+    "title": "Other leaves still discard decision-critical constraint semantics"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 2 preserves AND/OR/XONE structure and fixes the prior flattening defect for secx leaves, but the advertised self-contained decision tree is still semantically incomplete. DischargeExpr::Other retains only left_operand and discards operator and right operand. Consequently a host cannot determine whether a non-secx alternative holds, distinguish two constraints over the same left operand, or evaluate XONE without consulting the original Policy. The new non-secprop alternative test checks only that the left operand survives, so it does not validate the documented claim that valid alternatives are readable from the result alone.",
+  "verdict": "request_changes"
+ }
+}
