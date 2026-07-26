@@ -1,0 +1,44 @@
+{
+ "host_envelope": {
+  "pr": 4200,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "8bcbdc5596c9069dd218a8039bedfd4c8921f91d",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The repo already ships a generic, documented network-retry helper at scripts/lib/fetch-retry.sh (`retry CMD [ARGS...]`, sq-nj0pd), sourced by five fetch-* scripts. It is the same `until`-loop construction, but parameterised via FETCH_RETRY_MAX / FETCH_RETRY_DELAY and - notably - it captures `rc=$?` and does `return \"$rc\"`, preserving the failing command's real exit status.\n\nThe new retry_cargo_cyclonedx hard-codes 3/10s and returns a flat `1`, discarding cargo's actual exit code. That is a small diagnostic regression on a release-critical path: a release-log reader can no longer distinguish, say, a network exit code from a manifest-parse exit code, and the two constants cannot be tuned from the environment when a release is being retried against a degraded registry.\n\nNot a correctness defect - behaviour is right today - but it adds a third copy of the same idiom (fetch-retry.sh, supply-chain.yml:332-340, and now this) with no shared source of truth.",
+    "file": "scripts/gen-sbom-vex.sh",
+    "fix_hint": "Prefer sourcing the existing helper:\n\n    . \"$REPO_ROOT/scripts/lib/fetch-retry.sh\"\n    ...\n    FETCH_RETRY_MAX=3 FETCH_RETRY_DELAY=10 retry cargo cyclonedx --all --format json --spec-version 1.5\n\n(the `cd` into gui/src-tauri keeps working since the function is already defined in the parent shell). If a local helper is genuinely preferred, at minimum capture and re-return the real status: `rc=$?` inside the loop and `return \"$rc\"` instead of `return 1`, matching fetch-retry.sh.",
+    "severity": "minor",
+    "title": "Duplicates the existing scripts/lib/fetch-retry.sh `retry()` helper, and drops the real exit status"
+   },
+   {
+    "body": "docs-quality.yml shellchecks each shell helper together with a paired scripts/tests/test_*.sh self-test - ci-free-disk, disk-guard, worktree-gc, reconcile-merged-beads, check-site-links, check-release-aliases, and notably the sibling gen-js-sbom.sh. gen-sbom-vex.sh is in neither list, and this PR adds branching control flow to it without adding either.\n\nThe fail-closed property is the load-bearing claim in the new comment, and nothing in CI pins it. It is correct today only because the function happens to be the last command of the `&&` list at the GUI call site; a shell function returning non-zero is errexit-exempt in an `if` condition, on the left of `&&`/`||`, or mid-pipeline. A later refactor that moves either call into one of those positions would silently turn this fail-open and publish a release whose SBOM/VEX generation quietly did not happen - which is exactly the compliance evidence PUB-1 and VEX-4 in compliance/sbom/controls/sbom.md depend on.\n\nI note the precedent it copies (supply-chain.yml sq-hxn7) is also untested, so this is a pre-existing convention gap this PR inherits rather than one it invents - hence minor, not major.",
+    "file": "scripts/gen-sbom-vex.sh",
+    "fix_hint": "Add scripts/tests/test_gen_sbom_vex_retry.sh asserting the two behaviours I verified by hand: with a stub `cargo` on PATH that always fails, the script exits non-zero after exactly 3 attempts (assert the attempt count, so the test goes red if the retry silently becomes fail-open); with a stub that fails once then succeeds, the script proceeds. Then register it in .github/workflows/docs-quality.yml alongside the gen-js-sbom.sh step:\n\n    - name: shellcheck gen-sbom-vex.sh + its retry self-test\n      run: shellcheck scripts/gen-sbom-vex.sh scripts/tests/test_gen_sbom_vex_retry.sh",
+    "severity": "minor",
+    "title": "New control flow on a release-critical script with no self-test and no shellcheck coverage"
+   },
+   {
+    "body": "ci.yml:100, ci-select.yml:136, selection-alarm.yml:105 and vectorized-feature-off.yml:275 all set `CARGO_NET_RETRY: \"10\"` - cargo's native retry for exactly this failure mode (transient registry download resets). The release.yml `Generate per-release SBOM + VEX` step only sets VERSION.\n\nWithout it, the shell retry re-runs the entire `cargo cyclonedx --all` across the whole workspace to recover from a single dropped HTTP transfer, and each recovery costs a fixed 10s sleep. Cargo's own retry handles the same blip in-process, at the level of the individual request, with no full re-run. The two are complementary rather than alternatives - the shell retry still usefully covers non-network cargo-metadata failures - so this is an additive suggestion, not a defect in what was written.",
+    "file": "scripts/gen-sbom-vex.sh",
+    "fix_hint": "Add `CARGO_NET_RETRY: \"10\"` to the `env:` block of the `Generate per-release SBOM + VEX` step in .github/workflows/release.yml (next to the existing VERSION), matching the four workflows that already set it. Optionally also export a default from gen-sbom-vex.sh itself (`export CARGO_NET_RETRY=\"${CARGO_NET_RETRY:-10}\"`) so local runs get the same behaviour.",
+    "severity": "nit",
+    "title": "CARGO_NET_RETRY is not set for the release SBOM job, so the coarse shell retry is the only defence"
+   },
+   {
+    "body": "compliance/sbom/controls/sbom.md cites this script by line number as certification evidence: `#L37` for `cargo cyclonedx --all` (control N2), `#L58` for the VEX timestamp (N7), `#L49-67` for VEX version stamping (VEX-4); compliance/sbom/evidence.md:112 cites `#L47`.\n\nTo be fair, these were already stale before this PR - `cargo cyclonedx --all` sat at L43, not L37, and the VEX heredoc began near L93, not L49. This change does not introduce the drift, but it adds 18 lines above every anchor and widens it: the real invocation is now L61, and `#L47` now lands on the new retry helper's error branch while `#L49-67` lands in the middle of the sbom-normalize comment block.\n\nIn a repo where these tables are the audit artifact, a reviewer following the anchor lands on unrelated code. Genuinely a nit, and arguably out of scope for this bead - the target files are not in this diff.",
+    "file": "scripts/gen-sbom-vex.sh",
+    "fix_hint": "Either refresh the anchors in compliance/sbom/controls/sbom.md (L24, L29, L54) and compliance/sbom/evidence.md (L112) to the post-change lines - `cargo cyclonedx --all` is now L61, the VEX heredoc L113-129, the `rm -f \"$src\"` cleanup L75 - or, more durably, drop the `#L<n>` fragments in favour of quoting the anchoring symbol or comment marker (e.g. \"scripts/gen-sbom-vex.sh, the `==> stamping VEX` block\") so routine edits stop invalidating certification evidence. If preferred, file this as a separate self-improvement issue rather than expanding this PR.",
+    "severity": "nit",
+    "title": "Inserting 18 lines shifts the compliance evidence line-anchors further out of date"
+   }
+  ],
+  "progress": null,
+  "summary": "Wraps the two `cargo cyclonedx` invocations in gen-sbom-vex.sh in a bounded 3-attempt/10s retry so a transient crates.io reset during `cargo metadata` does not abort a release. I verified the load-bearing behaviour empirically rather than by inspection, replicating the exact function body and both call-site shapes under `set -euo pipefail` with a stubbed `cargo`: (1) sustained failure -> exactly 3 attempts, function returns 1, and the script aborts at BOTH call sites - the plain top-level call and the `( cd gui/src-tauri && retry_cargo_cyclonedx ... )` subshell (a sentinel echo after each call site was never reached). The subshell case is correct because the function is the LAST command of the AND-list, so errexit is not suppressed, and the subshell's non-zero status then trips errexit in the parent. (2) failure-then-success -> the `until` condition is errexit-exempt, the retry runs, and the script continues normally. Attempt accounting is right (3 total) and the error message matches. The comment's two claims are honest: `cargo metadata` genuinely can hit the registry network, and the helper does fail closed. Security posture is unchanged: the abs-path leak tripwire, sbom-normalize.jq, and the VEX stamping are untouched, and a retry cannot substitute drifted dependencies because cargo verifies checksums against the committed Cargo.lock. The shape also matches an already-merged precedent, the inline sq-hxn7 retry at .github/workflows/supply-chain.yml:332-340, which uses the identical 3-attempt/10s parameters. No blocker or major issue found; the four notes below are maintainability/consistency, not correctness, so this is an approve.",
+  "verdict": "approve"
+ }
+}
