@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4185,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "6969b847c39092f1ba6f6bd0c11799b83dbac7e7",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "At line 498 the harness constructs `ServerConfig { query_timeout: Some(Duration::from_secs(5)), ..ServerConfig::default() }`, so strictly it does not use `ServerConfig::default()` as-is. The adaptive_commit part of the claim is exact (it is inherited unchanged from the default at crates/sparq-server/src/http.rs:829, and the SPARQ_ADAPTIVE_COMMIT env override only applies to `ServerConfig::from_env`, not `default()`), so nothing the doc, note or STDOUT asserts is wrong. Purely a wording precision point on a PR whose whole purpose is claim precision.",
+    "file": "bench/serve/src/bin/pss_update_throughput.rs",
+    "fix_hint": "Optional: reword to \"inherits ServerConfig::default()'s adaptive_commit (ON)\" or \"builds its ServerConfig from ServerConfig::default()\" at the doc comment (line 356), the JSON note (line 300) and the comment at line 584. Not worth another round on its own.",
+    "severity": "nit",
+    "title": "\"This harness uses ServerConfig::default()\" is shorthand - the harness overrides query_timeout via struct-update"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 2 resolves every round-1 finding. All four sibling assertions of the retracted \"~1/window-bound\" claim are now corrected in the SAME file: the machine-readable results_json note (line ~299), the STDOUT TOTAL line (line 568), the reference comment (lines 582-585) that previously cross-referenced and contradicted the crud_stream doc, and the STDOUT reference line (line 588). A repo-wide grep under bench/serve/ finds only one remaining \"1/group-commit-window\" mention (line 355) and it is now correctly conditioned (\"only when adaptive commit is disabled\"), which matches the windowed branch at crates/sparq-serve/src/writer.rs:658-663 where a serial client with an empty queue blocks to the deadline.\n\nFactual verification of the new claim: the harness builds ServerConfig { query_timeout: Some(5s), ..ServerConfig::default() } (line 498) and calls AppState::with_config; ServerConfig::default() sets adaptive_commit: true unconditionally (crates/sparq-server/src/http.rs:829 - the SPARQ_ADAPTIVE_COMMIT / --no-adaptive-commit override lives in from_env at http.rs:1052 and does NOT affect default()), and writer_config forwards it to WriterConfig (http.rs:6586). In adaptive mode the writer try_recv's and closes the batch the moment the backlog empties (writer.rs:650-655), so a serial client is engine-bound. Supporting tests exist (http.rs:10708 adaptive_commit_is_on_by_default, http.rs:10736 writer_config_carries_adaptive_commit_from_server_config, crates/sparq-serve/tests/writer.rs adaptive_commit_does_not_wait_the_window_for_a_serial_client). The round-1 ambiguity (WriterConfig::adaptive_commit defaults to false at writer.rs:202) is now removed by naming ServerConfig explicitly at every site, and the [SONNET-4.6] marker now carries the (sq-p7kk5) bead and prefixes the newly authored sentence.\n\nTest validity: the extended results_json_round_trips assertions are substantive, not vacuous - each pinned substring is present in the emitted note after Rust'\u2026 [truncated 451 chars]",
+  "verdict": "approve"
+ }
+}
