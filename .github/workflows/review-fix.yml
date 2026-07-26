@@ -384,6 +384,20 @@ jobs:
           packages = sorted(label[5:] for label in issue_labels if label.startswith("area:"))
           if any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", p) for p in packages):
               raise SystemExit("source issue has an unsafe area:* label")
+          # THE partition reduction — imported, NEVER re-implemented here (registry issue #112; the
+          # 2026-07-26 adopt loop). `package` is derived twice by design: once by the dispatcher
+          # that MINTS the CAS claim (dispatch-claim.plan_package) and once here by the run that
+          # ADOPTS it, and the adopt step below compares the two for EQUALITY. This step used to
+          # carry its own pre-#112 reduction (`packages[0] if packages else "__global__"`), so a PR
+          # whose source issue held TWO `area:*` labels was minted `__global__` and re-derived as
+          # the alphabetically-first area: the adopt step rejected its own dispatcher's claim on
+          # every tick forever (51 of 69 review-fix failures that day, 47 on one PR). The identical
+          # bug also under-serialized the SELF-claim path below, which leases `--package "$PACKAGE"`
+          # — a multi-area PR reserved one area and left its siblings free to co-run.
+          # `dispatch_claim` is the module loaded above, so this calls the MINTER'S OWN function
+          # object (which itself delegates to lease_schema.plan_package): the two sides of the
+          # adopt comparison are now the same code by construction, not by agreement.
+          package = dispatch_claim.plan_package(packages)
           values = {
               "head_branch": head_branch,
               "head_sha": head_sha,
@@ -397,7 +411,7 @@ jobs:
               "security": "true" if security else "false",
               "security_keywords": security_keywords_b64,
               "packages": ",".join(packages),
-              "package": packages[0] if packages else "__global__",
+              "package": package,
           }
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               for key, value in values.items():
@@ -552,6 +566,14 @@ jobs:
       harness: ${{ steps.adopt.outputs.harness || steps.claim.outputs.harness }}
       credential_format: ${{ steps.adopt.outputs.credential_format || steps.claim.outputs.credential_format }}
       secret_ref: ${{ steps.adopt.outputs.secret_ref || steps.claim.outputs.secret_ref }}
+      # The classified adoption-rejection route (empty when adoption succeeded or was not
+      # attempted). `disagreement` is the only class the `adopt_disagreement` job below acts on —
+      # it is the only one for which retrying THIS PR can never converge. Job outputs are still
+      # evaluated when a job FAILS, which is what lets the escalation job read this.
+      adopt_reject_class: ${{ steps.adopt.outputs.adopt_reject_class }}
+      # Whether the inline release of the rejected claim actually landed; `false` means a scarce
+      # account slot is stranded until groom's dead-lease sweep, and it is now VISIBLE.
+      adopt_lease_released: ${{ steps.adopt.outputs.lease_released }}
     steps:
       - name: Checkout private registry (pinned, no persisted token)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -712,16 +734,55 @@ jobs:
           set -euo pipefail
           prefix="review:"
           [[ "$MODE" == fix ]] && prefix="fix:"
+          export ADOPT_REJECT_FILE="$RUNNER_TEMP/adopt-reject-class"
+          : > "$ADOPT_REJECT_FILE"
+          # An UNINSPECTABLE claim is the racy class, not a disagreement: the lease expired, groom's
+          # dead-lease sweep took it, or an operator released it between dispatch and adoption. This
+          # used to run under bare `set -e`, so a failed --inspect killed the step BEFORE the release
+          # below — leaking any lease that did still exist until the TTL/groom sweep.
+          set +e
           python3 registry/scripts/select-and-claim.py \
             --inspect "$CLAIM_ID" \
             --repo "$GITHUB_REPOSITORY" \
             --expected-holder-prefix "$prefix$TARGET_REPO#$PR_NUMBER@" > "$RUNNER_TEMP/adopt.json"
-          if ! python3 - "$RUNNER_TEMP/adopt.json" <<'PY'
+          inspect_rc=$?
+          set -e
+          validate_rc=0
+          if [[ "$inspect_rc" -ne 0 ]]; then
+            printf 'transient\n' > "$ADOPT_REJECT_FILE"
+          else
+          set +e
+          python3 - "$RUNNER_TEMP/adopt.json" <<'PY'
           import hashlib
           import json
           import os
           import re
           import sys
+
+          # ADOPTION-REJECTION TAXONOMY (the 2026-07-26 review-lane loop). Every guard below used to
+          # `raise SystemExit(...)`, which the shell turned into a bare `exit 1`: the run went red,
+          # EVERY downstream job skipped, and the PR silently did not advance — while the doorbell
+          # immediately re-rang the dispatcher, which re-enumerated the same PR and re-minted the
+          # same claim. For a DETERMINISTIC rejection (a re-derived field that disagrees) that loop
+          # can never converge: 47 runs on a single PR in one day, 51 of 69 review-fix failures.
+          # So the rejection now names its own recovery route, and the shell ACTS on it:
+          #   transient    — the claim itself is gone/unreadable (TTL, groom sweep, operator
+          #                  release). Genuinely racy; defer WITHOUT failing and let the next tick
+          #                  re-dispatch. Retrying is the correct exit.
+          #   infra        — a registry-side capability is unavailable for reasons INDEPENDENT of
+          #                  this PR (no PROVENANCE_SALT; an account catalog row with no provider).
+          #                  Retry, red, but NEVER park: the cause is fleet-wide and central, so
+          #                  parking would take every PR in the fleet down instead of one.
+          #   disagreement — a field re-derived from THIS PR disagrees with the claim minted for it.
+          #                  Deterministic in this PR: it will reject identically on every future
+          #                  tick, so the ONLY terminating exit is to stop re-claiming it and route
+          #                  it to a human, which the `adopt_disagreement` job below does.
+          # FAIL-LOUD DEFAULT: the shell reads an absent/unrecognised class as `disagreement`, so a
+          # crash in this validator escalates rather than joining a silent retry loop.
+          def reject(reject_class, message):
+              with open(os.environ["ADOPT_REJECT_FILE"], "w", encoding="utf-8") as handle:
+                  handle.write(reject_class)
+              raise SystemExit(message)
 
           with open(sys.argv[1], encoding="utf-8") as handle:
               claim = json.load(handle)
@@ -737,28 +798,28 @@ jobs:
           pool = os.environ["ACCOUNT_POOL"].split(",")
           models = os.environ["MODELS"].split(",")
           if account != os.environ["EXPECTED_ACCOUNT"] or account not in pool:
-              raise SystemExit("dispatcher claim account is outside resolved policy")
+              reject("disagreement", "dispatcher claim account is outside resolved policy")
           if model not in models:
-              raise SystemExit("dispatcher claim model is outside resolved routing")
+              reject("disagreement", "dispatcher claim model is outside resolved routing")
           if claim_id != os.environ["CLAIM_ID"] or not re.fullmatch(r"[0-9a-f]{32}", str(claim_id)):
-              raise SystemExit("dispatcher claim id is invalid")
+              reject("disagreement", "dispatcher claim id is invalid")
           if claim.get("role") != mode or claim.get("package") != os.environ["PACKAGE"]:
-              raise SystemExit("dispatcher claim work partition disagrees with the resolved PR")
+              reject("disagreement", "dispatcher claim work partition disagrees with the resolved PR")
           if secret_ref != f"{account.upper()}_TOKEN" or not re.fullmatch(
                   r"[A-Z][A-Z0-9_]*", str(secret_ref)):
-              raise SystemExit("dispatcher claim secret_ref is unsafe")
+              reject("disagreement", "dispatcher claim secret_ref is unsafe")
           if not provider:
-              raise SystemExit("claimed account has no provider metadata; failing closed")
+              reject("infra", "claimed account has no provider metadata; failing closed")
           if mode == "review" and provider == impl_provider:
-              raise SystemExit("reviewer provider equals implementer provider; refusing")
+              reject("disagreement", "reviewer provider equals implementer provider; refusing")
           if mode == "review":
               # Salted-hash account assertion (locked decision 22a); missing salt fails closed.
               if not salt:
-                  raise SystemExit("PROVENANCE_SALT is unavailable; refusing to assert reviewer identity")
+                  reject("infra", "PROVENANCE_SALT is unavailable; refusing to assert reviewer identity")
               if hashlib.sha256(f"{account}:{salt}".encode()).hexdigest()[:16] == impl_account_h:
-                  raise SystemExit("reviewer account equals implementer account; refusing")
+                  reject("disagreement", "reviewer account equals implementer account; refusing")
           if mode == "fix" and provider != impl_provider:
-              raise SystemExit("fixer provider must equal implementer provider; refusing")
+              reject("disagreement", "fixer provider must equal implementer provider; refusing")
           values = {
               "acquired": "true",
               "account": account,
@@ -772,15 +833,52 @@ jobs:
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               for key, value in values.items():
                   if not isinstance(value, str) or "\n" in value or "\r" in value:
-                      raise SystemExit(f"dispatcher claim returned unsafe {key}")
+                      reject("disagreement", f"dispatcher claim returned unsafe {key}")
                   output.write(f"{key}={value}\n")
           # Privacy (locked decision 22b): public workflow logs never carry account handles.
           print(f"dispatcher lease adopted: model={model}, claim={claim_id[:8]}")
           PY
-          then
+          validate_rc=$?
+          set -e
+          fi
+          # ONE shared recovery path for BOTH rejection sources. Deliberately not an `elif` chain:
+          # attaching this block to the validator's branch alone would leave the UNINSPECTABLE-claim
+          # path with no release, no outputs and a silent exit 0 — the same silent-drop shape this
+          # whole change exists to remove. shell_recovery_reached() in the self-test executes this
+          # script for both sources and asserts the release actually runs.
+          if [[ "$inspect_rc" -ne 0 || "$validate_rc" -ne 0 ]]; then
+            # FAIL-LOUD default: an absent or unrecognised class escalates. Never silently retry.
+            reject_class="$(tr -d '\r\n' < "$ADOPT_REJECT_FILE")"
+            case "$reject_class" in
+              transient|infra|disagreement) ;;
+              *) reject_class=disagreement ;;
+            esac
+            # RETURN THE WORK. Release the lease NOW so the scarce account slot is not stranded
+            # until the TTL / groom's ~15min dead-lease sweep. NEVER `|| true`: the old form
+            # swallowed a failed release, so a stranded slot left no signal at all (the
+            # exit-zero-swallowing class). Record the outcome and shout if it failed.
+            lease_released=true
             python3 registry/scripts/select-and-claim.py \
               --release "$CLAIM_ID" \
-              --repo "$GITHUB_REPOSITORY" || true
+              --repo "$GITHUB_REPOSITORY" || lease_released=false
+            {
+              printf 'acquired=false\n'
+              printf 'adopt_reject_class=%s\n' "$reject_class"
+              printf 'lease_released=%s\n' "$lease_released"
+            } >> "$GITHUB_OUTPUT"
+            if [[ "$lease_released" != true ]]; then
+              printf '::error::adoption rejected (%s) AND the lease release failed; claim %s is stranded until groom sweeps it\n' \
+                "$reject_class" "${CLAIM_ID:0:8}"
+            fi
+            if [[ "$reject_class" == transient ]]; then
+              # The claim is simply gone. Nothing to escalate and nothing lost: `acquired=false`
+              # skips every downstream job (no reviewer starts), and the doorbell re-rings the
+              # dispatcher, which re-enumerates this PR on the next tick. Deferring WITHOUT
+              # failure so a routine race stops reading as a broken lane.
+              printf 'The dispatcher claim is no longer adoptable (expired/swept/released); deferring without failure.\n'
+              exit 0
+            fi
+            printf '::error::dispatcher claim adoption rejected (%s); see the classified route above\n' "$reject_class"
             exit 1
           fi
 
@@ -1662,6 +1760,73 @@ jobs:
             --pr "${{ inputs.pr_number }}" \
             --issue "${{ needs.resolve.outputs.issue }}" \
             --reason "the ${{ inputs.mode }} model chain for a ${{ needs.resolve.outputs.impl_provider }}-implemented PR is unresolvable in the target routing (no concrete provider model)"
+
+  # THE MACHINE EXIT for a DETERMINISTIC adoption rejection (the 2026-07-26 review-lane loop).
+  #
+  # Structurally the same class as `unresolvable` above — a resolve/claim-time invariant the machine
+  # cannot satisfy for THIS PR — and it gets the same terminal: park the PR + its source issue onto
+  # the human lane with an ops alert. It exists because the alternative is not "retry until it
+  # works", it is "retry forever": a `disagreement` is a field re-derived from this PR that
+  # contradicts the claim minted for this PR, so the next tick re-derives the identical mismatch.
+  # Before this job the loop was invisible AND unbounded — the adopt step exited 1, every downstream
+  # job skipped, and the doorbell re-rang the dispatcher immediately. sparq-org/sparq#3528 burned 47
+  # runs and 47 account-lease acquisitions in one day, ~20% of the review lane, with no signal
+  # anywhere except a red run that looked like the fleet's ambient noise.
+  #
+  # `always() &&` is LOAD-BEARING: the `claim` job FAILS on a disagreement, so without it this job
+  # would be skipped by the failed dependency and the escalation would silently never fire — which
+  # is exactly the bug being fixed, one layer out. `transient` and `infra` deliberately do NOT reach
+  # here: a race must simply be retried, and an `infra` cause is fleet-wide, so parking on it would
+  # take every PR in the fleet down instead of the one PR that is actually stuck.
+  #
+  # Runs NO target code and holds no lease (the adopt step already released it inline).
+  adopt_disagreement:
+    name: Escalate an unadoptable dispatcher claim
+    if: ${{ always() && needs.claim.outputs.adopt_reject_class == 'disagreement' }}
+    needs: [resolve, claim]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # SECRET-EXFIL GUARD (issue #101): reads REGISTRY_ADMIN_APP_ID/KEY, which live in the
+    # `dispatch-secrets` environment (deployment-branch policy: default branch only) — full
+    # rationale on the `claim` job in dispatch.yml.
+    environment: dispatch-secrets
+    permissions:
+      contents: read
+      issues: write   # write: ops-alert upsert in the registry
+    steps:
+      - name: Checkout private registry (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: registry
+          persist-credentials: false
+
+      - name: Mint App token for the escalation
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
+          private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
+          owner: ${{ needs.resolve.outputs.target_owner }}
+          repositories: ${{ needs.resolve.outputs.target_name }}
+          permission-issues: write
+          permission-pull-requests: write
+
+      - name: Route the PR and its source issue to a human
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REGISTRY_REPO: ${{ github.repository }}
+          REGISTRY_ALERT_TOKEN: ${{ github.token }}
+          # Privacy routing (locked decision 22c): maintainer-set ALERT_REPO sends the ops alert
+          # to a private repo; unset falls back to the registry.
+          ALERT_REPO: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
+          ALERT_TOKEN: ${{ secrets.ALERT_TOKEN || '' }}
+          MAINTAINER_HANDLE: jeswr
+        run: |
+          python3 registry/scripts/worker-pr.py needs-user \
+            --repo "${{ inputs.target_repo }}" \
+            --pr "${{ inputs.pr_number }}" \
+            --issue "${{ needs.resolve.outputs.issue }}" \
+            --reason "the dispatcher-minted ${{ inputs.mode }} account claim for this PR disagrees with the claim fields re-derived from the PR itself, so no ${{ inputs.mode }} run can adopt it. This is DETERMINISTIC in this PR — every dispatch tick re-derives the same mismatch and burns another account lease — so the PR is parked instead of re-claimed. Registry-side defect: reconcile the two derivations (see lease_schema.plan_package for the 2026-07-26 area:*/package instance) rather than re-running this PR."
 
   # Model-access health record (registry #32): consumes the review/fix model exit CLASS (success OR
   # any failure) into the registry health ledger. A SEPARATE always()-guarded job — like the worker

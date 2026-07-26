@@ -313,14 +313,18 @@ MAX_FAILING_LEGS = 20
 
 def plan_package(areas):
     """The single conflict partition a plan/lease row reserves for a collection of `area:*`
-    sections (registry issue #112). EXACTLY one area -> that area; ZERO OR MULTIPLE -> the
-    serializing global partition. Mirrors dispatch-plan.py:_plan_package byte-for-byte so the
-    anti-tamper package/label agreement in _route_matches holds: the old
-    alphabetically-first reduction dropped every secondary area, so a multi-area issue/PR
-    leased or dispatched onto a crate a second area already held. Fail-closed — over-serialize
-    a multi-area row rather than free a busy sibling crate."""
-    uniq = {a for a in areas if isinstance(a, str) and a}
-    return next(iter(uniq)) if len(uniq) == 1 else GLOBAL_PACKAGE
+    sections (registry issue #112) — DELEGATED to lease_schema.plan_package, which is the one
+    canonical reduction.
+
+    It used to be a local copy carrying a comment promising it "mirrors dispatch-plan.py
+    byte-for-byte". That promise held; the one it did NOT make — that review-fix.yml's `resolve`
+    job derives the same value — is the one that broke, and a prose promise is not a test. The
+    adopt step compares the dispatcher's minted `package` against resolve's re-derived `package`
+    for EQUALITY, so a third un-migrated copy turned every multi-area PR into a claim the
+    dispatcher minted and the adopter refused, forever. Sharing the function removes the drift
+    axis entirely; _plan_package_agreement() in the self-test pins the one copy that CANNOT share
+    it (dispatch-plan.py ships in the target repos, which have no lease_schema.py)."""
+    return _lease_schema.plan_package(areas)
 
 
 class DispatchError(RuntimeError):
@@ -349,6 +353,12 @@ _park_policy = _load_module(
 # mutation could double-dispatch a worker, which is exactly incident #559's storm class.
 _gh_retry = _load_module(
     "registry_gh_retry", Path(__file__).resolve().with_name("gh_retry.py"))
+
+# THE canonical area->package partition reduction, shared with review-fix.yml's `resolve` job (the
+# ONLY other independent deriver of this value) so the adopt step's equality check can never reject
+# a claim this module minted. See lease_schema.plan_package for the 2026-07-26 incident.
+_lease_schema = _load_module(
+    "registry_lease_schema", Path(__file__).resolve().with_name("lease_schema.py"))
 
 
 def _require_exact_fields(value, fields, where):
@@ -4453,6 +4463,142 @@ def _review_fix_workflow_values():
 _RF_ALREADY_DONE_ANCHOR = r"(?m)^[ \t]*already_done = False$"
 _RF_ALREADY_DONE_END = r"(?m)^[ \t]*#[ \t]*REGISTRY provenance"
 
+# review-fix.yml's `resolve` job must derive the lease `package` partition through THIS module's
+# plan_package — the same function object the dispatcher mints the claim with — because the adopt
+# step compares the two derivations for equality (see lease_schema.plan_package).
+_RF_PACKAGE_ANCHOR = r"(?m)^[ \t]*package = dispatch_claim\.plan_package\(packages\)$"
+_RF_PACKAGE_END = r"(?m)^[ \t]*values = \{"
+
+# review-fix.yml's `Adopt dispatcher-owned CAS claim` validator, from its rejection-classifier down
+# to the end of the heredoc. Executed against fixtures so every guard's REJECTION CLASS is pinned to
+# the workflow's real code, not to a re-implementation of it.
+_RF_ADOPT_ANCHOR = r"(?m)^[ \t]*def reject\(reject_class, message\):$"
+_RF_ADOPT_END = r"(?m)^[ \t]*PY$"
+
+# The expected `if:` on the adopt step and on the escalation job it feeds. Compared for EQUALITY
+# against the PARSED document (never grepped): `if: false`, a dropped `always()`, or an inverted
+# comparison are all invisible to a substring or count() assertion over the workflow text, and the
+# dropped-`always()` mutant in particular is a real bug — the `claim` job FAILS on a disagreement,
+# so without `always()` the escalation job is skipped by its failed dependency and the machine exit
+# silently never fires.
+_RF_ADOPT_STEP_IF = ("${{ inputs.claim_id != '' && needs.resolve.outputs.already_done != 'true' }}")
+_RF_ADOPT_ESCALATION_IF = ("${{ always() && needs.claim.outputs.adopt_reject_class "
+                           "== 'disagreement' }}")
+_RF_ADOPT_ESCALATION_JOB = "adopt_disagreement"
+
+
+def _review_fix_adopt_seam(document):
+    """The YAML SEAM of the adoption-rejection machine exit, checked STRUCTURALLY against a PARSED
+    review-fix.yml document. Returns a sorted list of violation strings; empty means the seam is
+    intact.
+
+    Structural on purpose (the 2026-07-26 review-lane loop, and the repo's standing finding that
+    every uncaught mutant lives at the YAML seam rather than in the Python): a substring or
+    `count(...) == N` assertion over the workflow TEXT cannot distinguish a live step from one
+    carrying `if: false`, cannot see a `needs:` that dropped `claim`, and cannot see an `env:` input
+    re-pointed at the wrong expression. Each check below therefore reads a specific parsed node, and
+    the self-test proves NON-VACUITY by mutating that node in memory and requiring the matching
+    violation back.
+
+    Takes the parsed document (not text) so the self-test can build mutants without round-tripping
+    through a serializer."""
+    violations = []
+    jobs = ((document or {}).get("jobs") or {})
+
+    claim_job = jobs.get("claim") or {}
+    steps = claim_job.get("steps")
+    adopt = None
+    if isinstance(steps, list):
+        matches = [s for s in steps if isinstance(s, dict) and s.get("id") == "adopt"]
+        if len(matches) == 1:
+            adopt = matches[0]
+        else:
+            violations.append(f"claim job must hold EXACTLY ONE step id=adopt; found "
+                              f"{len(matches)}")
+    else:
+        violations.append("claim job exposes no steps list")
+
+    if adopt is not None:
+        if adopt.get("if") != _RF_ADOPT_STEP_IF:
+            violations.append("adopt step `if:` is not the expected dispatcher-claim guard "
+                              f"(found {adopt.get('if')!r}) — a disabled adopt step would hand the "
+                              "run an unvalidated lease or skip validation entirely")
+        env = adopt.get("env") or {}
+        # The adopt step compares the claim's minted `package` against THIS expression. Re-pointing
+        # it (or dropping it) reintroduces exactly the derivation disagreement being fixed.
+        if env.get("PACKAGE") != "${{ needs.resolve.outputs.package }}":
+            violations.append("adopt step env.PACKAGE must be "
+                              "${{ needs.resolve.outputs.package }} (found "
+                              f"{env.get('PACKAGE')!r})")
+        run = adopt.get("run")
+        if not isinstance(run, str):
+            violations.append("adopt step has no run script")
+        else:
+            # The recovery route itself: the class file, the classified branch, the non-swallowed
+            # release, and the deferring exit for the racy class.
+            if "ADOPT_REJECT_FILE" not in run:
+                violations.append("adopt step no longer exports ADOPT_REJECT_FILE, so a rejection "
+                                  "carries no class and cannot be routed")
+            if "adopt_reject_class=" not in run:
+                violations.append("adopt step no longer writes adopt_reject_class to GITHUB_OUTPUT")
+            if re.search(r"--release[\s\S]{0,200}?\|\|[ \t]*true", run):
+                violations.append("adopt step swallows a failed lease release with `|| true`, so a "
+                                  "stranded account slot leaves no signal")
+            if not re.search(r"reject_class\b[^\n]*==[^\n]*transient", run):
+                violations.append("adopt step no longer branches on the transient class, so a "
+                                  "routine claim race still reds the lane")
+            # The self-test EXECUTES this validator with these modules supplied (its `import` lines
+            # sit above the extracted anchor, shared with the self-claim step). Assert the workflow
+            # still imports each one, or the harness would mask a production NameError.
+            for module in ("hashlib", "json", "os", "re", "sys"):
+                if not re.search(rf"(?m)^[ \t]*import {module}$", run):
+                    violations.append(f"adopt step no longer imports `{module}`, which its "
+                                      "validator uses")
+
+    claim_outputs = claim_job.get("outputs") or {}
+    if claim_outputs.get("adopt_reject_class") != "${{ steps.adopt.outputs.adopt_reject_class }}":
+        violations.append("claim job must export adopt_reject_class from the adopt step; without "
+                          "it the escalation job's `if:` is always false and the machine exit is "
+                          f"dead (found {claim_outputs.get('adopt_reject_class')!r})")
+    if claim_outputs.get("adopt_lease_released") != "${{ steps.adopt.outputs.lease_released }}":
+        violations.append("claim job must export adopt_lease_released so a stranded lease is "
+                          f"visible (found {claim_outputs.get('adopt_lease_released')!r})")
+
+    escalation = jobs.get(_RF_ADOPT_ESCALATION_JOB)
+    if not isinstance(escalation, dict):
+        violations.append(f"review-fix.yml is missing the `{_RF_ADOPT_ESCALATION_JOB}` job — a "
+                          "deterministic adoption rejection would have no machine exit and would "
+                          "re-claim an account lease on every dispatch tick forever")
+    else:
+        if escalation.get("if") != _RF_ADOPT_ESCALATION_IF:
+            violations.append(f"`{_RF_ADOPT_ESCALATION_JOB}` `if:` must be "
+                              f"{_RF_ADOPT_ESCALATION_IF!r} (found {escalation.get('if')!r}); the "
+                              "`always()` is load-bearing because the claim job FAILS on a "
+                              "disagreement")
+        needs = escalation.get("needs")
+        needs = [needs] if isinstance(needs, str) else list(needs or [])
+        for required in ("resolve", "claim"):
+            if required not in needs:
+                violations.append(f"`{_RF_ADOPT_ESCALATION_JOB}` must declare needs: {required} "
+                                  f"(found {needs!r})")
+        body = _yaml_dump_job(escalation)
+        if "worker-pr.py needs-user" not in body:
+            violations.append(f"`{_RF_ADOPT_ESCALATION_JOB}` no longer invokes `worker-pr.py "
+                              "needs-user`, so it fails to actually park the PR and the loop "
+                              "resumes")
+        if (escalation.get("permissions") or {}).get("issues") != "write":
+            violations.append(f"`{_RF_ADOPT_ESCALATION_JOB}` needs issues: write to upsert the ops "
+                              "alert")
+    return sorted(violations)
+
+
+def _yaml_dump_job(job):
+    """A job subtree as text, for the few checks that are about the presence of a COMMAND rather
+    than the shape of a node. Serialised from the parsed subtree (never sliced out of the raw file)
+    so it cannot accidentally match a sibling job's script."""
+    import yaml  # self-test-only, same lazy import shape as resolve-conflicts.validate_syntax_blob
+    return yaml.safe_dump(job, default_flow_style=False, width=4096)
+
 
 def _review_fix_step_python(anchor, end_anchor, what, job="resolve", source=None):
     """Extract a python block VERBATIM out of a review-fix.yml step's `run:` script so a
@@ -5837,6 +5983,405 @@ def _self_test():
     print("  ok   #584 f3: review-fix.yml's already_done predicate is PARSED (a reflowed-equivalent "
           "workflow yields the identical block) and every missing/ambiguous anchor raises an "
           "actionable AssertionError instead of a bare ValueError")
+
+    # ---- THE 2026-07-26 REVIEW-LANE LOOP: the adopt step rejected its own dispatcher's claim on
+    # every tick because review-fix.yml's `resolve` job still carried the pre-#112 alphabetically-
+    # first `package` reduction while this module had migrated to multi-area -> __global__.
+    # sparq-org/sparq#3528 (source issue #2582: `area:ci` + `area:site`) burned 47 runs and 47
+    # account-lease acquisitions in one day; 51 of that day's 69 review-fix failures were this one
+    # rejection. Three layers are pinned below: the DERIVATION agreement, the workflow's real
+    # derivation EXECUTED, and the YAML seam of the machine exit parsed structurally. ----
+    import copy as _copy
+    _ls = _load_module("registry_lease_schema", Path(__file__).resolve().with_name(
+        "lease_schema.py"))
+    _dp = _load_module("registry_dispatch_plan", Path(__file__).resolve().with_name(
+        "dispatch-plan.py"))
+    assert GLOBAL_PACKAGE == _ls.GLOBAL_PACKAGE == _dp.GLOBAL, (
+        GLOBAL_PACKAGE, _ls.GLOBAL_PACKAGE, _dp.GLOBAL)
+    # dispatch-plan.py ships INSIDE the target repos, which have no lease_schema.py, so it is the
+    # one copy that cannot import the canonical function. Pin it by AGREEMENT instead — including
+    # the live incident's two-area row, the case the old reduction got wrong.
+    _area_matrix = ([], ["ci"], ["site"], ["ci", "site"], ["site", "ci"], ["ci", "ci"],
+                    ["a", "b", "c"])
+    for _areas in _area_matrix:
+        _canonical = _ls.plan_package(_areas)
+        assert plan_package(_areas) == _canonical, (_areas, plan_package(_areas), _canonical)
+        assert _dp._plan_package([f"area:{a}" for a in _areas]) == _canonical, (
+            "dispatch-plan.py's target-shipped copy drifted from the canonical reduction", _areas)
+    assert _ls.plan_package(["ci", "site"]) == GLOBAL_PACKAGE, "the incident row must serialize"
+    print("  ok   adopt-loop L1: all THREE derivations of the area->package partition agree, the "
+          "live two-area incident row (area:ci + area:site) included")
+
+    # L2. review-fix.yml's resolve job derives `package` by CALLING this module's plan_package —
+    # executed, not grepped. The extracted slice is the workflow's real line.
+    _pkg_src = _review_fix_step_python(
+        _RF_PACKAGE_ANCHOR, _RF_PACKAGE_END, "resolve-job package partition derivation")
+
+    def _resolve_package(areas, source=None):
+        """Run review-fix.yml's OWN `package` derivation over `areas`."""
+        src = _pkg_src if source is None else _review_fix_step_python(
+            _RF_PACKAGE_ANCHOR, _RF_PACKAGE_END, "resolve-job package partition derivation",
+            source=source)
+        ns = {"dispatch_claim": types.SimpleNamespace(plan_package=plan_package),
+              "packages": sorted(areas)}
+        exec(src, ns)  # noqa: S102 — repository-owned workflow source
+        return ns["package"]
+
+    for _areas in _area_matrix:
+        assert _resolve_package(_areas) == _ls.plan_package(_areas), (
+            "review-fix.yml's resolve job derives a package the dispatcher would not have minted",
+            _areas, _resolve_package(_areas), _ls.plan_package(_areas))
+    assert _resolve_package(["ci", "site"]) == GLOBAL_PACKAGE
+    # NON-VACUITY: reinstate the exact pre-fix reduction in the workflow text and require the
+    # comparison above to go red. This is the mutant that ran in production for a day.
+    _rf_live = (Path(__file__).resolve().parents[1] / ".github" / "workflows"
+                / "review-fix.yml").read_text(encoding="utf-8")
+    _rf_prefix_bug = _rf_live.replace(
+        "package = dispatch_claim.plan_package(packages)",
+        'package = packages[0] if packages else "__global__"')
+    assert _rf_prefix_bug != _rf_live, "the pre-fix-reduction mutant fixture is vacuous"
+    _bug_caught = None
+    try:
+        _bug_pkg = _resolve_package(["ci", "site"], source=_rf_prefix_bug)
+        _bug_caught = ("derived", _bug_pkg)
+    except AssertionError as _exc:                 # the anchor is gone -> also a caught mutant
+        _bug_caught = ("anchor-gone", str(_exc))
+    assert _bug_caught[0] == "anchor-gone" or _bug_caught[1] != _ls.plan_package(["ci", "site"]), \
+        "the pre-#112 reduction mutant was NOT caught — this check is vacuous"
+    print("  ok   adopt-loop L2: review-fix.yml's resolve job derivation is EXECUTED and agrees "
+          "with the minter on every row; restoring the pre-#112 `packages[0]` reduction is caught")
+
+    # L3. The adopt validator's rejection ROUTING, executed against fixtures. Every guard must name
+    # its recovery class, and deleting any guard must make its fixture wrongly ADOPT.
+    _adopt_src = _review_fix_step_python(
+        _RF_ADOPT_ANCHOR, _RF_ADOPT_END, "adopt-step claim validator", job="claim")
+    assert "def reject(" in _adopt_src and '"acquired": "true"' in _adopt_src, _adopt_src[:400]
+    _good_claim = {"account": "acct01", "model": "sol", "claim_id": "a" * 32,
+                   "secret_ref": "ACCT01_TOKEN", "provider": "openai", "role": "review",
+                   "package": GLOBAL_PACKAGE, "harness": "codex", "credential_format": "oauth"}
+    _good_env = {"MODE": "review", "IMPL_PROVIDER": "anthropic",
+                 "IMPL_ACCOUNT_H": "0" * 16, "PROVENANCE_SALT": "pepper",
+                 "ACCOUNT_POOL": "acct01,acct02", "MODELS": "sol,luna",
+                 "EXPECTED_ACCOUNT": "acct01", "CLAIM_ID": "a" * 32,
+                 "PACKAGE": GLOBAL_PACKAGE}
+
+    def _run_adopt(claim=None, env=None, source=None):
+        """Execute the WORKFLOW's adopt validator. Returns (reject_class, outputs) where
+        reject_class is None on a successful adoption."""
+        src = _adopt_src if source is None else source
+        with tempfile.TemporaryDirectory() as tmp:
+            claim_path = os.path.join(tmp, "adopt.json")
+            out_path = os.path.join(tmp, "github_output")
+            cls_path = os.path.join(tmp, "reject-class")
+            with open(claim_path, "w", encoding="utf-8") as handle:
+                json.dump({**_good_claim, **(claim or {})}, handle)
+            open(out_path, "w", encoding="utf-8").close()
+            open(cls_path, "w", encoding="utf-8").close()
+            saved_env, saved_argv = dict(os.environ), list(sys.argv)
+            try:
+                os.environ.update({**_good_env, **(env or {}),
+                                   "GITHUB_OUTPUT": out_path, "ADOPT_REJECT_FILE": cls_path})
+                sys.argv = ["adopt", claim_path]
+                failed = None
+                try:
+                    # The validator's own `import` lines sit ABOVE the extracted anchor (they are
+                    # shared with the self-claim step), so supply the modules it references; the
+                    # seam checker separately asserts the workflow still imports each of them.
+                    exec(src, {"__name__": "__adopt__", "os": os, "sys": sys, "re": re,
+                               "json": json, "hashlib": hashlib})  # noqa: S102 — repo-owned
+                except SystemExit as exc:
+                    failed = str(exc)
+                with open(cls_path, encoding="utf-8") as handle:
+                    cls = handle.read().strip()
+                with open(out_path, encoding="utf-8") as handle:
+                    outputs = dict(
+                        line.split("=", 1) for line in handle.read().splitlines() if "=" in line)
+            finally:
+                os.environ.clear()
+                os.environ.update(saved_env)
+                sys.argv = saved_argv
+        if failed is None:
+            assert not cls, f"a SUCCESSFUL adoption must write no rejection class (got {cls!r})"
+            return None, outputs
+        return (cls or "MISSING"), outputs
+
+    _cls, _outs = _run_adopt()
+    assert _cls is None and _outs.get("acquired") == "true", (_cls, _outs)
+    assert _outs.get("secret_ref") == "ACCT01_TOKEN" and _outs.get("model") == "sol", _outs
+    # Each row: (label, claim overrides, env overrides, expected class). `disagreement` = a field
+    # re-derived from THIS PR contradicts the minted claim (deterministic -> park). `infra` = a
+    # registry-side capability is missing for PR-INDEPENDENT reasons (fleet-wide -> never park).
+    _reject_matrix = (
+        ("account outside the resolved pool", {"account": "acct99"},
+         {"EXPECTED_ACCOUNT": "acct99"}, "disagreement"),
+        ("account is not the dispatched one", {"account": "acct02"}, {}, "disagreement"),
+        ("model outside the resolved chain", {"model": "gpt-nope"}, {}, "disagreement"),
+        ("claim id is not the dispatched one", {"claim_id": "b" * 32}, {}, "disagreement"),
+        ("claim id is malformed", {"claim_id": "zz"}, {"CLAIM_ID": "zz"}, "disagreement"),
+        ("role disagrees with the mode", {"role": "fix"}, {}, "disagreement"),
+        ("THE INCIDENT: package disagrees with the resolved partition", {"package": "ci"}, {},
+         "disagreement"),
+        ("secret_ref does not derive from the account", {"secret_ref": "OTHER_TOKEN"}, {},
+         "disagreement"),
+        ("account catalog row carries no provider", {"provider": ""}, {}, "infra"),
+        ("reviewer provider equals the implementer's", {"provider": "anthropic"}, {},
+         "disagreement"),
+        ("PROVENANCE_SALT is unavailable", {}, {"PROVENANCE_SALT": ""}, "infra"),
+        ("fixer provider differs from the implementer's", {"role": "fix", "provider": "openai"},
+         {"MODE": "fix"}, "disagreement"),
+    )
+    for _label, _claim, _env, _want in _reject_matrix:
+        _cls, _outs = _run_adopt(_claim, _env)
+        assert _cls == _want, (_label, _cls, _want)
+        # A rejected adoption must NEVER publish a usable lease: no account, no secret_ref, no
+        # `acquired=true`. This is the fail-open counterfactual — if any rejection path leaked
+        # these, two reviewers could share one account credential.
+        assert _outs.get("acquired") != "true", (_label, _outs)
+        assert "secret_ref" not in _outs and "account" not in _outs, (_label, _outs)
+    # The reviewer-equals-implementer ACCOUNT assertion (salted hash) rejects too.
+    _same_h = hashlib.sha256(b"acct01:pepper").hexdigest()[:16]
+    _cls, _outs = _run_adopt({}, {"IMPL_ACCOUNT_H": _same_h})
+    assert _cls == "disagreement" and _outs.get("acquired") != "true", (_cls, _outs)
+    print(f"  ok   adopt-loop L3: all {len(_reject_matrix) + 1} adopt-validator guards are EXECUTED "
+          "out of review-fix.yml and each names its recovery class; no rejection path publishes an "
+          "account, a secret_ref or acquired=true")
+
+    # L3 NON-VACUITY: delete each guard from the workflow's own source and require the fixture that
+    # depended on it to wrongly ADOPT — i.e. the assertion above goes red. A guard whose deletion
+    # changes nothing is a vacuous guard.
+    _guard_mutants = (
+        ('reject("disagreement", "dispatcher claim work partition disagrees with the resolved PR")',
+         {"package": "ci"}, {}),
+        # NOTE: the account fixture must also carry the matching secret_ref, or neutering the
+        # ACCOUNT guard just falls through to the secret_ref guard and the mutant looks "caught"
+        # for the wrong reason (a mutation test passing for the wrong reason is a vacuous test).
+        ('reject("disagreement", "dispatcher claim account is outside resolved policy")',
+         {"account": "acct02", "secret_ref": "ACCT02_TOKEN"}, {}),
+        ('reject("disagreement", "dispatcher claim model is outside resolved routing")',
+         {"model": "gpt-nope"}, {}),
+        ('reject("disagreement", "dispatcher claim secret_ref is unsafe")',
+         {"secret_ref": "OTHER_TOKEN"}, {}),
+        ('reject("infra", "claimed account has no provider metadata; failing closed")',
+         {"provider": ""}, {}),
+        ('reject("disagreement", "reviewer provider equals implementer provider; refusing")',
+         {"provider": "anthropic"}, {}),
+    )
+    for _guard, _claim, _env in _guard_mutants:
+        assert _guard in _adopt_src, f"guard-deletion fixture is stale: {_guard}"
+        _neutered = _adopt_src.replace(_guard, "pass")
+        _mcls, _mouts = _run_adopt(_claim, _env, source=_neutered)
+        assert _mcls is None and _mouts.get("acquired") == "true", (
+            "deleting this guard did NOT change the outcome, so the guard is vacuous", _guard,
+            _mcls)
+    # ...and the FAIL-LOUD default: a validator that dies WITHOUT naming a class must read as the
+    # escalating class, never as a silent retry. The shell maps an empty/unknown class to
+    # `disagreement`; assert the workflow's own `case` does exactly that.
+    _crash_src = _adopt_src.replace(
+        "with open(sys.argv[1], encoding=\"utf-8\") as handle:",
+        "raise SystemExit('exploded before classifying')\nwith open(sys.argv[1], encoding=\"utf-8\") as handle:")
+    _ccls, _couts = _run_adopt(source=_crash_src)
+    assert _ccls == "MISSING" and _couts.get("acquired") != "true", (_ccls, _couts)
+    _adopt_shell = None
+    for _step in _yaml.safe_load(_rf_live)["jobs"]["claim"]["steps"]:
+        if isinstance(_step, dict) and _step.get("id") == "adopt":
+            _adopt_shell = _step["run"]
+    assert _adopt_shell and re.search(
+        r"case \"\$reject_class\" in\s*\n\s*transient\|infra\|disagreement\)[^\n]*\n\s*\*\)"
+        r" reject_class=disagreement ;;", _adopt_shell), (
+        "the adopt step must map an ABSENT or unrecognised rejection class to `disagreement` — a "
+        "crash that defaults to a retryable class rejoins the silent forever-loop")
+    print("  ok   adopt-loop L3 non-vacuity: deleting any of the six pinned guards makes its "
+          "fixture wrongly ADOPT (each guard is load-bearing), and an unclassified crash defaults "
+          "to the ESCALATING class, not to a silent retry")
+
+    # L4. THE YAML SEAM, parsed structurally. Every check is proven non-vacuous by mutating the
+    # PARSED node and requiring the matching violation back — the `if: false` / dropped-`always()` /
+    # wrong-input mutants a substring or count() assertion over the workflow text cannot see.
+    _rf_doc = _yaml.safe_load(_rf_live)
+    assert _review_fix_adopt_seam(_rf_doc) == [], _review_fix_adopt_seam(_rf_doc)
+
+    def _seam_mutant(mutate):
+        doc = _copy.deepcopy(_rf_doc)
+        mutate(doc)
+        return _review_fix_adopt_seam(doc)
+
+    def _adopt_step_of(doc):
+        return next(s for s in doc["jobs"]["claim"]["steps"] if s.get("id") == "adopt")
+
+    _seam_mutants = (
+        ("adopt step `if: false`",
+         lambda d: _adopt_step_of(d).__setitem__("if", "${{ false }}"), "adopt step `if:`"),
+        ("adopt step removed entirely",
+         lambda d: d["jobs"]["claim"]["steps"].remove(_adopt_step_of(d)),
+         "EXACTLY ONE step id=adopt"),
+        ("adopt step env.PACKAGE re-pointed at the wrong input",
+         lambda d: _adopt_step_of(d)["env"].__setitem__(
+             "PACKAGE", "${{ needs.resolve.outputs.packages }}"), "env.PACKAGE"),
+        ("adopt step env.PACKAGE dropped",
+         lambda d: _adopt_step_of(d)["env"].pop("PACKAGE"), "env.PACKAGE"),
+        ("claim job stops exporting adopt_reject_class",
+         lambda d: d["jobs"]["claim"]["outputs"].pop("adopt_reject_class"), "adopt_reject_class"),
+        ("claim job stops exporting adopt_lease_released",
+         lambda d: d["jobs"]["claim"]["outputs"].pop("adopt_lease_released"),
+         "adopt_lease_released"),
+        ("escalation job deleted",
+         lambda d: d["jobs"].pop(_RF_ADOPT_ESCALATION_JOB), "missing the `adopt_disagreement` job"),
+        ("escalation job `if: false`",
+         lambda d: d["jobs"][_RF_ADOPT_ESCALATION_JOB].__setitem__("if", "${{ false }}"),
+         "`if:` must be"),
+        # THE SUBTLE ONE: dropping `always()` leaves an `if:` that READS correct and greps clean,
+        # but the claim job FAILS on a disagreement so the job is skipped and the exit never fires.
+        ("escalation job drops always()",
+         lambda d: d["jobs"][_RF_ADOPT_ESCALATION_JOB].__setitem__(
+             "if", "${{ needs.claim.outputs.adopt_reject_class == 'disagreement' }}"),
+         "`always()` is load-bearing"),
+        ("escalation job stops needing claim",
+         lambda d: d["jobs"][_RF_ADOPT_ESCALATION_JOB].__setitem__("needs", ["resolve"]),
+         "needs: claim"),
+        ("escalation job no longer parks the PR",
+         lambda d: d["jobs"][_RF_ADOPT_ESCALATION_JOB]["steps"].__setitem__(
+             -1, {"name": "gutted", "run": "echo nothing"}), "needs-user"),
+        ("escalation job loses issues: write",
+         lambda d: d["jobs"][_RF_ADOPT_ESCALATION_JOB]["permissions"].__setitem__(
+             "issues", "read"), "issues: write"),
+        ("adopt step swallows the failed release again",
+         lambda d: _adopt_step_of(d).__setitem__("run", _adopt_step_of(d)["run"].replace(
+             '--repo "$GITHUB_REPOSITORY" || lease_released=false',
+             '--repo "$GITHUB_REPOSITORY" || true')), "`|| true`"),
+        ("adopt step stops classifying",
+         lambda d: _adopt_step_of(d).__setitem__(
+             "run", _adopt_step_of(d)["run"].replace("ADOPT_REJECT_FILE", "UNUSED_FILE")),
+         "ADOPT_REJECT_FILE"),
+        ("adopt step stops deferring the transient class",
+         lambda d: _adopt_step_of(d).__setitem__(
+             "run", _adopt_step_of(d)["run"].replace(
+                 'if [[ "$reject_class" == transient ]]; then', "if false; then")),
+         "transient class"),
+    )
+    for _label, _mutate, _expect in _seam_mutants:
+        _found = _seam_mutant(_mutate)
+        assert any(_expect in v for v in _found), (
+            f"YAML-seam mutant NOT caught: {_label} (expected a violation mentioning "
+            f"{_expect!r}, got {_found})")
+    # A reflow of the workflow must not change the verdict (the #584 f3 lesson): the seam checker
+    # reads parsed nodes, so a re-serialised document is still intact.
+    assert _review_fix_adopt_seam(
+        _yaml.safe_load(_yaml.safe_dump(_rf_doc, width=4096))) == []
+    print(f"  ok   adopt-loop L4: the machine exit's YAML seam is checked on PARSED nodes and all "
+          f"{len(_seam_mutants)} mutants are caught — `if: false` on the step AND on the escalation "
+          "job, a dropped `always()`, a re-pointed env input, a deleted job, a dropped output, a "
+          "gutted park step and a restored `|| true`")
+
+    # L5. THE SHELL SEAM, EXECUTED. L1-L4 pin the Python and the parsed YAML; neither can see whether
+    # the step's SHELL actually reaches the recovery block. It caught a real self-inflicted bug during
+    # this change: writing the two rejection sources as `if inspect-failed ... elif ! validator` left
+    # the recovery attached to the validator branch ALONE, so an uninspectable claim exited 0 with no
+    # release, no outputs and no signal — the exact silent-drop shape being removed. So run the real
+    # script, with `select-and-claim.py` stubbed, and assert on the CALLS it makes.
+    _STUB = (
+        "#!/usr/bin/env python3\n"
+        "import os, sys\n"
+        "with open(os.environ['STUB_CALLS'], 'a', encoding='utf-8') as h:\n"
+        "    h.write(' '.join(sys.argv[1:]) + '\\n')\n"
+        "if '--inspect' in sys.argv:\n"
+        "    rc = int(os.environ.get('STUB_INSPECT_RC', '0'))\n"
+        "    if rc == 0:\n"
+        "        sys.stdout.write(os.environ['STUB_INSPECT_JSON'])\n"
+        "    sys.exit(rc)\n"
+        "if '--release' in sys.argv:\n"
+        "    sys.exit(int(os.environ.get('STUB_RELEASE_RC', '0')))\n"
+        "sys.exit(9)\n")
+
+    def _run_adopt_shell(claim=None, env=None, inspect_rc=0, release_rc=0, script=None):
+        """Execute review-fix.yml's REAL adopt step, with select-and-claim.py stubbed. Returns
+        (exit_code, outputs, calls, stdout)."""
+        src = _adopt_shell if script is None else script
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "registry", "scripts"))
+            os.makedirs(os.path.join(tmp, "runnertemp"))
+            with open(os.path.join(tmp, "registry", "scripts", "select-and-claim.py"),
+                      "w", encoding="utf-8") as handle:
+                handle.write(_STUB)
+            calls_path = os.path.join(tmp, "calls")
+            out_path = os.path.join(tmp, "github_output")
+            open(calls_path, "w", encoding="utf-8").close()
+            open(out_path, "w", encoding="utf-8").close()
+            shell_env = {
+                **os.environ, **_good_env, **(env or {}),
+                "STUB_CALLS": calls_path, "STUB_INSPECT_RC": str(inspect_rc),
+                "STUB_RELEASE_RC": str(release_rc),
+                "STUB_INSPECT_JSON": json.dumps({**_good_claim, **(claim or {})}),
+                "GITHUB_OUTPUT": out_path,
+                "RUNNER_TEMP": os.path.join(tmp, "runnertemp"),
+                "GITHUB_REPOSITORY": "jeswr/agent-account-registry",
+                "TARGET_REPO": "sparq-org/sparq", "PR_NUMBER": "3528",
+                "GH_TOKEN": "stub",
+            }
+            proc = _subprocess.run(["bash", "-c", src], cwd=tmp, env=shell_env,
+                                   capture_output=True, text=True, check=False)
+            with open(calls_path, encoding="utf-8") as handle:
+                calls = handle.read()
+            with open(out_path, encoding="utf-8") as handle:
+                outputs = dict(line.split("=", 1)
+                               for line in handle.read().splitlines() if "=" in line)
+        return proc.returncode, outputs, calls, proc.stdout + proc.stderr
+
+    # (a) A SUCCESSFUL adoption publishes the lease and releases NOTHING.
+    _rc, _o, _calls, _log = _run_adopt_shell()
+    assert _rc == 0 and _o.get("acquired") == "true", (_rc, _o, _log)
+    assert "--release" not in _calls, ("a successful adoption must not release its own lease", _calls)
+    assert "adopt_reject_class" not in _o, _o
+    # (b) THE UNINSPECTABLE CLAIM (the bug this layer caught): defers WITHOUT failing, and the
+    # release still runs. An `elif`-attached recovery block makes every assertion on this line fail.
+    _rc, _o, _calls, _log = _run_adopt_shell(inspect_rc=1)
+    _uninspectable = ("the UNINSPECTABLE-claim path did not reach the shared recovery block: it "
+                      "must release the lease, publish adopt_reject_class=transient/acquired=false "
+                      "and exit 0. An empty outputs dict here means the recovery block is gated on "
+                      "the validator's result alone (the `elif` shape) and the claim race is being "
+                      "silently dropped with the lease still held.",
+                      _rc, _o, _calls, _log)
+    assert _rc == 0, _uninspectable
+    assert _o.get("adopt_reject_class") == "transient", _uninspectable
+    assert _o.get("acquired") == "false" and _o.get("lease_released") == "true", _uninspectable
+    assert "--release" in _calls, ("the uninspectable-claim path MUST still return the lease; an "
+                                  "unreleased lease strands a scarce account slot", _calls)
+    # (c) THE INCIDENT, end to end through the shell: a package disagreement releases, reports
+    # `disagreement`, and FAILS the job so the escalation job's `if:` fires.
+    _rc, _o, _calls, _log = _run_adopt_shell({"package": "ci"})
+    assert _rc == 1 and _o.get("adopt_reject_class") == "disagreement", (_rc, _o, _log)
+    assert _o.get("acquired") == "false" and "--release" in _calls, (_o, _calls)
+    assert "secret_ref" not in _o and "account" not in _o, ("a rejected adoption must publish no "
+                                                            "usable credential reference", _o)
+    # (d) The `infra` class releases and reds, but is NOT the escalating class (no park).
+    _rc, _o, _calls, _log = _run_adopt_shell({"provider": ""})
+    assert _rc == 1 and _o.get("adopt_reject_class") == "infra", (_rc, _o, _log)
+    assert "--release" in _calls, _calls
+    # (e) A FAILED release is reported, never swallowed — and does not change the class's exit.
+    _rc, _o, _calls, _log = _run_adopt_shell({"package": "ci"}, release_rc=1)
+    assert _rc == 1 and _o.get("lease_released") == "false", (_rc, _o, _log)
+    assert "::error::" in _log and "stranded" in _log, _log
+    # (f) FAIL-LOUD default, end to end: an unrecognised class in the file escalates. Mutate the
+    # class the shell writes for the racy path and require the `case` default to take over.
+    _bogus = _adopt_shell.replace("printf 'transient\\n' > \"$ADOPT_REJECT_FILE\"",
+                                  "printf 'bogus\\n' > \"$ADOPT_REJECT_FILE\"")
+    assert _bogus != _adopt_shell, "the unknown-class fixture is vacuous"
+    _rc, _o, _calls, _log = _run_adopt_shell(inspect_rc=1, script=_bogus)
+    assert _rc == 1 and _o.get("adopt_reject_class") == "disagreement", (
+        "an unrecognised rejection class must ESCALATE, not silently retry", _rc, _o, _log)
+    # (g) NON-VACUITY of (b): drop the inspect source from the shared recovery guard — precisely the
+    # bug that shipped for a moment during this change — and require (b) to go red.
+    _elif_bug = _adopt_shell.replace(
+        'if [[ "$inspect_rc" -ne 0 || "$validate_rc" -ne 0 ]]; then',
+        'if [[ "$validate_rc" -ne 0 ]]; then')
+    assert _elif_bug != _adopt_shell, "the shared-recovery mutant fixture is vacuous"
+    _rc, _o, _calls, _log = _run_adopt_shell(inspect_rc=1, script=_elif_bug)
+    assert not ("--release" in _calls and _o.get("adopt_reject_class") == "transient"), (
+        "dropping the inspect source from the shared recovery guard changed NOTHING, so check (b) "
+        "is vacuous", _rc, _o, _calls)
+    print("  ok   adopt-loop L5: the adopt step's real SHELL is EXECUTED with a stubbed allocator — "
+          "success releases nothing, BOTH rejection sources release the lease and publish their "
+          "class, a failed release is reported not swallowed, an unknown class escalates, and "
+          "dropping either source from the shared recovery guard is caught")
 
     # ---- [round-5 P1] CROSS-LANE SUPERSESSION (park -> sibling-launch -> UNPARK): while a
     # PR sat human-parked its crate was freed and a SIBLING claimed a lease there (an impl
