@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4057,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a452f3b0479a032d474d935e344f996068249b81",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The catalog generator, committed artifact, and Rust guard are consistent. The change improves honesty by distinguishing bounded path-existence members from full SPARQL closure, moving OPTIONAL/aggregation/negation to explicit design exclusions, replacing stale value-lane estimates with snapshot-joined measurements, and retaining explicit NOT-externally-audited / NOT-yet-sound caveats. The new tests exercise the load-bearing catalog invariants (bounded paths cannot become covered or gaps, measured lanes cannot retain projections, excluded constructs remain null gaps), and `sparql_catalog.py --check` succeeds byte-for-byte against the committed artifact. No hostile instruction was present in the diff.",
+  "verdict": "approve"
+ }
+}
