@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3967,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ffd4c465307c2a289246c858273b7e2bdf30c166",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "cmd_provision treats every nonzero result from add-role-to-instance-profile as meaning the role is already attached. AWS can also reject this operation because the profile contains another role, permissions are insufficient, input is invalid, or the service fails. In all of those cases the command continues, prints \"provisioned\", and launchers attach a profile that cannot PutObject. This defeats the channel's core retrieval guarantee. cmd_check and bench_s3_iam_args compound the problem by checking only that the profile exists, not that SPARQ_BENCH_S3_ROLE is attached; cmd_check can therefore report READY for a broken configuration.",
+    "file": "scripts/bench/bench-s3-results.sh",
+    "fix_hint": "After a failed add-role-to-instance-profile, query get-instance-profile and succeed only if Roles contains the exact configured role; otherwise return an error. Reuse an exact-role-membership predicate in cmd_check and preferably bench_s3_iam_args so launch degrades with a warning instead of attaching a known-invalid profile. Extend the AWS stub with a profile containing the wrong role and tests proving provision fails, check is not ready, and launcher args are omitted.",
+    "severity": "major",
+    "title": "Provisioning hides failure to attach the upload role"
+   }
+  ],
+  "progress": null,
+  "summary": "The durable upload design is generally well scoped and the hermetic tests cover the disabled path, policy shape, and basic provisioning flow. However, provisioning and readiness checks do not verify the load-bearing IAM relationship between the instance profile and the upload role. Worse, provisioning suppresses every failure from adding that relationship and reports success. A pre-existing or malformed profile can therefore make provision/check/launch all appear successful while instances receive no write permission and results remain unretrievable.",
+  "verdict": "request_changes"
+ }
+}
