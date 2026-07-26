@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3860,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "94f1abb5cd43f2205c9a74464df86899af18a44c",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The new feature-gated differential test is correct and non-vacuous as scoped. It compares QL query rewriting over the unmodified graph with OWL 2 RL materialization for fixtures deliberately restricted to the profiles' shared named-class/property fragment, and separately checks the expected strict QL advantage for an existential-generating axiom that RL cannot realize. Answer comparison is order-independent, preserves complete variable bindings, requires RL answers to be a subset of QL answers, and requires exact equality for overlap cases. The companion test establishes that each exact-agreement fixture gains at least one answer through reasoning, avoiding trivial raw-data agreement. The dependency is test-only, default features are disabled, and the documentation accurately limits the claims to these fixtures and the RL/QL overlap. No security or soundness defect was found.",
+  "verdict": "approve"
+ }
+}
