@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4090,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "0058a89902d751f61ffadf3a458bc56285ae57a3",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The host-only accepted-set anchor is correctly scoped and consistently caveated as not closing the IRI/version disclosure and not being externally audited. The implementation atomically commits the field-mapped list IRI, version, and authoritative status-list root; uses the existing sparse Merkle implementation with fail-closed depth/capacity handling; derives policy entries only from authoritative snapshots inside [min_version, now] in deterministic BTreeMap order; and exposes the matching public API and usage documentation. The tests are substantive: they exercise witness-to-root refolding, independent triple-component binding, order sensitivity, freshness and future-version exclusion, authoritative-root derivation, anchor movement on revocation, and underspecified/overflow failure. No security or correctness defect is evident in the scoped host-anchor increment.",
+  "verdict": "approve"
+ }
+}
