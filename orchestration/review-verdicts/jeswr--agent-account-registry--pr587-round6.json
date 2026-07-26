@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 587,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "e83c2266aa2c6e7254ed75229468fbf6678377b8",
+  "round": 6
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The security property still depends on `codex login status` and `claude auth status --json` loading the isolated OAuth credential and refreshing an expired access token. The diff labels these operations documented and authenticated, but supplies no sound contract or integration evidence that either status command performs that refresh. Every happy-path test uses `fake_cli`, whose injected implementation writes the refreshed credential fixture itself. Thus the tests pass even if the real commands only report local authentication state and never refresh; argv equality proves command spelling, not refresh behavior. In that case stale but refreshable credentials are always rejected and the advertised broker path is non-functional.",
+    "file": "scripts/broker-refresh.py",
+    "fix_hint": "Use provider CLI operations with a documented contract to authenticate and refresh the isolated credential, and add a non-vacuous contract/integration check that observes the real operation updating an expired isolated credential. A hermetic fake may test control flow, but it cannot be the evidence that the selected real command refreshes.",
+    "severity": "major",
+    "title": "Status probes are still assumed to refresh, while the self-test performs the refresh"
+   },
+   {
+    "body": "`_require` still accepts every non-bool `int` or `float`, including NaN and infinities, while Python's default `json.load` accepts non-standard `NaN` and `Infinity` constants. For Anthropic `expiresAt: NaN`, `_epoch_seconds` returns NaN and `exp - now <= _MIN_REMAINING_SECONDS` evaluates false, so `assert_token_live` returns true and `broker` can mint a capability with a non-finite expiry. Positive infinity also passes. This is the same concrete fail-open path reported in round 5, and the expanded self-test still has no non-finite-expiry cases.",
+    "file": "scripts/broker-refresh.py",
+    "fix_hint": "Require every numeric expiry to be finite and positive before unit conversion or comparison, for example with `math.isfinite`, and add broker-path tests proving that NaN, positive and negative Infinity, booleans, and other invalid numeric expiries cannot mint a capability. Consider rejecting non-standard JSON constants during credential parsing as defense in depth.",
+    "severity": "major",
+    "title": "NaN Anthropic expiry still bypasses the liveness gate"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 6 leaves both round-5 major findings materially unresolved. The real refresh path still assumes that provider status commands perform an OAuth refresh; all executable evidence still comes from an injected runner that writes the refreshed fixture itself. Separately, Anthropic non-finite expiries remain accepted: Python JSON can parse NaN/Infinity, `_require` permits them, and NaN makes the minimum-lifetime comparison fail open. The added tests do not cover non-finite values or establish the real status commands' refresh contract.",
+  "verdict": "request_changes"
+ }
+}
