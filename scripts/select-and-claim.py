@@ -1453,7 +1453,7 @@ def _self_test():
         adopt_hd = _wf_heredoc("Adopt dispatcher-owned CAS claim (ownership transfer)")
         selected_hd = _wf_heredoc("Resolve claimed account to concrete target model")
 
-        def _run_hd(script, argv, extra_env, td):
+        def _run_hd(script, argv, extra_env, td, cwd=None):
             gh_out = Path(td) / "github_output"
             if gh_out.exists():
                 gh_out.unlink()
@@ -1461,7 +1461,8 @@ def _self_test():
             env["GITHUB_OUTPUT"] = str(gh_out)
             env.update(extra_env)
             proc = subprocess.run([sys.executable, "-", *argv], input=script,
-                                  capture_output=True, text=True, env=env, check=False)
+                                  capture_output=True, text=True, env=env, check=False,
+                                  cwd=cwd)
             out = gh_out.read_text(encoding="utf-8") if gh_out.exists() else ""
             return proc.returncode, proc.stderr, out
 
@@ -1478,15 +1479,24 @@ def _self_test():
         with tempfile.TemporaryDirectory() as hd_td:
             hd_tdp = Path(hd_td)
             fixture = hd_tdp / "claim.json"
+            # The adopt heredoc IMPORTS the canonical partition reduction from the registry
+            # checkout (`registry/scripts/lease_schema.py`, registry issue #112 / the 2026-07-26
+            # mint-vs-adopt loop), so it must run in the layout the real step runs in:
+            # actions/checkout with `path: registry`. Reproduce that instead of re-implementing the
+            # reduction here — a re-implementation in the test is the same defect one layer out.
+            hd_layout = hd_tdp / "workspace"
+            hd_layout.mkdir()
+            (hd_layout / "registry").symlink_to(Path(__file__).resolve().parent.parent)
 
             def _claim_case(record):
                 fixture.write_text(json.dumps(record), encoding="utf-8")
                 return _run_hd(claim_hd, [str(fixture), "acct01,acct02", "sol,luna"],
                                {}, hd_td)
 
-            def _adopt_case(record):
+            def _adopt_case(record, env=None):
                 fixture.write_text(json.dumps(record), encoding="utf-8")
-                return _run_hd(adopt_hd, [str(fixture)], adopt_env, hd_td)
+                return _run_hd(adopt_hd, [str(fixture)], {**adopt_env, **(env or {})}, hd_td,
+                               cwd=str(hd_layout))
 
             for label, case, record, reject_word in (
                     ("claim", _claim_case, base_claim, "allocator"),
@@ -1505,6 +1515,36 @@ def _self_test():
                     check(f"worker.yml {label} heredoc rejects EMPTY {field}",
                           (rc != 0, f"{reject_word} returned an empty or missing {field}" in err,
                            "acquired=true" in out), (True, True, False))
+
+            # ---- THE MINT-vs-ADOPT PARTITION AGREEMENT, behaviourally (registry issue #112 / the
+            # 2026-07-26 review-lane loop). The dispatcher mints `package` with
+            # dispatch-claim.plan_package (multi-area -> __global__); this heredoc re-derives it and
+            # compares for EQUALITY. Before the reduction was single-sourced, worker.yml's copy was
+            # a private re-implementation held to the minter by a comment, and reverting it to the
+            # pre-#112 alphabetically-first rule left the entire enrolled suite green. These two
+            # rows are the counterfactual pair: a multi-area claim minted `__global__` must be
+            # ADOPTED, and the pre-#112 value for the same issue must be REFUSED. Both flip if the
+            # heredoc's derivation drifts in either direction.
+            multi = {**base_claim, "role": "impl", "package": "__global__"}
+            rc, err, out = _adopt_case(multi, {"PACKAGES": "crate-a,crate-b"})
+            check("worker.yml adopt heredoc ADOPTS a multi-area claim minted as __global__ "
+                  f"(stderr tail: {_tail(err)!r})",
+                  (rc, "acquired=true" in out), (0, True))
+            rc, err, out = _adopt_case({**multi, "package": "crate-a"},
+                                       {"PACKAGES": "crate-a,crate-b"})
+            check("worker.yml adopt heredoc REFUSES the pre-#112 alphabetically-first partition "
+                  "for the same multi-area issue",
+                  (rc != 0, "work partition disagrees" in err, "acquired=true" in out),
+                  (True, True, False))
+            rc, err, out = _adopt_case({**multi, "package": "crate-a"},
+                                       {"PACKAGES": "crate-a"})
+            check("worker.yml adopt heredoc ADOPTS a single-area claim minted as that area "
+                  f"(stderr tail: {_tail(err)!r})",
+                  (rc, "acquired=true" in out), (0, True))
+            rc, err, out = _adopt_case({**multi}, {"PACKAGES": ""})
+            check("worker.yml adopt heredoc ADOPTS a NO-area claim minted as __global__ "
+                  "(fail-closed: an arealess issue serializes)",
+                  (rc, "acquired=true" in out), (0, True))
 
             # Live (DRY_RUN=false) selected-model gate against a fake protected target routing.
             (hd_tdp / "target").mkdir()
