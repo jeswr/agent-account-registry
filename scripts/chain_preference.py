@@ -91,8 +91,8 @@ The narrowing is deliberate and it is what keeps the original invariant's PURPOS
 WHY INJECTION NEEDS THE TIER RULES RE-APPLIED AND RE-ORDERING DOES NOT
 ----------------------------------------------------------------------
 `policy-resolve._reject_docs_only` enforces the 2026-07-18 directive ("terra / sonnet are docs-only")
-over the STATICALLY DECLARED `model_chain` of the defaults branch, of every `match_labels` route and
-of every non-`DOCS_ROLES` role route, at validation time, fail-closed.
+over the STATICALLY DECLARED `model_chain` of the defaults branch, of every `match_labels` route,
+and of every non-`DOCS_ROLES` role route — at validation time, fail-closed.
 
 RE-ORDERING is bounded by that control for free: its precondition is `lead in chain`, so it can only
 ever permute a chain the control already accepted, and a permutation cannot introduce a model. That

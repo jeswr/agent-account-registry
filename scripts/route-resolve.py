@@ -338,7 +338,8 @@ escalate = true
     chk("...but a docs-only lead injected into role:docs still RESOLVES at PLAN (the bound mirrors "
         "the _reject_docs_only EXEMPTION, so it is not a blanket ban)",
         resolve(["area:gui", "role:docs"], _docs_ok)[0], ["terra", "opus5"])
-    # THE LIVE SHAPE sparq SHIPS: `lead = "sol"` + `inject_roles = ["impl"]`. Unchanged by the bound.
+    # THE LIVE SHAPE sparq SHIPS: `lead = "sol"` + `inject_roles = ["impl"]`. Unchanged by the
+    # bound.
     _live_shape = _copy.deepcopy(_pref_doc)
     _live_shape["chain_preference"] = [{"labels": ["area:gui"], "lead": "sol",
                                         "requires": ["sol", "opus5"], "inject_roles": ["impl"]}]
