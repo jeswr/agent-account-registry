@@ -182,16 +182,6 @@
   },
   {
    "account": "488920c2efe2b3fb",
-   "claim_id": "eb5814d6cf8e4ca383a183e570766a2a",
-   "holder": "sparq-org/sparq#3043@30189754464.1",
-   "package": "sparq-policy",
-   "role": "impl",
-   "model": "opus5",
-   "issued_at": 1785044428,
-   "expires_at": 1785050728
-  },
-  {
-   "account": "488920c2efe2b3fb",
    "claim_id": "bfd6b55ebe8344399c53b6ac49315f55",
    "holder": "sparq-org/sparq#3055@30189756899.1",
    "package": "sparq-mcp",
