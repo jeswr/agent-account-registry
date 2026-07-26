@@ -1,0 +1,44 @@
+{
+ "host_envelope": {
+  "pr": 4097,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "41774a2c23731bceef009f3fbaa84b8e364640d6",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "parse_xsd_f32 still hand-copies the specials table and the ASCII byte filter from sparq_core::parse_xsd_f64. The new anti-drift test closes the practical risk \u2014 I mutation-checked it and all three realistic drift mutants go red \u2014 but the guarantee is a pinned list rather than a structural one, so a drift that only shows on a lexical outside the 27-entry list would slip through. My 3M-lexical fuzz found no such divergence today, so this is a maintainability nit, not a correctness one, and it is a strict improvement over round 1.",
+    "file": "crates/sparq-substrate/src/numeric.rs",
+    "fix_hint": "Optional follow-up bead: hoist the shared acceptance rule into sparq-core (e.g. `pub fn xsd_float_lexical(v: &str) -> Option<XsdSpecialOrPlain>` or a small macro) and have both parsers dispatch through it, differing only in the final v.parse::<f64>() vs v.parse::<f32>() and the special constants. That makes parity hold by construction and lets the differential test become a redundant belt-and-braces check.",
+    "severity": "nit",
+    "title": "Acceptance predicate is still duplicated; the test now guards it, but parity is by test rather than by construction"
+   },
+   {
+    "body": "The PR correctly refreshed the README line and the numeric.rs provenance block, but two comments in a file not touched by this diff still assert the old call chain, and are now false:\n\n- crates/sparq-reason/src/dtype.rs:461 \u2014 \"delegate to the shared substrate parse_xsd_f32 (which in turn calls parse_xsd_f64 -> sparq_core)\".\n- crates/sparq-reason/src/dtype.rs around line 1645 \u2014 \"d_value_key delegates to parse_xsd_f32 (which itself calls parse_xsd_f64)\".\n\nThe code and the parity test they document are still correct \u2014 dtype.rs does delegate to parse_xsd_f32, and I ran sparq-reason --all-features green \u2014 so this is comment-only staleness. Anchored on numeric.rs because the schema requires a diff path; the text to change lives in dtype.rs.",
+    "file": "crates/sparq-substrate/src/numeric.rs",
+    "fix_hint": "Drop the two stale parentheticals, or rewrite them as \"which shares sparq_core's XSD acceptance set but rounds directly at f32 precision\". Cheap enough to fold into this PR; otherwise a doc-sync bead.",
+    "severity": "nit",
+    "title": "Two comments outside the diff still describe parse_xsd_f32 as calling parse_xsd_f64"
+   },
+   {
+    "body": "Num::Dec(d) => d.lexical().parse::<f32>() heap-allocates on every mixed decimal x float binop, where the previous self.f64() as f32 was allocation-free. Round 1 flagged this and explicitly did not ask for it to be reverted: the accuracy gain is real (rounding the exact decimal lexical straight to f32 is correctly rounded; going via d.f64() double-rounds), and the path is uncommon. Repeating it only so it is not lost \u2014 the repo carries a performance-dominance mandate. Dec::lexical sizes its buffer as mag.len() + scale + 2, so a large-scale Dec allocates proportionally.",
+    "file": "crates/sparq-substrate/src/numeric.rs",
+    "fix_hint": "Follow-up bead, not this PR. If the Dec x Float path ever appears in a profile, compute the correctly-rounded f32 from (mant, scale) directly, or write! into a fixed-size stack buffer (a Dec lexical is bounded by ~40 mantissa digits plus the scale).",
+    "severity": "nit",
+    "title": "promoted_f32's Dec branch still allocates a String on the arithmetic path (carried from round 1)"
+   },
+   {
+    "body": "The `_ if v.bytes().all(...)` guard arm in parse_xsd_f32 is about 106 columns, over the rustfmt.toml max_width = 100. rustfmt.toml documents that CI runs cargo fmt --all --check informationally (continue-on-error) pending a deferred workspace reformat, and clippy is the hard gate, so this does not fail anything today. The equivalent line in sparq-core is long too, so this is consistent with the surrounding code. Noting it only so the eventual flip of fmt to a hard gate does not surprise anyone. (rustfmt and clippy components are not installed on this toolchain, so I could not run either locally.)",
+    "file": "crates/sparq-substrate/src/numeric.rs",
+    "fix_hint": "Optional: break the guard across lines, e.g. bind `let plain = |c: u8| c.is_ascii_digit() || matches!(c, b'+' | b'-' | b'.' | b'e' | b'E');` above the match and use `_ if v.bytes().all(plain) =>`. Equally fine to leave it and let the deferred workspace-wide cargo fmt --all handle it.",
+    "severity": "nit",
+    "title": "The new filter guard line exceeds rustfmt max_width = 100"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 1's blocker is resolved by exactly the remedy round 1 named as its minimum acceptable alternative: an anti-drift differential asserting parse_xsd_f32(v).is_some() == parse_xsd_f64(v).is_some() over the suggested matrix, citing sq-9781x in the failure message. I checked it is non-vacuous rather than taking it on faith: replicating both bodies standalone, three realistic drift mutants (drop 'E' from the f32 filter; raw parse with no filter; drop the \"+INF\" special) all go RED on this exact list (\"1.5E2\"; the 8 Rust-only spellings; \"+INF\"). I also fuzzed 3,000,000 random lexicals plus extremes (1e400, 1e-400, 1e-324, a 400-digit mantissa): zero acceptance divergence, so parity holds by Rust's grammar today and the test pins it against a future edit.\n\nThe value change re-verified independently. I constructed 54,000 genuine f64-then-f32 double-rounding witnesses (odd 25-bit mantissas at f32 tie points, scaled and perturbed). Two invariants held on every one: (a) `i as f32` \u2014 the new promoted_f32 Int path \u2014 is always bit-identical to the correctly-rounded parse::<f32>, so the Int and parse branches cannot disagree; (b) the set of lexicals where sparq-core's f64 numeric cache value agrees with the widened f32 evaluator value is UNCHANGED by this PR, so no new cache-vs-evaluator value divergence appears (the cache stores parse_xsd_f64 un-narrowed for xsd:float \u2014 pre-existing and untouched). Dec::lexical only emits [-]digits[.digits], so the expect() is unreachable.\n\nRound 1's minor doc finding is fixed: README 60-61 now describes the split, and the provenance block qualifies the departure from the pre-move narrowing path.\n\nTests: sparq-substrate --features numeric 66/66 green (incl. cache_f64_seam_vs_as_numeric_differential and the new float_promotion_and_parse_are_single_rounded); sparq-reason --all-features green, incl. float_dtype_key_parity_with_substrate_parse_xsd_f32. Runtime code is byte-identical to round 1. clippy is absent here, so that gate is CI-only.",
+  "verdict": "approve"
+ }
+}
