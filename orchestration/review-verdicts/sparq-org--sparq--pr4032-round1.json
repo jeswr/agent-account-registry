@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4032,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "99f5994bd0b95de69da5e83270f176e092969b3f",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The test constructs `v1` without a thread-local override, but `encode_emit` intentionally falls back to `SPARQ_EMIT_FORMAT`. If the test process is launched with that variable set to `v2`, the asserted default-V1 invariant fails even though production behavior is correct. This makes the test sensitive to ambient configuration and means it does not strictly test the claimed no-override state.",
+    "file": "crates/sparq-core/src/store.rs",
+    "fix_hint": "Construct the V1 store with `with_emit_format(EmitFormat::V1, || TripleStore::from_triples_compressed(...))`, while keeping the V2 construction explicitly overridden as it is now.",
+    "severity": "minor",
+    "title": "Default-V1 assertion depends on ambient SPARQ_EMIT_FORMAT"
+   }
+  ],
+  "progress": null,
+  "summary": "The change correctly routes the in-memory compressed-store construction through the existing emit-format policy while preserving the feature-off path as the original V1 encoder. The feature relationships are coherent (`spqcprm2` implies `mmap`), V2 permutations retain the format needed by the decoder, and the public-surface documentation is updated. The added test exercises the real store construction and scan paths across both formats and compares them with the raw store. One minor test-isolation issue remains: its purported default-V1 construction can inherit a process environment override.",
+  "verdict": "approve"
+ }
+}
