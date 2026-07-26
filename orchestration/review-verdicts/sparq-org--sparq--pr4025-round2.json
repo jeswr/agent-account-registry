@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 4025,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "526d690ca9c73fe7ed90209631d6750280db75a8",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new `smoke_index < smoke_run_index < trivy_index < qemu_index < push_index` assertion makes \"register QEMU only after the native gate\" a required contract for lws-container.yml. That is the opposite of release.yml (which pins `qemu_index < buildx_indices[0]`) and of Docker's documented setup-qemu-then-setup-buildx order: the docker-container driver boots buildkitd at Buildx setup time and enumerates its supported platforms then, so binfmt registered afterwards may not be advertised.\n\nIn practice this is likely benign \u2014 the moby/buildkit image used by the docker-container driver ships embedded QEMU emulators, which is why arm64 usually builds without setup-qemu-action at all \u2014 but I could not confirm it here, and lws-container.yml is tag/dispatch-triggered so the arm64 leg may never have run. Round 1 raised the same risk; this round removes the misleading assertion message (good) but tightens the ordering into contract, so a later realignment with release.yml would now go red.\n\nNot a blocker: the ordering is a deliberate, commented security choice (gate the native artifact before enabling emulation), and if the arm64 build does fail the workflow fails loudly rather than publishing a bad manifest.",
+    "file": ".github/workflows/lws-container.yml",
+    "fix_hint": "Trigger one `workflow_dispatch` run of lws-container.yml and confirm the `Publish amd64 + arm64 image index` step actually produces both descriptors under Buildx-before-QEMU. If it does, add a one-line comment next to the assertion recording that the order was empirically validated (and why it intentionally differs from release.yml). If it does not, move `Set up Buildx for native gate` after the QEMU step and relax the assertion to `trivy_index < push_index`, which preserves the real security property (nothing is published before the scan) without pinning emulator-setup placement.",
+    "severity": "minor",
+    "title": "Buildx-before-QEMU ordering is now hard contract (trivy_index < qemu_index) and the arm64 leg looks unexercised"
+   },
+   {
+    "body": "The renamed step reads \"Release container contracts (both multi-arch images + safe ghcr tags)\". The tag-safety assertions (`assert_dispatch_tags_never_canonical`, the trigger-gated `latest`) cover release.yml/sparq-server only. lws-container.yml publishes `type=raw,value=latest` with no trigger guard, so a `workflow_dispatch` from any branch overwrites the deployment-followed `:latest` for sparq-lws-core \u2014 deliberate per that workflow's own comment, but not covered by any assertion.\n\nThe comment body above the step is accurate (it scopes sq-n6rv/sq-p9xq to sparq-server), so this is only the compressed title reading broader than the code. Pre-existing workflow behaviour, not introduced here.",
+    "file": ".github/workflows/docs-quality.yml",
+    "fix_hint": "Retitle to e.g. \"Release container contracts (both multi-arch images + sparq-server ghcr tags)\", or file a bead to decide whether sparq-lws-core's dispatch path should also be barred from pushing the moving `:latest` and pin that in `assert_lws_container_contract`.",
+    "severity": "nit",
+    "title": "Step title says \"safe ghcr tags\" for both images, but only sparq-server's tag contract is asserted"
+   },
+   {
+    "body": "`test_moving_lws_scan_after_push_fails_contract` proves the LWS ordering assertion is non-vacuous, but the identical assertion added to `assert_release_container_contract` has no counterpart, so a future refactor that drops or weakens it (e.g. comparing the wrong pair of indices) would go unnoticed. Low risk since the two assertions share a shape and the LWS mutation exercises the pattern.\n\nSeparately, neither contract pins `context:` on the push step, so the scanned amd64 artifact and the published multi-arch index could in principle be built from different contexts/build-args; both workflows currently use `context: .` for both builds.",
+    "file": "scripts/tests/test_release_container_multiarch.py",
+    "fix_hint": "Add `test_moving_release_scan_after_push_fails_contract` mirroring the LWS mutation against release.yml's \"Trivy scan released image (fail on fixable HIGH/CRITICAL)\" and \"Build and push\" steps, and optionally assert `push_with.get(\"context\") == smoke_with.get(\"context\")` in both contracts so scanned and published images cannot diverge at the source.",
+    "severity": "nit",
+    "title": "New release-side ordering assertion has no mutation test, unlike its LWS twin"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 2 resolves the round-1 blocker and three of the four minors, and I could not find a new correctness or soundness defect.\n\n(1) The major overclaim is fixed. Both contracts now keep their step indices and assert the pipeline order: `assert_release_container_contract` pins smoke < smoke_run < trivy < push (release.yml: 657 < 669 < 682 < 714, so the live test passes), and `assert_lws_container_contract` pins smoke < smoke_run < trivy < qemu < push, which is strictly stronger than the header comment claims. The added `test_moving_lws_scan_after_push_fails_contract` is genuinely non-vacuous: I simulated the pop/insert arithmetic on the real 9-step publish job (trivy_index=4, push_index=8) \u2014 pop(4) shrinks the list to 8, insert(8, trivy) appends, so trivy lands after the push and the chained assertion goes red (8 < 4 is false). The yaml.safe_dump round-trip is harmless here (the `on:`->True key coercion never reaches jobs; \"1\" survives quoted).\n\n(2) The unused-permission finding is fixed at the source: `id-token: write` / `attestations: write` are dropped from lws-container.yml (there is no attest/cosign/OIDC consumer in that job; BuildKit provenance+sbom only need packages: write) and the corresponding assertions are gone. No doc, compliance file, or sibling contract test claims OIDC attestation for sparq-lws-core.\n\n(3) `LWS_CONTAINER_SKIP_BUILD: \"1\"` is now pinned, closing the scanned-image/smoked-image divergence (container-smoke.sh does rebuild when it is unset).\n\n(4) The docs-quality.yml comment restores the [OPUS-5] sq-w1dxx rationale plus sq-fvzi6/sq-n6rv/sq-p9xq and appends the [GPT-5] sq-fqrv4 line.\n\n(5) The misleading \"native gate must run before QEMU\" message is gone; buildx is now only cardinality-checked.\n\nI could not execute the suite (PyYAML absent, no pip), so this is source-traced against the live workflows, not executed. Remaining items are minor/nit and non-blocking.",
+  "verdict": "approve"
+ }
+}
