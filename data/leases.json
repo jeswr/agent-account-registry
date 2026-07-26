@@ -222,16 +222,6 @@
   },
   {
    "account": "488920c2efe2b3fb",
-   "claim_id": "a264f91486b04d3e9bd8a368603e2498",
-   "holder": "review:sparq-org/sparq#3868@dispatch-30185267227.1",
-   "package": "deploy-demo",
-   "role": "review",
-   "model": "opus5",
-   "issued_at": 1785034889,
-   "expires_at": 1785039089
-  },
-  {
-   "account": "488920c2efe2b3fb",
    "claim_id": "990f0c35ea7f424eafed0c544e523d1e",
    "holder": "fix:sparq-org/sparq#3869@dispatch-30185267227.1",
    "package": "sparq-fedplan-mpc",
