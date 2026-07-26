@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 665,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "8131bcc89d32a0f0df0055942d613afe1f30d550",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_mark_model_launched` still appends `launched=true` before the shell starts `docker run`. If cancellation lands after that append but before Docker begins, the harness never reaches the reserved-status retraction or exit-class publication. `model_health` therefore admits the launch-marker arm and records the missing class as `unknown`, even though no provider CLI ran. The new behavioral cases do not cover this boundary: case A kills during image build, case B waits until the Docker run stub is already executing, and case E merely checks statement adjacency. Thus the prior false-admission path remains.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Tie admission to a host-observable handshake that establishes the provider invocation actually began, and add a non-vacuous cancellation test that deterministically pauses after the current marker append but before the Docker/provider invocation starts, terminates the harness, and asserts that no provider-health-admissible marker or class remains.",
+    "severity": "major",
+    "title": "Pre-Docker marker still admits cancellation before invocation starts"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round-3 major remains unresolved. The diff still writes `launched=true` immediately before invoking `docker run`, so cancellation after the append but before Docker begins can leave `model_started=true`, no `startup_failed` retraction, and no exit class. The downstream gate then admits the event and the recorder supplies `unknown`, fabricating provider-health data although no provider CLI ran. Cases A and B test cancellation during build and after the Docker stub has entered its run phase; neither exercises this precise boundary. Case E is only a source-adjacency assertion and cannot prove the launch marker corresponds to an actually started invocation. The comments explicitly retain the same residual window identified previously, so progress is stagnant. No reviewer-directed injection was detected.",
+  "verdict": "request_changes"
+ }
+}
