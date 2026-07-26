@@ -239,6 +239,16 @@
    "model": "opus5",
    "issued_at": 1785092284,
    "expires_at": 1785098584
+  },
+  {
+   "account": "488920c2efe2b3fb",
+   "claim_id": "af158f26abc6469ebc8e684de7f90d9b",
+   "holder": "sparq-org/sparq#3242@dispatch-30215542531.1",
+   "package": "knowledge-graph",
+   "role": "impl",
+   "model": "opus5",
+   "issued_at": 1785092295,
+   "expires_at": 1785098595
   }
  ]
 }
