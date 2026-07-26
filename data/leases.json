@@ -82,16 +82,6 @@
   },
   {
    "account": "dc2d751954080e13",
-   "claim_id": "a71b587938aa4006b7a04d16def98f66",
-   "holder": "sparq-org/sparq#2767@30212317076.1",
-   "package": "upstream",
-   "role": "impl",
-   "model": "sol",
-   "issued_at": 1785086363,
-   "expires_at": 1785092663
-  },
-  {
-   "account": "dc2d751954080e13",
    "claim_id": "9aa22a9b51fe44049792cad77d307d98",
    "holder": "sparq-org/sparq#2832@30212319867.1",
    "package": "trust",
