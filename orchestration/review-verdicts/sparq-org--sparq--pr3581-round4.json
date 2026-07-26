@@ -1,0 +1,44 @@
+{
+ "host_envelope": {
+  "pr": 3581,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "1a167090bc25eefc398c4d238c8ba6ffc5c6a169",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Now that `continue-on-error` is gone, `rustfmt (check)` is a hard gate -- but it still sits at the very end of the `lint` job, after `cargo clippy --workspace --all-targets`, `cargo clippy --workspace --all-targets --all-features`, two `cargo doc` passes, and the standalone `bench/dict` clippy + `cargo run selftest` (a separate workspace with its own target dir).\n\nConsequence: a one-second, trivially-fixable formatting failure now only surfaces after the job has done essentially all of its work. Every fmt-only red costs a full lint-job build, and the same cost is paid again on the fix push. While the rustfmt step was informational this ordering was harmless; making it gating is exactly the point at which it starts to matter.",
+    "file": ".github/workflows/ci.yml",
+    "fix_hint": "Move the `- name: rustfmt (check)` step to immediately after the toolchain setup step (before the first clippy invocation). It needs no cargo build and no rust-cache warm-up, so it fails fast and costs nothing when it passes. No other change required.",
+    "severity": "minor",
+    "title": "rustfmt (check) is the LAST step of the now-gating lint job, behind every expensive build"
+   },
+   {
+    "body": "The PR renames the CI job `clippy (gate) + fmt (non-blocking)` -> `fmt + clippy (gate)` and correctly updates this evidence file and `docs/branch-protection.md`, but two other in-repo references to the old name were missed:\n\n- `bench/dict/README.md:87` -- \"The CI `clippy (gate) + fmt` job (`.github/workflows/ci.yml`) therefore clippy-gates this crate...\"\n- `AGENTS.md:211` -- \"The gating `clippy (gate)` lane **also runs `cargo doc --workspace --no-deps --all-features`**...\"\n\nBoth backtick a job name that no longer exists, so a reader grepping the workflow for either string finds nothing. This is documentation drift only -- gating is unaffected, because branch protection requires just `ci-summary / gate` and the aggregator discovers jobs dynamically.\n\n(No action needed for `scripts/tests/test_ci_summary_gate.py:1178` or `scripts/check-advisory-registry.py`: those use the old string as a deliberately arbitrary synthetic registry key in a regression fixture, not as a binding to the real job.)",
+    "file": "compliance/openssf/evidence.md",
+    "fix_hint": "Update the two references to `fmt + clippy (gate)`: `bench/dict/README.md:87` and `AGENTS.md:211`. Both are single-token edits in prose.",
+    "severity": "minor",
+    "title": "Job rename left stale references to the old lint-job name in AGENTS.md and bench/dict/README.md"
+   },
+   {
+    "body": "This is the only hunk across all 642 reformatted Rust files whose token stream changes beyond what rustfmt can produce:\n\n    -  Err(RpcError::new(METHOD_NOT_FOUND, format!(\"method not found: {other}\")))\n    +  format!(\"method not found: {}\", other),\n\nrustfmt never converts an inline captured argument into a positional one, so this is a hand edit. It is behaviourally identical (same rendered string) and clippy-clean today -- `clippy::uninlined_format_args` is allow-by-default on the CI toolchain, and ~1200 positional `format!` uses already exist in `crates/*/src`, so the `-D warnings` gate is unaffected. I also confirmed it is not a botched merge resolution: the inline `{other}` form was introduced in #1960 and was never changed on main.\n\nThe concern is process, not behaviour: a 647-file diff is only reviewable because it is mechanical, and a single unexplained hand edit erodes that property (and reverses the inline-captured-arg idiom the surrounding file uses).",
+    "file": "crates/sparq-mcp/src/solid.rs",
+    "fix_hint": "Restore the inline form and let rustfmt wrap it:\n\n    other => Err(RpcError::new(\n        METHOD_NOT_FOUND,\n        format!(\"method not found: {other}\"),\n    )),\n\nIf the edit was deliberate, say so in the PR body so the \"formatting-only\" claim stays exact.",
+    "severity": "nit",
+    "title": "Sole non-mechanical source edit in the PR: inline format arg reverted to a positional one"
+   },
+   {
+    "body": "The rewritten header now asserts: \"The workspace is formatted and CI enforces `cargo fmt --all --check` as a hard gate.\" That is accurate for the root workspace, but `cargo fmt --all` only visits the current workspace's members. Per the comment on the `bench/dict standalone selftest` step in `ci.yml`, `bench/dict` carries its own `[workspace]` table (as do `bench/parse` and `bench/serve`), so those crates are formatted by nobody and gated by nothing.\n\nThis leaves an asymmetry inside a single job: `bench/dict` is clippy-gated under `-D warnings` via an explicit `--manifest-path`, but not fmt-gated, even though this PR's stated goal is repo-wide formatting normalisation with a hard gate.",
+    "file": "rustfmt.toml",
+    "fix_hint": "Either extend the gate -- add `cargo fmt --manifest-path bench/dict/Cargo.toml --all --check` (and the same for `bench/parse` / `bench/serve` if they are formatted) next to the existing per-manifest clippy invocation -- or record the exclusion explicitly in this header, e.g. \"scope: the root workspace only; bench/{dict,parse,serve} carry their own [workspace] tables and are not fmt-gated.\"",
+    "severity": "nit",
+    "title": "The new fmt gate does not reach the standalone bench workspaces it claims to cover"
+   }
+  ],
+  "progress": null,
+  "summary": "Repo-wide rustfmt normalization (642 .rs files) plus the CI flip of `cargo fmt --all --check` from continue-on-error to a hard gate.\n\nVERIFICATION: I recomputed the full diff against the merge base (dece4ca1 == origin/main tip, so the merge commit adds nothing) and ran a token-level comparison of every changed Rust file -- lexing each side, dropping whitespace/comments, then normalizing trailing commas and match-arm braces. Result: 642/642 files are formatting-equivalent. Residual token deltas fall entirely into rustfmt-legitimate classes: use/mod reordering (83 files, verified to touch only import tokens), trailing-comma churn, match-arm brace removal, method-chain line breaks, and let-else expansion appending a no-op `;` after a diverging continue/return/break. Exactly one non-mechanical source edit exists (sparq-mcp/src/solid.rs, output-identical) -- filed as a nit. No semantic change, no reverted main-side work, no test deleted or weakened.\n\nGATE-FLIP SAFETY: branch protection requires exactly one context (`ci-summary / gate`) and the aggregator discovers checks dynamically, so renaming `clippy (gate) + fmt (non-blocking)` -> `fmt + clippy (gate)` cannot silently drop the clippy gate; the job is absent from .github/advisory-registry.json, so it still gates. docs/branch-protection.md, compliance/openssf/evidence.md and rustfmt.toml were updated consistently. bench/feature-off-declarations/3581.json matches the checker's required {pr, date, reason} shape, and its rationale (reflowed always-compiled sources shift embedded source locations without enabling a default-path capability) is corroborated by the token analysis.\n\nNOT VERIFIABLE HERE: rustfmt cannot be installed in this sandbox (read-only FS), so `cargo fmt --all --check` was not run. That is self-gating -- an unformatted tree simply reds the now-hard job.\n\nNo blocker/major issues; approving with 2 minor + 2 nit.",
+  "verdict": "approve"
+ }
+}
