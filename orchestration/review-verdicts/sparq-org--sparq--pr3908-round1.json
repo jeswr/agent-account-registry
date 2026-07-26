@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 3908,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e7fcf9f9fc61856a8a42d3546a276f532f62531e",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 2.1 says permuting remaining arms changes only when rows are materialized, not how many, and calls the negative result structural. That is not generally true for left-deep joins: different orders can produce very different intermediate cardinalities, especially for correlated predicates\u2014the exact estimation weakness identified immediately above. Evaluating all arms eventually does not imply equal total intermediate rows or equal join work. A single purpose-built fixture and non-canonical benchmark establish a negative for that implementation/workload, not impossibility of a profitable local adaptive reorder. This unsupported premise is load-bearing for rejecting option A and retiring the issue.",
+    "file": "research/adaptive-replan-local-evaluator.md",
+    "fix_hint": "Rewrite the record to scope the conclusion to commit f85d0180's exact trigger, replanning policy, plan space, executor, and measured fixtures. Remove claims of structural impossibility unless supported by a formal argument or representative benchmark evidence. Explain precisely why the tested reordered alternatives had equal intermediate work, and preserve adaptive reordering as unresolved for other correlated join shapes.",
+    "severity": "major",
+    "title": "Unsupported claim that join reordering cannot reduce materialized work"
+   },
+   {
+    "body": "The document recommends closing sq-gafdh/#2932 as a duplicate and repeatedly treats sq-p6p6 as deliberately closed/superseded, yet section 6 admits the bead status was not verified and asks whether the branch merely stalled. The principal implementation, test, gates, and benchmark evidence live only on an unmerged remote branch. A durable record on main cannot present the requested task as conclusively completed and closed while its own evidence leaves that disposition uncertain.",
+    "file": "research/adaptive-replan-local-evaluator.md",
+    "fix_hint": "Verify and cite the bead/issue disposition before asserting deliberate closure. If it cannot be verified, describe the prior branch as an attempted, unmerged experiment and recommend maintainer review rather than retirement. Bring the minimal reproducible benchmark methodology/results or a stable archived artifact onto main so the conclusion does not depend on a potentially deleted branch and commit-message claims.",
+    "severity": "major",
+    "title": "Durable decision record relies on an unmerged branch and unverified task state"
+   }
+  ],
+  "progress": null,
+  "summary": "The record is useful prior-art discovery, but its central conclusion is stated more strongly than the evidence supports. It turns one unmerged implementation and one non-canonical microbenchmark into a general structural claim that local join reordering cannot reduce materialized work. In a left-deep evaluator, ordering selective/correlated joins can change intermediate cardinalities substantially even when every eventual arm is evaluated; exact single-pattern counts do not determine join-result cardinalities. The document itself acknowledges that multi-pattern estimates are inaccurate under correlation, which undercuts the claimed impossibility. Because this premise drives the recommendation to retire the requested work, the record is not sound as written. It should distinguish the observed negative for the specific sq-p6p6 mechanism/fixture from any general conclusion, and ground closure/status claims in durable evidence available on main.",
+  "verdict": "request_changes"
+ }
+}
