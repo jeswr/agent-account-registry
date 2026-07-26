@@ -71,6 +71,17 @@ on:
         required: true
         default: '1'
         type: string
+      # ONE input, not two: workflow_dispatch is HARD-CAPPED at 10 inputs by GitHub, and this
+      # workflow is at the cap. The self-declared class dispatches BOTH providers (one run each),
+      # so the review SIDE must ride along — it is folded into the class token rather than
+      # spending a second input slot. A dispatch HINT only: resolve re-derives both halves from
+      # the live PR + the registry record and fails closed on any disagreement.
+      review_class:
+        description: Provenance trust class, with the review side for the weaker self-declared class
+        required: false
+        default: worker-run
+        type: choice
+        options: [worker-run, self-declared-anthropic, self-declared-openai]
       account:
         description: Dispatcher-claimed account handle (verified against the adopted lease)
         required: true
@@ -104,6 +115,9 @@ jobs:
       impl_provider: ${{ steps.pr.outputs.impl_provider }}
       impl_alias: ${{ steps.pr.outputs.impl_alias }}
       impl_account_h: ${{ steps.pr.outputs.impl_account_h }}
+      trust_class: ${{ steps.pr.outputs.trust_class }}
+      review_provider: ${{ steps.pr.outputs.review_provider }}
+      pr_author_bound: ${{ steps.pr.outputs.pr_author_bound }}
       already_done: ${{ steps.pr.outputs.already_done }}
       issue: ${{ steps.pr.outputs.issue }}
       security: ${{ steps.pr.outputs.security }}
@@ -130,6 +144,7 @@ jobs:
           FIX_CONTEXT: ${{ inputs.fix_context }}
           MODEL_PIN: ${{ inputs.model_pin }}
           REVIEW_ROUND: ${{ inputs.review_round }}
+          REVIEW_CLASS: ${{ inputs.review_class }}
           ACCOUNT: ${{ inputs.account }}
           CLAIM_ID: ${{ inputs.claim_id }}
         run: |
@@ -173,6 +188,22 @@ jobs:
               raise SystemExit("fix_context must be short single-line printable ASCII")
           if not re.fullmatch(r"[1-9][0-9]{0,2}", review_round):
               raise SystemExit("review_round must be a small positive integer")
+          # [issue #657] The trust class + review side are ONE dispatch HINT, and it is never
+          # trusted: the resolve step below re-derives BOTH halves from the live PR (head ref +
+          # author) and the registry provenance record, and fails closed on any disagreement.
+          # Validated here only to a closed set so nothing unsafe reaches a workflow output or a
+          # prompt. (One input, not two: workflow_dispatch is hard-capped at 10 inputs.)
+          review_class = os.environ.get("REVIEW_CLASS") or "worker-run"
+          if review_class not in {"worker-run", "self-declared-anthropic",
+                                  "self-declared-openai"}:
+              raise SystemExit("review_class must be worker-run or self-declared-<provider>")
+          trust_class, _, review_provider = review_class.partition("-declared-")
+          if review_provider:
+              trust_class = "self-declared"
+          # The weaker class is REVIEW-ONLY: it has no trusted implementer, so there is no
+          # same-provider fixer to route to and no repair flavour may ride it.
+          if trust_class == "self-declared" and mode != "review":
+              raise SystemExit("the self-declared trust class has no fix lane")
           if not re.fullmatch(r"acct[0-9a-z]{2,}", account):
               raise SystemExit("account must be an acctNN registry handle")
           if claim_id and not re.fullmatch(r"[0-9a-f]{32}", claim_id):
@@ -219,6 +250,7 @@ jobs:
           PR_NUMBER: ${{ inputs.pr_number }}
           MODE: ${{ inputs.mode }}
           FIX_KIND: ${{ inputs.fix_kind }}
+          REVIEW_CLASS: ${{ inputs.review_class }}
         run: |
           set -euo pipefail
           gh api "repos/$TARGET_REPO/pulls/$PR_NUMBER" > "$RUNNER_TEMP/pull.json"
@@ -235,8 +267,16 @@ jobs:
           repo = os.environ["TARGET_REPO"]
           mode = os.environ["MODE"]
           fix_kind = os.environ.get("FIX_KIND") or "verdict"
-          if pull.get("state") != "open" or pull.get("draft") is not True:
-              raise SystemExit("pull request is not an open draft")
+          # [issue #657] The DISPATCH HINT, re-split into its two halves. Nothing below trusts
+          # it: the class is re-derived from the live PR (head ref + author) and the registry
+          # record, and any disagreement with the hint is fatal. The closed-set validation ran
+          # in the inputs step above, so an unknown token never reaches here.
+          hint_trust_class, _, hint_review_provider = (
+              (os.environ.get("REVIEW_CLASS") or "worker-run").partition("-declared-"))
+          if hint_review_provider:
+              hint_trust_class = "self-declared"
+          if pull.get("state") != "open":
+              raise SystemExit("pull request is not open")
           head = pull.get("head") or {}
           head_repo = (head.get("repo") or {}).get("full_name")
           head_branch = str(head.get("ref", ""))
@@ -253,12 +293,15 @@ jobs:
           author = str((pull.get("user") or {}).get("login", ""))
           if head_repo != repo:
               raise SystemExit("pull request head is a fork; refusing to run models on it")
-          if not re.fullmatch(r"sparq-agent/issue-([1-9][0-9]*)-[A-Za-z0-9._-]+", head_branch):
-              raise SystemExit("pull request head is not a worker branch")
           if not re.fullmatch(r"[0-9a-f]{40}", head_sha):
               raise SystemExit("pull request head sha is malformed")
-          if not author.endswith("[bot]"):
-              raise SystemExit("pull request author is not a bot")
+          # [issue #657] The worker-branch + bot-author invariants are the WORKER-RUN class's
+          # identity, and they are re-asserted (unchanged) inside provenance_trust_class below,
+          # against this exact live read. They are NOT asserted here any more because the
+          # strictly weaker self-declared class is defined by NOT satisfying them — and it earns
+          # its admission by being reviewed by BOTH providers instead. The DRAFT requirement is
+          # likewise a worker-run invariant (it protects the undraft step of the arm); a
+          # self-declared PR is normally already non-draft and has no undraft step.
           labels = sorted({
               label.get("name") for label in (pull.get("labels") or [])
               if isinstance(label, dict) and isinstance(label.get("name"), str)
@@ -284,11 +327,6 @@ jobs:
           # marker equal to the live head proves this head's review completed end-to-end — a
           # duplicate dispatch (raced against the bind) exits gracefully via `already_done`
           # instead of burning a scarce reviewer slot on a re-review.
-          already_done = False
-          if mode == "review":
-              marker = re.search(r"<!-- sparq-reviewed-sha:([0-9a-f]{40}|none) -->",
-                                 pull.get("body") or "")
-              already_done = bool(marker) and marker.group(1) == head_sha
 
           # REGISTRY provenance is the root of trust for the implementer identity. Missing
           # record => never reviewed (fail closed); the target model has no registry token.
@@ -316,16 +354,68 @@ jobs:
               "registry_dispatch_claim", Path("registry", "scripts", "dispatch-claim.py"))
           dispatch_claim = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(dispatch_claim)
-          admission_error = dispatch_claim.provenance_admission_error(record, pull["number"])
+          # [issue #657] ONE classification, derived from the head ref + the author (properties
+          # the RECORD cannot assert) and then from that class's own record-shape admission —
+          # the SAME dispatch-claim.provenance_trust_class the dispatcher's PLAN and CLAIM run.
+          # The worker-run branch is byte-identical to the previous behaviour (worker head ref +
+          # bot author + provenance_admission_error). The self-declared branch is the strictly
+          # weaker, additive class. NO admissible class => refused, never defaulted.
+          trust_class, admission_error = dispatch_claim.provenance_trust_class(
+              record, pull["number"], head_branch, author)
           if admission_error:
               raise SystemExit(admission_error)
-          impl_provider = record["impl_provider"]
-          impl_alias = record["impl_alias"]
-          # Privacy (locked decision 22a): the PUBLIC registry stores only the salted account
-          # hash, never a raw acctNN handle; the reviewer-side hash comparison runs at claim time.
-          impl_account_h = record["impl_account_h"]
+          if trust_class != hint_trust_class:
+              raise SystemExit(f"live provenance trust class {trust_class!r} disagrees with the "
+                               f"dispatched {hint_trust_class!r} (fail closed)")
+          pr_author_bound = ""
+          if trust_class == dispatch_claim.WORKER_RUN_TRUST_CLASS:
+              if pull.get("draft") is not True:
+                  raise SystemExit("worker pull request is not a draft")
+              impl_provider = record["impl_provider"]
+              impl_alias = record["impl_alias"]
+              # Privacy (locked decision 22a): the PUBLIC registry stores only the salted account
+              # hash, never a raw acctNN handle; the reviewer-side hash comparison runs at claim
+              # time.
+              impl_account_h = record["impl_account_h"]
+              review_provider = dispatch_claim.review_provider_set(trust_class,
+                                                                   impl_provider)[0]
+          else:
+              # The SELF-DECLARED class. There is no implementer identity to read — that is the
+              # point — so the lane assigns a pseudo-implementer INVERSE to the review side this
+              # run drives, and the review side itself is re-derived from the LIVE PR body
+              # markers (which providers have already reviewed THIS head), never adopted from
+              # the dispatch input. The dispatched side must still be outstanding, or this run
+              # is stale and must not burn a reviewer slot.
+              outstanding = dispatch_claim.outstanding_review_providers(
+                  trust_class, pull.get("body") or "", head_sha)
+              if hint_review_provider not in outstanding:
+                  raise SystemExit(
+                      f"the dispatched {hint_review_provider!r}-side review is no longer "
+                      "outstanding for this head (fail closed)")
+              if record["pr_author"] != author:
+                  raise SystemExit("self-declared provenance names a different PR author "
+                                   "(fail closed)")
+              review_provider = hint_review_provider
+              impl_provider = dispatch_claim.review_lane_impl_provider(review_provider)
+              impl_alias = "self-declared"
+              impl_account_h = dispatch_claim.SELF_DECLARED_IMPL_ACCOUNT_H
+              pr_author_bound = record["pr_author"]
           issue = record["issue"]
           opened_sha = record["head_sha_at_open"]
+          # Idempotence guard: a duplicate dispatch (raced against the marker bind) exits
+          # gracefully via `already_done` instead of burning a scarce reviewer slot on a
+          # re-review. For the worker-run class the marker is the head-level reviewed-sha; for
+          # the self-declared class it is THIS SIDE's per-provider marker (the head-level one is
+          # bound only once every side has reported).
+          already_done = False
+          if mode == "review":
+              if trust_class == dispatch_claim.WORKER_RUN_TRUST_CLASS:
+                  marker = re.search(r"<!-- sparq-reviewed-sha:([0-9a-f]{40}|none) -->",
+                                     pull.get("body") or "")
+                  already_done = bool(marker) and marker.group(1) == head_sha
+              else:
+                  already_done = review_provider in dispatch_claim.reviewed_review_providers(
+                      pull.get("body") or "", head_sha)
           if opened_sha != head_sha:
               compare = json.loads(subprocess.run(
                   ["gh", "api", f"repos/{repo}/compare/{opened_sha}...{head_sha}"],
@@ -392,6 +482,9 @@ jobs:
               "impl_provider": impl_provider,
               "impl_alias": impl_alias,
               "impl_account_h": impl_account_h,
+              "trust_class": trust_class,
+              "review_provider": review_provider if mode == "review" else "",
+              "pr_author_bound": pr_author_bound,
               "already_done": "true" if already_done else "false",
               "issue": str(issue),
               "security": "true" if security else "false",
@@ -404,7 +497,8 @@ jobs:
                   if "\n" in value or "\r" in value:
                       raise SystemExit(f"unsafe resolved value: {key}")
                   output.write(f"{key}={value}\n")
-          print(f"PR bound to provenance: impl={impl_provider}/{impl_alias} issue=#{issue}")
+          print(f"PR bound to provenance [{trust_class}]: impl={impl_provider}/{impl_alias} "
+                f"review-side={review_provider or 'n/a'} issue=#{issue}")
           PY
 
       - name: Resolve policy and compute the mode chain (inverse chain outside resolve())
@@ -1426,6 +1520,11 @@ jobs:
           # Catalog-controlled provider reaches this job via env ONLY — never interpolated into the
           # run: shell source, where `x"; curl evil|sh; echo "` would execute (issue #199).
           IMPL_PROVIDER: ${{ needs.resolve.outputs.impl_provider }}
+          # [issue #657] The RE-DERIVED class + the enrolment-bound PR author (never the
+          # dispatch input): for the self-declared class the outcome's identity gate re-targets
+          # from "the App bot, drafted" to "exactly this author"; head equality is unchanged.
+          TRUST_CLASS: ${{ needs.resolve.outputs.trust_class }}
+          PR_AUTHOR_BOUND: ${{ needs.resolve.outputs.pr_author_bound }}
         run: |
           set -euo pipefail
           args=(
@@ -1441,6 +1540,8 @@ jobs:
             --bot-login "${{ needs.resolve.outputs.pr_author }}"
             --run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
             --reviewed-sha "${{ needs.run.outputs.reviewed_sha }}"
+            --trust-class "$TRUST_CLASS"
+            --pr-author "$PR_AUTHOR_BOUND"
           )
           [[ "$SECURITY" == "true" ]] && args+=(--security)
           while IFS= read -r p; do
@@ -1490,6 +1591,14 @@ jobs:
           # would execute (issue #199). worker-pr.py ready-and-arm asserts reviewer != implementer.
           IMPL_PROVIDER: ${{ needs.resolve.outputs.impl_provider }}
           REVIEWER_PROVIDER: ${{ needs.claim.outputs.provider }}
+          # [issue #657] The arm gate for the SELF-DECLARED class: worker-pr.py refuses to arm
+          # unless this run is the OPENAI-side review (the genuinely cross-provider one, since
+          # the orchestrator is an anthropic harness by construction) AND the anthropic side
+          # already has a verdict bound to this exact head. An anthropic-side pass alone NEVER
+          # arms. Both values are the RE-DERIVED ones from resolve, never the dispatch inputs.
+          TRUST_CLASS: ${{ needs.resolve.outputs.trust_class }}
+          REVIEW_PROVIDER: ${{ needs.resolve.outputs.review_provider }}
+          PR_AUTHOR_BOUND: ${{ needs.resolve.outputs.pr_author_bound }}
         run: |
           set -euo pipefail
           args=(
@@ -1504,6 +1613,9 @@ jobs:
             --issue "${{ needs.resolve.outputs.issue }}"
             --bot-login "${{ needs.resolve.outputs.pr_author }}"
             --reviewed-base "${{ needs.resolve.outputs.base_ref }}"
+            --trust-class "$TRUST_CLASS"
+            --review-provider "$REVIEW_PROVIDER"
+            --pr-author "$PR_AUTHOR_BOUND"
           )
           while IFS= read -r p; do
             [[ -n "$p" ]] && args+=(--surface-path "$p")
@@ -1514,6 +1626,27 @@ jobs:
           done < <(printf '%s' "${SECURITY_KEYWORDS_B64:-W10=}" | base64 -d \
             | python3 -c 'import json,sys; [print(x) for x in json.load(sys.stdin)]')
           python3 registry/scripts/worker-pr.py "${args[@]}"
+
+      # [issue #657] PER-PROVIDER marker, bound BEFORE the head-level reviewed-sha marker.
+      # It records that THIS review side has minted a verdict for this head, which is what makes
+      # the self-declared class's dual-provider review converge: the dispatcher re-emits the PR
+      # for the remaining side, and the arm gate reads this marker to prove the OTHER side
+      # already reviewed the same head. Gated on exactly the conditions that prove this run's
+      # outcome actually landed — the same predicate the head-level bind below uses.
+      - name: Bind this review side (per-provider marker)
+        if: ${{ inputs.mode == 'review' && needs.resolve.outputs.trust_class == 'self-declared' && steps.outcome.outcome == 'success' && steps.outcome.outputs.decision != 'hold' && steps.outcome.outputs.decision != 'stale' && (steps.outcome.outputs.decision != 'arm' || (steps.arm.outcome == 'success' && steps.arm.outputs.arm_complete == 'true')) }}
+        env:
+          GH_TOKEN: ${{ steps.app-token-outcome.outputs.token }}
+          # Catalog-controlled provider reaches this write-scoped job via env ONLY — never
+          # interpolated into the run: shell source (issue #199).
+          REVIEW_PROVIDER: ${{ needs.resolve.outputs.review_provider }}
+        run: |
+          set -euo pipefail
+          python3 registry/scripts/worker-pr.py reviewed-provider \
+            --repo "${{ inputs.target_repo }}" \
+            --pr "${{ inputs.pr_number }}" \
+            --provider "$REVIEW_PROVIDER" \
+            --sha "${{ needs.run.outputs.reviewed_sha }}"
 
       # LAST mutation by design: binding reviewed-sha == head marks this head's review complete;
       # everything before it is re-derivable, so a crash anywhere above re-converges via the
@@ -1528,7 +1661,13 @@ jobs:
         # [issue #156] decision == 'stale' is the head-moved DROP (the live head advanced off
         # the reviewed sha during the run): the outcome applied NOTHING, so reviewed-sha must
         # stay unbound — the sweep re-reviews the current head.
-        if: ${{ inputs.mode == 'review' && steps.outcome.outcome == 'success' && steps.outcome.outputs.decision != 'hold' && steps.outcome.outputs.decision != 'stale' && (steps.outcome.outputs.decision != 'arm' || (steps.arm.outcome == 'success' && steps.arm.outputs.arm_complete == 'true')) }}
+        # [issue #657] For the SELF-DECLARED class this marker means "every provider in the
+        # review set has reviewed this head", so it is bound only on the LAST side — the
+        # openai-side run (DUAL_REVIEW_PROVIDERS is ordered anthropic-then-openai, and the
+        # dispatcher emits the outstanding sides in that order). Binding it on the anthropic
+        # side would tell the sweep the head is fully reviewed while the cross-provider side has
+        # not run — i.e. exactly the single-provider review this issue exists to prevent.
+        if: ${{ inputs.mode == 'review' && steps.outcome.outcome == 'success' && steps.outcome.outputs.decision != 'hold' && steps.outcome.outputs.decision != 'stale' && (needs.resolve.outputs.trust_class != 'self-declared' || needs.resolve.outputs.review_provider == 'openai') && (steps.outcome.outputs.decision != 'arm' || (steps.arm.outcome == 'success' && steps.arm.outputs.arm_complete == 'true')) }}
         env:
           GH_TOKEN: ${{ steps.app-token-outcome.outputs.token }}
         run: |

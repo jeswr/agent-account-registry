@@ -894,6 +894,76 @@ def replace_reviewed_sha(body, sha):
     return body + "\n\n" + marker + "\n"
 
 
+# ---- [OPUS-5] issue #657: the PER-PROVIDER review marker ---------------------------------------------
+# `sparq-reviewed-sha` keeps its exact meaning ("this head is FULLY reviewed") and its exact
+# format — every existing consumer (the disarm net, groom, the fix lane, the dispatcher's
+# no-repeat guard) is untouched. This ADDITIVE second marker records WHICH review provider has
+# minted a verdict bound to a given head, which is what makes the SELF-DECLARED class's
+# dual-provider review converge: the review lane re-emits the PR until every provider in its
+# review set has reviewed the CURRENT head, then binds sparq-reviewed-sha once.
+# Mirrors dispatch-claim.py REVIEW_PROVIDER_MARKER_RE (keep the two formats in sync).
+REVIEW_PROVIDER_MARKER_RE = re.compile(
+    r"<!-- sparq-reviewed-provider:(anthropic|openai):([0-9a-f]{40}) -->")
+SELF_DECLARED_TRUST_CLASS = "self-declared"
+WORKER_RUN_TRUST_CLASS = "worker-run"
+DUAL_REVIEW_PROVIDERS = ("anthropic", "openai")
+ARM_GATING_REVIEW_PROVIDER = "openai"
+
+
+def reviewed_providers_of(body, head_sha):
+    """The providers with a review verdict bound to EXACTLY `head_sha`. A marker naming any
+    other sha is ignored: a head advance invalidates every side's review."""
+    if not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", head_sha):
+        return frozenset()
+    return frozenset(provider
+                     for provider, sha in REVIEW_PROVIDER_MARKER_RE.findall(body or "")
+                     if sha == head_sha)
+
+
+def add_reviewed_provider(body, provider, sha):
+    """Splice in this side's marker, replacing any PRIOR marker for the SAME provider (so a
+    re-review at a new head supersedes rather than accumulating) and leaving every other
+    provider's marker untouched. Idempotent."""
+    if provider not in DUAL_REVIEW_PROVIDERS:
+        raise WorkerPrError("reviewed-provider must be a registered review provider")
+    if not re.fullmatch(r"[0-9a-f]{40}", sha or ""):
+        raise WorkerPrError("reviewed-provider requires a 40-hex sha")
+    body = body or ""
+    marker = f"<!-- sparq-reviewed-provider:{provider}:{sha} -->"
+    if marker in body:
+        return body
+    same_provider = re.compile(
+        rf"<!-- sparq-reviewed-provider:{provider}:[0-9a-f]{{40}} -->")
+    if same_provider.search(body):
+        return same_provider.sub(marker, body, count=1)
+    return body + "\n\n" + marker + "\n"
+
+
+def self_declared_arm_refusal(trust_class, review_provider, body, head_sha):
+    """Return why a PR of `trust_class` may NOT be armed off THIS review run, or None.
+
+    For the worker-run class this is a no-op (its single cross-provider review is the gate, as
+    before). For the SELF-DECLARED class (issue #657) two conditions are required, both
+    fail-closed:
+    1. this run's review side is ARM_GATING_REVIEW_PROVIDER (openai). The orchestrator is an
+       anthropic harness BY CONSTRUCTION, so the openai-side review is the one that is genuinely
+       cross-provider for it. An anthropic-side pass ALONE never arms — it is corroborating.
+    2. every OTHER provider in the review set already has a verdict bound to this exact head.
+    Mirrors dispatch-claim.self_declared_arm_gate_error; the registry-side self-tests pin both."""
+    if trust_class != SELF_DECLARED_TRUST_CLASS:
+        return None
+    if review_provider != ARM_GATING_REVIEW_PROVIDER:
+        return (f"self-declared PRs arm only off the {ARM_GATING_REVIEW_PROVIDER}-side review "
+                f"(this run is {review_provider or 'unknown'}-side); refusing to arm")
+    done = reviewed_providers_of(body, head_sha)
+    missing = [provider for provider in DUAL_REVIEW_PROVIDERS
+               if provider != review_provider and provider not in done]
+    if missing:
+        return ("self-declared PR has no head-bound review from "
+                f"{', '.join(missing)}; refusing to arm on a single-provider review")
+    return None
+
+
 def security_flagged(labels, extra_keywords=()):
     """Security surfaces never auto-arm: substring keywords mirror routing match_labels; trust:* is
     a prefix namespace. `extra_keywords` (defect #3) lets the caller inject the TARGET routing's
@@ -2147,6 +2217,99 @@ def provenance_record(registry_repo, target_repo, pr_number, head_sha, impl_prov
         f"provenance {target_repo}#{pr_number}",
         volatile_fields=_PROVENANCE_VOLATILE_FIELDS)
     print(f"provenance {'recorded' if created else 'already recorded'} for {target_repo}#{pr_number}")
+
+
+_SELF_DECLARED_VOLATILE_FIELDS = frozenset({"recorded_at_run"})
+
+
+def self_declared_provenance_record(registry_repo, target_repo, pr_number, issue, run_key,
+                                    verify_author=None):
+    """Issue #657: ENROL a non-worker (orchestrator-authored) PR into the review lane under the
+    SELF-DECLARED trust class — a strictly LOWER class that buys exactly one capability, a
+    dual-provider review, and no autonomous same-provider repair.
+
+    The record deliberately carries NO implementer identity. That is the whole point: the agent
+    that wrote the diff holds the registry credential, so any provider it recorded would be a
+    self-declaration by the content author, and a self-declared `provider: openai` on
+    anthropic-authored content would route review to an anthropic model — the same provider,
+    silently defeating the cross-provider inversion. dispatch-claim.self_declared_admission_error
+    REFUSES a record carrying any implementer field, and review_provider_set's self-declared
+    branch consumes no record at all, so there is structurally nothing here to forge.
+
+    Everything the record DOES carry is either an identity the lane re-asserts against live data
+    (`pr_number`, `pr_author`, `head_sha_at_open`) or a link the lane needs to keep an existing
+    invariant working (`issue` — the source-issue needs:* human hold and the area:* package
+    derivation both read it; this class buys NO exemption from either).
+
+    Integrity: with `verify_author` the PR is re-read LIVE and must be an OPEN, same-repo (never
+    fork) PR authored by exactly that login, and the head sha is taken from the API. Enrolment is
+    an explicit, per-PR act by a registry-credential holder — there is no bulk/implicit path."""
+    if not (isinstance(pr_number, int) and not isinstance(pr_number, bool) and pr_number > 0):
+        raise WorkerPrError("self-declared provenance requires a positive integer --pr")
+    if not (isinstance(issue, int) and not isinstance(issue, bool) and issue > 0):
+        raise WorkerPrError("self-declared provenance requires a positive integer --issue")
+    if not verify_author or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*(?:\[bot\])?",
+                                             verify_author):
+        raise WorkerPrError("self-declared provenance requires a safe --verify-author login")
+    pull = _gh_json(["api", f"repos/{target_repo}/pulls/{pr_number}"])
+    if pull.get("state") != "open":
+        raise WorkerPrError("self-declared provenance target PR is not open")
+    author = str((pull.get("user") or {}).get("login", ""))
+    if author != verify_author:
+        raise WorkerPrError(
+            f"self-declared provenance target PR is authored by {author!r}, not {verify_author!r}")
+    head = pull.get("head") or {}
+    if (head.get("repo") or {}).get("full_name") != target_repo:
+        raise WorkerPrError("self-declared provenance target PR head is a fork")
+    head_sha = str(head.get("sha", ""))
+    if not re.fullmatch(r"[0-9a-f]{40}", head_sha):
+        raise WorkerPrError("self-declared provenance target PR head sha is malformed")
+    document = {
+        "pr_number": pr_number,
+        "trust_class": SELF_DECLARED_TRUST_CLASS,
+        "pr_author": author,
+        "head_sha_at_open": head_sha,
+        "issue": issue,
+        "recorded_at_run": run_key,
+    }
+    created = _registry_put_file(
+        registry_repo, provenance_path(target_repo, pr_number), document,
+        f"self-declared provenance {target_repo}#{pr_number}",
+        volatile_fields=_SELF_DECLARED_VOLATILE_FIELDS)
+    print(f"self-declared provenance {'recorded' if created else 'already recorded'} for "
+          f"{target_repo}#{pr_number} (dual-provider review; no implementer identity)")
+
+
+def set_reviewed_provider(repo, pr_number, provider, sha):
+    """Issue #657: bind THIS review side's per-provider marker into the PR body. Same
+    narrowed-window read/splice/PATCH/verify loop as set_reviewed_sha (see its docstring for the
+    residual REST-body TOCTOU, issue #294) and the same fail-closed deadline: it raises rather
+    than reporting a bind it could not confirm."""
+    if provider not in DUAL_REVIEW_PROVIDERS:
+        raise WorkerPrError("reviewed-provider must be a registered review provider")
+    deadline = _registry_now() + _REGISTRY_CAS_DEADLINE_S
+    attempts = 0
+    while True:
+        if attempts:
+            _registry_sleep_backoff(attempts)
+        base = _gh_json(["api", f"repos/{repo}/pulls/{pr_number}"]).get("body") or ""
+        target = add_reviewed_provider(base, provider, sha)
+        if target == base:
+            print(f"reviewed-provider already bound: {provider}@{sha[:12]}")
+            return
+        _gh_json(["api", "-X", "PATCH", f"repos/{repo}/pulls/{pr_number}", "--input", "-"],
+                 input_doc={"body": target})
+        live = _gh_json(["api", f"repos/{repo}/pulls/{pr_number}"]).get("body") or ""
+        if live == target:
+            print(f"reviewed-provider bound: {provider}@{sha[:12]}")
+            return
+        attempts += 1
+        if _registry_now() >= deadline:
+            raise WorkerPrError(
+                f"reviewed-provider bind for {repo}#{pr_number} could not be confirmed within "
+                f"the {_REGISTRY_CAS_DEADLINE_S:.0f}s deadline under concurrent PR-body edits; "
+                f"refusing to report a bind that may have overwritten another change "
+                f"(fail closed)")
 
 
 def verdict_envelope(target_repo, pr_number, round_n, reviewed_sha, document):
@@ -3543,7 +3706,8 @@ def _arm_auto_merge(repo, pr_number, reviewed_sha, attempts=ARM_ATTEMPTS, issue=
 
 def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, reviewer_provider,
                   reviewer_account, arm, issue=None, surface_paths=None, bot_login="",
-                  reviewed_base="", security_keywords=None):
+                  reviewed_base="", security_keywords=None,
+                  trust_class=WORKER_RUN_TRUST_CLASS, review_provider="", pr_author=""):
     """The ONLY place a PR can be armed. Fail-closed assertions per locked decision 6; a live-head
     mismatch returns the PR to review:needs (a fixer/other push raced the approval). [issue #139,
     round-4 P1] EVERY arm precondition — the hold surfaces (HUMAN_OWNED_LABELS on the PR, needs:*
@@ -3581,9 +3745,15 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
     issue labels vs the routing keywords), not just at resolve: a security label added mid
     review folds into the same audit trail (a True posture appends SECURITY_LABEL_AUDIT_HIT),
     so an auto-armed trust-plane change is audited whether it was flagged by path or by label."""
+    if trust_class not in {WORKER_RUN_TRUST_CLASS, SELF_DECLARED_TRUST_CLASS}:
+        raise WorkerPrError("refusing to arm: unknown provenance trust class")
     if reviewer_provider == impl_provider:
         raise WorkerPrError("refusing to arm: reviewer provider equals implementer provider")
     salt = os.environ.get("PROVENANCE_SALT", "")
+    # [issue #657] For the self-declared class impl_account_h is a non-hex sentinel (the
+    # implementer is not a pool account at all — it is the maintainer's own credential), so this
+    # comparison RUNS unchanged and holds trivially. Stated plainly rather than skipped: for that
+    # class the load-bearing control is the dual-provider review asserted below, not this line.
     if account_hash(reviewer_account, salt) == impl_account_h:
         raise WorkerPrError("refusing to arm: reviewer account equals implementer account")
     if not re.fullmatch(r"[0-9a-f]{40}", reviewed_sha):
@@ -3591,6 +3761,14 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
     live = _gh_json(["api", f"repos/{repo}/pulls/{pr_number}"])
     if live.get("state") != "open":
         raise WorkerPrError("pull request is no longer open")
+    # [issue #657] THE SELF-DECLARED ARM GATE, asserted on the LIVE body before any mutation:
+    # only the openai-side review may arm (it is the genuinely cross-provider one, because the
+    # orchestrator is an anthropic harness by construction), and only once the anthropic side
+    # already has a verdict bound to THIS exact head. An anthropic-side pass alone NEVER arms.
+    self_declared_refusal = self_declared_arm_refusal(
+        trust_class, review_provider, live.get("body") or "", reviewed_sha)
+    if self_declared_refusal:
+        raise WorkerPrError(f"refusing to arm: {self_declared_refusal}")
     # [issue #139] The entry read above is used ONLY for the cheap open-state gate and the
     # immutable base_ref of the SHA-bound trust-surface compare. EVERY arm precondition —
     # holds, head/state/author/draft, non-fork head, base ref — is (re-)validated below against
@@ -3644,7 +3822,12 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
     freshness = revalidate_outcome_head(
         fresh.get("state"), str((fresh.get("user") or {}).get("login", "")),
         fresh.get("draft"), str((fresh.get("head") or {}).get("sha", "")),
-        reviewed_sha, bot_login)
+        reviewed_sha, bot_login,
+        # [issue #657] For the self-declared class the author identity is re-asserted against
+        # the ENROLMENT-bound pr_author from the registry provenance record, and the draft check
+        # does not apply (there is no undraft step to protect); the head-equality gate — the one
+        # that stops a stale verdict labelling a new head — is identical for both classes.
+        trust_class=trust_class, pr_author=pr_author)
     if freshness == "head-moved":
         # Not an error: new commits landed between approve and arm; re-review binds the new head.
         set_review_state(repo, pr_number, "needs")
@@ -3690,7 +3873,13 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
         # SHA-bound and idempotent, so an arm failure + re-review re-audits the new head.
         _apply_trust_surface_audit(repo, pr_number, trust_hits, reviewed_sha,
                                    bot_login=bot_login)
-    _run_gh(["pr", "ready", str(pr_number), "-R", repo])
+    # [issue #657] The undraft (and, on failure, the draft RESTORE below) exists to protect the
+    # worker lane's DRAFT invariant. A self-declared PR is normally already non-draft, and
+    # drafting one that never was a draft on an arm failure would be an unrequested mutation of a
+    # human's PR — so both are keyed to the PR actually being a draft on the fresh pre-arm read.
+    was_draft = fresh.get("draft") is True
+    if was_draft:
+        _run_gh(["pr", "ready", str(pr_number), "-R", repo])
     arm_mode = ""
     if arm:
         # Atomic SHA-bound arm (sol r2): GitHub's own CAS — the mutation's expectedHeadOid
@@ -3710,7 +3899,10 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
         armed_ok, arm_mode, arm_error = _arm_auto_merge(repo, pr_number, reviewed_sha,
                                                         issue=issue)
         if not armed_ok:
-            undo = _run_gh(["pr", "ready", str(pr_number), "-R", repo, "--undo"], check=False)
+            # Restore the draft ONLY if this run took it out of draft (issue #657): a PR that
+            # was never a draft must not be drafted by a failed arm.
+            undo = (_run_gh(["pr", "ready", str(pr_number), "-R", repo, "--undo"], check=False)
+                    if was_draft else argparse.Namespace(returncode=0))
             if undo.returncode == 0:
                 if arm_mode == "human_hold":
                     # (sol r2 on #334) a park landed MID-ARM (during the retry backoff
@@ -3806,7 +3998,8 @@ def _apply_trust_surface_audit(repo, pr_number, hits, reviewed_sha, bot_login=""
 
 
 # ---- composite outcomes (thin workflow steps, testable decisions) --------------------------------
-def revalidate_outcome_head(state, login, draft, live_head, reviewed_sha, bot_login):
+def revalidate_outcome_head(state, login, draft, live_head, reviewed_sha, bot_login,
+                            trust_class=WORKER_RUN_TRUST_CLASS, pr_author=""):
     """Issue #156: gate EVERY review/fix outcome mutation on the live PR still being the exact
     reviewed commit — an OPEN, bot-authored, DRAFT PR whose head equals the sha the model ran
     against. Returns "ok", or a short stale reason ("closed"/"author"/"undrafted"/
@@ -3814,13 +4007,26 @@ def revalidate_outcome_head(state, login, draft, live_head, reviewed_sha, bot_lo
     findings never label a new head and a stale escalation never terminally parks a
     replacement head. Exact-head equality is STRICTER than the issue's ancestry requirement
     and subsumes it: a descendant head still means unreviewed commits are live. Pure and
-    fail-closed — an unreadable/unexpected shape yields a stale reason, never "ok"."""
+    fail-closed — an unreadable/unexpected shape yields a stale reason, never "ok".
+
+    [issue #657] A SELF-DECLARED PR is not a worker draft: it is authored by a human/orchestrator
+    login and is normally already non-draft. Those two identity checks are therefore
+    RE-TARGETED for that class, never dropped — the author must equal the `pr_author` the
+    registry provenance record bound at ENROLMENT time (a value written by a registry-credential
+    holder, re-asserted here against the live PR, so a retargeted or transferred PR still fails
+    closed), and the draft check does not apply because there is no undraft step to protect. The
+    head-equality gate — the one that actually stops a stale verdict labelling a new head — is
+    IDENTICAL for both classes."""
     if state != "open":
         return "closed"
-    if bot_login and login != bot_login:
-        return "author"
-    if draft is not True:
-        return "undrafted"
+    if trust_class == SELF_DECLARED_TRUST_CLASS:
+        if not pr_author or login != pr_author:
+            return "author"
+    else:
+        if bot_login and login != bot_login:
+            return "author"
+        if draft is not True:
+            return "undrafted"
     if not re.fullmatch(r"[0-9a-f]{40}", live_head or ""):
         return "malformed-head"
     if not re.fullmatch(r"[0-9a-f]{40}", reviewed_sha or ""):
@@ -3869,7 +4075,12 @@ def review_outcome(args):
     freshness = revalidate_outcome_head(
         live.get("state"), str((live.get("user") or {}).get("login", "")),
         live.get("draft"), str((live.get("head") or {}).get("sha", "")),
-        args.reviewed_sha, args.bot_login)
+        args.reviewed_sha, args.bot_login,
+        # [issue #657] class-aware identity gate (see revalidate_outcome_head): a self-declared
+        # PR is not a worker draft, so the author check re-targets to the enrolment-bound
+        # pr_author and the draft check does not apply. Head equality is unchanged.
+        trust_class=getattr(args, "trust_class", None) or WORKER_RUN_TRUST_CLASS,
+        pr_author=getattr(args, "pr_author", "") or "")
     if freshness != "ok":
         # Issue #162: legitimate head churn (the reviewed head advanced during the review) is
         # NOT a substantive round — void its pre-model round marker for THIS (round, run) so a
@@ -6775,6 +6986,75 @@ def _self_test():
           revalidate_outcome_head("open", "sparq[bot]", True, "", "a" * 40, "sparq[bot]"),
           "malformed-head")
 
+    # ---- [OPUS-5] issue #657: the SELF-DECLARED trust class (worker-pr side) --------------------------
+    sha_x, sha_y = "a" * 40, "b" * 40
+    anth = f"<!-- sparq-reviewed-provider:anthropic:{sha_x} -->"
+    oai = f"<!-- sparq-reviewed-provider:openai:{sha_x} -->"
+    # The per-provider marker counts ONLY at the exact head it names — a head advance re-opens
+    # every side, so a review of superseded content is never carried forward.
+    check("reviewed-provider markers are read per head",
+          sorted(reviewed_providers_of(anth + oai, sha_x)), ["anthropic", "openai"])
+    check("reviewed-provider markers do not survive a head advance",
+          sorted(reviewed_providers_of(anth + oai, sha_y)), [])
+    check("reviewed-provider marker splice is idempotent",
+          add_reviewed_provider(f"body\n\n{anth}\n", "anthropic", sha_x),
+          f"body\n\n{anth}\n")
+    # A re-review at a NEW head supersedes that provider's marker and leaves the other side's
+    # marker alone (so the two sides never silently accumulate stale passes).
+    check("reviewed-provider marker supersedes the same side, keeps the other",
+          sorted(reviewed_providers_of(add_reviewed_provider(anth + oai, "anthropic", sha_y),
+                                       sha_x)), ["openai"])
+    check("reviewed-provider marker for a new head is recorded",
+          sorted(reviewed_providers_of(add_reviewed_provider(anth + oai, "anthropic", sha_y),
+                                       sha_y)), ["anthropic"])
+    for bad in ("mallory", "", "ANTHROPIC"):
+        try:
+            add_reviewed_provider("", bad, sha_x)
+            raise AssertionError(f"add_reviewed_provider admitted {bad!r}")
+        except WorkerPrError:
+            pass
+    # THE ARM GATE. An anthropic-side pass ALONE never arms; the openai side arms only when the
+    # anthropic side already has a verdict bound to the SAME head. The worker-run class is
+    # untouched (its single cross-provider review remains the gate).
+    check("worker-run arming is unaffected by the self-declared gate",
+          self_declared_arm_refusal(WORKER_RUN_TRUST_CLASS, "", "", sha_x), None)
+    check("an anthropic-side self-declared review never arms",
+          bool(self_declared_arm_refusal(SELF_DECLARED_TRUST_CLASS, "anthropic",
+                                         anth + oai, sha_x)), True)
+    check("an openai-side self-declared review without the anthropic side never arms",
+          bool(self_declared_arm_refusal(SELF_DECLARED_TRUST_CLASS, "openai", "", sha_x)), True)
+    check("an openai-side self-declared review with a STALE anthropic side never arms",
+          bool(self_declared_arm_refusal(
+              SELF_DECLARED_TRUST_CLASS, "openai",
+              f"<!-- sparq-reviewed-provider:anthropic:{sha_y} -->", sha_x)), True)
+    check("an openai-side self-declared review with a head-bound anthropic side arms",
+          self_declared_arm_refusal(SELF_DECLARED_TRUST_CLASS, "openai", anth, sha_x), None)
+    check("an unknown review side never arms a self-declared PR",
+          bool(self_declared_arm_refusal(SELF_DECLARED_TRUST_CLASS, "", anth, sha_x)), True)
+    # The outcome-freshness gate is RE-TARGETED for the weaker class, never dropped: the author
+    # must equal the enrolment-bound pr_author, the draft check does not apply, and the
+    # head-equality gate — the one that stops a stale verdict labelling a new head — is identical.
+    check("self-declared: a non-draft human-authored PR is a valid outcome target",
+          revalidate_outcome_head("open", "jeswr", False, sha_x, sha_x, "sparq[bot]",
+                                  trust_class=SELF_DECLARED_TRUST_CLASS, pr_author="jeswr"),
+          "ok")
+    check("self-declared: a foreign author is still refused",
+          revalidate_outcome_head("open", "mallory", False, sha_x, sha_x, "sparq[bot]",
+                                  trust_class=SELF_DECLARED_TRUST_CLASS, pr_author="jeswr"),
+          "author")
+    check("self-declared: an UNBOUND pr_author is refused (never defaults to any author)",
+          revalidate_outcome_head("open", "jeswr", False, sha_x, sha_x, "sparq[bot]",
+                                  trust_class=SELF_DECLARED_TRUST_CLASS, pr_author=""),
+          "author")
+    check("self-declared: a moved head is still refused",
+          revalidate_outcome_head("open", "jeswr", False, sha_y, sha_x, "sparq[bot]",
+                                  trust_class=SELF_DECLARED_TRUST_CLASS, pr_author="jeswr"),
+          "head-moved")
+    check("self-declared: a closed PR is still refused",
+          revalidate_outcome_head("closed", "jeswr", False, sha_x, sha_x, "sparq[bot]",
+                                  trust_class=SELF_DECLARED_TRUST_CLASS, pr_author="jeswr"),
+          "closed")
+
     # stage_verdict_for_fix: unwrap ONLY when the envelope binds the record to the live head
     # AND names exactly this dispatch's repo/PR/round; a moved head, a legacy unbound record,
     # or a matching-sha record for the wrong repo/PR/round refuses to stage (staged=false).
@@ -7431,6 +7711,8 @@ def _self_test():
         labels_payload = raa_state.get("labels_payload")
         return {"state": raa_state.get("state", "open"), "node_id": "PR_kwTESTNODE",
                 "draft": raa_state.get("draft", True),
+                # [issue #657] the arm reads the LIVE body for the per-provider review markers
+                "body": raa_state.get("body", ""),
                 "user": {"login": raa_state.get("author", "sparq[bot]")},
                 "labels": (labels_payload if labels_payload is not None
                            else [{"name": name} for name in raa_state.get("labels", ())]),
@@ -7465,7 +7747,9 @@ def _self_test():
                 issue_labels=(), issue=None, probe_garbage=False, labels_payload=None,
                 benign_diff=False, security_keywords=(), merge_script=None,
                 hold_after_fail=None, draft=True, author="sparq[bot]", head_repo="o/r",
-                state="open", late_after_read=None):
+                state="open", late_after_read=None,
+                trust_class=WORKER_RUN_TRUST_CLASS, review_provider="", pr_author="",
+                body=""):
         raa_calls.clear(); raa_outputs.clear()
         sha = "b" * 40
         raa_state.update(head=(sha if head_ok else "c" * 40), merge_fails=merge_fails,
@@ -7474,7 +7758,7 @@ def _self_test():
                          benign_diff=benign_diff, merge_script=merge_script,
                          hold_after_fail=hold_after_fail, draft=draft, author=author,
                          head_repo=head_repo, state=state, late_after_read=late_after_read,
-                         pr_reads=0)
+                         body=body, pr_reads=0)
         globals()["_gh_json"] = raa_gh_json
         globals()["_run_gh"] = raa_run_gh
         globals()["_pr_changed_files"] = lambda repo, pr: ["scripts/worker-pr.py"]
@@ -7483,10 +7767,22 @@ def _self_test():
         globals()["needs_user"] = lambda repo, pr, reason, **kw: raa_calls.append("needs-user")
         globals()["_arm_sleep_backoff"] = lambda attempt: raa_calls.append(f"sleep:{attempt}")
         globals()["_write_outputs"] = raa_outputs.update
-        ready_and_arm("o/r", 41, sha, "anthropic", "ab" * 8, "openai", "acctX", True,
+        ready_and_arm("o/r", 41, sha,
+                      "anthropic" if trust_class == WORKER_RUN_TRUST_CLASS
+                      else _self_declared_impl(review_provider),
+                      "ab" * 8 if trust_class == WORKER_RUN_TRUST_CLASS else "self-declared",
+                      "openai" if trust_class == WORKER_RUN_TRUST_CLASS
+                      else review_provider, "acctX", True,
                       issue=issue, bot_login="sparq[bot]",
                       reviewed_base=raa_state.get("reviewed_base", "main"),
-                      security_keywords=security_keywords or None)
+                      security_keywords=security_keywords or None,
+                      trust_class=trust_class, review_provider=review_provider,
+                      pr_author=pr_author)
+
+    def _self_declared_impl(review_provider):
+        """The lane-assigned pseudo-implementer: the INVERSE of the review side (exactly what
+        review-fix.yml's resolve step computes)."""
+        return {"anthropic": "openai", "openai": "anthropic"}[review_provider]
 
     # (sol r4 on #334) mutation-NAME matching, not flag matching: the latch argv is
     # recognised by the literal GraphQL mutation name, and "merge-capable" argv is the
@@ -7541,6 +7837,68 @@ def _self_test():
               any(TRUST_AUDIT_MARKER_PREFIX + sha in c for c in raa_calls), True)
         check("the audit snapshot is SHA-bound (compare at reviewed sha, not the PR endpoint)",
               raa_outputs.get("trust_surface"), True)
+
+        # ---- [OPUS-5] #657: ready_and_arm ENFORCES the self-declared dual-review arm gate -------
+        # The pure predicate (self_declared_arm_refusal) is unit-tested above; THIS pins that
+        # ready_and_arm actually calls it and REFUSES — the guard is otherwise vacuous, which a
+        # mutation run caught (deleting the raise passed every other test in this file).
+        def _arm_refusal(trust_class=SELF_DECLARED_TRUST_CLASS, **kwargs):
+            try:
+                run_raa(trust_class=trust_class, pr_author="jeswr", draft=False,
+                        author="jeswr", **kwargs)
+            except WorkerPrError as exc:
+                return str(exc)
+            return ""
+
+        anth_at_head = f"<!-- sparq-reviewed-provider:anthropic:{sha} -->"
+        oai_at_head = f"<!-- sparq-reviewed-provider:openai:{sha} -->"
+        check("ready_and_arm REFUSES to arm a self-declared PR off the anthropic-side review",
+              ARM_GATING_REVIEW_PROVIDER in _arm_refusal(review_provider="anthropic",
+                                                         body=anth_at_head + oai_at_head),
+              True)
+        check("ready_and_arm REFUSES the openai side while the anthropic side has no verdict",
+              "anthropic" in _arm_refusal(review_provider="openai", body=""), True)
+        check("ready_and_arm REFUSES the openai side when the anthropic verdict is on ANOTHER head",
+              "anthropic" in _arm_refusal(
+                  review_provider="openai",
+                  body=f"<!-- sparq-reviewed-provider:anthropic:{'d' * 40} -->"), True)
+        check("ready_and_arm ADMITS the openai side once the anthropic side reviewed this head",
+              _arm_refusal(review_provider="openai", body=anth_at_head), "")
+        check("...and that admitted self-declared arm really latched auto-merge",
+              any(LATCH_MUTATION in c for c in raa_calls), True)
+        check("ready_and_arm refuses an unknown trust class outright",
+              "unknown provenance trust class" in _arm_refusal(review_provider="openai",
+                                                               trust_class="worker"),
+              True)
+        # A non-draft PR is never undrafted, and — the part that actually matters — a FAILED arm
+        # never DRAFTS a PR that was not a draft (that would be an unrequested mutation of a
+        # human's PR, and it would hide the PR from every reviewer).
+        _arm_refusal(review_provider="openai", body=anth_at_head)
+        check("a self-declared (non-draft) arm issues no undraft",
+              any(c.startswith("pr ready") and "--undo" not in c for c in raa_calls), False)
+        try:
+            run_raa(trust_class=SELF_DECLARED_TRUST_CLASS, review_provider="openai",
+                    pr_author="jeswr", draft=False, author="jeswr", body=anth_at_head,
+                    merge_script=[(1, "boom"), (1, "boom"), (1, "boom"), (1, "boom"),
+                                  (1, "boom"), (1, "boom"), (1, "boom"), (1, "boom")])
+        except WorkerPrError:
+            pass
+        check("a FAILED self-declared arm never drafts a PR that was not a draft",
+              any("--undo" in c for c in raa_calls), False)
+        # The worker-run class is UNAFFECTED by all of the above (its single cross-provider
+        # review remains the gate, and its failed arm still restores the draft): re-run the
+        # baseline and confirm it still arms.
+        run_raa()
+        check("worker-run arming is unchanged by the self-declared gate",
+              any(LATCH_MUTATION in c for c in raa_calls), True)
+        check("worker-run arming still undrafts the PR",
+              any(c.startswith("pr ready") and "--undo" not in c for c in raa_calls), True)
+        try:
+            run_raa(merge_script=[(1, "boom")] * 8)
+        except WorkerPrError:
+            pass
+        check("a FAILED worker-run arm still restores the draft",
+              any("--undo" in c for c in raa_calls), True)
         # _files_at_sha unit facets (sol r4): renames carry both names; the 300-cap and
         # malformed rows fail closed to the assumed-trust sentinel.
         real_files_gh = globals()["_gh_json"]
@@ -8081,6 +8439,14 @@ def main():
     shap.add_argument("action", choices=("get", "set"))
     shap.add_argument("--sha")
 
+    # [issue #657] The ADDITIVE per-provider review marker. `sparq-reviewed-sha` keeps its exact
+    # meaning ("this head is FULLY reviewed") and is bound only once every side has reported;
+    # this records WHICH side has reported, which is what makes the dual-provider review set
+    # converge instead of re-dispatching the same side forever.
+    rprov = subparsers.add_parser("reviewed-provider", parents=[common])
+    rprov.add_argument("--provider", choices=DUAL_REVIEW_PROVIDERS, required=True)
+    rprov.add_argument("--sha", required=True)
+
     vval = subparsers.add_parser("validate-verdict")
     vval.add_argument("--verdict-file", required=True)
     vval.add_argument("--files-file", required=True)
@@ -8106,6 +8472,20 @@ def main():
     prov.add_argument("--issue", required=True, type=int)
     prov.add_argument("--run-key", required=True)
     prov.add_argument("--verify-bot-login", default="")
+
+    # [issue #657] ENROL a non-worker (orchestrator-authored) PR into the review lane under the
+    # SELF-DECLARED trust class. Deliberately takes NO implementer provider/alias/account: the
+    # agent that wrote the diff holds the registry credential, so any provider it recorded would
+    # be a self-declaration by the content author. The lane reviews such a PR with BOTH providers
+    # instead, so no declaration is load-bearing. Enrolment is an explicit per-PR act.
+    sdprov = subparsers.add_parser("self-declared-provenance")
+    sdprov.add_argument("--registry-repo", required=True)
+    sdprov.add_argument("--target-repo", required=True)
+    sdprov.add_argument("--pr", required=True, type=int)
+    sdprov.add_argument("--issue", required=True, type=int)
+    sdprov.add_argument("--run-key", required=True)
+    sdprov.add_argument("--verify-author", required=True,
+                        help="the login that MUST author the live PR (fail closed)")
 
     # Publisher-independent recovery (issue #128): resolve the PR from the deterministic head branch
     # and record provenance even when the publish job's pr_number output was lost after `gh pr
@@ -8208,6 +8588,17 @@ def main():
     # against these so a security label added DURING review still lands in the audit trail.
     arm.add_argument("--security-keyword", action="append", default=[],
                      help="security label keyword (repeatable; from the target routing match_labels)")
+    # [issue #657] The provenance trust class and, for the self-declared class, WHICH review side
+    # this run is. Both are re-derived by review-fix.yml's resolve step from the live PR + the
+    # registry record; they are never adopted from the dispatch input. The arm refuses unless the
+    # side is the openai one AND the anthropic side already reviewed this exact head.
+    arm.add_argument("--trust-class", choices=(WORKER_RUN_TRUST_CLASS,
+                                               SELF_DECLARED_TRUST_CLASS),
+                     default=WORKER_RUN_TRUST_CLASS)
+    arm.add_argument("--review-provider", default="",
+                     help="the provider that performed THIS review (self-declared class)")
+    arm.add_argument("--pr-author", default="",
+                     help="the enrolment-bound PR author (self-declared class identity gate)")
 
     rout = subparsers.add_parser("review-outcome", parents=[common])
     rout.add_argument("--verdict-file", required=True)
@@ -8231,6 +8622,13 @@ def main():
     rout.add_argument("--reviewed-sha", required=True,
                       help="the commit the review ran against; the outcome defers if the live "
                            "head has moved off it (issue #156)")
+    # [issue #657] class-aware identity gate for the outcome mutation (self-declared PRs are not
+    # worker drafts: the author check re-targets to the enrolment-bound pr_author and the draft
+    # check does not apply; head equality is unchanged).
+    rout.add_argument("--trust-class", choices=(WORKER_RUN_TRUST_CLASS,
+                                                SELF_DECLARED_TRUST_CLASS),
+                      default=WORKER_RUN_TRUST_CLASS)
+    rout.add_argument("--pr-author", default="")
 
     fout = subparsers.add_parser("fix-outcome", parents=[common])
     fout.add_argument("--round", required=True, type=int)
@@ -8286,6 +8684,12 @@ def main():
                 set_reviewed_sha(args.repo, args.pr, args.sha)
             else:
                 get_reviewed_sha(args.repo, args.pr)
+        elif args.command == "reviewed-provider":
+            set_reviewed_provider(args.repo, args.pr, args.provider, args.sha)
+        elif args.command == "self-declared-provenance":
+            self_declared_provenance_record(args.registry_repo, args.target_repo, args.pr,
+                                            args.issue, args.run_key,
+                                            verify_author=args.verify_author)
         elif args.command == "validate-verdict":
             diff_files = Path(args.files_file).read_text(encoding="utf-8").splitlines()
             with open(args.verdict_file, encoding="utf-8") as handle:
@@ -8335,7 +8739,10 @@ def main():
                           args.arm == "true", issue=args.issue,
                           surface_paths=args.surface_path or None,
                           bot_login=args.bot_login, reviewed_base=args.reviewed_base,
-                          security_keywords=args.security_keyword or None)
+                          security_keywords=args.security_keyword or None,
+                          trust_class=args.trust_class,
+                          review_provider=args.review_provider,
+                          pr_author=args.pr_author)
         elif args.command == "review-outcome":
             review_outcome(args)
         elif args.command == "fix-outcome":

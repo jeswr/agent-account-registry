@@ -43,7 +43,12 @@ import tomllib
 # (`snapshot_skips`) so one oversized PR's check-run listing defers THAT PR instead of
 # killing the whole sweep. CLAIM only COUNTS these into the dispatch-summary histogram —
 # a hostile plan can at worst inflate accounting noise, never trigger an act.
-SCHEMA = "registry-dispatch-plan/v4"
+# v4 -> v5 (issue #657): every review item carries its provenance `trust_class` and the
+# `review_provider` side the item is for. Required because the self-declared class dispatches
+# TWO reviews for one PR — one per provider — so "which side is this run" is no longer derivable
+# from the item's impl_provider alone, and because CLAIM must re-derive the class live rather
+# than infer it.
+SCHEMA = "registry-dispatch-plan/v5"
 PLAN_FIELDS = {"schema", "generated_at", "repositories", "review_items", "disarm_items",
                "snapshot_skips"}
 REPOSITORY_FIELDS = {"target_repo", "target_sha", "items"}
@@ -65,6 +70,8 @@ REVIEW_ITEM_FIELDS = {
     "head_sha",
     "state",
     "impl_provider",
+    "trust_class",
+    "review_provider",
     "repo",
     "package",
     "security",
@@ -188,6 +195,50 @@ PARKED_PR_HOLD_LABELS = HUMAN_HOLD_PR_LABELS | {MACHINE_PARK_PR_LABEL}
 # admission globally.
 CLAIM_REVALIDATION_PARK_LABELS = PARKED_PR_HOLD_LABELS | {"status:blocked"}
 IMPL_PROVIDERS = {"anthropic", "openai"}
+# ---- [OPUS-5] issue #657: the SELF-DECLARED (strictly LOWER) provenance trust class -------------------
+# A WORKER PR's implementer identity is not forgeable by the model that wrote the content, and
+# that holds STRUCTURALLY, not by promise: the model runs in a container with no registry write
+# access, so the HOST writes the provenance record. An ORCHESTRATOR-authored PR has no worker run
+# and no lease, and the agent that wrote the diff HOLDS the registry credential — so the property
+# cannot be restored by recording harder (the thing that would write the record is the thing that
+# wrote the diff), and deriving the provider from the authenticated opener does not restore it
+# either (that says who PUSHED, not which model WROTE). Both options in issue #657's body were
+# withdrawn for exactly that reason.
+#
+# The approved design (issue #657 design comment, maintainer-approved 2026-07-25) therefore does
+# not try to obtain an unforgeable declaration. It puts such a PR in a strictly LOWER trust class
+# and reviews it with BOTH providers, so the cross-provider inversion holds UNCONDITIONALLY with
+# NO trusted input: whatever the true author, at least one of the two reviews is genuinely
+# cross-provider, and no declaration is load-bearing anywhere on the path.
+#
+# This is an ADDITIONAL, explicitly weaker class — never a relaxation of the worker-run path.
+# provenance_admission_error() and everything that calls it are untouched.
+WORKER_RUN_TRUST_CLASS = "worker-run"
+SELF_DECLARED_TRUST_CLASS = "self-declared"
+PROVENANCE_TRUST_CLASSES = (WORKER_RUN_TRUST_CLASS, SELF_DECLARED_TRUST_CLASS)
+# ORDERED, and the order is load-bearing: the anthropic-side review runs FIRST so that by the
+# time the openai-side review — the ARM-GATING one — resolves, the other side's verdict is
+# already bound to the same head. Never a set: the sequence is part of the contract.
+DUAL_REVIEW_PROVIDERS = ("anthropic", "openai")
+# The arm-gating side. The orchestrator is an ANTHROPIC harness BY CONSTRUCTION, so the
+# openai-side review is the one that is genuinely cross-provider for it; an anthropic-side pass
+# alone NEVER arms (it is corroborating only).
+ARM_GATING_REVIEW_PROVIDER = "openai"
+# Cross-provider inversion as a TABLE rather than an `if`: review is always by the other side.
+REVIEW_OPPOSITE = {"anthropic": "openai", "openai": "anthropic"}
+# A self-declared record may NOT carry an implementer-identity field. Two load-bearing reasons:
+# (1) such a field would be a self-declaration by the credential-holding author — precisely the
+# forgeable input this class exists in order NOT to have; (2) its presence means the record was
+# minted as (or edited toward) the STRONG class, which is a class confusion, not a nuance. So it
+# is REFUSED outright rather than silently ignored — fail closed, never default.
+SELF_DECLARED_FORBIDDEN_FIELDS = ("impl_provider", "impl_alias", "impl_account_h")
+# Sentinel implementer account hash for the self-declared class. worker_pr.account_hash() returns
+# 16 lowercase hex, so this literal can NEVER equal a live reviewer hash. That is the honest
+# statement of the fact, not a bypass: the implementer of a self-declared PR is not a pool account
+# at all (it is the maintainer's own credential), so reviewer != implementer holds trivially on
+# the ACCOUNT axis, and the load-bearing control for this class is the dual-provider review —
+# NOT this comparison. The comparison still RUNS, unchanged, on the same code path.
+SELF_DECLARED_IMPL_ACCOUNT_H = "self-declared"
 SAFE_REPO = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*")
 SAFE_ATOM = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 SAFE_PACKAGE = re.compile(r"(?:[A-Za-z0-9][A-Za-z0-9_.-]*|__global__)")
@@ -290,6 +341,15 @@ _UNPROBED = object()
 HEAD_REF_RE = re.compile(r"^sparq-agent/issue-([1-9][0-9]*)-")
 # Mirrors worker-pr.py REVIEWED_SHA_RE (the marker is written there; keep formats in sync).
 REVIEWED_SHA_RE = re.compile(r"<!-- sparq-reviewed-sha:([0-9a-f]{40}|none) -->")
+# Issue #657 per-provider review marker, written by review-fix.yml's outcome job via
+# worker-pr.py `reviewed-provider set`. ADDITIVE: `sparq-reviewed-sha` keeps its exact meaning
+# and its exact format, so every existing consumer (the disarm net, groom, the fix lane) is
+# untouched. This second marker records WHICH review provider has already minted a verdict
+# bound to a given head, which is what makes the dual-provider review set convergent — the
+# review lane keeps re-emitting the PR until every provider in its review set has reviewed the
+# CURRENT head. Mirrors worker-pr.py REVIEW_PROVIDER_MARKER_RE (keep formats in sync).
+REVIEW_PROVIDER_MARKER_RE = re.compile(
+    r"<!-- sparq-reviewed-provider:(anthropic|openai):([0-9a-f]{40}) -->")
 SECURITY_KEYWORDS = ("zk", "mpc", "crypto", "auth", "e2ee")
 # The authoritative aggregator check-run on the target (sparq's `ci-summary / gate` job): only a
 # CONCLUDED failure of THIS check on the CURRENT head enumerates a ci-fix; in-progress = no churn.
@@ -471,6 +531,27 @@ def validate_plan(document):
         impl_provider = item["impl_provider"]
         if not isinstance(impl_provider, str) or impl_provider not in IMPL_PROVIDERS:
             raise DispatchError(f"{where} impl_provider is invalid")
+        # [issue #657] The plan artifact is HOSTILE DATA to CLAIM. Both new fields are validated
+        # to a closed set here, and their MUTUAL CONSISTENCY is asserted too: `review_provider`
+        # must be exactly the inverse of `impl_provider`. A forged plan therefore cannot name a
+        # review side that is the SAME provider as the (pseudo-)implementer — the claim layer's
+        # own `reviewer provider == implementer provider` refusal would catch a live claim, but
+        # this refuses the plan before an account is ever burned.
+        trust_class = item["trust_class"]
+        if not isinstance(trust_class, str) or trust_class not in PROVENANCE_TRUST_CLASSES:
+            raise DispatchError(f"{where} trust_class is invalid")
+        review_provider = item["review_provider"]
+        if not isinstance(review_provider, str) or review_provider not in IMPL_PROVIDERS:
+            raise DispatchError(f"{where} review_provider is invalid")
+        if review_provider != REVIEW_OPPOSITE[impl_provider]:
+            raise DispatchError(
+                f"{where} review_provider is not the inverse of impl_provider")
+        # A self-declared item is REVIEW-ONLY: this class has no trusted implementer, so no
+        # same-provider fix/repair state may ever ride it (enumerate_review_items refuses to
+        # emit one; this refuses a forged plan that asserts one).
+        if trust_class == SELF_DECLARED_TRUST_CLASS and state != "needs-review":
+            raise DispatchError(
+                f"{where} self-declared trust class admits only the needs-review state")
         repo = _safe_string(item["repo"], SAFE_REPO, f"{where} repo")
         if repo not in seen_repositories:
             raise DispatchError(f"{where} repo is not a planned repository")
@@ -1334,6 +1415,184 @@ def is_enumerable_provenance(record, pr_number):
     return provenance_admission_error(record, pr_number) is None
 
 
+# ---- [OPUS-5] issue #657: self-declared provenance, trust classification, review SET ----------
+
+def self_declared_admission_error(record, pr_number):
+    """Return why a PARSED SELF-DECLARED provenance record for target PR ``pr_number`` is NOT
+    admissible, or None when it passes every field requirement of the weaker class.
+
+    Deliberately a SEPARATE function from provenance_admission_error, not a relaxed mode of it:
+    the two classes admit disjoint record shapes, and a shared function with an `if` is exactly
+    how a "relaxation" of the strong path gets introduced by accident later.
+
+    Required: dict shape, `trust_class` EXACTLY "self-declared" (an absent trust_class is a
+    worker-run record and is refused here), strict-int `pr_number` identity (float/bool excluded
+    — 41.0 == 41 and True == 1 under Python equality), a safe `pr_author` login (re-asserted
+    against the LIVE PR author downstream, so a record cannot be retargeted at a third party's
+    PR), a positive-int `issue` (the source-issue needs:* human hold and the area:* package
+    derivation both read it — this class buys NO exemption from either), and a well-formed
+    40-hex `head_sha_at_open` (the ancestry check).
+
+    FORBIDDEN: every implementer-identity field (SELF_DECLARED_FORBIDDEN_FIELDS). A record that
+    carries one was minted as, or edited toward, the STRONG class; that is class confusion and it
+    is refused outright. This is what makes "nothing in the resolution path reads a declared
+    provider" checkable rather than aspirational."""
+    if not isinstance(record, dict):
+        return "no self-declared provenance record (fail closed)"
+    if record.get("trust_class") != SELF_DECLARED_TRUST_CLASS:
+        return "provenance record is not of the self-declared trust class"
+    number = record.get("pr_number")
+    if not isinstance(number, int) or isinstance(number, bool) or number != pr_number:
+        return "self-declared provenance record does not match this PR"
+    for field in SELF_DECLARED_FORBIDDEN_FIELDS:
+        if field in record:
+            return (f"self-declared provenance record carries the implementer field {field!r}; "
+                    "the self-declared class has no trusted implementer identity (refusing)")
+    author = record.get("pr_author")
+    if not isinstance(author, str) or not SAFE_LOGIN.fullmatch(author):
+        return "self-declared provenance record has no safe pr_author"
+    issue = record.get("issue")
+    if not isinstance(issue, int) or isinstance(issue, bool) or issue <= 0:
+        return "self-declared provenance issue number is invalid"
+    opened_sha = record.get("head_sha_at_open")
+    if not isinstance(opened_sha, str) or not SAFE_SHA.fullmatch(opened_sha):
+        return "self-declared provenance head sha is malformed"
+    return None
+
+
+def provenance_trust_class(record, pr_number, head_ref, author_login, bot_login=""):
+    """Return ``(trust_class, error)`` for target PR ``pr_number``: exactly one of
+    (WORKER_RUN_TRUST_CLASS, None), (SELF_DECLARED_TRUST_CLASS, None), or (None, "<reason>").
+
+    THE CLASS IS DERIVED FROM PROPERTIES THE RECORD CANNOT ASSERT — the PR's head ref and its
+    author — never from a field inside the record. A record that claims to be worker-run cannot
+    obtain the strong class for a PR whose head ref is not a worker branch (the ref embeds the
+    worker RUN ID and only the worker publishes it) and whose author is not the App bot; a record
+    that claims to be self-declared cannot demote a genuine worker PR into the weaker,
+    dual-reviewed class either. Both directions are refusals, so the classification itself is not
+    a forgeable input.
+
+    A PR with NO admissible record of EITHER class is REFUSED, never defaulted."""
+    worker_shaped = (bool(HEAD_REF_RE.match(head_ref or ""))
+                     and isinstance(author_login, str) and author_login.endswith("[bot]")
+                     and (not bot_login or author_login == bot_login))
+    if worker_shaped:
+        error = provenance_admission_error(record, pr_number)
+        if error:
+            return None, error
+        declared = record.get("trust_class")
+        if declared is not None and declared != WORKER_RUN_TRUST_CLASS:
+            return None, ("worker PR carries a non-worker provenance trust class "
+                          "(class confusion; refusing)")
+        return WORKER_RUN_TRUST_CLASS, None
+    error = self_declared_admission_error(record, pr_number)
+    if error:
+        return None, error
+    return SELF_DECLARED_TRUST_CLASS, None
+
+
+def review_provider_set(trust_class, worker_impl_provider=None):
+    """The COMPLETE, ORDERED set of providers that must EACH mint a review verdict for a PR of
+    this trust class. This is THE cross-provider inversion, in one place.
+
+    - WORKER_RUN: exactly one review, by the provider OPPOSITE the provenance-bound implementer.
+      Unchanged behaviour; ``worker_impl_provider`` must be a registered provider.
+    - SELF_DECLARED: BOTH providers. Note the shape of this branch — it consumes NO record and
+      NO provider argument whatsoever. There is structurally nothing here for a declaration to
+      influence, which is why a forged `provider` in a self-declared record cannot reduce the
+      review set to a single same-provider review. (self_declared_admission_error additionally
+      REFUSES a record that carries an implementer field at all, so the forgery is normally
+      rejected before it ever reaches this function; this branch is the second, structural
+      backstop for any implementer field the forbidden list does not name.)
+    - anything else: REFUSED. A PR with no provenance of either class never resolves a review
+      set, so it can never be reviewed and can never be armed.
+
+    Raises DispatchError on refusal — callers must not be able to receive an empty set and read
+    it as "nothing to review"."""
+    if trust_class == WORKER_RUN_TRUST_CLASS:
+        if (not isinstance(worker_impl_provider, str)
+                or worker_impl_provider not in IMPL_PROVIDERS):
+            raise DispatchError(
+                "worker-run review set requires a registered implementer provider")
+        return (REVIEW_OPPOSITE[worker_impl_provider],)
+    if trust_class == SELF_DECLARED_TRUST_CLASS:
+        return DUAL_REVIEW_PROVIDERS
+    raise DispatchError(
+        "no admissible provenance trust class; refusing to resolve a review set")
+
+
+def reviewed_review_providers(body, head_sha):
+    """The providers that have already minted a review verdict bound to EXACTLY ``head_sha``,
+    read from the additive per-provider PR-body markers. A marker for any other sha is ignored:
+    a head advance invalidates every prior side's review, so both sides re-review."""
+    if not isinstance(head_sha, str) or not SAFE_SHA.fullmatch(head_sha):
+        return frozenset()
+    return frozenset(
+        provider for provider, sha in REVIEW_PROVIDER_MARKER_RE.findall(body or "")
+        if sha == head_sha)
+
+
+def outstanding_review_providers(trust_class, body, head_sha, worker_impl_provider=None):
+    """The providers in this PR's review set that have NOT yet reviewed ``head_sha``, in dispatch
+    order. Empty means the head is fully reviewed. Refuses (via review_provider_set) when there
+    is no admissible trust class."""
+    done = reviewed_review_providers(body, head_sha)
+    return tuple(provider
+                 for provider in review_provider_set(trust_class, worker_impl_provider)
+                 if provider not in done)
+
+
+def _review_class_input(trust_class, review_provider):
+    """The single `review_class` dispatch input review-fix.yml takes: the trust class, with the
+    review SIDE folded in for the self-declared class. One input rather than two because
+    workflow_dispatch is HARD-CAPPED at 10 inputs by GitHub and review-fix.yml sits at the cap
+    (actionlint flags an 11th; GitHub itself would reject the dispatch). Fails closed on an
+    unknown class rather than emitting a token the workflow will reject mid-dispatch."""
+    if trust_class == WORKER_RUN_TRUST_CLASS:
+        return WORKER_RUN_TRUST_CLASS
+    if trust_class == SELF_DECLARED_TRUST_CLASS and review_provider in IMPL_PROVIDERS:
+        return f"{SELF_DECLARED_TRUST_CLASS}-{review_provider}"
+    raise DispatchError("cannot encode the review class for dispatch (fail closed)")
+
+
+def review_lane_impl_provider(review_provider):
+    """The implementer provider the review LANE runs under so that ``review_provider`` is the
+    side that reviews — i.e. the inverse of the review side.
+
+    For a worker-run PR this IS the provenance-bound implementer, by construction. For a
+    self-declared PR there is no known implementer, so this is a LANE-ASSIGNED pseudo-implementer
+    derived from the review side the lane is currently driving. That is why the entire downstream
+    chain (REVIEW_CHAIN lookup, the claim-layer `reviewer provider == implementer provider`
+    refusal, worker-pr.py's arm-time assertion) keeps working BYTE-IDENTICALLY for both classes:
+    the value it consumes is derived from the review side we chose, never from a declaration."""
+    if review_provider not in REVIEW_OPPOSITE:
+        raise DispatchError("unknown review provider; refusing to resolve a review lane")
+    return REVIEW_OPPOSITE[review_provider]
+
+
+def self_declared_arm_gate_error(review_provider, body, head_sha):
+    """Return why a SELF-DECLARED PR may NOT be armed off this review run, or None when it may.
+
+    Two conditions, both required, both fail-closed:
+    1. this run's review side is ARM_GATING_REVIEW_PROVIDER (openai). The orchestrator is an
+       anthropic harness by construction, so the openai-side review is the one that is genuinely
+       cross-provider. An anthropic-side pass ALONE never arms.
+    2. every OTHER provider in the review set has already minted a verdict bound to this exact
+       head. Combined with (1) — and with the fact that a request-changes verdict flips the PR
+       out of the review lane rather than leaving a stale pass — this is "both sides reviewed
+       this head, and the cross-provider side is passing right now"."""
+    if review_provider != ARM_GATING_REVIEW_PROVIDER:
+        return (f"self-declared PRs arm only off the {ARM_GATING_REVIEW_PROVIDER}-side review "
+                f"(this run is {review_provider or 'unknown'}-side); refusing to arm")
+    done = reviewed_review_providers(body, head_sha)
+    missing = [provider for provider in DUAL_REVIEW_PROVIDERS
+               if provider != review_provider and provider not in done]
+    if missing:
+        return ("self-declared PR has no head-bound review from "
+                f"{', '.join(missing)}; refusing to arm on a single-provider review")
+    return None
+
+
 def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, bot_login="",
                            pr_status=None, exclusions=None):
     """PURE review_items enumerator (called by the dispatch.yml PLAN step against its own data;
@@ -1414,17 +1673,20 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
         if pull.get("state") != "open":
             exclude_signalled(f"snapshot state is {pull.get('state')!r}, not open")
             continue
-        if not HEAD_REF_RE.match(ref):
-            exclude_signalled("head ref is not a worker branch")
-            continue
         if head_repo != repo:
             exclude_signalled("head repo is not the target repo")
-            continue                      # fork head — attacker-controlled, never reviewed
-        if not login.endswith("[bot]") or (bot_login and login != bot_login):
-            exclude_signalled("author is not the trusted App bot")
-            continue
+            continue                      # fork head — attacker-controlled, never reviewed.
+                                          # Applies to BOTH trust classes and is checked BEFORE
+                                          # classification: the weaker class buys no fork
+                                          # admission whatsoever.
         record = provenance.get(number)
-        record_error = provenance_admission_error(record, number)
+        # [issue #657] ONE classification, derived from the head ref + author (properties the
+        # RECORD cannot assert) and then from the class's own record-shape admission. The
+        # worker-run branch is byte-identical to the previous behaviour — head ref must be a
+        # worker branch, author must be the trusted App bot, record must pass the ONE shared
+        # provenance_admission_error. The self-declared branch is the strictly weaker, additive
+        # class (dual-provider review). No record of either class => refused, never defaulted.
+        trust_class, record_error = provenance_trust_class(record, number, ref, login, bot_login)
         if record_error:
             exclude_signalled(record_error)
             continue                      # missing/invalid registry provenance record — fail
@@ -1432,7 +1694,8 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
                                           # review-fix.yml resolve, and groom's draft carve-out
                                           # apply the same one, so "enumerated here" and
                                           # "admitted there" cannot drift)
-        impl_provider = record["impl_provider"]
+        impl_provider = (record["impl_provider"]
+                         if trust_class == WORKER_RUN_TRUST_CLASS else None)
         if HUMAN_HOLD_PR_LABELS & set(labels):
             exclude_signalled("PR carries a human-owned hold label")
             continue                      # terminal — human-owned, nothing autonomous re-enters
@@ -1507,17 +1770,65 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
         reviewed = REVIEWED_SHA_RE.search(pull.get("body") or "")
         reviewed_match = bool(reviewed and reviewed.group(1) == sha)
 
-        def emit(state, context=""):
+        def emit(state, context="", review_provider=None):
+            # [issue #657] Every review item now carries its trust class AND the review side it
+            # is for. `impl_provider` keeps its exact meaning for the worker-run class (the
+            # provenance-bound implementer). For the self-declared class there is no known
+            # implementer, so it carries the LANE-ASSIGNED pseudo-implementer — the inverse of
+            # the review side this item drives — which is what lets the whole downstream chain
+            # (REVIEW_CHAIN lookup, claim-layer cross-provider refusal, arm-time assertion) stay
+            # byte-identical for both classes without ever reading a declaration.
+            side = review_provider
+            if side is None and impl_provider:
+                side = REVIEW_OPPOSITE[impl_provider]
             items.append({
                 "pr_number": number,
                 "head_sha": sha,
                 "state": state,
-                "impl_provider": impl_provider,
+                "impl_provider": impl_provider or review_lane_impl_provider(side),
+                "trust_class": trust_class,
+                "review_provider": side or "",
                 "repo": repo,
                 "package": plan_package(areas),
                 "security": _security_flagged(set(labels) | set(source_labels)),
                 "context": context[:CI_CONTEXT_MAX],
             })
+
+        # [issue #657] SELF-DECLARED PRs get a REVIEW-ONLY lane. The weaker class buys exactly
+        # ONE capability — a dual-provider review — and never any autonomous repair: there is no
+        # trusted implementer provider, so there is no same-provider fixer to route a
+        # request-changes verdict to, and running a ci-fix / rebase model on content whose author
+        # is unknown is precisely the thing this class must not do. Every other state hands to a
+        # human. Fail-closed by construction, and the exclusion is NAMED, never silent.
+        if trust_class == SELF_DECLARED_TRUST_CLASS:
+            # A self-declared record is an EXPLICIT enrolment act by the orchestrator, so every
+            # exclusion of one is printed unconditionally — not gated on the review:* signal set
+            # the way worker-PR exclusions are. Silent exclusion is precisely the failure mode
+            # that let "0 review item(s)" coexist with a backlog of unreviewable PRs (#657).
+            def exclude_self_declared(reason):
+                print(f"review-enumeration: exclude {repo}#{number}: {reason}")
+                if exclusions is not None:
+                    exclusions[reason] += 1
+
+            if status.get("conflicting") is True:
+                exclude_self_declared("self-declared PR has a conflicting base "
+                                      "(no autonomous rebase lane for this trust class)")
+                continue
+            if "review:changes" in labels:
+                exclude_self_declared("self-declared PR needs changes "
+                                      "(no same-provider fix lane for this trust class)")
+                continue
+            if f"review:{repo}#{number}" in live_keys:
+                exclude_self_declared("a live per-PR review lease already owns this PR")
+                continue
+            outstanding = outstanding_review_providers(
+                trust_class, pull.get("body") or "", sha)
+            if not outstanding:
+                exclude_self_declared(
+                    "every provider in the review set has already reviewed this head")
+                continue
+            emit("needs-review", review_provider=outstanding[0])
+            continue
 
         # GAP-B: conflict repair FIRST and alone — CI on a conflicted base is noise. This is
         # REVIEW-STATE-AGNOSTIC by design (issue #351, the #256 limbo): a review:pass PR is
@@ -2830,11 +3141,11 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
             head_ref = str(head.get("ref", ""))
             head_sha = str(head.get("sha", ""))
             login = str((pull.get("user") or {}).get("login", ""))
-            if head_repo != repo or not HEAD_REF_RE.match(head_ref):
-                print(f"defer review {repo}#{number}: head is not a same-repo worker branch")
-                continue
-            if login != bot_login:
-                print(f"defer review {repo}#{number}: PR author is not the App bot")
+            # Fork heads are attacker-controlled and are refused for BOTH trust classes; the
+            # worker-branch / App-bot requirements belong to the WORKER-RUN class and are
+            # re-asserted inside provenance_trust_class below, against this same live read.
+            if head_repo != repo:
+                print(f"defer review {repo}#{number}: head repo is not the target repo")
                 continue
             if head_sha != item["head_sha"] or not SAFE_SHA.fullmatch(head_sha):
                 print(f"defer review {repo}#{number}: head advanced since planning; re-plan")
@@ -2859,13 +3170,42 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
             # ONE shared record-shape admission (provenance_admission_error — same function as
             # PLAN, review-fix.yml resolve, and groom's draft carve-out), re-run on the LIVE
             # re-read so a record edited between PLAN and CLAIM still fails closed.
-            record_error = provenance_admission_error(record, number)
+            # [issue #657] ONE classification, re-derived LIVE from the fresh PR read (head ref +
+            # author) and the fresh record read — never trusted from the plan artifact. A plan
+            # that claims a class the live data does not support is refused here, before any
+            # account is claimed.
+            trust_class, record_error = provenance_trust_class(
+                record, number, head_ref, login, bot_login)
             if record_error:
                 print(f"defer review {repo}#{number}: {record_error}")
                 continue
-            if record["impl_provider"] != item["impl_provider"]:
-                print(f"defer review {repo}#{number}: provenance disagrees with the plan")
+            if trust_class != item["trust_class"]:
+                print(f"defer review {repo}#{number}: live provenance trust class "
+                      f"({trust_class}) disagrees with the plan ({item['trust_class']})")
                 continue
+            if trust_class == WORKER_RUN_TRUST_CLASS:
+                if record["impl_provider"] != item["impl_provider"]:
+                    print(f"defer review {repo}#{number}: provenance disagrees with the plan")
+                    continue
+            else:
+                # Self-declared: REVIEW-ONLY, and the review side is re-derived from the LIVE PR
+                # body markers rather than adopted from the plan — a plan whose side has since
+                # been reviewed (or which names a side outside the set) is stale and defers.
+                if item["state"] != "needs-review":
+                    print(f"defer review {repo}#{number}: self-declared PRs admit only the "
+                          "needs-review state (no autonomous fix/repair lane)")
+                    continue
+                if record["pr_author"] != login:
+                    print(f"defer review {repo}#{number}: self-declared provenance names author "
+                          f"{record['pr_author']!r}, live author is {login!r}")
+                    continue
+                outstanding = outstanding_review_providers(
+                    trust_class, pull.get("body") or "", head_sha)
+                if item["review_provider"] not in outstanding:
+                    print(f"defer review {repo}#{number}: the planned "
+                          f"{item['review_provider']}-side review is no longer outstanding for "
+                          "this head")
+                    continue
             opened_sha = record["head_sha_at_open"]
             issue_number = record["issue"]
             # Human-owned SOURCE issue: groom's stale paths park work with needs:user (and a
@@ -2938,7 +3278,16 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                                    "the PR head no longer descends from the worker-opened commit "
                                    "(history was rewritten); refusing autonomous review")
                     continue
-            if not draft and item["state"] in {"needs-review", "needs-fix"}:
+            # [issue #657] The defuse-to-draft below is a WORKER-LANE safety transition: it
+            # protects the invariant that a worker PR is only ever reviewed while drafted and
+            # unarmed. A SELF-DECLARED PR is a human/orchestrator PR that is normally already
+            # non-draft and was never armed by this lane — drafting it would be an unrequested
+            # mutation of someone else's PR, and it would hide the PR from human reviewers. The
+            # weaker class instead gets NO autonomous state mutation at all: it is reviewed as it
+            # stands, and the arm's own gates (openai-side + both-sides-reviewed + sha-bound CAS)
+            # are what make that safe.
+            if (not draft and item["state"] in {"needs-review", "needs-fix"}
+                    and trust_class == WORKER_RUN_TRUST_CLASS):
                 # Label-driven re-entry may arrive while the PR is READY (and possibly armed).
                 # Defuse before any review/fix model runs, but preserve the externally selected
                 # review:needs/review:changes state; the historical disarm relabel-to-needs would
@@ -3092,7 +3441,13 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                               f"was cleared at {cutoff} (a human unlabel or a proven "
                               f"automatic re-admission); the round budget charges "
                               f"{budget_rounds} of {rounds} recorded round(s)")
-            impl_provider = record["impl_provider"]
+            # [issue #657] For the worker-run class this is the provenance-bound implementer.
+            # For the self-declared class there is no implementer to bind, so the lane assigns
+            # the pseudo-implementer INVERSE to the review side this run drives — every
+            # downstream consumer (REVIEW_CHAIN, the cross-provider claim refusal, the arm
+            # assertion) then behaves byte-identically without reading any declaration.
+            impl_provider = (record["impl_provider"] if trust_class == WORKER_RUN_TRUST_CLASS
+                             else review_lane_impl_provider(item["review_provider"]))
             run_key = (f"{os.environ.get('GITHUB_RUN_ID', 'local')}."
                        f"{os.environ.get('GITHUB_RUN_ATTEMPT', '1')}")
             # Round budget via the PURE decide_budget (maintainer directive 2026-07-17): the
@@ -3179,7 +3534,14 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                            if pin_floor else FIX_CHAIN[impl_provider])
             # Privacy (locked decision 22a): provenance stores ONLY the salted account hash; a
             # raw-handle/missing hash already deferred above (provenance_admission_error).
-            impl_account_h = record["impl_account_h"]
+            # [issue #657] A self-declared PR's implementer is NOT a pool account (it is the
+            # maintainer's own credential), so there is no hash to bind: the sentinel is a
+            # non-hex literal, which account_hash() can never produce, so the reviewer-account
+            # inequality below RUNS UNCHANGED and holds. Stated honestly: for this class that
+            # assertion is trivially true and the load-bearing control is the dual-provider
+            # review, not this comparison.
+            impl_account_h = (record["impl_account_h"] if trust_class == WORKER_RUN_TRUST_CLASS
+                              else SELF_DECLARED_IMPL_ACCOUNT_H)
             if item["state"] in {"needs-review", "stranded"}:
                 reviewed = REVIEWED_SHA_RE.search(pull.get("body") or "")
                 # A needs-review head that already equals its reviewed-sha marker has nothing to
@@ -3187,7 +3549,14 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 # the sole, deliberate exception: it re-reviews the MATCHING head to escape the
                 # residue of an interrupted defuse/disarm — the reviewed-sha guard is bypassed
                 # for it, and the round budget above bounds how often it may retry.
+                # [issue #657] For the SELF-DECLARED class the authoritative "already reviewed"
+                # predicate is the per-provider marker set (checked above via
+                # outstanding_review_providers), not the single sparq-reviewed-sha marker: that
+                # marker means "this head is FULLY reviewed" and is bound only once every side
+                # has reported, so consulting it here would be redundant at best and, if a
+                # partial bind ever landed, would strand the second side's review forever.
                 if (item["state"] == "needs-review"
+                        and trust_class == WORKER_RUN_TRUST_CLASS
                         and reviewed and reviewed.group(1) == head_sha
                         and "review:needs" not in labels):
                     print(f"defer review {repo}#{number}: head already reviewed")
@@ -3442,6 +3811,13 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
             # honours it (review mode never carries a pin; the input is ladder-validated there).
             "-f", f"model_pin={(pin_floor or '') if mode == 'fix' else ''}",
             "-f", f"review_round={round_number}",
+            # [issue #657] The trust class and the review SIDE ride to review-fix.yml as ONE
+            # input (workflow_dispatch is hard-capped at 10 inputs and that lane is at the cap).
+            # It is NOT trusted there: resolve re-derives both halves from the live PR + the
+            # registry record and refuses on any disagreement. It is carried so the lane knows
+            # which of the two self-declared reviews this run is, and so a worker-run run can
+            # never be silently reinterpreted as the weaker class.
+            "-f", f"review_class={_review_class_input(trust_class, item['review_provider'])}",
             "-f", f"account={account}",
             "-f", f"claim_id={claim_id}",
         ], check=False)
@@ -4451,7 +4827,17 @@ def _review_fix_workflow_values():
 # The `already_done` idempotence predicate embedded in review-fix.yml's resolve step, addressed by
 # LINE-ANCHORED regexes rather than by exact indentation-bearing literals (#584 follow-up finding 3).
 _RF_ALREADY_DONE_ANCHOR = r"(?m)^[ \t]*already_done = False$"
-_RF_ALREADY_DONE_END = r"(?m)^[ \t]*#[ \t]*REGISTRY provenance"
+# [issue #657] The predicate MOVED below the provenance read (it now branches on the resolved
+# trust class), so the end anchor is the next statement after it — the ancestry check.
+_RF_ALREADY_DONE_END = r"(?m)^[ \t]*if opened_sha != head_sha:"
+# [issue #657] The TRUST-CLASS RESOLUTION block of the same resolve step — the trust-critical
+# code that decides which class a PR is in, which side reviews it, and what pseudo-implementer
+# the whole downstream cross-provider chain runs under. Extracted and EXECUTED by the self-test
+# (not text-matched) so a YAML-side deletion of any guard in it reds a named assertion. The
+# YAML seam is exactly where a "tested" guard goes vacuous.
+_RF_TRUST_CLASS_ANCHOR = (
+    r"(?m)^[ \t]*trust_class, admission_error = dispatch_claim\.provenance_trust_class\($")
+_RF_TRUST_CLASS_END = r"(?m)^[ \t]*issue = record\[\"issue\"\]$"
 
 
 def _review_fix_step_python(anchor, end_anchor, what, job="resolve", source=None):
@@ -4906,6 +5292,8 @@ def _self_test():
             "head_sha": "d" * 40,
             "state": "needs-review",
             "impl_provider": "anthropic",
+            "trust_class": "worker-run",
+            "review_provider": "openai",
             "repo": "example/repo",
             "package": "crate-a",
             "security": False,
@@ -4915,6 +5303,8 @@ def _self_test():
             "head_sha": "e" * 40,
             "state": "needs-ci-fix",
             "impl_provider": "openai",
+            "trust_class": "worker-run",
+            "review_provider": "anthropic",
             "repo": "example/repo",
             "package": "crate-b",
             "security": False,
@@ -4924,6 +5314,8 @@ def _self_test():
             "head_sha": "e" * 40,
             "state": "stranded",
             "impl_provider": "anthropic",
+            "trust_class": "worker-run",
+            "review_provider": "openai",
             "repo": "example/repo",
             "package": "crate-a",
             "security": False,
@@ -5678,9 +6070,30 @@ def _self_test():
         # (Extracted via the PARSED helper — #584 follow-up finding 3 — so a reflow of that YAML
         # can no longer red this REQUIRED gate with a bare `ValueError: substring not found`.)
         for _body, _want in ((_bound_body, True), (_handed["body"], False)):
-            _ns = {"re": re, "mode": "review", "head_sha": sha_a, "pull": {"body": _body}}
+            _ns = {"re": re, "mode": "review", "head_sha": sha_a, "pull": {"body": _body},
+                   # [issue #657] the predicate is now class-aware; `dispatch_claim` is THIS
+                   # module (the workflow imports it out of the registry checkout), so executing
+                   # the block here also proves the workflow's call targets still exist.
+                   "trust_class": WORKER_RUN_TRUST_CLASS, "review_provider": "openai",
+                   "dispatch_claim": sys.modules[__name__]}
             exec(_ad_src, _ns)  # noqa: S102 — repository-owned workflow source
             assert _ns["already_done"] is _want, (_reason, _want, _body)
+    # [issue #657] The SAME extracted workflow predicate, executed for the SELF-DECLARED class:
+    # its idempotence key is THIS SIDE's per-provider marker, not the head-level reviewed-sha —
+    # so the head-level marker alone must NOT make the openai side think it is already done
+    # (that is exactly how a dual-provider review would silently collapse to one side).
+    _sd_cases = (
+        (_bound_body, "openai", False),                       # head-level marker only
+        (f"<!-- sparq-reviewed-provider:openai:{sha_a} -->", "openai", True),
+        (f"<!-- sparq-reviewed-provider:openai:{sha_a} -->", "anthropic", False),
+        (f"<!-- sparq-reviewed-provider:openai:{sha_b} -->", "openai", False),   # other head
+    )
+    for _body, _side, _want in _sd_cases:
+        _ns = {"re": re, "mode": "review", "head_sha": sha_a, "pull": {"body": _body},
+               "trust_class": SELF_DECLARED_TRUST_CLASS, "review_provider": _side,
+               "dispatch_claim": sys.modules[__name__]}
+        exec(_ad_src, _ns)  # noqa: S102 — repository-owned workflow source
+        assert _ns["already_done"] is _want, (_body, _side, _want)
     # NON-VACUITY / counterfactual: the round-1 fix (flip the label, KEEP the marker) does NOT
     # transfer ownership. It only moves the spin — green strands (whose review dispatch exits
     # already_done), red returns to the fix lane, and pending/unknown owns nothing at all.
@@ -6029,6 +6442,302 @@ def _self_test():
         == "provenance record does not match this PR"
     assert provenance_admission_error({**provenance[41], "impl_provider": []}, 41) \
         == "provenance implementer provider is invalid"
+
+    # ---- [OPUS-5] issue #657: the SELF-DECLARED class and the DUAL-PROVIDER review set ----------
+    # The security property under test is NOT "the declaration is validated" — it is that NO
+    # declaration is load-bearing anywhere on the resolve path. Every assertion below is named
+    # for the guard it defends and reds when that guard is deleted (see the PR's mutation table).
+    sd_ref = "fix/groom-human-authored-pr-defuse"
+    sd_record = {
+        "pr_number": 51, "trust_class": "self-declared", "pr_author": "jeswr",
+        "issue": 7, "head_sha_at_open": sha_a, "recorded_at_run": "9.1",
+    }
+
+    def sd_pull(body="", labels=(), login="jeswr", ref=sd_ref, sha=sha_a, **kwargs):
+        return pull(51, ref, sha, login=login, draft=False, labels=labels, body=body, **kwargs)
+
+    def sd_items(record=sd_record, **kwargs):
+        return enumerate_review_items(repo, [sd_pull(**kwargs)], {51: record}, [],
+                                      issue_labels, now)
+
+    def sd_sides(record=sd_record, **kwargs):
+        return [item["review_provider"] for item in sd_items(record, **kwargs)]
+
+    # (1) THE BOTH-PROVIDERS RULE. A self-declared review set is BOTH providers, in dispatch
+    # order (anthropic first so the arm-gating openai side resolves second), and the worker-run
+    # set is unchanged — exactly one review, by the opposite provider.
+    assert review_provider_set(SELF_DECLARED_TRUST_CLASS) == ("anthropic", "openai")
+    assert review_provider_set(WORKER_RUN_TRUST_CLASS, "anthropic") == ("openai",)
+    assert review_provider_set(WORKER_RUN_TRUST_CLASS, "openai") == ("anthropic",)
+    # (2) REFUSAL, never a default: no admissible class resolves NO review set at all. A caller
+    # can never receive an empty tuple and read it as "nothing to review".
+    for bad_class in (None, "", "worker", "self_declared", 5, []):
+        try:
+            review_provider_set(bad_class)
+            raise AssertionError(f"review_provider_set admitted {bad_class!r}")
+        except DispatchError:
+            pass
+    # (3) *** THE FORGED-DECLARATION TEST (issue #657 acceptance). ***
+    # The orchestrator writes its own provenance record, so any provider it records is a
+    # self-declaration by the author of the content. Content is anthropic-authored by
+    # construction; a forged `provider: "openai"` therefore asks the lane for an ANTHROPIC
+    # reviewer — the same provider as the true author, silently defeating the inversion.
+    # Assert that the forgery cannot reduce the review set to that single same-provider review:
+    # BOTH sides are still dispatched, and in particular the openai side (the one that is
+    # genuinely cross-provider for anthropic-authored content) IS dispatched.
+    # MUTATION TRIPWIRE: replace the SELF_DECLARED branch of review_provider_set with
+    # `(REVIEW_OPPOSITE[record["provider"]],)` — i.e. honour the declaration — and the openai
+    # side disappears from `dispatched`, reddening this assertion by NAME.
+    forged = {**sd_record, "provider": "openai", "declared_provider": "openai",
+              "reviewer_provider": "anthropic", "impl": "openai"}
+    dispatched = []
+    forged_body = ""
+    for _tick in range(4):                # bounded: the loop must CONVERGE, not spin
+        round_items = sd_items(forged, body=forged_body)
+        if not round_items:
+            break
+        assert len(round_items) == 1, round_items
+        side = round_items[0]["review_provider"]
+        dispatched.append(side)
+        # the lane records the side that reviewed; the next tick emits the remaining side
+        forged_body += f"\n<!-- sparq-reviewed-provider:{side}:{sha_a} -->"
+    assert dispatched == ["anthropic", "openai"], (
+        "a forged provider declaration reduced the self-declared review set to a single "
+        f"same-provider review: the lane dispatched {dispatched}")
+    # ... and the head is only FULLY reviewed once both sides have reported.
+    assert sd_items(forged, body=forged_body) == []
+    # (4) The pseudo-implementer each run carries is the INVERSE of its review side, and it is
+    # always a registered provider — so the claim layer's `reviewer provider == implementer
+    # provider` refusal and worker-pr.py's arm assertion keep working byte-identically without
+    # ever reading a declaration.
+    first = sd_items(forged)[0]
+    assert first["trust_class"] == SELF_DECLARED_TRUST_CLASS
+    assert first["review_provider"] == "anthropic"
+    assert first["impl_provider"] == "openai" and first["impl_provider"] in IMPL_PROVIDERS
+    assert first["state"] == "needs-review" and first["package"] == "crate-a"
+    assert review_lane_impl_provider("anthropic") == "openai"
+    assert review_lane_impl_provider("openai") == "anthropic"
+    # (5) CLASS CONFUSION IS REFUSED IN BOTH DIRECTIONS. The class is derived from the head ref
+    # and the author — properties the record cannot assert.
+    #   (a) a self-declared record carrying ANY implementer-identity field is refused outright
+    #       (it was minted as, or edited toward, the strong class),
+    for field, value in (("impl_provider", "openai"), ("impl_alias", "sol"),
+                         ("impl_account_h", "ab" * 8)):
+        error = self_declared_admission_error({**sd_record, field: value}, 51)
+        assert error and field in error, (field, error)
+        assert sd_items({**sd_record, field: value}) == []
+    #   (b) a genuine WORKER PR cannot be demoted into the weaker dual-review class,
+    demoted = {**provenance[41], "trust_class": SELF_DECLARED_TRUST_CLASS}
+    assert provenance_trust_class(demoted, 41, "sparq-agent/issue-7-1-1", bot, bot) == (
+        None, "worker PR carries a non-worker provenance trust class "
+              "(class confusion; refusing)")
+    #   (c) a WORKER-shaped record on a NON-worker PR gets no strong class — it is judged as a
+    #       self-declared record and refused for lacking the trust_class marker,
+    assert provenance_trust_class(provenance[41], 41, sd_ref, "jeswr", bot) == (
+        None, "provenance record is not of the self-declared trust class")
+    #   (d) and a PR with NO record of EITHER class is refused, never defaulted.
+    assert provenance_trust_class(None, 51, sd_ref, "jeswr", bot)[0] is None
+    assert enumerate_review_items(repo, [sd_pull()], {}, [], issue_labels, now) == []
+    # (6) The weaker class buys NO fork admission, and no human-hold exemption.
+    assert sd_items(head_repo="attacker/repo") == []
+    for hold in sorted(HUMAN_HOLD_PR_LABELS) + [MACHINE_PARK_PR_LABEL]:
+        assert sd_items(labels=(hold,)) == [], hold
+    assert enumerate_review_items(repo, [sd_pull()], {51: sd_record}, [],
+                                  {7: ["area:crate-a", "needs:user"]}, now) == []
+    # (7) REVIEW-ONLY LANE: the weaker class buys exactly one capability (a dual-provider
+    # review) and never an autonomous same-provider repair — there is no trusted implementer to
+    # route one to. A request-changes state and a conflicting base both hand to a human.
+    assert sd_items(labels=("review:changes",)) == []
+    conflicting = enumerate_review_items(
+        repo, [sd_pull()], {51: sd_record}, [], issue_labels, now,
+        pr_status={51: {"head_sha": sha_a, "conflicting": True}})
+    assert conflicting == [], conflicting
+    # A live per-PR review lease still single-flights it.
+    assert enumerate_review_items(
+        repo, [sd_pull()], {51: sd_record},
+        [{"holder": f"review:{repo}#51@dispatch-1.1", "package": "crate-a",
+          "expires_at": now + 600}], issue_labels, now) == []
+    # (8) MARKER SEMANTICS: a per-provider marker counts only at the EXACT head it names, so a
+    # head advance re-opens BOTH sides (a review of superseded content is never carried over).
+    both_at_a = (f"<!-- sparq-reviewed-provider:anthropic:{sha_a} -->"
+                 f"<!-- sparq-reviewed-provider:openai:{sha_a} -->")
+    assert reviewed_review_providers(both_at_a, sha_a) == frozenset({"anthropic", "openai"})
+    assert reviewed_review_providers(both_at_a, sha_b) == frozenset()
+    assert outstanding_review_providers(SELF_DECLARED_TRUST_CLASS, both_at_a, sha_b) == (
+        "anthropic", "openai")
+    assert outstanding_review_providers(SELF_DECLARED_TRUST_CLASS, both_at_a, sha_a) == ()
+    assert outstanding_review_providers(
+        SELF_DECLARED_TRUST_CLASS,
+        f"<!-- sparq-reviewed-provider:anthropic:{sha_a} -->", sha_a) == ("openai",)
+    assert reviewed_review_providers(both_at_a, "not-a-sha") == frozenset()
+    # (9) THE ARM GATE. An anthropic-side pass ALONE never arms; the openai side arms only once
+    # the anthropic side has a verdict bound to the SAME head.
+    # MUTATION TRIPWIRE: drop the `review_provider != ARM_GATING_REVIEW_PROVIDER` refusal and
+    # the first assertion reds; drop the missing-sides refusal and the second reds.
+    assert self_declared_arm_gate_error("anthropic", both_at_a, sha_a)
+    assert ARM_GATING_REVIEW_PROVIDER in self_declared_arm_gate_error("anthropic", both_at_a,
+                                                                     sha_a)
+    assert self_declared_arm_gate_error("openai", "", sha_a)
+    assert "anthropic" in self_declared_arm_gate_error("openai", "", sha_a)
+    assert self_declared_arm_gate_error(
+        "openai", f"<!-- sparq-reviewed-provider:anthropic:{sha_a} -->", sha_a) is None
+    assert self_declared_arm_gate_error("", both_at_a, sha_a)
+    assert self_declared_arm_gate_error(
+        "openai", f"<!-- sparq-reviewed-provider:anthropic:{sha_b} -->", sha_a)
+    # (10) THE PLAN ARTIFACT IS HOSTILE DATA. A forged plan cannot name a review side equal to
+    # the (pseudo-)implementer, nor ride the self-declared class into a fix/repair state.
+    def _plan_rejects(mutate, why):
+        document = json.loads(json.dumps(fixture))
+        mutate(document)
+        try:
+            validate_plan(document)
+        except DispatchError:
+            return True
+        raise AssertionError(f"validate_plan admitted {why}")
+
+    assert _plan_rejects(
+        lambda d: d["review_items"][0].update(review_provider="anthropic"),
+        "a review side equal to the implementer provider")
+    assert _plan_rejects(
+        lambda d: d["review_items"][0].update(trust_class="worker"), "an unknown trust class")
+    assert _plan_rejects(
+        lambda d: d["review_items"][0].update(review_provider="mallory"),
+        "an unregistered review provider")
+    assert _plan_rejects(
+        lambda d: d["review_items"][1].update(trust_class="self-declared"),
+        "a self-declared item in a fix/repair state")
+    print("  ok   #657: self-declared class -> dual-provider review; a forged provider "
+          "declaration cannot reduce the review set; openai-side gates the arm")
+
+    # ---- [OPUS-5] issue #657, THE YAML SEAM. Everything above is python; the lane's actual decisions
+    # live in review-fix.yml's resolve step, and a guard that exists only there is exactly the
+    # kind that goes vacuous. So EXECUTE the workflow's real trust-class resolution block (parsed
+    # out of the YAML, never re-implemented here) against fixtures, and assert the wiring of the
+    # steps whose behaviour is expressed purely as an `if:` expression.
+    _tc_src = _review_fix_step_python(
+        _RF_TRUST_CLASS_ANCHOR, _RF_TRUST_CLASS_END, "trust-class resolution block")
+    assert "provenance_trust_class" in _tc_src and "review_lane_impl_provider" in _tc_src, _tc_src
+
+    def _resolve_class(record, *, pull_body="", draft=True, author="jeswr", head_branch=sd_ref,
+                       hint_class="self-declared", hint_side="anthropic", head=sha_a):
+        """Run review-fix.yml's OWN resolution block. Returns the resolved namespace, or the
+        SystemExit message it fails closed with."""
+        namespace = {
+            "re": re, "dispatch_claim": sys.modules[__name__],
+            "record": record, "pull": {"number": 51, "body": pull_body, "draft": draft},
+            "head_branch": head_branch, "author": author, "head_sha": head, "mode": "review",
+            "hint_trust_class": hint_class, "hint_review_provider": hint_side,
+        }
+        try:
+            exec(_tc_src, namespace)  # noqa: S102 — repository-owned workflow source
+        except SystemExit as exc:
+            return str(exc)
+        return namespace
+
+    # (a) The WORKER-RUN path through the workflow is unchanged: identity from the record, one
+    # review, by the opposite provider, and the DRAFT invariant still enforced.
+    _worker_record = {**provenance[41], "pr_number": 51}
+    _wr = _resolve_class(_worker_record, author=bot, head_branch="sparq-agent/issue-7-1-1",
+                         hint_class="worker-run", hint_side="")
+    assert isinstance(_wr, dict), _wr
+    assert (_wr["trust_class"], _wr["impl_provider"], _wr["review_provider"],
+            _wr["impl_account_h"], _wr["pr_author_bound"]) == (
+        "worker-run", "anthropic", "openai", "ab" * 8, ""), _wr
+    assert "not a draft" in _resolve_class(
+        _worker_record, author=bot, head_branch="sparq-agent/issue-7-1-1",
+        hint_class="worker-run", hint_side="", draft=False)
+    # (b) The SELF-DECLARED path: NO implementer read, a lane-assigned pseudo-implementer that is
+    # the INVERSE of the review side (this is what makes the downstream cross-provider assertion
+    # do real work), the sentinel account hash, and the enrolment-bound author carried forward.
+    for _side in DUAL_REVIEW_PROVIDERS:
+        _sd = _resolve_class(sd_record, draft=False, hint_side=_side)
+        assert isinstance(_sd, dict), (_side, _sd)
+        assert _sd["trust_class"] == SELF_DECLARED_TRUST_CLASS, _sd
+        assert _sd["review_provider"] == _side, _sd
+        assert _sd["impl_provider"] == REVIEW_OPPOSITE[_side], (
+            "the workflow's pseudo-implementer is not the inverse of the review side, so the "
+            "claim-layer and arm-time cross-provider assertions would compare the wrong pair")
+        assert _sd["impl_account_h"] == SELF_DECLARED_IMPL_ACCOUNT_H, _sd
+        assert _sd["pr_author_bound"] == "jeswr", _sd
+        assert not re.fullmatch(r"[0-9a-f]{16}", _sd["impl_account_h"]), (
+            "the self-declared implementer-account sentinel must be UNHASHLIKE so the "
+            "reviewer!=implementer account comparison can never accidentally match")
+    # (c) Fail-closed refusals ON THE WORKFLOW'S OWN CODE.
+    assert "disagrees with the dispatched" in _resolve_class(
+        _worker_record, author=bot, head_branch="sparq-agent/issue-7-1-1",
+        hint_class="self-declared"), "a class hint that the live data contradicts must be fatal"
+    assert "no longer outstanding" in _resolve_class(
+        sd_record, draft=False, hint_side="openai",
+        pull_body=f"<!-- sparq-reviewed-provider:openai:{sha_a} -->")
+    assert "different PR author" in _resolve_class(
+        {**sd_record, "pr_author": "someone-else"}, draft=False)
+    assert "implementer field" in _resolve_class(
+        {**sd_record, "impl_provider": "openai"}, draft=False)
+    assert "not of the self-declared trust class" in _resolve_class(
+        {key: value for key, value in sd_record.items() if key != "trust_class"}, draft=False)
+    # (d) The steps whose behaviour is an `if:` expression: assert the WIRING, because there is
+    # no python to execute for them. Deleting any of these clauses reds this assertion.
+    import yaml as _yaml_657
+    _rf = _yaml_657.safe_load(
+        (Path(__file__).resolve().parents[1] / ".github" / "workflows" / "review-fix.yml")
+        .read_text(encoding="utf-8"))
+    _outcome_steps = _rf["jobs"]["outcome"]["steps"]
+    _arm_step = [step for step in _outcome_steps
+                 if isinstance(step.get("run"), str) and "ready-and-arm" in step["run"]]
+    assert len(_arm_step) == 1, _arm_step
+    for _flag in ("--trust-class", "--review-provider", "--pr-author"):
+        assert _flag in _arm_step[0]["run"], (
+            f"the arm step no longer passes {_flag}; worker-pr.py would fall back to the "
+            "worker-run default and arm a self-declared PR off a single review")
+    _marker_step = [step for step in _outcome_steps
+                    if isinstance(step.get("run"), str)
+                    and "worker-pr.py reviewed-provider" in step["run"]]
+    assert len(_marker_step) == 1, (
+        "review-fix.yml no longer has EXACTLY ONE step binding the per-provider review marker; "
+        "without it the dual-provider review never converges (the same side is re-dispatched "
+        f"forever) and the arm gate can never prove the other side reviewed this head: "
+        f"{_marker_step}")
+    assert "self-declared" in str(_marker_step[0].get("if", "")), (
+        "the per-provider marker bind is not gated on the self-declared class")
+    _bind_step = [step for step in _outcome_steps
+                  if isinstance(step.get("run"), str)
+                  and "reviewed-sha set" in step["run"]]
+    assert len(_bind_step) == 1, _bind_step
+    _bind_if = str(_bind_step[0].get("if", ""))
+    assert "self-declared" in _bind_if and ARM_GATING_REVIEW_PROVIDER in _bind_if, (
+        "the head-level reviewed-sha bind is no longer restricted to the LAST review side for "
+        "the self-declared class — binding it on the anthropic side would tell the sweep the "
+        "head is fully reviewed while the cross-provider side has not run")
+    _outcome_step = [step for step in _outcome_steps
+                     if isinstance(step.get("run"), str) and "review-outcome" in step["run"]]
+    assert len(_outcome_step) == 1 and "--trust-class" in _outcome_step[0]["run"], _outcome_step
+    # GitHub HARD-CAPS workflow_dispatch at 10 inputs, and this lane sits exactly at the cap —
+    # which is why the trust class and the review side ride as ONE `review_class` token. An
+    # 11th input is not a style question: actionlint rejects it and GitHub refuses the dispatch,
+    # so the whole review lane would go dark. Pin the cap here (the review-fix.yml `on:` key
+    # parses as the boolean True under YAML 1.1) and pin the encoder against the workflow's own
+    # declared option list, so the two cannot drift.
+    _rf_inputs = _rf[True]["workflow_dispatch"]["inputs"]
+    assert len(_rf_inputs) <= 10, (
+        f"review-fix.yml declares {len(_rf_inputs)} workflow_dispatch inputs; GitHub's hard cap "
+        "is 10 and an 11th makes every dispatch of the review lane fail")
+    _declared_classes = set(_rf_inputs["review_class"]["options"])
+    _encoded = {_review_class_input(WORKER_RUN_TRUST_CLASS, "openai")} | {
+        _review_class_input(SELF_DECLARED_TRUST_CLASS, side)
+        for side in DUAL_REVIEW_PROVIDERS}
+    assert _encoded == _declared_classes, (
+        f"the dispatcher encodes review_class values {sorted(_encoded)} but review-fix.yml "
+        f"declares {sorted(_declared_classes)}; a mismatch makes the dispatch fail input "
+        "validation and the PR silently never gets reviewed")
+    for _bad in ((WORKER_RUN_TRUST_CLASS[:-1], "openai"), (SELF_DECLARED_TRUST_CLASS, "mallory"),
+                 (SELF_DECLARED_TRUST_CLASS, ""), (None, "openai")):
+        try:
+            _review_class_input(*_bad)
+            raise AssertionError(f"_review_class_input encoded {_bad!r}")
+        except DispatchError:
+            pass
+    print("  ok   #657 YAML seam: review-fix.yml's OWN trust-class resolution block executes "
+          "correctly for both classes and fails closed; the arm/marker/bind steps are wired")
 
     # ---- interpret_check_runs / pr_ci_status (pure CI interpreters, GAP-A inputs) ----
     runs = [
@@ -6459,16 +7168,16 @@ def _self_test():
         helper_calls.append((script, args))
 
     def live_pull(*, draft, labels=(), body="", auto_merge=None, mergeable=True,
-                  base_ref="main"):
+                  base_ref="main", head_ref="sparq-agent/issue-7-1-1", login=None):
         # base.ref defaults to the repo default branch ("main"): the review-lane invariant
         # (issue #164) is base == protected default; a test passes base_ref!="main" to exercise
         # the retargeted-PR exclusion.
         return {"number": 41, "state": "open", "draft": draft, "body": body,
                 "mergeable": mergeable, "auto_merge": auto_merge,
-                "head": {"ref": "sparq-agent/issue-7-1-1", "sha": sha_a,
+                "head": {"ref": head_ref, "sha": sha_a,
                          "repo": {"full_name": repo}},
                 "base": {"ref": base_ref, "repo": {"default_branch": "main"}},
-                "user": {"login": bot, "type": "Bot"},
+                "user": {"login": login or bot, "type": "Bot"},
                 "labels": [{"name": name} for name in labels]}
 
     def run_items(items, allocator=None, routing=None, policy=None, usage=None):
@@ -6488,7 +7197,8 @@ def _self_test():
         return launched, reasons
 
     ci_item = {"pr_number": 41, "head_sha": sha_a, "state": "needs-ci-fix",
-               "impl_provider": "anthropic", "repo": repo, "package": "crate-a",
+               "impl_provider": "anthropic", "trust_class": "worker-run",
+               "review_provider": "openai", "repo": repo, "package": "crate-a",
                "security": False, "context": "js"}
     real_io = (_gh_json, _run_target_helper, _target_token, _target_is_human_maintainer)
     with tempfile.TemporaryDirectory() as tmp:
@@ -6593,6 +7303,80 @@ def _self_test():
             assert helper_calls == [], helper_calls
             assert alloc.calls == [], alloc.calls
 
+            # ---- [OPUS-5] issue #657: the SELF-DECLARED class via the LIVE CLAIM path -------------
+            # CLAIM is what burns an account lease, so every self-declared decision it makes is
+            # re-derived from the LIVE PR + the LIVE record here, never adopted from the plan.
+            sd_record_file = Path(wiring_root) / wiring_worker_pr.provenance_path(repo, 41)
+            worker_record_json = sd_record_file.read_text(encoding="utf-8")
+            sd_record_file.write_text(json.dumps({
+                "pr_number": 41, "trust_class": "self-declared", "pr_author": "jeswr",
+                "issue": 7, "head_sha_at_open": sha_a, "recorded_at_run": "9.1",
+            }), encoding="utf-8")
+            sd_item = {"pr_number": 41, "head_sha": sha_a, "state": "needs-review",
+                       "impl_provider": "openai", "trust_class": "self-declared",
+                       "review_provider": "anthropic", "repo": repo, "package": "crate-a",
+                       "security": False, "context": ""}
+            sd_pull_kwargs = dict(draft=False, login="jeswr",
+                                  head_ref="fix/groom-human-authored-pr-defuse")
+            sd_routing = {"models": {
+                "opus5": {"provider_model": "claude-opus-5", "harness": "claude"},
+                "opus": {"provider_model": "claude-opus-4-8", "harness": "claude"},
+                "fable": {"provider_model": "claude-fable-5", "harness": "claude"},
+                "sol": {"provider_model": "TBD", "harness": "codex"},
+                "luna": {"provider_model": "TBD", "harness": "codex"}}}
+            fake.update(pull=live_pull(**sd_pull_kwargs), check_runs=gate_green, comments=[],
+                        issue_labels=["area:crate-a"])
+            alloc = StrandAllocator()
+            run_items([sd_item], allocator=alloc, routing=sd_routing)
+            # The anthropic-side review is offered the ANTHROPIC chain — i.e. the lane-assigned
+            # pseudo-implementer (openai) drove REVIEW_CHAIN correctly. A non-worker head ref and
+            # a non-bot author no longer defer the claim, which is the whole gap #657 closes.
+            assert alloc.calls == [("review", ["opus5", "opus", "fable"])], alloc.calls
+            assert helper_calls == [], helper_calls
+            # ... and once the anthropic side has reviewed THIS head, CLAIM re-derives the
+            # outstanding set from the LIVE body and refuses to re-dispatch that same side.
+            # MUTATION TRIPWIRE: delete CLAIM's `item["review_provider"] not in outstanding`
+            # freshness check and this assertion reds (the lane would burn a second lease +
+            # runner re-reviewing a side that already reported).
+            fake["pull"] = live_pull(
+                body=f"<!-- sparq-reviewed-provider:anthropic:{sha_a} -->", **sd_pull_kwargs)
+            alloc = StrandAllocator()
+            run_items([sd_item], allocator=alloc, routing=sd_routing)
+            assert alloc.calls == [], alloc.calls
+            # ... while the OPENAI side is still outstanding on that same body, and it claims the
+            # OPENAI chain — the two sides really are dispatched to opposite providers.
+            alloc = StrandAllocator()
+            run_items([dict(sd_item, impl_provider="anthropic", review_provider="openai")],
+                      allocator=alloc, routing=sd_routing)
+            assert alloc.calls == [("review", ["sol", "luna"])], alloc.calls
+            # A plan whose class disagrees with the LIVE record never dispatches. (The body is
+            # reset to marker-free first, so this defers for the CLASS reason and not because
+            # the planned side happened to be already-reviewed — a vacuity a mutation run caught.)
+            fake["pull"] = live_pull(**sd_pull_kwargs)
+            alloc = StrandAllocator()
+            run_items([dict(sd_item, trust_class="worker-run")], allocator=alloc,
+                      routing=sd_routing)
+            assert alloc.calls == [], alloc.calls
+            # A self-declared item may never ride a fix/repair state: with a concluded-RED gate
+            # (the live ci-fix trigger) an unguarded lane would defuse the PR and dispatch a
+            # SAME-PROVIDER fixer against content whose author is unknown.
+            fake.update(pull=live_pull(**sd_pull_kwargs), check_runs=gate_red)
+            alloc = StrandAllocator()
+            run_items([dict(sd_item, state="needs-ci-fix", context="js")], allocator=alloc,
+                      routing=sd_routing)
+            assert alloc.calls == [], alloc.calls
+            assert helper_calls == [], helper_calls
+            # An author that does not match the enrolment-bound one never dispatches.
+            fake.update(pull=live_pull(**{**sd_pull_kwargs, "login": "mallory"}),
+                        check_runs=gate_green)
+            alloc = StrandAllocator()
+            run_items([sd_item], allocator=alloc, routing=sd_routing)
+            assert alloc.calls == [], alloc.calls
+            sd_record_file.write_text(worker_record_json, encoding="utf-8")
+            fake.update(pull=live_pull(draft=True, labels=["review:needs"]), comments=[])
+            print("  ok   #657 CLAIM: a self-declared PR claims the ANTHROPIC chain first, then "
+                  "the OPENAI chain, and a side that already reviewed this head is refused")
+
             # ---- round-budget escalation (directive 2026-07-17): decide_budget replaces the
             # flat rounds>=max needs-user at CLAIM, the fix chain honours the pinned floor, and
             # a starved pinned chain DEFERS (defer-not-fallback: fable is never re-offered) ----
@@ -6627,7 +7411,8 @@ def _self_test():
                     "summary": "s", "issues": [], "progress": progress}), encoding="utf-8")
 
             fix_item = {"pr_number": 41, "head_sha": sha_a, "state": "needs-fix",
-                        "impl_provider": "anthropic", "repo": repo, "package": "crate-a",
+                        "impl_provider": "anthropic", "trust_class": "worker-run",
+                        "review_provider": "openai", "repo": repo, "package": "crate-a",
                         "security": False, "context": ""}
             routing_ok = {"models": {
                 "opus5": {"provider_model": "claude-opus-5", "harness": "claude"},
@@ -7409,7 +8194,8 @@ def _self_test():
                     "labels": [{"name": f"area:fanout-{offset}"}]}
                 fanout_items.append({
                     "pr_number": pr_number, "head_sha": head_sha,
-                    "state": "needs-ci-fix", "impl_provider": "openai", "repo": repo,
+                    "state": "needs-ci-fix", "impl_provider": "openai",
+                    "trust_class": "worker-run", "review_provider": "anthropic", "repo": repo,
                     "package": f"fanout-{offset}", "security": False, "context": "gate",
                 })
                 path = Path(wiring_root) / wiring_worker_pr.provenance_path(repo, pr_number)
