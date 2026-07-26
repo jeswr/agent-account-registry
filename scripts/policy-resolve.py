@@ -384,7 +384,11 @@ def resolve(target_repo, role_or_labels, policy_doc, routing_doc):
     else:
         routed = role_routes[role] if role is not None else defaults
         model_chain, agent, escalate = routed
-        model_chain = _chain_preference.apply_preferences(labels, model_chain, preferences)
+        # `role` is passed so a preference's `inject_roles` allow-list can be evaluated: adding the
+        # lead to a chain that lacks it is legal only for the roles the DECLARATION names. `role` is
+        # None for a ROLELESS issue (the defaults branch), which can never be injected into.
+        model_chain = _chain_preference.apply_preferences(labels, model_chain, preferences,
+                                                         role=role)
 
     return {
         "target_repo": target_repo,

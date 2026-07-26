@@ -226,6 +226,23 @@ lead     = "sol"
 requires = ["sol", "opus5"]
 """
 
+# [OPUS-5] registry #738 / the OPUS5-ONLY `role:impl` chain. `role = "impl"` moved from
+# `["opus5", "sol"]` to `["opus5"]` + `escalate = true` (measured: sol 18% vs opus5 86% in-cell
+# first-attempt yield, n=74). That edit DISARMS the re-order-only carve-out — a `["opus5"]` chain
+# does not contain `sol`, so the `requires` condition declines and GUI impl work silently becomes
+# opus5-only, the exact inversion PR #4211 fixed. The fixtures below pin BOTH halves: that the
+# collision is real, and that `inject_roles` closes it identically on both resolvers.
+SPARQ_IMPL_TWO_RUNG = 'role = "impl"\nmodel_chain = ["opus5", "sol"]\nagent = "sparq-rust-impl"'
+SPARQ_IMPL_OPUS5_ONLY = ('role = "impl"\nmodel_chain = ["opus5"]\n'
+                         'agent = "sparq-rust-impl"\nescalate = true')
+GUI_DECLARATION_INJECT = """
+[[chain_preference]]
+labels       = ["area:gui"]
+lead         = "sol"
+requires     = ["sol", "opus5"]
+inject_roles = ["impl"]
+"""
+
 # The security-route exemption is UNOBSERVABLE while the soundness chain is single-model: the
 # `requires` condition declines it for an unrelated reason, so applying the preference to the
 # security branch is a mutation no assertion can see. This variant makes the soundness chain
@@ -297,6 +314,59 @@ def _self_test():  # noqa: C901 — a flat sequence of assertions
         chain(xsec, ("area:gui", "role:impl")), ["sol", "opus5"])
     chk("PLAN and CLAIM agree on every matrix row for the cross-provider-security table",
         compare(xsec), [])
+
+    # (3c) [OPUS-5] THE OPUS5-ONLY `role:impl` CHAIN (registry #738) AND ITS COLLISION WITH THE
+    # CARVE-OUT. Both halves are asserted, because the first is the defect and the second is the fix
+    # and a table can only ship one of them.
+    assert SPARQ_IMPL_TWO_RUNG in SPARQ_SHAPED, \
+        "the impl-route fixture is stale — it no longer edits the impl route"
+    _single = SPARQ_SHAPED.replace(SPARQ_IMPL_TWO_RUNG, SPARQ_IMPL_OPUS5_ONLY, 1)
+    single_reorder = tomllib.loads(_single + GUI_DECLARATION)
+    single_inject = tomllib.loads(_single + GUI_DECLARATION_INJECT)
+    chk("the fixture edit really produced a single-rung escalating impl route",
+        [(r.get("model_chain"), r.get("escalate")) for r in single_reorder["route"]
+         if r.get("role") == "impl"], [(["opus5"], True)])
+    # THE COLLISION, as a test rather than as prose: with the re-order-only declaration the carve-out
+    # goes INERT and GUI impl work resolves opus5-only. Both resolvers agree — which is exactly why
+    # nothing in the pipeline would have reported it.
+    chk("re-order-only declaration + a ['opus5'] impl chain DISARMS the carve-out (both sides "
+        "agree on the WRONG answer, so agreement alone could never have caught this)",
+        (chain(single_reorder, ("area:gui", "role:impl")),
+         _plan(_ROUTE.resolve, ("area:gui", "role:impl"), single_reorder)[1][0]),
+        (["opus5"], ["opus5"]))
+    # THE FIX: `inject_roles` restores sol-first for GUI impl work, on BOTH resolvers.
+    chk("inject_roles restores SOL-FIRST for area:gui + role:impl at CLAIM",
+        chain(single_inject, ("area:gui", "role:impl")), ["sol", "opus5"])
+    chk("...and at PLAN", _plan(_ROUTE.resolve, ("area:gui", "role:impl"),
+                                single_inject)[1][0], ["sol", "opus5"])
+    chk("...and opus5 stays reachable behind sol (preference, not exclusion)",
+        "opus5" in chain(single_inject, ("area:gui", "role:impl")), True)
+    chk("...and the carve-out still never re-routes the AGENT",
+        _claim(("area:gui", "role:impl"), single_inject)[1][1], "sparq-rust-impl")
+    chk("PLAN and CLAIM agree on EVERY matrix row for the single-rung + inject_roles table",
+        compare(single_inject), [])
+    chk("PLAN and CLAIM agree on every matrix row for the single-rung re-order-only table too "
+        "(the collision is a WRONG answer, not a divergence)", compare(single_reorder), [])
+    # The injection is scoped to `role:impl` and to `area:gui`: nothing else may grow a rung.
+    chk("role:research keeps its single-provider escalating chain under the inject declaration",
+        (chain(single_inject, ("area:gui", "role:research")),
+         _claim(("area:gui", "role:research"), single_inject)[1][2]), (["opus5"], True))
+    chk("a plain (non-gui) role:impl issue is NOT given sol back",
+        chain(single_inject, ("area:sparq-core", "role:impl")), ["opus5"])
+    for _near in (("area:guide", "role:impl"), ("area:guidance", "role:impl"),
+                  ("area:site", "role:impl"), ("dashboard", "role:impl")):
+        chk(f"{_near[0]} + role:impl is NOT given sol back (exact selector, under injection too)",
+            chain(single_inject, _near), ["opus5"])
+    chk("a security surface under area:gui is still returned unmodified",
+        chain(single_inject, ("area:gui", "area:sparq-zk", "role:impl")), ["opus5"])
+    # A declaration that tried to inject into an authorship-pinned escalating role is REFUSED, and
+    # refused IDENTICALLY by both resolvers — so the prohibition cannot become a one-sided rule.
+    banned = tomllib.loads(_single + GUI_DECLARATION_INJECT.replace(
+        'inject_roles = ["impl"]', 'inject_roles = ["impl", "research"]', 1))
+    chk("inject_roles naming an authorship-pinned role makes CLAIM refuse",
+        _claim(("area:gui", "role:impl"), banned)[0], "refused")
+    chk("...and PLAN refuse identically, so the two still AGREE (fail-closed on BOTH sides)",
+        compare(banned), [])
 
     # (4) NON-VACUITY OF THE HARNESS ITSELF. Give PLAN a resolver that knows a rule CLAIM does not
     # — the exact sparq #4211 shape, a carve-out implemented only in the target's Python — and the
