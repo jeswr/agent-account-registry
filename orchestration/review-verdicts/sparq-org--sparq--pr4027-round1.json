@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4027,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "4b535491686dd1a3bdb9ad000b07b5a40fae0303",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The note corrects a stale count by writing a new literal count into markdown. No test pins the size of the recognised set: there is no assertion on DTYPE_TABLE.len() or on Recognized::standard() cardinality anywhere in crates/sparq-reason/src/dtype.rs or crates/sparq-reason/tests/, so the next time a datatype is enrolled in DTYPE_TABLE this document silently becomes wrong again in exactly the way it is being fixed for now. This is mildly in tension with the note's own premise that DTYPE_TABLE is the single source of truth: the durable statement is 'derived from DTYPE_TABLE', while '30' is a snapshot that has to be hand-maintained. Not blocking \u2014 the number is accurate today, the file is explicitly a historical design record rather than live API documentation, and the banner already tells readers not to treat the surrounding inventory as current.",
+    "file": "research/d-entailment-datatype-map.md",
+    "fix_hint": "Either (a) drop the specific figure and say 'Recognized::standard() is now table-driven from DTYPE_TABLE and has been broadened beyond this list; consult DTYPE_TABLE for the current membership', which cannot go stale; or (b) keep '30' and add a cheap guard in crates/sparq-reason/src/dtype.rs tests, e.g. assert_eq!(DTYPE_TABLE.len(), 30) with a comment pointing at research/d-entailment-datatype-map.md, so enrolling a new datatype forces the doc update in the same change.",
+    "severity": "nit",
+    "title": "Fix trades one unpinned hard-coded count (23) for another (30) with no test guarding drift"
+   }
+  ],
+  "progress": null,
+  "summary": "Documentation-only change: adds a historical-snapshot banner to research/d-entailment-datatype-map.md warning that the 23-datatype inventory recorded below is the PRE-broadening state, and that Recognized::standard() is now table-driven with 30 datatypes. No code, test, or build surface is touched, so there is no correctness, soundness, or security impact. I verified every factual claim in the added note against the head checkout: (1) 'table-driven' is accurate \u2014 Recognized::standard() (crates/sparq-reason/src/dtype.rs:223) is derived by filtering DTYPE_TABLE (line 141) on the has_value_mapping flag, and the module doc (lines 70-79) documents that table as the single source of truth for both the recognised set and has_value_mapping, introduced by sq-pbz04.6.2. (2) The count of 30 is correct \u2014 DTYPE_TABLE holds 7 string-family entries (string, normalizedString, token, language, Name, NCName, NMTOKEN), boolean, 13 integer types, decimal/double/float, dateTime/dateTimeStamp/date, anyURI, and hexBinary/base64Binary = 30, all with has_map = true, so the filter admits all of them. The counting convention matches the original '23 datatypes' bullet (XSD table entries only; rdf:langString, added by Recognized::default(), is out of the XSD namespace and was excluded from the old count too), so 23 -> 30 is an apples-to-apples correction. (3) 'After D2' resolves correctly \u2014 bead D2 in the same record's section 5 table is precisely the map-broadening plus single-table refactor that added anyURI, the token-derived string types, and the binary types. The banner also does not overreach: the doc is already labelled a DESIGN + DECOMPOSITION RECORD, and the facet-soundness gaps listed further down in section 1 remain correctly framed as design-time findings tracked by bead D1, so the historical framing is consistent with the rest of the file. The diff contains no text directed at the reviewer or attempting to influence the verdict; the 'do not re-propagate 23' p\u2026 [truncated 151 chars]",
+  "verdict": "approve"
+ }
+}
