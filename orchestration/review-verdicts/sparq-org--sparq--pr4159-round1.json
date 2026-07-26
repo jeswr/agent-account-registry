@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4159,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "fd6561de3b11d3ce147b63d6db4c0398198c6d99",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`unwritten_integer_lexicals` enforces only `observed lexicals \u2286 written lexicals`; it does not prove that every still-live written term remains present. Meanwhile `normalize_term` maps distinct terms such as `\"0105\"^^xsd:integer` and `\"+105\"^^xsd:integer` to the same term. If the same subject/predicate/graph receives both spellings and sparq incorrectly drops or collapses one while retaining the other, Oxigraph also exposes one normalized quad, the normalized cross-compare passes, and the retained sparq lexical is in `written`, so the preservation oracle passes. The focused test proves current behavior on one fixed update but does not mutation-test this failure mode in the differential. Therefore the advertised strict lexical-preservation guarantee is not established.",
+    "file": "crates/sparq-bench/src/update_fuzz.rs",
+    "fix_hint": "Track expected live sparq terms (including graph position and nested triple-term structure) through generated updates, or use a targeted per-operation oracle that verifies all inserted non-canonical term identities before an operation can legitimately remove them. Add a mutation/non-vacuity test constructing two same-value spellings at the same quad coordinates and a sparq snapshot missing one spelling; assert that the full adjudication path rejects it. Do not rely solely on the one-way unwritten-lexical set check.",
+    "severity": "major",
+    "title": "Numeric adjudication can hide loss of a distinct written RDF term"
+   }
+  ],
+  "progress": null,
+  "summary": "The expanded differential harness has a soundness hole in its numeric-lexical adjudication. The retry projects distinct RDF terms onto the same canonical integer term, while the sparq-side oracle only rejects lexicals that were never generated. Together these checks can miss a sparq regression that collapses or drops one of two non-canonical spellings of the same value while retaining another written spelling. This contradicts the PR's claim that lexical preservation is pinned strictly.",
+  "verdict": "request_changes"
+ }
+}
