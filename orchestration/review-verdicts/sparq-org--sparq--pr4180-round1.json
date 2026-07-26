@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4180,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "9f497c74ca1201c8688624cdd48c8e662569d966",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`NamedNode` (the oxrdf type) was used only at the two `dict.intern(&OTerm::NamedNode(NamedNode::new_unchecked(...)))` sites, which this diff moves inside `#[cfg(feature = \"dl_transitive\")]`. `OTerm` has only one other user, `ql_kb`, which is itself `#[cfg(feature = \"dispatch_ql\")]` (check.rs:948-949). The import at check.rs:207 is not gated, so:\n\n  cargo check -p sparq-reason-dl --features dispatch\n    warning: unused imports: `NamedNode` and `Term as OTerm`\n      --> crates/sparq-reason-dl/src/check.rs:207:13\n\n  cargo check -p sparq-reason-dl --features dispatch_ql\n    warning: unused import: `NamedNode`\n\n  cargo check -p sparq-reason-dl --all-features   # clean\n\n(All three run locally against this PR head.) `dispatch` without `dl_transitive` is a first-class supported combination \u2014 `dl_transitive` is documented as opt-in/OFF by default in crates/sparq-reason-dl/Cargo.toml \u2014 and `cargo clippy -- -D warnings` on it now fails. Since the sole purpose of this diff is warning hygiene across feature states, swapping a `dead_code` warning for an `unused_imports` warning in the same state leaves the change incomplete. It is invisible to CI only because the workspace clippy lanes cover default-features (where `check.rs` is not compiled) and `--all-features` (where the import is used), and `sparq-conformance`'s `dl-direct` enables dispatch + dl_transitive + dispatch_ql together.",
+    "file": "crates/sparq-reason-dl/src/check.rs",
+    "fix_hint": "Gate the import to match its users, e.g. replace check.rs:207 with:\n\n  #[cfg(feature = \"dl_transitive\")]\n  use oxrdf::NamedNode;\n  #[cfg(any(feature = \"dl_transitive\", feature = \"dispatch_ql\"))]\n  use oxrdf::Term as OTerm;\n\nOr, simpler and drift-proof, delete the import and use fully-qualified paths at the four use sites (`oxrdf::Term::NamedNode(oxrdf::NamedNode::new_unchecked(...))` at check.rs:524/527 and `oxrdf::Term::NamedNode(n)` in `ql_kb`). Then confirm all four states are warning-free: `cargo clippy -p sparq-reason-dl -- -D warnings`, `--features dispatch`, `--features dispatch_ql`, `--all-features` (add `--all-targets` to each).",
+    "severity": "major",
+    "title": "Gating the interning block behind `dl_transitive` orphans the `oxrdf::{NamedNode, Term as OTerm}` import \u2014 new unused_imports warning in the `dispatch`-only state the PR set out to clean up"
+   },
+   {
+    "body": "The `#[cfg(feature = \"dl_transitive\")]` block and the `#[cfg(not(feature = \"dl_transitive\"))]` binding both start from `conclusion.to_vec()`, so the base construction is written twice and the two arms can drift independently. Purely cosmetic \u2014 behaviour is identical.",
+    "file": "crates/sparq-reason-dl/src/check.rs",
+    "fix_hint": "Bind the base once and cfg-gate only the augmentation, e.g.:\n\n  let mut conclusion_for_extraction = conclusion.to_vec();\n  #[cfg(feature = \"dl_transitive\")]\n  { /* premise_roles collection + declaration push into conclusion_for_extraction */ }\n\nwhich keeps a single source for the base vector (mark it `#[allow(unused_mut)]` or use the cfg'd-block form if the `mut` trips a warning with the feature off).",
+    "severity": "nit",
+    "title": "`conclusion.to_vec()` is now duplicated across the two cfg arms"
+   }
+  ],
+  "progress": null,
+  "summary": "The refactor is semantically a no-op and correct: before the change the `collect_role_ids` call was already inside a `#[cfg(feature = \"dl_transitive\")]` statement, so with the feature off `premise_roles` was always empty and `conclusion_for_extraction` degenerated to `conclusion.to_vec()` \u2014 exactly what the new `#[cfg(not(...))]` arm produces. Gating `collect_role_ids` / `collect_role_ids_in_ce` behind `dl_transitive` correctly removes the `dead_code` warning they produced in the `dispatch`-without-`dl_transitive` state, and it drops a needless `conclusion_predicates` allocation there. No entailment/soundness behaviour changes; the fail-closed extraction path and `roll_conclusion_anonymous` handling are untouched.\n\nHowever the change is INCOMPLETE for the very feature state it targets. Moving the `dict.intern(&OTerm::NamedNode(NamedNode::new_unchecked(...)))` calls inside the `dl_transitive` block leaves `use oxrdf::{NamedNode, Term as OTerm};` (check.rs:207) with no remaining user when `dl_transitive` is off. Verified by compiling:\n  - `cargo check -p sparq-reason-dl --features dispatch` -> `warning: unused imports: `NamedNode` and `Term as OTerm``\n  - `cargo check -p sparq-reason-dl --features dispatch_ql` -> `warning: unused import: `NamedNode``\n  - `cargo check -p sparq-reason-dl --all-features` -> clean\nSo the PR trades two `dead_code` warnings for one/two `unused_imports` warnings in the same supported build, and `cargo clippy -- -D warnings` on `--features dispatch` would fail. CI happens not to catch this (the workspace clippy lanes run default-features, where `check.rs` is not compiled at all, and `--all-features`, where both features are on; `sparq-conformance/dl-direct` also turns all three features on), which is why the regression is silent rather than red \u2014 not a reason to keep it.\n\nNo security or injection concerns: the diff is code plus authorship comments only.",
+  "verdict": "request_changes"
+ }
+}
