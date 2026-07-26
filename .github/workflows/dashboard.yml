@@ -54,6 +54,7 @@ jobs:
 
       # Only this filter sees the complete secret map; the probe receives an ACCT_* file.
       - name: Materialize the ACCT_* worker-token subset for the probe
+        id: acct-secrets
         continue-on-error: true
         env:
           ALL_SECRETS: ${{ toJSON(secrets) }}
@@ -77,10 +78,25 @@ jobs:
               json.dump(subset, handle)
           PY
 
+      # PROBE OUTCOME IS PERSISTED (issue #219). This step and the materialization above are
+      # continue-on-error, and a failed probe is replaced by `{}` — which used to be
+      # indistinguishable from "every account is idle", so precisely WHEN measurement failed the
+      # public dashboard published the whole catalog as fresh available capacity. The outcome now
+      # travels with the snapshot as `usage-probe.json` and dashboard-gen (--usage-status) refuses
+      # to render capacity from anything but an explicit, fresh `ok`.
       - name: Probe live account usage (tokens never printed)
+        # `id:` so dashboard-gen's self-test can EXTRACT and EXECUTE this exact step body
+        # (#612 review round 2, finding 4): `bash -n` and actionlint cannot see shell polarity, so
+        # dropping the `!` below — a nonzero probe left classified `ok` — used to survive the whole
+        # suite. The self-test now runs this body against a stubbed probe and asserts the outcome.
+        id: usage-probe
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
+          # A failed materialization leaves NO ACCT_* file, and account-usage._load_secrets returns
+          # {} for an unreadable one — the probe then exits 0 having silently measured nothing.
+          # That is the loudest instance of this bug, so the filter's outcome gates the status.
+          SECRETS_STEP_OUTCOME: ${{ steps.acct-secrets.outcome }}
           # The salt is the probe's ONLY route to the openai quota signal (issue #29): the
           # model-health ledger keys rate-limit backoff records by SALTED account hash, so a
           # salt-less probe emits bare `{"exempt": true}` entries and the reactive backoff never
@@ -93,18 +109,111 @@ jobs:
           SECRETS_FILE: ${{ runner.temp }}/acct-secrets.json
         run: |
           set -uo pipefail
-          python3 scripts/account-usage.py --self-test
+          outcome=ok
+          detail=probe-succeeded
+          if [ "${SECRETS_STEP_OUTCOME}" != "success" ]; then
+            outcome=failed
+            detail=secret-materialization-failed
+          fi
+          # A `success` step outcome does not prove the filter WROTE anything (#612 review round 2,
+          # finding 4): a materialization step whose body were replaced by `true` reports success
+          # and leaves no ACCT_* file, _load_secrets returns {} for an unreadable one, and the probe
+          # then exits 0 having measured nothing — publishing a fresh `measured` sidecar. Worse, the
+          # probe-EXEMPT providers (openai/codex) do not need a token at all, so they would still be
+          # emitted and published as free capacity off a materialization that never ran. So the
+          # subset file is checked POSITIVELY, not merely inferred from a neighbour's outcome.
+          if [ "$outcome" = ok ] && [ ! -s "${SECRETS_FILE}" ]; then
+            outcome=failed
+            detail=secret-file-missing
+          fi
+          # ...and a subset with no USABLE token is measurement-equivalent to no file: every
+          # non-exempt account is fail-closed omitted for want of a token.
+          #
+          # #612 review round 4 (MAJOR) measured that the previous `grep -q '"ACCT'` proved neither
+          # valid JSON nor a non-empty token: `{"ACCT01_TOKEN":""}` and the truncated
+          # `{"ACCT01_TOKEN":` both passed it, and _load_secrets then yields an empty token or (on
+          # JSONDecodeError) `{}` — so the probe measured nothing, kept `outcome=ok`, and published
+          # the probe-EXEMPT accounts as fresh free capacity. That is the very overgrant this step
+          # exists to close. A substring cannot express "at least one ACCT*_TOKEN key whose value is
+          # a non-empty string", so the subset is PARSED instead.
+          #
+          # The no-token-bytes-in-the-log constraint that motivated `grep -q` is kept BY
+          # CONSTRUCTION, not by luck: the validator's only stdout is one of the three fixed words
+          # ok/empty/malformed, that stdout is captured into a variable and never echoed, every
+          # failure is caught so there is no traceback to echo a fragment of the document, and its
+          # stderr is discarded anyway.
+          #
+          # SCOPING (round 4): an all-exempt fleet (openai/codex only — issue #29) needs no token at
+          # all, so a zero-usable-token subset would be a legitimate steady state and this guard
+          # would degrade the page unnecessarily. The catalog is anthropic-majority by construction
+          # (every non-exempt account needs a token), so today that configuration does not exist; if
+          # it ever becomes real, condition this guard on the catalog containing >=1 non-exempt
+          # account rather than weakening it.
+          subset_state=$(python3 -c '
+          import json
+          import re
+          import sys
+
+          try:
+              with open(sys.argv[1], encoding="utf-8") as handle:
+                  document = json.load(handle)
+          except Exception:
+              print("malformed")
+              sys.exit(0)
+          if not isinstance(document, dict):
+              print("malformed")
+              sys.exit(0)
+          usable = [key for key, value in document.items()
+                    if re.fullmatch(r"ACCT[A-Z0-9]+_TOKEN", str(key))
+                    and isinstance(value, str) and value.strip()]
+          print("ok" if usable else "empty")
+          ' "${SECRETS_FILE}" 2>/dev/null) || subset_state=malformed
+          if [ "$outcome" = ok ] && [ "$subset_state" != ok ]; then
+            outcome=failed
+            detail=secret-subset-empty
+            if [ "$subset_state" != empty ]; then
+              # Unparseable, truncated, or not a JSON object at all. Distinguished from `empty`
+              # because it is a different production defect (a broken filter, a truncated write)
+              # and both tokens are fixed literals — neither can carry document bytes.
+              detail=secret-subset-malformed
+            fi
+          fi
+          if [ "$outcome" = ok ] && ! python3 scripts/account-usage.py --self-test; then
+            outcome=failed
+            detail=probe-self-test-failed
+          fi
           # stderr flows to the step log: the probe's fail-open ::warning:: lines are sanitized
           # (no handles/salt/counts — asserted by its self-test), and the old 2>/dev/null is
           # exactly what hid this step's missing-salt gap in production.
-          python3 scripts/account-usage.py > "$RUNNER_TEMP/usage.json" || printf '{}' > "$RUNNER_TEMP/usage.json"
-          echo 'usage-probe: snapshot written'
+          if [ "$outcome" = ok ] && ! python3 scripts/account-usage.py > "$RUNNER_TEMP/usage.json"; then
+            outcome=failed
+            detail=probe-exited-nonzero
+          fi
+          if [ "$outcome" != ok ]; then
+            # Same empty snapshot as before — but now it arrives LABELLED as unmeasured, so the
+            # generator renders unknown/degraded instead of a fleet-wide "available".
+            printf '{}' > "$RUNNER_TEMP/usage.json"
+          fi
+          # `outcome`/`detail` are step-local literals from the fixed sets above — never
+          # attacker-influenced text — so this printf cannot emit malformed JSON.
+          printf '{"schema":"account-usage-probe/v1","outcome":"%s","detail":"%s","attempted_at":%s}\n' \
+            "$outcome" "$detail" "$(date -u +%s)" > "$RUNNER_TEMP/usage-probe.json"
+          echo "usage-probe: snapshot written (outcome=${outcome} detail=${detail})"
 
-      - name: Upload privacy-safe usage snapshot (pinned)
+      - name: Upload privacy-safe usage snapshot + probe outcome (pinned)
+        # `id:` so the self-test can assert this step's `path:` against the files the probe step
+        # ACTUALLY produced when executed (#612 review round 4): dropping `usage-probe.json` from
+        # the transport left the whole suite green, because the generator's fail-closed handling of
+        # an absent sidecar makes the loss look like a healthy refusal instead of a broken pipeline.
+        id: upload-usage
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: dashboard-usage-${{ github.run_id }}
-          path: ${{ runner.temp }}/usage.json
+          # Both files travel together: a snapshot without its outcome sidecar is refused by
+          # dashboard-gen (issue #219) rather than rendered on trust.
+          path: |
+            ${{ runner.temp }}/usage.json
+            ${{ runner.temp }}/usage-probe.json
           retention-days: 1
           if-no-files-found: error
 
@@ -142,6 +251,9 @@ jobs:
           path: ${{ runner.temp }}
 
       - name: Generate privacy-safe dashboard
+        # `id:` so the self-test can assert the --usage/--usage-status pairing against THIS step
+        # rather than against the whole file (#612 review round 2, class E).
+        id: dashboard-build
         env:
           GH_TOKEN: ${{ github.token }}
           PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
@@ -157,7 +269,12 @@ jobs:
           # The observability snapshot (issue #246) is OPTIONAL on the ledger until its collector
           # lands: an absent file keeps the panel hidden, while a present-but-invalid one fails
           # this build loudly inside dashboard-gen (never published on a guess).
+          # --usage-status is MANDATORY alongside --usage (issue #219): dashboard-gen refuses a
+          # usage snapshot with no persisted probe outcome, and treats a missing/failed/stale
+          # outcome as "not measured" — unknown availability, zero eligible capacity, and a
+          # degradation marker on the page — instead of publishing the catalog as fresh capacity.
           python3 scripts/dashboard-gen.py --usage "$RUNNER_TEMP/usage.json" \
+            --usage-status "$RUNNER_TEMP/usage-probe.json" \
             --leases ledger/data/leases.json --model-health ledger/data/model-health.json \
             --observability ledger/data/observability.json
           # metrics.yml CAS-publishes the optional snapshot under the ledger's whitelisted data/

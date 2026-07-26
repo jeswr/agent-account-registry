@@ -126,20 +126,46 @@ LABELS = {
     "status:ready": ("0e8a16", "Ready for trusted automated dispatch"),
     "status:deferred": ("d4c5f9", "Private-registry worker orchestration state"),
     # Keep in sync with park_policy.MACHINE_PARK_DESCRIPTION: a machine park clears on a human
-    # unlabel OR on proven cause-recovery (registry #614 — the automatic re-admission path).
+    # unlabel, on proven cause-recovery (registry #614 — the automatic re-admission path), or on
+    # the capped sustained-fleet-health retry once that proof has aged out (registry #691).
     "status:parked": ("1d76db",
-                      "Machine-owned capacity park (soft hold; cleared by a human unlabel or "
-                      "proven recovery)"),
+                      "Machine-owned capacity park (soft hold; human unlabel, proven recovery, "
+                      "or capped retry)"),
     "needs:user": ("b60205", "Human attention required"),
 }
 
 
 class GroomError(RuntimeError):
-    """A concise fail-closed error which never contains credential or response bodies."""
+    """A concise fail-closed error which never contains credentials, and no SUCCESSFUL response body.
+
+    TWO deliberate exceptions, both produced ONLY through the one masking contract
+    (_masked_detail: single-line, bounded at GH_DETAIL_LIMIT, credential-masked):
+
+      1. issue #644 — a `gh` subprocess diagnostic (_gh_failure_detail). Three hours of
+         `parked PR redraft failed for sparq-org/sparq#3427` carried no cause at all, so no reader
+         could tell a permission refusal from a GitHub-side restriction.
+      2. issue #647 — the error envelope of a FAILED GitHub API call (_http_failure_detail). The
+         per-object writes in the stale-PR hand-off and issue-repair loops are `api.request` calls;
+         "HTTP 403" alone cannot distinguish a permission refusal from a bad payload, and those
+         loops now DEFER per object instead of aborting, so a causeless deferral would be silent.
+
+    Neither is a response body in the sense this contract guards: they are the operator's only
+    witness to a failure, never the content of a successful read.
+    """
 
 
 class GroomConflict(GroomError):
     """A retryable contents-API compare-and-swap conflict."""
+
+
+class RedraftUnavailable(GroomError):
+    """A parked-PR redraft failure that is NOT a property of the pull request (issue #644).
+
+    A missing `gh` binary, or no App token for the PR's owner, is a property of the RUN: every
+    remaining candidate fails identically, so this must never be reported as one PR's deferral.
+    It still does not abort the sweep — dead-lease reclaim runs — it forces the run's exit status
+    non-zero at the very end (defuse_exit_failure, precedence rule 1).
+    """
 
 
 @dataclass(frozen=True)
@@ -660,6 +686,61 @@ def stale_worker_pr_reason(
     return BAD_MERGE_STATES.get(merge_state)
 
 
+# ---- the ONE diagnostic-masking contract (issue #644 defect 1, extended by issue #647) ----------
+# #644: `gh` writes its failure cause to stderr and groom CAPTURED then DISCARDED it, so every
+# failing run said only "parked PR redraft failed for <repo>#<n>" — three hours of identical
+# failures with zero diagnostic information, and it cost a full incident to characterise.
+# #647: the SAME discard exists on the HTTP side. Every per-object write in the stale-PR hand-off
+# and issue-repair loops is an `api.request`, and its GroomError reported only
+# "<purpose> GitHub API POST failed with HTTP 403" — GitHub's own error envelope ("Resource not
+# accessible by integration", "Validation Failed: …"), the one thing that distinguishes a
+# permission refusal from a bad payload, was thrown away with the exception. A silent failure in a
+# loop is exactly what made the last one expensive, so both surfaces report their cause through
+# this ONE helper: BOUNDED — a runaway body must not flood the operator log — and credential-MASKED.
+GH_DETAIL_LIMIT = 400
+# Belt-and-braces on top of the exact-token replacement: any GitHub credential SHAPE is masked, so
+# a token this call does not own (an ambient GH_TOKEN, a nested gh diagnostic, an echoed header)
+# cannot reach the log either.
+_TOKEN_SHAPE = re.compile(r"(?:gh[pousra]|github_pat)_[A-Za-z0-9_]{8,}")
+
+
+def _masked_detail(text: str, token: str) -> str:
+    """One single-line, bounded, credential-masked diagnostic — the shared masking contract."""
+    text = " ".join((text or "").split())
+    if token:
+        text = text.replace(token, "***")
+    text = _TOKEN_SHAPE.sub("***", text)
+    if len(text) > GH_DETAIL_LIMIT:
+        text = text[:GH_DETAIL_LIMIT] + "…"
+    return text
+
+
+def _http_failure_detail(exc: HTTPError, token: str) -> str:
+    """GitHub's own masked, bounded error envelope for a failed call, or "" when it carried none.
+
+    The envelope is a DIAGNOSTIC, not resource content: GitHub answers a failed call with
+    ``{"message": …, "documentation_url": …}``. Reading it must never itself raise — an HTTPError
+    constructed without a body (or already consumed) has no readable stream — so every failure
+    mode here degrades to the status line's own reason rather than replacing one lost cause with
+    another (issue #647).
+    """
+    raw: Any = b""
+    try:
+        raw = exc.read()
+    except Exception:  # noqa: BLE001 — a diagnostic read must never mask the real failure
+        raw = b""
+    if isinstance(raw, bytes):
+        text = raw.decode("utf-8", "replace")
+    else:
+        text = str(raw or "")
+    detail = _masked_detail(text, token)
+    if detail:
+        return detail
+    return _masked_detail(
+        str(getattr(exc, "msg", "") or getattr(exc, "reason", "") or ""), token
+    )
+
+
 class GitHubAPI:
     def __init__(self, token: str, purpose: str):
         if not token:
@@ -704,8 +785,14 @@ class GitHubAPI:
                 if retryable and exc.code in _TRANSIENT_HTTP and attempt < _TRANSIENT_RETRIES:
                     _sleep_transient(attempt, _retry_after_seconds(exc.headers))
                     continue
+                # Issue #647: report WHY. This exception is the only witness a per-object write
+                # failure ever gets, and the loops that call it now defer per object instead of
+                # aborting the sweep — a deferral whose cause is "HTTP 403" and nothing else is
+                # the #644 discarded-cause defect wearing a different hat.
+                detail = _http_failure_detail(exc, self._token)
                 raise GroomError(
                     f"{self._purpose} GitHub API {method} failed with HTTP {exc.code}"
+                    + (f": {detail}" if detail else "")
                 ) from exc
             except (URLError, TimeoutError, ConnectionResetError) as exc:
                 if retryable and _is_transient_network(exc) and attempt < _TRANSIENT_RETRIES:
@@ -1070,13 +1157,54 @@ def _configured_stale_hours(args: argparse.Namespace) -> int:
 
 
 def _parked_pr_snapshot(
-    pull: dict[str, Any], now: int, stale_seconds: int
+    pull: dict[str, Any], now: int, stale_seconds: int, bot_login: str
 ) -> tuple[str, str] | None:
     """Return the stable head/activity fingerprint of a defuse candidate, absent its latches."""
     if pull.get("draft") is not False:
         return None
     labels = _labels(pull, "parked pull request")
     if not (labels & HUMAN_HOLD_PR_LABELS):
+        return None
+    # Defuse exists to stop OUR OWN parked PRs burning target CI while they wait on a human. A
+    # human's pull request is not ours to re-draft: the human-hold label means the decision is
+    # theirs, and converting their PR to draft is the machine mutating a person's artifact.
+    #
+    # This is also where a permanent red came from (2026-07-25): sparq-org/sparq#3427 is authored
+    # by the maintainer and labelled `needs:user`, so every sweep selected it, every redraft came
+    # back `Resource not accessible by integration (convertPullRequestToDraft)`, and — being the
+    # only candidate — it tripped precedence rule 2 ("attempted, none completed") on every tick
+    # for hours. The fix belongs HERE, in candidate selection, and NOT in phase_exit_failure:
+    # weakening the exit rule to tolerate a stuck object would buy exactly the silence that rule
+    # is written to prevent. An object that was never ours to touch is not a failed attempt.
+    #
+    # Fail direction: unknown or malformed authorship SKIPS. The permissive answer here would be
+    # to mutate a PR whose owner we could not establish, which is the wrong way round.
+    #
+    # Ownership is EXACT LOGIN **and** `type == "Bot"`, conjunctively. Two review rounds, two
+    # different halves:
+    #
+    #   r1: `type == "Bot"` ALONE is not ownership — it admits `dependabot[bot]`, `copilot`,
+    #       and every third-party App, and the reviewer drove one through live revalidation to
+    #       a real `gh pr ready --undo` plus an audit comment. The obligation is "OUR OWN
+    #       parked PRs", a single login, so a predicate over the category is the wrong scope.
+    #   r2: replacing it with exact login ALONE dropped the type check entirely, so a payload
+    #       carrying our login with NO `type`, or with a contradictory `type: "User"`, was
+    #       admitted. The r1 "malformed authorship" fixture only ever exercised a FOREIGN
+    #       login, so it was rejected for the wrong reason and pinned nothing.
+    #
+    # Both conjuncts are load-bearing and each has its own test. A well-formed payload for our
+    # own App satisfies both; anything that fails either — unknown identity, absent type,
+    # contradictory type — is somebody else's PR as far as this guard is concerned, which is
+    # the direction that declines to mutate.
+    if not bot_login:
+        return None
+    user = pull.get("user")
+    if not isinstance(user, dict):
+        return None
+    login = user.get("login")
+    if not isinstance(login, str) or login.casefold() != bot_login.casefold():
+        return None
+    if user.get("type") != "Bot":
         return None
     updated_at = pull.get("updated_at")
     updated = _epoch(updated_at, "parked pull request")
@@ -1135,11 +1263,12 @@ def _live_defuse_snapshot(
     pull: dict[str, Any],
     now: int,
     stale_seconds: int,
+    bot_login: str,
 ) -> tuple[str, str] | None:
     """The complete safe-class predicate, including both live merge latch surfaces."""
     if pull.get("state") != "open":
         return None
-    snapshot = _parked_pr_snapshot(pull, now, stale_seconds)
+    snapshot = _parked_pr_snapshot(pull, now, stale_seconds, bot_login)
     if snapshot is None:
         return None
     # REST auto_merge is intentionally an additional fail-closed signal. GraphQL is live and
@@ -1160,18 +1289,19 @@ def _collect_defuse_prs(
     pulls: dict[int, dict[str, Any]],
     now: int,
     stale_seconds: int,
+    bot_login: str,
 ) -> dict[tuple[str, int], tuple[str, str]]:
     """Collect live safe-class parked PRs; an unreadable latch skips only that PR."""
     candidates: dict[tuple[str, int], tuple[str, str]] = {}
     for number, listed in sorted(pulls.items()):
         try:
-            if _parked_pr_snapshot(listed, now, stale_seconds) is None:
+            if _parked_pr_snapshot(listed, now, stale_seconds, bot_login) is None:
                 continue
             detail = api.request("GET", f"/repos/{repo}/pulls/{number}", allow_404=True)
             if not isinstance(detail, dict):
                 continue
             snapshot = _live_defuse_snapshot(
-                api, repo, number, detail, now, stale_seconds
+                api, repo, number, detail, now, stale_seconds, bot_login
             )
         except GroomError as exc:
             print(f"ALERT PR {repo}#{number}: {exc} — defuse deferred")
@@ -1181,9 +1311,26 @@ def _collect_defuse_prs(
     return candidates
 
 
+def _gh_failure_detail(result: Any, token: str) -> str:
+    """The masked, bounded, single-line cause of a failed `gh` call — never the token itself."""
+    text = _masked_detail(
+        " ".join(
+            part.strip()
+            for part in (getattr(result, "stderr", "") or "", getattr(result, "stdout", "") or "")
+            if part.strip()
+        ),
+        token,
+    )
+    if not text:
+        return f"gh exited {result.returncode} with no output"
+    return f"gh exited {result.returncode}: {text}"
+
+
 def _redraft_pr(repo: str, number: int, token: str) -> None:
     if not token:
-        raise GroomError(f"target token is unavailable for parked PR {repo}#{number}")
+        raise RedraftUnavailable(
+            f"target token is unavailable for parked PR {repo}#{number}"
+        )
     env = dict(os.environ)
     env["GH_TOKEN"] = token
     try:
@@ -1195,9 +1342,99 @@ def _redraft_pr(repo: str, number: int, token: str) -> None:
             env=env,
         )
     except FileNotFoundError as exc:
-        raise GroomError("gh is unavailable for parked PR defuse") from exc
+        raise RedraftUnavailable("gh is unavailable for parked PR defuse") from exc
     if result.returncode != 0:
-        raise GroomError(f"parked PR redraft failed for {repo}#{number}")
+        raise GroomError(
+            f"parked PR redraft failed for {repo}#{number}: "
+            f"{_gh_failure_detail(result, token)}"
+        )
+
+
+@dataclass(frozen=True)
+class PhaseOutcome:
+    """What one per-object sweep phase did, and whether its failures were per-object or systemic.
+
+    Introduced for the defuse phase (issue #644) and made the SHARED shape for every per-object
+    phase of the sweep (issue #647), so all of them are judged by the ONE precedence rule below
+    instead of each inventing its own leniency.
+    """
+
+    label: str = "parked PR defuse"  # phase name, as it reads in the exit report
+    changed: int = 0  # objects whose phase work COMPLETED (a deliberate skip counts; see below)
+    attempted: int = 0  # objects this phase took up
+    deferred: tuple[str, ...] = ()  # per-object deferrals, "<repo>#<n>: <cause>"
+    unavailable: tuple[str, ...] = ()  # NON-per-object failures (no gh, no owner token)
+
+
+def phase_exit_failure(outcome: PhaseOutcome) -> str | None:
+    """The systemic reason the run must exit non-zero, or None to leave its status green.
+
+    PRECEDENCE RULE (issue #644, applied to EVERY per-object phase by issue #647 — there is
+    exactly one of these in this module, deliberately). The sibling defect class here is
+    exit-zero-swallows-failure, so the direction matters: making a failure per-object must never
+    buy silence.
+
+      1. A NON-per-object failure DOMINATES. No `gh`, or no App token for the owner, is a property
+         of the run, not of the object, so the status goes non-zero even if every other candidate
+         completed fine.
+      2. Otherwise, if the phase took objects up and NONE completed, the per-object reading is no
+         longer credible — a whole-phase failure is systemic in effect — so the status goes
+         non-zero and names every deferral.
+      3. Otherwise a deferral ALONGSIDE at least one completed object is exactly what it claims to
+         be: one object's problem, ALERT-logged and retried next sweep. The status stays green.
+      4. In every case this is decided AFTER the sweep has done its work. The exit status is the
+         REPORT, never the control flow — that inversion is the #644 defect itself, where one
+         un-redraftable PR raised past dead-lease reclaim, stuck-issue repair and the stale-PR
+         hand-off. Callers therefore evaluate this last, after _release_claims.
+
+    Rule 2 fires on `deferred` as well as on `attempted` (issue #647). A phase whose per-object
+    failure happens in a READ — before it counts the object as attempted — must not be able to
+    report nothing-completed-and-something-failed as green; the disjunction makes that swallow
+    unrepresentable rather than merely unlikely. It is a no-op for the defuse phase, which counts
+    the attempt before anything it records as a deferral.
+
+    A deliberate SKIP counts as a COMPLETED object, not a failure: a phase that correctly decided
+    to do nothing to every object it saw is a working phase (this is what keeps rule 2 from
+    red-flagging, say, a hand-off loop whose every candidate was revalidated away). Defuse keeps
+    its own narrower counting — deferrals from its PRE-redraft revalidation are recorded nowhere,
+    since those reads already failed closed per PR before #644 and counting them would change an
+    unrelated path's status semantics.
+    """
+    if outcome.unavailable:
+        return (
+            f"{outcome.label} is unavailable for the whole run: "
+            + "; ".join(outcome.unavailable)
+        )
+    if (outcome.attempted or outcome.deferred) and not outcome.changed:
+        return (
+            f"every {outcome.label} failed ({outcome.attempted} attempted, 0 completed): "
+            + "; ".join(outcome.deferred)
+        )
+    return None
+
+
+def sweep_exit_failure(outcomes: "list[PhaseOutcome] | tuple[PhaseOutcome, ...]") -> str | None:
+    """EVERY phase's systemic failure, joined — never just the first (issue #647).
+
+    The sweep has four per-object phases — stale-PR detection, issue status repair, parked-PR
+    defuse, stale-PR hand-off — and they fail independently. Reporting only the first would hide a
+    second systemic failure behind a fixed one, so each phase is judged by the one precedence rule
+    and every reason is named.
+    """
+    reasons = [
+        reason
+        for outcome in outcomes
+        if (reason := phase_exit_failure(outcome)) is not None
+    ]
+    return " | ".join(reasons) if reasons else None
+
+
+# Issue #644's names for the defuse instance of the shared shape above. Kept as ALIASES, not
+# copies: the enrolled #644 assertions keep their exact call sites while there stays exactly one
+# precedence implementation in the module (issue #647 requirement — reuse the rule, do not invent
+# a second one).
+DefuseOutcome = PhaseOutcome
+defuse_exit_failure = phase_exit_failure
 
 
 def _execute_defuse_actions(
@@ -1206,9 +1443,22 @@ def _execute_defuse_actions(
     tokens: dict[str, str],
     now: int,
     stale_seconds: int,
-) -> int:
-    """Revalidate and redraft bounded safe-class actions, then write one audit comment."""
+    bot_login: str = "",
+) -> DefuseOutcome:
+    """Revalidate and redraft bounded safe-class actions, then write one audit comment.
+
+    EVERY per-PR failure mode degrades to "defuse deferred" for THAT PR and continues — including
+    the redraft and its audit comment (issue #644). Candidates are processed lowest-number-first,
+    so an un-redraftable one used to be a PERMANENT head-of-line block: its uncaught GroomError
+    raised past dead-lease reclaim, stuck-issue repair and the stale-PR hand-off, and groom failed
+    on every run for hours. A PR that cannot be converted to draft is not a reason to stop
+    reclaiming dead leases. The failures are RECORDED, not swallowed: defuse_exit_failure decides
+    the run's exit status from this outcome once the sweep has finished.
+    """
     changed = 0
+    attempted = 0
+    deferred: list[str] = []
+    unavailable: list[str] = []
     for action in actions:
         if action.mode != "defuse":
             continue
@@ -1225,6 +1475,7 @@ def _execute_defuse_actions(
                     pull,
                     now,
                     stale_seconds,
+                    bot_login,
                 )
                 if isinstance(pull, dict)
                 else None
@@ -1238,7 +1489,7 @@ def _execute_defuse_actions(
             )
             continue
         owner = action.repo.split("/", 1)[0]
-        _redraft_pr(action.repo, action.number, tokens.get(owner, ""))
+        attempted += 1
         body = (
             "> 🤖 SPARQ agent\n\n"
             f"This pull request remained ready-for-review while terminally parked and had no "
@@ -1247,14 +1498,35 @@ def _execute_defuse_actions(
             "Marking it ready for review resumes it.\n\n"
             f"{DEFUSE_PR_MARKER}"
         )
-        api.request(
-            "POST",
-            f"/repos/{action.repo}/issues/{action.number}/comments",
-            {"body": body},
-        )
+        # The mutation pair sits INSIDE the same per-PR resilience block as the revalidation above
+        # (issue #644 defect 2). RedraftUnavailable is caught FIRST — it is a subclass, and it is
+        # the not-a-property-of-this-PR case, so it is recorded separately and reds the run.
+        try:
+            _redraft_pr(action.repo, action.number, tokens.get(owner, ""))
+            api.request(
+                "POST",
+                f"/repos/{action.repo}/issues/{action.number}/comments",
+                {"body": body},
+            )
+        except RedraftUnavailable as exc:
+            print(
+                f"ALERT PR {action.repo}#{action.number}: {exc} — defuse deferred "
+                "(not a property of this PR; this run fails after the sweep completes)"
+            )
+            unavailable.append(f"{action.repo}#{action.number}: {exc}")
+            continue
+        except GroomError as exc:
+            print(f"ALERT PR {action.repo}#{action.number}: {exc} — defuse deferred")
+            deferred.append(f"{action.repo}#{action.number}: {exc}")
+            continue
         print(f"WRITE defuse parked PR repo={action.repo} pr={action.number}")
         changed += 1
-    return changed
+    return DefuseOutcome(
+        changed=changed,
+        attempted=attempted,
+        deferred=tuple(deferred),
+        unavailable=tuple(unavailable),
+    )
 
 
 # A single newest-100 worker-run page is NOT enough to correlate every live lease (issue #173):
@@ -1773,13 +2045,25 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
     attempts: dict[tuple[str, int], int] = {}
     stale_prs: dict[tuple[str, int], str] = {}
     defuse_prs: dict[tuple[str, int], tuple[str, str]] = {}
+    # Issue #647, THIRD instance of the same shape, found while closing the other two: the per-PR
+    # DETAIL read below is an unwrapped per-object operation with reclaim downstream, so one PR
+    # whose detail GET is refused (or comes back malformed) aborted the sweep before
+    # _release_claims — #644's leak with yet another trigger. It takes the same mechanical change
+    # because this read feeds ONLY the stale-PR hand-off candidacy: deferring one PR's DETECTION
+    # costs that PR one tick of hand-off and nothing else. (The two OTHER unwrapped reads in this
+    # loop do NOT take it — the per-issue comments read feeds the attempt budget, and the per-repo
+    # snapshots feed the dead-claim computation, so degrading either can cause a WRONG mutation
+    # rather than a deferred one. Both are reported on #647 rather than changed here.)
+    detect_attempted = 0
+    detect_completed = 0
+    detect_deferrals: list[str] = []
     for repo, api in groomable.items():
         repo_limits = limits[repo]
         issues[repo] = _issues(api, repo)
         pulls[repo] = _pulls(api, repo)
         defuse_prs.update(
             _collect_defuse_prs(
-                api, repo, pulls[repo], now, defuse_stale_seconds
+                api, repo, pulls[repo], now, defuse_stale_seconds, bot_login
             )
         )
         for number, issue in issues[repo].items():
@@ -1791,21 +2075,34 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
                 < repo_limits.threshold_seconds
             ):
                 continue
-            detail = api.request("GET", f"/repos/{repo}/pulls/{number}")
-            if not isinstance(detail, dict):
-                raise GroomError(
-                    f"target pull request detail is malformed for {repo}#{number}"
+            detect_attempted += 1
+            try:
+                detail = api.request("GET", f"/repos/{repo}/pulls/{number}")
+                if not isinstance(detail, dict):
+                    raise GroomError(
+                        f"target pull request detail is malformed for {repo}#{number}"
+                    )
+                reason = stale_worker_pr_reason(
+                    detail,
+                    bot_login,
+                    repo_limits.threshold_seconds,
+                    now,
+                    has_valid_provenance=worker_pr_provenance_enumerable(
+                        repo, number, ledger_root=ledger_root),
                 )
-            reason = stale_worker_pr_reason(
-                detail,
-                bot_login,
-                repo_limits.threshold_seconds,
-                now,
-                has_valid_provenance=worker_pr_provenance_enumerable(
-                    repo, number, ledger_root=ledger_root),
-            )
+            except GroomError as exc:
+                print(f"ALERT PR {repo}#{number}: {exc} — stale PR detection deferred")
+                detect_deferrals.append(f"{repo}#{number}: {exc}")
+                continue
+            detect_completed += 1
             if reason:
                 stale_prs[(repo, number)] = reason
+    detect_outcome = PhaseOutcome(
+        label="stale PR detection",
+        changed=detect_completed,
+        attempted=detect_attempted,
+        deferred=tuple(detect_deferrals),
+    )
 
     admitted = {
         repo: _admitted_worker_prs(repo, pulls[repo], bot_login, ledger_root=ledger_root)
@@ -1867,237 +2164,319 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
 
     reset = 0
     deferred = 0
+    # Issue #647: the SAME head-of-line abort shape #644 fixed for the defuse phase. Every
+    # operation below — the fresh issue re-read, the comment reads, the mutation-boundary PR
+    # re-read and _apply_labels' own ensure-label / add / delete writes — was UNWRAPPED, and
+    # _release_claims is downstream of this loop, so ONE un-labellable issue aborted the whole
+    # sweep before dead-lease reclaim. That is the defect that cost 13 consecutive failed runs and
+    # ~4 hours without reclaim. Failures are RECORDED here, never swallowed: phase_exit_failure
+    # decides the run's status from this outcome AFTER the sweep has done its work.
+    repair_attempted = 0
+    repair_completed = 0
+    repair_deferrals: list[str] = []
     for action in issue_actions:
         api = groomable[action.repo]
         key = (action.repo, action.number)
-        if key in fresh_live_issues:
-            print(f"SKIP issue {action.repo}#{action.number}: a live lease appeared")
+        repair_attempted += 1
+        repair_failed = False
+        try:
+            if key in fresh_live_issues:
+                print(f"SKIP issue {action.repo}#{action.number}: a live lease appeared")
+                continue
+            issue = _fresh_issue(api, action.repo, action.number)
+            if issue is None or issue.get("state") != "open":
+                print(f"SKIP issue {action.repo}#{action.number}: no longer open")
+                continue
+            labels = _labels(issue, f"target issue {action.repo}#{action.number}")
+            mode = action.mode
+            if mode == "ready":
+                current_comments = (
+                    _comments(api, action.repo, action.number)
+                    if issue.get("comments", 0)
+                    else []
+                )
+                orphan_repair = action.reason in (
+                    "in review without an open worker PR",
+                    "no orchestration status after a worker attempt",
+                )
+                fresh_has_status = any(label.startswith("status:") for label in labels)
+                fresh_in_review = "status:in-progress-review" in labels
+                if (
+                    count_attempts(current_comments, bot_login)
+                    >= limits[action.repo].max_attempts
+                ):
+                    mode = "defer"
+                elif not orphan_repair and "status:in-progress" not in labels:
+                    print(
+                        f"SKIP issue {action.repo}#{action.number}: no longer in progress"
+                    )
+                    continue
+                elif orphan_repair and (
+                    "needs:user" in labels
+                    or (fresh_has_status and not fresh_in_review)
+                ):
+                    print(
+                        f"SKIP issue {action.repo}#{action.number}: status changed under grooming"
+                    )
+                    continue
+                elif action.number in current_links[action.repo]:
+                    print(f"SKIP issue {action.repo}#{action.number}: an open PR appeared")
+                    continue
+                elif (
+                    (action.reason.startswith("stale") or orphan_repair)
+                    and now
+                    - _epoch(
+                        issue.get("updated_at"),
+                        f"target issue {action.repo}#{action.number}",
+                    )
+                    < limits[action.repo].threshold_seconds
+                ):
+                    print(
+                        f"SKIP issue {action.repo}#{action.number}: activity refreshed its threshold"
+                    )
+                    continue
+            else:
+                current_comments = (
+                    _comments(api, action.repo, action.number)
+                    if issue.get("comments", 0)
+                    else []
+                )
+                if (
+                    count_attempts(current_comments, bot_login)
+                    < limits[action.repo].max_attempts
+                ):
+                    print(
+                        f"SKIP issue {action.repo}#{action.number}: attempt budget is no longer exhausted"
+                    )
+                    continue
+            if mode == "defer":
+                # Mutation-boundary revalidation (issue #170, review round 1): re-read the target's
+                # open PRs NOW — not the pre-loop snapshot — so a final-attempt worker PR that opened
+                # after planning (or while earlier actions were processed) still suppresses the park.
+                # Covers BOTH defer paths (a planned exhaustion defer and the ready-path downgrade
+                # above). Suppression requires the ADMITTED proven-worker set, never loose linkage.
+                # This is as close to the label write as the API permits; the residual window is
+                # GitHub's own read-to-write gap. The park is now the machine-owned status:parked
+                # soft hold (an admitted PR would keep flowing through review either way), but an
+                # open admitted PR means the FINAL allowed attempt SUCCEEDED — parking its issue is
+                # simply wrong, so skipping — the fail-closed side, retried next sweep — wins any
+                # tie.
+                boundary_pulls = _pulls(api, action.repo)
+                if action.number in _admitted_worker_prs(
+                    action.repo, boundary_pulls, bot_login, ledger_root=ledger_root
+                ):
+                    print(
+                        f"SKIP issue {action.repo}#{action.number}: an admitted worker PR is open"
+                    )
+                    continue
+                # Issue #174: the checkout the on-disk admission reads is IMMUTABLE for the whole
+                # sweep, so a provenance record a delayed job or backfill lands DURING the sweep is
+                # invisible above. Re-read this issue's worker-PR provenance from the LIVE `ledger`
+                # ref immediately before the park: a raced-in valid record still suppresses it
+                # (review-loop-owned — its final attempt succeeded), and an unavailable or
+                # conflicting live read skips the park with an operational alert rather than
+                # parking on an unusable read (a wrong park mislabels the issue for a full
+                # readmission cycle).
+                live = _live_issue_admission(
+                    registry_api, registry_repo, action.repo, action.number,
+                    boundary_pulls, bot_login,
+                )
+                if live == "admitted":
+                    print(
+                        f"SKIP issue {action.repo}#{action.number}: a valid provenance record for "
+                        "its worker PR now exists on the live ledger ref"
+                    )
+                    continue
+                if live == "indeterminate":
+                    print(
+                        f"ALERT issue {action.repo}#{action.number}: live provenance revalidation "
+                        "was unavailable or conflicting — deferring the status:parked park to "
+                        "the next sweep"
+                    )
+                    continue
+            changed = _apply_labels(api, action.repo, action.number, labels, mode)
+            if changed and mode == "ready":
+                reset += 1
+            elif changed:
+                deferred += 1
+        except GroomError as exc:
+            repair_failed = True
+            print(
+                f"ALERT issue {action.repo}#{action.number}: {exc} — status repair deferred"
+            )
+            repair_deferrals.append(f"{action.repo}#{action.number}: {exc}")
             continue
-        issue = _fresh_issue(api, action.repo, action.number)
-        if issue is None or issue.get("state") != "open":
-            print(f"SKIP issue {action.repo}#{action.number}: no longer open")
-            continue
-        labels = _labels(issue, f"target issue {action.repo}#{action.number}")
-        mode = action.mode
-        if mode == "ready":
-            current_comments = (
-                _comments(api, action.repo, action.number)
-                if issue.get("comments", 0)
-                else []
-            )
-            orphan_repair = action.reason in (
-                "in review without an open worker PR",
-                "no orchestration status after a worker attempt",
-            )
-            fresh_has_status = any(label.startswith("status:") for label in labels)
-            fresh_in_review = "status:in-progress-review" in labels
-            if (
-                count_attempts(current_comments, bot_login)
-                >= limits[action.repo].max_attempts
-            ):
-                mode = "defer"
-            elif not orphan_repair and "status:in-progress" not in labels:
-                print(
-                    f"SKIP issue {action.repo}#{action.number}: no longer in progress"
-                )
-                continue
-            elif orphan_repair and (
-                "needs:user" in labels
-                or (fresh_has_status and not fresh_in_review)
-            ):
-                print(
-                    f"SKIP issue {action.repo}#{action.number}: status changed under grooming"
-                )
-                continue
-            elif action.number in current_links[action.repo]:
-                print(f"SKIP issue {action.repo}#{action.number}: an open PR appeared")
-                continue
-            elif (
-                (action.reason.startswith("stale") or orphan_repair)
-                and now
-                - _epoch(
-                    issue.get("updated_at"),
-                    f"target issue {action.repo}#{action.number}",
-                )
-                < limits[action.repo].threshold_seconds
-            ):
-                print(
-                    f"SKIP issue {action.repo}#{action.number}: activity refreshed its threshold"
-                )
-                continue
-        else:
-            current_comments = (
-                _comments(api, action.repo, action.number)
-                if issue.get("comments", 0)
-                else []
-            )
-            if (
-                count_attempts(current_comments, bot_login)
-                < limits[action.repo].max_attempts
-            ):
-                print(
-                    f"SKIP issue {action.repo}#{action.number}: attempt budget is no longer exhausted"
-                )
-                continue
-        if mode == "defer":
-            # Mutation-boundary revalidation (issue #170, review round 1): re-read the target's
-            # open PRs NOW — not the pre-loop snapshot — so a final-attempt worker PR that opened
-            # after planning (or while earlier actions were processed) still suppresses the park.
-            # Covers BOTH defer paths (a planned exhaustion defer and the ready-path downgrade
-            # above). Suppression requires the ADMITTED proven-worker set, never loose linkage.
-            # This is as close to the label write as the API permits; the residual window is
-            # GitHub's own read-to-write gap. The park is now the machine-owned status:parked
-            # soft hold (an admitted PR would keep flowing through review either way), but an
-            # open admitted PR means the FINAL allowed attempt SUCCEEDED — parking its issue is
-            # simply wrong, so skipping — the fail-closed side, retried next sweep — wins any
-            # tie.
-            boundary_pulls = _pulls(api, action.repo)
-            if action.number in _admitted_worker_prs(
-                action.repo, boundary_pulls, bot_login, ledger_root=ledger_root
-            ):
-                print(
-                    f"SKIP issue {action.repo}#{action.number}: an admitted worker PR is open"
-                )
-                continue
-            # Issue #174: the checkout the on-disk admission reads is IMMUTABLE for the whole
-            # sweep, so a provenance record a delayed job or backfill lands DURING the sweep is
-            # invisible above. Re-read this issue's worker-PR provenance from the LIVE `ledger`
-            # ref immediately before the park: a raced-in valid record still suppresses it
-            # (review-loop-owned — its final attempt succeeded), and an unavailable or
-            # conflicting live read skips the park with an operational alert rather than
-            # parking on an unusable read (a wrong park mislabels the issue for a full
-            # readmission cycle).
-            live = _live_issue_admission(
-                registry_api, registry_repo, action.repo, action.number,
-                boundary_pulls, bot_login,
-            )
-            if live == "admitted":
-                print(
-                    f"SKIP issue {action.repo}#{action.number}: a valid provenance record for "
-                    "its worker PR now exists on the live ledger ref"
-                )
-                continue
-            if live == "indeterminate":
-                print(
-                    f"ALERT issue {action.repo}#{action.number}: live provenance revalidation "
-                    "was unavailable or conflicting — deferring the status:parked park to "
-                    "the next sweep"
-                )
-                continue
-        changed = _apply_labels(api, action.repo, action.number, labels, mode)
-        if changed and mode == "ready":
-            reset += 1
-        elif changed:
-            deferred += 1
+        finally:
+            # This issue's work COMPLETED unless a GroomError deferred it. A deliberate SKIP
+            # (`continue`) is a completed decision, not a failure, so the accounting has to run on
+            # every exit path except the deferral — which is what `finally` buys here, since a
+            # `continue` inside the block would jump straight past a trailing statement. Rule 2 of
+            # phase_exit_failure then reds the run only when NOTHING completed while something was
+            # deferred: a repo-wide credential or permission loss stays loud, one issue's refusal
+            # stays a per-issue ALERT.
+            if not repair_failed:
+                repair_completed += 1
+    repair_outcome = PhaseOutcome(
+        label="issue status repair",
+        changed=repair_completed,
+        attempted=repair_attempted,
+        deferred=tuple(repair_deferrals),
+    )
 
-    defused_count = _execute_defuse_actions(
-        pull_actions, groomable, target_tokens, now, defuse_stale_seconds
+    defuse_outcome = _execute_defuse_actions(
+        pull_actions, groomable, target_tokens, now, defuse_stale_seconds, bot_login
     )
 
     stale_count = 0
+    # Issue #647, the second surviving instance of #644's shape — and the one whose reclaim
+    # exposure is most direct, since _release_claims is the very next statement after this loop.
+    # The detail GET, _ensure_label, the label POST, the comment read and the comment POST were all
+    # UNWRAPPED per-object operations: one unreachable or un-labellable PR (sparq-org/sparq#3427 is
+    # exactly this shape — a human-authored, workflow-touching PR under a token with no `workflows`
+    # permission) aborted the sweep before dead-lease reclaim. Each PR now defers ITSELF.
+    stale_attempted = 0
+    stale_completed = 0
+    stale_deferrals: list[str] = []
     for action in pull_actions:
         if action.mode != "park":
             continue
         api = groomable[action.repo]
-        pull = api.request(
-            "GET", f"/repos/{action.repo}/pulls/{action.number}", allow_404=True
-        )
-        if not isinstance(pull, dict) or pull.get("state") != "open":
-            print(f"SKIP PR {action.repo}#{action.number}: no longer open")
-            continue
-        reason = stale_worker_pr_reason(
-            pull,
-            bot_login,
-            limits[action.repo].threshold_seconds,
-            now,
-            has_valid_provenance=worker_pr_provenance_enumerable(
-                action.repo, action.number, ledger_root=ledger_root),
-        )
-        if reason is None:
-            print(f"SKIP PR {action.repo}#{action.number}: no longer stale/failing")
-            continue
-        # Issue #174: the ORPHAN-draft reason was derived from provenance ABSENCE on the IMMUTABLE
-        # checkout (worker_pr_provenance_enumerable, at planning and just above). A delayed
-        # provenance job or backfill that lands DURING the sweep is invisible there, so re-read the
-        # record from the LIVE `ledger` ref immediately before the terminal park. A raced-in valid
-        # record means the draft is review-loop-owned (cancel the park); an unavailable or
-        # conflicting live read skips the park with an operational alert rather than terminally
-        # parking on an unusable read. Only the provenance-derived orphan reason is revalidated — a
-        # NON-draft PR wedged in a bad merge state is parked regardless of provenance, so its
-        # (unrelated) escalation is left untouched.
-        if reason == ORPHAN_DRAFT_REASON:
-            state, _record = _live_provenance_record(
-                registry_api, registry_repo, action.repo, action.number
+        stale_attempted += 1
+        stale_failed = False
+        try:
+            pull = api.request(
+                "GET", f"/repos/{action.repo}/pulls/{action.number}", allow_404=True
             )
-            if state == "admits":
-                print(
-                    f"SKIP PR {action.repo}#{action.number}: a valid provenance record now "
-                    "exists on the live ledger ref (review-loop-owned)"
-                )
+            if not isinstance(pull, dict) or pull.get("state") != "open":
+                print(f"SKIP PR {action.repo}#{action.number}: no longer open")
                 continue
-            if state == "indeterminate":
-                print(
-                    f"ALERT PR {action.repo}#{action.number}: live provenance revalidation was "
-                    "unavailable or conflicting — deferring the terminal needs:user park to the "
-                    "next sweep"
-                )
-                continue
-        labels = _labels(pull, f"target pull request {action.repo}#{action.number}")
-        label_changed = False
-        if "needs:user" not in labels:
-            # Sticky human unpark (park_policy.py defect 2): a human who removed needs:user
-            # from this PR more recently than any application vetoes the re-park (the whole
-            # action — a repeated "human review is required" comment would spam a PR the human
-            # explicitly unparked). This PR park stays needs:user: an orphan draft / wedged
-            # merge state is a genuine human hand-off, not a capacity park.
-            if park_policy.park_vetoed(
-                    action.repo, action.number, "needs:user",
-                    lambda r, n: api.paginate(f"/repos/{r}/issues/{n}/timeline"),
-                    is_human=lambda login: _is_human_maintainer(
-                        api, action.repo, login)):
-                print(f"SKIP PR {action.repo}#{action.number}: needs:user park suppressed "
-                      "(sticky human unpark)")
-                continue
-            _ensure_label(api, action.repo, "needs:user")
-            api.request(
-                "POST",
-                f"/repos/{action.repo}/issues/{action.number}/labels",
-                {"labels": ["needs:user"]},
+            reason = stale_worker_pr_reason(
+                pull,
+                bot_login,
+                limits[action.repo].threshold_seconds,
+                now,
+                has_valid_provenance=worker_pr_provenance_enumerable(
+                    action.repo, action.number, ledger_root=ledger_root),
             )
+            if reason is None:
+                print(f"SKIP PR {action.repo}#{action.number}: no longer stale/failing")
+                continue
+            # Issue #174: the ORPHAN-draft reason was derived from provenance ABSENCE on the IMMUTABLE
+            # checkout (worker_pr_provenance_enumerable, at planning and just above). A delayed
+            # provenance job or backfill that lands DURING the sweep is invisible there, so re-read the
+            # record from the LIVE `ledger` ref immediately before the terminal park. A raced-in valid
+            # record means the draft is review-loop-owned (cancel the park); an unavailable or
+            # conflicting live read skips the park with an operational alert rather than terminally
+            # parking on an unusable read. Only the provenance-derived orphan reason is revalidated — a
+            # NON-draft PR wedged in a bad merge state is parked regardless of provenance, so its
+            # (unrelated) escalation is left untouched.
+            if reason == ORPHAN_DRAFT_REASON:
+                state, _record = _live_provenance_record(
+                    registry_api, registry_repo, action.repo, action.number
+                )
+                if state == "admits":
+                    print(
+                        f"SKIP PR {action.repo}#{action.number}: a valid provenance record now "
+                        "exists on the live ledger ref (review-loop-owned)"
+                    )
+                    continue
+                if state == "indeterminate":
+                    print(
+                        f"ALERT PR {action.repo}#{action.number}: live provenance revalidation was "
+                        "unavailable or conflicting — deferring the terminal needs:user park to the "
+                        "next sweep"
+                    )
+                    continue
+            labels = _labels(pull, f"target pull request {action.repo}#{action.number}")
+            label_changed = False
+            if "needs:user" not in labels:
+                # Sticky human unpark (park_policy.py defect 2): a human who removed needs:user
+                # from this PR more recently than any application vetoes the re-park (the whole
+                # action — a repeated "human review is required" comment would spam a PR the human
+                # explicitly unparked). This PR park stays needs:user: an orphan draft / wedged
+                # merge state is a genuine human hand-off, not a capacity park.
+                if park_policy.park_vetoed(
+                        action.repo, action.number, "needs:user",
+                        lambda r, n: api.paginate(f"/repos/{r}/issues/{n}/timeline"),
+                        is_human=lambda login: _is_human_maintainer(
+                            api, action.repo, login)):
+                    print(f"SKIP PR {action.repo}#{action.number}: needs:user park suppressed "
+                          "(sticky human unpark)")
+                    continue
+                _ensure_label(api, action.repo, "needs:user")
+                api.request(
+                    "POST",
+                    f"/repos/{action.repo}/issues/{action.number}/labels",
+                    {"labels": ["needs:user"]},
+                )
+                print(
+                    f"WRITE add labels repo={action.repo} issue={action.number} labels=needs:user"
+                )
+                label_changed = True
+            comments = _comments(api, action.repo, action.number)
+            already_commented = any(
+                comment["user"]["login"].casefold() == bot_login.casefold()
+                and STALE_PR_MARKER in comment["body"]
+                for comment in comments
+            )
+            comment_changed = False
+            if not already_commented:
+                body = (
+                    "> 🤖 SPARQ agent\n\n"
+                    f"This worker PR has been untouched beyond the {limits[action.repo].worker_timeout_minutes}-"
+                    f"minute maintenance threshold, and {reason}. Grooming will not close, merge, or force-push "
+                    "it; human review is required.\n\n"
+                    f"{STALE_PR_MARKER}"
+                )
+                api.request(
+                    "POST",
+                    f"/repos/{action.repo}/issues/{action.number}/comments",
+                    {"body": body},
+                )
+                print(f"WRITE stale PR comment repo={action.repo} pr={action.number}")
+                comment_changed = True
+            if label_changed or comment_changed:
+                stale_count += 1
+        except GroomError as exc:
+            stale_failed = True
             print(
-                f"WRITE add labels repo={action.repo} issue={action.number} labels=needs:user"
+                f"ALERT PR {action.repo}#{action.number}: {exc} — stale PR hand-off deferred"
             )
-            label_changed = True
-        comments = _comments(api, action.repo, action.number)
-        already_commented = any(
-            comment["user"]["login"].casefold() == bot_login.casefold()
-            and STALE_PR_MARKER in comment["body"]
-            for comment in comments
-        )
-        comment_changed = False
-        if not already_commented:
-            body = (
-                "> 🤖 SPARQ agent\n\n"
-                f"This worker PR has been untouched beyond the {limits[action.repo].worker_timeout_minutes}-"
-                f"minute maintenance threshold, and {reason}. Grooming will not close, merge, or force-push "
-                "it; human review is required.\n\n"
-                f"{STALE_PR_MARKER}"
-            )
-            api.request(
-                "POST",
-                f"/repos/{action.repo}/issues/{action.number}/comments",
-                {"body": body},
-            )
-            print(f"WRITE stale PR comment repo={action.repo} pr={action.number}")
-            comment_changed = True
-        if label_changed or comment_changed:
-            stale_count += 1
+            stale_deferrals.append(f"{action.repo}#{action.number}: {exc}")
+            continue
+        finally:
+            # Same accounting as the issue-repair loop above: a deliberate SKIP is a completed
+            # decision, a GroomError is a deferral, and `finally` is what sees both (a `continue`
+            # inside the block jumps past any trailing statement).
+            if not stale_failed:
+                stale_completed += 1
+    stale_outcome = PhaseOutcome(
+        label="stale PR hand-off",
+        changed=stale_completed,
+        attempted=stale_attempted,
+        deferred=tuple(stale_deferrals),
+    )
 
     reclaimed = _release_claims(registry_api, registry_repo, dead_claims)
     print(
         f"SUMMARY reclaimed={reclaimed} reset={reset} deferred={deferred} "
-        f"stale_prs={stale_count} defused_prs={defused_count}"
+        f"stale_prs={stale_count} defused_prs={defuse_outcome.changed} "
+        f"defuse_deferred={len(defuse_outcome.deferred) + len(defuse_outcome.unavailable)} "
+        f"repair_deferred={len(repair_outcome.deferred)} "
+        f"stale_pr_deferred={len(stale_outcome.deferred)} "
+        f"detect_deferred={len(detect_outcome.deferred)}"
     )
+    # Issue #644 precedence rule 4, now covering all three per-object phases (issue #647): the
+    # sweep's WORK — dead-lease reclaim above included — always completes first, and a systemic
+    # failure in ANY phase is reported by the exit status HERE, at the end. A single un-redraftable,
+    # unreachable or un-labellable object alongside a completed one stays a per-object ALERT
+    # (rule 3) and leaves this green; it does not, and must not, buy silence for a whole-phase
+    # failure. The exit status is the report, never the control flow.
+    systemic_sweep_failure = sweep_exit_failure(
+        (detect_outcome, repair_outcome, defuse_outcome, stale_outcome)
+    )
+    if systemic_sweep_failure is not None:
+        raise GroomError(systemic_sweep_failure)
     return reclaimed, reset, deferred, stale_count
 
 
@@ -2374,6 +2753,10 @@ def _self_test() -> int:
     ).isoformat()
     recent_activity = datetime.fromtimestamp(defuse_now - 60, timezone.utc).isoformat()
 
+    # The App login these fixtures' PRs are authored by. Ownership is EXACT (a `type == "Bot"`
+    # check would admit dependabot and every other third-party App — see _parked_pr_snapshot).
+    DEFUSE_BOT_LOGIN = "app[bot]"   # the identity this module's harness resolves throughout
+
     def _defuse_pull(number: int, **changes: Any) -> dict[str, Any]:
         pull = {
             "number": number,
@@ -2382,6 +2765,9 @@ def _self_test() -> int:
             "labels": [{"name": "needs:user"}],
             "updated_at": old_activity,
             "head": {"sha": f"{number:040x}"},
+            # Defuse candidates are OUR OWN parked PRs. A human's PR, and a FOREIGN bot's,
+            # are both excluded by _parked_pr_snapshot; both are covered separately below.
+            "user": {"login": DEFUSE_BOT_LOGIN, "type": "Bot"},
             "auto_merge": None,
         }
         pull.update(changes)
@@ -2397,6 +2783,29 @@ def _self_test() -> int:
         7: _defuse_pull(7),
         8: _defuse_pull(8),
         9: _defuse_pull(9),
+        # #3427: identical to the admitted #1 in EVERY respect except authorship. This is the
+        # live shape that made groom permanently red — the maintainer's own `needs:user` PR was
+        # selected on every sweep and every redraft came back
+        # `Resource not accessible by integration (convertPullRequestToDraft)`.
+        10: _defuse_pull(10, user={"login": "jeswr", "type": "User"}),
+        # Unknown/malformed authorship must fail toward NOT touching the PR. These carry OUR
+        # OWN login on purpose: with a foreign login they would be rejected by the ownership
+        # conjunct and would pin nothing about `type` (exactly how the r1 version was vacuous).
+        11: _defuse_pull(11, user=None),
+        12: _defuse_pull(12, user={"login": DEFUSE_BOT_LOGIN}),          # no `type` at all
+        20: _defuse_pull(20, user={"login": DEFUSE_BOT_LOGIN, "type": "User"}),   # contradictory
+        21: _defuse_pull(21, user={"login": DEFUSE_BOT_LOGIN, "type": ""}),       # empty type
+        # A FOREIGN bot. `type == "Bot"` admitted these; cross-provider review drove
+        # dependabot[bot] all the way through live revalidation to a real `gh pr ready --undo`
+        # plus an audit comment. Ownership is a single login, not a category.
+        13: _defuse_pull(13, user={"login": "dependabot[bot]", "type": "Bot"}),
+        14: _defuse_pull(14, user={"login": "copilot[bot]", "type": "Bot"}),
+        15: _defuse_pull(15, user={"login": "github-actions[bot]", "type": "Bot"}),
+        # Logins that CONTAIN ours but are not ours — the App-name-squatting shape. Found by
+        # mutation: with only the fixtures above, relaxing the comparison to a substring test
+        # stayed GREEN, because none of them is a superstring of the bot login.
+        17: _defuse_pull(17, user={"login": "not-app[bot]", "type": "Bot"}),
+        18: _defuse_pull(18, user={"login": "app[bot]-lookalike", "type": "Bot"}),
     }
     del defuse_details[8]["auto_merge"]  # unknown REST latch state must fail closed
 
@@ -2429,11 +2838,80 @@ def _self_test() -> int:
         defuse_details,
         defuse_now,
         defuse_stale_seconds,
+        DEFUSE_BOT_LOGIN,
     )
     check(
         "#548 tripwire (b): a recently-active parked PR is NOT defused",
         ("owner/repo", 2) in defuse_candidates,
         False,
+    )
+    # #3427: a HUMAN's parked PR is not ours to re-draft. Asserted against the admitted bot PR #1
+    # in the same breath — without that contrast this would also pass if the whole defuse phase
+    # were deleted, which is the vacuity shape this repo keeps producing.
+    check(
+        "#3427: a human-authored parked PR is NOT a defuse candidate, while the otherwise "
+        "IDENTICAL bot-authored PR still is",
+        (
+            ("owner/repo", 1) in defuse_candidates,
+            ("owner/repo", 10) in defuse_candidates,
+        ),
+        (True, False),
+    )
+    check(
+        "#3427: unknown or malformed authorship fails toward NOT mutating the PR — asserted "
+        "with OUR OWN login, so it pins the `type` conjunct rather than the ownership one "
+        "(#659 review r2: the foreign-login version was rejected for the wrong reason)",
+        {("owner/repo", number) in defuse_candidates for number in (11, 12, 20, 21)},
+        {False},
+    )
+    # The first cut of this guard tested `user.type == "Bot"`, which admits EVERY GitHub App.
+    # Cross-provider review reproduced dependabot[bot] passing live revalidation and reaching a
+    # real `gh pr ready --undo` plus an audit comment. The obligation is exact ownership of a
+    # single login, so a predicate over the category of bot-authored PRs is the wrong scope.
+    check(
+        "#659 review: a FOREIGN bot's parked PR is NOT a defuse candidate (type == 'Bot' is "
+        "not ownership — dependabot/copilot/github-actions are other people's PRs)",
+        {("owner/repo", number) in defuse_candidates for number in (13, 14, 15)},
+        {False},
+    )
+    check(
+        "#659 review: a login that merely CONTAINS ours is NOT ours (equality, not substring "
+        "— an App-name squatter must not inherit our authority)",
+        {("owner/repo", number) in defuse_candidates for number in (17, 18)},
+        {False},
+    )
+    check(
+        "#659 review: ownership comparison is case-insensitive, as GitHub logins are",
+        _parked_pr_snapshot(
+            _defuse_pull(16, user={"login": DEFUSE_BOT_LOGIN.upper(), "type": "Bot"}),
+            defuse_now, defuse_stale_seconds, DEFUSE_BOT_LOGIN,
+        )
+        is not None,
+        True,
+    )
+    # An unresolved App identity must admit NOTHING: with nothing to compare against, every PR
+    # belongs to somebody else. Asserted against the SAME fixture that IS admitted with an
+    # identity, so this cannot pass merely because the fixture was unusable.
+    check(
+        "#659 review: an unresolved bot_login admits nothing (fail-closed), while the same "
+        "fixture IS admitted once the identity is known",
+        (
+            _parked_pr_snapshot(defuse_details[1], defuse_now, defuse_stale_seconds, "")
+            is None,
+            # The case the guard EXISTS for, found by mutation: without it, a degraded payload
+            # reporting an empty login would compare equal to an unresolved empty bot_login and
+            # be admitted. Two empty strings must not constitute a match.
+            _parked_pr_snapshot(
+                _defuse_pull(19, user={"login": "", "type": "Bot"}),
+                defuse_now, defuse_stale_seconds, "",
+            )
+            is None,
+            _parked_pr_snapshot(
+                defuse_details[1], defuse_now, defuse_stale_seconds, DEFUSE_BOT_LOGIN
+            )
+            is not None,
+        ),
+        (True, True, True),
     )
     check(
         "#548 tripwire (c): review:changes alone is NOT a terminal defuse hold",
@@ -2497,14 +2975,21 @@ def _self_test() -> int:
             {"owner": "owner-target-token"},
             defuse_now,
             defuse_stale_seconds,
+            DEFUSE_BOT_LOGIN,
         )
     finally:
         subprocess.run = real_subprocess_run
     check(
         "#548 tripwire (a): stale needs:user non-draft PR is redrafted with its target token",
-        (defused, defuse_commands),
+        (defused.changed, defuse_commands),
         (1, [(["gh", "pr", "ready", "1", "-R", "owner/repo", "--undo"],
               "owner-target-token")]),
+    )
+    check(
+        "#644: an all-clean defuse phase is attempted, completed, and leaves the run green",
+        (defused.attempted, defused.deferred, defused.unavailable,
+         defuse_exit_failure(defused)),
+        (1, (), (), None),
     )
     check(
         "#548 tripwire (a): defuse writes one loud audit comment with resume instructions",
@@ -2530,6 +3015,334 @@ def _self_test() -> int:
         "#548 tripwire (f): auto-defuses are bounded to ten per sweep",
         (MAX_AUTO_DEFUSES_PER_TICK, len(bound_actions)),
         (10, 10),
+    )
+
+    # ---- issue #644: an un-redraftable PR must not abort the sweep, and must say WHY ------------
+    # Live incident: sparq-org/sparq#3427 (open, non-draft, needs:user, quiet since 01:41:36Z)
+    # became a defuse candidate at 07:41:36Z, and groom then failed on EVERY run — the redraft's
+    # GroomError was raised from OUTSIDE the per-PR resilience block, and because candidates are
+    # processed lowest-number-first it was a permanent head-of-line block: nothing after the defuse
+    # phase ran, dead-lease reclaim included. The failure also discarded `gh`'s stderr, so three
+    # hours of identical failures carried zero cause. This fixture drives BOTH defects from the
+    # LIVE functions (no fixture text is mutated to make them red).
+    redraft_stderr = (
+        "GraphQL: refusing to allow a GitHub App to create or update workflow "
+        "`.github/workflows/codeql.yml` without `workflows` permission (convertPullRequestToDraft)"
+    )
+
+    class _RedraftAPI:
+        """A defuse-phase API whose latch reads always succeed, so only the redraft can fail."""
+
+        def __init__(self):
+            self.comments: list[str] = []
+            self.pulls = {21: _defuse_pull(21), 22: _defuse_pull(22)}
+            self.comment_failures: set[int] = set()
+
+        def request(self, method, path, body=None, allow_404=False, **_kwargs):
+            if method == "GET":
+                return self.pulls.get(int(path.rsplit("/", 1)[1]))
+            if path == "/graphql":
+                return {"data": {"repository": {"pullRequest": {
+                    "mergeQueueEntry": None, "autoMergeRequest": None}}}}
+            number = int(path.split("/issues/", 1)[1].split("/", 1)[0])
+            if number in self.comment_failures:
+                raise GroomError("issue comment write failed")
+            self.comments.append(path)
+            return {}
+
+    def _redraft_actions(api: _RedraftAPI) -> list[PullAction]:
+        return [
+            PullAction(
+                repo="owner/repo",
+                number=number,
+                reason="terminally parked and quiet",
+                mode="defuse",
+                head_sha=api.pulls[number]["head"]["sha"],
+                updated_at=api.pulls[number]["updated_at"],
+            )
+            for number in sorted(api.pulls)
+        ]
+
+    def _run_defuse(
+        api: _RedraftAPI,
+        failing: set[int],
+        tokens: dict[str, str] | None = None,
+        stderr: str = redraft_stderr,
+        gh_missing: bool = False,
+    ) -> tuple[DefuseOutcome | None, bool, list[int]]:
+        """Run the real defuse phase against `api`; report whether it ABORTED (the #644 defect)."""
+        drafted: list[int] = []
+
+        class _Result:
+            def __init__(self, number):
+                self.returncode = 1 if number in failing else 0
+                self.stdout = ""
+                self.stderr = stderr if number in failing else ""
+
+        def _fake_run(args, **_kwargs):
+            if gh_missing:
+                raise FileNotFoundError("gh")
+            number = int(args[3])
+            if number not in failing:
+                drafted.append(number)
+            return _Result(number)
+
+        real_run = subprocess.run
+        subprocess.run = _fake_run
+        try:
+            return _execute_defuse_actions(
+                _redraft_actions(api),
+                {"owner/repo": api},
+                {"owner": "owner-target-token"} if tokens is None else tokens,
+                defuse_now,
+                defuse_stale_seconds,
+                DEFUSE_BOT_LOGIN,
+            ), False, drafted
+        except GroomError:
+            # Reached ONLY if a per-PR failure escapes the block — i.e. the defect is back.
+            return None, True, drafted
+        finally:
+            subprocess.run = real_run
+
+    # (1) THE DEFECT: the LOWEST-numbered candidate cannot be redrafted. The sweep must process the
+    # remaining candidate anyway. Moving the _redraft_pr call back outside the per-PR
+    # `except GroomError -> defuse deferred -> continue` block reds this check.
+    head_of_line_api = _RedraftAPI()
+    head_of_line, aborted, drafted = _run_defuse(head_of_line_api, failing={21})
+    check(
+        "#644: an un-redraftable LOWEST-numbered PR must NOT abort the defuse phase (the "
+        "_redraft_pr call must sit INSIDE the per-PR `except GroomError -> deferred -> continue`)",
+        aborted,
+        False,
+    )
+    check(
+        "#644: the later candidate is still redrafted and audited after the head-of-line failure",
+        (drafted, head_of_line_api.comments, head_of_line.changed if head_of_line else -1),
+        ([22], ["/repos/owner/repo/issues/22/comments"], 1),
+    )
+    check(
+        "#644: the FAILED candidate gets no audit comment and is recorded as one deferral",
+        (
+            "/repos/owner/repo/issues/21/comments" in head_of_line_api.comments
+            if head_of_line else True,
+            len(head_of_line.deferred) if head_of_line else -1,
+            head_of_line.deferred[0].startswith("owner/repo#21: ") if head_of_line else False,
+        ),
+        (False, 1, True),
+    )
+    # (2) THE DISCARDED CAUSE: `gh`'s stderr must reach the reported error, verbatim enough to
+    # identify the refusal. Dropping _gh_failure_detail (or its result.stderr read) reds this.
+    check(
+        "#644: a redraft failure REPORTS gh's stderr (the discarded-cause defect: 'workflows "
+        "permission' must be visible in the deferral, not just 'redraft failed')",
+        (
+            "without `workflows` permission" in head_of_line.deferred[0]
+            if head_of_line and head_of_line.deferred else False,
+            "gh exited 1" in head_of_line.deferred[0]
+            if head_of_line and head_of_line.deferred else False,
+        ),
+        (True, True),
+    )
+    masked_api = _RedraftAPI()
+    masked, _aborted, _drafted = _run_defuse(
+        masked_api,
+        failing={21},
+        stderr="gh: authentication failed for token owner-target-token (ghs_abcdefgh12345678)",
+    )
+    check(
+        "#644: the reported gh stderr is credential-MASKED (neither the target token nor any "
+        "token-shaped string may reach the operator log)",
+        (
+            "owner-target-token" in masked.deferred[0] if masked and masked.deferred else True,
+            "ghs_abcdefgh12345678" in masked.deferred[0] if masked and masked.deferred else True,
+            masked.deferred[0].count("***") if masked and masked.deferred else -1,
+        ),
+        (False, False, 2),
+    )
+    check(
+        "#644: an empty gh stderr still reports the exit code rather than nothing",
+        _gh_failure_detail(
+            type("_R", (), {"returncode": 3, "stdout": "", "stderr": ""})(), ""
+        ),
+        "gh exited 3 with no output",
+    )
+    bounded = _gh_failure_detail(
+        type("_R", (), {"returncode": 1, "stdout": "", "stderr": "x" * 5000})(), ""
+    )
+    check(
+        "#644: the reported gh output is bounded (a runaway body must not flood the log)",
+        (len(bounded) <= GH_DETAIL_LIMIT + 40, bounded.endswith("…")),
+        (True, True),
+    )
+    # (3) EXIT-STATUS DISCRIMINATION, both directions. This is the exit-zero-swallows-failure
+    # guard: per-PR deferral must not make a whole-phase failure silently green.
+    check(
+        "#644 precedence rule 3: ONE deferred candidate alongside a completed defuse leaves the "
+        "run GREEN (a single un-redraftable PR only defers itself)",
+        defuse_exit_failure(head_of_line) if head_of_line else "aborted",
+        None,
+    )
+    all_failed_api = _RedraftAPI()
+    all_failed, _aborted, all_drafted = _run_defuse(all_failed_api, failing={21, 22})
+    all_failed_reason = defuse_exit_failure(all_failed) if all_failed else None
+    check(
+        "#644 precedence rule 2: EVERY candidate failing is systemic — the run exits NON-zero and "
+        "names the deferrals, never a silent green",
+        (
+            all_drafted,
+            all_failed.changed if all_failed else -1,
+            all_failed.attempted if all_failed else -1,
+            all_failed_reason is not None,
+            "every parked PR defuse failed (2 attempted, 0 completed)" in (all_failed_reason or ""),
+            "owner/repo#21" in (all_failed_reason or "")
+            and "owner/repo#22" in (all_failed_reason or ""),
+        ),
+        ([], 0, 2, True, True, True),
+    )
+    no_token_api = _RedraftAPI()
+    no_token, _aborted, _no_token_drafted = _run_defuse(no_token_api, failing=set(), tokens={})
+    no_token_reason = defuse_exit_failure(no_token) if no_token else None
+    check(
+        "#644 precedence rule 1: a NON-per-PR failure (no owner token) is systemic even though it "
+        "was raised per PR — and it never aborts the phase",
+        (
+            len(no_token.unavailable) if no_token else -1,
+            no_token.deferred if no_token else "aborted",
+            no_token_reason is not None,
+            "unavailable for the whole run" in (no_token_reason or ""),
+        ),
+        (2, (), True, True),
+    )
+    gh_missing_api = _RedraftAPI()
+    gh_missing, _aborted, _gh_drafted = _run_defuse(
+        gh_missing_api, failing=set(), gh_missing=True
+    )
+    check(
+        "#644 precedence rule 1: a missing `gh` binary is systemic, not one PR's deferral",
+        (
+            len(gh_missing.unavailable) if gh_missing else -1,
+            defuse_exit_failure(gh_missing) is not None if gh_missing else False,
+        ),
+        (2, True),
+    )
+    # Rule 1 DOMINATES rule 3: one owner unavailable must red the run even when another candidate
+    # completed. (Both candidates share an owner here, so force the split with a mixed outcome.)
+    mixed = DefuseOutcome(
+        changed=1, attempted=2, deferred=(), unavailable=("owner/repo#21: no token",)
+    )
+    check(
+        "#644 precedence rule 1 DOMINATES rule 3: a completed defuse does not excuse a non-per-PR "
+        "failure",
+        defuse_exit_failure(mixed) is not None,
+        True,
+    )
+    # A failed AUDIT COMMENT is also per-PR (same head-of-line shape), and because the phase then
+    # completed nothing, rule 2 keeps the run loud rather than silently green.
+    audit_api = _RedraftAPI()
+    audit_api.comment_failures = {21, 22}
+    audit, audit_aborted, audit_drafted = _run_defuse(audit_api, failing=set())
+    check(
+        "#644: a failed audit comment defers that PR instead of aborting the sweep, and an "
+        "all-failed phase still exits non-zero",
+        (
+            audit_aborted,
+            audit_drafted,
+            audit.changed if audit else -1,
+            len(audit.deferred) if audit else -1,
+            defuse_exit_failure(audit) is not None if audit else False,
+        ),
+        (False, [21, 22], 0, 2, True),
+    )
+    check(
+        "#644: a phase with NO attempted candidate is green (an unreadable latch already defers "
+        "per PR by design; that unrelated path's status semantics are unchanged)",
+        defuse_exit_failure(DefuseOutcome()),
+        None,
+    )
+
+    # ---- issue #647: ONE precedence rule, applied to EVERY per-object phase --------------------
+    # #644 fixed the defuse phase and wrote the precedence rule down. #647 closes the CLASS: the
+    # stale-PR hand-off and issue-repair loops now record the same outcome shape and are judged by
+    # the SAME function. These checks pin that there is one rule, that it names the phase it is
+    # reporting, and that nothing here can buy silence.
+    check(
+        "#647: #644's names are ALIASES of the shared rule, not a second copy of it (a duplicated "
+        "precedence implementation is what this issue forbids)",
+        (DefuseOutcome is PhaseOutcome, defuse_exit_failure is phase_exit_failure),
+        (True, True),
+    )
+    check(
+        "#647: the systemic report NAMES the phase it came from, so an operator reading a red run "
+        "knows which loop failed",
+        (
+            phase_exit_failure(PhaseOutcome(
+                label="stale PR hand-off", attempted=2, deferred=("owner/repo#31: refused",))),
+            phase_exit_failure(PhaseOutcome(
+                label="issue status repair", attempted=1, deferred=("owner/repo#41: refused",))),
+        ),
+        (
+            "every stale PR hand-off failed (2 attempted, 0 completed): owner/repo#31: refused",
+            "every issue status repair failed (1 attempted, 0 completed): owner/repo#41: refused",
+        ),
+    )
+    check(
+        "#647 rule 2 fires on a deferral recorded BEFORE the attempt was counted — a phase that "
+        "completed nothing while something failed can never report green (the read-stage swallow "
+        "is unrepresentable, not merely unlikely)",
+        phase_exit_failure(PhaseOutcome(
+            label="stale PR hand-off", attempted=0, deferred=("owner/repo#31: GET refused",)
+        )) is not None,
+        True,
+    )
+    check(
+        "#647: EVERY failing phase is named in the sweep's exit status, not just the first "
+        "(a second systemic failure must not hide behind a fixed one)",
+        sweep_exit_failure((
+            PhaseOutcome(label="issue status repair", attempted=1,
+                         deferred=("owner/repo#41: refused",)),
+            PhaseOutcome(label="parked PR defuse", changed=1, attempted=1),
+            PhaseOutcome(label="stale PR hand-off", attempted=1,
+                         deferred=("owner/repo#31: refused",)),
+        )),
+        "every issue status repair failed (1 attempted, 0 completed): owner/repo#41: refused | "
+        "every stale PR hand-off failed (1 attempted, 0 completed): owner/repo#31: refused",
+    )
+    check(
+        "#647: an all-green sweep reports no exit failure at all",
+        sweep_exit_failure((
+            PhaseOutcome(label="issue status repair", changed=2, attempted=2),
+            PhaseOutcome(),
+            PhaseOutcome(label="stale PR hand-off", changed=3, attempted=3,
+                         deferred=("owner/repo#31: refused",)),
+        )),
+        None,
+    )
+    # The HTTP-side cause helper, alongside #644's gh-side one: bounded, masked, and never itself
+    # the reason a diagnostic is lost (an HTTPError with no readable body must degrade to its
+    # status reason, not to nothing).
+    check(
+        "#647: a failed call's error envelope is reported, credential-masked and bounded",
+        (
+            _http_failure_detail(
+                HTTPError("https://api.github.com/x", 403, "Forbidden", {},
+                          io.BytesIO(b'{"message":"Bad credentials ghs_abcdefgh12345678 tok"}')),
+                "tok",
+            ),
+            len(_http_failure_detail(
+                HTTPError("https://api.github.com/x", 422, "Unprocessable", {},
+                          io.BytesIO(b"y" * 5000)),
+                "",
+            )) <= GH_DETAIL_LIMIT + 1,
+        ),
+        ('{"message":"Bad credentials *** ***"}', True),
+    )
+    check(
+        "#647: an HTTPError carrying NO readable body degrades to its status reason rather than "
+        "losing the cause a second time",
+        _http_failure_detail(
+            HTTPError("https://api.github.com/x", 403, "Forbidden", {}, None), "tok"
+        ),
+        "Forbidden",
     )
 
     # [FABLE-5] Deadlock regression (live PRs #3472/#3470): a stale DRAFT worker PR with a VALID
@@ -3801,11 +4614,22 @@ def _self_test() -> int:
             self.purpose = purpose
 
         def request(self, method, path, body=None, allow_404=False, **_kwargs):
+            # Issue #647: a per-object operation can be refused by GitHub. The refusal raised here
+            # is the EXACT GroomError the LIVE GitHubAPI.request builds for that HTTP failure
+            # (_live_http_failure below) — never a hand-written string.
+            refusal = terminal_sweep_env.get("http_failures", {}).get((method, path))
+            if refusal is not None:
+                raise refusal
             if method == "GET" and path.startswith("/repos/owner/repo/issues/"):
                 number = int(path.rsplit("/", 1)[1])
                 return terminal_sweep_env["fresh_issues"].get(number)
             if method == "GET":
                 return terminal_sweep_env.get("gets", {}).get(path)
+            if path == "/graphql":
+                # Both live merge latches absent, so a defuse candidate stays safe-class and the
+                # ONLY thing that can fail in the phase is the redraft itself (issue #644).
+                return {"data": {"repository": {"pullRequest": {
+                    "mergeQueueEntry": None, "autoMergeRequest": None}}}}
             terminal_sweep_env["writes"].append((method, path))
             return {}
 
@@ -3813,7 +4637,7 @@ def _self_test() -> int:
             if path == "/repos/owner/repo/issues?state=open":
                 return terminal_sweep_env["planned_issues"]
             if path == "/repos/owner/repo/pulls?state=open":
-                return []
+                return terminal_sweep_env.get("pulls", [])
             return []
 
     terminal_sweep_releases: list[set[str]] = []
@@ -3845,6 +4669,37 @@ def _self_test() -> int:
             ledger_root="",
             stale_hours=DEFAULT_STALE_HOURS,
         ))
+
+    # Issue #647: the refusal a per-object write meets, built by the LIVE GitHubAPI.request from a
+    # real HTTPError carrying GitHub's own error envelope. The fixture therefore asserts nothing
+    # about a string it wrote itself — dropping the envelope from request's raise, dropping
+    # _http_failure_detail's body read, or dropping the credential mask each changes THIS value and
+    # reds the assertions below.
+    def _live_http_failure(
+        method: str,
+        path: str,
+        envelope: str,
+        code: int = 403,
+        token: str = "sweep-token",
+        purpose: str = "target owner",
+    ) -> GroomError:
+        real_api = terminal_sweep_saved["GitHubAPI"](token, purpose)
+        saved_urlopen = globals()["urlopen"]
+
+        def _refuse(_request, timeout=None):
+            raise HTTPError(
+                "https://api.github.com" + path, code, "Forbidden", {},
+                io.BytesIO(envelope.encode()),
+            )
+
+        globals()["urlopen"] = _refuse
+        try:
+            real_api.request(method, path, {"labels": ["needs:user"]})
+        except GroomError as exc:
+            return exc
+        finally:
+            globals()["urlopen"] = saved_urlopen
+        raise AssertionError("the live GitHubAPI.request must fail on an HTTP error")
 
     try:
         globals().update(terminal_sweep_patched)
@@ -3908,6 +4763,425 @@ def _self_test() -> int:
             "#509 reap cap logs the exact deferred count",
             f"reap cap reached — 5 deferred" in cap_log.getvalue(),
             True,
+        )
+
+        # ---- issue #644 END-TO-END: the sweep must SURVIVE an un-redraftable parked PR ----------
+        # The live failure: an uncaught redraft GroomError raised out of run_sweep BEFORE
+        # _release_claims, so groom leaked leases on every run for hours while reporting only
+        # "parked PR redraft failed for sparq-org/sparq#3427". Here the ONLY defuse candidate
+        # cannot be redrafted AND a dead lease is waiting. Reclaim must still happen, the cause
+        # must be in the log, and — because NO candidate completed — the run must still end
+        # non-zero (precedence rule 2), not silently green.
+        terminal_sweep_leases[:] = [{
+            **base,
+            "claim_id": "f" * 32,
+            "holder": "owner/repo#7@777.1",
+            "issued_at": 1,
+            "expires_at": 2,
+        }]
+        stuck_pr = {
+            "number": 21,
+            "state": "open",
+            "draft": False,
+            "labels": [{"name": "needs:user"}],
+            "updated_at": datetime.fromtimestamp(
+                now - DEFAULT_STALE_HOURS * 3600 - 600, timezone.utc
+            ).isoformat(),
+            "head": {"sha": "c" * 40, "ref": "ci/codeql-nonblocking-retroactive"},
+            # A BOT-authored PR touching workflow files. It was originally modelled on
+            # sparq-org/sparq#3427, which is HUMAN-authored — but human PRs are no longer defuse
+            # candidates at all (see _parked_pr_snapshot), so the #3427 shape now belongs to the
+            # dedicated check further down. What this block still tests, and must keep testing, is
+            # the head-of-line property: one un-redraftable candidate must not abort the phase.
+            # A bot PR touching `.github/workflows/**` reaches that same failure legitimately.
+            "user": {"login": "app[bot]", "type": "Bot"},
+            "body": "a worker PR touching .github/workflows/**",
+            "auto_merge": None,
+        }
+        terminal_sweep_env.update(
+            planned_issues=[],
+            fresh_issues={},
+            pulls=[stuck_pr],
+            gets={"/repos/owner/repo/pulls/21": stuck_pr},
+            writes=[],
+        )
+        terminal_sweep_releases.clear()
+
+        class _StuckRedraft:
+            returncode = 1
+            stdout = ""
+            stderr = (
+                "GraphQL: refusing to allow a GitHub App to create or update workflow "
+                "`.github/workflows/codeql.yml` without `workflows` permission"
+            )
+
+        stuck_log = io.StringIO()
+        saved_stdout = sys.stdout
+        real_run = subprocess.run
+        subprocess.run = lambda *_a, **_k: _StuckRedraft()
+        sys.stdout = stuck_log
+        stuck_error = ""
+        try:
+            _stuck_summary = _terminal_sweep()
+        except GroomError as exc:
+            stuck_error = str(exc)
+        finally:
+            sys.stdout = saved_stdout
+            subprocess.run = real_run
+        stuck_output = stuck_log.getvalue()
+        check(
+            "MUTATION #644: dead-lease reclaim STILL RUNS when the only parked PR cannot be "
+            "redrafted (move _redraft_pr back outside the per-PR except block and run_sweep "
+            "raises before _release_claims, leaking the lease)",
+            terminal_sweep_releases,
+            [{"f" * 32}],
+        )
+        check(
+            "#644: the sweep reaches its SUMMARY and reports the deferral instead of aborting",
+            (
+                "ALERT PR owner/repo#21:" in stuck_output,
+                "defuse deferred" in stuck_output,
+                "SUMMARY reclaimed=1" in stuck_output,
+                "defused_prs=0 defuse_deferred=1" in stuck_output,
+            ),
+            (True, True, True, True),
+        )
+        check(
+            "#644: the un-redraftable PR's gh stderr reaches the log, and the run still exits "
+            "NON-zero naming the whole-phase failure (no exit-zero swallowing)",
+            (
+                "without `workflows` permission" in stuck_output,
+                "every parked PR defuse failed (1 attempted, 0 completed)" in stuck_error,
+                "owner/repo#21" in stuck_error,
+            ),
+            (True, True, True),
+        )
+        terminal_sweep_env.update(pulls=[], gets={})
+
+        # ---- issue #647: the SAME head-of-line abort shape in the two OTHER per-object loops -----
+        # #644 fixed the defuse phase. The stale-PR hand-off loop and the issue-repair loop kept the
+        # identical structure — unwrapped per-object reads and writes with _release_claims
+        # DOWNSTREAM — so one unreachable PR or one un-labellable issue could still abort a sweep
+        # whose later phases include reclaim. Both loops are driven END-TO-END through the real
+        # run_sweep here, with the LOWEST-numbered object refused (the head-of-line position that
+        # made #644 permanent), and each scenario is checked in both precedence directions.
+        forbidden_envelope = (
+            '{"message":"Resource not accessible by integration","documentation_url":'
+            '"https://docs.github.com/rest/issues/labels#add-labels-to-an-issue","status":"403"}'
+        )
+
+        def _stale_worker_pr(number: int) -> dict[str, Any]:
+            """A non-draft worker PR wedged in a bad merge state: a park (hand-off) candidate."""
+            return {
+                "number": number,
+                "state": "open",
+                "draft": False,
+                "labels": [],
+                "updated_at": datetime.fromtimestamp(1_000, timezone.utc).isoformat(),
+                "head": {"sha": f"{number:040x}", "ref": f"sparq-agent/issue-9{number}-fix"},
+                "user": {"login": "app[bot]"},
+                "body": f"{WORKER_PR_MARKER}\n\nautomated work",
+                "mergeable_state": "dirty",
+                "auto_merge": None,
+            }
+
+        def _repairable_issue(number: int) -> dict[str, Any]:
+            """A stale status:in-progress issue with no PR and no lease: a status-repair action."""
+            return {
+                "number": number,
+                "state": "open",
+                "labels": [{"name": "area:crate-a"}, {"name": "status:in-progress"}],
+                "updated_at": datetime.fromtimestamp(1_000, timezone.utc).isoformat(),
+                "comments": 0,
+            }
+
+        def _sweep_with_refusals(
+            refusals: dict[tuple[str, str], GroomError],
+            *,
+            pulls: tuple[dict[str, Any], ...] = (),
+            issues: tuple[dict[str, Any], ...] = (),
+            details: tuple[dict[str, Any], ...] | None = None,
+        ) -> tuple[str, str, list[set[str]]]:
+            """Run the REAL run_sweep with the given per-object refusals; report (log, error, releases).
+
+            `details` overrides what the per-PR detail GET returns, so a candidate can be
+            revalidated AWAY inside the hand-off loop (the deliberate-skip case).
+            """
+            terminal_sweep_leases[:] = [{
+                **base,
+                "claim_id": "e" * 32,
+                "holder": "owner/repo#7@777.1",
+                "issued_at": 1,
+                "expires_at": 2,
+            }]
+            terminal_sweep_env.update(
+                planned_issues=list(issues),
+                fresh_issues={issue["number"]: issue for issue in issues},
+                pulls=list(pulls),
+                gets={
+                    f"/repos/owner/repo/pulls/{pull['number']}": pull
+                    for pull in (pulls if details is None else details)
+                },
+                writes=[],
+                http_failures=dict(refusals),
+            )
+            terminal_sweep_releases.clear()
+            log = io.StringIO()
+            saved = sys.stdout
+            sys.stdout = log
+            error = ""
+            try:
+                _terminal_sweep()
+            except GroomError as exc:
+                error = str(exc)
+            finally:
+                sys.stdout = saved
+                terminal_sweep_env.update(
+                    pulls=[], gets={}, http_failures={}, planned_issues=[], fresh_issues={}
+                )
+            return log.getvalue(), error, [set(claims) for claims in terminal_sweep_releases]
+
+        # (1) STALE-PR HAND-OFF LOOP, head-of-line refusal. The lower-numbered PR's needs:user label
+        # POST is refused; the later PR must still be parked and commented, and the dead lease —
+        # released by _release_claims, the very next statement after this loop — must still be
+        # reclaimed. Move the try/except wrap away and run_sweep raises here instead.
+        park_log, park_error, park_releases = _sweep_with_refusals(
+            {("POST", "/repos/owner/repo/issues/31/labels"): _live_http_failure(
+                "POST", "/repos/owner/repo/issues/31/labels", forbidden_envelope)},
+            pulls=(_stale_worker_pr(31), _stale_worker_pr(32)),
+        )
+        park_writes = terminal_sweep_env["writes"]
+        check(
+            "MUTATION #647 (stale-PR hand-off): dead-lease reclaim STILL RUNS when the "
+            "LOWEST-numbered parked PR's label write is refused (remove the loop's per-PR "
+            "try/except and run_sweep raises before _release_claims, releasing NOTHING)",
+            park_releases,
+            [{"e" * 32}],
+        )
+        check(
+            "#647 (stale-PR hand-off): the refused PR does NOT block the later PR — #32 is still "
+            "labelled AND commented, and #31 writes nothing past its refusal",
+            (
+                ("POST", "/repos/owner/repo/issues/32/labels") in park_writes,
+                ("POST", "/repos/owner/repo/issues/32/comments") in park_writes,
+                ("POST", "/repos/owner/repo/issues/31/comments") in park_writes,
+                "SKIP PR owner/repo#32" in park_log,
+            ),
+            (True, True, False, False),
+        )
+        check(
+            "#647 (stale-PR hand-off): the refusal's CAUSE reaches the deferral — GitHub's own "
+            "'Resource not accessible by integration' envelope, not just 'HTTP 403' (drop the "
+            "envelope from GitHubAPI.request's raise, or _http_failure_detail's body read, and "
+            "this reds)",
+            (
+                "ALERT PR owner/repo#31:" in park_log,
+                "stale PR hand-off deferred" in park_log,
+                "Resource not accessible by integration" in park_log,
+                "HTTP 403" in park_log,
+            ),
+            (True, True, True, True),
+        )
+        check(
+            "#647 precedence rule 3 (stale-PR hand-off): ONE refused PR alongside a completed one "
+            "leaves the run GREEN, and the sweep still reports its SUMMARY",
+            (
+                park_error,
+                "SUMMARY reclaimed=1" in park_log,
+                "stale_prs=1" in park_log,
+                "stale_pr_deferred=1" in park_log,
+            ),
+            ("", True, True, True),
+        )
+        # (1b) EVERY candidate refused: per-object leniency must not make a whole-phase failure
+        # green. Reclaim still runs FIRST — the exit status is the report, never the control flow.
+        park_all_log, park_all_error, park_all_releases = _sweep_with_refusals(
+            {
+                ("POST", f"/repos/owner/repo/issues/{number}/labels"): _live_http_failure(
+                    "POST", f"/repos/owner/repo/issues/{number}/labels", forbidden_envelope)
+                for number in (31, 32)
+            },
+            pulls=(_stale_worker_pr(31), _stale_worker_pr(32)),
+        )
+        check(
+            "#647 precedence rule 2 (stale-PR hand-off): EVERY candidate refused is systemic — the "
+            "run exits NON-zero naming both deferrals — while reclaim STILL ran first",
+            (
+                park_all_releases,
+                "every stale PR hand-off failed (2 attempted, 0 completed)" in park_all_error,
+                "owner/repo#31" in park_all_error and "owner/repo#32" in park_all_error,
+                "SUMMARY reclaimed=1" in park_all_log,
+                "stale_pr_deferred=2" in park_all_log,
+            ),
+            ([{"e" * 32}], True, True, True, True),
+        )
+        # (1c) The credential mask must hold on the path that now carries a response body into the
+        # operator log. Removing the token replacement OR the _TOKEN_SHAPE substitution reds this.
+        leaky_envelope = (
+            '{"message":"Bad credentials for token sweep-token '
+            '(ghs_leakleakleak12345678) while adding labels"}'
+        )
+        masked_log, _masked_error, _masked_releases = _sweep_with_refusals(
+            {("POST", "/repos/owner/repo/issues/31/labels"): _live_http_failure(
+                "POST", "/repos/owner/repo/issues/31/labels", leaky_envelope)},
+            pulls=(_stale_worker_pr(31), _stale_worker_pr(32)),
+        )
+        check(
+            "#647: an error envelope that echoes a credential is MASKED before it reaches the "
+            "operator log (neither the exact target token nor any token-shaped string may appear)",
+            (
+                "sweep-token" in masked_log,
+                "ghs_leakleakleak12345678" in masked_log,
+                "Bad credentials for token *** (***) while adding labels" in masked_log,
+            ),
+            (False, False, True),
+        )
+
+        # (2) ISSUE-REPAIR LOOP, head-of-line refusal. Same shape: the lower-numbered issue's
+        # _apply_labels write is refused, the later issue must still be repaired, reclaim must still
+        # run. This loop sits BEFORE the defuse phase and the hand-off loop, so its abort took out
+        # strictly more of the sweep than #644's did.
+        repair_log, repair_error, repair_releases = _sweep_with_refusals(
+            {("POST", "/repos/owner/repo/issues/41/labels"): _live_http_failure(
+                "POST", "/repos/owner/repo/issues/41/labels", forbidden_envelope)},
+            issues=(_repairable_issue(41), _repairable_issue(42)),
+        )
+        repair_writes = terminal_sweep_env["writes"]
+        check(
+            "MUTATION #647 (issue repair): dead-lease reclaim STILL RUNS when the LOWEST-numbered "
+            "issue's label write is refused (remove the loop's per-issue try/except and run_sweep "
+            "raises before _release_claims, releasing NOTHING)",
+            repair_releases,
+            [{"e" * 32}],
+        )
+        check(
+            "#647 (issue repair): the refused issue does NOT block the later one — #42 is still "
+            "re-readied (status:ready added, status:in-progress removed) while #41's transition "
+            "stops at its refusal",
+            (
+                ("POST", "/repos/owner/repo/issues/42/labels") in repair_writes,
+                ("DELETE", "/repos/owner/repo/issues/42/labels/status%3Ain-progress")
+                in repair_writes,
+                ("DELETE", "/repos/owner/repo/issues/41/labels/status%3Ain-progress")
+                in repair_writes,
+            ),
+            (True, True, False),
+        )
+        check(
+            "#647 (issue repair): the refusal's CAUSE reaches the deferral, credential-masked and "
+            "naming the issue",
+            (
+                "ALERT issue owner/repo#41:" in repair_log,
+                "status repair deferred" in repair_log,
+                "Resource not accessible by integration" in repair_log,
+            ),
+            (True, True, True),
+        )
+        check(
+            "#647 precedence rule 3 (issue repair): ONE refused issue alongside a repaired one "
+            "leaves the run GREEN, and the SUMMARY counts both the repair and the deferral",
+            (
+                repair_error,
+                "SUMMARY reclaimed=1" in repair_log,
+                "reset=1" in repair_log,
+                "repair_deferred=1" in repair_log,
+            ),
+            ("", True, True, True),
+        )
+        repair_all_log, repair_all_error, repair_all_releases = _sweep_with_refusals(
+            {
+                ("POST", f"/repos/owner/repo/issues/{number}/labels"): _live_http_failure(
+                    "POST", f"/repos/owner/repo/issues/{number}/labels", forbidden_envelope)
+                for number in (41, 42)
+            },
+            issues=(_repairable_issue(41), _repairable_issue(42)),
+        )
+        check(
+            "#647 precedence rule 2 (issue repair): EVERY issue refused is systemic — the run exits "
+            "NON-zero naming both deferrals — while reclaim STILL ran first",
+            (
+                repair_all_releases,
+                "every issue status repair failed (2 attempted, 0 completed)" in repair_all_error,
+                "owner/repo#41" in repair_all_error and "owner/repo#42" in repair_all_error,
+                "SUMMARY reclaimed=1" in repair_all_log,
+                "repair_deferred=2" in repair_all_log,
+            ),
+            ([{"e" * 32}], True, True, True, True),
+        )
+        # (3) A phase that SKIPPED every object it TOOK UP is a working phase, not a failed one: the
+        # sole hand-off candidate is revalidated away inside the loop (it closed after planning),
+        # nothing is deferred, and the run must stay GREEN. This is the direction that keeps rule 2
+        # honest without red-flagging every quiet sweep — counting the skip as an incomplete attempt
+        # instead reds this check.
+        skip_log, skip_error, skip_releases = _sweep_with_refusals(
+            {},
+            pulls=(_stale_worker_pr(31),),
+            details=({**_stale_worker_pr(31), "state": "closed"},),
+        )
+        # (4) THIRD INSTANCE, found while closing the other two: the per-PR DETAIL read in the
+        # pre-planning loop. Refusing the lowest-numbered PR's detail GET used to abort the sweep
+        # before EVERYTHING — the defuse phase, both mutation loops and reclaim. The later PR must
+        # still be detected and handed off, and reclaim must still run.
+        detect_log, detect_error, detect_releases = _sweep_with_refusals(
+            {("GET", "/repos/owner/repo/pulls/31"): _live_http_failure(
+                "GET", "/repos/owner/repo/pulls/31", forbidden_envelope, code=451)},
+            pulls=(_stale_worker_pr(31), _stale_worker_pr(32)),
+        )
+        detect_writes = terminal_sweep_env["writes"]
+        check(
+            "MUTATION #647 (third instance — stale-PR detection): an unreadable PR DETAIL defers "
+            "only that PR; reclaim still runs and the later PR is still handed off (remove the "
+            "per-PR try/except in the pre-planning loop and run_sweep raises before every "
+            "subsequent phase, releasing NOTHING)",
+            (
+                detect_releases,
+                ("POST", "/repos/owner/repo/issues/32/labels") in detect_writes,
+                ("POST", "/repos/owner/repo/issues/32/comments") in detect_writes,
+            ),
+            ([{"e" * 32}], True, True),
+        )
+        check(
+            "#647 (stale-PR detection): the deferral names the PR and carries the refusal's cause, "
+            "and rule 3 leaves the run green because another PR was detected",
+            (
+                "ALERT PR owner/repo#31:" in detect_log,
+                "stale PR detection deferred" in detect_log,
+                "Resource not accessible by integration" in detect_log,
+                detect_error,
+                "detect_deferred=1" in detect_log,
+            ),
+            (True, True, True, "", True),
+        )
+        detect_all_log, detect_all_error, detect_all_releases = _sweep_with_refusals(
+            {
+                ("GET", f"/repos/owner/repo/pulls/{number}"): _live_http_failure(
+                    "GET", f"/repos/owner/repo/pulls/{number}", forbidden_envelope, code=451)
+                for number in (31, 32)
+            },
+            pulls=(_stale_worker_pr(31), _stale_worker_pr(32)),
+        )
+        check(
+            "#647 precedence rule 2 (stale-PR detection): EVERY detail read refused is systemic — "
+            "non-zero naming both deferrals — while reclaim STILL ran first",
+            (
+                detect_all_releases,
+                "every stale PR detection failed (2 attempted, 0 completed)" in detect_all_error,
+                "owner/repo#31" in detect_all_error and "owner/repo#32" in detect_all_error,
+                "detect_deferred=2" in detect_all_log,
+            ),
+            ([{"e" * 32}], True, True, True),
+        )
+
+        check(
+            "#647: a hand-off candidate revalidated AWAY inside the loop is a COMPLETED decision, "
+            "not a failure — the run stays green, and reclaim still runs",
+            (
+                skip_error,
+                skip_releases,
+                "SKIP PR owner/repo#31: no longer open" in skip_log,
+                "stale_prs=0 " in skip_log and "stale_pr_deferred=0" in skip_log,
+            ),
+            ("", [{"e" * 32}], True, True),
         )
     finally:
         globals().update(terminal_sweep_saved)

@@ -18,6 +18,7 @@ import re
 import subprocess
 import types
 import sys
+import urllib.parse
 import tempfile
 import textwrap
 import time
@@ -2115,19 +2116,213 @@ def _capacity_recovery_probe(model_health, health_window, now):
     stamp of the latest park application: model-health's per-account cause-recovery predicate over
     the SAME validated health window the decline ladder and #604's auth cooldowns read (never a
     parallel store). An unreadable window (None) or an unparseable park stamp yields no evidence,
-    which the admission reads as STAY PARKED."""
+    which the admission reads as STAY PARKED.
+
+    THE LAYER THAT BINDS (registry #691). This is where a park's machine exit is actually decided
+    — capacity_park_admission consumes whatever this returns, and everything else (the migration
+    precondition below, the label writes, the receipts) is downstream of it. It offers exactly two
+    exits, STRONGEST FIRST, and the order is the safety property:
+
+      1. capacity_recovery_evidence — GENUINE evidence that THIS park's own starvation cause
+         cleared. Always tried first, and if it fires nothing else is consulted.
+      2. If it did not fire but park_cause_provable says the park's cause is STILL OBSERVABLE, the
+         strong exit is REACHABLE and this probe returns None on purpose: a park that can still
+         earn a real proof must WAIT for it, never be released on a weaker one. Substituting the
+         proxy here would silently downgrade every ordinary capacity park.
+      3. Only once the strong exit is UNREACHABLE — the park's cause has aged out of the window,
+         or the park was applied while the fleet was healthy — does the labelled
+         sustained_fleet_health_evidence HEURISTIC apply (registry #691). Without it those parks
+         have no machine exit at all: measured 2026-07-25, all 32 sparq legacy parks deferred on
+         exactly that condition, and a hold with no machine exit turns a transient outage into a
+         permanent stall.
+
+    Both exits return the SAME evidence shape and are consumed by the SAME admission, so both
+    inherit — unchanged, and this is deliberate rather than incidental — the unconditional refusal
+    on any human-owned hold or human-applied park, the strictly-after-the-park ordering check, the
+    consumed-exactly-once evidence key, and the AUTO_READMISSION_MAX cap."""
     def probe(parked_at):
         if health_window is None or not parked_at:
             return None
         parked_epoch = int(_park_policy.parse_ts(parked_at).timestamp())
-        return model_health.capacity_recovery_evidence(health_window, parked_epoch, now)
+        evidence = model_health.capacity_recovery_evidence(health_window, parked_epoch, now)
+        if evidence is not None:
+            return evidence
+        if model_health.park_cause_provable(health_window, parked_epoch, now):
+            return None                 # the real proof can still arrive — wait for it
+        return model_health.sustained_fleet_health_evidence(health_window, parked_epoch, now)
 
     return probe
 
 
+def _legacy_migration_provable(model_health, health_window, now):
+    """The legacy-park migration precondition, as ONE named production function so the self-test
+    binds the expression main() actually evaluates instead of restating it.
+
+    It must agree with _capacity_recovery_probe about what "releasable" means — if it is wider,
+    the migration converts parks into a class that cannot release them (the exact harm
+    park_cause_provable exists to prevent); if it is narrower, parks stall on the human terminal
+    forever (registry #691). model_health.park_exit_reachable is the disjunction of exactly the
+    two exits the probe offers, in the same order, which is how the two are kept from drifting.
+
+    An unreadable window (None) defers the migration, consuming nothing."""
+    if health_window is None:
+        return False
+    return model_health.park_exit_reachable(health_window, now, now)
+
+
+# groom's durable age-park receipt (groom.STALE_PR_MARKER). Kept as a literal here rather than
+# imported: groom is a separate entry point with its own checkout root, and this is a READ of a
+# marker groom already writes, never a second writer of it.
+GROOM_STALE_PR_MARKER = "<!-- registry-groom-stale-pr:v1 -->"
+# How many legacy parks one tick may migrate. The migration is one-shot per PR (its own reason
+# marker is the receipt that makes reclassify_legacy_park refuse a second pass), so this only
+# paces the re-entry: 21 PRs re-entering the review lane in one tick would starve the very
+# allocator whose starvation parked most of them.
+LEGACY_PARK_MIGRATION_MAX = 5
+# How many machine capacity parks one tick may RE-ADMIT (registry #698, found reviewing #697).
+#
+# THE BOUND WAS PROVEN FOR THE WRONG POPULATION. There are TWO paths into this sweep's label
+# writes, and only one of them was paced:
+#   * the MIGRATION path — a PR with no live machine park — is capped by LEGACY_PARK_MIGRATION_MAX
+#     above, for the stated reason that "21 PRs re-entering the review lane in one tick would
+#     starve the very allocator whose starvation parked most of them"; and
+#   * the RE-ADMISSION path — a PR that ALREADY carries `review:parked`, or whose source issue
+#     carries `status:parked` — had NO ceiling at all. It is fed by the migration, by the review
+#     loop's own capacity parks, and by hand.
+# That reason applies to the second path identically: a re-admission is exactly the same re-entry
+# into exactly the same lane. MEASURED on the live sparq population while reviewing #697: 9 PRs
+# sat on `review:parked` with no human hold, none of them reachable by the migration path, and
+# #697's aged-out exit mints for all 9 against the live ledger — so without this they would all
+# have re-entered on the FIRST tick after merge.
+#
+# Same value as the migration cap because it is the same lane and the same reason; deliberately
+# a SEPARATE constant because the two populations are independent and either may need tuning
+# alone. A re-admission deferred by this ceiling consumes NOTHING (the evidence probe is not even
+# called), the sweep walks PRs in ascending number order so the drain is deterministic rather
+# than starving, and each deferred park is simply re-admitted on a later tick.
+AUTO_READMISSION_PER_TICK_MAX = 5
+
+
+def _migrate_legacy_park(repo, number, issue_number, comments, labels, bot_login, provable,
+                         post_comment, convert_labels, source_labels=(),
+                         issue_hold_machine_owned=None, log=print):
+    """[G1] Re-classify ONE legacy prose-only park out of the human terminal (sparq-org/sparq#3809).
+
+    31 of the 33 stalled sparq draft PRs were parked BEFORE the capacity/question split, so they
+    carry the HUMAN-owned `review:needs-user` for an INFRA cause. capacity_park_admission keys on
+    `review:parked` plus bot receipts, which they do not have, so NOTHING will ever re-classify
+    them: they are stalled permanently by construction. This is the migration that ends that.
+
+    Returns True iff this PR was migrated. Every gate fails toward LEAVING THE PARK ALONE:
+
+    - Only a PR sitting on the human terminal is a candidate at all.
+    - The cause must be recognised from the BOT'S OWN comments, and an injection / human-arm
+      signal ANYWHERE in that history refuses the PR forever (park_policy.reclassify_legacy_park;
+      the six genuine sparq escalations are pinned as its fixtures).
+    - A QUESTION-class cause is RECORDED but never moved: the human terminal is already correct
+      for it, and the marker just makes the reason machine-readable from now on.
+    - `provable` (_legacy_migration_provable => model_health.park_exit_reachable at the
+      conversion instant) must hold. This is the gate that keeps the migration from doing HARM:
+      converting a park into a machine class that cannot release it trades a VISIBLE stall a
+      human can see and clear for a SILENT one nothing will ever clear. It holds when EITHER
+      exit is reachable — the park's own starvation cause is still observable (the strong,
+      genuine-evidence exit), or the health ledger is readable and the fleet is presently healthy
+      (the labelled aged-out heuristic, registry #691). Neither => defer to a later tick,
+      consuming nothing.
+
+    ONE-SHOT BY CONSTRUCTION: the reason marker this writes is itself the receipt that makes
+    reclassify_legacy_park treat the PR as no-longer-legacy, so no second migration can happen —
+    and RECEIPT-FIRST like every other park write, so a crash between the receipt and the labels
+    leaves receipt-no-label (the next tick's ordinary admission converges it), never the reverse.
+    """
+    if _park_policy.HUMAN_PR_PARK_LABEL not in labels:
+        return False
+    stale_marker = any(
+        GROOM_STALE_PR_MARKER in str(comment.get("body", ""))
+        and str((comment.get("user") or {}).get("login", "")).casefold() == bot_login.casefold()
+        for comment in comments if isinstance(comment, dict))
+    cause, park_class, detail = _park_policy.reclassify_legacy_park(
+        comments, bot_login, stale_marker=stale_marker, log=log)
+    if cause is None:
+        log(f"legacy park stands {repo}#{number}: {detail}")
+        return False
+    if park_class != _park_policy.PARK_CLASS_CAPACITY:
+        # Record the cause; never move the label. A question-class park is where it belongs.
+        post_comment(repo, number,
+                     "> 🤖 SPARQ agent — recording this park's stop reason in machine-readable "
+                     f"form. The cause is `{cause}`, which is a genuine human question: the "
+                     "`review:needs-user` hold is CORRECT and is deliberately left in place. "
+                     "This comment only makes the reason readable to automation.\n\n"
+                     f"{_park_policy.park_reason_marker(cause)}")
+        log(f"legacy park classified (not moved) {repo}#{number}: {detail}")
+        return False
+    if not provable:
+        log(f"legacy park deferred {repo}#{number}: cause {cause!r} is machine-owned, but the "
+            "machine class has NO exit that could open for it right now (neither an observable "
+            "starvation cause nor a readable, presently-healthy fleet) — deferring rather than "
+            "trading a visible stall for a silent one")
+        return False
+    # THE HOLD AXIS. A park is a PAIR: `review:needs-user` on the PR AND `needs:user` on the
+    # source issue. Clearing only the PR half leaves the issue half live, and
+    # capacity_park_admission refuses unconditionally on ANY live `needs:*` — so the PR would be
+    # re-classified, its recovery evidence would be minted, and it would STILL never re-admit.
+    # MEASURED on the live sparq population: 24 of the 33 source issues carry `needs:user`.
+    #
+    # The issue half may only be cleared when it is the MACHINE's own park half. If a PROVEN
+    # HUMAN applied it, it is a real human question about the ISSUE and clearing it would erase
+    # a human hold — so that PR defers instead (and an unreadable timeline defers too).
+    # The migration may clear EXACTLY ONE label: `needs:user`, the issue-side half of the park
+    # pair that the park writer itself created. Nothing else. Any OTHER `needs:*` on the source
+    # issue is somebody else's hold with its own meaning — `needs:external-audit` is the sq-qhy4
+    # external accredited-cryptographer audit gate — and the migration has no business forming an
+    # opinion about it. Those fall through to migration_residual_holds below, which DEFERS.
+    #
+    # Ownership is proven for THAT LABEL specifically (label_application_machine_owned), not
+    # inferred from the newest event across READMISSION_LABELS: authorising the deletion of one
+    # label with evidence about three different ones is a domain mismatch, and it cleared
+    # human-applied holds and treated "no events at all" as permission.
+    clearing = []
+    if _park_policy.HUMAN_PARK_LABEL in set(source_labels):
+        if issue_number and issue_hold_machine_owned is not None \
+                and issue_hold_machine_owned(issue_number, _park_policy.HUMAN_PARK_LABEL):
+            clearing = [_park_policy.HUMAN_PARK_LABEL]
+        else:
+            log(f"legacy park deferred {repo}#{number}: the source issue's "
+                f"`{_park_policy.HUMAN_PARK_LABEL}` is human-owned or unprovable — the migration "
+                "may not clear it, and leaving it would strand the PR permanently")
+            return False
+    residual = _park_policy.migration_residual_holds(
+        set(labels) - {_park_policy.HUMAN_PR_PARK_LABEL}, source_labels, clearing=clearing)
+    if residual:
+        log(f"legacy park deferred {repo}#{number}: {'/'.join(residual)} would still block "
+            "re-admission after the conversion — refusing to migrate a park into a state it "
+            "could not leave")
+        return False
+    post_comment(repo, number,
+                 "> 🤖 SPARQ agent — re-classifying this park. It was applied for the INFRA "
+                 f"cause `{cause}` before park causes were split into machine-owned and "
+                 "human-owned classes, so it landed on the human-owned `review:needs-user` "
+                 "terminal and nothing could ever re-admit it. It becomes the MACHINE-owned "
+                 f"`{MACHINE_PARK_PR_LABEL}` soft hold. BOTH halves of the park pair are "
+                 "converted — the PR label here and the machine-applied `needs:user` on the "
+                 "source issue — because either one left standing would block re-admission on "
+                 "its own. It re-admits once its starvation cause is proven recovered, or — if "
+                 "that cause has aged out of the health window and can no longer be proven — "
+                 "once the fleet has been demonstrably healthy for a sustained period, which is "
+                 "a labelled heuristic rather than proof of this park's own cause. Either exit "
+                 "is capped at two automatic re-admissions, after which a human decides. A "
+                 "human can still clear it by unlabeling at any time. No review judgement is "
+                 "implied or changed.\n\n"
+                 f"{_park_policy.park_reason_marker(cause)}")
+    convert_labels(number, issue_number)
+    log(f"legacy park MIGRATED {repo}#{number}: {detail}")
+    return True
+
+
 def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_login, script_dir,
                             worker_pr, evidence_probe, comments_fn=None, timeline_fn=None,
-                            post_comment=None, clear_labels=None, log=print):
+                            post_comment=None, clear_labels=None, log=print,
+                            migration_provable=False, convert_labels=None):
     """AUTOMATIC re-admission of MACHINE capacity parks whose starvation cause has demonstrably
     cleared (registry #614) — the sweep that closes the structural stall: a MACHINE-owned park
     could only ever be cleared by a HUMAN, so a capacity outage stranded every PR it parked even
@@ -2149,6 +2344,38 @@ def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_logi
     comments_fn = comments_fn or _pr_comments
     timeline_fn = timeline_fn or _issue_timeline_events
     post_comment = post_comment or _run_gh_target_comment
+    if convert_labels is None:
+        def convert_labels(pr_number, issue_number):
+            # The legacy migration writes the labels DIRECTLY rather than through worker-pr's
+            # `review-state set`, and that is deliberate: set_review_state REFUSES every
+            # automated transition away from review:needs-user (issue #138), which is exactly
+            # the guard that stops automation silently unparking a human hold. That guard is
+            # left completely intact — this path is not a general transition, it is a
+            # cause-classified, deny-gated, provability-gated, one-shot migration whose
+            # authorisation is the durable reason receipt posted immediately above it.
+            _run_gh_target_api(
+                repo, "DELETE",
+                f"repos/{repo}/issues/{pr_number}/labels/"
+                + urllib.parse.quote(_park_policy.HUMAN_PR_PARK_LABEL, safe=""))
+            _run_gh_target_api(repo, "POST", f"repos/{repo}/issues/{pr_number}/labels",
+                               {"labels": [MACHINE_PARK_PR_LABEL]})
+            if issue_number:
+                # The ISSUE half of the park pair. worker-issue's `parked` transition does NOT
+                # remove `needs:user` (its remove-set is the status:* labels only), and
+                # capacity_park_admission refuses on ANY live `needs:*` — so without this delete
+                # the migrated PR could never re-admit. Only reached once the caller has proven
+                # the hold is machine-owned; a human-applied one defers instead.
+                # ONLY `needs:user` — the half of the park pair the park writer created. Any
+                # other needs:* is somebody else's hold and deferred the migration upstream.
+                if _park_policy.HUMAN_PARK_LABEL in set(
+                        issue_labels.get(issue_number, []) if issue_number else []):
+                    _run_gh_target_api(
+                        repo, "DELETE",
+                        f"repos/{repo}/issues/{issue_number}/labels/"
+                        + urllib.parse.quote(_park_policy.HUMAN_PARK_LABEL, safe=""))
+                _run_target_helper(script_dir, repo, "worker-issue.py", [
+                    "status", "--repo", repo, "--issue", str(issue_number),
+                    "--status", "parked"])
     if clear_labels is None:
         def clear_labels(pr_number, issue_number):
             # The SAME label writes a human readmission gesture triggers on the CLAIM path:
@@ -2166,7 +2393,7 @@ def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_logi
     for page in pull_pages if isinstance(pull_pages, list) else []:
         if isinstance(page, list):
             rows.extend(row for row in page if isinstance(row, dict))
-    readmitted = 0
+    readmitted = migrated = 0
     for row in sorted(rows, key=lambda row: row.get("number") or 0):
         number = row.get("number")
         if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
@@ -2193,10 +2420,43 @@ def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_logi
                 issue_number = None
             source_labels = set(issue_labels.get(issue_number, []) if issue_number else [])
             if MACHINE_PARK_PR_LABEL not in labels and "status:parked" not in source_labels:
+                # [G1] No machine park — but this may be a LEGACY park stranded on the human
+                # terminal for an infra cause (sparq-org/sparq#3809). Re-classify it (at most
+                # LEGACY_PARK_MIGRATION_MAX per tick) so it re-enters the machine class and
+                # inherits the exit above; it is re-admitted on a LATER tick, on its own proof,
+                # never here and never in the same breath as the conversion.
+                if migrated < LEGACY_PARK_MIGRATION_MAX and _migrate_legacy_park(
+                        repo, number, issue_number, comments_fn(repo, number), labels,
+                        bot_login, migration_provable, post_comment, convert_labels,
+                        source_labels=source_labels,
+                        # The issue-side hold may only be cleared when the MACHINE applied it.
+                        # park_applications is the same helper the admission uses to decide
+                        # ownership, so "human-owned there" and "may not clear here" cannot
+                        # drift; an unreadable timeline yields False and the PR defers.
+                        issue_hold_machine_owned=(
+                            lambda issue, label:
+                                _park_policy.label_application_machine_owned(
+                                    repo, issue, label, timeline_fn,
+                                    is_human=lambda probe: _target_is_human_maintainer(
+                                        repo, probe),
+                                    log=log)),
+                        log=log):
+                    migrated += 1
                 continue                  # no live machine park — nothing to re-admit
-            holds = sorted((HUMAN_HOLD_PR_LABELS & labels)
-                           | {label for label in source_labels
-                              if isinstance(label, str) and label.startswith("needs:")})
+            # PACING, the second half of the bound (registry #698). Checked BEFORE the timeline
+            # and comment reads so a paced tick is also a cheap one, and before the evidence
+            # probe so a deferred park consumes NO evidence and mints NO receipt — it is simply
+            # re-admitted on a later tick.
+            if readmitted >= AUTO_READMISSION_PER_TICK_MAX:
+                log(f"auto-readmit deferred {repo}#{number}: this tick has already re-admitted "
+                    f"{readmitted} park(s) (cap {AUTO_READMISSION_PER_TICK_MAX}) — the park "
+                    "stands until the next tick so the re-entry cannot starve the allocator "
+                    "whose starvation parked most of them")
+                continue
+            # ONE spelling of the hold rule (park_policy.human_owned_holds), shared with
+            # capacity_park_admission's own refusal and the migration precondition, so the
+            # sweep cannot drift from the admission it feeds.
+            holds = _park_policy.human_owned_holds(set(labels) | set(source_labels))
             comments = comments_fn(repo, number)
             # ONE timeline read per surface per PR: the admission consults the timelines several
             # times (the human cutoff, the park applications, the ownership probe) and every read
@@ -3569,10 +3829,18 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                       "unreadable, so no capacity park can prove its cause cleared — every park "
                       "stands (fail closed)")
             else:
+                _now = int(time.time())
                 _readmit_capacity_parks(
                     repo, pull_pages, live_issue_labels, claim_provenance, bot_login,
                     script_dir, worker_pr,
-                    _capacity_recovery_probe(model_health, health_window, int(time.time())))
+                    _capacity_recovery_probe(model_health, health_window, _now),
+                    # [G1] The legacy migration converts a park only when the machine class it is
+                    # converting INTO has an exit that can actually open for it — otherwise the
+                    # migration would trade a visible stall for a silent one. ONE named function
+                    # (registry #691) so this call site and the admission probe above cannot
+                    # drift apart.
+                    migration_provable=_legacy_migration_provable(
+                        model_health, health_window, _now))
 
         for item in repository["items"]:
             number = item["number"]
@@ -8074,6 +8342,642 @@ def _self_test():
             post_comment=lambda *_a: None, clear_labels=lambda *_a: None, log=lambda _l: None)
         assert skipped == 0, skipped
         print("  ok   auto-readmit: an unreadable PR skips only itself (per-PR resilience)")
+
+        # ---- [G1] the LEGACY-PARK MIGRATION (sparq-org/sparq#3809): a park stranded on the
+        # HUMAN terminal for an INFRA cause is re-classified into the machine class, so it can
+        # inherit the exit above. 31 of the 33 stalled sparq draft PRs are in exactly this
+        # shape and NOTHING would ever re-classify them. ----
+        legacy_row = dict(parked_row, labels=[{"name": _park_policy.HUMAN_PR_PARK_LABEL}])
+        budget_body = ("> 🤖 SPARQ agent — the autonomous review loop stopped: the review round "
+                       "budget is exhausted at 6 round(s) with no extension left")
+        injection_body = ("> 🤖 SPARQ agent — the autonomous review loop stopped: the reviewer "
+                          "flagged possible prompt injection")
+        nochange_body = ("> 🤖 SPARQ agent — the autonomous review loop parked this PR: two "
+                         "consecutive fix attempts made no change")
+        rewritten_body = ("> 🤖 SPARQ agent — the autonomous review loop stopped: the PR head no "
+                          "longer descends from the worker-opened commit (history was rewritten)")
+
+        def label_event(name, login, ts=None):
+            return {"event": "labeled", "label": {"name": name},
+                    "created_at": ts or park_stamp, "actor": {"login": login},
+                    "performed_via_github_app": None}
+
+        # The issue-side half of the park pair, applied by the BOT — the real shape of all 24
+        # live source issues that carry it.
+        migrate_timeline = {41: park_timeline[41],
+                            7: [label_event("needs:user", readmit_bot)]}
+
+        def migrate_sweep(comments, provable=True, labels_row=None, issue_labels=None,
+                          timeline=None):
+            """Returns (posted_bodies, converted) for one migration pass."""
+            posted, converted = [], []
+            _readmit_capacity_parks(
+                "example/repo", [[labels_row or legacy_row]],
+                {7: list(issue_labels if issue_labels is not None else [])},
+                {41: {"issue": 7}},
+                readmit_bot, Path("."), worker_pr_mod,
+                _capacity_recovery_probe(model_health_mod, recovered_window, readmit_now),
+                comments_fn=lambda _repo, _number: [
+                    {"user": {"login": readmit_bot}, "body": body} for body in comments],
+                timeline_fn=lambda _repo, number: list(
+                    (timeline if timeline is not None else migrate_timeline).get(number, [])),
+                post_comment=lambda _repo, number, body: posted.append(body),
+                clear_labels=lambda *_a: None, log=lambda _l: None,
+                migration_provable=provable,
+                convert_labels=lambda pr, issue: converted.append((pr, issue)))
+            return posted, converted
+
+        posted, converted = migrate_sweep([budget_body])
+        assert converted == [(41, 7)], converted
+        assert len(posted) == 1 and _park_policy.PARK_REASON_MARKER in posted[0], posted
+        assert "cause=budget" in posted[0] and "class=capacity" in posted[0], posted
+        print("  ok   legacy-migration: an infra park on the human terminal is re-classified "
+              "into the machine class, receipt-first")
+
+        # THE guard: a genuine escalation is NEVER migrated — including the live sparq#3743
+        # shape, where the injection flag is OLDER than a later capacity-park comment.
+        for name, bodies in (
+                ("#3542-shape", [injection_body]),
+                ("#3743-shape", [injection_body, nochange_body]),
+                ("#3608-shape", [nochange_body, injection_body])):
+            posted, converted = migrate_sweep(bodies)
+            assert (posted, converted) == ([], []), (name, posted, converted)
+        print("  ok   legacy-migration: a genuine injection escalation is never migrated, at "
+              "any position in its history")
+
+        # A question-class cause is RECORDED but never moved — the human terminal is correct.
+        posted, converted = migrate_sweep([rewritten_body])
+        assert converted == [], converted
+        assert len(posted) == 1 and "cause=history-rewritten" in posted[0], posted
+        assert "class=question" in posted[0], posted
+        print("  ok   legacy-migration: a question-class cause is made machine-readable but "
+              "its human hold is left in place")
+
+        # THE do-no-harm gate: not provable => defer, consuming nothing. Without this the
+        # migration would convert a VISIBLE stall into a SILENT one.
+        posted, converted = migrate_sweep([budget_body], provable=False)
+        assert (posted, converted) == ([], []), (posted, converted)
+        print("  ok   legacy-migration: an unprovable park is DEFERRED, never converted into a "
+              "state it could not leave")
+
+        # ONE-SHOT: the reason marker it wrote makes the PR no longer legacy.
+        posted, converted = migrate_sweep([budget_body, budget_body
+                                           + _park_policy.park_reason_marker("budget")])
+        assert (posted, converted) == ([], []), (posted, converted)
+        print("  ok   legacy-migration: a PR that already carries a reason marker is never "
+              "migrated twice")
+
+        # An unrecognised cause, and a PR already in the machine class, are both untouched.
+        assert migrate_sweep(["something went wrong"]) == ([], []), "unrecognised cause moved"
+        assert migrate_sweep([budget_body], labels_row=parked_row)[1] == [], \
+            "a PR already in the machine class was migrated"
+        print("  ok   legacy-migration: an unrecognised cause and an already-machine park are "
+              "left alone")
+
+        # THE guard the human-terminal precondition actually exists for: a PR that is NOT PARKED
+        # AT ALL still reaches _migrate_legacy_park (it has no machine park, so the sweep's outer
+        # check lets it through) and still carries budget prose from an EARLIER, since-cleared
+        # park. Migrating it would APPLY review:parked to a live, unparked PR — parking work that
+        # nobody parked. Only a PR sitting on the human terminal is a migration candidate.
+        live_row = dict(parked_row, labels=[{"name": "review:needs"}])
+        posted, converted = migrate_sweep([budget_body], labels_row=live_row)
+        assert (posted, converted) == ([], []), (posted, converted)
+        print("  ok   legacy-migration: an UNPARKED PR carrying stale park prose is never "
+              "parked by the migration")
+
+        # ---- THE COMPOSED TEST: migrate, then re-admit the RESULTING state. ------------------
+        # A park is a PAIR (review:needs-user on the PR + needs:user on the source issue) and the
+        # first cut cleared only the PR half. Each stage passed its own fixture in isolation —
+        # migration with `{7: []}`, re-admission with `{7: ["status:in-progress-review"]}` — and
+        # the defect lived exactly in the seam they never composed. MEASURED on the live sparq
+        # population: 24 of 33 source issues carry needs:user, so 19 of 20 migrated PRs would
+        # have become permanently unreleasable. This test composes the two stages.
+        composed_pr_labels = {"review:needs-user"}
+        composed_issue_labels = {"status:deferred", "needs:user", "role:impl"}
+
+        def composed_convert(pr, issue):
+            """What the production convert_labels does, applied to the fixture state."""
+            composed_pr_labels.discard(_park_policy.HUMAN_PR_PARK_LABEL)
+            composed_pr_labels.add(MACHINE_PARK_PR_LABEL)
+            for hold in _park_policy.human_owned_holds(composed_issue_labels):
+                composed_issue_labels.discard(hold)
+            composed_issue_labels.add("status:parked")
+
+        stage1_row = dict(parked_row, labels=[{"name": n} for n in composed_pr_labels])
+        migrated_count = _readmit_capacity_parks(
+            "example/repo", [[stage1_row]], {7: sorted(composed_issue_labels)},
+            {41: {"issue": 7}}, readmit_bot, Path("."), worker_pr_mod,
+            _capacity_recovery_probe(model_health_mod, still_broken_window, readmit_now),
+            comments_fn=lambda _repo, _number: [
+                {"user": {"login": readmit_bot}, "body": budget_body}],
+            timeline_fn=lambda _repo, number: list(migrate_timeline.get(number, [])),
+            post_comment=lambda *_a: None, clear_labels=lambda *_a: None, log=lambda _l: None,
+            migration_provable=True, convert_labels=composed_convert)
+        assert migrated_count == 0, "the migration must not re-admit in the same breath"
+        assert composed_pr_labels == {MACHINE_PARK_PR_LABEL}, composed_pr_labels
+        assert "needs:user" not in composed_issue_labels, composed_issue_labels
+
+        # Stage 2 — the SAME PR, on the state stage 1 actually produced, with proven recovery.
+        stage2_row = dict(parked_row, labels=[{"name": n} for n in sorted(composed_pr_labels)])
+        composed_readmitted, composed_cleared = 0, []
+        composed_readmitted = _readmit_capacity_parks(
+            "example/repo", [[stage2_row]], {7: sorted(composed_issue_labels)},
+            {41: {"issue": 7}}, readmit_bot, Path("."), worker_pr_mod,
+            _capacity_recovery_probe(model_health_mod, recovered_window, readmit_now),
+            comments_fn=lambda _repo, _number: [],
+            timeline_fn=lambda _repo, number: list(park_timeline.get(number, [])),
+            post_comment=lambda *_a: None,
+            clear_labels=lambda pr, issue: composed_cleared.append((pr, issue)),
+            log=lambda _l: None, migration_provable=False)
+        assert composed_readmitted == 1, (composed_readmitted, sorted(composed_issue_labels))
+        assert composed_cleared == [(41, 7)], composed_cleared
+        print("  ok   legacy-migration COMPOSED: a migrated PR whose source issue carried "
+              "needs:user actually re-admits on proven recovery (both halves of the pair)")
+
+        # ...and a HUMAN-applied `needs:user` is NOT clearable: that PR defers instead.
+        posted, converted = migrate_sweep(
+            [budget_body], issue_labels=["needs:user"],
+            timeline={41: park_timeline[41], 7: [label_event("needs:user", "jeswr")]})
+        assert (posted, converted) == ([], []), (posted, converted)
+        print("  ok   legacy-migration: a HUMAN-applied issue hold is never cleared — that PR "
+              "defers rather than having a real human hold erased")
+
+        # The residual-hold precondition, on a state the fleet can actually reach: groom's
+        # age-park writes `needs:user` onto the PR ITSELF (groom.py adds it to
+        # /issues/<pr>/labels), so a PR can carry BOTH review:needs-user and needs:user. The
+        # conversion removes only review:needs-user, so the PR-side needs:user SURVIVES and
+        # would block re-admission exactly like the issue-side one did. That hold is groom's
+        # orphan/wedged-merge hand-off — a genuine human question — so the right answer is to
+        # DEFER, not to clear it. (No PR is in this state today; it is reachable, and this seam
+        # is precisely where the issue-half defect lived.)
+        groom_row = dict(parked_row, labels=[{"name": _park_policy.HUMAN_PR_PARK_LABEL},
+                                             {"name": "needs:user"}])
+        posted, converted = migrate_sweep([budget_body], labels_row=groom_row)
+        assert (posted, converted) == ([], []), (posted, converted)
+        print("  ok   legacy-migration: a hold that would SURVIVE the conversion (groom's "
+              "PR-side needs:user) defers the migration instead of stranding the PR")
+
+        # ---- the ownership proof must be ABOUT THE LABEL BEING CLEARED ----------------------
+        # Authorising a delete with evidence about a DIFFERENT label failed in three directions.
+        # Each of these was a live hole, demonstrated by execution before the fix.
+        #
+        # (i) a human-applied needs:user, with a LATER bot park event on another label. Reading
+        # the newest event across READMISSION_LABELS said "machine"; the needs:user application
+        # itself was a human's.
+        posted, converted = migrate_sweep(
+            [budget_body], issue_labels=["needs:user"],
+            timeline={41: park_timeline[41], 7: [
+                label_event("needs:user", "jeswr", model_health_mod._iso_z(readmit_now - 900)),
+                label_event("status:parked", readmit_bot,
+                            model_health_mod._iso_z(readmit_now - 60))]})
+        assert (posted, converted) == ([], []), (posted, converted)
+        print("  ok   legacy-migration: a HUMAN-applied needs:user is not clearable just because "
+              "a LATER bot park event exists on a different label")
+
+        # (ii) another party's needs:* is never touched and never reasoned about. The migration
+        # may only ever clear `needs:user`; anything else defers via the residual precondition.
+        # `needs:external-audit` is the sq-qhy4 external accredited-cryptographer audit gate —
+        # silently deleting it is the worst single outcome available on this path.
+        for foreign in ("needs:external-audit", "needs:ec2", "needs:maintainer"):
+            posted, converted = migrate_sweep(
+                [budget_body], issue_labels=["needs:user", foreign],
+                timeline={41: park_timeline[41], 7: [
+                    label_event("needs:user", readmit_bot),
+                    label_event(foreign, "jeswr")]})
+            assert (posted, converted) == ([], []), (foreign, posted, converted)
+        print("  ok   legacy-migration: a foreign needs:* (incl. the sq-qhy4 external-audit "
+              "gate) defers the migration and is never deleted")
+
+        # (iii) ABSENCE OF EVIDENCE IS NOT PROOF. A needs:user with no `labeled` event at all
+        # previously read as machine-owned, because "no park application" returned not-human.
+        posted, converted = migrate_sweep(
+            [budget_body], issue_labels=["needs:user"],
+            timeline={41: park_timeline[41], 7: []})
+        assert (posted, converted) == ([], []), (posted, converted)
+        print("  ok   legacy-migration: a needs:user with NO labeled event is not clearable "
+              "(absence of evidence is not proof of machine ownership)")
+
+        # ---- THE WRITER BINDING: exercise the PRODUCTION convert_labels ---------------------
+        # Every other test injects its own convert_labels, so the real writer — the code that
+        # actually mutates GitHub — was executed by NOTHING. That is the defect class this PR
+        # kept repeating: a test that restates the policy instead of binding the writer. Here
+        # the GitHub seams are injected the way the suite already injects
+        # _target_is_human_maintainer, convert_labels is left as None so the PRODUCTION closure
+        # runs, and the exact API calls are asserted.
+        api_calls, helper_calls = [], []
+        prev_api = globals()["_run_gh_target_api"]
+        prev_helper = globals()["_run_target_helper"]
+        globals()["_run_gh_target_api"] = (
+            lambda repo, method, path, input_doc=None: api_calls.append((method, path, input_doc))
+            or types.SimpleNamespace(stdout="{}"))
+        globals()["_run_target_helper"] = (
+            lambda script_dir, repo, script, args: helper_calls.append((script, args)))
+        try:
+            _readmit_capacity_parks(
+                "example/repo", [[legacy_row]], {7: ["needs:user", "status:deferred"]},
+                {41: {"issue": 7}}, readmit_bot, Path("."), worker_pr_mod,
+                _capacity_recovery_probe(model_health_mod, recovered_window, readmit_now),
+                comments_fn=lambda _repo, _number: [
+                    {"user": {"login": readmit_bot}, "body": budget_body}],
+                timeline_fn=lambda _repo, number: list(migrate_timeline.get(number, [])),
+                post_comment=lambda *_a: None, clear_labels=lambda *_a: None,
+                log=lambda _l: None, migration_provable=True)   # convert_labels=None => REAL
+        finally:
+            globals()["_run_gh_target_api"] = prev_api
+            globals()["_run_target_helper"] = prev_helper
+        assert api_calls == [
+            ("DELETE", "repos/example/repo/issues/41/labels/review%3Aneeds-user", None),
+            ("POST", "repos/example/repo/issues/41/labels",
+             {"labels": [MACHINE_PARK_PR_LABEL]}),
+            ("DELETE", "repos/example/repo/issues/7/labels/needs%3Auser", None),
+        ], api_calls
+        assert helper_calls == [("worker-issue.py", [
+            "status", "--repo", "example/repo", "--issue", "7", "--status", "parked"])], \
+            helper_calls
+        print("  ok   legacy-migration WRITER: the PRODUCTION convert_labels clears BOTH halves "
+              "of the park pair — asserted on the real API calls, not a fixture restatement")
+
+        # BOUNDED RE-ENTRY: one tick may migrate at most LEGACY_PARK_MIGRATION_MAX PRs. 21 PRs
+        # re-entering at once would starve the very allocator whose starvation parked most of
+        # them — the migration must not recreate its own cause.
+        # Assert the BOUND ITSELF first, before sizing any fixture from it: a per-tick pacing cap
+        # that is not small is not a pacing cap, and a fixture sized from an unbounded constant
+        # would hang instead of failing (which is how this test first went wrong).
+        assert 0 < LEGACY_PARK_MIGRATION_MAX <= 10, LEGACY_PARK_MIGRATION_MAX
+        many_rows = [dict(legacy_row, number=n,
+                          head=dict(legacy_row["head"], ref=f"sparq-agent/issue-{n}-abc"))
+                     for n in range(41, 41 + LEGACY_PARK_MIGRATION_MAX + 3)]
+        many_converted = []
+        _readmit_capacity_parks(
+            "example/repo", [many_rows], {}, {row["number"]: {"issue": 7} for row in many_rows},
+            readmit_bot, Path("."), worker_pr_mod,
+            _capacity_recovery_probe(model_health_mod, recovered_window, readmit_now),
+            comments_fn=lambda _repo, _number: [
+                {"user": {"login": readmit_bot}, "body": budget_body}],
+            timeline_fn=lambda _repo, number: list(park_timeline.get(number, [])),
+            post_comment=lambda *_a: None, clear_labels=lambda *_a: None, log=lambda _l: None,
+            migration_provable=True,
+            convert_labels=lambda pr, issue: many_converted.append(pr))
+        assert len(many_converted) == LEGACY_PARK_MIGRATION_MAX, many_converted
+        print(f"  ok   legacy-migration: one tick migrates at most "
+              f"{LEGACY_PARK_MIGRATION_MAX} parks (bounded re-entry)")
+
+        # ---- [registry #691] THE AGED-OUT PARK EXIT, AT THE LAYER THAT BINDS ---------------
+        # _capacity_recovery_probe is where a park's machine exit is actually decided; the
+        # migration precondition is only a PREDICTOR of it. Every test below therefore drives
+        # the PRODUCTION probe and the PRODUCTION precondition function — nothing here restates
+        # the policy, and `migration_provable` is never hand-set to True.
+        #
+        # THE DEFECT: capacity_recovery_evidence fixes a park's cause at its APPLICATION
+        # INSTANT and the health window is a rolling 48 h, so a park older than the window has
+        # no record at or before `parked_at` at all and can never satisfy condition 1. Measured
+        # 2026-07-25: all 32 sparq legacy parks deferred with "no starvation cause is
+        # observable". Safe, but the hold was permanent while the label claimed otherwise.
+        span_secs = model_health_mod.SUSTAINED_HEALTH_SPAN_SECONDS
+        readmit_account2 = model_health_mod.account_hash("acct02", readmit_salt)
+        aged_park_epoch = readmit_now - 5 * 24 * 3600      # the live sparq shape: days old
+        aged_park_stamp = model_health_mod._iso_z(aged_park_epoch)
+
+        def hrec(provider, account, cls, dt, run):
+            return model_health_mod.make_record(provider, account, "sol", cls, run,
+                                                readmit_now + dt)
+
+        # A fleet that has been demonstrably healthy for a full span and is succeeding NOW.
+        healthy_window = (
+            # coverage anchor: the window reaches back as far as the health claim does
+            [hrec("openai", readmit_account, model_health_mod.SUCCESS, -span_secs - 600, "h0")]
+            + [hrec("openai", readmit_account, model_health_mod.SUCCESS, -300 - 600 * k,
+                    f"h{k + 1}") for k in range(3)]
+            + [hrec("anthropic", readmit_account2, model_health_mod.SUCCESS, -600 - 600 * k,
+                    f"j{k}") for k in range(3)])
+        aged_timeline = {41: [{"event": "labeled", "label": {"name": MACHINE_PARK_PR_LABEL},
+                               "created_at": aged_park_stamp, "actor": {"login": readmit_bot},
+                               "performed_via_github_app": None}], 7: []}
+        fleet_health_key = f"fleet-health/openai/{readmit_account}/h1"
+
+        # (1) THE LIVENESS FIX, end to end through the production sweep: the aged-out park is
+        # re-admitted on the labelled fleet-health heuristic, receipt-first, and the receipt
+        # names which gate released it.
+        count, posted, cleared = readmit_sweep(healthy_window, timeline=aged_timeline)
+        assert count == 1 and cleared == [(41, 7)], (count, cleared)
+        assert len(posted) == 1 and fleet_health_key in posted[0][1], posted
+        assert worker_pr_mod.AUTO_READMIT_MARKER in posted[0][1], posted
+        assert "acct01" not in posted[0][1] and "acct02" not in posted[0][1], posted
+        # HONESTY: the receipt must say what it actually knows. Claiming the strong gate's
+        # finding here — "the account that was failing when this park landed has since
+        # succeeded" — would be false for a park whose own cause aged out.
+        assert "not proof that this park's own cause cleared" in posted[0][1], posted[0][1]
+        assert "demonstrably CLEARED" not in posted[0][1], posted[0][1]
+        print("  ok   aged-out exit: a park whose own cause aged out of the health window is "
+              "re-admitted on sustained fleet health, receipt-first")
+
+        # (2) FAIL CLOSED. An unhealthy fleet, an unreadable window and a malformed record all
+        # leave the aged-out park exactly where it is. This is the direction the whole design
+        # fails in, and a liveness fix that failed open would be a worse trade than the stall.
+        unhealthy = healthy_window + [hrec("openai", readmit_account, model_health_mod.CLASS_AUTH,
+                                           -1200, "bad1")]
+        for name, window in (("a launch failure inside the proven span", unhealthy),
+                             ("an unreadable health window", None),
+                             ("a malformed health record",
+                              healthy_window + [dict(healthy_window[-1],
+                                                     exit_class="totally-new")])):
+            count, posted, cleared = readmit_sweep(window, timeline=aged_timeline)
+            assert (count, posted, cleared) == (0, [], []), (name, count, posted, cleared)
+        print("  ok   aged-out exit: an unhealthy fleet, an unreadable window and a malformed "
+              "record all DEFER — the aged-out park stands")
+
+        # (3) PRECEDENCE — the heuristic never displaces a proof that can still arrive.
+        # (3a) when the park's OWN cause is observable and has recovered, the STRONG gate mints
+        # and the key is its shape, not the proxy's.
+        strong_park_epoch = readmit_now - span_secs - 1200
+        strong_timeline = {41: [{"event": "labeled", "label": {"name": MACHINE_PARK_PR_LABEL},
+                                 "created_at": model_health_mod._iso_z(strong_park_epoch),
+                                 "actor": {"login": readmit_bot},
+                                 "performed_via_github_app": None}], 7: []}
+        strong_window = healthy_window + [
+            hrec("openai", readmit_account, model_health_mod.CLASS_AUTH, -span_secs - 1400, "x1")]
+        count, posted, cleared = readmit_sweep(strong_window, timeline=strong_timeline)
+        assert count == 1 and len(posted) == 1, (count, posted)
+        # The strong gate's earliest qualifying recovery — the coverage anchor h0, NOT the
+        # heuristic's newest-success anchor h1 — and the receipt states the proof it has.
+        assert f"evidence=openai/{readmit_account}/h0 " in posted[0][1], posted
+        assert "fleet-health" not in posted[0][1], posted
+        assert "demonstrably CLEARED" in posted[0][1], posted
+        print("  ok   aged-out exit: the STRONG cause-recovery proof is tried first and its "
+              "evidence — not the heuristic — is what gets receipted")
+        # (3b) THE ORDER IS THE SAFETY PROPERTY. Here the strong exit is REACHABLE but not yet
+        # satisfied (the fleet pseudo-account was starved before the park and has recorded no
+        # success since), while the fleet-health proxy WOULD fire on this very window. The probe
+        # must mint NOTHING. Assert the proxy would have fired, so this cannot pass vacuously.
+        fleet_hash = model_health_mod.account_hash("fleet01", readmit_salt)
+        reachable_window = healthy_window + [
+            hrec("fleet", fleet_hash, model_health_mod.CLASS_ZERO_DISPATCH,
+                 -span_secs - 1400, "z1"),
+            hrec("fleet", fleet_hash, model_health_mod.CLASS_ZERO_DISPATCH, -1000, "z2")]
+        assert model_health_mod.park_cause_provable(
+            reachable_window, strong_park_epoch, readmit_now) is True
+        assert model_health_mod.capacity_recovery_evidence(
+            reachable_window, strong_park_epoch, readmit_now) is None
+        assert model_health_mod.sustained_fleet_health_evidence(
+            reachable_window, strong_park_epoch, readmit_now) is not None
+        count, posted, cleared = readmit_sweep(reachable_window, timeline=strong_timeline)
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        print("  ok   aged-out exit: while the STRONG proof is still reachable the park WAITS "
+              "for it — the weaker heuristic is refused even though it would have fired")
+
+        # (4) BOUNDED RE-ENTRY. The heuristic is consumed through the same cap as every other
+        # automatic re-admission. Assert the BOUND ITSELF, then size the fixture from a literal
+        # (a fixture sized from the constant shrinks with it and survives a raised cap).
+        assert _park_policy.AUTO_READMISSION_MAX == 2, _park_policy.AUTO_READMISSION_MAX
+        two_markers = [{"user": {"login": readmit_bot},
+                        "body": f"x {worker_pr_mod.AUTO_READMIT_MARKER} evidence=fleet-health/o/"
+                                f"x/{i} at=zzz -->"} for i in range(2)]
+        count, posted, cleared = readmit_sweep(healthy_window, timeline=aged_timeline,
+                                               comments=two_markers)
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        count, posted, cleared = readmit_sweep(healthy_window, timeline=aged_timeline,
+                                               comments=two_markers[:1])
+        assert count == 1, count
+        print("  ok   aged-out exit: exactly AUTO_READMISSION_MAX automatic re-admissions are "
+              "available to it — the cap terminates the aged-out path too")
+        # ...and the evidence itself is consumed EXACTLY ONCE: the same fleet-health key can
+        # never re-earn a re-admission after a NEWER park application.
+        # THE RE-PARK MUST BE OLDER THAN THE SPAN. A fresh re-park is refused by the
+        # park-younger-than-the-span guard, so the same-key check would never be reached and
+        # this test would pass for the wrong reason (MEASURED: it did — deleting the
+        # consumed-key check left this line green until the fixture was fixed). The receipt
+        # stamp deliberately PREDATES the re-park too, so the idempotent auto-receipt branch
+        # does not short-circuit ahead of the check under test.
+        reparked_epoch = readmit_now - span_secs - 100
+        consumed = [{"user": {"login": readmit_bot},
+                     "body": worker_pr_mod.auto_readmission_receipt(
+                         fleet_health_key,
+                         model_health_mod._iso_z(readmit_now - 2 * span_secs))}]
+        reparked = {41: aged_timeline[41] + [
+            {"event": "labeled", "label": {"name": MACHINE_PARK_PR_LABEL},
+             "created_at": model_health_mod._iso_z(reparked_epoch),
+             "actor": {"login": readmit_bot}, "performed_via_github_app": None}], 7: []}
+        # Prove the fixture actually reaches the check: the SAME evidence is available again.
+        assert (model_health_mod.sustained_fleet_health_evidence(
+            healthy_window, reparked_epoch, readmit_now) or {}).get("key") == fleet_health_key
+        count, posted, cleared = readmit_sweep(healthy_window, timeline=reparked,
+                                               comments=consumed)
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        print("  ok   aged-out exit: its evidence is consumed EXACTLY ONCE — the same "
+              "fleet-health key cannot re-earn a re-admission after a new park")
+
+        # (4b) BOUNDED RE-ENTRY, THE OTHER PATH (registry #698). The migration cap paces only
+        # PRs with NO live machine park; a PR ALREADY on `review:parked` never reaches it, so the
+        # re-admission path had no ceiling at all and the herd bound was proven for the wrong
+        # population. MEASURED while reviewing #697: 9 live sparq PRs sat in exactly that state,
+        # unreachable by the migration, and the aged-out exit mints for all 9 — they would have
+        # re-entered the review lane in ONE tick. Assert the BOUND ITSELF, then size the fixture
+        # from a LITERAL so lowering the ceiling cannot shrink the fixture with it.
+        assert 0 < AUTO_READMISSION_PER_TICK_MAX <= 10, AUTO_READMISSION_PER_TICK_MAX
+        herd_rows = [dict(parked_row, number=n,
+                          head=dict(parked_row["head"], ref=f"sparq-agent/issue-{n}-abc"))
+                     for n in range(60, 60 + AUTO_READMISSION_PER_TICK_MAX + 4)]
+        herd_cleared = []
+        herd_count = _readmit_capacity_parks(
+            "example/repo", [herd_rows], {}, {row["number"]: {"issue": 7} for row in herd_rows},
+            readmit_bot, Path("."), worker_pr_mod,
+            _capacity_recovery_probe(model_health_mod, healthy_window, readmit_now),
+            comments_fn=lambda _repo, _number: [],
+            timeline_fn=lambda _repo, number: list(
+                aged_timeline[41] if number != 7 else []),
+            post_comment=lambda *_a: None,
+            clear_labels=lambda pr, issue: herd_cleared.append(pr),
+            log=lambda _l: None, migration_provable=False)
+        assert herd_count == AUTO_READMISSION_PER_TICK_MAX, (herd_count, herd_cleared)
+        assert len(herd_cleared) == AUTO_READMISSION_PER_TICK_MAX, herd_cleared
+        # ...and the drain is DETERMINISTIC, not starving: ascending PR order, so the parks this
+        # tick deferred are the ones the next tick reaches first.
+        assert herd_cleared == sorted(herd_cleared) == [
+            row["number"] for row in herd_rows[:AUTO_READMISSION_PER_TICK_MAX]], herd_cleared
+        print(f"  ok   aged-out exit: one tick RE-ADMITS at most "
+              f"{AUTO_READMISSION_PER_TICK_MAX} parks in ascending order — the re-admission "
+              f"path is paced too, not just the migration path")
+
+        # (5) STRICTLY NARROWER THAN THE DENY. A human-owned hold on either surface still
+        # refuses, unconditionally, on the aged-out path.
+        human_aged = dict(parked_row, labels=[{"name": MACHINE_PARK_PR_LABEL},
+                                              {"name": "review:needs-user"}])
+        count, posted, cleared = readmit_sweep(healthy_window, rows=[[human_aged]],
+                                               timeline=aged_timeline)
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        count, posted, cleared = readmit_sweep(healthy_window, timeline=aged_timeline,
+                                               labels={7: ["status:parked", "needs:user"]})
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        human_aged_park = {41: [{"event": "labeled",
+                                 "label": {"name": MACHINE_PARK_PR_LABEL},
+                                 "created_at": aged_park_stamp, "actor": {"login": "jeswr"},
+                                 "performed_via_github_app": None}], 7: []}
+        count, posted, cleared = readmit_sweep(healthy_window, timeline=human_aged_park)
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        print("  ok   aged-out exit: a human-owned hold and a MAINTAINER-applied park refuse it "
+              "exactly as they refuse the cause-recovery path")
+
+        # ---- the MIGRATION PRECONDITION, as the production function computes it -------------
+        # Never hand-set: _legacy_migration_provable is the expression main() evaluates.
+        assert _legacy_migration_provable(model_health_mod, healthy_window, readmit_now) is True
+        assert _legacy_migration_provable(model_health_mod, None, readmit_now) is False
+        # An OBSERVED but SILENT fleet is not a healthy one, and no cause is observable either:
+        # neither exit is reachable, so the migration defers exactly as it did before #691.
+        stale_window = [hrec("openai", readmit_account, model_health_mod.SUCCESS,
+                             -span_secs - 600, "s0")]
+        assert _legacy_migration_provable(model_health_mod, stale_window, readmit_now) is False
+        # A BROKEN fleet still admits the migration — but via the STRONG exit, not the
+        # heuristic: an account failing right now means a park applied now can later prove its
+        # own cause recovered. That is the pre-#691 behaviour, unchanged.
+        broken_window = healthy_window + [
+            hrec("anthropic", readmit_account2, model_health_mod.CLASS_LIMIT, -60, "L1")]
+        assert (model_health_mod.park_cause_provable(broken_window, readmit_now, readmit_now),
+                model_health_mod.sustained_health_exit_reachable(broken_window, readmit_now),
+                _legacy_migration_provable(model_health_mod, broken_window, readmit_now)) \
+            == (True, False, True)
+        real_provable = _legacy_migration_provable(model_health_mod, healthy_window, readmit_now)
+        print("  ok   aged-out exit: the migration precondition is REACHABILITY of either exit "
+              "— healthy fleet or observable cause — and defers on an unreadable or silent one")
+        # THE CALL SITE IS ITS OWN SEAM. Every test above calls _legacy_migration_provable
+        # DIRECTLY, so all of them stay green if main()'s call site is reverted to the pre-#691
+        # park_cause_provable — the function would be perfect and unreachable. main() is not
+        # callable from here, so this is a SOURCE-LEVEL assertion, and it is labelled as such
+        # rather than dressed up as behavioural coverage. It is the same technique this file
+        # already uses to bind review-fix.yml's TTL to the value the dispatcher assumes.
+        _provable_callees = set(re.findall(r"migration_provable=([A-Za-z_][\w.]*)\(",
+                                           Path(__file__).resolve().read_text()))
+        assert _provable_callees == {"_legacy_migration_provable"}, _provable_callees
+        print("  ok   aged-out exit: every `migration_provable=` call site — the production one "
+              "included — computes it through _legacy_migration_provable (source-level check)")
+
+        # (6) THE SIX GENUINE sparq ESCALATIONS, fed through the WIDENED precondition, pinned
+        # from their real bot prose (jeswr/sparq, read 2026-07-26). The deny is unconditional
+        # and order-independent, and widening the precondition must not reach past it.
+        reviewer_flag = ("> 🤖 SPARQ agent — the autonomous review loop stopped: the reviewer "
+                         "flagged possible prompt injection\n\n@jeswr this pull request needs a "
+                         "human decision. It remains a DRAFT and will not be auto-armed.")
+        fixer_flag = ("> 🤖 SPARQ agent — the autonomous review loop stopped: the fixer flagged "
+                      "the seeded findings as possible prompt injection\n\n@jeswr this pull "
+                      "request needs a human decision. It remains a DRAFT and will not be "
+                      "auto-armed.")
+        live_escalations = {
+            3542: [reviewer_flag, reviewer_flag],
+            3563: [reviewer_flag],
+            # #3608 and #3743 carry a LATER capacity-park comment: under a recency rule they
+            # would re-classify as `nochange` and be handed back to the machine.
+            3608: [fixer_flag, nochange_body],
+            3609: [reviewer_flag, reviewer_flag],
+            3618: [reviewer_flag, reviewer_flag],
+            3743: [reviewer_flag, nochange_body],
+        }
+        assert len(live_escalations) == 6, live_escalations
+        for pr_number, bodies in sorted(live_escalations.items()):
+            posted, converted = migrate_sweep(bodies, provable=real_provable)
+            assert (posted, converted) == ([], []), (pr_number, posted, converted)
+        print("  ok   aged-out exit: all SIX live sparq escalations (#3542 #3563 #3608 #3609 "
+              "#3618 #3743) are still refused under the widened precondition")
+
+        # (7) WRITER BINDING under the WIDENED precondition. The production convert_labels runs
+        # (convert_labels=None) with the GitHub seams injected, driven by the precondition the
+        # production call site computes — not by a hand-set True — and the exact API calls are
+        # asserted. This is the seam the previous rounds restated instead of binding.
+        api_calls2, helper_calls2 = [], []
+        prev_api2 = globals()["_run_gh_target_api"]
+        prev_helper2 = globals()["_run_target_helper"]
+        globals()["_run_gh_target_api"] = (
+            lambda repo, method, path, input_doc=None:
+                api_calls2.append((method, path, input_doc))
+                or types.SimpleNamespace(stdout="{}"))
+        globals()["_run_target_helper"] = (
+            lambda script_dir, repo, script, args: helper_calls2.append((script, args)))
+        try:
+            _readmit_capacity_parks(
+                "example/repo", [[legacy_row]], {7: ["needs:user", "status:deferred"]},
+                {41: {"issue": 7}}, readmit_bot, Path("."), worker_pr_mod,
+                _capacity_recovery_probe(model_health_mod, healthy_window, readmit_now),
+                comments_fn=lambda _repo, _number: [
+                    {"user": {"login": readmit_bot}, "body": budget_body}],
+                timeline_fn=lambda _repo, number: list(migrate_timeline.get(number, [])),
+                post_comment=lambda *_a: None, clear_labels=lambda *_a: None,
+                log=lambda _l: None,
+                migration_provable=_legacy_migration_provable(
+                    model_health_mod, healthy_window, readmit_now))
+        finally:
+            globals()["_run_gh_target_api"] = prev_api2
+            globals()["_run_target_helper"] = prev_helper2
+        assert api_calls2 == [
+            ("DELETE", "repos/example/repo/issues/41/labels/review%3Aneeds-user", None),
+            ("POST", "repos/example/repo/issues/41/labels",
+             {"labels": [MACHINE_PARK_PR_LABEL]}),
+            ("DELETE", "repos/example/repo/issues/7/labels/needs%3Auser", None),
+        ], api_calls2
+        assert helper_calls2 == [("worker-issue.py", [
+            "status", "--repo", "example/repo", "--issue", "7", "--status", "parked"])], \
+            helper_calls2
+        print("  ok   aged-out exit WRITER: the PRODUCTION convert_labels runs off the "
+              "PRODUCTION precondition on a healthy fleet — asserted on the real API calls")
+
+        # (8) THE WHOLE CHAIN. A legacy park that could not migrate before #691 (the fleet is
+        # healthy, so no starvation cause is observable) migrates now, and the park it becomes
+        # is ACTUALLY RELEASED one span later by the production probe. Fixing one layer above
+        # where the invariant binds is how the previous rounds failed; this composes both.
+        assert model_health_mod.park_cause_provable(
+            healthy_window, readmit_now, readmit_now) is False, \
+            "the pre-#691 precondition must be the one that blocked this park"
+        chain_pr_labels = {"review:needs-user"}
+        chain_issue_labels = {"status:deferred", "needs:user", "role:impl"}
+
+        def chain_convert(pr, issue):
+            chain_pr_labels.discard(_park_policy.HUMAN_PR_PARK_LABEL)
+            chain_pr_labels.add(MACHINE_PARK_PR_LABEL)
+            for hold in _park_policy.human_owned_holds(chain_issue_labels):
+                chain_issue_labels.discard(hold)
+            chain_issue_labels.add("status:parked")
+
+        chain_migrated = _readmit_capacity_parks(
+            "example/repo", [[dict(parked_row,
+                                   labels=[{"name": n} for n in sorted(chain_pr_labels)])]],
+            {7: sorted(chain_issue_labels)}, {41: {"issue": 7}}, readmit_bot, Path("."),
+            worker_pr_mod,
+            _capacity_recovery_probe(model_health_mod, healthy_window, readmit_now),
+            comments_fn=lambda _repo, _number: [
+                {"user": {"login": readmit_bot}, "body": budget_body}],
+            timeline_fn=lambda _repo, number: list(migrate_timeline.get(number, [])),
+            post_comment=lambda *_a: None, clear_labels=lambda *_a: None, log=lambda _l: None,
+            migration_provable=_legacy_migration_provable(
+                model_health_mod, healthy_window, readmit_now),
+            convert_labels=chain_convert)
+        assert chain_migrated == 0, "the migration must not re-admit in the same breath"
+        assert chain_pr_labels == {MACHINE_PARK_PR_LABEL}, chain_pr_labels
+        assert "needs:user" not in chain_issue_labels, chain_issue_labels
+        # One span later, with the same health continuing, the park it became is released.
+        later_now = readmit_now + span_secs
+        continued_window = healthy_window + [
+            hrec("openai", readmit_account, model_health_mod.SUCCESS,
+                 span_secs - 300 - 600 * k, f"c{k}") for k in range(3)] + [
+            hrec("anthropic", readmit_account2, model_health_mod.SUCCESS,
+                 span_secs - 600 - 600 * k, f"e{k}") for k in range(3)]
+        chain_timeline = {41: [{"event": "labeled",
+                                "label": {"name": MACHINE_PARK_PR_LABEL},
+                                "created_at": model_health_mod._iso_z(readmit_now),
+                                "actor": {"login": readmit_bot},
+                                "performed_via_github_app": None}], 7: []}
+        chain_cleared = []
+        chain_readmitted = _readmit_capacity_parks(
+            "example/repo", [[dict(parked_row,
+                                   labels=[{"name": n} for n in sorted(chain_pr_labels)])]],
+            {7: sorted(chain_issue_labels)}, {41: {"issue": 7}}, readmit_bot, Path("."),
+            worker_pr_mod,
+            _capacity_recovery_probe(model_health_mod, continued_window, later_now),
+            comments_fn=lambda _repo, _number: [],
+            timeline_fn=lambda _repo, number: list(chain_timeline.get(number, [])),
+            post_comment=lambda *_a: None,
+            clear_labels=lambda pr, issue: chain_cleared.append((pr, issue)),
+            log=lambda _l: None, migration_provable=False)
+        assert chain_readmitted == 1, (chain_readmitted, sorted(chain_issue_labels))
+        assert chain_cleared == [(41, 7)], chain_cleared
+        print("  ok   aged-out exit CHAIN: a legacy park that could not migrate before #691 "
+              "migrates AND is actually released one span later (both layers, end to end)")
     finally:
         globals()["_target_is_human_maintainer"] = prev_target_probe
 

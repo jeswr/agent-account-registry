@@ -564,18 +564,24 @@ def void_attempt_on_outage(repo, issue, bot_login, run_key, exit_class):
 
 
 def _assert_verifier_immutable(trust_gate, forbid_gate_root):
-    """The pre-publish verifier must NOT resolve into the model-mutable tree (issue #568).
+    """The pre-publish verifier must NOT resolve into the CANDIDATE-CONTROLLED tree (issue #568).
 
-    The pre-publish re-check runs AFTER the model has rewritten the target working tree — and a
-    trust-surface issue legitimately edits `scripts/trust-gate.py` there — so executing that copy
-    would let the candidate change control the very program that authorizes its own publication.
-    The workflow instead passes a snapshot taken pre-model from the SHA-pinned checkout; this is
-    the runtime proof of that property, not merely a convention.
+    Executing a trust gate the candidate change supplied would let that change control the very
+    program authorizing its own publication — and a trust-surface issue legitimately edits
+    `scripts/trust-gate.py`, so this is a live shape, not a hypothetical. The caller names the tree
+    to exclude, because which tree that is depends on where the re-check runs:
 
-    Resolution is over REAL paths (Path.resolve follows symlinks and collapses `..`), so a
-    symlink or a `target/../target` spelling planted by the model cannot smuggle the tree copy
-    back in. Fail-closed in every direction: a missing forbidden root, an unresolvable path, or a
-    gate at/under the root all raise."""
+      * in the isolated `publish` job (issue #575, the current call site) it is the extracted
+        publish BUNDLE — the only candidate-controlled bytes on that runner — and the gate itself
+        comes from the target checkout pinned to the pre-gate base, digest-bound to the pre-model
+        record;
+      * when the re-check lived in the worker job it was the post-model `target` working tree, and
+        the gate came from a pre-model RUNNER_TEMP snapshot.
+
+    Either way this is the runtime proof of the property, not merely a convention. Resolution is
+    over REAL paths (Path.resolve follows symlinks and collapses `..`), so a symlink or a
+    `dir/../dir` spelling cannot smuggle the excluded tree back in. Fail-closed in every direction:
+    a missing forbidden root, an unresolvable path, or a gate at/under the root all raise."""
     if not forbid_gate_root:
         raise WorkerIssueError("pre-publish reverify requires the model-mutable root to exclude")
     try:
@@ -1027,6 +1033,20 @@ def _self_test():
     assert simulate_attempts(["success"])[0] == 1
     # DOCUMENTED #596 DECISION: rate-limit is non-chargeable, exactly like auth.
     assert simulate_attempts(["rate-limit"])[0] == 0
+    # #614's HOST-SIDE credential pre-flight classes. This is the task-side half of the #604/#614
+    # allow-list gap the retro-review found: `void-attempt` reads the RAW class, and model-health's
+    # fold onto auth/transient happens LATER in the model_health job — so until the drift lock in
+    # worker-pr.CREDENTIAL_OUTAGE_EXIT_CLASSES these CHARGED an attempt (and, on a final attempt,
+    # parked the issue) for a failure that happened before the model container existed.
+    for preflight_class in ("credential-remint-required", "credential-refresh-transient"):
+        pf_charged, pf_outs, pf_bodies = simulate_attempts([preflight_class])
+        assert pf_charged == 0, (preflight_class, pf_charged)
+        assert pf_outs == ["true"], (preflight_class, pf_outs)
+        assert any(f"exit-class={preflight_class}" in b for b in pf_bodies), pf_bodies
+    # The budget consequence, end to end: three host-side pre-flight failures against
+    # max_attempts=3 leave the attempt budget UNSPENT instead of exhausting it.
+    assert simulate_attempts(["credential-remint-required"] * 3)[0] == 0
+    assert simulate_attempts(["credential-refresh-transient"] * 3)[0] == 0
     # ...but an UNATTRIBUTABLE failure still charges, so the bounded-crash accounting survives.
     assert simulate_attempts(["unknown"])[0] == 1
     assert simulate_attempts(["setup"])[0] == 1
