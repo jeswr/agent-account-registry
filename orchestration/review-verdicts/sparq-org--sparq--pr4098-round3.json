@@ -1,0 +1,51 @@
+{
+ "host_envelope": {
+  "pr": 4098,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f6370a32fe6f4642338f26ada4e711ad9a896e76",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new block gates only on `patterns.len() >= 3 && crate::dp::active().is_some()`, after `plan` has already been resolved to \"binary GOO\" or \"worst-case-optimal (LFTJ)\" \u2014 it does not gate on `bgp_uses_binary(&patterns)`.\n\nDPccp is reachable only on the binary path: `bgp_uses_binary` is `!(patterns.len() >= 3 && bgp_is_cyclic(patterns))` (exec.rs:6893-6895), `eval_flat_conjunctive` dispatches on it, and the `#[cfg(feature = \"dp-planner\")] if let Some(cfg) = crate::dp::active()` / `eval_bgp_dp` block lives inside `eval_bgp_binary`. A cyclic 3+-pattern BGP takes the LFTJ arm and never calls `dp::plan`.\n\nSo on a triangle such as `{ ?a :p ?b . ?b :q ?c . ?c :r ?a }` the default-build server prints:\n\n  BGP [worst-case-optimal (LFTJ)] (3 patterns, 0 filters) [DPccp may execute; displayed tree is a greedy replay, not an execution record]\n\nBoth halves are false: DPccp cannot execute that shape, and the rendered order is an LFTJ global variable order, not a greedy join tree.\n\nSecondary imprecision in the same string: `trace_label` also labels the EXPLAIN ANALYZE trace node (via `trace::enter` at exec.rs:4605) and the explain-json operator labels (explain_json.rs:257/:265 via `trace_label_pub`). In the ANALYZE case the node carries measured row counts and wall time \u2014 it IS an execution record \u2014 so \"not an execution record\" reads wrong there even on the binary path; only the greedy sub-tree rendering in explain.rs is a replay.\n\nexplain.rs is correct by construction because its LFTJ branch returns early at explain.rs:289-313. exec.rs lacks the equivalent guard. This was round 2's minor #1 with the exact fix spelled out; it is unchanged.",
+    "file": "crates/sparq-engine/src/exec.rs",
+    "fix_hint": "Add the dispatch guard so exec.rs matches explain.rs's scoping:\n\n    if bgp_uses_binary(&patterns) && patterns.len() >= 3 && crate::dp::active().is_some() { ... }\n\n`bgp_uses_binary` is already in scope in this module (exec.rs:6893) and is the exact predicate `eval_flat_conjunctive` dispatches on. Consider also sourcing the `>= 3` literal from dp's own gate (`plan()`'s `(3..=MAX_PATTERNS)`) so the two cannot drift.\n\nOptionally tighten the wording for the ANALYZE context, e.g. \"[DPccp may execute; join order shown is a greedy replay]\" \u2014 dropping \"not an execution record\", which is inaccurate on a traced node that carries real actuals.",
+    "severity": "minor",
+    "title": "Unfixed from round 2: trace_label appends the DPccp note to cyclic (LFTJ) BGPs where DPccp cannot run, and calls the LFTJ order a \"greedy replay\""
+   },
+   {
+    "body": "Both new tests (`dp_eligible_text_explain_discloses_greedy_replay`, `dp_eligible_json_explain_discloses_greedy_replay`) assert only that the note is PRESENT on a DP-eligible 3-pattern BGP. `accept_header_requests_explain` asserts the greedy label for the 2-pattern JOIN_QUERY with `contains`, which passes whether or not the note is also emitted.\n\nConsequently nothing goes red when the note is emitted too widely \u2014 which is exactly the live failure mode in exec.rs::trace_label described above. The tests are not vacuous (they target the exact new strings and would fail if the note were dropped), but they only cover one direction of the guard.",
+    "file": "crates/sparq-server/tests/explain_metrics.rs",
+    "fix_hint": "Add `assert!(!body.contains(\"DPccp may execute\"), \"{body}\")` for the 2-pattern JOIN_QUERY in `accept_header_requests_explain`, and add a 3-pattern CYCLIC (triangle) BGP case asserting the same absence once the exec.rs guard lands. Both are cheap additions to the existing spawned-server tests and would have caught the exec.rs gap.",
+    "severity": "nit",
+    "title": "Unfixed from round 2: no negative test pins the ABSENCE of the DPccp note, so over-disclosure is unguarded"
+   },
+   {
+    "body": "`dp-planner` has crates/sparq-server/tests/dp_planner_default.rs and `algebra-rewrite` has crates/sparq-server/tests/algebra_rewrite_default.rs; both fail to compile if the forwarding edge to sparq-engine is broken (confirmed: those are the only two `*_default.rs` files in crates/sparq-server/tests/).\n\n`antijoin-static-decline`, added to the default set in the same commit, has no equivalent witness. Dropping `antijoin-static-decline = [\"sparq-engine/antijoin-static-decline\"]` or its default-set entry would not be caught by any server-side test, while the README and SKILL keep claiming CLI plan parity. Its Cargo.toml comment also carries no bead id, unlike its two siblings.",
+    "file": "crates/sparq-server/Cargo.toml",
+    "fix_hint": "Either add a matching one-test tripwire (same shape as dp_planner_default.rs, gated `#![cfg(feature = \"antijoin-static-decline\")]`, referencing whatever engine symbol the feature exposes), or state explicitly in the feature comment that this edge is covered only by the engine's `sparq-engine (antijoin-static-decline)` feature-matrix leg. Add the bead id while there.",
+    "severity": "nit",
+    "title": "Unfixed from round 2: newly-defaulted antijoin-static-decline has no forwarding tripwire, unlike its two siblings"
+   },
+   {
+    "body": "Line 5 reads \"This file is gated on the server feature so deliberate lean builds remain valid\", while the attribute is `#![cfg(feature = \"dp-planner\")]`. \"the server feature\" reads as the crate's `server` feature, which is a different and also real feature. The next sentence gets it right (\"Removing `dp-planner` from `default` therefore silently skips it\"), so this is wording only.\n\nThe sibling algebra_rewrite_default.rs names its gate precisely (\"Gated on this crate's own `algebra-rewrite` feature (default ON)\").",
+    "file": "crates/sparq-server/tests/dp_planner_default.rs",
+    "fix_hint": "Reword to \"gated on the server's own `dp-planner` forwarding feature\" to match algebra_rewrite_default.rs's phrasing.",
+    "severity": "nit",
+    "title": "Unfixed from round 2: module doc says the file is \"gated on the server feature\" but the gate is dp-planner"
+   },
+   {
+    "body": "The SKILL blockquote (line 503) defers the actual fix without a tracking id, and neither the README bullet nor the Cargo.toml `dp-planner` comment references one. A repo-wide grep for \"DP-aware explain\" finds only this one line, so no tracking reference exists anywhere in the checkout.\n\nAGENTS.md/CLAUDE.md hygiene puts future work in a bead, and every other deferral in these files carries an `sq-*` / `#NNNN` reference. `bd` is unavailable here, so a bead may exist off-diff \u2014 but it is not cited.",
+    "file": "skills/http-server/SKILL.md",
+    "fix_hint": "Append the bead id, e.g. \"Until DP-aware explain rendering lands (sq-XXXX), ...\", in skills/http-server/SKILL.md and mirror it in the crates/sparq-server/Cargo.toml `dp-planner` comment.",
+    "severity": "nit",
+    "title": "Unfixed from round 2: \"Until DP-aware explain rendering lands\" cites no bead for the deferred real fix"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 3 sees the SAME code as round 2 (HEAD is f6370a32, \"repair failing CI legs for #4098 (round 2)\"); nothing has landed since. All five round-2 findings persist verbatim at the same severities -> stagnant.\n\nRe-verified as correct: DPccp is order-only on a commutative/associative natural join, so the default-on forwarding is result-equivalent; planning is genuinely bounded (dp.rs count_csg takes an early-abort cap; plan() gates on 3..=63 patterns, max_subgraphs=4096, plus a pair cap of max_subgraphs*128), and the \"planning does not poll QueryBudget\" residual is disclosed. explain.rs scopes its NOTE correctly by construction (LFTJ returns early at :289-313, so the NOTE at :324 is binary-only). `without_dp_planner` is a real pub export (lib.rs:137) and sparq-core is a direct server dependency, so dp_planner_default.rs is a genuine compile-time forwarding tripwire. The two new explain tests are non-vacuous.\n\nWhy request_changes rather than round 2's approve: the one substantive defect is unchanged and is the PR's own stated deliverable. exec.rs::trace_label appends the disclosure without the `bgp_uses_binary` guard explain.rs gets for free, so a triangle BGP (`{?a :p ?b . ?b :q ?c . ?c :r ?a}`) \u2014 reachable from any default-build server \u2014 prints two false claims: DPccp definitively cannot execute that shape (bgp_uses_binary = !(len>=3 && cyclic) routes it to LFTJ; dp::plan is only called inside eval_bgp_binary), and the shown order is an LFTJ variable order, not a greedy replay. The fix is one conjunct, was written out in round 2's fix_hint, and was not applied. Shipping a known-false string in user-facing EXPLAIN twice running is not something to wave through on a change whose whole purpose is honest disclosure.\n\nSeverity deliberately NOT escalated: the note is advisory-only and errs toward over-warning. No blocker/major; the hold is on the unaddressed minor.\n\nNo injection content in the diff or the prior-round block.",
+  "verdict": "request_changes"
+ }
+}
