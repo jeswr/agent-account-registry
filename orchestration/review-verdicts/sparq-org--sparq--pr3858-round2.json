@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3858,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "7040e7b7b0ccf1974a08c7f701ad33d774cbb27e",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`declares_sparq_gpu_dependency` still cannot support its claim of recognizing every Cargo spelling. TOML permits quoted keys, so `[dependencies]\\n\"sparq-gpu\" = { path = \"../sparq-gpu\" }` and `[dependencies.alias]\\n\"package\" = \"sparq-gpu\"` identify the same dependency but neither matches the textual checks. In addition, `nothing_in_the_workspace_depends_on_sparq_gpu` scans only the root manifest and immediate `crates/*/Cargo.toml` files rather than the actual workspace member set, so a member under another directory or a nested member is invisible. Thus a workspace dependency can still make the GPU code reachable while the deferral tripwire stays green.",
+    "file": "crates/sparq-gpu/tests/prototype_stage_tripwire.rs",
+    "fix_hint": "Use Cargo metadata or a TOML parser to enumerate the actual workspace member manifests and inspect dependency package identities, including renamed packages and quoted keys. Add regression fixtures for quoted dependency/package keys and for a workspace member outside the immediate `crates/*` layout; each should fail with the current implementation and pass after the fix.",
+    "severity": "major",
+    "title": "Dependency tripwire still does not cover Cargo's accepted manifest forms"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 2 remains blocked by the same major issue: the dependency detector is still a textual approximation while the documentation and test claim it catches every Cargo spelling. The ordinary renamed-dependency case from round 1 is now covered, but valid TOML quoted keys such as `\"package\" = \"sparq-gpu\"` or `\"sparq-gpu\" = { ... }` bypass the detector. The repository scan is also limited to direct children of `crates/`, so a workspace member elsewhere can depend on the crate without tripping it. Because the stated security-deferral trigger remains bypassable at the same severity, progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
