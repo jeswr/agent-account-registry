@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3993,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e307021e56b728a65601d54fde3d0b7e14c05aa9",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The endpoint-pattern implementation is coherent and complete as scoped. It canonicalizes syntax-level patterns against the query prologue, validates that the declared endpoint variable is in scope, evaluates the pattern through the real query engine, drops unbound or graph-absent terms, and deterministically deduplicates candidate IDs before using the existing path enumerator. Fixed-node behavior is preserved through Endpoint::Node, the public API documentation and skill are updated, and the tests exercise both START and END restrictions, the validation error, fixed-node equivalence, the programmatic API, and the empty-selection case. No correctness, soundness, security, or vacuous-test issue is evident in the diff.",
+  "verdict": "approve"
+ }
+}
