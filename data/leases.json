@@ -173,12 +173,12 @@
   {
    "account": "dc2d751954080e13",
    "claim_id": "c2ff13a18f28439897a27952178a9d88",
-   "holder": "sparq-org/sparq#3346@dispatch-30217431665.1",
+   "holder": "sparq-org/sparq#3346@30217791557.1",
    "package": "sparq-jsonld",
    "role": "ci",
    "model": "sol",
-   "issued_at": 1785095586,
-   "expires_at": 1785101886
+   "issued_at": 1785095611,
+   "expires_at": 1785101911
   },
   {
    "account": "dc2d751954080e13",
