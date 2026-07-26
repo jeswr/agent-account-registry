@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3595,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b1e864f465aa4da09957b4cce0633e2d2b03d473",
+  "round": 6
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "SourceSegment exposes declared_rows as an arbitrary usize. reconstruct_federated_public_inputs calls encoded_len for every source before check_shape; encoded_len uses unchecked additions and multiplications, so values near usize::MAX panic in debug builds and can wrap before Vec::with_capacity in release builds. If arithmetic happens not to overflow, encode then loops over 0..declared_rows and emits 96 bytes per row, allowing trivial memory/CPU exhaustion. Such values also cannot be byte-identical to an authoritative scan layout because CircuitId.r is u32 and the verifier admits only compiled circuit-family sizes. The existing shape tests cover relationships among rows, row_count, and r but not whether r itself is a valid circuit dimension.",
+    "file": "crates/sparq-mpc/src/federated.rs",
+    "fix_hint": "Represent r with the authoritative bounded type and validate it against the supported compiled scan family before capacity calculation, or add a checked conversion/bound and use checked arithmetic for encoded_len/capacity summation. Perform all validation before allocation. Add a negative test with an oversized r (including usize::MAX) proving the API returns MpcError without panic or allocation.",
+    "severity": "major",
+    "title": "Unbounded declared_rows can overflow sizing or exhaust verifier resources"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Both round-5 findings are substantively fixed: shape validation now requires row_count == rows.len() and row_count <= declared_rows, and all caller-supplied field words plus the challenge are range-checked with meaningful negative tests. However, the new public SourceSegment still accepts an unbounded usize declared_rows. encoded_len performs unchecked arithmetic on it before validation, and encode iterates to that value; malformed input can therefore panic on overflow or force effectively unbounded allocation/work. It also permits r values that cannot correspond to the authoritative u32 CircuitId.r whose layout is claimed to be mirrored. Because this is a new major correctness/availability finding, progress is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
