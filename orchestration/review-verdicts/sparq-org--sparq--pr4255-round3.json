@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4255,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f35e5e5672350bf8ac3216000db3913271d3cd1e",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2's sole major honesty finding is resolved consistently across quotient.rs, the crate README, and the MPC skill: each now states that authority-bearing IRIs collapse to an authority while authority-less and relative IRIs remain verbatim and are disclosed by publication. The focused regression an_authorityless_iri_is_disclosed_verbatim_in_a_summary exercises the actual builder and stored summary representation, including the contrasting authority-bearing case, so it is not vacuous. The Rule-C2 implementation remains recall-safe as scoped: only complete summaries constrain evaluation; absent/incomplete summaries are unconstrained; predicate/term-domain ambiguity and resource limits decline without pruning; checked combination arithmetic avoids overflow; selection alignment is validated fail-closed; and binding joins enforce agreement on every shared variable. No hostile reviewer-directed instruction was detected in the diff.",
+  "verdict": "approve"
+ }
+}
