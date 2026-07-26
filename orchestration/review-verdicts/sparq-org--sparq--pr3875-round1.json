@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3875,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b22c79e29c930463a8be32f1a6dc631d4bc7efa3",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "PEER_PKGS contains bare package names, including bare `esbuild`, and the script installs them without versions. Consequently a fresh gather can resolve different validator, RDF/JS, transitive dependency, or bundler code and emit different bytes. `bundle.mjs` nevertheless emits `deterministic: true` and says every peer and esbuild input is pinned, while the README calls the bytes deterministic/canonical-capable. Merely recording the resolved versions after installation provides provenance, not reproducibility. This is a correctness issue in the benchmark evidence, not just documentation wording.",
+    "file": "bench/shacl-wasm/run.sh",
+    "fix_hint": "Install from a committed lockfile/package manifest with exact versions (for example, use `npm ci` in a gather-only package directory with a committed lockfile), or pass exact package versions sourced from an existing authoritative pinned recipe and pin esbuild too. Ensure transitive dependencies are locked. If intentionally retaining floating installs, remove the deterministic/canonical-capable claims from `bundle.mjs`, its envelope, and the related documentation.",
+    "severity": "major",
+    "title": "Unpinned npm installs invalidate the deterministic byte claim"
+   }
+  ],
+  "progress": null,
+  "summary": "The bundle-measurement seam is thoughtfully structured, but its central determinism claim is not supported by the implementation. The peer dependency set is installed from unversioned npm package names, so the bundle inputs can change between runs even though the generated envelope declares the result deterministic and the documentation describes the inputs and esbuild version as pinned. Recording whichever versions happened to resolve does not make the measurement reproducible. This must be fixed before the output can be treated as canonical-capable.",
+  "verdict": "request_changes"
+ }
+}
