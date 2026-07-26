@@ -219,6 +219,16 @@
    "model": "sol",
    "issued_at": 1785091664,
    "expires_at": 1785097964
+  },
+  {
+   "account": "51bde6688e140866",
+   "claim_id": "aaad80acaacc4931b7f763b1616eb3a8",
+   "holder": "sparq-org/sparq#2360@dispatch-30215134269.1",
+   "package": "workspace",
+   "role": "impl",
+   "model": "opus5",
+   "issued_at": 1785091668,
+   "expires_at": 1785097968
   }
  ]
 }
