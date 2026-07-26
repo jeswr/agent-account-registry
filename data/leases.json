@@ -11,16 +11,6 @@
    "expires_at": 1785050124
   },
   {
-   "account": "9e13ea21abf27e68",
-   "claim_id": "649d221746464f63ac7659fc8fd053a9",
-   "holder": "sparq-org/sparq#2672@30189496694.1",
-   "package": "sparq-zk-compose",
-   "role": "soundness",
-   "model": "opus5",
-   "issued_at": 1785043854,
-   "expires_at": 1785050154
-  },
-  {
    "account": "dc2d751954080e13",
    "claim_id": "45a69c13ac624391a291c72702ec05d2",
    "holder": "sparq-org/sparq#2738@dispatch-30189313128.1",
