@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2493,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "0ff91f42a3c0209b244950abaaeaa4cac0e4aebd",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The diff still adds the public `pkg-query --citations` flag, compatibility rules, output contract, and examples without changing any `skills/<surface>/SKILL.md`. Updating the crate README and binary documentation does not satisfy AGENTS.md's required maintenance rule, which explicitly classifies CLI flags and behavior as public APIs whose matching skill must be updated in the same change. This is materially the same major finding as round 3.",
+    "file": "crates/sparq-kb/src/bin/pkg_query.rs",
+    "fix_hint": "Update the appropriate existing usage skill with `pkg-query --citations`, including the required `query` feature, incompatible flags, stdout/stderr contract, and a runnable example. If sparq-kb has no matching skill, add a focused skill for this public surface and link it from the skills router as required. Include those files in this PR.",
+    "severity": "major",
+    "title": "New public CLI mode is still absent from an Agent Skill"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 4 is stagnant. The CLI implementation and end-to-end tests remain internally consistent, but the sole major finding from round 3 is unchanged: this diff adds the public `pkg-query --citations` mode and documents it only in the crate README and binary help/docs. The repository's required maintenance rule says a new CLI flag or behavior must update the matching Agent Skill in the same change, so the public surface remains incompletely documented.",
+  "verdict": "request_changes"
+ }
+}
