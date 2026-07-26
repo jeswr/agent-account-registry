@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4245,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "7cf5a3dbe20c2d42160e3cd817d9d324f38194e5",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The lazy per-permutation cache is keyed consistently by the six repr-compatible enum discriminants, preserves SPO as an allocation-free alias, and uses binary-search bounds over sorted projected rows. Cache invalidation occurs before every non-empty delta mutation, covering both insertion and pending-insertion retraction, while cloned overlays retain caches that remain valid for their cloned added set. The expanded equivalence sweep compares scans, sort order, estimates, and repeated mutations against rebuilt stores; the focused zero-copy test also warms non-SPO caches and witnesses both growth and shrink invalidation on real scan paths. Heap accounting includes materialized projections. No correctness, soundness, security, or test-validity defect was found in the diff.",
+  "verdict": "approve"
+ }
+}
