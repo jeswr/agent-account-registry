@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4201,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "63029c921b344998bcd1b36b534e04ebb80440cf",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "When the raw-string terminator or `*/` is not found, both branches set `end = len(content)` and mask the remainder of the file. Confirmed at PR head:\n\n  `let s = r#\"oops;\\n#[cfg(feature = \"live\")]\\n` -> `_extract_cfg_expressions()` returns `[]`\n  `/* oops\\n#[cfg(feature = \"live\")]\\n`          -> `[]`\n\nThat is a silent erasure in the demotion direction, which is the one thing classify_leg's docstring promises cannot happen (\"A detector bug can only keep a full leg; it can never silently demote a sensitive leg\"). Severity is nit rather than major because both inputs are non-compiling Rust \u2014 the tree this scans is built by cargo on the same PR, so the state is not reachable in practice, and it is strictly better than the pre-PR regex which handled neither construct at all. Raising it only so the residual is recorded rather than discovered later.",
+    "file": "scripts/feature-matrix-tiers.py",
+    "fix_hint": "In the raw-string and block-comment branches, when the terminator is not found, treat the construct as NOT a literal/comment: leave the span unmasked and advance `i += 1` instead of masking to EOF. A spurious extra cfg only retains a leg (fail-closed), which matches the documented invariant. Two extra cases in TestCfgExtraction (the two repros above, asserting `['feature = \"live\"']`) would pin it.",
+    "severity": "nit",
+    "title": "Unterminated raw string or block comment masks to EOF, dropping every later cfg (fail-open direction)"
+   },
+   {
+    "body": "Measured on this checkout: sanitizing all 1324 crates/**/*.rs files (32.8 MB) takes 7.6 s with the new scanner vs 1.1 s with the pre-PR regexes; a full classify over the 169 real fragment legs goes 4.1 s -> 15.9 s (each leg re-reads and re-sanitizes its crate, so files under multi-leg crates are re-scanned once per leg). 16 s is fine for a CI ratchet step, so this is informational, not a defect \u2014 noting it because the cost scales with both the crate tree and the leg count, and both grow.",
+    "file": "scripts/feature-matrix-tiers.py",
+    "fix_hint": "If it ever becomes noticeable, memoize the sanitized text (or the extracted expression list) per file path within a single process run \u2014 e.g. a dict keyed by resolved path in _classify_feature_in_src_files / _classify_feature_in_test_files, or an lru_cache on a small `_cfg_exprs_for_file(path)` helper. No behavioural change; the detector is read-only over a fixed tree for the duration of a run.",
+    "severity": "nit",
+    "title": "Per-character Python scan is ~4x slower on the classify/enforce path"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 4 replaces the whack-a-mole regex masking with a real left-to-right lexer, which resolves the round-3 major and all three minors. Everything below was re-verified independently, not taken on trust.\n\nRESOLVED (major, phantom raw-string opener / fail-open): _sanitize_for_cfg_scan is now a single-pass scanner over {line comment, nested block comment, raw string with N hashes, b/c-prefixed and ordinary string, char literal} that masks in place preserving length and CR/LF. All three round-3 repros are fixed at PR head: `let m = \"mode r\";`, `let m = \"w/r\";` and `#[cfg(feature = \"vector-r\")]` followed by a second cfg now each extract the correct expressions (previously [] , [] , and one mangled expr). Tree-wide check over 1324 crates/**/*.rs files: 3822 line-anchored cfg attributes survive sanitization, 0 files lose any, 0 extraction exceptions, and len(safe)==len(content) holds everywhere. Behaviour-preservation: I ran classify_leg over all 169 real fragment legs under BOTH the pre-PR (HEAD~1) and the new sanitizer \u2014 152/169 sensitive under both, 0 legs changed classification, cmd_enforce exits 0 with 0 violations. Adversarial probes all correct: lifetimes/labels vs char literals, `'\"'`, raw idents `r#type`, nested `/* /* */ */`, b\"\"/c\"\"/cr#\"\" decoys, CRLF, `a / *p`.\n\nRESOLVED (minor, vacuous fixture): the new test_extract_single_cfg fixture returns the mangled `['feature = \"vector-r\")]\\nfn a() {}...']` under the pre-PR regex and the correct two exprs under the new code \u2014 genuinely red-on-old. Same for test_ordinary_literal_trailing_r_does_not_open_raw_string and test_nested_block_comment_cfg_is_masked. Suite: 56 tests OK.\n\nRESOLVED (minor, doc): TestMutationFailOpen::test_mutation_check_divergence exists (lines 574/602); the arrow rationale checks out against crates/sparq-py/src/lib.rs:46; 58 -> 52 = 58 - 6 is now consistent; 0 legs declare a tier, so 0 -> 0 is accurate.\n\nOnly two nits remain; nothing blocking.",
+  "verdict": "approve"
+ }
+}
