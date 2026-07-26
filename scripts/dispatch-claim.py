@@ -8710,13 +8710,24 @@ def _self_test():
               "available to it — the cap terminates the aged-out path too")
         # ...and the evidence itself is consumed EXACTLY ONCE: the same fleet-health key can
         # never re-earn a re-admission after a NEWER park application.
+        # THE RE-PARK MUST BE OLDER THAN THE SPAN. A fresh re-park is refused by the
+        # park-younger-than-the-span guard, so the same-key check would never be reached and
+        # this test would pass for the wrong reason (MEASURED: it did — deleting the
+        # consumed-key check left this line green until the fixture was fixed). The receipt
+        # stamp deliberately PREDATES the re-park too, so the idempotent auto-receipt branch
+        # does not short-circuit ahead of the check under test.
+        reparked_epoch = readmit_now - span_secs - 100
         consumed = [{"user": {"login": readmit_bot},
                      "body": worker_pr_mod.auto_readmission_receipt(
-                         fleet_health_key, model_health_mod._iso_z(readmit_now - 300))}]
+                         fleet_health_key,
+                         model_health_mod._iso_z(readmit_now - 2 * span_secs))}]
         reparked = {41: aged_timeline[41] + [
             {"event": "labeled", "label": {"name": MACHINE_PARK_PR_LABEL},
-             "created_at": model_health_mod._iso_z(readmit_now - 60),
+             "created_at": model_health_mod._iso_z(reparked_epoch),
              "actor": {"login": readmit_bot}, "performed_via_github_app": None}], 7: []}
+        # Prove the fixture actually reaches the check: the SAME evidence is available again.
+        assert (model_health_mod.sustained_fleet_health_evidence(
+            healthy_window, reparked_epoch, readmit_now) or {}).get("key") == fleet_health_key
         count, posted, cleared = readmit_sweep(healthy_window, timeline=reparked,
                                                comments=consumed)
         assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
@@ -8763,6 +8774,17 @@ def _self_test():
         real_provable = _legacy_migration_provable(model_health_mod, healthy_window, readmit_now)
         print("  ok   aged-out exit: the migration precondition is REACHABILITY of either exit "
               "— healthy fleet or observable cause — and defers on an unreadable or silent one")
+        # THE CALL SITE IS ITS OWN SEAM. Every test above calls _legacy_migration_provable
+        # DIRECTLY, so all of them stay green if main()'s call site is reverted to the pre-#691
+        # park_cause_provable — the function would be perfect and unreachable. main() is not
+        # callable from here, so this is a SOURCE-LEVEL assertion, and it is labelled as such
+        # rather than dressed up as behavioural coverage. It is the same technique this file
+        # already uses to bind review-fix.yml's TTL to the value the dispatcher assumes.
+        _provable_callees = set(re.findall(r"migration_provable=([A-Za-z_][\w.]*)\(",
+                                           Path(__file__).resolve().read_text()))
+        assert _provable_callees == {"_legacy_migration_provable"}, _provable_callees
+        print("  ok   aged-out exit: every `migration_provable=` call site — the production one "
+              "included — computes it through _legacy_migration_provable (source-level check)")
 
         # (6) THE SIX GENUINE sparq ESCALATIONS, fed through the WIDENED precondition, pinned
         # from their real bot prose (jeswr/sparq, read 2026-07-26). The deny is unconditional
