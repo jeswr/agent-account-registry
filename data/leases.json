@@ -149,6 +149,16 @@
    "model": "opus5",
    "issued_at": 1785087534,
    "expires_at": 1785091734
+  },
+  {
+   "account": "51bde6688e140866",
+   "claim_id": "afcd6476852d45a28423de75c8f3ddde",
+   "holder": "review:sparq-org/sparq#4201@dispatch-30212728079.1",
+   "package": "ci-fragments",
+   "role": "review",
+   "model": "opus5",
+   "issued_at": 1785087541,
+   "expires_at": 1785091741
   }
  ]
 }
