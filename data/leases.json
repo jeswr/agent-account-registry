@@ -12,16 +12,6 @@
   },
   {
    "account": "dc2d751954080e13",
-   "claim_id": "4fc5a0cd6b85490889692c2fcdd37c52",
-   "holder": "sparq-org/sparq#2514@30208798808.1",
-   "package": "sparq-reason-dl",
-   "role": "impl",
-   "model": "sol",
-   "issued_at": 1785080605,
-   "expires_at": 1785086905
-  },
-  {
-   "account": "dc2d751954080e13",
    "claim_id": "92aca61cc1814210bd8ee1a2433fdab7",
    "holder": "sparq-org/sparq#2515@30208800934.1",
    "package": "sparq-lws-core",
