@@ -92,16 +92,6 @@
   },
   {
    "account": "3ff9b4af73df69dc",
-   "claim_id": "8e1dfc3979954949aac57fc3ac4f818d",
-   "holder": "sparq-org/sparq#3180@30212362844.1",
-   "package": "sparq-core-nt-dict",
-   "role": "impl",
-   "model": "opus5",
-   "issued_at": 1785086439,
-   "expires_at": 1785092739
-  },
-  {
-   "account": "3ff9b4af73df69dc",
    "claim_id": "2088d6e9aad3466888707c054bbb6719",
    "holder": "sparq-org/sparq#3196@30212368177.1",
    "package": "sparq-policy",
