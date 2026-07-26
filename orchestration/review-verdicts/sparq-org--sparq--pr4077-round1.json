@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4077,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c511e2c81bae884b83d8835701cd523f1c363d50",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "EntityLinker::link calls exact_iri_entities unconditionally. Consequently EntityLinker::build(...).link(...) and NlqConfig { link_entities: true, link_values: false, ... } now link verbatim IRIs, despite the README, NlqConfig documentation, and skill describing both exact-dictionary probes as part of link_values and saying that setting is off by default. The new unlabelled_entity_still_links_by_verbatim_iri test confirms this unintended default-on behavior by omitting with_values(). This can alter prompts and invalidate recorded fixtures for users who enabled the pre-existing entity linker but did not opt into the new tier.",
+    "file": "crates/sparq-nlq/src/link.rs",
+    "fix_hint": "Gate exact_iri_entities behind the same opt-in state as literal values (for example, store an explicit values/dictionary-linking enabled flag set by with_values), and update the verbatim-IRI tests to require with_values(). Add a regression test proving that a verbatim IRI does not link when the exact dictionary tier is disabled. Alternatively, if default-on IRI probing is intentional, revise all public docs/config semantics and explicitly account for the backward-compatible prompt/fixture impact.",
+    "severity": "major",
+    "title": "Verbatim IRI linking bypasses the link_values opt-in"
+   }
+  ],
+  "progress": null,
+  "summary": "The literal-value index is plausibly implemented and its datatype/language preservation tests exercise the real linker path, but the verbatim-IRI behavior is not actually gated by the new opt-in setting. This contradicts the public configuration contract and changes existing entity-linking behavior whenever link_entities is enabled, even though link_values remains false.",
+  "verdict": "request_changes"
+ }
+}
