@@ -1,8 +1,10 @@
 # [GPT-5.6] Private-registry worker. Dry-run remains the default; REG-3's live path claims a CAS
-# lease, revalidates trust, runs one routed model attempt, gates it, and opens a DRAFT target PR
-# (cross-provider review pending). Publish never arms: the worker records the implementer's
-# identity in the registry (orchestration/provenance/) and stops; its lease releases immediately,
-# and the dispatch sweep drives the review-fix loop that alone may arm the PR.
+# lease, revalidates trust, runs one routed model attempt, seals that work PRE-GATE as a
+# digest-bound bundle, gates it host-side, and a SEPARATE clean-runner `publish` job (no target
+# code) reconstructs the bundle and opens the DRAFT target PR (cross-provider review pending).
+# Publish never arms: the pipeline records the implementer's identity in the registry
+# (orchestration/provenance/) and stops; the lease releases immediately, and the dispatch sweep
+# drives the review-fix loop that alone may arm the PR.
 name: worker
 # The target_repo is embedded in the run-name so the throughput-metrics collector (scripts/
 # metrics.py) can attribute a registry-hosted worker run to its TARGET — sparq's worker/review
@@ -688,6 +690,8 @@ jobs:
           owner: ${{ needs.resolve.outputs.target_owner }}
           repositories: ${{ needs.resolve.outputs.target_name }}
           permission-contents: read
+          # No post-phase revoker in the worker job — see the live mint's rationale below.
+          skip-token-revoke: true
 
       - name: Mint live target-scoped App token
         id: app-token-live
@@ -704,6 +708,16 @@ jobs:
           # Granted at App + installation level 2026-07-17 (maintainer): lets workers push
           # branches touching .github/workflows/* (role:ci issues were structurally blocked).
           permission-workflows: write
+          # POST-PHASE CREDENTIAL BAN (PR #310 round 3 blocker): by default this action
+          # registers a post-job phase that REVOKES the installation token — authenticating
+          # WITH that token — and action post phases run after ALL normal steps, i.e. AFTER
+          # the gate has executed target-controlled code on this runner. That revoker is
+          # exactly the later credential-bearing process a detached hostile gate process could
+          # observe. Every mint in this job therefore disables revocation and relies on the
+          # 60-minute installation TTL (plus narrow scoping) instead; the clean-runner jobs
+          # below keep the default revoker because no target code ever runs there.
+          # worker-live.sh's boundary self-test enforces this on every worker-job mint.
+          skip-token-revoke: true
 
       - name: Verify target App identity and default branch
         id: target

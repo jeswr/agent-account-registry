@@ -2324,6 +2324,42 @@ PY
   printf 'worker-live: wrote the full refreshed credential back to the account secret (env dispatch-secrets)\n'
 }
 
+# PURE (self-tested): print the step id of every `worker`-job token mint that does NOT disable
+# the action's token-revocation post phase. Expected output is EMPTY.
+#
+# WHY (PR #310 round 3 blocker, the gap #575 left open). actions/create-github-app-token by
+# default registers a POST-job phase that REVOKES the installation token — authenticating WITH
+# that token. GitHub runs action post phases after ALL normal steps, i.e. AFTER the hostile gate
+# has executed target-controlled build scripts and tests on this runner. So a mint that stays
+# silent about revocation puts a credential-bearing process on the runner strictly later than
+# the gate: exactly the shape `_tokens_after_gate` exists to ban, but invisible to it, because
+# no `GH_TOKEN:` ever appears in the workflow text — the action supplies the token internally.
+# Every worker-job mint must therefore set `skip-token-revoke: true` and rely on the 60-minute
+# installation TTL plus narrow scoping instead. The isolated `publish`/`final_state` jobs keep
+# the default revoker: no target code ever runs there.
+#
+# Job boundary is a two-space-indented key (same convention as `_tokens_after_gate`), so the
+# clean jobs' own legitimate, revoking mints are deliberately not counted.
+_worker_mints_missing_revoke_skip() {
+  awk '
+    /^  [A-Za-z0-9_-]+:[[:space:]]*$/ {
+      if (injob && mint && !skip) print id
+      mint=0; skip=0; id="(unnamed)"
+      injob = ($0 ~ /^  worker:[[:space:]]*$/)
+      next
+    }
+    !injob { next }
+    /^      -[[:space:]]/ {
+      if (mint && !skip) print id
+      mint=0; skip=0; id="(unnamed)"
+    }
+    /^[[:space:]]*id:[[:space:]]/ { ln=$0; sub(/^[[:space:]]*id:[[:space:]]*/,"",ln); id=ln }
+    /^[[:space:]]*uses:[[:space:]]*actions\/create-github-app-token@/ { mint=1 }
+    /^[[:space:]]*skip-token-revoke:[[:space:]]*true[[:space:]]*$/ { skip=1 }
+    END { if (injob && mint && !skip) print id }
+  ' "$1"
+}
+
 # Non-vacuous host-side self-test: provider-model argv selection, telemetry extraction (claude
 # stream-json + codex --json fixtures, privacy: no transcript content crosses), and task-prompt
 # prefix stability (byte-identical static head across two different issues, variance only below
@@ -3121,6 +3157,29 @@ WFFIX
     "$(_tokens_after_gate "$wf_mutant" | wc -l | tr -d ' ')" "1"
   chk "#575 (LIVE): the pre-gate/post-model write-token mints are gone from the worker job" \
     "$(grep -Ec '^        id: app-token-(publish|post)$' "$wf" || true)" "0"
+
+  # --- [#126 round 3] The gap the scan above CANNOT see. `_tokens_after_gate` reads workflow
+  # TEXT, so it only catches a credential someone wrote down. create-github-app-token's default
+  # token-revocation POST phase writes nothing down and still runs a token-bearing process after
+  # ALL normal steps — i.e. after the hostile gate. Every worker-job mint must opt out of it. ---
+  chk "#126 (LIVE): every worker-job token mint disables the post-gate revocation phase" \
+    "$(_worker_mints_missing_revoke_skip "$wf" | wc -l | tr -d ' ')" "0"
+  # NON-VACUITY, both regression directions: an explicit opt-in (false) and silence (key absent)
+  # are each the shape that reopens the hole, and each must be reported.
+  local wf_revoke_false="$tmp/worker-revoke-false.yml" wf_revoke_absent="$tmp/worker-revoke-absent.yml"
+  sed 's/^          skip-token-revoke: true$/          skip-token-revoke: false/' "$wf" > "$wf_revoke_false"
+  sed '/^          skip-token-revoke: true$/d' "$wf" > "$wf_revoke_absent"
+  chk "#126: a worker-job mint with skip-token-revoke: false is REPORTED (non-vacuous)" \
+    "$(_worker_mints_missing_revoke_skip "$wf_revoke_false" | wc -l | tr -d ' ')" "2"
+  chk "#126: a worker-job mint SILENT about revocation is REPORTED (non-vacuous)" \
+    "$(_worker_mints_missing_revoke_skip "$wf_revoke_absent" | wc -l | tr -d ' ')" "2"
+  # ...and the scan is JOB-SCOPED, not a blanket rule: the isolated publish job's own mint
+  # legitimately keeps the default revoker (no target code runs there) and must NOT be reported.
+  # This is what proves the LIVE assertion above passes on merit rather than by scanning nothing.
+  chk "#126: the clean publish job's revoking mint is NOT flagged (scan is worker-job scoped)" \
+    "$(_worker_mints_missing_revoke_skip "$wf" | grep -c 'app-token-pub' || true)" "0"
+  chk "#126: ...and that publish-job mint really does exist to be skipped (control)" \
+    "$(grep -Ec '^        id: app-token-pub$' "$wf" || true)" "1"
   local verify_ln mint_ln
   verify_ln=$(grep -n 'worker-live\.sh verify-bundle' "$wf" | head -n1 | cut -d: -f1)
   mint_ln=$(grep -n '^        id: app-token-pub$' "$wf" | head -n1 | cut -d: -f1)
