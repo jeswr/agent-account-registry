@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 634,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "128b231c7219ae5a59cd48cfb45fbfd12b3a4895",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "validate_plan_artifact() invokes validate_plan(), whose membership rule compares emitted repos only with plan[\"repositories\"]; both are controlled by the hostile PLAN artifact. A compromised producer can add o/unplanned to that manifest and emit matching rows\u2014the self-test's positive control demonstrates acceptance\u2014or fabricate many unique review/disarm rows within legitimate repos. Unlike dispatch-claim.py's dispatch(), the enqueuer does not compare the planned set with protected enabled policy and does not independently derive each emission from authenticated live state before its contents:write CAS. Exact fields, duplicate rejection, head shape, and later drain revalidation therefore do not establish artifact origin or prevent pollution/exhaustion of the 2,000-row durable queue.",
+    "file": "scripts/task-queue.py",
+    "fix_hint": "Before projection, bind the artifact to trusted inputs outside the artifact: require the repository manifest to exactly equal a protected policy/workflow manifest, impose a strict independently derived per-plan emission bound, and authenticate each projected PR/head/state (for example by deriving emissions in a clean trusted job from authenticated snapshots and protected registry code). Add mutation-sensitive zero-write tests showing rejection when both repositories and item.repo are changed together and when many unique rows are fabricated inside an allowed repo, while a genuine plan still commits.",
+    "severity": "major",
+    "title": "PLAN validation remains self-consistency, not authentication"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round-3 trust-boundary finding remains at major severity. validate_plan_artifact() still calls only dispatch-claim.py's validate_plan(), which proves schema, uniqueness, ordering, and consistency with a repository set supplied by the same hostile artifact. The independent binding in dispatch()\u2014exact equality with enabled protected policy plus live claim-side derivation\u2014is still not used by the contents:write enqueue path. The new positive-control test explicitly accepts a forged repository after adding it to the artifact's own manifest, and there is still no test that jointly mutating the manifest and item repo, or fabricating many unique rows inside an allowed repository, is rejected with zero writes. Head revalidation later in drain improves stale-row handling but does not authenticate enqueue origin or prevent finite-queue pollution. Progress is stagnant because the same major issue remains without an external trusted binding or strict authenticated emission bound.",
+  "verdict": "request_changes"
+ }
+}
