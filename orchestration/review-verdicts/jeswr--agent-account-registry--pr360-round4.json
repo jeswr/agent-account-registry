@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 360,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "9b153e26e65cf1e2871ac790f1ea569a97a03df9",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`live_leases` is read once before iterating, and `review_item_crate_superseded` checks only that checkout snapshot. The diff itself confirms that allocator claims land remotely and that a sibling lease committed after the snapshot, including an earlier successful claim in the same dispatch loop, is invisible. Since `allocator.claim` continues to serialize only same-prefix leases, mixed review/fix and implementation contenders for one repository/package can both claim successfully. The added test proves detection only when the local checkout is rewritten before a separate `run_items` invocation; it cannot fail on the actual post-snapshot race.",
+    "file": "scripts/dispatch-claim.py",
+    "fix_hint": "Move repository/package cross-lane exclusion into select-and-claim's SHA-bound CAS transaction so every claim path evaluates the current remote ledger state atomically with its write. Add a contention test in which mixed-lane contenders begin from the same snapshot and the second CAS attempt observes and rejects the first contender's newly committed lease.",
+    "severity": "major",
+    "title": "Cross-lane exclusion still is not enforced in the claim-time CAS"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The prior major soundness issue remains materially unchanged. This round adds a fail-closed checkout-snapshot recheck and non-vacuous coverage for leases already present in that snapshot, but the code and comments explicitly acknowledge that it is not a claim-time lock. `live_leases` is still loaded only once before the dispatch loop, while successful allocator claims are committed to the remote ledger and remain invisible to this snapshot. Because the allocator still checks only same-prefix leases, a foreign-lane claim committed after the snapshot\u2014including an earlier claim in the same loop\u2014can still coexist on the same repository/package. The wiring test only rewrites the checkout between separate `run_items` calls and therefore does not exercise the unresolved post-snapshot contention race. Cross-lane exclusion must be enforced atomically against the live remote ledger in the SHA-bound CAS transaction before this change is complete.",
+  "verdict": "request_changes"
+ }
+}
