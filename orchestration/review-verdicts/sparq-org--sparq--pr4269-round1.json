@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4269,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "2113af15dd63a048986e095accafd574c0b1de5c",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new section says that everything outside the equivalence scope has no N3 counterpart and that the N3 driver \"refuses such a policy.\" That is not the implemented contract. `validate_policy_for_n3` scope-guards unsupported constructs on prohibitions because ignoring one could drop a deny, but deliberately does not scope-guard unsupported permission constraints; those simply produce no grant. The public rustdoc on `materialize_odrl_n3` states this explicitly: unsupported permission constructs produce no grant, while unsupported prohibition constructs return `Err`. Examples in this paragraph such as `purpose`, `spatial`, `count`, and `xone` can therefore result in denial rather than refusal when attached to a permission. This is a material API/operational distinction because callers may treat `Err` differently from a successful empty authorization result.",
+    "file": "skills/usage-control-policy/SKILL.md",
+    "fix_hint": "Replace the blanket refusal claim with the actual fail-closed split: unsupported permission constructs emit no grant, while unsupported prohibition constructs that the Rust oracle might satisfy cause whole-policy refusal. Call out any constructs that are unconditionally refused (for example duties or malformed/ambiguous shapes) separately.",
+    "severity": "major",
+    "title": "Unsupported permission constructs are denied, not uniformly refused"
+   },
+   {
+    "body": "The landed-state section says `xone`, `purpose`, `spatial`, and stateless `count` \"have no rules and the driver refuses those policies.\" As implemented, unsupported permission constraints are not rejected by the driver; they complete without producing a grant. Only the prohibition case must be refused to preserve the Rust-deny subset invariant (with some globally unsafe shapes refused regardless of rule kind). The status reconciliation therefore misrecords the behavior that actually landed.",
+    "file": "research/odrl-n3-compiled-rules.md",
+    "fix_hint": "Describe these constructs as outside the supported equivalence scope, then state the rule-kind-sensitive behavior: unsupported permissions yield no grant; unsupported prohibitions are refused when omission could lose a Rust denial. Preserve separate wording for constructs the validator rejects globally.",
+    "severity": "major",
+    "title": "Landed-state summary repeats the incorrect blanket-refusal behavior"
+   }
+  ],
+  "progress": null,
+  "summary": "The cross-crate oracle/inclusion documentation is consistent with the implementation and differential test, but the new SKILL and research status text overstate how unsupported permission constructs are handled. The real N3 driver intentionally distinguishes unsupported permissions (no grant / deny) from unsupported prohibitions (whole-policy refusal). Since this distinction affects caller-visible behavior and the new text explicitly says the driver refuses all listed unsupported policies, the documentation is not yet correct.",
+  "verdict": "request_changes"
+ }
+}
