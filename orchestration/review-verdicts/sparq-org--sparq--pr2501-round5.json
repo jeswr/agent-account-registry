@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 2501,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "6f4b55e06151527590b66155a57790d37131795b",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`ContinuousQuery::with_budget` says `max_rows` / `max_bytes` \"bound each window's working set\" and calls `with_window_timeout` a \"relative per-window wall-clock bound.\" Enforcement is cooperative and occurs only at executor polling sites; as the README, adjacent timeout rustdoc, skill, and tests now acknowledge, index-answerable or tiny early-exit evaluations can finish without polling. `max_bytes` also accounts an estimated executor working set, not the window's complete working set. Thus the generated API docs retain the same material overclaim identified in round 4.",
+    "file": "crates/sparq-rsp/src/query.rs",
+    "fix_hint": "Rewrite this rustdoc consistently with the corrected README: describe max_rows/max_bytes/cancel as cooperative limits observed at the next executor poll; say max_bytes covers the executor-accounted estimated evaluation working set rather than total/window-materialisation memory; note that paths completing before a poll are unchecked; and describe `with_window_timeout` as installing a refreshed per-evaluation deadline, not as a wall-clock bound.",
+    "severity": "major",
+    "title": "Public API rustdoc still promises unenforced resource bounds"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 5 is stagnant. The README and skill now accurately describe cooperative polling, estimated executor-accounted bytes, and the absence of a strict wall-clock cap, so the prior documentation finding is substantially addressed there. However, the public `ContinuousQuery::with_budget` rustdoc still says row/byte limits \"bound each window's working set\" and directs users to `with_window_timeout` for a \"relative per-window wall-clock bound.\" Those claims conflict with the newly corrected README, the adjacent timeout rustdoc, and the tests' acknowledgement that executions may complete before the first poll. Because generated API documentation still promises bounds the cooperative implementation does not provide, the same major honesty issue remains.",
+  "verdict": "request_changes"
+ }
+}
