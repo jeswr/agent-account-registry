@@ -42,16 +42,6 @@
   },
   {
    "account": "51bde6688e140866",
-   "claim_id": "9975990447994348bcbb821e2406d649",
-   "holder": "review:sparq-org/sparq#4146@dispatch-30207076708.1",
-   "package": "sparq-server",
-   "role": "review",
-   "model": "opus5",
-   "issued_at": 1785078291,
-   "expires_at": 1785082491
-  },
-  {
-   "account": "51bde6688e140866",
    "claim_id": "c1134766a8ca4655b1ac4dadfd9725f4",
    "holder": "fix:jeswr/agent-account-registry#630@dispatch-30207076708.1",
    "package": "worker",
