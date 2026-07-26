@@ -1,0 +1,51 @@
+{
+ "host_envelope": {
+  "pr": 4198,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "81ba1019328d43914ff41be3c8a77d095e5296c4",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Moving the terms out of the vendored file fixes the byte-for-byte guarantee \u2014 that part of round 1 is genuinely resolved. But the attribution half is only fixed at the filesystem level. The new terms are minted directly in the vendored namespace (https://w3id.org/zkp-sparql/sig-impl#MlDsa, #lattice, #assert-mldsa-*) and the file declares no ontology node at all, so the graph itself carries zero authorship or derivation signal. Once these triples are loaded alongside vocab/sig-impl.yaml.ld \u2014 which is the whole point of an extension \u2014 nothing distinguishes sparq-authored assertions from the ISWC 2025 paper authors' assertions except a source-file boundary that does not survive parsing.\n\nThe sibling extension in the same directory does this correctly: secprop-ext.ttl:54-65 declares <https://w3id.org/zkp-sparql/sec-prop-ext> a owl:Ontology with rdfs:label, dcterms:description and owl:imports <https://w3id.org/zkp-sparql/sec-prop>, and binds a distinct secx: alias (line 42, commented 'SAME namespace; prose-only distinction') so the reader can see which terms are sparq's. Namespace reuse is fine and is the documented design (extend, not fork) \u2014 the missing piece is the marker.\n\nThis also makes PROVENANCE.md:113-115 overclaim. It states the terms 'extend the existing sig-impl: namespace without changing or attributing new claims to the vendored ontology or its paper authors.' At the IRI level they are new claims under those authors' namespace, and nothing in the graph says otherwise. In a provenance record that is the load-bearing sentence, so it should either be made true or be narrowed to what holds (file-level separation only).",
+    "file": "crates/sparq-trust/ontologies/zkp-sparql/sigimpl-ext.ttl",
+    "fix_hint": "Copy the header pattern from secprop-ext.ttl:52-65 into sigimpl-ext.ttl: declare <https://w3id.org/zkp-sparql/sig-impl-ext> a owl:Ontology with an rdfs:label, a dcterms:description stating this is sparq-authored and not part of origin SHA 0fe80ea..., dcterms:creator / dcterms:date 2026-07-26, and owl:imports <https://w3id.org/zkp-sparql/sig-impl>. Optionally bind a sigx: alias to the same namespace for the sparq-minted terms, mirroring secx:, so the source-level distinction is visible. Then either leave PROVENANCE.md:113-115 as-is (it becomes true) or narrow it to say the separation is by file and by the owl:Ontology marker.",
+    "severity": "major",
+    "title": "Extension graph carries no machine-readable provenance: no owl:Ontology / owl:imports / dcterms:creator, unlike secprop-ext.ttl"
+   },
+   {
+    "body": "Round 1 raised this as out-of-scope because the files were vendored. That no longer applies: sigimpl-ext.ttl is sparq-owned, and crates/sparq-trust already gates every sparq-authored Turtle artefact with a parse test \u2014 tests/secprop_ttl.rs (include_str! of secprop-ext.ttl, asserts valid Turtle via oxttl::TurtleParser, non-zero triples, expected subjects present), tests/vocab_ttl.rs for ontologies/trust/trust.ttl, tests/trust_framework_ttl.rs. Nothing include_str!s or validates the new file, and no SHACL check runs against shapes/sig-impl.shapes.ttl, so a syntax error or a dropped term would ship silently with no gate red. By hand-check the file does parse and does satisfy both shapes, but that is asserted, not demonstrated.",
+    "file": "crates/sparq-trust/ontologies/zkp-sparql/sigimpl-ext.ttl",
+    "fix_hint": "Add crates/sparq-trust/tests/sigimpl_ttl.rs modelled on tests/secprop_ttl.rs: include_str! the file, iterate oxttl::TurtleParser expecting no error and >0 triples, and assert sig-impl:MlDsa, sig-impl:lattice and the three assert-mldsa-* IRIs appear as subjects. Feature-gate it the same way secprop_ttl.rs is gated if a default-OFF feature applies. A SHACL run against shapes/sig-impl.shapes.ttl using the workspace's sparq-shacl support would be stronger but is reasonable to bead separately.",
+    "severity": "minor",
+    "title": "New sparq-authored Turtle ships with no parse test, though the crate has three direct precedents"
+   },
+   {
+    "body": "The table at PROVENANCE.md:14-20 is keyed on sub-vocabulary prefix (sec-prop:, sig-impl:, sec-req:, prov-ext:) with the namespace IRI in column 2. The added row keys on the filename 'sigimpl-ext.ttl' and repeats the sig-impl: namespace, which breaks the table's schema. It also makes sigimpl-ext.ttl look like the directory's only sparq extension: secprop-ext.ttl, the older and larger extension, has no row at all.",
+    "file": "crates/sparq-trust/ontologies/zkp-sparql/PROVENANCE.md",
+    "fix_hint": "Either drop the row and describe both extensions in the 'Vendored-copy edit policy' paragraph that already names them, or restructure into a short 'sparq extensions' table listing secprop-ext.ttl and sigimpl-ext.ttl with file, namespace extended, and authorising bead/issue, keeping the sub-vocabulary table for the vendored prefixes only.",
+    "severity": "nit",
+    "title": "New table row uses a filename as the key in a namespace-prefix table, and secprop-ext.ttl still has no row"
+   },
+   {
+    "body": "assert-mldsa-sigtype-leakage justifies sig-impl:no with 'parameter-set-specific fixed-length encodings ... reveals the algorithm family'. The vendored assert-ed25519-sigtype-leakage makes the same observation ('the 64-byte fixed-size signature reveals the algorithm class') but records sig-impl:partial, and ECDSA likewise. The conservative 'no' is defensible and is what round 1 asked for, but a reader comparing the rows cannot tell whether the asymmetry is deliberate. The distinguishing fact \u2014 that the generic PoK adapter those entries rely on has no deployed lattice construction \u2014 is exactly what makes 'no' the right call, and it is not stated.",
+    "file": "crates/sparq-trust/ontologies/zkp-sparql/sigimpl-ext.ttl",
+    "fix_hint": "Add one clause to the justification, e.g. '...; the generic proof-of-knowledge adapter that partially blinds the group-based suites has no deployed lattice analogue, so no partial credit is recorded here.' Keep it as an observable-status statement rather than a feasibility claim, so it stays within what FIPS 204 plus the surrounding entries support.",
+    "severity": "nit",
+    "title": "sigtype-leakage verdict 'no' is unexplained next to ed25519/ECDSA 'partial' for the same observable"
+   },
+   {
+    "body": "Carried unchanged from round 1 and still not a conformance defect: no shape requires full property coverage, and SD-JWT-VC / ed25519 / ECDSA each cover only three of the eight properties. It remains a content gap at the one row where the property is most informative \u2014 ML-DSA is the only entry claiming post-quantum forgery resistance, and assert-bbs-pq-snooping draws the hiding-vs-binding-under-CRQC distinction a reader would most want compared against the migration target.",
+    "file": "crates/sparq-trust/ontologies/zkp-sparql/sigimpl-ext.ttl",
+    "fix_hint": "Either add sig-impl:assert-mldsa-pq-snooping with a citation that actually speaks to harvest-now-decrypt-later for signatures (bibo:nist-ir8547-2024 is the one the surrounding entries use), or state in the rdfs:comment that snooping is deliberately out of scope for this entry.",
+    "severity": "nit",
+    "title": "sig-impl:MlDsa still omits a sec-prop:PostQuantumSnooping assertion"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 2 resolves both round-1 blockers and both round-1 majors. vocab/sig-impl.yaml.ld is no longer touched (git diff origin/main...HEAD shows only PROVENANCE.md + the new sigimpl-ext.ttl), so the byte-for-byte guarantee against origin SHA 0fe80ea... is intact and the upstream header comment and its paper attribution are restored. PROVENANCE.md is coherent again: the 'Four signature implementations' row is back, the edit-policy paragraph now names sigimpl-ext.ttl as a sparq extension, and a dated 2026-07-26 / issue #2832 note records the addition. The sigtype-leakage assertion has dropped the unsupported ZK-adapter claim and now asserts sig-impl:no with an observable-fact justification FIPS 204 does support, and the undated 'no deployed W3C VC cryptosuite' sentence is gone. Verified against the vendored graph: the three sec-prop: properties are declared SecurityProperty instances; bibo:nist-fips204-2024 exists in vocab/prov-ext.yaml.ld; sig-impl:yes/no are Verdict instances; verdict polarity matches the BBS+/ed25519/ECDSA rows; the node satisfies both SHACL shapes by hand-check; the Turtle is well-formed and the prose is British English.\n\nOne major remains. The round-1 attribution concern is fixed at the filesystem level but not in the graph: sigimpl-ext.ttl mints sig-impl:MlDsa, sig-impl:lattice and the three assert-mldsa-* IRIs directly in the paper authors' namespace with no owl:Ontology node, no owl:imports and no dcterms:creator, unlike the sibling secprop-ext.ttl which carries exactly that header. Merged into a store the sparq terms are indistinguishable from vendored ones, so PROVENANCE.md's new sentence claiming the terms add nothing 'attributing new claims to the vendored ontology or its paper authors' is stronger than what the artefact delivers. Beyond that: the new file has no parse test although secprop_ttl.rs / vocab_ttl.rs / trust_framework_ttl.rs establish the pattern, plus three nits.",
+  "verdict": "request_changes"
+ }
+}
