@@ -132,16 +132,6 @@
   },
   {
    "account": "f79434c3ffba014f",
-   "claim_id": "3598493a5f1140bb98b37efee3a1b688",
-   "holder": "sparq-org/sparq#3263@30183680618.1",
-   "package": "sparq-trust",
-   "role": "ci",
-   "model": "opus5",
-   "issued_at": 1785030935,
-   "expires_at": 1785037235
-  },
-  {
-   "account": "f79434c3ffba014f",
    "claim_id": "3c7e8bb0fcad47098ad7a13cd9ce2dc3",
    "holder": "sparq-org/sparq#3272@30183682107.1",
    "package": "release",
