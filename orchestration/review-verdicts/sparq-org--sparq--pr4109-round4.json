@@ -1,0 +1,51 @@
+{
+ "host_envelope": {
+  "pr": 4109,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "fa043a7aa4dc8662461a2ee43849e652aed5c257",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Downgraded from round 3's major. The unsupported factual claim (\"returns the owning feature through its spatial index\") is correctly removed and the premise is now explicitly labelled as oracle-gated \u2014 the honesty defect is fixed. Two premises remain unobserved: `uom:metre` passed as a URI, and the `-1` limit literal. Both are build-time rejections, so they now degrade to a bounded 60s `ERROR/index-probe-failed` with stderr captured, never a number \u2014 which is why this is no longer major.\n\nWhat remains is wording. \"do not publish a timing from an unverified or count-different run\" is phrased as a prohibition a reader may take to be enforced by the harness. It is not: it is an instruction to whoever commits a canonical envelope (see the separate finding on the publish path). Given sq-a8anf's precedent \u2014 an unverified Jena rendering forced a retraction \u2014 the distinction between an enforced gate and an operator instruction is worth making explicit here.",
+    "file": "bench/geo/queries-jena/within10km_indexed.rq",
+    "fix_hint": "Reword to name the mechanism honestly, e.g. \"the harness records COUNT vs sparq's within10km oracle and marks disagreement (count_crosscheck.agree=false, DIFF on the site); the operator MUST NOT hand-promote a count-different timing.\" Better still, record one real observation in the sibling's form once a jar is available: \"verified count-equal to sparq's expected.tsv within10km (51) on the pinned 100k feature-modelled corpus, jena-fuseki-geosparql 5.4.0\", plus which units form Jena accepted.",
+    "severity": "minor",
+    "title": "The query rendering is still unexecuted; the header's \"do not publish\" reads as a pipeline guarantee but is operator discipline"
+   },
+   {
+    "body": "Round 3 flagged exactly this defect in the `scale` string and it is now correctly fixed there (guarded on `FEATURE_CORPUS != \"n/a\"`). The sibling field was left unguarded: lines 549-552 set `cross[\"within10km_indexed\"][\"corpus_variant\"] = \"feature-modelled (2x triples, separate server)\"` for every run, while FEATURE_CORPUS is only ever built inside the `JENA_STATUS = pending` branch (line 314).\n\nSo under `ONLY=sparq` \u2014 the documented acceptance smoke \u2014 or when the jar is absent and the leg gracefully skips, the envelope carries a `within10km_indexed` crosscheck row asserting a corpus variant that does not exist for that run, alongside `sparq: 51` borrowed from a workload the indexed leg never ran and `jena-geosparql: n/a`. Nothing false is numerically published (agree=false, no timing), and such envelopes are non-canonical and not ingested, but it is the same provenance-string-describing-nothing defect the round-3 fix was meant to remove.",
+    "file": "scripts/bench/geo-same-box.sh",
+    "fix_hint": "Guard it the same way the scale string now is: `if w == \"within10km_indexed\" and os.environ[\"FEATURE_CORPUS\"] != \"n/a\": cross[w][\"corpus_variant\"] = ...`. Consider also skipping the whole `within10km_indexed` crosscheck row when the indexed leg never ran, so an ONLY=sparq envelope does not carry a row for a workload nothing executed.",
+    "severity": "minor",
+    "title": "corpus_variant is asserted unconditionally, so an ONLY=sparq or jar-absent envelope claims a feature-modelled variant that was never built"
+   },
+   {
+    "body": "Pre-existing and generic, but it becomes load-bearing for this new row. `parseTsv` (line ~140) builds `values` from the raw `<id>_tsv` column, and `buildEntry` reads only `count_crosscheck` plus those TSVs \u2014 it never reads the envelope's `timings` block. The `WITHHELD(count-disagree: sparq=%s jena=%s)` string that geo-same-box.sh line 590 constructs is therefore dead as far as the site is concerned.\n\nConsequence for `within10km_indexed`: if Jena's index granularity turns out to be 102 rather than the 51 the repo's 0-item observation implies, the published row is rows=51 (borrowed via cc.sparq), a real Jena microsecond number, `count_match: false` -> DIFF, and the new dagger. That is a marked disagreement rather than a fabrication, and it matches how sp2b q08/q12b already publish \u2014 so not a blocker. But the harness's stated invariant (\"a jena timing appears ONLY where count_crosscheck agrees\") is true of the envelope and false of the dashboard.",
+    "file": "scripts/bench/ingest-canonical-competitors.mjs",
+    "fix_hint": "Either null the cell when the crosscheck disagrees \u2014 in buildEntry, after computing `values`, set `values[id] = null` for non-sparq engines when `rowCountMatch(cc) === false` \u2014 or prefer the envelope's `timings` block over the raw TSV when present and treat a `WITHHELD(...)` string as null. If the DIFF-badge-plus-number convention is the deliberate house style, say so in the timings_note so the envelope stops claiming timings are withheld from the published view.",
+    "severity": "minor",
+    "title": "The envelope's WITHHELD(count-disagree) marker never reaches the publisher, so a count-disagreeing indexed timing is published as a number"
+   },
+   {
+    "body": "Round 4 moved the feature probe out of start_fuseki into wait_index_probe, which is the right split. But the `[readiness-ask]` parameter and its `local default_ask='ASK {}'` / `readiness_ask=\"${4:-$default_ask}\"` plumbing (lines 174-177) now have no caller: all three call sites \u2014 line 320, line 391 and line 741 \u2014 pass exactly three arguments.\n\nThis parameter was the site of the round-2 blocker (the quoting bug that emitted a stray brace). Leaving it in place, unused and untested, invites a future caller to reintroduce the one-stage confusion the round-4 refactor just removed.",
+    "file": "scripts/bench/geo-same-box.sh",
+    "fix_hint": "Drop the 4th parameter and inline `ASK {}` as the readiness query, updating the `# <corpus.nt> <port> <logfile>` signature comment. Keep wait_index_probe as the only parameterised probe.",
+    "severity": "nit",
+    "title": "start_fuseki's 4th readiness-ask parameter is now dead code"
+   },
+   {
+    "body": "The round-3 fix hint proposed exactly this shape (a marker plus a `title`), so this is a faithful implementation rather than a defect. Noting it only because the caveat it carries \u2014 that the row's count oracle is a different workload and its timing came from a 2x-triple corpus on a separate server \u2014 is the single most load-bearing qualifier on that row, and a `title` attribute is invisible on touch devices and to keyboard-only users. The footer paragraph explains the counts column but never says what the dagger means.",
+    "file": "site/src/components/benchmarks/same-box-table.tsx",
+    "fix_hint": "Add one conditional line to the footer paragraph when any row carries either field, e.g. \"\u2020 this row's count oracle is a different workload and/or its timing came from a distinct corpus variant \u2014 hover for detail\", and give the sup an aria-label matching the title so the caveat is reachable without a pointer.",
+    "severity": "nit",
+    "title": "The dagger marker has no visible legend \u2014 the caveat is title-only"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 4 clears the round-3 major. Each fix verified against the checkout, not the prose.\n\nEmpirically confirmed: (1) the awk feature transform on a corpus matching generate_corpus (bench_geo.rs:85-98) \u2014 WKT literals byte-identical after the OFS rebuild, exactly 2x lines, and no subject carries both hasGeometry and asWKT; (2) `set -euo pipefail` does not trip on the `[ \"$JENA_STATUS\" = pending ] && JENA_STATUS=ok` line (tested: exit 0, value preserved); (3) bash -n clean; (4) the contract the probes rest on \u2014 http_sparql_adapter.py:68 maps ASK true -> count 1 and line 304 emits `engine\\tcount\\tquery_us`, so `cut -f2 = 1` is right for both `ASK {}` and the withinCircle probe. That was a potential blocker; it holds.\n\nThe round-3 major is answered by evidence already in the repo. within10km.rq records that over the direct corpus \u2014 100k bare `subject geo:asWKT` triples \u2014 Jena's spatial index \"indexes 0 items\", so Jena indexes only hasGeometry-reachable features. The feature corpus thus registers exactly the 100k features: 51, not 102. The one sub-concern that could yield a silently wrong number is positively supported. The other two (uom:metre as URI, the -1 limit) are build-time failures, and round 4 engineered them to fail loudly \u2014 a two-stage probe caps the feature ASK at 60s (was 300s), records a distinct `index-probe-failed` status, and captures adapter stderr. The verified sibling already passes `uom:metre` as a URI to spatialF:nearby, so the units form is consistent.\n\nAlso verified: conditional `scale` suffix; `-nt` cache invalidation; the dagger cannot appear on existing rows (mjs filters `!== q`); SameBoxRow types consistent; rowCountMatch reads only cc.agree so count_match cannot be perturbed; pid-file plumbing reaps both JVMs and Geographica's stop_fuseki prevents contention.\n\nLIMITS: no java/jar/network, so I could not execute the leg; no node_modules, so no tsc. Three minors and two nits remain, none blocking.",
+  "verdict": "approve"
+ }
+}
