@@ -103,12 +103,12 @@
   {
    "account": "9e13ea21abf27e68",
    "claim_id": "0b3b6d788f4c4f19af4b371d71a27bae",
-   "holder": "sparq-org/sparq#2681@dispatch-30212092399.1",
+   "holder": "sparq-org/sparq#2681@30212310611.1",
    "package": "sparq-e2ee-ng-broker",
    "role": "soundness",
    "model": "opus5",
-   "issued_at": 1785086328,
-   "expires_at": 1785092628
+   "issued_at": 1785086355,
+   "expires_at": 1785092655
   },
   {
    "account": "51bde6688e140866",
