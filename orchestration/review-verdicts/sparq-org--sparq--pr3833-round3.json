@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3833,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e2bb3fa74c15990c90a7674c67674160f5a685e6",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2's major finding is resolved. The authoritative mechanized-proof record now explicitly distinguishes merge-blocking assertion-based witness survival from supplementary `kani::cover!` reporting, corrects the affected audit-table rows, and propagates the rule into the standing harness template and testing-strategy assessment. The implementation matches that record: it asserts the existence and exact adversarial shape of the named percent-encoded-dot corpus witness on the real static corpus path, retains the symbolic cover only as a report, and raises/documents the unwind bound required by the concrete string comparison. The pinned corpus entry matches every asserted field, and the guarded lookup avoids out-of-bounds access if the witness is removed. No hostile reviewer-directed instruction was detected in the diff.",
+  "verdict": "approve"
+ }
+}
