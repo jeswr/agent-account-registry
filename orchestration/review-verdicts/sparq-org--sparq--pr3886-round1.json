@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3886,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e73bd3242dd9a1af9d1b9f68189a1ea91142714a",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "In `ChangeRelay::pump`, `self.acked_through_seq = Some(seq)` occurs before `write_cursor(...)`. When persistence fails (for example, an unwritable cursor directory or rename failure), `pump` returns `RelayError::Cursor` but leaves the in-memory watermark advanced. Retrying `pump` on the same relay computes `from` from that advanced value and skips the flushed records despite the durable cursor never recording them. This contradicts the stated fail-closed/at-least-once invariant that the durable cursor is authoritative and a failed pump is always safe to retry.",
+    "file": "crates/sparq-serve/src/change_sink.rs",
+    "fix_hint": "Persist the candidate watermark first and update `self.acked_through_seq` only after `write_cursor` succeeds. Add a real-path regression test that forces cursor persistence to fail after sink flush, verifies the in-memory watermark remains unchanged, restores writability, and confirms the next pump re-delivers the same records rather than skipping them.",
+    "severity": "major",
+    "title": "Cursor write failure advances the live relay and can silently skip records"
+   }
+  ],
+  "progress": null,
+  "summary": "The relay's durable-delivery invariant is broken on cursor persistence failure. After the sink has flushed, `pump` updates the in-memory watermark before atomically writing the cursor. If that write fails, the method returns an error but the live relay subsequently starts after the unpersisted watermark, silently skipping records even though its durable cursor still points earlier. The tests cover sink and log failures but not this load-bearing cursor-I/O failure path.",
+  "verdict": "request_changes"
+ }
+}
