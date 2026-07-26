@@ -1,27 +1,27 @@
 {
-  "generated_at": "2026-07-26T21:40:13Z",
+  "generated_at": "2026-07-26T21:43:53Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
-      "issues_open": 1366,
-      "issues_ready": 392,
+      "issues_open": 1368,
+      "issues_ready": 393,
       "issues_closed_1h": 6,
       "issues_closed_24h": 109,
       "prs_open": 103,
       "prs_draft": 77,
-      "prs_opened_1h": 7,
+      "prs_opened_1h": 5,
       "prs_closed_1h": 0,
       "prs_merged_1h": 6,
       "prs_merged_24h": 118,
       "review_changes_backlog": 5,
       "needs_user_parked": 10,
       "review_lane_health": "ok",
-      "review_lane_runs_1h": 24,
-      "worker_attempts_1h": 7,
-      "worker_success_rate_1h": 0.2857,
-      "pr_open_rate": 7.0,
+      "review_lane_runs_1h": 25,
+      "worker_attempts_1h": 6,
+      "worker_success_rate_1h": 0.1667,
+      "pr_open_rate": 5.0,
       "pr_close_rate": 6.0,
-      "net_pr_flow": 1.0
+      "net_pr_flow": -1.0
     },
     "jeswr/agent-account-registry": {
       "issues_open": 313,
@@ -50,11 +50,11 @@
       "target": "sparq-org/sparq",
       "classification": "backlog-growing",
       "fire": true,
-      "summary": "open PRs 103 > 40 and net PR flow +1.0/hr (open 7.0 > close 6.0) sustained over 2 snapshots",
+      "summary": "open PRs 103 > 40 and net PR flow +-1.0/hr (open 5.0 > close 6.0) sustained over 2 snapshots",
       "metrics": {
         "prs_open": 103,
-        "net_pr_flow": 1.0,
-        "pr_open_rate": 7.0,
+        "net_pr_flow": -1.0,
+        "pr_open_rate": 5.0,
         "pr_close_rate": 6.0
       }
     },
@@ -62,10 +62,10 @@
       "target": "sparq-org/sparq",
       "classification": "worker-failing",
       "fire": true,
-      "summary": "worker success rate 29% < 50% floor over 2 snapshots (7 attempts this hour)",
+      "summary": "worker success rate 17% < 50% floor over 2 snapshots (6 attempts this hour)",
       "metrics": {
-        "worker_success_rate_1h": 0.2857,
-        "worker_attempts_1h": 7
+        "worker_success_rate_1h": 0.1667,
+        "worker_attempts_1h": 6
       }
     }
   ]
