@@ -193,12 +193,12 @@
   {
    "account": "3ff9b4af73df69dc",
    "claim_id": "8e1dfc3979954949aac57fc3ac4f818d",
-   "holder": "sparq-org/sparq#3180@dispatch-30212092399.1",
+   "holder": "sparq-org/sparq#3180@30212362844.1",
    "package": "sparq-core-nt-dict",
    "role": "impl",
    "model": "opus5",
-   "issued_at": 1785086416,
-   "expires_at": 1785092716
+   "issued_at": 1785086439,
+   "expires_at": 1785092739
   },
   {
    "account": "58b7c92faa5b5ca5",
