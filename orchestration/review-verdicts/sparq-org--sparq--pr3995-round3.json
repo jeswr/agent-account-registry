@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 3995,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c664aa94e195153d30732169c3ec411e2f270042",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`container`/`boundBy` gives each node a single owner, and `scopedNodes` consequently emits its class and attributes only under the first OPTIONAL or FILTER NOT EXISTS that reaches it. With `?person OPTIONAL worksAt ?org` and `?company OPTIONAL partnerOf ?org`, where `?org a ex:Organisation`, the second OPTIONAL can bind `?org` to a non-Organisation whenever the first does not bind it. Likewise, the mixed OPTIONAL/NOT EXISTS case excludes any partner rather than only a partner satisfying the target node constraints. This changes query answers and contradicts the canvas node's shared type/attribute semantics.",
+    "file": "gui/app/src/lib/query-builder.ts",
+    "fix_hint": "Emit the shared target's constraints in every scoped incoming group that can independently bind or test that target, while avoiding top-level hoisting. For the two-OPTIONAL case, both OPTIONAL blocks should contain `?organisation a ex:Organisation`; the exclusion block should contain the same target constraints. Replace the current expected-string tests with those expectations and add result-equivalence fixtures where the second edge reaches a non-matching target, so the tests fail if constraints are omitted.",
+    "severity": "major",
+    "title": "Shared scoped targets apply node constraints to only the first incoming group"
+   },
+   {
+    "body": "The two new shared-target tests explicitly expect the target type triple only in the first OPTIONAL and absent from the second OPTIONAL or exclusion. Those assertions pass the flawed single-owner implementation but do not verify that every binding path respects the typed node. They are therefore non-vacuous serialization tests of the wrong invariant, not result-equivalence evidence.",
+    "file": "gui/app/src/lib/query-builder.test.ts",
+    "fix_hint": "Expect the target class and attribute patterns in each independently scoped group, and execute the generated query against data containing both matching and non-matching target types to pin the intended answer set for two OPTIONALs and OPTIONAL plus FILTER NOT EXISTS.",
+    "severity": "minor",
+    "title": "Shared-target tests codify incomplete semantics instead of checking answers"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 3 replaces the degree heuristic and correctly nests chained OPTIONAL patterns, but shared typed targets are still serialized with incomplete constraints. The new ownership model assigns a node's class and attributes to only the first scoped edge that reaches it. A later OPTIONAL can therefore bind that same variable without satisfying the node's declared type or attributes, and a later FILTER NOT EXISTS tests a broader pattern than the diagram describes. The new exact-string tests encode this incorrect behavior rather than establishing result equivalence. The prior major scoping defect therefore remains at the same severity.",
+  "verdict": "request_changes"
+ }
+}
