@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4199,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "897322ac06403f23f88b2f50ad0698b1ebcffbc0",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The round-1 prefix nit is mostly fixed: the [TX-STATUS-001] block now declares trustx:/prov:/xsd:, the [TX-RESP-001] block declares rdf:/prov:/trustx:/ex:, and the section 7.2 TriG block declares prov:/trustx:/ex:.\n\nStill outstanding: the enumerated-parties block (<urn:requirements:direct> ...) and the framework-certified block (<urn:requirements:framework> ...) use trustx: and xsd: with no local @prefix, inheriting them from the 'Common shape' block earlier in the same section. Since every other example in the document is now self-contained, these two read inconsistently and will not parse if copied alone.",
+    "file": "site/specs/trust-expression.typ",
+    "fix_hint": "Add `@prefix trustx: <https://sparq.dev/ns/trust#> .` and `@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .` to the two mode-example blocks in sections 4.3 and 4.4, matching the now-self-contained blocks in sections 5 and 7.",
+    "severity": "nit",
+    "title": "Two mode-example Turtle blocks still rely on the section-4.1 prefix preamble"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 2 resolves every round-1 finding, verified against the checkout rather than the diff text.\n\nBlocker 1 (namespace) FIXED: section 4 now binds trustx: to https://sparq.dev/ns/trust#, matching crates/sparq-trust/src/framework_vocab.rs:61 (TRUSTX_NS) and the companion draft site/specs/trust-graph-authz.typ, and all four Turtle/TriG blocks declare that IRI. It also names sparq_trust::framework_vocab as the shipped constant surface instead of minting terms greenfield.\n\nBlocker 2 (boundary inversion) FIXED: the section-6 row now reads 'Inclusive start and inclusive end', TX-STATUS-001 states explicitly that a reference instant equal to either endpoint is covered, and section 10 adds both endpoint conformance cases. This matches framework_vocab.rs (validFrom/validUntil documented '(inclusive)') and graph.rs GATE 4, which rejects only now < valid_from || now > valid_until.\n\nMajor 3 FIXED: the SHOULD now points at sec-req: individuals via framework_vocab::SEC_REQ_EIDAS20 / SEC_REQ_UK_DVS (both present) and explicitly separates sec-req: (regulatory requirements) from sec-prop: (security properties).\n\nMajor 4 FIXED: section 6 is retitled 'Normative Trust Expression vocabulary' and its table now covers all 20 terms the document uses normatively. trustx:underCertification is gone; TX-RESP-001 uses trustx:certifies, a shipped constant. The draft honestly discloses that trustx:credential/status/valid have no matching Rust constants yet.\n\nMinor 5 FIXED: citations now use the public sparq_zk_compose::verifier::verify_manifest (verifier.rs:5623, pub); I confirmed it reaches bind_issuer_attestations via verify_manifest_impl -> prefilter_manifest_structure_impl (verifier.rs:2647). sparq_core::nt is described as internal. Every other cited anchor exists and is public: ProofManifest, revocation, VerifyingLiveStatusCheck, SignedStatusList, justify_status_decision, desugar_for_predicate, admissible.\n\nMechanics re-checked: all seven build-specs.mjs-parsed fields \u2026 [truncated 260 chars]",
+  "verdict": "approve"
+ }
+}
