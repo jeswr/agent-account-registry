@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3640,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "079c9ae85f7edbf26998888010037f0e30868a99",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The prior-round finding is still present. Stage 2 says private values are shared t-of-n with t=floor((n-1)/2), and the F_share row again says it distributes a t-of-n sharing, while the record uses t as the maximum corrupt coalition and polynomial degree (including n=2t+1 and degree-2t products). For degree-t Shamir sharing, any t shares reveal no information, but reconstruction requires t+1 valid shares. The current wording conflates privacy/corruption threshold with reconstruction threshold in the pipeline and its ideal functionality.",
+    "file": "research/mpc-composition-uc-posture.md",
+    "fix_hint": "Replace both t-of-n descriptions with unambiguous degree-t Shamir terminology and explicitly state that any t shares reveal no information while t+1 valid shares reconstruct, with t=floor((n-1)/2). Check nearby threshold-open/reconstruction wording for the same convention.",
+    "severity": "major",
+    "title": "Shamir reconstruction threshold remains misstated as t-of-n"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 5 is stagnant: the round-4 threshold error remains unchanged in both the stage-2 description and the F_share ideal-functionality row. The document defines t=floor((n-1)/2) as the corruption/privacy threshold and later correctly describes degree-t sharing, where any t shares reveal no information. Calling that a t-of-n sharing is therefore inconsistent: degree-t Shamir reconstruction requires t+1 shares. Because this terminology occurs in the load-bearing pipeline and ideal-functionality descriptions of a security posture record, the document is not yet correct as scoped.",
+  "verdict": "request_changes"
+ }
+}
