@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3833,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "9aa80a474adfa6cfcba589a1e1e24daf67e96469",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The revised comments and proof correctly say that an unsatisfied plain `kani::cover!` is only a report and does not fail verification, but they repeatedly cite `research/mechanized-proof-program.md` \u00a75.1 as the governing discipline. That section still says witness survival is provided by `kani::cover!` and that an unreachable cover \"goes red\" as a mechanical guard. Thus the implementation and its cited audit requirement disagree on the load-bearing anti-vacuity rule. Because this PR is specifically correcting a soundness misconception in that program, leaving the central record unchanged makes the correction incomplete and can propagate the same vacuity bug to other suites.",
+    "file": "crates/sparq-wac-oracle/src/escalation_corpus.rs",
+    "fix_hint": "Update the cited \u00a75.1 audit/design record in the same PR to distinguish merge-blocking assertions from supplementary cover reports, and revise any requirement text claiming that an unsatisfied plain cover makes the verification verdict fail. Keep the concrete/static assertion requirement as the actual gate.",
+    "severity": "major",
+    "title": "Cited domain-coverage audit record still prescribes the unsound cover-as-gate pattern"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The code-side anti-vacuity fix is materially sound: merge-blocking assertions walk the real static corpus, validate every flagged evader, and pin the named percent-encoded-dot witness; the raised unwind bound also accounts for the concrete string comparison. However, the change is incomplete against the audit record it cites. `research/mechanized-proof-program.md` \u00a75.1 still states that an unreachable `kani::cover!` goes red and mechanically guards pruning, while this diff correctly explains that a plain unsatisfied cover does not fail Kani verification. Leaving the authoritative requirement contradictory invites future harnesses to repeat the exact vacuity defect being fixed. This is a new documentation-consistency finding relative to round 1, so progress is regressing.",
+  "verdict": "request_changes"
+ }
+}
