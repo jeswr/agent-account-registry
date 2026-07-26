@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4350,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "6f28b0982eae052ab646691fbafb49a2a40f252b",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The three added tests exercise only small hand-picked bound-ID cases and compute expectations with a bespoke expansion. They do not compare the sort-based implementation with the prior/hash or naive join path, and therefore cannot demonstrate result equivalence over the broader input domain. For an engine join fast path, this is insufficient evidence against silent bag-semantics regressions. Both the actual-sort branch and the `sorted_by` no-sort branch need randomized coverage, including empty inputs, duplicates, high-NDV/singleton groups, multiple matches, no matches, and `NO_ID`/unbound rows where the caller permits them. The test should compare multisets, not emission order.",
+    "file": "crates/sparq-engine/src/exec.rs",
+    "fix_hint": "Retain a test-only reference implementation using the former hash grouping (or invoke an independently naive equivalent path), generate deterministic randomized result rows and matching graph data, and assert multiset equality against `bind_join` with `sorted_by: None` and with truthfully sorted input plus matching metadata. Add a mutation/control assertion or test-only deliberately faulty variant showing the differential fails when a group/duplicate/match is dropped.",
+    "severity": "major",
+    "title": "Join fast-path rewrite lacks an independent differential test"
+   }
+  ],
+  "progress": null,
+  "summary": "The sort/run rewrite is plausible and the focused examples cover duplicate rows, fan-out, the presorted shortcut, and stale metadata. However, this is a new engine join fast path and its tests only restate hand-picked expected results. They do not compare the optimized implementation against an independent baseline across varied bags and both strategy branches, so key wrong-answer classes (including unbound IDs, empty inputs, repeated/noncontiguous values, and varying match multiplicities) remain unverified. The engine review contract requires a randomized differential and a mutation check for such a rewrite.",
+  "verdict": "request_changes"
+ }
+}
