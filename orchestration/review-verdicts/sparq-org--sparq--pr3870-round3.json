@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3870,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "5af9ef9f74159636130c974b5fc5e3d07391bcb7",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "This CLI explicitly documents that it has no --help and users should invoke commands with too few arguments to discover usage. Yet the top-level fallback still omits both `reason` and the feature-gated `classify` command, and `cmd_reason` still prints `<rdfs|owl|n3>` when its newly accepted profile set is `<rdfs|owl|n3|el>`. Thus a reason-el build's built-in discovery output contradicts the implemented public surface. The new test checks the unknown-profile message, but does not exercise either stale usage path.",
+    "file": "crates/sparq-cli/src/main.rs",
+    "fix_hint": "Update `cmd_reason`'s usage string to include `el`. In the top-level usage, include the existing reason command and conditionally advertise `classify <data-file> <format> [out.nt]` when `reason-el` is enabled (or otherwise clearly label it feature-gated). Add subprocess assertions for `reason` with missing arguments and for the feature-enabled top-level usage so this public contract cannot drift.",
+    "severity": "minor",
+    "title": "The no-help CLI's usage contract omits the new EL surfaces"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The round-2 honesty finding is repaired: the crate README and inference skill now consistently limit completeness to the recognised feature-dependent fragment under a regular RBox, with the nominal and concrete-domain boundaries stated, and the concrete-domain subprocess test exercises the real CLI path. One new, smaller completeness defect remains in the changed CLI surface: because this CLI deliberately has no --help, its usage errors are the command-discovery contract, but neither the top-level usage nor the reason subcommand's missing-argument usage advertises the newly added classify command / el profile. This is a new minor finding, so progress is regressing under the required round-comparison scale.",
+  "verdict": "request_changes"
+ }
+}
