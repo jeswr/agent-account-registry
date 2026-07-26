@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 3870,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "70218a166c1beb57eb17d7c3d80a96829110b69a",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new command documentation and usage text call the result the `COMPLETE OWL 2 EL` / `COMPLETE ... lattice`, but `reason-el` enables only `sparq-reason-el/rbox`, not `cdomain`, and the classifier documentation explicitly says concrete-domain axioms are skipped without that feature and that completeness is not claimed for every nominal interaction. `el_honesty_notes` reports skipped inputs after classification, but the unconditional completeness claim remains false for valid EL inputs using those supported-by-OWL-profile constructs. This is an honesty-sensitive reasoner surface and a public CLI contract, so it is blocking.",
+    "file": "crates/sparq-cli/src/main.rs",
+    "fix_hint": "Qualify every CLI-facing completeness statement in this file as complete only for the classifier's recognized/supported fragment (and regular RBoxes), including the `classify` usage text and function docs. Alternatively enable and validate every feature needed for the claimed OWL 2 EL scope, but the documented nominal limitation would still require a precise scope caveat. Add an end-to-end test that feeds a skipped in-profile construct and verifies the CLI does not describe that result as unconditionally complete.",
+    "severity": "major",
+    "title": "CLI overclaims completeness for the full OWL 2 EL profile"
+   },
+   {
+    "body": "The skill directs users to this CLI for the `complete` lattice of an EL ontology while later documenting concrete-domain and nominal completeness gaps. Because `reason-el` does not enable `cdomain`, these statements contradict the actual shipped feature combination. A stderr warning about skipped axioms cannot retroactively make an unconditional completeness promise accurate.",
+    "file": "skills/inference/SKILL.md",
+    "fix_hint": "Change the new CLI guidance to say complete for the recognized EL fragment under the stated regularity assumptions, and summarize the material limitations next to the first recommendation rather than only much later in the skill. Apply the same qualification consistently to the other changed public docs.",
+    "severity": "major",
+    "title": "Inference skill repeats the unqualified complete-lattice claim"
+   }
+  ],
+  "progress": null,
+  "summary": "The opt-in wiring and end-to-end differential test exercise the real CLI paths, but the new public documentation and command help repeatedly promise a complete OWL 2 EL lattice even though this feature enables only `rbox`, while the classifier's own documented `cdomain` and nominal-interaction limitations remain. Reporting skipped axioms is good fail-closed behavior, but it does not make the returned lattice complete for an arbitrary OWL 2 EL ontology. The public contract must scope the completeness claim to the supported fragment.",
+  "verdict": "request_changes"
+ }
+}
