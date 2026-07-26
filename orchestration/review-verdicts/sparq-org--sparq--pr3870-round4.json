@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3870,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "beda3a7a0e97bdac0bb84ffcbfe72ca953716caa",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`cmd_reason` still prints `usage: sparq-cli reason <data-file> <format> <rdfs|owl|n3> [out.nt]` even though `el` is now accepted, and the top-level fallback still omits both the existing `reason` command and feature-gated `classify`. Since `skills/cli/SKILL.md` explicitly says there is no `--help` and users discover commands through these usage errors, the executable's discovery output contradicts the public surface. The new tests do not exercise either path.",
+    "file": "crates/sparq-cli/src/main.rs",
+    "fix_hint": "Add `el` to `cmd_reason`'s missing-argument usage. Add `reason` to top-level usage and conditionally advertise `classify <data-file> <format> [out.nt]` under `reason-el`. Add subprocess assertions for `reason` with missing arguments and for feature-enabled top-level usage.",
+    "severity": "minor",
+    "title": "The no-help CLI still omits EL surfaces from its usage contract"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 4 is stagnant: the sole round-3 finding remains unchanged. The feature-enabled CLI still accepts `reason ... el` and dispatches `classify`, but its built-in discovery contract remains stale: `cmd_reason` advertises only `<rdfs|owl|n3>`, while the top-level usage omits both `reason` and feature-gated `classify`. This is especially material because the documented CLI intentionally provides no `--help`. The added tests cover classify's own missing-argument text and the unknown-profile list, but not either stale usage path. The EL result-path test is otherwise end-to-end and consistent with the scoped completeness argument in `research/owl2-el-ql-reasoning-spike.md`.",
+  "verdict": "request_changes"
+ }
+}
