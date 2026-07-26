@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4135,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a3dc5c4584e516ac9bee685c2348c76c0e9d93bc",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new public module-level documentation uses the intra-doc link `verifier::bind_entailment`, but `bind_entailment` is a private function in `verifier.rs`. Public documentation linking a private item triggers the `rustdoc::private_intra_doc_links` warning; with the repository's warnings-as-errors/all-features rustdoc gate, this is a gate failure. The link may also be unresolved from this module without a crate-qualified path, but making it crate-qualified would not solve the private-item problem.",
+    "file": "crates/sparq-zk-compose/src/derivation.rs",
+    "fix_hint": "Replace the intra-doc link with plain code formatting such as `verifier::bind_entailment` (backticks without link brackets), or link to a genuinely public API that represents the check. Run the all-features rustdoc portion of the clippy gate to confirm there are no private or broken intra-doc links.",
+    "severity": "major",
+    "title": "Public rustdoc links to private bind_entailment function"
+   }
+  ],
+  "progress": null,
+  "summary": "The fail-closed policy logic and its end-to-end tests are coherent, and the documentation consistently preserves the research-grade/not-externally-audited qualification. However, the new public module documentation links to a private verifier function. This is the exact feature-gated rustdoc failure class called out by the repository's review contract and is expected to fail the all-features documentation gate, so the PR is not ready to approve.",
+  "verdict": "request_changes"
+ }
+}
