@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4274,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f60ad10c7b1ec1b8d34a93f06487521f880da287",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior major finding. The generator now emits the known SUBSTR start-before-one and ROUND(-0.5) divergences as live SPEC-REFERENCE assertions using independently computed F&O values, while retaining self-expiring guards for sparq's current behavior. The committed Noir oracle visibly contains executable assertions for substring(\"12345\", 0, 3) == \"12\" and negative-zero round bits, and the focused Rust test verifies that these assertions remain live and that no assertion is commented out. The documentation accurately distinguishes these rows from sparq-differential rows and preserves the research-grade, not-externally-audited caveat. No hostile reviewer-directed instruction was detected in the diff.",
+  "verdict": "approve"
+ }
+}
