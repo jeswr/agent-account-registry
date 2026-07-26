@@ -373,6 +373,13 @@ _gh_retry = _load_module(
 _lease_schema = _load_module(
     "registry_lease_schema", Path(__file__).resolve().with_name("lease_schema.py"))
 
+# [OPUS-5] registry #701. THE no_change routing decision: a worker exit that produced no diff must
+# not re-dispatch the tier that produced it. Same shared-module idiom — the vocabulary and the
+# decision live in ONE place, consumed here (routing), by model-health (storage), and by
+# worker-live.sh (production).
+_no_change_routing = _load_module(
+    "registry_no_change_routing", Path(__file__).resolve().with_name("no_change_routing.py"))
+
 
 def _require_exact_fields(value, fields, where):
     if not isinstance(value, dict):
@@ -2568,7 +2575,8 @@ def _decline_outcome_name(record):
 
 
 def _escalate_repeated_declines(repo, item, outcomes, comments, bot_login, script_dir,
-                                apply_action=None, post_comment=None):
+                                apply_action=None, post_comment=None,
+                                min_outcomes=DECLINE_ESCALATION_MIN):
     """Apply or reconcile one repeated-decline escalation.
 
     Returns ``proceed`` below threshold and after a previously completed impl->research reroute;
@@ -2576,8 +2584,15 @@ def _escalate_repeated_declines(repo, item, outcomes, comments, bot_login, scrip
     BEFORE the label mutation so a mutation failure can be reconciled next tick without a second
     loud comment. Conversely, a failed comment performs no label mutation and safely retries.
     Injectable mutation/comment callables keep the --self-test tripwires on the real control flow.
+
+    `min_outcomes` (registry #701) is the threshold this call is allowed to fire at. It stays
+    DECLINE_ESCALATION_MIN for the historical "two honest declines" ladder, and drops to 1 for the
+    ONE case where a second outcome could add nothing: the resolved model chain has no tier left
+    that has not already produced a `no_change` for this issue, so the only remaining choices are
+    "run the failed tier again" or "decompose". The caller — never this function — decides that,
+    from `no_change_routing.retry_decision`.
     """
-    if len(outcomes) < DECLINE_ESCALATION_MIN:
+    if len(outcomes) < min_outcomes:
         return "proceed"
 
     evidence, key = _decline_escalation_evidence(outcomes)
