@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4355,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "5439e798c2140f96bf297ca0cd39c73bed29a0cf",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`GENERATED_TIMING_FILE` only detects the contiguous text `paper-timing.generated`, so a paper can use a constant expression such as `json(\"/src/data/paper-\" + \"timing.generated.json\")` and then render `.records.at(key).value`. This names none of `INTERNALS`, imports no timing module, and therefore produces no problem while publishing a bare measured timing. The negative tests cover only the exact literal path and do not exercise this straightforward bypass. This contradicts the diff's load-bearing claim that the build gate fails on any route other than the provenance-rendering accessors.",
+    "file": "site/scripts/timing-source-gate.mjs",
+    "fix_hint": "Make the publication boundary structural rather than dependent on substring/internal-name denylisting. For example, compile registered papers in a project root where raw timing JSON is not directly addressable and expose only a generated provenance-rendering module/artifact, or parse/evaluate imports and data-source expressions with a conservative fail-closed policy. At minimum, reject all `json()`/raw file-reading constructs in paper sources except explicitly audited evidence-library implementations, and add a negative fixture using a concatenated path (plus aliases/helpers) that must fail.",
+    "severity": "major",
+    "title": "Lexical source gate is bypassed by a constructed generated-data path"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 2 fixes the three prior major findings: committed expected-row data is now loaded independently with mutation coverage, raw timing data is no longer a public binding, and the tests exercise concrete import/direct-read bypasses. However, the replacement publication boundary still does not establish its claimed invariant. It is a lexical denylist that recognizes only a literal `paper-timing.generated` substring and a fixed set of current internal names. Typst code can construct the JSON path from string fragments and read the raw value without matching either check. Because the documentation claims the build fails on any other route to a timing value, this remains a major honesty-boundary defect. Progress is regressing under the required scale because this is a new finding, despite the earlier findings being addressed.",
+  "verdict": "request_changes"
+ }
+}
