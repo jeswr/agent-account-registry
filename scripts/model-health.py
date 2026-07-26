@@ -889,6 +889,45 @@ def capacity_recovery_evidence(records, parked_at, now):
     }
 
 
+def park_cause_provable(records, parked_at, now):
+    """True when a capacity park applied at `parked_at` could EVER prove its cause recovered —
+    i.e. SOME account's newest record at or before `parked_at` is a PARK_STARVATION_CLASSES
+    signal, so a later success can satisfy capacity_recovery_evidence.
+
+    This exists for ONE caller: the legacy-park migration (sparq-org/sparq#3809). Converting a
+    park from the human terminal into the machine class is only an improvement if the machine
+    class can actually release it. capacity_recovery_evidence fixes the park's cause at the
+    park's application instant: if the fleet was HEALTHY at that instant, no account's
+    newest-at-park record is a starvation signal, condition 1 can never be satisfied, and NO
+    future success can ever recover that park. Converting then would trade a VISIBLE stall
+    (`review:needs-user`, which a human sees and can clear) for a SILENT one (`review:parked`,
+    which nothing will ever clear) — strictly worse.
+
+    So the migration converts only while the starvation cause is still OBSERVABLE, and defers to
+    a later tick otherwise. It is a precondition check, never a grant: it proves the exit is
+    REACHABLE, and capacity_recovery_evidence still has to be satisfied on its own terms before
+    anything is actually re-admitted.
+
+    Fails toward False (do not migrate) on every ambiguity, exactly like the evidence gate."""
+    if not isinstance(records, list) or not records:
+        return False
+    if (not isinstance(parked_at, (int, float)) or isinstance(parked_at, bool)
+            or parked_at != parked_at or parked_at in (float("inf"), float("-inf"))):
+        return False
+    for record in records:
+        try:
+            _validate_record(record)
+        except ValueError:
+            return False
+    cause = {}
+    for record in sorted(records, key=lambda r: r["ts"]):
+        if record["ts"] > now + FUTURE_SKEW_SECONDS:
+            continue                    # future-forged stamps prove nothing
+        if record["ts"] <= parked_at:
+            cause[record["account"]] = record
+    return any(record["exit_class"] in PARK_STARVATION_CLASSES for record in cause.values())
+
+
 def account_backoffs(records, now):
     """Reactive per-account backoff for probe-exempt providers (maintainer decision 2026-07-17,
     registry issue #29), DERIVED purely from the pruned health window. Walks records in ts order:
@@ -2846,6 +2885,31 @@ def _self_test():
             starved_then_dispatched
             + [rec("fleet", "fleet01", CLASS_ZERO_DISPATCH, dt=250, run="z2")],
             parked, now + 300), None)
+
+    # ---- park_cause_provable: the legacy-migration precondition -----------------------------
+    # Converting a park out of the human terminal is only an improvement if the machine class can
+    # release it. A park applied while the fleet was HEALTHY can never satisfy condition 1, so
+    # migrating then would trade a visible stall for a silent one.
+    chk("a park applied while the cause is OBSERVABLE is provable (migration admitted)",
+        park_cause_provable(starved_then_dispatched, parked, now + 300), True)
+    chk("a park applied while the fleet is HEALTHY is NOT provable (migration deferred)",
+        park_cause_provable(
+            [rec("fleet", "fleet01", CLASS_ZERO_DISPATCH, dt=0, run="z1"),
+             rec("fleet", "fleet01", SUCCESS, dt=50, run="d1")], parked, now + 300), False)
+    chk("a park applied BEFORE every record in the window is NOT provable "
+        "(the outage aged out — no future success can recover it)",
+        park_cause_provable(starved_then_dispatched, now - WINDOW_SECONDS - 1, now + 300), False)
+    chk("an empty/unreadable window is NOT provable (fail toward not migrating)",
+        [park_cause_provable([], parked, now + 300),
+         park_cause_provable([{"account": "x"}], parked, now + 300),
+         park_cause_provable(starved_then_dispatched, None, now + 300)], [False, False, False])
+    # The precondition must AGREE with the gate it is a precondition for: anything the evidence
+    # gate can ever admit must be reported provable.
+    chk("provable is implied by actual evidence (the precondition never contradicts the gate)",
+        all(park_cause_provable(window, parked, now + 300)
+            for window in ([rec("openai", "codex01", cls, dt=0, run="f1"),
+                            rec("openai", "codex01", SUCCESS, dt=200, run="s1")]
+                           for cls in sorted(PARK_STARVATION_CLASSES))), True)
 
     # ---- prune / window bound ---------------------------------------------------------------
     many = [rec("anthropic", "acct01", CLASS_TRANSIENT, dt=i) for i in range(MAX_RECORDS + 50)]

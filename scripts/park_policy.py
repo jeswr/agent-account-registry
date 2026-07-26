@@ -501,6 +501,70 @@ def human_owned_holds(labels):
                    and (label == HUMAN_PR_PARK_LABEL or label.startswith("needs:"))})
 
 
+def label_application_machine_owned(repo, number, label, fetch_events, is_human=None, log=print):
+    """Whether the newest `labeled` event for THIS EXACT `label` on `repo#number` was applied by
+    something other than a proven human — i.e. whether an automated path may clear it.
+
+    Returns False for every ambiguity, including the one that matters most: a label with NO
+    `labeled` event at all. Absence of evidence is NOT proof of machine ownership.
+
+    WHY THIS IS NOT park_applications (blocking review finding, #690). park_applications answers
+    "when was the newest park applied across READMISSION_LABELS, and was that human" — a question
+    about THREE labels (needs:user / status:parked / review:parked) collectively. Using it to
+    authorise deleting a DIFFERENT label is a domain mismatch, and it fails in three separate
+    directions, all demonstrated by execution:
+      - a human-applied `needs:user` is cleared because a LATER bot `status:parked` event exists
+        (only `labeled` events are read, so a since-removed park still counts);
+      - a human-applied `needs:external-audit` or `needs:ec2` is cleared with NO evidence about
+        that label whatsoever;
+      - with no park events at all it returns "not human", so absence reads as permission.
+    Live prevalence on sparq-org/sparq makes the third case load-bearing rather than theoretical:
+    `needs:area` 200, `needs:ec2` 33, `needs:docker` 4, `needs:zk` 3, `needs:external-subject` 2,
+    `needs:maintainer` 2, `needs:upstream` 1, and `needs:external-audit` 1 — that last one is the
+    sq-qhy4 external accredited-cryptographer audit gate, whose silent deletion is the worst
+    single outcome available on this path."""
+    probe = _human_probe(is_human)
+    try:
+        events = fetch_events(repo, number)
+    except Exception as exc:  # noqa: BLE001 — an unreadable timeline proves nothing
+        log(f"label ownership unknown for {repo}#{number} {label!r} ({exc}); not clearable")
+        return False
+    newest, newest_human = None, False
+    try:
+        for created, kind, login, via_app in _event_rows(events, label):
+            if kind != "labeled":
+                continue
+            instant = parse_ts(created)
+            human = _is_proven_human(login, via_app, probe)
+            if newest is None or instant > newest:
+                newest, newest_human = instant, human
+            elif instant == newest and human:
+                newest_human = True     # an instant tie resolves toward HUMAN-owned
+    except Exception as exc:  # noqa: BLE001 — malformed shape proves nothing
+        log(f"label ownership unknown for {repo}#{number} {label!r} ({exc}); not clearable")
+        return False
+    if newest is None:
+        log(f"label ownership unknown for {repo}#{number} {label!r}: no `labeled` event exists, "
+            "so nothing proves a machine applied it; not clearable")
+        return False
+    return not newest_human
+
+
+def migration_residual_holds(pr_labels, issue_labels, clearing=()):
+    """The human-owned holds that would STILL be live after a legacy migration that removes
+    `clearing`. EMPTY means the migrated park is actually releasable; anything else means the
+    migration would strand it, and the caller must DEFER instead.
+
+    This is the hold-axis twin of model_health.park_cause_provable's evidence axis: together they
+    are the full "will the machine class actually be able to release this?" precondition. Neither
+    alone is sufficient — the first cut had only the evidence half and stranded 19 of the 20 PRs
+    it would have migrated on the live sparq population."""
+    dropped = {label for label in clearing if isinstance(label, str)}
+    return human_owned_holds(
+        ({label for label in pr_labels if isinstance(label, str)}
+         | {label for label in issue_labels if isinstance(label, str)}) - dropped)
+
+
 def capacity_park_admission(repo, pr_number, issue_number, fetch_events, is_human=None,
                             log=print, consumed=frozenset(), auto_receipts=(),
                             auto_marker_count=None, auto_evidence=None, live_holds=()):
