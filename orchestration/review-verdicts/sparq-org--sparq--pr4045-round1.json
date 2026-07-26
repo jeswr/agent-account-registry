@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4045,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "5150ea337e84120b73f0e82fb3be1be8c06afc9e",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "In `build_report`, an absent case ID or encoding synthesizes status `missing`, then the `skipped-no-odre`/`missing` branch records `verdict = \"skipped\"`. However, report status depends only on `odre_meta.status`, so when ODRE is present the report remains `complete`; the missing result is excluded from `comparable`, and `main` exits 0 if the remaining divergences are classified. This contradicts the schema's `complete` contract (every case has a real verdict) and allows a truncated/corrupt `odre-decisions.json` to produce a misleading PASS and agreement rate. The self-test does not exercise this path.",
+    "file": "bench/ac/odre/agreement.py",
+    "fix_hint": "When ODRE metadata says `present`, treat any missing case, missing encoding, duplicate case ID, or unexpected case ID as an input/completeness error and exit nonzero before computing agreement. Validate exact case-ID and encoding coverage in both directions. Add a self-test that deletes one case/encoding result and proves the lane fails rather than emitting a complete report.",
+    "severity": "major",
+    "title": "Missing ODRE results are silently treated as skips in a complete run"
+   },
+   {
+    "body": "`main` checks only that the static ledger and capability table agree with each other. It never compares `decisions[\"odre\"][\"version\"]` to their pinned version. `odre_adapter.py` permits any importable `pyodre` from `ODRE_PYTHON` and even records `unknown` on metadata failure, yet the classifier then applies source-read rules specifically attributed to pyodre 1.0.6 and reports the system as the pinned implementation. A different installed release can therefore be scored and have its divergences excused using stale 1.0.6 assumptions.",
+    "file": "bench/ac/odre/agreement.py",
+    "fix_hint": "For a present ODRE installation, require the observed package version to equal the ledger/capability pin before running or classifying; reject `unknown` and mismatches with a nonzero input/incomplete exit. Add a self-test for a mismatched observed version. If non-pinned runs are intentionally supported, they must not use the pinned capability/divergence ledger or make pinned-version claims.",
+    "severity": "major",
+    "title": "The pinned ODRE implementation version is not enforced"
+   }
+  ],
+  "progress": null,
+  "summary": "The lane is not fail-closed for incomplete ODRE output. Although the schema and report status define `complete` as every case having a real verdict, a missing case/encoding result is converted to `skipped`, excluded from agreement tallies, and still permits status `complete` and exit 0. This can publish a PASS/agreement figure from only a subset of the exported corpus. Runtime enforcement of the claimed ODRE version pin is also missing: the installed version is recorded but never checked against 1.0.6 before applying version-specific capability and divergence rules.",
+  "verdict": "request_changes"
+ }
+}
