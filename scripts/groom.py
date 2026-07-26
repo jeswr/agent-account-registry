@@ -380,8 +380,9 @@ def worker_pr_provenance_enumerable(
     is_enumerable_provenance: JSON object, strict-int matching pr_number (float/bool
     excluded — 41.0 == 41 and True == 1 under lax equality), registered impl provider,
     safe-atom impl alias, positive-int issue, well-formed 40-hex head sha, salted 16-hex
-    account hash — the COMPLETE field set; see provenance_admission_error, the one function
-    every consumer calls).
+    account hash, and a MACHINE-ATTESTED ``recorded_at_run`` stamp (issue #657 — the record's
+    trust basis must be a host-side run the implementing model could not influence) — the
+    COMPLETE field set; see provenance_admission_error, the one function every consumer calls).
 
     Mirrors worker-pr.provenance_path / dispatch-claim's review lookup: the record lives at
     ``orchestration/provenance/<owner>--<name>--pr<N>.json`` in the registry checkout, which is
@@ -3426,7 +3427,9 @@ def _self_test() -> int:
         record_dir.mkdir(parents=True)
         record_path = record_dir / "owner--repo--pr99.json"
         # COMPLETE by the review path's full requirement set — including impl_alias (safe
-        # atom) and issue (positive int), the two fields the round-3 partial predicate missed.
+        # atom) and issue (positive int), the two fields the round-3 partial predicate missed,
+        # and recorded_at_run (issue #657): the record's ATTESTATION BASIS must be a host-side
+        # run. This is a worker record, so worker.yml's `<run>.<attempt>` shape.
         valid_record = {
             "pr_number": 99,
             "head_sha_at_open": "1" * 40,
@@ -3434,6 +3437,7 @@ def _self_test() -> int:
             "impl_alias": "fable",
             "impl_account_h": "ab" * 8,
             "issue": 7,
+            "recorded_at_run": "29694084610.1",
         }
         record_path.write_text(json.dumps(valid_record), encoding="utf-8")
         check(
@@ -3788,6 +3792,10 @@ def _self_test() -> int:
                 "impl_alias": "fable",
                 "impl_account_h": "ab" * 8,
                 "issue": 9,
+                # Machine-attested stamp (issue #657): a record whose trust basis is not a
+                # host-side run is refused by the shared admission predicate, so a "proven
+                # worker attempt" must carry worker.yml's `<run>.<attempt>` stamp to suppress.
+                "recorded_at_run": "29694084610.1",
             }),
             encoding="utf-8",
         )
@@ -3948,6 +3956,10 @@ def _self_test() -> int:
     live_valid = {
         "pr_number": 91, "head_sha_at_open": "1" * 40, "impl_provider": "anthropic",
         "impl_alias": "fable", "impl_account_h": "ab" * 8, "issue": 9,
+        # Machine-attested stamp (issue #657): the shared admission predicate now requires the
+        # record's trust basis to be a host-side run. This fixture is a WORKER record, so it
+        # carries the worker.yml provenance job's `<run>.<attempt>` stamp.
+        "recorded_at_run": "29694084610.1",
     }
     # A Contents 404 only proves file absence once the ledger REF is verified (review round 1),
     # so every conclusive read first resolves the ref and pins the record read to its tip sha.
@@ -5365,6 +5377,10 @@ def _self_test() -> int:
                     "pr_number": 91, "head_sha_at_open": "3" * 40,
                     "impl_provider": "anthropic", "impl_alias": "fable",
                     "impl_account_h": "ef" * 8, "issue": 8,
+                    # Machine-attested stamp (issue #657) — a WORKER record, so worker.yml's
+                    # `<run>.<attempt>`. Without it the shared admission predicate refuses the
+                    # record and the live-ref gate can no longer cancel the park.
+                    "recorded_at_run": "29694084610.1",
                 }).encode()).decode(),
             }
             # (C) The worker PR is visible at the boundary but ABSENT on the immutable checkout;
