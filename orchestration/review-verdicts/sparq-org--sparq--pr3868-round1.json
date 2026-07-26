@@ -1,0 +1,65 @@
+{
+ "host_envelope": {
+  "pr": 3868,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "fdddb515ed886a4c78333b908018166effbe3060",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The final guard greps for `(password|passwd|api[_-]?key|private[_-]?key|client[_-]?secret|token):[[:space:]]*[^[:space:]#]+`, i.e. it requires the sensitive word to appear as a YAML *key*. In a Knative/Cloud Run Service the environment block is always a list of `- name: <VAR>` / `value: \"<literal>\"` pairs, so the key is literally `name` or `value` and never `password`/`token`. The regex is therefore structurally incapable of firing on these two files.\n\nI verified this empirically on a copy outside the repo. Injecting a realistic literal signing key in the exact manifest shape:\n\n    - name: SOLID_SERVER_DPOP_SK\n      value: \"AAAAC3NzaC1lZDI1NTE5SUPERSECRETKEY\"\n\nstill produced `deploy/demo manifests: OK`, exit 0. SOLID_SERVER_DPOP_SK is a real variable read by crates/sparq-lws-core/src/auth.rs:64, so this is not a hypothetical shape. The check gives false assurance on the control it is named for, which is worse than having no check, because the README directs operators to run it as the gate before making a public service live.",
+    "file": "deploy/demo/check.sh",
+    "fix_hint": "Match on the value side, not the key side. Either scan `value:` lines whose adjacent `- name:` matches a sensitive pattern, or scan for high-entropy/secret-shaped literals directly. A minimal fix that closes the proven gap:\n\n    if grep -Eiq '^[[:space:]]*-?[[:space:]]*name:[[:space:]]*\"?[A-Z_]*(PASSWORD|SECRET|API_?KEY|PRIVATE_?KEY|_SK|TOKEN)' \"${lws}\" \"${idp}\"; then\n      echo \"sensitive env var name in demo manifest; use secretKeyRef\" >&2; exit 1\n    fi\n\nand keep the existing key-shaped regex as a second belt. Add a self-test that feeds a fixture containing an injected secret and asserts the script exits non-zero, so the guard is pinned red-on-wrong.",
+    "severity": "major",
+    "title": "Secret-scan regex cannot match the only shape a secret can take in a Cloud Run manifest (mutation-proven vacuous)"
+   },
+   {
+    "body": "`required_lws` interleaves variable names and bare values as independent `grep -Fq` calls against the whole file, so nothing ties `value: \"solid\"` to SOLID_SERVER_AUDIENCE, `value: \"1\"` to SOLID_SERVER_TRUSTED_PROXY, or `value: \"memory\"` to PSS_SPARQ_BACKEND. Any value that also appears elsewhere in the file is unpinned.\n\nMutation-proven on a copy outside the repo: changing SOLID_SERVER_TRUSTED_PROXY from \"1\" to \"0\" still produced `deploy/demo manifests: OK`, exit 0, because `value: \"1\"` remains satisfied by SOLID_SERVER_SEED_DEMO.\n\nThat specific flip is security-relevant, not cosmetic. Per crates/sparq-lws-core/src/rate_limit.rs, TRUSTED_PROXY=0 means X-Forwarded-For is NOT trusted and the limiter keys the direct peer instead of the real client IP; combined with SOLID_SERVER_RATE_LIMIT_EXEMPT_INTERNAL defaulting ON, an internal front-end hop can then be exempted outright. On a deliberately public, unauthenticated demo the per-IP flood protection is the main abuse control, and the acceptance check does not actually pin it.",
+    "file": "deploy/demo/check.sh",
+    "fix_hint": "Assert name/value pairs rather than free-floating tokens. Parse the env list once and compare a map, e.g. in the existing python3 heredoc build `{name: value}` from the `env:` block and assert the expected dict exactly:\n\n    expected = {\n      'SOLID_SERVER_AUDIENCE': 'solid',\n      'SOLID_SERVER_TRUSTED_PROXY': '1',\n      'SOLID_SERVER_SEED_DEMO': '1',\n      'PSS_SPARQ_BACKEND': 'memory',\n      ...\n    }\n\nThen mutation-test it: flip each pinned value in a fixture and assert the script exits non-zero, so no single-value regression can pass.",
+    "severity": "major",
+    "title": "required_lws greps decouple env names from values; flipping SOLID_SERVER_TRUSTED_PROXY to \"0\" passes the check"
+   },
+   {
+    "body": "Both manifests set `run.googleapis.com/invoker-iam-disabled: \"true\"`, making the services reachable unauthenticated from the internet, but neither sets `spec.template.spec.serviceAccountName`. Cloud Run then runs them as the project's default compute service account, which on many projects still carries the broad legacy Editor role.\n\nThis is a deliberate departure from the rest of the repo: deploy/gcp/sparq-lws.yaml:85 and deploy/gcp/sparq-server.yaml:81 both provision a dedicated least-privilege SA, and deploy/gcp/sparq-lws.yaml documents it as requirement R5. The demo README explicitly tells readers not to copy the deploy/gcp posture (aimed at the warm-instance and health-probe settings), which makes it easy to miss that the least-privilege identity was dropped alongside them.\n\nBlast radius matters more here than in production, not less: this is the one service intentionally exposed to anonymous internet traffic, running a public playground where any registered visitor can write. Any path that reaches the instance metadata server yields project-wide credentials, and \"it is only a throwaway demo\" does not bound that, since the credentials are the project's, not the demo's.",
+    "file": "deploy/demo/sparq-lws-demo.yaml",
+    "fix_hint": "Add a dedicated runtime SA to both manifests, e.g. `serviceAccountName: sparq-demo-sa@PROJECT_ID.iam.gserviceaccount.com`, granted no roles at all (the demo needs no GCP APIs). Document the `gcloud iam service-accounts create` step in deploy/demo/README.md alongside the existing budget-alert instruction, and add a check.sh assertion that both manifests set serviceAccountName and that it is not the default compute account.",
+    "severity": "major",
+    "title": "Publicly-invokable services omit serviceAccountName, so both run as the default compute service account"
+   },
+   {
+    "body": "The README states that each image must be resolved to an immutable `@sha256:<digest>` before deployment \"so an upstream tag change cannot silently alter the demo\", but both committed manifests use mutable tags (`ghcr.io/sparq-org/sparq-lws-core:latest`, `docker.io/solidproject/community-server:latest`) and check.sh does not assert anything about the image reference. Since the README positions check.sh as the pre-deployment gate, an operator who follows the documented workflow can deploy mutable `:latest` images to a public service and get a clean OK. The third-party CSS image in particular is an unpinned external dependency on a publicly-exposed service.",
+    "file": "deploy/demo/README.md",
+    "fix_hint": "Add to check.sh an assertion that every `image:` line either contains `@sha256:` or is accompanied by the placeholder comment, and fail (or at minimum warn loudly on stderr) when a bare `:latest` tag is present. Alternatively commit the manifests with digest placeholders that the sed render step must substitute, so an unrendered file cannot deploy.",
+    "severity": "minor",
+    "title": "Immutable-digest requirement is documented but unenforced; committed manifests pin :latest"
+   },
+   {
+    "body": "The deploy snippet runs `mkdir -p .rendered-demo` and writes rendered manifests there. The path is relative, so following the README from the repository root creates an untracked `.rendered-demo/` directory inside the working tree. I checked .gitignore and there is no matching entry, so the rendered files (which embed the concrete PROJECT_NUMBER and REGION) show up in `git status` and can be committed by an accidental `git add -A`. Project number is not a high-value secret, but committing environment-specific rendered infrastructure is exactly the kind of drift the repo's hygiene rules discourage.",
+    "file": "deploy/demo/README.md",
+    "fix_hint": "Add `.rendered-demo/` to .gitignore, or change the README to render into a temporary directory outside the tree, e.g. `render_dir=\"$(mktemp -d)\"` and reference `\"${render_dir}/css-idp.yaml\"` in the `gcloud run services replace` calls.",
+    "severity": "minor",
+    "title": "Documented render step writes .rendered-demo/ into the repo root, which is not gitignored"
+   },
+   {
+    "body": "check.sh is introduced as the structural acceptance check for these manifests, but nothing invokes it automatically; the only reference is the README's instruction to run it by hand before deployment. A manual-only check on committed YAML will drift, and the two vacuity holes proven above are precisely the kind of regression a gate would otherwise surface. The repo's other deploy directories have no equivalent script, so there is no existing lane that would pick this up implicitly.",
+    "file": "deploy/demo/check.sh",
+    "fix_hint": "Invoke `bash deploy/demo/check.sh` from the existing CI workflow, ideally path-filtered on `deploy/demo/**` so it costs nothing on unrelated PRs, and route it through the gate aggregator so a failure blocks the merge queue.",
+    "severity": "minor",
+    "title": "Acceptance check is manual-only and not wired into any CI gate"
+   },
+   {
+    "body": "The CSS startup probe uses periodSeconds: 10, failureThreshold: 3, timeoutSeconds: 1 and no initialDelaySeconds, giving the container roughly 30 seconds to bind port 3000 before Cloud Run gives up and restarts it. Community Solid Server boots by resolving a large Components.js dependency-injection graph, which on a single throttled vCPU cold start can approach or exceed that budget. If it does, the service crash-loops and never becomes reachable, and because minScale is 0 every idle period re-runs the same cold start. The LWS service carries the same tight budget but is a Rust binary that binds quickly, so the risk is concentrated on CSS. Cloud Run's own default startup budget is far more generous than 30s, so this is a tightening introduced by the manifest rather than an inherited default.",
+    "file": "deploy/demo/css-idp.yaml",
+    "fix_hint": "Raise failureThreshold (e.g. to 12, giving ~120s) on the CSS service, or add initialDelaySeconds and increase timeoutSeconds to 3 to match the tolerance used in deploy/gcp/sparq-lws.yaml. Confirm the real cold-start time once against the deployed service and record the observed figure in deploy/demo/README.md as an operational note rather than a benchmark number.",
+    "severity": "minor",
+    "title": "Startup probe allows roughly 30s for CSS to bind, which risks a cold-start crash-loop"
+   }
+  ],
+  "progress": null,
+  "summary": "Adds an ephemeral public Cloud Run demo (sparq LWS + CSS IdP) plus a structural check script. The documentation is unusually honest: I verified the README's security claims about /playground/ (public-read, authenticated-write, NO acl:Control) against crates/sparq-lws-core/src/seed.rs and its tests (seeds_demo_playground_authenticated_write_public_read) and they match exactly; the SEED_DEMO + PSS_SPARQ_BACKEND=memory pairing is consistent with the Guard #2 non-memory boot refusal; SOLID_SERVER_AUDIENCE=solid and TRUSTED_PROXY=1 (rightmost XFF entry, one Google front-end hop) are correct for direct run.app access. I ran deploy/demo/check.sh in this checkout: it passes and exercises the hand-rolled validate_subset fallback (PyYAML is absent here), so that path is genuinely covered.\n\nHowever, the change is not complete, and the failures are concentrated in the two security controls the PR advertises. Two mutation tests, run on copies outside the repo, both went GREEN when they should have gone RED:\n\n(1) I injected `- name: SOLID_SERVER_DPOP_SK` / `value: \"AAAAC3NzaC1lZDI1NTE5SUPERSECRETKEY\"` into the LWS manifest and check.sh still printed \"deploy/demo manifests: OK\". The secret regex requires password/token/api_key to be the YAML *key*, but in Cloud Run manifests the key is always `name:`/`value:`, so the scan cannot fire on the only shape a secret can take in these files.\n\n(2) I flipped SOLID_SERVER_TRUSTED_PROXY from \"1\" to \"0\" and check.sh still passed, because the required-value greps are decoupled from their env names and `value: \"1\"` is still satisfied by SOLID_SERVER_SEED_DEMO. That flip silently disables XFF trust on a deliberately public service.\n\nSeparately, both services set invoker-iam-disabled: \"true\" (fully public, unauthenticated) yet omit serviceAccountName, so they run as the default compute service account. Every other GCP manifest in this repo (deploy/gcp/sparq-lws.yaml:85, deploy/gcp/sparq-server.yaml:81) provisions a dedicated least-privilege SA.",
+  "verdict": "request_changes"
+ }
+}
