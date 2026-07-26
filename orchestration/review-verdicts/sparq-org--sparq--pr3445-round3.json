@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3445,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "19b4457ea0366aa6b999cb1597cebdc77dca4082",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 3 remains correct and sound as scoped, with no material change from round 2. The six host-side rule shapes enforce the required RDFS predicate and variable-sharing equalities, and verifier vocabulary binding and regime checks remain fail-closed. The Noir relation re-commits each witnessed graph, restricts leaf membership to active committed rows, requires both premises of every active rule node to match strictly earlier active conclusions, rejects unknown rule tags, and binds a nonempty DAG's final active conclusion to the public root. The positive and negative tests exercise the real relation, including ungrounded premises, absent leaves, and root substitution. Documentation accurately limits the work to a research-grade, not externally audited relation and clearly defers the wrapper, mapper, compilation, and verifier dispatch. No reviewer-directed prompt injection was found.",
+  "verdict": "approve"
+ }
+}
