@@ -526,6 +526,52 @@ maintainer action (re-mint the setup-token). It is deliberately a **cooldown, no
 account may be the fleet's only cross-provider review account, and zero reviews is worse than a
 partial success rate.
 
+### A `no_change` never re-dispatches the same tier (issue #701)
+
+Measured 2026-07-26 over 196 completed `worker.yml` runs: **70 success / 126 failure**, dominated by
+the structured exit class `no_change` — the model ran to a clean exit and produced **no diff**. The
+same hard issue was then retried **up to 3x with the same model**, with no record of why the previous
+attempt produced nothing, so one issue could consume three worker slots and three account leases to
+produce nothing. Every sampled target was a substantive, correctly-labelled, genuinely hard task, so
+this is a task-difficulty ↔ execution-mode mismatch, not a stale backlog.
+
+Two halves, both in `scripts/no_change_routing.py` (the single declaration; `worker-live.sh` produces,
+`model-health.py` stores, `dispatch-claim.py` routes):
+
+- **`why_no_diff`.** A worker returning no edits is asked, in the stable prompt prefix, to write
+  `.worker-no-diff.json` naming one of a **closed five-word vocabulary** (`underspecified`,
+  `blocked_on_decision`, `too_large`, `already_done`, `other`). The file is lifted out of the tree
+  **before** the change detection — otherwise writing the explanation would itself be the diff — and
+  the reason rides the existing sanitized `no-change-v1` envelope as its **vocabulary index**, never
+  as text, so nothing model-authored can reach the public ledger or an alert body. Absent, malformed,
+  or out-of-vocabulary ⇒ `unspecified`, which is the value the router treats as *no signal*.
+- **The decision**, taken in `dispatch()` on the deferred-retry path **before `allocator.claim()`**
+  picks a model (the claim is what would otherwise walk the resolved chain from its head again):
+  dispatch on an **untried** tier of the same chain, or — when no untried tier remains, or the
+  declared reason says the task's *shape* is the blocker (`too_large` / `underspecified`) — fire
+  #500's `role:impl` → `role:research` reroute at a threshold of **one**, because a second identical
+  outcome cannot inform a decision the evidence has already made.
+
+Fail-closed and bounded, in the directions that matter:
+
+- An unreadable health window already leaves the issue deferred with **no** escalation, and `unknown`
+  (the fold target for an unattributable exit) is neither `no_change` nor success — so an unreadable
+  exit class can never mark an issue intractable.
+- The narrowing has its **own** machine exit, `TIER_EXCLUSION_SECONDS` (**6 h**), 8x tighter than the
+  48 h health window: a chain narrowed onto a tier with no capacity cannot stall the issue for the
+  full window.
+- Escalation terminates in `min(len(chain), DECLINE_ESCALATION_MIN)` dispatches, each on a distinct
+  tier, and the terminal for an issue already on a non-implementation route is the **machine-owned**
+  `status:parked` soft hold — never `needs:user` (#703).
+
+The evidence path is itself a **YAML seam**: `worker.yml`'s `exit-class` step and the separate
+no-target-code `model_health` job are the only wire carrying a `no_change` (and its `why_no_diff`)
+into the ledger the dispatcher routes on. Cutting it fails **silently** — no job goes red, the
+dispatcher simply sees no evidence and resumes retrying the same tier — so
+`dispatch-claim._no_change_seam_violations` pins it on **parsed** nodes (`if:`, step/job presence,
+the `needs:` edge, both `env:` inputs, and the `--reset-hint` argument), with each mutant applied to
+the parsed document in memory and required to come back named.
+
 ## Security posture
 
 - Tokens: only in GitHub secrets (encrypted at rest, masked in logs), and only in the
