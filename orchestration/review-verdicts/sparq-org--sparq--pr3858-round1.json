@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3858,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "530d687b9e4dc3cb8706f45ee924a1c5832040f7",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`declares_sparq_gpu_dependency` only recognizes dependency keys literally named `sparq-gpu`. Cargo permits renaming a package, for example `[dependencies]\\ngpu_backend = { package = \"sparq-gpu\", path = \"../sparq-gpu\" }`, and also permits the equivalent table form. Such a dependency makes the GPU code reachable while this tripwire stays green. Consequently, `dependency_detector_catches_every_spelling` is not actually exhaustive and the threat-model deferral is not enforced at its stated trigger.",
+    "file": "crates/sparq-gpu/tests/prototype_stage_tripwire.rs",
+    "fix_hint": "Parse manifests as TOML (or use Cargo metadata) and inspect dependency package identities, including renamed dependencies and target-specific dependency tables. Add a regression case using `gpu_backend = { package = \"sparq-gpu\", path = \"../sparq-gpu\" }` that fails with the current detector and passes after the fix.",
+    "severity": "major",
+    "title": "Dependency tripwire misses Cargo package-renamed dependencies"
+   }
+  ],
+  "progress": null,
+  "summary": "The security deferral is documented honestly, but the enforcement tripwire does not cover all Cargo dependency spellings despite claiming that it does. A workspace crate can depend on sparq-gpu through a renamed dependency and the test remains green, making the publication/reachability trigger bypassable.",
+  "verdict": "request_changes"
+ }
+}
