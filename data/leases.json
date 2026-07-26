@@ -32,16 +32,6 @@
   },
   {
    "account": "9e13ea21abf27e68",
-   "claim_id": "5d7e64d5a08a4dd8a9d6137df19d050f",
-   "holder": "review:sparq-org/sparq#3820@dispatch-30180191936.1",
-   "package": "sparq-substrate",
-   "role": "review",
-   "model": "opus5",
-   "issued_at": 1785023907,
-   "expires_at": 1785028107
-  },
-  {
-   "account": "9e13ea21abf27e68",
    "claim_id": "28b8e46108104e49b932e2f5b54261ab",
    "holder": "review:sparq-org/sparq#3821@dispatch-30180191936.1",
    "package": "sparq-reason",
