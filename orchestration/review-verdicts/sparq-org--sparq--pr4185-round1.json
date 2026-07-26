@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 4185,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d42445ef0d3c1121fc082aa16bf16d25b70bb453",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The diff corrects the crud_stream doc comment but leaves four identical stale claims elsewhere in the same file:\n\n- line 300, the emitted JSON `note` string: \"single-client throughput is ~1/window-bound by design\" \u2014 this is the machine-readable artifact consumers keep.\n- line 565, STDOUT: \"TOTAL: ... updates/s (SINGLE-client, window-bound)\".\n- lines 580-582, comment: \"Single-client throughput is ~1/window-bound by design (see crud_stream doc + writer_spike ...), so 'below few-hundred/s' here is the single-client window bound, not a writer limit.\" This explicitly points the reader at the crud_stream doc the diff just changed, so the file now contradicts itself at the exact cross-reference.\n- line 585, STDOUT: \"single-client thr {:.0}/s is ~1/window-bound (writer_spike = concurrent ceiling)\".\n\nSince the harness runs with ServerConfig::default() (adaptive_commit = true per crates/sparq-server/src/http.rs:829, wired through writer_config at http.rs:6584), these surviving statements are wrong for the configuration this binary actually measures. For an honesty-only PR, correcting the doc comment while leaving the same claim in the user-facing and machine-readable output leaves the drift in place where it does the most damage.",
+    "file": "bench/serve/src/bin/pss_update_throughput.rs",
+    "fix_hint": "Update all four sites to match the corrected doc: reword the results_json `note` (line 300) and the two println! strings (lines 565, 585) to say the single-client figure is engine-bound under the default adaptive group-commit path and is still NOT the concurrent write ceiling (writer_spike), and fix the comment at lines 580-582 so it no longer asserts the window bound while citing the crud_stream doc. The existing round-trip test only asserts note.contains(\"NON-CANONICAL\"), so the note text can change freely; consider extending results_json_round_trips to pin the corrected wording so it cannot silently drift again.",
+    "severity": "major",
+    "title": "Retracted \"~1/window-bound\" claim still asserted in the JSON note, STDOUT summary and a comment that cross-references the corrected doc"
+   },
+   {
+    "body": "The new prose says \"With the default adaptive group-commit path\". There are two layers with opposite defaults: crates/sparq-serve/src/writer.rs:202 sets WriterConfig::adaptive_commit = false (\"Off by default so the documented windowed contract is preserved\"), while crates/sparq-server/src/http.rs:829 sets ServerConfig::adaptive_commit = true. A reader who checks the sparq-serve default will conclude the new claim is false. The claim is only true here because the harness constructs ServerConfig::default() and AppState wires it through writer_config().",
+    "file": "bench/serve/src/bin/pss_update_throughput.rs",
+    "fix_hint": "Name the specific knob and where the harness gets it, e.g. \"this harness runs with ServerConfig::default(), whose adaptive_commit is ON (sq-p7kk5), so the writer never waits the window for a serial client\" \u2014 that makes the claim checkable against a single source and distinguishes it from WriterConfig's windowed-by-default contract.",
+    "severity": "minor",
+    "title": "\"the default adaptive group-commit path\" is ambiguous \u2014 WriterConfig::adaptive_commit defaults to false, ServerConfig::adaptive_commit defaults to true"
+   },
+   {
+    "body": "The marker is inserted immediately before \"Aggregate write throughput rises with CONCURRENT clients ...\", which is unchanged pre-existing text, while the newly authored sentences precede the marker. Elsewhere in this repo the marker prefixes the content it authored and usually carries the bead, e.g. \"[OPUS-4.8] (sq-p7kk5) ...\" at writer.rs:644 and http.rs:1049. As written the marker mislabels which prose is new.",
+    "file": "bench/serve/src/bin/pss_update_throughput.rs",
+    "fix_hint": "Move the marker to the start of the newly written sentence and add the driving bead, e.g. \"... [SONNET-4.6] (sq-p7kk5) the per-client throughput is `1/group-commit-window`-bounded only when adaptive commit is disabled ...\", leaving the untouched aggregate-throughput sentence unmarked.",
+    "severity": "nit",
+    "title": "[SONNET-4.6] attribution marker prefixes pre-existing prose and carries no bead id"
+   }
+  ],
+  "progress": null,
+  "summary": "Doc-only change to the crud_stream HONESTY note in bench/serve/src/bin/pss_update_throughput.rs. The new claim is FACTUALLY CORRECT for this binary: the harness builds `ServerConfig { query_timeout: .., ..ServerConfig::default() }` (line ~496) and calls `AppState::with_config`; ServerConfig::default() sets `adaptive_commit: true` (crates/sparq-server/src/http.rs:829), and try_with_config_inner spawns the writer via `writer_config(&config)` (http.rs:2780, 6584-6588), which forwards adaptive_commit to WriterConfig. In adaptive mode the writer `try_recv`s and closes the batch as soon as the backlog empties (crates/sparq-serve/src/writer.rs:650-655), so a serial client is indeed engine-bound, not 1/window-bound. Test coverage for that behaviour exists (crates/sparq-serve/tests/writer.rs:494 adaptive_commit_does_not_wait_the_window_for_a_serial_client). So the correction itself is sound and no vacuous test / security issue is introduced.\n\nHowever the change is INCOMPLETE, which matters because this PR is purely an honesty fix. Four sibling assertions of the now-retracted claim survive in the SAME file and are untouched: the machine-readable JSON `note` emitted by results_json (line 300), the STDOUT TOTAL line (line 565), the reference comment at lines 580-582 \u2014 which explicitly cross-references \"see crud_stream doc\" and therefore now directly contradicts the doc it points at \u2014 and the STDOUT reference line (line 585). A consumer reading the emitted artifact or console output still gets the wrong framing. Secondary nits: the `[SONNET-4.6]` marker is placed at the head of a PRE-EXISTING sentence rather than the newly authored prose and carries no bead id, and the phrase \"the default adaptive group-commit path\" is ambiguous because WriterConfig::adaptive_commit defaults to FALSE (writer.rs:202) while ServerConfig::adaptive_commit defaults to TRUE; naming the ServerConfig knob would keep the doc verifiable.",
+  "verdict": "request_changes"
+ }
+}
