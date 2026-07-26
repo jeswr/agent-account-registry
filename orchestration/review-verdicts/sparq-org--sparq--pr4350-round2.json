@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4350,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "52053841a73fe8f7c23a3e419e2350facb4703e1",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior major finding. The added deterministic randomized differential compares bind_join as a multiset against an independently structured grouping-free nested-loop reference, exercises both the actual-sort and truthfully presorted no-sort branches, and covers empty inputs, duplicate rows, unmatched/NO_ID keys, varying distinctness, and multi-match fan-out. The three faulty-reference controls are required to fire and demonstrate detection of dropped duplicate rows, whole groups, and extra matches. The production run-grouping rewrite preserves every input-row/match pairing; stale sorted metadata can only split equal-key runs and cause redundant scans, not alter the output bag.",
+  "verdict": "approve"
+ }
+}
