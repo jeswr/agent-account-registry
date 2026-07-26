@@ -3066,6 +3066,11 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 # S=0 fails closed.  No static per-lane ceiling can strand an idle provider.
                 account_slot_bound=True,
                 return_reason=True,
+                # [F1] Wind the review/fix lane down per account as well. `.get` because this
+                # helper is also driven with partial policy rows: an ABSENT timeout disables only
+                # the PROJECTION factor, leaving the utilisation taper in force — degraded, never
+                # un-tapered, and never an exception on a lane that must keep draining.
+                run_seconds=(policy.get("worker_timeout_minutes") or 0) * 60 or None,
             )
         except (RuntimeError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
             defer_reasons["lease-error"] += 1
@@ -3934,6 +3939,9 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                     max_holder_concurrent=effective_cap,
                     usage=usage,
                     margin=margin,
+                    # [F1] The taper must bind PER ACCOUNT at selection, not only as the
+                    # fleet-wide `effective_cap` above — same run-length estimate as that cap.
+                    run_seconds=resolved["worker_timeout_minutes"] * 60,
                 )
             except (RuntimeError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
                 defer_reasons["lease-error"] += 1

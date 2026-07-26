@@ -162,11 +162,20 @@ def compute_ready(issues, in_progress_packages=None, log=None, package_width=DEF
     `area:<section>` package. It defaults to 1, which is the historical exactly-one-per-package
     serialization, byte-for-byte — so an unset width changes nothing anywhere.
 
-    WHY THIS KNOB EXISTS, measured. The frontier — not `max_concurrent` — is what actually bounds
-    parallelism on a package-clustered backlog. On the registry, 12 drainable candidates spread
-    over only 3 distinct areas collapse to a frontier of 3, and no account-side ceiling can widen
-    that: raising `max_concurrent` alone is inert. Width is the lever that converts drainable
-    backlog into concurrent work.
+    WHY THIS KNOB EXISTS, and — precisely — WHAT IT DOES NOT DO. Measured on the registry: 12
+    drainable candidates spread over only 3 distinct areas collapse to a frontier of 3, so
+    `max_concurrent` was never the limiter and raising it alone is inert. Width widens THIS layer,
+    the PLAN frontier, and nothing else.
+
+    IT IS NOT, ON ITS OWN, A THROUGHPUT LEVER (review finding F2 — an earlier version of this
+    docstring claimed it converted drainable backlog into concurrent work; that was wrong). The
+    binding constraint sits one layer DOWN, at the lease layer: `select-and-claim.partition_available`
+    refuses a second live lease on the same package, and `dispatch-claim.filter_busy_area_items`
+    drops any item whose package already has an in-flight worker PR or live lease. With width 2 the
+    frontier grows from 3 to 6 and the three extra rows are then refused with `package-single-flight`
+    — a MEASURED net gain of ZERO additional concurrent workers. Width only becomes a throughput
+    lever once the lease-layer partition is widened by the same bound (tracked in #692); until then
+    every target is deliberately configured at width 1 and this parameter is prepared, not enabled.
 
     THE COST, honestly. One-per-package exists because two agents in the same area tend to edit the
     same file, and this repo's areas map onto very large single scripts. Width > 1 therefore trades

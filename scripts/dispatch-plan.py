@@ -493,6 +493,28 @@ def _self_test():
     chk("[#688] a target with no policy width defaults to the one-per-package frontier",
         planner.calls, [None])
 
+    # The REGISTRY-CODE width validation that runs BEFORE any target code sees the value. Review
+    # flagged it as defence-in-depth that survived being replaced with `if False:` — so execute it.
+    validate_block = _workflow_block(
+        os.path.join(_root, ".github", "workflows", "dispatch.yml"), "policy-extract",
+        "width-validate")
+
+    def _validate(row):
+        ns = {"row": row, "repo": "o/t", "MAX_WIDTH": 8, "widths": {}}
+        try:
+            exec(validate_block, ns)  # noqa: S102 — workflow block
+        except SystemExit as exc:
+            return f"REFUSED: {exc}"
+        return ns["widths"].get("o/t")
+
+    chk("[#688] the workflow width validation ACCEPTS the in-range values",
+        [_validate(r) for r in ({}, {"package_width": 1}, {"package_width": 8}, "not-a-table")],
+        [1, 1, 8, 1])
+    chk("[#688] ...and REFUSES every out-of-range or wrong-typed value (bounded BOTH sides)",
+        [str(_validate({"package_width": bad})).startswith("REFUSED")
+         for bad in (0, -1, 9, 1000, "2", True, 1.5, None)],
+        [True] * 8)
+
     # issue #112: a MULTI-area issue reserves the serializing GLOBAL partition, NOT the
     # alphabetically-first area — else a busy secondary area (here 'worker') could not exclude
     # it and it would double-dispatch. A single-area issue still reserves just that area.

@@ -454,6 +454,30 @@ def adaptive_slots(account, u, now=None, run_seconds=None, margin=SAFETY_MARGIN)
     return max(1, min(cap, int(round(cap * factor))))
 
 
+def account_slot_cap(account, u, now=None, run_seconds=None, margin=SAFETY_MARGIN):
+    """The account's EFFECTIVE per-account slot bound right now — the ONE function every
+    concurrency site must use instead of reading `max_concurrent_workers` directly.
+
+    With no usage view (`u is None`) this is the static cap, unchanged. With a usage view it is the
+    wind-down-tapered grant, so a tapped account's bound falls to 0 while it is still `usage_eligible`.
+
+    WHY THIS EXISTS (review finding F1). The taper was originally consumed only by the two AGGREGATE
+    sums (`dynamic_concurrency`, `available_account_slots`), while the SELECTION site
+    (`_choose_account_model`) still compared live leases against the raw static cap. A fleet-wide cap
+    is not a per-account refusal: with `adaptive_slots == 0` and `usage_eligible == True`, the
+    allocator would still hand out that exact account, up to its full static complement. Every
+    per-account claim in the docs was therefore describing behaviour that did not happen. Routing all
+    three sites through one function is what makes the per-account claim true.
+    """
+    try:
+        cap = int(account.get("max_concurrent_workers", 4))
+    except (TypeError, ValueError, OverflowError):
+        return 0                       # malformed catalog value -> no slots (never an exception)
+    if u is None:
+        return max(0, cap)             # deliberate static path (usage=None) — untapered
+    return adaptive_slots(account, u, now=now, run_seconds=run_seconds, margin=margin)
+
+
 def _weekly_reset(u):
     """Whole-account weekly reset used for provider-wide use-it-or-lose-it draining."""
     _, reset = _usage_window(u, "7d")
@@ -488,7 +512,7 @@ def _order_eligible_accounts(accounts, leases, usage, package, role):
 
 
 def _choose_account_model(accounts, leases, model_chain, package, role, now, usage=None,
-                          margin=SAFETY_MARGIN):
+                          margin=SAFETY_MARGIN, run_seconds=None):
     """Return ``(account, model)`` for the first model with eligible capacity, or None.
 
     Each alias pass applies the complete account availability, concurrency, and usage/backoff gates
@@ -499,7 +523,9 @@ def _choose_account_model(accounts, leases, model_chain, package, role, now, usa
     for model in model_chain:
         serving = [a for a in accounts
                    if a.get("available", True) and model in a.get("models", [])
-                   and active_for(live, a["handle"]) < int(a.get("max_concurrent_workers", 4))]
+                   and active_for(live, a["handle"]) < account_slot_cap(
+                       a, None if usage is None else usage.get(a["handle"]),
+                       now=now, run_seconds=run_seconds, margin=margin)]
         if usage is not None:
             serving = [a for a in serving
                        if usage_eligible(usage.get(a["handle"]), margin, model=model, now=now)]
@@ -511,7 +537,8 @@ def _choose_account_model(accounts, leases, model_chain, package, role, now, usa
     return None
 
 
-def choose_account(accounts, leases, model_chain, package, role, now, usage=None, margin=SAFETY_MARGIN):
+def choose_account(accounts, leases, model_chain, package, role, now, usage=None, margin=SAFETY_MARGIN,
+                   run_seconds=None):
     """Return the account handle to claim, or None. `accounts`: list of dicts
     {handle, models:[...], max_concurrent_workers, available:bool}. Walks the model chain; within a
     model keeps accounts under their concurrency cap and — when live `usage` (a {handle: {status,
@@ -521,7 +548,8 @@ def choose_account(accounts, leases, model_chain, package, role, now, usage=None
     resets. With `usage=None` the behaviour is the original cache-affinity-then-least-loaded selection
     (backward compatible)."""
     selected = _choose_account_model(
-        accounts, leases, model_chain, package, role, now, usage=usage, margin=margin)
+        accounts, leases, model_chain, package, role, now, usage=usage, margin=margin,
+        run_seconds=run_seconds)
     return selected[0]["handle"] if selected is not None else None
 
 
@@ -557,7 +585,7 @@ def dynamic_concurrency(accounts, usage, model_chain=None, absolute_cap=None, ma
             continue
         u = usage.get(a["handle"])
         if any(usage_eligible(u, margin, model=m, now=now) for m in servable):
-            total += adaptive_slots(a, u, now=now, run_seconds=run_seconds, margin=margin)
+            total += account_slot_cap(a, u, now=now, run_seconds=run_seconds, margin=margin)
     if absolute_cap is not None:
         total = min(total, absolute_cap)
     return total
@@ -593,16 +621,11 @@ def available_account_slots(accounts, leases, model_chain, now, account_pool=Non
                 usage_eligible(usage.get(handle), margin, model=model, now=now)
                 for model in servable):
             continue
-        try:
-            cap = int(account.get("max_concurrent_workers", 4))
-        except (TypeError, ValueError, OverflowError):
-            continue
         # [OPUS-5 issue #688] The review/fix lane's bound winds down with the quota window too —
         # otherwise raising the review-lane ceiling reintroduces the cliff on the very lane the
         # throughput goal loads hardest. `usage=None` (the deliberate static path) is untapered.
-        if usage is not None:
-            cap = min(cap, adaptive_slots(account, usage.get(handle), now=now,
-                                          run_seconds=run_seconds, margin=margin))
+        cap = account_slot_cap(account, None if usage is None else usage.get(handle),
+                               now=now, run_seconds=run_seconds, margin=margin)
         slots += max(0, cap - active_for(live, handle))
     return slots
 
@@ -1007,7 +1030,8 @@ def read_accounts(repo):
 
 def claim(repo, package, role, model_chain, holder, now, ttl=3600, retries=6,
           account_pool=None, holder_prefix="", max_holder_concurrent=None, usage=None,
-          margin=SAFETY_MARGIN, account_slot_bound=False, return_reason=False):
+          margin=SAFETY_MARGIN, account_slot_bound=False, return_reason=False,
+          run_seconds=None):
     """CAS-claim a lease. Returns {account, secret_ref, model, claim_id} or None (none free).
     Raises LeaseIOError when an account WAS eligible but the ledger write kept failing — that is an
     infrastructure failure (persistent CAS contention, or the contents-API PUT rejected outright,
@@ -1049,10 +1073,12 @@ def claim(repo, package, role, model_chain, holder, now, ttl=3600, retries=6,
             if active_holders >= max_holder_concurrent:
                 return result(None, "lane-cap")
         if account_slot_bound and available_account_slots(
-                accounts, live, model_chain, now, usage=usage, margin=margin) <= 0:
+                accounts, live, model_chain, now, usage=usage, margin=margin,
+                run_seconds=run_seconds) <= 0:
             return result(None, "no-account-slots")
         selected = _choose_account_model(
-            accounts, live, model_chain, package, role, now, usage=usage, margin=margin)
+            accounts, live, model_chain, package, role, now, usage=usage, margin=margin,
+            run_seconds=run_seconds)
         if selected is None:
             return result(None, "no-account-slots")
         a, model = selected
@@ -2282,6 +2308,44 @@ def _self_test():
                          now=W_NOW, margin=0.15), 1)
     check("probe-EXEMPT accounts publish no windows and are never wound down",
           winddown_factor({"exempt": True, "reachability": "live"}, now=W_NOW, run_seconds=5400), 1.0)
+
+    # -- CALL SITE 0 (review finding F1): THE SELECTION SITE. This is the one that makes the
+    # per-account claim TRUE. The taper used to be consumed only by the two aggregate sums, so
+    # `choose_account` still compared live leases against the raw static cap — a fleet-wide cap is
+    # NOT a per-account refusal. The exact counterexample from review is the first row: an account
+    # with adaptive_slots == 0 that is still usage_eligible, already carrying 3 live leases, was
+    # handed out anyway. Reverting `account_slot_cap` to `int(a.get("max_concurrent_workers", 4))`
+    # in _choose_account_model makes these rows red.
+    W_TAPPED = {"handle": "tapped", "models": ["opus5"], "max_concurrent_workers": 4,
+                "available": True}
+    W_FRESH = {"handle": "fresh", "models": ["opus5"], "max_concurrent_workers": 4,
+               "available": True}
+    W_SEL_USAGE = {"fresh": w_usage(0.0), "tapped": w_usage(0.85)}
+    W_HELD = [make_lease("tapped", f"h{i}", "p", "r", "opus5", W_NOW, 3600) for i in range(3)]
+    check("F1: a ZEROED account is still usage_eligible — so the taper must bind at SELECTION",
+          (usage_eligible(w_usage(0.85), 0.15, now=W_NOW),
+           adaptive_slots(W_TAPPED, w_usage(0.85), now=W_NOW, margin=0.15)), (True, 0))
+    check("F1: choose_account REFUSES the zeroed account (the review counterexample)",
+          choose_account([W_TAPPED], W_HELD, ["opus5"], "p", "r", W_NOW,
+                         usage=W_SEL_USAGE, margin=0.15), None)
+    check("F1: ...and routes to the account WITH headroom instead",
+          choose_account([W_TAPPED, W_FRESH], [], ["opus5"], "p", "r", W_NOW,
+                         usage=W_SEL_USAGE, margin=0.15), "fresh")
+    check("F1: when EVERY account is zeroed, choose_account returns None (no dispatch at all)",
+          choose_account([W_TAPPED, W_FRESH], [], ["opus5"], "p", "r", W_NOW,
+                         usage={h: w_usage(0.85) for h in W_SEL_USAGE}, margin=0.15), None)
+    check("F1: the projection zeroes the SELECTION site too, not just the aggregate",
+          (choose_account([W_FRESH], [], ["opus5"], "p", "r", W_NOW,
+                          usage={"fresh": fast_burn}, margin=0.15, run_seconds=5400),
+           choose_account([W_FRESH], [], ["opus5"], "p", "r", W_NOW,
+                          usage={"fresh": slow_burn}, margin=0.15, run_seconds=5400)),
+          (None, "fresh"))
+    check("F1: usage=None keeps the ORIGINAL static selection (deliberate untapered path)",
+          choose_account([W_TAPPED], W_HELD, ["opus5"], "p", "r", W_NOW), "tapped")
+    check("F1: account_slot_cap is the single bound — static without usage, tapered with it",
+          (account_slot_cap(W_TAPPED, None),
+           account_slot_cap(W_TAPPED, w_usage(0.85), now=W_NOW, margin=0.15),
+           account_slot_cap({"handle": "x", "max_concurrent_workers": "junk"}, None)), (4, 0, 0))
 
     # -- CALL SITE 1: dynamic_concurrency must CONSUME the taper. Two accounts, both eligible, both
     # cap=4: a fresh one and a nearly-tapped one. Summing flat caps gives 8; summing adaptive_slots

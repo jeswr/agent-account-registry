@@ -129,6 +129,10 @@ jobs:
       # "[bot]" authors stay an over-proposal for CLAIM's exact check to settle (PLAN holds no
       # token, so it can never resolve the pipeline's own App bot login itself).
       - name: Extract the policy trusted-bot allowlist (registry code, pre-target)
+        # `id:` so dispatch-plan.py's self-test can locate this step and EXECUTE the
+        # width-validation block below (review: it was defence-in-depth that survived being
+        # replaced with `if False:` — an untested guard is not a guard).
+        id: policy-extract
         run: |
           set -euo pipefail
           python3 - "$RUNNER_TEMP/dispatch-targets/repos.txt" \
@@ -164,11 +168,13 @@ jobs:
                       or any(not isinstance(bot, str) or not bot.strip() for bot in bots)):
                   raise SystemExit(f"trusted_bots for {repo} must be a list of non-empty strings")
               allowlist[repo] = sorted(set(bots))
+              # >>> width-validate — EXECUTED by scripts/dispatch-plan.py --self-test.
               width = row.get("package_width", 1) if isinstance(row, dict) else 1
               if isinstance(width, bool) or not isinstance(width, int) or not (1 <= width <= MAX_WIDTH):
                   raise SystemExit(
                       f"package_width for {repo} must be an integer in [1, {MAX_WIDTH}]")
               widths[repo] = width
+              # <<< width-validate
           Path(out_path).write_text(json.dumps(allowlist), encoding="utf-8")
           Path(width_path).write_text(json.dumps(widths), encoding="utf-8")
           PY
