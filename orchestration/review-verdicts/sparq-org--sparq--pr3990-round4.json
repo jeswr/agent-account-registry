@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3990,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "422bf31eb434a449dd98a49227cf0f1dce52985f",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 4 finds no correctness, soundness, test-validity, or security defect. The cache proof now binds reuse to both the pinned tarball digest and a deterministic path-and-content digest, and its hermetic self-test drives the real script through acceptance plus count-preserving edit, missing-proof, and wrong-pin rejection cases. The comparator remains explicitly bounded rather than overclaimed: malformed or unsupported GML constructs fail closed to verbatim comparison, entity references and escaping are preserved, and non-vacuous tests distinguish changed coordinates, namespaces, attributes, markup, and malformed suffixes. The research record accurately limits the comparator uncertainty to the GML-bearing requirements, weakens the rank accordingly, and retains only the robust behind-the-leader conclusion. Relative to round 3, the findings remain empty and the approved state is materially unchanged.",
+  "verdict": "approve"
+ }
+}
