@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4274,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c2c8543111a53cf742bc561529f5eb695d0ab9b8",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 3 finds no correctness, soundness, test-validity, or security regression. The generated SPEC-REFERENCE assertions for SUBSTR start-before-one and ROUND(-0.5) remain live, the focused generator test locates and verifies their exact executable assertions, the self-expiring divergence tests still guard removal of the special cases, and the end-to-end fault injection makes the real nargo run fail if the circuit wiring is vacuous. The workflow pins both the Noir toolchain version and noir_XPath release tag, runs the cheap drift/unit-test half before installation, and accurately limits its claims to sampled witness-generation verification with the required research-grade/not-externally-audited caveat. No reviewer-directed or other prompt-injection text was detected in the diff.",
+  "verdict": "approve"
+ }
+}
