@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4180,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c7955b10a9c85349f5a0ee8a3a61bb15cb3e11be",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "check.rs:513-541 binds the name three times: the base `let conclusion_for_extraction = conclusion.to_vec();`, then the cfg-gated `let conclusion_for_extraction = { ... }`, then `let mut conclusion_for_extraction = conclusion_for_extraction;` inside the block to regain mutability. It is correct and compiles clean in both feature states (verified), and it deliberately avoids an `#[allow(unused_mut)]` that the more obvious form would need. Purely a readability observation \u2014 no behavioural or soundness concern, and not worth churning the diff for.",
+    "file": "crates/sparq-reason-dl/src/check.rs",
+    "fix_hint": "Optional, only if a future edit touches this region anyway: rename the inner mutable binding (e.g. `let mut augmented = conclusion_for_extraction;` ... `augmented`) so the three bindings are visually distinct, or accept the alternative shape `#[allow(unused_mut)] let mut conclusion_for_extraction = conclusion.to_vec();` followed by a bare cfg-gated `{ ... }` augmentation block. No change required for this PR.",
+    "severity": "nit",
+    "title": "Triple shadowing of `conclusion_for_extraction` across the cfg boundary is dense to read"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 1's major finding is FIXED and empirically verified. The orphaned import is now gated to exactly match its users: `NamedNode` under `dl_transitive` (its only uses, check.rs:528/531, are inside the gated block) and `Term as OTerm` under `any(dl_transitive, dispatch_ql)` (also used by `ql_kb`, check.rs:951-961, which is `#[cfg(feature = \"dispatch_ql\")]`). I compiled all five relevant feature states of the crate with `--all-targets` at this PR head: default, `--features dl_transitive`, `--features dispatch`, `--features dispatch_ql`, `--all-features`. ALL are warning-free and error-free, including the `dispatch`-only state that round 1 flagged as regressed. `RUSTDOCFLAGS=-D warnings cargo doc --all-features --no-deps` is also clean, so the feature-gated intra-doc-link trap is not tripped. `cargo test -p sparq-reason-dl --all-features` passes: 31 tests + 2 doc-tests, 0 failed. (clippy is not installed on this box, so the -D warnings check was done via cargo check/doc rather than clippy; the underlying rustc lints are the ones at issue here.)\n\nRound 1's nit is also fixed: `conclusion.to_vec()` now appears once (check.rs:513) as the shared base, with only the augmentation cfg-gated.\n\nSemantics are unchanged. With `dl_transitive` ON the block performs the identical operations in the identical order as before. With it OFF the behaviour was already degenerate pre-diff: `collect_role_ids` sat behind a `#[cfg(feature = \"dl_transitive\")]` statement, so `premise_roles` was always empty and the `if !premise_roles.is_empty()` guard meant the two `dict.intern` calls never ran. Because those interns never fired, no `Dict` mutation is lost and no Id allocation diverges. The now-skipped `conclusion_predicates` allocation was only read inside that same guard, so dropping it is pure win. The fail-closed extraction path and `roll_conclusion_anonymous` are untouched; no entailment/soundness behaviour changes.\n\nTest validity: the modified block is guarded by a \u2026 [truncated 631 chars]",
+  "verdict": "approve"
+ }
+}
