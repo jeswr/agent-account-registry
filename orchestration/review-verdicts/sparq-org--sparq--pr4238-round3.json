@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4238,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "8f91186c4b911f49672823a5c16670b84ea0e0f1",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 3 remains clean. The prior round had no findings, and the current diff preserves the truncation-safety invariant: document-closing bytes are withheld until an explicit Done marker, then dropped on worker failure or an engine error; negotiated clients receive a terminal trailer, while other clients receive a body-frame error. The focused state-machine tests cover completion, each abort class, absent terminal markers, and both trailer-negotiation branches. The real-router and real-socket tests exercise a genuine multi-chunk capped query, with an uncapped anti-vacuity control. The qvalue parser remains conservative for zero and malformed weights. No correctness, soundness, security, test-validity, or instruction-injection issue is evident. Progress is stagnant because both round 2 and round 3 have zero findings.",
+  "verdict": "approve"
+ }
+}
