@@ -1,0 +1,44 @@
+{
+ "host_envelope": {
+  "pr": 4085,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "811ec3cf11296f9d756549cbadf6348e04666852",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "When the timed jena leg succeeds (j == s, so count_agree is True) but the entity-ID sidecar fails, the `rm -f \"$TMP/jena-$wl.ids\"` at line 301 makes read_ids return None, so ids_agree is False and the else-branch at line 439 fires. The envelope's timing cell then reads:\n\n  WITHHELD(entity-list-disagree: counts=10, sparq-rows=10 jena-rows=0, |sparq\\jena|=10 |jena\\sparq|=0)\n\nThat string states as fact that jena returned an entirely disjoint entity set. What actually happened is that the oracle replay never produced an answer \u2014 a harness failure, not a result. This matters because the whole point of the envelope is that a disagreement IS a recorded result: a reader triaging this row would go looking for a jena k-NN correctness bug that does not exist.\n\nThe information needed to disambiguate is present but only elsewhere: count_crosscheck records jena_entity_ids as \"n/a\", and the log line at 300 says the oracle FAILED. Withholding the timing is the right call either way, so this is a labelling defect, not a soundness one. The symmetric case (sparq oracle absent, sparq-rows=0) has the same problem.",
+    "file": "scripts/bench/geo-same-box.sh",
+    "fix_hint": "Branch on availability before attributing a disagreement, e.g.\n\n    if not count_agree:\n        reason = \"count-disagree: sparq=%s jena=%s\" % (s, j)\n    elif sparq_ids is None or jena_ids is None:\n        reason = \"oracle-unavailable: sparq-ids=%s jena-ids=%s\" % (\n            \"present\" if sparq_ids is not None else \"missing\",\n            \"present\" if jena_ids is not None else \"missing\")\n    else:\n        reason = \"entity-list-disagree: ...\"   # existing string\n\nThat keeps the fail-closed behaviour identical while making the timings table say what actually happened.",
+    "severity": "minor",
+    "title": "A failed/absent jena oracle is reported as \"entity-list-disagree\", which asserts an engine disagreement that was never observed"
+   },
+   {
+    "body": "The block at line 227 is guarded only by `[ \"$SPARQ_STATUS\" = \"ok\" ]`, not by `want jena-geosparql`. With ONLY=sparq (the GEO_SMOKE acceptance path) the two `nearest-ids` invocations still run, each re-reading the ~100k-triple corpus and rebuilding the GeoIndex from scratch, and the resulting .ids files are then never consumed \u2014 \"jena-geosparql\" is absent from engines_meta, so the timing block that reads them at line 428 is skipped entirely.\n\nPure waste rather than incorrectness, but it is added to the fastest acceptance path in the script.",
+    "file": "scripts/bench/geo-same-box.sh",
+    "fix_hint": "Add the existing helper to the guard: `if [ \"$SPARQ_STATUS\" = \"ok\" ] && want jena-geosparql; then`. The crosscheck is only meaningful when there is a competitor to cross-check against.",
+    "severity": "nit",
+    "title": "sparq nearest-ids oracle runs even when jena-geosparql is not in ONLY, costing two extra 100k corpus load+index passes"
+   },
+   {
+    "body": "Line 228 pins `\"nearest_k10 10\" \"nearest_k100 100\"` while the envelope derives k generically via `int(w.removeprefix(\"nearest_k\"))` at line 406 and the jena side dispatches on the generic `[[ \"$wl\" == nearest_k* ]]`. Adding, say, nearest_k1000 to WORKLOADS (line 115) would produce a jena .ids file but no sparq one, giving sparq_ids=None -> ids_agree=False -> a permanently withheld timing plus the misleading \"entity-list-disagree\" string from the issue above.\n\nFail-closed, so nothing dishonest ships \u2014 but it fails silently, in the one direction a maintainer would not think to check.",
+    "file": "scripts/bench/geo-same-box.sh",
+    "fix_hint": "Derive the list from WORKLOADS instead of restating it, e.g.\n\n  for wl in $WORKLOADS; do\n    [[ \"$wl\" == nearest_k* ]] || continue\n    k=\"${wl#nearest_k}\"\n    ...\n  done\n\nwhich mirrors the generic dispatch the other two call sites already use.",
+    "severity": "nit",
+    "title": "The oracle's (workload, k) pairs are hardcoded separately from WORKLOADS, so a future nearest_k workload silently loses its timing"
+   },
+   {
+    "body": "The round-1 numbering fix is correct as far as it goes \u2014 \"Two modes:\" became \"Modes:\", nearest-ids got a Mode 3 heading, and query moved to Mode 4. But the fenced sh block at lines 6-14 still stops at #3, so `query <corpus.nt> <query.rq> [iters]` has a `## Mode 4` prose section with no corresponding entry in the usage block a reader scans first. (The default report mode dispatched at line 113 is listed as #1, so the block is otherwise complete.)\n\nPre-existing in spirit \u2014 query was equally missing when it was Mode 3 \u2014 but this PR is the one that touched the block.",
+    "file": "crates/sparq-geo/examples/bench_geo.rs",
+    "fix_hint": "Append the fourth invocation to the fenced block so it matches the headings:\n\n  //! # 4. Run one pinned SPARQL query file (needs the `engine` feature):\n  //! cargo run --release -p sparq-geo --example bench_geo -- query <corpus.nt> <query.rq> [iters]",
+    "severity": "nit",
+    "title": "The fenced usage block lists 3 invocations but the file documents 4 modes; `query` is still absent from it"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 2 fixes every round-1 finding, and I verified each independently rather than taking the diff's word for it.\n\nMajor 1 (unguarded sparq nearest-ids under set -e): now `if ! timeout \"$TIMEOUT_S\" ... ; then log; rm -f; fi` at scripts/bench/geo-same-box.sh:227-236 \u2014 matches the graceful-degradation contract of every other engine leg, and the `rm -f` makes the truncated-by-redirect file take the fail-closed path.\n\nMajor 2 (unbounded jena replay): now double-capped \u2014 outer `timeout \"$TIMEOUT_S\"` plus `urlopen(request, timeout=int(os.environ[\"TIMEOUT_S\"]))`, with TIMEOUT_S exported into the sidecar env (line 280-292).\n\nMinor 3 (WITHHELD string): count-disagree and entity-disagree are now distinct reasons, the latter carrying both row counts and the symmetric-difference sizes (line 437-454).\n\nMinor 4 (design record): research/gap-geo-2026-07.md \u00a73 and \u00a75 both updated; \u00a75's rendering corrected to spatialF:greatCircleGeom. I grepped the repo for surviving \"only result-set SIZE\" claims about nearest_k and found none \u2014 line 796's counts-only note belongs to the Geographica family, which has no nearest_k workload.\n\nMinor 5 (cardinality): `len(sparq_ids) == expected_k and len(set(sparq_ids)) == expected_k` closes both the empty-set and duplicate-row holes.\n\nNit 6: \"Modes:\", a Mode 3 heading, and query renumbered to Mode 4.\n\nVerification I ran: `cargo check -q -p sparq-geo --example bench_geo` clean; `bash -n` clean; I executed the new ids_agree expression standalone against both-None, [] == [], all-duplicates, jena-oracle-missing, and the good case \u2014 all fail closed (only the good case yields agree=True), and the conditional-expression precedence parses as intended. The sparq oracle calls the same `index.nearest(QUERY_CENTER, k)` that bench_mode times (bench_geo.rs:251-254 vs 137-141), and `<%s>` on the jena side matches oxrdf's NamedNode Display, so the two sides are format-compatible.\n\nWhat remains is one reporting-clarity minor and three nits \u2014 no blocker or major.",
+  "verdict": "approve"
+ }
+}
