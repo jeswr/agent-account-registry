@@ -552,8 +552,10 @@ Two halves, both in `scripts/no_change_routing.py` (the single declaration; `wor
   the total, since every run may write `.worker-no-diff.json` and `.worker-followups.jsonl` and so
   has a nonzero `Edit`/`Write` count even when it opened nothing. `probe_tool_calls == 0` on a
   `no_change` is therefore "declared defeat from the prompt alone", which is a different failure with
-  a different fix than "investigated, then declined" — and **absent ≠ zero**, so the field is emitted
-  whenever telemetry parsed and omitted only when it did not. Two asymmetries are load-bearing when
+  a different fix than "investigated, then declined". A confident zero is a claim about the model, so
+  **absent ≠ zero** and the field is emitted only off a *recognised* harness event stream: a missing,
+  empty, unparseable, foreign-protocol, or wrong-harness log omits it rather than reporting `0`.
+  Two asymmetries are load-bearing when
   reading it: codex has **no `Read` tool** (it reads through the shell, landing in `Bash`), so the
   probe *total* is the cross-harness question and `Read` alone is not; and `num_turns` is **not**
   comparable across harnesses, since `codex exec` is normally one codex turn containing many calls.
