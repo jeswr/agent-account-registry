@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3973,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f44475feec78080fc95fc86e8bcfbe7cd6843dce",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change is coherent and honestly scoped. The boolean builder reuses the existing u64 relation with hooks 0/1, pins the public xsd:boolean datatype constant, derives rather than accepts the expected verdict, and rejects unsupported lexical/datatype inputs. The tests cover the complete truth table, host/member leaf rebinding, both datatype-lane separation directions, dispatch legality, serialization/TOML layout, and real witness acceptance/rejection when nargo is available; the new feature-matrix leg ensures the feature-gated suite is exercised in CI. Public API documentation is updated and repeatedly preserves the INV-VL, CR-G8/sq-qhy4, and external-audit caveats. No actionable correctness, soundness, security, or test-validity defect was found. Local execution was unavailable because cargo is not installed in this review environment.",
+  "verdict": "approve"
+ }
+}
