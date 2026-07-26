@@ -71,6 +71,39 @@ without reaction counting. **Release** and **heartbeat** are keyed by the unique
 (idempotent). The groomer **reclaims** leases past `expires_at` (a dead/cancelled worker frees its
 slot automatically — no receipt-guessing).
 
+### The `package` partition has exactly ONE derivation
+
+A row's `package` is the single conflict partition its lease reserves, reduced from the source
+issue's `area:*` labels: **exactly one** distinct area reserves that area, **zero or multiple**
+reserve the serializing `__global__` partition (fail-closed — over-serialize a multi-area row rather
+than free a busy sibling crate). That reduction is `lease_schema.plan_package`, and it is the **only**
+copy: `dispatch-claim.py` delegates to it and review-fix.yml's `resolve` job calls
+`dispatch_claim.plan_package` — the minter's own function object. `dispatch-plan.py` ships inside the
+target repos (which have no `lease_schema.py`) so it keeps a local copy, pinned by an agreement
+assertion in `dispatch-claim.py --self-test`.
+
+This matters because the value is derived **twice by design** — once by the dispatcher that mints a
+CAS claim, once by the review/fix run that adopts it — and review-fix.yml's `Adopt dispatcher-owned
+CAS claim` step compares the two for **equality**. When `resolve` carried its own pre-#112
+alphabetically-first reduction, every PR whose source issue held two `area:*` labels had its own
+dispatcher's claim rejected on every tick, forever.
+
+### Adoption rejections are CLASSIFIED, and the deterministic class has a machine exit
+
+A rejected adoption always releases the lease inline (never `|| true` — a swallowed release strands a
+scarce account slot with no signal) and then routes on its class:
+
+| class | cause | exit |
+|---|---|---|
+| `transient` | the claim is gone/unreadable (TTL, groom sweep, operator release) | defer **without failing**; the doorbell re-rings and the next tick re-dispatches |
+| `infra` | a registry-side capability is missing for PR-**independent** reasons (no `PROVENANCE_SALT`; a catalog row with no provider) | retry, red — but **never park**, because the cause is fleet-wide |
+| `disagreement` | a field re-derived from **this PR** contradicts the claim minted for it | release + park the PR and its source issue via `worker-pr.py needs-user` (`adopt_disagreement` job) |
+
+`disagreement` gets a terminal rather than a retry because it is deterministic in the PR: the next
+tick re-derives the identical mismatch, so retrying can never converge — it only burns another
+account lease. An absent or unrecognised class reads as `disagreement` (fail **loud**), so a crash in
+the validator escalates instead of joining a silent retry loop.
+
 ## Selection logic (`select-and-claim`)
 
 `scripts/select-and-claim.py` (added in Phase 3) takes `(package, role, model-chain)` and returns an
