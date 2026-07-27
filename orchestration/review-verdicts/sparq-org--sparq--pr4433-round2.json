@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4433,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "6b34e89dbdba436649fee7dd47f08f05e0c0ecbf",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior major finding. The comment now correctly distinguishes ordinary Git behavior for tracked files from release-plz's explicit rejection of committed-and-ignored paths. The cited release-plz.toml note contains the quoted failure, documents allow_dirty = true, and identifies the same tracked-and-ignored mechanism. The two named regression seed files are tracked, the claimed count of 27 property-test sources matches the repository, and the per-test failure_persistence opt-out precedent exists. No correctness, soundness, test-validity, or security issue remains in this documentation-only change.",
+  "verdict": "approve"
+ }
+}
