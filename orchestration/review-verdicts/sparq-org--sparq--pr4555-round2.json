@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4555,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "20b6e85331573dccfdf6b8e1ff3224ea02fc6a50",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The revision still adds a measurement table containing corpus opcode totals and percentages, per-package opcode deltas, synthetic-chain deltas, and wall-clock compile timings. The companion new research record contains the same classes of hard-coded measurements throughout \u00a7\u00a76\u20137. Repository policy explicitly prohibits hard-coded performance numbers in Markdown and says work-box timings are non-canonical; labeling these figures \u201cnon-canonical\u201d does not remove that prohibition. This is materially the same major finding as round 1.",
+    "file": "research/noir-optimization-program.md",
+    "fix_hint": "Move raw opcode counts, percentages, package deltas, fixture results, test-run measurements, and wall-clock timings into the repository\u2019s approved generated/result artifact mechanism. Link that artifact from both research records and retain only qualitative, evidence-scoped conclusions in Markdown.",
+    "severity": "major",
+    "title": "Hard-coded performance measurements remain in Markdown"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 2 is improving: the unsupported universal \u201cnever regresses\u201d language was replaced with evidence-bounded wording, and the duplicated issue-body paragraph was removed. One prior major blocker remains. Both changed Markdown files still embed extensive benchmark results and work-box timings\u2014opcode totals, percentages, package-level deltas, synthetic-fixture measurements, test counts, and compile timings\u2014even though the repository contract prohibits hard-coded performance numbers in Markdown and treats work-box timings as non-canonical. Calling the measurements non-canonical does not satisfy that policy. Move the raw measurements to an approved generated/result artifact and keep the research Markdown qualitative, with links to the artifact.",
+  "verdict": "request_changes"
+ }
+}
