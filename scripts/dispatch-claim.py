@@ -6111,6 +6111,15 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                                 _park_policy.park_ladder_decision(
                                     cutoff,
                                     worker_pr.park_generation_cutoffs(comments, bot_login),
+                                    # [registry #797] This lane's `cutoff` comes STRAIGHT from
+                                    # readmission_cutoff — the strict maintainer probe — with no
+                                    # automatic-re-admission stamps folded in, so every window it
+                                    # can mint is one a proven human opened. Stated explicitly
+                                    # because the ladder now refuses to decide without it, and
+                                    # because that is exactly the claim the terminal's comment
+                                    # ("after a human readmission") makes to the maintainer.
+                                    window_authority=(
+                                        _park_policy.WINDOW_AUTHORITY_HUMAN),
                                     already_labeled="status:parked" in item["labels"]))
                             if action == "freeze":
                                 # Unreadable timeline: the ladder never advances on unproven

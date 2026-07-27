@@ -771,6 +771,17 @@ STATUS_TRANSITIONS = {
     "readmitted": ({"status:in-progress-review"},
                    {"status:parked", "status:deferred", "status:ready",
                     "status:in-progress"}),
+    # `handback` [registry #797]: the SOURCE-ISSUE half of a MACHINE-TERMINAL retirement
+    # (worker-pr._retire_worker_pr). Its worker PR consumed two full budgets and has just been
+    # CLOSED, so — unlike `readmitted`, which restores the in-progress-review posture of a PR
+    # that is still open — the issue goes back to the implementable frontier for a FRESH attempt,
+    # normally on a decomposed `role:research` route the caller swapped in first. It clears the
+    # machine park and every in-flight posture and restores `status:ready`. It applies NO park
+    # label, so it is not veto-gated: like `readmitted`, clearing a machine park points the same
+    # way a human unpark does. `status:ready` here is dispatchability, never approval (issue #31).
+    "handback": ({"status:ready"},
+                 {"status:parked", "status:deferred", "status:in-progress",
+                  "status:in-progress-review"}),
     "complete": (set(), {"status:in-progress", "status:in-progress-review",
                          "status:deferred", "status:parked"}),
 }
@@ -1780,10 +1791,10 @@ def main():
     trust.add_argument("--forbid-gate-root", default=None)
 
     status = subparsers.add_parser("status", parents=[common])
-    status.add_argument("--status", choices=("in-progress", "in-progress-review", "retry",
-                                             "deferred", "needs-user", "parked", "readmitted",
-                                             "complete"),
-                        required=True)
+    # Derived from STATUS_TRANSITIONS, never re-declared: a transition added to the table without
+    # a CLI choice is unreachable from every helper call site (worker-pr, dispatch-claim), and
+    # this list silently drifting out of date is exactly how a new exit becomes a no-op.
+    status.add_argument("--status", choices=tuple(sorted(STATUS_TRANSITIONS)), required=True)
 
     receipt = subparsers.add_parser("claim-receipt", parents=[common])
     receipt.add_argument("--model", required=True)

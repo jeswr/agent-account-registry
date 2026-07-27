@@ -218,6 +218,21 @@ PARK_GENERATION_MARKER = "<!-- sparq-park-generation:v1"
 # re-admission has to be provable after the labels are gone, exactly like a human's unlabel.
 # Bot-authored + reserved-namespace like every other durable marker.
 AUTO_READMIT_MARKER = "<!-- sparq-auto-readmit:v1"
+# [registry #797] The MACHINE-TERMINAL (retirement) receipt — the FOURTH member of the
+# park-receipt family, and a DISTINCT marker for the same reason the other two are: it records a
+# disposition, not a consumed window, and folding it into the generation receipts would corrupt
+# the counter they ARE. Fields: `window=<ladder window key> generation=<n>`.
+#
+# It records that park_ladder_decision returned `machine-terminal`: the loop re-admitted this PR
+# itself (park_policy invariant 3), the PR exhausted its budget again, and
+# PARK_MACHINE_TERMINAL_GENERATIONS machine-minted windows are now spent. That establishes the
+# approach is not converging — and establishes NOTHING about a human's attention — so the exit is
+# a MACHINE-owned retirement (review:parked stands, the draft PR is CLOSED, the source issue is
+# handed back for architect decomposition) rather than the human-owned review:needs-user terminal
+# this used to page with. It is ALSO the convergence key: the ladder dedupes the window on the
+# next tick, so a retirement whose close/hand-back half died mid-write is re-driven from this
+# receipt instead of being stranded half-done.
+PARK_RETIREMENT_MARKER = "<!-- sparq-park-retired:v1"
 # The window key for the initial no-cutoff window — mirrors park_policy.PARK_WINDOW_NONE
 # (kept literal here so the pure marker parser needs no module load; never valid ISO-8601, so
 # it cannot collide with a real cutoff).
@@ -571,6 +586,28 @@ def park_generation_records(comments, bot_login, log=print):
                 "fingerprint": policy.park_fingerprint(match.group(3), match.group(4)),
             })
     return records
+
+
+def park_retirement_windows(comments, bot_login, log=print):
+    """[registry #797] The window keys whose MACHINE-TERMINAL retirement is already receipted
+    (PARK_RETIREMENT_MARKER). Bot-authored only, like every marker parser: a forged marker must
+    be able neither to fabricate a retirement nor to suppress a due one.
+
+    A malformed window field is treated as ABSENT with a loud log — the same direction
+    park_generation_records takes, and for the same reason: an unreadable receipt must delay the
+    disposition (which the next tick re-derives) rather than fabricate one that never happened."""
+    pattern = re.escape(PARK_RETIREMENT_MARKER) + r" window=(\S+) generation=([0-9]+) -->"
+    policy = _park_policy()
+    windows = set()
+    for comment in _bot_comments(comments, bot_login):
+        for match in re.finditer(pattern, str(comment.get("body", ""))):
+            window = match.group(1)
+            if window != PARK_WINDOW_NONE and not policy.valid_timestamp(window):
+                log(f"::warning::malformed park-retirement receipt window {window!r} treated as "
+                    "absent — the retirement is re-derived rather than assumed")
+                continue
+            windows.add(window if window == PARK_WINDOW_NONE else policy.canonical_ts(window))
+    return windows
 
 
 def auto_readmission_records(comments, bot_login, log=print):
@@ -3216,6 +3253,77 @@ def stranded_recover(repo, pr_number, proven_head, issue=None):
     _write_outputs({"action": action, "marker": "invalidate"})
 
 
+def _retire_worker_pr(repo, pr_number, issue, probe, policy, close_pr=None, patch_issue=None,
+                      read_issue=None, set_status=None, log=print):
+    """[registry #797] Execute a MACHINE-TERMINAL retirement: close the exhausted draft worker PR
+    and hand its WORK back to the source issue. IDEMPOTENT end to end — every step is a no-op
+    when it has already happened — because the `dedupe` arm re-drives it from the durable
+    receipt after a crash, and because a retirement that could only be applied once would strand
+    half of itself on the first transient.
+
+    THE PR HALF: `PATCH pulls/N state=closed`. A closed draft loses nothing — the branch, the
+    commits and the diff all survive and a human (or a later dispatch) can reopen it — while an
+    open one that will never be worked again keeps appearing in every enumeration, every sweep
+    and every read budget forever. This is the exit the machine class did not have: without it a
+    spent capacity park is ABSORBING (the registry #764 shape, PR-side), and "absorbing" is how
+    the 2026-07-18 mass park stayed live for eight days.
+
+    THE ISSUE HALF (park_policy.retirement_handback — PURE, tested there): a HUMAN-held source
+    issue is not touched at all; an issue still on `role:impl` is swapped to `role:research` for
+    architect decomposition, because two full budgets on the same approach is evidence about the
+    approach; anything already off the impl route is simply requeued (a second reroute would
+    loop). The role swap is a FULL label-set PATCH, never add-then-remove: the planner rejects an
+    issue with two role labels or none, and both interleavings can produce one.
+
+    EVERY step is best-effort and LOGGED. The authoritative record of the disposition is the
+    durable receipt the caller posted BEFORE calling this; a failed close or hand-back must not
+    raise back into the review outcome (the PR is correctly parked either way) and is re-driven
+    on the next tick. Fail direction on an unreadable source issue: hand nothing back — an issue
+    whose labels cannot be read cannot be proven free of a human hold."""
+    close_pr = close_pr or (lambda: _gh_json(
+        ["api", "-X", "PATCH", f"repos/{repo}/pulls/{pr_number}", "--input", "-"],
+        input_doc={"state": "closed"}))
+    read_issue = read_issue or (lambda: _gh_json(["api", f"repos/{repo}/issues/{issue}"]))
+    patch_issue = patch_issue or (lambda labels: _gh_json(
+        ["api", "-X", "PATCH", f"repos/{repo}/issues/{issue}", "--input", "-"],
+        input_doc={"labels": labels}))
+    set_status = set_status or (lambda status: _load_worker_issue().set_status(
+        repo, issue, status))
+    try:
+        close_pr()
+        log(f"machine retirement: closed {repo}#{pr_number} (branch and diff kept)")
+    except Exception as exc:  # noqa: BLE001 — the receipt is the record; a failed close retries
+        log(f"::warning::machine retirement: could not close {repo}#{pr_number} ({exc}); the "
+            "receipt stands and the next tick re-drives the close")
+    if not issue:
+        return
+    try:
+        live = read_issue()
+        labels = [label.get("name") if isinstance(label, dict) else label
+                  for label in (live.get("labels") or [])] if isinstance(live, dict) else None
+        if labels is None or any(not isinstance(name, str) for name in labels):
+            raise WorkerPrError("source issue labels are unreadable")
+    except Exception as exc:  # noqa: BLE001 — an unreadable issue is never handed back
+        log(f"::warning::machine retirement: source issue {repo}#{issue} is unreadable ({exc}) "
+            "— handing nothing back (an unreadable hold cannot be proven absent)")
+        return
+    action, desired, detail = policy.retirement_handback(labels)
+    if action == "hold":
+        log(f"machine retirement: source issue {repo}#{issue} left untouched — {detail}")
+        return
+    try:
+        if desired != sorted(labels):
+            patch_issue(desired)
+        # The issue re-enters the frontier: the machine park is lifted and the in-progress-review
+        # posture (whose PR just closed) is cleared. `set_status` re-checks the sticky human
+        # veto at its own write point, and applies no park label here.
+        set_status("handback")
+        log(f"machine retirement: source issue {repo}#{issue} handed back — {detail}")
+    except Exception as exc:  # noqa: BLE001 — best-effort; re-driven from the receipt next tick
+        log(f"::warning::machine retirement: hand-back of {repo}#{issue} failed ({exc}); the "
+            "retirement receipt stands and the next tick re-drives it")
+
+
 # ---- terminal escalation + arm --------------------------------------------------------------------
 def needs_user(repo, pr_number, reason, issue=None, alert_repo=None, alert_token=None,
                maintainer=None, park_class="question", bot_login="", head_sha="",
@@ -3277,20 +3385,30 @@ def needs_user(repo, pr_number, reason, issue=None, alert_repo=None, alert_token
         # The ladder's window is the LATER of the proven-human readmission gesture and any
         # AUTOMATIC re-admission receipt (registry #614): an automatic re-admission grants the
         # same real budget window a human gesture grants, so a PR that was automatically
-        # re-admitted and then exhausted its budget AGAIN consumes a FRESH generation and still
-        # reaches the PARK_ESCALATION_GENERATIONS question-class terminal — it just gets there
-        # having actually retried. Without this the re-park would dedupe against the
-        # pre-recovery window forever and never escalate to a human. WINDOW_UNREADABLE still wins
-        # outright (the ladder must FREEZE on an unproven timeline).
-        cutoff = policy.effective_readmission_cutoff(
+        # re-admitted and then exhausted its budget AGAIN consumes a FRESH generation. Without
+        # this the re-park would dedupe against the pre-recovery window forever and never
+        # escalate at all. WINDOW_UNREADABLE still wins outright (the ladder must FREEZE on an
+        # unproven timeline).
+        #
+        # [registry #797] BUT WHICH LADDER that fresh generation is charged to depends on WHO
+        # opened the window, and readmission_window is what says so. This exact call site is the
+        # defect: it used to hand the ladder a bare cutoff string, so the loop's OWN automatic
+        # re-admissions were counted as human generations and the terminal below paged the
+        # maintainer with "This PR was human-readmitted" about a re-admission the maintainer
+        # never made. MEASURED on 35 live sparq PRs: 20 of the 21 carrying generation receipts
+        # had escalated on a window whose key is byte-identical to their own auto-readmit stamp;
+        # ZERO had escalated on a human's gesture.
+        window = policy.readmission_window(
             policy.readmission_cutoff(repo, pr_number, issue, _issue_timeline, is_human=probe,
                                       on_unreadable=policy.WINDOW_UNREADABLE),
             auto_readmission_stamps(comments, bot_login))
+        cutoff = window["cutoff"]
         records = park_generation_records(comments, bot_login)
         receipts = {record["window"] for record in records}
         fingerprint = policy.park_fingerprint(head_sha, attempt_key)
         action, window_key, generation = policy.park_ladder_decision(
-            cutoff, receipts, fingerprint=fingerprint,
+            cutoff, receipts, window_authority=window["authority"],
+            machine_windows=window["machine_windows"], fingerprint=fingerprint,
             consumed_fingerprints={record["fingerprint"] for record in records
                                    if record["fingerprint"]})
         if action == "freeze":
@@ -3299,6 +3417,16 @@ def needs_user(repo, pr_number, reason, issue=None, alert_repo=None, alert_token
                   "ladder never advances on unproven data)")
             return
         if action == "dedupe":
+            # [registry #797] CONVERGE A HALF-DONE RETIREMENT FIRST. The retirement is
+            # receipt-first, so a crash (or a transient GitHub failure) between the receipt and
+            # the close/hand-back leaves the PR receipted-but-open — and the ladder dedupes this
+            # window forever after, so without this arm the disposition would be stranded
+            # half-taken with nothing left to re-drive it. Every step is idempotent.
+            if window_key in park_retirement_windows(comments, bot_login):
+                print(f"machine retirement already receipted for window {window_key}; "
+                      "converging its close + source-issue hand-back (idempotent)")
+                _retire_worker_pr(repo, pr_number, issue, probe, policy)
+                return
             print(f"capacity park already receipted for window {window_key}; awaiting a "
                   "fresh human gesture — no label/comment churn")
             return
@@ -3332,11 +3460,57 @@ def needs_user(repo, pr_number, reason, issue=None, alert_repo=None, alert_token
             park_cause if policy.park_cause_class(park_cause) == policy.PARK_CLASS_CAPACITY
             else "capacity-unspecified",
             generation=generation, head=head_sha or None)
+        if action == "machine-terminal":
+            # [registry #797] THE MACHINE'S OWN GIVE-UP. The loop re-admitted this PR itself
+            # (invariant 3 — proven cause-recovery, or the labelled sustained-fleet-health
+            # heuristic of #691) and it exhausted its budget again;
+            # PARK_MACHINE_TERMINAL_GENERATIONS machine-minted windows are now spent, which is
+            # every automatic chance AUTO_READMISSION_MAX allows. What that establishes is that
+            # the approach is not converging. What it does NOT establish is anything at all
+            # about a human's attention — so this exit is machine-owned end to end and the
+            # maintainer is not paged: the PR keeps the MACHINE `review:parked` class, the draft
+            # is CLOSED (its branch and its whole diff survive; nothing is deleted), and the
+            # WORK goes back to the source issue for architect decomposition rather than a
+            # third identical attempt.
+            #
+            # RECEIPT-FIRST, exactly like every other park write: the durable retirement receipt
+            # lands BEFORE the close and the hand-back, so a crash between them leaves
+            # receipt-no-disposition, which the `dedupe` arm above re-drives. The reverse order
+            # would close the PR with nothing on record saying why.
+            _comment(repo, pr_number,
+                     f"> 🤖 SPARQ agent — the autonomous review loop is RETIRING this pull "
+                     f"request: {reason}\n\n"
+                     f"This is a MACHINE-owned give-up, **not** a human question. The loop "
+                     f"parked this PR for capacity, re-admitted it **itself** on recorded "
+                     f"recovery evidence, and it exhausted its budget again — "
+                     f"{generation} machine-granted budget window(s) consumed (latest "
+                     f"{window_key}), which is every automatic re-admission "
+                     f"`AUTO_READMISSION_MAX` allows. No human re-admitted it and no human "
+                     f"decision is required here, so nobody is being paged.\n\n"
+                     f"What happens now: the PR is **closed** (the branch and the diff are "
+                     f"kept — reopen it at any time), and the source issue is handed back for "
+                     f"architect decomposition instead of a third identical attempt. Two full "
+                     f"review budgets on the same approach is evidence about the APPROACH, not "
+                     f"about the maintainer's inbox."
+                     f"\n\n{PARK_RETIREMENT_MARKER} window={window_key} "
+                     f"generation={generation} -->{generation_marker}{reason_marker}")
+            if not policy.park_vetoed(repo, pr_number, MACHINE_PARK_PR_LABEL,
+                                      _issue_timeline, is_human=probe):
+                set_review_state(repo, pr_number, "parked")
+            _retire_worker_pr(repo, pr_number, issue, probe, policy)
+            print(f"machine retirement recorded (machine generation {generation}): {reason}")
+            return
         if action == "terminal":
             # Bounded escalation: PARK_ESCALATION_GENERATIONS windows consumed — repeated
             # post-readmission failure IS a human question now. The terminal label write is
             # veto-checked like every park write (round-3 finding 1), and the comment never
             # claims a label that did not land.
+            #
+            # [registry #797] Reaching HERE now PROVES a human opened the window this generation
+            # was charged to (park_ladder_decision refuses the human terminal on any other
+            # authority), which is what makes the "human-readmitted" sentence below true. It was
+            # not: 20 of the 21 live sparq escalations carrying receipts had reached this branch
+            # on the loop's OWN automatic re-admission.
             #
             # RECEIPT-FIRST ordering (round-4 finding 2): the veto is PROBED first (so the
             # receipt is honest about a suppressed write), the durable receipt is posted
@@ -6693,6 +6867,158 @@ def _self_test():
                    head_sha="", attempt_key="rounds=5")
         check("(k) an unknown fingerprint parks exactly as before (no `head=` in the receipt)",
               (bool(park_route_calls), "head=" in park_route_comments[-1]), (True, False))
+
+        # ---- [registry #797] THE MACHINE RE-ADMISSION MUST NOT REACH THE HUMAN CLASS.
+        # This is the CALL SITE, executed end to end — the pure-ladder assertions in
+        # park_policy cannot see whether needs_user actually passes the authority it derives,
+        # and a call site that reverts to the bare `effective_readmission_cutoff` leaves every
+        # one of those pure tests green. Replayed from the live sparq #4422 / #3595 shape:
+        # gen-1 initial window receipted, then the loop's OWN auto-readmit receipt(s), and
+        # ZERO human events on either timeline. ----
+        retire_calls = []
+        real_retire_json = wiring_globals["_gh_json"]
+
+        def _fake_retire_json(args, **kwargs):
+            path = args[-3] if "--input" in args else args[-1]
+            retire_calls.append(("api", args[1] if args[0] == "api" else args[0], path,
+                                 kwargs.get("input_doc")))
+            if path.endswith("/issues/7"):
+                return {"labels": [{"name": "area:engine"}, {"name": "role:impl"},
+                                    {"name": "status:parked"}]}
+            return {}
+
+        def auto_receipt(stamp, key="fleet-health/anthropic/9e13/301.1"):
+            return {"user": {"login": bot}, "created_at": stamp,
+                    "body": f"x {AUTO_READMIT_MARKER} evidence={key} at={stamp} -->"}
+
+        def gen_receipt(generation, window):
+            return {"user": {"login": bot}, "created_at": window,
+                    "body": f"x {PARK_GENERATION_MARKER} gen={generation} cutoff={window} -->"}
+
+        try:
+            wiring_globals["_gh_json"] = _fake_retire_json
+            # (#797-a) #4422 EXACTLY: the initial window receipted, ONE machine re-admission,
+            # no human gesture anywhere. Pre-#797 this emitted review:needs-user + "This PR was
+            # human-readmitted" + an @maintainer page. It must now stay in the MACHINE class.
+            auto_1 = "2026-07-27T08:02:21Z"
+            park_route_state["timelines"] = {
+                41: [labeled("review:parked", "2026-07-27T07:00:00Z")], 7: []}
+            park_route_state["comments"] = [gen_receipt(1, PARK_WINDOW_NONE),
+                                            auto_receipt(auto_1)]
+            park_route_calls.clear()
+            park_route_comments.clear()
+            retire_calls.clear()
+            needs_user("o/r", 41, "budget spent", issue=7, park_class="capacity",
+                       bot_login=bot, head_sha="c" * 40, attempt_key="rounds=4")
+            check("#797-a (#4422): a MACHINE re-admission NEVER writes the human-owned "
+                  "review:needs-user / needs:user pair",
+                  [call for call in park_route_calls
+                   if call[-1] == "needs-user" or "needs-user" in str(call)], [])
+            check("#797-a: ...and never claims the maintainer readmitted it",
+                  ("human-readmitted" in park_route_comments[-1],
+                   "needs a human decision" in park_route_comments[-1]), (False, False))
+            check("#797-a: it consumes the machine window as a MACHINE park (gen 1 of the "
+                  "machine ladder), receipt first",
+                  park_route_calls,
+                  [("receipt",), ("pr-state", "parked"), ("issue-status", 7, "parked")])
+            check("#797-a: the receipt binds the MACHINE-minted window key",
+                  f"cutoff={auto_1}" in park_route_comments[-1], True)
+            check("#797-a: nothing is closed or handed back while the machine still has a "
+                  "chance left", retire_calls, [])
+            # (#797-b) #3595 EXACTLY: a SECOND machine window. AUTO_READMISSION_MAX chances are
+            # spent, so the machine RETIRES — its own terminal — and still does not page.
+            auto_2 = "2026-07-27T14:50:59Z"
+            park_route_state["comments"] = [gen_receipt(1, PARK_WINDOW_NONE),
+                                            gen_receipt(1, auto_1),
+                                            auto_receipt(auto_1), auto_receipt(auto_2, "k2")]
+            park_route_calls.clear()
+            park_route_comments.clear()
+            retire_calls.clear()
+            needs_user("o/r", 41, "budget spent", issue=7, park_class="capacity",
+                       bot_login=bot, head_sha="d" * 40, attempt_key="rounds=5")
+            check("#797-b (#3595): the SECOND machine window RETIRES — machine-owned, "
+                  "receipt first, review:parked kept",
+                  park_route_calls, [("receipt",), ("pr-state", "parked"),
+                                     ("issue-status", 7, "handback")])
+            check("#797-b: the retirement is receipted durably against its window",
+                  f"{PARK_RETIREMENT_MARKER} window={auto_2}" in park_route_comments[-1], True)
+            check("#797-b: the comment says MACHINE give-up, never a human question",
+                  ("MACHINE-owned give-up" in park_route_comments[-1],
+                   "needs a human decision" in park_route_comments[-1],
+                   "human-readmitted" in park_route_comments[-1]), (True, False, False))
+            check("#797-b: the draft PR is CLOSED (the absorbing machine park finally has an "
+                  "exit)",
+                  [doc for _kind, _verb, path, doc in retire_calls
+                   if path.endswith("/pulls/41")], [{"state": "closed"}])
+            check("#797-b: the source issue is handed back on the DECOMPOSITION route "
+                  "(role:impl -> role:research), as one atomic full-label PATCH",
+                  [doc for _kind, _verb, path, doc in retire_calls
+                   if path.endswith("/issues/7") and doc is not None],
+                  [{"labels": ["area:engine", "role:research", "status:parked"]}])
+            # (#797-c) THE MIRROR: the SAME receipt history, but the newest gesture is a PROVEN
+            # human unlabel. The human ladder is intact — this still escalates, and the
+            # "human-readmitted" sentence is finally true when it is written.
+            park_route_state["timelines"] = {
+                41: [labeled("review:parked", "2026-07-27T07:00:00Z"),
+                     unlabel("review:parked", "2026-07-27T18:00:00Z")], 7: []}
+            park_route_state["comments"] = [gen_receipt(1, PARK_WINDOW_NONE),
+                                            gen_receipt(1, auto_1), auto_receipt(auto_1)]
+            park_route_calls.clear()
+            park_route_comments.clear()
+            retire_calls.clear()
+            needs_user("o/r", 41, "budget spent", issue=7, park_class="capacity",
+                       bot_login=bot, head_sha="e" * 40, attempt_key="rounds=6")
+            check("#797-c: a GENUINE human re-admission still reaches the human terminal — "
+                  "the protection is preserved, not removed",
+                  park_route_calls,
+                  [("receipt",), ("pr-state", "needs-user"),
+                   ("issue-status", 7, "needs-user")])
+            check("#797-c: ...and only THEN is 'human-readmitted' a true statement",
+                  "human-readmitted" in park_route_comments[-1], True)
+            check("#797-c: a human escalation closes nothing and hands nothing back",
+                  retire_calls, [])
+            # (#797-d) CONVERGENCE: the retirement receipt exists but the close died. The
+            # ladder dedupes the window, so without the dedupe-arm convergence the disposition
+            # is stranded half-taken forever.
+            park_route_state["timelines"] = {
+                41: [labeled("review:parked", "2026-07-27T07:00:00Z")], 7: []}
+            park_route_state["comments"] = [
+                gen_receipt(1, PARK_WINDOW_NONE), gen_receipt(1, auto_1),
+                auto_receipt(auto_1), auto_receipt(auto_2, "k2"),
+                {"user": {"login": bot}, "created_at": auto_2,
+                 "body": (f"x {PARK_RETIREMENT_MARKER} window={auto_2} generation=2 -->"
+                          f" {PARK_GENERATION_MARKER} gen=2 cutoff={auto_2} -->")}]
+            park_route_calls.clear()
+            park_route_comments.clear()
+            retire_calls.clear()
+            needs_user("o/r", 41, "budget spent", issue=7, park_class="capacity",
+                       bot_login=bot, head_sha="f" * 40, attempt_key="rounds=7")
+            check("#797-d: a receipted-but-unclosed retirement is CONVERGED on the next tick "
+                  "(no new comment, the close re-driven)",
+                  (park_route_comments,
+                   [path for _kind, _verb, path, _doc in retire_calls
+                    if path.endswith("/pulls/41")]), ([], ["repos/o/r/pulls/41"]))
+            # (#797-e) A HUMAN-HELD source issue is never touched by a retirement.
+            park_route_state["comments"] = [gen_receipt(1, PARK_WINDOW_NONE),
+                                            gen_receipt(1, auto_1),
+                                            auto_receipt(auto_1), auto_receipt(auto_2, "k2")]
+            park_route_calls.clear()
+            park_route_comments.clear()
+            retire_calls.clear()
+            wiring_globals["_gh_json"] = lambda args, **kwargs: (
+                {"labels": [{"name": "role:impl"}, {"name": "needs:external-audit"}]}
+                if str(args[-1]).endswith("/issues/7")
+                else _fake_retire_json(args, **kwargs))
+            needs_user("o/r", 41, "budget spent", issue=7, park_class="capacity",
+                       bot_login=bot, head_sha="0" * 40, attempt_key="rounds=8")
+            check("#797-e: a retirement leaves a HUMAN-HELD source issue completely alone "
+                  "(no label PATCH, no status flip)",
+                  ([doc for _kind, _verb, path, doc in retire_calls
+                    if path.endswith("/issues/7") and doc is not None],
+                   [call for call in park_route_calls if call[0].startswith("issue-status")]),
+                  ([], []))
+        finally:
+            wiring_globals["_gh_json"] = real_retire_json
     finally:
         wiring_globals.update(real_park_route)
 
