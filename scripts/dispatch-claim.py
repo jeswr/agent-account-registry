@@ -407,8 +407,10 @@ def repair_gate_checks_for(draft):
 # so nothing downstream can conflate the tiers by accident, and nothing has to re-parse a name.
 GATE_GREEN_MERGE_REQUIRED = "green:merge-required"
 GATE_GREEN_DRAFT_TIER = "green:draft-tier"
-# The tier-reachable greens, in the ORDER of decreasing evidential strength. Repair consumers test
-# membership; nothing else may.
+# The set of tier-reachable greens. Repair consumers test MEMBERSHIP in this set; nothing else
+# may, and no consumer may rank the two — a repair decision that is right for one grade is right
+# for the other (that is the whole content of "repair is not admission"). A consumer that needs to
+# tell them apart wants the ADMISSION reading, status["gate"], not a comparison of these two.
 TIER_REACHABLE_GREEN = frozenset({GATE_GREEN_MERGE_REQUIRED, GATE_GREEN_DRAFT_TIER})
 # Which green a resolved aggregator run yields, keyed by the EXACT tier name that won. Exact
 # equality against this closed table is the tier discriminator — never a prefix or substring test.
