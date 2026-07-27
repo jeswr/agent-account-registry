@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 877,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "87349efdeaf79667dd767639f9597e23fe3c5eee",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "_python_version_at_least anchors only the beginning of `have`, so values such as `3.11garbage` return `ok` even though the function says unparseable inputs return `unknown`. This does not affect the actual interpreter check because `_pyver` is emitted as an exact major.minor value from sys.version_info, but it makes the advertised pure helper looser than its comments and tests imply.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Either require the intended complete format (for example exact major.minor), or explicitly support a conventional patch/suffix grammar and add positive and negative suffix tests.",
+    "severity": "minor",
+    "title": "Version parser accepts arbitrary suffixes despite its documented contract"
+   }
+  ],
+  "progress": null,
+  "summary": "The change correctly fails closed before worker-live's fixture suite can run under an unsupported or unreadable Python interpreter. The numeric major/minor comparison covers the important boundary, newer-version, older-version, string-ordering, and invalid-input cases, so the tests are non-vacuous. Hoisting the JWT header removes the pre-3.12 f-string syntax failure without changing the fixture shape, and the added assertion independently checks all three token segments, the exact decoded header, signature sentinel, and expiration window. No trust check is weakened and no untrusted text or credential material is newly exposed. One minor contract mismatch remains in the pure helper, but the production probe obtains an exact major.minor string directly from sys.version_info, so it cannot create a permissive path in this gate.",
+  "verdict": "approve"
+ }
+}
