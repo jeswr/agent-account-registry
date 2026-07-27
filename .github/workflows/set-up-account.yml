@@ -454,7 +454,10 @@ jobs:
           # during which another (non-serialized) writer may claim this number, so the store step
           # derives the real slot from complete live state and atomically claims it (an acct-claims
           # ref) before writing (#186). This hint only makes a retry converge on the same slot.
-          n=$(gh issue list -R "${{ github.repository }}" --state all --json title \
+          # `--limit 500` is LOAD-BEARING (#238): gh caps `issue list` at 30 results by default, so
+          # without it this `max` undercounts once >30 acctNN issues exist and the hint points at an
+          # already-taken slot. 500 matches select-and-claim.py's read_accounts/audit_catalog window.
+          n=$(gh issue list -R "${{ github.repository }}" --state all --limit 500 --json title \
                 --jq '[.[].title|select(test("^acct[0-9]+$"))|ltrimstr("acct")|tonumber]|max // 0' 2>/dev/null || echo 0)
           {
             printf 'provider=%s\n' "$prov"
