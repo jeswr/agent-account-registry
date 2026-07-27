@@ -10777,6 +10777,43 @@ def _self_test():
                 "--head-sha", sha_a, "--issue", "7"], helper_calls
             assert alloc.calls == [("review", ["sol", "luna"])], alloc.calls
             assert launched == 0 and reasons["review:no-slot"] == 1, reasons
+            # ---- [issue #762] THE SAME RECOVERY ON THE REAL SPARQ DRAFT SHAPE ----------------
+            # The head publishes ONLY `gate, draft-tier` — the strict `check_name=gate` request
+            # gets an EMPTY page, which is what every live sparq worker draft looks like. This is
+            # the load-bearing half: the enumerator change alone would produce items that CLAIM
+            # then deferred every tick forever, because the live re-derivation used to issue that
+            # one strict, unpaginated request. Reverting it to `check_name=CI_GATE_CHECK` reds
+            # this block — the recovery does not fire and stranded-recover is never called.
+            fake.update(pull=live_pull(
+                draft=True, labels=["review:needs"],
+                body=f"x <!-- sparq-reviewed-sha:{sha_a} -->"),
+                check_runs=[{"name": CI_GATE_DRAFT_TIER_CHECK, "status": "completed",
+                             "conclusion": "success", "started_at": "2026-07-23T01:00:00Z"}],
+                comments=[])
+            alloc = StrandAllocator()
+            launched, reasons = run_items(
+                [stranded_item], allocator=alloc, routing=strand_routing)
+            assert [(script, args[0]) for script, args in helper_calls] == [
+                ("worker-pr.py", "stranded-recover")], helper_calls
+            assert alloc.calls == [("review", ["sol", "luna"])], alloc.calls
+            assert launched == 0 and reasons["review:no-slot"] == 1, reasons
+            # ...and the recovery is a REVIEW dispatch: the only helper it invoked retracts a
+            # marker, and the only account it asked for is a REVIEWER. Nothing armed, nothing
+            # merged, no auto-merge helper was called — subset-green bought a re-review and
+            # nothing else. Adding an arm to this path reds the helper-call equality above.
+            assert not any("arm" in str(args) or "merge" in str(args)
+                           for _script, args in helper_calls), helper_calls
+            # A DRAFT-TIER head that is still IN PROGRESS does not recover (pending is not green).
+            fake.update(pull=live_pull(
+                draft=True, labels=["review:needs"],
+                body=f"x <!-- sparq-reviewed-sha:{sha_a} -->"),
+                check_runs=[{"name": CI_GATE_DRAFT_TIER_CHECK, "status": "in_progress",
+                             "conclusion": None, "started_at": "2026-07-23T01:00:00Z"}],
+                comments=[])
+            alloc = StrandAllocator()
+            run_items([stranded_item], allocator=alloc, routing=strand_routing)
+            assert helper_calls == [] and alloc.calls == [], (helper_calls, alloc.calls)
+            fake["check_runs"] = gate_green      # restore the shared fixture for what follows
             # repeated failed recovery: the round budget is spent (hard cap) -> loud needs-user,
             # and no review is dispatched — terminal escalation is RESERVED for this case.
             # Re-bind the marker first: the recovery above RETRACTED it (issue #708), and an
