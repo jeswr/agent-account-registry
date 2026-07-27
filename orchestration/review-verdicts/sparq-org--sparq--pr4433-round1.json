@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4433,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ace2e7561d3cba663cd6f4f9210df5370c7df9ce",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Lines 108-112 claim that a blanket ignore rule would make the two already tracked regression files enter a state that causes Cargo's VCS dirty check to abort. Git ignore rules apply to untracked files; an already tracked file remains tracked, and modifications to it remain visible to Git and Cargo even when its path matches an ignore pattern. Conversely, ignoring newly generated untracked regression files would generally hide them from the dirty check. Thus the asserted causal link to sq-owci is technically incorrect and makes this long-lived policy note misleading.",
+    "file": ".gitignore",
+    "fix_hint": "Keep the recommendation not to blanket-ignore regression seeds, but justify it with the valid counterexample-retention reason. Remove the claim that an ignore rule makes tracked seeds trigger Cargo's dirty check, or replace it with a precisely verified account of the prior release failure that distinguishes tracked modifications from ignored untracked files.",
+    "severity": "major",
+    "title": "Tracked-and-ignored rationale misstates Git and Cargo dirty-check behavior"
+   }
+  ],
+  "progress": null,
+  "summary": "The policy choice to retain proptest regression seeds is reasonable, and the cited tracked seed files and per-test opt-out precedent exist. However, the new rationale materially misstates Git/Cargo behavior: adding an ignore pattern does not cause an already tracked file to become invisible to Git's tracked-file or dirty-worktree checks. The comment therefore attributes the prior release failure to a mechanism that cannot explain it and should be corrected before this durable repository guidance lands.",
+  "verdict": "request_changes"
+ }
+}
