@@ -3007,6 +3007,17 @@ def _self_test():
                           {"user": "nope", "body": _age}], _epi_bot),
            _total(_live, [{"body": _age}], _epi_bot)],
           [(False, ""), (False, ""), (False, ""), (False, ""), (False, "")])
+    # THE MARKERS ARE WIRE FORMAT, and nothing else in this tree can notice a rename. groom
+    # ALIASES these constants, and every fixture on both sides is built from the alias, so a
+    # renamed marker stays perfectly self-consistent across all three suites while ORPHANING
+    # every receipt already durable on a live PR: the un-park sweep stops recognising its own
+    # parks, and the re-admission sweep stops recognising groom's. The version suffix is what
+    # makes that a deliberate act rather than a refactor, so the literal is pinned here — the
+    # ONE place a rename has to be argued for.
+    check("age_park_episode: the marker spellings are WIRE FORMAT — a rename orphans every "
+          "receipt already durable on a live PR, so it must be a version bump, never a refactor",
+          (GROOM_AGE_PARK_MARKER, GROOM_AGE_UNPARK_MARKER),
+          ("<!-- registry-groom-age-park:v1", "<!-- registry-groom-age-unpark:v1"))
     check("age_park_episode: `foreign-episode` is a declared code and is EXIT-REACHABLE — the "
           "census must never file it as needing a human",
           (PARK_REFUSAL_FOREIGN_EPISODE in PARK_REFUSAL_CODES,
