@@ -14,6 +14,7 @@ triggers a worker (the credential-gated seam lives in the registry's dispatch-cl
 import argparse
 import io
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -367,7 +368,15 @@ def _self_test():
     def _workflow_block(path, step_id, marker):
         """The dedented python between `# >>> <marker>` and `# <<< <marker>` inside the ONE
         workflow step whose `id:` is `step_id`. Raises on anything it cannot resolve uniquely — an
-        assertion that cannot find its target must fail, never pass vacuously."""
+        assertion that cannot find its target must fail, never pass vacuously.
+
+        [sparq #4329] It ALSO refuses when the step, or the job containing it, carries an `if:`.
+        Extraction-by-sentinel reads the source text, so `if: false` on the step would disable the
+        block in production with every executed assertion below still green — the precise
+        never-runs-in-anger vacuity the sentinel harness exists to prevent. There is no legitimate
+        conditional on the readiness step (PLAN runs it every tick), so ANY `if:` is refused rather
+        than evaluated; a future conditional must be declared here deliberately.
+        """
         with open(path, encoding="utf-8") as handle:
             lines = handle.read().split("\n")
         ids = [i for i, line in enumerate(lines) if line.strip() == f"id: {step_id}"]
@@ -384,6 +393,26 @@ def _self_test():
                 end = i
                 break
         block = lines[starts[0]:end]
+        # the STEP's own keys sit one level in from its `- ` marker
+        step_if = [line for line in block
+                   if line.startswith(" " * (indent + 2) + "if:")]
+        if step_if:
+            raise AssertionError(
+                f"workflow step `id: {step_id}` carries {step_if[0].strip()!r} — this block is "
+                "EXECUTED by this self-test from its source text, so a conditional step would "
+                "pass every assertion while never running. Refusing.")
+        # ...and the JOB that owns it: `jobs:` entries at indent 2, their keys at indent 4.
+        jobs = [i for i in range(starts[0], -1, -1)
+                if re.fullmatch(r"  [A-Za-z0-9_-]+:\s*", lines[i])]
+        if not jobs:
+            raise AssertionError(f"cannot locate the job owning step `id: {step_id}` — refusing")
+        job_end = next((i for i in range(jobs[0] + 1, len(lines))
+                        if re.fullmatch(r"  [A-Za-z0-9_-]+:\s*", lines[i])), len(lines))
+        job_if = [line for line in lines[jobs[0]:job_end] if line.startswith("    if:")]
+        if job_if:
+            raise AssertionError(
+                f"the job owning step `id: {step_id}` carries {job_if[0].strip()!r} — a disabled "
+                "job would leave every executed assertion below green. Refusing.")
         opens = [i for i, line in enumerate(block) if line.strip().startswith(f"# >>> {marker}")]
         closes = [i for i, line in enumerate(block) if line.strip() == f"# <<< {marker}"]
         if len(opens) != 1 or len(closes) != 1 or closes[0] <= opens[0]:
@@ -445,6 +474,145 @@ def _self_test():
         ("30 status:ready issue(s)" in _truncated,
          "#19, #20 (+10 more)" in _truncated, "#21" in _truncated),
         (True, True, False))
+
+    # ------------------------------------------------------------------------------------------
+    # [sparq #4329] NATIVE GitHub dependency edges. The dispatcher derived `open_blockers` ONLY
+    # from a `Blocked-by: #NN` BODY regex, so a dependency the maintainer added through GitHub's
+    # native UI had ZERO effect on dispatch. The fix unions the native
+    # `issue_dependencies_summary.blocked_by` count with the marker count, and it lives ENTIRELY
+    # in workflow python — the exact seam where every uncaught mutant in this repo has lived.
+    # So the block is EXTRACTED and EXECUTED here, not pattern-matched: each row below dies on a
+    # one-token flip (delete the native read, turn the union into a replacement either way, read
+    # `total_blocked_by` instead, admit a malformed summary as zero, invert the dark alarm).
+    # Its only inputs are `raw`, `repo`, `label_names` and `re`.
+    # ------------------------------------------------------------------------------------------
+    _dispatch_yml = os.path.join(_root, ".github", "workflows", "dispatch.yml")
+    blocker_block = _workflow_block(_dispatch_yml, "readiness", "blocker-union")
+
+    # THE YAML SEAM ITSELF. Extraction reads SOURCE TEXT, so `if: false` on the readiness step (or
+    # on the PLAN job) disables both sentinel blocks in production while every executed row below
+    # stays green — a substring or `count(...) == N` assertion cannot see it either. Prove the
+    # harness refuses both, by injecting each conditional into a real copy of the workflow.
+    def _with_line(after_pattern, inserted):
+        with open(_dispatch_yml, encoding="utf-8") as handle:
+            lines = handle.read().split("\n")
+        hits = [i for i, line in enumerate(lines) if line.rstrip() == after_pattern]
+        if len(hits) != 1:
+            raise AssertionError(f"expected one {after_pattern!r} line, found {len(hits)}")
+        lines.insert(hits[0] + 1, inserted)
+        handle_dir = os.path.join(_root, ".github", "workflows")
+        path = os.path.join(handle_dir, ".dispatch-seam-probe.yml")
+        with open(path, "w", encoding="utf-8") as out:
+            out.write("\n".join(lines))
+        return path
+
+    def _refusal(path):
+        try:
+            _workflow_block(path, "readiness", "blocker-union")
+        except AssertionError as exc:
+            return str(exc)
+        finally:
+            os.remove(path)
+        return ""
+
+    _step_off = _refusal(_with_line("        id: readiness", "        if: false"))
+    chk("[#4329][YAML seam] `if: false` on the readiness STEP is REFUSED, not silently accepted",
+        ("carries 'if: false'" in _step_off, "never running" in _step_off), (True, True))
+    _job_off = _refusal(_with_line(
+        "    name: PLAN (unprivileged, secret-free target half)", "    if: false"))
+    chk("[#4329][YAML seam] `if: false` on the PLAN JOB is REFUSED too",
+        ("job owning step" in _job_off, "if: false" in _job_off), (True, True))
+
+    def _blockers(rows, repo="o/t"):
+        """Run the REAL workflow block over REST-shaped issue rows; return (rows, printed)."""
+        namespace = {
+            "raw": rows, "repo": repo, "re": re,
+            "label_names": lambda issue: sorted(
+                label["name"] for label in issue.get("labels", [])),
+        }
+        text = _captured(lambda: exec(blocker_block, namespace))  # noqa: S102 — workflow block
+        return namespace["readiness_input"], text
+
+    def _rest(number, body="", summary=..., labels=()):
+        """A row in the SHAPE the authenticated snapshot writes (`GET /repos/../issues`)."""
+        row = {"number": number, "body": body,
+               "labels": [{"name": name} for name in labels]}
+        if summary is not ...:
+            row["issue_dependencies_summary"] = summary
+        return row
+
+    def _sum(open_blockers, total=None):
+        return {"blocked_by": open_blockers, "blocking": 0,
+                "total_blocked_by": open_blockers if total is None else total, "total_blocking": 0}
+
+    # (1) THE REGRESSION THIS EXISTS FOR — a native edge with NO body marker must hold the issue.
+    _rows, _ = _blockers([_rest(40, body="no marker here", summary=_sum(1))])
+    chk("[#4329] a NATIVE blocked_by edge with no body marker holds the issue",
+        [row["open_blockers"] for row in _rows], [1])
+    # ...and it reaches the FRONTIER, not merely the row dict: a correct count nothing consults
+    # is precisely the bug being fixed.
+    _ready_labels = ("status:ready", "role:impl", "priority:P1", "area:usage")
+    _rows, _ = _blockers([_rest(40, body="", summary=_sum(1), labels=_ready_labels)])
+    chk("[#4329] ...and compute_ready() HOLDS it end-to-end",
+        [it["number"] for it in compute_ready(_rows)], [])
+    _rows, _ = _blockers([_rest(40, body="", summary=_sum(0), labels=_ready_labels)])
+    chk("[#4329] ...while the same issue with no native edge IS dispatched",
+        [it["number"] for it in compute_ready(_rows)], [40])
+    # (2) UNION, never replace: 3 live sparq issues are marker-only, so a replacement drops them.
+    _rows, _ = _blockers([_rest(41, labels=("role:impl",)),
+                          _rest(42, body="Blocked-by: #41", summary=_sum(0),
+                                labels=_ready_labels)])
+    chk("[#4329] a MARKER-only edge (native says zero) still holds the issue",
+        ([row["open_blockers"] for row in _rows], [it["number"] for it in compute_ready(_rows)]),
+        ([0, 1], []))
+    # (3) a CLOSED blocker must NOT hold the child on either channel. Native: `blocked_by` counts
+    # only open blockers while `total_blocked_by` counts the closed one (MEASURED on 16 live
+    # sparq issues, e.g. #3264 blocked_by=0 total_blocked_by=1). Marker: #43 is not in the snapshot.
+    _rows, _ = _blockers([_rest(44, body="Blocked-by: #43", summary=_sum(0, total=2),
+                                labels=_ready_labels)])
+    chk("[#4329] an issue whose ONLY blocker is CLOSED is NOT held",
+        ([row["open_blockers"] for row in _rows], [it["number"] for it in compute_ready(_rows)]),
+        ([0], [44]))
+    # (4) union arithmetic over every channel combination, through the workflow block itself.
+    _rows, _ = _blockers([_rest(50, body="", summary=...),
+                          _rest(51, body="", summary=_sum(0)),
+                          _rest(52, body="", summary=_sum(3)),
+                          _rest(53, body="Blocked-by: #50", summary=_sum(0)),
+                          _rest(54, body="Blocked-by: #50", summary=_sum(3)),
+                          _rest(55, body="Blocked-by: #99999", summary=_sum(0))])
+    chk("[#4329] the block unions both channels and never replaces either",
+        [row["open_blockers"] for row in _rows], [0, 0, 3, 1, 3, 0])
+    # (5) a PRESENT-but-malformed summary FAILS CLOSED (holds), and says why.
+    _rows, _text = _blockers([_rest(60, summary={"blocked_by": -1}, labels=_ready_labels),
+                              _rest(61, summary={"blocked_by": "1"}, labels=_ready_labels),
+                              _rest(62, summary={"blocked_by": True}, labels=_ready_labels),
+                              _rest(63, summary=["not", "a", "dict"], labels=_ready_labels)])
+    chk("[#4329] a malformed native summary holds the issue instead of admitting it",
+        ([row["open_blockers"] for row in _rows],
+         [it["number"] for it in compute_ready(_rows)],
+         _text.count("fail-closed"), "o/t#63" in _text),
+        ([1, 1, 1, 1], [], 4, True))
+    # (6) the DARK-CHANNEL alarm — absent on EVERY row is a schema regression, not a quiet repo.
+    _, _dark = _blockers([_rest(70, summary=...), _rest(71, summary=...)])
+    chk("[#4329] a snapshot with no native-dependency data raises the DARK alarm",
+        ("::warning::o/t: NATIVE BLOCKER CHANNEL IS DARK" in _dark, "none of 2 open" in _dark,
+         "LIT" in _dark),
+        (True, True, False))
+    _, _lit = _blockers([_rest(70, summary=...), _rest(71, summary=_sum(1))])
+    chk("[#4329] one row carrying the summary keeps the channel LIT, and it is reported at ZERO",
+        ("DARK" in _lit,
+         "o/t: native blocker channel: LIT (1 of 2 open issue(s) held by a blocker)" in _lit),
+        (False, True))
+    _, _empty = _blockers([])
+    chk("[#4329] an empty snapshot never fabricates a DARK alarm", "DARK" in _empty, False)
+    # (7) the fail-closed field validation the block inherited must survive the rewrite.
+    _malformed = ""
+    try:
+        _blockers([{"number": 0, "body": "", "labels": []}])
+    except SystemExit as exc:
+        _malformed = str(exc)
+    chk("[#4329] a malformed issue number still kills the sweep, fail-closed",
+        _malformed, "target issue fields are malformed")
 
     # issue #112: a MULTI-area issue reserves the serializing GLOBAL partition, NOT the
     # alphabetically-first area — else a busy secondary area (here 'worker') could not exclude

@@ -231,9 +231,13 @@ DEFERRED_GATED = BUSY_OR_GATED - {"status:deferred", "status:parked"}
 # Readiness re-derivation (issue #102): PLAN computes blockers/non-dispatchability with HOSTILE
 # target code (dispatch-plan.py in the cloned target). CLAIM must independently re-prove the same
 # readiness predicate from LIVE registry-owned code before dispatch — an epic is a tracking
-# umbrella (never a work item), and `Blocked-by: #N` gates until every referenced issue is closed.
-# Kept byte-identical to scripts/ready-issues.py (NON_DISPATCHABLE + the blocker regex) so CLAIM
-# and the ready engine cannot silently diverge.
+# umbrella (never a work item), and an open blocker gates the row until it is closed. Open blockers
+# are the UNION of GitHub's NATIVE dependency edges and the legacy `Blocked-by: #N` body markers
+# (sparq issue #4329) — CLAIM read the markers ALONE, so a dependency the maintainer added through
+# GitHub's native UI passed the authoritative gate. The rule is kept semantically identical to
+# scripts/ready-issues.py (NON_DISPATCHABLE + the blocker regex + the native summary) so CLAIM and
+# the ready engine cannot silently diverge; CLAIM must never be the WEAKER of the two, because it
+# is the backstop that catches a planner regression.
 NON_DISPATCHABLE = "kind:epic"
 BLOCKED_BY_RE = re.compile(r"[Bb]locked-by:\s*#([0-9]+)")
 # Cross-provider chains (locked decisions 14/17): the review chain is the INVERSE of the
@@ -2260,6 +2264,33 @@ def _open_blockers(repo, body):
     return still_open
 
 
+def _native_open_blockers(repo, issue):
+    """OPEN blockers from GitHub's NATIVE dependency edges, off the LIVE issue payload CLAIM
+    already fetched (sparq issue #4329) — zero extra requests.
+
+    `issue_dependencies_summary.blocked_by` counts only OPEN blockers (`total_blocked_by` counts
+    closed ones too), so a satisfied dependency never holds a row. MEASURED over all 1368 open
+    sparq issues: the field's set and per-issue counts are identical to GraphQL `blockedBy`
+    filtered to state=OPEN.
+
+    ABSENT summary -> 0: an older API response carries no native data and the marker channel still
+    speaks. PRESENT-but-malformed -> DispatchError, so the item DEFERS: a schema CLAIM cannot
+    interpret is not proof the row is unblocked, and admitting it is the fail-OPEN direction.
+    """
+    summary = issue.get("issue_dependencies_summary")
+    if summary is None:
+        return 0
+    number = issue.get("number")
+    if not isinstance(summary, dict):
+        raise DispatchError(
+            f"{repo}#{number} issue_dependencies_summary is not an object (unreadable)")
+    value = summary.get("blocked_by")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise DispatchError(
+            f"{repo}#{number} issue_dependencies_summary.blocked_by is unreadable ({value!r})")
+    return value
+
+
 def _current_issue_matches(repo, item, trusted_bots, allow_actions_bot_issues=False):
     issue = _gh_json(["api", f"repos/{repo}/issues/{item['number']}"])
     if not isinstance(issue, dict) or "pull_request" in issue or issue.get("state") != "open":
@@ -2282,9 +2313,18 @@ def _current_issue_matches(repo, item, trusted_bots, allow_actions_bot_issues=Fa
     # a deferred-retry of a re-blocked or epic issue must fail closed exactly like a fresh one.
     if NON_DISPATCHABLE in labels:
         return False, "issue is a non-dispatchable epic"
+    # UNION, never replace (sparq #4329): the marker channel still carries live edges, and the
+    # fail-safe direction is one-way — MISSING an edge dispatches a genuinely blocked issue, while
+    # over-counting one only defers it to the next tick.
     blocked = _open_blockers(repo, body)
-    if blocked:
-        return False, "issue has unresolved blockers: " + ", ".join(f"#{n}" for n in blocked)
+    native = _native_open_blockers(repo, issue)
+    if blocked or native:
+        detail = []
+        if blocked:
+            detail.append(", ".join(f"#{n}" for n in blocked))
+        if native:
+            detail.append(f"{native} open native dependency edge(s)")
+        return False, "issue has unresolved blockers: " + "; ".join(detail)
     if item["deferred"]:
         # Deferred-retry (locked decision 20): status:deferred IS the trigger; every other
         # busy/gated label still fails closed. CLAIM flips deferred->ready on dispatch.
@@ -6857,6 +6897,58 @@ def _self_test():
             pass
     # the parser is byte-identical to the ready engine's blocker regex (no silent divergence)
     assert BLOCKED_BY_RE.findall("Blocked-by: #7 and blocked-by:#8") == ["7", "8"]
+    # ------------------------------------------------------------------------------------------
+    # [sparq #4329] NATIVE dependency edges at the AUTHORITATIVE gate. CLAIM re-derived blockers
+    # from the BODY alone, so a dependency added through GitHub's native UI passed the very check
+    # that exists to catch a planner regression. Every row here goes through the real
+    # _current_issue_matches, and each dies on a one-token flip.
+    # ------------------------------------------------------------------------------------------
+    def dep_summary(open_blockers, total=None):
+        return {"blocked_by": open_blockers, "blocking": 0,
+                "total_blocked_by": open_blockers if total is None else total, "total_blocking": 0}
+
+    def native_issue(summary, body=plain_body, labels=None):
+        base = ready_issue(labels or ready_labels, body)
+        if summary is not None:
+            base["issue_dependencies_summary"] = summary
+        base["number"] = item102["number"]
+        return base
+
+    # (1) THE REGRESSION: a native edge with NO body marker must gate the row.
+    nat_ok, nat_reason = match_with(native_issue(dep_summary(2)), {}, item102)
+    assert not nat_ok and "2 open native dependency edge(s)" in nat_reason, nat_reason
+    # (2) ...and the same row with no native edge still dispatches (the gate is not blanket).
+    clear_ok, clear_reason = match_with(native_issue(dep_summary(0)), {}, item102)
+    assert clear_ok, clear_reason
+    # (3) UNION, never replace: the marker channel keeps gating when the native count is zero.
+    mk_ok, mk_reason = match_with(
+        native_issue(dep_summary(0), body=blk_body), {42: {"state": "open"}}, blk_item)
+    assert not mk_ok and "#42" in mk_reason, mk_reason
+    # ...and both channels are reported when both fire.
+    both_ok, both_reason = match_with(
+        native_issue(dep_summary(1), body=blk_body), {42: {"state": "open"}}, blk_item)
+    assert not both_ok and "#42" in both_reason \
+        and "1 open native dependency edge(s)" in both_reason, both_reason
+    # (4) a CLOSED blocker holds nothing on either channel: `blocked_by` excludes closed blockers
+    # even while `total_blocked_by` counts them (MEASURED on 16 live sparq issues).
+    sat_ok, sat_reason = match_with(
+        native_issue(dep_summary(0, total=3), body=blk_body), {42: {"state": "closed"}}, blk_item)
+    assert sat_ok, sat_reason
+    # (5) an ABSENT summary is not an error — the marker channel alone still decides.
+    absent_ok, absent_reason = match_with(native_issue(None), {}, item102)
+    assert absent_ok, absent_reason
+    # (6) a PRESENT-but-malformed summary FAILS CLOSED: DispatchError defers the item rather than
+    # admitting a row CLAIM cannot prove unblocked.
+    for bad in ({"blocked_by": -1}, {"blocked_by": "1"}, {"blocked_by": True},
+                {"blocked_by": None}, ["not", "a", "dict"]):
+        try:
+            match_with(native_issue(bad), {}, item102)
+            raise AssertionError(f"malformed dependency summary {bad!r} must fail closed")
+        except DispatchError:
+            pass
+    # (7) CLAIM must never be WEAKER than the ready engine on this predicate.
+    assert _native_open_blockers("o/t", {"issue_dependencies_summary": dep_summary(4)}) == 4
+    assert _native_open_blockers("o/t", {}) == 0
     # A DRAFT worker PR must land in linked_open_prs (dedupes issue re-dispatch) while the SAME PR
     # is separately enumerated as a review_item — the two enumerations must not fight (the issue
     # stays busy in status:in-progress-review while the PR cycles). Linking is draft-agnostic, so

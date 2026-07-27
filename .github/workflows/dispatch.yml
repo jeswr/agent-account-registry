@@ -294,10 +294,60 @@ jobs:
                   issue for issue in snapshot("issues", index)
                   if isinstance(issue, dict) and "pull_request" not in issue
               ]
+              # NATIVE GitHub dependency edges, UNIONED with the legacy `Blocked-by: #NN` body
+              # markers. Until this landed, THIS LINE was the whole of the dispatcher's notion of
+              # "blocked": a regex over the issue BODY. GitHub issue dependencies are generally
+              # available and the maintainer uses the native UI, so a dependency added that way
+              # had ZERO effect on dispatch (sparq issue #4329). MEASURED 2026-07-26 over all
+              # 1368 open sparq issues (cursor-paginated, len == GraphQL totalCount): 112 issues
+              # carry a native edge (170 edges), and of the 427 issues created since 2026-07-20,
+              # 0 carry a native edge and 1 carries a marker — the marker channel is effectively
+              # dead for new work while the native channel is the one being written.
+              #
+              # UNION, never replace: 3 open sparq issues (#2833/#2975/#3817) carry a marker with
+              # no native edge. The fail-safe direction is one-way — the readiness engine keys on
+              # `open_blockers > 0`, so MISSING an edge dispatches an issue that is genuinely
+              # blocked, while OVER-counting one only delays it.
+              #
+              # `issue_dependencies_summary` rides along in the REST list payload the snapshot
+              # step already writes, so this costs ZERO extra requests. Its `blocked_by` counts
+              # only OPEN blockers (`total_blocked_by` counts closed ones too) — MEASURED against
+              # GraphQL `blockedBy` filtered to state=OPEN over all 1368 open issues: identical
+              # sets AND identical per-issue counts, with 16 issues showing
+              # total_blocked_by > blocked_by. So a CLOSED blocker never holds its child.
+              #
+              # >>> blocker-union — EXECUTED by scripts/dispatch-plan.py --self-test. The block is
+              # the SCHEDULED path; a pure-python assertion elsewhere cannot see it, and every
+              # uncaught mutant in this repo's history has lived at the YAML seam. Removing either
+              # sentinel makes that extraction FAIL CLOSED. Keep the block self-contained: `raw`,
+              # `repo`, `label_names` and `re` are its only inputs; it produces `open_numbers`,
+              # `readiness_input` and `details`.
               open_numbers = {
                   issue.get("number") for issue in raw
                   if isinstance(issue.get("number"), int)
               }
+
+              def native_open_blockers(issue, repo):
+                  # ABSENT summary -> 0 (this snapshot carries no native-dependency data, so only
+                  # the marker channel can speak). PRESENT-but-malformed -> 1 unknown blocker:
+                  # reading an uninterpretable schema as "zero blockers" is the fail-OPEN
+                  # direction, so the issue is HELD, loudly, until a human looks.
+                  summary = issue.get("issue_dependencies_summary")
+                  if summary is None:
+                      return 0
+                  number = issue.get("number")
+                  if not isinstance(summary, dict):
+                      print(f"::warning::{repo}#{number}: issue_dependencies_summary is not an "
+                            "object — holding the issue (fail-closed)")
+                      return 1
+                  value = summary.get("blocked_by")
+                  if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                      print(f"::warning::{repo}#{number}: issue_dependencies_summary.blocked_by "
+                            f"is {value!r}, not a non-negative int — holding the issue "
+                            "(fail-closed)")
+                      return 1
+                  return value
+
               details = {}
               readiness_input = []
               for issue in raw:
@@ -307,13 +357,38 @@ jobs:
                       raise SystemExit("target issue fields are malformed")
                   labels = label_names(issue)
                   blockers = re.findall(r"[Bb]locked-by:\s*#([0-9]+)", body)
+                  marker_open = sum(int(blocker) in open_numbers for blocker in blockers)
                   readiness_input.append({
                       "number": number,
                       "state": "OPEN",
                       "labels": labels,
-                      "open_blockers": sum(int(blocker) in open_numbers for blocker in blockers),
+                      # `max` IS the union for the only decision made from this number: the engine
+                      # holds the issue iff native > 0 or marker_open > 0, i.e. iff max > 0. It is
+                      # a lower bound on the cardinality of the union of the two blocker SETS (the
+                      # native channel reports a count, not numbers), which can only understate a
+                      # delay — never flip a held issue to ready. MEASURED: 0 of 1368 open issues
+                      # have the two channels disagreeing on the count.
+                      "open_blockers": max(native_open_blockers(issue, repo), marker_open),
                   })
                   details[number] = (issue, labels, body)
+              # The GUARD against the native channel going DARK unnoticed: an absent summary reads
+              # as 0, which is indistinguishable from "GitHub renamed the field" unless somebody
+              # checks. MEASURED: present on 1368/1368 open sparq ISSUES (and 0/104 PR rows, which
+              # `raw` already excludes), so "no row carries it" is a schema regression. Printed on
+              # EVERY tick including the healthy one — a check that is silent when it passes is a
+              # check nobody notices has stopped running.
+              if raw and not any(
+                      isinstance(issue.get("issue_dependencies_summary"), dict) for issue in raw):
+                  print(f"::warning::{repo}: NATIVE BLOCKER CHANNEL IS DARK — none of {len(raw)} "
+                        "open issues carries `issue_dependencies_summary`. Native GitHub "
+                        "dependencies are being IGNORED and only `Blocked-by: #NN` body markers "
+                        "can hold an issue: a maintainer's native dependency edits have no "
+                        "effect on dispatch until this is fixed.")
+              else:
+                  print(f"{repo}: native blocker channel: LIT "
+                        f"({sum(1 for row in readiness_input if row['open_blockers'])} of "
+                        f"{len(readiness_input)} open issue(s) held by a blocker)")
+              # <<< blocker-union
 
               pulls = snapshot("pulls", index)
               linked = linked_issue_numbers(pulls, repo)
