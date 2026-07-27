@@ -44,6 +44,7 @@
 # routing, close-ONLY-on-an-explicitly-healthy-census, sanitized fail-loud `gh` wrapper, and a
 # soft-fail on a successful-but-malformed `gh issue list`.
 import argparse
+import importlib.util
 import json
 import os
 import subprocess
@@ -88,6 +89,59 @@ OTHER_OWNED_STATUS = {"status:deferred", "status:parked", "status:in-progress",
 # exit never leaves dozens of machine-owed rows standing, and never leaves one standing for days.
 STOCK_THRESHOLD = 25
 MAX_AGE_DAYS = 3.0
+#   * UNATTRIBUTABLE — [#809] the subset of the machine-owed stock that the CURATOR, not the
+#     classifier, provably cannot complete. `curate-frontier.py` mints an issue's
+#     `priority:*`/`role:*`/`area:*` in one write, and it manufactures the first two
+#     unconditionally (`priority_for` always returns P2 or P3; `role_for` always returns a role) —
+#     so `area:` is the ONLY input of the three it cannot produce for itself. An issue whose text
+#     names no area is therefore terminal for BOTH lanes at once, and it is invisible in the two
+#     counts above because it is indistinguishable there from a row that is merely waiting.
+#     MEASURED on this board 2026-07-27: 122 of the machine-owed rows are in this state.
+#     Its own threshold because it is its own failure: the stock bar can be met by draining
+#     attributable work while this population never moves, which is precisely how 68 issues sat
+#     behind an `##[warning]` that fired every run and changed nothing.
+UNATTRIBUTABLE_THRESHOLD = 20
+# How many issue numbers the alert body names before folding the rest into a count. Mirrors
+# `curate-frontier.MAX_REFUSAL_LINES`; an issue body that lists 122 numbers is skimmed like the
+# warning it replaces.
+_WORKLIST_CAP = 20
+
+# The curator's own attribution rule, so this alarm can never report a different population from
+# the one the curator actually refuses. Same reason `census` takes `classify=static_triage.triage`
+# rather than reimplementing completeness: a second copy of a predicate is a second thing to drift.
+_CURATOR_PATH = Path(__file__).resolve().parent / "curate-frontier.py"
+
+
+_CURATOR = None
+
+
+def _load_curator():
+    """The curator module, loaded once. An unimportable sibling raises, exactly as the module-scope
+    `import triage` above already does: this script's whole purpose is measuring the curate/triage
+    lanes, and a census computed without one of them is not a healthier census, it is a blind one.
+    """
+    global _CURATOR
+    if _CURATOR is None:
+        spec = importlib.util.spec_from_file_location("registry_curate_frontier", _CURATOR_PATH)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _CURATOR = module
+    return _CURATOR
+
+
+def area_vocabulary(issues):
+    """The `area:*` labels IN USE on the board — the curator's declared-area vocabulary, read from
+    the issues this alarm already holds rather than from a second `gh` call it would have to
+    budget for.
+
+    This UNDER-approximates the repository's label set (a declared-but-unused area is missing), and
+    that direction is the safe one for an ALARM: a missing vocabulary entry can only make
+    `derive_area` decline an issue it would otherwise resolve, so the count can be too HIGH and
+    never too low. An alarm that over-reports is noticed; one that under-reports is the defect
+    being measured.
+    """
+    return {label for issue in issues if isinstance(issue, dict)
+            for label in _labels(issue) if label.startswith("area:")}
 
 
 def _labels(issue):
@@ -117,7 +171,7 @@ def _age_days(created_at, now):
     return (now - stamp).total_seconds() / 86400.0
 
 
-def census(issues, now, classify=static_triage.triage, known_labels=None):
+def census(issues, now, classify=static_triage.triage, known_labels=None, derive_area=None):
     """The POPULATION measurement, per state, with timestamps. Pure.
 
     Returns a dict with `machine_owed` (the count this alert keys on), `unclassifiable` (the
@@ -141,6 +195,10 @@ def census(issues, now, classify=static_triage.triage, known_labels=None):
     machine_gated = gated_ec2 = 0
     oldest_age = None
     oldest_number = None
+    if derive_area is None:
+        derive_area = _load_curator().derive_area
+    vocabulary = area_vocabulary(issues)
+    unattributable = []
     for issue in issues:
         if not isinstance(issue, dict) or "pull_request" in issue:
             continue
@@ -157,6 +215,16 @@ def census(issues, now, classify=static_triage.triage, known_labels=None):
         if NON_DISPATCHABLE in labels or (labels & OTHER_OWNED_STATUS):
             continue                                   # another lane owns the row
         machine_owed += 1
+        # [#809] `area:` is the one input NEITHER lane can manufacture, so this subset is terminal
+        # for both. A `derive_area` that RAISES on a malformed row counts the row as
+        # unattributable, the same fail-toward-alerting default `_age_days` uses: an unreadable row
+        # is not evidence of health.
+        try:
+            attributed = derive_area(issue, labels, vocabulary)[0]
+        except Exception:
+            attributed = None
+        if attributed is None:
+            unattributable.append(issue.get("number"))
         try:
             result = classify(labels, "task", trusted=True, known_labels=known_labels)
             complete = bool(result.get("ready"))
@@ -171,6 +239,10 @@ def census(issues, now, classify=static_triage.triage, known_labels=None):
         "untriaged": untriaged,
         "machine_owed": machine_owed,
         "unclassifiable": unclassifiable,
+        "unattributable": len(unattributable),
+        # The WORKLIST, not just the number. The `##[warning]` this replaces named 5 issues and an
+        # ellipsis, so nobody could act on it even having read it.
+        "unattributable_numbers": sorted(n for n in unattributable if isinstance(n, int)),
         "machine_gated": machine_gated,
         "gated_ec2": gated_ec2,
         "oldest_age_days": oldest_age,
@@ -178,11 +250,15 @@ def census(issues, now, classify=static_triage.triage, known_labels=None):
     }
 
 
-def breached(counts, stock_threshold=STOCK_THRESHOLD, max_age_days=MAX_AGE_DAYS):
+def breached(counts, stock_threshold=STOCK_THRESHOLD, max_age_days=MAX_AGE_DAYS,
+             unattributable_threshold=UNATTRIBUTABLE_THRESHOLD):
     """The reasons this census is unhealthy, as a sorted list ([] == healthy).
 
-    Two INDEPENDENT conditions, OR-ed. Either one alone is a broken exit, so neither may mask the
-    other: a stock bar alone misses a slow leak, and an age bar alone misses an undrained burst.
+    Three INDEPENDENT conditions, OR-ed. Each alone is a broken exit and none may mask another: a
+    stock bar alone misses a slow leak; an age bar alone misses an undrained burst; and BOTH are
+    satisfied by draining the attributable half of the queue while the unattributable half — which
+    no lane in this estate can ever drain — stands still. [#809] That third case is not
+    hypothetical: it is the state this board is in.
     """
     reasons = []
     if counts["machine_owed"] > stock_threshold:
@@ -193,6 +269,15 @@ def breached(counts, stock_threshold=STOCK_THRESHOLD, max_age_days=MAX_AGE_DAYS)
         reasons.append(
             f"age: #{counts['oldest_number']} has been {UNTRIAGED} for {age:.1f} days "
             f"> {max_age_days}")
+    # `.get`, not `[...]`: a caller holding a census dict from before this key existed (a replayed
+    # snapshot) must not crash the alarm — it simply cannot breach on a signal it never measured.
+    unattributable = counts.get("unattributable", 0)
+    if unattributable > unattributable_threshold:
+        reasons.append(
+            f"unattributable: {unattributable} machine-owed issue(s) name no `area:` the curator "
+            f"can derive > {unattributable_threshold} — `curate-frontier.py` mints "
+            "`priority:`/`role:`/`area:` in ONE write and can manufacture the first two but never "
+            "the third, so these can never be staged by any lane until an `area:` is attributed")
     return sorted(reasons)
 
 
@@ -238,6 +323,21 @@ def render_body(counts, reasons, run_url, maintainer):
         "this alert exists to measure. If it grows, audit "
         "`curate-frontier.is_ec2_measurement`",
     ]
+    # [#809] THE TERMINAL SUBSET, NAMED. Reported even at zero: a line that disappears when
+    # healthy cannot be told apart from a line that was never computed.
+    worklist = counts.get("unattributable_numbers") or []
+    shown = ", ".join(f"#{number}" for number in worklist[:_WORKLIST_CAP])
+    if len(worklist) > _WORKLIST_CAP:
+        shown += f" (+{len(worklist) - _WORKLIST_CAP} more)"
+    lines.append(
+        f"- of the machine-owed rows, those naming no derivable `area:`: "
+        f"**{counts.get('unattributable', 0)}** — `curate-frontier.py` writes an issue's "
+        "`priority:*`, `role:*` and `area:*` in ONE mutation and manufactures the first two "
+        "unconditionally, so `area:` is the only one of the three it cannot produce for itself. "
+        "These rows are terminal for BOTH lanes at once and are what an `##[warning]` naming five "
+        "issues and an ellipsis could never make actionable. Attributing ONE `area:` label to any "
+        "of them is sufficient to make it stageable"
+        + (f": {shown}" if shown else ""))
     if counts["oldest_age_days"] is not None:
         lines.append(
             f"- oldest member: #{counts['oldest_number']}, {counts['oldest_age_days']:.1f} days")
@@ -407,8 +507,9 @@ def _self_test():
 
     now = datetime(2026, 7, 27, 18, 0, tzinfo=timezone.utc)
 
-    def iss(number, labels, created="2026-07-27T17:00:00Z", pr=False):
-        row = {"number": number, "labels": [{"name": n} for n in labels], "created_at": created}
+    def iss(number, labels, created="2026-07-27T17:00:00Z", pr=False, title=""):
+        row = {"number": number, "labels": [{"name": n} for n in labels], "created_at": created,
+               "title": title}
         if pr:
             row["pull_request"] = {}
         return row
@@ -436,8 +537,11 @@ def _self_test():
         census([iss(1, ["status:untriaged", "status:deferred"])], now)["machine_owed"], 0)
     chk("a status:available account record is not machine-owed",
         census([iss(1, ["status:untriaged", "status:available"])], now)["machine_owed"], 0)
+    # Compared as a WHOLE dict on purpose: it pins the census SHAPE, so a key added later cannot
+    # slip in un-zeroed on the empty board.
     chk("a PR row is never censused", census([iss(1, ["status:untriaged"], pr=True)], now),
         {"untriaged": 0, "machine_owed": 0, "unclassifiable": 0,
+         "unattributable": 0, "unattributable_numbers": [],
          "machine_gated": 0, "gated_ec2": 0,
          "oldest_age_days": None, "oldest_number": None})
 
@@ -487,11 +591,56 @@ def _self_test():
     chk("a missing age never breaches on its own",
         breached({**healthy, "oldest_age_days": None}), [])
 
+    # ---- [#809] THE UNATTRIBUTABLE SUBSET: counted, keyed on, and named ------------------------
+    # The census key. An untriaged row whose TITLE names a declared area is attributable; the same
+    # row with a title naming none is not. Both are machine-owed, so `machine_owed` cannot tell
+    # them apart — which is the whole point of the key.
+    attributable = census(
+        [iss(1, ["status:untriaged", "area:groom"]),
+         iss(2, ["status:untriaged"], title="groom: the sweep double-counts")], now)
+    chk("an issue carrying an area label is not unattributable",
+        attributable["unattributable"], 0)
+    chk("...nor is one whose title names an area the board declares",
+        attributable["machine_owed"], 2)
+    opaque = census([iss(7, ["status:untriaged", "area:groom"]),
+                     iss(8, ["status:untriaged"], title="Stop the double-counting")], now)
+    chk("an issue naming no derivable area IS counted", opaque["unattributable"], 1)
+    chk("...and is NAMED, so the alert is a worklist rather than a number",
+        opaque["unattributable_numbers"], [8])
+    chk("...while the rest of the machine-owed stock is unaffected", opaque["machine_owed"], 2)
+    # THE VOCABULARY COMES FROM THE BOARD. Issue 8's title names `groom`, but only because issue 7
+    # carries `area:groom` is `groom` in the vocabulary at all — drop that row and the SAME title
+    # is unattributable. This is what pins `area_vocabulary` to the board instead of a hardcoded
+    # list, and it is the direction that fails toward alerting.
+    chk("an area absent from the whole board is not a vocabulary the curator may use",
+        census([iss(8, ["status:untriaged"], title="groom: the sweep double-counts")],
+               now)["unattributable"], 1)
+    # A `derive_area` that RAISES counts the row rather than silently passing it.
+    chk("a derive_area that raises fails toward alerting",
+        census([iss(9, ["status:untriaged"])], now,
+               derive_area=lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+               )["unattributable"], 1)
+    # The threshold, strict like the stock bar, and INDEPENDENT of the other two.
+    chk("unattributable is a STRICT threshold (== the bar is healthy)",
+        breached({**healthy, "unattributable": UNATTRIBUTABLE_THRESHOLD}), [])
+    chk("UNATTRIBUTABLE ALONE breaches — a queue draining its attributable half while this one "
+        "stands still satisfies both other bars",
+        [r.split(":")[0] for r in
+         breached({**healthy, "unattributable": UNATTRIBUTABLE_THRESHOLD + 1})],
+        ["unattributable"])
+    # A census dict from before this key existed must not crash the alarm.
+    chk("a legacy census without the key cannot breach on it",
+        breached({k: v for k, v in healthy.items()}), [])
+
     # THE LIVE SHAPE. The board that produced this script must trip it — a threshold pair that
     # calls the measured outage healthy would be a vacuous alert.
     live = census([iss(n, ["status:untriaged", "role:impl"], "2026-07-13T23:49:56Z")
                    for n in range(1, 275)], now)
-    chk("the MEASURED 2026-07-27 board trips both conditions", len(breached(live)), 2)
+    chk("the MEASURED 2026-07-27 board trips all three conditions", len(breached(live)), 3)
+    # …and the THIRD one is the one that names the terminal subset. These fixtures carry no
+    # `area:*` label and a title (`iss`) that names none either, which is exactly the live shape.
+    chk("...including the unattributable condition, which the other two cannot express",
+        [r.split(":")[0] for r in breached(live)], ["age", "stock", "unattributable"])
 
     # ---- decide -------------------------------------------------------------------------------
     chk("breach with no open alert -> upsert", decide(["stock: x"], False), "upsert")
@@ -548,6 +697,26 @@ def _self_test():
     chk("the body reports the gated exclusion and attributes the machine-written half",
         ("**3**" in gated_body and "**2**" in gated_body
          and MACHINE_WRITTEN_GATE in gated_body and "never keyed on" in gated_body), True)
+    # [#809] THE WORKLIST IS IN THE ARTIFACT A HUMAN READS, not only in the returned dict — the
+    # exact failure of the `##[warning]` this replaces. Deleting the census line from render_body,
+    # or dropping `unattributable_numbers` from the census, reds this.
+    opaque_body = render_body(
+        census([iss(1, ["status:untriaged", "area:groom"]),
+                iss(41, ["status:untriaged"]), iss(42, ["status:untriaged"])], now),
+        ["stock: x"], "", "jeswr")
+    chk("the body names the unattributable count AND the issues, not just the count",
+        ("**2**" in opaque_body and "#41" in opaque_body and "#42" in opaque_body), True)
+    # The cap folds the tail into an accurate count rather than truncating into an ellipsis.
+    capped = render_body(
+        census([iss(n, ["status:untriaged"]) for n in range(1, _WORKLIST_CAP + 4)], now),
+        ["stock: x"], "", "jeswr")
+    chk("...and the display cap reports the REST accurately instead of trailing off",
+        f"(+3 more)" in capped and f"#{_WORKLIST_CAP}" in capped, True)
+    # Reported even at ZERO: a line that vanishes when healthy cannot be distinguished from a line
+    # that was never computed — the exact ambiguity that let this population hide.
+    chk("the unattributable line is present even when the count is zero",
+        "naming no derivable `area:`" in render_body(
+            census([iss(1, ["status:untriaged", "area:groom"])], now), [], "", "jeswr"), True)
 
     # ---- AUTHORITY: this script writes no work-issue label ------------------------------------
     # Scan the OPERATIONAL half only — everything above `def _self_test(` — so the assertion is
