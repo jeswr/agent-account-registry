@@ -12,16 +12,6 @@
   },
   {
    "account": "51bde6688e140866",
-   "claim_id": "50d23299a9ca4cbfab91d588a862afec",
-   "holder": "sparq-org/sparq#2723@30240822834.1",
-   "package": "upstream",
-   "role": "impl",
-   "model": "opus5",
-   "issued_at": 1785131360,
-   "expires_at": 1785137660
-  },
-  {
-   "account": "51bde6688e140866",
    "claim_id": "7804b3e22e62409c86bd34b1530b5081",
    "holder": "fix:sparq-org/sparq#4354@dispatch-30240467437.1",
    "package": "sparq-core-store",
