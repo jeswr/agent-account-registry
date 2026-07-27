@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 4537,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a4b273957e4efb4f88c4e004c3c2f5b792ce047c",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`sketch_predicate` passes `(o, vector(o))` to `pool_weighted`, so the weight comes from metadata about the object entity. The design and existing `pool_weighted` contract define the key as the subject/head whose provenance qualifies the asserted value. Provenance attached to `ex:dubious` does not establish that the separate `ex:hub ex:cites ex:dubious` assertion is dubious. The new prose acknowledges and then changes this load-bearing meaning, producing a heuristic with different semantics rather than wiring `w(t)`. The test is therefore non-vacuous mechanically but validates the wrong invariant.",
+    "file": "crates/sparq-vectors/src/grounding.rs",
+    "fix_hint": "Represent or resolve provenance for each `(node, predicate, object)` assertion and pass the identifier whose provenance actually qualifies that assertion. If plain RDF cannot distinguish statement provenance, keep the uniform/no-op behavior or require an explicit reified/RDF-star provenance mapping; do not infer assertion confidence from the object entity's metadata. Replace the test fixture with two independently provenance-qualified edge assertions.",
+    "severity": "major",
+    "title": "Pooling weights entity provenance, not the asserted edge's provenance"
+   },
+   {
+    "body": "`predicate_block_weight` scans every triple with a predicate and stores their global mean in a shared `SchemaHeader`. That same multiplier is then returned for every grounded node, including nodes with no incident edge for that predicate. This contradicts the claimed design invariant that query-time scaling of a node's modality is derived from that node's incident-edge provenance. The end-to-end test hides the defect: it grounds `ex:solid` but gives its second block the weight derived solely from `ex:shaky ex:weak ex:y`, an edge not incident to `ex:solid`.",
+    "file": "crates/sparq-vectors/src/provenance.rs",
+    "fix_hint": "Compute weights at the node/block grounding boundary from that node's contributing edges, or introduce per-row/per-node weight storage if persistence is required. Do not put node-specific provenance into a graph-global schema header. Update the test so each returned weight is derived from the grounded node's actual block contributions and add a second node with different provenance to prove weights are not globally shared.",
+    "severity": "major",
+    "title": "A global predicate average cannot provide per-node incident-edge fusion weights"
+   },
+   {
+    "body": "The new text states that the training axis has a positive MRR delta clearing 2\u00b7se and that pooling has no measured lift at any blend. These are empirical performance outcomes from an unspecified work-box run, not stable API behavior or canonical checked evidence. The repository contract explicitly forbids hard-coded performance numbers and treats work-box/session results as non-canonical; encoding the conclusion in a public skill also risks becoming false as code, seeds, or fixtures change.",
+    "file": "skills/vector-search/SKILL.md",
+    "fix_hint": "Describe how to run the instrument and how to interpret its returned statistics without asserting the current observed outcome. If a canonical result is required, route it through the repository's approved benchmark artifact/ratchet and cite that generated evidence rather than hard-coding a local run's conclusion.",
+    "severity": "major",
+    "title": "Documentation publishes non-canonical measured performance conclusions"
+   }
+  ],
+  "progress": null,
+  "summary": "The new callers do not implement the documented per-triple/incident-edge provenance semantics. Pooling substitutes each object neighbour's own entity provenance for the provenance of the edge assertion, while header weighting computes one graph-global predicate weight and applies it to every node. The end-to-end tests encode those substitutions rather than validating the design invariant. The skill also publishes a session-specific measured outcome, contrary to the repository's non-canonical performance-evidence rule.",
+  "verdict": "request_changes"
+ }
+}
