@@ -4953,7 +4953,7 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 # otherwise turn a requested fix into a review during this safety transition.
                 _run_target_helper(script_dir, repo, "worker-pr.py", [
                     "disarm", "--repo", repo, "--pr", str(number), "--when", "always",
-                    "--preserve-review-state"])
+                    "--preserve-review-state", "--bot-login", bot_login])
                 draft = True
                 print(f"re-enter review {repo}#{number}: safely returned the ready PR to draft "
                       f"while preserving {item['state']}")
@@ -4987,7 +4987,8 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                     # review sweep only enumerates drafts. disarm --when always is idempotent +
                     # live-revalidated; the repair item re-admits next tick against the draft.
                     _run_target_helper(script_dir, repo, "worker-pr.py", [
-                        "disarm", "--repo", repo, "--pr", str(number), "--when", "always"])
+                        "disarm", "--repo", repo, "--pr", str(number), "--when", "always",
+                        "--bot-login", bot_login])
                     print(f"defer review {repo}#{number}: defused to draft for {item['state']}; "
                           "retried next tick")
                     continue
@@ -5553,12 +5554,76 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
     return launched
 
 
-def _apply_disarm_items(disarm_items, repo, script_dir, bot_login, disarm_counts=None):
+def _disarm_row_admissible(row, repo, pull, record, bot_login):
+    """[registry #570] Re-bind ONE hostile `disarm_items` row to LIVE state before CLAIM hands it
+    to the retraction helper.  Returns ``(True, "")`` only when every input below is present AND
+    provable; every other shape returns ``(False, reason)`` and the caller SKIPS the row.
+
+    The plan-side enumerator (`enumerate_disarm_items`) already applies the trusted-identity and
+    provenance checks — but its own docstring calls the rows it produces HOSTILE, and `validate_plan`
+    re-checks only SHAPE (positive ints, 40-hex SHAs, planned-repo membership, dedupe, ordering).
+    CLAIM is the layer that ACTS, so a control that lives only on the PLAN side is not a control on
+    this path at all: a forged row naming a foreign App's same-repo PR passed straight through.
+    These are therefore the SAME predicates, re-derived here against the tick's live open-pull
+    snapshot and the local provenance checkouts.
+
+    PURE (no I/O) and TOTAL — it runs per item inside the disarm sweep, where a raise would abort
+    the whole safety lane rather than skip one row.
+
+    Deliberately NOT re-derived here: the armed/ready bit and the merge-only carry-forward. Those
+    need authoritative GraphQL reads that only `worker-pr.py disarm` can make, and it re-derives
+    them itself; asserting them from the stale listing would fail-CLOSED on a live latch, which on
+    THIS net (the one whose act IS the safety measure) is the fail-open direction."""
+    if not bot_login:
+        return False, "no trusted App identity for this repo"
+    number = row.get("pr_number") if isinstance(row, dict) else None
+    if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
+        return False, "the plan row's pr_number is malformed"
+    if not isinstance(pull, dict):
+        return False, "the PR is absent from the live open-pull snapshot"
+    if pull.get("state") != "open":
+        return False, "the PR is not open in the live snapshot"
+    head = pull.get("head") or {}
+    if (head.get("repo") or {}).get("full_name") != repo:
+        # Fork gate first, as everywhere else: a fork head is attacker-controlled.
+        return False, "the live head is not in the target repo"
+    if not HEAD_REF_RE.match(str(head.get("ref", ""))):
+        return False, "the live head is not a same-repo worker branch"
+    if str((pull.get("user") or {}).get("login", "")) != bot_login:
+        # THE #570 defect: `[bot]` is a suffix shared by every App with write access here, so
+        # authorising on it aimed the redraft/disable-auto/relabel at a FOREIGN App's PR.
+        return False, "the live PR author is not the trusted App identity"
+    record_number = record.get("pr_number") if isinstance(record, dict) else None
+    # Strict int identity, bool excluded — the same float/bool-equality hazard the enumerator and
+    # provenance_admission_error guard against: 41.0 == 41 and True == 1 under a bare !=.
+    if (not isinstance(record_number, int) or isinstance(record_number, bool)
+            or record_number != number):
+        return False, "no local provenance record binds this PR number"
+    sha = str(head.get("sha", ""))
+    if not SAFE_SHA.fullmatch(sha):
+        return False, "the live head sha is malformed"
+    if row.get("head_sha") != sha:
+        return False, "the plan row's head sha is not the live head (stale/moved)"
+    reviewed = REVIEWED_SHA_RE.search(str(pull.get("body") or ""))
+    if (reviewed.group(1) if reviewed else "none") == sha:
+        return False, "the arm is bound to the live head — a valid arm is never disarmed"
+    return True, ""
+
+
+def _apply_disarm_items(disarm_items, repo, script_dir, bot_login, disarm_counts=None, *,
+                        pull_pages, provenance):
     """GAP-C (registry issue #42): retract stale GitHub auto-merge latches BEFORE any fix/review
-    admission each sweep. The plan rows are HOSTILE — worker-pr.py `disarm --when mismatch`
-    re-derives every precondition from the LIVE API (open same-repo bot worker PR, armed OR
-    ready with an interrupted disarm, head != reviewed-sha marker) and is a no-op otherwise, so a
-    spoofed row can never disarm a validly-armed PR. A human hold (review:needs-user / needs:user)
+    admission each sweep. The plan rows are HOSTILE — `_disarm_row_admissible` re-binds each row to
+    the tick's LIVE open-pull snapshot and the local provenance checkouts (registry #570), and
+    worker-pr.py `disarm --when mismatch --bot-login <app>` then re-derives every precondition from
+    the LIVE API (open same-repo worker PR authored by that EXACT App, armed OR ready with an
+    interrupted disarm, head != reviewed-sha marker) and is a no-op otherwise, so a spoofed row can
+    neither disarm a validly-armed PR nor reach another App's. `pull_pages`/`provenance` are the
+    SAME two views the rest of the tick reads (never a second derivation — that is the drift class
+    #707 exists to prevent) and are keyword-REQUIRED: a caller that cannot supply them must fail at
+    the call, not silently degrade the safety net to the plan's word.
+
+    A human hold (review:needs-user / needs:user)
     does NOT block this safety-only retraction (issue #105): --when mismatch retracts the latch
     while preserving the hold label. Failures skip the item (per-item resilience); the
     enumeration re-emits next tick until the invariant holds — including across a crash between
@@ -5566,12 +5631,19 @@ def _apply_disarm_items(disarm_items, repo, script_dir, bot_login, disarm_counts
 
     `disarm_counts` (issue #108) is the disarm lane's tick accumulator: `launched` when the
     live-revalidated retraction applied (or was a confirmed no-op), `error` when the helper RAISED,
-    `deferred` when no App token/bot identity was available to even attempt it. An `error` here is
+    `deferred` when no App token/bot identity was available to even attempt it — or when the row
+    could not be re-bound to live state (#570: unprovable is not actionable). An `error` here is
     safety-critical — a stale auto-merge latch that could not be retracted — so the caller surfaces
     disarm_counts['error'] to the tick-health recorder INDEPENDENTLY of the fleet dispatch count; a
     worker launch must never let a failed disarm read as a healthy tick."""
     if disarm_counts is None:
         disarm_counts = Counter()
+    live_pulls = {}
+    for page in pull_pages if isinstance(pull_pages, list) else []:
+        for pull in page if isinstance(page, list) else []:
+            number = pull.get("number") if isinstance(pull, dict) else None
+            if isinstance(number, int) and not isinstance(number, bool):
+                live_pulls[number] = pull
     for item in disarm_items:
         number = item["pr_number"]
         disarm_counts["planned"] += 1
@@ -5580,8 +5652,16 @@ def _apply_disarm_items(disarm_items, repo, script_dir, bot_login, disarm_counts
                 disarm_counts["deferred"] += 1
                 print(f"defer disarm {repo}#{number}: target App token unavailable")
                 continue
+            admissible, reason = _disarm_row_admissible(
+                item, repo, live_pulls.get(number),
+                provenance.get(number) if isinstance(provenance, dict) else None, bot_login)
+            if not admissible:
+                disarm_counts["deferred"] += 1
+                print(f"skip disarm {repo}#{number}: {reason} (fail closed)")
+                continue
             _run_target_helper(script_dir, repo, "worker-pr.py", [
-                "disarm", "--repo", repo, "--pr", str(number), "--when", "mismatch"])
+                "disarm", "--repo", repo, "--pr", str(number), "--when", "mismatch",
+                "--bot-login", bot_login])
             disarm_counts["launched"] += 1
             print(f"disarm {repo}#{number}: live armed-SHA invariant re-checked and applied")
         except DispatchError as exc:
@@ -6066,7 +6146,10 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
         # regardless of the worker/review/fix outcome below.
         _apply_disarm_items(
             [entry for entry in plan["disarm_items"] if entry["repo"] == repo],
-            repo, script_dir, bot_login, lanes["disarm"])
+            repo, script_dir, bot_login, lanes["disarm"],
+            # [registry #570] The hostile rows are re-bound to the SAME live pull view and the
+            # SAME provenance map the busy revalidation above reads — one derivation, no drift.
+            pull_pages=pull_pages, provenance=claim_provenance)
 
         # [registry #614] AUTOMATIC re-admission of MACHINE capacity parks whose starvation cause
         # has demonstrably cleared. It runs on the LIVE listing because PLAN's pure walk excludes
@@ -11754,8 +11837,12 @@ def _self_test():
             # trigger still live: the ready PR IS defused (disarm --when always), exactly once
             fake["check_runs"] = gate_red
             run_items([ci_item])
-            assert [(script, args[0], args[-1]) for script, args in helper_calls] == [
-                ("worker-pr.py", "disarm", "always")], helper_calls
+            # #570: the always-defuse leg also hands the helper the EXACT trusted App identity,
+            # so its author gate is that App and not any-`[bot]`.
+            assert [(script, args[0], args[args.index("--when") + 1],
+                     args[args.index("--bot-login") + 1] if "--bot-login" in args else None)
+                    for script, args in helper_calls] == [
+                ("worker-pr.py", "disarm", "always", "sparq-worker[bot]")], helper_calls
             # ==== THE BLOCKING FINDING, AT THE TITLED LEG ====
             # A stale, CONCLUDED-RED `gate, draft-tier` row on a READY, ARMED, cleanly-mergeable
             # PR must NOT defuse it. sparq's ci-summary.yml fail-closes a draft-tier run to
@@ -15234,9 +15321,21 @@ def _self_test():
     assert _chain_probe_exempt(["sol"], {}) is False                       # no catalog
 
     # ---- CLAIM disarm application (issue #42): runs per-item-resilient and token-gated; the
-    # live precondition re-derivation itself lives in worker-pr.py disarm (tested there) ----
+    # live precondition re-derivation ALSO lives in worker-pr.py disarm (tested there), but
+    # registry #570 requires CLAIM — the layer that ACTS on the hostile row — to re-bind the row
+    # to live state itself before the helper is ever invoked ----
     calls = []
     real_helper, real_token = _run_target_helper, _target_token
+
+    def disarm_pull(number, *, login="reg[bot]", sha="1" * 40, reviewed="none",
+                    ref=None, head_repo="example/repo", state="open"):
+        """A live open-pull listing row for the disarm re-binding tests."""
+        return {"number": number, "state": state,
+                "user": {"login": login},
+                "body": f"body\n\n<!-- sparq-reviewed-sha:{reviewed} -->\n",
+                "head": {"sha": sha, "ref": ref or f"sparq-agent/issue-{number}-fix",
+                         "repo": {"full_name": head_repo}}}
+
     try:
         globals()["_target_token"] = lambda repo: "tok"
 
@@ -15247,16 +15346,26 @@ def _self_test():
 
         globals()["_run_target_helper"] = fake_helper
         disarm_counts = Counter()
+        live_pages = [[disarm_pull(13), disarm_pull(14)]]
+        prov = {13: {"pr_number": 13}, 14: {"pr_number": 14}}
         _apply_disarm_items([
             {"pr_number": 13, "head_sha": "1" * 40, "reviewed_sha": "none",
              "repo": "example/repo"},
             {"pr_number": 14, "head_sha": "1" * 40, "reviewed_sha": "none",
              "repo": "example/repo"},
-        ], "example/repo", Path("."), "reg[bot]", disarm_counts)
+        ], "example/repo", Path("."), "reg[bot]", disarm_counts,
+            pull_pages=live_pages, provenance=prov)
         # a failing item SKIPS (never aborts the sweep) and every call is the strict
-        # mismatch-only mode — CLAIM never requests an unconditional disarm from the plan
-        assert [args[4] for args in calls] == ["13", "14"], calls
-        assert all(args[0] == "disarm" and args[-1] == "mismatch" for args in calls)
+        # mismatch-only mode — CLAIM never requests an unconditional disarm from the plan.
+        # #570: the trusted App identity is HANDED DOWN, so the helper's author gate is the exact
+        # App and not any-`[bot]`. The WHOLE argv is pinned: red if the identity is dropped, if
+        # the mode widens, or if a row is aimed at another repo/PR.
+        assert calls == [
+            ["disarm", "--repo", "example/repo", "--pr", "13", "--when", "mismatch",
+             "--bot-login", "reg[bot]"],
+            ["disarm", "--repo", "example/repo", "--pr", "14", "--when", "mismatch",
+             "--bot-login", "reg[bot]"],
+        ], calls
         # Issue #108: PR 13's raise lands in the disarm lane's ERROR tally (a stale auto-merge latch
         # that could NOT be retracted — safety-critical), while PR 14's clean retraction is a
         # `launched`. This error MUST alert the tick regardless of worker/review/fix launches, so it
@@ -15268,10 +15377,95 @@ def _self_test():
         # `deferred` (never `error`): we could not even attempt the safety retraction this tick.
         no_token = Counter()
         _apply_disarm_items([{"pr_number": 15, "head_sha": "1" * 40, "reviewed_sha": "none",
-                              "repo": "example/repo"}], "example/repo", Path("."), "", no_token)
+                              "repo": "example/repo"}], "example/repo", Path("."), "", no_token,
+                            pull_pages=[[disarm_pull(15)]], provenance={15: {"pr_number": 15}})
         assert calls == []
         assert no_token["deferred"] == 1 and no_token["error"] == 0 \
             and no_token["launched"] == 0, no_token
+
+        # ---- registry #570: a forged row that CLAIM cannot re-bind to live state invokes the
+        # helper ZERO times. Each case below differs from the POSITIVE CONTROL by exactly one
+        # field, so none of them can pass for the wrong reason. ----
+        row = {"pr_number": 21, "head_sha": "2" * 40, "reviewed_sha": "none",
+               "repo": "example/repo"}
+        forged = {
+            # THE ATTACK: an open, same-repo, worker-shaped, marker-less PR belonging to a
+            # DIFFERENT GitHub App. Pre-#570 this redrafted + relabelled the victim App's PR.
+            "foreign App author":
+                ([[disarm_pull(21, login="mallory[bot]", sha="2" * 40)]], {21: {"pr_number": 21}},
+                 "reg[bot]"),
+            # No trusted identity is unprovable, not permissive.
+            "empty trusted identity":
+                ([[disarm_pull(21, sha="2" * 40)]], {21: {"pr_number": 21}}, ""),
+            # The PLAN-side provenance requirement, re-derived where the act happens.
+            "missing provenance record":
+                ([[disarm_pull(21, sha="2" * 40)]], {}, "reg[bot]"),
+            # ...including a record that binds a DIFFERENT PR (strict int identity).
+            "provenance record binds another PR":
+                ([[disarm_pull(21, sha="2" * 40)]], {21: {"pr_number": 22}}, "reg[bot]"),
+            # The row names a head the live PR no longer has: acting would disarm on stale input.
+            "stale/moved head":
+                ([[disarm_pull(21, sha="3" * 40)]], {21: {"pr_number": 21}}, "reg[bot]"),
+            # A VALID arm — the marker binds the live head. The #42 invariant never disarms these.
+            "valid arm bound to the live head":
+                ([[disarm_pull(21, sha="2" * 40, reviewed="2" * 40)]], {21: {"pr_number": 21}},
+                 "reg[bot]"),
+            # The PR is not in the live snapshot at all (closed/merged since PLAN, or invented).
+            "PR absent from the live snapshot":
+                ([[]], {21: {"pr_number": 21}}, "reg[bot]"),
+            # A fork head is attacker-controlled and is never acted on.
+            "fork head":
+                ([[disarm_pull(21, sha="2" * 40, head_repo="mallory/repo")]],
+                 {21: {"pr_number": 21}}, "reg[bot]"),
+            # Not a worker branch — outside the trust surface entirely.
+            "non-worker head ref":
+                ([[disarm_pull(21, sha="2" * 40, ref="main")]], {21: {"pr_number": 21}},
+                 "reg[bot]"),
+        }
+        for label, (pages, records, identity) in forged.items():
+            calls.clear()
+            counts = Counter()
+            _apply_disarm_items([dict(row)], "example/repo", Path("."), identity, counts,
+                                pull_pages=pages, provenance=records)
+            assert calls == [], (label, calls)
+            assert counts["launched"] == 0 and counts["error"] == 0, (label, counts)
+            assert counts["planned"] == 1 and counts["deferred"] == 1, (label, counts)
+        # The predicate's own empty-identity guard, exercised DIRECTLY: `_apply_disarm_items`
+        # defers before reaching it, so without this the guard would be untested code — and it is
+        # load-bearing for exactly the shape the caller cannot screen, a live pull whose author
+        # login is empty/absent (where a bare `login != bot_login` would compare "" against "" and
+        # ADMIT). Both halves are asserted, plus the trusted-identity control.
+        assert _disarm_row_admissible(dict(row), "example/repo",
+                                      disarm_pull(21, login="", sha="2" * 40),
+                                      {"pr_number": 21}, "")[0] is False
+        assert _disarm_row_admissible(dict(row), "example/repo", disarm_pull(21, sha="2" * 40),
+                                      {"pr_number": 21}, "")[0] is False
+        assert _disarm_row_admissible(dict(row), "example/repo",
+                                      disarm_pull(21, login="", sha="2" * 40),
+                                      {"pr_number": 21}, "reg[bot]")[0] is False
+        assert _disarm_row_admissible(dict(row), "example/repo", disarm_pull(21, sha="2" * 40),
+                                      {"pr_number": 21}, "reg[bot]") == (True, "")
+        # POSITIVE CONTROL — the SAME row, all inputs provable: the legitimate mismatch disarm
+        # still fires under the trusted identity. Without this every assertion above would pass
+        # on a helper that never runs at all.
+        calls.clear()
+        good = Counter()
+        _apply_disarm_items([dict(row)], "example/repo", Path("."), "reg[bot]", good,
+                            pull_pages=[[disarm_pull(21, sha="2" * 40)]],
+                            provenance={21: {"pr_number": 21}})
+        assert [args[4] for args in calls] == ["21"], calls
+        assert calls[0][-2:] == ["--bot-login", "reg[bot]"], calls
+        assert good["launched"] == 1 and good["deferred"] == 0 and good["error"] == 0, good
+        # ...and #105 is not regressed: a human-held PR with a genuinely stale latch is STILL
+        # admitted here (the hold is preserved inside worker-pr.py disarm, not by skipping it).
+        calls.clear()
+        held = Counter()
+        held_pull = disarm_pull(21, sha="2" * 40)
+        held_pull["labels"] = [{"name": "review:needs-user"}]
+        _apply_disarm_items([dict(row)], "example/repo", Path("."), "reg[bot]", held,
+                            pull_pages=[[held_pull]], provenance={21: {"pr_number": 21}})
+        assert [args[4] for args in calls] == ["21"], calls
+        assert held["launched"] == 1 and held["deferred"] == 0, held
     finally:
         globals()["_run_target_helper"] = real_helper
         globals()["_target_token"] = real_token
