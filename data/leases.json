@@ -29,6 +29,16 @@
    "model": "opus5",
    "issued_at": 1785172518,
    "expires_at": 1785176718
+  },
+  {
+   "account": "dc2d751954080e13",
+   "claim_id": "1210b8b7a52449d9b5afa444bcb8b967",
+   "holder": "review:sparq-org/sparq#3858@dispatch-30287073877.1",
+   "package": "sparq-gpu",
+   "role": "review",
+   "model": "sol",
+   "issued_at": 1785172529,
+   "expires_at": 1785176729
   }
  ]
 }
