@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4634,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "6aaf5485461657c45fa4ceefcce7cab40cf714eb",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The three isolated-provenance lanes are wired consistently: digest production is separated from signing, collectors are fail-closed and lack signing credentials, trusted builders receive only validated subject digests, and release publication depends on both release provenance jobs. Artifact coverage matches the published claims, including portable hashing on macOS and honest treatment of unexercised lanes and the remaining container-image gap. The structural contract test exercises the real workflow text and its mutation suite passes, with non-vacuous checks for the new release-artifact and dist paths. No correctness, soundness, test-validity, or security defect was found in the diff.",
+  "verdict": "approve"
+ }
+}
