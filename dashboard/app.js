@@ -57,16 +57,19 @@ function renderSummary(data) {
   const providers = Object.entries(data.fleet.capacity || {}).sort(([left], [right]) => (
     left.localeCompare(right)
   ));
-  for (const [provider, values] of providers) {
+  // Issue #374: `capacity[provider]` is a BOOLEAN — whether the allocator would find an eligible
+  // account for this provider right now — not the `eligible / total` account census it used to be.
+  for (const [provider, hasCapacity] of providers) {
     const line = node("div", "provider-line");
-    line.append(node("span", "", provider), node("strong", "", `${values.eligible} / ${values.total}`));
+    line.append(node("span", "", provider),
+      node("strong", "", hasCapacity ? "available" : "none free"));
     lines.append(line);
   }
   if (!providers.length) lines.append(node("p", "summary-meta", "No provider records"));
   capacity.append(lines);
-  // The `eligible` figure is exactly the number a failed probe used to overstate (issue #580): with
-  // nothing measured it reads 0 for every provider, which alone looks like a fleet-wide outage.
-  // Say which of the two it is, right where the misleading number is rendered.
+  // "none free" is exactly what a failed probe used to overstate in the other direction (issue
+  // #580): with nothing measured EVERY provider reads unavailable, which alone looks like a
+  // fleet-wide outage. Say which of the two it is, right where the misleading value is rendered.
   if (data.usage_probe && typeof data.usage_probe === "object"
       && data.usage_probe.measured !== true) {
     capacity.append(node("p", "summary-meta", "Eligible capacity unmeasured — see the notice above"));
@@ -105,128 +108,52 @@ function usageProbeCard(probe) {
   return card;
 }
 
-function renderWindow(windowData) {
-  const wrapper = node("div", "window");
-  const head = node("div", "window-head");
-  const percent = windowData.used_percent;
-  const known = typeof percent === "number" && Number.isFinite(percent);
-  const limit = windowData.limit ? ` · limit ${windowData.limit}` : "";
-  head.append(
-    node("span", "window-name", windowData.name + limit),
-    node("span", "window-value", known ? `${percent.toFixed(percent % 1 ? 1 : 0)}% used` : "unknown"),
-  );
-  const meter = node("div", "meter");
-  meter.setAttribute("role", "progressbar");
-  meter.setAttribute("aria-label", `${windowData.name} quota utilization`);
-  if (known) {
-    meter.setAttribute("aria-valuenow", String(percent));
-    meter.setAttribute("aria-valuemin", "0");
-    meter.setAttribute("aria-valuemax", "100");
-    const fill = node("span", percent >= 85 ? "high" : "");
-    fill.style.width = `${Math.min(100, Math.max(0, percent))}%`;
-    meter.append(fill);
-  }
-  const resetText = windowData.reset_at
-    ? `Resets ${relative(windowData.reset_at)} · ${utc(windowData.reset_at)}`
-    : "Reset unknown";
-  wrapper.append(head, meter, node("p", "reset", resetText));
-  return wrapper;
-}
+// Issue #374: the per-account cards (salted label, availability badge, active-agent count,
+// weekly reset and live per-window utilization) are GONE, together with renderWindow /
+// renderWeeklyReset / accountCard / renderAccounts. dashboard-gen no longer publishes an
+// `accounts` array at all, so there is nothing left for them to render — the per-provider section
+// below is the whole quota surface now.
 
-function renderWeeklyReset(resetAt) {
-  const reset = node("div", "weekly-reset");
-  reset.append(node("span", "weekly-reset-label", "Weekly reset"));
-  if (parseTime(resetAt)) {
-    reset.append(
-      node("strong", "weekly-reset-relative", relative(resetAt)),
-      node("span", "weekly-reset-utc", utc(resetAt)),
-    );
-  } else {
-    reset.append(
-      node("strong", "weekly-reset-relative", "Unknown"),
-      node("span", "weekly-reset-utc", "No 7 day reset in the latest snapshot"),
-    );
-  }
-  return reset;
-}
+// --- Provider quota: per-provider AGGREGATE headroom, computed server-side by
+// dashboard-gen._provider_quota from the signals that actually exist — live per-window utilization
+// probes where the provider exposes them (anthropic), and only availability + reactive backoff
+// where it does not (probe-exempt openai). Accounts the fail-closed probe OMITTED are never
+// rendered free — dispatch treats that omission as unavailable (sol finding 2, PR #281); so are
+// PARTIAL probe entries (status-only / one window without the other), which dispatch and
+// usage-alert equally reject (sol finding 1, PR #281 fix round 3) and which contribute NOTHING to
+// the aggregate (fix round 4).
+//
+// Issue #374 MINIMIZED what crosses to the page. The card used to print the fleet census —
+// "3 accounts · 1 free · 1 capped · 1 unreported", a "single account" badge, and per-window
+// "0.85 of 2 account-windows free" plus "≈200 provider limit-units left (limits known for 1/2)".
+// Every one of those numbers counted accounts out loud on a public page. The generator now sends
+// a `headroom` WORD (available/capped/unknown/unavailable — the same predicate the allocator uses,
+// so the page still cannot advertise capacity dispatch would refuse) and a per-window
+// `remaining_fraction` in [0,1] (the MEAN across reporting accounts, invariant under fleet size).
+// An absent `provider_quota` key (older data.json) hides the whole section. -----------------------
+const QUOTA_HEADROOM_TEXT = {
+  available: "capacity available",
+  capped: "all quota spent — waiting on a reset",
+  unknown: "no usable measurement — treated unavailable by dispatch",
+  unavailable: "no usable account for this provider",
+};
 
-function accountCard(account) {
-  const card = node("article", "account-card");
-  const top = node("div", "card-top");
-  top.append(node("h4", "account-label", account.label));
-  const badges = node("div", "badges");
-  badges.append(node("span", `badge ${account.availability}`, account.availability));
-  top.append(badges);
-  const agents = node("div", "agent-count");
-  agents.append(node("span", "", "Active agents"), node("strong", "", String(account.active_agents)));
-  const windows = node("div", "window-list");
-  for (const windowData of account.windows) windows.append(renderWindow(windowData));
-  card.append(top, renderWeeklyReset(account.weekly_reset_at), agents, windows);
-  return card;
-}
-
-function renderAccounts(accounts) {
-  const container = byId("accounts");
-  container.replaceChildren();
-  byId("account-count").textContent = `${accounts.length} account${accounts.length === 1 ? "" : "s"}`;
-  if (!accounts.length) {
-    container.append(node("p", "empty", "No account records are available."));
-    return;
-  }
-
-  const groups = new Map();
-  for (const account of accounts) {
-    if (!groups.has(account.provider)) groups.set(account.provider, []);
-    groups.get(account.provider).push(account);
-  }
-  for (const [provider, providerAccounts] of groups) {
-    const section = node("section", "provider-section");
-    const heading = node("div", "provider-heading");
-    heading.append(
-      node("h3", "provider-title", provider),
-      node("span", "freshness", `${providerAccounts.length} account${providerAccounts.length === 1 ? "" : "s"}`),
-    );
-    const grid = node("div", "account-grid");
-    for (const account of providerAccounts) grid.append(accountCard(account));
-    section.append(heading, grid);
-    container.append(section);
-  }
-}
-
-// --- Provider quota (cumulative): per-provider AGGREGATE headroom across that provider's
-// accounts, computed server-side by dashboard-gen._provider_quota from the signals that actually
-// exist — live per-window utilization probes where the provider exposes them (anthropic), and
-// only the availability counts + reactive backoff where it does not (probe-exempt openai).
-// Accounts the fail-closed probe OMITTED surface as `accounts_unknown` ("unreported") and are
-// never rendered free — dispatch treats that omission as unavailable (sol finding 2, PR #281);
-// so do PARTIAL probe entries (status-only / one window without the other), which dispatch and
-// usage-alert equally reject (sol finding 1, PR #281 fix round 3) and which contribute NOTHING
-// to the window sums, limit estimates, or reset stamps (fix round 4: an unknown account never
-// feeds the headroom rendered next to its own "unreported" badge).
-// The honest aggregate unit is "account-windows free" (Σ remaining window fraction over the
-// accounts that reported), with a PARTIAL limit-weighted sum only where limit headers are known;
-// each card states its signal source, and the section header carries the snapshot freshness.
-// An absent `provider_quota` key (older data.json) hides the whole section. Decision 22: rows
-// contain provider names + counts only — no account identifiers of any form. ---------------------
 function quotaWindowRow(windowData) {
   const wrap = node("div", "window");
   const head = node("div", "window-head");
-  const remaining = typeof windowData.remaining_account_windows === "number"
-    && Number.isFinite(windowData.remaining_account_windows)
-    ? windowData.remaining_account_windows : null;
-  const reporting = Number.isInteger(windowData.accounts_reporting)
-    ? windowData.accounts_reporting : 0;
+  const fraction = typeof windowData.remaining_fraction === "number"
+    && Number.isFinite(windowData.remaining_fraction)
+    ? Math.min(1, Math.max(0, windowData.remaining_fraction)) : null;
   head.append(
     node("span", "window-name", windowData.name),
-    node("span", "window-value", remaining === null || !reporting
+    node("span", "window-value", fraction === null
       ? "unknown"
-      : `${remaining} of ${reporting} account-window${reporting === 1 ? "" : "s"} free`),
+      : `${Math.round(fraction * 100)}% of this window's quota left`),
   );
   const meter = node("div", "meter");
   meter.setAttribute("role", "progressbar");
   meter.setAttribute("aria-label", `${windowData.name} aggregate remaining quota`);
-  if (remaining !== null && reporting > 0) {
-    const fraction = Math.min(1, Math.max(0, remaining / reporting));
+  if (fraction !== null) {
     meter.setAttribute("aria-valuenow", String(Math.round(fraction * 100)));
     meter.setAttribute("aria-valuemin", "0");
     meter.setAttribute("aria-valuemax", "100");
@@ -235,11 +162,6 @@ function quotaWindowRow(windowData) {
     meter.append(fill);
   }
   const notes = [];
-  if (typeof windowData.limit_remaining === "number"
-      && Number.isFinite(windowData.limit_remaining)) {
-    notes.push(`≈${windowData.limit_remaining.toLocaleString()} provider limit-units left`
-      + ` (limits known for ${windowData.limits_known}/${reporting})`);
-  }
   if (windowData.soonest_reset) {
     notes.push(`next reset ${relative(windowData.soonest_reset)}`
       + (windowData.oldest_reset && windowData.oldest_reset !== windowData.soonest_reset
@@ -253,35 +175,19 @@ function providerQuotaCard(row) {
   const card = node("article", "account-card quota-card");
   const top = node("div", "card-top");
   top.append(node("h4", "quota-provider", String(row.provider || "unknown")));
+  const headroom = Object.prototype.hasOwnProperty.call(QUOTA_HEADROOM_TEXT, row.headroom)
+    ? row.headroom : "unknown";
   const badges = node("div", "badges");
-  if (row.single_account) badges.append(node("span", "badge", "single account"));
-  if (Number.isInteger(row.accounts_capped) && row.accounts_capped > 0) {
-    badges.append(node("span", "badge capped", `${row.accounts_capped} capped`));
-  }
-  if (Number.isInteger(row.accounts_unknown) && row.accounts_unknown > 0) {
-    // Distinct neutral badge: an unreported (fail-closed-omitted) account is NOT free — the
-    // muted default badge style separates "no signal" from green/amber/red real states.
-    badges.append(node("span", "badge", `${row.accounts_unknown} unreported`));
-  }
+  badges.append(node("span", `badge ${headroom}`, headroom));
   top.append(badges);
-  const total = Number.isInteger(row.accounts_total) ? row.accounts_total : 0;
-  let countsText = `${total} account${total === 1 ? "" : "s"}`
-    + ` · ${Number.isInteger(row.accounts_available) ? row.accounts_available : 0} free`
-    + ` · ${Number.isInteger(row.accounts_capped) ? row.accounts_capped : 0} capped`;
-  if (Number.isInteger(row.accounts_unavailable) && row.accounts_unavailable > 0) {
-    countsText += ` · ${row.accounts_unavailable} unavailable`;
-  }
-  if (Number.isInteger(row.accounts_unknown) && row.accounts_unknown > 0) {
-    countsText += ` · ${row.accounts_unknown} unreported — treated unavailable by dispatch`;
-  }
   const windows = node("div", "window-list");
   const windowRows = Array.isArray(row.windows) ? row.windows : [];
   for (const windowData of windowRows) windows.append(quotaWindowRow(windowData));
   if (!windowRows.length) {
     windows.append(node("p", "quota-note",
-      "Aggregate remaining quota is not observable for this provider — availability and capped counts above are the only real signal."));
+      "Remaining quota is not observable for this provider — the headroom state above is the only real signal."));
   }
-  card.append(top, node("p", "quota-counts", countsText), windows);
+  card.append(top, node("p", "quota-counts", QUOTA_HEADROOM_TEXT[headroom]), windows);
   if (row.soonest_reset) {
     card.append(node("p", "quota-note",
       `Soonest known reset ${relative(row.soonest_reset)} · all known windows reset by ${utc(row.oldest_reset)}`));
@@ -675,7 +581,6 @@ const OBS_DEFAULT_THRESHOLDS = {
   workflow_failure_rate: 0.5, defer_reason_hourly: 4,
   queue_age_clamp_minutes: 10, merge_stall_minutes: 90,
 };
-const OBS_SALTED_RE = /^[0-9a-f]{8}$/;
 const OBS_SPARK_POINTS = 24;
 // data.json holds only the current snapshot; trends accumulate client-side across refreshes,
 // keyed by generated_at so re-polling an unchanged snapshot is not double-counted.
@@ -926,21 +831,24 @@ function obsFlowCard(flow, thresholds) {
       { sub: "pending target CI runs" }));
   }
   if (grid.childElementCount) card.append(grid);
-  const leases = Array.isArray(flow.leases) ? flow.leases : [];
-  if (leases.length) {
+  // Issue #374: this used to be one bar PER SALTED ACCOUNT — a per-account row array by another
+  // name, whose length was the fleet size and whose labels were stable across builds. The
+  // generator now sends only the mean and max of the reported utilizations, which is what the
+  // load-balance question ("is one account carrying the fleet?") actually needs.
+  const leaseUtilization = flow.lease_utilization_1h;
+  if (leaseUtilization && typeof leaseUtilization === "object") {
     const list = node("div", "obs-reasons");
-    list.append(node("p", "obs-spark-caption", "lease utilization / 1h (salted accounts)"));
-    for (const lease of leases) {
-      // Defense in depth for decision 22: only the salted 8-hex label shape is ever rendered.
-      if (typeof lease.label !== "string" || !OBS_SALTED_RE.test(lease.label)) continue;
+    list.append(node("p", "obs-spark-caption", "lease utilization / 1h (across the fleet)"));
+    for (const [caption, value] of [["mean", leaseUtilization.mean],
+                                    ["busiest", leaseUtilization.max]]) {
       const rowEl = node("div", "obs-reason-row");
-      rowEl.append(node("span", "obs-lane", `${lease.label}${lease.provider ? ` · ${lease.provider}` : ""}`));
+      rowEl.append(node("span", "obs-lane", caption));
       const meter = node("div", "obs-bar-track wide");
-      const used = obsNum(lease.utilization_1h);
+      const used = obsNum(value);
       const fill = node("span", `obs-bar-fill${used !== null && used >= 0.85 ? " hot" : ""}`);
       fill.style.width = `${used === null ? 0 : Math.min(100, used * 100)}%`;
       meter.append(fill);
-      rowEl.append(meter, node("span", "obs-reason-count", obsPct(lease.utilization_1h)));
+      rowEl.append(meter, node("span", "obs-reason-count", obsPct(value)));
       list.append(rowEl);
     }
     card.append(list);
@@ -983,7 +891,6 @@ function render(data) {
   renderRepositoryAgents(data.active_by_repository, data.fleet.active_agents);
   renderSummary(data);
   renderProviderQuota(data.provider_quota, data.generated_at);
-  renderAccounts(data.accounts || []);
   renderOutcomes(data.fleet.dispatch_outcomes || []);
   renderHealth(data.model_health);
   renderObservability(data.observability);

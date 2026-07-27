@@ -76,23 +76,16 @@
         <div class="section-heading">
           <div>
             <p class="eyebrow">Cumulative headroom</p>
-            <h2 id="provider-quota-heading">Provider quota (cumulative)</h2>
+            <h2 id="provider-quota-heading">Provider quota</h2>
           </div>
           <p id="provider-quota-time" class="freshness"></p>
         </div>
         <div id="provider-quota" class="quota-grid" aria-live="polite"></div>
       </section>
 
-      <section aria-labelledby="accounts-heading">
-        <div class="section-heading">
-          <div>
-            <p class="eyebrow">Live inventory</p>
-            <h2 id="accounts-heading">Accounts</h2>
-          </div>
-          <p id="account-count" class="freshness"></p>
-        </div>
-        <div id="accounts" class="provider-sections" aria-live="polite"></div>
-      </section>
+      <!-- The per-account "Accounts" inventory section was removed by issue #374: the public
+           payload no longer carries an `accounts` array, so there is nothing to render here. The
+           "Provider quota" section above is the whole quota surface. -->
 
       <section aria-labelledby="dispatch-heading">
         <div class="section-heading compact">
@@ -122,7 +115,12 @@
       </section>
     </main>
 
-    <footer>Public operational view · account identities are HMAC-salted</footer>
+    <!-- Scope this claim to what the payload actually withholds. `fleet.active_agents` and the
+         per-repository model counts ARE published (they are live-lease counts, already public on
+         the `ledger` branch), and with one worker per account they are a lower bound on the fleet
+         size — so an absolute "no fleet counts" claim would be false. See the KNOWN RESIDUAL block
+         in scripts/dashboard-gen.py. -->
+    <footer>Public operational view · no account identities or per-account rows; live-agent counts are published</footer>
   </div>
   <script src="app.js" defer></script>
 </body>
