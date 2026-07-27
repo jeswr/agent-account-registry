@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 860,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "a7e30a8f1e4ba21da97e2d66bd89b8e007f49dc3",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "S1 instructs the operator to grant the migrate mint's permissions: Secrets write, Environments write, and Actions read. It then claims the other phases request narrower subsets and that satisfying migrate therefore satisfies all four. But the same paragraph states that quiesce mints with Actions write. Actions write is not a subset of Actions read, so an installation configured exactly as S1 directs may fail to mint the quiesce token at S4. This makes the stated prerequisite insufficient and the runbook non-executable as written.",
+    "file": "research/271-coordinated-secret-migration-runbook.md",
+    "fix_hint": "List the union of permissions required across every phase, including Actions write (plus Secrets write and Environments write, with read access implied where GitHub's permission model provides it), and avoid claiming that quiesce's Actions write request is a narrower subset of migrate's Actions read request. Verify the exact GitHub App installation permission names/levels against each phase's mint inputs.",
+    "severity": "major",
+    "title": "S1 omits the Actions write installation grant required by quiesce"
+   }
+  ],
+  "progress": null,
+  "summary": "The runbook contains a permission-set error in its first operational prerequisite. It says granting the three permissions requested by the migrate phase is sufficient for all four phases, but quiesce requires Actions write while migrate requests only Actions read. Following S1 literally can therefore reproduce a mint failure at S4, before the migration begins. Because this is an operator-facing cutover sequence and the faulty claim directly undermines its executable completeness, the change needs correction.",
+  "verdict": "request_changes"
+ }
+}
