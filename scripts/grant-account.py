@@ -1892,8 +1892,24 @@ else:
           (1, ["status:pending"], []))
 
     template = (root / ".github/ISSUE_TEMPLATE/set-up-account.yml").read_text(encoding="utf-8")
+    form = strip_yaml_comments(template)
     check("the request form documents the grant label (in the form itself, not a comment)",
-          GRANT_LABEL_PREFIX in strip_yaml_comments(template), True)
+          GRANT_LABEL_PREFIX in form, True)
+    # ------------------------------------------------------------------------------------------
+    # [#261] THE FORM COLLECTS NO REQUEST DATA. It used to open with a REQUIRED `provider` dropdown
+    # whose value landed in the issue BODY, which the broker never reads — the `meta` step above
+    # resolves the provider from the `provider:*` LABELS (asserted, and EXECUTED, further up). So a
+    # request could be filed "with a provider" and still be refused for having no provider label,
+    # and the field advertised a second source of truth that can disagree with the labels the broker
+    # enforces. Both rows below fail closed on an empty/renamed form rather than passing vacuously.
+    # ------------------------------------------------------------------------------------------
+    element_types = [line.strip()[len("- type: "):].strip()
+                     for line in form.split("\n") if line.strip().startswith("- type: ")]
+    check("[#261] the form declares elements, and NONE of them collects request data",
+          (bool(element_types), sorted(set(element_types) - {"markdown", "checkboxes"})),
+          (True, []))
+    check("[#261] the form documents the provider LABELS (in the form itself, not a comment)",
+          ("provider:openai" in form, "provider:anthropic" in form), (True, True))
 
     print("grant-account self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1

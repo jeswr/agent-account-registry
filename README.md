@@ -649,8 +649,10 @@ the parsed document in memory and required to come back named.
 You don't paste tokens manually. Instead:
 
 1. Open a **"set up new account"** issue (there's a template), label it with **one
-   `grant:<owner>/<repo>` label per repository the account is authorized for**, then add the
-   **`set-up-account`** label. Each target must be an `enabled = true` row of `policy/repos.toml`:
+   `grant:<owner>/<repo>` label per repository the account is authorized for** and **exactly one
+   `provider:openai`/`provider:anthropic` label**, then add the **`set-up-account`** label last.
+   Labels are the *only* carrier — the broker never parses the issue body, so the form collects no
+   request data (#261). Each target must be an `enabled = true` row of `policy/repos.toml`:
    `account_pool` is the credential-authorization boundary, so an account is granted ONLY to the
    repositories the request names (#579), and a request that names none is **refused before any
    login** instead of being granted to every repository.
