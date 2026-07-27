@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4632,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "254def644ae0ab4a862ae4744f956057f4ebbcab",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The table says there is \"exactly one\" runtime import, identifies it as `node:assert/strict`, and then acknowledges that `node:test` is dynamically imported. In the referenced implementation, line 23 imports `{ strict as assert }` from `node:assert` (not `node:assert/strict`), while `resolveTestApi` dynamically imports `node:test`. Thus there are two built-in module imports on the default path, one static and one dynamic. This does not undermine the zero-external-dependency conclusion, but it makes a specifically claimed, source-verified fact wrong.",
+    "file": "research/rdfjs-conformance-upstream.md",
+    "fix_hint": "Rewrite the row to say that the harness uses only Node built-ins: a static import from `node:assert` and a lazy dynamic import of `node:test` when no test API is injected. Keep the separate and correct claim that there are zero external runtime dependencies.",
+    "severity": "minor",
+    "title": "Runtime-import inventory is factually incorrect and self-contradictory"
+   }
+  ],
+  "progress": null,
+  "summary": "The proposal is careful about unresolved upstream decisions and appropriately caveats claims that could not be verified locally. However, its evidence table contains a concrete factual contradiction about the harness's runtime imports: the implementation statically imports `node:assert`, not `node:assert/strict`, and also dynamically imports `node:test`. Because the document presents this table as freshly re-derived and verified against exact source lines, it should be corrected before serving as the review record or ready-to-post proposal.",
+  "verdict": "request_changes"
+ }
+}
