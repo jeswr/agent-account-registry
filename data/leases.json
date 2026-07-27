@@ -22,16 +22,6 @@
   },
   {
    "account": "dc2d751954080e13",
-   "claim_id": "1210b8b7a52449d9b5afa444bcb8b967",
-   "holder": "review:sparq-org/sparq#3858@dispatch-30287073877.1",
-   "package": "sparq-gpu",
-   "role": "review",
-   "model": "sol",
-   "issued_at": 1785172529,
-   "expires_at": 1785176729
-  },
-  {
-   "account": "dc2d751954080e13",
    "claim_id": "20ceb3f0315b4736940be1e59956a07a",
    "holder": "review:sparq-org/sparq#3886@dispatch-30287073877.1",
    "package": "sparq-serve",
