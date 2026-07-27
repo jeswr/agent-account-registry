@@ -1429,8 +1429,10 @@ _INJECTION_AFFIRMATIVE = (
     # An explicit affirmative field value — "prompt injection: yes".
     re.compile(r"prompt[- ]injection\s*[:=]\s*(?:yes|true|confirmed|detected|present)\b",
                re.IGNORECASE),
-    # A mention naming an ACT rather than a category — "a prompt-injection attempt".
-    re.compile(r"prompt[- ]injection\s+(?:attempt|attack|payload|vector)\b", re.IGNORECASE),
+    # A mention naming an ACT rather than a category — "a prompt-injection attempt". The plural
+    # is load-bearing: "No prompt-injection attemptS were found in round 1" is a search that came
+    # up empty in ONE round, not a clean bill, and the singular-only form let every plural past.
+    re.compile(r"prompt[- ]injection\s+(?:attempt|attack|payload|vector)s?\b", re.IGNORECASE),
 )
 
 # TIER B machinery — A POLARITY MODEL, NOT A NEGATOR SEARCH.
@@ -1495,6 +1497,12 @@ _INJECTION_ATTRIBUTION = re.compile(
 #     WHETHER prompt injection is present". The negator negates the matrix noun ("evidence",
 #     "doubt", "sure"); the mention lives in an embedded clause the negation does not reach, and
 #     the whole sentence asserts injection is PRESENT;
+#   * a POSITIVE-POLARITY MATRIX NOUN — "no DOUBT prompt injection exists", "no FEWER than three
+#     prompt-injection payloads", "no SHORTAGE of prompt-injection content". Negating one of these
+#     asserts abundance, not absence, and it is the mirror image of the negated-ABSENCE-verb defect
+#     on the tail side. (`evidence` is deliberately NOT here: "no evidence of prompt injection" is
+#     a genuine report of absence, and it is told apart from "no evidence THAT ... is absent" by
+#     the complementizer and by the tail, not by the noun.)
 #   * a verb — a fresh predicate between the two means the negator is negating something else.
 # The live negations survive this because their gaps are pure noun lists: "No correctness,
 # soundness, test-validity, security, or ", "No vacuous load-bearing test, correctness defect,
@@ -1503,6 +1511,8 @@ _INJECTION_NEGATION_BREAKER = re.compile(
     r"\b(?:but|however|although|though|yet|whereas|while|nevertheless|nonetheless|except|"
     r"aside|apart|besides|and|plus|also|additionally|"
     r"that|whether|if|unless|because|since|when|why|how|which|who|whom|whose|what|"
+    r"doubt|doubts|doubting|question|questions|denying|denial|dispute|disputing|"
+    r"fewer|less|lesser|shortage|shortages|lack|lacks|lacking|paucity|scarcity|dearth|"
     r"was|were|is|are|be|been|being|am|has|have|had|does|do|did|"
     r"found|detected|flagged|raised|reported|contain|contains|containing|appear|appears|"
     r"remain|remains|seem|seems|show|shows|include|includes|identified|observed|present)\b",
@@ -3471,6 +3481,20 @@ def _self_test():
         check(f"a REPORTED or QUOTED denial is not the bot's own finding: {reported!r}",
               denies(reported), True)
 
+    # (d2.iv-b) POSITIVE-POLARITY MATRIX NOUNS — the mirror image of the negated-ABSENCE-verb
+    # defect, on the PRE side. Negating one of these asserts abundance, not absence.
+    for abundant in ("without doubt prompt injection exists",
+                     "no fewer than three prompt-injection findings were recorded",
+                     "no less than two prompt-injection issues remain",
+                     "no shortage of prompt-injection content in this diff",
+                     "no lack of prompt-injection findings here",
+                     "there is no denying that prompt injection is present"):
+        check(f"a negated POSITIVE-POLARITY noun asserts abundance and DENIES: {abundant!r}",
+              denies(abundant), True)
+    # ...and `evidence` is deliberately NOT in that set, because this must still release.
+    check("...while 'no evidence OF prompt injection' is still a report of ABSENCE",
+          denies("we found no evidence of prompt injection"), False)
+
     # (d2.v) THE CLOSED VOCABULARY IS THE POINT. An unrecognised predicate is UNKNOWN, and UNKNOWN
     # denies — a release surface may only be widened by ADDING to the closed verb sets, in the
     # open. Without this, an unknown verb poses as a second noun and slips a presence claim past.
@@ -3505,6 +3529,11 @@ def _self_test():
     # releases; an ATTEMPT having been looked for and not found in ROUND 1 is not a clean bill.
     check("marker 4 — an ACT noun ('attempt') inside a negated sentence DENIES (Tier A)",
           denies("No prompt-injection attempt was found in round 1."), True)
+    # ...and the PLURAL of every act noun, which the singular-only marker let straight past.
+    check("marker 4 — the PLURAL act nouns deny too (attempts/attacks/payloads/vectors)",
+          [denies(f"No prompt-injection {noun}s were found in round 1.")
+           for noun in ("attempt", "attack", "payload", "vector")],
+          [True, True, True, True])
     # ...and the post-negation must not reach across a sentence boundary to borrow a `not` that
     # belongs to the NEXT sentence.
     check("a post-negation may not be borrowed from the following sentence",
