@@ -174,8 +174,16 @@ AGE_UNPARK_MAX = 2
 # AGE_PARK_CAUSES value, `head` the head SHA at park time, `gen` the 1-based park generation.
 # The (cause, head, gen) triple is the CONSUME-ONCE key: an un-park is granted for a given triple
 # at most once, so the same recovery can never be re-earned.
-AGE_PARK_MARKER = "<!-- registry-groom-age-park:v1"
-AGE_UNPARK_MARKER = "<!-- registry-groom-age-unpark:v1"
+#
+# The two marker spellings live in park_policy, NOT here (registry #769). groom WRITES them and
+# dispatch-claim's automatic re-admission sweep READS them — it must recognise a groom age park
+# in order to leave it alone — and those are separate entry points with separate checkout roots.
+# A hand-copied literal in the reader is a spelling that can drift silently from the writer's,
+# and the failure it produces is not a crash but a sweep that quietly stops recognising the class
+# it was written to skip. One spelling, imported by both, cannot drift; the aliases below keep
+# every existing call site in this file unchanged.
+AGE_PARK_MARKER = park_policy.GROOM_AGE_PARK_MARKER
+AGE_UNPARK_MARKER = park_policy.GROOM_AGE_UNPARK_MARKER
 _AGE_RECEIPT = re.compile(
     r"cause=(?P<cause>[a-z-]{1,40}) head=(?P<head>[0-9a-f]{40}) gen=(?P<gen>[1-9][0-9]{0,3}) -->"
 )
@@ -1871,6 +1879,28 @@ def _execute_age_unpark_actions(
             attempted += 1
             failed = False
             try:
+                # THE ONE RULE, and this phase must obey it like every other automatic exit
+                # (park_policy.human_owned_holds; blocking review finding #769). Measured on the
+                # real function before this line existed: a PR wearing BOTH `review:parked` and
+                # `needs:user` was granted its re-admission — `grants=1`, one un-park receipt
+                # minted, `review:parked` deleted. Nothing human was cleared, so invariant 3 was
+                # not violated in the literal sense, and that is exactly what made it easy to
+                # miss: the harm is that the ONE automatic recovery this park will ever earn was
+                # SPENT on a PR that provably could not re-enter, because the live `needs:user`
+                # keeps every downstream admission refusing. The recovery is consume-once, so it
+                # could never be re-earned, and the PR's next age park would land a generation
+                # higher for no reason it caused.
+                #
+                # Checked BEFORE the comments read, so a held PR also costs no API call, and
+                # BEFORE both write branches — the ordinary grant AND the convergence retry —
+                # because both end in a label DELETE. The park simply stands; a human is the
+                # exit, which is what a human-owned hold means.
+                held = park_policy.human_owned_holds(labels)
+                if held:
+                    print(f"age park stands {repo}#{number}: human-owned hold(s) live "
+                          f"({'/'.join(held)}) — a machine never un-parks past a human decision, "
+                          "and spends no re-admission on a PR that could not re-enter anyway")
+                    continue
                 comments = _comments(api, repo, number)
                 owed, granted = age_unpark_state(comments, bot_login)
                 if owed is None:
@@ -3082,13 +3112,35 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
                     # automatic-re-admission cap. The over-cap case names the flap, because
                     # "this recurred N times" is a genuinely different question from "this took
                     # too long" and is the one a human should be asked.
-                    flap = (
-                        f" This is age-park generation {generation}; the machine already granted "
-                        f"the {AGE_UNPARK_MAX} automatic re-admissions this cause is allowed and "
-                        "the PR returned to the same state, so a repeated failure — not a "
-                        "timeout — is what is being escalated."
-                        if cause is not None else ""
-                    )
+                    #
+                    # THE GRANT COUNT IS READ, NEVER ASSUMED (registry #769). The cap counts PARK
+                    # generations, and a generation is consumed by every re-park however the label
+                    # was cleared — a human unlabel, or (until #769 bound the class) another
+                    # sweep's heuristic. So "generation 3" does NOT imply "the machine granted 2
+                    # re-admissions", and the original wording asserted that it did. A comment
+                    # that tells a maintainer the machine already tried twice, when the durable
+                    # record shows it never tried at all, sends them looking for a flapping cause
+                    # instead of the thing that actually kept clearing the label. The grants are
+                    # on record as un-park receipts; the sentence states what they say.
+                    grants = len(age_receipts(comments, AGE_UNPARK_MARKER, bot_login))
+                    if cause is None:
+                        flap = ""
+                    elif grants:
+                        flap = (
+                            f" This is age-park generation {generation}; the machine granted "
+                            f"{grants} automatic re-admission(s) (cap {AGE_UNPARK_MAX}) and the "
+                            "PR returned to the same state, so a repeated failure — not a "
+                            "timeout — is what is being escalated."
+                        )
+                    else:
+                        flap = (
+                            f" This is age-park generation {generation}, past the cap of "
+                            f"{AGE_UNPARK_MAX} automatic re-admissions, so it escalates here. "
+                            "Note that the machine granted NO automatic re-admission on this PR: "
+                            "it re-parked without its cause ever being proven recovered, so what "
+                            "is worth looking at is what kept clearing the park, not a flapping "
+                            "cause."
+                        )
                     body = (
                         "> 🤖 SPARQ agent\n\n"
                         f"This worker PR has been untouched beyond the {limits[action.repo].worker_timeout_minutes}-"

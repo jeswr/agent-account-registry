@@ -861,6 +861,14 @@ PARK_REFUSAL_NOT_OFFERED = "not-offered"            # proof-gate call: auto_evid
 # same missing-edge defect this taxonomy exists to remove, one layer down, so both are codes.
 PARK_REFUSAL_READ_FAILED = "read-failed"            # the PR's own GitHub state was unreadable
 PARK_REFUSAL_TICK_DEFERRED = "tick-deferred"        # AUTO_READMISSION_PER_TICK_MAX spent
+# [registry #769] The park is live, machine-owned and hold-free, but it belongs to ANOTHER
+# mechanism's cause-gated park EPISODE — today groom's age park — whose own sweep owns its exit.
+# Deliberately NOT folded into `not-offered`: that code means "a read-only proof-gate call passed
+# no probe", i.e. nothing was ever going to be minted on that call, whereas this is a MINTING
+# sweep declining a park it does not own. The tree already records what conflating two states
+# with different remedies costs (the `no-evidence` note in #835's review), so the second one gets
+# its own code rather than the nearest existing one.
+PARK_REFUSAL_FOREIGN_EPISODE = "foreign-episode"    # another mechanism's cause-gated park
 
 # Which refusals a later tick can clear WITHOUT a human. The split is the whole point of the
 # taxonomy, so it is data, not a predicate scattered across callers.
@@ -870,6 +878,12 @@ PARK_REFUSAL_TICK_DEFERRED = "tick-deferred"        # AUTO_READMISSION_PER_TICK_
 # `evidence-consumed` is EXIT-REACHABLE: it demands a NEW outage-and-recovery pair, which a later
 # tick can genuinely observe. `not-offered` is EXIT-REACHABLE because it is not a refusal about
 # the PR at all — it is the CLAIM proof gate deliberately evaluating without minting.
+# `foreign-episode` is EXIT-REACHABLE, and that classification is a CLAIM this file has to keep
+# honest rather than a label of convenience: it asserts that some OTHER sweep will clear the park
+# without a human. It is only ever emitted for a park whose owning mechanism has a machine exit —
+# age_park_episode's contract — so a park that reaches this code is countable, named every tick,
+# and attributable to the sweep that owes it an answer. Filing it as human-terminal would be the
+# opposite lie (nobody is waiting on a human).
 PARK_REFUSAL_HUMAN_TERMINAL = frozenset({
     PARK_REFUSAL_HUMAN_HOLD, PARK_REFUSAL_HUMAN_APPLIED, PARK_REFUSAL_CAP,
 })
@@ -879,6 +893,7 @@ PARK_REFUSAL_CODES = frozenset({
     PARK_REFUSAL_EVIDENCE_MALFORMED, PARK_REFUSAL_EVIDENCE_CONSUMED,
     PARK_REFUSAL_EVIDENCE_STALE, PARK_REFUSAL_NOT_OFFERED,
     PARK_REFUSAL_READ_FAILED, PARK_REFUSAL_TICK_DEFERRED,
+    PARK_REFUSAL_FOREIGN_EPISODE,
 })
 
 # The two ADMITTING actions and the human-gesture action are not refusals; they are recorded in
@@ -1218,6 +1233,127 @@ PARK_REASON_MARKER = "<!-- sparq-park-reason:v1"
 
 PARK_CLASS_CAPACITY = "capacity"
 PARK_CLASS_QUESTION = "question"
+
+# --- [registry #769] groom's AGE park, and the episode binding that keeps it groom's ------------
+#
+# `review:parked` is a SHARED, MULTI-WRITER label. It is written by worker-pr's capacity ladder,
+# by dispatch-claim's starvation park and legacy migration, and — since groom's age hand-off took
+# the machine class — by groom's timeout park. Each of those writers has its OWN cause and its
+# OWN cause-gated exit, and the label alone cannot tell them apart.
+#
+# These two markers are declared HERE, not in groom, for the same reason human_owned_holds is:
+# the writer (groom) and the reader (dispatch-claim's re-admission sweep) are separate entry
+# points with separate checkout roots, and a hand-copied literal in the reader is a spelling that
+# can drift silently from the writer. One spelling, imported by both, cannot.
+GROOM_AGE_PARK_MARKER = "<!-- registry-groom-age-park:v1"
+GROOM_AGE_UNPARK_MARKER = "<!-- registry-groom-age-unpark:v1"
+
+
+def age_park_episode(comments, bot_login, superseding_markers=(), log=print):
+    """``(owned, detail)`` — whether the live machine park belongs to groom's AGE-park episode,
+    and therefore is NOT the capacity sweep's to clear.
+
+    THE DEFECT THIS EXISTS TO CLOSE (registry #769, reproduced end to end against the real
+    dispatch-claim sweep over real model-health records). groom's age park writes
+    `review:parked`, which puts it in the exact candidate population
+    `_readmit_capacity_parks` sweeps. Its cause — an orphan draft, a wedged merge state — is not
+    an account starvation, so `capacity_recovery_evidence` finds nothing and
+    `park_cause_provable` is False; the probe therefore falls through to the labelled
+    `sustained_fleet_health_evidence` HEURISTIC, which fires on "the park is at least
+    SUSTAINED_HEALTH_SPAN_SECONDS old AND the fleet has been healthy across that span".
+    MEASURED: the identical park and the identical health window yield `None` at 3 h and
+    `auto-mint` at 7 h. The only variable is crossing the span — so the evidence clearing an AGE
+    park was, in substance, MORE AGE. A timeout is not a human question, and it is not its own
+    recovery proof either.
+
+    WHY THE HEURISTIC IS NOT SIMPLY REMOVED. It was added by registry #691 for parks that had NO
+    machine exit at all — measured, all 32 sparq legacy parks — and deleting it restores exactly
+    that stall. The narrower true statement is that it is the WRONG EVIDENCE FOR THIS CLASS: an
+    age park is not a park without an exit, it is a park whose exit lives in another sweep
+    (groom's `age_park_cause_recovered`, gated on the park's own cause). So the class is made
+    ineligible for health-only clearance and nothing else changes. Genuine capacity parks keep
+    the heuristic byte-for-byte.
+
+    WHAT IS ACCEPTED INSTEAD, and it is strictly MORE than the heuristic offered:
+      * groom's own cause proof — an admissible provenance record on the live ledger ref for an
+        orphan-draft park, or a `mergeable_state` out of BAD_MERGE_STATES for a merge park;
+      * a proven-human gesture, which `capacity_park_admission` checks BEFORE this predicate is
+        ever consulted and which is therefore untouched;
+      * groom's escalation to the human class once the age cap is spent.
+
+    THE SHAPE IS `starvation_park_owner`'s, and for the same stated reason: a receipt that is not
+    bound to an EPISODE lives forever and eventually authorises a write it never earned. Here the
+    binding runs the other way — this predicate proves the park is SOMEONE ELSE'S — so every
+    ambiguity resolves toward the age episode owning it, i.e. toward the capacity sweep leaving
+    the park alone.
+
+      1. INERT UNLESS PROVEN RELEVANT. With no bot-authored age-park receipt anywhere in the
+         history the answer is False with no timestamp parsing at all. This is what makes the
+         change safe for the entire existing capacity population: a PR that has never seen a
+         groom age park cannot reach a single new branch, so no legacy park loses the #691 exit.
+      2. TRUST FILTER FIRST. Only the orchestration bot's own comments are receipts (the rule
+         every other receipt reader here applies), so a third party cannot forge an age receipt
+         and talk a genuine capacity park into standing forever.
+      3. EPISODE BINDING. `superseding_markers` are the durable park receipts of the OTHER
+         mechanisms — worker-pr's park-generation receipt and PARK_REASON_MARKER. One of those
+         STRICTLY newer than the newest age receipt means another mechanism has parked since, so
+         the age episode is closed and the ordinary capacity path resumes. They are passed in
+         rather than hard-coded because the generation marker's spelling is owned by worker-pr;
+         the caller pins it against the real module.
+      4. TIES LEAVE THE PARK ALONE. A superseding receipt sharing an instant with the age
+         receipt is the ambiguous case, so it does NOT close the episode (the mirror of
+         starvation_park_owner's `>=`-refuses, in the direction that refuses to clear).
+      5. AN UNREADABLE STAMP IS NOT AN EPISODE BOUNDARY. Once an age receipt is known to exist,
+         a bot comment whose `created_at` cannot be parsed makes the boundary unprovable, and
+         the answer is True — the age episode keeps the park.
+
+    Note what is deliberately NOT a superseding marker: groom's own un-park receipt. groom writes
+    the receipt BEFORE it deletes the label, so a receipt with the label still live is groom's
+    own crash residue, which groom's convergence branch completes. Treating it as an episode
+    boundary would hand that residue to the capacity sweep, which would clear it while minting a
+    receipt claiming a starvation recovery that never happened."""
+    if not bot_login:
+        return (False, "")
+    rows = []
+    seen_age = False
+    for comment in comments if isinstance(comments, list) else []:
+        if not isinstance(comment, dict):
+            continue
+        login = str((comment.get("user") or {}).get("login", ""))
+        if login.casefold() != str(bot_login).casefold():
+            continue
+        body = str(comment.get("body", ""))
+        if GROOM_AGE_PARK_MARKER in body:
+            seen_age = True
+        rows.append((comment.get("created_at"), body))
+    if not seen_age:
+        return (False, "")
+    newest_age = None
+    stamped = []
+    for stamp, body in rows:
+        if not valid_timestamp(stamp):
+            log(f"::warning::a bot receipt carries an unreadable stamp {stamp!r}, so the "
+                "age-park episode boundary cannot be established; the age park stands")
+            return (True, "a bot receipt carries an unreadable stamp, so the age-park episode "
+                          "boundary cannot be established")
+        instant = parse_ts(stamp)
+        stamped.append((instant, body))
+        if GROOM_AGE_PARK_MARKER in body and (newest_age is None or instant > newest_age):
+            newest_age = instant
+    for instant, body in stamped:
+        if instant <= newest_age:
+            continue                    # a tie is ambiguous: it does NOT close the episode
+        for marker in superseding_markers:
+            if marker and marker in body:
+                return (False,
+                        f"another park mechanism receipted at {canonical_ts(instant.isoformat())}"
+                        ", strictly after the newest age-park receipt — the age episode is "
+                        "closed and this park is the capacity sweep's again")
+    return (True,
+            f"groom's cause-gated AGE park (newest receipt "
+            f"{canonical_ts(newest_age.isoformat())}) — its exit is groom's own cause proof, and "
+            "sustained fleet health is not evidence about an orphan draft or a wedged merge "
+            "state")
 
 # The CLOSED taxonomy of park causes and the class each belongs to. The class decides label
 # ownership (invariant 1): a capacity cause takes the MACHINE-owned soft hold (review:parked /
