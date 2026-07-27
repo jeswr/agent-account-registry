@@ -120,10 +120,31 @@
         <div id="obs-triggers" class="obs-trigger-stack" aria-live="polite"></div>
         <div id="obs-grid" class="obs-grid" aria-live="polite"></div>
       </section>
+      <!-- Live client-side layer (live.js). Progressive enhancement: it re-derives four
+           numbers straight from the public GitHub API so they are not limited by the
+           snapshot's cron + Pages-deploy lag. Stays hidden unless a live poll succeeds, so a
+           blocked or rate-limited visitor simply sees the snapshot sections above. -->
+      <section id="live-section" aria-labelledby="live-heading" hidden>
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Live · direct from the GitHub API</p>
+            <h2 id="live-heading">Real-time throughput</h2>
+          </div>
+          <p id="live-status" class="freshness"></p>
+        </div>
+        <div id="live-targets" class="live-grid" aria-live="polite"></div>
+        <p class="live-footnote">
+          Unauthenticated and anonymous — no credential is sent from this page. Polling paces
+          itself against the shared 60-requests/hour per-IP limit and uses conditional requests,
+          so an unchanged repository costs no quota. Counts shown as “≥ n” are lower bounds
+          because the API page was full.
+        </p>
+      </section>
     </main>
 
     <footer>Public operational view · account identities are HMAC-salted</footer>
   </div>
+  <script src="live.js" defer></script>
   <script src="app.js" defer></script>
 </body>
 </html>

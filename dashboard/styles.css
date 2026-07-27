@@ -275,3 +275,78 @@ footer { margin-top: 50px; padding: 24px 0 40px; border-top: 1px solid var(--lin
   .pulse { animation: breathe 2.2s ease-out infinite; }
   @keyframes breathe { 0%, 100% { box-shadow: 0 0 0 4px rgba(85, 209, 135, .08); } 50% { box-shadow: 0 0 0 8px rgba(85, 209, 135, 0); } }
 }
+
+/* --- Live client-side layer (live.js) ------------------------------------------------------ */
+/* Deliberately visually distinct from the snapshot panels: a live value and a snapshot value
+   must never be mistaken for one another. */
+.live-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+
+.live-card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius);
+  padding: 18px 20px;
+}
+
+.live-card-title {
+  margin: 0 0 14px;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: .84rem;
+  color: var(--accent);
+  word-break: break-all;
+}
+
+.live-stats { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.live-stat { background: var(--panel-2); border-radius: 12px; padding: 12px 14px; }
+.live-stat-label { margin: 0; font-size: .7rem; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
+.live-stat-value { margin: 6px 0 0; font-size: 1.55rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+.live-stat-note { margin: 4px 0 0; font-size: .7rem; color: var(--muted); }
+
+.live-census-caption {
+  margin: 16px 0 6px;
+  font-size: .7rem;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  color: var(--muted);
+}
+
+.live-census, .live-cron { list-style: none; margin: 0; padding: 0; display: grid; gap: 3px; }
+
+.live-census li, .live-cron li {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 10px;
+  padding: 4px 8px;
+  border-radius: 7px;
+  background: var(--panel-2);
+  font-size: .76rem;
+}
+
+.live-census-name, .live-cron-name {
+  font-family: "SFMono-Regular", Consolas, monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.live-census-count { font-variant-numeric: tabular-nums; font-weight: 700; color: var(--accent); }
+.live-cron-meta { color: var(--muted); font-size: .72rem; white-space: nowrap; }
+
+.live-cron li[data-state="ok"] .live-cron-meta { color: var(--good); }
+.live-cron li[data-state="stale"] { border-left: 2px solid var(--warn); }
+.live-cron li[data-state="stale"] .live-cron-meta { color: var(--warn); }
+.live-cron li[data-state="failing"] { border-left: 2px solid var(--bad); }
+.live-cron li[data-state="failing"] .live-cron-meta { color: var(--bad); }
+
+.live-partial { margin: 12px 0 0; font-size: .72rem; color: var(--warn); }
+
+/* Paused is a VISIBLE state, never a silent fall-back to the snapshot. */
+#live-status[data-state="paused"] { color: var(--warn); }
+#live-status[data-state="live"] { color: var(--good); }
+
+.live-footnote { margin: 12px 0 0; font-size: .72rem; line-height: 1.5; color: var(--muted); }
+
+@media (max-width: 860px) {
+  .live-grid, .live-stats { grid-template-columns: 1fr; }
+}

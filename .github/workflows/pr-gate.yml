@@ -121,6 +121,29 @@ jobs:
             bash -n "$f"
           done
 
+      # The dashboard's client-side JS carries real decision logic (API rate-limit pacing,
+      # lower-bound detection on truncated pages, newest-run-per-name cron resolution). It runs
+      # in visitors' browsers where nothing else can catch a regression, so its pure logic
+      # ships a `--self-test` mirroring the Python convention above. Uses the runner's
+      # preinstalled Node — no extra action dependency, and this asserts nothing about a
+      # specific Node version.
+      - name: node --self-test every dashboard module that has one
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          node --version
+          n=0
+          for f in dashboard/*.js; do
+            grep -q -- '--self-test' "$f" || continue
+            echo "== node $f --self-test =="
+            node "$f" --self-test
+            ((n += 1))
+          done
+          # A silently-empty loop here would report success while testing nothing — the exact
+          # false-green shape this repo keeps finding. Fail instead.
+          [[ "$n" -gt 0 ]] || { echo "::error::no dashboard JS self-tests ran"; exit 1; }
+          echo "ran $n dashboard JS self-tests"
+
       - name: actionlint + yaml-parse every workflow
         run: |
           set -euo pipefail
