@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4375,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "00a9a80065381bbc055dc78da0d2e9a8967c0ca1",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "SV-ND-2 requires a request whose bound index is unreadable or absent to be indistinguishable from the same request against a non-existent index. SV-ND-4, however, permits a requester with at least one eligible entry to distinguish those cases, and the Unreadable descriptor conformance scenario requires the unreadable-descriptor bound case to return neighbours while the unbound case returns zero solutions. The added prose claims both observables are excepted at the assertion itself, but SV-ND-2 itself contains no exception. A conforming implementation cannot satisfy both normative requirements.",
+    "file": "site/specs/solid-vector-api.typ",
+    "fix_hint": "Qualify SV-ND-2 itself so bound-index unreadability/absence must be indistinguishable only when the requester has an empty eligible entry set, while retaining the unconditional indistinguishability requirements for unreadable versus absent seeds and referenced graphs. Align the nearby explanation and conformance scenario with that exact boundary.",
+    "severity": "major",
+    "title": "SV-ND-2 still contradicts the bound-index disclosure exception"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 4 remains materially unchanged on the prior blocking point. SV-ND-4 explicitly permits a requester with an eligible entry to distinguish a bound index whose descriptor is unreadable from no bound index, and the Unreadable descriptor scenario requires neighbours in the former case and zero solutions in the latter. But SV-ND-2 still normatively requires a request whose bound index is unreadable or absent to be indistinguishable from the same request against a non-existent index. The new explanatory prose says the exception is made at the assertion itself, but SV-ND-2 contains no such qualification. The specification therefore still prescribes mutually incompatible conformance behavior. This is the same major finding at the same severity as round 3, so progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
