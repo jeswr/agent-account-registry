@@ -423,6 +423,17 @@ jobs:
           # this `run:` script, which would execute a label named `$(...)` (the PR #260 round-4
           # blocker class). Exactly ONE provider label is required: the old loop let the last
           # matching label win, so a request labelled with BOTH providers silently picked one.
+          #
+          # #263: that property is now EXECUTED, not claimed in prose. Labels are applicable by
+          # anyone with TRIAGE permission while the trust gate above only vets the triggering actor
+          # and the issue author for admin/maintain, so a pre-applied hostile label name was code
+          # execution in a job holding issues:write + contents:write that gates the
+          # REGISTRY_SECRETS_PAT steps — a far lower bar than that gate exists to enforce. So
+          # grant-account.py --self-test renders THIS step's expressions the way the runner renders
+          # them (textually, before bash parses a word), takes LABELS_JSON from the env: block
+          # below rather than supplying its own, runs the fragment with a label named
+          # `$(touch <canary>)` and FAILS if the canary appears. The harness is proved real by
+          # firing the same label through the deleted inline form, where the canary MUST appear.
           LABELS_JSON: ${{ toJSON(github.event.issue.labels.*.name) }}
         run: |
           set -euo pipefail
