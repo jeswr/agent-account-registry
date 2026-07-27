@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3884,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "682f3dc8c7f26e231ea3086f499d28d6b7925c6b",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`ends_operand` continues to exclude `>` because that byte can be the greater-than operator, but `>` also terminates an IRI operand. For `FILTER(<http://ex/a><1&&FLTR(?o)&&?b>2)`, scanning the first IRI leaves `prev == '>'`; the following compact `<` is therefore treated as an IRIREF opener. Its body remains IRIREF-legal until the later `>`, so `iriref_end` skips over `FLTR` and no `FILTER` suggestion is produced. This is the same major correctness finding as round 3, and no added test exercises that counterexample.",
+    "file": "crates/sparq-terse/src/diagnose.rs",
+    "fix_hint": "Track the preceding token's lexical kind rather than only its final byte, so an IRI operand ending in `>` is distinguishable from the greater-than operator. Add a real-path regression using `FILTER(<http://ex/a><1&&FLTR(?o)&&?b>2)` that asserts `FLTR` suggests `FILTER`, while retaining a case where a greater-than operator is followed by a genuine IRI.",
+    "severity": "major",
+    "title": "IRI operand before compact less-than still swallows diagnostics"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 4 is stagnant: the round-3 acceptance-set mismatch remains in the submitted implementation. `opens_iriref` still reduces the preceding token to one byte, while `ends_operand` still excludes `>`. Thus a completed IRI operand followed immediately by a less-than operator is misclassified as the start of another IRIREF; a later `>` can cause the scanner to skip the misspelled keyword. The newly added compact-comparison tests cover variables and call results before `<`, but not the exact IRI-operand counterexample from round 3.",
+  "verdict": "request_changes"
+ }
+}
