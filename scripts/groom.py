@@ -6365,6 +6365,52 @@ def _self_test() -> int:
                 ),
                 ([], True, True),
             )
+        # THE CONVERGENCE PATH under the same hold. The three checks above all exercise the GRANT
+        # branch, so they pin the guard's POSITION only above that one: a guard moved below the
+        # `granted is not None` branch would still pass them while the convergence retry deleted
+        # the label off a human-held PR. Same fixture, plus the un-park receipt already on record
+        # and the machine label still live — the exact crash residue the convergence branch exists
+        # for — and it must refuse too.
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/37/comments": [
+                _park_receipt_comment(1, 37),
+                _grant_comment(f"{AGE_UNPARK_MARKER} cause=merge-dirty head={37:040x} gen=1 -->",
+                               at="2026-07-26T11:00:00Z")],
+            **_bot_park_timeline(37)}
+        held_converge_log, _e, _r = _sweep_with_refusals(
+            {}, pulls=(_machine_parked_pr(37, "clean", ("review:parked", "needs:user"),
+                                          fresh=True),))
+        check(
+            "[#769] the CONVERGENCE retry refuses under a human-owned hold too — the guard is "
+            "above BOTH write branches, not just the grant",
+            (
+                terminal_sweep_env["writes"],
+                "age_converged=0" in held_converge_log,
+                "human-owned hold(s) live (needs:user)" in held_converge_log,
+            ),
+            ([], True, True),
+        )
+        # ... and the SAME convergence fixture WITHOUT the hold does converge, so the check above
+        # cannot pass merely because convergence stopped working.
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/37/comments": [
+                _park_receipt_comment(1, 37),
+                _grant_comment(f"{AGE_UNPARK_MARKER} cause=merge-dirty head={37:040x} gen=1 -->",
+                               at="2026-07-26T11:00:00Z")],
+            **_bot_park_timeline(37)}
+        unheld_converge_log, _e, _r = _sweep_with_refusals(
+            {}, pulls=(_machine_parked_pr(37, "clean", ("review:parked",), fresh=True),))
+        check(
+            "[#769] CONTROL: the identical convergence WITHOUT the hold still completes the "
+            "interrupted unlabel",
+            (
+                ("DELETE", "/repos/owner/repo/issues/37/labels/review%3Aparked")
+                in terminal_sweep_env["writes"],
+                "age_converged=1" in unheld_converge_log,
+            ),
+            (True, True),
+        )
+
         # THE OTHER DIRECTION, on the SAME fixture minus the hold — otherwise the three checks
         # above would pass just as well if the exit had stopped granting anything at all. This is
         # the same PR, same recovered cause, same receipts: it MUST still be re-admitted.
