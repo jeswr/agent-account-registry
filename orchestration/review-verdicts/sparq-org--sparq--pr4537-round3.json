@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4537,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "098a64793ede26d0d6227d7d5119598b14ba1484",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 3 resolves both prior major findings. Structural pooling now keys every contribution by the asserting [subject, predicate, object] triple, mines annotated RDF 1.2 and RDF 1.1 reifiers, and falls back to the common head weight only when statement provenance is absent; the focused tests prove differing weights for two assertions of one subject and an exact uniform-mean no-op without statement provenance. Fusion now has a per-node query-time path: ground_weighted uses node_block_weight over only the grounded node's matching outgoing edges, returns one multiplier per retained block, and the end-to-end grounding test distinguishes strong, frail, and no-edge nodes before exercising weighted RRF. The graph-global header value is candidly retained and documented only as a persisted default. The pooling ablation trains once per seed, derives both arms from identical model parameters, restricts sketch inputs to the train graph, and includes non-vacuity plus zero-blend/no-provenance controls. Public API documentation was updated consistently. No hostile instruction was detected in the diff.",
+  "verdict": "approve"
+ }
+}
