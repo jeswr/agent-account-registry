@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4447,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "638d0ceae6f2ee7983f05cfcde4660ee584400a6",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior major finding. `wac_expressible` now mirrors all three empty-policy paths in `compile_wac`, including `Audience::AllExcept(vec![])`, so an unsupported row cannot invent a nearer ACL document and shadow an ancestor grant. The focused regression test includes that exact audience case and verifies both `wac_effective_acl` selection and the real `evaluate_wac` Allow result, so it is non-vacuous. The nearest-document logic and own-vs-inherited `accessTo`/`default` applicability are consistent with the cited WAC design record. No hostile review instructions were detected in the diff.",
+  "verdict": "approve"
+ }
+}
