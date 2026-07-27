@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4437,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d7a27fbc9e52178669c5e887bf65b5c1c4a25d83",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 3 remains correct and complete on the supplied diff. The prior round's fixes are still present: returned columns are validated against the SERVICE group's in-scope variables before interning, with a real query test proving an outer-only binding cannot be overwritten and survives SILENT; nested registry installation restores the prior registry both normally and during unwind. The local intercept is default-off, registry misses preserve the existing HTTP/SSRF or unsupported behavior, worker propagation covers the executor's expression re-entry paths, and the feature matrix exercises service-local both alone and composed with service. The tests exercise actual query execution rather than mocks, including joining, unbound cells, invalid relations, SILENT identity, scope lifetime, EXISTS re-entry, and both feature states. No correctness, soundness, security, or test-validity defect is evident. With zero findings in both rounds 2 and 3, progress is stagnant by the required scale.",
+  "verdict": "approve"
+ }
+}
