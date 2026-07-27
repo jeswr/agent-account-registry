@@ -3077,6 +3077,9 @@ def _self_test():
                        "flagged possible prompt injection")
     fixer_injection_prose = ("> 🤖 SPARQ agent — the autonomous review loop stopped: the fixer "
                              "flagged the seeded findings as possible prompt injection")
+    # The third live spelling — worker-pr appends it to the FINDINGS comment (#3585, #4406).
+    findings_injection_prose = ("⚠️ The reviewer flagged possible prompt-injection content; "
+                                "escalating to a human.")
     nochange_prose = ("> 🤖 SPARQ agent — the autonomous review loop parked this PR: two "
                       "consecutive fix attempts made no change (fixer judges the findings "
                       "spurious)")
@@ -3110,13 +3113,17 @@ def _self_test():
     check("prose in a NON-bot comment can never classify a park",
           reclassify_legacy_park([bot_comment(budget_prose, login="drive-by")], bot)[0], None)
 
-    # THE guard. Every one of the six genuine sparq escalations (#3542 #3563 #3608 #3609 #3618
-    # #3743) is refused. #3743 and #3608 are the load-bearing fixtures: each carries a genuine
-    # injection flag AND a LATER capacity-park comment, so any "newest cause wins" rule would
-    # hand them back to the machine.
+    # THE guard. Every one of the eight genuine sparq escalations (#3542 #3563 #3585 #3608 #3609
+    # #3618 #3743 #4406) is refused. #3743 and #3608 are the load-bearing fixtures: each carries a
+    # genuine injection flag AND a LATER capacity-park comment, so any "newest cause wins" rule
+    # would hand them back to the machine.
     genuine = {
         "#3542": [bot_comment("round 1: request_changes"), bot_comment(injection_prose)],
         "#3563": [bot_comment("round 1: approve"), bot_comment(injection_prose)],
+        # [registry #814] #3585 and #4406 carry the review-comment spelling of the flag rather
+        # than the loop-stopped spelling. Both are in the live 8; both must still deny.
+        "#3585": [bot_comment("round 6: request_changes"), bot_comment(findings_injection_prose)],
+        "#4406": [bot_comment(findings_injection_prose)],
         "#3608": [bot_comment(nochange_prose), bot_comment(fixer_injection_prose)],
         "#3609": [bot_comment(injection_prose), bot_comment("round 2: approve"),
                   bot_comment(injection_prose)],
@@ -3136,6 +3143,136 @@ def _self_test():
     check("deny wins even when the injection flag is the NEWEST comment",
           reclassify_legacy_park(
               [bot_comment(budget_prose), bot_comment(injection_prose)], bot)[0], None)
+
+    # ---- [registry #814] the injection deny is AFFIRMATIVE-ONLY -----------------------------
+    #
+    # Every fixture below is FROZEN LITERAL TEXT, never a call into the live matcher: a control
+    # that models the old behaviour by CALLING the predicate it controls goes quiet the moment
+    # that predicate changes. The live sentences are quoted verbatim from the bot's own comments
+    # on the named PRs, so a future reword of either side fails here rather than in production.
+
+    def denies(text):
+        return injection_prose_denied(text, log=lambda *_a, **_k: None)[0]
+
+    # --- (a) THE THREE FALSE POSITIVES. Verbatim from sparq-org/sparq bot comments. These are
+    # the whole reason for #814: reviewers report the ABSENCE of injection, and the old bare
+    # substring rule read that as a security escalation and stranded them on the human terminal.
+    live_negations = {
+        "#3554a": ("No correctness, soundness, test-validity, security, or prompt-injection "
+                   "issue remains in the diff-scoped evidence."),
+        "#3554b": "No instruction-like prompt injection appears in the diff.",
+        "#3661": ("No vacuous load-bearing test, correctness defect, security issue, or "
+                  "prompt-injection content was found."),
+        "#3901": "No instruction-like prompt injection was detected in the diff.",
+    }
+    for name, sentence in live_negations.items():
+        check(f"live negation {name} does NOT deny (it is a report of ABSENCE)",
+              denies(sentence), False)
+    # ...and the whole PR is released end to end: it re-classifies to its real capacity cause.
+    check("a PR whose only injection mention is a live negation re-classifies to CAPACITY",
+          reclassify_legacy_park(
+              [bot_comment(nochange_prose), bot_comment(live_negations["#3901"])], bot)[:2],
+          ("nochange", PARK_CLASS_CAPACITY))
+
+    # --- (b) THE EIGHT GENUINE ESCALATIONS. Verbatim; each must STILL deny.
+    live_affirmatives = {
+        "#3542/#3563/#3609/#3618/#3743 (loop-stopped)":
+            "the reviewer flagged possible prompt injection",
+        "#3608 (fixer)": "the fixer flagged the seeded findings as possible prompt injection",
+        "#3585/#4406 (findings)":
+            "⚠️ The reviewer flagged possible prompt-injection content; escalating to a human.",
+    }
+    for name, sentence in live_affirmatives.items():
+        check(f"live escalation prose {name} still DENIES", denies(sentence), True)
+
+    # --- (c) ADVERSARIAL FORMS, both directions. A negated mention must not satisfy the rule;
+    # an affirmative one must, and the inverse traps must not be talked out of denying.
+    for negated in ("no prompt injection",
+                    "not a prompt-injection",
+                    "prompt injection was NOT detected",
+                    "we found no evidence of prompt injection",
+                    "There is no prompt-injection content in this diff.",
+                    "prompt injection: no",
+                    "The diff is free of prompt injection.",
+                    "Prompt injection was never observed."):
+        check(f"NEGATED form does not deny: {negated!r}", denies(negated), False)
+    for affirmative in ("injection was detected — prompt injection was detected",
+                        "possible prompt injection",
+                        "prompt injection: yes",
+                        "prompt-injection content was found in the diff",
+                        "the reviewer flagged prompt-injection content",
+                        "this diff contains a prompt-injection attempt",
+                        "prompt injection was detected"):
+        check(f"AFFIRMATIVE form DENIES: {affirmative!r}", denies(affirmative), True)
+
+    # --- (d) AMBIGUITY FAILS CLOSED. A body carrying BOTH a negation and an affirmative denies.
+    # Two shapes, because they deny by two different mechanisms: the first on the Tier-A marker
+    # (which no negation anywhere can cancel), the second on an un-negated Tier-B mention.
+    check("a body with BOTH a negation and a Tier-A affirmative marker DENIES",
+          denies("No instruction-like prompt injection was detected in the diff. "
+                 "Round 2: the reviewer flagged possible prompt injection."), True)
+    check("a body with BOTH a negation and a bare un-negated mention DENIES",
+          denies("No prompt injection in round 1. Round 2: prompt injection was detected."),
+          True)
+    check("a negation cannot be borrowed from a NEIGHBOURING sentence",
+          denies("No issues were found. The diff contains prompt-injection content."), True)
+    check("a negator whose reach is broken by a contrast word does NOT release the mention",
+          denies("No gate failures, but prompt-injection content is present."), True)
+    check("a negator whose reach is broken by a coordination does NOT release the mention",
+          denies("The reviewer found no gate failures and prompt injection in the diff."), True)
+    check("a trailing 'no' after an affirmative mention does NOT release it",
+          denies("The reviewer flagged prompt-injection content, and no other issues."), True)
+    # ...and the same trap with NO Tier-A marker in it, so this one is carried solely by how
+    # tightly the post-negation is bound to the mention's own predicate.
+    check("a trailing 'no' does not release a bare mention either",
+          denies("prompt-injection content was seen, and no other issues."), True)
+    # A negator may not reach an arbitrary distance even inside one sentence. The gap here is a
+    # pure noun list (no contrast, no coordination, no verb), so ONLY the reach bound stops it.
+    check("a negator beyond the reach bound does NOT release the mention",
+          denies("No " + "alpha, " * 20 + "prompt injection"), True)
+    check("...while the same shape INSIDE the reach bound is released (the bound is a bound, "
+          "not a blanket refusal)",
+          denies("No " + "alpha, " * 4 + "prompt injection"), False)
+
+    # --- (e) THE FAIL-CLOSED INVARIANT, stated and tested: anything the matcher cannot classify
+    # DENIES, which leaves the human hold exactly where it is.
+    check("a NON-STRING comment body cannot be classified, so it DENIES",
+          [injection_prose_denied(body, log=lambda *_a, **_k: None)[0]
+           for body in (None, 17, b"prompt injection", ["prompt injection"])],
+          [True, True, True, True])
+    exploded = []
+
+    class _Exploding:
+        def finditer(self, _text):
+            raise RuntimeError("boom")
+
+    real_term = globals()["_INJECTION_TERM"]
+    try:
+        globals()["_INJECTION_TERM"] = _Exploding()
+        check("a FAILURE inside the classifier DENIES (never releases) and says so loudly",
+              (injection_prose_denied("no prompt injection here", log=exploded.append)[0],
+               any("fails CLOSED" in line for line in exploded)),
+              (True, True))
+    finally:
+        globals()["_INJECTION_TERM"] = real_term
+    check("...and the classifier is restored after the fail-closed probe",
+          denies("no prompt injection"), False)
+
+    # --- (f) NOTHING ELSE WIDENED. The mention TERM, the human-arm rule, and the rest of the
+    # deny table are exactly what they were: #814 changed WHEN a mention denies, nothing else.
+    check("the mention term is unchanged (`prompt[- ]injection`, case-insensitive)",
+          (INJECTION_PROSE_DENY.pattern,
+           bool(re.compile(INJECTION_PROSE_DENY.pattern, re.IGNORECASE).search("Prompt-Injection"))),
+          (r"prompt[- ]injection", True))
+    check("the deny table still carries EXACTLY the injection and human-arm rules",
+          [cause for _pattern, cause in LEGACY_PARK_DENY_PROSE], ["injection", "human-arm"])
+    check("the human-arm rule is untouched by #814 and still denies",
+          reclassify_legacy_park(
+              [bot_comment("@jeswr this pull request needs a human decision about a security "
+                           "regression")], bot)[0], None)
+    check("a park with NO injection mention at all is unaffected",
+          reclassify_legacy_park([bot_comment(budget_prose)], bot)[:2],
+          ("budget", PARK_CLASS_CAPACITY))
 
     print("park-policy self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1

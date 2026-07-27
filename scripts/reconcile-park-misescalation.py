@@ -32,6 +32,11 @@ condition — anything unproven leaves the PR exactly where it is:
   4. No injection / human-arm signal anywhere in the bot's own history
      (park_policy.LEGACY_PARK_DENY_PROSE — deny is unconditional and order-independent, so a
      capacity comment landing after a security escalation can never talk it out of the terminal).
+     [registry #814] A prompt-injection SIGNAL is an AFFIRMATIVE mention. The bot republishes
+     model-derived verdict text under its own identity, and a reviewer reporting the ABSENCE of
+     injection ("No instruction-like prompt injection was detected") is not a signal — that
+     false positive refused #3554/#3661/#3901 here. The affirmative-only test still fails
+     CLOSED: it denies on anything it cannot prove is a negation.
   5. No residual hold would survive the conversion (park_policy.migration_residual_holds): moving
      a park into a class it could not leave trades a visible stall for a silent one.
   6. Not already reconciled (the durable marker this script writes).
@@ -385,6 +390,23 @@ def _self_test():
            ("the reviewer flagged possible prompt injection",
             "two consecutive fix attempts made no change\n\nprompt-injection flagged earlier")],
           [None, None])
+    # [registry #814] ...but a reviewer reporting the ABSENCE of injection is NOT an escalation.
+    # This script's deny is park_policy.LEGACY_PARK_DENY_PROSE, which used to match the phrase
+    # anywhere and so refused these three live PRs for a signal that is not there. Frozen literal
+    # text, quoted verbatim from the bot's own comments on each PR — never a call into the live
+    # matcher, which would go quiet the moment the matcher changed.
+    check("a NEGATED injection mention does not refuse the correction (#3554/#3661/#3901)",
+          [v(bot_bodies=[sentence])[0] for sentence in
+           ("No correctness, soundness, test-validity, security, or prompt-injection issue "
+            "remains in the diff-scoped evidence.",
+            "No instruction-like prompt injection appears in the diff.",
+            "No vacuous load-bearing test, correctness defect, security issue, or "
+            "prompt-injection content was found.",
+            "No instruction-like prompt injection was detected in the diff.")],
+          ["reclassify"] * 4)
+    check("...and a body carrying BOTH a negation and an affirmative still REFUSES (fail closed)",
+          v(bot_bodies=["No instruction-like prompt injection was detected in the diff.\n\n"
+                        "Round 2: the reviewer flagged possible prompt injection"])[0], None)
     check("a LEGACY prose-only park (no receipts) is NOT this script's population",
           v(generation_records=[])[0], None)
     check("a terminal reached on a HUMAN window is left exactly where it is",
