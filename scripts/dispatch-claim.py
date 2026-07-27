@@ -1815,8 +1815,9 @@ def filter_busy_area_items(items, repo, pulls, issue_labels, provenance, pr_stat
 #   12 parks * 5 requests       =  60  <=  102     (59% of the spare, 9.8% of a tick)
 #
 # and 12 is 3x the largest starved board actually measured (4 holders, the window above), so the
-# measured case drains in ONE tick — one floor interval, not five. A board wider than the bound is
-# paced onto later ticks exactly as before, loudly. _starvation_sweep_self_test asserts BOTH halves
+# measured case drains in ONE tick (10 min) rather than FOUR (40 min); the observed outage ran ~55
+# min because that window also spans the tick that first measured it and the one that cleared it. A
+# board wider than the bound is paced onto later ticks exactly as before, loudly. _starvation_sweep_self_test asserts BOTH halves
 # of this arithmetic against dispatch-tick-floor.py's own constants, so neither the floor nor this
 # bound can drift away from the reasoning that produced it.
 STARVATION_PARK_REQUESTS_EACH = 5
