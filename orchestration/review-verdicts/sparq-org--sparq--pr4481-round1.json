@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4481,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "5953daa3bb275ecd0492bb9d6f091bbd2757c02c",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`odrl_policies_for` drops every policy that fails parsing and the W2 lane continues with the remaining policies, while the comment claims this can only remove grants. That is false for the compiled corpus because a policy may be a Prohibition: removing a matching prohibition can expose a permission from another policy under deny-overrides. Treating `unparseable > 0` as advisory therefore makes the purported fail-closed security lane incomplete, and there is no test covering a parse failure involving a deny/allow combination.",
+    "file": "bench/ac/live/src/main.rs",
+    "fix_hint": "Fail the W2 and W4 ODRL lanes when any non-empty compiled policy is unparseable (or preserve and prove equivalent deny semantics instead of dropping it). Add a regression test with an allow plus an intentionally unparseable matching prohibition and assert that the lane fails rather than reporting a pass/advisory.",
+    "severity": "major",
+    "title": "Dropping an unparseable prohibition can widen effective access"
+   },
+   {
+    "body": "The translation-contract comment says the W2 lane had a \"roughly a 2x wall-clock increase\" measured on the work box. Repository policy explicitly forbids hard-coded performance numbers and treats work-box timings as non-canonical evidence.",
+    "file": "bench/ac/live/src/main.rs",
+    "fix_hint": "Remove the numeric timing claim. It is sufficient to state qualitatively that rebuilding a fresh store per request adds non-canonical benchmark overhead while the lane's contract is its exit status.",
+    "severity": "minor",
+    "title": "Non-canonical work-box performance number is hard-coded"
+   }
+  ],
+  "progress": null,
+  "summary": "The ODRL live lane adds useful target-hoist and non-vacuity coverage, but its parse-error handling is not fail-closed for a deny-overrides policy set. It also embeds a work-box timing claim prohibited by the repository's evidence rules.",
+  "verdict": "request_changes"
+ }
+}
