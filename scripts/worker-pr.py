@@ -179,6 +179,18 @@ MARKER_KINDS = {
 FIX_MODEL_MARKER = "<!-- sparq-fix-model:v1"
 MODEL_PIN_MARKER = "<!-- sparq-fix-modelpin:v1"
 PROGRESS_MARKER = "<!-- sparq-review-progress:v1"
+# [registry #814] THE THREE INJECTION-ESCALATION SPELLINGS THIS SCRIPT WRITES, named ONCE.
+#
+# These are the only prose this script emits under its own identity that must permanently
+# disqualify a PR from automatic re-classification out of the human-owned terminal, and they are
+# what park_policy.LEGACY_PARK_DENY_PROSE reads back. Naming them is what lets the self-test bind
+# the WRITER to the CLASSIFIER **by identity** rather than by a frozen copy: the test passes THESE
+# OBJECTS through the real deny table, so rewording one here re-evaluates the test with the new
+# value and fails. A copy of the sentence in a fixture list cannot do that — see the self-test.
+INJECTION_PROSE_REVIEW = "the reviewer flagged possible prompt injection"
+INJECTION_PROSE_FIX = "the fixer flagged the seeded findings as possible prompt injection"
+INJECTION_PROSE_FINDINGS = ("⚠️ The reviewer flagged possible prompt-injection content; "
+                            "escalating to a human.")
 # Budget-exhaustion window receipt (finding B; round-3 finding 1 made it label-INDEPENDENT):
 # EVERY consumed-and-exhausted budget window — the INITIAL full-budget window included — is
 # receipted with this marker bound to its window key (the readmission cutoff, or
@@ -2201,7 +2213,7 @@ def post_findings(repo, pr_number, verdict_file, round_n):
         lines.append(f"{PROGRESS_MARKER} round={round_n} progress={progress} -->")
     if document.get("injection_detected"):
         lines.append("")
-        lines.append("⚠️ The reviewer flagged possible prompt-injection content; escalating to a human.")
+        lines.append(INJECTION_PROSE_FINDINGS)
     _comment(repo, pr_number, "\n".join(lines))
     print("findings posted")
 
@@ -4694,7 +4706,7 @@ def review_outcome(args):
         attempt_key = f"rounds={args.round}"
         if document["injection_detected"]:
             # A flagged injection is a genuine human (security) question -> needs:user.
-            reason, park_class = "the reviewer flagged possible prompt injection", "question"
+            reason, park_class = INJECTION_PROSE_REVIEW, "question"
         elif approved and getattr(args, "self_attested", False):
             # [#657] APPROVED, and deliberately not armed. This is not a failure and not a
             # capacity stop — the class is review-only by design (record §3 option (b)), so the
@@ -4789,7 +4801,7 @@ def fix_outcome(args):
     if decision == "re-review":
         set_review_state(args.repo, args.pr, "needs")
     elif decision == "needs-user":
-        reason = ("the fixer flagged the seeded findings as possible prompt injection"
+        reason = (INJECTION_PROSE_FIX
                   if injection else
                   "two consecutive fix attempts made no change (fixer judges the findings spurious)"
                   if not made_changes else
@@ -9676,28 +9688,43 @@ def _self_test():
     # the two together: rewording an injection reason here would silently stop the migration
     # recognising it, and a security-parked PR would be handed back to the machine.
     #
-    # This binds them in BOTH directions. The literal must still be present in this file (so a
-    # reword fails here rather than in production), and it must still be matched by a deny
-    # pattern (so loosening the pattern fails too).
+    # [registry #814] THE BINDING IS BY IDENTITY, NOT BY A FROZEN COPY.
+    #
+    # The version of this guard that shipped with #3809 tested `reason_text in _wp_source` against
+    # a LITERAL LIST declared three lines above it. That check is a TAUTOLOGY — the fixture list is
+    # itself part of `_wp_source`, so the sentence is always "present in this file" no matter what
+    # the write sites say. MEASURED (#814 round 4): rewording the FIX reason or the FINDINGS prose
+    # at its write site left the whole self-test GREEN. Only the review reason failed, and it
+    # failed in an unrelated `decide_review` check that happens to assert the string — not here.
+    # Two of the three sentences this guard is named for were unprotected.
+    #
+    # So the fixtures are gone: the checks below pass the REAL module-level constants — the same
+    # objects the three write sites emit — through the REAL deny table. Reword one and the check
+    # re-evaluates with the new value and goes red, which is the whole point of the guard.
     deny_policy = _park_policy()
-    _wp_source = Path(__file__).resolve().read_text(encoding="utf-8")
-    injection_reasons = [
-        "the reviewer flagged possible prompt injection",
-        "the fixer flagged the seeded findings as possible prompt injection",
-        "The reviewer flagged possible prompt-injection content; escalating to a human.",
-    ]
-    for reason_text in injection_reasons:
-        check(f"the injection reason {reason_text[:38]!r}... is still written by this file",
-              reason_text in _wp_source, True)
-        check(f"...and is still DENIED by park_policy.LEGACY_PARK_DENY_PROSE",
-              any(pattern.search(reason_text)
-                  for pattern, _cause in deny_policy.LEGACY_PARK_DENY_PROSE), True)
+    injection_reasons = (
+        ("review", INJECTION_PROSE_REVIEW),
+        ("fix", INJECTION_PROSE_FIX),
+        ("findings", INJECTION_PROSE_FINDINGS),
+    )
+    for reason_name, reason_text in injection_reasons:
+        check(f"the {reason_name} injection prose this file WRITES is DENIED by "
+              f"park_policy.LEGACY_PARK_DENY_PROSE ({reason_text[:38]!r}...)",
+              [cause for pattern, cause in deny_policy.LEGACY_PARK_DENY_PROSE
+               if pattern.search(reason_text)][:1], ["injection"])
     # And the guard must actually refuse a park carrying each of them, end to end.
-    for reason_text in injection_reasons:
+    for reason_name, reason_text in injection_reasons:
         check(f"reclassify_legacy_park REFUSES a park whose prose is {reason_text[:30]!r}...",
               deny_policy.reclassify_legacy_park(
                   [{"user": {"login": "bot"}, "body": f"> 🤖 SPARQ agent — {reason_text}"}],
                   "bot")[0], None)
+    # ...and the constants are what the WRITE SITES actually emit. Without this, the three checks
+    # above would still pass after someone re-inlined a reworded literal at a park write site and
+    # left the (now unused) constant correct — the frozen-copy failure mode wearing a new hat.
+    _wp_source = Path(__file__).resolve().read_text(encoding="utf-8")
+    for _const in ("INJECTION_PROSE_REVIEW", "INJECTION_PROSE_FIX", "INJECTION_PROSE_FINDINGS"):
+        check(f"{_const} is REFERENCED by a write site, not just defined",
+              _wp_source.count(_const) >= 2, True)
 
     print("worker-pr self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
