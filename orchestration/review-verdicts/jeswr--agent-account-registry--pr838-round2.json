@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 838,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "f2631ebc3baf8455648aad0205b70d5415c0ed0f",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "The round-1 findings are resolved. Recovery 1 now correctly distinguishes the pre-merge resume path from post-merge activation and no longer suggests that an unmerged PR can activate. Recovery 2 now states that the editable account record is only a transcript/comparison input, not authorization or provenance, and routes widening through live grant-label equality plus a checked row-scoped account-pool branch. Its manual fallback likewise requires the exact provenance-carrying branch and confines that PR to the policy grant. The guidance accurately describes the fail-closed membership and provenance checks, including the already-available activation no-op occurring only after all proofs run. No blocker, major, or other actionable issue remains in this documentation-only diff.",
+  "verdict": "approve"
+ }
+}
