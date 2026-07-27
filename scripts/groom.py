@@ -1391,13 +1391,19 @@ def _parked_pr_snapshot(
     return head_sha, updated_at
 
 
-def _merge_latch_state(api: GitHubAPI, repo: str, number: int) -> tuple[bool, bool]:
-    """Return live ``(queued, auto_merge_requested)`` state, failing closed on shape errors."""
+def _merge_latch_state(api: GitHubAPI, repo: str, number: int) -> tuple[str, bool, bool]:
+    """Return live ``(node_id, queued, auto_merge_requested)`` state, failing closed on shape
+    errors.
+
+    The node id was added for issue #684: the defuse path only ever needed to KNOW a latch was
+    live (it declines to redraft a latched PR), but the age-park path has to RETRACT one, and
+    both `dequeuePullRequest` and `disablePullRequestAutoMerge` address the PR by node id. Same
+    single query, same fail-closed shape check — an unreadable latch is never an absent latch."""
     owner, name = repo.split("/", 1)
     query = (
         "query($owner:String!,$name:String!,$number:Int!){"
         "repository(owner:$owner,name:$name){pullRequest(number:$number){"
-        "mergeQueueEntry{id} autoMergeRequest{enabledAt}}}}"
+        "id mergeQueueEntry{id} autoMergeRequest{enabledAt}}}}"
     )
     document = api.request(
         "POST",
@@ -1414,6 +1420,8 @@ def _merge_latch_state(api: GitHubAPI, repo: str, number: int) -> tuple[bool, bo
         pull = repository.get("pullRequest") if isinstance(repository, dict) else None
     if (
         not isinstance(pull, dict)
+        or not isinstance(pull.get("id"), str)
+        or not pull["id"]
         or "mergeQueueEntry" not in pull
         or "autoMergeRequest" not in pull
         or (
@@ -1426,7 +1434,214 @@ def _merge_latch_state(api: GitHubAPI, repo: str, number: int) -> tuple[bool, bo
         )
     ):
         raise GroomError("parked pull request merge-latch state is unknown")
-    return pull["mergeQueueEntry"] is not None, pull["autoMergeRequest"] is not None
+    return (
+        pull["id"],
+        pull["mergeQueueEntry"] is not None,
+        pull["autoMergeRequest"] is not None,
+    )
+
+
+def _park_retract(api: GitHubAPI, action: str, node_id: str) -> None:
+    """One latch-retraction mutation for `park_policy.disarm_before_park` (issue #684).
+
+    groom has never retracted a latch before — `_live_defuse_snapshot` only DECLINES to redraft
+    a latched PR. The age-park has to, because it labels stale NON-DRAFT PRs (`needs:user` on a
+    PR wedged in a BAD_MERGE_STATE), and once #683 lands that label releases the PR's crate
+    partitions while its auto-merge latch would still fire on green CI."""
+    if action == park_policy.PARK_DISARM_DEQUEUE:
+        query = "mutation($id:ID!){dequeuePullRequest(input:{id:$id}){clientMutationId}}"
+    elif action == park_policy.PARK_DISARM_DISABLE_AUTO:
+        query = (
+            "mutation($id:ID!){disablePullRequestAutoMerge(input:{pullRequestId:$id})"
+            "{clientMutationId}}"
+        )
+    else:
+        raise GroomError(f"unknown park disarm action {action}")
+    api.request("POST", "/graphql", {"query": query, "variables": {"id": node_id}})
+
+
+def _disarm_before_park(api: GitHubAPI, repo: str, number: int, park: Any) -> tuple[str, ...]:
+    """Apply `park` only after PROVING PR `repo#number` carries no live auto-merge latch (#684).
+
+    Raises GroomError when the latch cannot be proven gone — the caller then leaves the PR
+    UNPARKED-AND-ARMED, which is the prior, known-safe state (an unparked PR still reserves its
+    crate partitions, so nothing can be handed the crate underneath it) rather than the
+    PARKED-AND-ARMED state a label-first ordering produces."""
+    try:
+        return park_policy.disarm_before_park(
+            repo,
+            number,
+            lambda: _merge_latch_state(api, repo, number),
+            lambda action, node_id: _park_retract(api, action, node_id),
+            park,
+        )
+    except park_policy.ParkDisarmError as exc:
+        raise GroomError(" ".join(str(exc).split())) from exc
+
+
+def _is_our_pull(pull: dict[str, Any], bot_login: str) -> bool:
+    """Our own App's pull request: EXACT login AND ``type == "Bot"``, conjunctively.
+
+    Factored out of `_parked_pr_snapshot` (both conjuncts are load-bearing there for two
+    separately-reviewed reasons) so the #684 round-2 reconciler below applies the SAME ownership
+    rule from one definition. Unknown or malformed authorship is not ours: it declines to mutate."""
+    if not bot_login:
+        return False
+    user = pull.get("user")
+    if not isinstance(user, dict):
+        return False
+    login = user.get("login")
+    if not isinstance(login, str) or login.casefold() != bot_login.casefold():
+        return False
+    return user.get("type") == "Bot"
+
+
+def park_release_reason(pr_labels: set[str], source_labels: set[str] | None) -> str | None:
+    """The LABEL-STATE predicate #683's crate-release valve consumes, re-derived READ-SIDE.
+
+    ISSUE #684 ROUND 2 — THE LAYER THAT BINDS. The first version of this change hooked the disarm
+    into all five machine park-WRITE paths and proved the enumeration exhaustive by mutation. That
+    is a true and useful property, and it is not the property #683 needs, because #683's release
+    predicate (`busy_packages_of_pulls`) is over LABEL STATE, not over call paths:
+
+      D1  any of PARKED_PR_HOLD_LABELS on the PR — `needs:user` is literally the "human attention
+          required" label, so a HUMAN applying it is the intended, common gesture;
+      D2  any `needs:*` label on the provenance-linked SOURCE ISSUE.
+
+    No write-path change can establish an invariant a read-side label predicate consumes: the
+    producers include humans, and (issue #686) `set_review_state`'s convergence of an ambiguous
+    `review:*` namespace to `review:needs-user`, which runs AFTER the arm on the arm path. So the
+    reconciler observes the RESULT — whatever label state exists right now, whoever wrote it — and
+    drives the latch to match. That converges; a write-path enumeration cannot.
+
+    Both label sets are IMPORTED from dispatch-claim rather than restated, because the whole value
+    of this predicate is being the SAME predicate: a set that drifts from the one #683 reads is a
+    reconciler that silently stops covering a disjunct. `source_labels is None` means the source
+    issue is closed/unlisted/unlinked, which is exactly when #683 does NOT fire D2 — so it does not
+    fire here either. Returns a stable reason string, or None when no release trigger stands."""
+    claim = _review_loop_module()
+    held = sorted(set(pr_labels) & set(claim.PARKED_PR_HOLD_LABELS))
+    if held:
+        return f"pr-label {held[0]}"
+    if source_labels:
+        needs = sorted(
+            label for label in source_labels
+            if isinstance(label, str) and label.startswith("needs:")
+        )
+        if needs:
+            return f"source-issue-label {needs[0]}"
+    return None
+
+
+def collect_park_disarm_candidates(
+    repo: str,
+    pulls: dict[int, dict[str, Any]],
+    issues: dict[int, dict[str, Any]],
+    bot_login: str,
+    provenance_of: Any,
+) -> tuple[list[tuple[int, str]], tuple[str, ...]]:
+    """PURE selection for the #684 round-2 label-state reconciler: our own open PRs whose CURRENT
+    label state is a #683 release trigger, in ascending PR order with the reason that selected them.
+    Returns ``(candidates, deferrals)``.
+
+    Deliberately WEAKER than `_parked_pr_snapshot` on three conjuncts, each for a stated reason:
+
+    - **no staleness gate.** #683 frees the crates the moment the label is visible, so a six-hour
+      quiet period would be a six-hour window of parked-and-merge-capable. Retraction is safe to do
+      immediately and unsafe to delay; the defuse REDRAFT (a visible mutation of a PR a human may
+      be reading) is the thing that earns a quiet period, not the latch retraction.
+    - **drafts included.** A latched draft still classifies `latched` in
+      `_pull_inactivity_decision`, so it holds its crate under #683's `posture != 'latched'`
+      predicate, and the latch fires the moment anything readies it.
+    - **`review:parked` included** (via PARKED_PR_HOLD_LABELS). groom's own HUMAN_HOLD_PR_LABELS
+      omits the machine capacity park; #683's release set does not, and this predicate must be
+      #683's, not groom's.
+
+    Ownership stays STRICT: our login and `type == "Bot"`. Retracting a latch on a human's PR is
+    mutating a person's artifact, and a human-authored, human-armed, human-parked PR is out of
+    scope here — recorded as a known gap rather than silently covered.
+
+    Per-PR fail-closed (issue #647's class): a malformed label set or an unreadable provenance
+    record DEFERS that PR and nothing else. It must not raise out of here — this phase runs before
+    dead-lease reclaim and the stale-PR hand-off, and one bad listing row aborting the sweep is
+    exactly the defect #644/#647 were about. The deferral is REPORTED, not swallowed: with no PR
+    reconciled at all it reds the run through `phase_exit_failure` rule 2."""
+    candidates: list[tuple[int, str]] = []
+    deferrals: list[str] = []
+    for number, pull in sorted(pulls.items()):
+        if pull.get("state") not in (None, "open"):
+            continue
+        if not _is_our_pull(pull, bot_login):
+            continue
+        try:
+            pr_labels = _labels(pull, f"target pull request {repo}#{number}")
+            source_labels: set[str] | None = None
+            record = provenance_of(number)
+            if isinstance(record, dict):
+                source = issues.get(record.get("issue"))
+                if isinstance(source, dict):
+                    source_labels = _labels(
+                        source, f"target issue {repo}#{record.get('issue')}")
+            reason = park_release_reason(pr_labels, source_labels)
+        except GroomError as exc:
+            print(f"ALERT PR {repo}#{number}: {exc} — park-disarm selection deferred")
+            deferrals.append(f"{repo}#{number}: {exc}")
+            continue
+        if reason is not None:
+            candidates.append((number, reason))
+    return candidates, tuple(deferrals)
+
+
+def _execute_park_disarm_actions(
+    api: GitHubAPI, repo: str, candidates: list[tuple[int, str]],
+    selection_deferrals: tuple[str, ...] = (),
+) -> PhaseOutcome:
+    """Retract the auto-merge latch of every already-parked PR (#684 round 2), per-PR fail-closed.
+
+    The park label is ALREADY applied — there is nothing left to write — so the primitive's `park`
+    callback is the audit line. That is the point of reusing `park_policy.disarm_before_park` here
+    rather than calling the mutations directly: the retraction is still ordered read -> retract ->
+    PROOF re-read, and a latch that cannot be proven gone still raises instead of being reported as
+    retracted. An unarmed PR costs exactly one read and no mutation, which is the steady state, so
+    this phase is a no-op sweep once it has converged.
+
+    A per-PR failure is an ALERT plus a deferral for that PR only: it must never abort the sweep
+    (issue #647's class), and the PR simply stays parked-and-armed for one more tick — the state
+    that #683's `posture != 'latched'` conjunct refuses to release, so the failure direction is a
+    delayed drain, never a mid-air merge.
+
+    COUNTING, and it is load-bearing against `phase_exit_failure` rule 2: an ALREADY-UNARMED parked
+    PR is a deliberate SKIP, which that rule counts as a COMPLETED object. It has to, because the
+    converged steady state of a reconciler is "every candidate needed nothing" — counting those as
+    failures would red every healthy sweep, and the pressure to then weaken rule 2 is precisely how
+    exit-zero-swallows-failure gets reintroduced somewhere it matters."""
+    attempted = 0
+    changed = 0
+    deferrals: list[str] = list(selection_deferrals)
+    for number, reason in candidates:
+        attempted += 1
+
+        def _receipt(pr: int = number, why: str = reason) -> None:
+            print(f"WRITE park-disarm repo={repo} pr={pr} trigger={why}")
+
+        try:
+            performed = _disarm_before_park(api, repo, number, _receipt)
+        except GroomError as exc:
+            print(f"ALERT PR {repo}#{number}: {exc} — park disarm deferred")
+            deferrals.append(f"{repo}#{number}: {exc}")
+            continue
+        changed += 1
+        if performed:
+            print(
+                f"PARK-DISARM PR {repo}#{number}: retracted {'+'.join(performed)} "
+                f"(release trigger: {reason})"
+            )
+    return PhaseOutcome(
+        label="parked PR latch reconcile",
+        changed=changed,
+        attempted=attempted,
+        deferred=tuple(deferrals),
+    )
 
 
 def _live_defuse_snapshot(
@@ -1450,7 +1665,7 @@ def _live_defuse_snapshot(
         raise GroomError("parked pull request auto_merge state is unknown")
     if pull["auto_merge"] is not None:
         return None
-    queued, auto_merge_requested = _merge_latch_state(api, repo, number)
+    _node_id, queued, auto_merge_requested = _merge_latch_state(api, repo, number)
     if queued or auto_merge_requested:
         return None
     return snapshot
@@ -2284,6 +2499,29 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
         deferred=tuple(detect_deferrals),
     )
 
+    # ISSUE #684 ROUND 2 — the LABEL-STATE reconciler. Every write path in this repo can disarm
+    # before it parks (and now does), and that still cannot establish the invariant #683 consumes,
+    # because #683 reads LABEL STATE and humans write labels. This phase closes the loop from the
+    # read side: whatever is parked right now, by whoever, gets its auto-merge latch retracted.
+    # It runs BEFORE _plan_actions on purpose — the age-park below may add candidates, and those
+    # are handled by their own write-path disarm rather than waiting a tick for this sweep.
+    park_disarm_outcomes: list[PhaseOutcome] = []
+    for repo, api in groomable.items():
+        park_candidates, park_selection_deferrals = collect_park_disarm_candidates(
+            repo, pulls[repo], issues[repo], bot_login,
+            lambda number, repo=repo: _provenance_record(
+                repo, number, ledger_root=ledger_root),
+        )
+        park_disarm_outcomes.append(_execute_park_disarm_actions(
+            api, repo, park_candidates, park_selection_deferrals))
+    park_disarm_outcome = PhaseOutcome(
+        label="parked PR latch reconcile",
+        changed=sum(outcome.changed for outcome in park_disarm_outcomes),
+        attempted=sum(outcome.attempted for outcome in park_disarm_outcomes),
+        deferred=tuple(item for outcome in park_disarm_outcomes
+                       for item in outcome.deferred),
+    )
+
     admitted = {
         # [registry #835] The repo's master-protected enrolment allowlist, so an ADMITTED
         # orchestrator-class PR suppresses its source issue's exhaustion park exactly as an
@@ -2599,15 +2837,34 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
                     print(f"SKIP PR {action.repo}#{action.number}: needs:user park suppressed "
                           "(sticky human unpark)")
                     continue
-                _ensure_label(api, action.repo, "needs:user")
-                api.request(
-                    "POST",
-                    f"/repos/{action.repo}/issues/{action.number}/labels",
-                    {"labels": ["needs:user"]},
-                )
-                print(
-                    f"WRITE add labels repo={action.repo} issue={action.number} labels=needs:user"
-                )
+
+                def apply_age_park(repo: str = action.repo, number: int = action.number) -> None:
+                    _ensure_label(api, repo, "needs:user")
+                    api.request(
+                        "POST",
+                        f"/repos/{repo}/issues/{number}/labels",
+                        {"labels": ["needs:user"]},
+                    )
+                    print(
+                        f"WRITE add labels repo={repo} issue={number} labels=needs:user"
+                    )
+
+                # #684: THE age-park is the sharpest parked-and-armed exposure in the tree — it is
+                # the one park writer that labels NON-DRAFT PRs (case 1 of stale_worker_pr_reason:
+                # a worker PR wedged in a BAD_MERGE_STATE), and `blocked`/`unstable`/`unknown` all
+                # match a PR whose CI is simply mid-run. Once #683 lands, that `needs:user` frees
+                # the PR's crate partitions on the label alone, so an auto-merge latch surviving
+                # the park merges into a crate the partition has just handed to a sibling.
+                # The retraction is ordered AFTER the sticky-unpark veto (a suppressed park writes
+                # no label, releases no crate, and must not strip an arm from a PR the human just
+                # unparked) and BEFORE the label write, which is why the write is a callback:
+                # there is no ordering of statements here that can land the label first.
+                # A latch that cannot be proven gone raises GroomError, which this loop's
+                # per-PR handler turns into an ALERT + deferral — the PR stays UNPARKED-AND-ARMED
+                # (still reserving its crates) and the next sweep retries. Note the handler is on
+                # the loop body, not on a success path: the deferral runs for this park exactly as
+                # it does for an unreachable PR or an un-labellable one (issue #647).
+                _disarm_before_park(api, action.repo, action.number, apply_age_park)
                 label_changed = True
             comments = _comments(api, action.repo, action.number)
             already_commented = any(
@@ -2660,7 +2917,9 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
         f"defuse_deferred={len(defuse_outcome.deferred) + len(defuse_outcome.unavailable)} "
         f"repair_deferred={len(repair_outcome.deferred)} "
         f"stale_pr_deferred={len(stale_outcome.deferred)} "
-        f"detect_deferred={len(detect_outcome.deferred)}"
+        f"detect_deferred={len(detect_outcome.deferred)} "
+        f"park_disarmed={park_disarm_outcome.changed} "
+        f"park_disarm_deferred={len(park_disarm_outcome.deferred)}"
     )
     # Issue #644 precedence rule 4, now covering all three per-object phases (issue #647): the
     # sweep's WORK — dead-lease reclaim above included — always completes first, and a systemic
@@ -2669,7 +2928,8 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
     # (rule 3) and leaves this green; it does not, and must not, buy silence for a whole-phase
     # failure. The exit status is the report, never the control flow.
     systemic_sweep_failure = sweep_exit_failure(
-        (detect_outcome, repair_outcome, defuse_outcome, stale_outcome)
+        (detect_outcome, repair_outcome, defuse_outcome, stale_outcome,
+         park_disarm_outcome)
     )
     if systemic_sweep_failure is not None:
         raise GroomError(systemic_sweep_failure)
@@ -3016,10 +3276,12 @@ def _self_test() -> int:
                 number = body["variables"]["number"]
                 if number == 9:
                     return {"data": {"repository": {"pullRequest": {
+                        "id": f"PR_node{number}",
                         "mergeQueueEntry": None,
                         # Missing autoMergeRequest is UNKNOWN, never safely absent.
                     }}}}
                 return {"data": {"repository": {"pullRequest": {
+                    "id": f"PR_node{number}",
                     "mergeQueueEntry": {"id": "queue-5"} if number == 5 else None,
                     "autoMergeRequest": {"enabledAt": old_activity}
                     if number == 7 else None,
@@ -3239,7 +3501,7 @@ def _self_test() -> int:
                 return self.pulls.get(int(path.rsplit("/", 1)[1]))
             if path == "/graphql":
                 return {"data": {"repository": {"pullRequest": {
-                    "mergeQueueEntry": None, "autoMergeRequest": None}}}}
+                    "id": "PR_node", "mergeQueueEntry": None, "autoMergeRequest": None}}}}
             number = int(path.split("/issues/", 1)[1].split("/", 1)[0])
             if number in self.comment_failures:
                 raise GroomError("issue comment write failed")
@@ -5116,10 +5378,37 @@ def _self_test() -> int:
             if method == "GET":
                 return terminal_sweep_env.get("gets", {}).get(path)
             if path == "/graphql":
-                # Both live merge latches absent, so a defuse candidate stays safe-class and the
-                # ONLY thing that can fail in the phase is the redraft itself (issue #644).
+                query = (body or {}).get("query", "")
+                # Issue #684: the age-park's latch RETRACTIONS are recorded into the SAME
+                # ordered `writes` journal as the label POST, so "the label landed before the
+                # latch was retracted" is a red assertion. The default `latch` is empty =
+                # unlatched, which keeps every pre-#684 fixture byte-identical: both merge
+                # latches absent, a defuse candidate stays safe-class, and the ONLY thing that
+                # can fail in the phase is the redraft itself (issue #644).
+                latches = terminal_sweep_env.get("latch") or {}
+                if query.startswith("mutation"):
+                    node = (body or {}).get("variables", {}).get("id") or ""
+                    action = ("dequeue" if "dequeuePullRequest" in query
+                              else "disable-auto")
+                    terminal_sweep_env["writes"].append(("GRAPHQL", action, node))
+                    latch = latches.get(int(node.removeprefix("PR_node") or 0), {})
+                    if not latch.get("sticky"):
+                        latch["queued"] = False
+                        latch["auto"] = False
+                    if action in latch.get("fail", ()):
+                        raise GroomError(
+                            f"GitHub POST failed (HTTP 422) for /graphql ({action})")
+                    return {}
+                number = (body or {}).get("variables", {}).get("number")
+                terminal_sweep_env["writes"].append(("GRAPHQL", "latch-read", number))
+                latch = latches.get(number, {})
+                if latch.get("read_raises"):
+                    return {"data": {"repository": {"pullRequest": None}}}
                 return {"data": {"repository": {"pullRequest": {
-                    "mergeQueueEntry": None, "autoMergeRequest": None}}}}
+                    "id": f"PR_node{number}",
+                    "mergeQueueEntry": {"id": "MQE"} if latch.get("queued") else None,
+                    "autoMergeRequest": ({"enabledAt": "2026-07-25T00:00:00Z"}
+                                         if latch.get("auto") else None)}}}}
             terminal_sweep_env["writes"].append((method, path))
             return {}
 
@@ -5391,6 +5680,7 @@ def _self_test() -> int:
             pulls: tuple[dict[str, Any], ...] = (),
             issues: tuple[dict[str, Any], ...] = (),
             details: tuple[dict[str, Any], ...] | None = None,
+            latch: dict[str, Any] | None = None,
         ) -> tuple[str, str, list[set[str]]]:
             """Run the REAL run_sweep with the given per-object refusals; report (log, error, releases).
 
@@ -5414,6 +5704,7 @@ def _self_test() -> int:
                 },
                 writes=[],
                 http_failures=dict(refusals),
+                latch=dict(latch or {}),
             )
             terminal_sweep_releases.clear()
             log = io.StringIO()
@@ -5427,7 +5718,8 @@ def _self_test() -> int:
             finally:
                 sys.stdout = saved
                 terminal_sweep_env.update(
-                    pulls=[], gets={}, http_failures={}, planned_issues=[], fresh_issues={}
+                    pulls=[], gets={}, http_failures={}, planned_issues=[], fresh_issues={},
+                    latch={}
                 )
             return log.getvalue(), error, [set(claims) for claims in terminal_sweep_releases]
 
@@ -5483,6 +5775,416 @@ def _self_test() -> int:
             ),
             ("", True, True, True),
         )
+        # ============ issue #684: the age-park retracts the auto-merge latch ============
+        # groom's age-park is the ONLY park writer that labels NON-DRAFT PRs, so it is the
+        # sharpest parked-and-armed exposure: once #683 frees a parked PR's crates on the
+        # `needs:user` label alone, a surviving latch merges into a crate the partition has
+        # just handed to a sibling. These run the REAL run_sweep, and every assertion is on
+        # the ORDERED write journal, so the ordering itself is what is pinned.
+        park_label_post = ("POST", "/repos/owner/repo/issues/31/labels")
+        disarm_log, disarm_error, _ = _sweep_with_refusals(
+            {}, pulls=(_stale_worker_pr(31),), latch={31: {"auto": True}})
+        disarm_writes = terminal_sweep_env["writes"]
+        check(
+            "#684 (groom age-park): the auto-merge latch is retracted and PROVEN gone BEFORE "
+            "needs:user lands on the stale NON-DRAFT PR (reorder the label write above the "
+            "disarm, or drop the proof re-read, and this reds)",
+            (
+                [entry for entry in disarm_writes
+                 if entry[0] == "GRAPHQL" or entry == park_label_post],
+                disarm_error,
+            ),
+            (
+                [("GRAPHQL", "latch-read", 31), ("GRAPHQL", "disable-auto", "PR_node31"),
+                 ("GRAPHQL", "latch-read", 31), park_label_post],
+                "",
+            ),
+        )
+        _, _, _ = _sweep_with_refusals(
+            {}, pulls=(_stale_worker_pr(31),), latch={31: {"queued": True, "auto": True}})
+        queued_writes = terminal_sweep_env["writes"]
+        check(
+            "#684 (groom age-park): a MERGE-QUEUE member is dequeued FIRST, then un-armed, "
+            "then parked",
+            [entry for entry in queued_writes
+             if entry[0] == "GRAPHQL" or entry == park_label_post],
+            [("GRAPHQL", "latch-read", 31), ("GRAPHQL", "dequeue", "PR_node31"),
+             ("GRAPHQL", "disable-auto", "PR_node31"), ("GRAPHQL", "latch-read", 31),
+             park_label_post],
+        )
+        # THE HAZARD: a latch that survives its retraction must leave the PR
+        # UNPARKED-AND-ARMED. Red if a failed/ineffective disarm is swallowed and the park
+        # proceeds anyway (the "disarm only counts on the success path" mutation).
+        stuck_log, stuck_error, stuck_releases = _sweep_with_refusals(
+            {}, pulls=(_stale_worker_pr(31), _stale_worker_pr(32)),
+            latch={31: {"queued": True, "sticky": True}})
+        stuck_writes = terminal_sweep_env["writes"]
+        check(
+            "#684 (groom age-park): a merge-queue entry that CANNOT be dequeued is NOT parked "
+            "and NOT commented — the PR stays unparked-and-armed, still reserving its crates",
+            (
+                park_label_post in stuck_writes,
+                ("POST", "/repos/owner/repo/issues/31/comments") in stuck_writes,
+            ),
+            (False, False),
+        )
+        check(
+            "#684 (groom age-park): the un-retractable latch is REPORTED loudly as a per-PR "
+            "deferral, naming the surviving latch form — never a silent skip",
+            (
+                "ALERT PR owner/repo#31:" in stuck_log,
+                "merge-queue latch still live" in stuck_log,
+                "NOT parking" in stuck_log,
+                "stale PR hand-off deferred" in stuck_log,
+                "stale_pr_deferred=1" in stuck_log,
+            ),
+            (True, True, True, True, True),
+        )
+        check(
+            "#684 (groom age-park): the aborted park defers only ITS OWN PR — #32 still parks "
+            "and the dead lease is still reclaimed (the disarm sits INSIDE the per-PR "
+            "try/except, not on a success-only path)",
+            (
+                ("POST", "/repos/owner/repo/issues/32/labels") in stuck_writes,
+                stuck_releases,
+                stuck_error,
+            ),
+            (True, [{"e" * 32}], ""),
+        )
+        # A retraction that FAILS OUTRIGHT and leaves the latch live must abort the park —
+        # the exit-zero-swallows-failure shape, in its most dangerous position.
+        fail_log, _, _ = _sweep_with_refusals(
+            {}, pulls=(_stale_worker_pr(31),),
+            latch={31: {"auto": True, "sticky": True, "fail": ("disable-auto",)}})
+        check(
+            "#684 (groom age-park): a retraction that FAILS and leaves the latch live aborts "
+            "the park, and the API failure rides the deferral message",
+            (
+                park_label_post in terminal_sweep_env["writes"],
+                "auto-merge latch still live" in fail_log,
+                "HTTP 422" in fail_log,
+                "stale PR hand-off deferred" in fail_log,
+            ),
+            (False, True, True, True),
+        )
+        # #487's race: the retraction is REJECTED because the latch had already gone. The PROOF
+        # re-read, not the mutation's exit code, decides — so this converges and DOES park.
+        _sweep_with_refusals(
+            {}, pulls=(_stale_worker_pr(31),),
+            latch={31: {"auto": True, "fail": ("disable-auto",)}})
+        check(
+            "#684 (groom age-park): a RACED already-unarmed retraction converges idempotently "
+            "and still parks (#487)",
+            park_label_post in terminal_sweep_env["writes"],
+            True,
+        )
+        # An unreadable latch is not an absent latch.
+        unread_log, _, _ = _sweep_with_refusals(
+            {}, pulls=(_stale_worker_pr(31),), latch={31: {"auto": True, "read_raises": True}})
+        check(
+            "#684 (groom age-park): an UNREADABLE latch state defers the park rather than "
+            "assuming the PR is unarmed",
+            (
+                park_label_post in terminal_sweep_env["writes"],
+                "merge-latch state is unknown" in unread_log,
+                "NOT parking" in unread_log,
+            ),
+            (False, True, True),
+        )
+        # An UNLATCHED park is the common case: one read, no mutation, and it parks.
+        _sweep_with_refusals({}, pulls=(_stale_worker_pr(31),))
+        check(
+            "#684 (groom age-park): an unarmed stale PR parks after ONE latch read and no "
+            "retraction (idempotent — disarming an unarmed PR is a no-op, not an error)",
+            [entry for entry in terminal_sweep_env["writes"]
+             if entry[0] == "GRAPHQL" or entry == park_label_post],
+            [("GRAPHQL", "latch-read", 31), park_label_post],
+        )
+
+        # ==================================================================================
+        # ISSUE #684 ROUND 2 — THE LABEL-STATE RECONCILER. The layer that binds.
+        #
+        # Round 1 hooked five machine park-WRITE paths and mutation-proved the enumeration. The
+        # review's blocking findings were all one shape: #683's release predicate is over LABEL
+        # STATE with two disjuncts, and no write-path change can establish an invariant a
+        # read-side label predicate consumes. Every fixture below is one of the reviewer's own
+        # executable counterexamples turned into a named assertion.
+        # ==================================================================================
+        claim_mod = _review_loop_module()
+
+        # (R0) ANTI-DRIFT. The whole value of this predicate is being the SAME predicate #683
+        # reads. A restated set that drifts is a reconciler that silently stops covering a
+        # disjunct, so the sets are IMPORTED and that is asserted here rather than assumed.
+        check(
+            "#684 round-2 (R0): the reconciler's PR-label trigger set IS dispatch-claim's "
+            "PARKED_PR_HOLD_LABELS — the exact set #683's release valve reads, machine "
+            "review:parked included (groom's own HUMAN_HOLD_PR_LABELS omits it)",
+            (sorted(claim_mod.PARKED_PR_HOLD_LABELS),
+             sorted(HUMAN_HOLD_PR_LABELS) != sorted(claim_mod.PARKED_PR_HOLD_LABELS)),
+            (["needs:user", "review:needs-user", "review:parked"], True),
+        )
+        for trigger in sorted(claim_mod.PARKED_PR_HOLD_LABELS):
+            check(
+                f"#684 round-2 (R0): PR label {trigger} alone is a release trigger (D1)",
+                park_release_reason({trigger}, None), f"pr-label {trigger}",
+            )
+        check("#684 round-2 (R0): D2 fires on ANY needs:* on the SOURCE ISSUE, with no PR label "
+              "at all — the disjunct round 1 touched no writer for",
+              (park_release_reason(set(), {"needs:user"}),
+               park_release_reason(set(), {"needs:ec2"})),
+              ("source-issue-label needs:user", "source-issue-label needs:ec2"))
+        check("#684 round-2 (R0): a non-needs source label is NOT a trigger, and neither is an "
+              "unlinked/closed source issue (source_labels=None) — exactly where #683 does not "
+              "fire D2 either",
+              (park_release_reason(set(), {"status:parked", "area:core"}),
+               park_release_reason(set(), None), park_release_reason({"area:core"}, set())),
+              (None, None, None))
+
+        # (R1) SELECTION. `_park_snapshot` shorthand builds a listing row; every conjunct this
+        # collector DROPS relative to defuse's candidate selection gets its own fixture, because
+        # a fixture that satisfies both the right and the wrong reading proves nothing.
+        def _park_row(number, **over):
+            row = {
+                "number": number,
+                "state": "open",
+                "draft": False,
+                "labels": [],
+                "user": {"login": "app[bot]", "type": "Bot"},
+                # DELIBERATELY FRESH: one second old. defuse requires six hours of quiet; this
+                # reconciler must not, so a stale-gated implementation reds on every row here.
+                "updated_at": datetime.fromtimestamp(now - 1, timezone.utc).isoformat(),
+                "head": {"sha": "a" * 40, "ref": f"sparq-agent/issue-8-{number}-1",
+                         "repo": {"full_name": "owner/repo"}},
+                "body": WORKER_PR_MARKER + "\n\nFixes #8",
+            }
+            row.update(over)
+            return row
+
+        def _select(pulls, issues=None, provenance=None, bot="app[bot]"):
+            return collect_park_disarm_candidates(
+                "owner/repo", {row["number"]: row for row in pulls}, issues or {}, bot,
+                lambda number: (provenance or {}).get(number))
+
+        linked = {91: {"issue": 8}}
+        source_parked = {8: {"number": 8, "labels": [{"name": "needs:user"}]}}
+        source_clean = {8: {"number": 8, "labels": [{"name": "area:core"}]}}
+        check(
+            "#684 round-2 (R1/D1): the reviewer's counterexample — a HUMAN applies needs:user to "
+            "an ARMED NON-DRAFT PR with no machine label at all — is selected. No write-path hook "
+            "can reach this producer; this is why the layer moved.",
+            _select([_park_row(91, labels=[{"name": "needs:user"}])], source_clean, linked),
+            ([(91, "pr-label needs:user")], ()),
+        )
+        check(
+            "#684 round-2 (R1/D1): the machine capacity park review:parked is selected too — "
+            "sparq#3628's own class, which groom's HUMAN_HOLD_PR_LABELS would have skipped",
+            _select([_park_row(91, labels=[{"name": "review:parked"}])], source_clean, linked),
+            ([(91, "pr-label review:parked")], ()),
+        )
+        check(
+            "#684 round-2 (R1/D2): the SOURCE-ISSUE disjunct — PR unlabelled, source issue "
+            "carries needs:user — is selected. This is the hole this PR's OWN veto branch used to "
+            "reach (worker-pr terminal park, now fixed there too).",
+            _select([_park_row(91)], source_parked, linked),
+            ([(91, "source-issue-label needs:user")], ()),
+        )
+        check(
+            "#684 round-2 (R1): CONTROL — nothing parked on either surface selects NOTHING (a "
+            "collector that returned every PR would satisfy every assertion above)",
+            _select([_park_row(91)], source_clean, linked), ([], ()),
+        )
+        check(
+            "#684 round-2 (R1): a DRAFT parked PR is selected (a latched draft still classifies "
+            "`latched` in _pull_inactivity_decision, so it holds its crate, and the latch fires "
+            "the moment anything readies it) — no draft conjunct here",
+            _select([_park_row(91, draft=True, labels=[{"name": "needs:user"}])],
+                    source_clean, linked),
+            ([(91, "pr-label needs:user")], ()),
+        )
+        check(
+            "#684 round-2 (R1): a ONE-SECOND-OLD parked PR is selected — the six-hour defuse "
+            "quiet period would be six hours of parked-and-merge-capable",
+            _select([_park_row(91, labels=[{"name": "review:needs-user"}],
+                               updated_at=datetime.fromtimestamp(
+                                   now, timezone.utc).isoformat())],
+                    source_clean, linked),
+            ([(91, "pr-label review:needs-user")], ()),
+        )
+        check(
+            "#684 round-2 (R1): a HUMAN's parked PR is NEVER selected — retracting a latch on a "
+            "person's PR is mutating their artifact (the sparq#3427 lesson), and `type` must say "
+            "Bot even when the login matches",
+            (_select([_park_row(91, labels=[{"name": "needs:user"}],
+                               user={"login": "jeswr", "type": "User"})], source_clean, linked),
+             _select([_park_row(91, labels=[{"name": "needs:user"}],
+                               user={"login": "app[bot]"})], source_clean, linked),
+             _select([_park_row(91, labels=[{"name": "needs:user"}])], source_clean, linked,
+                     bot="")),
+            (([], ()), ([], ()), ([], ())),
+        )
+        check(
+            "#684 round-2 (R1): with NO provenance record the source-issue disjunct cannot be "
+            "consulted, and D1 still stands on its own",
+            (_select([_park_row(91)], source_parked, {}),
+             _select([_park_row(91, labels=[{"name": "needs:user"}])], source_parked, {})),
+            (([], ()), ([(91, "pr-label needs:user")], ())),
+        )
+        check(
+            "#684 round-2 (R1): a malformed label set DEFERS that PR ALONE and never raises out "
+            "of the collector (issue #647's class: this phase runs before dead-lease reclaim)",
+            _select([_park_row(90, labels="not-a-list"),
+                     _park_row(91, labels=[{"name": "needs:user"}])], source_clean, linked),
+            ([(91, "pr-label needs:user")],
+             ("owner/repo#90: target pull request owner/repo#90 labels are malformed",)),
+        )
+
+        # (R2) EXECUTION: the retraction is ordered read -> retract -> PROOF re-read -> receipt,
+        # and the failure direction leaves the PR parked-and-armed rather than reported clean.
+        recon_journal: list[Any] = []
+        recon_latch = {"queued": False, "auto": False, "sticky": False, "unreadable": False}
+
+        class _ReconAPI:
+            def request(self, method, path, body=None, allow_404=False, **_kwargs):
+                query = (body or {}).get("query", "") if isinstance(body, dict) else ""
+                if "dequeuePullRequest" in query:
+                    recon_journal.append("retract:dequeue")
+                    if not recon_latch["sticky"]:
+                        recon_latch["queued"] = False
+                    return {}
+                if "disablePullRequestAutoMerge" in query:
+                    recon_journal.append("retract:disable-auto")
+                    if not recon_latch["sticky"]:
+                        recon_latch["auto"] = False
+                    return {}
+                recon_journal.append("latch-read")
+                if recon_latch["unreadable"]:
+                    return {"data": {"repository": {"pullRequest": None}}}
+                return {"data": {"repository": {"pullRequest": {
+                    "id": "PR_node91",
+                    "mergeQueueEntry": {"id": "q"} if recon_latch["queued"] else None,
+                    "autoMergeRequest": {"enabledAt": "x"} if recon_latch["auto"] else None,
+                }}}}
+
+        def _reconcile(candidates=((91, "pr-label needs:user"),), deferrals=(), **latch):
+            recon_journal.clear()
+            recon_latch.update({"queued": False, "auto": False, "sticky": False,
+                                "unreadable": False})
+            recon_latch.update(latch)
+            return _execute_park_disarm_actions(
+                _ReconAPI(), "owner/repo", list(candidates), deferrals)
+
+        outcome = _reconcile(auto=True)
+        check(
+            "#684 round-2 (R2): an ALREADY-PARKED latched PR has its auto-merge retracted and "
+            "PROVEN gone — read, retract, proof re-read, THEN the audit receipt",
+            (recon_journal, outcome.changed, outcome.attempted, outcome.deferred),
+            (["latch-read", "retract:disable-auto", "latch-read"], 1, 1, ()),
+        )
+        outcome = _reconcile(queued=True, auto=True)
+        check(
+            "#684 round-2 (R2): a merge-queue member is DEQUEUED first, then un-armed, then proven",
+            (recon_journal, outcome.changed),
+            (["latch-read", "retract:dequeue", "retract:disable-auto", "latch-read"], 1),
+        )
+        outcome = _reconcile()
+        check(
+            "#684 round-2 (R2): the converged steady state — an already-unarmed parked PR costs "
+            "ONE read, no mutation, and counts as a COMPLETED object, so phase_exit_failure rule "
+            "2 does NOT red a healthy sweep (weakening rule 2 instead is how exit-zero-swallows-"
+            "failure comes back)",
+            (recon_journal, outcome.changed, phase_exit_failure(outcome)),
+            (["latch-read"], 1, None),
+        )
+        outcome = _reconcile(auto=True, sticky=True)
+        check(
+            "#684 round-2 (R2): a latch that CANNOT be proven gone is a per-PR deferral, never a "
+            "silent success — the PR stays parked-and-armed, which is the state #683's "
+            "`posture != 'latched'` conjunct refuses to release, so the failure direction is a "
+            "delayed drain and never a mid-air merge",
+            (outcome.changed, len(outcome.deferred),
+             any("auto-merge latch still live" in item for item in outcome.deferred),
+             phase_exit_failure(outcome) is not None),
+            (0, 1, True, True),
+        )
+        outcome = _reconcile(unreadable=True, auto=True)
+        check(
+            "#684 round-2 (R2): an UNREADABLE latch is not an absent latch — deferral, no "
+            "retraction claimed",
+            (outcome.changed, len(outcome.deferred),
+             any("merge-latch state is unknown" in item for item in outcome.deferred)),
+            (0, 1, True),
+        )
+        outcome = _reconcile(candidates=(), deferrals=("owner/repo#90: bad",))
+        check(
+            "#684 round-2 (R2): a SELECTION deferral with nothing reconciled is systemic — a "
+            "phase that could not read its own candidates must not report green (rule 2 fires on "
+            "`deferred` as well as `attempted`)",
+            (outcome.attempted, outcome.deferred, phase_exit_failure(outcome) is not None),
+            (0, ("owner/repo#90: bad",), True),
+        )
+
+        # (R3) THE CALL SITE. A predicate tested in isolation whose call site is unpinned is
+        # exactly the round-1 defect (mutant A). Two independent nets: the AST proves run_sweep
+        # calls the phase AND feeds its outcome to sweep_exit_failure; the live sweep below proves
+        # the mutations actually reach the API.
+        import ast as _recon_ast
+        import inspect as _recon_inspect
+        recon_tree = _recon_ast.parse(_recon_inspect.getsource(run_sweep))
+        recon_calls = {
+            node.func.id for node in _recon_ast.walk(recon_tree)
+            if isinstance(node, _recon_ast.Call) and isinstance(node.func, _recon_ast.Name)
+        }
+        recon_exit_args = [
+            node for node in _recon_ast.walk(recon_tree)
+            if isinstance(node, _recon_ast.Call) and isinstance(node.func, _recon_ast.Name)
+            and node.func.id == "sweep_exit_failure"
+        ]
+        recon_exit_names = {
+            name.id for call in recon_exit_args for name in _recon_ast.walk(call)
+            if isinstance(name, _recon_ast.Name)
+        }
+        check(
+            "#684 round-2 (R3): run_sweep CALLS the reconciler and feeds its outcome to "
+            "sweep_exit_failure — deleting either edge leaves the phase perfect and never run",
+            ({"collect_park_disarm_candidates", "_execute_park_disarm_actions"} <= recon_calls,
+             len(recon_exit_args), "park_disarm_outcome" in recon_exit_names),
+            (True, 1, True),
+        )
+
+        # (R4) THE YAML SEAM. groom.py's sweep is invoked from groom.yml; an `if: false` on that
+        # job or that step disables this reconciler with every Python assertion above still green.
+        # Parsed structurally — a substring or count() over the workflow text cannot see `if:`.
+        import yaml as _recon_yaml
+        recon_workflow = _recon_yaml.safe_load(
+            Path(".github/workflows/groom.yml").read_text(encoding="utf-8")
+        ) if Path(".github/workflows/groom.yml").is_file() else None
+        if recon_workflow is None:
+            check("#684 round-2 (R4): groom.yml is readable from the checkout root", False, True)
+        else:
+            recon_job = recon_workflow["jobs"]["groom"]
+            # The SWEEP invocation, not the policy-printing one and not the self-test: a
+            # `python3 scripts/groom.py` line carrying neither a `--print-*` query flag nor
+            # `--self-test`. Line-level, because the sweep step runs the self-test first.
+            def _runs_the_sweep(step: dict[str, Any]) -> bool:
+                for line in str(step.get("run", "")).splitlines():
+                    if not re.search(r"python3\s+scripts/groom\.py", line):
+                        continue
+                    if "--print-" in line or "--self-test" in line:
+                        continue
+                    return True
+                return False
+
+            recon_steps = [step for step in recon_job["steps"] if _runs_the_sweep(step)]
+            check(
+                "#684 round-2 (R4): exactly ONE unconditional groom.yml step runs the sweep, in "
+                "an unconditional job — `if: false` on either (the cheapest way to disable a "
+                "reconciler) goes red HERE rather than in production",
+                (len(recon_steps),
+                 [step.get("if") for step in recon_steps],
+                 recon_job.get("if")),
+                (1, [None], None),
+            )
+
         # (1b) EVERY candidate refused: per-object leniency must not make a whole-phase failure
         # green. Reclaim still runs FIRST — the exit status is the report, never the control flow.
         park_all_log, park_all_error, park_all_releases = _sweep_with_refusals(
@@ -5701,6 +6403,25 @@ def _self_test() -> int:
                 if sweep_env.get("provenance_error") and "/contents/" in path:
                     raise GroomError("registry contents read failed")
                 return sweep_env["gets"].get(path)
+            # #684 round 2: the live merge-latch surface, so the label-state reconciler's
+            # mutations can be observed END TO END from run_sweep rather than only unit-tested.
+            if path == "/graphql":
+                query = (body or {}).get("query", "") if isinstance(body, dict) else ""
+                if "dequeuePullRequest" in query:
+                    sweep_env["graphql_calls"].append("dequeue")
+                    sweep_env["sweep_latch"]["queued"] = False
+                    return {}
+                if "disablePullRequestAutoMerge" in query:
+                    sweep_env["graphql_calls"].append("disable-auto")
+                    sweep_env["sweep_latch"]["auto"] = False
+                    return {}
+                sweep_env["graphql_calls"].append("latch-read")
+                latch = sweep_env["sweep_latch"]
+                return {"data": {"repository": {"pullRequest": {
+                    "id": "PR_node92",
+                    "mergeQueueEntry": {"id": "q"} if latch.get("queued") else None,
+                    "autoMergeRequest": {"enabledAt": "x"} if latch.get("auto") else None,
+                }}}}
             sweep_env["writes"].append((method, path))
             return {}
 
@@ -5708,8 +6429,9 @@ def _self_test() -> int:
             if path == "/repos/owner/repo/pulls?state=open":
                 sweep_env["pull_reads"] += 1
                 if sweep_env["pull_reads"] >= sweep_env["pr_visible_from"]:
-                    return [sweep_env["worker_pull"]]
-                return []
+                    return [sweep_env["worker_pull"]] + list(
+                        sweep_env.get("extra_pulls", ()))
+                return list(sweep_env.get("extra_pulls", ()))
             return sweep_env["pages"].get(path, [])
 
     sweep_now = int(time.time())
@@ -5744,7 +6466,10 @@ def _self_test() -> int:
     }
 
     def _sweep_scenario(pr_visible_from: int) -> tuple[int, int, int, int]:
-        sweep_env.update(pull_reads=0, pr_visible_from=pr_visible_from, writes=[])
+        sweep_env.update(pull_reads=0, pr_visible_from=pr_visible_from, writes=[],
+                         graphql_calls=[])
+        sweep_env.setdefault("sweep_latch", {})
+        sweep_env.setdefault("extra_pulls", [])
         return run_sweep(argparse.Namespace(
             registry_repo="owner/registry",
             policy_file="unused-policy",
@@ -5905,6 +6630,42 @@ def _self_test() -> int:
                 (summary_e[2], sweep_env["writes"], "ALERT" in alert_buf.getvalue()),
                 (0, [], True),
             )
+            # ---- #684 ROUND 2 (R5): the reconciler END TO END through run_sweep ----------
+            # (R3) proves run_sweep names the phase; this proves the retraction mutations reach
+            # the API when a real sweep meets a real parked-and-latched PR. PR 92 is OURS, open,
+            # NON-draft, one minute old (no quiet period), carries a HUMAN-applied `needs:user`
+            # and NO machine park label — the D1 producer no write-path hook can reach.
+            sweep_env["extra_pulls"] = [{
+                "number": 92,
+                "state": "open",
+                "draft": False,
+                "labels": [{"name": "needs:user"}],
+                "user": {"login": "app[bot]", "type": "Bot"},
+                "updated_at": datetime.fromtimestamp(sweep_now - 60, timezone.utc).isoformat(),
+                "head": {"sha": "c" * 40, "ref": "sparq-agent/issue-8-92-1",
+                         "repo": {"full_name": "owner/repo"}},
+                "body": WORKER_PR_MARKER + "\n\nFixes #8",
+            }]
+            sweep_env["sweep_latch"] = {"queued": True, "auto": True}
+            _sweep_scenario(pr_visible_from=10**6)
+            check(
+                "#684 round-2 (R5): a real sweep RETRACTS the latch of a human-parked PR — "
+                "dequeue, then disable-auto, then the PROOF re-read. Deleting the run_sweep call "
+                "site (or gating it off) empties this list while every unit assertion stays green",
+                sweep_env["graphql_calls"],
+                ["latch-read", "dequeue", "disable-auto", "latch-read"],
+            )
+            # CONTROL: the SAME PR with the park label removed must produce NO latch traffic at
+            # all — otherwise the assertion above would pass for a phase that disarms everything.
+            sweep_env["extra_pulls"][0]["labels"] = []
+            sweep_env["sweep_latch"] = {"queued": True, "auto": True}
+            _sweep_scenario(pr_visible_from=10**6)
+            check(
+                "#684 round-2 (R5 control): an UNPARKED armed PR is left alone — no latch read, "
+                "no retraction (the reconciler keys on the park, not on the arm)",
+                sweep_env["graphql_calls"], [],
+            )
+            sweep_env["extra_pulls"] = []
     finally:
         os.chdir(sweep_prior_cwd)
         globals().update(sweep_saved)
