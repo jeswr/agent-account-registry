@@ -64,6 +64,14 @@ always fatal (decision 22): a `flow.leases[].label` that is not the 8-hex HMAC-s
 label raises, trigger `evidence` links are pinned to `https://github.com/`, and the existing
 `_assert_private` raw-handle sweep runs over the finished document.
 
+**Collector input ≠ published output for `flow.leases` (issue #374).** The collector still sends
+one row per account (`{label, provider, utilization_1h}`) and every row is still label-validated as
+above — but the ROWS are not republished. `_normalize_observability` emits
+`flow.lease_utilization_1h = {"mean", "max"}` over the utilizations that parsed, and nothing else:
+a per-account row array is a direct read of the fleet's size, and its salted labels are stable
+across builds, which is exactly what the dashboard's own `accounts` array was removed for. Keep
+sending the rows — the privacy check needs them — and expect only the aggregate on the page.
+
 ## `data/metrics-history.json` — throughput time-series (ring)
 
 `scripts/metrics.py` (workflow `metrics.yml`, `*/15` cron) CAS-appends a per-target throughput

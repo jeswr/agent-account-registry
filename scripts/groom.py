@@ -20,6 +20,7 @@ by the existing policy-resolve.py core before any GitHub write is attempted.
 from __future__ import annotations
 
 import argparse
+import ast
 import base64
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -172,6 +173,16 @@ class RedraftUnavailable(GroomError):
 class Limits:
     worker_timeout_minutes: int
     max_attempts: int
+    # [registry #835] The repo's MASTER-protected `review_enrolment_authors` allowlist — the
+    # half of the #657 orchestrator-PR admission that lives behind branch protection. Groom is
+    # otherwise CLASS-BLIND: every one of its suppression guards (_admitted_review_prs,
+    # _live_issue_admission, _current_links) keys on WORKER identity, so an enrolled
+    # orchestrator PR under review could not hold its source issue out of the exhaustion park —
+    # and a parked source issue de-enumerates the PR from the review lane
+    # (dispatch-claim.enumerate_review_items excludes on `status:parked` / any `needs:*` there).
+    # Nothing alarmed, because groom's run SUCCEEDED and the PR was simply absent from the next
+    # enumeration. Empty (every repo's default) means groom behaves exactly as it did before.
+    enrolled_authors: tuple[str, ...] = ()
 
     @property
     def threshold_seconds(self) -> int:
@@ -412,6 +423,27 @@ def _provenance_record(
     by the review loop's one shared schema, else None (missing, unreadable, or schema-invalid —
     every case the review loop fails closed on). Resolution and validity semantics are documented
     on worker_pr_provenance_enumerable, the boolean wrapper."""
+    record = _read_provenance_json(repo, number, registry_root, ledger_root=ledger_root)
+    if record is None:
+        return None
+    if not _review_loop_module().is_enumerable_provenance(record, number):
+        return None
+    return record
+
+
+def _read_provenance_json(
+    repo: str, number: int, registry_root: Path = Path("."),
+    ledger_root: Path | None = None,
+) -> dict[str, Any] | None:
+    """The PARSED record for ``repo#number`` with NO admission applied, or None when it is
+    missing or not readable JSON.
+
+    [registry #835] Split out of ``_provenance_record`` because the two classes admit through
+    DIFFERENT predicates over the SAME bytes: a worker record through
+    ``is_enumerable_provenance`` (which deliberately has no orchestrator opt-in), an enrolled
+    orchestrator record through ``admits_orchestrator_pr`` + ``provenance_admission_error(...,
+    admit_orchestrator=True)``. Resolution is unchanged: the ``ledger`` data-plane checkout is
+    primary (issue #96), the master checkout is the legacy pre-outage fallback."""
     owner, _, name = repo.partition("/")
     if not owner or not name:
         raise GroomError("target repository name is malformed")
@@ -424,16 +456,72 @@ def _provenance_record(
     if not record_path.is_file():
         return None
     try:
-        record = json.loads(record_path.read_text(encoding="utf-8"))
+        return json.loads(record_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None  # unreadable/malformed JSON — the review loop fails closed on it too
-    if not _review_loop_module().is_enumerable_provenance(record, number):
+
+
+def _orchestrator_admission(repo: str, pull: dict[str, Any], enrolled_authors: Any) -> Any:
+    """[registry #835] The #657 orchestrator-class admission PREDICATE for one open PR, as a
+    ``(record, number) -> bool`` callable — or None when this PR is not even a candidate.
+
+    Returning None (rather than a predicate that always says False) is what lets the callers
+    skip the record read entirely for the overwhelming majority of PRs, and it keeps the two
+    NON-waivable facts at the top where no later change can reorder past them:
+
+    - the FORK GATE. ``head.repo == repo`` is the single attacker-facing predicate here; a fork
+      head is attacker-controlled and is never admitted, on any path, by any waiver.
+    - a non-empty allowlist and a plausible login. An EMPTY ``review_enrolment_authors`` — every
+      repo's default — makes this None for every PR, so groom behaves byte-for-byte as it did.
+
+    The returned predicate is ``admits_orchestrator_pr`` (#821's ONE waiver decision, reused
+    rather than re-derived, so "admitted at PLAN/CLAIM" and "suppresses groom's park here"
+    cannot drift) conjoined with the shared FIELD admission under its orchestrator opt-in. The
+    waived properties are exactly the two producer-shape gates the worker identity applies (the
+    head-ref pattern, the App-bot author and its body marker); nothing else."""
+    head = pull.get("head") or {}
+    head_repo = head.get("repo") or {}
+    if (head_repo.get("full_name") if isinstance(head_repo, dict) else None) != repo:
         return None
-    return record
+    login = (pull.get("user") or {}).get("login", "")
+    if not enrolled_authors or not isinstance(login, str) or not login:
+        return None
+    review = _review_loop_module()
+
+    def admits(record: Any, pr_number: int) -> bool:
+        return bool(
+            review.admits_orchestrator_pr(record, pr_number, login, enrolled_authors)
+            and review.provenance_admission_error(
+                record, pr_number, admit_orchestrator=True) is None)
+
+    return admits
+
+
+def _orchestrator_source_issue(
+    repo: str, number: int, pull: dict[str, Any], enrolled_authors: Any,
+    registry_root: Path = Path("."), ledger_root: Path | None = None,
+) -> int | None:
+    """[registry #835] The source issue an ADMITTED orchestrator-class PR is bound to, else None.
+
+    The binding is the RECORD's ``issue`` field and nothing else. That is not a weakening: it is
+    the same binding the review loop itself dispatches on, and
+    research/657-orchestrator-pr-admission.md §7.2 measured that the head ref was never the
+    binding for a worker PR either (``HEAD_REF_RE``'s capture group is not consumed anywhere in
+    this repository). A worker PR additionally cross-checks branch-vs-record because it HAS a
+    branch to cross-check; an orchestrator PR has an ordinary branch by definition."""
+    admits = _orchestrator_admission(repo, pull, enrolled_authors)
+    if admits is None:
+        return None
+    record = _read_provenance_json(repo, number, registry_root, ledger_root=ledger_root)
+    if not admits(record, number):
+        return None
+    issue = record["issue"]  # a positive int — guaranteed by the field admission above
+    return issue
 
 
 def _live_provenance_record(
-    registry_api: "GitHubAPI", registry_repo: str, repo: str, number: int
+    registry_api: "GitHubAPI", registry_repo: str, repo: str, number: int,
+    admits: Any = None,
 ) -> tuple[str, dict[str, Any] | None]:
     """Read target PR ``repo#number``'s registry provenance record from the LIVE authoritative
     ``ledger`` ref, returning ``(state, record)`` where ``state`` is one of:
@@ -458,7 +546,13 @@ def _live_provenance_record(
     This live read is the FINAL gate immediately before the write — it can only CANCEL a park, never
     cause one. Records live in the REGISTRY repo, so it reads via the registry client
     (``REGISTRY_GH_TOKEN``) pinned to the commit sha ``LEDGER_REF`` resolves to at read time —
-    the ref is verified to exist before any 404 is trusted, as _read_ledger's branch probe does."""
+    the ref is verified to exist before any 404 is trusted, as _read_ledger's branch probe does.
+
+    [registry #835] ``admits`` overrides the ADMISSION only — never the read, the ref probe or
+    any of the indeterminate cases. It is the ``(record, number) -> bool`` predicate the caller's
+    CLASS admits by, defaulting to the worker one (``is_enumerable_provenance``, which
+    deliberately has no orchestrator opt-in). One live-read function, one place where an
+    unreadable ledger becomes ``indeterminate``; only the predicate over the bytes differs."""
     owner, _, name = repo.partition("/")
     if not owner or not name:
         raise GroomError("target repository name is malformed")
@@ -501,38 +595,51 @@ def _live_provenance_record(
         )
     except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
         return "indeterminate", None  # present-but-undecodable — conflicting, never strand
-    if _review_loop_module().is_enumerable_provenance(record, number):
+    if admits is None:
+        admits = _review_loop_module().is_enumerable_provenance
+    if admits(record, number):
         return "admits", record
     return "denies", None  # cleanly read but not admissible — the orphan-park hand-off stands
 
 
 def _live_issue_admission(
     registry_api: "GitHubAPI", registry_repo: str, repo: str, number: int,
-    pulls: dict[int, dict[str, Any]], bot_login: str,
+    pulls: dict[int, dict[str, Any]], bot_login: str, enrolled_authors: Any = (),
 ) -> str:
     """Live-ref admission for a SINGLE source issue at the terminal mutation boundary (issue #174).
 
-    Among ``pulls`` (freshly re-read open PRs), is a worker PR BOUND TO ``number`` (worker identity
-    AND branch-encoded issue == ``number``) admitted by a schema-valid record on the LIVE ``ledger``
-    ref? Returns ``"admitted"`` (a valid record for its worker PR now exists live → cancel the
-    exhaustion park), ``"indeterminate"`` (a candidate worker PR's live read was unavailable or
-    conflicting → skip the park and raise an operational alert), or ``"denied"`` (the live ref
-    conclusively admits none → the park may proceed).
+    Among ``pulls`` (freshly re-read open PRs), is a PR BOUND TO ``number`` admitted by a
+    schema-valid record on the LIVE ``ledger`` ref? Returns ``"admitted"`` (a valid record for
+    its PR now exists live → cancel the exhaustion park), ``"indeterminate"`` (a candidate PR's
+    live read was unavailable or conflicting → skip the park and raise an operational alert), or
+    ``"denied"`` (the live ref conclusively admits none → the park may proceed).
 
-    Mirrors _admitted_worker_prs' identity + issue-binding (via _worker_pr_identity and the record's
-    ``issue`` field) so the on-disk and live admissions cannot drift; only the record SOURCE differs
-    (the live ref instead of the immutable checkout). An indeterminate read is scoped to THIS issue's
-    candidate PRs, so an unusable read on an unrelated PR never blocks this park."""
+    Mirrors _admitted_review_prs' identity + issue-binding so the on-disk and live admissions
+    cannot drift; only the record SOURCE differs (the live ref instead of the immutable
+    checkout). That includes the [#835] orchestrator class: a PR the on-disk admission would
+    suppress on but the live boundary would not is the same drift the worker path already
+    forbids. An indeterminate read is scoped to THIS issue's candidate PRs, so an unusable read
+    on an unrelated PR never blocks this park."""
     bot = bot_login.casefold()
     if not bot:
         return "denied"  # no bot identity — nothing proven, fail closed (park may proceed)
     indeterminate = False
     for pr_number, pull in pulls.items():
         branch = _worker_pr_identity(repo, pull, bot)
-        if branch is None or int(branch.group("issue")) != number:
-            continue  # only a worker PR bound to THIS issue can suppress its park
+        if branch is not None:
+            if int(branch.group("issue")) != number:
+                continue  # only a worker PR bound to THIS issue can suppress its park
+            admits = None                 # the worker predicate (is_enumerable_provenance)
+        else:
+            # [registry #835] Not worker-shaped — the #657 orchestrator class may still be
+            # admitted, on the SAME terms the on-disk admission applies. `None` here means "not
+            # even a candidate" (a fork head, an unenrolled author, an empty allowlist), which
+            # is the pre-#835 outcome for every PR.
+            admits = _orchestrator_admission(repo, pull, enrolled_authors)
+            if admits is None:
+                continue
         state, record = _live_provenance_record(
-            registry_api, registry_repo, repo, pr_number
+            registry_api, registry_repo, repo, pr_number, admits=admits
         )
         if state == "indeterminate":
             indeterminate = True
@@ -549,7 +656,7 @@ def _worker_pr_identity(
     ``repo`` — a worker-pattern head branch, a same-repository head (a fork head is
     attacker-controlled), the App-bot author, and the worker PR body marker — else None.
 
-    This is the identity subset shared by two admissions so they cannot drift: `_admitted_worker_prs`
+    This is the identity subset shared by two admissions so they cannot drift: `_admitted_review_prs`
     (which additionally requires the registry-provenance root of trust) and `_current_links`
     (recovery-suppression linkage, issue #172). An outsider's fork PR, a non-bot author, or a PR
     whose body merely says `Fixes #N` must never pass — any of those could otherwise hold a stale
@@ -574,16 +681,26 @@ def _worker_pr_identity(
     return branch
 
 
-def _admitted_worker_prs(
+def _admitted_review_prs(
     repo: str,
     pulls: dict[int, dict[str, Any]],
     bot_login: str,
     registry_root: Path = Path("."),
     ledger_root: Path | None = None,
+    enrolled_authors: Any = (),
 ) -> set[int]:
-    """Source-issue numbers among ``pulls`` (open PRs) with a PROVEN admitted worker attempt —
+    """Source-issue numbers among ``pulls`` (open PRs) with a PROVEN admitted attempt —
     the ONLY linkage strong enough to suppress the exhausted-attempt defer (issue #170, review
     round 1).
+
+    [registry #835] Named for what it answers — "which source issues does the REVIEW LOOP
+    already own a PR for?" — because it is no longer worker-only. Groom was class-blind: an
+    enrolled #657 orchestrator PR could not suppress its source issue's exhaustion park, and a
+    parked source issue de-enumerates that PR from the review lane silently (no `review:*` label
+    means `exclude_signalled` prints nothing, and the park's own machine exit could not see the
+    PR either — the other half of #835). The orchestrator class is admitted here on the SAME
+    terms a worker PR is, with the two producer-shape gates waived and nothing else; see
+    _orchestrator_source_issue.
 
     Linkage weaker than these admissions (a worker-looking branch or a `Fixes #N` body
     reference) is deliberately NOT trusted for suppression: anyone can open a PR whose body says `Fixes #N`,
@@ -607,6 +724,12 @@ def _admitted_worker_prs(
     for number, pull in pulls.items():
         branch = _worker_pr_identity(repo, pull, bot)
         if branch is None:
+            # [registry #835] Not worker-shaped. The #657 orchestrator class is admitted on the
+            # same terms; an empty allowlist (every repo's default) makes this constantly None.
+            issue = _orchestrator_source_issue(
+                repo, number, pull, enrolled_authors, registry_root, ledger_root=ledger_root)
+            if issue is not None:
+                admitted.add(issue)
             continue
         record = _provenance_record(repo, number, registry_root, ledger_root=ledger_root)
         if record is None:
@@ -842,6 +965,17 @@ def _policy_document(policy_file: Path) -> Any:
         raise GroomError("repository policy could not be read") from exc
 
 
+def _enrolled_authors(resolver: Any, repo: str, document: Any) -> tuple[str, ...]:
+    """[registry #835] The repo's master-protected `review_enrolment_authors`, sorted.
+
+    Resolved through ``policy-resolve.review_enrolment_authors`` — the accessor that validates
+    the whole policy row — for the same reason PLAN, CLAIM and review-fix.yml resolve it that
+    way (#657): a hand-rolled read of the TOML key would happily parse a malformed or
+    `[bot]`-bearing list, and with the head-ref gate waived a `[bot]` entry would widen the
+    trusted-App author gate to ANY installed App. Absent/empty => enrolment OFF."""
+    return tuple(sorted(resolver.review_enrolment_authors(repo, document)))
+
+
 def load_limits(policy_file: Path, resolver_file: Path) -> dict[str, Limits]:
     document = _policy_document(policy_file)
     repos = document.get("repos") if isinstance(document, dict) else None
@@ -869,6 +1003,10 @@ def load_limits(policy_file: Path, resolver_file: Path) -> dict[str, Limits]:
             max_attempts=_positive_int(
                 row.get("max_attempts"), f"max attempts for {repo}"
             ),
+            # [registry #835] Read through policy-resolve's OWN accessor, never a hand-rolled
+            # TOML read: that accessor VALIDATES the whole row, and its validation is the only
+            # thing keeping a `[bot]` login (i.e. another GitHub App) out of the allowlist.
+            enrolled_authors=_enrolled_authors(resolver, repo, document),
         )
     if not limits:
         raise GroomError("repository policy has no enabled target rows")
@@ -882,6 +1020,25 @@ def load_limits(policy_file: Path, resolver_file: Path) -> dict[str, Limits]:
 EXPECTED_TARGET_OWNERS = {"sparq-org": "sparq_names", "jeswr": "jeswr_names"}
 
 
+def owner_repos_from_names(names: Any) -> dict[str, list[str]]:
+    """Group an ``owner/name`` sequence into ``{owner: [name, ...]}`` — EVERY repo per owner, in
+    input order, duplicates collapsed. Shared by the policy path (groom/curate/conflict-resolver)
+    and dispatch.yml's ``DISPATCH_TARGET_REPOS`` manifest path (issue #273): both mint ONE App
+    token per owner, so keeping a single "representative" repo per owner scopes that token to one
+    repo and 404s every read/write on the owner's other targets. Unsafe names fail closed."""
+    if not isinstance(names, list) or not names:
+        raise GroomError("target repo list is empty or not a JSON array")
+    owners: dict[str, list[str]] = {}
+    for repo in names:
+        if not isinstance(repo, str) or SAFE_REPO.fullmatch(repo) is None:
+            raise GroomError("target repo list contains an unsafe name")
+        owner, name = repo.split("/", 1)
+        bucket = owners.setdefault(owner, [])
+        if name not in bucket:
+            bucket.append(name)
+    return owners
+
+
 def enabled_owner_repos(document: Any) -> dict[str, list[str]]:
     """EVERY enabled repo name per owner (issue #168, review round 1). Each per-owner App-token
     mint must be scoped to ALL of that owner's enabled repositories — a single "representative"
@@ -890,32 +1047,47 @@ def enabled_owner_repos(document: Any) -> dict[str, list[str]]:
     repos = document.get("repos") if isinstance(document, dict) else None
     if not isinstance(repos, dict) or not repos:
         raise GroomError("repository policy has no target rows")
-    owners: dict[str, list[str]] = {}
+    enabled: list[str] = []
     for repo, raw in repos.items():
         if not isinstance(repo, str) or SAFE_REPO.fullmatch(repo) is None:
             raise GroomError("repository policy contains an unsafe target name")
         if not isinstance(raw, dict) or not isinstance(raw.get("enabled"), bool):
             raise GroomError(f"repository policy enablement is malformed for {repo}")
-        if not raw["enabled"]:
-            continue
-        owner, name = repo.split("/", 1)
-        owners.setdefault(owner, []).append(name)
-    if not owners:
+        if raw["enabled"]:
+            enabled.append(repo)
+    if not enabled:
         raise GroomError("repository policy has no enabled target rows")
-    return owners
+    return owner_repos_from_names(enabled)
+
+
+def _owner_repo_lines(owners: dict[str, list[str]], source: str) -> list[str]:
+    """GITHUB_OUTPUT lines (``<key>=name1,name2``) scoping each static mint step's
+    ``repositories`` input to that owner's FULL repo list. Fails LOUD unless the owner set is
+    exactly ``EXPECTED_TARGET_OWNERS`` — never silently drops an owner's token."""
+    if set(owners) != set(EXPECTED_TARGET_OWNERS):
+        raise GroomError(
+            f"unexpected target owners {sorted(owners)}; {source} mints tokens for exactly "
+            f"{sorted(EXPECTED_TARGET_OWNERS)} — add a mint step before widening the target set"
+        )
+    return [f"{key}={','.join(owners[owner])}" for owner, key in EXPECTED_TARGET_OWNERS.items()]
 
 
 def owner_repo_output_lines(document: Any) -> list[str]:
-    """GITHUB_OUTPUT lines (``<key>=name1,name2``) scoping each mint step's ``repositories``
-    input to the owner's full enabled-repo list. Fails LOUD unless the enabled owner set is
-    exactly ``EXPECTED_TARGET_OWNERS`` — never silently drops an owner's token."""
-    owners = enabled_owner_repos(document)
-    if set(owners) != set(EXPECTED_TARGET_OWNERS):
-        raise GroomError(
-            f"unexpected enabled target owners {sorted(owners)}; groom.yml mints tokens for "
-            f"exactly {sorted(EXPECTED_TARGET_OWNERS)} — add a mint step before widening policy"
-        )
-    return [f"{key}={','.join(owners[owner])}" for owner, key in EXPECTED_TARGET_OWNERS.items()]
+    """Mint-scope GITHUB_OUTPUT lines for the POLICY-driven sweeps (groom/curate/
+    conflict-resolver), covering every enabled repo of every enabled owner."""
+    return _owner_repo_lines(enabled_owner_repos(document), "groom.yml")
+
+
+def manifest_owner_repo_output_lines(raw: Any) -> list[str]:
+    """Mint-scope GITHUB_OUTPUT lines for dispatch.yml (issue #273), whose owners come from the
+    ``DISPATCH_TARGET_REPOS`` manifest (a JSON array of ``owner/name``) rather than from policy.
+    CLAIM routes the minted token by OWNER, so each owner's token must carry every manifest repo
+    under that owner. A manifest that is not a JSON array of safe names fails CLOSED."""
+    try:
+        targets = json.loads(raw)
+    except (TypeError, ValueError):
+        raise GroomError("target manifest is not valid JSON") from None
+    return _owner_repo_lines(owner_repos_from_names(targets), "dispatch.yml")
 
 
 def ledger_read_path(registry_repo: str) -> str:
@@ -1747,7 +1919,7 @@ def _current_links(
     linking them would suppress stale/orphan recovery for unrelated issues the App is not
     actually working.
 
-    This is the identity gate WITHOUT the registry-provenance record `_admitted_worker_prs`
+    This is the identity gate WITHOUT the registry-provenance record `_admitted_review_prs`
     additionally requires: recovery suppression asks 'is the App itself actively working this issue
     right now', for which the authoring identity is authoritative — provenance-record visibility
     (issue #96) is not, and demanding it here would prematurely reset a legitimately in-progress
@@ -1860,7 +2032,7 @@ def _plan_actions(
             # An open PROVEN worker PR for this issue means the final allowed attempt SUCCEEDED —
             # parking the source issue (`needs:user`) would strip that PR from dispatch's review
             # loop (any source `needs:*` is terminal there), so exhaustion never defers while an
-            # ADMITTED attempt is open. Admission is `_admitted_worker_prs` — the review loop's
+            # ADMITTED attempt is open. Admission is `_admitted_review_prs` — the review loop's
             # own identity + registry-provenance checks — NEVER the loose `links` map below: an
             # arbitrary PR whose body says `Fixes #N` (or a fork with a worker-shaped head) must
             # not hold an exhausted issue out of `needs:user` (review round 1). This guard must
@@ -1874,7 +2046,14 @@ def _plan_actions(
                     IssueAction(repo, number, "defer", "attempt budget exhausted")
                 )
                 continue
-            if key in live_by_issue or number in links:
+            # [registry #835] `admitted` is added to the recovery-suppression linkage for the
+            # same reason the exhaustion guard above consults it: `links` is WORKER-shaped, so
+            # without this an issue whose enrolled orchestrator PR is under review is re-readied
+            # as "stale in-progress without PR" and a worker is dispatched onto work that is
+            # already in the review lane. It is a NO-OP for the worker class by construction —
+            # `_admitted_review_prs`' worker branch is `_current_links`' identity gate plus a
+            # record, so every worker issue in `admitted` is already a `links` key (asserted).
+            if key in live_by_issue or number in links or number in admitted[repo]:
                 continue
             stale = (
                 now - _epoch(issue["updated_at"], f"target issue {repo}#{number}")
@@ -2106,7 +2285,11 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
     )
 
     admitted = {
-        repo: _admitted_worker_prs(repo, pulls[repo], bot_login, ledger_root=ledger_root)
+        # [registry #835] The repo's master-protected enrolment allowlist, so an ADMITTED
+        # orchestrator-class PR suppresses its source issue's exhaustion park exactly as an
+        # admitted worker PR does. Hard-coding `()` here re-opens the silent de-enumeration.
+        repo: _admitted_review_prs(repo, pulls[repo], bot_login, ledger_root=ledger_root,
+                                   enrolled_authors=limits[repo].enrolled_authors)
         for repo in groomable
     }
     issue_actions, pull_actions, dead_claims = _plan_actions(
@@ -2138,6 +2321,15 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
     current_pulls = {repo: _pulls(api, repo) for repo, api in groomable.items()}
     current_links = {
         repo: _current_links(repo, repo_pulls, bot_login)
+        for repo, repo_pulls in current_pulls.items()
+    }
+    # [registry #835] The class-aware half of the same "is this issue already being worked?"
+    # question, re-derived at the mutation boundary from the SAME fresh listing (no extra API
+    # read — the admission is a local record lookup). Without it a PLAN->boundary window in
+    # which an enrolled orchestrator PR opens still re-readies its source issue.
+    current_admitted = {
+        repo: _admitted_review_prs(repo, repo_pulls, bot_login, ledger_root=ledger_root,
+                                   enrolled_authors=limits[repo].enrolled_authors)
         for repo, repo_pulls in current_pulls.items()
     }
     # #509 mutation-boundary guard for label/orphan reaping.  A claim selected from the earlier
@@ -2220,7 +2412,8 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
                         f"SKIP issue {action.repo}#{action.number}: status changed under grooming"
                     )
                     continue
-                elif action.number in current_links[action.repo]:
+                elif (action.number in current_links[action.repo]
+                        or action.number in current_admitted[action.repo]):
                     print(f"SKIP issue {action.repo}#{action.number}: an open PR appeared")
                     continue
                 elif (
@@ -2263,11 +2456,12 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
                 # simply wrong, so skipping — the fail-closed side, retried next sweep — wins any
                 # tie.
                 boundary_pulls = _pulls(api, action.repo)
-                if action.number in _admitted_worker_prs(
-                    action.repo, boundary_pulls, bot_login, ledger_root=ledger_root
+                if action.number in _admitted_review_prs(
+                    action.repo, boundary_pulls, bot_login, ledger_root=ledger_root,
+                    enrolled_authors=limits[action.repo].enrolled_authors,
                 ):
                     print(
-                        f"SKIP issue {action.repo}#{action.number}: an admitted worker PR is open"
+                        f"SKIP issue {action.repo}#{action.number}: an admitted PR is open"
                     )
                     continue
                 # Issue #174: the checkout the on-disk admission reads is IMMUTABLE for the whole
@@ -2281,6 +2475,7 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
                 live = _live_issue_admission(
                     registry_api, registry_repo, action.repo, action.number,
                     boundary_pulls, bot_login,
+                    enrolled_authors=limits[action.repo].enrolled_authors,
                 )
                 if live == "admitted":
                     print(
@@ -3775,7 +3970,7 @@ def _self_test() -> int:
         [(9, "defer")],
     )
 
-    # ---- _admitted_worker_prs: the admission that gates exhaustion suppression (round 1) ----
+    # ---- _admitted_review_prs: the admission that gates exhaustion suppression (round 1) ----
     # Only a PR carrying the review loop's OWN identity + provenance admissions may suppress the
     # exhausted-attempt defer; every weaker linkage (a `Fixes #N` body reference, a fork's
     # worker-shaped head, a bot PR with no registry provenance record) must be refused —
@@ -3810,7 +4005,7 @@ def _self_test() -> int:
         }
         check(
             "admission: a proven worker attempt (identity + provenance) suppresses",
-            _admitted_worker_prs("owner/repo", {91: proven_pull}, "app[bot]", admit_root),
+            _admitted_review_prs("owner/repo", {91: proven_pull}, "app[bot]", admit_root),
             {9},
         )
         arbitrary_pull = {
@@ -3821,12 +4016,12 @@ def _self_test() -> int:
         }
         check(
             "NEGATIVE: an arbitrary PR with a `Fixes #9` body reference is NOT admitted",
-            _admitted_worker_prs("owner/repo", {92: arbitrary_pull}, "app[bot]", admit_root),
+            _admitted_review_prs("owner/repo", {92: arbitrary_pull}, "app[bot]", admit_root),
             set(),
         )
         # issue #172: `_current_links` (recovery-suppression linkage) now applies the SAME
         # worker-PR identity gate, so an untrusted PR can no longer hold a stale issue out of
-        # recovery. Unlike `_admitted_worker_prs` it does NOT require a provenance record (see its
+        # recovery. Unlike `_admitted_review_prs` it does NOT require a provenance record (see its
         # docstring) — for "is the App working this issue right now" the authoring identity is
         # authoritative. Positive first, so the gate rejecting everything flips these red.
         check(
@@ -3887,12 +4082,12 @@ def _self_test() -> int:
         }
         check(
             "NEGATIVE: a fork PR with a spoofed worker-shaped head is NOT admitted",
-            _admitted_worker_prs("owner/repo", {91: fork_pull}, "app[bot]", admit_root),
+            _admitted_review_prs("owner/repo", {91: fork_pull}, "app[bot]", admit_root),
             set(),
         )
         check(
             "NEGATIVE: a worker-shaped branch from a NON-BOT author is NOT admitted",
-            _admitted_worker_prs(
+            _admitted_review_prs(
                 "owner/repo",
                 {91: {**proven_pull, "user": {"login": "mallory"}}},
                 "app[bot]",
@@ -3902,7 +4097,7 @@ def _self_test() -> int:
         )
         check(
             "NEGATIVE: a bot worker branch WITHOUT the worker PR marker is NOT admitted",
-            _admitted_worker_prs(
+            _admitted_review_prs(
                 "owner/repo",
                 {91: {**proven_pull, "body": "Fixes #9"}},
                 "app[bot]",
@@ -3922,12 +4117,12 @@ def _self_test() -> int:
         }
         check(
             "NEGATIVE: a worker-shaped bot PR with NO provenance record is NOT admitted",
-            _admitted_worker_prs("owner/repo", {93: unrecorded_pull}, "app[bot]", admit_root),
+            _admitted_review_prs("owner/repo", {93: unrecorded_pull}, "app[bot]", admit_root),
             set(),
         )
         check(
             "NEGATIVE: a record whose issue disagrees with the branch-encoded issue is refused",
-            _admitted_worker_prs(
+            _admitted_review_prs(
                 "owner/repo",
                 {91: {**proven_pull,
                       "head": {"ref": "sparq-agent/issue-8-91-1",
@@ -3939,7 +4134,7 @@ def _self_test() -> int:
         )
         check(
             "NEGATIVE: an unresolved (empty) bot login admits nothing (fail closed)",
-            _admitted_worker_prs("owner/repo", {91: proven_pull}, "", admit_root),
+            _admitted_review_prs("owner/repo", {91: proven_pull}, "", admit_root),
             set(),
         )
 
@@ -4051,7 +4246,7 @@ def _self_test() -> int:
     check("live provenance: a malformed target repo fails closed", live_repo_failed, True)
 
     # _live_issue_admission: the single-issue admission the defer boundary asks — mirrors
-    # _admitted_worker_prs' identity + issue-binding, only the record SOURCE differs (live ref).
+    # _admitted_review_prs' identity + issue-binding, only the record SOURCE differs (live ref).
     live_worker_pull = {
         "head": {"ref": "sparq-agent/issue-9-91-1", "repo": {"full_name": "owner/repo"}},
         "user": {"login": "app[bot]"},
@@ -4065,7 +4260,7 @@ def _self_test() -> int:
         "admitted",
     )
     # NEGATIVE: the live record's issue field disagrees with the branch-encoded issue — admit
-    # neither (exactly _admitted_worker_prs' cross-check, applied to the live record).
+    # neither (exactly _admitted_review_prs' cross-check, applied to the live record).
     check(
         "live admission: a record whose issue disagrees with the branch is DENIED",
         _live_issue_admission(
@@ -4105,6 +4300,255 @@ def _self_test() -> int:
             "owner/repo", 9, {91: live_worker_pull}, ""),
         "denied",
     )
+
+    # ---- [registry #835] GROOM IS NO LONGER CLASS-BLIND ---------------------------------------
+    # THE DEFECT: every suppression guard here keyed on WORKER identity, so an enrolled #657
+    # orchestrator PR under review could not hold its source issue out of the attempt-exhaustion
+    # park. Groom then wrote status:parked to that source issue, and
+    # dispatch-claim.enumerate_review_items excludes a PR whose source issue carries
+    # status:parked (or any needs:*) — SILENTLY, because a PR with no `review:*` label is not
+    # `signalled` and `exclude_signalled` prints nothing for it. Groom's run succeeded; the PR
+    # was simply absent from the next enumeration. Both directions are asserted, plus a worker
+    # regression control and the five shapes that must stay out.
+    orch_login = "enrolled-orchestrator"
+    orch_enrolled = (orch_login,)
+    orch_review = _review_loop_module()
+    orch_record = dict(orch_review.orchestrator_probe_record(95), issue=9)
+    check(
+        "[#835] the fixture really is the ORCHESTRATOR attestation class (else nothing below "
+        "tests the class at all)",
+        orch_review.provenance_attestation_class(orch_record),
+        orch_review.ORCHESTRATOR_CLASS,
+    )
+    orch_pull = {
+        "updated_at": datetime.fromtimestamp(now - 700, timezone.utc).isoformat(),
+        # The #657 population's shape: same-repo head on an ORDINARY branch, HUMAN author, and
+        # no worker body marker — it fails EVERY predicate _worker_pr_identity applies.
+        "head": {"ref": "fix/ordinary-branch", "repo": {"full_name": "owner/repo"}},
+        "user": {"login": orch_login},
+        "body": "an orchestrator-authored pull request",
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        orch_root = Path(tmp)
+        (orch_root / PROVENANCE_DIR).mkdir(parents=True)
+
+        def _write_record(number: int, record: Any) -> None:
+            (orch_root / PROVENANCE_DIR / f"owner--repo--pr{number}.json").write_text(
+                json.dumps(record), encoding="utf-8")
+
+        _write_record(95, orch_record)
+        _write_record(91, {
+            "pr_number": 91, "head_sha_at_open": "1" * 40, "impl_provider": "anthropic",
+            "impl_alias": "fable", "impl_account_h": "ab" * 8, "issue": 9,
+            "recorded_at_run": "29694084610.1"})
+
+        def admitted_for(pulls: dict[int, dict[str, Any]], authors: Any) -> set[int]:
+            return _admitted_review_prs("owner/repo", pulls, "app[bot]", orch_root,
+                                        enrolled_authors=authors)
+
+        check(
+            "[#835] an ENROLLED orchestrator-class PR suppresses its source issue's exhaustion "
+            "park (reverting the admission reds THIS check)",
+            admitted_for({95: orch_pull}, orch_enrolled), {9})
+        check(
+            "[#835] ...and with an EMPTY allowlist the very same PR suppresses NOTHING "
+            "(enrolment is the discriminator, not the branch shape)",
+            admitted_for({95: orch_pull}, ()), set())
+        orch_worker_pull = {
+            "updated_at": orch_pull["updated_at"],
+            "head": {"ref": "sparq-agent/issue-9-91-1", "repo": {"full_name": "owner/repo"}},
+            "user": {"login": "app[bot]"},
+            "body": WORKER_PR_MARKER + "\n\nFixes #9",
+        }
+        check(
+            "[#835] REGRESSION CONTROL: a worker-class PR still suppresses, in BOTH allowlist "
+            "states (frozen literals, not a re-call of the live predicate)",
+            [admitted_for({91: orch_worker_pull}, ()),
+             admitted_for({91: orch_worker_pull}, orch_enrolled)], [{9}, {9}])
+        for _why, _pull, _record in (
+                ("a THIRD-PARTY author is not enrolled",
+                 {**orch_pull, "user": {"login": "drive-by-contributor"}}, orch_record),
+                ("a FORK head is never admitted, on any path",
+                 {**orch_pull,
+                  "head": {"ref": "fix/x", "repo": {"full_name": "mallory/repo"}}}, orch_record),
+                ("the record must be THIS PR's record",
+                 orch_pull, dict(orch_review.orchestrator_probe_record(7), issue=9)),
+                ("a MACHINE-attested record is not the orchestrator class",
+                 orch_pull, {**orch_record, "recorded_at_run": "29694084610.1"}),
+                ("a malformed record fails closed",
+                 orch_pull, {**orch_record, "issue": 0})):
+            _write_record(95, _record)
+            check(f"[#835] NEGATIVE: {_why}", admitted_for({95: _pull}, orch_enrolled), set())
+        _write_record(95, orch_record)
+        check(
+            "[#835] NEGATIVE: no record at all fails closed",
+            admitted_for({96: {**orch_pull}}, orch_enrolled), set())
+
+        # END TO END, through the SAME composition run_sweep uses: the exhaustion planner reads
+        # the admitted set this allowlist produces. This is the check that expresses the actual
+        # harm — a defer action on issue #9 IS the silent de-enumeration of PR #95.
+        exhausted_issue = {"owner/repo": {9: {
+            "labels": [{"name": "status:in-progress"}],
+            "updated_at": datetime.fromtimestamp(now - 700, timezone.utc).isoformat()}}}
+
+        def exhaustion_modes(pulls: dict[int, dict[str, Any]], authors: Any) -> list[Any]:
+            acts, _prs, _dead = _plan_actions(
+                {"owner/repo": Limits(worker_timeout_minutes=10, max_attempts=2,
+                                      enrolled_authors=authors)},
+                exhausted_issue, {"owner/repo": pulls},
+                {"owner/repo": admitted_for(pulls, authors)},
+                {("owner/repo", 9): 2}, {}, [], {}, now, "app[bot]")
+            return [(a.number, a.mode) for a in acts]
+
+        check(
+            "[#835] END TO END: an exhausted issue whose ENROLLED orchestrator PR is open is "
+            "NOT parked — no silent de-enumeration",
+            exhaustion_modes({95: orch_pull}, orch_enrolled), [])
+        check(
+            "[#835] END TO END: the pre-#835 behaviour (empty allowlist) still parks it — this "
+            "is the defect, and it is what enrolment removes",
+            exhaustion_modes({95: orch_pull}, ()), [(9, "defer")])
+        check(
+            "[#835] END TO END REGRESSION CONTROL: an open worker PR still suppresses with the "
+            "allowlist enabled",
+            exhaustion_modes({91: orch_worker_pull}, orch_enrolled), [])
+        check(
+            "[#835] END TO END: an UNENROLLED third party cannot hold an exhausted issue out of "
+            "its park",
+            exhaustion_modes({95: {**orch_pull, "user": {"login": "mallory"}}}, orch_enrolled),
+            [(9, "defer")])
+        # The claim that makes adding `admitted` to the recovery-suppression guard worker-NEUTRAL:
+        # for the worker class the admitted set is a SUBSET of the links keys, so the new
+        # disjunct can never change a worker outcome. Asserted, not asserted-in-prose.
+        for _authors in ((), orch_enrolled):
+            check(
+                f"[#835] REGRESSION CONTROL: worker admitted ⊆ links keys (authors={_authors})",
+                admitted_for({91: orch_worker_pull}, _authors)
+                <= set(_current_links("owner/repo", {91: orch_worker_pull}, "app[bot]")),
+                True)
+        # ...and the recovery path itself: a stale in-progress issue with an ENROLLED
+        # orchestrator PR open is NOT re-readied (before #835 it was, and a worker was
+        # dispatched onto work already in the review lane).
+        stale_open = {"owner/repo": {9: {
+            "labels": [{"name": "status:in-progress"}],
+            "updated_at": datetime.fromtimestamp(now - 700, timezone.utc).isoformat()}}}
+
+        def recovery_modes(pulls: dict[int, dict[str, Any]], authors: Any) -> list[Any]:
+            acts, _prs, _dead = _plan_actions(
+                {"owner/repo": Limits(worker_timeout_minutes=10, max_attempts=9,
+                                      enrolled_authors=authors)},
+                stale_open, {"owner/repo": pulls},
+                {"owner/repo": admitted_for(pulls, authors)},
+                {("owner/repo", 9): 1}, {}, [], {}, now, "app[bot]")
+            return [(a.number, a.mode) for a in acts]
+
+        check(
+            "[#835] the stale-in-progress recovery does NOT re-ready an issue whose enrolled "
+            "orchestrator PR is open",
+            recovery_modes({95: orch_pull}, orch_enrolled), [])
+        check(
+            "[#835] ...and with an empty allowlist it still re-readies (the pre-#835 behaviour, "
+            "so the check above is not vacuous)",
+            recovery_modes({95: orch_pull}, ()), [(9, "ready")])
+        check(
+            "[#835] REGRESSION CONTROL: the recovery path is unchanged for a worker PR and for "
+            "an issue with no PR at all",
+            [recovery_modes({91: orch_worker_pull}, orch_enrolled), recovery_modes({}, ())],
+            [[], [(9, "ready")]])
+
+    # The MUTATION BOUNDARY re-read must admit the class on the same terms, or the on-disk
+    # admission suppresses and the live one lets the park through — the exact drift the worker
+    # path already forbids (issue #174).
+    orch_live_path = (
+        "/repos/owner/registry/contents/orchestration/provenance/"
+        f"owner--repo--pr95.json?ref={live_tip}")
+    orch_live_record = dict(orch_review.orchestrator_probe_record(95), issue=9)
+    check(
+        "[#835] live admission: an ENROLLED orchestrator PR's raced-in record ADMITS (cancel "
+        "the park)",
+        _live_issue_admission(
+            _StubAPI({**live_ref, orch_live_path: _contents(orch_live_record)}),
+            "owner/registry", "owner/repo", 9, {95: orch_pull}, "app[bot]",
+            enrolled_authors=orch_enrolled),
+        "admitted",
+    )
+    check(
+        "[#835] live admission: the same PR with an EMPTY allowlist is never even read (DENIED)",
+        _live_issue_admission(
+            _RaisingAPI(), "owner/registry", "owner/repo", 9, {95: orch_pull}, "app[bot]"),
+        "denied",
+    )
+    check(
+        "[#835] live admission: an enrolled PR whose live record binds ANOTHER issue is DENIED",
+        _live_issue_admission(
+            _StubAPI({**live_ref,
+                      orch_live_path: _contents({**orch_live_record, "issue": 8})}),
+            "owner/registry", "owner/repo", 9, {95: orch_pull}, "app[bot]",
+            enrolled_authors=orch_enrolled),
+        "denied",
+    )
+    check(
+        "[#835] live admission: an enrolled PR with an UNREADABLE live ledger is INDETERMINATE "
+        "(skip the park + alert), never a park on an unusable read",
+        _live_issue_admission(
+            _RaisingAPI(), "owner/registry", "owner/repo", 9, {95: orch_pull}, "app[bot]",
+            enrolled_authors=orch_enrolled),
+        "indeterminate",
+    )
+    check(
+        "[#835] live admission: a FORK head is never read and never suppresses, even enrolled",
+        _live_issue_admission(
+            _RaisingAPI(), "owner/registry", "owner/repo", 9,
+            {95: {**orch_pull,
+                  "head": {"ref": "fix/x", "repo": {"full_name": "mallory/repo"}}}},
+            "app[bot]", enrolled_authors=orch_enrolled),
+        "denied",
+    )
+
+    # THE POLICY READ. `Limits.enrolled_authors` defaults to `()`, so a load_limits that never
+    # populates it would leave every check above passing while production ran enrolment-off.
+    with tempfile.TemporaryDirectory() as tmp:
+        _pol_dir = Path(tmp)
+        (_pol_dir / "repos.toml").write_text(
+            '[repos."owner/repo"]\nenabled=true\nrouting="r.toml"\naccount_pool=["acct01"]\n'
+            'max_concurrent=1\nworker_timeout_minutes=30\ngate_profile="lint-only"\n'
+            'arm_auto_merge=false\nmax_attempts=3\ntrust="collaborators"\n'
+            f'review_enrolment_authors=["{orch_login}"]\n', encoding="utf-8")
+        _pol_limits = load_limits(_pol_dir / "repos.toml",
+                                  Path(__file__).resolve().with_name("policy-resolve.py"))
+        check(
+            "[#835] load_limits carries the repo's MASTER-protected allowlist onto Limits "
+            "(hard-coding `()` there turns groom's class awareness off in production)",
+            _pol_limits["owner/repo"].enrolled_authors, (orch_login,))
+        (_pol_dir / "repos.toml").write_text(
+            (_pol_dir / "repos.toml").read_text(encoding="utf-8").replace(
+                f'review_enrolment_authors=["{orch_login}"]\n', ""), encoding="utf-8")
+        check(
+            "[#835] ...and an unset allowlist is EMPTY, i.e. enrolment off by default",
+            load_limits(_pol_dir / "repos.toml",
+                        Path(__file__).resolve().with_name("policy-resolve.py")
+                        )["owner/repo"].enrolled_authors, ())
+
+    # THE CALL SITES, on the PARSED module. A behavioural test of the admissions cannot see
+    # `run_sweep` passing a hard-coded `()`; the guards would stay green while the feature was
+    # off in production. Parsed, never regexed — a source regex fails permissive under a reflow.
+    _sweep_fn = next(
+        node for node in ast.walk(ast.parse(
+            Path(__file__).resolve().read_text(encoding="utf-8")))
+        if isinstance(node, ast.FunctionDef) and node.name == "run_sweep")
+    _sweep_enrol = [
+        (getattr(node.func, "id", ""), ast.unparse(keyword.value))
+        for node in ast.walk(_sweep_fn) if isinstance(node, ast.Call)
+        and getattr(node.func, "id", "") in ("_admitted_review_prs", "_live_issue_admission")
+        for keyword in node.keywords if keyword.arg == "enrolled_authors"]
+    check(
+        "[#835] every class-aware admission in run_sweep is handed the LIVE per-repo allowlist "
+        "(not a literal), at all FOUR call sites",
+        sorted(_sweep_enrol),
+        sorted([("_admitted_review_prs", "limits[repo].enrolled_authors"),          # planning
+                ("_admitted_review_prs", "limits[repo].enrolled_authors"),          # boundary links
+                ("_admitted_review_prs", "limits[action.repo].enrolled_authors"),   # defer boundary
+                ("_live_issue_admission", "limits[action.repo].enrolled_authors")]))
 
     # Orphan repair: closed-unmerged worker PRs strip every status label ('complete' adds nothing),
     # and a dead review loop leaves status:in-progress-review. Both are recoverable ONLY when the
@@ -4363,6 +4807,40 @@ def _self_test() -> int:
     except GroomError:
         unsafe_owner_repo = True
     check("unsafe enabled repo name fails closed in mint scoping", unsafe_owner_repo, True)
+
+    # ---- dispatch.yml manifest mint scoping (issue #273) ----
+    # dispatch's owners come from the DISPATCH_TARGET_REPOS manifest, not policy, and CLAIM routes
+    # the minted token by OWNER. Reverting the manifest aggregation to "one representative repo
+    # per owner" (the #273 defect) reds the two-repos check; dropping the exact-owner-set
+    # assertion or the safe-name/JSON validation reds the fail-closed checks below.
+    check(
+        "manifest mint scope carries EVERY repo per owner, comma-joined",
+        sorted(manifest_owner_repo_output_lines(
+            '["sparq-org/sparq", "jeswr/agent-account-registry", "sparq-org/second-target"]'
+        )),
+        ["jeswr_names=agent-account-registry", "sparq_names=sparq,second-target"],
+    )
+    check(
+        "a repeated manifest entry is collapsed, not doubled in the mint scope",
+        owner_repos_from_names(["sparq-org/sparq", "sparq-org/sparq", "jeswr/registry"]),
+        {"sparq-org": ["sparq"], "jeswr": ["registry"]},
+    )
+    for manifest_name, bad_manifest in (
+        ("a third manifest owner fails loud (its mint step is missing)",
+         '["sparq-org/sparq", "jeswr/agent-account-registry", "third-org/repo"]'),
+        ("a manifest missing an expected owner fails loud", '["sparq-org/sparq"]'),
+        ("an unsafe manifest repo name fails closed", '["sparq-org/sparq", "jeswr/bad name"]'),
+        ("a non-string manifest entry fails closed", '["sparq-org/sparq", 7]'),
+        ("a non-array manifest fails closed", '{"sparq-org": "sparq"}'),
+        ("an empty manifest fails closed (never an unscoped mint)", "[]"),
+        ("a malformed/absent manifest fails closed", ""),
+    ):
+        manifest_died = False
+        try:
+            manifest_owner_repo_output_lines(bad_manifest)
+        except GroomError:
+            manifest_died = True
+        check(manifest_name, manifest_died, True)
 
     # ---- ledger-branch targeting (issue #28: data plane off the protected code branch) ----
     # Literal "ledger": pointing either helper back at the default branch (or changing the shipped
@@ -5444,6 +5922,13 @@ def main() -> int:
         help="print the per-owner enabled-repo GITHUB_OUTPUT lines that scope groom.yml's "
              "App-token mints (issue #168), then exit",
     )
+    parser.add_argument(
+        "--target-repos-env",
+        default="",
+        help="with --print-owner-repos: read the target set from this environment variable (a "
+             "JSON array of owner/name) instead of --policy-file — dispatch.yml's manifest-driven "
+             "per-owner mints (issue #273)",
+    )
     parser.add_argument("--registry-repo")
     parser.add_argument("--policy-file", default="policy/repos.toml")
     parser.add_argument("--policy-resolver", default="scripts/policy-resolve.py")
@@ -5468,9 +5953,18 @@ def main() -> int:
     args = parser.parse_args()
     if args.self_test:
         return _self_test()
+    if args.target_repos_env and not args.print_owner_repos:
+        parser.error("--target-repos-env is only valid with --print-owner-repos")
     if args.print_owner_repos:
         try:
-            for line in owner_repo_output_lines(_policy_document(Path(args.policy_file))):
+            if args.target_repos_env:
+                # Absent/empty manifest env => DIE, never an unscoped or single-repo mint.
+                lines = manifest_owner_repo_output_lines(
+                    os.environ.get(args.target_repos_env) or ""
+                )
+            else:
+                lines = owner_repo_output_lines(_policy_document(Path(args.policy_file)))
+            for line in lines:
                 print(line)
         except GroomError as exc:
             print(f"groom: {exc}", file=sys.stderr)

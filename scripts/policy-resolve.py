@@ -112,9 +112,42 @@ POLICY_FIELDS = {
 # thresholds + the per-target readiness-engine selector). policy-resolve accepts-and-ignores them
 # so the dispatch/groom resolver never rejects a policy augmented for the metrics collector; the
 # collector does its own strict validation of their contents.
+# [OPUS-5] review_enrolment_authors (issue #657, research/657-orchestrator-pr-admission.md §6):
+# the MASTER-PROTECTED half of orchestrator-PR admission.
+#
+# The review lane's shape gates — a `sparq-agent/issue-N-` head ref and a `[bot]` author — select
+# the population the WORKER lane produces. A PR the orchestrator authored itself, on an ordinary
+# branch under the maintainer's token, is therefore structurally unreachable by review however
+# correct it is: not deferred, not parked, invisible. Admission re-admits that class, and needs
+# BOTH halves:
+#   1. a provenance record whose attestation class is `orchestrator` (per-PR, `ledger` branch),
+#      and
+#   2. the PR author's login appearing in THIS list (per-repo, master).
+# Both are required because the two branches carry DIFFERENT authority. Provenance records live
+# on `ledger` precisely because master's required `gate` check rejects direct contents-API PUTs
+# (issue #96), so minting a record is a LOW-authority act available to anything holding the App
+# token. This list sits on master, behind the gate and branch protection, so the SET of logins
+# that can ever be admitted is a reviewed change even when an individual record is not. A record
+# naming a login absent from here admits NOTHING (fail-closed; absent => empty list => the shape
+# gates stand exactly as they do today).
+#
+# Entries are canonical lowercase GitHub USER logins. A `[bot]` login is REFUSED: a bot already
+# satisfies the author gate, so listing one could only widen it to an unrelated App.
+#
+# This list NEVER waives the fork gate (`head.repo == target`), the provenance-record field
+# admission, the human holds, the machine parks, or any lease rule. Nor does it make the class
+# equal to a worker PR: per the design record's Option 2(b) the class is REVIEW-ONLY, and its
+# reviewer side is a CONSTANT, never resolved by inverting the record's self-declared
+# `impl_provider` — for a self-authored PR that field is an assertion by the implementer about
+# itself, and inverting it yields a same-provider review that merely LOOKS cross-provider.
 OPTIONAL_POLICY_FIELDS = {"require_usage", "usage_safety_margin", "max_review_rounds",
                           "review_queue_ttl_minutes", "cross_provider_fallback", "security_paths",
-                          "trusted_bots", "allow_actions_bot_issues", "throughput", "readiness"}
+                          "trusted_bots", "allow_actions_bot_issues", "throughput", "readiness",
+                          "review_enrolment_authors"}
+
+# A canonical GitHub USER login: ASCII alphanumeric with internal single hyphens, <= 39 chars.
+# Deliberately excludes the "[bot]" suffix — see the OPTIONAL_POLICY_FIELDS note above.
+GITHUB_LOGIN_RE = re.compile(r"[a-z0-9](?:-?[a-z0-9]){0,38}")
 
 
 # Slots whose underlying account is dead and which must never appear in an account_pool again.
@@ -234,6 +267,26 @@ def _policy_row(target_repo, policy_doc):
     if ("allow_actions_bot_issues" in row
             and not isinstance(row["allow_actions_bot_issues"], bool)):
         raise PolicyError(f"allow_actions_bot_issues for {target_repo!r} must be boolean")
+    if "review_enrolment_authors" in row:
+        authors = row["review_enrolment_authors"]
+        # CANONICAL FORM IS AN INVARIANT here for the same reason it is for account_pool: the
+        # consumer (dispatch-claim.admits_orchestrator_pr) compares casefolded, so " JesWR" would
+        # match at the comparison site while reading as a different value in review. Rejecting
+        # non-canonical entries at the boundary keeps the reviewed text and the matched value
+        # the same string.
+        if not isinstance(authors, list) or any(not isinstance(a, str) for a in authors):
+            raise PolicyError(
+                f"review_enrolment_authors for {target_repo!r} must be a list of login strings")
+        noncanonical = [a for a in authors if GITHUB_LOGIN_RE.fullmatch(a) is None]
+        if noncanonical:
+            raise PolicyError(
+                f"review_enrolment_authors for {target_repo!r} contains non-canonical "
+                f"login(s) {noncanonical!r} — each entry must match "
+                f"{GITHUB_LOGIN_RE.pattern} exactly (lowercase, no whitespace, no '[bot]' "
+                f"suffix: a bot already satisfies the author gate and needs no enrolment)")
+        if len(set(authors)) != len(authors):
+            raise PolicyError(
+                f"review_enrolment_authors for {target_repo!r} contains duplicates")
     if "security_paths" in row:
         paths = row["security_paths"]
         if (not isinstance(paths, list)
@@ -257,7 +310,22 @@ def _policy_row(target_repo, policy_doc):
     # this shared loader rather than be independently guessed at each call site.
     normalized = dict(row)
     normalized.setdefault("allow_actions_bot_issues", False)
+    normalized.setdefault("review_enrolment_authors", [])
     return normalized
+
+
+def review_enrolment_authors(target_repo, policy_doc):
+    """The master-protected set of logins this repo may enrol into the review lane (casefolded).
+
+    Read by the PLAN assemble step and handed to enumerate_review_items. Deliberately NOT
+    surfaced through resolve(): resolve's output dict is compared field-by-field by
+    dispatch-claim._route_matches against the TARGET-side resolver, so adding a key there
+    would be a cross-repo contract change; this is a separate, registry-only read.
+
+    Absent / empty => empty frozenset, i.e. enrolment is OFF and the shape gates stand exactly
+    as before. _policy_row has already refused a malformed or non-canonical list, so reaching
+    here means every entry is a canonical login."""
+    return frozenset(_policy_row(target_repo, policy_doc)["review_enrolment_authors"])
 
 
 def _normalise_labels(role_or_labels):
@@ -634,6 +702,87 @@ agent = "docs-agent"
                              'trusted_bots=["dup[bot]", "dup[bot]"]\n')
     rejects("trusted_bots rejects duplicates", "trusted_bots",
             lambda: resolve("o/r", "impl", dup_bots, routing))
+    # ---- [OPUS-5 #657] review_enrolment_authors: the master-protected half of orchestrator-PR
+    # admission. Absent => empty => admission is OFF, which is the shipped state of every repo. ----
+    def _authors(body):
+        return review_enrolment_authors("o/r", tomllib.loads(
+            '[repos."o/r"]\nenabled=true\nrouting="r.toml"\naccount_pool=["acct01"]\n'
+            'max_concurrent=1\nworker_timeout_minutes=30\ngate_profile="lint-only"\n'
+            'arm_auto_merge=false\nmax_attempts=1\ntrust="collaborators"\n' + body))
+
+    check("review_enrolment_authors defaults EMPTY (admission off)", _authors(""), frozenset())
+    check("review_enrolment_authors surfaced",
+          _authors('review_enrolment_authors=["jeswr"]\n'), frozenset({"jeswr"}))
+    check("review_enrolment_authors accepts an explicitly empty list",
+          _authors("review_enrolment_authors=[]\n"), frozenset())
+    # A `[bot]` login is REFUSED. A bot already satisfies the review lane's author gate, so the
+    # only thing listing one could do is widen that gate to some OTHER App — the exact
+    # suffix-matching hole issue #111 closed for trusted_bots. Deleting the pattern check
+    # re-opens it, and this line goes red.
+    rejects("review_enrolment_authors refuses a [bot] login", "non-canonical",
+            lambda: _authors('review_enrolment_authors=["some-app[bot]"]\n'))
+    # CANONICAL FORM IS AN INVARIANT (the account_pool lesson): the consumer compares
+    # casefolded, so a padded or upper-case entry would MATCH at the comparison site while
+    # reading as a different value in review. Reject at the boundary instead.
+    for _bad, _why in (('" jeswr"', "leading space"), ('"JesWR"', "upper case"),
+                       ('"jeswr "', "trailing space"), ('""', "empty"),
+                       ('"-jeswr"', "leading hyphen"), ('"a b"', "space"),
+                       ('"jeswr\\n"', "newline"), ("7", "non-string")):
+        rejects(f"review_enrolment_authors refuses {_why}",
+                "review_enrolment_authors",
+                lambda body=f"review_enrolment_authors=[{_bad}]\n": _authors(body))
+    rejects("review_enrolment_authors refuses duplicates", "duplicates",
+            lambda: _authors('review_enrolment_authors=["jeswr", "jeswr"]\n'))
+    rejects("review_enrolment_authors must be a list", "must be a list",
+            lambda: _authors('review_enrolment_authors="jeswr"\n'))
+    # The field must be a RECOGNISED optional key: an unknown key is a hard refusal here, so a
+    # typo in policy/repos.toml fails the whole tick loudly instead of silently enrolling nobody.
+    check("review_enrolment_authors is a recognised optional field",
+          "review_enrolment_authors" in OPTIONAL_POLICY_FIELDS, True)
+    rejects("a TYPO'd enrolment key is refused, not ignored", "unknown fields",
+            lambda: _authors('review_enrolment_author=["jeswr"]\n'))
+    # It is NOT surfaced through resolve(): that dict is compared field-by-field against the
+    # TARGET-side resolver by dispatch-claim._route_matches, so an extra key there would be a
+    # cross-repo contract change causing permanent per-tick defers.
+    check("resolve() output is unchanged by enrolment", "review_enrolment_authors" in impl, False)
+
+    # ---- [registry #657 / #759] THE ENABLE INTERLOCK, from the OTHER SIDE OF THE SEAM ----------
+    # This module owns the master-protected allowlist; dispatch-claim owns the downstream wiring
+    # facts. While ANY consumer is not ready, a repo that ships the key enabled turns every
+    # enrolled PR into a loop that repeats every tick forever — refused at CLAIM, SystemExit'd at
+    # review-fix `resolve`, or silently DROPPED at the outcome step — with a generic defer counter
+    # as its only symptom (research/657-orchestrator-pr-admission.md §7.4). The fourth fact is
+    # INVERTED: the ARM must REFUSE the class, because that leg's failure mode is not a stall, it
+    # is a MERGE authorised by a provenance record the implementer wrote about itself.
+    #
+    # The same consistency check lives in dispatch-claim's self-test. It is DUPLICATED here on
+    # purpose, and this is the one duplication in this area that is not drift: both copies call the
+    # SAME `enrolment_enable_error` with the SAME probe functions, so they cannot disagree about
+    # the rule — only about whether it is checked at all. MEASURED reason: with dispatch-claim's
+    # copy alone, a single diff that enabled the key AND deleted that one assertion stayed green
+    # (mutant E4). Two enrolled scripts now have to be edited to get an enabling diff past `gate`.
+    _dc = _import_sibling("registry_dispatch_claim_enrolment_interlock", "dispatch-claim.py")
+    _live_policy = tomllib.loads(Path(__file__).resolve().parent.parent
+                                 .joinpath(POLICY_PATH).read_text(encoding="utf-8"))
+    _wiring = (_dc.claim_admits_orchestrator_class(),
+               _dc.review_fix_admits_orchestrator_class(),
+               _dc.outcome_admits_orchestrator_class(),
+               _dc.arm_refuses_orchestrator_class())
+    check("the SHIPPED policy enables no enrolment the review lane cannot yet serve",
+          _dc.enrolment_enable_error(_live_policy, *_wiring), None)
+    # NON-VACUOUS, and per-leg: the check above passes today because nothing is enabled, so prove
+    # the predicate reds on an enabling policy for EVERY leg independently. A single truthy row
+    # would let three of the four facts be dropped from the conjunction with nothing red.
+    _enabling = {"repos": {"o/r": {"review_enrolment_authors": ["jeswr"]}}}
+    for _index, _leg in enumerate(
+            ("CLAIM", "review-fix.yml resolve", "review-fix.yml outcome", "the arm refusal")):
+        _broken = list(_wiring)
+        _broken[_index] = not _broken[_index]
+        check(f"...and an enabling policy WOULD be refused with {_leg} not ready",
+              _dc.enrolment_enable_error(_enabling, *_broken) is not None, True)
+    check("...and an enabling policy is permitted once every leg is ready",
+          _dc.enrolment_enable_error(_enabling, True, True, True, True), None)
+
     # Issue #487: the exact actions-bot exception is a validated, per-repo opt-in. Missing means
     # false so a newly onboarded repository cannot inherit this author class accidentally.
     check("allow_actions_bot_issues defaults false", impl["allow_actions_bot_issues"], False)

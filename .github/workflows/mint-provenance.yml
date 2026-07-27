@@ -1,0 +1,151 @@
+# [OPUS-5] Mint the #657 `orchestrator`-class provenance record for ONE orchestrator-authored PR
+# (design record research/657-orchestrator-provenance-minting.md).
+#
+# WHY A workflow_dispatch AND NOT A TRIGGER. The orchestrator opens its PRs interactively with
+# `gh`, so there is no in-workflow moment to hang minting on, and the two alternatives are both
+# unsound here: a `pull_request`-triggered workflow would have to live in the TARGET repository —
+# putting a registry-writing job in the repo whose PRs the model fleet writes — and a
+# reconciliation sweep would turn a per-PR gesture into a standing "trust this author" claim,
+# which is precisely what the record must NOT assert. A manual dispatch keeps minting a deliberate,
+# per-PR, rate-limited act by someone holding `actions: write` on the REGISTRY.
+#
+# WHAT IT CANNOT DO. It cannot enrol anyone: scripts/mint-provenance.py refuses to mint for a login
+# that is not already in the target's `review_enrolment_authors` (policy/repos.toml, on
+# master, behind branch protection). It cannot mint a MACHINE-attested record: the attestation
+# stamp is built inside the script from this run's own GITHUB_RUN_ID/GITHUB_RUN_ATTEMPT, there is
+# no input on this path that names a run key or a class, and the script refuses any stamp whose
+# class is not the self-attested `orchestrator` one. And it cannot authorise a merge — the arm
+# refuses that class outright (worker-pr.ready_and_arm).
+#
+# DRY RUN unless apply=true. Every refusal leaves the PR with no record, i.e. exactly as invisible
+# to the review lane as it is today — never a per-tick refusal loop.
+name: mint-provenance
+run-name: mint-provenance ${{ inputs.target_repo }}#${{ inputs.pr_number }} apply=${{ inputs.apply }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_repo:
+        description: Target owner/repository (must be enabled in policy/repos.toml)
+        required: true
+        default: sparq-org/sparq
+        type: string
+      pr_number:
+        description: The orchestrator-authored pull request to mint a record for
+        required: true
+        type: string
+      issue_number:
+        description: >-
+          The OPEN source issue the PR names. It decides the lease partition the review reserves
+          and the human-hold surface that can park it, so it must be a real open issue (not a PR)
+          that the pull request references.
+        required: true
+        type: string
+      impl_alias:
+        description: >-
+          Implementing model alias. Must resolve to provider `anthropic` in the target's routing
+          catalog — that pin is what keeps the review side constant (the lane inverts the provider).
+        required: false
+        default: opus5
+        type: string
+      apply:
+        description: Write the record (false = dry run)
+        required: false
+        default: false
+        type: boolean
+      allow_global_partition:
+        description: >-
+          Accept a source issue whose area:* labels reduce to the serializing __global__ partition.
+          A review lease on it excludes every other lane for the life of the lease.
+        required: false
+        default: false
+        type: boolean
+
+permissions: {}
+
+concurrency:
+  group: mint-provenance
+  cancel-in-progress: false
+
+jobs:
+  mint:
+    name: Mint an orchestrator-class provenance record (ledger branch)
+    # The salt is a secret: refuse to run from any non-default ref (a modified branch copy of this
+    # workflow must never see it — the sol-audit arbitrary-ref class). It is also what stops a
+    # branch that adds itself to policy/repos.toml from being read as the enrolment allowlist.
+    if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # SECRET-EXFIL GUARD (issue #101): reads PROVENANCE_SALT, which lives in the `dispatch-secrets`
+    # environment (deployment-branch policy: default branch only). Complements (does not replace)
+    # the in-file ref guard above.
+    environment: dispatch-secrets
+    permissions:
+      contents: write   # ledger-branch record PUT via github.token
+      # Deliberately NO `actions: read`. Run-log reading is BACKFILL's identity source; this path's
+      # identity source is the live API read of the PR, and granting log access here would blur two
+      # attestation classes that must stay distinguishable.
+    steps:
+      - name: Checkout private registry (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Checkout public target for protected routing data (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ inputs.target_repo }}
+          path: target-routing
+          persist-credentials: false
+
+      - name: Enforce the policy row (enabled target + ITS validated routing pointer)
+        id: policy
+        env:
+          TARGET_REPO: ${{ inputs.target_repo }}
+        run: |
+          set -euo pipefail
+          [[ "$TARGET_REPO" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || { echo '::error::unsafe target repo'; exit 1; }
+          python3 - <<'PY'
+          import os
+          from pathlib import Path, PurePosixPath
+          import tomllib
+          target = os.environ["TARGET_REPO"]
+          row = tomllib.load(open("policy/repos.toml", "rb")).get("repos", {}).get(target)
+          # Only an ENABLED policy target may be minted for (mirrors backfill-provenance.yml's
+          # sol r1 finding: syntax-only checking permitted provenance pre-seeding for arbitrary
+          # public repositories), and the routing file comes from the row's validated pointer.
+          if not isinstance(row, dict) or row.get("enabled") is not True:
+              raise SystemExit(f"::error::{target} is not an enabled policy target")
+          routing = row.get("routing")
+          if not isinstance(routing, str) or not routing:
+              raise SystemExit("::error::policy row carries no routing pointer")
+          root = Path("target-routing").resolve()
+          resolved = root.joinpath(*PurePosixPath(routing).parts).resolve()
+          resolved.relative_to(root)  # traversal guard — raises on escape
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"routing_file=target-routing/{routing}\n")
+          PY
+
+      - name: Mint (self-test first; dry run unless apply=true)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Raw logins never appear beside their hash — the script prints only the salted hash.
+          PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          IMPL_ALIAS: ${{ inputs.impl_alias }}
+          APPLY: ${{ inputs.apply }}
+          ALLOW_GLOBAL: ${{ inputs.allow_global_partition }}
+          ROUTING_FILE: ${{ steps.policy.outputs.routing_file }}
+        run: |
+          set -euo pipefail
+          [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]] || { echo '::error::pr_number must be a positive integer'; exit 1; }
+          [[ "$ISSUE_NUMBER" =~ ^[1-9][0-9]*$ ]] || { echo '::error::issue_number must be a positive integer'; exit 1; }
+          python3 scripts/mint-provenance.py --self-test
+          args=(--target-repo "$TARGET_REPO" --registry-repo "$GITHUB_REPOSITORY" \
+                --pr "$PR_NUMBER" --issue "$ISSUE_NUMBER" --impl-alias "$IMPL_ALIAS" \
+                --routing-file "$ROUTING_FILE")
+          if [[ "$APPLY" == "true" ]]; then args+=(--apply); fi
+          if [[ "$ALLOW_GLOBAL" == "true" ]]; then args+=(--allow-global-partition); fi
+          python3 scripts/mint-provenance.py "${args[@]}"

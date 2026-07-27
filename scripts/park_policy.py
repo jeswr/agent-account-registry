@@ -110,7 +110,38 @@ READMISSION_LABELS = (HUMAN_PARK_LABEL, MACHINE_PARK_LABEL, MACHINE_PARK_PR_LABE
 # PARK_GENERATION_MARKER whose window key is the cutoff (or PARK_WINDOW_NONE for the initial
 # window). Label writes are best-effort UI on top: a sticky-veto-suppressed label re-apply
 # never stalls the ladder, because the ladder never reads labels.
+#
+# [registry #797] ONLY A HUMAN'S DECISION MAY CHARGE ONE OF THESE GENERATIONS. The counter above
+# says "human-readmitted", and the escalation comment it drives says so out loud — but until this
+# fix the ladder could not tell a human's unlabel from the loop's OWN automatic re-admission
+# (invariant 3 / registry #614), because both arrive as a bare `cutoff` string through
+# effective_readmission_cutoff. MEASURED on the live sparq population 2026-07-27: 35 open draft
+# PRs sat on the human-owned `review:needs-user` terminal, all 73 applications of it made by
+# `sparq-orchestrator[bot]` and NONE by a human; of the 21 carrying generation receipts, 20 had
+# escalated on a window minted by an AUTOMATIC re-admission (the window key is byte-identical to
+# the PR's own `sparq-auto-readmit` stamp — e.g. #4422 gen=2 cutoff=2026-07-27T08:02:21Z, and
+# #3595 whose BOTH windows are auto stamps) and ZERO on a window a human opened. The loop parked
+# its own PRs, re-admitted them itself, counted its own re-admission as a human generation, and
+# then paged the maintainer claiming they had readmitted it.
+#
+# So the generation counter is now attributed: see WINDOW_AUTHORITY_* / readmission_window, and
+# park_ladder_decision's REQUIRED `window_authority`. A window the machine minted charges the
+# MACHINE ladder (PARK_MACHINE_TERMINAL_GENERATIONS) instead, whose terminal is machine-owned.
 PARK_ESCALATION_GENERATIONS = 2
+# WHO opened the readmission window a park-generation is charged to. `readmission_window` derives
+# it; `park_ladder_decision` REQUIRES it (keyword-only, no default) so no call site can reach the
+# human terminal by forgetting to attribute its window — the defect above in one word.
+#   human    a PROVEN-human unlabel of a park label (readmission_cutoff's strict maintainer probe)
+#            is the newest gesture. ONLY this may charge a PARK_ESCALATION_GENERATIONS generation
+#            and so ONLY this can ever reach the human-owned terminal.
+#   machine  the loop's own automatic re-admission receipt is the newest gesture (or ties the
+#            human one — a tie proves nothing about the human's intent and resolves to machine).
+#   unknown  no window at all, an unreadable timeline, or a caller that cannot attribute. Treated
+#            exactly like `machine` for the terminal, and — having no attribution to count with —
+#            it counts EVERY consumed window on the machine ladder so it still terminates.
+WINDOW_AUTHORITY_HUMAN = "human"
+WINDOW_AUTHORITY_MACHINE = "machine"
+WINDOW_AUTHORITY_UNKNOWN = "unknown"
 # The receipt window key for a budget exhaustion with NO readmission cutoff (the initial
 # full-budget window). Never a valid ISO-8601 timestamp, so it can never collide with a real
 # cutoff key.
@@ -146,6 +177,164 @@ MACHINE_PARK_DESCRIPTION = (
 # even though each individual re-admission already needs its own fresh, unconsumed recovery
 # evidence; the two bounds are independent on purpose.
 AUTO_READMISSION_MAX = 2
+# [registry #797] The MACHINE-owned counterpart of PARK_ESCALATION_GENERATIONS: how many
+# MACHINE-minted budget windows may be consumed before the loop gives up on this PR and RETIRES it
+# (park_ladder_decision's `machine-terminal` action). Deliberately equal to AUTO_READMISSION_MAX —
+# machine windows are minted only by automatic re-admissions, which that constant already caps at
+# two per PR, so this fires exactly when the machine has spent its last automatic chance and the
+# item failed anyway. Past that point nothing further is learned by trying again, and — the whole
+# point of #797 — nothing about a HUMAN's attention has been established either, so the exit must
+# be a machine-owned retirement, never a page.
+PARK_MACHINE_TERMINAL_GENERATIONS = AUTO_READMISSION_MAX
+# ---------------------------------------------------------------------------------------------
+# [registry #764] THE ABSORBING-PARK EXIT. `park_ladder_decision` has five outcomes; three of them
+# neither attempt work nor advance the generation counter, so an item that lands on one lands on
+# it FOREVER unless a human intervenes:
+#
+#   legacy-quiet  a pre-receipt park: `not cutoff and already_labeled and not receipts`. It
+#                 returns BEFORE `generation = len(receipts) + 1`, so no receipt is ever minted,
+#                 so `receipts` stays empty, so the next tick takes the same branch. The stated
+#                 intent ("the ladder starts counting with the first receipted window") is
+#                 unreachable: nothing on this path ever writes that first receipt.
+#   dedupe        the window key is already receipted. A NEW key is minted only by a human
+#                 unlabel (readmission_cutoff), so with no gesture this repeats indefinitely.
+#   unchanged     a fresh window whose park fingerprint has not moved. Correct as idempotence,
+#                 but with nothing else attempting the item it too has no self-clearing exit.
+#
+# MEASURED 2026-07-27, registry dispatch run 30263179462: seven sparq issues (#2392 dedupe,
+# #2640/#2642/#2685/#2714/#2868/#2951 legacy-quiet) were 7 of 7 planned worker rows, launched 0.
+# They are NOT free: `compute_ready` serializes one row per `area:` package, so each one RESERVES
+# its package against every sibling. Eleven deferred candidates (nine still holding a live attempt
+# budget) sat behind those seven packages, and re-running the frontier with the seven removed
+# admits three of them immediately. An item that can never launch was holding the partition of
+# items that can.
+#
+# `freeze` is DELIBERATELY absent: an unreadable timeline must prove nothing at all (the ladder
+# never advances on unproven data), so it can neither start nor age an absorbing streak.
+PARK_ABSORBING_ACTIONS = frozenset({"legacy-quiet", "dedupe", "unchanged"})
+# Bounded grace before an absorbing park is RETIRED to the question-class terminal. The unit is
+# wall-clock, not ticks: the dispatch cron is every 10 minutes but an item is only OBSERVED on a
+# tick where it also won its package, so a tick count would measure contention rather than
+# stuckness. Six hours is ~36 scheduled ticks — long enough that a transient (a capacity dip, a
+# groom pass mid-flight, a human about to unpark) resolves on its own, short enough that a
+# genuinely stuck partition frees inside one working session.
+PARK_ABSORBING_GRACE_SECONDS = 6 * 3600
+# Every disposition absorbing_park_disposition can return. Closed set: the census map below
+# raises on anything outside it, so a new disposition cannot be added without also being counted.
+PARK_ABSORBING_DISPOSITIONS = ("observe", "wait", "retire", "spent", "hold-linked-pr",
+                               "not-absorbing")
+# The CLOSED census enum for the deferred-issue budget-exhaustion leg. Every population entering
+# the leg leaves through exactly one of these buckets, so the buckets SUM to the population and a
+# future missing edge shows as a growing bucket rather than as silence. Keyed by
+# (ladder action, absorbing disposition) — `None` where the action has no absorbing disposition.
+BUDGET_EXHAUSTED_CENSUS = {
+    ("freeze", None): "budget-exhausted-frozen",
+    ("park", None): "budget-exhausted",
+    ("terminal", None): "budget-exhausted-escalated",
+    # [registry #797] The MACHINE terminal. Declared here even though the deferred-issue lane
+    # passes WINDOW_AUTHORITY_HUMAN (its cutoff comes straight from readmission_cutoff, so it can
+    # only ever mint human windows): the enum RAISES on an undeclared pair, so if that lane is
+    # ever wired to an attributed window the exit lands in a counted bucket instead of crashing
+    # the tick — and, more to the point, instead of being silently re-routed to the human one.
+    ("machine-terminal", None): "budget-exhausted-machine-retired",
+    ("legacy-quiet", "observe"): "budget-exhausted-absorbing",
+    ("legacy-quiet", "wait"): "budget-exhausted-absorbing",
+    ("legacy-quiet", "retire"): "budget-exhausted-retired",
+    ("legacy-quiet", "spent"): "budget-exhausted-retired",
+    ("legacy-quiet", "hold-linked-pr"): "budget-exhausted-absorbing-linked-pr",
+    ("dedupe", "observe"): "budget-exhausted-absorbing",
+    ("dedupe", "wait"): "budget-exhausted-absorbing",
+    ("dedupe", "retire"): "budget-exhausted-retired",
+    ("dedupe", "spent"): "budget-exhausted-retired",
+    ("dedupe", "hold-linked-pr"): "budget-exhausted-absorbing-linked-pr",
+    ("unchanged", "observe"): "budget-exhausted-absorbing",
+    ("unchanged", "wait"): "budget-exhausted-absorbing",
+    ("unchanged", "retire"): "budget-exhausted-retired",
+    ("unchanged", "spent"): "budget-exhausted-retired",
+    ("unchanged", "hold-linked-pr"): "budget-exhausted-absorbing-linked-pr",
+}
+
+
+def budget_exhausted_bucket(action, disposition=None):
+    """The ONE census bucket for a budget-exhaustion outcome — a CLOSED enum that RAISES on an
+    undeclared (action, disposition) pair rather than inventing a counter nobody reads.
+
+    This is what makes "the counts sum to the population" checkable: every path out of the
+    deferred-issue budget-exhaustion leg must name its bucket through this function, so a new
+    exit added without a bucket fails loudly at the call site instead of vanishing from the
+    tick summary."""
+    key = (action, disposition)
+    if key not in BUDGET_EXHAUSTED_CENSUS:
+        raise KeyError(
+            f"undeclared budget-exhaustion census key {key!r}: every exit from the "
+            "deferred-issue budget leg must map to exactly one bucket (declare it in "
+            "BUDGET_EXHAUSTED_CENSUS) — refusing to count it as nothing")
+    return BUDGET_EXHAUSTED_CENSUS[key]
+
+
+def absorbing_park_disposition(action, streak_started_at, now, linked_open_pr=False,
+                               already_retired=False,
+                               grace=PARK_ABSORBING_GRACE_SECONDS, log=print):
+    """PURE. What to do about a park that has landed on an ABSORBING ladder action — the exit
+    `park_ladder_decision` structurally cannot provide for itself.
+
+    `action` is the ladder action; `streak_started_at` is the canonical stamp of the OLDEST
+    still-live absorbing receipt for this window ("" or None when none has been written yet);
+    `now` is a unix instant; `linked_open_pr` says whether the source issue has an open worker PR.
+
+    Returns (disposition, streak_started_at) with disposition one of:
+
+    - "not-absorbing": `action` is not in PARK_ABSORBING_ACTIONS (`freeze` and `park` and
+      `terminal` all own their own exits). The caller's existing behaviour is unchanged.
+    - "hold-linked-pr": the issue has an OPEN worker PR. Retiring it would apply `needs:user`,
+      which is exactly the 2026-07-18 mass-park failure — a human hold on the source issue
+      terminally strips its open PR from the review loop. The park stands, uncounted-as-retired
+      and separately bucketed, and the PR's own review lane owns the outcome. FAIL-CLOSED: the
+      caller passes True whenever it cannot PROVE the issue has no linked open PR.
+    - "observe": no receipt for this window yet — START the clock. The caller writes exactly ONE
+      durable observation receipt. Nothing else: no label, no escalation.
+    - "wait": the clock is running and the grace has NOT elapsed. Write nothing (the receipt is
+      already durable); count it and stay quiet.
+    - "spent": this window's terminal is ALREADY receipted. Stay quiet — the disposition was
+      taken once and is durable. This is what caps retirement at one per window even when a
+      sticky human unpark VETOED the `needs:user` write, leaving the item in the lane: without
+      it, every later expired clock would retire it again.
+    - "retire": the absorbing state has PERSISTED past `grace`. The caller escalates to the
+      question-class terminal — receipt first, then the veto-checked `needs:user` write — which
+      both records the disposition on the issue and removes it from the deferred-retry lane
+      (dispatch.yml's PLAN filter drops any `needs:*` label), releasing its package.
+
+    UNPROVABLE TIME FREEZES, it never retires: a `streak_started_at` that will not parse returns
+    ("wait", "") with a loud log. The conservative residue is that the next tick re-observes and
+    writes a good receipt — the streak restarts, escalation is delayed, never fabricated. This is
+    the same direction park_generation_records takes on a malformed cutoff.
+
+    RE-ADMISSION IS CONSUMED ONCE AND CAPPED, and this function is why: the caller keys the
+    receipt on the ladder's WINDOW, and only a human gesture mints a new window key
+    (readmission_cutoff). So a re-admitted item starts a brand-new streak with zero receipts, gets
+    exactly one fresh grace, and cannot inherit the aged clock of the park it was admitted out of.
+    """
+    if action not in PARK_ABSORBING_ACTIONS:
+        return ("not-absorbing", "")
+    if already_retired:
+        return ("spent", "")
+    if linked_open_pr:
+        return ("hold-linked-pr", streak_started_at or "")
+    if not streak_started_at:
+        return ("observe", "")
+    try:
+        # Ordering by PARSED instants, never raw strings (round-5 finding 2): a space-separator
+        # stamp sorts lexicographically before a `T` one of a LATER instant, which would read a
+        # minutes-old streak as hours old and retire it on the spot.
+        started = parse_ts(streak_started_at)
+        threshold = datetime.fromtimestamp(int(now) - int(grace), tz=timezone.utc)
+    except (ValueError, TypeError, OSError, OverflowError):
+        log(f"::warning::absorbing-park clock unreadable ({streak_started_at!r}) — freezing: "
+            "no retirement on unprovable time; the next tick re-observes")
+        return ("wait", "")
+    if started <= threshold:
+        return ("retire", streak_started_at)
+    return ("wait", streak_started_at)
 
 
 class MalformedTimelineError(RuntimeError):
@@ -514,6 +703,46 @@ def human_owned_holds(labels):
                    and (label == HUMAN_PR_PARK_LABEL or label.startswith("needs:"))})
 
 
+def retirement_handback(issue_labels):
+    """[registry #797] PURE. What happens to the SOURCE ISSUE when its worker PR is RETIRED by
+    the machine terminal — the half of the machine-owned give-up that keeps the WORK alive after
+    the attempt is abandoned.
+
+    Returns (action, labels, detail) with `labels` the full desired label set (None when nothing
+    is to be written):
+
+    - ("hold", None, ...): a HUMAN-owned hold (`human_owned_holds` — `review:needs-user` or any
+      `needs:*`) is live on the issue. A human is holding this work for a reason of their own;
+      the retirement records itself on the PR and touches the issue not at all. FAIL-CLOSED: the
+      caller passes the labels it could actually read, and an unreadable issue never reaches here.
+    - ("reroute", labels, ...): the issue is still on the IMPLEMENTATION route (`role:impl`).
+      Re-dispatching the same route is what just failed twice, so the role is swapped to
+      `role:research` for architect decomposition — the SAME hand-off the issue-side repeated-
+      decline path already makes (dispatch-claim._replace_issue_role_with_research), for the same
+      reason: the evidence says the item as specified is not implementable in one pass, not that
+      a human must adjudicate it.
+    - ("requeue", labels, ...): the issue is already off the impl route (research/docs/ci/site,
+      or no role at all). Swapping again would loop, so the labels are returned unchanged and
+      only the machine park is lifted by the caller's status transition.
+
+    The role swap is returned as a COMPLETE label set, never an add/remove pair: add-then-remove
+    can strand the issue with two role labels and remove-then-add with none, and the planner
+    rejects both shapes."""
+    labels = {label for label in (issue_labels or []) if isinstance(label, str)}
+    held = human_owned_holds(labels)
+    if held:
+        return ("hold", None,
+                f"human-owned hold(s) live on the source issue ({'/'.join(held)}) — the "
+                "retirement records itself on the PR and leaves the issue to its human")
+    if "role:impl" in labels:
+        return ("reroute", sorted((labels - {"role:impl"}) | {"role:research"}),
+                "the implementation route exhausted two full budgets — handing the issue to "
+                "architect decomposition (role:impl -> role:research)")
+    return ("requeue", sorted(labels),
+            "the issue is already off the implementation route — the park is lifted without a "
+            "second reroute, which would loop")
+
+
 def label_application_machine_owned(repo, number, label, fetch_events, is_human=None, log=print):
     """Whether the newest `labeled` event for THIS EXACT `label` on `repo#number` was applied by
     something other than a proven human — i.e. whether an automated path may clear it.
@@ -578,9 +807,153 @@ def migration_residual_holds(pr_labels, issue_labels, clearing=()):
          | {label for label in issue_labels if isinstance(label, str)}) - dropped)
 
 
+# --- G5: the closed taxonomy of AUTOMATIC-READMISSION REFUSAL codes --------------------------
+#
+# G4 (above) made a PARK's own cause machine-readable, because "a park whose cause no machine can
+# read has no machine exit by construction". capacity_park_admission then reproduced precisely
+# that defect ONE LAYER UP, in this same file: it answers every refusal with a free-prose
+# `detail` string, so no caller can tell apart two structurally different refusal classes:
+#
+#   * EXIT-REACHABLE — the park is machine-owned and a later tick can still clear it unaided:
+#     the recovery evidence has not appeared YET, the probe failed, the timeline was unreadable.
+#     Waiting IS the correct action, and the state is self-healing.
+#   * HUMAN-TERMINAL — nothing this machine will ever do can clear it. A human-owned hold is
+#     live, or a PROVEN HUMAN applied the park themselves, or the automatic cap is spent. The
+#     only exit is a human gesture, and until one arrives the state is frozen.
+#
+# Both print one indistinguishable "park stands" line per tick, forever, and the only aggregate
+# any sweep emits lumps them into a single bucket. MEASURED on sparq-org/sparq at
+# 2026-07-27T11:53Z (dispatch run 30262478746): 21 open PRs carried `review:parked`, and the
+# review-enumeration aggregate reported one undifferentiated
+# "machine capacity park stands (...)=13". Splitting that bucket by the per-PR CLAIM-half lines
+# in the SAME run gives 3 exit-reachable (#4528/#4519/#4133, "no recorded recovery of the park's
+# starvation cause") against 10 human-terminal — of which 4 (#4197/#3620/#3598/#3577) refuse on
+# "the latest park application is HUMAN-owned". Their timelines confirm it: `jeswr` (type=User)
+# hand-applied `review:parked`, the MACHINE-owned soft hold, which park_applications correctly
+# reads as a human-owned park.
+#
+# That last state is the missing edge. It is terminal; it is carried on the one label whose
+# documented contract (invariant 1) is "excludes the surface WITHOUT posing a human question"
+# and promises a machine exit; and it is counted by NOTHING, because every human-question census
+# keys on `needs:user` / `review:needs-user`. A population with no machine exit that no aggregate
+# can express is exactly the shape #753/#754 removed from the conflict lane.
+#
+# THIS TAXONOMY CHANGES NO DECISION. Every branch returns byte-identically what it returned
+# before; the code is recorded ALONGSIDE the answer so the population becomes countable. Nothing
+# here re-admits anything, and no fail-closed exclusion is weakened to raise a re-admission count
+# — the whole point is that the correct refusals become VISIBLE rather than more numerous.
+PARK_REFUSAL_HUMAN_HOLD = "human-hold"              # needs:* / review:needs-user live
+PARK_REFUSAL_HUMAN_APPLIED = "human-applied"        # a proven human applied the park itself
+PARK_REFUSAL_CAP = "cap"                            # AUTO_READMISSION_MAX spent
+PARK_REFUSAL_TIMELINE_UNREADABLE = "timeline-unreadable"
+PARK_REFUSAL_PROBE_FAILED = "probe-failed"
+PARK_REFUSAL_NO_EVIDENCE = "no-evidence"            # cause recovery not recorded (yet)
+PARK_REFUSAL_EVIDENCE_MALFORMED = "evidence-malformed"
+PARK_REFUSAL_EVIDENCE_CONSUMED = "evidence-consumed"
+PARK_REFUSAL_EVIDENCE_STALE = "evidence-stale"      # recovery not strictly after the park
+PARK_REFUSAL_NOT_OFFERED = "not-offered"            # proof-gate call: auto_evidence is None
+# The two exits a SWEEP takes BEFORE it ever reaches capacity_park_admission. Review of the first
+# round of this taxonomy measured 8 parked PRs in, 5 census rows out: both of these `continue`
+# before the admission call, so neither was written, and the rows summed to the ADMISSIONS rather
+# than to the population. `tick-deferred` is benign (it logs per PR and self-heals next tick);
+# `read-failed` is not — a PR whose GitHub read fails on every tick is precisely a stuck-forever
+# population, and it was absent from the only aggregate that could have expressed it. That is the
+# same missing-edge defect this taxonomy exists to remove, one layer down, so both are codes.
+PARK_REFUSAL_READ_FAILED = "read-failed"            # the PR's own GitHub state was unreadable
+PARK_REFUSAL_TICK_DEFERRED = "tick-deferred"        # AUTO_READMISSION_PER_TICK_MAX spent
+
+# Which refusals a later tick can clear WITHOUT a human. The split is the whole point of the
+# taxonomy, so it is data, not a predicate scattered across callers.
+#
+# `cap` is HUMAN-TERMINAL deliberately, and the refusal's own log line already says why: "an
+# account that keeps flapping is a genuine human question; the park stands until a human acts".
+# `evidence-consumed` is EXIT-REACHABLE: it demands a NEW outage-and-recovery pair, which a later
+# tick can genuinely observe. `not-offered` is EXIT-REACHABLE because it is not a refusal about
+# the PR at all — it is the CLAIM proof gate deliberately evaluating without minting.
+PARK_REFUSAL_HUMAN_TERMINAL = frozenset({
+    PARK_REFUSAL_HUMAN_HOLD, PARK_REFUSAL_HUMAN_APPLIED, PARK_REFUSAL_CAP,
+})
+PARK_REFUSAL_CODES = frozenset({
+    PARK_REFUSAL_HUMAN_HOLD, PARK_REFUSAL_HUMAN_APPLIED, PARK_REFUSAL_CAP,
+    PARK_REFUSAL_TIMELINE_UNREADABLE, PARK_REFUSAL_PROBE_FAILED, PARK_REFUSAL_NO_EVIDENCE,
+    PARK_REFUSAL_EVIDENCE_MALFORMED, PARK_REFUSAL_EVIDENCE_CONSUMED,
+    PARK_REFUSAL_EVIDENCE_STALE, PARK_REFUSAL_NOT_OFFERED,
+    PARK_REFUSAL_READ_FAILED, PARK_REFUSAL_TICK_DEFERRED,
+})
+
+# The two ADMITTING actions and the human-gesture action are not refusals; they are recorded in
+# the census under these codes so one census row exists per decision and the populations sum.
+PARK_ADMIT_CODES = {"auto-mint": "admitted-auto-mint",
+                    "auto-receipt": "admitted-auto-receipt",
+                    "human": "admitted-human-gesture"}
+
+
+def park_refusal_exit_class(code):
+    """"human-terminal" / "exit-reachable" for a refusal `code`, else None for a code outside the
+    closed taxonomy. An UNRECOGNISED code is NOT silently filed as self-healing: None forces the
+    caller to surface it, because a refusal nobody classified is the very thing this exists to
+    stop being invisible."""
+    if code in PARK_REFUSAL_HUMAN_TERMINAL:
+        return "human-terminal"
+    if code in PARK_REFUSAL_CODES:
+        return "exit-reachable"
+    return None
+
+
+def park_census_record(census, repo, pr_number, code, detail):
+    """Append EXACTLY ONE census row to `census` (a no-op for a non-list, the out-list idiom).
+
+    THE ONLY WRITER of a census row, used both by capacity_park_admission's own `_answer` and by
+    the sweep's pre-admission exits (`read-failed`, `tick-deferred`). One writer is the point: a
+    second hand-built `census.append(...)` elsewhere is how the `exit` class silently drifts from
+    park_refusal_exit_class, and the exit class is what splits "no tick will ever clear this"
+    from "a later tick will"."""
+    if not isinstance(census, list):
+        return
+    census.append({"repo": repo, "number": pr_number, "code": code,
+                   "exit": (None if code in set(PARK_ADMIT_CODES.values())
+                            else park_refusal_exit_class(code)),
+                   "detail": detail})
+
+
+def park_census_summary(records):
+    """PURE. Aggregate census `records` (as appended by capacity_park_admission's `census`
+    out-list) into (counts_by_code, human_terminal_numbers, unclassified_numbers).
+
+    `counts_by_code` is an ordered {code: count} over every well-formed record. The two number
+    lists are ascending and de-duplicated: the HUMAN-TERMINAL population is the one an operator
+    has to act on, and the UNCLASSIFIED population is the one that proves this taxonomy has
+    drifted from its writers. Malformed rows are counted under the reserved `"malformed"` code
+    rather than dropped — a census that silently discards what it cannot parse is how a
+    population goes missing in the first place."""
+    counts, terminal, unclassified = {}, set(), set()
+    for record in records if isinstance(records, (list, tuple)) else []:
+        if not isinstance(record, dict):
+            counts["malformed"] = counts.get("malformed", 0) + 1
+            continue
+        code = record.get("code")
+        number = record.get("number")
+        if not isinstance(code, str) or not code:
+            counts["malformed"] = counts.get("malformed", 0) + 1
+            continue
+        counts[code] = counts.get(code, 0) + 1
+        if not isinstance(number, int) or isinstance(number, bool):
+            continue
+        if code in PARK_ADMIT_CODES.values():
+            continue
+        exit_class = park_refusal_exit_class(code)
+        if exit_class == "human-terminal":
+            terminal.add(number)
+        elif exit_class is None:
+            unclassified.add(number)
+    ordered = {code: counts[code] for code in sorted(counts)}
+    return ordered, sorted(terminal), sorted(unclassified)
+
+
 def capacity_park_admission(repo, pr_number, issue_number, fetch_events, is_human=None,
                             log=print, consumed=frozenset(), auto_receipts=(),
-                            auto_marker_count=None, auto_evidence=None, live_holds=()):
+                            auto_marker_count=None, auto_evidence=None, live_holds=(),
+                            census=None):
     """Whether a MACHINE capacity park may be re-admitted now, and on WHOSE authority
     (invariant 3). Returns (action, evidence, detail), where `evidence` is None or
     {"key", "at"} — the recovery event's durable identity plus its canonical recovery stamp, i.e.
@@ -624,20 +997,39 @@ def capacity_park_admission(repo, pr_number, issue_number, fetch_events, is_huma
 
     EVERY ambiguity fails toward staying parked: an unreadable timeline, an unreadable/absent
     health record, a probe that raises, an unsafe evidence key, a recovery that is not STRICTLY
-    after the park (a tie included), a human-owned label, a human-applied park, and the cap."""
+    after the park (a tie included), a human-owned label, a human-applied park, and the cap.
+
+    `census`, when a list is passed, receives EXACTLY ONE row for this decision (the `occupancy`
+    out-list idiom used elsewhere in this pipeline):
+    {"repo", "number", "code", "exit", "detail"} — where `code` is a G5 taxonomy code and `exit`
+    is park_refusal_exit_class(code) (None for the admitting actions). It is a pure OBSERVATION
+    side channel: passing it changes no decision and no returned value, and park_census_summary
+    aggregates the rows so the human-terminal population stops being invisible."""
+    def _answer(action, evidence, code, detail):
+        """Record one census row and return the answer UNCHANGED. The recording is strictly
+        additive — a census list that is absent, or of the wrong type, is simply not written.
+        Delegates to park_census_record so this and the sweep's pre-admission exits cannot
+        disagree about the row shape or the exit class."""
+        park_census_record(census, repo, pr_number, PARK_ADMIT_CODES.get(action, code), detail)
+        return (action, evidence, detail)
+
     if capacity_park_readmitted(repo, pr_number, issue_number, fetch_events,
                                 is_human=is_human, log=log, consumed=consumed):
-        return ("human", None, "unconsumed proven-human readmission gesture")
+        return _answer("human", None, None, "unconsumed proven-human readmission gesture")
     held = human_owned_holds(live_holds)
     if held:
-        return (None, None,
-                f"human-owned hold(s) live ({'/'.join(held)}) — never auto-re-admitted")
+        return _answer(
+            None, None, PARK_REFUSAL_HUMAN_HOLD,
+            f"human-owned hold(s) live ({'/'.join(held)}) — never auto-re-admitted")
     latest_park, human_park, readable = park_applications(
         repo, pr_number, issue_number, fetch_events, is_human=is_human, log=log)
     if not readable:
-        return (None, None, "the park application timeline could not be read")
+        return _answer(None, None, PARK_REFUSAL_TIMELINE_UNREADABLE,
+                       "the park application timeline could not be read")
     if human_park:
-        return (None, None, "the latest park application is HUMAN-owned — only a human clears it")
+        return _answer(
+            None, None, PARK_REFUSAL_HUMAN_APPLIED,
+            "the latest park application is HUMAN-owned — only a human clears it")
     parked_at = canonical_ts(latest_park.isoformat()) if latest_park is not None else None
     for receipt in auto_receipts:
         stamp = receipt.get("at") if isinstance(receipt, dict) else None
@@ -645,46 +1037,104 @@ def capacity_park_admission(repo, pr_number, issue_number, fetch_events, is_huma
             continue                    # malformed receipts prove nothing (they still count
             # toward the cap below, so they can never buy an extra re-admission)
         if latest_park is None or parse_ts(stamp) > latest_park:
-            return ("auto-receipt", {"key": receipt.get("key"), "at": canonical_ts(stamp)},
-                    f"already automatically re-admitted at {canonical_ts(stamp)} "
-                    f"(receipt evidence {receipt.get('key')!r}); no new evidence consumed")
+            return _answer(
+                "auto-receipt", {"key": receipt.get("key"), "at": canonical_ts(stamp)}, None,
+                f"already automatically re-admitted at {canonical_ts(stamp)} "
+                f"(receipt evidence {receipt.get('key')!r}); no new evidence consumed")
     minted = len(auto_receipts) if auto_marker_count is None else auto_marker_count
     if minted >= AUTO_READMISSION_MAX:
         log(f"::warning::automatic readmission REFUSED for {repo}#{pr_number}: "
             f"{minted} automatic re-admission(s) already granted (cap "
             f"{AUTO_READMISSION_MAX}) and the park fired again — an account that keeps "
             "flapping is a genuine human question; the park stands until a human acts")
-        return (None, None, f"automatic-readmission cap reached ({minted}/"
-                            f"{AUTO_READMISSION_MAX})")
+        return _answer(None, None, PARK_REFUSAL_CAP,
+                       f"automatic-readmission cap reached ({minted}/"
+                       f"{AUTO_READMISSION_MAX})")
     if auto_evidence is None:
-        return (None, None, "no unconsumed human gesture and no recovery evidence offered")
+        return _answer(None, None, PARK_REFUSAL_NOT_OFFERED,
+                       "no unconsumed human gesture and no recovery evidence offered")
     try:
         evidence = auto_evidence(parked_at)
     except Exception as exc:  # noqa: BLE001 — an unreadable cause probe stays parked
         log(f"automatic readmission unknown for {repo}#{pr_number}: the recovery-evidence "
             f"probe failed ({exc}); the capacity park stands")
-        return (None, None, "the recovery-evidence probe failed")
+        return _answer(None, None, PARK_REFUSAL_PROBE_FAILED,
+                       "the recovery-evidence probe failed")
     if not evidence:
-        return (None, None, "no recorded recovery of the park's starvation cause")
+        return _answer(None, None, PARK_REFUSAL_NO_EVIDENCE,
+                       "no recorded recovery of the park's starvation cause")
     key = evidence.get("key") if isinstance(evidence, dict) else None
     recovered_at = evidence.get("recovered_at") if isinstance(evidence, dict) else None
     if not safe_receipt_part(key) or not valid_timestamp(recovered_at):
         log(f"automatic readmission unknown for {repo}#{pr_number}: the recovery evidence is "
             f"malformed (key={key!r}, recovered_at={recovered_at!r}); the capacity park stands")
-        return (None, None, "the recovery evidence is malformed")
+        return _answer(None, None, PARK_REFUSAL_EVIDENCE_MALFORMED,
+                       "the recovery evidence is malformed")
     recovered_canonical = canonical_ts(recovered_at)
     if key in {receipt.get("key") for receipt in auto_receipts if isinstance(receipt, dict)}:
         log(f"automatic readmission declined for {repo}#{pr_number}: the recovery evidence "
             f"{key!r} was already consumed by a receipted automatic re-admission — a NEW "
             "outage-and-recovery pair is required")
-        return (None, None, f"recovery evidence {key!r} already consumed")
+        return _answer(None, None, PARK_REFUSAL_EVIDENCE_CONSUMED,
+                       f"recovery evidence {key!r} already consumed")
     if latest_park is not None and parse_ts(recovered_at) <= latest_park:
-        return (None, None,
-                f"the recovery at {recovered_canonical} is not STRICTLY after the park "
-                f"application at {parked_at}")
-    return ("auto-mint", {"key": key, "at": recovered_canonical},
-            f"recovery evidence {key!r} recorded at {recovered_canonical}, strictly after the "
-            f"park application at {parked_at}")
+        return _answer(None, None, PARK_REFUSAL_EVIDENCE_STALE,
+                       f"the recovery at {recovered_canonical} is not STRICTLY after the park "
+                       f"application at {parked_at}")
+    return _answer("auto-mint", {"key": key, "at": recovered_canonical}, None,
+                   f"recovery evidence {key!r} recorded at {recovered_canonical}, strictly after "
+                   f"the park application at {parked_at}")
+
+
+def readmission_window(human_cutoff, auto_stamps=(), log=print):
+    """[registry #797] The budget readmission window AND WHO OPENED IT.
+
+    Returns {"cutoff", "authority", "machine_windows"}:
+      - "cutoff": exactly what effective_readmission_cutoff returns (the LATEST of the
+        proven-human cutoff and every well-formed automatic re-admission stamp, canonical
+        spelling; WINDOW_UNREADABLE is contagious; None when there is no window).
+      - "authority": WINDOW_AUTHORITY_HUMAN only when the winning window key is the PROVEN-HUMAN
+        gesture and NO automatic stamp shares that key; WINDOW_AUTHORITY_MACHINE when an
+        automatic re-admission receipt won (or tied — see below); WINDOW_AUTHORITY_UNKNOWN when
+        there is no window at all or the timeline was unreadable.
+      - "machine_windows": the canonical keys of every well-formed automatic stamp, so the ladder
+        can tell which of the PR's ALREADY-RECEIPTED windows were the machine's own and exclude
+        them from the human generation count.
+
+    A TIE RESOLVES TO MACHINE. If a human unlabel and an automatic re-admission canonicalise to
+    the same instant, the machine's re-admission is sufficient on its own to explain the window,
+    so the human's gesture is not PROVEN to be what opened it. Everywhere else in this module
+    ambiguity fails toward staying parked; here the equivalent conservative direction is failing
+    toward the MACHINE class, because the harm being fixed is a page nobody asked for.
+
+    THE DEFECT THIS SPLIT EXISTS FOR: the caller used to receive one bare string and had no way
+    to ask where it came from, so `park_ladder_decision` charged the machine's own re-admissions
+    to the human escalation ladder. See PARK_ESCALATION_GENERATIONS for the measured population.
+    """
+    if human_cutoff == WINDOW_UNREADABLE:
+        return {"cutoff": WINDOW_UNREADABLE, "authority": WINDOW_AUTHORITY_UNKNOWN,
+                "machine_windows": frozenset()}
+    machine, human = [], None
+    for source, stamp in ([("human gesture", human_cutoff)] if human_cutoff else []) \
+            + [("automatic re-admission", stamp) for stamp in (auto_stamps or [])]:
+        if not valid_timestamp(stamp):
+            log(f"::warning::readmission window: dropping the malformed {source} stamp "
+                f"{stamp!r} — unprovable time can never mint a budget window")
+            continue
+        entry = (parse_ts(stamp), canonical_ts(stamp))
+        if source == "human gesture":
+            human = entry
+        else:
+            machine.append(entry)
+    candidates = ([human] if human else []) + machine
+    if not candidates:
+        return {"cutoff": None, "authority": WINDOW_AUTHORITY_UNKNOWN,
+                "machine_windows": frozenset()}
+    machine_windows = frozenset(key for _instant, key in machine)
+    key = max(candidates)[1]
+    authority = (WINDOW_AUTHORITY_MACHINE if key in machine_windows
+                 else WINDOW_AUTHORITY_HUMAN)
+    return {"cutoff": key, "authority": authority, "machine_windows": machine_windows}
 
 
 def effective_readmission_cutoff(human_cutoff, auto_stamps=(), log=print):
@@ -698,25 +1148,23 @@ def effective_readmission_cutoff(human_cutoff, auto_stamps=(), log=print):
     purely from allocator starvation, so an outage pins it) and quietly re-defer forever. The
     automatic re-admission grants EXACTLY the window a human gesture grants, and it is bounded
     by exactly the same two things that bound the re-admission itself: fresh unconsumed
-    evidence and AUTO_READMISSION_MAX. The park-generation ladder is unchanged and still
-    escalates to the QUESTION class after PARK_ESCALATION_GENERATIONS consumed windows, so a PR
-    that is automatically re-admitted and then exhausts its real budget again still reaches a
-    human — it just does so having actually retried.
+    evidence and AUTO_READMISSION_MAX.
+
+    [registry #797] WHAT THIS FUNCTION MUST NOT BE USED FOR. The BUDGET is rightly blind to who
+    opened the window — a re-admitted PR gets a real retry either way, which is the whole point
+    of #614. The ESCALATION LADDER is not: this docstring used to claim that "a PR that is
+    automatically re-admitted and then exhausts its real budget again still reaches a human — it
+    just does so having actually retried", and that was the defect stated as a feature. Reaching
+    a human is only correct when a human decided something; when the MACHINE re-admitted, the
+    re-exhaustion establishes nothing whatsoever about a human's attention. Ladder callers use
+    readmission_window (which returns the same cutoff PLUS its authority) and pass that authority
+    to park_ladder_decision; this function stays as the cutoff-only view the BUDGET consumers
+    want, and delegates so the two can never disagree about the cutoff itself.
 
     WINDOW_UNREADABLE is contagious and wins outright: an automatic stamp must never mask an
     unreadable label timeline (the ladder has to FREEZE on unproven data). A malformed automatic
     stamp is dropped with a loud log — unprovable time can never mint a window."""
-    if human_cutoff == WINDOW_UNREADABLE:
-        return WINDOW_UNREADABLE
-    candidates = []
-    for source, stamp in ([("human gesture", human_cutoff)] if human_cutoff else []) \
-            + [("automatic re-admission", stamp) for stamp in (auto_stamps or [])]:
-        if not valid_timestamp(stamp):
-            log(f"::warning::readmission window: dropping the malformed {source} stamp "
-                f"{stamp!r} — unprovable time can never mint a budget window")
-            continue
-        candidates.append((parse_ts(stamp), stamp))
-    return canonical_ts(max(candidates)[1]) if candidates else None
+    return readmission_window(human_cutoff, auto_stamps, log=log)["cutoff"]
 
 
 def safe_receipt_part(value):
@@ -1010,14 +1458,25 @@ def reclassify_legacy_park(comments, bot_login, stale_marker=None, log=print):
     return (cause, park_class, f"legacy prose classifies this park as {cause!r} ({park_class})")
 
 
-def park_ladder_decision(cutoff, receipts, already_labeled=False, fingerprint=None,
-                         consumed_fingerprints=frozenset()):
+def park_ladder_decision(cutoff, receipts, *, window_authority, already_labeled=False,
+                         fingerprint=None, consumed_fingerprints=frozenset(),
+                         machine_windows=frozenset()):
     """The ONE label-independent capacity-park escalation ladder (round-3 finding 1), shared
     by the deferred-issue lane (dispatch-claim) and the worker-PR lane (worker-pr needs_user).
     `cutoff` is readmission_cutoff(..., on_unreadable=WINDOW_UNREADABLE); `receipts` is the
     durable bot-authored receipt set (worker-pr park_generation_cutoffs); `already_labeled`
     says whether the machine park label is currently live (COMMENT-DEDUPE input only — the
-    generation math never reads it). Returns (action, window_key, generation):
+    generation math never reads it).
+
+    `window_authority` (REQUIRED, keyword-only — WINDOW_AUTHORITY_*) says WHO opened this
+    window, and `machine_windows` says which of the ALREADY-RECEIPTED windows the machine
+    opened. Both come from readmission_window. It is required and keyword-only ON PURPOSE:
+    [registry #797] the live defect was a call site handing over a bare cutoff string with no
+    attribution at all, so the loop's own automatic re-admissions were charged to the HUMAN
+    escalation ladder and 20 of 21 live escalations paged the maintainer for a re-admission the
+    maintainer never made. A default would have let exactly that call site keep compiling.
+
+    Returns (action, window_key, generation):
 
     - ("freeze", None, None): the timeline was unreadable — no window, no receipt, no label,
       no comment; the ladder never advances on unproven data.
@@ -1032,11 +1491,24 @@ def park_ladder_decision(cutoff, receipts, already_labeled=False, fingerprint=No
       generation consumed). See below for why this is what makes readmission mean anything.
     - ("legacy-quiet", None, None): a pre-receipt park (label live, no gesture, no receipts)
       — stay quiet; generation accounting starts with the first receipted window.
-    - ("terminal", window_key, generation): PARK_ESCALATION_GENERATIONS windows consumed —
-      escalate to the question class. The terminal label write must consult the sticky veto
-      and the comment must be HONEST when the write was suppressed (never claim a label that
-      did not land). Requires a REAL cutoff: the initial PARK_WINDOW_NONE window alone can
-      never escalate, and a cutoff that regressed to None cannot prove a fresh window.
+    - ("terminal", window_key, generation): PARK_ESCALATION_GENERATIONS HUMAN-CHARGED windows
+      consumed — escalate to the question class. The terminal label write must consult the
+      sticky veto and the comment must be HONEST when the write was suppressed (never claim a
+      label that did not land). Requires a REAL cutoff: the initial PARK_WINDOW_NONE window
+      alone can never escalate, and a cutoff that regressed to None cannot prove a fresh
+      window. [registry #797] It ALSO requires `window_authority == WINDOW_AUTHORITY_HUMAN`:
+      a human question must mean a human is genuinely required, so ONLY a window a PROVEN
+      human opened may charge one of these generations, and MACHINE-minted windows are
+      excluded from the count of prior ones as well (`machine_windows`) — otherwise the very
+      first human re-admission after two of the loop's own would land straight on the terminal.
+    - ("machine-terminal", window_key, generation): [registry #797] the MACHINE ladder's own
+      exit — PARK_MACHINE_TERMINAL_GENERATIONS machine-minted windows consumed. The machine
+      re-admitted this item and it failed again, which establishes that the approach is not
+      converging and establishes NOTHING about a human's attention; the caller RETIRES it
+      (machine-owned class, worker PR closed, source issue handed back for decomposition)
+      instead of paging. Reached by every non-human authority, WINDOW_AUTHORITY_UNKNOWN
+      included: an unattributable window may never reach the human terminal, and must still
+      terminate.
     - ("park", window_key, generation): consume this window — soft park (veto-gated label,
       best-effort) + the MANDATORY receipt binding window_key.
 
@@ -1087,10 +1559,29 @@ def park_ladder_decision(cutoff, receipts, already_labeled=False, fingerprint=No
         return ("unchanged", window_key, None)
     if not cutoff and already_labeled and not receipts:
         return ("legacy-quiet", None, None)
-    generation = len(receipts) + 1
-    if cutoff and generation >= PARK_ESCALATION_GENERATIONS:
-        return ("terminal", window_key, generation)
-    return ("park", window_key, generation)
+    # [registry #797] TWO LADDERS, ATTRIBUTED. `charged` is the HUMAN ladder's history — the
+    # initial PARK_WINDOW_NONE window (never a machine re-admission) plus every window a proven
+    # human opened; the machine's own re-admission windows are subtracted out, so they can
+    # neither reach the human terminal themselves nor push a later human window onto it.
+    charged = {key for key in receipts if key not in machine_windows}
+    if not cutoff:
+        # The INITIAL full-budget window. No re-admission of any kind happened, so no ladder can
+        # escalate on it alone — unchanged from before, and deliberately not attributed.
+        return ("park", window_key, len(charged) + 1)
+    if window_authority == WINDOW_AUTHORITY_HUMAN and window_key not in machine_windows:
+        generation = len(charged) + 1
+        if generation >= PARK_ESCALATION_GENERATIONS:
+            return ("terminal", window_key, generation)
+        return ("park", window_key, generation)
+    # MACHINE (or unattributable) window: the machine ladder, whose terminal is a retirement.
+    # An UNKNOWN authority has no attribution to count with, so it counts EVERY consumed window
+    # — over-counting only makes it retire SOONER, which is the safe direction; under-counting
+    # would leave it absorbing (the #764 failure) with no exit at all.
+    machine_generation = (len(receipts) + 1 if window_authority == WINDOW_AUTHORITY_UNKNOWN
+                          else len(receipts) - len(charged) + 1)
+    if machine_generation >= PARK_MACHINE_TERMINAL_GENERATIONS:
+        return ("machine-terminal", window_key, machine_generation)
+    return ("park", window_key, machine_generation)
 
 
 def probe_maintainer(repo, login, read_permission, log=print):
@@ -1128,6 +1619,15 @@ def _self_test():
     # The strict maintainer probe every production site supplies (collaborator permission in
     # HUMAN_MAINTAINER_PERMISSIONS): jeswr is the trusted human; everyone else is not.
     trusted = lambda login: login == "jeswr"  # noqa: E731 — trivial trusted-set stub
+
+    # [registry #797] `window_authority` is a REQUIRED keyword on park_ladder_decision. Every
+    # pre-#797 ladder assertion below models a window a PROVEN HUMAN opened — that is what they
+    # always meant, because the old ladder had no other kind — so this shim states it once
+    # instead of 24 times. The #797 block calls park_ladder_decision DIRECTLY with the machine
+    # and unknown authorities, and pins the required-ness itself.
+    def ladder(cutoff, receipts, window_authority=WINDOW_AUTHORITY_HUMAN, **kwargs):
+        return park_ladder_decision(cutoff, receipts, window_authority=window_authority,
+                                    **kwargs)
 
     bot_park = event("labeled", "needs:user", "2026-07-18T10:00:00Z", "sparq-orchestrator[bot]")
     human_unpark = event("unlabeled", "needs:user", "2026-07-18T11:00:00Z", "jeswr")
@@ -1561,7 +2061,7 @@ def _self_test():
     # An overflow cutoff handed straight to the ladder freezes on the defensive rail —
     # it can mint neither a window key nor a receipt.
     check("round-7 f1: an overflow cutoff freezes the ladder",
-          park_ladder_decision("0001-01-01T00:00:00+23:59", set()), ("freeze", None, None))
+          ladder("0001-01-01T00:00:00+23:59", set()), ("freeze", None, None))
 
     # ---- readmission_cutoff on_unreadable: the ladder can DISTINGUISH windowless from
     # unreadable; default callers keep the plain None => full-count path ----
@@ -1576,44 +2076,44 @@ def _self_test():
 
     # ---- park_ladder_decision: the ONE receipts-driven escalation ladder ----
     check("ladder: unreadable timeline freezes",
-          park_ladder_decision(WINDOW_UNREADABLE, set()), ("freeze", None, None))
+          ladder(WINDOW_UNREADABLE, set()), ("freeze", None, None))
     check("ladder: initial park consumes the PARK_WINDOW_NONE window as generation 1",
-          park_ladder_decision(None, set()), ("park", PARK_WINDOW_NONE, 1))
+          ladder(None, set()), ("park", PARK_WINDOW_NONE, 1))
     check("ladder: the initial window re-fires quietly once receipted",
-          park_ladder_decision(None, {PARK_WINDOW_NONE}), ("dedupe", PARK_WINDOW_NONE, None))
+          ladder(None, {PARK_WINDOW_NONE}), ("dedupe", PARK_WINDOW_NONE, None))
     check("ladder: legacy pre-receipt park stays quiet (no receipt minted)",
-          park_ladder_decision(None, set(), already_labeled=True),
+          ladder(None, set(), already_labeled=True),
           ("legacy-quiet", None, None))
     check("ladder: a fresh gesture window after the initial receipt is TERMINAL at gen 2",
-          park_ladder_decision("2026-07-23T09:18:19Z", {PARK_WINDOW_NONE}),
+          ladder("2026-07-23T09:18:19Z", {PARK_WINDOW_NONE}),
           ("terminal", "2026-07-23T09:18:19Z", 2))
     check("ladder: a fresh gesture window with NO prior receipts parks as generation 1",
-          park_ladder_decision("2026-07-23T09:18:19Z", set()),
+          ladder("2026-07-23T09:18:19Z", set()),
           ("park", "2026-07-23T09:18:19Z", 1))
     check("ladder: an already-receipted gesture window dedupes (comments), never advances",
-          park_ladder_decision("2026-07-23T09:18:19Z", {"2026-07-23T09:18:19Z"}),
+          ladder("2026-07-23T09:18:19Z", {"2026-07-23T09:18:19Z"}),
           ("dedupe", "2026-07-23T09:18:19Z", None))
     check("ladder: a cutoff regressed to None can NEVER escalate past prior receipts",
-          park_ladder_decision(None, {"2026-07-21T08:00:00Z"}),
+          ladder(None, {"2026-07-21T08:00:00Z"}),
           ("park", PARK_WINDOW_NONE, 2))
     check("ladder: already_labeled never suppresses a due receipt once a window exists",
-          park_ladder_decision("2026-07-23T09:18:19Z", set(), already_labeled=True),
+          ladder("2026-07-23T09:18:19Z", set(), already_labeled=True),
           ("park", "2026-07-23T09:18:19Z", 1))
     # Round-6 finding 2: the ladder CANONICALIZES the window key it hands to every receipt
     # writer — a space-form cutoff mints the compact Z-form key (writable + round-trippable),
     # dedupes against its canonical receipt, and escalates on the canonical identity.
     check("ladder round-6 f2: a space-form cutoff mints the CANONICAL window key",
-          park_ladder_decision("2026-07-23 10:30:00Z", set()),
+          ladder("2026-07-23 10:30:00Z", set()),
           ("park", "2026-07-23T10:30:00Z", 1))
     check("ladder round-6 f2: a space-form cutoff dedupes against its canonical receipt",
-          park_ladder_decision("2026-07-23 10:30:00Z", {"2026-07-23T10:30:00Z"}),
+          ladder("2026-07-23 10:30:00Z", {"2026-07-23T10:30:00Z"}),
           ("dedupe", "2026-07-23T10:30:00Z", None))
     check("ladder round-6 f2: a space-form cutoff reaches the gen-2 terminal",
-          park_ladder_decision("2026-07-23 10:30:00Z", {PARK_WINDOW_NONE}),
+          ladder("2026-07-23 10:30:00Z", {PARK_WINDOW_NONE}),
           ("terminal", "2026-07-23T10:30:00Z", 2))
     check("ladder round-6 f2: an unparseable cutoff freezes (defensive rail — it can mint "
           "neither a window key nor a receipt)",
-          park_ladder_decision("not-a-timestamp", set()), ("freeze", None, None))
+          ladder("not-a-timestamp", set()), ("freeze", None, None))
 
     # ---- park_fingerprint + the UNCHANGED-HEAD idempotence axis (#555 recurrence gap).
     # THE DEFECT: a human readmission mints a BRAND-NEW window key, so the next tick that
@@ -1636,14 +2136,14 @@ def _self_test():
     # fingerprint is NOT consumed — quiet skip, no generation, no terminal.
     check("(a) ladder: a fresh window + an unchanged fingerprint is skipped QUIETLY (the "
           "#3488 bounce), never consumed",
-          park_ladder_decision("2026-07-23T09:18:19Z", {PARK_WINDOW_NONE},
+          ladder("2026-07-23T09:18:19Z", {PARK_WINDOW_NONE},
                                fingerprint=f"{head}/rounds=5",
                                consumed_fingerprints=consumed),
           ("unchanged", "2026-07-23T09:18:19Z", None))
     # (b) the head ADVANCED => real work was attempted => the window is consumed normally.
     check("(b) ladder: an advanced head consumes the fresh window (gen-2 terminal at the "
           "configured bound)",
-          park_ladder_decision("2026-07-23T09:18:19Z", {PARK_WINDOW_NONE},
+          ladder("2026-07-23T09:18:19Z", {PARK_WINDOW_NONE},
                                fingerprint=f"{'b' * 40}/rounds=5",
                                consumed_fingerprints=consumed),
           ("terminal", "2026-07-23T09:18:19Z", 2))
@@ -1652,33 +2152,33 @@ def _self_test():
     # the window IS consumed — this is what keeps the escalation bound reachable.
     check("(b') ladder: an advanced attempt counter on an UNCHANGED head still consumes the "
           "window (bounded escalation survives)",
-          park_ladder_decision("2026-07-23T09:18:19Z", {PARK_WINDOW_NONE},
+          ladder("2026-07-23T09:18:19Z", {PARK_WINDOW_NONE},
                                fingerprint=f"{head}/rounds=6",
                                consumed_fingerprints=consumed),
           ("terminal", "2026-07-23T09:18:19Z", 2))
     check("ladder: the FIRST park always lands — no receipted fingerprint can match",
-          park_ladder_decision(None, set(), fingerprint=f"{head}/rounds=5",
+          ladder(None, set(), fingerprint=f"{head}/rounds=5",
                                consumed_fingerprints=frozenset()),
           ("park", PARK_WINDOW_NONE, 1))
     check("ladder: a legacy receipt (no fingerprint recorded) claims no idempotence",
-          park_ladder_decision("2026-07-23T09:18:19Z", {PARK_WINDOW_NONE},
+          ladder("2026-07-23T09:18:19Z", {PARK_WINDOW_NONE},
                                fingerprint=f"{head}/rounds=5",
                                consumed_fingerprints=frozenset()),
           ("terminal", "2026-07-23T09:18:19Z", 2))
     check("ladder: an unknown fingerprint (None) can never suppress a due park",
-          park_ladder_decision("2026-07-23T09:18:19Z", {PARK_WINDOW_NONE},
+          ladder("2026-07-23T09:18:19Z", {PARK_WINDOW_NONE},
                                fingerprint=None, consumed_fingerprints=consumed),
           ("terminal", "2026-07-23T09:18:19Z", 2))
     # Precedence: the window dedupe (already receipted) and the freeze (unproven timeline)
     # both outrank the fingerprint check — an unchanged fingerprint must never turn a frozen
     # or already-receipted decision into a different action.
     check("ladder: the same-window dedupe still wins over the fingerprint check",
-          park_ladder_decision("2026-07-23T09:18:19Z", {"2026-07-23T09:18:19Z"},
+          ladder("2026-07-23T09:18:19Z", {"2026-07-23T09:18:19Z"},
                                fingerprint=f"{head}/rounds=5",
                                consumed_fingerprints=consumed),
           ("dedupe", "2026-07-23T09:18:19Z", None))
     check("ladder: an unreadable timeline still FREEZES ahead of the fingerprint check",
-          park_ladder_decision(WINDOW_UNREADABLE, {PARK_WINDOW_NONE},
+          ladder(WINDOW_UNREADABLE, {PARK_WINDOW_NONE},
                                fingerprint=f"{head}/rounds=5",
                                consumed_fingerprints=consumed),
           ("freeze", None, None))
@@ -1693,7 +2193,7 @@ def _self_test():
     for step in range(1, PARK_ESCALATION_GENERATIONS + 2):
         window = f"2026-07-23T{step:02d}:00:00Z"
         fingerprint = f"{head}/r={step}"
-        action, key, _generation = park_ladder_decision(
+        action, key, _generation = ladder(
             window, ladder_receipts, fingerprint=fingerprint,
             consumed_fingerprints=ladder_consumed)
         real_actions.append(action)
@@ -1701,7 +2201,7 @@ def _self_test():
         ladder_consumed.add(fingerprint)
         # ... the very next tick re-derives the SAME exhaustion from the SAME state under a
         # BRAND-NEW readmission window (a human just re-admitted): the #3488 bounce.
-        bounce_actions.append(park_ladder_decision(
+        bounce_actions.append(ladder(
             f"2026-07-24T{step:02d}:00:00Z", ladder_receipts, fingerprint=fingerprint,
             consumed_fingerprints=ladder_consumed)[0])
     check("(d) genuinely consumed windows climb the ladder to the configured TERMINAL and "
@@ -1711,6 +2211,156 @@ def _self_test():
     check("(d) an unchanged-state re-derivation NEVER advances the ladder at any generation "
           "(the bound is spent only on work actually attempted)",
           bounce_actions, ["unchanged"] * (PARK_ESCALATION_GENERATIONS + 1))
+
+    # ---- [registry #797] THE GENERATION COUNTER IS ATTRIBUTED: a MACHINE re-admission may not
+    # charge a HUMAN generation, and may never reach the human-owned terminal.
+    #
+    # THE LIVE DEFECT, verbatim from sparq PR #4422: gen=1 cutoff=none (the initial window), then
+    # an automatic re-admission receipted `at=2026-07-27T08:02:21Z`, then gen=2 with a cutoff
+    # BYTE-IDENTICAL to that auto stamp and a comment reading "This PR was human-readmitted and
+    # exhausted its budget again ... @jeswr this pull request needs a human decision". No human
+    # touched it: all 73 live applications of review:needs-user across the 35 held PRs were made
+    # by sparq-orchestrator[bot], and 20 of the 21 PRs carrying generation receipts had escalated
+    # on a machine-minted window (the other is a genuine injection escalation, #3743). ----
+    auto_stamp = "2026-07-27T08:02:21Z"
+    human_stamp = "2026-07-27T12:00:00Z"
+    machine_only = frozenset({auto_stamp})
+    # (i) THE HEADLINE GUARD. The exact #4422 state — the initial window receipted, and this
+    # window opened by the loop's OWN automatic re-admission. It must NOT be the human terminal.
+    check("#797 (i): the MACHINE's own re-admission window can NEVER reach the human terminal "
+          "(the #4422 false page)",
+          park_ladder_decision(auto_stamp, {PARK_WINDOW_NONE},
+                               window_authority=WINDOW_AUTHORITY_MACHINE,
+                               machine_windows=machine_only)[0] != "terminal", True)
+    check("#797 (i): ...it stays in the MACHINE class as that ladder's generation 1 — the "
+          "machine re-admitted once, so it still owns the outcome",
+          park_ladder_decision(auto_stamp, {PARK_WINDOW_NONE},
+                               window_authority=WINDOW_AUTHORITY_MACHINE,
+                               machine_windows=machine_only),
+          ("park", auto_stamp, 1))
+    # (i') #3595's real history: BOTH receipted windows are the loop's own auto stamps. The
+    # machine has now spent its AUTO_READMISSION_MAX chances, so THIS is where it gives up —
+    # on the machine terminal, still not on the maintainer's desk.
+    second_auto = "2026-07-26T14:50:59Z"
+    check("#797 (i'): a SECOND machine window exhausts the MACHINE ladder and RETIRES (#3595), "
+          "never pages",
+          park_ladder_decision(second_auto, {PARK_WINDOW_NONE, auto_stamp},
+                               window_authority=WINDOW_AUTHORITY_MACHINE,
+                               machine_windows=frozenset({auto_stamp, second_auto})),
+          ("machine-terminal", second_auto, PARK_MACHINE_TERMINAL_GENERATIONS))
+    # (ii) THE MIRROR. The SAME receipt history under a GENUINE human re-admission still reaches
+    # the human terminal — the protection this ladder exists for is preserved, not removed.
+    check("#797 (ii): a GENUINE human re-admission on the same history still escalates to the "
+          "human terminal",
+          park_ladder_decision(human_stamp, {PARK_WINDOW_NONE},
+                               window_authority=WINDOW_AUTHORITY_HUMAN,
+                               machine_windows=machine_only),
+          ("terminal", human_stamp, PARK_ESCALATION_GENERATIONS))
+    # (iii) MACHINE WINDOWS ARE SUBTRACTED FROM THE HUMAN COUNT. #3595's real history: BOTH
+    # receipted windows are auto stamps. The maintainer's FIRST actual re-admission must get a
+    # full human generation-1 window, not inherit two the machine spent on its own behalf.
+    check("#797 (iii): a human's first re-admission after two MACHINE windows gets generation 1, "
+          "not the machine's inherited count (#3595)",
+          park_ladder_decision(human_stamp, {auto_stamp, "2026-07-26T14:50:59Z"},
+                               window_authority=WINDOW_AUTHORITY_HUMAN,
+                               machine_windows=frozenset({auto_stamp,
+                                                          "2026-07-26T14:50:59Z"})),
+          ("park", human_stamp, 1))
+    # (iv) THE MACHINE LADDER STILL TERMINATES, and does so BOUNDED BY THE CONSTANT. Walk it
+    # from nothing with machine-only windows: the first machine window parks, and the
+    # PARK_MACHINE_TERMINAL_GENERATIONS-th retires. Asserted against the constant, never a 2.
+    machine_receipts, machine_actions = {PARK_WINDOW_NONE}, []
+    for step in range(1, PARK_MACHINE_TERMINAL_GENERATIONS + 2):
+        window = f"2026-07-28T{step:02d}:00:00Z"
+        seen = frozenset(key for key in machine_receipts if key != PARK_WINDOW_NONE) | {window}
+        action, key, _generation = park_ladder_decision(
+            window, machine_receipts, window_authority=WINDOW_AUTHORITY_MACHINE,
+            machine_windows=seen)
+        machine_actions.append(action)
+        machine_receipts.add(key)
+    check("#797 (iv): the MACHINE ladder terminates at PARK_MACHINE_TERMINAL_GENERATIONS and "
+          "stays there — a machine park is never absorbing",
+          machine_actions,
+          ["park"] * (PARK_MACHINE_TERMINAL_GENERATIONS - 1)
+          + ["machine-terminal"] * 2)
+    # (v) UNATTRIBUTABLE IS NOT HUMAN — and still terminates. A caller that cannot attribute its
+    # window must not be able to page anyone, and must not land in an absorbing state either.
+    check("#797 (v): an UNATTRIBUTABLE window never reaches the human terminal",
+          park_ladder_decision(human_stamp, {PARK_WINDOW_NONE},
+                               window_authority=WINDOW_AUTHORITY_UNKNOWN)[0],
+          "machine-terminal")
+    # (vi) THE ARGUMENT IS REQUIRED. This is what stops a future call site re-introducing the
+    # defect by simply not attributing its window: there is no default to fall back to.
+    try:
+        park_ladder_decision(human_stamp, {PARK_WINDOW_NONE})
+        required = "NO ERROR"
+    except TypeError as exc:
+        required = "window_authority" in str(exc)
+    check("#797 (vi): park_ladder_decision REFUSES to decide without an attributed window",
+          required, True)
+    # (vii) THE INITIAL WINDOW IS UNCHANGED under every authority: no re-admission of any kind
+    # happened, so it parks as generation 1 and can escalate nowhere.
+    check("#797 (vii): the initial no-cutoff window is authority-independent",
+          {authority: park_ladder_decision(None, set(), window_authority=authority)
+           for authority in (WINDOW_AUTHORITY_HUMAN, WINDOW_AUTHORITY_MACHINE,
+                             WINDOW_AUTHORITY_UNKNOWN)},
+          {WINDOW_AUTHORITY_HUMAN: ("park", PARK_WINDOW_NONE, 1),
+           WINDOW_AUTHORITY_MACHINE: ("park", PARK_WINDOW_NONE, 1),
+           WINDOW_AUTHORITY_UNKNOWN: ("park", PARK_WINDOW_NONE, 1)})
+
+    # ---- [registry #797] readmission_window: the ATTRIBUTION itself ----
+    check("#797 window: a human gesture newer than every auto stamp is HUMAN-authorised",
+          readmission_window(human_stamp, [auto_stamp]),
+          {"cutoff": human_stamp, "authority": WINDOW_AUTHORITY_HUMAN,
+           "machine_windows": machine_only})
+    check("#797 window: an auto stamp newer than the human gesture is MACHINE-authorised",
+          readmission_window("2026-07-26T00:00:00Z", [auto_stamp]),
+          {"cutoff": auto_stamp, "authority": WINDOW_AUTHORITY_MACHINE,
+           "machine_windows": machine_only})
+    check("#797 window: an auto re-admission with NO human gesture at all is MACHINE-authorised "
+          "(the whole live population)",
+          readmission_window(None, [auto_stamp]),
+          {"cutoff": auto_stamp, "authority": WINDOW_AUTHORITY_MACHINE,
+           "machine_windows": machine_only})
+    check("#797 window: a TIE resolves to MACHINE — an auto stamp at the same instant is a "
+          "sufficient explanation, so the human's intent is not PROVEN",
+          readmission_window(auto_stamp, [auto_stamp])["authority"],
+          WINDOW_AUTHORITY_MACHINE)
+    check("#797 window: an EQUIVALENT space-form spelling still ties to MACHINE (canonical "
+          "identity, round-6 finding 2)",
+          readmission_window("2026-07-27 08:02:21Z", [auto_stamp])["authority"],
+          WINDOW_AUTHORITY_MACHINE)
+    check("#797 window: no gesture of any kind is UNKNOWN, never human",
+          readmission_window(None, []),
+          {"cutoff": None, "authority": WINDOW_AUTHORITY_UNKNOWN,
+           "machine_windows": frozenset()})
+    check("#797 window: an unreadable timeline is contagious AND unattributable",
+          readmission_window(WINDOW_UNREADABLE, [auto_stamp]),
+          {"cutoff": WINDOW_UNREADABLE, "authority": WINDOW_AUTHORITY_UNKNOWN,
+           "machine_windows": frozenset()})
+    logs.clear()
+    check("#797 window: a malformed auto stamp is dropped loudly and cannot mint a window",
+          (readmission_window(None, ["zzz"], log=logs.append), len(logs)), (
+              {"cutoff": None, "authority": WINDOW_AUTHORITY_UNKNOWN,
+               "machine_windows": frozenset()}, 1))
+    check("#797 window: effective_readmission_cutoff is the same decision, cutoff-only (the "
+          "budget view and the ladder view can never disagree)",
+          [effective_readmission_cutoff(h, a) == readmission_window(h, a)["cutoff"]
+           for h, a in ((human_stamp, [auto_stamp]), (None, [auto_stamp]), (None, []),
+                        (WINDOW_UNREADABLE, [auto_stamp]), ("2026-07-25 01:00:00Z", []))],
+          [True] * 5)
+
+    # ---- [registry #797] retirement_handback: the SOURCE ISSUE half of a machine retirement ----
+    check("#797 handback: an impl-route issue is handed to architect decomposition",
+          retirement_handback(["area:engine", "role:impl", "status:parked"])[:2],
+          ("reroute", ["area:engine", "role:research", "status:parked"]))
+    check("#797 handback: an issue already off the impl route is requeued, never re-rerouted",
+          retirement_handback(["area:engine", "role:research"])[:2],
+          ("requeue", ["area:engine", "role:research"]))
+    check("#797 handback: a HUMAN-held source issue is not touched at all",
+          [retirement_handback(["role:impl", hold])[:2]
+           for hold in ("needs:user", "needs:external-audit", HUMAN_PR_PARK_LABEL)],
+          [("hold", None)] * 3)
 
     # ---- capacity_park_admission: AUTOMATIC re-admission of a MACHINE park on proven
     # cause-recovery (invariant 3, registry #614). THE DEFECT: a machine-owned park could only
@@ -1955,6 +2605,122 @@ def _self_test():
     check("the proof gate (no evidence probe) mints nothing",
           capacity_park_admission("o/r", 41, 7, fetch, is_human=trusted),
           (None, None, "no unconsumed human gesture and no recovery evidence offered"))
+
+    # ---- G5 census: every decision lands in a VISIBLE, COUNTED state with a reason ----------
+    #
+    # The population these guard is real. MEASURED on sparq-org/sparq at 2026-07-27T11:53Z
+    # (dispatch run 30262478746): 21 open PRs on `review:parked`, reported by the only aggregate
+    # that exists as one undifferentiated "machine capacity park stands (...)=13" — inside which
+    # 3 PRs were waiting on recovery evidence that a later tick can genuinely supply, and 4 were
+    # frozen behind a maintainer's own hand-applied `review:parked` that NO tick will ever clear.
+    # A per-run success signal cannot express the difference; these checks make it structural.
+    fresh = "2026-07-25T03:10:00Z"
+
+    def admission_census(**kwargs):
+        """One admission call, returning (action, the single census row it recorded)."""
+        rows = []
+        action = capacity_park_admission("o/r", 41, 7, fetch, is_human=trusted,
+                                         log=logs.append, census=rows, **kwargs)[0]
+        return action, (rows[0] if len(rows) == 1 else rows)
+
+    # THE HEADLINE GUARD. A maintainer's hand-applied `review:parked` is refused (unchanged) AND
+    # is now counted as HUMAN-TERMINAL rather than disappearing into the capacity bucket.
+    timelines[41] = [event("labeled", "review:parked", "2026-07-25T02:19:47Z", "jeswr")]
+    timelines[7] = []
+    check("census: a HUMAN-APPLIED park is refused and counted as human-terminal",
+          admission_census(auto_evidence=evidence_at("openai/a/1", fresh)),
+          (None, {"repo": "o/r", "number": 41, "code": PARK_REFUSAL_HUMAN_APPLIED,
+                  "exit": "human-terminal",
+                  "detail": "the latest park application is HUMAN-owned — only a human "
+                            "clears it"}))
+    # ... and the CONTRAST that gives the taxonomy its meaning: the same PR, parked by the
+    # MACHINE with no recovery yet, is the SAME refusal answer but a DIFFERENT exit class.
+    timelines[41] = [machine_park]
+    check("census: a machine park awaiting recovery is refused but EXIT-REACHABLE",
+          admission_census(auto_evidence=lambda _parked_at: None),
+          (None, {"repo": "o/r", "number": 41, "code": PARK_REFUSAL_NO_EVIDENCE,
+                  "exit": "exit-reachable",
+                  "detail": "no recorded recovery of the park's starvation cause"}))
+    check("census: a live needs:user is refused and counted as human-terminal",
+          admission_census(live_holds=["needs:user"],
+                           auto_evidence=evidence_at("openai/a/1", fresh)),
+          (None, {"repo": "o/r", "number": 41, "code": PARK_REFUSAL_HUMAN_HOLD,
+                  "exit": "human-terminal",
+                  "detail": "human-owned hold(s) live (needs:user) — never auto-re-admitted"}))
+    check("census: the CAP is human-terminal — a flapping account is a human question",
+          admission_census(auto_marker_count=AUTO_READMISSION_MAX,
+                           auto_evidence=evidence_at("openai/a/9", fresh))[1]["exit"],
+          "human-terminal")
+    unreadable_rows = []
+    capacity_park_admission("o/r", 41, 404, fetch, is_human=trusted, log=logs.append,
+                            census=unreadable_rows,
+                            auto_evidence=evidence_at("openai/a/1", fresh))
+    check("census: an unreadable timeline is COUNTED, not silent",
+          [(row["code"], row["exit"]) for row in unreadable_rows],
+          [(PARK_REFUSAL_TIMELINE_UNREADABLE, "exit-reachable")])
+    # THE SWEEP'S OWN EXITS. Two decisions about a parked PR are made BEFORE the admission is
+    # ever called (dispatch-claim._readmit_capacity_parks): the per-tick pacing defer and a
+    # per-PR GitHub read that failed. Review measured 8 parked PRs in and 5 rows out because of
+    # them. They are written through the SAME single writer, so their row shape and exit class
+    # cannot drift from the admission's.
+    sweep_exits = []
+    park_census_record(sweep_exits, "o/r", 10, PARK_REFUSAL_READ_FAILED, "comments unreadable")
+    park_census_record(sweep_exits, "o/r", 70, PARK_REFUSAL_TICK_DEFERRED, "cap 5 spent")
+    check("census: the sweep's PRE-ADMISSION exits are counted, with the admission's row shape",
+          sweep_exits,
+          [{"repo": "o/r", "number": 10, "code": PARK_REFUSAL_READ_FAILED,
+            "exit": "exit-reachable", "detail": "comments unreadable"},
+           {"repo": "o/r", "number": 70, "code": PARK_REFUSAL_TICK_DEFERRED,
+            "exit": "exit-reachable", "detail": "cap 5 spent"}])
+    # ...and NEITHER is human-terminal: a read failure and a paced defer are both things a later
+    # tick can genuinely clear. Filing either as human-terminal would put a transient blip into
+    # the cohort an operator is told needs a HUMAN gesture, which is how that warning stops
+    # meaning anything.
+    check("census: neither sweep exit is filed as human-terminal", park_census_summary(
+        sweep_exits), ({PARK_REFUSAL_READ_FAILED: 1, PARK_REFUSAL_TICK_DEFERRED: 1}, [], []))
+    check("census: the single writer ignores a non-list census (the out-list idiom)",
+          park_census_record(None, "o/r", 1, PARK_REFUSAL_READ_FAILED, "x"), None)
+    # An ADMISSION is censused too, so the rows sum to the population rather than to the
+    # refusals alone, and it belongs to NEITHER blocked class.
+    check("census: an auto-mint is recorded under an admit code with no exit class",
+          admission_census(auto_evidence=evidence_at("openai/a/1", fresh)),
+          ("auto-mint", {"repo": "o/r", "number": 41, "code": "admitted-auto-mint",
+                         "exit": None,
+                         "detail": "recovery evidence 'openai/a/1' recorded at "
+                                   "2026-07-25T03:10:00Z, strictly after the park application "
+                                   "at 2026-07-25T02:19:47Z"}))
+    # EXACTLY ONE ROW PER DECISION. A census that double-counts or silently skips is worse than
+    # none, so the arity is pinned over a mixed batch rather than assumed.
+    batch = []
+    for holds, probe in ((["needs:user"], evidence_at("openai/a/1", fresh)),
+                         ([], lambda _parked_at: None),
+                         ([], evidence_at("openai/a/1", fresh))):
+        capacity_park_admission("o/r", 41, 7, fetch, is_human=trusted, log=logs.append,
+                                live_holds=holds, auto_evidence=probe, census=batch)
+    check("census: exactly one row per decision, none skipped, none doubled", len(batch), 3)
+    check("census: summary counts by code and names the human-terminal population",
+          park_census_summary(batch),
+          ({"admitted-auto-mint": 1, PARK_REFUSAL_HUMAN_HOLD: 1, PARK_REFUSAL_NO_EVIDENCE: 1},
+           [41], []))
+    # The FAIL DIRECTION of the classifier: an unrecognised code must never be filed as
+    # self-healing. Silently reading "exit-reachable" for a code nobody registered is exactly how
+    # a stalled population goes missing again.
+    check("census: an UNKNOWN refusal code is not silently self-healing",
+          park_refusal_exit_class("some-future-code"), None)
+    check("census: an unknown code surfaces in the UNCLASSIFIED population",
+          park_census_summary([{"repo": "o/r", "number": 99, "code": "some-future-code"}]),
+          ({"some-future-code": 1}, [], [99]))
+    check("census: malformed rows are COUNTED, never dropped",
+          park_census_summary(["garbage", {"number": 1}, {"code": "", "number": 2}])[0],
+          {"malformed": 3})
+    # TAXONOMY DRIFT GUARD: every registered code classifies, and the two classes partition it.
+    check("census: every registered refusal code has an exit class",
+          sorted(code for code in PARK_REFUSAL_CODES
+                 if park_refusal_exit_class(code) is None), [])
+    check("census: the human-terminal set is a strict subset of the registered codes",
+          PARK_REFUSAL_HUMAN_TERMINAL < PARK_REFUSAL_CODES, True)
+    check("census: an admit code is never mistaken for a refusal code",
+          sorted(set(PARK_ADMIT_CODES.values()) & PARK_REFUSAL_CODES), [])
 
     # ---- effective_readmission_cutoff: an automatic re-admission grants the SAME real budget
     # window a human gesture grants (without it the cleared park is inert — every tick
