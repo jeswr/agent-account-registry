@@ -22,16 +22,6 @@
   },
   {
    "account": "efb4eb2781de6958",
-   "claim_id": "83a3ab8aefe141b288b41bf3af562668",
-   "holder": "fix:sparq-org/sparq#4555@dispatch-30292289159.1",
-   "package": "upstream",
-   "role": "fix",
-   "model": "opus5",
-   "issued_at": 1785175958,
-   "expires_at": 1785182258
-  },
-  {
-   "account": "efb4eb2781de6958",
    "claim_id": "43f6e87dbb7449809b5f5216f4a1ae8c",
    "holder": "fix:sparq-org/sparq#4568@dispatch-30292289159.1",
    "package": "release",
