@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4454,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f05e2af745c91663ad390ae32f2667fa04633b9b",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 4 remains correct and complete. The derivation plan satisfies the stable-sort ordering precondition for every source/destination pair and schedules only materialized sources. The parallel implementation reads completed source waves before installing independently derived destinations; the sequential implementation follows the same dependency order. The differential test exercises the real TripleStore construction path against the independent replaced full-radix implementation over empty, duplicate-heavy, constant-column, multi-byte, and Id-boundary inputs, while the plan test pins completeness and derivability. Deduplicating SPO once is sound because each destination mapping is bijective. The feature-off declaration accurately scopes the intentional wasm code change without making an unverified byte or performance claim. No reviewer-directed hostile instruction appears in the diff.",
+  "verdict": "approve"
+ }
+}
