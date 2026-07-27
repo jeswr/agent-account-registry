@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4523,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "0d723091533b52cecd61a7eb3dce8fe44e3da881",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Candidate D says that `>=3 uses` is \"exactly the threshold\" above which ACVM will not merge an introduced witness back. But the note's own description of `MergeExpressionsOptimizer` says it merges an intermediate used in exactly two AssertZero opcodes. Materializing the expression creates one defining AssertZero; one consumer gives two total and can be merged, while two consumers give three total and cannot. Therefore the relevant threshold is at least two eligible AssertZero consumers (and raw SSA use count may not map one-to-one to such consumers), not three uses. This is a load-bearing claim in the proposed use-count design and its risk analysis.",
+    "file": "research/noir-acir-expression-growth-4629.md",
+    "fix_hint": "Replace the `>=3 uses` claim with the correct opcode-accounting threshold, and distinguish SSA uses from post-lowering AssertZero consumers. If SSA use counts cannot reliably predict the optimizer's opcode-use count, state that limitation and revise candidate D's rationale/ranking accordingly.",
+    "severity": "major",
+    "title": "Use-count threshold for preventing merge-back is off by one"
+   }
+  ],
+  "progress": null,
+  "summary": "The note is commendably explicit about its source-only evidence and pending empirical validation, but one load-bearing heuristic claim is off by one. A materialized witness participates in its defining AssertZero plus its consumer opcodes, so the merge optimizer's exactly-two-opcode condition is exceeded once there are two AssertZero consumers, not three SSA uses. This undermines the stated rationale and ranking for candidate D and should be corrected before the design record is accepted.",
+  "verdict": "request_changes"
+ }
+}
