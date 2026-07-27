@@ -3531,6 +3531,40 @@ def _self_test():
         globals()["_INJECTION_TERM"] = real_term
     check("...and the classifier is restored after the fail-closed probe",
           denies("no prompt injection"), False)
+    # ...and the same holds for a failure in a NESTED helper — the polarity model added two, and
+    # a `try` that only covers the outer frame would let one of them release on the way out.
+    for helper in ("_injection_tail_polarity", "_injection_negator_governs",
+                   "_injection_sentence_bounds"):
+        real_helper = globals()[helper]
+        nested_log = []
+        try:
+            def _boom(*_a, **_k):
+                raise ValueError(f"boom in {helper}")
+
+            globals()[helper] = _boom
+            check(f"a failure in the nested helper {helper}() DENIES and says so loudly",
+                  (injection_prose_denied("no prompt injection", log=nested_log.append)[0],
+                   any("fails CLOSED" in line for line in nested_log)),
+                  (True, True))
+        finally:
+            globals()[helper] = real_helper
+    # RecursionError is not a subclass of the errors a narrow `except` would name, and a body
+    # deep enough to blow the stack must still leave the human hold exactly where it is.
+    real_bounds = globals()["_injection_sentence_bounds"]
+    recursion_log = []
+    try:
+        def _deep(*_a, **_k):
+            def _f(n):
+                return _f(n + 1)
+            return _f(0)
+
+        globals()["_injection_sentence_bounds"] = _deep
+        check("a RecursionError inside the classifier DENIES",
+              injection_prose_denied("no prompt injection", log=recursion_log.append)[0], True)
+    finally:
+        globals()["_injection_sentence_bounds"] = real_bounds
+    check("...and the classifier is restored after every fail-closed probe",
+          (denies("no prompt injection"), denies("prompt injection was detected")), (False, True))
 
     # --- (f) NOTHING ELSE WIDENED. The mention TERM, the human-arm rule, and the rest of the
     # deny table are exactly what they were: #814 changed WHEN a mention denies, nothing else.
