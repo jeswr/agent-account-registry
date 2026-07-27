@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4501,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "3844db5237b18a9537fc600bb4a05ca68ff2d308",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 addresses both prior major findings. The replacement regression test now exercises the production salt-resolution and public-input reconstruction functions, checks the exact C(G) public-input word, and verifies the serialized salt-withheld counterfactual round-trips while preserving the same reconstructed bytes. The research record also narrows the cross-presentation argument correctly: salt domination is explicitly conditional on issuance-side salt injectivity, SaltReused is accurately limited to within-manifest enforcement, and the text no longer claims identical partitions or machine-enforced global uniqueness. The remaining ZK assurance limits and pending external audit are clearly caveated. No hostile instruction was detected in the diff.",
+  "verdict": "approve"
+ }
+}
