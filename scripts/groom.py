@@ -221,7 +221,11 @@ def age_receipts(comments: list[dict[str, Any]], marker: str, bot_login: str
         if match is None:
             continue
         found.append({"cause": match.group("cause"), "head": match.group("head"),
-                      "gen": int(match.group("gen"))})
+                      "gen": int(match.group("gen")),
+                      # The comment's own creation stamp. park_policy's receipt readers all key
+                      # recency off this, and without it a receipt cannot be compared against a
+                      # park application — which is the guard this file was missing.
+                      "at": comment.get("created_at")})
     return found
 
 
@@ -252,38 +256,47 @@ def age_park_generation(comments: list[dict[str, Any]], bot_login: str) -> int:
 
 
 def age_unpark_state(comments: list[dict[str, Any]], bot_login: str
-                     ) -> tuple[dict[str, Any] | None, bool]:
-    """``(park_receipt, already_consumed)`` for the newest age park on record.
+                     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """``(park_receipt, grant_receipt)`` for the newest age park on record.
 
     ``park_receipt`` is None when this is not an age park of ours, or when the park is OVER THE
     CAP (generation > AGE_UNPARK_MAX) — an over-cap park was written in the HUMAN class by
     age_park_label and must never be automatically re-admitted, so the exit phase must not even
     consider it.
 
-    ``already_consumed`` is True when an un-park receipt already carries the SAME
-    (cause, head, gen) triple. That is the consume-exactly-once invariant: the recovery can never
-    be re-earned, and a further re-admission requires a NEW park at a new fingerprint.
+    ``grant_receipt`` is the un-park receipt carrying the SAME (cause, head, gen) triple, or None
+    when the recovery is still unconsumed. That is the consume-exactly-once invariant: the
+    recovery can never be re-earned, and a further re-admission requires a NEW park at a new
+    fingerprint. The RECEIPT is returned rather than a bool because the caller needs its
+    TIMESTAMP: convergence is only legitimate while no park application is newer than the grant.
 
     The two are returned SEPARATELY rather than collapsed into "owed or not" because the caller
     needs to distinguish two states that look identical from the label alone (registry #614's
     `auto-receipt` branch, mirrored):
 
-      - consumed AND the machine label is GONE — the normal, finished case;
-      - consumed AND the machine label is STILL LIVE — the receipt landed and the unlabel did
+      - granted AND the machine label is GONE — the normal, finished case;
+      - granted AND the machine label is STILL LIVE — the receipt landed and the unlabel did
         not. Receipt-first ordering guarantees this is the only crash residue possible, and
         collapsing it into None strands the PR under `review:parked` FOREVER: nothing re-parks it
         (its cause has recovered, so the hand-off derives no reason) and nothing clears it. One
         plain HTTP transient on the DELETE is enough to reach it. The caller CONVERGES on that
-        state by retrying the unlabel, consuming no new evidence and minting no new receipt."""
+        state by retrying the unlabel, consuming no new evidence and minting no new receipt.
+
+    THE LABEL DOES NOT IDENTIFY ITS WRITER. `review:parked` is a SHARED MULTI-WRITER label —
+    dispatch-claim writes it at two sites and worker-pr's capacity park writes it too — so its
+    presence proves *a* writer parked this PR, never that THIS sweep did. The caller must
+    therefore also prove the grant is NEWER than every park application before converging."""
     parks = age_receipts(comments, AGE_PARK_MARKER, bot_login)
     if not parks:
         return None, False
     latest = parks[-1]
     if latest["gen"] > AGE_UNPARK_MAX:
         return None, False
-    consumed = {(r["cause"], r["head"], r["gen"])
-                for r in age_receipts(comments, AGE_UNPARK_MARKER, bot_login)}
-    return latest, (latest["cause"], latest["head"], latest["gen"]) in consumed
+    key = (latest["cause"], latest["head"], latest["gen"])
+    for grant in age_receipts(comments, AGE_UNPARK_MARKER, bot_login):
+        if (grant["cause"], grant["head"], grant["gen"]) == key:
+            return latest, grant
+    return latest, None
 
 
 class GroomError(RuntimeError):
@@ -1804,35 +1817,51 @@ def _execute_age_unpark_actions(
     registry_api: "GitHubAPI",
     registry_repo: str,
     bot_login: str,
-) -> tuple[PhaseOutcome, int]:
+) -> tuple[PhaseOutcome, int, int]:
     """Re-admit MACHINE age-parks whose own cause has provably recovered — the exit that makes the
     class split honest.
 
     Relabelling an age park from the human terminal to the machine soft hold WITHOUT this phase
     would be strictly worse than the defect it replaces: `needs:user` is at least visible in a
     human census, whereas a `review:parked` nothing can clear is an INVISIBLE permanent hold.
-    park_policy's own automatic path cannot supply this exit — capacity_park_admission is gated on
-    per-account model-health recovery evidence, which no orphan-draft or wedged-merge-state park
-    will ever satisfy — so the sweep that KNOWS the cause owns clearing it.
+    park_policy's own automatic path cannot supply this exit WHOLESALE — capacity_park_admission is
+    gated on per-account model-health recovery evidence that no orphan-draft or wedged-merge-state
+    park will ever satisfy, and its cap counts worker-pr's AUTO_READMIT_MARKER, so routing groom's
+    age receipts through it would make the two re-admission budgets consume each other. The sweep
+    that KNOWS the cause therefore owns clearing it — but every GUARD that mechanism applies is
+    obtained by CALLING park_policy (park_vetoed, label_application_machine_owned,
+    park_applications for recency, valid_timestamp/parse_ts/canonical_ts), never by reproducing
+    it. Two rounds of this PR shipped a mirrored mechanism missing a guard the original had;
+    nothing here re-implements a park_policy decision.
 
     Bounded exactly as invariant 3 bounds the capacity path:
       - CAUSE-GATED. age_park_cause_recovered, never elapsed time.
       - CONSUMED EXACTLY ONCE. The un-park receipt carries the park receipt's own
-        (cause, head, gen) triple; age_unpark_owed refuses a second grant on the same triple, so
-        one recovery can never be re-earned.
+        (cause, head, gen) triple; age_unpark_state reports that grant, so one recovery can never
+        be re-earned — a further re-admission needs a NEW park at a new fingerprint.
       - CAPPED. Enforced upstream at park time by age_park_label: generation > AGE_UNPARK_MAX is
         written in the HUMAN class, so an over-cap park never reaches this phase at all.
-      - NEVER CLEARS A HUMAN PARK. A PR carrying a human-owned hold has no owed receipt to begin
-        with (the hand-off wrote no machine receipt), and a machine label whose LATEST application
-        was made by a proven human is refused here by park_policy.park_applications.
-      - RECEIPT-FIRST. The un-park receipt is posted BEFORE the label is removed, so a crash
-        leaves receipt-no-label (converges: the label is simply gone next tick) rather than
-        label-no-receipt, which would let the same recovery be consumed twice.
+      - NEVER CLEARS A LABEL IT CANNOT PROVE IS MACHINE-APPLIED. Every unlabel — the ordinary grant
+        AND the convergence retry — is authorised by park_policy.label_application_machine_owned
+        for THAT EXACT LABEL (the #690 predicate; park_applications is the wrong API for this and
+        is never used for it here). It returns False for every ambiguity: a human-latest
+        application, no `labeled` event at all, an unreadable timeline, a malformed shape.
+      - RECEIPT-FIRST, WITH A REAL CONVERGENCE BRANCH. The receipt is posted BEFORE the unlabel, so
+        the only crash residue is receipt-no-label. That does NOT resolve itself — nothing re-parks
+        a PR whose cause has recovered — so the branch below retries the unlabel, gated on the
+        grant being STRICTLY NEWER than every park application (registry #614's `auto-receipt`
+        recency conjunct). `review:parked` is a SHARED MULTI-WRITER label, so without that conjunct
+        a different writer's later park is deleted off this sweep's stale grant.
 
-    Every failure is PER-PR: one unreadable PR never stops the rest."""
+    Every failure is PER-PR: one unreadable PR never stops the rest.
+
+    Returns (outcome, grants, convergences). GRANTS are new re-admissions and are what
+    AGE_UNPARK_MAX governs; CONVERGENCES are retries of one already-authorised, never-effected
+    write and change no decision — they are counted apart so neither can be read as the other."""
     attempted = 0
     completed = 0
-    unparked = 0
+    unparked = 0      # NEW grants: one per park receipt, governed by AGE_UNPARK_MAX
+    converged = 0     # RETRIES of an already-granted, never-effected unlabel: state-change-free
     deferrals: list[str] = []
     for repo, api in apis.items():
         for number, listed in sorted(pulls.get(repo, {}).items()):
@@ -1843,7 +1872,7 @@ def _execute_age_unpark_actions(
             failed = False
             try:
                 comments = _comments(api, repo, number)
-                owed, consumed = age_unpark_state(comments, bot_login)
+                owed, granted = age_unpark_state(comments, bot_login)
                 if owed is None:
                     continue  # not an age park of ours, or over the cap (human class)
 
@@ -1877,29 +1906,68 @@ def _execute_age_unpark_actions(
                     print(f"WRITE remove label repo={repo} issue={number} "
                           f"label={park_policy.MACHINE_PARK_PR_LABEL}")
 
-                if consumed:
-                    # CONVERGENCE (registry #614's `auto-receipt` branch, mirrored). The receipt
-                    # for this exact recovery is already on record, yet the machine label is still
-                    # live — reaching this line means exactly that. Receipt-first ordering makes
-                    # receipt-no-label the only crash residue possible, and it is reached by one
-                    # plain HTTP transient on the DELETE. Treating it as "already consumed, skip"
-                    # strands the PR under `review:parked` permanently: its cause has recovered, so
-                    # the hand-off derives no reason and never re-parks it, and no other path
-                    # clears it — the INVISIBLE permanent hold this whole phase exists to prevent.
-                    # So retry the unlabel, consuming NO new evidence and minting NO new receipt
-                    # (the generation is untouched, so convergence can never inflate the cap).
-                    # The ownership proof still gates it: a human who re-applied the label after
-                    # our receipt is the newest `labeled` event, and _clearable() refuses.
+                if granted is not None:
+                    # CONVERGENCE (registry #614's `auto-receipt` branch). The receipt for this
+                    # exact recovery is already on record, yet the machine label is still live.
+                    # Receipt-first ordering makes receipt-no-label the only crash residue
+                    # possible, and one plain HTTP transient on the DELETE reaches it. Treating it
+                    # as "already consumed, skip" strands the PR under `review:parked` permanently
+                    # — its cause has recovered, so the hand-off derives no reason and never
+                    # re-parks it, and nothing else clears it.
+                    #
+                    # THE RECENCY CONJUNCT, which the mirrored version dropped and which is what
+                    # makes this safe. `auto-receipt` fires only when the receipt is STRICTLY
+                    # NEWER than the newest park application (`parse_ts(stamp) > latest_park`).
+                    # Without it, "the label is present" was read as "my un-park never landed" —
+                    # but `review:parked` is a SHARED MULTI-WRITER label (dispatch-claim at two
+                    # sites, worker-pr's capacity park), so its presence proves *a* writer parked
+                    # this PR, never that THIS sweep did. A DIFFERENT writer's LATER park was
+                    # therefore deleted off this sweep's stale receipt. Live shape: age-park ->
+                    # recover -> unpark -> the account starves -> worker-pr capacity-parks ->
+                    # every groom tick deletes it -> re-park. Uncapped ping-pong, which is exactly
+                    # the flap #614/#691's cap exists to bound, and it sat OUTSIDE that cap
+                    # because convergence mints no receipt.
+                    #
+                    # Recency closes it STRUCTURALLY rather than by counting: a re-park is a NEWER
+                    # `labeled` event than the grant, so convergence refuses and the ordinary
+                    # capped path handles it as the new park it is. What remains under this branch
+                    # is only ever a RETRY of one already-authorised, never-effected write, so it
+                    # is counted separately from grants and can never become one.
+                    stamp = granted.get("at")
+                    if not park_policy.valid_timestamp(stamp):
+                        print(f"age park stands {repo}#{number}: the un-park receipt carries no "
+                              "readable timestamp, so it cannot be proven newer than the park")
+                        continue
+                    # park_applications is the RIGHT api here, and is NOT the #690 misuse: #690 is
+                    # about authorising the DELETE of one specific label with evidence about three.
+                    # This asks its documented question — "when was the newest park applied" — and
+                    # a park on ANY park label refuses, the conservative direction. The delete
+                    # authorisation remains _clearable() / label_application_machine_owned.
+                    latest_park, _human, readable = park_policy.park_applications(
+                        repo, number, None,
+                        lambda r, n: api.paginate(f"/repos/{r}/issues/{n}/timeline"),
+                        is_human=lambda login: _is_human_maintainer(api, repo, login))
+                    if not readable:
+                        print(f"age park stands {repo}#{number}: the park application timeline "
+                              "could not be read, so the grant cannot be proven current")
+                        continue
+                    if latest_park is not None and park_policy.parse_ts(stamp) <= latest_park:
+                        print(f"age park stands {repo}#{number}: a park application at "
+                              f"{park_policy.canonical_ts(latest_park.isoformat())} is NEWER than "
+                              f"the un-park receipt at {park_policy.canonical_ts(stamp)} — this "
+                              "label is a DIFFERENT park, not the one that receipt cleared")
+                        continue
                     if not _clearable():
                         print(f"age park stands {repo}#{number}: "
                               f"`{park_policy.MACHINE_PARK_PR_LABEL}` is not provably "
                               "machine-applied — only a human clears it")
                         continue
                     print(f"CONVERGE PR {repo}#{number}: an un-park receipt for "
-                          f"(cause={owed['cause']}, gen={owed['gen']}) is already on record but "
-                          "the label survived — completing the interrupted unlabel")
+                          f"(cause={owed['cause']}, gen={owed['gen']}) is already on record and "
+                          "newer than every park application, but the label survived — completing "
+                          "the interrupted unlabel")
                     _drop_label()
-                    unparked += 1
+                    converged += 1
                     continue
 
                 pull = api.request("GET", f"/repos/{repo}/pulls/{number}", allow_404=True)
@@ -1946,6 +2014,7 @@ def _execute_age_unpark_actions(
         PhaseOutcome(label="age park re-admission", changed=completed, attempted=attempted,
                      deferred=tuple(deferrals)),
         unparked,
+        converged,
     )
 
 
@@ -2862,7 +2931,7 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
         pull_actions, groomable, target_tokens, now, defuse_stale_seconds, bot_login
     )
 
-    unpark_outcome, unpark_count = _execute_age_unpark_actions(
+    unpark_outcome, unpark_count, converge_count = _execute_age_unpark_actions(
         pulls, groomable, registry_api, registry_repo, bot_login
     )
 
@@ -3054,7 +3123,7 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
         f"defuse_deferred={len(defuse_outcome.deferred) + len(defuse_outcome.unavailable)} "
         f"repair_deferred={len(repair_outcome.deferred)} "
         f"stale_pr_deferred={len(stale_outcome.deferred)} "
-        f"age_unparked={unpark_count} "
+        f"age_unparked={unpark_count} age_converged={converge_count} "
         f"age_unpark_deferred={len(unpark_outcome.deferred)} "
         f"detect_deferred={len(detect_outcome.deferred)}"
     )
@@ -6072,6 +6141,12 @@ def _self_test() -> int:
             return (first in writes and second in writes
                     and writes.index(first) < writes.index(second))
 
+        def _grant_comment(receipt: str, at: str = "2026-07-26T11:00:00Z") -> dict[str, Any]:
+            """A bot-authored un-park GRANT receipt, with the `created_at` the recency conjunct
+            compares against the newest park application. A grant with no readable stamp cannot be
+            proven current and must refuse."""
+            return {"user": {"login": "app[bot]"}, "body": receipt, "created_at": at}
+
         def _labelled(label: str, at: str, actor: str) -> dict[str, Any]:
             return {"event": "labeled", "label": {"name": label},
                     "created_at": at, "actor": {"login": actor}}
@@ -6115,7 +6190,7 @@ def _self_test() -> int:
         terminal_sweep_env["pages"] = {
             "/repos/owner/repo/issues/33/comments": [
                 _park_receipt_comment(1, 33),
-                {"user": {"login": "app[bot]"}, "body": unpark_receipt}],
+                _grant_comment(unpark_receipt)],
             **_bot_park_timeline(33)}
         replay_log, _e, _r = _sweep_with_refusals(
             {}, pulls=({**recovered_pr, "labels": []},))
@@ -6252,7 +6327,7 @@ def _self_test() -> int:
         terminal_sweep_env["pages"] = {
             "/repos/owner/repo/issues/33/comments": [
                 _park_receipt_comment(1, 33),
-                {"user": {"login": "app[bot]"}, "body": unpark_receipt}],
+                _grant_comment(unpark_receipt)],
             **_bot_park_timeline(33)}
         converge_log, _e, _r = _sweep_with_refusals({}, pulls=(recovered_pr,))
         check(
@@ -6262,9 +6337,71 @@ def _self_test() -> int:
                 _label_delete in terminal_sweep_env["writes"],
                 _comment_bodies(),
                 "CONVERGE PR owner/repo#33" in converge_log,
-                "age_unparked=1" in converge_log,
+                # A convergence is a RETRY of an already-authorised write, not a new grant. The
+                # two are counted apart so neither can be read as the other — the reviewer's
+                # probe C ("5 replays = 5 unparks against a cap of 2") is answered by this line:
+                # grants stay at 0 however many times the tick replays.
+                ("age_unparked=0" in converge_log, "age_converged=1" in converge_log),
             ),
-            (True, [], True, True),
+            (True, [], True, (True, True)),
+        )
+
+        # ---- B: a DIFFERENT writer's LATER park must NOT be deleted off a stale grant ----------
+        # `review:parked` is written by dispatch-claim (x2) and worker-pr's capacity park as well
+        # as by this sweep, so its presence never proves THIS sweep parked the PR. Live shape:
+        # age-park -> recover -> unpark -> the account starves -> worker-pr capacity-parks -> every
+        # groom tick deletes it. Drop the recency conjunct and this reds.
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/33/comments": [
+                _park_receipt_comment(1, 33), _grant_comment(unpark_receipt)],
+            "/repos/owner/repo/issues/33/timeline": [
+                _labelled("review:parked", "2026-07-26T10:00:00Z", "app[bot]"),
+                _labelled("review:parked", "2026-07-26T12:00:00Z", "app[bot]")],
+        }
+        newer_park_log, _e, _r = _sweep_with_refusals({}, pulls=(recovered_pr,))
+        check(
+            "a LATER park application refuses convergence — a shared multi-writer label being "
+            "present never proves THIS sweep's un-park failed to land",
+            (
+                terminal_sweep_env["writes"],
+                "is NEWER than the un-park receipt" in newer_park_log,
+                "age_converged=0" in newer_park_log,
+            ),
+            ([], True, True),
+        )
+
+        # C/D: convergence can never span two parks, so it cannot escape the cap it sits outside
+        # of. Replaying the SAME tick grants nothing new each time, and the moment anything
+        # re-parks the PR the check above refuses — which is the structural bound, not a counter.
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/33/comments": [
+                _park_receipt_comment(1, 33), _grant_comment(unpark_receipt)],
+            **_bot_park_timeline(33)}
+        replay_grants = []
+        for _tick in range(3):
+            tick_log, _e, _r = _sweep_with_refusals({}, pulls=(recovered_pr,))
+            replay_grants.append(("age_unparked=0" in tick_log,
+                                  _comment_bodies() == []))
+        check(
+            "replaying the same tick mints NO new grant and NO second receipt, however many times "
+            "it runs — the cap governs grants, and convergence can never become one",
+            replay_grants,
+            [(True, True)] * 3,
+        )
+
+        # A grant with no readable timestamp cannot be proven newer than the park, so it refuses.
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/33/comments": [
+                _park_receipt_comment(1, 33),
+                {"user": {"login": "app[bot]"}, "body": unpark_receipt}],
+            **_bot_park_timeline(33)}
+        no_stamp_log, _e, _r = _sweep_with_refusals({}, pulls=(recovered_pr,))
+        check(
+            "an un-park grant with NO readable timestamp refuses convergence (it cannot be proven "
+            "current)",
+            (terminal_sweep_env["writes"],
+             "carries no readable timestamp" in no_stamp_log),
+            ([], True),
         )
 
         # Convergence is NOT a licence to clear a human's label: a human who re-applied
@@ -6273,10 +6410,13 @@ def _self_test() -> int:
         terminal_sweep_env["pages"] = {
             "/repos/owner/repo/issues/33/comments": [
                 _park_receipt_comment(1, 33),
-                {"user": {"login": "app[bot]"}, "body": unpark_receipt}],
+                _grant_comment(unpark_receipt)],
+            # The human application lands BEFORE the grant, so the recency conjunct PASSES and the
+            # ownership proof is the only thing that can refuse — isolating _clearable() inside the
+            # convergence branch rather than letting recency mask it.
             "/repos/owner/repo/issues/33/timeline": [
-                _labelled("review:parked", "2026-07-26T10:00:00Z", "app[bot]"),
-                _labelled("review:parked", "2026-07-26T13:00:00Z", "jeswr")],
+                _labelled("review:parked", "2026-07-26T09:00:00Z", "app[bot]"),
+                _labelled("review:parked", "2026-07-26T10:30:00Z", "jeswr")],
         }
         converge_human_log, _e, _r = _sweep_with_refusals(
             {}, pulls=(recovered_pr,),
