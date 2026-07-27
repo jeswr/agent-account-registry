@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3595,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b1e864f465aa4da09957b4cce0633e2d2b03d473",
+  "round": 7
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "SourceSegment still exposes declared_rows as an arbitrary usize. reconstruct_federated_public_inputs evaluates encoded_len for every source before check_shape; encoded_len uses unchecked additions and multiplications, so values near usize::MAX can panic in debug builds or wrap in release builds before Vec::with_capacity. Values that avoid arithmetic overflow still make encode loop over 0..declared_rows and append 96 bytes per padded row, enabling trivial memory/CPU exhaustion. The shape checks only compare caller-controlled values and do not establish that r belongs to a supported compiled scan circuit family.",
+    "file": "crates/sparq-mpc/src/federated.rs",
+    "fix_hint": "Validate declared_rows against the authoritative supported scan-circuit dimensions before any sizing or allocation, preferably by representing it with the same bounded circuit-dimension type. Use checked arithmetic for per-segment lengths and the aggregate capacity, returning MpcError on overflow. Add a negative test using an oversized value including usize::MAX that proves reconstruction returns MpcError without panic or allocation.",
+    "severity": "major",
+    "title": "Unbounded declared_rows still permits overflow and verifier resource exhaustion"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round-6 major finding remains unresolved. SourceSegment::declared_rows is still an arbitrary usize, encoded_len still performs unchecked arithmetic, reconstruct_federated_public_inputs still sums encoded_len values before check_shape, and encode still iterates through every declared row. Thus malformed public input can panic or wrap during sizing and can force unbounded allocation/CPU work. No oversized-r negative test was added. Because the same major availability/correctness issue remains at the same severity, progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
