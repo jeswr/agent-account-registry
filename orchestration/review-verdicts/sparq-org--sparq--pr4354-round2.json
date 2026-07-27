@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4354,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "069eb4b16852bc55144bf050ca312ef7cf855065",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The prior-round finding was not addressed. The document still contains exact work-box byte counts and microsecond timings, derived percentages and ratios, run-to-run noise estimates, and exact map/vector capacity observations. It also repeats numeric magnitudes in the findings and disposition. Repository policy prohibits hard-coded performance numbers in Markdown and treats work-box timings as non-canonical; caveats such as \"NON-CANONICAL\" and \"advisory\" do not make the committed numbers compliant or prevent them from becoming stale.",
+    "file": "research/numerics-sparsify-measured.md",
+    "fix_hint": "Remove the numeric results table and all derived hard-coded magnitudes, including percentages, ratios, microseconds, spread estimates, row/term counts used as measured evidence, and exact byte/capacity observations. Retain the qualitative negative conclusion, methodology, reproducible commands, result-equivalence evidence, and a pointer to generated artifacts from the approved benchmark workflow if available.",
+    "severity": "major",
+    "title": "Prohibited hard-coded work-box performance numbers remain"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 1's major issue remains materially unchanged. research/numerics-sparsify-measured.md still commits a full table of non-canonical work-box timings, byte counts, percentages, ratios, noise estimates, and derived exact capacity observations, then repeats those magnitudes in the findings and disposition. The repository contract explicitly prohibits hard-coded performance numbers in Markdown and states that work-box timings are non-canonical; labeling them advisory does not cure the violation. The implementation and equivalence tests otherwise appear coherent from the diff, but this policy breach remains blocking.",
+  "verdict": "request_changes"
+ }
+}
