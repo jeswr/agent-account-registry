@@ -251,25 +251,39 @@ def age_park_generation(comments: list[dict[str, Any]], bot_login: str) -> int:
     )
 
 
-def age_unpark_owed(comments: list[dict[str, Any]], bot_login: str
-                    ) -> dict[str, Any] | None:
-    """The age-park receipt whose recovery is still UNCONSUMED, or None.
+def age_unpark_state(comments: list[dict[str, Any]], bot_login: str
+                     ) -> tuple[dict[str, Any] | None, bool]:
+    """``(park_receipt, already_consumed)`` for the newest age park on record.
 
-    The newest park receipt is owed an un-park iff no un-park receipt carries the SAME
-    (cause, head, gen) triple. That is the consume-exactly-once invariant: once granted, the same
-    recovery can never be re-earned — a further re-admission requires a NEW park (a new
-    generation) at a new fingerprint."""
+    ``park_receipt`` is None when this is not an age park of ours, or when the park is OVER THE
+    CAP (generation > AGE_UNPARK_MAX) — an over-cap park was written in the HUMAN class by
+    age_park_label and must never be automatically re-admitted, so the exit phase must not even
+    consider it.
+
+    ``already_consumed`` is True when an un-park receipt already carries the SAME
+    (cause, head, gen) triple. That is the consume-exactly-once invariant: the recovery can never
+    be re-earned, and a further re-admission requires a NEW park at a new fingerprint.
+
+    The two are returned SEPARATELY rather than collapsed into "owed or not" because the caller
+    needs to distinguish two states that look identical from the label alone (registry #614's
+    `auto-receipt` branch, mirrored):
+
+      - consumed AND the machine label is GONE — the normal, finished case;
+      - consumed AND the machine label is STILL LIVE — the receipt landed and the unlabel did
+        not. Receipt-first ordering guarantees this is the only crash residue possible, and
+        collapsing it into None strands the PR under `review:parked` FOREVER: nothing re-parks it
+        (its cause has recovered, so the hand-off derives no reason) and nothing clears it. One
+        plain HTTP transient on the DELETE is enough to reach it. The caller CONVERGES on that
+        state by retrying the unlabel, consuming no new evidence and minting no new receipt."""
     parks = age_receipts(comments, AGE_PARK_MARKER, bot_login)
     if not parks:
-        return None
+        return None, False
     latest = parks[-1]
     if latest["gen"] > AGE_UNPARK_MAX:
-        return None  # over cap: never automatically re-admitted (age_park_label wrote HUMAN)
+        return None, False
     consumed = {(r["cause"], r["head"], r["gen"])
                 for r in age_receipts(comments, AGE_UNPARK_MARKER, bot_login)}
-    if (latest["cause"], latest["head"], latest["gen"]) in consumed:
-        return None
-    return latest
+    return latest, (latest["cause"], latest["head"], latest["gen"]) in consumed
 
 
 class GroomError(RuntimeError):
@@ -1829,9 +1843,65 @@ def _execute_age_unpark_actions(
             failed = False
             try:
                 comments = _comments(api, repo, number)
-                owed = age_unpark_owed(comments, bot_login)
+                owed, consumed = age_unpark_state(comments, bot_login)
                 if owed is None:
-                    continue  # not an age park of ours, or its recovery is already consumed
+                    continue  # not an age park of ours, or over the cap (human class)
+
+                def _clearable() -> bool:
+                    """May an automated path delete THIS EXACT label right now?
+
+                    park_policy.label_application_machine_owned, never park_applications
+                    (blocking review finding #690). park_applications answers a question about
+                    READMISSION_LABELS *collectively* — "when was the newest park applied across
+                    needs:user / status:parked / review:parked, and was that human" — and using it
+                    to authorise deleting ONE specific label is a domain mismatch that fails in
+                    directions this call site reaches: a HUMAN-applied `review:parked` reads as
+                    machine-owned the moment any bot writes a LATER `needs:user` event, and a live
+                    label with no `labeled` event at all reads absence as permission. The correct
+                    predicate proves ownership OF THIS LABEL, and returns False for every
+                    ambiguity — human-latest, no event, unreadable, malformed. It is the same
+                    function dispatch-claim authorises its own label deletions with, so "may not
+                    clear there" and "may not clear here" cannot drift."""
+                    return park_policy.label_application_machine_owned(
+                        repo, number, park_policy.MACHINE_PARK_PR_LABEL,
+                        lambda r, n: api.paginate(f"/repos/{r}/issues/{n}/timeline"),
+                        is_human=lambda login: _is_human_maintainer(api, repo, login))
+
+                def _drop_label() -> None:
+                    api.request(
+                        "DELETE",
+                        f"/repos/{repo}/issues/{number}/labels/"
+                        f"{quote(park_policy.MACHINE_PARK_PR_LABEL, safe='')}",
+                        allow_404=True,
+                    )
+                    print(f"WRITE remove label repo={repo} issue={number} "
+                          f"label={park_policy.MACHINE_PARK_PR_LABEL}")
+
+                if consumed:
+                    # CONVERGENCE (registry #614's `auto-receipt` branch, mirrored). The receipt
+                    # for this exact recovery is already on record, yet the machine label is still
+                    # live — reaching this line means exactly that. Receipt-first ordering makes
+                    # receipt-no-label the only crash residue possible, and it is reached by one
+                    # plain HTTP transient on the DELETE. Treating it as "already consumed, skip"
+                    # strands the PR under `review:parked` permanently: its cause has recovered, so
+                    # the hand-off derives no reason and never re-parks it, and no other path
+                    # clears it — the INVISIBLE permanent hold this whole phase exists to prevent.
+                    # So retry the unlabel, consuming NO new evidence and minting NO new receipt
+                    # (the generation is untouched, so convergence can never inflate the cap).
+                    # The ownership proof still gates it: a human who re-applied the label after
+                    # our receipt is the newest `labeled` event, and _clearable() refuses.
+                    if not _clearable():
+                        print(f"age park stands {repo}#{number}: "
+                              f"`{park_policy.MACHINE_PARK_PR_LABEL}` is not provably "
+                              "machine-applied — only a human clears it")
+                        continue
+                    print(f"CONVERGE PR {repo}#{number}: an un-park receipt for "
+                          f"(cause={owed['cause']}, gen={owed['gen']}) is already on record but "
+                          "the label survived — completing the interrupted unlabel")
+                    _drop_label()
+                    unparked += 1
+                    continue
+
                 pull = api.request("GET", f"/repos/{repo}/pulls/{number}", allow_404=True)
                 if not isinstance(pull, dict) or pull.get("state") != "open":
                     print(f"SKIP PR {repo}#{number}: no longer open")
@@ -1845,17 +1915,10 @@ def _execute_age_unpark_actions(
                     print(f"age park stands {repo}#{number} (cause={owed['cause']} "
                           f"gen={owed['gen']}): {why}")
                     continue
-                _latest, human_park, readable = park_policy.park_applications(
-                    repo, number, None,
-                    lambda r, n: api.paginate(f"/repos/{r}/issues/{n}/timeline"),
-                    is_human=lambda login: _is_human_maintainer(api, repo, login))
-                if not readable:
-                    print(f"age park stands {repo}#{number}: the park application timeline "
-                          "could not be read")
-                    continue
-                if human_park:
-                    print(f"age park stands {repo}#{number}: the latest park application is "
-                          "HUMAN-owned — only a human clears it")
+                if not _clearable():
+                    print(f"age park stands {repo}#{number}: "
+                          f"`{park_policy.MACHINE_PARK_PR_LABEL}` is not provably "
+                          "machine-applied — only a human clears it")
                     continue
                 receipt = (f"{AGE_UNPARK_MARKER} cause={owed['cause']} head={owed['head']} "
                            f"gen={owed['gen']} -->")
@@ -1869,14 +1932,7 @@ def _execute_age_unpark_actions(
                 )
                 print(f"WRITE age-unpark receipt repo={repo} pr={number} cause={owed['cause']} "
                       f"gen={owed['gen']}")
-                api.request(
-                    "DELETE",
-                    f"/repos/{repo}/issues/{number}/labels/"
-                    f"{quote(park_policy.MACHINE_PARK_PR_LABEL, safe='')}",
-                    allow_404=True,
-                )
-                print(f"WRITE remove label repo={repo} issue={number} "
-                      f"label={park_policy.MACHINE_PARK_PR_LABEL}")
+                _drop_label()
                 unparked += 1
             except GroomError as exc:
                 failed = True
@@ -6016,10 +6072,25 @@ def _self_test() -> int:
             return (first in writes and second in writes
                     and writes.index(first) < writes.index(second))
 
+        def _labelled(label: str, at: str, actor: str) -> dict[str, Any]:
+            return {"event": "labeled", "label": {"name": label},
+                    "created_at": at, "actor": {"login": actor}}
+
+        # A BOT `labeled review:parked` event must EXIST for the label to be provably
+        # machine-applied. park_policy.label_application_machine_owned refuses on absence —
+        # "absence of evidence is NOT proof of machine ownership" — so every happy-path fixture
+        # here carries the event the live sweep would have written. The earlier fixtures omitted
+        # it and passed only because the predicate then in use (park_applications) read absence
+        # as permission: exactly reproduced direction 2 of #690.
+        def _bot_park_timeline(number: int) -> dict[str, list[dict[str, Any]]]:
+            return {f"/repos/owner/repo/issues/{number}/timeline": [
+                _labelled("review:parked", "2026-07-26T10:00:00Z", "app[bot]")]}
+
         recovered_pr = _machine_parked_pr(33, "clean", ("review:parked",))
         unpark_receipt = f"{AGE_UNPARK_MARKER} cause=merge-dirty head={33:040x} gen=1 -->"
         terminal_sweep_env["pages"] = {
-            "/repos/owner/repo/issues/33/comments": [_park_receipt_comment(1, 33)]}
+            "/repos/owner/repo/issues/33/comments": [_park_receipt_comment(1, 33)],
+            **_bot_park_timeline(33)}
         unpark_log, _e, _r = _sweep_with_refusals({}, pulls=(recovered_pr,))
         unpark_writes = terminal_sweep_env["writes"]
         _label_delete = ("DELETE", "/repos/owner/repo/issues/33/labels/review%3Aparked")
@@ -6039,11 +6110,15 @@ def _self_test() -> int:
         # Consume-exactly-once: replay the SAME recovery with the un-park receipt already on
         # record. Drop the `consumed` set from age_unpark_owed and this reds — the recovery would
         # be re-earned every tick, i.e. the infinite-retry failure that is worse than a hold.
+        # Consumed AND the label is GONE — the normal finished state. Nothing is written, and in
+        # particular no SECOND receipt: the recovery cannot be re-earned.
         terminal_sweep_env["pages"] = {
             "/repos/owner/repo/issues/33/comments": [
                 _park_receipt_comment(1, 33),
-                {"user": {"login": "app[bot]"}, "body": unpark_receipt}]}
-        replay_log, _e, _r = _sweep_with_refusals({}, pulls=(recovered_pr,))
+                {"user": {"login": "app[bot]"}, "body": unpark_receipt}],
+            **_bot_park_timeline(33)}
+        replay_log, _e, _r = _sweep_with_refusals(
+            {}, pulls=({**recovered_pr, "labels": []},))
         check(
             "a re-admission is CONSUMED EXACTLY ONCE: the same (cause, head, gen) recovery grants "
             "nothing on a later tick — no receipt, no unlabel",
@@ -6054,7 +6129,8 @@ def _self_test() -> int:
         # The cause has NOT recovered: the park stands, and it says why. Invert
         # age_park_cause_recovered's merge branch and this reds.
         terminal_sweep_env["pages"] = {
-            "/repos/owner/repo/issues/34/comments": [_park_receipt_comment(1, 34)]}
+            "/repos/owner/repo/issues/34/comments": [_park_receipt_comment(1, 34)],
+            **_bot_park_timeline(34)}
         stands_log, _e, _r = _sweep_with_refusals(
             {}, pulls=(_machine_parked_pr(34, "dirty", ("review:parked",), fresh=True),))
         check(
@@ -6084,11 +6160,15 @@ def _self_test() -> int:
 
         # A machine label a PROVEN HUMAN applied is likewise never auto-cleared: the actor decides,
         # not the label. Remove the park_applications human_park check and this reds.
+        # TWO events, bot FIRST and the human LATER, so "the latest application was human" is
+        # genuinely the deciding fact. The previous single-event fixture proved nothing: with only
+        # a human event, absence-of-a-bot-event would have refused it anyway, so the branch this
+        # names was never exercised. Delete the human event and the sweep DOES clear the label.
         terminal_sweep_env["pages"] = {
             "/repos/owner/repo/issues/36/comments": [_park_receipt_comment(1, 36)],
             "/repos/owner/repo/issues/36/timeline": [
-                {"event": "labeled", "label": {"name": "review:parked"},
-                 "created_at": "2026-07-26T10:00:00Z", "actor": {"login": "jeswr"}}],
+                _labelled("review:parked", "2026-07-26T10:00:00Z", "app[bot]"),
+                _labelled("review:parked", "2026-07-26T12:00:00Z", "jeswr")],
         }
         human_applied_log, _e, _r = _sweep_with_refusals(
             {}, pulls=(_machine_parked_pr(36, "clean", ("review:parked",), fresh=True),),
@@ -6096,11 +6176,135 @@ def _self_test() -> int:
                         {"permission": "admin"}},
         )
         check(
-            "a machine park a PROVEN HUMAN applied is never auto-cleared — only a human clears it",
+            "a machine park whose LATEST application is a PROVEN HUMAN is never auto-cleared, "
+            "even though an EARLIER bot application exists",
             (
                 terminal_sweep_env["writes"],
-                "the latest park application is HUMAN-owned" in human_applied_log,
+                "not provably machine-applied" in human_applied_log,
             ),
+            ([], True),
+        )
+
+        # ---- #690 direction 1: authorising a DELETE of one label with evidence about THREE ----
+        # A human applied `review:parked`; a bot later applied `needs:user`. park_applications
+        # reads the newest `labeled` event across READMISSION_LABELS, so it reports "latest park
+        # was a machine" and the human's label is deleted. label_application_machine_owned reads
+        # ONLY `review:parked` events and refuses. Swap the call back and this reds.
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/38/comments": [_park_receipt_comment(1, 38)],
+            "/repos/owner/repo/issues/38/timeline": [
+                _labelled("review:parked", "2026-07-26T10:00:00Z", "jeswr"),
+                _labelled("needs:user", "2026-07-26T12:00:00Z", "app[bot]")],
+        }
+        cross_label_log, _e, _r = _sweep_with_refusals(
+            {}, pulls=(_machine_parked_pr(38, "clean", ("review:parked",), fresh=True),),
+            extra_gets={"/repos/owner/repo/collaborators/jeswr/permission":
+                        {"permission": "admin"}},
+        )
+        check(
+            "#690 direction 1: a HUMAN-applied review:parked is NOT clearable because a LATER "
+            "bot event exists on a DIFFERENT park label — ownership is proven per-label",
+            (terminal_sweep_env["writes"], "not provably machine-applied" in cross_label_log),
+            ([], True),
+        )
+
+        # ---- #690 direction 3: absence of evidence is not permission ---------------------------
+        # A live `review:parked` with NO `labeled` event at all (timeline truncated, label applied
+        # before the window, or applied by an import). Nothing proves a machine applied it.
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/39/comments": [_park_receipt_comment(1, 39)]}
+        no_event_log, _e, _r = _sweep_with_refusals(
+            {}, pulls=(_machine_parked_pr(39, "clean", ("review:parked",), fresh=True),))
+        check(
+            "#690 direction 3: a live review:parked with NO `labeled` event is NOT clearable — "
+            "absence of evidence is not proof of machine ownership",
+            (terminal_sweep_env["writes"], "not provably machine-applied" in no_event_log),
+            ([], True),
+        )
+
+        # ---- the UNREADABLE timeline, which previously had no red test at all ------------------
+        # The PR body claims "unreadable timeline -> stay parked"; before this check that claim was
+        # unsupported (deleting the branch left the suite green). A raising timeline read must
+        # refuse, and must NOT be swallowed into a re-admission.
+        class _RaisingPages(dict):
+            def get(self, key, default=None):
+                if key.endswith("/timeline"):
+                    raise GroomError("timeline read failed")
+                return super().get(key, default)
+
+        terminal_sweep_env["pages"] = _RaisingPages(
+            {"/repos/owner/repo/issues/40/comments": [_park_receipt_comment(1, 40)]})
+        unreadable_log, _e, _r = _sweep_with_refusals(
+            {}, pulls=(_machine_parked_pr(40, "clean", ("review:parked",), fresh=True),))
+        check(
+            "an UNREADABLE park timeline keeps the park (the claim the body makes, now with a "
+            "test that reds when the refusal is removed)",
+            (terminal_sweep_env["writes"], "not provably machine-applied" in unreadable_log),
+            ([], True),
+        )
+        terminal_sweep_env["pages"] = {}
+
+        # ---- CONVERGENCE: receipt landed, unlabel did not (registry #614 `auto-receipt`) -------
+        # Reached by ONE HTTP transient on the DELETE. Without this branch the PR keeps
+        # `review:parked` forever: its cause has recovered so the hand-off derives no reason and
+        # never re-parks it, and nothing else clears it — the INVISIBLE permanent hold. Delete the
+        # `if consumed:` block and this reds.
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/33/comments": [
+                _park_receipt_comment(1, 33),
+                {"user": {"login": "app[bot]"}, "body": unpark_receipt}],
+            **_bot_park_timeline(33)}
+        converge_log, _e, _r = _sweep_with_refusals({}, pulls=(recovered_pr,))
+        check(
+            "CONVERGENCE: a consumed receipt with the label STILL LIVE completes the interrupted "
+            "unlabel — no second receipt, no new evidence, the generation untouched",
+            (
+                _label_delete in terminal_sweep_env["writes"],
+                _comment_bodies(),
+                "CONVERGE PR owner/repo#33" in converge_log,
+                "age_unparked=1" in converge_log,
+            ),
+            (True, [], True, True),
+        )
+
+        # Convergence is NOT a licence to clear a human's label: a human who re-applied
+        # `review:parked` AFTER our receipt owns it. Remove the _clearable() gate from the
+        # convergence branch and this reds.
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/33/comments": [
+                _park_receipt_comment(1, 33),
+                {"user": {"login": "app[bot]"}, "body": unpark_receipt}],
+            "/repos/owner/repo/issues/33/timeline": [
+                _labelled("review:parked", "2026-07-26T10:00:00Z", "app[bot]"),
+                _labelled("review:parked", "2026-07-26T13:00:00Z", "jeswr")],
+        }
+        converge_human_log, _e, _r = _sweep_with_refusals(
+            {}, pulls=(recovered_pr,),
+            extra_gets={"/repos/owner/repo/collaborators/jeswr/permission":
+                        {"permission": "admin"}},
+        )
+        check(
+            "CONVERGENCE still refuses a human-owned label: a human who re-applied review:parked "
+            "after the receipt owns it",
+            (terminal_sweep_env["writes"],
+             "not provably machine-applied" in converge_human_log),
+            ([], True),
+        )
+
+        # ---- the OVER-CAP gate, which previously survived deletion ------------------------------
+        # A gen-3 park receipt is over AGE_UNPARK_MAX, so age_park_label wrote the HUMAN class and
+        # the exit phase must not consider it AT ALL — even with a recovered cause, a live machine
+        # label and a clean bot-applied timeline. Delete the `gen > AGE_UNPARK_MAX` branch from
+        # age_unpark_state and this reds.
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/42/comments": [_park_receipt_comment(3, 42)],
+            **_bot_park_timeline(42)}
+        over_cap_log, _e, _r = _sweep_with_refusals(
+            {}, pulls=(_machine_parked_pr(42, "clean", ("review:parked",), fresh=True),))
+        check(
+            "the OVER-CAP gate holds at the exit too: a gen-3 park is never automatically "
+            "re-admitted, however clean everything else looks",
+            (terminal_sweep_env["writes"], "age_unparked=0" in over_cap_log),
             ([], True),
         )
         terminal_sweep_env["pages"] = {}
@@ -6161,7 +6365,8 @@ def _self_test() -> int:
         # a whole re-admission phase can fail in total while the run reports success — the
         # exit-zero-swallows-failure shape this module already carries three scars from.
         terminal_sweep_env["pages"] = {
-            "/repos/owner/repo/issues/37/comments": [_park_receipt_comment(1, 37)]}
+            "/repos/owner/repo/issues/37/comments": [_park_receipt_comment(1, 37)],
+            **_bot_park_timeline(37)}
         unpark_fail_log, unpark_fail_error, _r = _sweep_with_refusals(
             {("POST", "/repos/owner/repo/issues/37/comments"): _live_http_failure(
                 "POST", "/repos/owner/repo/issues/37/comments", forbidden_envelope)},
