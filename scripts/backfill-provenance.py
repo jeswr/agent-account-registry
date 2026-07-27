@@ -35,6 +35,7 @@ prints a handle either.
 import argparse
 import ast
 import contextlib
+import functools
 import importlib.util
 import inspect
 import io
@@ -497,6 +498,21 @@ def _decoded_record(body):
         return None
 
 
+def _ledger_record(worker_pr, registry_repo, target_repo, number):
+    """The PARSED ledger-first provenance record for `target_repo#number`, or None.
+
+    A named function rather than a nested lambda: ``effective_record_body`` calls its probe with
+    the KEYWORD ``ref=``, so the probe's parameter name is part of the contract — and the head ref
+    is called `ref` in the caller's scope too, which is exactly the shadowing a lambda invites.
+    Raises ``WorkerPrError`` on a non-404 probe failure, as ``effective_record_body`` does."""
+    record_path = worker_pr.provenance_path(target_repo, number)
+
+    def probe(ref=None):
+        return worker_pr._probe_registry_file(registry_repo, record_path, ref=ref)
+
+    return _decoded_record(effective_record_body(probe, worker_pr.LEDGER_REF))
+
+
 def existing_record_admission_error(body, pr_number, admission_error):
     """Why an existing record body does NOT admit target PR ``pr_number``, or None when it
     passes the review loop's full admission (sol #217: a successful Contents response used to
@@ -743,11 +759,8 @@ def backfill(target_repo, registry_repo, routing_file, apply_changes, no_draft_c
             try:
                 orchestrator_record = orchestrator_class_admission(
                     claim, pull, target_repo, enrolled_authors,
-                    lambda: _decoded_record(effective_record_body(
-                        lambda ref=None: worker_pr._probe_registry_file(
-                            registry_repo, worker_pr.provenance_path(target_repo, number),
-                            ref=ref),
-                        worker_pr.LEDGER_REF)))
+                    functools.partial(_ledger_record, worker_pr, registry_repo,
+                                      target_repo, number))
             except worker_pr.WorkerPrError:
                 # An unreadable registry probe on a PR that was invisible to this script anyway
                 # is not news: it stays invisible. Nothing is written, nothing is claimed.
