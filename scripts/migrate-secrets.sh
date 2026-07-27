@@ -23,7 +23,11 @@
 #     token cannot read or move any secret):
 #     Q1. `gh workflow disable` each of the four secret-WRITER workflows (worker / review-fix /
 #         set-up-account / pat-validity) — a disabled workflow cannot start a NEW run (and a
-#         `gh run rerun` of an old pre-env-binding snapshot is refused too). Idempotent.
+#         `gh run rerun` of an old pre-env-binding snapshot is refused too). Idempotent by
+#         ASSERTION (#328): gh resolves `workflow disable` against ACTIVE workflows only, so it
+#         errors on an already-disabled one; a nonzero disable is inconclusive and Q1 accepts it
+#         only when the workflow's state reads back `disabled_manually`. That is what makes a
+#         quiesce re-dispatch after a Q2 drain refusal converge instead of dying at Q1.
 #     Q2. COHERENT drain check (round-8 finding 2): ONE unfiltered `gh run list --all --limit
 #         1000 --json status,databaseId` snapshot per writer workflow, with the five
 #         NONTERMINAL statuses (queued / in_progress / requested / waiting / pending, round-6
@@ -410,14 +414,33 @@ NONTERMINAL_FILTER='[.[] | select(.status == "queued" or .status == "in_progress
 
 # Quiesce (round-8: the SECRET-FREE first run of the two-run protocol): disable every writer
 # workflow so no NEW writer run — including a `gh run rerun` of an old pre-env-binding snapshot
-# — can start. Idempotent (disabling a disabled workflow succeeds). Re-enabled by `--phase
-# resume-writers` (self-resume after a COMPLETED migrate, or a standalone phase: resume).
+# — can start. Re-enabled by `--phase resume-writers` (self-resume after a COMPLETED migrate,
+# or a standalone phase: resume).
+#
+# IDEMPOTENCE IS ASSERTED, NOT ASSUMED (issue #328, run 29674141477): `gh workflow disable`
+# resolves its selector against ACTIVE workflows ONLY, so it EXITS NONZERO ("could not find
+# any workflows named ...") on an already-disabled one. Q2 (the drain check) legitimately
+# refuses a first quiesce attempt whose writers were already disabled by Q1, and the operator's
+# re-dispatch then died at Q1 on every writer the first attempt had disabled — the retry could
+# never converge. A nonzero disable is therefore INCONCLUSIVE, not fatal: read the workflow's
+# state and accept ONLY the exact postcondition Q1 owes the migrate phase's M0a gate —
+# `disabled_manually`. Anything else — active (a genuine failure: a 403 from a mint without
+# Actions: write, or a transient), `disabled_inactivity` (which M0a rejects), or a state that
+# cannot be read at all — fails closed before Q2 and before any mutation. The state read sits
+# under Actions: READ, which the quiesce mint's Actions: WRITE grant includes, so the retry
+# path needs no new permission (pinned by the self-test's production-grant retry scenario).
 quiesce_writers() {
-  local wf
+  local wf wf_state
   for wf in "${WRITER_WORKFLOWS[@]}"; do
-    gh workflow disable "$wf" -R "$REPO" \
-      || die "gh workflow disable ${wf} failed — cannot quiesce the secret writers, refusing before any listing or mutation (fail closed; NOTE: workflow disable needs the App token's Actions: write grant)"
-    printf 'quiesced (workflow disabled): %s\n' "$wf"
+    if gh workflow disable "$wf" -R "$REPO"; then
+      printf 'quiesced (workflow disabled): %s\n' "$wf"
+      continue
+    fi
+    wf_state=$(gh api "repos/${REPO}/actions/workflows/${wf}" --jq .state) \
+      || die "gh workflow disable ${wf} failed and its state could not be read — cannot prove ${wf} is quiesced, refusing before any listing or mutation (fail closed; NOTE: the disable needs the App token's Actions: write grant, which includes the Actions: read this state check uses)"
+    [[ "$wf_state" == "disabled_manually" ]] \
+      || die "gh workflow disable ${wf} failed and the workflow is '${wf_state}', not disabled_manually — cannot quiesce the secret writers, refusing before any listing or mutation (fail closed; NOTE: workflow disable needs the App token's Actions: write grant)"
+    printf 'quiesced (already disabled_manually — the disable was a selector miss on a workflow a previous quiesce attempt disabled): %s\n' "$wf"
   done
 }
 
@@ -1244,12 +1267,34 @@ printf '%s\n' "$*" >> "$state/calls.log"
 # a scenario red here. Workflow disable/enable (the round-5 quiesce) sit under Actions: WRITE.
 _grant() {
   [[ ! -f "$state/grants" ]] && return 0
-  grep -qxF -- "$1" "$state/grants"
+  grep -qxF -- "$1" "$state/grants" && return 0
+  # GitHub's fine-grained permissions are LEVELS, not a set: write INCLUDES read. The quiesce
+  # mint declares Actions: WRITE only, and its #328 retry path issues an Actions:READ
+  # workflow-state read — so a read requirement is satisfied by a write grant, and the
+  # production-grant retry scenario stays a real test of the production token rather than of a
+  # fictional read+write one. A missing grant ENTIRELY still 403s (scenario 16).
+  [[ "$1" == *:read ]] && grep -qxF -- "${1%:read}:write" "$state/grants"
+}
+# The modeled state of workflow $1: an explicit `state_<wf>` override (used to model
+# disabled_inactivity), else disabled_manually once a `workflow disable` has touched it, else
+# active. Shared by `workflow disable`'s selector resolution and the workflow-state endpoint so
+# the two can never disagree.
+_wf_state() {
+  if [[ -f "$state/state_$1" ]]; then cat "$state/state_$1"
+  elif [[ -f "$state/disabled_$1" ]]; then echo disabled_manually
+  else echo active; fi
 }
 case "$*" in
   "workflow disable "*" -R o/r")
     _grant actions:write \
       || { echo "HTTP 403: Resource not accessible by integration (workflow disable needs Actions: write)" >&2; exit 1; }
+    # #328: gh resolves `workflow disable` against ACTIVE workflows ONLY — disabling an
+    # already-disabled (or inactivity-disabled) workflow is a selector MISS, not a no-op.
+    [[ "$(_wf_state "$3")" == active ]] \
+      || { echo "could not find any workflows named $3" >&2; exit 1; }
+    # A modeled transient/denied disable of an ACTIVE workflow (state unchanged) — the reject
+    # direction of the #328 idempotence rule.
+    [[ -f "$state/fail_disable_$3" ]] && { echo "HTTP 502: Bad Gateway" >&2; exit 1; }
     touch "$state/disabled_$3"   # model gh state: the workflow is now DISABLED
     exit 0 ;;
   "workflow enable "*" -R o/r")
@@ -1264,7 +1309,7 @@ case "$*" in
     _grant actions:read \
       || { echo "HTTP 403: Resource not accessible by integration (workflow-state read needs Actions: read)" >&2; exit 1; }
     wfname=${2#repos/o/r/actions/workflows/}
-    if [[ -f "$state/disabled_${wfname}" ]]; then echo disabled_manually; else echo active; fi
+    _wf_state "$wfname"
     exit 0 ;;
   "api repos/o/r/actions/runs/"*" --jq .created_at")
     # Round-9 ordering attestation: the MIGRATE gate fetches ITS OWN run's created_at (the
@@ -1504,6 +1549,22 @@ FAKE
     printf 'run list --all -R o/r --workflow %s --limit 1000 --json status,databaseId --jq %s\n' \
       "$wf" "$NONTERMINAL_FILTER" >> "$expected_quiesce"
   done
+  # ISSUE #328 — the RETRY shape of the same phase: every writer is ALREADY disabled, so each
+  # `gh workflow disable` is a selector MISS (nonzero) and is followed by the workflow-state
+  # read that proves the postcondition; then the identical 4 drain snapshots. Pinning this
+  # sequence keeps the idempotence path from silently degrading into a blanket swallow of
+  # disable failures (no state check) or into an unconditional pre-read on the happy path
+  # (which would break the scenario-0 pin above).
+  local expected_quiesce_retry="$tmp/expected-quiesce-retry.log"
+  : > "$expected_quiesce_retry"
+  for wf in worker.yml review-fix.yml set-up-account.yml pat-validity.yml; do
+    printf 'workflow disable %s -R o/r\n' "$wf" >> "$expected_quiesce_retry"
+    printf 'api repos/o/r/actions/workflows/%s --jq .state\n' "$wf" >> "$expected_quiesce_retry"
+  done
+  for wf in worker.yml review-fix.yml set-up-account.yml pat-validity.yml; do
+    printf 'run list --all -R o/r --workflow %s --limit 1000 --json status,databaseId --jq %s\n' \
+      "$wf" "$NONTERMINAL_FILTER" >> "$expected_quiesce_retry"
+  done
   # Seed the state a SUCCESSFUL quiesce run leaves behind (writers disabled), plus the round-9
   # GOOD ORDERING: this run (id 7777) was queued at 12:00 and the newest successful quiesce
   # run COMPLETED at 11:50 — strictly before the queue instant, so the ordering attestation
@@ -1589,6 +1650,61 @@ FAKE
     "$rc-$(grep -c "pat-validity.yml is 'active'" "$tmp/s0d.out")" 1-1
   chk "partially-quiesced migrate: zero mutations" \
     "$(grep -cE '^secret (set|delete) ' "$s0d/calls.log" || true)" 0
+
+  # --- scenario 0e: ISSUE #328 — the QUIESCE RETRY. This resumes exactly where scenario 0b
+  # stopped: that attempt disabled all 4 writers and then REFUSED at Q2 (a live writer run),
+  # deliberately leaving them disabled. The operator waits for the run to finish and
+  # re-dispatches quiesce — and in run 29674141477 that retry DIED at Q1, because gh resolves
+  # `workflow disable` against ACTIVE workflows only and errored on every already-disabled
+  # writer, so 0b's "re-dispatch quiesce converges" claim was false. The retry must now
+  # converge on the ALREADY-DISABLED state. The grants file is the PRODUCTION quiesce mint
+  # verbatim — Actions: WRITE and nothing else — so the scenario also proves the postcondition
+  # read needs no grant the secret-free mint lacks.
+  local s0e="$tmp/s0e"
+  mkdir -p "$s0e"
+  for wf in worker.yml review-fix.yml set-up-account.yml pat-validity.yml; do touch "$s0e/disabled_$wf"; done
+  printf 'actions:write\n' > "$s0e/grants"
+  rc=$(run_case "$s0e" "$tmp/s0e.out" quiesce none)
+  chk "#328 quiesce RETRY over already-disabled writers CONVERGES (the 29674141477 failure)" "$rc" 0
+  chk "#328 retry: EXACT gh argv (4 missed disables each PROVEN by a state read -> 4 drain snapshots)" \
+    "$(diff -q "$expected_quiesce_retry" "$s0e/calls.log" >/dev/null 2>&1 && echo same || echo diff)" same
+  chk "#328 retry: all 4 writers accepted as already disabled_manually" \
+    "$(grep -c 'already disabled_manually' "$tmp/s0e.out")" 4
+  chk "#328 retry: reaches QUIESCE PHASE COMPLETE (Q2 ran — the drain is re-proven, not skipped)" \
+    "$(grep -c 'QUIESCE PHASE COMPLETE' "$tmp/s0e.out")" 1
+  chk "#328 retry: all 4 writers still DISABLED afterwards" \
+    "$(find "$s0e" -name 'disabled_*' | wc -l)" 4
+  chk "#328 retry: still touches NO secret endpoint under the Actions:write-only production grant" \
+    "$(grep -cE '(^secret |/secrets)' "$s0e/calls.log" || true)" 0
+
+  # --- scenario 0f: #328 REJECT DIRECTION 1 — a failed disable whose workflow is
+  # disabled_inactivity (GitHub's own 60-day auto-disable of a scheduled workflow) is NOT the
+  # postcondition Q1 owes M0a, which accepts disabled_manually ONLY. Accepting any non-active
+  # state here would hand the migrate phase a gate it must then reject — fail closed at Q1,
+  # before the drain check and before any mutation.
+  local s0f="$tmp/s0f"
+  mkdir -p "$s0f"
+  touch "$s0f/disabled_worker.yml" "$s0f/disabled_review-fix.yml"
+  printf 'disabled_inactivity\n' > "$s0f/state_set-up-account.yml"
+  rc=$(run_case "$s0f" "$tmp/s0f.out" quiesce none)
+  chk "#328 disabled_inactivity is NOT accepted as quiesced -> fail closed" "$rc" 1
+  chk "#328 disabled_inactivity: message names the state and the required disabled_manually" \
+    "$(grep -c "set-up-account.yml failed and the workflow is 'disabled_inactivity', not disabled_manually" "$tmp/s0f.out")" 1
+  chk "#328 disabled_inactivity: ZERO drain listings (fail closed before Q2) and pat-validity never reached" \
+    "$(grep -cE '^run list ' "$s0f/calls.log" || true)-$(grep -cE '^workflow disable pat-validity' "$s0f/calls.log" || true)" 0-0
+
+  # --- scenario 0g: #328 REJECT DIRECTION 2 — a disable that fails while the workflow is still
+  # ACTIVE (a transient 5xx, or a mint without Actions: write) is a REAL failure: the writer is
+  # NOT quiesced. The idempotence rule must not degrade into swallowing every nonzero disable.
+  local s0g="$tmp/s0g"
+  mkdir -p "$s0g"
+  touch "$s0g/fail_disable_review-fix.yml"
+  rc=$(run_case "$s0g" "$tmp/s0g.out" quiesce none)
+  chk "#328 disable failing on a still-ACTIVE writer -> fail closed (idempotence is not a blanket swallow)" "$rc" 1
+  chk "#328 still-active writer: message names the active state" \
+    "$(grep -c "review-fix.yml failed and the workflow is 'active', not disabled_manually" "$tmp/s0g.out")" 1
+  chk "#328 still-active writer: review-fix stays ENABLED and ZERO drain listings ran" \
+    "$([[ -f "$s0g/disabled_review-fix.yml" ]] && echo disabled || echo active)-$(grep -cE '^run list ' "$s0g/calls.log" || true)" active-0
 
   # --- scenario 1: FRESH MAIN PHASE — a quiesce run has succeeded (writers disabled +
   # drained), env empty, repo holds all 14. Also the exact argv-sequence assertion (the
@@ -1924,6 +2040,18 @@ FAKE
     > "$tmp/s12c-snap-all.out" 2>&1 || snap_all_rc=$?
   chk "fake-gh model: SNAPSHOT listing with --all serves the filtered count on the disabled workflow" \
     "$snap_all_rc-$(cat "$tmp/s12c-snap-all.out")" 0-0
+  # ISSUE #328 non-vacuity: the same ACTIVE-only selector resolution applies to `workflow
+  # disable` itself — a REPEAT disable of the workflow just disabled above ERRORS, which is
+  # exactly what killed the quiesce retry in run 29674141477. Without this modeled failure the
+  # retry scenarios (0e/0f/0g) would be vacuous: every disable would trivially succeed.
+  local dis2_rc=0
+  FAKE_GH_STATE="$s12c" "$tmp/bin/gh" workflow disable worker.yml -R o/r > "$tmp/s12c-dis2.out" 2>&1 || dis2_rc=$?
+  chk "fake-gh model: a REPEAT workflow disable on the already-disabled workflow ERRORS (#328: gh resolves the selector against ACTIVE workflows only)" \
+    "$dis2_rc" 1
+  chk "fake-gh model: the repeat-disable failure names the selector miss" \
+    "$(grep -c 'could not find any workflows named worker.yml' "$tmp/s12c-dis2.out")" 1
+  chk "fake-gh model: the failed repeat disable leaves the workflow disabled_manually (the state Q1's postcondition check reads)" \
+    "$(FAKE_GH_STATE="$s12c" "$tmp/bin/gh" api repos/o/r/actions/workflows/worker.yml --jq .state)" disabled_manually
 
   # --- scenario 12d: TRANSITIONING RUN (round-8 finding 2 — the non-atomic drain check): a
   # writer run moves between nonterminal statuses (requested -> queued, the real forward
