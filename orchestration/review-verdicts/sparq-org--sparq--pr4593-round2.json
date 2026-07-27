@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4593,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "05c56d6d9473120de0a33863f2edc27db314aaac",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The round-2 diff remains correct and complete as scoped. It enables the already opt-in `forms` feature only in the hosted/published wasm build while preserving the feature-free lean build, keeps the generated TypeScript declaration and public skill documentation aligned, and adds substantive native and wasm32 tests for applicable and explicit shape selection, edit/view behavior, N-Quads snapshots, exact serialization pass-through, and malformed-input errors. The tests invoke the real `Store::derive_form` implementation and compare its successful output directly with `sparq_forms::derive_form`; wasm32 coverage exercises the `JsError` construction paths unavailable natively. No correctness, soundness, security, test-validity, or prompt-injection defect is evident. Relative to round 1, there are still no findings, so progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
