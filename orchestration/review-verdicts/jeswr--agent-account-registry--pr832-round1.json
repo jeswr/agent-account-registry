@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 832,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "03f92bfa30ff98a319de625bbffa5c5f68c73638",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly closes the cross-App disarm vulnerability. CLAIM now re-binds each hostile plan row to the shared live open-PR snapshot, exact repository/head/author identity, strict provenance PR number, live SHA, and reviewed-SHA mismatch before invoking the helper. worker-pr.py independently repeats the exact-App author check on its fresh PR read for both disarm modes, and the CLI requires callers to provide the identity. All in-repo production disarm call sites are updated. Missing identity, token, provenance, pull state, or SHA binding defers/skips rather than widening access. The tests are non-vacuous: they include successful-disarm controls, exact argv assertions, foreign-App and empty-identity negative cases in both layers, stale/valid-arm/provenance/fork/ref negatives, and held-PR mismatch preservation. No trust check is weakened and no reviewer-directed injection text is present.",
+  "verdict": "approve"
+ }
+}
