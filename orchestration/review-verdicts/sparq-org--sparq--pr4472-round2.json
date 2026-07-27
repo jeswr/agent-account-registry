@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4472,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "4d3fd76f688815414375a5158032c0ff083cbe92",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The design first states that termArg distinguishes str by coercing it to a NamedNode, but step 3 then classifies a string-literal constant as a syntactic form that cannot produce a graph name and requires rejecting it at generation time. Those statements are incompatible: under the described existing evaluation semantics, a str expression does produce the NamedNode variant admitted by GraphName. Implementing the proposed check would reject valid quad-emission grammars rather than merely reject out-of-space graph terms.",
+    "file": "research/shuttle-gen-rs-backend-gaps-2026-07.md",
+    "fix_hint": "Remove string-literal constants from the statically rejected forms, or explain and specify a graph-slot-specific semantic change that intentionally disables the existing str-to-NamedNode coercion. Add a positive generator/runtime test for the chosen string case so the compile-time filter is demonstrated to be acceptance-preserving; keep literal(..) and tt(..) as negative cases.",
+    "severity": "major",
+    "title": "Compile-time graph check rejects a form that termArg turns into a named node"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 2 fixes both prior findings: it adds runtime.inc.rs to the gen-rs touch-point inventory and makes the graph-name value space a real invariant through a closed GraphName type plus fallible emission-time conversion, with negative and behavioral tests in both backends. However, the newly specified compile-time check contradicts the document's own account of termArg(): it rejects string-literal graph expressions even though termArg coerces str to NamedNode. That would reject an expression whose evaluated value is in the graph-name value space, so the design is not yet correct as written.",
+  "verdict": "request_changes"
+ }
+}
