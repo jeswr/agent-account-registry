@@ -8226,9 +8226,12 @@ def _self_test():
         assert "head ref is not a worker branch" in _off_log.getvalue()
 
         # (3) A FORK PR IS NEVER ADMITTED — the one predicate no waiver can reach. The record is
-        # valid, the author is enrolled, the branch would be waived: only the fork gate stands, and
-        # it must stand FIRST. Hoisting it above the waivable gates is what this pins; moving it
-        # back below them reds this because the head-ref reason would win instead.
+        # valid, the author is enrolled, the branch would be waived: only the fork gate stands.
+        # THE OUTCOME is what this pins, and it pins it by behaviour: deleting the fork gate, or
+        # conditioning it on `orchestrator_admitted`, reds these lines. It does NOT pin the gate's
+        # POSITION — review of #759 measured that moving the gate below both waivable gates left
+        # this green, because for an ADMITTED PR the head-ref gate is waived and the fork gate is
+        # reached wherever it sits. The position is pinned separately, and observably, in (3b).
         _fork_log = io.StringIO()
         with contextlib.redirect_stdout(_fork_log):
             assert enumerate_review_items(
@@ -8326,6 +8329,26 @@ def _self_test():
         globals()["claim_review_admission_error"] = _saved_claim_admission
     assert claim_admits_orchestrator_class() is False, \
         "the wired-CLAIM fixture leaked — every later assertion would describe the wrong world"
+
+    # (3b) THE FORK GATE'S POSITION, pinned by the REPORTED REASON. The ordering claim attached to
+    # (3) was measured untrue in review of #759: for an ADMITTED PR the head-ref gate is waived, so
+    # the fork gate is reached wherever it sits and moving it changed no outcome. The position IS
+    # observable — on a fork PR that is NOT admitted, with an ordinary branch, the two gates
+    # disagree about which one reports. The fork gate is the single attacker-facing predicate here,
+    # so it must be the one that names the refusal: a "head ref is not a worker branch" audit line
+    # for an attacker-controlled head is a misleading record of what actually stopped it. Moving
+    # the fork gate back below the head-ref gate reds exactly this pair.
+    _order_log = io.StringIO()
+    with contextlib.redirect_stdout(_order_log):
+        assert enumerate_review_items(
+            repo, [_enrol_pull(head_repo="attacker/repo")], {41: _orch}, [], issue_labels, now,
+            enrolled_authors=()) == []
+    assert "head repo is not the target repo" in _order_log.getvalue(), \
+        ("the FORK gate must report first — it is the attacker-facing predicate, and it is hoisted "
+         f"above every waivable gate for that reason. Got: {_order_log.getvalue()}")
+    assert "head ref is not a worker branch" not in _order_log.getvalue(), \
+        ("the head-ref gate reported before the fork gate — the fork gate has been moved back "
+         "below a waivable predicate")
 
     # (8b) THE INTERLOCK, AS THE SHIPPED TREE ACTUALLY BEHAVES. Identical inputs to (1) — the
     # enrolled login, the valid orchestrator record, the ordinary branch — but the CLAIM leg
