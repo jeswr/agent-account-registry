@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4535,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "cf35d6a513b8bbd6d600ba7f4f176a9c942c1092",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change is a research-only, explicitly qualified null-result record and a consistent index update; it modifies no compiler or proving code. The central conclusion is internally supported by the cited emitted ACIR shape: the existing constant-divisor bound makes the quotient one bit, duplicate range constraints target the same witnesses and are eliminated, and the proposed specialization retains the same hint, bit/remainder range checks, and division relation. The adjacent 2^128 observation is clearly separated as unimplemented and unmeasured, its constraint-equivalence argument is appropriately bounded to a constant power-of-two divisor, and the document requires real-path differential, negative, gate, and corpus testing before any upstream change. Claims about unavailable evidence, measurements, PR #10159, and the candidate's proof status are consistently caveated. The accompanying program record accurately summarizes those limits. No hostile instruction directed at the reviewer was found in the diff.",
+  "verdict": "approve"
+ }
+}
