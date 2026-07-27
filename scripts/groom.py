@@ -1713,8 +1713,8 @@ def phase_exit_failure(outcome: PhaseOutcome) -> str | None:
 def sweep_exit_failure(outcomes: "list[PhaseOutcome] | tuple[PhaseOutcome, ...]") -> str | None:
     """EVERY phase's systemic failure, joined — never just the first (issue #647).
 
-    The sweep has four per-object phases — stale-PR detection, issue status repair, parked-PR
-    defuse, stale-PR hand-off — and they fail independently. Reporting only the first would hide a
+    The sweep has five per-object phases — stale-PR detection, issue status repair, parked-PR
+    defuse, age-park re-admission, stale-PR hand-off — and they fail independently. Reporting only the first would hide a
     second systemic failure behind a fixed one, so each phase is judged by the one precedence rule
     and every reason is named.
     """
@@ -2872,8 +2872,14 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
                 raise GroomError(
                     f"target pull request head sha is malformed for {action.repo}#{action.number}")
             machine_park = park_label == park_policy.MACHINE_PARK_PR_LABEL
+            # A receipt is minted for EVERY classified cause, machine park or over-cap human
+            # escalation alike. Both consume a generation, so both must be on record — and the
+            # escalation must not be silenced by the machine receipts that preceded it: those
+            # bodies carry STALE_PR_MARKER, so a plain marker dedupe would swallow the one comment
+            # that explains the flap and hand the maintainer a bare `needs:user`. An UNMAPPED
+            # cause mints nothing and keeps master's once-ever dedupe byte-for-byte.
             receipt = (f"{AGE_PARK_MARKER} cause={cause} head={head_sha} gen={generation} -->"
-                       if machine_park else "")
+                       if cause is not None else "")
             label_changed = False
             if park_label not in labels:
                 # Sticky human unpark (park_policy.py defect 2): a human who removed THIS label
@@ -2907,7 +2913,7 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
             # class keeps the original once-ever dedupe unchanged.
             already_commented = any(
                 comment["user"]["login"].casefold() == bot_login.casefold()
-                and ((receipt in comment["body"]) if machine_park
+                and ((receipt in comment["body"]) if receipt
                      else (STALE_PR_MARKER in comment["body"]))
                 for comment in comments
             )
@@ -2942,7 +2948,7 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
                         f"This worker PR has been untouched beyond the {limits[action.repo].worker_timeout_minutes}-"
                         f"minute maintenance threshold, and {reason}. Grooming will not close, merge, or force-push "
                         f"it; human review is required.{flap}\n\n"
-                        f"{STALE_PR_MARKER}"
+                        f"{STALE_PR_MARKER}" + (f"\n{receipt}" if receipt else "")
                     )
                 api.request(
                     "POST",
@@ -5921,9 +5927,11 @@ def _self_test() -> int:
         # automatic re-admission it may, and the disposition becomes ESCALATION to the human class.
         # Raise AGE_UNPARK_MAX (or drop the generation comparison) and this reds.
         def _park_receipt_comment(gen: int, number: int = 31, cause: str = "merge-dirty") -> dict:
+            # Faithful to what the hand-off actually posts — STALE_PR_MARKER INCLUDED. A
+            # fixture that omitted it would let a dedupe reverted to the once-ever marker pass.
             return {"user": {"login": "app[bot]"},
-                    "body": f"> 🤖 SPARQ agent\n\n{AGE_PARK_MARKER} cause={cause} "
-                            f"head={number:040x} gen={gen} -->"}
+                    "body": f"> 🤖 SPARQ agent\n\n{STALE_PR_MARKER}\n{AGE_PARK_MARKER} "
+                            f"cause={cause} head={number:040x} gen={gen} -->"}
 
         terminal_sweep_env["pages"] = {
             "/repos/owner/repo/issues/31/comments": [
@@ -5965,6 +5973,12 @@ def _self_test() -> int:
                 "auto_merge": None,
             }
 
+        def _before(writes: list[Any], first: Any, second: Any) -> bool:
+            """`first` was written strictly before `second`. Total, never raises: an assertion
+            that CRASHES on a mutant reports a crash-kill, which hides WHICH guard failed."""
+            return (first in writes and second in writes
+                    and writes.index(first) < writes.index(second))
+
         recovered_pr = _machine_parked_pr(33, "clean", ("review:parked",))
         unpark_receipt = f"{AGE_UNPARK_MARKER} cause=merge-dirty head={33:040x} gen=1 -->"
         terminal_sweep_env["pages"] = {
@@ -5978,8 +5992,8 @@ def _self_test() -> int:
             (
                 any(unpark_receipt in body for body in _comment_bodies()),
                 _label_delete in unpark_writes,
-                unpark_writes.index(("POST", "/repos/owner/repo/issues/33/comments"))
-                < unpark_writes.index(_label_delete),
+                _before(unpark_writes, ("POST", "/repos/owner/repo/issues/33/comments"),
+                        _label_delete),
                 "age_unparked=1" in unpark_log,
             ),
             (True, True, True, True),
@@ -6051,6 +6065,82 @@ def _self_test() -> int:
                 "the latest park application is HUMAN-owned" in human_applied_log,
             ),
             ([], True),
+        )
+        terminal_sweep_env["pages"] = {}
+
+        # (A4) THE STICKY VETO FOLLOWS THE LABEL BEING WRITTEN. A human who removed `review:parked`
+        # more recently than any application has explicitly unparked THIS PR, and the machine must
+        # not re-apply it. Hard-code the veto's label argument back to "needs:user" — a six-character
+        # change that leaves the park class, the receipt and every other check above intact — and
+        # the veto silently queries a label with no history, so the suppressed park is written
+        # anyway. That is the mutant this check exists for.
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/31/timeline": [
+                {"event": "labeled", "label": {"name": "review:parked"},
+                 "created_at": "2026-07-26T10:00:00Z", "actor": {"login": "app[bot]"}},
+                {"event": "unlabeled", "label": {"name": "review:parked"},
+                 "created_at": "2026-07-26T11:00:00Z", "actor": {"login": "jeswr"}}],
+        }
+        veto_log, _e, _r = _sweep_with_refusals(
+            {}, pulls=(_stale_worker_pr(31),),
+            extra_gets={"/repos/owner/repo/collaborators/jeswr/permission":
+                        {"permission": "admin"}},
+        )
+        check(
+            "the sticky human unpark is checked against the label ACTUALLY BEING WRITTEN: a human "
+            "who removed review:parked vetoes the MACHINE age park (not just needs:user)",
+            (
+                _park_bodies(),
+                "review:parked park suppressed" in veto_log,
+                _comment_bodies(),
+            ),
+            ([], True, []),
+        )
+        terminal_sweep_env["pages"] = {}
+
+        # (A5) A SECOND generation must be able to mint. The machine class dedupes on its own
+        # receipt fingerprint; revert it to the once-ever STALE_PR_MARKER dedupe and generation 2
+        # is never recorded — so the cap in (A3) can never be reached and the escalation to the
+        # human class becomes unreachable. The prior tick's receipt already carries
+        # STALE_PR_MARKER, so only the fingerprint dedupe distinguishes the two.
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/31/comments": [_park_receipt_comment(1)]}
+        gen2_log, _e, _r = _sweep_with_refusals({}, pulls=(_stale_worker_pr(31),))
+        check(
+            "a RE-park after a re-admission mints a NEW generation receipt — without it the cap "
+            "is unreachable and nothing ever escalates",
+            (
+                any(f"{AGE_PARK_MARKER} cause=merge-dirty head={31:040x} gen=2 -->" in body
+                    for body in _comment_bodies()),
+                _park_bodies(),
+            ),
+            (True, [{"labels": ["review:parked"]}]),
+        )
+        terminal_sweep_env["pages"] = {}
+
+        # (A6) The exit phase is judged by the SHARED precedence rule, like every other phase.
+        # Its ONLY candidate's receipt write is refused: nothing completed, so the run must exit
+        # NON-ZERO naming the deferral. Drop unpark_outcome from the sweep_exit_failure tuple and
+        # a whole re-admission phase can fail in total while the run reports success — the
+        # exit-zero-swallows-failure shape this module already carries three scars from.
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/37/comments": [_park_receipt_comment(1, 37)]}
+        unpark_fail_log, unpark_fail_error, _r = _sweep_with_refusals(
+            {("POST", "/repos/owner/repo/issues/37/comments"): _live_http_failure(
+                "POST", "/repos/owner/repo/issues/37/comments", forbidden_envelope)},
+            pulls=(_machine_parked_pr(37, "clean", ("review:parked",), fresh=True),),
+        )
+        check(
+            "a re-admission phase in which NOTHING completed exits NON-ZERO naming the deferral "
+            "(the phase is enrolled in the shared exit precedence, not exempt from it)",
+            (
+                "every age park re-admission failed (1 attempted, 0 completed)"
+                in unpark_fail_error,
+                "owner/repo#37" in unpark_fail_error,
+                "age_unpark_deferred=1" in unpark_fail_log,
+                "age_unparked=0" in unpark_fail_log,
+            ),
+            (True, True, True, True),
         )
         terminal_sweep_env["pages"] = {}
 
