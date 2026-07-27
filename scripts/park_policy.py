@@ -1364,6 +1364,220 @@ def park_reason_records(comments, bot_login, log=print):
 # records' trust filter), never a third party's, so no one can talk a park out of the human
 # terminal by quoting a string.
 
+# --- [registry #814] THE INJECTION DENY IS AFFIRMATIVE-ONLY ----------------------------------
+#
+# THE DEFECT. The injection half of the deny table below used to be a bare substring rule —
+# `prompt[- ]injection` matched ANYWHERE in the bot's own history. But the bot REPUBLISHES
+# model-derived verdict text under its own identity (worker-pr.post_findings), and a reviewer
+# reporting a CLEAN diff says exactly that, in those words. So the deny fired on a NEGATION and
+# stranded three live sparq PRs on the HUMAN-owned terminal for a signal that is not there. Their
+# real sentences (pinned verbatim as self-test fixtures below, so this can never silently regress):
+#
+#   #3554  "No correctness, soundness, test-validity, security, or prompt-injection issue remains
+#           in the diff-scoped evidence."   and   "No instruction-like prompt injection appears in
+#           the diff."
+#   #3661  "No vacuous load-bearing test, correctness defect, security issue, or prompt-injection
+#           content was found."
+#   #3901  "No instruction-like prompt injection was detected in the diff."
+#
+# THE DIRECTION OF THIS CHANGE, STATED PLAINLY. Narrowing a deny WIDENS what automation may act
+# on. This rule is the only thing keeping `reclassify_legacy_park` (and therefore
+# dispatch-claim._migrate_legacy_park) and `reconcile-park-misescalation` from taking a security
+# escalation out of a human's hands. It is therefore built to DENY BY DEFAULT and release ONLY on
+# PROOF, in two tiers:
+#
+#   TIER A — an UNCONDITIONALLY affirmative marker ANYWHERE in the text denies, full stop, and no
+#            negation anywhere can cancel it. Every one of the eight genuine live escalations
+#            (#3542 #3563 #3585 #3608 #3609 #3618 #3743 #4406) carries one, because the prose
+#            worker-pr writes at both injection park sites is "flagged possible prompt injection"
+#            / "flagged possible prompt-injection content". Tier A is also what makes a body
+#            carrying BOTH a negation and an affirmative fail CLOSED.
+#   TIER B — every REMAINING mention denies UNLESS its negation is PROVEN: a recognised negator
+#            must govern that mention from inside the mention's OWN sentence, with nothing between
+#            the two that breaks the negator's reach (a contrast word, a coordination, or a verb
+#            that starts a fresh predicate). "Cannot prove a negation" is NOT "is a negation" — it
+#            denies.
+#
+# THE RELEASE CONDITION, in full: no affirmative marker anywhere AND every single mention proven
+# negated. Everything else denies, including anything unclassifiable — a non-string body or a
+# failure inside the classifier itself (see injection_prose_denied's except arm).
+#
+# WHAT DID NOT CHANGE. The mention TERM is byte-identical to the pattern this rule has always
+# used (`prompt[- ]injection`, case-insensitive; the old separate `possible prompt injection`
+# entry was strictly subsumed by it, and now appears as a Tier-A affirmative marker). Deny is
+# still UNCONDITIONAL and ORDER-INDEPENDENT over the bot's whole history, the `human-arm` rule is
+# untouched, and no other prose rule, cause, or label authority moves.
+
+# The mention. Byte-identical to the historic deny pattern: #814 narrows WHEN a mention denies,
+# never WHICH strings count as a mention.
+_INJECTION_TERM = re.compile(r"prompt[- ]injection", re.IGNORECASE)
+
+# TIER A. Intrinsically affirmative constructions. A match ANYWHERE denies unconditionally — a
+# negation elsewhere in the body cannot cancel one of these, which is the fail-closed direction.
+_INJECTION_AFFIRMATIVE = (
+    # "possible prompt injection" / "possible prompt-injection content": the literal prose
+    # worker-pr writes at both injection park sites, and the reason all eight genuine live
+    # escalations deny. Note the deliberate consequence: "no possible prompt injection was found"
+    # ALSO denies. That is the correct direction for a security deny — an affirmative noun phrase
+    # is never talked away.
+    re.compile(r"\b(?:possible|potential|suspected|apparent|likely|probable|attempted)\s+"
+               r"prompt[- ]injection", re.IGNORECASE),
+    # A FLAG verb reaching the mention without leaving the sentence — "the reviewer flagged
+    # possible prompt injection", "the fixer flagged the seeded findings as possible prompt
+    # injection".
+    re.compile(r"\bflag(?:ged|ging|s)?\b[^.;!?\n]{0,80}?prompt[- ]injection", re.IGNORECASE),
+    # An explicit affirmative field value — "prompt injection: yes".
+    re.compile(r"prompt[- ]injection\s*[:=]\s*(?:yes|true|confirmed|detected|present)\b",
+               re.IGNORECASE),
+    # A mention naming an ACT rather than a category — "a prompt-injection attempt".
+    re.compile(r"prompt[- ]injection\s+(?:attempt|attack|payload|vector)\b", re.IGNORECASE),
+)
+
+# TIER B machinery. Sentence scoping is DELIBERATELY over-eager (a bare `.`, `|` or newline ends a
+# sentence): over-splitting can only shrink the window a negator is allowed to reach across, and a
+# negator that cannot reach its mention leaves the mention DENYING. Over-splitting is fail-closed.
+_INJECTION_SENTENCE_BOUNDARY = re.compile(r"[.!?;\n\r|]")
+
+_INJECTION_NEGATOR = re.compile(
+    r"(?:\b(?:no|not|none|neither|nor|never|without|nothing|absent|lacks|lacking|zero)\b"
+    r"|\bfree\s+(?:of|from)\b|\bdevoid\s+of\b|n't\b)", re.IGNORECASE)
+
+# What BREAKS a negator's reach. If any of these sits between the negator and the mention, the
+# negator is not proven to govern the mention and the mention denies. Two families:
+#   * contrast / coordination — "no X, BUT prompt injection ...", "no X AND prompt injection ..."
+#     (the second is the shape that would otherwise release "the reviewer found no gate failures
+#     and prompt injection in the diff");
+#   * a verb — a fresh predicate between the two means the negator is negating something else.
+# The three live negations survive this because their gaps are pure noun lists: "No correctness,
+# soundness, test-validity, security, or ", "No vacuous load-bearing test, correctness defect,
+# security issue, or ", "No instruction-like ".
+_INJECTION_NEGATION_BREAKER = re.compile(
+    r"\b(?:but|however|although|though|yet|whereas|while|nevertheless|nonetheless|except|"
+    r"aside|apart|besides|and|plus|also|additionally|"
+    r"was|were|is|are|be|been|being|am|has|have|had|does|do|did|"
+    r"found|detected|flagged|raised|reported|contain|contains|containing|appear|appears|"
+    r"remain|remains|seem|seems|show|shows|include|includes|identified|observed|present)\b",
+    re.IGNORECASE)
+
+# How far a negator may reach forward to its mention, in characters. The longest real gap in the
+# live population is #3661's 69-character noun list; 120 leaves headroom without letting a negator
+# at the far end of a long sentence claim an unrelated mention.
+_INJECTION_NEGATION_REACH = 120
+
+# The mention's OWN predicate, negated: "prompt injection was NOT detected", "prompt-injection
+# content has not been observed", "prompt injection: no". Deliberately tight — the copula/modal
+# must be within three words of the mention and the negator immediately after it — because a loose
+# forward scan would read "flagged possible prompt injection; no other issues" as a negation.
+_INJECTION_POST_NEGATION = re.compile(
+    r"\A(?:"
+    r"[\s,]*(?:\S+\s+){0,3}?(?:was|were|is|are|be|been|has|have|had|does|do|did|can|could|"
+    r"would|will|shall|should|may|might|appears?|seems?)\s+(?:not|never)\b"
+    r"|[\s,]*(?:not|never)\b"
+    r"|\s*[:=]\s*(?:no|none|not|false|absent)\b"
+    r")", re.IGNORECASE)
+
+
+def _injection_sentence_bounds(text, start, end):
+    """The span of the SENTENCE containing text[start:end] — the only window a negator may
+    reach across. Over-eager boundaries are fail-closed (see the note above)."""
+    left = 0
+    for boundary in _INJECTION_SENTENCE_BOUNDARY.finditer(text, 0, start):
+        left = boundary.end()
+    boundary = _INJECTION_SENTENCE_BOUNDARY.search(text, end)
+    return left, (boundary.start() if boundary else len(text))
+
+
+def _injection_mention_negated(text, start, end):
+    """(negated, why) for ONE mention. True ONLY on proof; every other outcome is False, which
+    denies. This is the whole fail-closed invariant in one function."""
+    left, right = _injection_sentence_bounds(text, start, end)
+    after = text[end:right]
+    post = _INJECTION_POST_NEGATION.match(after)
+    if post:
+        return True, f"its own predicate is negated ({post.group(0).strip()!r})"
+    before = text[left:start]
+    for negator in _INJECTION_NEGATOR.finditer(before):
+        gap = before[negator.end():]
+        if len(gap) > _INJECTION_NEGATION_REACH:
+            continue
+        if _INJECTION_NEGATION_BREAKER.search(gap):
+            continue
+        return True, f"negated by {negator.group(0).strip()!r} in the same sentence"
+    return False, ""
+
+
+def injection_prose_denied(text, log=print):
+    """(denied, detail) — whether ONE bot comment body records a prompt-injection SIGNAL, under
+    the affirmative-only rule documented above. `denied` True means the PR may never be
+    automatically re-classified out of the human-owned terminal.
+
+    FAIL CLOSED IS THE INVARIANT: this returns True for every input it cannot positively classify
+    as negation-only — a non-string body, and any exception raised anywhere inside the classifier.
+    A mention whose negation cannot be PROVEN is not a negation; it denies."""
+    try:
+        if not isinstance(text, str):
+            return True, ("the comment body is not text, so no negation can be proven — the "
+                          "injection deny fails CLOSED")
+        mentions = list(_INJECTION_TERM.finditer(text))
+        if not mentions:
+            return False, ""
+        for affirmative in _INJECTION_AFFIRMATIVE:
+            hit = affirmative.search(text)
+            if hit:
+                return True, ("an affirmative prompt-injection marker is recorded: "
+                              f"{hit.group(0).strip()!r}")
+        for mention in mentions:
+            negated, _why = _injection_mention_negated(text, mention.start(), mention.end())
+            if negated:
+                continue
+            left, right = _injection_sentence_bounds(text, mention.start(), mention.end())
+            return True, ("a prompt-injection mention that is not a proven negation is "
+                          f"recorded: {text[left:right].strip()[:160]!r}")
+        return False, ""
+    except Exception as exc:  # noqa: BLE001 — an unclassifiable body must DENY, never release
+        log(f"::warning::injection-prose classification failed ({exc}); the deny fails CLOSED "
+            "and the park stays on the human-owned terminal")
+        return True, f"injection-prose classification failed ({exc}) — failing closed"
+
+
+class _InjectionDenyHit:
+    """The truthy result of a deny, standing in for an `re.Match`. Carries the reason so a caller
+    that wants to explain itself can, without changing the `if pattern.search(body)` shape every
+    consumer of LEGACY_PARK_DENY_PROSE already uses."""
+
+    __slots__ = ("detail",)
+
+    def __init__(self, detail):
+        self.detail = detail
+
+    def group(self, *_args):
+        return self.detail
+
+    def __repr__(self):
+        return f"<injection-deny {self.detail!r}>"
+
+
+class _InjectionProseDeny:
+    """A drop-in for a compiled pattern inside LEGACY_PARK_DENY_PROSE.
+
+    WHY A MATCHER OBJECT RATHER THAN A NEW FUNCTION EVERY CONSUMER MUST ADOPT: the deny table is
+    read by three call sites (reclassify_legacy_park here, reconcile-park-misescalation.verdict,
+    worker-pr's deny-prose binding self-test) and all three use exactly `pattern.search(body)`.
+    Putting the fix in the TABLE means no call site can be missed — and a missed call site would
+    be a SILENT WIDENING, the one failure mode this change must not have."""
+
+    pattern = _INJECTION_TERM.pattern
+
+    def search(self, text, log=print):
+        denied, detail = injection_prose_denied(text, log=log)
+        return _InjectionDenyHit(detail) if denied else None
+
+    def __repr__(self):
+        return "<affirmative-only prompt-injection deny>"
+
+
+INJECTION_PROSE_DENY = _InjectionProseDeny()
+
 # Prose that, ANYWHERE in a PR's bot history, permanently disqualifies it from automatic
 # re-classification. DENY IS UNCONDITIONAL AND ORDER-INDEPENDENT — deliberately NOT "the most
 # recent cause wins".
@@ -1373,9 +1587,13 @@ def park_reason_records(comments, bot_login, log=print):
 # attempts made no change"). Under a recency rule both would re-classify as `nochange` and be
 # handed back to the machine — re-admitting two PRs a human parked for a security reason. A
 # raised injection flag is a property of the PR's whole history, not of its newest comment.
+#
+# [registry #814] The injection entry is the AFFIRMATIVE-ONLY matcher above, not a bare substring:
+# a NEGATED mention ("No instruction-like prompt injection was detected") is not a signal. The
+# `human-arm` entry is deliberately unchanged — it is a different rule with a different failure
+# mode, and widening this fix to it would be a second change wearing the first one's evidence.
 LEGACY_PARK_DENY_PROSE = (
-    (re.compile(r"possible prompt injection", re.IGNORECASE), "injection"),
-    (re.compile(r"prompt[- ]injection", re.IGNORECASE), "injection"),
+    (INJECTION_PROSE_DENY, "injection"),
     (re.compile(r"needs a human decision.*security", re.IGNORECASE), "human-arm"),
 )
 
@@ -1407,7 +1625,11 @@ def reclassify_legacy_park(comments, bot_login, stale_marker=None, log=print):
     2. DENY, UNCONDITIONALLY AND ORDER-INDEPENDENTLY (see LEGACY_PARK_DENY_PROSE). One injection
        or human-arm signal anywhere in the bot history disqualifies the PR forever. This is
        checked BEFORE any cause is derived so no ordering, recency, or precedence rule can ever
-       reach past it.
+       reach past it. [registry #814] A prompt-injection SIGNAL is an AFFIRMATIVE mention: a
+       reviewer reporting the ABSENCE of injection ("No instruction-like prompt injection was
+       detected") is not one. The affirmative-only test is fail-closed — it denies on anything it
+       cannot prove is a negation — and it is still unconditional and order-independent over the
+       whole history.
     3. The NEWEST recognised cause decides — but only a CAPACITY cause migrates. A question-class
        cause is returned with its class so the caller can record the marker WITHOUT moving the
        label: `history-rewritten` and `marker-corrupt` are genuine human questions and the human
