@@ -1,0 +1,44 @@
+{
+ "host_envelope": {
+  "pr": 4578,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "7e9478213972498f6c1497d579f0f91f33b92dd2",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "ValueSource::values returns only Vec<String>, documented as either a literal lexical form or a named-node IRI. Once those are collapsed to strings, generated code cannot distinguish an IRI object from a literal, nor xsd:string \"42\" from xsd:integer \"42\". check_integer and the other checkers validate only lexical text, so a property constrained by sh:datatype xsd:integer will accept an IRI whose string is \"42\" or a literal with the wrong datatype. This contradicts the public claim that load checks every declared datatype and means the generated loader does not enforce the mapped SHACL constraint.",
+    "file": "crates/sparq-wrapper-shacl/src/emit.rs",
+    "fix_hint": "Make ValueSource return a structured RDF value carrying at least term kind, literal lexical form, datatype IRI, and language where applicable. Require a literal with the exact declared datatype before lexical conversion. Add a real-path test showing that a lexically valid value with the wrong datatype and a named node are rejected.",
+    "severity": "major",
+    "title": "ValueSource erases RDF term kind and datatype, making sh:datatype checks unsound"
+   },
+   {
+    "body": "The harness stores every object as an untyped String and implements the same lossy ValueSource contract, so its bad-datatype case only tests malformed lexical text (\"forty-two\"). It never tests the load-bearing SHACL invariant that an object's RDF datatype and term kind match sh:datatype. Consequently the compile-and-run acceptance test passes even though correctly typed and incorrectly typed RDF terms with the same lexical form are indistinguishable.",
+    "file": "crates/sparq-wrapper-shacl/tests/emission.rs",
+    "fix_hint": "Use a fixture value enum or an adapter over actual RDF terms. Add cases for xsd:string \"42\" and a named-node object on an xsd:integer field, both of which must yield a datatype/type error, while xsd:integer \"42\" succeeds.",
+    "severity": "major",
+    "title": "Acceptance harness is vacuous for RDF datatype correctness"
+   },
+   {
+    "body": "check_date_time intentionally bounds every day at 31 rather than validating the calendar, accepts hour 24 with nonzero minutes/seconds, and accepts timezone +14 with nonzero minutes; these are not valid xsd:dateTime values. check_any_uri rejects the empty URI reference even though the xsd:anyURI value space permits it. The emitted loader therefore both accepts invalid values and rejects valid ones while claiming checked XSD scalars.",
+    "file": "crates/sparq-wrapper-shacl/src/emit.rs",
+    "fix_hint": "Implement the full XML Schema lexical/value constraints (including month-specific days, leap years, the 24:00:00 restriction, and the +14:00 timezone boundary), and align anyURI handling with XSD. Prefer a proven datatype parser if a std-only implementation cannot be made complete; add boundary tests for each rule.",
+    "severity": "major",
+    "title": "Generated XSD lexical checkers accept invalid values"
+   },
+   {
+    "body": "lower_type calls lower_field for property_children before sorting the resulting fields. assign returns the first name assigned to a child shape. If the same anonymous sh:node shape is reached through multiple properties, whichever property child the parser exposes first determines that nested type's generated name. Sorting fields afterward cannot undo the assignment, so equivalent statement orderings can produce different Rust source despite the byte-determinism guarantee.",
+    "file": "crates/sparq-wrapper-shacl/src/lower.rs",
+    "fix_hint": "Sort property children by their predicate path (with a deterministic tie-breaker) before any call that can assign a nested type name, or perform a deterministic discovery/naming pass before lowering fields. Add a statement-reordering test where two properties reference the same anonymous node shape and assert identical IR/source.",
+    "severity": "major",
+    "title": "Anonymous nested type naming can depend on property encounter order"
+   }
+  ],
+  "progress": null,
+  "summary": "The generated loaders are presented as checking SHACL datatypes and faithfully loading shape-conforming RDF, but the ValueSource interface discards RDF term kind and datatype and therefore cannot enforce sh:datatype at all. There are also concrete lexical-validation errors, and anonymous nested-type naming can still depend on parser encounter order despite the determinism guarantee. The current acceptance test uses an already-lossy string fixture, so it cannot expose the primary semantic defect.",
+  "verdict": "request_changes"
+ }
+}
