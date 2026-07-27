@@ -51,9 +51,26 @@ degrades the record loudly instead of impersonating an absent aggregator.
 Repo-level listings (issues / pulls) keep their sweep-fatal 5000-entry ceiling: the
 target planner step requires a complete issue snapshot for every manifest repo, so a
 per-repo degradation there needs a cross-step design (follow-up; see the PR record).
+
+COST (issue #721). This step is the dispatch tick: measured 2026-07-27 it was 759 s and
+812 s of a 771 s / 829 s PLAN job — ~98% — against a 600 s cron period. An instrumented
+run of THIS code against the live targets timed every request:
+
+    wall 684.9 s | inside urlopen 663.9 s (96.9%) | local compute 21.1 s (3.1%)
+    613 requests, 28,334 rows, median request 0.843 s
+    check-runs 474 req / 564.6 s (85%) | pr-detail 116 / 80.5 s | listings 23 / 18.8 s
+
+So the step is API-ROUND-TRIP bound, not compute bound, and the requests were issued one
+at a time. The request SET is not reducible without weakening completeness (the two
+tier-name gate reads exist because REST `check_name` takes one value; the legs walk exists
+because REST cannot filter check runs by conclusion), so the lever is OVERLAP: independent
+reads now run concurrently, bounded by SNAPSHOT_CONCURRENCY, folded back in input order.
+Nothing about WHICH pages are fetched, how a walk terminates, the per-walk ceilings, or the
+`total_count` cross-check changes — see _ordered_map.
 """
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import importlib.util
 import json
 import os
@@ -75,6 +92,24 @@ WORKER_HEAD_PREFIX = "sparq-agent/"
 MERGEABLE_POLL_ATTEMPTS = 3
 MERGEABLE_POLL_INTERVAL_SECONDS = 1
 SAFE_SHA = re.compile(r"[0-9a-f]{40}")
+
+# How many INDEPENDENT GitHub reads may be in flight at once (issue #721 / this file's
+# module docstring). This is a SECONDARY-RATE-LIMIT BUDGET, not a tuning knob:
+#   * GitHub's documented secondary limit for the REST API is 900 points per minute, and a
+#     GET costs 1 point.
+#   * Measured mean latency of this snapshot's reads (2026-07-27 instrumented run, 613
+#     requests against the live targets) is ~0.85 s, so C reads in flight sustain roughly
+#     C / 0.85 requests per second.
+#   * C = 8  ->  ~9.4 req/s  ->  ~565 req/min: inside the budget with headroom.
+#     C = 16 -> ~18.8 req/s  -> ~1130 req/min: OVER it.
+# Raising this without re-deriving that arithmetic trades a slow tick for a throttled one.
+# The PRIMARY limit is unaffected: overlapping reads does not change how many are issued.
+SNAPSHOT_CONCURRENCY = 8
+# Ceiling on a server-suggested `Retry-After` back-off. Overlapping reads is the way to
+# provoke a secondary rate limit, so the back-off must honour what GitHub asks for — but a
+# long suggestion must fail the read CLOSED inside the job's 15-minute timeout rather than
+# park the whole sweep on a sleep.
+RETRY_AFTER_CAP_SECONDS = 30
 
 
 class FetchError(Exception):
@@ -105,6 +140,28 @@ def _load_claim():
     return module
 
 
+def _retry_delay(exc, attempt):
+    """Seconds to wait before retrying a retryable read.
+
+    GitHub answers a SECONDARY rate limit (403/429) with a `Retry-After` header saying how
+    long to wait. The fixed 5s/10s ladder ignored it, which is survivable for a strictly
+    serial walk and is NOT survivable once reads overlap — retrying early on a secondary
+    limit is what turns a throttle into a ban. A malformed, non-positive, or absent header
+    falls back to the original ladder; an oversized one is capped (RETRY_AFTER_CAP_SECONDS)
+    so the read exhausts its retries and fails CLOSED instead of sleeping out the job.
+    """
+    header = getattr(exc, "headers", None)
+    suggested = header.get("Retry-After") if hasattr(header, "get") else None
+    if suggested is not None:
+        try:
+            seconds = int(str(suggested).strip())
+        except ValueError:
+            seconds = 0
+        if seconds > 0:
+            return min(seconds, RETRY_AFTER_CAP_SECONDS)
+    return 5 * (attempt + 1)
+
+
 def make_fetch(token):
     """Authenticated single-page reader with retry/backoff; raises FetchError, never exits
     (the caller decides sweep-fatal vs per-item)."""
@@ -122,7 +179,7 @@ def make_fetch(token):
                     return json.load(response)
             except HTTPError as exc:
                 if exc.code in RETRYABLE and attempt < 2:
-                    time.sleep(5 * (attempt + 1))
+                    time.sleep(_retry_delay(exc, attempt))
                     continue
                 raise FetchError(
                     f"authenticated GitHub read failed (HTTP {exc.code}) for "
@@ -135,6 +192,32 @@ def make_fetch(token):
                     "authenticated GitHub read failed for " + url.split("?")[0]) from exc
 
     return fetch
+
+
+def _ordered_map(worker, jobs, concurrency=SNAPSHOT_CONCURRENCY):
+    """Run `worker` over `jobs` with at most `concurrency` in flight, results in INPUT ORDER.
+
+    What this is allowed to change, and what it is not:
+
+    * It overlaps reads that are already INDEPENDENT — one worker PR's status never depends
+      on a sibling's, and every request issued is a GET. It does NOT change which URLs are
+      requested, how a page walk terminates, the per-walk ceilings, or the `total_count`
+      cross-check. Completeness is therefore exactly the serial walk's completeness.
+    * Results are keyed by input index, so the emitted snapshot — including the ORDER of the
+      `skips` histogram, which the dispatch summary renders — is byte-identical to the
+      serial walk for the same set of API responses. Determinism is a correctness property
+      here, not a nicety; `snapshot_parallel_output_is_identical_to_serial` pins it.
+    * Failures are NOT swallowed. `ThreadPoolExecutor.map` re-raises the first exception in
+      INPUT order as the results are consumed, so a sweep-fatal FetchError out of a repo
+      listing stays sweep-fatal (`sweep_fatal_listing_failure_is_still_fatal` pins it) and a
+      per-item SnapshotItemError is still caught by the per-item handler that raised it.
+    """
+    jobs = list(jobs)
+    workers = min(max(int(concurrency), 1), len(jobs))
+    if workers <= 1:
+        return [worker(job) for job in jobs]
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return list(pool.map(worker, jobs))
 
 
 def _paginated(fetch, path):
@@ -277,12 +360,19 @@ def _pr_status_record(fetch, claim, repo, number):
     return record
 
 
-def _pr_status_snapshot(fetch, claim, repo, pulls):
+def _pr_status_snapshot(fetch, claim, repo, pulls, concurrency=SNAPSHOT_CONCURRENCY):
     """Per-worker-PR CI/merge status (GAP-A/B/C inputs) with per-item degradation.
     Returns (status_items, skips). Two tiers: a PRE-detail failure records a skip and NO
     status record (every snapshot-derived admission stands down); a POST-detail check-run
     failure records the SAME skip row for visibility but ALSO emits a degraded record
-    (detail intact, check_runs empty + marked) so the #42 disarm net still fires."""
+    (detail intact, check_runs empty + marked) so the #42 disarm net still fires.
+
+    The per-PR reads OVERLAP (issue #721: this walk was 85% of a 13-minute PLAN job, and
+    97% of that was time spent waiting inside urlopen). Each PR is still snapshotted by the
+    unchanged `_pr_status_record` — detail, then the tier-name gate reads, then the
+    conditional legs walk, in that order — so what changed is only which PRs are in flight
+    together. The results are folded back in INPUT order, so `status_items` and the `skips`
+    histogram are what a serial walk would have produced."""
     worker_pulls = [
         pull for pull in pulls
         if isinstance(pull, dict) and pull.get("state") == "open"
@@ -295,16 +385,23 @@ def _pr_status_snapshot(fetch, claim, repo, pulls):
         # marks the repo-wide skip): issue dispatch continues, every snapshot-derived PR
         # admission stands down. Better a status-blind tick than a dead sweep.
         return {}, [{"pr_number": 0, "reason": "worker-pr-census-overflow"}]
-    status_items = {}
-    skips = []
-    for pull in worker_pulls:
+
+    def snapshot_one(pull):
         number = pull["number"]
         try:
-            record = _pr_status_record(fetch, claim, repo, number)
+            return number, _pr_status_record(fetch, claim, repo, number), None
         except SnapshotItemError as exc:
             # THE per-item catch (run 29617040167): one unreadable PR detail defers
-            # itself with a recorded reason; its siblings and the sweep continue.
-            skips.append({"pr_number": number, "reason": exc.reason})
+            # itself with a recorded reason; its siblings and the sweep continue. It is
+            # caught INSIDE the worker so a per-item failure can never abort a sibling's
+            # read the way an exception escaping into _ordered_map would.
+            return number, None, exc.reason
+
+    status_items = {}
+    skips = []
+    for number, record, skip_reason in _ordered_map(snapshot_one, worker_pulls, concurrency):
+        if record is None:
+            skips.append({"pr_number": number, "reason": skip_reason})
             continue
         status_items[str(number)] = record
         if "check_runs_degraded" in record:
@@ -314,15 +411,29 @@ def _pr_status_snapshot(fetch, claim, repo, pulls):
     return status_items, skips
 
 
-def snapshot_targets(fetch, claim, repos, out_dir):
+def snapshot_targets(fetch, claim, repos, out_dir, concurrency=SNAPSHOT_CONCURRENCY):
+    # Phase 1 — every repo-level listing is independent of every other, so the walks
+    # overlap. Each walk is UNCHANGED: the same serial page-walk to a short page, the same
+    # sweep-fatal 5000-entry ceiling, the same non-list-page rejection. A FetchError out of
+    # any of them still aborts the whole snapshot, and now does so BEFORE any file is
+    # written (strictly safer than the old repo-at-a-time loop, which left the earlier
+    # repo's raw-*.json on disk when a later repo's listing died).
+    listing_paths = []
+    for repo in repos:
+        listing_paths.append(f"/repos/{repo}/issues?state=open")
+        listing_paths.append(f"/repos/{repo}/pulls?state=open")
+    listings = _ordered_map(lambda path: _paginated(fetch, path), listing_paths, concurrency)
+
     for index, repo in enumerate(repos):
-        issues = _paginated(fetch, f"/repos/{repo}/issues?state=open")
-        pulls = _paginated(fetch, f"/repos/{repo}/pulls?state=open")
+        issues, pulls = listings[2 * index], listings[2 * index + 1]
         Path(out_dir, f"raw-issues-{index}.json").write_text(
             json.dumps({"complete": True, "items": issues}), encoding="utf-8")
         Path(out_dir, f"raw-pulls-{index}.json").write_text(
             json.dumps({"complete": True, "items": pulls}), encoding="utf-8")
-        status_items, skips = _pr_status_snapshot(fetch, claim, repo, pulls)
+        # Phase 2 — per-PR status. Repos stay SEQUENTIAL here so `concurrency` is the exact
+        # number of reads this process can ever have in flight (the secondary-rate-limit
+        # budget above); the concurrency lives INSIDE _pr_status_snapshot.
+        status_items, skips = _pr_status_snapshot(fetch, claim, repo, pulls, concurrency)
         for skip in skips:
             print(f"SNAPSHOT skip {repo}#{skip['pr_number']}: {skip['reason']}")
         Path(out_dir, f"raw-prstatus-{index}.json").write_text(
@@ -333,6 +444,7 @@ def snapshot_targets(fetch, claim, repos, out_dir):
 
 def _self_test():
     import tempfile
+    import threading
     from unittest.mock import patch
 
     claim = _load_claim()
@@ -387,6 +499,15 @@ def _self_test():
     ]
 
     conflict_detail_reads = 0
+    # The re-poll counter is shared state and the snapshot now reads PRs concurrently, so
+    # it is guarded; `reset_fixture` lets the identity check below re-run the SAME fixture
+    # from the SAME starting state at a different concurrency.
+    fixture_lock = threading.Lock()
+
+    def reset_fixture():
+        nonlocal conflict_detail_reads
+        with fixture_lock:
+            conflict_detail_reads = 0
 
     def fake_fetch(url):
         nonlocal conflict_detail_reads
@@ -401,9 +522,11 @@ def _self_test():
             # projected upstream response): the record must PRESERVE the absence.
             return {"head": {"sha": sha_ok}, "mergeable": True, "draft": True}
         if url.split("?")[0].endswith("/pulls/19"):
-            conflict_detail_reads += 1
+            with fixture_lock:
+                conflict_detail_reads += 1
+                seen = conflict_detail_reads
             return {"head": {"sha": sha_conflict},
-                    "mergeable": None if conflict_detail_reads == 1 else False,
+                    "mergeable": None if seen == 1 else False,
                     "draft": True, "auto_merge": None}
         for number, sha in ((7, sha_over), (9, sha_ok), (11, sha_red), (15, sha_legs_over),
                             (21, sha_draft_red), (23, sha_short)):
@@ -456,6 +579,10 @@ def _self_test():
             return page([gate_run()], total=42)
         raise AssertionError(f"unexpected fetch {url}")
 
+    # NOTE: this run uses the SHIPPED default concurrency, so every degradation assertion
+    # below — the skip histogram and its ORDER, the two-tier degradation split, the
+    # partial-read cross-check — is an assertion about the concurrent path, not a serial
+    # one that the concurrent path merely resembles.
     with patch.object(time, "sleep") as sleep, tempfile.TemporaryDirectory() as out_dir:
         snapshot_targets(fake_fetch, claim, [repo], out_dir)
         doc = json.loads(Path(out_dir, "raw-prstatus-0.json").read_text(encoding="utf-8"))
@@ -602,6 +729,220 @@ def _self_test():
         pass
     else:
         raise AssertionError("runaway repo listing must stay fail-closed")
+
+    # ---- (vii) CONCURRENCY (issue #721) -------------------------------------------------
+    # The claim under test is narrow and must be tested as stated: independent reads
+    # OVERLAP, the overlap is BOUNDED by the rate-limit budget, and overlapping changes
+    # NOTHING about what the snapshot says. Each check below names the mutation that reds
+    # it, and each is a BEHAVIOUR kill (a wrong answer / a lost overlap), not a crash.
+
+    def snapshot_parallel_output_is_identical_to_serial():
+        """RED if concurrency changes ANY byte of the snapshot — including the ORDER of the
+        `skips` histogram. Mutation: fold results in completion order (e.g. swap
+        `pool.map` for `as_completed`) and the skip rows reorder; drop the per-item catch
+        inside `snapshot_one` and PR 13's skip becomes an aborted sweep."""
+        rendered = {}
+        for label, concurrency in (("serial", 1), ("parallel", SNAPSHOT_CONCURRENCY)):
+            reset_fixture()
+            with patch.object(time, "sleep"), tempfile.TemporaryDirectory() as out_dir:
+                snapshot_targets(fake_fetch, claim, [repo], out_dir, concurrency=concurrency)
+                rendered[label] = {path.name: path.read_bytes()
+                                   for path in sorted(Path(out_dir).iterdir())}
+        assert rendered["serial"] == rendered["parallel"], (
+            "concurrent snapshot diverged from the serial walk: "
+            + repr({name: (rendered['serial'].get(name), rendered['parallel'].get(name))
+                    for name in set(rendered['serial']) | set(rendered['parallel'])
+                    if rendered['serial'].get(name) != rendered['parallel'].get(name)}))
+        # ...and the thing they agree on is the COMPLETE, degradation-bearing snapshot, not
+        # two identically-empty runs (the way this check would go vacuous).
+        both = json.loads(rendered["serial"]["raw-prstatus-0.json"].decode("utf-8"))
+        assert both["complete"] is True
+        assert sorted(both["items"]) == ["11", "15", "17", "19", "21", "23", "7", "9"]
+        assert [skip["pr_number"] for skip in both["skips"]] == [7, 13, 15, 23]
+        assert both["items"]["23"]["check_runs_degraded"] == "check-runs-malformed"
+
+    def per_pr_reads_actually_overlap():
+        """THE headline guard. RED if the per-PR reads are issued one at a time: every
+        worker PR's detail read blocks on a barrier that only releases once
+        SNAPSHOT_CONCURRENCY of them are simultaneously in flight. Mutation: delete the
+        ThreadPoolExecutor from `_ordered_map` (or hard-code concurrency to 1) and the
+        barrier times out -> `overlapped` is False -> red. This is a behaviour kill: the
+        serial code still returns a correct snapshot, it just never overlaps."""
+        parties = SNAPSHOT_CONCURRENCY
+        barrier = threading.Barrier(parties, timeout=15)
+        seen = {"broken": False, "in_flight": 0, "peak": 0}
+        seen_lock = threading.Lock()
+        overlap_pulls = [worker_pull(200 + n, sha_ok) for n in range(parties)]
+
+        def barrier_fetch(url):
+            with seen_lock:
+                seen["in_flight"] += 1
+                seen["peak"] = max(seen["peak"], seen["in_flight"])
+            try:
+                if re.search(r"/pulls/\d+$", url.split("?")[0]):
+                    try:
+                        barrier.wait()
+                    except threading.BrokenBarrierError:
+                        seen["broken"] = True
+                    return {"head": {"sha": sha_ok}, "mergeable": True, "draft": False,
+                            "auto_merge": None}
+                return page([gate_run()] if requested_name(url) == gate else [])
+            finally:
+                with seen_lock:
+                    seen["in_flight"] -= 1
+
+        items, skips = _pr_status_snapshot(barrier_fetch, claim, repo, overlap_pulls)
+        assert seen["broken"] is False, (
+            f"per-PR reads did not overlap: only {seen['peak']} of {parties} reads were "
+            "ever in flight together, so the barrier timed out")
+        assert seen["peak"] == parties, seen
+        # and the overlapped run still produced every record, with no skips.
+        assert sorted(items) == sorted(str(200 + n) for n in range(parties)), sorted(items)
+        assert skips == [], skips
+
+    def repo_listings_overlap_across_repos():
+        """The phase-1 half of the same claim, and it needs its own red test: the per-PR
+        guard above passes happily while the repo-level listing walks are still issued one
+        repo at a time. RED if phase 1 stops overlapping (mutation: replace the
+        `_ordered_map` in `snapshot_targets` with a list comprehension) — the barrier only
+        releases once all 2*len(repos) independent walks are in flight together."""
+        listing_repos = ["overlap/one", "overlap/two"]
+        parties = min(2 * len(listing_repos), SNAPSHOT_CONCURRENCY)
+        barrier = threading.Barrier(parties, timeout=15)
+        seen = {"broken": False, "walks": 0}
+        seen_lock = threading.Lock()
+
+        def listing_fetch(url):
+            path = url.split("?")[0]
+            assert path.endswith("/issues") or path.endswith("/pulls"), url
+            with seen_lock:
+                seen["walks"] += 1
+            try:
+                barrier.wait()
+            except threading.BrokenBarrierError:
+                seen["broken"] = True
+            return []          # a short first page: each walk is exactly one request
+
+        with tempfile.TemporaryDirectory() as out_dir:
+            snapshot_targets(listing_fetch, claim, listing_repos, out_dir)
+            written = sorted(path.name for path in Path(out_dir).iterdir())
+        assert seen["broken"] is False, (
+            "repo-level listing walks did not overlap: the barrier timed out after "
+            f"{seen['walks']} of {parties} walks started")
+        assert seen["walks"] == parties, seen
+        assert written == ["raw-issues-0.json", "raw-issues-1.json", "raw-prstatus-0.json",
+                           "raw-prstatus-1.json", "raw-pulls-0.json",
+                           "raw-pulls-1.json"], written
+
+    def in_flight_reads_never_exceed_the_requested_bound():
+        """RED if the cap stops being honoured. Uses a deliberately SMALL bound (3) so the
+        check is independent of the box's CPU count: dropping `max_workers` from the
+        ThreadPoolExecutor falls back to an interpreter default of at least 5 on any
+        supported runner, which exceeds 3. Deleting the `min(..., len(jobs))` clamp or
+        passing the bound through unread reds this too."""
+        bound = 3
+        seen = {"in_flight": 0, "peak": 0}
+        seen_lock = threading.Lock()
+        slow_pulls = [worker_pull(300 + n, sha_ok) for n in range(40)]
+
+        def slow_fetch(url):
+            with seen_lock:
+                seen["in_flight"] += 1
+                seen["peak"] = max(seen["peak"], seen["in_flight"])
+            try:
+                # A real wait (not the patched time.sleep) so overlap is observable.
+                threading.Event().wait(0.01)
+                if re.search(r"/pulls/\d+$", url.split("?")[0]):
+                    return {"head": {"sha": sha_ok}, "mergeable": True, "draft": False,
+                            "auto_merge": None}
+                return page([gate_run()] if requested_name(url) == gate else [])
+            finally:
+                with seen_lock:
+                    seen["in_flight"] -= 1
+
+        items, skips = _pr_status_snapshot(
+            slow_fetch, claim, repo, slow_pulls, concurrency=bound)
+        assert seen["peak"] <= bound, f"cap not honoured: {seen['peak']} reads in flight"
+        assert seen["peak"] > 1, f"the bounded run never overlapped at all: {seen['peak']}"
+        assert len(items) == 40 and skips == []
+
+    def concurrency_stays_inside_the_secondary_rate_limit_budget():
+        """The shipped default is a BUDGET, not taste. GitHub allows 900 points/minute for
+        REST and a GET costs 1; the measured mean read on this workload is ~0.85 s, so C
+        in-flight reads sustain C/0.85 per second. RED if SNAPSHOT_CONCURRENCY is raised
+        past what that arithmetic allows (C=16 -> ~1130/min, over budget)."""
+        github_rest_points_per_minute = 900
+        measured_mean_read_seconds = 0.85      # instrumented run, 613 reads, 2026-07-27
+        sustained_per_minute = SNAPSHOT_CONCURRENCY / measured_mean_read_seconds * 60
+        assert sustained_per_minute <= github_rest_points_per_minute, sustained_per_minute
+        # ...and the budget check is not vacuous: the next power of two blows it.
+        assert (2 * SNAPSHOT_CONCURRENCY) / measured_mean_read_seconds * 60 \
+            > github_rest_points_per_minute
+
+    def sweep_fatal_listing_failure_is_still_fatal():
+        """RED if a failure inside a concurrent listing walk is swallowed. Mutation: catch
+        or `return_exceptions`-style absorb the FetchError in `_ordered_map` and the
+        snapshot returns normally with a repo's listing silently missing — the exact
+        'partial view sold as complete' failure the fail-closed ceiling exists to prevent.
+        Also pins that NOTHING is written when the snapshot dies."""
+        def half_dead(url):
+            if url.split("?")[0].endswith("/repos/dead/repo/pulls"):
+                raise FetchError("listing down")
+            return []
+
+        with tempfile.TemporaryDirectory() as out_dir:
+            try:
+                snapshot_targets(half_dead, claim, [repo, "dead/repo"], out_dir)
+            except FetchError:
+                pass
+            else:
+                raise AssertionError("a failed repo listing must stay sweep-fatal")
+            assert list(Path(out_dir).iterdir()) == [], "a dead sweep wrote a partial snapshot"
+
+    def retry_after_is_honoured_and_capped():
+        """Overlapping reads is how a SECONDARY rate limit gets provoked, so the back-off
+        has to honour what GitHub asks for. Tests the helper AND its call site in
+        `make_fetch` — a helper that nothing calls is the classic vacuous guard."""
+        def http_error(code, headers):
+            return HTTPError("https://api.github.com/x", code, "throttled", headers, None)
+
+        assert _retry_delay(http_error(403, {"Retry-After": "7"}), 0) == 7
+        assert _retry_delay(http_error(429, {"Retry-After": "3600"}), 0) \
+            == RETRY_AFTER_CAP_SECONDS
+        # absent / malformed / non-positive headers fall back to the original ladder
+        assert _retry_delay(http_error(500, {}), 0) == 5
+        assert _retry_delay(http_error(500, {}), 1) == 10
+        assert _retry_delay(http_error(403, {"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}),
+                            1) == 10
+        assert _retry_delay(http_error(403, {"Retry-After": "0"}), 0) == 5
+
+        # THE CALL SITE: make_fetch must actually wait what the header asked for.
+        attempts = {"n": 0}
+
+        def throttled(request, timeout=None):
+            attempts["n"] += 1
+            raise http_error(403, {"Retry-After": "7"})
+
+        module = sys.modules[__name__]
+        with patch.object(module, "urlopen", throttled), \
+                patch.object(time, "sleep") as slept:
+            try:
+                make_fetch("t")("https://api.github.com/x")
+            except FetchError:
+                pass
+            else:
+                raise AssertionError("an exhausted retryable read must raise FetchError")
+        assert attempts["n"] == 3, attempts
+        assert [call.args[0] for call in slept.call_args_list] == [7, 7], \
+            slept.call_args_list
+
+    snapshot_parallel_output_is_identical_to_serial()
+    per_pr_reads_actually_overlap()
+    repo_listings_overlap_across_repos()
+    in_flight_reads_never_exceed_the_requested_bound()
+    concurrency_stays_inside_the_secondary_rate_limit_budget()
+    sweep_fatal_listing_failure_is_still_fatal()
+    retry_after_is_honoured_and_capped()
 
     print("plan-snapshot self-test PASSED")
     return 0
