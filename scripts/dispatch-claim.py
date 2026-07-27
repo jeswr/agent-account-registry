@@ -1675,6 +1675,34 @@ def admits_orchestrator_pr(record, pr_number, login, enrolled_authors):
     }
 
 
+def enrolment_enable_error(policy_doc, claim_admits, rf_admits):
+    """Why the tree must NOT ship an enabled `review_enrolment_authors` yet, or None.
+
+    PLAN-side admission alone is not a feature, it is an OUTAGE. CLAIM re-reads the provenance
+    record with its own provenance_admission_error call and review-fix.yml's resolve step raises
+    SystemExit on the same predicate; while either still refuses the orchestrator class, an
+    enumerated orchestrator PR is re-refused EVERY TICK, forever, with a generic defer counter as
+    its only symptom.
+
+    A PURE function of (policy document, two wiring facts) so the self-test can exercise it with
+    a repo that DOES enable enrolment. Asserting only against the live policy — which enables it
+    for nobody — makes the guard unfalsifiable: deleting it changes no outcome, and a mutation
+    run says so. The live policy is then one more input to the same function, not the only one."""
+    if claim_admits and rf_admits:
+        return None
+    repos = (policy_doc or {}).get("repos") if isinstance(policy_doc, dict) else None
+    configured = sorted(
+        name for name, row in (repos or {}).items()
+        if isinstance(row, dict) and row.get("review_enrolment_authors"))
+    if not configured:
+        return None
+    return (f"policy enables review_enrolment_authors for {configured} while the review lane's "
+            f"downstream consumers still refuse the orchestrator class (CLAIM admits="
+            f"{bool(claim_admits)}, review-fix.yml resolve admits={bool(rf_admits)}) — every "
+            "enrolled PR would be enumerated by PLAN and re-refused at CLAIM on every tick, "
+            "forever. See research/657-orchestrator-pr-admission.md section 7.4.")
+
+
 def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, bot_login="",
                            pr_status=None, exclusions=None, enrolled_authors=()):
     """PURE review_items enumerator (called by the dispatch.yml PLAN step against its own data;
@@ -8200,22 +8228,32 @@ def _self_test():
         "provenance admission consumption")
     _repos_doc = tomllib.loads(
         (Path(__file__).resolve().parents[1] / "policy" / "repos.toml").read_text("utf-8"))
-    _configured = {name: row.get("review_enrolment_authors")
-                   for name, row in (_repos_doc.get("repos") or {}).items()
-                   if row.get("review_enrolment_authors")}
-    if not (_claim_admits and _rf_admits):
-        assert not _configured, (
-            "policy/repos.toml enables review_enrolment_authors for "
-            f"{sorted(_configured)} while the review lane's DOWNSTREAM consumers still refuse "
-            "the orchestrator class (CLAIM record re-read admits="
-            f"{_claim_admits}, review-fix.yml resolve admits={_rf_admits}). Every enrolled PR "
-            "would be enumerated by PLAN and re-refused at CLAIM on every tick, forever. Wire "
-            "both consumers first — see research/657-orchestrator-pr-admission.md.")
-        print("  ok   #657 enable interlock: admission is wired at PLAN only, and policy "
-              "correctly enables it for NO repo (turning it on now would defer forever)")
-    else:
-        print("  ok   #657 enable interlock: CLAIM and review-fix.yml both admit the class, "
-              f"so policy may enable it ({sorted(_configured) or 'none enabled yet'})")
+    # (a) The LIVE tree must be consistent — this is the assertion that actually protects the
+    #     fleet, and today it passes because the wiring is absent AND nothing is enabled.
+    _live_error = enrolment_enable_error(_repos_doc, _claim_admits, _rf_admits)
+    assert _live_error is None, _live_error
+    # (b) ...but (a) alone is UNFALSIFIABLE while no repo enables the key: deleting the interlock
+    #     changes no outcome, which a mutation run reports as a surviving mutant. So drive the
+    #     same predicate with a policy that DOES enable it. These four rows are the guard's real
+    #     truth table; removing the interlock reds the first of them.
+    _enabled_doc = {"repos": {"o/r": {"review_enrolment_authors": ["jeswr"]}}}
+    _empty_doc = {"repos": {"o/r": {"review_enrolment_authors": []}}}
+    assert enrolment_enable_error(_enabled_doc, False, False) is not None, \
+        "enabling enrolment while BOTH downstream consumers refuse must be refused"
+    assert enrolment_enable_error(_enabled_doc, True, False) is not None, \
+        "review-fix.yml alone still raises SystemExit — half-wired is still a permanent defer"
+    assert enrolment_enable_error(_enabled_doc, False, True) is not None, \
+        "CLAIM alone still re-refuses the record — half-wired is still a permanent defer"
+    assert enrolment_enable_error(_enabled_doc, True, True) is None, \
+        "once both consumers admit the class the interlock must stop constraining policy"
+    assert enrolment_enable_error(_empty_doc, False, False) is None
+    for _junk in (None, {}, {"repos": None}, {"repos": {"o/r": "not-a-table"}}, "nope"):
+        assert enrolment_enable_error(_junk, False, False) is None, repr(_junk)
+    assert "o/r" in enrolment_enable_error(_enabled_doc, False, False), \
+        "the refusal must NAME the offending repo — a generic message is not actionable"
+    print(f"  ok   #657 enable interlock: CLAIM admits={_claim_admits}, review-fix.yml "
+          f"admits={_rf_admits}; policy is consistent with that, and the guard is proven "
+          f"against a policy that DOES enable enrolment")
 
     # YAML SEAM: the attestation checks live in provenance_admission_error, so they are only
     # load-bearing on the path that actually runs a model against a PR if review-fix.yml's
