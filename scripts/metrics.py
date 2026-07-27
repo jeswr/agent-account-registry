@@ -683,6 +683,11 @@ def dispatch_panel(records, repo, now, stale_after=DISPATCH_STALE_SECONDS):
         "conflict_by_area": dict(latest.get("conflict_by_area") or {}),
         # The assemble leg is where the loss was actually measured; publishing the chain is what
         # turns "nothing dispatched" into an attributable answer on the feed itself.
+        # READ `assembler_by_area` AS THE CAUSE, NOT THE VICTIM: it is keyed on the area actually
+        # HELD by the reservation that caused each drop, never on the dropped row's own crate
+        # (registry #758). `__global__` means ONE workspace-wide reservation ate those rows, which
+        # argues AGAINST widening crate parallelism; a crate name means genuine contention on that
+        # crate. `__deferred-retry__` / `__uncensused__` are non-crate buckets — see dispatch.yml.
         "assembler_deferrals": int(latest.get("assembler_deferrals", 0) or 0),
         "assembler_by_area": dict(latest.get("assembler_by_area") or {}),
         "chain": dict(latest.get("chain") or {}),
@@ -1359,15 +1364,20 @@ def _test_dispatch_panel(chk):
     chk("[gate-a feed] a stale ring is LABELLED stale, not published as healthy",
         (lambda p: (p["status"], p["frontier_width"]))(
             dispatch_panel([rec(now - 99_999, 10, 9)], "sparq-org/sparq", now)), ("stale", 10))
+    # The fixture is the MEASURED board of run 30222895098: 30 rows, all eaten by ONE `__global__`
+    # reservation. The held-area key must survive to the feed intact — publishing it as 27 crate
+    # names with one row each is the misattribution registry #758 fixed, and it is the reading that
+    # argues for widening crate parallelism (the under-serialisation direction).
     chained = dispatch_panel(
-        [rec(now, 32, 0, assembler_deferrals=30, assembler_by_area={"ci": 18, "sparq-core": 12},
+        [rec(now, 32, 0, assembler_deferrals=30, assembler_by_area={"__global__": 30},
              chain={"frontier_and_retry_rows": 32, "route_rejections": 2,
                     "assembler_deferrals": 30, "claim_deferrals": 0, "realised_dispatches": 0,
                     "unrealised_planned_rows": 0, "unaccounted": 0})],
         "sparq-org/sparq", now)
     chk("[gate-a feed] the feed says WHERE the frontier was lost, not just that it was",
-        (chained["assembler_deferrals"], chained["assembler_by_area"]["ci"],
-         chained["chain"]["unaccounted"], chained["realisation_rate"]), (30, 18, 0, 0.0))
+        (chained["assembler_deferrals"], chained["assembler_by_area"],
+         chained["chain"]["unaccounted"], chained["realisation_rate"]),
+        (30, {"__global__": 30}, 0, 0.0))
     chk("[gate-a feed] a target that has never reported says so",
         dispatch_panel(fresh, "other/repo", now), {"status": "no-record"})
     # "could not read the ring" and "the dispatcher never reported" are DIFFERENT failures.

@@ -629,6 +629,23 @@ def _workflow_block(path, step_id, marker):
     return source
 
 
+def _load_dispatch_claim():
+    """The REAL `scripts/dispatch-claim.py`, loaded the way dispatch.yml itself loads it.
+
+    Self-test-only. The assemble-leg seam assertions run the production `filter_busy_area_items`
+    rather than a stub: a stub with no holder concept cannot tell "attributed to the reservation
+    that caused the drop" apart from "attributed to the dropped row's own crate", which is exactly
+    how the wrong keying shipped (registry #756 review / #758 mutant M8)."""
+    import importlib.util   # self-test-only, same lazy-import discipline as the yaml import
+    path = Path(__file__).resolve().parent / "dispatch-claim.py"
+    spec = importlib.util.spec_from_file_location("registry_dispatch_claim_telemetry", path)
+    if spec is None or spec.loader is None:
+        raise AssertionError(f"cannot load {path} — the assemble-leg seam test has no filter")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _workflow_step_text(path, step_id, strip_comments=False):
     """The yaml of the ONE step with `id: <step_id>`, for asserting its `if:`/env/path wiring.
 
@@ -741,7 +758,9 @@ def _self_test():   # noqa: C901 — one flat assertion table, deliberately
     measured = build_record("sparq-org/sparq", "99.1", dict(
         frontier_doc, frontier_width=32, deferred_retry_width=0,
         plan_rows_before_assemble=30, assembler_deferrals=30,
-        assembler_by_area={"sparq-core": 12, "ci": 18}), {"planned": 0, "launched": 0}, 100)
+        assembler_by_area={"__global__": 30}), {"planned": 0, "launched": 0}, 100)
+    chk("[chain-sum] the HELD-area attribution reaches the record unflattened",
+        measured["assembler_by_area"], {"__global__": 30})
     chk("[chain-sum] the legs partition the frontier — the loss cannot hide between two counters",
         (measured["chain"]["route_rejections"], measured["chain"]["assembler_deferrals"],
          measured["chain"]["claim_deferrals"], measured["chain"]["realised_dispatches"],
@@ -964,11 +983,118 @@ def _self_test():   # noqa: C901 — one flat assertion table, deliberately
     chk("[YAML seam] a fully-free board records zero conflict deferrals",
         (everything["frontier_width"], everything["conflict_deferrals"]), (8, 0))
 
-    # The ASSEMBLE leg — the one the measured run actually died at — is likewise EXECUTED.
+    # The ASSEMBLE leg — the one the measured run actually died at — is likewise EXECUTED, and
+    # against the REAL `dispatch-claim` partition, never a stub.
+    #
+    # WHY THE REAL MODULE (registry #756 review; registry #758 mutant M8). The first version of
+    # this test drove a stub whose whole body was `list(items)[:1]`. That stub HAS NO CONCEPT OF A
+    # HOLDER, so no assertion written against it could distinguish "attributed to the reservation
+    # that caused the drop" from "attributed to the dropped row's own crate" — and the wrong one
+    # shipped. The arithmetic was pinned; the semantics the field is NAMED for were not. A stub
+    # that cannot express the defect cannot pin the fix, so the discriminating cases below run the
+    # production filter over production-shaped pulls/provenance/issue-label fixtures.
     assemble_block = _workflow_block(workflow, "assemble", "assembler-census")
+    claim_mod = _load_dispatch_claim()
+    fixture_sha = "a" * 40
 
-    class _StubClaim:
-        """Stands in for the registry `dispatch-claim` module: keeps only the first item."""
+    def _pull(number, ref, labels=()):
+        """A `/pulls?state=open` row of the shape dispatch.yml's PLAN projection hands over."""
+        return {"number": number, "state": "open", "draft": False, "auto_merge": None, "body": "",
+                "head": {"ref": ref, "sha": fixture_sha, "repo": {"full_name": "o/t"}},
+                "user": {"login": "sparq-agent[bot]", "type": "Bot"},
+                "labels": [{"name": name} for name in labels]}
+
+    def _record(pr_number, issue):
+        return {"pr_number": pr_number, "head_sha_at_open": fixture_sha,
+                "impl_provider": "anthropic", "impl_alias": "fable",
+                "impl_account_h": "ab" * 8, "issue": issue, "recorded_at_run": "1.1"}
+
+    def _run_assemble(items, pulls=(), issue_labels=None, provenance=None, leases=(),
+                      claim=None):
+        published = {}
+        namespace = {
+            "repository": {"items": [dict(item) for item in items]}, "repo": "o/t",
+            "claim_mod": claim if claim is not None else claim_mod, "leases": list(leases),
+            "now": 0, "pulls": list(pulls), "issue_labels": dict(issue_labels or {}),
+            "provenance": dict(provenance or {}), "pr_status": {}, "starvation": {},
+            "assembler_census": published}
+        exec(assemble_block, namespace)   # noqa: S102 — the workflow block, executed on purpose
+        return published["o/t"], [item["number"] for item in namespace["repository"]["items"]]
+
+    def _sums(record):
+        """The census obligation, as one number: every row entering the leg is in a named bucket."""
+        return (sum(record["assembler_by_area"].values()) + record["plan_rows"]
+                - record["plan_rows_before_assemble"])
+
+    # (1) THE MEASURED BOARD (run 30222895098, reduced). ONE stray PR whose provenance-linked
+    #     source issue carries no `area:` label reserves `__global__` — the documented fail-closed
+    #     path — and eats every row. The rows' own crates are all DISTINCT and all FREE.
+    #     Row-package keying publishes "10 areas x 1 row" and argues for widening crate
+    #     parallelism; the truth is "1 area x 10 rows" and argues for the exact opposite.
+    stall_crates = ["bench", "ci", "docs", "gui", "js", "sparq-core", "sparq-engine", "sparq-geo",
+                    "sparq-reason", "sparq-trust"]
+    stall_rows = [{"number": 100 + i, "package": crate, "deferred": False}
+                  for i, crate in enumerate(stall_crates)]
+    stall_holder = [_pull(4360, "sparq-agent/issue-4336-1-1", ["review:needs"])]
+    stall_record, stall_kept = _run_assemble(
+        stall_rows, stall_holder, {4336: ["role:impl"]}, {4360: _record(4360, 4336)})
+    chk("[YAML seam] a __global__ reservation is attributed to the HOLDER, not to the 10 innocent "
+        "crates it happened to defer",
+        (stall_record["assembler_by_area"], stall_record["assembler_deferrals"],
+         stall_record["plan_rows"], stall_kept),
+        ({"__global__": 10}, 10, 0, []))
+    chk("[YAML seam] ...and the published buckets SUM to the population entering the leg",
+        (_sums(stall_record), stall_record["plan_rows_before_assemble"]), (0, 10))
+
+    # (2) A GENUINE crate conflict still names the crate — the fix must not flatten every drop to
+    #     `__global__`, or the panel loses the one case where crate parallelism IS the answer.
+    crate_holder = [_pull(41, "sparq-agent/issue-7-1-1", ["review:needs"])]
+    crate_record, crate_kept = _run_assemble(
+        [{"number": 7, "package": "ci", "deferred": False},
+         {"number": 8, "package": "docs", "deferred": False}],
+        crate_holder, {7: ["area:ci", "role:impl"]}, {41: _record(41, 7)})
+    chk("[YAML seam] a real one-crate overlap is still attributed to that crate",
+        (crate_record["assembler_by_area"], crate_record["plan_rows"], crate_kept),
+        ({"ci": 1}, 1, [8]))
+
+    # (3) THE DISCRIMINATOR, and the mutation this block had no red test for. BOTH a `__global__`
+    #     holder and a holder of the row's OWN crate are on the board. Keying on the row's package
+    #     yields {"ci": 1}; keying on the cause yields {"__global__": 1}. Deleting the global
+    #     holder frees the row, deleting the crate holder changes nothing — so the global holder
+    #     is the cause and the crate holder is a bystander. This assertion is the difference.
+    both_record, _ = _run_assemble(
+        [{"number": 7, "package": "ci", "deferred": False}],
+        stall_holder + crate_holder, {4336: ["role:impl"], 7: ["area:ci", "role:impl"]},
+        {4360: _record(4360, 4336), 41: _record(41, 7)})
+    chk("[YAML seam] with a global holder AND a holder of the row's own crate, the CAUSE wins",
+        (both_record["assembler_by_area"], _sums(both_record)), ({"__global__": 1}, 0))
+
+    # (4) The deferred-retry filter runs BEFORE the busy-area partition and its drops are NOT
+    #     busy-area deferrals. They land in their own named bucket instead of inflating a crate's
+    #     count — nested inside one expression they were invisible and the buckets could not sum.
+    retry_record, retry_kept = _run_assemble(
+        [{"number": 5, "package": "sparq-core", "deferred": True},
+         {"number": 6, "package": "sparq-engine", "deferred": False}],
+        leases=[{"holder": "o/t#5", "package": "sparq-core", "expires_at": 10**12}])
+    chk("[YAML seam] a lease-deferred retry row is counted under its OWN reason, and the buckets "
+        "still sum",
+        (retry_record["assembler_by_area"], retry_record["assembler_deferrals"],
+         retry_kept, _sums(retry_record)),
+        ({"__deferred-retry__": 1}, 1, [6], 0))
+
+    # (5) A FREE board records nothing and keeps everything.
+    free_record, free_kept = _run_assemble(
+        [{"number": 7, "package": "ci", "deferred": False},
+         {"number": 8, "package": "docs", "deferred": False}])
+    chk("[YAML seam] a fully-free board defers nothing at the assemble leg",
+        (free_record["assembler_by_area"], free_record["assembler_deferrals"], free_kept),
+        ({}, 0, [7, 8]))
+
+    # (6) MISSING EDGE. A filter that drops rows without filling the census must show up as a
+    #     visible, counted residual — not as silence, and not smeared over the real buckets. This
+    #     is the only case that still uses a stub, because the production filter cannot produce it.
+    class _CensusBlindClaim:
+        """A partition that eats rows and records NOTHING — the missing-edge shape."""
 
         @staticmethod
         def filter_deferred_items(items, *_a, **_k):
@@ -979,22 +1105,14 @@ def _self_test():   # noqa: C901 — one flat assertion table, deliberately
             kwargs.get("starvation", {})["kept"] = 1
             return list(items)[:1]
 
-    assembler_census = {}
-    assemble_ns = {
-        "repository": {"items": [{"number": 1, "package": "sparq-core"},
-                                 {"number": 2, "package": "ci"},
-                                 {"number": 3, "package": "ci"},
-                                 {"number": 4, "package": None}]},
-        "repo": "o/t", "claim_mod": _StubClaim(), "leases": [], "now": 0, "pulls": [],
-        "issue_labels": {}, "provenance": {}, "pr_status": {}, "starvation": {},
-        "assembler_census": assembler_census}
-    exec(assemble_block, assemble_ns)   # noqa: S102 — the workflow block, executed on purpose
-    chk("[YAML seam] the EXECUTED assemble block counts the rows the busy-area filter ate",
-        assembler_census.get("o/t"),
-        {"plan_rows_before_assemble": 4, "assembler_deferrals": 3,
-         "assembler_by_area": {"ci": 2, "__unknown__": 1}, "plan_rows": 1})
-    chk("[YAML seam] ...and it still applies the real filter (the items list is REPLACED)",
-        [item["number"] for item in assemble_ns["repository"]["items"]], [1])
+    blind_record, blind_kept = _run_assemble(
+        [{"number": 1, "package": "sparq-core"}, {"number": 2, "package": "ci"},
+         {"number": 3, "package": "ci"}, {"number": 4, "package": None}],
+        claim=_CensusBlindClaim())
+    chk("[YAML seam] an uncounted drop branch surfaces as a NAMED residual, never as silence",
+        (blind_record["assembler_by_area"], blind_record["assembler_deferrals"],
+         blind_kept, _sums(blind_record)),
+        ({"__uncensused__": 3}, 3, [1], 0))
     assemble_yaml = Path(workflow).read_text(encoding="utf-8")
     chk("[YAML seam] PLAN merges the assemble leg into the census CLAIM will read",
         ('census_doc.setdefault("repositories", {}).setdefault(' in assemble_yaml,

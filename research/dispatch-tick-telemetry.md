@@ -76,6 +76,44 @@ already uses) and **one contents GET per metrics run**.
 counts distinct issue numbers, parsed area attribution is capped at the subtraction-derived total,
 and `append_records` is idempotent on `(run_id, repo)` so a replayed emission is a confirmed no-op.
 
+**4. Attribution names the CAUSE, not the victim — and there is exactly one implementation of the
+rule.** `assembler_by_area` is keyed on the area a reservation actually **held**, never on the
+dropped row's own crate. The two differ precisely in the case that matters: `filter_busy_area_items`
+drops every row when some occupant reserves `__global__`, and in that branch the row's own crate is
+irrelevant to the decision — the row would have been dropped had its crate been completely free. The
+first draft of this record keyed on the row's package, and on its own motivating tick
+(`30222895098`) that publishes **27 crate names with one row each** for a stall in which **one** PR
+reserved the workspace. That reading argues for *widening* crate parallelism, which is the
+under-serialisation direction and precisely the decision Gate A exists to gate.
+
+The census is therefore filled **by the filter**, at the branch that makes each drop decision, via
+registry #758's `partition_defer_attribution` — the same function both the PLAN assemble leg and
+CLAIM's `revalidate_items_against_live_pulls` call. This record deliberately does **not** carry a
+second copy of the precedence rule: two implementations of one rule drift, and that drift is what
+produced the defect. **This makes #758 a merge-order prerequisite for this PR** (see
+"Dependency on #758" below).
+
+Every dropped row lands in a visible, counted bucket. Beyond the held areas, two non-crate buckets
+exist so a consumer can never mistake them for contention:
+
+| bucket | meaning |
+| --- | --- |
+| `__global__` | one workspace-wide reservation ate these rows — do **not** widen crate parallelism |
+| `<crate>` | genuine contention on that crate |
+| `__deferred-retry__` | eaten by the lease filter *before* the busy-area partition ran |
+| `__uncensused__` | arithmetic residual — a drop branch that fills no census (a missing edge) |
+
+`sum(assembler_by_area.values()) + plan_rows == plan_rows_before_assemble` is asserted by the
+executed seam test, so a drop with no reason cannot be silently absorbed.
+
+### Dependency on #758
+
+The assemble-leg block calls `filter_busy_area_items(..., census=partition_census)` and reads
+`census["by_held_area"]`. Both the `census=` parameter and `partition_defer_attribution` land in
+registry **#758**, so this branch merges `#758` in and **#758 must land first**. If #758 lands
+first this PR's diff simply shrinks to its own commits; the alternative — a private second copy of
+the precedence rule here — is the drift that caused the bug.
+
 ## Where the loss actually is (measured, not assumed)
 
 Live sparq snapshot, 2026-07-26, run through the shipped census block:
@@ -123,8 +161,11 @@ inflate that blob.
   its own tick. The complementary signal is `worker_success_rate_1h` on the same feed. This record
   does not measure worker yield, and Gate A's ratio should be read with that in mind — it can only
   ever be an upper bound on genuinely productive dispatch.
-- A cross-cutting (`__global__`) candidate is attributed to the deterministic first reserved area,
+- In **`conflict_by_area`** (the READINESS leg, parsed out of the target engine's own conflict log)
+  a cross-cutting (`__global__`) candidate is attributed to the deterministic first reserved area,
   not to a fabricated `__global__` holder — the same convention the sparq readiness engine uses.
+  This convention does **not** apply to `assembler_by_area` (the ASSEMBLE leg), which is keyed on
+  the reservation that caused each drop and does emit `__global__` as a first-class key.
 - Area-attribution cardinality is capped at 25 keys plus `__other__`; the **total is preserved**.
 - The registry target's readiness engine gained the `conflict_log` sink so both targets attribute
   identically. A target planner without it degrades to `attribution: "unavailable"` with the whole

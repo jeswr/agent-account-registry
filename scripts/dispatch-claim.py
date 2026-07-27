@@ -1156,8 +1156,106 @@ def busy_packages_of_pulls(repo, pulls, issue_labels, provenance, pr_status=None
     return busy
 
 
+# ---------------------------------------------------------------------------------------
+# [registry #758] WHY a partition drop happened, as a closed enum. Every drop at the assemble
+# leg (and at CLAIM's live re-check of the same partition) is exactly one of these, and the
+# recorder below REFUSES anything else — a new drop branch that forgets to name its reason
+# raises instead of vanishing into an existing bucket.
+#
+#   global-reservation  an occupant reserves `__global__`, which defers EVERY row regardless of
+#                       the row's own crate. THE ROW'S CRATE IS NOT CONTENDED.
+#   cross-cutting-item  the ROW is `__global__` and so cannot co-run with any reservation at all.
+#   crate-conflict      a genuine one-crate overlap: an occupant holds this row's own package.
+#   sibling-lease       the lease ledger holds a live sibling lease on this row's package.
+#
+# Ordered by CAUSAL DOMINANCE, not by convenience: `global-reservation` outranks the rest
+# because it alone is sufficient, so removing anything else changes nothing.
+PARTITION_DEFER_REASONS = (
+    "global-reservation", "cross-cutting-item", "crate-conflict", "sibling-lease")
+
+
+def partition_defer_attribution(package, busy, occupancy):
+    """PURE. Why `package` is deferred against the `busy` union, as
+    `(reason, held_area, holder_pr, holder_state)`, or None when it is not deferred at all.
+
+    [registry #758] This exists because the pre-fix attribution was a FIRST-MATCH scan over
+    `occupancy` in pull-listing order:
+
+        next((pr, reason) for decision, pr, packages, reason, *_ in occupancy
+             if decision == "busy" and (GLOBAL in packages or package == GLOBAL
+                                        or package in packages))
+
+    which names whichever qualifying occupant the listing happened to put first. MEASURED on
+    dispatch runs 30222895098 / 30226203645 / 30226592642 / 30226829693: one PR (sparq#4360)
+    reserved `__global__` for four consecutive ticks — because its source issue #4336 carries no
+    `area:` label at all — and deferred every row. The 30-33 log lines per tick nevertheless
+    reported 27 DIFFERENT crate names across 4 different PRs, i.e. a crate-conflict story for a
+    stall that no amount of crate parallelism could have relieved. When sparq#4360 merged at
+    00:17:07Z the very next tick planned 14 rows and launched 6, with no code change anywhere.
+
+    So the scan must mirror the DECIDING predicate's own precedence instead of listing order:
+
+        busy and (GLOBAL in busy  or  package == GLOBAL  or  package in busy)
+                  ^ sufficient alone  ^ item-side         ^ genuine crate overlap
+
+    Determinism, and why it is not listing order: among equally-qualifying occupants the LOWEST
+    PR number wins. Listing order is an API artifact that can reorder between two ticks over an
+    unchanged board, which would make the same stall blame two different PRs on consecutive
+    ticks — the attribution has to be a function of the board, not of the fetch."""
+    if not busy:
+        return None
+    def holder_of(predicate):
+        """The lowest-numbered BUSY occupant satisfying `predicate`, with its park state."""
+        matches = [(pr_number, reason)
+                   for decision, pr_number, packages, reason, *_ in occupancy
+                   if decision == "busy" and predicate(packages)]
+        if not matches:
+            # The busy union is derived from these same occupancy rows, so a reservation with no
+            # occupant behind it means the caller passed a `busy` set and an `occupancy` list that
+            # disagree. Say `unknown` rather than silently naming an unrelated PR.
+            return ("unknown", "unknown")
+        return min(matches, key=lambda match: match[0]
+                   if isinstance(match[0], int) and not isinstance(match[0], bool) else 1 << 62)
+    if GLOBAL_PACKAGE in busy:
+        holder, state = holder_of(lambda packages: GLOBAL_PACKAGE in packages)
+        return ("global-reservation", GLOBAL_PACKAGE, holder, state)
+    if package == GLOBAL_PACKAGE:
+        holder, state = holder_of(lambda _packages: True)
+        return ("cross-cutting-item", GLOBAL_PACKAGE, holder, state)
+    if package in busy:
+        holder, state = holder_of(lambda packages: package in packages)
+        return ("crate-conflict", package, holder, state)
+    return None
+
+
+def record_partition_defer(census, reason, held_area, holder):
+    """Fold ONE drop into a caller-supplied census dict, in place. No-op when `census` is not a
+    dict, so every call site can pass its optional sink unconditionally.
+
+    [registry #758] Counted HERE, at the branch that makes the decision — the same discipline
+    `starvation` already follows — because a count re-derived downstream from the surviving rows
+    cannot see WHICH reservation ate the others. `reason` MUST be in PARTITION_DEFER_REASONS:
+    an unrecognised reason RAISES rather than being swallowed, so a future drop branch cannot be
+    added silently and read as zero on the Gate A feed."""
+    if reason not in PARTITION_DEFER_REASONS:
+        raise ValueError(
+            f"unknown partition defer reason {reason!r} — add it to PARTITION_DEFER_REASONS "
+            "(an unnamed drop reason would publish as a silent zero)")
+    if not isinstance(census, dict):
+        return
+    # Every bucket is pre-seeded at zero so a reason that STOPPED firing is visibly zero rather
+    # than absent — "missing edge" and "edge with no traffic" must not look alike (registry #753).
+    by_reason = census.setdefault("by_reason", {reason: 0 for reason in PARTITION_DEFER_REASONS})
+    by_reason[reason] = by_reason.get(reason, 0) + 1
+    by_area = census.setdefault("by_held_area", {})
+    by_area[str(held_area)] = by_area.get(str(held_area), 0) + 1
+    by_holder = census.setdefault("by_holder", {})
+    by_holder[str(holder)] = by_holder.get(str(holder), 0) + 1
+    census["total"] = census.get("total", 0) + 1
+
+
 def filter_busy_area_items(items, repo, pulls, issue_labels, provenance, pr_status=None,
-                           leases=None, now=0, starvation=None):
+                           leases=None, now=0, starvation=None, census=None):
     """Drop plan items whose package has an in-flight worker PR (registry issue #27: the review
     loop's PRs were invisible to the busy-area partition, double-dispatching onto a busy crate).
     Global semantics mirror the target ready-engine: a global reservation blocks everything, and
@@ -1181,7 +1279,15 @@ def filter_busy_area_items(items, repo, pulls, issue_labels, provenance, pr_stat
     artifact carries only the survivors, so without this a starved tick (`kept == 0` because one
     PR reserves all 54 crates) is indistinguishable downstream from an EMPTY BACKLOG — and the
     self-healing sweep must never fire on an empty backlog. Counted here, at the exact branch that
-    makes the decision, rather than re-derived later from a different view."""
+    makes the decision, rather than re-derived later from a different view.
+
+    [registry #758] `census`, when a dict is passed, receives the per-reason / per-HELD-AREA /
+    per-holder breakdown of everything this leg dropped (see record_partition_defer). This is the
+    leg where the frontier actually dies and it had no counter at all: the pre-existing
+    `frontier_size` is assigned the POST-filter count, so the entire loss sat between "the frontier
+    was wide" and "nothing was planned" with nothing on it. Attributed to the area that is actually
+    HELD, never to the dropped row's own package — those differ precisely in the case that matters
+    (a `__global__` reservation defers rows whose own crates nobody holds)."""
     occupancy = []
     busy = busy_packages_of_pulls(
         repo, pulls, issue_labels, provenance, pr_status, occupancy=occupancy)
@@ -1190,15 +1296,16 @@ def filter_busy_area_items(items, repo, pulls, issue_labels, provenance, pr_stat
     kept = []
     for item in items:
         package = item.get("package")
-        if busy and (GLOBAL_PACKAGE in busy or package == GLOBAL_PACKAGE or package in busy):
-            blocker = next(
-                ((pr_number, reason)
-                 for decision, pr_number, packages, reason, *_ in occupancy
-                 if decision == "busy" and
-                 (GLOBAL_PACKAGE in packages or package == GLOBAL_PACKAGE or package in packages)),
-                ("unknown", "unknown"))
-            print(f"assembler defer #{item.get('number')}: crate {package} busy via "
-                  f"pr#{blocker[0]} [{blocker[1]}]")
+        attribution = partition_defer_attribution(package, busy, occupancy)
+        if attribution is not None:
+            reason, held_area, holder, holder_state = attribution
+            # The HELD area and the ROW's crate are printed as separate facts. Pre-fix this read
+            # `crate {package} busy via pr#{holder}`, which invited exactly the wrong repair:
+            # on run 30222895098 that phrasing reported 27 contended crates for a stall in which
+            # one PR reserved `__global__` and no named crate was contended at all.
+            print(f"assembler defer #{item.get('number')} [{reason}]: row crate {package}; "
+                  f"held area {held_area} reserved by pr#{holder} [{holder_state}]")
+            record_partition_defer(census, reason, held_area, holder)
             # Only a drop that a `__global__` OCCUPANT caused is starvation evidence. An item
             # dropped because its OWN package is `__global__`, or because a sibling holds its one
             # crate, is the partition working as designed and no park would help it.
@@ -1211,11 +1318,20 @@ def filter_busy_area_items(items, repo, pulls, issue_labels, provenance, pr_stat
                 leases, now):
             print(f"exclude {repo}#{item.get('number')}: superseded-until-sibling-resolves — "
                   "a live sibling lease (any lane) holds its package")
+            record_partition_defer(census, "sibling-lease", package, "lease-ledger")
             continue
         kept.append(item)
     if isinstance(starvation, dict):
         starvation["deferred"] = global_deferred
         starvation["kept"] = len(kept)
+    if isinstance(census, dict):
+        # Always present, at zero if nothing fired: a leg that dropped nothing and a leg that was
+        # never instrumented must not read alike on the Gate A feed (registry #753/#754).
+        census.setdefault("by_reason", {reason: 0 for reason in PARTITION_DEFER_REASONS})
+        census.setdefault("by_held_area", {})
+        census.setdefault("by_holder", {})
+        census.setdefault("total", 0)
+        census["kept"] = len(kept)
     return kept
 
 
@@ -1314,7 +1430,7 @@ def live_pull_detail_stub(pull):
 
 
 def revalidate_items_against_live_pulls(items, repo, pull_pages, issue_labels, provenance,
-                                        leases=None, now=0, occupancy=None):
+                                        leases=None, now=0, occupancy=None, census=None):
     """[round-4 P1] PURE CLAIM-side re-check of the PLAN busy partition against the LIVE
     pull listing CLAIM already fetches: the PLAN artifact's freeing decisions are minutes
     old by the time an item launches, so a parked draft that went ready (or a brand-new
@@ -1362,18 +1478,22 @@ def revalidate_items_against_live_pulls(items, repo, pull_pages, issue_labels, p
     for item in items:
         number = item["number"]
         package = item.get("package")
-        if busy and (GLOBAL_PACKAGE in busy or package == GLOBAL_PACKAGE or package in busy):
-            blocker = next(
-                (pr_number for decision, pr_number, packages, _reason, *_ in live_occupancy
-                 if decision == "busy" and
-                 (GLOBAL_PACKAGE in packages or package == GLOBAL_PACKAGE or package in packages)),
-                "unknown")
-            print(f"claim-revalidation defer #{number}: crate {package} busy via pr#{blocker}")
+        attribution = partition_defer_attribution(package, busy, live_occupancy)
+        if attribution is not None:
+            # [registry #758] SAME partition, SAME attribution helper. This leg carried a verbatim
+            # copy of the first-match scan, so the misattribution measured at the assemble leg was
+            # reproduced here on the live re-read — fixing only PLAN would have left the identical
+            # wrong story on the CLAIM log for the same stall.
+            reason, held_area, blocker, _state = attribution
+            print(f"claim-revalidation defer #{number} [{reason}]: row crate {package}; "
+                  f"held area {held_area} reserved by pr#{blocker}")
+            record_partition_defer(census, reason, held_area, blocker)
             continue
         if sibling_lease_conflict(
                 repo, {f"{repo}#{number}"},
                 {package} if isinstance(package, str) else set(), leases, now):
             print(f"claim-revalidation defer #{number}: crate {package} busy via sibling lease")
+            record_partition_defer(census, "sibling-lease", package, "lease-ledger")
             continue
         dispatchable.add(number)
     return dispatchable
@@ -6110,6 +6230,28 @@ def _self_test():
     assert trip_k["claim_calls"] == 0, trip_k
     print("  ok   #701 (k): the terminal is status:parked (machine-recoverable), never needs:user")
 
+    # (k2) [OPUS-5] registry #738 — THE SINGLE-RUNG `role:impl` CHAIN TAKES THE DECOMPOSE ARM.
+    # Removing sol from the impl fallback left `role:impl` at `["opus5"]`, so #733's
+    # `retry-other-tier` arm has no other tier to narrow TO. It must therefore take the `decompose`
+    # arm — reroute at a threshold of ONE — and must NOT dead-end (no second identical opus5
+    # dispatch, no silent defer with the evidence unspent). Driven through the REAL dispatch() call
+    # site with the impl role, not by asserting on retry_decision in isolation.
+    #
+    # MUTANT: make retry_decision return PROCEED on an emptied chain => `claim_calls` becomes 1 and
+    # the reroute API calls vanish => RED.
+    assert _no_change_routing.retry_decision(
+        ["opus5"], [nc_record("opus5", -20)], decline_now) == (_no_change_routing.DECOMPOSE, [])
+    trip_k2 = run_decline_tripwire([nc_record("opus5", -20)], role="impl",
+                                   model_chain=("opus5",))
+    assert [call[0] for call in trip_k2["api_calls"]] == ["POST", "GET", "PATCH"], trip_k2
+    assert DECLINE_ESCALATION_MARKER in trip_k2["api_calls"][0][2]["body"], trip_k2
+    assert trip_k2["api_calls"][-1][2]["labels"] == [
+        "area:dispatch", "priority:P1", "role:research", "status:deferred"], trip_k2
+    assert trip_k2["claim_calls"] == 0 and trip_k2["claimed_chains"] == [], trip_k2
+    assert "needs:user" not in json.dumps(trip_k2["api_calls"]), trip_k2
+    print("  ok   #738 (k2): a no_change on the OPUS5-ONLY impl chain decomposes on the FIRST "
+          "outcome — never a second identical opus5 dispatch, never a needs:user park")
+
     # (l) NO DEADLOCK AFTER THE REROUTE. Once the reroute for this exact evidence is receipted and
     # the issue sits on its new route, the SAME evidence must not also narrow the new route's chain
     # to nothing — that would defer the decomposition forever. The spent evidence falls through on
@@ -10035,17 +10177,148 @@ def _self_test():
     print("  ok   issue-519 tripwire (d): non-parked draft stays busy")
 
     # The assembler consumes the reason from the SAME decision that reserved the crate.
+    # [registry #758] This tripwire asserted ONE exact line, and its fixture had ONE occupant
+    # holding ONE crate — a pure `crate-conflict`. It therefore never posed the only question
+    # that can be got wrong here (which occupant to name when SEVERAL qualify), which is exactly
+    # why the measured misattribution below went uncaught for four consecutive production ticks.
+    # It now asserts the reason CLASS too, and the enum is covered exhaustively further down.
     assembler_output = io.StringIO()
+    assembler_census = {}
     with contextlib.redirect_stdout(assembler_output):
         assembler_kept = filter_busy_area_items(
             [frontier[1]], repo, [parked_draft()], collapse_labels, busy_prov,
-            {76: {"head_sha": sha_a, "armed": True}}, leases=[], now=now)
-    expected_assembler_log = \
-        "assembler defer #71: crate crate-b busy via pr#76 [latched]"
+            {76: {"head_sha": sha_a, "armed": True}}, leases=[], now=now,
+            census=assembler_census)
+    expected_assembler_log = ("assembler defer #71 [crate-conflict]: row crate crate-b; "
+                              "held area crate-b reserved by pr#76 [latched]")
     assert assembler_kept == [], assembler_kept
     assert assembler_output.getvalue().splitlines() == [expected_assembler_log], \
         assembler_output.getvalue()
+    assert assembler_census["by_reason"]["crate-conflict"] == 1, assembler_census
+    assert assembler_census["by_held_area"] == {"crate-b": 1}, assembler_census
     print("  ok   issue-519 tripwire (e): assembler defer names artifact and gate reason")
+
+    # ---- [registry #758] PARTITION DEFER ATTRIBUTION: the reported class must be the CAUSE ----
+    # MEASURED defect, dispatch runs 30222895098 / 30226203645 / 30226592642 / 30226829693: the
+    # blocker was chosen by a FIRST-MATCH scan in pull-listing order, so a crate-specific occupant
+    # shadowed the `__global__` occupant that alone deferred every row. 30-33 rows/tick were
+    # reported across 27 crate names and 4 PRs; one PR (sparq#4360, source issue #4336 carrying no
+    # `area:` label) was the whole cause, and the tick after it merged planned 14 and launched 6.
+    def occupant(number, *packages):
+        return ("busy", number, frozenset(packages), "not-parked", False)
+
+    # (1) THE REGRESSION ITSELF. Both a global holder and a crate holder qualify; the global one
+    #     is the cause, because deleting the crate holder changes nothing and deleting the global
+    #     one frees the row. Pre-fix this returned whichever came first in the list.
+    global_and_crate = [occupant(4361, "ci"), occupant(4360, GLOBAL_PACKAGE, "ci"),
+                        occupant(4366, "docs")]
+    assert partition_defer_attribution(
+        "sparq-server", {GLOBAL_PACKAGE, "ci", "docs"}, global_and_crate) == \
+        ("global-reservation", GLOBAL_PACKAGE, 4360, "not-parked")
+    # ...and the row whose OWN crate a non-global occupant holds is STILL a global-reservation
+    # drop, because that reservation defers it regardless. This is the case the pre-fix scan got
+    # wrong 5 times in run 30222895098 (#2606 ci, #2653 sparq-reason, #2725 docs,
+    # #2946 sparq-zk-compose, #3209 performance were blamed on pr#4361/4366/4369).
+    assert partition_defer_attribution(
+        "ci", {GLOBAL_PACKAGE, "ci", "docs"}, global_and_crate)[:3] == \
+        ("global-reservation", GLOBAL_PACKAGE, 4360)
+    # (2) ORDER-INDEPENDENCE. The same board in any listing order names the same PR — a fetch-order
+    #     artifact must never move the blame between two ticks over an unchanged board.
+    for permutation in ([global_and_crate[i] for i in order]
+                        for order in ((0, 1, 2), (2, 1, 0), (1, 0, 2), (2, 0, 1))):
+        assert partition_defer_attribution(
+            "sparq-server", {GLOBAL_PACKAGE, "ci", "docs"}, permutation)[2] == 4360, permutation
+    # (3) EXHAUSTIVE over the enum — every reason PARTITION_DEFER_REASONS declares is produced by
+    #     a named case here, so adding a reason without a case fails the coverage assertion below.
+    covered = {
+        "global-reservation": partition_defer_attribution(
+            "crate-a", {GLOBAL_PACKAGE}, [occupant(10, GLOBAL_PACKAGE)]),
+        "cross-cutting-item": partition_defer_attribution(
+            GLOBAL_PACKAGE, {"crate-a"}, [occupant(11, "crate-a")]),
+        "crate-conflict": partition_defer_attribution(
+            "crate-a", {"crate-a"}, [occupant(12, "crate-a")]),
+    }
+    assert covered["global-reservation"] == ("global-reservation", GLOBAL_PACKAGE, 10, "not-parked")
+    assert covered["cross-cutting-item"] == ("cross-cutting-item", GLOBAL_PACKAGE, 11, "not-parked")
+    assert covered["crate-conflict"] == ("crate-conflict", "crate-a", 12, "not-parked")
+    for reason, attribution in covered.items():
+        assert attribution[0] == reason, (reason, attribution)
+    # `sibling-lease` is produced by the two filter call sites rather than by the pure helper;
+    # both are asserted below. Coverage is checked against the DECLARED enum, so a new reason
+    # with no case here goes red.
+    assert set(covered) | {"sibling-lease"} == set(PARTITION_DEFER_REASONS), (
+        "PARTITION_DEFER_REASONS gained a member with no named attribution case")
+    # (4) NOT DEFERRED at all -> None (the helper must never invent a blocker).
+    assert partition_defer_attribution("crate-a", set(), []) is None
+    assert partition_defer_attribution("crate-a", {"crate-b"}, [occupant(13, "crate-b")]) is None
+    # (5) A reservation with no occupant behind it says `unknown` rather than naming a bystander.
+    assert partition_defer_attribution(
+        "crate-a", {GLOBAL_PACKAGE}, [occupant(14, "crate-z")])[2] == "unknown"
+    print("  ok   registry-758 (a): the reported defer class is the CAUSE, order-independently")
+
+    # (6) AN UNHANDLED REASON CANNOT BE SWALLOWED. A future drop branch that forgets to declare
+    #     its reason must raise here, not publish as a silent zero on the Gate A feed.
+    swallow_census = {}
+    try:
+        record_partition_defer(swallow_census, "some-new-reason", "crate-a", 1)
+    except ValueError as exc:
+        assert "some-new-reason" in str(exc), exc
+    else:
+        raise AssertionError("an undeclared defer reason was silently accepted")
+    assert swallow_census == {}, swallow_census
+    # ...and every DECLARED reason is accepted, so the guard is a whitelist, not a wall.
+    for reason in PARTITION_DEFER_REASONS:
+        record_partition_defer(swallow_census, reason, "crate-a", 1)
+    assert swallow_census["total"] == len(PARTITION_DEFER_REASONS), swallow_census
+    assert all(swallow_census["by_reason"][reason] == 1 for reason in PARTITION_DEFER_REASONS)
+    print("  ok   registry-758 (b): an undeclared defer reason raises instead of vanishing")
+
+    # (7) THE CENSUS IS ATTRIBUTED TO THE HELD AREA, NOT THE ROW'S OWN CRATE. This is the exact
+    #     shape the Gate A feed publishes: on the measured board it must read ONE held area with
+    #     every row behind it, not N crate names with one row each.
+    stall_rows = [{"number": 2586, "package": "sparq-server", "deferred": False},
+                  {"number": 2392, "package": "sparq-crdt", "deferred": False},
+                  {"number": 2606, "package": "ci", "deferred": False}]
+    stall_pulls = [pull(60, "sparq-agent/issue-8-1-1", sha_a, labels=["review:needs"]),
+                   pull(41, "sparq-agent/issue-7-1-1", sha_a, labels=["area:ci"])]
+    stall_census = {}
+    with contextlib.redirect_stdout(io.StringIO()):
+        stall_kept = filter_busy_area_items(
+            stall_rows, repo, stall_pulls, {8: ["role:impl"], 7: ["area:ci", "role:impl"]},
+            busy_prov, leases=[], now=now, census=stall_census)
+    assert stall_kept == [], stall_kept
+    assert stall_census["by_reason"] == {"global-reservation": 3, "cross-cutting-item": 0,
+                                         "crate-conflict": 0, "sibling-lease": 0}, stall_census
+    assert stall_census["by_held_area"] == {GLOBAL_PACKAGE: 3}, stall_census
+    assert stall_census["by_holder"] == {"60": 3}, stall_census
+    assert (stall_census["total"], stall_census["kept"]) == (3, 0), stall_census
+    # The bucket sum is the row count: no row may be counted twice, and none may go missing.
+    assert sum(stall_census["by_reason"].values()) == len(stall_rows) == stall_census["total"]
+    # A leg that dropped NOTHING still publishes every bucket at zero — "never instrumented" and
+    # "instrumented, no traffic" must not read alike (registry #753/#754).
+    quiet_census = {}
+    with contextlib.redirect_stdout(io.StringIO()):
+        filter_busy_area_items(stall_rows, repo, [], collapse_labels, busy_prov,
+                               leases=[], now=now, census=quiet_census)
+    assert quiet_census["total"] == 0 and quiet_census["kept"] == 3, quiet_census
+    assert set(quiet_census["by_reason"]) == set(PARTITION_DEFER_REASONS), quiet_census
+    assert set(quiet_census["by_reason"].values()) == {0}, quiet_census
+    # The sibling-lease drop was uncounted at this leg entirely; it now lands in the census.
+    lease_census = {}
+    lease_rows = [{"number": 71, "package": "crate-b", "deferred": False}]
+    with contextlib.redirect_stdout(io.StringIO()):
+        assert filter_busy_area_items(
+            lease_rows, repo, [], collapse_labels, busy_prov, leases=None, now=now,
+            census=lease_census) == []
+    assert lease_census["by_reason"]["sibling-lease"] == 1, lease_census
+    assert lease_census["total"] == 1 and lease_census["kept"] == 0, lease_census
+    # Passing NO census must not change the partition — telemetry is observation only.
+    with contextlib.redirect_stdout(io.StringIO()):
+        assert filter_busy_area_items(stall_rows, repo, stall_pulls,
+                                      {8: ["role:impl"], 7: ["area:ci", "role:impl"]},
+                                      busy_prov, leases=[], now=now) == stall_kept
+    print("  ok   registry-758 (c): the census counts HELD areas, sums to the row count, "
+          "and never moves the partition")
     # source-issue parks compose the same way: issue 80 is needs:user-parked; its
     # NON-draft worker PR still reserves crate-a...
     assert busy_packages_of_pulls(
@@ -10130,17 +10403,40 @@ def _self_test():
 
     needs_user_live = live_row(76, "sparq-agent/issue-81-1-1", draft=True,
                                labels=["needs:user"])
-    expected_defer_log = "claim-revalidation defer #71: crate crate-b busy via pr#76"
+    expected_defer_log = ("claim-revalidation defer #71 [crate-conflict]: row crate crate-b; "
+                          "held area crate-b reserved by pr#76")
     for coherent_busy in (dict(needs_user_live, draft=False),
                           dict(needs_user_live, auto_merge=latched)):
         busy_output = io.StringIO()
+        revalidation_census = {}
         with contextlib.redirect_stdout(busy_output):
             busy_result = revalidate_items_against_live_pulls(
                 frontier, repo, [[coherent_busy]], collapse_labels, busy_prov,
-                leases=[], now=now)
+                leases=[], now=now, census=revalidation_census)
         assert busy_result == {70, 72, 73}, busy_result
         assert expected_defer_log in busy_output.getvalue(), busy_output.getvalue()
+        assert revalidation_census["by_reason"]["crate-conflict"] == 1, revalidation_census
+        assert revalidation_census["by_held_area"] == {"crate-b": 1}, revalidation_census
     print("  ok   claim-revalidation tripwire (b): non-draft or latch-visible parks stay busy")
+
+    # [registry #758] The CLAIM leg carried a VERBATIM copy of the assemble leg's first-match
+    # scan, so it reproduced the same misattribution on the live re-read. Both legs now share
+    # partition_defer_attribution; this asserts the CLAIM leg specifically, because a fix applied
+    # to PLAN alone would have left the identical wrong story on the CLAIM log for the same stall.
+    live_global = live_row(60, "sparq-agent/issue-8-1-1", draft=False, labels=["review:needs"])
+    live_crate = live_row(77, "sparq-agent/issue-82-1-1", draft=False, labels=["area:crate-b"])
+    for live_order in ([live_global, live_crate], [live_crate, live_global]):
+        cross_leg_output = io.StringIO()
+        cross_leg_census = {}
+        with contextlib.redirect_stdout(cross_leg_output):
+            revalidate_items_against_live_pulls(
+                [frontier[1]], repo, [live_order], {8: ["role:impl"]}, busy_prov,
+                leases=[], now=now, census=cross_leg_census)
+        assert ("claim-revalidation defer #71 [global-reservation]: row crate crate-b; "
+                "held area __global__ reserved by pr#60") in cross_leg_output.getvalue(), \
+            cross_leg_output.getvalue()
+        assert cross_leg_census["by_held_area"] == {GLOBAL_PACKAGE: 1}, cross_leg_census
+    print("  ok   registry-758 (d): the CLAIM leg attributes the same partition the same way")
 
     unparked_output = io.StringIO()
     with contextlib.redirect_stdout(unparked_output):
@@ -11228,6 +11524,44 @@ def _self_test():
     assert escalate_starved(False, {"acct01": {}}, 0) is False
     assert escalate_starved(None, {"acct01": {}}, 0) is False
 
+    # [OPUS-5] registry #738 — `role:impl` IS NOW ONE OF THOSE ROUTES, and the composition is what
+    # matters, not the predicate in isolation. Removing sol left a single-rung `["opus5"]` impl
+    # chain; without `escalate = true` an opus5 capacity outage could only defer, and defer again,
+    # forever, with nobody notified. So the LIVE routing table's `role:impl` route is resolved here
+    # and its own `escalate` value is fed into the starvation ladder.
+    #
+    # MUTANT: delete `escalate = true` from the role:impl route in orchestration/routing.toml, or
+    # from a target's, => the first assertion goes red. MUTANT: make `escalate_starved` require a
+    # multi-rung chain => the second goes red.
+    _impl_route = _POLICY_FOR_IMPL = None
+    for _r in tomllib.loads(
+            (Path(__file__).resolve().parents[1] / "orchestration" / "routing.toml")
+            .read_text(encoding="utf-8")).get("route", []):
+        if _r.get("role") == "impl" and "match_labels" not in _r:
+            _impl_route = _r
+            break
+    assert _impl_route is not None, "the live routing table declares no role:impl route"
+    assert _impl_route["model_chain"] == ["opus5"], _impl_route
+    assert _impl_route.get("escalate") is True, (
+        "role:impl is a SINGLE-RUNG chain: without escalate = true, an opus5 capacity outage is a "
+        "silent permanent stall with no counted reason and no ops alert")
+    # A starved single-rung impl route IS detected as starved (so the defer is attributable) ...
+    assert escalate_starved(_impl_route.get("escalate"), {"acct01": {}}, 0) is True
+    # ... and the FIRST such tick is TRANSIENT: no park, no human terminal, keep retrying. This is
+    # the "defer must terminate and be attributable, not park" obligation, asserted rather than
+    # assumed.
+    assert escalate_persist_decision([], "app[bot]", int(time.time()),
+                                     "<!-- sparq-worker-attempt:v1") == (False, "")
+    # ... and the counted reasons are DISTINGUISHABLE from the generic capacity defer, so a starved
+    # impl frontier cannot hide inside `no-eligible-account`.
+    assert len({"escalate-tier-starved-transient", "escalate-tier-starved",
+                "no-eligible-account"}) == 3
+    _dispatch_src = Path(__file__).resolve().read_text(encoding="utf-8")
+    for _reason in ("escalate-tier-starved-transient", "escalate-tier-starved"):
+        assert f'defer_reasons["{_reason}"]' in _dispatch_src, _reason
+    print("  ok   #738: role:impl is single-rung AND escalating; starvation defers transiently with "
+          "its own counted reason before any park")
+
     # Issue #116: a starved escalate route must NOT convert one transient usage snapshot into a
     # permanent human terminal. escalate_persist_decision separates the momentary-starved predicate
     # (escalate_starved, above) from the bounded, PERSISTENT decision to escalate to needs:user.
@@ -11985,6 +12319,29 @@ def _starvation_seam_violations(document):
     if "registry-dispatch-plan/v4" in run:
         out.append("dispatch.yml: the plan-assembly step still mentions the v4 schema — a "
                    "reverted stamp or a reverted inline check would ship a plan CLAIM refuses")
+    # [registry #758] The assemble-leg census wiring. COMMENTS ARE STRIPPED FIRST, deliberately:
+    # this block is heavily commented and every fragment below also appears in prose above it, so
+    # a substring check over the raw `run:` text would stay green after the CODE was deleted —
+    # the claim-in-a-comment failure mode measured on registry #756's artifact-upload check.
+    code = "\n".join(line.split("#", 1)[0] for line in run.splitlines())
+    for fragment, why in (
+        ("census=partition_census",
+         "filter_busy_area_items is no longer asked for the per-reason breakdown, so the leg "
+         "that eats the frontier goes back to having no counter at all"),
+        ('print("assemble-census "',
+         "the census is computed and then never emitted — a leg whose count nobody can read is "
+         "the same hole as a leg with no count"),
+        ('partition_census.get("total", 0)',
+         "the emitted line stops carrying the deferral TOTAL"),
+        ('"by_held_area"',
+         "the emitted line stops carrying the HELD-AREA attribution — which is the entire fix: "
+         "attributing to the dropped row's own crate is what reported 27 contended crates for a "
+         "stall caused by one `__global__` reservation"),
+        ('"by_reason"',
+         "the emitted line stops carrying the per-reason breakdown"),
+    ):
+        if fragment not in code:
+            out.append(f"dispatch.yml: the plan-assembly step lost {fragment!r} — {why}")
     claim_steps = (jobs.get(_STARVATION_CLAIM_STEP) or {}).get("steps")
     if not isinstance(claim_steps, list):
         out.append("dispatch.yml: jobs.claim.steps is not a list — the sweep has no runner")
@@ -11998,6 +12355,30 @@ def _starvation_seam_violations(document):
         out.append("dispatch.yml: the `claim` step no longer runs dispatch-claim.py, so the "
                    "starved-plan sweep never executes")
     return sorted(out)
+
+
+def _census_code_to_comment(run):
+    """[registry #758] Build the COMMENT-TRAP mutant of the assemble step: every #758 census
+    fragment survives in a COMMENT while none of it survives as code, and `starvation=starvation`
+    — which shares a line with `census=partition_census` — is deliberately left intact so the
+    pre-existing non-stripping starvation check cannot kill this mutant on someone else's behalf.
+    A raw-substring wiring check calls this step wired; the comment-stripped one must not."""
+    assert "starvation=starvation, census=partition_census)" in run, \
+        "the comment-trap mutant no longer knows where the census kwarg lives"
+    mutated = run.replace("starvation=starvation, census=partition_census)",
+                          "starvation=starvation)")
+    # The `run:` scalar arrives DEDENTED from yaml.safe_load, so the anchors must not assume a
+    # column. Cut from the start of the print statement's line to the end of its last line.
+    marker = 'print("assemble-census "'
+    begin = mutated.rindex("\n", 0, mutated.index(marker)) + 1
+    end = mutated.index("\n", mutated.index('.items())]))', begin)) + 1
+    fragments = ('census=partition_census print("assemble-census " '
+                 'partition_census.get("total", 0) "by_held_area" "by_reason"')
+    mutated = mutated[:begin] + f"# {fragments}\n" + mutated[end:]
+    assert marker not in mutated.replace(f"# {fragments}", ""), \
+        "the trap left the print statement as CODE — it would not test the stripping"
+    assert "starvation=starvation" in mutated, "the trap must not disturb the starvation kwarg"
+    return mutated
 
 
 def _starvation_yaml_seam_self_test():
@@ -12055,6 +12436,30 @@ def _starvation_yaml_seam_self_test():
                            if s.get("id") == "claim").__setitem__("run", "echo hi"),
         "claim steps replaced by a scalar":
             lambda d: d["jobs"]["claim"].__setitem__("steps", "nope"),
+        # [registry #758] the assemble-leg census wiring
+        "the filter is no longer asked for the per-reason census":
+            drop_fragment("census=partition_census"),
+        "the census is computed but never emitted":
+            drop_fragment('print("assemble-census "'),
+        "the emitted line drops the deferral total":
+            drop_fragment('partition_census.get("total", 0)'),
+        "the emitted line drops the HELD-AREA attribution":
+            drop_fragment('"by_held_area"'),
+        "the emitted line drops the per-reason breakdown":
+            drop_fragment('"by_reason"'),
+        # THE COMMENT TRAP, as a first-class mutant: delete the CODE and leave prose that still
+        # contains every fragment. A raw-text substring check passes this; the comment-stripped
+        # one must not. Measured on registry #756: an upload-path check stayed green exactly this
+        # way because the step's own comment named the file it searched for.
+        #
+        # SURGICAL ON PURPOSE. A first draft of this mutant deleted whole LINES containing the
+        # census fragments, which collaterally deleted `starvation=starvation` (it shares a line
+        # with `census=partition_census`) — so the pre-existing, NON-stripping starvation check
+        # killed it and the trap proved nothing about the stripping. It survived correctly only
+        # once the collateral damage was removed. The census code, and only the census code, goes.
+        "the census code is replaced by a comment naming every fragment":
+            lambda d: assemble_step(d).__setitem__(
+                "run", _census_code_to_comment(assemble_step(d)["run"])),
     }
     survivors = [name for name, edit in seam_mutants.items() if not mutant(edit)]
     assert not survivors, f"dispatch.yml seam mutants NOT caught: {survivors}"

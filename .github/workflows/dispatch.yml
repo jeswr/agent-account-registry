@@ -763,32 +763,81 @@ jobs:
               # `lane worker: planned=0 launched=0`. The pre-existing `frontier_size` field cannot
               # see it — it is literally assigned the POST-filter `planned` count, so the whole loss
               # sits between "the frontier was wide" and "nothing was planned" with no counter on
-              # it. Each lost row is attributed to the package it was holding out for. Pure
-              # bookkeeping over lists this step already has: no extra call, no API request.
+              # it. Pure bookkeeping over lists this step already has: no extra call, no API request.
+              #
+              # THE CAUSE, NEVER THE VICTIM (registry #758; mutant M8, confirmed against THIS block
+              # by review of #756). The first draft of this census keyed every dropped row on the
+              # ROW'S OWN package. `filter_busy_area_items` drops a row when a `__global__` occupant
+              # reserves everything, when the row is itself `__global__`, or when the row's own crate
+              # is held — and in the FIRST case the row's crate is irrelevant to the decision: the
+              # row would have been dropped had its crate been completely free. On run 30222895098
+              # all 30 drops were caused by ONE `__global__` reservation (sparq#4360) and row-package
+              # keying published them as 27 crate names with one row each. That reading argues for
+              # WIDENING crate parallelism — the under-serialisation direction, and precisely the
+              # decision Gate A exists to gate.
+              #
+              # So the attribution is NOT re-derived here from the surviving rows (that view
+              # structurally cannot see which reservation ate the others). It is filled BY the
+              # filter, at the branch that makes each decision, through #758's shared
+              # `partition_defer_attribution` — ONE implementation of the precedence rule for both
+              # legs, because two implementations of one rule drift and that drift is what produced
+              # this bug.
+              #
               # Inputs: `repository`, `repo`, `claim_mod`, `leases`, `now`, `pulls`,
               # `issue_labels`, `provenance`, `pr_status`, `starvation`, `assembler_census`.
+              partition_census = {}
               packages_before = {item["number"]: item.get("package")
                                  for item in repository["items"]}
+              rows_before_assemble = len(packages_before)
+              # The two filters are applied as SEPARATE statements so their drops are separately
+              # attributable. Nested, the deferred-retry drops (an impl lease on the row's own issue
+              # is still live) would inflate `assembler_deferrals` with rows the busy-area partition
+              # never saw, and the published buckets could not sum to the population entering the
+              # leg. Behaviour is unchanged: same functions, same order, same arguments.
+              retry_filtered = claim_mod.filter_deferred_items(
+                  repository["items"], repo, leases, now)
               repository["items"] = claim_mod.filter_busy_area_items(
-                  claim_mod.filter_deferred_items(repository["items"], repo, leases, now),
+                  retry_filtered,
                   repo, pulls, issue_labels, provenance, pr_status, leases, now,
-                  starvation=starvation)
+                  starvation=starvation, census=partition_census)
+              # BRACE-FREE by construction: GitHub's secret masker rewrites `{`/`}` to `***` in log
+              # output, so a JSON dump of this census would arrive corrupted. Flat key=value only.
+              print("assemble-census " + " ".join(
+                  [repo, "rows_before=" + str(rows_before_assemble),
+                   "deferred=" + str(partition_census.get("total", 0)),
+                   "kept=" + str(partition_census.get("kept", 0))]
+                  + ["reason." + reason + "=" + str(count) for reason, count
+                     in sorted((partition_census.get("by_reason") or {}).items())]
+                  + ["area." + area + "=" + str(count) for area, count
+                     in sorted((partition_census.get("by_held_area") or {}).items())]
+                  + ["holder.pr" + holder + "=" + str(count) for holder, count
+                     in sorted((partition_census.get("by_holder") or {}).items())]))
               kept_numbers = {item["number"] for item in repository["items"]}
-              dropped_by_area = {}
-              for dropped_number, dropped_package in packages_before.items():
-                  if dropped_number not in kept_numbers:
-                      key = str(dropped_package) if dropped_package else "__unknown__"
-                      dropped_by_area[key] = dropped_by_area.get(key, 0) + 1
+              dropped_by_area = {str(area): int(count) for area, count
+                                 in (partition_census.get("by_held_area") or {}).items()}
+              # EVERY dropped row lands in a visible, counted bucket with a reason. The two
+              # non-crate buckets are named so a consumer can never read them as crate contention:
+              #   __deferred-retry__  eaten by the lease filter BEFORE the busy-area partition ran
+              #   __uncensused__      the arithmetic residual. Nonzero means a drop branch exists
+              #                       that fills no census — a MISSING EDGE, which must be visible
+              #                       on the feed rather than absorbed into a crate's count.
+              retry_dropped = rows_before_assemble - len(retry_filtered)
+              if retry_dropped:
+                  dropped_by_area["__deferred-retry__"] = retry_dropped
+              uncensused = (rows_before_assemble - len(kept_numbers)
+                            - sum(dropped_by_area.values()))
+              if uncensused:
+                  dropped_by_area["__uncensused__"] = uncensused
               assembler_census[repo] = {
-                  "plan_rows_before_assemble": len(packages_before),
-                  "assembler_deferrals": len(packages_before) - len(kept_numbers),
+                  "plan_rows_before_assemble": rows_before_assemble,
+                  "assembler_deferrals": rows_before_assemble - len(kept_numbers),
                   "assembler_by_area": dropped_by_area,
                   "plan_rows": len(kept_numbers),
               }
               print("assembler-census " + " ".join([
                   repo,
-                  "plan_rows_before_assemble=" + str(len(packages_before)),
-                  "assembler_deferrals=" + str(len(packages_before) - len(kept_numbers)),
+                  "plan_rows_before_assemble=" + str(rows_before_assemble),
+                  "assembler_deferrals=" + str(rows_before_assemble - len(kept_numbers)),
                   "plan_rows=" + str(len(kept_numbers)),
               ]))
               # <<< assembler-census

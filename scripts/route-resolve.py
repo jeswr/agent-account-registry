@@ -134,11 +134,15 @@ def resolve(labels, doc):
     if role is not None:
         for r in routes:
             if "match_labels" not in r and r.get("role") == role:
-                return (_PREF.apply_preferences(labels, r["model_chain"], preferences),
+                # `role=` is what lets a preference's `inject_roles` allow-list be evaluated (adding
+                # the lead to a chain that lacks it is legal only for the roles the DECLARATION
+                # names). policy-resolve passes the same value at the same point.
+                return (_PREF.apply_preferences(labels, r["model_chain"], preferences, role=role),
                         r["agent"], bool(r.get("escalate")))
-    # Phase 3 — defaults (no security match and no role).
+    # Phase 3 — defaults (no security match and no role). role is None here BY CONSTRUCTION, so a
+    # roleless issue can never be injected into — passed explicitly rather than left to the default.
     d = doc.get("defaults", {})
-    return (_PREF.apply_preferences(labels, d.get("model_chain", []), preferences),
+    return (_PREF.apply_preferences(labels, d.get("model_chain", []), preferences, role=None),
             d.get("agent"), False)
 
 
@@ -173,9 +177,17 @@ def _self_test():
     # dispatch is a trust surface too.
     mc, ag, esc = resolve(["role:impl", "area:dispatch"], doc)
     chk("impl+dispatch -> opus5/escalate", (mc, esc), (["opus5"], True))
-    # a NON-trust area (usage) -> plain impl -> sol-led chain (sol-first routing, 2026-07-18).
+    # [OPUS-5] a NON-trust area (usage) -> plain impl -> OPUS5-ONLY + escalate (maintainer decision
+    # 2026-07-26 on the registry #738 measurement: "Remove sol from impl fallback"; sol converted
+    # 18% vs opus5 86% in-cell, n=74). The FULL tuple is asserted, not just the head, so demoting
+    # sol back to a second rung reds this instead of passing on `mc[0] == "opus5"`.
     mc, ag, esc = resolve(["role:impl", "area:usage"], doc)
-    chk("impl+usage -> opus5-led", (mc[0], ag, esc), ("opus5", "registry-impl", False))
+    chk("impl+usage -> OPUS5-ONLY, escalating", (mc, ag, esc),
+        (["opus5"], "registry-impl", True))
+    chk("role:impl names NO openai tier at all (exclusion, not a demotion)",
+        sorted({doc["models"][m]["provider"] for m in mc}), ["anthropic"])
+    chk("role:impl ESCALATES, so a single-rung chain has a machine exit rather than deferring "
+        "forever with nobody notified", esc, True)
     # [OPUS-5] docs -> SOL-led (maintainer 2026-07-26: "deprecate sonnet and haiku for docs
     # writing in favor of gpt 5.6 sol"). The second assertion is the one that reds if either
     # cheap anthropic tier is put back into the docs chain.
@@ -194,12 +206,22 @@ def _self_test():
     # sol wherever both are viable implementors). This repo has no `area:gui`, so it carries no
     # sol carve-out — every implementor route here takes the opus5-first default.
     chk("no role -> defaults", resolve(["area:usage"], doc)[0][0], "opus5")
-    for _role in ("impl", "site", "ci"):
+    # `role:impl` is deliberately NOT in this loop since 2026-07-26 — it is the one implementor
+    # route where sol was REMOVED rather than demoted, and it is asserted separately above. Every
+    # OTHER implementor route keeps sol as a reachable fallback (preference, not exclusion).
+    for _role in ("site", "ci"):
         _mc = resolve([f"role:{_role}"], doc)[0]
         chk(f"role:{_role} prefers opus5 over sol", _mc[0], "opus5")
         chk(f"role:{_role} keeps sol reachable (preference, not exclusion)", "sol" in _mc, True)
         chk(f"role:{_role} chain is cross-provider (terminates under either outage)",
             sorted({doc["models"][m]["provider"] for m in _mc}), ["anthropic", "openai"])
+    # ...and the exclusion is EXACTLY role:impl. This is the guard that reds if a future edit
+    # copies the exclusion onto a route the maintainer did not scope it to.
+    chk("the ONLY route with no openai rung among the implementor routes is role:impl",
+        sorted(r for r in ("impl", "site", "ci", "docs")
+               if not any(doc["models"][m]["provider"] == "openai"
+                          for m in resolve([f"role:{r}"], doc)[0])),
+        ["impl"])
     chk("docs KEEPS its sol lead (the separate docs-writing directive)",
         resolve(["role:docs"], doc)[0][0], "sol")
 
@@ -287,6 +309,45 @@ escalate = true
         resolve(["role:impl", "area:usage"], reordered), (["fable", "haiku"], "impl-agent", False))
     chk("no security + no matching role -> defaults",
         resolve(["area:usage"], reordered), (["fable"], "default-agent", False))
+
+    # ---- [OPUS-5] THE DOCS-ONLY BOUND ON `inject_roles`, ON THE PLAN SIDE.
+    # THIS resolver has NO docs-only rule of its own: `_reject_docs_only` is a CLAIM-side
+    # (policy-resolve) control over statically declared chains. That is precisely why the bound on
+    # the INJECTED lead lives in the SHARED `chain_preference` module — enforcing it only on the
+    # CLAIM side would make CLAIM refuse while PLAN routed, which `_route_matches` turns into a
+    # permanent per-tick `route-policy-failed` defer rather than a closed hole. These rows assert
+    # PLAN refuses the identical declaration, so the two sides cannot split.
+    _pref_doc = _copy.deepcopy(doc)
+    _pref_doc["route"] = [r for r in _pref_doc["route"] if "match_labels" not in r]
+    _attack = _copy.deepcopy(_pref_doc)
+    _attack["chain_preference"] = [{"labels": ["area:gui"], "lead": "terra",
+                                    "requires": ["terra", "opus5"], "inject_roles": ["impl"]}]
+    raises("PLAN refuses a DOCS-ONLY lead injected into role:impl, at parse time — the same "
+           "refusal the CLAIM-side resolver gives, from the same shared module",
+           _PREF.ChainPreferenceError,
+           lambda: resolve(["area:gui", "role:impl"], _attack))
+    raises("...and refuses it for an issue the selector does NOT even match, because a bad "
+           "DECLARATION is refused when the table is READ, not when an issue happens to select it",
+           _PREF.ChainPreferenceError,
+           lambda: resolve(["area:usage", "role:impl"], _attack))
+    _docs_ok = _copy.deepcopy(_pref_doc)
+    _docs_ok["chain_preference"] = [{"labels": ["area:gui"], "lead": "terra",
+                                     "requires": ["terra", "opus5"], "inject_roles": ["docs"]}]
+    _docs_ok["route"] = [({**r, "model_chain": ["opus5"]} if r.get("role") == "docs" else r)
+                         for r in _docs_ok["route"]]
+    chk("...but a docs-only lead injected into role:docs still RESOLVES at PLAN (the bound mirrors "
+        "the _reject_docs_only EXEMPTION, so it is not a blanket ban)",
+        resolve(["area:gui", "role:docs"], _docs_ok)[0], ["terra", "opus5"])
+    # THE LIVE SHAPE sparq SHIPS: `lead = "sol"` + `inject_roles = ["impl"]`. Unchanged by the
+    # bound.
+    _live_shape = _copy.deepcopy(_pref_doc)
+    _live_shape["chain_preference"] = [{"labels": ["area:gui"], "lead": "sol",
+                                        "requires": ["sol", "opus5"], "inject_roles": ["impl"]}]
+    chk("the LIVE area:gui carve-out (lead = sol, inject_roles = [impl]) still injects sol-first "
+        "into the single-rung impl chain at PLAN",
+        resolve(["area:gui", "role:impl"], _live_shape)[0], ["sol", "opus5"])
+    chk("...and a non-gui impl issue is still OPUS5-ONLY under that same declaration",
+        resolve(["area:usage", "role:impl"], _live_shape)[0], ["opus5"])
 
     print("route-resolve self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
