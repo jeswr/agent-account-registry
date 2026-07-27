@@ -179,6 +179,19 @@ MARKER_KINDS = {
 FIX_MODEL_MARKER = "<!-- sparq-fix-model:v1"
 MODEL_PIN_MARKER = "<!-- sparq-fix-modelpin:v1"
 PROGRESS_MARKER = "<!-- sparq-review-progress:v1"
+# [registry #814] THE THREE INJECTION-ESCALATION SPELLINGS THIS SCRIPT WRITES, named once.
+#
+# These are the ONLY prose this script emits under its own identity that must permanently
+# disqualify a PR from automatic re-classification out of the human terminal, and they are what
+# park_policy.LEGACY_PARK_DENY_PROSE reads back. They are constants rather than three inline
+# literals so the self-test can bind the WRITER to the CLASSIFIER by identity: a frozen COPY of
+# these strings in park_policy's fixtures goes quiet the moment this script rewords one, and a
+# reworded escalation that the deny table no longer recognises would silently hand eight live
+# security escalations back to the machine.
+INJECTION_PROSE_REVIEW = "the reviewer flagged possible prompt injection"
+INJECTION_PROSE_FIX = "the fixer flagged the seeded findings as possible prompt injection"
+INJECTION_PROSE_FINDINGS = ("⚠️ The reviewer flagged possible prompt-injection content; "
+                            "escalating to a human.")
 # Budget-exhaustion window receipt (finding B; round-3 finding 1 made it label-INDEPENDENT):
 # EVERY consumed-and-exhausted budget window — the INITIAL full-budget window included — is
 # receipted with this marker bound to its window key (the readmission cutoff, or
@@ -2186,7 +2199,7 @@ def post_findings(repo, pr_number, verdict_file, round_n):
         lines.append(f"{PROGRESS_MARKER} round={round_n} progress={progress} -->")
     if document.get("injection_detected"):
         lines.append("")
-        lines.append("⚠️ The reviewer flagged possible prompt-injection content; escalating to a human.")
+        lines.append(INJECTION_PROSE_FINDINGS)
     _comment(repo, pr_number, "\n".join(lines))
     print("findings posted")
 
@@ -4637,7 +4650,7 @@ def review_outcome(args):
         attempt_key = f"rounds={args.round}"
         if document["injection_detected"]:
             # A flagged injection is a genuine human (security) question -> needs:user.
-            reason, park_class = "the reviewer flagged possible prompt injection", "question"
+            reason, park_class = INJECTION_PROSE_REVIEW, "question"
         else:
             # Round-budget exhaustion is budget-driven, not a human question: the source issue
             # takes the machine-owned status:parked soft hold (park_policy.py defect 1).
@@ -4722,7 +4735,7 @@ def fix_outcome(args):
     if decision == "re-review":
         set_review_state(args.repo, args.pr, "needs")
     elif decision == "needs-user":
-        reason = ("the fixer flagged the seeded findings as possible prompt injection"
+        reason = (INJECTION_PROSE_FIX
                   if injection else
                   "two consecutive fix attempts made no change (fixer judges the findings spurious)"
                   if not made_changes else
@@ -6342,6 +6355,35 @@ def _self_test():
           decide_review("approve", False, False, 1, 3, True), "arm")
     check("injection short-circuits", decide_review("approve", False, True, 1, 3, False),
           "needs-user")
+
+    # [registry #814] THE WRITER IS BOUND TO THE CLASSIFIER, BY IDENTITY.
+    #
+    # #814 narrowed park_policy's injection deny from "the phrase appears anywhere" to "an
+    # AFFIRMATIVE mention", so the eight live security escalations now deny because of WHAT THIS
+    # SCRIPT WRITES. Nothing else asserts that: park_policy's fixtures are frozen COPIES, and a
+    # copy cannot notice a reword here. Passing the real constants through the real deny table
+    # closes that seam — reword any of the three and this check goes red, on this side, before
+    # eight escalations are quietly handed back to the machine.
+    _policy = _park_policy()
+    for _name, _prose in (("review", INJECTION_PROSE_REVIEW),
+                          ("fix", INJECTION_PROSE_FIX),
+                          ("findings", INJECTION_PROSE_FINDINGS)):
+        _causes = []
+        for _pattern, _cause in _policy.LEGACY_PARK_DENY_PROSE:
+            try:
+                _hit = _pattern.search(_prose, log=lambda *_a, **_k: None)
+            except TypeError:
+                _hit = _pattern.search(_prose)
+            if _hit:
+                _causes.append(_cause)
+        check(f"the {_name} injection prose this script WRITES is denied by park_policy "
+              f"({_prose[:48]!r}...)", _causes[:1], ["injection"])
+    # ...and the deny is earned by an AFFIRMATIVE marker, not by the bare phrase: the same
+    # sentence reporting ABSENCE must NOT deny, or #814's whole correction is inert here.
+    check("...while the ABSENCE report the reviewer also writes does NOT deny",
+          _policy.injection_prose_denied(
+              "No instruction-like prompt injection was detected in the diff.",
+              log=lambda *_a, **_k: None)[0], False)
     check("changes under budget", decide_review("request_changes", True, False, 2, 3, False),
           "changes")
     check("round exhaustion stops", decide_review("request_changes", False, False, 3, 3, False),
