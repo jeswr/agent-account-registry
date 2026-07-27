@@ -16116,6 +16116,19 @@ def _starvation_sweep_self_test():
         f"in ONE executed tick; at a cap of {STARVATION_PARKS_PER_TICK_MAX} it takes "
         f"{_drain_ticks} tick(s) = {_drain_minutes} min of TOTAL dispatch outage, because the "
         "union keeps the partition reserved until the LAST holder is parked")
+    # THE OBSERVATION ITSELF IS PINNED. Everything above is satisfied by a SMALLER board, so a
+    # mutant that quietly understates the measurement leaves the whole battery green while the
+    # bound it justifies stops being justified — measured: `MEASURED_STARVED_HOLDER_BOARD = 1`
+    # survived this file until this assertion existed. A recorded observation can only be
+    # defended by pinning it; it is re-derived from a NEW measurement, never from code.
+    assert MEASURED_STARVED_HOLDER_BOARD == 4, (
+        "MEASURED_STARVED_HOLDER_BOARD is an OBSERVATION — sparq-org/sparq, four consecutive "
+        "executed dispatch ticks 2026-07-27 20:12:40Z-20:47:36Z, assemble-census kept=0 with "
+        "every row deferred by reason.global-reservation. Change it only with a new measurement, "
+        "and re-derive STARVATION_PARKS_PER_TICK_MAX when you do")
+    assert (MEASURED_STARVED_HOLDER_BOARD * _floor.MIN_TICK_INTERVAL_SECONDS // 60) == 40, \
+        "the PRE-FIX drain of the measured board is the number this change is justified by " \
+        "(4 holders x a 10-minute floor); if either input moved, the justification moved with it"
     print(f"  ok   #822 drain time: the measured {MEASURED_STARVED_HOLDER_BOARD}-holder board "
           f"drains in {_drain_ticks} tick ({_drain_minutes} min), not "
           f"{MEASURED_STARVED_HOLDER_BOARD} ticks "
