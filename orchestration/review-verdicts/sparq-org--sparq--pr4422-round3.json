@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4422,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a8572943fb442f5021cebd34b9c28c1106219cbc",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "join_eq_r_repeated_pair_pads_and_accepts calls two_pair_universe(), which commits A rows with join keys JK and JK2 and matching B rows with both keys. The true join cardinality at slots A[2] x B[0] is therefore 2, not 1 as the test commentary states. Repeating the first pair does test lane reuse, but this fixture does not validate the specifically claimed case that an actual one-match graph can fill R=2 lanes. On this honesty-sensitive surface, the test description and exercised invariant must agree.",
+    "file": "zk/compose/compose_core/src/tests.nr",
+    "fix_hint": "Build JR2 from committed graphs containing exactly one genuine joined pair (or a second nonmatching row if multi-row coverage is desired), assert/use those commitments, and repeat that sole pair across both lanes. Keep JR1 on two_pair_universe() for the distinct-pair case.",
+    "severity": "minor",
+    "title": "JR2 claims N=1 but constructs a two-match graph"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 2's major cardinality overclaim is materially fixed: the revised code and documentation consistently state that R lanes may repeat, prove only existence of a genuine match in cardinality terms, and establish no bound on the true join cardinality N. The per-lane relation and adversarial tests otherwise support the scoped circuit statement. One test remains internally false, however: JR2 says its universe has N=1 and presents itself as the one-match padding witness, but it calls two_pair_universe(), whose committed graphs have two genuine joined pairs. Thus the test does not exercise the exact scenario its comments claim. This is a new, lower-severity finding, so progress is regressing under the mandated scale.",
+  "verdict": "request_changes"
+ }
+}
