@@ -9,6 +9,8 @@ deprecated_models.py
 dispatch-claim.py
 dispatch-plan.py
 dispatch-secrets-guard.py
+dispatch-stall-alert.py
+dispatch-tick-floor.py
 gh_retry.py
 grant-account.py
 groom-alert.py
@@ -16,8 +18,10 @@ groom.py
 lease_schema.py
 ledger-invariant.py
 ledger_retry.py
+metrics-alert.py
 metrics.py
 migrate-secrets.sh
+mint-provenance.py
 model-health.py
 no_change_routing.py
 park_policy.py
@@ -26,11 +30,13 @@ plan-alert.py
 plan-snapshot.py
 policy-resolve.py
 ready-issues.py
+reconcile-park-misescalation.py
 resolve-conflicts.py
 retriage.py
 route-resolve.py
 select-and-claim.py
 stuck_adjudicator.py
+triage-stock-alert.py
 triage.py
 trust-gate.py
 usage-alert.py
