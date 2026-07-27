@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4437,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ebf7cb310fa98eaed2ca473d7ec0de7db4c39cc9",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves both prior major findings. The executor now rejects returned columns outside the SERVICE group's in-scope variables before interning, and the integration test demonstrates that an outer-only ?x cannot be overwritten or suppress the outer solution under SILENT. The local registry guard now saves and restores the previous registry, with tests covering ordinary nested shadowing and unwind restoration. The changes remain behind the default-off service-local feature, include feature-matrix coverage both alone and combined with service, preserve registry-miss HTTP/SSRF behavior, and add non-vacuous real-query tests for the load-bearing paths. No new correctness, soundness, test-validity, or security issue is evident in the supplied diff.",
+  "verdict": "approve"
+ }
+}
