@@ -822,10 +822,11 @@ jobs:
               # excluded here either: CLAIM re-derives the live round count and applies the
               # terminal transition itself, so a PR whose final outcome mutation crashed
               # converges loudly. `review_exclusions` collects every SIGNALLED
-              # (review:changes / review:needs / review:parked) exclusion reason for the one
-              # aggregate line at
+              # (review:changes / review:needs / review:parked, plus issue #464's CONFLICTING
+              # base — a DIRTY PR signals on its own, whatever its labels) exclusion reason for
+              # the one aggregate line at
               # PLAN completion (park-policy defect 3: "0 review item(s)" can never again
-              # coexist silently with labeled worker PRs).
+              # coexist silently with signalled worker PRs).
               # [OPUS-5 #657] The MASTER-protected half of orchestrator-PR admission. Read from
               # the private `registry` checkout (master), NEVER from the `registry-ledger`
               # checkout: provenance records live on ledger precisely because master's required
@@ -959,10 +960,12 @@ jobs:
                 f"{len(review_items)} review item(s), {len(disarm_items)} disarm item(s), "
                 f"{len(snapshot_skips)} snapshot skip(s)")
           # Park-policy defect 3: ONE aggregate exclusion line, printed on EVERY plan, so a
-          # "0 review item(s)" tick can never coexist silently with labeled worker PRs.
+          # "0 review item(s)" tick can never coexist silently with signalled worker PRs.
+          # "signalled", not "labeled", since issue #464: a CONFLICTING base is a signal in its
+          # own right, so the count now covers DIRTY PRs that carry no review:* label at all.
           exclusion_detail = ", ".join(
               f"{reason}={count}" for reason, count in sorted(review_exclusions.items()))
-          print(f"review-enumeration excluded {sum(review_exclusions.values())} labeled "
+          print(f"review-enumeration excluded {sum(review_exclusions.values())} signalled "
                 f"worker PR(s): {exclusion_detail or 'none'}")
           # [registry #762] ONE census line on EVERY plan, listing every bucket including the
           # zeros. A per-stage rate cannot express a MISSING EDGE (#753); only a population
