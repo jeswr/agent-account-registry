@@ -1286,43 +1286,22 @@ jobs:
       # {owner: token} JSON map (_target_token resolves per repo owner). Each mint is
       # continue-on-error: a missing install for one owner only skips THAT owner's mutation paths;
       # the other owner's dispatch + the issue dispatch for both continue.
+      # The scoping itself is groom.py --print-owner-repos --target-repos-env (issue #273): the
+      # same SELF-TESTED resolver groom/curate/conflict-resolver already use, reading the manifest
+      # instead of policy. It collects EVERY manifest repo per owner — not one representative name,
+      # which would scope that owner's token to a single repo and 404 every mutation on the
+      # owner's OTHER manifest repos (a supported manifest shape the exact-owner-set assertion
+      # does not constrain) — and it still fails LOUD unless the manifest owners are exactly
+      # {sparq-org, jeswr}, so adding an owner without a mint step dies here instead of silently
+      # dropping that owner's token. Repo names are not secret; tee keeps the scope in the log.
       - name: Resolve distinct target owners (per-owner token mint)
         id: owners
         env:
           TARGET_REPOS: ${{ env.DISPATCH_TARGET_REPOS }}
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import json
-          import os
-          import re
-
-          targets = json.loads(os.environ["TARGET_REPOS"])
-          safe = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*")
-          owners = {}
-          for repo in targets:
-              if not safe.fullmatch(repo):
-                  raise SystemExit("unsafe target repo in the manifest")
-              owner, name = repo.split("/", 1)
-              # Collect EVERY repository per owner (defect #120): keeping only one representative
-              # name scoped each owner's App token to a single repo, so any additional enabled
-              # repo under that owner passed the owner-set assertion but had all its mutations
-              # 404/unauthorized and deferred forever. The App-token action's `repositories`
-              # input accepts the full comma-separated list.
-              names = owners.setdefault(owner, [])
-              if name not in names:
-                  names.append(name)
-          # The mint steps below are static (two known owners); assert the manifest owners are
-          # exactly {sparq-org, jeswr} so a manifest change fails LOUD here instead of silently
-          # dropping a new owner's token (which would reintroduce the wrong-owner-token bug).
-          if set(owners) != {"sparq-org", "jeswr"}:
-              raise SystemExit(f"unexpected target owners {sorted(owners)}; add a mint step")
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-              # Comma-separated repo list per owner (GITHUB_OUTPUT is line-based; each name is
-              # already `safe`-validated so it can never contain a comma).
-              output.write(f"sparq_name={','.join(owners['sparq-org'])}\n")
-              output.write(f"jeswr_name={','.join(owners['jeswr'])}\n")
-          PY
+          python3 registry/scripts/groom.py --print-owner-repos \
+            --target-repos-env TARGET_REPOS | tee -a "$GITHUB_OUTPUT"
 
       - name: Mint sparq-org target-scoped App token (issue/PR mutations only)
         id: app-token-sparq
@@ -1332,7 +1311,7 @@ jobs:
           app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
           private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
           owner: sparq-org
-          repositories: ${{ steps.owners.outputs.sparq_name }}
+          repositories: ${{ steps.owners.outputs.sparq_names }}
           permission-issues: write
           permission-pull-requests: write
 
@@ -1344,7 +1323,7 @@ jobs:
           app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
           private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
           owner: jeswr
-          repositories: ${{ steps.owners.outputs.jeswr_name }}
+          repositories: ${{ steps.owners.outputs.jeswr_names }}
           permission-issues: write
           permission-pull-requests: write
 
