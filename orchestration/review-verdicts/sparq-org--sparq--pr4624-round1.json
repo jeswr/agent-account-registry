@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 4624,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "7c536c464b50d877cde023dd1514388e513a780a",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new note (line 147-151) correctly states that build-matrix.yml is the single source of truth for the tier matrix. But the unchanged line 134 still describes release.yml's package job as building \"for every hardware tier (same matrix as `dist.yml`: ...)\", which is the old hand-synced-duplicate framing this PR is retiring. A reader hitting line 134 first is told dist.yml is the reference matrix; ten lines later they are told build-matrix.yml is. Not factually false (the matrices are identical because they are literally the same file), but it leaves the section internally inconsistent about where the matrix lives \u2014 which is the exact confusion this PR set out to remove.\n\nSecondary: the tier list on lines 134-135 enumerates \"x64/arm64 Windows\" (2 Windows tiers), but build-matrix.yml:103-106 defines three \u2014 win-x64-baseline, win-x64-v3, win-arm64 \u2014 so the parenthetical undercounts the 10-tier matrix as 9. Pre-existing, not introduced here.",
+    "file": "docs/release.md",
+    "fix_hint": "Reword line 134 to point at the reusable workflow rather than dist.yml, e.g. \"**package** \u2014 calls the reusable `build-matrix.yml` with `mode: archive`, building every hardware tier (arm64/x64 darwin, x86-64 baseline/v2/v3/v4 + arm64 Linux, x64 baseline/v3 + arm64 Windows)\". That also fixes the Windows tier undercount and removes the need for the note to re-explain the relationship.",
+    "severity": "minor",
+    "title": "Adjacent line 134 still says \"same matrix as dist.yml\", contradicting the new \"single source of truth\" note 13 lines below"
+   },
+   {
+    "body": "Line 134 says the package job \"builds `sparq-cli` for every hardware tier\" and lines 136-137 say each archive contains \"the binary, `README.md`, `LICENSE` (if present), and `CHANGELOG.md`\". Since sq-v286.6 the shared matrix builds and packages two binaries: build-matrix.yml:135-136 runs `cargo auditable build ... -p sparq-cli` and `-p sparq-server`, and the archive step at build-matrix.yml:155-156 copies both into `pkg/$PKG/`. The `binary` mode does the same (build-matrix.yml:235-236, 242-243).\n\nSo the description of the release archive contents is now incomplete at HEAD \u2014 a user reading this doc would not expect a sparq-server binary in the tarball. Pre-existing rather than introduced by this diff, but this PR is precisely the docs/release.md-vs-build-matrix.yml reconciliation pass, so it is the natural place to fix it.",
+    "file": "docs/release.md",
+    "fix_hint": "Update line 134 to \"builds `sparq-cli` **and** `sparq-server` for every hardware tier\" and line 136 to \"containing both binaries, `README.md`, `LICENSE` (if present), and `CHANGELOG.md`\". Note the archive NAME is deliberately still `sparq-cli-vX.Y.Z-<tier>` (build-matrix.yml:139-140, 153) \u2014 keep that as written so the doc stays accurate about the filename.",
+    "severity": "minor",
+    "title": "Lines 134-137 omit sparq-server: archives contain BOTH binaries, not just sparq-cli"
+   },
+   {
+    "body": "The inline `[GPT-5]` tag follows the established repo pattern of model-attribution markers in prose (docs/branch-protection.md:126 `[OPUS-5]`, :158 `[FABLE-5]`, docs/release.md:155 `[OPUS-4.8]`), so it is stylistically in-band. It is, however, the only `[GPT-5]` occurrence anywhere under docs/, and the marker vocabulary elsewhere tracks the project's own agent-tier table. Purely a convention question, not a correctness one \u2014 flagging so the maintainer can decide rather than silently accepting a new marker namespace.\n\nMinor placement point: other markers sit either in an HTML comment on their own line or at the start of a sentence; `Note: [GPT-5] \\`dist.yml\\` is ...` splits the \"Note:\" lead-in from its clause.",
+    "file": "docs/release.md",
+    "fix_hint": "Either drop the marker (the git history already records authorship) or move it to the front of the sentence / into an HTML comment, e.g. `<!-- [GPT-5] reconciled with build-matrix.yml (sq-v286.2) -->` on the line above, matching docs/release.md:155.",
+    "severity": "nit",
+    "title": "`[GPT-5]` is the first non-Claude authorship marker in docs/ \u2014 confirm the convention allows it"
+   }
+  ],
+  "progress": null,
+  "summary": "Docs-only change to docs/release.md replacing a now-stale note about dist.yml with an accurate one. I verified every claim against the checkout at PR head:\n\n1. \"dist.yml is manual-dispatch only; it does not run on v* tags\" \u2014 CONFIRMED: .github/workflows/dist.yml has `on: workflow_dispatch:` and no `tags:`/push trigger; its header comment records the removal (sq-v286.2).\n2. \"Both dist.yml and release.yml call the reusable build-matrix.yml\" \u2014 CONFIRMED: dist.yml `uses: ./.github/workflows/build-matrix.yml`; release.yml:143 does the same.\n3. \"build-matrix.yml is the single source of truth for the hardware-tier matrix and build steps\" \u2014 CONFIRMED: build-matrix.yml is a `workflow_call` reusable workflow holding the single 10-tier matrix (lines 89-106) and the shared checkout/Rust/cargo-auditable build steps; neither caller inlines a matrix any more.\n4. \"dist.yml selects mode: binary ... release.yml selects mode: archive\" \u2014 CONFIRMED: dist.yml `with: mode: binary`; release.yml:145 `mode: archive`.\n\nThe removed text was actively wrong at HEAD (it asserted dist.yml still fires on v* tags and that release.yml duplicates the matrix), so this is a net honesty improvement. The dropped macos-13 -> macos-15-intel parenthetical is correctly obsolete now that there is one matrix (build-matrix.yml:92 uses macos-15-intel).\n\nNo blockers or majors. Remaining findings are pre-existing staleness in the immediately adjacent numbered list that this reconciliation pass left untouched \u2014 the doc now says build-matrix.yml is the single source of truth while line 134 still frames dist.yml as the reference matrix, and lines 134-137 predate the sq-v286.6 addition of sparq-server to the archives. Docs-only diff: no code, tests, or security surface touched, so there is nothing to check for vacuous tests. No prompt-injection content in the diff; the inline [GPT-5] token is an authorship marker matching the repo's existing [OPUS-5]/[FABLE-5] convention, not an instruction.",
+  "verdict": "approve"
+ }
+}
