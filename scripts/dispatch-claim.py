@@ -3477,7 +3477,10 @@ def readmission_park_exit_candidate(pr_labels, source_labels):
 
     [registry #777] This bounds the population the refusal is ABOUT. A PR carrying neither label
     is not being moved off any park, so counting it as "refused" would bury the real signal under
-    the whole open listing — 73 of the 84 live worker PRs on 2026-07-27."""
+    the whole open listing — 32 of the 85 live worker PRs on 2026-07-27 are not park-exit
+    candidates at all. It also keeps this guard off a class that is not its business: an UN-parked
+    recordless PR (sparq#4555 that day) is nobody's re-admission, and it is registry #775's
+    reservation-side escalation that owns it."""
     return (readmission_machine_parked(pr_labels, source_labels)
             or _park_policy.HUMAN_PR_PARK_LABEL in set(pr_labels))
 
@@ -3742,13 +3745,36 @@ def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_logi
             # record — BEFORE either exit, and before the pacing budget, so a refusal consumes
             # nothing and is reported identically on a busy tick and a quiet one.
             #
-            # MEASURED read-only against the live board on 2026-07-27 (118 open PRs, 84 worker,
-            # the real ledger provenance and issue labels): 11 of the 84 worker PRs have NO
-            # record at all. #2521 carries `review:parked` and nothing else, so the exit above
-            # is the only thing between it and re-entry; re-admitting it — applying exactly what
-            # `clear_labels` writes, `review:*` -> `review:needs` — takes the busy union from
-            # `__global__` absent to `__global__` held and the ready frontier from kept=119 to
-            # kept=0, with all 449 ready rows deferred behind that one PR.
+            # MEASURED read-only against the live board on 2026-07-27, on PRODUCTION'S OWN
+            # frontier (dispatch run 30280083966: `assemble-census rows_before=26 deferred=17
+            # kept=9 reason.global-reservation=0`), 24 of whose 26 rows are recoverable verbatim
+            # from that run's log. Re-admitting sparq#2439 — applying exactly what `clear_labels`
+            # writes, `review:*` -> `review:needs` — takes the busy union from `__global__`
+            # ABSENT to `__global__` HELD and those rows from kept=8 to kept=0, every one of them
+            # deferred with `reason.global-reservation`. sparq#2456 reproduces it identically.
+            #
+            # THE ENUMERATION METHOD IS THE LOAD-BEARING PART, because getting it wrong is what
+            # made an earlier revision of this comment cite a 4x-too-large population and the
+            # wrong worked example. Provenance is read LEDGER-FIRST WITH A MASTER FALLBACK
+            # (dispatch.yml, mirrored by `_claim_provenance_map`), so a `ref=ledger` 404 does NOT
+            # mean recordless: a PR can have an admissible record on the master checkout alone.
+            # There are THREE outcomes, not two — no record anywhere / a record that EXISTS but is
+            # REFUSED (a malformed attestation stamp) / admissible — and only the first two are
+            # this guard's population. Measured with both roots: 3 of 85 worker PRs are
+            # not-enumerable, of which the guard refuses exactly the 2 that carry a park
+            # (sparq#2439, sparq#2456 — both on the `review:needs-user` MIGRATION path, which is
+            # why that half is the live-reachable one); the third, sparq#4555, is UN-parked, so
+            # it is correctly no business of this guard and is registry #775's reservation-side
+            # class instead.
+            #
+            # RETRACTED, and left here because the retraction is the useful part: an earlier
+            # revision named sparq#2521 as the worked example and asserted it "carries
+            # `review:parked` and nothing else". Both claims were false. It carries five labels
+            # (two of them `review:*`), it has an ADMISSIBLE master record, and its source issue
+            # #2463 carries `needs:ec2` — so `busy_packages_of_pulls` parks it from the SOURCE
+            # hold whatever its review label says. Re-admitting it leaves the board byte-identical
+            # (kept=8 in both arms) and this guard correctly does NOT refuse it. Its containment
+            # is designed, not coincidental.
             #
             # BOTH halves of the harm are already documented by busy_packages_of_pulls: such a
             # PR "is invisible to the enumerator but can still carry a latched arm, and its true
@@ -13803,13 +13829,19 @@ def _self_test():
         # row behind it. The `parked AND inactive` carve-out is the only thing containing these
         # PRs, and re-admission removes the label that carve-out keys on.
         #
-        # MEASURED read-only against the live board on 2026-07-27 (118 open PRs, 84 worker, the
-        # real ledger provenance and issue labels): 11 of the 84 worker PRs are recordless.
-        # Re-admitting #2521 — applying exactly what `clear_labels` writes, `review:*` ->
-        # `review:needs` — takes the busy union from `__global__` absent to `__global__` held and
-        # the ready frontier from kept=119 to kept=0, with all 449 ready rows deferred behind that
-        # one PR. Its park is refused today only because a HUMAN happened to apply it: containment
-        # by coincidence, which is what this replaces.
+        # MEASURED read-only on 2026-07-27 against PRODUCTION'S OWN frontier (dispatch run
+        # 30280083966: `assemble-census rows_before=26 deferred=17 kept=9
+        # reason.global-reservation=0`). Re-admitting sparq#2439 — applying exactly what
+        # `clear_labels` writes, `review:*` -> `review:needs` — takes the busy union from
+        # `__global__` ABSENT to `__global__` HELD and those rows from kept=8 to kept=0, every one
+        # deferred with `reason.global-reservation`. sparq#2456 reproduces it identically.
+        #
+        # ENUMERATION, the part that is easy to get wrong: provenance is read LEDGER-FIRST WITH A
+        # MASTER FALLBACK, and there are THREE outcomes — absent everywhere / present but REFUSED
+        # (malformed attestation stamp) / admissible. Only the first two are this guard's
+        # population: 3 of 85 worker PRs, of which it refuses the 2 that carry a park. The cases
+        # below are built to cover exactly that split, INCLUDING the admissible-record PR that
+        # must NOT be refused — the case a ledger-only enumeration got wrong.
         _refusal_bucket = readmit_refusal_bucket(READMIT_REFUSAL_NO_PROVENANCE)
 
         def guard_park_event(_repo, number):
@@ -13839,25 +13871,50 @@ def _self_test():
                 refusals=refusals)
             return readmitted, cleared
 
-        # (1) THE GUARD. The same fixture that re-admits above, with the record removed, is
-        # REFUSED — and the refusal is COUNTED under a declared reason, not logged into silence.
-        refusal_census = Counter()
-        assert _refusal_bucket not in refusal_census, "the bucket must be MINTED by the sweep"
-        readmitted, cleared = guard_sweep({}, refusals=refusal_census)
-        assert (readmitted, cleared) == (0, []), (readmitted, cleared)
-        assert refusal_census[_refusal_bucket] == 1, refusal_census
-        # (2) SELF-CLEARING, BY EXECUTION. Same PR, same tick inputs, record present => it
-        # re-admits, with no label written by a human and no second mechanism involved.
+        # (1) THE GUARD, over BOTH not-enumerable shapes. The refusal is COUNTED under a declared
+        # reason, not logged into silence.
+        #
+        # The second shape is the one that matters live and the one a two-outcome enumeration
+        # misses entirely: a record that EXISTS but is REFUSED. Every not-enumerable PR on the
+        # live board is that shape — sparq#2439/#2456 carry master-checkout records whose
+        # `recorded_at_run` attestation stamp is missing, so `provenance.get(number)` returns a
+        # dict and only the ADMISSION says no. A guard written against `record is None` would pass
+        # every test built from the first shape and refuse nobody in production.
+        for _shape, _prov in (
+                ("absent everywhere", {}),
+                ("present but REFUSED (unstamped — the live sparq#2439/#2456 shape)",
+                 {41: {key: value for key, value in readmit_prov()[41].items()
+                       if key != "recorded_at_run"}})):
+            refusal_census = Counter()
+            assert _refusal_bucket not in refusal_census, "the bucket must be MINTED by the sweep"
+            readmitted, cleared = guard_sweep(_prov, refusals=refusal_census)
+            assert (readmitted, cleared) == (0, []), (_shape, readmitted, cleared)
+            assert refusal_census[_refusal_bucket] == 1, (_shape, refusal_census)
+        # ...and the second shape really is a PRESENT record, so the case is about ADMISSION and
+        # not about absence. Inverting this makes the case a duplicate of the first.
+        assert isinstance({key: value for key, value in readmit_prov()[41].items()
+                           if key != "recorded_at_run"}, dict)
+        assert provenance_admission_error(
+            {key: value for key, value in readmit_prov()[41].items()
+             if key != "recorded_at_run"}, 41) == ATTESTATION_UNRECOGNISED_REASON
+        # (2) SELF-CLEARING, BY EXECUTION, and NO FALSE POSITIVE. Same PR, same tick inputs,
+        # ADMISSIBLE record => it re-admits, with no label written by a human and no second
+        # mechanism. This is also the case a ledger-only enumeration got wrong on the live board:
+        # three PRs it called recordless (sparq#2465/#2493/#2521) hold admissible MASTER-checkout
+        # records, and the guard must leave every one of them alone.
         cleared_census = Counter()
         readmitted, cleared = guard_sweep(readmit_prov(), refusals=cleared_census)
         assert (readmitted, cleared) == (1, [(41, 7)]), (readmitted, cleared)
         assert cleared_census[_refusal_bucket] == 0, cleared_census
-        print("  ok   #777 guard: a recordless park is REFUSED release and counted; the SAME PR "
-              "re-admits the moment its record exists (self-clearing, proven by execution)")
+        print("  ok   #777 guard: BOTH not-enumerable shapes (absent, and present-but-refused) "
+              "are refused and counted; an ADMISSIBLE record re-admits (self-clearing, no false "
+              "positive)")
 
         # (3) SEALED, so "the sweep refused nobody" and "the sweep never ran" do not read alike
         # (registry #753/#754) — and a PR that is not a park-exit candidate at all is NOT counted.
-        # 73 of the 84 live worker PRs carry no park; counting them would bury the real signal.
+        # 32 of the 85 live worker PRs carry no park; counting them would bury the real signal.
+        # This is also the shape of live sparq#4555 — recordless AND un-parked — which belongs to
+        # registry #775's reservation-side escalation, not to this release-side guard.
         unparked_census = Counter()
         readmitted, cleared = guard_sweep(
             {}, rows=[[dict(parked_row, labels=[{"name": "review:needs"}])]],
