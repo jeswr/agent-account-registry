@@ -1026,29 +1026,6 @@ def repair_gate_conclusion(check_runs, log=print):
     return GATE_GREEN_BY_TIER[name] if state == "success" else state
 
 
-def unknown_aggregator_tiers(check_runs):
-    """PURE cross-repo CONTRACT-DRIFT detector (issue #762): the aggregator-SHAPED check-run names
-    present on a head that are NOT in the closed CI_REPAIR_GATE_CHECKS table.
-
-    Non-empty means the target repo publishes an aggregator tier this repo does not recognise —
-    the exact condition that made the ci-fix lane silently unreachable on sparq for ten days,
-    because an unrecognised tier and an absent aggregator both read as "missing".
-
-    ALARM ONLY. The returned names are counted and logged; no caller may resolve, classify or
-    admit on them. Widening repair_gate_conclusion to consume this would reinstate the defect
-    with a wider blast radius: an unknown tier's leg set is unknown, so neither its red nor its
-    green direction can be argued for. The remedy is a human adding the name to the table after
-    checking what that tier actually runs."""
-    if not isinstance(check_runs, list):
-        return []
-    return sorted({
-        run["name"] for run in check_runs
-        if isinstance(run, dict) and isinstance(run.get("name"), str)
-        and run["name"] not in CI_REPAIR_GATE_CHECKS
-        and AGGREGATOR_TIER_SHAPE.fullmatch(run["name"])
-    })
-
-
 def pr_ci_status(record):
     """PURE per-PR CI/merge status from the PLAN snapshot's raw detail record. Hostile-tolerant:
     anything malformed degrades to unknown (empty dict / None fields) so a poisoned snapshot can
@@ -6782,6 +6759,32 @@ def review_fix_admits_orchestrator_class(source=None):
 
 
 def _self_test():
+    # ---- NO MODULE-SCOPE SHADOWING (registry #762, found by rebasing #765 onto #761) ----------
+    # This module is 14k lines and two PRs edited overlapping regions of it. The merge left TWO
+    # top-level `def unknown_aggregator_tiers` — the later one silently shadowed the earlier, so
+    # one PR's function was DEAD and the other PR's tests were, unknowingly, exercising the
+    # survivor. The bodies happened to agree, so nothing failed and no mutation could find it:
+    # mutating the shadowed copy is a no-op by construction, which is precisely why a behavioural
+    # suite cannot see this class at all. Python has no duplicate-definition error, so assert it.
+    _module_names = Counter()
+    for _node in ast.parse(Path(__file__).resolve().read_text(encoding="utf-8")).body:
+        if isinstance(_node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            _module_names[_node.name] += 1
+        elif isinstance(_node, ast.Assign):
+            for _t in _node.targets:
+                if isinstance(_t, ast.Name):
+                    _module_names[_t.id] += 1
+    _shadowed = sorted(name for name, count in _module_names.items() if count > 1)
+    assert not _shadowed, (
+        f"module-scope shadowing in dispatch-claim.py: {_shadowed} — a later top-level "
+        "definition silently replaces an earlier one, so the earlier is dead code no test can "
+        "reach and no mutant can kill (this is what a bad three-way merge leaves behind)")
+    # ...and NON-VACUOUS: the check must actually see a duplicate when one exists.
+    assert sorted(
+        name for name, count in Counter(
+            node.name for node in ast.parse("def a():\n    pass\n\n\ndef a():\n    pass\n").body
+            if isinstance(node, ast.FunctionDef)).items() if count > 1) == ["a"]
+
     # _run_gh_target_api MUST return the CompletedProcess on success — callers read .stdout
     # (decline reroute re-read, #505). A missing `return result` made it fall off to None and
     # crash the CLAIM job with AttributeError on every escalation tick (run 29982184587).
