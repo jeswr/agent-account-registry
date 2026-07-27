@@ -110,6 +110,33 @@ _TRANSIENT_TEXT = (
     "unexpected end of json input",
 )
 _SECONDARY_403 = ("secondary rate limit", "abuse detection", "retry-after", "retry later")
+# [registry #710] The PRIMARY (core/installation) rate-limit 403 — the shape `_SECONDARY_403` does
+# NOT cover, and the one that was actually losing provenance records. GitHub answers an exhausted
+# primary budget with `403` and the body
+#
+#     gh: API rate limit exceeded for installation. ... For more information about rate limiting ...
+#
+# (`for user ID <n>` for a user token). None of the four secondary markers appear in it, so it fell
+# through to `_REFUSAL_STATUSES` and was reported `class=permanent reason=refused-http-403
+# attempts=1/5` — a throttle described to the operator as a permission verdict.
+#
+# MEASURED 2026-07-27: 6 of 6 open `sparq-agent/issue-*` PRs in sparq-org/sparq with no provenance
+# record on master OR ledger had a FAILED `provenance` job, and all 6 logged exactly that line with
+# this body. Every one then reserved `__global__` in dispatch-claim.busy_packages_of_pulls.
+#
+# It is a REGRESSION OF #748, not an original hole: before #748 recovered the status off the debug
+# trace, this body carried no status gh could print, so `classify_read_failure` reached its
+# statusless default and RETRIED it. Recovering the status is right; routing the recovered 403 into
+# the refusal table without re-checking which 403 shapes are throttles is what broke it — and it
+# also silenced `PROVENANCE-RETRY-VACUOUS`, whose trigger is a statusless unretried read.
+#
+# Deliberately the specific phrase, not a bare "rate limit": GitHub's own docs URL ("...about rate
+# limiting...") appears in unrelated error bodies, and matching that would reclassify real refusals.
+_PRIMARY_RATE_LIMIT_403 = ("api rate limit exceeded",)
+# The read-classifier reasons that mean "the budget refused us", as opposed to "the server refused
+# us" (`refused-http-*`) or "the server wobbled" (`transient-*`). Callers key on this set rather than
+# substring-matching the reason, so the operator-facing CLASS can name a throttle as a throttle.
+RATE_LIMIT_READ_REASONS = frozenset({"secondary-rate-limit-403", "primary-rate-limit-403"})
 # Statusless failures that retrying CANNOT fix: gh usage/flag errors and "no credential configured".
 # Everything ELSE that is statusless is retried on a read (registry #748) — this table exists so a
 # typo'd flag does not cost four jittered attempts, NOT to decide availability questions.
@@ -237,6 +264,14 @@ def classify_read_failure(message, status=None):
     if status in _REFUSAL_STATUSES:
         if status == "403" and any(marker in lowered for marker in _SECONDARY_403):
             return True, "secondary-rate-limit-403"
+        # [registry #710] BOTH GitHub rate limits answer 403. The primary/installation one is a
+        # throttle exactly like the secondary one, and retrying it is subject to the same bounded
+        # budget — four extra requests against a limit that is already at zero, versus a lost
+        # provenance record and a fleet-wide `__global__` reservation. Kept a DISTINCT reason from
+        # the secondary shape: they reset on different clocks, so an operator reading the log must
+        # be able to tell "wait ~a minute" from "the hourly budget is gone".
+        if status == "403" and any(marker in lowered for marker in _PRIMARY_RATE_LIMIT_403):
+            return True, "primary-rate-limit-403"
         return False, f"refused-http-{status}"
     if status and (status.startswith("5") or status == "429"):
         return True, f"transient-http-{status}"
@@ -476,8 +511,33 @@ OBSERVED_GH_FAILURES = (
     ("secondary rate limit",
      "HTTP 403: You have exceeded a secondary rate limit (https://api.github.com/x)", "403", True),
     ("permission 403", "HTTP 403: Resource not accessible by integration", "403", False),
+    # [registry #710] The PRIMARY rate limit, in the two forms it reaches this layer. The second is
+    # the one MEASURED in the six 2026-07-27 provenance losses: gh printed NO status, so the 403 was
+    # recovered off the debug trace by #748 — which is precisely how it landed in the refusal table.
+    ("primary rate limit 403 (status in gh's message)",
+     "HTTP 403: API rate limit exceeded for installation", "403", True),
+    ("primary rate limit 403 (user token wording)",
+     "HTTP 403: API rate limit exceeded for user ID 4783300", "403", True),
     ("usage error", "unknown flag: --jsonn", None, False),
 )
+
+# The VERBATIM stderr of one of the six 2026-07-27 provenance losses (registry #710) — worker run
+# 30297094506, `provenance` job, target PR sparq-org/sparq#4604. gh printed no status line, so this
+# is also the corpus's only shape whose status exists ONLY on the debug trace. Kept whole (trace +
+# body) because the defect lived in the interaction between the two: the trace supplies the 403 and
+# the body supplies the reason it is not a refusal.
+MEASURED_PRIMARY_RATE_LIMIT_STDERR = """\
+* Request at 2026-07-27 19:46:47.100000000 +0000 UTC m=+0.051081984
+* Request to https://api.github.com/repos/sparq-org/sparq/pulls?head=sparq-org:sparq-agent/issue-3358-30297094506-1&state=open&per_page=100
+> GET /repos/sparq-org/sparq/pulls?head=sparq-org:sparq-agent/issue-3358-30297094506-1&state=open&per_page=100 HTTP/1.1
+> Host: api.github.com
+< HTTP/2.0 403 Forbidden
+< X-Ratelimit-Remaining: 0
+* Request took 118.2ms
+gh: API rate limit exceeded for installation. If you reach out to GitHub Support for help, please \
+include the request ID 9C32:2AA981:637C0D6:15F2AAE4:6A67B5A7 and timestamp 2026-07-27 19:46:47 UTC. \
+For more information about rate limiting, see \
+https://docs.github.com/rest/overview/rate-limits-for-the-rest-api"""
 
 # The same 502 failure WITH `GH_DEBUG=api` on, verbatim in shape from the local reproduction: this is
 # the stream `scrub_debug_trace` must reduce to gh's one-line diagnostic and `trace_status` must
@@ -527,6 +587,12 @@ def _self_test():
           is_transient_stderr("HTTP 422: upstream 502 bad gateway text"), False)
     check("permission 403 fatal", is_transient_stderr("HTTP 403: Resource not accessible"), False)
     check("empty stderr not transient", is_transient_stderr(""), False)
+    # [registry #710] `is_transient_stderr` is the NON-READ (write) classifier and is deliberately
+    # NOT widened: a mutation is never replayed, whatever refused it. Pinned so a later "make rate
+    # limits retryable everywhere" edit cannot quietly make writes replayable — that decision belongs
+    # to #558/#559, not to this fix.
+    check("#710 the WRITE classifier still refuses a primary rate limit (writes are never replayed)",
+          is_transient_stderr("HTTP 403: API rate limit exceeded for installation"), False)
     # [registry #772] The truncated-body class, verbatim from the six worker.yml runs that lost a
     # provenance record. It carries NO HTTP status, so it reaches the text table or nothing at all.
     check("truncated JSON body transient",
@@ -706,6 +772,48 @@ def _self_test():
     check("#748 the pre-fix conservative classifier still says NO to it "
           "(so the two classifiers are genuinely different and the widening is the fix)",
           is_transient_stderr(_UNTABLED), False)
+
+    # ---- [registry #710] the PRIMARY rate-limit 403 ----
+    # THE RED TEST FOR THE FIX IN THE TITLE. Driven through the EXACT composition `run_gh` performs
+    # on a failure — scrub the trace, recover the status from message-then-trace, classify — against
+    # the VERBATIM stderr of a measured provenance loss. Emptying `_PRIMARY_RATE_LIMIT_403` (or
+    # deleting its branch in `classify_read_failure`) returns (False, 'refused-http-403') here.
+    _rl_message = scrub_debug_trace(MEASURED_PRIMARY_RATE_LIMIT_STDERR)
+    _rl_status = failure_status(_rl_message, MEASURED_PRIMARY_RATE_LIMIT_STDERR)
+    check("#710 the MEASURED primary-rate-limit stderr recovers 403 and is RETRIED as a throttle, "
+          "not refused (this exact shape lost 6/6 provenance records on 2026-07-27)",
+          (_rl_status, classify_read_failure(_rl_message, _rl_status)),
+          ("403", (True, "primary-rate-limit-403")))
+    # The status is ONLY on the trace — which is why #748's status recovery is what routed this
+    # class into the refusal table, and why #748's own `statusless` alarm went silent for it.
+    check("#710 gh printed NO status in its message for this shape, so the 403 exists only on the "
+          "debug trace (the #748 interaction that caused the regression)",
+          _MESSAGE_STATUS_RE.search(_rl_message) is None, True)
+    # NOT "every 403 now retries": the discrimination is the point. A permission refusal on the same
+    # status is still permanent, so widening the marker tuple to something that matches both reds.
+    check("#710 a PERMISSION 403 on a read is still a one-attempt refusal",
+          classify_read_failure("HTTP 403: Resource not accessible by integration", "403"),
+          (False, "refused-http-403"))
+    check("#710 the two rate limits stay DISTINGUISHABLE (they reset on different clocks) and both "
+          "are named in RATE_LIMIT_READ_REASONS, which is what callers key their CLASS on",
+          (classify_read_failure("HTTP 403: You have exceeded a secondary rate limit", "403")[1],
+           classify_read_failure("HTTP 403: API rate limit exceeded for installation", "403")[1],
+           sorted(RATE_LIMIT_READ_REASONS)),
+          ("secondary-rate-limit-403", "primary-rate-limit-403",
+           ["primary-rate-limit-403", "secondary-rate-limit-403"]))
+    # OVER-BREADTH, asserted on the MARKER rather than on the classifier's output — because the
+    # classifier's output cannot see it. The secondary branch is checked FIRST, so a primary marker
+    # broad enough to also match the SECONDARY body (e.g. a bare "rate limit") still returns
+    # `secondary-rate-limit-403` and every output-level check passes: only BRANCH ORDER would be
+    # keeping the two classes apart, and the distinction the log line sells would be an accident.
+    #
+    # This replaced a check that was VACUOUS and is reported rather than hidden: it asserted that a
+    # refusal merely LINKING `.../rate-limits-for-the-rest-api` stays refused, which a bare
+    # "rate limit" marker never matched anyway (the URL is hyphenated), so the mutant SURVIVED it.
+    check("#710 the primary marker is specific enough that it does not ALSO match the secondary "
+          "body — the two classes must be separable by content, not by branch order",
+          any(marker in "http 403: you have exceeded a secondary rate limit"
+              for marker in _PRIMARY_RATE_LIMIT_403), False)
 
     real_run = subprocess.run
     try:
