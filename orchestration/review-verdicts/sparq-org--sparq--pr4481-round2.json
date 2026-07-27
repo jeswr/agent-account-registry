@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4481,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "45105686e36407663f10a8300511e62e1be7ec55",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves both prior findings. W2 and W4 now return Outcome::Failed whenever any non-empty compiled ODRL policy is unparseable, so a dropped prohibition cannot silently widen access; the added regression constructs a parseable allow plus an unparseable prohibition and verifies both lanes fail. The non-canonical numeric work-box timing claim has also been removed and replaced with qualitative, explicitly non-canonical wording. The fail-closed checks precede materialization in both lanes, and the regression includes a non-vacuous allow-only control, so it is not vacuous. No new correctness, soundness, test-validity, or security issue is evident in the supplied diff.",
+  "verdict": "approve"
+ }
+}
