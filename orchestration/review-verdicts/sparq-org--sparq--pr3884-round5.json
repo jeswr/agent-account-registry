@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3884,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "682f3dc8c7f26e231ea3086f499d28d6b7925c6b",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`scan_bare_words` still reduces the preceding token to `prev: u8`, while `ends_operand` excludes `>`. For `FILTER(<http://ex/a><1&&FLTR(?o)&&?b>2)`, scanning the first IRI leaves `prev == '>'`; the following compact `<` is consequently classified as an IRIREF opener. Because its body remains IRIREF-legal through the later `>`, `iriref_end` skips over `FLTR` and no `FILTER` suggestion is emitted. This is the same major correctness finding as round 4, and none of the new tests exercises the exact IRI-operand counterexample.",
+    "file": "crates/sparq-terse/src/diagnose.rs",
+    "fix_hint": "Track the preceding token's lexical kind, not only its final byte, so a completed IRI operand ending in `>` is distinguishable from the greater-than operator. Add a real-path regression using `FILTER(<http://ex/a><1&&FLTR(?o)&&?b>2)` that asserts `FLTR` suggests `FILTER`, while retaining coverage where a greater-than operator is followed by a genuine IRI.",
+    "severity": "major",
+    "title": "Completed IRI operand before compact less-than still hides diagnostics"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 5 is stagnant. The round-4 major correctness defect remains: IRIREF/operator disambiguation still records only the preceding token's final byte, and `ends_operand` deliberately excludes `>`. After scanning a completed IRI operand, the immediately following compact `<` is therefore treated as a new IRIREF opener. In the prior counterexample, that false IRIREF consumes through the later `>` and hides `FLTR`, so the promised diagnostic is absent. The added real-path tests still cover variables before compact `<`, not an IRI operand before compact `<`.",
+  "verdict": "request_changes"
+ }
+}
