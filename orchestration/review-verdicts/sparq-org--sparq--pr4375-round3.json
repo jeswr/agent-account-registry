@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4375,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "00a9a80065381bbc055dc78da0d2e9a8967c0ca1",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "SV-ND-2 normatively requires a request whose bound index is unreadable or absent to be indistinguishable from the same request against a non-existent one. But SV-ND-4 now expressly permits a requester with at least one eligible entry to distinguish an unreadable bound index from no bound index, and the Unreadable descriptor conformance scenario requires the bound case to return neighbours while the unbound case returns zero solutions. Thus a service following the stated query and test behavior violates SV-ND-2. The prior contradiction was moved out of SV-ND-4 rather than fully resolved.",
+    "file": "site/specs/solid-vector-api.typ",
+    "fix_hint": "Narrow SV-ND-2 to the resources whose non-disclosure remains required. In particular, exclude bound-index existence from its unreadable-versus-absent rule for requesters with eligible entries, while retaining indistinguishability for an empty eligible entry set and for unreadable/absent seeds and referenced graphs. Update its explanatory cross-references and conformance wording so SV-ND-2, SV-ND-4, and the Unreadable descriptor scenario state the same boundary.",
+    "severity": "major",
+    "title": "SV-ND-2 still forbids the bound-index existence channel accepted by SV-ND-4"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 3 fixes the prior SV-ND-4 wording by expressly excepting disclosure of a bound index's existence and declared dimension to requesters with eligible entries. However, the same behavior remains forbidden by the separate normative SV-ND-2 assertion: it requires a request involving an unreadable bound index to be indistinguishable from the corresponding request with a non-existent index. The conformance scenario requires exactly the opposite when the requester can read an indexed source but not the descriptor: the bound case returns neighbours while the absent case returns zero solutions. This is materially the same unresolved normative contradiction at the same severity, so progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
