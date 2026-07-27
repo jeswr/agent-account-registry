@@ -1249,7 +1249,7 @@ GROOM_AGE_PARK_MARKER = "<!-- registry-groom-age-park:v1"
 GROOM_AGE_UNPARK_MARKER = "<!-- registry-groom-age-unpark:v1"
 
 
-def age_park_episode(comments, bot_login, superseding_markers=(), log=print):
+def age_park_episode(labels, comments, bot_login, superseding_markers=(), log=print):
     """``(owned, detail)`` — whether the live machine park belongs to groom's AGE-park episode,
     and therefore is NOT the capacity sweep's to clear.
 
@@ -1287,6 +1287,14 @@ def age_park_episode(comments, bot_login, superseding_markers=(), log=print):
     ambiguity resolves toward the age episode owning it, i.e. toward the capacity sweep leaving
     the park alone.
 
+      0. THE PR-SIDE MACHINE PARK MUST BE LIVE — starvation_park_owner's clause 1, and it is
+         load-bearing rather than a formality. This predicate makes a claim about ONE label:
+         "this `review:parked` is groom's". Where no `review:parked` is live the claim has no
+         subject, and answering it anyway strands a real park: the re-admission sweep also
+         admits a PR whose SOURCE ISSUE carries `status:parked` with no PR-side label at all,
+         and such a PR can still carry an age receipt from an EARLIER, already-closed episode
+         (groom parked it, the cause recovered, groom cleared the label). Judging that receipt
+         would refuse an issue-side capacity park groom has no exit for.
       1. INERT UNLESS PROVEN RELEVANT. With no bot-authored age-park receipt anywhere in the
          history the answer is False with no timestamp parsing at all. This is what makes the
          change safe for the entire existing capacity population: a PR that has never seen a
@@ -1312,6 +1320,9 @@ def age_park_episode(comments, bot_login, superseding_markers=(), log=print):
     own crash residue, which groom's convergence branch completes. Treating it as an episode
     boundary would hand that residue to the capacity sweep, which would clear it while minting a
     receipt claiming a starvation recovery that never happened."""
+    if MACHINE_PARK_PR_LABEL not in {label for label in (labels or ())
+                                     if isinstance(label, str)}:
+        return (False, "")
     if not bot_login:
         return (False, "")
     rows = []
@@ -2910,54 +2921,68 @@ def _self_test():
     _age = f"{GROOM_AGE_PARK_MARKER} cause=orphan-draft head={'c' * 40} gen=1 -->"
     _ladder = "<!-- sparq-park-generation:v1 gen=1 cutoff=none -->"
     _sup = ("<!-- sparq-park-generation:v1", PARK_REASON_MARKER)
+    _live = (MACHINE_PARK_PR_LABEL,)
+    # CLAUSE 0 first, because it is the one that decides whether the question is even asked. A PR
+    # with no live PR-side park still reaches the re-admission sweep through its source issue's
+    # `status:parked`, and it can still carry an age receipt from an EARLIER, already-closed
+    # episode. Judging that receipt would refuse an issue-side capacity park groom has no exit
+    # for — a stranding this predicate must not cause. Every hold spelling is driven because the
+    # label set here is the PR's own, not the pair.
+    for _absent in ((), ("review:needs", "needs:user"), ("status:parked",), None):
+        check(f"age_park_episode: NO live `{MACHINE_PARK_PR_LABEL}` ({_absent!r}) => the "
+              "predicate declines to answer, however loud the age receipt",
+              age_park_episode(_absent, [_epi(_age, "2026-07-26T10:00:00Z")], _epi_bot, _sup),
+              (False, ""))
     check("age_park_episode: INERT with no age receipt — the entire existing capacity "
           "population reaches no new branch (this is what keeps #691's exit intact)",
-          age_park_episode([_epi("nothing here", "2026-07-26T10:00:00Z"),
-                            _epi(_ladder, "bad-stamp")], _epi_bot, _sup, log=logs.append),
+          age_park_episode(_live, [_epi("nothing here", "2026-07-26T10:00:00Z"),
+                                   _epi(_ladder, "bad-stamp")], _epi_bot, _sup,
+                           log=logs.append),
           (False, ""))
     check("age_park_episode: ...and an inert answer parses no stamps at all, so a malformed one "
           "cannot make a non-age park unreadable", logs, [])
     check("age_park_episode: a bot age receipt with no later foreign park receipt is groom's",
-          age_park_episode([_epi(_age, "2026-07-26T10:00:00Z")], _epi_bot, _sup)[0], True)
+          age_park_episode(_live, [_epi(_age, "2026-07-26T10:00:00Z")], _epi_bot, _sup)[0], True)
     check("age_park_episode: TRUST FILTER — a third party cannot forge an age receipt and "
           "freeze a genuine capacity park",
-          age_park_episode([_epi(_age, "2026-07-26T10:00:00Z", login="drive-by")],
+          age_park_episode(_live, [_epi(_age, "2026-07-26T10:00:00Z", login="drive-by")],
                            _epi_bot, _sup),
           (False, ""))
     check("age_park_episode: a STRICTLY newer foreign park receipt CLOSES the episode — the "
           "label is that mechanism's park now, and the capacity path must resume",
-          age_park_episode([_epi(_age, "2026-07-26T10:00:00Z"),
+          age_park_episode(_live, [_epi(_age, "2026-07-26T10:00:00Z"),
                             _epi(_ladder, "2026-07-26T11:00:00Z")], _epi_bot, _sup)[0],
           False)
     check("age_park_episode: a TIE does NOT close it — the ambiguous case leaves the park alone",
-          age_park_episode([_epi(_age, "2026-07-26T10:00:00Z"),
+          age_park_episode(_live, [_epi(_age, "2026-07-26T10:00:00Z"),
                             _epi(_ladder, "2026-07-26T10:00:00Z")], _epi_bot, _sup)[0],
           True)
     check("age_park_episode: an OLDER foreign receipt does not close a NEWER age park",
-          age_park_episode([_epi(_ladder, "2026-07-26T09:00:00Z"),
+          age_park_episode(_live, [_epi(_ladder, "2026-07-26T09:00:00Z"),
                             _epi(_age, "2026-07-26T10:00:00Z")], _epi_bot, _sup)[0],
           True)
     check("age_park_episode: the NEWEST age receipt is the boundary, not the oldest",
-          age_park_episode([_epi(_age, "2026-07-26T09:00:00Z"),
+          age_park_episode(_live, [_epi(_age, "2026-07-26T09:00:00Z"),
                             _epi(_ladder, "2026-07-26T10:00:00Z"),
                             _epi(_age, "2026-07-26T11:00:00Z")], _epi_bot, _sup)[0],
           True)
     check("age_park_episode: groom's OWN un-park receipt is not a foreign park — receipt-first "
           "ordering makes receipt-no-label groom's convergence to complete, not this sweep's",
           age_park_episode(
+              _live,
               [_epi(_age, "2026-07-26T10:00:00Z"),
                _epi(f"{GROOM_AGE_UNPARK_MARKER} cause=orphan-draft head={'c' * 40} gen=1 -->",
                     "2026-07-26T11:00:00Z")], _epi_bot, _sup)[0],
           True)
     check("age_park_episode: FAIL CLOSED — once an age receipt exists, an unreadable bot stamp "
           "leaves the boundary unprovable and the park stays with groom",
-          age_park_episode([_epi(_age, "2026-07-26T10:00:00Z"),
+          age_park_episode(_live, [_epi(_age, "2026-07-26T10:00:00Z"),
                             _epi(_ladder, None)], _epi_bot, _sup, log=logs.append)[0],
           True)
     check("age_park_episode: no bot identity, a non-list and a malformed row are all inert",
-          [age_park_episode([_epi(_age, "2026-07-26T10:00:00Z")], "", _sup),
-           age_park_episode("not a list", _epi_bot, _sup),
-           age_park_episode([None, "x", {"user": None, "body": None}], _epi_bot, _sup)],
+          [age_park_episode(_live, [_epi(_age, "2026-07-26T10:00:00Z")], "", _sup),
+           age_park_episode(_live, "not a list", _epi_bot, _sup),
+           age_park_episode(_live, [None, "x", {"user": None, "body": None}], _epi_bot, _sup)],
           [(False, ""), (False, ""), (False, "")])
     check("age_park_episode: `foreign-episode` is a declared code and is EXIT-REACHABLE — the "
           "census must never file it as needing a human",

@@ -4163,7 +4163,11 @@ def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_logi
             # is the census classification a maintainer must see, so the hold keeps precedence.
             if not holds:
                 age_park, age_detail = _park_policy.age_park_episode(
-                    comments, bot_login,
+                    # `labels` is the PR's own live set. The predicate refuses to answer at all
+                    # without a live `review:parked` — this sweep ALSO admits a PR whose SOURCE
+                    # ISSUE carries `status:parked` and which has no PR-side label, and such a PR
+                    # can still carry an age receipt from an earlier, already-cleared episode.
+                    labels, comments, bot_login,
                     # The other mechanisms' durable PARK receipts. worker-pr owns the generation
                     # marker's spelling, so it is passed from the literal this file already pins
                     # against the real module rather than re-derived inside park_policy.
@@ -15569,6 +15573,20 @@ def _self_test():
         assert unstamped == (0, [], []), unstamped
         print("  ok   [#769] a NON-bot age receipt is not a receipt, and an unreadable bot stamp "
               "fails CLOSED (the park stays with groom)")
+
+        # (6b) THE PR-SIDE PARK MUST BE LIVE for the binding to speak at all. This sweep ALSO
+        # admits a PR whose SOURCE ISSUE carries `status:parked` with no PR-side label, and such a
+        # PR can still carry an age receipt from an EARLIER, already-closed episode — groom parked
+        # it, the cause recovered, groom cleared the label, the receipt stayed. Judging that
+        # receipt would refuse an issue-side capacity park groom has no exit for, i.e. this guard
+        # would itself become the stranding it exists to prevent. Delete clause 0 and this reds.
+        issue_side = readmit_sweep(
+            healthy_window, comments=age_comments, timeline=park_at(old),
+            rows=[[dict(parked_row, labels=[{"name": "review:needs"}])]],
+            labels={7: ["status:parked"]})
+        assert issue_side[0] == 1 and issue_side[2] == [(41, 7)], issue_side
+        print("  ok   [#769] an ISSUE-side `status:parked` with NO live `review:parked` is "
+              "unaffected — a closed age episode's receipt cannot strand another park")
 
         # (7) PRECEDENCE. A human-owned hold outranks the episode binding in the census, because
         # `human-hold` is HUMAN-TERMINAL and is the row a maintainer must actually see. The park
