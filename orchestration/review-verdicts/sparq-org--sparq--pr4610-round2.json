@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4610,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "06c3c03b1010d69be16dc660451ccb46bf23979f",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`has_only_iri_chars` repairs percent escapes and code-point ranges, but the function explicitly does not enforce component structure even though `is_absolute_iri` is documented and consumed as an absolute-IRI predicate. For example, strings such as `http://[` or `http://example.com:bad-port` contain a valid scheme and only admitted characters, so this predicate accepts them despite invalid authority/host/port syntax. Used by expansion step 15.4, that still permits invalid datatype IRIs to avoid `InvalidTypedValue`. This is materially the round-one finding: one cited witness is fixed, but the general RFC 3987 validation obligation is not.",
+    "file": "crates/sparq-jsonld/src/context/iri.rs",
+    "fix_hint": "Use a standards-complete RFC 3987 IRI parser/validator for this predicate, or implement the complete `IRI = scheme ':' ihier-part [ '?' iquery ] [ '#' ifragment ]` grammar including authority, host/IP-literal, port, path, query, fragment, and `iprivate` placement. Add end-to-end datatype negative tests for structurally invalid strings that use only otherwise legal characters, plus positive tests for representative authority-less schemes and Unicode IRIs.",
+    "severity": "major",
+    "title": "Datatype validation still omits RFC 3987 structural syntax"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 2 fixes the malformed-percent and Unicode code-point cases identified in round 1, and adds useful non-vacuous regression tests. However, the same major correctness issue remains at a narrower boundary: `is_absolute_iri` still claims to recognize an absolute RFC 3987 IRI and is used to satisfy JSON-LD expansion's datatype-IRI validation obligation, while the implementation explicitly omits the RFC 3987 structural grammar. It therefore accepts invalid absolute-looking strings composed only of admitted characters. Because invalid datatype IRIs can still expand successfully, the change remains incomplete and cannot be approved.",
+  "verdict": "request_changes"
+ }
+}
