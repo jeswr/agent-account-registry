@@ -3511,6 +3511,25 @@ def _self_test():
         check(f"a tail the closed grammar cannot parse is UNKNOWN and DENIES: {unknown!r}",
               denies(unknown), True)
 
+    # (d2.vii) EVERY ROW OF _INJECTION_POLARITY IS EXERCISED. A decision table is the easiest
+    # place in this file for vacuity to hide: a row no fixture reaches can be flipped to `True`
+    # without a single check going red. These six were exactly that — measured, not assumed —
+    # and each one names the row it reaches.
+    check("(negator, presence-negated) is a DOUBLE negation and DENIES",
+          denies("No prompt injection was not detected in the diff."), True)
+    check("(negator, absence) DENIES — a remediation verb concedes the injection existed",
+          denies("No prompt-injection content was mitigated in round 2."), True)
+    check("(negator, absence-negated) DENIES",
+          denies("No prompt-injection content was not mitigated."), True)
+    check("(negator, field-absent) RELEASES",
+          denies("No prompt injection: no"), False)
+    # `found`/`likely`/`possible`/`suspected` are affirmative FIELD VALUES that Tier-A marker 3
+    # does not list, so these two reach the table rather than being short-circuited by Tier A.
+    check("(negator, field-present) DENIES",
+          denies("No prompt injection: found"), True)
+    check("(no negator, field-present) DENIES",
+          denies("prompt injection: found"), True)
+
     # THE TIER-A ISOLATORS — ONE PER MARKER. Each is a sentence Tier B RELEASES on its own, so
     # only the unconditional affirmative marker denies it. Deleting the marker named in each
     # check turns that check, and only that check, red. Round 1 shipped two of these four; the
