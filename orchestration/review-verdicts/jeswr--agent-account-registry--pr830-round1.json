@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 830,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "4b6280a5b853702696b1be41b022ea515969e315",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly replaces the duplicated inline manifest resolver with the shared, fail-closed groom.py resolver. It preserves input order, collapses duplicates, includes every repository for each owner, validates JSON/type/repository syntax, and enforces the exact static owner set before emitting token-scope outputs. The workflow consumes the renamed plural outputs consistently, and set -euo pipefail plus tee preserves failure propagation. The added self-tests are non-vacuous: they cover multi-repository aggregation, deduplication, unexpected/missing owners, unsafe and non-string entries, non-array/empty input, and malformed or absent JSON. No trust check, audit binding, label route, permission boundary, or secret-handling control is weakened.",
+  "verdict": "approve"
+ }
+}
