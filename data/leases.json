@@ -82,16 +82,6 @@
   },
   {
    "account": "dc2d751954080e13",
-   "claim_id": "96c593c3a14747c1b7e0e958f4f0260d",
-   "holder": "review:sparq-org/sparq#4255@dispatch-30288792548.1",
-   "package": "sparq-fedplan-mpc",
-   "role": "review",
-   "model": "sol",
-   "issued_at": 1785174485,
-   "expires_at": 1785178685
-  },
-  {
-   "account": "dc2d751954080e13",
    "claim_id": "648caa55951b4368adb3314bcc6ea3fe",
    "holder": "review:sparq-org/sparq#4338@dispatch-30288792548.1",
    "package": "knowledge-graph",
