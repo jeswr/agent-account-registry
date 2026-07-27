@@ -12,16 +12,6 @@
   },
   {
    "account": "51bde6688e140866",
-   "claim_id": "027f89abe6094b5c841fe00d6b6b8f7f",
-   "holder": "sparq-org/sparq#3076@30236340779.1",
-   "package": "workspace",
-   "role": "ci",
-   "model": "opus5",
-   "issued_at": 1785125425,
-   "expires_at": 1785131725
-  },
-  {
-   "account": "51bde6688e140866",
    "claim_id": "506534449f7e441f9fe1c0e428e8a045",
    "holder": "fix:sparq-org/sparq#4437@dispatch-30236283228.1",
    "package": "sparq-engine",
