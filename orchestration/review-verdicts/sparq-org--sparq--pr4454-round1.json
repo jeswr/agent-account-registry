@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4454,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c8e1fa9dcde33a8832fa9f443a514f74bfd90599",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new `build_raw_perms` documentation records specific speedup ratios, thread-by-thread measurements, a regression ratio, and an estimated crossover. The repository's review contract says no hard-coded performance numbers may ship and that work-box timings must never be presented as canonical evidence. Calling the figures non-canonical is appropriately honest but still leaves the prohibited numbers in a public-facing source comment and makes them stale as implementations or hardware change.",
+    "file": "crates/sparq-core/src/store.rs",
+    "fix_hint": "Remove all measured numeric ratios and crossover figures from the rustdoc. Keep only the structural explanation, the explicit statement that the tradeoff remains unverified on the canonical benchmark setup, and the ignored local measurement command so developers can generate current machine-local results without committing them.",
+    "severity": "major",
+    "title": "Rustdoc hard-codes non-canonical work-box performance numbers"
+   }
+  ],
+  "progress": null,
+  "summary": "The derivation algorithm and its differential coverage appear sound: every planned source/destination pair satisfies the stable-sort invariant, the wave schedule materializes sources before use, and the randomized/reference comparison exercises empty, duplicate, constant-digit, multi-byte, and ID-boundary cases. However, the new rustdoc embeds numerous work-box timing ratios and performance figures. Repository policy expressly forbids hard-coded performance numbers and treats work-box timings as non-canonical evidence; labeling them non-canonical does not remove the prohibited hard-coded values. Remove those figures before approval.",
+  "verdict": "request_changes"
+ }
+}
