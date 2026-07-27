@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4519,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c07831986edb771316b51b44ccbb3a1dace26e25",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "run_aux_arms caps deeper requests at candidates.max(graph.dict.len()), but check_arm_ids deliberately accepts inline-integer IDs that are not bounded by dict.len(), and derive_mask may contain such IDs when ?node is constrained through an object position. An arm can rank more than dict.len() valid inline IDs before an admissible inline ID; the loop then stops at want >= ceiling without reaching it. The termination argument says entity arms do not rank inline literals, but neither ArmFn nor the vec:hybrid subject contract enforces that restriction. Thus the implementation still does not generally return the arm's top candidates over the admissible domain it documents.",
+    "file": "crates/sparq-vectors/src/rewrite.rs",
+    "fix_hint": "Do not use graph.dict.len() as an exhaustion bound while inline IDs are accepted. Prefer a paging protocol with explicit exhaustion/cursor semantics, or pass the admissibility constraint into the arm. Alternatively, enforce and document that auxiliary hits must be stored entity IDs and reject inline IDs. Add a filtered-ann query-path test whose admissible node is an inline integer bound in object position and lies beyond the current dictionary-length request ceiling.",
+    "severity": "major",
+    "title": "Dictionary-length paging ceiling can lose admissible inline IDs"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 3 fixes the prior post-truncation masking defect for ordinary dictionary-backed IDs by paging prefix-consistent arms and adds a meaningful below-first-page query-path witness. However, the paging ceiling is graph.dict.len() even though the same implementation explicitly accepts inline-integer IDs outside that stored dictionary domain. A filtered hybrid arm may therefore stop before reaching an admissible inline-integer hit, so the claimed admissible-domain ranking is still incomplete. This is a new boundary defect relative to round 2, so progress is regressing.",
+  "verdict": "request_changes"
+ }
+}
