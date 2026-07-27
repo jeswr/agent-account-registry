@@ -42,16 +42,6 @@
   },
   {
    "account": "efb4eb2781de6958",
-   "claim_id": "79d492975c7e4ad78bbfc86d0d115c33",
-   "holder": "review:sparq-org/sparq#4624@dispatch-30306401516.1",
-   "package": "release",
-   "role": "review",
-   "model": "opus5",
-   "issued_at": 1785187501,
-   "expires_at": 1785191701
-  },
-  {
-   "account": "efb4eb2781de6958",
    "claim_id": "57b200a416a441c29cddf2d4624cf464",
    "holder": "jeswr/agent-account-registry#271@30306801179.1",
    "package": "workflows",
