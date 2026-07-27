@@ -1,18 +1,18 @@
 {
-  "generated_at": "2026-07-27T21:20:17Z",
+  "generated_at": "2026-07-27T21:23:21Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
       "issues_open": 1529,
       "issues_ready": 373,
       "issues_closed_1h": 1,
-      "issues_closed_24h": 51,
+      "issues_closed_24h": 50,
       "prs_open": 101,
       "prs_draft": 78,
       "prs_opened_1h": 2,
       "prs_closed_1h": 0,
       "prs_merged_1h": 1,
-      "prs_merged_24h": 57,
+      "prs_merged_24h": 56,
       "review_changes_backlog": 6,
       "needs_user_parked": 19,
       "review_lane_health": "ok",
@@ -24,10 +24,10 @@
       "net_pr_flow": 1.0
     },
     "jeswr/agent-account-registry": {
-      "issues_open": 359,
+      "issues_open": 358,
       "issues_ready": 76,
-      "issues_closed_1h": 4,
-      "issues_closed_24h": 15,
+      "issues_closed_1h": 5,
+      "issues_closed_24h": 16,
       "prs_open": 37,
       "prs_draft": 23,
       "prs_opened_1h": 6,
@@ -46,6 +46,18 @@
     }
   },
   "alerts": [
+    {
+      "target": "sparq-org/sparq",
+      "classification": "backlog-growing",
+      "fire": true,
+      "summary": "open PRs 101 > 40 and net PR flow +1.0/hr (open 2.0 > close 1.0) sustained over 2 snapshots",
+      "metrics": {
+        "prs_open": 101,
+        "net_pr_flow": 1.0,
+        "pr_open_rate": 2.0,
+        "pr_close_rate": 1.0
+      }
+    },
     {
       "target": "jeswr/agent-account-registry",
       "classification": "backlog-growing",
