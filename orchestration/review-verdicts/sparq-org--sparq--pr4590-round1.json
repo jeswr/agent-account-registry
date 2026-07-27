@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4590,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "8c1c78192dfc7dbb8676abdf8f90ebed13a1c794",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new comment says `Quad_Subject` and `Quad_Object` both include `Quad`, and the feature block tests `factory.quad(..., innerQuad)` as an object. In the current RDF/JS Data Model specification, `subject` includes `Quad`, but `object` is listed as NamedNode, Literal, BlankNode, or Variable; it does not include Quad. The feature probe also requires object-position support, so an implementation that correctly supports the specified subject-position quoted Quad but rejects Quad objects will have the entire quoted-triple block skipped, including valid subject-position checks. Conversely, an implementation accepting Quad objects is being tested against an extension rather than the cited conformance contract.",
+    "file": "packages/rdfjs-conformance/src/index.mjs",
+    "fix_hint": "Align the suite with the normative RDF/JS contract: detect quoted triples using a Quad in subject position only, remove or explicitly separate the object-position assertion as a clearly named non-conformance extension, and ensure the subject-position, recursive-equality, and copy tests still run for implementations supporting the specified Quad-subject capability.",
+    "severity": "major",
+    "title": "Quoted Quad objects are not part of the cited RDF/JS Quad object domain"
+   },
+   {
+    "body": "The new README text advertises \u201ca `Quad` in the subject/object position\u201d as RDF/JS conformance coverage, but the cited RDF/JS Data Model specification currently includes `Quad` only in the subject domain. This makes the documented scope inaccurate.",
+    "file": "packages/rdfjs-conformance/README.md",
+    "fix_hint": "Document the normative subject-position coverage. If object-position support is retained as an optional extension test, label it explicitly as such and keep its detection independent from the normative quoted-subject tests.",
+    "severity": "minor",
+    "title": "README overstates quoted triples as valid in both subject and object positions"
+   }
+  ],
+  "progress": null,
+  "summary": "The directional-literal coverage and recursive keying are coherent, but the quoted-triple block asserts an object-position capability that the cited RDF/JS Data Model specification does not define. That makes the proposed conformance suite capable of rejecting an implementation for behavior outside the specification it claims to test.",
+  "verdict": "request_changes"
+ }
+}
