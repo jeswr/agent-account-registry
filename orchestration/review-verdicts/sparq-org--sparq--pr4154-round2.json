@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4154,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f452b5152b5722c8a1b868cb21f06f71d757e3b5",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Sections 2.1\u20132.4 still commit absolute timings, nanoseconds-per-operation estimates, fixed speedups, phase fractions, and derived Amdahl ceilings from a shared 4-vCPU work box. The NON-CANONICAL caveats prevent an overclaim but do not cure the repository-contract violation: hard-coded performance numbers are prohibited in Markdown, and work-box timings cannot serve as canonical evidence. The measurements are also still the principal support for the B \u2192 C \u2192 D recommendation, so the prior round's major finding has not been resolved.",
+    "file": "research/el-e4-concurrent-saturation.md",
+    "fix_hint": "Remove the absolute timing tables and fixed timing-derived figures from this Markdown record. Retain reproduction commands, deterministic counters, structural complexity evidence, and qualitative conclusions. If raw measurements must be preserved, place them in an appropriate generated or machine-readable benchmark artifact that is not outward Markdown, and make the design record reference methodology and non-timing invariants without embedding fixed performance results.",
+    "severity": "major",
+    "title": "Work-box performance numbers remain hard-coded in Markdown"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 2 is stagnant. The sole prior major finding remains materially unchanged: the new Markdown record still embeds extensive absolute shared-work-box timings, per-operation nanosecond estimates, fixed speedups, phase fractions, and derived Amdahl figures. Calling the measurements NON-CANONICAL and limiting their intended audience does not satisfy the repository's explicit prohibition on hard-coded performance numbers in Markdown. Because those figures remain central evidence for the proposed sequencing, this is a substantive policy and evidence-handling issue rather than a cosmetic one.",
+  "verdict": "request_changes"
+ }
+}
