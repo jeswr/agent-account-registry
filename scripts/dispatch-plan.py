@@ -1020,8 +1020,18 @@ def _routing_doc():
     # probe row was added, SAFETY therefore admitted that planner (MEASURED against this repo's
     # own engine with the guard deleted: alone=[], paired=[], verdict ACCEPT) — and it plans an
     # area-less PR row as an issue, which is the ONLY shape 40 of 40 open PRs here have. This row
-    # asserts the refusal happens on a board with NO area-declaring rows at all, so deleting
-    # `bare_alone` from the probe reds it while (5b) stays green.
+    # asserts the refusal happens on a board with NO area-declaring row to shield the PR.
+    #
+    # It does NOT isolate `bare_alone` from (5b) — an earlier revision of this comment claimed
+    # "deleting `bare_alone` reds it while (5b) stays green", and that is measurably wrong. Delete
+    # `bare_alone` from `pr_row_aware`'s refusal condition in `dispatch.yml` and re-run: BOTH rows
+    # red, (5b) with (False, False, True, False) and this one with `PLAN DIED on the admitted
+    # planner: KeyError: 500`. Both refusals come from the same probe, so both stop printing at
+    # once. What separates them is what the board then DOES: on (5b)'s area-declaring board the
+    # admitted planner is still harmless (`500 in _planned` stays False — the PR self-shields), so
+    # (5b) witnesses only that the refusal text vanished. This row is the one whose board realises
+    # the outage: the admitted planner emits a plan row whose `number` is a PULL REQUEST and the
+    # downstream assembly dies on it. Two rows, one probe, two different consequences.
     # Caught for the same reason case (7) catches: when SAFETY admits this planner, PLAN goes on
     # to emit a plan row whose `number` is a PR and the downstream assembly dies on it. A crash
     # reads as "the harness broke"; the fact under test is that the probe must REFUSE, so the

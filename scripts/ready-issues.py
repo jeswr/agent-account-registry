@@ -878,27 +878,56 @@ def _self_test():
              if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef, _ast.ClassDef))]
     check("[#768] no top-level def is defined twice (a shadowed copy is unmutatable dead code)",
           sorted(name for name in set(_tops) if _tops.count(name) > 1), [])
-    # MONOTONICITY, BY EXECUTION over every subset of a PR-bearing board: adding PR occupancy can
-    # only REMOVE frontier rows, never add one. Under-serialisation is the corrupting direction,
-    # so this pins the SIGN of the whole change rather than one example of it.
+    # ADD-ONLY RESERVATIONS + CONFLICT-FREEDOM, BY EXECUTION over every subset of a PR-bearing
+    # board. These are the two universals this change actually has, and both pin the SIGN of it:
+    #
+    #   (i)  ADD-ONLY — folding a unit (`source_links`) is a SUPERSET of the unfolded per-row
+    #        loop, so the fold can never RELEASE a key. This is `unit_reservations`' "MONOTONE BY
+    #        CONSTRUCTION" docstring claim, EXECUTED rather than asserted in prose; dropping
+    #        either half of a unit (sparq #4539: 41% of live pairs are not supersets) reds it.
+    #   (ii) CONFLICT-FREEDOM — no offered row sits on a held key and no two offered rows collide,
+    #        re-derived here independently of `compute_ready`'s own selection loop. This is the
+    #        SAFETY property; `[:1]`-truncating the occupancy loop reds it.
+    #
+    # WHAT THIS DELIBERATELY NO LONGER CLAIMS. It read "MONOTONE: no subset of PR rows ever ADDS a
+    # frontier row (0 violations)". That universal is FALSE, and false for a reason that has
+    # nothing to do with PR rows: selection is greedy in (priority, number) order, so a held key
+    # can knock out a multi-area contender and let a lower-priority issue on a DIFFERENT area take
+    # a slot it would otherwise never reach. MEASURED with a seeded generator (3 occupancy rows x
+    # 5 ready issues declaring 1-2 areas each, all 8 subsets, 4000 boards = 32000 trials): 4739
+    # trials violate frontier-monotonicity on THIS engine — and 5582 violate it on `origin/master`
+    # through in-flight ISSUE occupancy, with no PR row on the board at all. It is pre-existing
+    # greedy-selection behaviour that this check mislabelled as a property of PR occupancy, and 0
+    # of the violating trials was UNSAFE — which is why (ii) is the check that belongs here. The
+    # old fixed board could not see any of it: every issue on it declared exactly ONE area.
     import itertools
     _mono_prs = [pr(800, ["area:worker"]), pr(801, []), pr(802, ["area:docs", "area:usage"])]
-    _mono_iss = [iss(810, R + ["priority:P1", "area:worker"]),
+    _mono_iss = [iss(810, R + ["priority:P1", "area:docs", "area:usage"]),
                  iss(811, R + ["priority:P1", "area:docs"]),
                  iss(812, R + ["priority:P2", "area:usage"]),
-                 iss(813, R + ["priority:P3"])]
-    _violations = []
-    for _k in range(len(_mono_prs) + 1):
-        for _subset in itertools.combinations(_mono_prs, _k):
-            _with = {it["number"] for it in compute_ready(list(_subset) + _mono_iss,
-                                                          log=lambda _line: None)}
-            _without = {it["number"] for it in compute_ready(_mono_iss, log=lambda _line: None)}
-            if not _with <= _without:
-                _violations.append(sorted(p["number"] for p in _subset))
-    check("[#768] MONOTONE: no subset of PR rows ever ADDS a frontier row (0 violations)",
-          (_violations, len(list(itertools.chain.from_iterable(
-              itertools.combinations(_mono_prs, k) for k in range(len(_mono_prs) + 1))))),
-          ([], 8))
+                 iss(813, R + ["priority:P3"]),
+                 iss(814, ["status:in-progress", "role:impl", "area:groom"])]
+    _links = {800: [814]}          # PR #800 and the in-flight issue it closes are ONE unit
+
+    def _held(rows, links=None):
+        return set().union(set(), *(areas for areas, _row in unit_reservations(rows, links)))
+
+    _subsets = [list(s) for _k in range(len(_mono_prs) + 1)
+                for s in itertools.combinations(_mono_prs, _k)]
+    _released, _unsafe = [], []
+    for _subset in _subsets:
+        _board = _subset + _mono_iss
+        if not _held(_board) <= _held(_board, _links):
+            _released.append(sorted(p["number"] for p in _subset))
+        _seen = set(_held(_board))
+        for _it in compute_ready(_board, log=lambda _line: None):
+            _pkgs = packages_of(labels_of(_it))
+            if (GLOBAL in _seen) or (_pkgs & _seen) or (GLOBAL in _pkgs and _seen):
+                _unsafe.append((sorted(p["number"] for p in _subset), _it["number"]))
+            _seen |= _pkgs
+    check("[#768] ADD-ONLY: the fold never RELEASES a key, and the offered frontier is "
+          "CONFLICT-FREE, over every subset of a PR-bearing board",
+          (_released, _unsafe, len(_subsets)), ([], [], 8))
     print("ready-issues self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 
