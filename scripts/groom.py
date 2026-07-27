@@ -2703,51 +2703,96 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
                 if state == "indeterminate":
                     print(
                         f"ALERT PR {action.repo}#{action.number}: live provenance revalidation was "
-                        "unavailable or conflicting — deferring the terminal needs:user park to the "
-                        "next sweep"
+                        "unavailable or conflicting — deferring the age park to the next sweep"
                     )
                     continue
             labels = _labels(pull, f"target pull request {action.repo}#{action.number}")
+            # The park CLASS is decided here and nowhere else (age_park_label). Reading the
+            # comments BEFORE the label write is what makes that possible: the generation — how
+            # many times this sweep has already parked this PR — lives in the durable receipts,
+            # and it is the cap that decides machine-vs-human for a flapping PR. Both reads were
+            # already made in this block; only their order changed.
+            comments = _comments(api, action.repo, action.number)
+            generation = age_park_generation(comments, bot_login)
+            park_label = age_park_label(reason, generation)
+            cause = age_park_cause(reason)
+            head_sha = pull.get("head", {}).get("sha")
+            if not isinstance(head_sha, str) or re.fullmatch(r"[0-9a-f]{40}", head_sha) is None:
+                raise GroomError(
+                    f"target pull request head sha is malformed for {action.repo}#{action.number}")
+            machine_park = park_label == park_policy.MACHINE_PARK_PR_LABEL
+            receipt = (f"{AGE_PARK_MARKER} cause={cause} head={head_sha} gen={generation} -->"
+                       if machine_park else "")
             label_changed = False
-            if "needs:user" not in labels:
-                # Sticky human unpark (park_policy.py defect 2): a human who removed needs:user
+            if park_label not in labels:
+                # Sticky human unpark (park_policy.py defect 2): a human who removed THIS label
                 # from this PR more recently than any application vetoes the re-park (the whole
-                # action — a repeated "human review is required" comment would spam a PR the human
-                # explicitly unparked). This PR park stays needs:user: an orphan draft / wedged
-                # merge state is a genuine human hand-off, not a capacity park.
+                # action — a repeated hand-off comment would spam a PR the human explicitly
+                # unparked). The veto is checked against the label actually being written, so the
+                # machine class is veto-gated exactly as the human class always was.
                 if park_policy.park_vetoed(
-                        action.repo, action.number, "needs:user",
+                        action.repo, action.number, park_label,
                         lambda r, n: api.paginate(f"/repos/{r}/issues/{n}/timeline"),
                         is_human=lambda login: _is_human_maintainer(
                             api, action.repo, login)):
-                    print(f"SKIP PR {action.repo}#{action.number}: needs:user park suppressed "
+                    print(f"SKIP PR {action.repo}#{action.number}: {park_label} park suppressed "
                           "(sticky human unpark)")
                     continue
-                _ensure_label(api, action.repo, "needs:user")
+                _ensure_label(api, action.repo, park_label)
                 api.request(
                     "POST",
                     f"/repos/{action.repo}/issues/{action.number}/labels",
-                    {"labels": ["needs:user"]},
+                    {"labels": [park_label]},
                 )
                 print(
-                    f"WRITE add labels repo={action.repo} issue={action.number} labels=needs:user"
+                    f"WRITE add labels repo={action.repo} issue={action.number} "
+                    f"labels={park_label}"
                 )
                 label_changed = True
-            comments = _comments(api, action.repo, action.number)
+            # A MACHINE park dedupes on its own receipt FINGERPRINT, not on "any hand-off comment
+            # ever": a PR that machine-parked, provably recovered, was re-admitted and then parked
+            # AGAIN must mint a NEW receipt — otherwise generation 2 is invisible, the cap can
+            # never be reached, and the escalation to the human class never happens. The HUMAN
+            # class keeps the original once-ever dedupe unchanged.
             already_commented = any(
                 comment["user"]["login"].casefold() == bot_login.casefold()
-                and STALE_PR_MARKER in comment["body"]
+                and ((receipt in comment["body"]) if machine_park
+                     else (STALE_PR_MARKER in comment["body"]))
                 for comment in comments
             )
             comment_changed = False
             if not already_commented:
-                body = (
-                    "> 🤖 SPARQ agent\n\n"
-                    f"This worker PR has been untouched beyond the {limits[action.repo].worker_timeout_minutes}-"
-                    f"minute maintenance threshold, and {reason}. Grooming will not close, merge, or force-push "
-                    "it; human review is required.\n\n"
-                    f"{STALE_PR_MARKER}"
-                )
+                if machine_park:
+                    body = (
+                        "> 🤖 SPARQ agent\n\n"
+                        f"This worker PR has been untouched beyond the "
+                        f"{limits[action.repo].worker_timeout_minutes}-minute maintenance "
+                        f"threshold, and {reason}. That is a MACHINE-recoverable cause, not a "
+                        f"question for a human, so this is the machine-owned "
+                        f"`{park_label}` soft hold: grooming re-admits it automatically once the "
+                        "cause is proven recovered, and will not close, merge, or force-push it. "
+                        f"No action is required from you.\n\n{STALE_PR_MARKER}\n{receipt}"
+                    )
+                else:
+                    # The human class is now reached only by an UNMAPPED cause (no machine exit
+                    # can be proven, so a human really is the exit) or by exceeding the
+                    # automatic-re-admission cap. The over-cap case names the flap, because
+                    # "this recurred N times" is a genuinely different question from "this took
+                    # too long" and is the one a human should be asked.
+                    flap = (
+                        f" This is age-park generation {generation}; the machine already granted "
+                        f"the {AGE_UNPARK_MAX} automatic re-admissions this cause is allowed and "
+                        "the PR returned to the same state, so a repeated failure — not a "
+                        "timeout — is what is being escalated."
+                        if cause is not None else ""
+                    )
+                    body = (
+                        "> 🤖 SPARQ agent\n\n"
+                        f"This worker PR has been untouched beyond the {limits[action.repo].worker_timeout_minutes}-"
+                        f"minute maintenance threshold, and {reason}. Grooming will not close, merge, or force-push "
+                        f"it; human review is required.{flap}\n\n"
+                        f"{STALE_PR_MARKER}"
+                    )
                 api.request(
                     "POST",
                     f"/repos/{action.repo}/issues/{action.number}/comments",
