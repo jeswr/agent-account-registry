@@ -3399,6 +3399,115 @@ LEGACY_PARK_MIGRATION_MAX = 5
 AUTO_READMISSION_PER_TICK_MAX = 5
 
 
+# ---------------------------------------------------------------------------------------
+# [registry #777] WHY a park was REFUSED an exit, as a CLOSED enum — same discipline as #758's
+# `record_partition_defer`: an undeclared reason RAISES rather than silently minting a bucket.
+#
+# A refusal with no name is the state-with-no-exit class this estate has now found eight times:
+# the PR stops being mentioned, the operator cannot tell "refused for cause" from "never
+# considered", and the hold becomes permanent by omission. So every refusal below is counted
+# into the tick's SHARED `defer_reasons` histogram (registry #756) under a declared reason — not
+# into a parallel counter that nothing publishes.
+READMIT_REFUSAL_NO_PROVENANCE = "unenumerable-provenance"
+READMIT_REFUSAL_REASONS = (READMIT_REFUSAL_NO_PROVENANCE,)
+READMIT_REFUSAL_BUCKET_PREFIX = "readmit-refused:"
+# How many refused PRs one warning annotation names before it summarises. The COUNT is always
+# exact; only the enumeration is bounded, so a growing population cannot turn one log line into
+# an unbounded dump.
+READMIT_REFUSAL_NAMES_MAX = 10
+
+
+def readmit_refusal_bucket(reason):
+    """The ONE `defer_reasons` key a refusal reason publishes under.
+
+    RAISES on an undeclared reason, and does so from the single place every writer goes through,
+    so a future refusal branch that forgets to name itself fails loud at the first refusal
+    instead of publishing as a silent zero."""
+    if reason not in READMIT_REFUSAL_REASONS:
+        raise DispatchError(
+            f"undeclared re-admission refusal reason {reason!r} — every path that refuses a "
+            f"park an exit must name itself in READMIT_REFUSAL_REASONS "
+            f"{list(READMIT_REFUSAL_REASONS)} (an unnamed refusal is a hold with no exit)")
+    return READMIT_REFUSAL_BUCKET_PREFIX + reason
+
+
+def record_readmit_refusal(census, reason):
+    """Count ONE refusal into `census` (the tick's shared defer histogram), in place.
+
+    ORDER MATTERS, exactly as in record_partition_defer: an undeclared `reason` raises FIRST,
+    whatever `census` is, so a call site that passes no sink cannot smuggle an unnamed reason
+    past the whitelist. Once the reason is accepted a non-dict `census` is a no-op, so the sweep
+    can pass its optional sink unconditionally and the REFUSAL ITSELF never depends on a sink
+    being wired — a missing counter must not become a missing guard."""
+    key = readmit_refusal_bucket(reason)
+    if not isinstance(census, dict):
+        return census
+    census[key] = census.get(key, 0) + 1
+    return census
+
+
+def seal_readmit_refusals(census):
+    """Pre-seed every declared refusal bucket at zero once the sweep has actually RUN.
+
+    "Missing edge" and "edge with no traffic" must not read alike (registry #753/#754): a tick
+    where the sweep ran and refused nobody publishes an explicit `readmit-refused:...=0`, while a
+    tick where the sweep never ran at all (no App login, no target token, unreadable health
+    window) publishes no key — which is the honest difference between the two."""
+    if not isinstance(census, dict):
+        return census
+    for reason in READMIT_REFUSAL_REASONS:
+        census.setdefault(readmit_refusal_bucket(reason), 0)
+    return census
+
+
+def readmission_machine_parked(pr_labels, source_labels):
+    """PURE. True iff a LIVE machine capacity park stands on EITHER half of the park pair — the
+    PR's `review:parked` or the source issue's `status:parked`. This is the sweep's own
+    re-admission precondition, named once so the refusal below and the branch it guards cannot
+    drift into disagreeing about which PRs the sweep can act on."""
+    return (MACHINE_PARK_PR_LABEL in set(pr_labels)
+            or "status:parked" in set(source_labels))
+
+
+def readmission_park_exit_candidate(pr_labels, source_labels):
+    """PURE. True iff `_readmit_capacity_parks` has ANY exit it could take for this PR: it
+    already carries the machine park (the RE-ADMISSION path) or it sits on the human terminal
+    the legacy migration converts INTO that class (the MIGRATION path, whose own first gate is
+    `HUMAN_PR_PARK_LABEL in labels`).
+
+    [registry #777] This bounds the population the refusal is ABOUT. A PR carrying neither label
+    is not being moved off any park, so counting it as "refused" would bury the real signal under
+    the whole open listing — 73 of the 84 live worker PRs on 2026-07-27."""
+    return (readmission_machine_parked(pr_labels, source_labels)
+            or _park_policy.HUMAN_PR_PARK_LABEL in set(pr_labels))
+
+
+def readmit_refusal_body(repo, refused, reason=READMIT_REFUSAL_NO_PROVENANCE):
+    """The operator-facing receipt for the PRs this tick refused. Names the count, the PRs, the
+    cause and the ONE recovery that clears it.
+
+    It routes to NOBODY: no label, no `needs:user`, no issue. This condition is
+    MACHINE-RECOVERABLE — the record lands, the next tick re-admits — so it stays in the machine
+    class, and paging a human for it is the exact complaint a separate fix is already in flight
+    for. What it must not be is SILENT."""
+    shown = sorted(refused)[:READMIT_REFUSAL_NAMES_MAX]
+    listed = ", ".join(f"{repo}#{number}" for number in shown)
+    if len(refused) > len(shown):
+        listed += f", +{len(refused) - len(shown)} more"
+    return (
+        f"{len(refused)} machine capacity park(s) were refused re-admission this tick because "
+        f"the PR has NO admissible registry provenance record ({reason}): {listed}.\n\n"
+        f"A re-admitted PR with no record is invisible to the review enumerator (which fails "
+        f"closed on exactly this) AND reserves the serializing `{GLOBAL_PACKAGE}` partition, "
+        f"because its crates are unknowable — so the re-admission buys no review and stalls "
+        f"every ready row behind it. The park therefore STANDS; nothing here narrows the "
+        f"reservation.\n\n"
+        f"**Recovery (machine, no human action needed):** run the `backfill-provenance` "
+        f"workflow with `target_repo={repo}` and `apply=true`. It reconstructs the implementer "
+        f"identity from the worker run log and writes the record to the `ledger` branch; the "
+        f"very next tick re-admits the park on its own evidence.")
+
+
 def _migrate_legacy_park(repo, number, issue_number, comments, labels, bot_login, provable,
                          post_comment, convert_labels, source_labels=(),
                          issue_hold_machine_owned=None, log=print):
@@ -3518,7 +3627,7 @@ def _migrate_legacy_park(repo, number, issue_number, comments, labels, bot_login
 def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_login, script_dir,
                             worker_pr, evidence_probe, comments_fn=None, timeline_fn=None,
                             post_comment=None, clear_labels=None, log=print,
-                            migration_provable=False, convert_labels=None):
+                            migration_provable=False, convert_labels=None, refusals=None):
     """AUTOMATIC re-admission of MACHINE capacity parks whose starvation cause has demonstrably
     cleared (registry #614) — the sweep that closes the structural stall: a MACHINE-owned park
     could only ever be cleared by a HUMAN, so a capacity outage stranded every PR it parked even
@@ -3535,6 +3644,19 @@ def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_logi
     leaves receipt-no-label — which the receipt-driven proof gate admits and this sweep converges
     on the next tick — never label-no-receipt, which would erase the re-admission from every proof
     surface and re-strand the PR. Every failure is PER-PR: one unreadable PR never stops the rest.
+
+    [registry #777] THE RELEASE PREDICATE AND THE RESERVATION PREDICATE, READ FROM ONE PLACE. A
+    park is REFUSED an exit — both exits — while its PR has no admissible provenance record. This
+    function is the layer that binds because it already holds the provenance map the reservation
+    is computed from (`record = provenance.get(number)` below, the same map
+    `busy_packages_of_pulls` reads), so "may this park be released?" and "what does this PR
+    reserve if it is?" are decided against ONE view instead of two files' worth of copies. See
+    the guard's own comment for the measurement.
+
+    `refusals`, when a dict is passed, receives those refusals as counted, named buckets (see
+    record_readmit_refusal). It is the tick's SHARED `defer_reasons` histogram, not a parallel
+    counter — the sweep would otherwise be the one leg of the tick whose declines never reach the
+    summary. Passing nothing changes NOTHING about the refusal itself.
 
     Returns the number of PRs re-admitted this tick."""
     comments_fn = comments_fn or _pr_comments
@@ -3590,6 +3712,7 @@ def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_logi
         if isinstance(page, list):
             rows.extend(row for row in page if isinstance(row, dict))
     readmitted = migrated = 0
+    refused = []
     for row in sorted(rows, key=lambda row: row.get("number") or 0):
         number = row.get("number")
         if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
@@ -3615,7 +3738,52 @@ def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_logi
                     or issue_number <= 0:
                 issue_number = None
             source_labels = set(issue_labels.get(issue_number, []) if issue_number else [])
-            if MACHINE_PARK_PR_LABEL not in labels and "status:parked" not in source_labels:
+            # [registry #777] REFUSE TO RELEASE a park whose PR has NO admissible provenance
+            # record — BEFORE either exit, and before the pacing budget, so a refusal consumes
+            # nothing and is reported identically on a busy tick and a quiet one.
+            #
+            # MEASURED read-only against the live board on 2026-07-27 (118 open PRs, 84 worker,
+            # the real ledger provenance and issue labels): 11 of the 84 worker PRs have NO
+            # record at all. #2521 carries `review:parked` and nothing else, so the exit above
+            # is the only thing between it and re-entry; re-admitting it — applying exactly what
+            # `clear_labels` writes, `review:*` -> `review:needs` — takes the busy union from
+            # `__global__` absent to `__global__` held and the ready frontier from kept=119 to
+            # kept=0, with all 449 ready rows deferred behind that one PR.
+            #
+            # BOTH halves of the harm are already documented by busy_packages_of_pulls: such a
+            # PR "is invisible to the enumerator but can still carry a latched arm, and its true
+            # crate is unknowable — it reserves the GLOBAL partition (fail closed)". So the
+            # re-admission cannot buy the review it exists to buy, AND it serializes every crate
+            # in the repository. The `parked AND inactive` carve-out is the only thing containing
+            # these PRs today, and re-admission removes the label that carve-out keys on.
+            #
+            # This REFUSES A RELEASE; it is not a new hold and it narrows no reservation. Nothing
+            # here touches the area set, the busy union, or the fail-closed `__global__` rule —
+            # unknown provenance genuinely means unknown areas, and under-serialising is the
+            # corrupting direction (two workers on one crate can produce a semantic conflict that
+            # compiles, passes and is wrong).
+            #
+            # It covers the MIGRATION exit too, on that path's OWN stated invariant: converting a
+            # park into a machine class that cannot release it "trades a VISIBLE stall a human
+            # can see and clear for a SILENT one nothing will ever clear". While the record is
+            # missing this guard IS that inability, so the conversion would do precisely the harm
+            # `provable` exists to prevent.
+            #
+            # SELF-CLEARING, with no human in the loop: `provenance` is re-read from the ledger
+            # checkout every tick, so the tick after the record lands this branch is not taken
+            # and the park re-admits on its own ordinary evidence.
+            if readmission_park_exit_candidate(labels, source_labels) \
+                    and not is_enumerable_provenance(record, number):
+                record_readmit_refusal(refusals, READMIT_REFUSAL_NO_PROVENANCE)
+                refused.append(number)
+                log(f"readmit refused {repo}#{number}: "
+                    f"{provenance_admission_error(record, number)} — a re-admitted PR with no "
+                    f"record is invisible to the review enumerator and reserves the serializing "
+                    f"`{GLOBAL_PACKAGE}` partition, so the park stands until "
+                    f"`backfill-provenance` writes the record (machine recovery; no human "
+                    f"action required)")
+                continue
+            if not readmission_machine_parked(labels, source_labels):
                 # [G1] No machine park — but this may be a LEGACY park stranded on the human
                 # terminal for an infra cause (sparq-org/sparq#3809). Re-classify it (at most
                 # LEGACY_PARK_MIGRATION_MAX per tick) so it re-enters the machine class and
@@ -3690,6 +3858,13 @@ def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_logi
         except (DispatchError, worker_pr.WorkerPrError) as exc:
             log(f"::warning::auto-readmit skipped for {repo}#{number}: {exc}; the capacity "
                 "park stands")
+    # [registry #777] The refusal's TERMINAL STATE. Sealed unconditionally so a sweep that ran
+    # and refused nobody publishes an explicit zero, and annotated once — never per PR, which
+    # would bury the signal — when anything was refused.
+    seal_readmit_refusals(refusals)
+    if refused:
+        log("::warning title=readmit refused (no provenance record)::"
+            + readmit_refusal_body(repo, refused).replace("\n", " "))
     return readmitted
 
 
@@ -5572,7 +5747,13 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                     # (registry #691) so this call site and the admission probe above cannot
                     # drift apart.
                     migration_provable=_legacy_migration_provable(
-                        model_health, health_window, _now))
+                        model_health, health_window, _now),
+                    # [registry #777] The tick's SHARED defer histogram (registry #756), not a
+                    # private counter: a park refused an exit has to reach the same summary
+                    # every other decline reaches, or the refusal is a state with no exit
+                    # wearing a log line. Sealed inside the sweep, so a tick that refused
+                    # nobody still publishes an explicit zero.
+                    refusals=defer_reasons)
 
         # [registry #677] THE MACHINE EXIT FOR A STARVED PLAN. Four times on 2026-07-26 the
         # issue lane went to `PLAN complete: 0 issue item(s)` / `lane worker: planned=0 launched=0`
@@ -12839,13 +13020,30 @@ def _self_test():
         7: [],
     }
 
+    # [registry #777] Every fixture below used to pass `readmit_prov()` — a record the review
+    # loop REFUSES (it has no pr_number, provider, alias, account hash, sha or attestation stamp).
+    # That was harmless while the sweep never consulted provenance; it is not harmless now, so the
+    # whole block moves to an ADMISSIBLE record and the recordless shape becomes an explicit,
+    # named case rather than the accidental default.
+    def readmit_prov(number=41, issue=7):
+        return {number: {"pr_number": number, "issue": issue, "impl_provider": "anthropic",
+                         "impl_alias": "sol", "impl_account_h": "0" * 16,
+                         "head_sha_at_open": "a" * 40,
+                         # MACHINE-ATTESTED stamp (registry #657/#732).
+                         "recorded_at_run": "29694084610.1"}}
+
+    assert provenance_admission_error(readmit_prov()[41], 41) is None, \
+        ("the re-admission fixtures must carry an ADMISSIBLE record — otherwise the #777 guard "
+         "refuses every one of them and the whole block passes for the wrong reason: "
+         + str(provenance_admission_error(readmit_prov()[41], 41)))
+
     def readmit_sweep(window, rows=None, labels=None, comments=(), holds=None, timeline=None):
         """Run the sweep with every GitHub seam injected; returns (count, posted, cleared)."""
         posted, cleared = [], []
         count = _readmit_capacity_parks(
             "example/repo", rows if rows is not None else [[parked_row]],
             labels if labels is not None else {7: ["status:in-progress-review"]},
-            {41: {"issue": 7}}, readmit_bot, Path("."), worker_pr_mod,
+            readmit_prov(), readmit_bot, Path("."), worker_pr_mod,
             _capacity_recovery_probe(model_health_mod, window, readmit_now),
             comments_fn=lambda _repo, _number: list(comments),
             timeline_fn=lambda _repo, number: list((timeline or park_timeline).get(number, [])),
@@ -12940,7 +13138,7 @@ def _self_test():
             raise DispatchError("comments unavailable")
 
         skipped = _readmit_capacity_parks(
-            "example/repo", [[parked_row]], {7: []}, {41: {"issue": 7}}, readmit_bot, Path("."),
+            "example/repo", [[parked_row]], {7: []}, readmit_prov(), readmit_bot, Path("."),
             worker_pr_mod, _capacity_recovery_probe(model_health_mod, recovered_window,
                                                     readmit_now),
             comments_fn=boom_comments,
@@ -12980,7 +13178,7 @@ def _self_test():
             _readmit_capacity_parks(
                 "example/repo", [[labels_row or legacy_row]],
                 {7: list(issue_labels if issue_labels is not None else [])},
-                {41: {"issue": 7}},
+                readmit_prov(),
                 readmit_bot, Path("."), worker_pr_mod,
                 _capacity_recovery_probe(model_health_mod, recovered_window, readmit_now),
                 comments_fn=lambda _repo, _number: [
@@ -13072,7 +13270,7 @@ def _self_test():
         stage1_row = dict(parked_row, labels=[{"name": n} for n in composed_pr_labels])
         migrated_count = _readmit_capacity_parks(
             "example/repo", [[stage1_row]], {7: sorted(composed_issue_labels)},
-            {41: {"issue": 7}}, readmit_bot, Path("."), worker_pr_mod,
+            readmit_prov(), readmit_bot, Path("."), worker_pr_mod,
             _capacity_recovery_probe(model_health_mod, still_broken_window, readmit_now),
             comments_fn=lambda _repo, _number: [
                 {"user": {"login": readmit_bot}, "body": budget_body}],
@@ -13088,7 +13286,7 @@ def _self_test():
         composed_readmitted, composed_cleared = 0, []
         composed_readmitted = _readmit_capacity_parks(
             "example/repo", [[stage2_row]], {7: sorted(composed_issue_labels)},
-            {41: {"issue": 7}}, readmit_bot, Path("."), worker_pr_mod,
+            readmit_prov(), readmit_bot, Path("."), worker_pr_mod,
             _capacity_recovery_probe(model_health_mod, recovered_window, readmit_now),
             comments_fn=lambda _repo, _number: [],
             timeline_fn=lambda _repo, number: list(park_timeline.get(number, [])),
@@ -13181,7 +13379,7 @@ def _self_test():
         try:
             _readmit_capacity_parks(
                 "example/repo", [[legacy_row]], {7: ["needs:user", "status:deferred"]},
-                {41: {"issue": 7}}, readmit_bot, Path("."), worker_pr_mod,
+                readmit_prov(), readmit_bot, Path("."), worker_pr_mod,
                 _capacity_recovery_probe(model_health_mod, recovered_window, readmit_now),
                 comments_fn=lambda _repo, _number: [
                     {"user": {"login": readmit_bot}, "body": budget_body}],
@@ -13215,7 +13413,8 @@ def _self_test():
                      for n in range(41, 41 + LEGACY_PARK_MIGRATION_MAX + 3)]
         many_converted = []
         _readmit_capacity_parks(
-            "example/repo", [many_rows], {}, {row["number"]: {"issue": 7} for row in many_rows},
+            "example/repo", [many_rows], {}, {n: r for row in many_rows
+             for n, r in readmit_prov(row["number"]).items()},
             readmit_bot, Path("."), worker_pr_mod,
             _capacity_recovery_probe(model_health_mod, recovered_window, readmit_now),
             comments_fn=lambda _repo, _number: [
@@ -13385,7 +13584,8 @@ def _self_test():
                      for n in range(60, 60 + AUTO_READMISSION_PER_TICK_MAX + 4)]
         herd_cleared = []
         herd_count = _readmit_capacity_parks(
-            "example/repo", [herd_rows], {}, {row["number"]: {"issue": 7} for row in herd_rows},
+            "example/repo", [herd_rows], {}, {n: r for row in herd_rows
+             for n, r in readmit_prov(row["number"]).items()},
             readmit_bot, Path("."), worker_pr_mod,
             _capacity_recovery_probe(model_health_mod, healthy_window, readmit_now),
             comments_fn=lambda _repo, _number: [],
@@ -13499,7 +13699,7 @@ def _self_test():
         try:
             _readmit_capacity_parks(
                 "example/repo", [[legacy_row]], {7: ["needs:user", "status:deferred"]},
-                {41: {"issue": 7}}, readmit_bot, Path("."), worker_pr_mod,
+                readmit_prov(), readmit_bot, Path("."), worker_pr_mod,
                 _capacity_recovery_probe(model_health_mod, healthy_window, readmit_now),
                 comments_fn=lambda _repo, _number: [
                     {"user": {"login": readmit_bot}, "body": budget_body}],
@@ -13543,7 +13743,7 @@ def _self_test():
         chain_migrated = _readmit_capacity_parks(
             "example/repo", [[dict(parked_row,
                                    labels=[{"name": n} for n in sorted(chain_pr_labels)])]],
-            {7: sorted(chain_issue_labels)}, {41: {"issue": 7}}, readmit_bot, Path("."),
+            {7: sorted(chain_issue_labels)}, readmit_prov(), readmit_bot, Path("."),
             worker_pr_mod,
             _capacity_recovery_probe(model_health_mod, healthy_window, readmit_now),
             comments_fn=lambda _repo, _number: [
@@ -13572,7 +13772,7 @@ def _self_test():
         chain_readmitted = _readmit_capacity_parks(
             "example/repo", [[dict(parked_row,
                                    labels=[{"name": n} for n in sorted(chain_pr_labels)])]],
-            {7: sorted(chain_issue_labels)}, {41: {"issue": 7}}, readmit_bot, Path("."),
+            {7: sorted(chain_issue_labels)}, readmit_prov(), readmit_bot, Path("."),
             worker_pr_mod,
             _capacity_recovery_probe(model_health_mod, continued_window, later_now),
             comments_fn=lambda _repo, _number: [],
@@ -13584,6 +13784,233 @@ def _self_test():
         assert chain_cleared == [(41, 7)], chain_cleared
         print("  ok   aged-out exit CHAIN: a legacy park that could not migrate before #691 "
               "migrates AND is actually released one span later (both layers, end to end)")
+
+        # ---- [registry #777] A RECORDLESS PR MUST NOT BE RE-ADMITTED ------------------------
+        # THE DEFECT: the sweep cleared the machine park on a PR whose provenance record is
+        # MISSING. On re-entry that PR is invisible to `enumerate_review_items` (which fails
+        # closed on exactly this) AND reserves the serializing `__global__` partition, because
+        # its crates are unknowable — so the re-admission buys no review and stalls every ready
+        # row behind it. The `parked AND inactive` carve-out is the only thing containing these
+        # PRs, and re-admission removes the label that carve-out keys on.
+        #
+        # MEASURED read-only against the live board on 2026-07-27 (118 open PRs, 84 worker, the
+        # real ledger provenance and issue labels): 11 of the 84 worker PRs are recordless.
+        # Re-admitting #2521 — applying exactly what `clear_labels` writes, `review:*` ->
+        # `review:needs` — takes the busy union from `__global__` absent to `__global__` held and
+        # the ready frontier from kept=119 to kept=0, with all 449 ready rows deferred behind that
+        # one PR. Its park is refused today only because a HUMAN happened to apply it: containment
+        # by coincidence, which is what this replaces.
+        _refusal_bucket = readmit_refusal_bucket(READMIT_REFUSAL_NO_PROVENANCE)
+
+        def guard_park_event(_repo, number):
+            """The machine park application, for ANY PR number in these fixtures."""
+            if number == 7:
+                return []
+            return [{"event": "labeled", "label": {"name": MACHINE_PARK_PR_LABEL},
+                     "created_at": park_stamp, "actor": {"login": readmit_bot},
+                     "performed_via_github_app": None}]
+
+        def guard_sweep(provenance, rows=None, refusals=None, logs=None, comments=(),
+                        issue_labels=None, convert=None):
+            """One sweep, every GitHub seam injected. Returns (readmitted, cleared)."""
+            cleared = []
+            readmitted = _readmit_capacity_parks(
+                "example/repo", rows if rows is not None else [[parked_row]],
+                {7: list(issue_labels or [])}, provenance, readmit_bot, Path("."), worker_pr_mod,
+                _capacity_recovery_probe(model_health_mod, recovered_window, readmit_now),
+                comments_fn=lambda _repo, _number: [
+                    {"user": {"login": readmit_bot}, "body": body} for body in comments],
+                timeline_fn=guard_park_event,
+                post_comment=lambda *_a: None,
+                clear_labels=lambda pr, issue: cleared.append((pr, issue)),
+                log=(logs.append if logs is not None else (lambda _l: None)),
+                migration_provable=True,
+                convert_labels=(convert if convert is not None else (lambda *_a: None)),
+                refusals=refusals)
+            return readmitted, cleared
+
+        # (1) THE GUARD. The same fixture that re-admits above, with the record removed, is
+        # REFUSED — and the refusal is COUNTED under a declared reason, not logged into silence.
+        refusal_census = Counter()
+        assert _refusal_bucket not in refusal_census, "the bucket must be MINTED by the sweep"
+        readmitted, cleared = guard_sweep({}, refusals=refusal_census)
+        assert (readmitted, cleared) == (0, []), (readmitted, cleared)
+        assert refusal_census[_refusal_bucket] == 1, refusal_census
+        # (2) SELF-CLEARING, BY EXECUTION. Same PR, same tick inputs, record present => it
+        # re-admits, with no label written by a human and no second mechanism involved.
+        cleared_census = Counter()
+        readmitted, cleared = guard_sweep(readmit_prov(), refusals=cleared_census)
+        assert (readmitted, cleared) == (1, [(41, 7)]), (readmitted, cleared)
+        assert cleared_census[_refusal_bucket] == 0, cleared_census
+        print("  ok   #777 guard: a recordless park is REFUSED release and counted; the SAME PR "
+              "re-admits the moment its record exists (self-clearing, proven by execution)")
+
+        # (3) SEALED, so "the sweep refused nobody" and "the sweep never ran" do not read alike
+        # (registry #753/#754) — and a PR that is not a park-exit candidate at all is NOT counted.
+        # 73 of the 84 live worker PRs carry no park; counting them would bury the real signal.
+        unparked_census = Counter()
+        readmitted, cleared = guard_sweep(
+            {}, rows=[[dict(parked_row, labels=[{"name": "review:needs"}])]],
+            refusals=unparked_census)
+        assert (readmitted, cleared) == (0, []), (readmitted, cleared)
+        assert unparked_census[_refusal_bucket] == 0, unparked_census
+        assert _refusal_bucket in unparked_census, (
+            "a sweep that ran and refused nobody must publish an EXPLICIT zero — otherwise a "
+            "missing edge and an edge with no traffic are indistinguishable on the tick summary")
+        # The REFUSAL is not conditional on a sink being wired: a missing counter must never
+        # become a missing guard.
+        assert guard_sweep({}, refusals=None) == (0, []), "the guard depends on its own sink"
+        print("  ok   #777 telemetry: the bucket is sealed at an explicit zero, an unparked PR is "
+              "never counted, and the refusal itself does not depend on the sink")
+
+        # (4) THE COUNTS SUM TO THE POPULATION, and a refusal consumes NO pacing budget. The two
+        # recordless PRs sort FIRST, so if a refusal charged the per-tick cap the last recorded
+        # park would be deferred and this would red.
+        assert 0 < AUTO_READMISSION_PER_TICK_MAX <= 10, AUTO_READMISSION_PER_TICK_MAX
+        mixed_numbers = list(range(41, 43 + AUTO_READMISSION_PER_TICK_MAX))
+        mixed_rows = [dict(parked_row, number=n,
+                           head=dict(parked_row["head"], ref=f"sparq-agent/issue-7-{n}"))
+                      for n in mixed_numbers]
+        mixed_prov = {}
+        for n in mixed_numbers[2:]:
+            mixed_prov.update(readmit_prov(n))
+        mixed_census = Counter()
+        readmitted, cleared = guard_sweep(mixed_prov, rows=[mixed_rows], refusals=mixed_census)
+        assert readmitted == AUTO_READMISSION_PER_TICK_MAX, (readmitted, cleared)
+        assert [pr for pr, _issue in cleared] == mixed_numbers[2:], cleared
+        assert mixed_census[_refusal_bucket] == 2, mixed_census
+        assert mixed_census[_refusal_bucket] + readmitted == len(mixed_rows), (
+            "every park-exit candidate must land in EXACTLY ONE outcome — refused or re-admitted; "
+            "a candidate in neither bucket is the silent state this change exists to remove")
+        print(f"  ok   #777 accounting: refused + re-admitted == the {len(mixed_rows)} park-exit "
+              f"candidates, and a refusal never charges the per-tick re-admission cap")
+
+        # (5) THE MIGRATION EXIT IS REFUSED TOO — on that path's OWN invariant. `_migrate_legacy_park`
+        # exists never to convert a park into a machine class that cannot release it ("a VISIBLE
+        # stall a human can see and clear" for "a SILENT one nothing will ever clear"). While the
+        # record is missing, the guard above IS that inability.
+        legacy_recordless = dict(parked_row,
+                                 labels=[{"name": _park_policy.HUMAN_PR_PARK_LABEL}])
+        migration_census, migrated_prs = Counter(), []
+        guard_sweep({}, rows=[[legacy_recordless]], refusals=migration_census,
+                    comments=[budget_body],
+                    convert=lambda pr, issue: migrated_prs.append(pr))
+        assert migrated_prs == [], migrated_prs
+        assert migration_census[_refusal_bucket] == 1, migration_census
+        # ...and the SAME legacy park, with a record, migrates: the refusal is about the record.
+        recorded_census, recorded_migrations = Counter(), []
+        guard_sweep(readmit_prov(), rows=[[legacy_recordless]], refusals=recorded_census,
+                    comments=[budget_body],
+                    convert=lambda pr, issue: recorded_migrations.append(pr))
+        assert recorded_migrations == [41], recorded_migrations
+        assert recorded_census[_refusal_bucket] == 0, recorded_census
+        print("  ok   #777 migration exit: a recordless legacy park is not converted into a class "
+              "that could not release it; the same park WITH a record still migrates")
+
+        # (6) THE TERMINAL STATE IS VISIBLE AND STAYS IN THE MACHINE CLASS. One annotation per
+        # sweep (never one per PR), naming the count and the ONE machine recovery — and routing
+        # to NO human: the maintainer is already being paged for things that do not need them.
+        warn_logs = []
+        guard_sweep({}, rows=[[mixed_rows[0], mixed_rows[1]]], logs=warn_logs)
+        warn_lines = [line for line in warn_logs if line.startswith("::warning")]
+        assert len(warn_lines) == 1, warn_lines
+        assert "2 machine capacity park(s) were refused" in warn_lines[0], warn_lines
+        assert "example/repo#41" in warn_lines[0] and "example/repo#42" in warn_lines[0]
+        assert "backfill-provenance" in warn_lines[0] and "apply=true" in warn_lines[0]
+        assert _park_policy.HUMAN_PARK_LABEL not in warn_lines[0], (
+            "a MACHINE-recoverable condition must not page a human (registry #776) — the "
+            "annotation may not mention, let alone apply, the human hold")
+        assert sum(line.startswith("::warning") for line in
+                   (lambda log=[]: (guard_sweep(readmit_prov(), logs=log), log)[1])()) == 0
+        # The enumeration is BOUNDED but the count is EXACT — a growing population cannot turn one
+        # annotation into an unbounded dump, and cannot make the number wrong either.
+        many_body = readmit_refusal_body("o/r", list(range(1, READMIT_REFUSAL_NAMES_MAX + 4)))
+        assert f"{READMIT_REFUSAL_NAMES_MAX + 3} machine capacity park(s)" in many_body, many_body
+        assert "+3 more" in many_body, many_body
+        print("  ok   #777 terminal state: ONE annotation per sweep names the exact count and the "
+              "machine recovery, never a human hold, with a bounded enumeration")
+
+        # (7) THE CLOSED ENUM. An undeclared reason RAISES rather than minting a bucket that
+        # publishes as a silent zero — and it raises BEFORE the sink is consulted, so a call site
+        # that passes no sink cannot smuggle an unnamed reason past the whitelist.
+        for _bad in ("invented-reason", None, "", "UNENUMERABLE-PROVENANCE", 0):
+            for _sink in ({}, None):
+                try:
+                    record_readmit_refusal(_sink, _bad)
+                except DispatchError:
+                    continue
+                raise AssertionError(
+                    f"undeclared refusal reason {_bad!r} must RAISE (sink={_sink!r})")
+        assert record_readmit_refusal(None, READMIT_REFUSAL_NO_PROVENANCE) is None
+        print("  ok   #777 closed enum: an undeclared refusal reason raises, sink or no sink")
+
+        # (8) NOTHING ABOVE NARROWS THE RESERVATION. This is a refusal to RELEASE, not a licence
+        # to under-serialise: a recordless PR still reserves the WHOLE serializing partition, and
+        # inverting that is a defect rather than an optimisation (two workers on one crate can
+        # produce a semantic conflict that compiles, passes and is wrong).
+        _guard_holder = {"number": 41, "state": "open", "draft": True, "auto_merge": None,
+                         "labels": [{"name": MACHINE_PARK_PR_LABEL}],
+                         "head": {"ref": "sparq-agent/issue-7-1-1", "sha": "c" * 40,
+                                  "repo": {"full_name": "o/r"}}}
+        assert busy_packages_of_pulls(
+            "o/r", [dict(_guard_holder, labels=[])], {}, {}) == {GLOBAL_PACKAGE}, \
+            "the fail-closed __global__ reservation for unknown provenance was weakened"
+        # ...and THE CONSEQUENCE the guard exists for, executed: parked the holder frees its
+        # crates and the frontier survives; re-admitted it holds `__global__` and the frontier
+        # goes to zero. This is the live A/B (kept 119 -> 0) in miniature.
+        _guard_rows = [{"number": 900, "package": "crate-a", "deferred": False},
+                       {"number": 901, "package": "crate-b", "deferred": False}]
+        _parked_starve, _free_starve = {}, {}
+        with contextlib.redirect_stdout(io.StringIO()):
+            _kept_parked = filter_busy_area_items(
+                _guard_rows, "o/r", [_guard_holder], {}, {}, leases=[], now=0,
+                starvation=_parked_starve)
+            _kept_readmitted = filter_busy_area_items(
+                _guard_rows, "o/r", [dict(_guard_holder, labels=[{"name": "review:needs"}])],
+                {}, {}, leases=[], now=0, starvation=_free_starve)
+        assert len(_kept_parked) == 2 and _parked_starve == {"deferred": 0, "kept": 2}, \
+            (_kept_parked, _parked_starve)
+        assert _kept_readmitted == [] and _free_starve == {"deferred": 2, "kept": 0}, \
+            (_kept_readmitted, _free_starve)
+        print("  ok   #777 fail-closed intact: a recordless PR still reserves the whole "
+              "partition, and re-admitting one demonstrably zeroes the frontier (the A/B)")
+
+        # (9) THE CALL SITE — the leg named in the title. Every assertion above drives
+        # `_readmit_capacity_parks` directly, so without this pin production could pass no sink at
+        # all and the whole terminal state would exist nowhere the tick summary can see. Decided
+        # on `dispatch()`'s AST by the SAME helper the #758 census wiring uses (already
+        # mutation-tested there), because `"refusals=defer_reasons" in source` is satisfied by a
+        # comment and by dead code.
+        _readmit_scope = ast.parse(textwrap.dedent(inspect.getsource(dispatch))).body[0].body
+        _readmit_wiring = _call_keyword_violations(
+            _readmit_scope, "dispatch()", "_readmit_capacity_parks",
+            {"refusals": "defer_reasons"})
+        assert _readmit_wiring == [], _readmit_wiring
+        _readmit_stripped = ast.parse(textwrap.dedent(inspect.getsource(dispatch))).body[0].body
+        for _node in ast.walk(ast.Module(body=_readmit_stripped, type_ignores=[])):
+            if isinstance(_node, ast.Call) \
+                    and _callee_name(_node.func) == "_readmit_capacity_parks":
+                _node.keywords = [kw for kw in _node.keywords if kw.arg != "refusals"]
+        assert _call_keyword_violations(
+            _readmit_stripped, "probe", "_readmit_capacity_parks",
+            {"refusals": "defer_reasons"}), (
+            "the #777 call-site pin is VACUOUS: deleting `refusals=defer_reasons` from "
+            "dispatch() produced no violation, which is exactly how a six-character call-site "
+            "edit leaves a suite green while destroying the shipped output")
+        # ...and it must be the SHARED histogram, not a private dict the summary never reads.
+        _readmit_private = ast.parse(textwrap.dedent(inspect.getsource(dispatch))).body[0].body
+        for _node in ast.walk(ast.Module(body=_readmit_private, type_ignores=[])):
+            if isinstance(_node, ast.Call) \
+                    and _callee_name(_node.func) == "_readmit_capacity_parks":
+                _node.keywords = [ast.keyword(arg="refusals", value=ast.Name(id="_private",
+                                                                            ctx=ast.Load()))
+                                  if kw.arg == "refusals" else kw for kw in _node.keywords]
+        assert _call_keyword_violations(
+            _readmit_private, "probe", "_readmit_capacity_parks",
+            {"refusals": "defer_reasons"}), \
+            "a PRIVATE sink at the call site must red — nothing downstream would publish it"
+        print("  ok   #777 call site: dispatch() passes the SHARED defer histogram, proven on "
+              "the AST and mutation-tested against deletion and against a private sink")
     finally:
         globals()["_target_is_human_maintainer"] = prev_target_probe
 
