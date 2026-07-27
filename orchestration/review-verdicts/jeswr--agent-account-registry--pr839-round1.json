@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 839,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "aec2be4bb2a60dc8d796965b7c21c1df8abf737b",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The document continues to publish `fleet.active_agents = len(live)` and per-repository active-agent counts. The new comment explicitly acknowledges that, because `max_concurrent_workers` is 1, N concurrent agents proves at least N accounts. This is therefore still a public fleet-composition disclosure, not merely an unrelated operational metric. The clone-invariance test misses it by returning the whole `fleet` object from fixtures with no live leases, so it only proves invariance at zero load. Under otherwise identical 1-account and 3-account fixtures with one and three live leases, respectively, the published documents differ and disclose the lower bound. Retaining a knowingly composition-revealing field makes the stated minimization incomplete.",
+    "file": "scripts/dashboard-gen.py",
+    "fix_hint": "Remove or cardinality-minimize the public active-agent and per-repository active-agent counts, or narrow the claimed privacy property and public messaging with explicit maintainer approval. Add a non-vacuous clone-invariance test using valid live leases at each fleet size so the test exercises this known disclosure.",
+    "severity": "major",
+    "title": "Published active-agent count still leaks account-fleet composition"
+   },
+   {
+    "body": "The new footer says `no account identities or fleet counts are published`, but the payload and page still publish `fleet.active_agents` and repository/model active-agent counts. The generator's own new comment calls that value a lower bound on fleet size. This absolute public assurance is therefore factually false even under the change's documented assumptions.",
+    "file": "dashboard/index.html",
+    "fix_hint": "Do not make the absolute no-fleet-count claim while active-agent counts remain public. Either remove/minimize those counts as part of this change or use accurate wording that does not deny the known disclosure.",
+    "severity": "major",
+    "title": "Footer falsely states that no fleet counts are published"
+   }
+  ],
+  "progress": null,
+  "summary": "The per-account rows and direct account census fields are removed soundly, and the new projections and self-tests are generally non-vacuous and fail closed. However, the change claims that the public surface no longer publishes fleet counts while deliberately retaining a value that directly exposes a lower bound on account-fleet size. That makes the privacy change incomplete and the new public-facing assurance false.",
+  "verdict": "request_changes"
+ }
+}
