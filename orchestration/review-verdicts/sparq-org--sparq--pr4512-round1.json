@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4512,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "2ace9ca029712cda389d9e4df7e887044666ebbc",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The documentation-only change is internally consistent: it narrows the earlier conformance-verification claim to sections A and B, records the three already-filed SHACL-CS pull requests without claiming they have landed, preserves the no-vendoring constraint while the upstream license PR remains open, and explains why the existing upstream strict-mode tests were vacuous for the two unguarded constructs. The linked research record is updated consistently with the new status section. No correctness, soundness, test-validity, or security defect is evident in the diff.",
+  "verdict": "approve"
+ }
+}
