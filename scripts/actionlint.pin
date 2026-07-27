@@ -1,0 +1,25 @@
+# SINGLE SOURCE OF TRUTH for the pinned actionlint both lint lanes provision (issue #431).
+#
+# Consumed by BOTH:
+#   * .github/workflows/pr-gate.yml — step "Install actionlint (pinned release, sha256-verified)"
+#   * scripts/worker-live.sh        — _actionlint_pin / _ensure_actionlint / _fetch_pinned_actionlint
+#
+# Before this file the version + checksums were hard-coded separately in each lane (#428), so a
+# bump could land in one and not the other and the two lanes would lint the SAME workflows with
+# DIFFERENT actionlints. A bump is now ONE edit here; worker-live.sh's --self-test asserts that
+# pr-gate.yml still reads this file and carries no actionlint version/checksum literal of its own,
+# so re-inlining a private copy turns the required gate red.
+#
+# This file is DATA. Both lanes PARSE it — strict `KEY=VALUE`, one line per key, each value matched
+# against that key's exact shape — and neither one ever `source`s or otherwise evaluates it. The
+# pins stay checked in and are NEVER env-supplied, so nothing PR- or env-controlled can swap in a
+# different artifact; a missing file, an absent key, a duplicated key or a malformed value REFUSES
+# in both lanes rather than defaulting (the resulting download could not be verified).
+#
+# BUMPING (all three keys together): take ACTIONLINT_TARBALL_SHA256_LINUX_AMD64 from the release's
+# published checksums, then ACTIONLINT_BIN_SHA256_LINUX_AMD64 from `sha256sum` of the `actionlint`
+# file extracted from that already-verified tarball. The checksums are the linux/amd64 release
+# artifact — worker-live.sh refuses on any other arch rather than fetching a build it cannot verify.
+ACTIONLINT_VERSION=1.7.7
+ACTIONLINT_TARBALL_SHA256_LINUX_AMD64=023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757
+ACTIONLINT_BIN_SHA256_LINUX_AMD64=9f7dedb4e23f89f2922073d1a6720405b7b520d4f5832ebb96f0d55a2958886c

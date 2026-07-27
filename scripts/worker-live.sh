@@ -1085,17 +1085,103 @@ _tokens_after_gate() {
 # [issue #140 review r1] The gate below FAILS CLOSED when a workflow changed and actionlint is
 # unavailable — so the worker lane must be able to provision actionlint itself, or every legitimate
 # workflow change dies at `command -v`. Provisioning mirrors .github/workflows/pr-gate.yml: the
-# SAME pinned release version + tarball sha256 (keep the two in sync when bumping). The pins are
-# hard-coded here and never read from the environment, so nothing PR- or env-controlled can swap
-# in a different artifact; a failed download, a checksum mismatch, or an arch with no pinned
-# checksum REFUSES and the gate still dies (the fail-closed behaviour is preserved, not weakened).
+# SAME pinned release version + tarball sha256. A failed download, a checksum mismatch, or an arch
+# with no pinned checksum REFUSES and the gate still dies (the fail-closed behaviour is preserved,
+# not weakened).
 # [#428 review r2] The EXTRACTED binary is pinned too (BIN sha, of the `actionlint` file inside
 # the pinned tarball) — it is what the cache fast path re-verifies on every reuse, so cached bytes
-# sit inside the same checksum boundary as a fresh download. When bumping the version, update BOTH
-# digests: tarball sha from the release checksums, binary sha via sha256sum of the extracted file.
-_ACTIONLINT_VERSION=1.7.7
-_ACTIONLINT_SHA256_LINUX_AMD64=023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757
-_ACTIONLINT_BIN_SHA256_LINUX_AMD64=9f7dedb4e23f89f2922073d1a6720405b7b520d4f5832ebb96f0d55a2958886c
+# sit inside the same checksum boundary as a fresh download.
+# [issue #431] Those pins used to be hard-coded HERE **and** in pr-gate.yml, so a bump could drift
+# the two lint lanes onto different actionlints. They now live in exactly one place —
+# scripts/actionlint.pin — which both lanes PARSE (never source). Still checked-in, still never
+# env-supplied: the path below is derived from SCRIPT_DIR, not from the environment, so nothing
+# PR- or env-controlled can swap in a different artifact.
+_ACTIONLINT_PIN_FILE="$SCRIPT_DIR/actionlint.pin"
+
+# PURE (self-tested): _actionlint_pin <key> [pin-file] — print the single-source pinned value for
+# KEY. REFUSES (rc 1, nothing printed) when the key is not one of the three known pins, the file is
+# missing, the key does not appear EXACTLY once, or its value does not match that key's exact shape
+# (dotted-numeric version / 64 lowercase hex). The file is parsed, NEVER sourced — a value can only
+# ever be a version or a digest, so a poisoned pin file cannot inject shell. Refusing is fail
+# closed: the caller cannot then fetch an artifact it would be unable to verify, and the gate dies
+# exactly as it does when actionlint is simply absent.
+_actionlint_pin() {
+  local key=$1 file=${2:-$_ACTIONLINT_PIN_FILE} pattern line
+  case "$key" in
+    ACTIONLINT_VERSION) pattern='[0-9]+(\.[0-9]+)*' ;;
+    ACTIONLINT_TARBALL_SHA256_LINUX_AMD64|ACTIONLINT_BIN_SHA256_LINUX_AMD64) pattern='[0-9a-f]{64}' ;;
+    *) return 1 ;;
+  esac
+  [[ -f "$file" ]] || return 1
+  local -a keyed=()
+  mapfile -t keyed < <(grep -E "^${key}=" -- "$file" || true)
+  # exactly once: a duplicated key must not let a well-formed line launder a malformed sibling
+  [[ ${#keyed[@]} -eq 1 ]] || return 1
+  line=${keyed[0]}
+  [[ "$line" =~ ^${key}=${pattern}$ ]] || return 1
+  printf '%s\n' "${line#*=}"
+}
+
+# [issue #431] PURE (self-tested): assert a lint lane's workflow takes its actionlint pin from the
+# single-source pin file and keeps NO copy of its own. Fails (rc 1, naming the reason) when the
+# workflow does not parse, when it has no actionlint provisioning step at all, when such a step
+# never reads the pin file, or when it carries a literal 64-hex checksum or a literal x.y.z version
+# — i.e. exactly the drift this check exists to prevent. Fail-closed in both the unparseable and
+# the no-step-found directions: a renamed/restructured provisioning step must be re-verified by a
+# human, not silently pass.
+_assert_actionlint_pin_single_sourced() {
+  local workflow=$1 pin_rel=${2:-scripts/actionlint.pin}
+  python3 - "$workflow" "$pin_rel" <<'PY'
+import re
+import sys
+
+import yaml
+
+workflow, pin_rel = sys.argv[1:3]
+HEX64 = re.compile(r"(?<![0-9a-f])[0-9a-f]{64}(?![0-9a-f])")
+VERSION = re.compile(r"(?<![\w.])[0-9]+\.[0-9]+\.[0-9]+(?![\w.])")
+
+try:
+    with open(workflow, encoding="utf-8") as handle:
+        doc = yaml.safe_load(handle)
+except Exception as exc:  # unparseable == unverifiable == refuse
+    print(f"actionlint pin: {workflow} does not parse: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def run_bodies(node):
+    if isinstance(node, dict):
+        body = node.get("run")
+        if isinstance(body, str):
+            yield body
+        for value in node.values():
+            yield from run_bodies(value)
+    elif isinstance(node, list):
+        for item in node:
+            yield from run_bodies(item)
+
+
+provisioning = [b for b in run_bodies(doc)
+                if "actionlint" in b and ("releases/download" in b or "sha256sum" in b)]
+if not provisioning:
+    print(f"actionlint pin: {workflow} has no actionlint provisioning step to check "
+          "(fail closed)", file=sys.stderr)
+    raise SystemExit(1)
+
+faults = []
+for body in provisioning:
+    if pin_rel not in body:
+        faults.append(f"an actionlint provisioning step does not read {pin_rel}")
+    if HEX64.search(body):
+        faults.append("an actionlint provisioning step carries a hard-coded 64-hex checksum")
+    if VERSION.search(body):
+        faults.append("an actionlint provisioning step carries a hard-coded x.y.z version")
+if faults:
+    for fault in sorted(set(faults)):
+        print(f"actionlint pin: {workflow}: {fault}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
 
 # _fetch_pinned_actionlint <dest_dir> <url> <tar_sha256> <bin_sha256>: download → sha256-verify
 # the tarball → extract into a FRESH temp dir → sha256-verify the extracted binary → atomically
@@ -1104,7 +1190,7 @@ _ACTIONLINT_BIN_SHA256_LINUX_AMD64=9f7dedb4e23f89f2922073d1a6720405b7b520d4f5832
 # any pre-existing dest binary, so a failed/partial provisioning can never leave bytes behind for
 # the cache fast path to trust. url/sha params exist only so the self-test can prove the accept
 # AND the refuse directions offline via file:// fixtures; the production caller
-# (_ensure_actionlint) always passes the hard-coded pins above.
+# (_ensure_actionlint) always passes the single-source pins from scripts/actionlint.pin.
 _fetch_pinned_actionlint() {
   local dest=$1 url=$2 tar_sha256=$3 bin_sha256=$4
   local tmpdir
@@ -1149,15 +1235,26 @@ _fetch_pinned_actionlint_unpack() {
 # params exist only so the self-test can exercise the cache-verification and refusal paths offline
 # via fixtures; the sole production call site passes no arguments, so nothing PR- or
 # env-controlled can swap the pins.
+# [issue #431] The defaults are resolved from scripts/actionlint.pin on every call. That resolution
+# is itself fail-closed: an absent/duplicated/malformed pin REFUSES here rather than falling back
+# to some other version — there is no unpinned path to an actionlint binary.
 _ensure_actionlint() {
-  local bin_sha256=${1:-$_ACTIONLINT_BIN_SHA256_LINUX_AMD64}
-  local url=${2:-"https://github.com/rhysd/actionlint/releases/download/v${_ACTIONLINT_VERSION}/actionlint_${_ACTIONLINT_VERSION}_linux_amd64.tar.gz"}
-  local tar_sha256=${3:-$_ACTIONLINT_SHA256_LINUX_AMD64}
   if command -v actionlint >/dev/null 2>&1; then
     command -v actionlint
     return 0
   fi
-  local cache="${WORKER_TOOL_CACHE:-${HOME:-/tmp}/.cache/worker-tools}/actionlint-${_ACTIONLINT_VERSION}"
+  local version tar_pin bin_pin
+  if ! { version=$(_actionlint_pin ACTIONLINT_VERSION) \
+      && tar_pin=$(_actionlint_pin ACTIONLINT_TARBALL_SHA256_LINUX_AMD64) \
+      && bin_pin=$(_actionlint_pin ACTIONLINT_BIN_SHA256_LINUX_AMD64); }; then
+    printf 'worker-live: actionlint pin %s is missing or malformed (refusing)\n' \
+      "$_ACTIONLINT_PIN_FILE" >&2
+    return 1
+  fi
+  local bin_sha256=${1:-$bin_pin}
+  local url=${2:-"https://github.com/rhysd/actionlint/releases/download/v${version}/actionlint_${version}_linux_amd64.tar.gz"}
+  local tar_sha256=${3:-$tar_pin}
+  local cache="${WORKER_TOOL_CACHE:-${HOME:-/tmp}/.cache/worker-tools}/actionlint-${version}"
   if [[ -e "$cache/actionlint" ]]; then
     if [[ -x "$cache/actionlint" ]] \
         && printf '%s  %s\n' "$bin_sha256" "$cache/actionlint" | sha256sum -c - >/dev/null 2>&1; then
@@ -1174,7 +1271,7 @@ _ensure_actionlint() {
     printf 'worker-live: no pinned actionlint checksum for arch %s (refusing)\n' "$(uname -m)" >&2
     return 1
   fi
-  printf 'worker-live: provisioning pinned actionlint v%s (sha256-verified)\n' "$_ACTIONLINT_VERSION" >&2
+  printf 'worker-live: provisioning pinned actionlint v%s (sha256-verified)\n' "$version" >&2
   _fetch_pinned_actionlint "$cache" "$url" "$tar_sha256" "$bin_sha256"
 }
 
@@ -1246,8 +1343,9 @@ registry_selftest_gate() {
   #    linter; a yaml parse only proves the file is well-formed. Silently degrading to yaml-only when
   #    actionlint was absent let a semantically-broken trust-plane workflow pass the gate. The worker
   #    lane does not pre-install actionlint, so the gate provisions the pinned, sha256-verified
-  #    release itself (_ensure_actionlint — the same pin as pr-gate.yml) and FAILS CLOSED only when
-  #    neither a present nor a verifiably provisioned binary can be had.
+  #    release itself (_ensure_actionlint — [#431] from the same single-source scripts/actionlint.pin
+  #    pr-gate.yml reads, so the two lanes cannot lint with different actionlints) and FAILS CLOSED
+  #    only when neither a present nor a verifiably provisioned binary can be had.
   local actionlint_bin=''
   for t in "${targets[@]}"; do
     kind=${t%%:*}; name=${t#*:}
@@ -3224,28 +3322,98 @@ PY
   # cache branch is deterministic even on hosts that have actionlint installed
   mkdir -p "$tmp/al-path"
   local al_tool
-  for al_tool in sha256sum uname mktemp dirname curl tar rm mkdir mv; do
+  # `grep` is in the list because [#431] the pin resolution _ensure_actionlint now performs uses it
+  for al_tool in sha256sum uname mktemp dirname curl tar rm mkdir mv grep; do
     ln -sf "$(command -v "$al_tool")" "$tmp/al-path/$al_tool"
   done
-  mkdir -p "$tmp/al-cache/actionlint-${_ACTIONLINT_VERSION}"
-  cp "$tmp/al-src/actionlint" "$tmp/al-cache/actionlint-${_ACTIONLINT_VERSION}/actionlint"
-  chmod +x "$tmp/al-cache/actionlint-${_ACTIONLINT_VERSION}/actionlint"
+  # the cache dir is named for the SINGLE-SOURCE pinned version — resolving it here (rather than
+  # hard-coding it) is itself part of the #431 contract under test
+  local al_ver
+  al_ver=$(_actionlint_pin ACTIONLINT_VERSION)
+  mkdir -p "$tmp/al-cache/actionlint-${al_ver}"
+  cp "$tmp/al-src/actionlint" "$tmp/al-cache/actionlint-${al_ver}/actionlint"
+  chmod +x "$tmp/al-cache/actionlint-${al_ver}/actionlint"
   chk "_ensure_actionlint reuses a cache copy that matches the pinned binary digest" \
     "$(PATH="$tmp/al-path" WORKER_TOOL_CACHE="$tmp/al-cache" \
        _ensure_actionlint "$al_bin_sha" "file://$tmp/no-such-artifact.tar.gz" "$al_tar_sha")" \
-    "$tmp/al-cache/actionlint-${_ACTIONLINT_VERSION}/actionlint"
+    "$tmp/al-cache/actionlint-${al_ver}/actionlint"
   # [r2] the cache fast path is INSIDE the checksum boundary: a tampered/truncated cache copy is
   # never trusted on executability alone — it is discarded, and with no verifiable download the
   # resolution refuses (fail closed) instead of executing it.
   printf '#!/usr/bin/env bash\necho tampered\n' \
-    > "$tmp/al-cache/actionlint-${_ACTIONLINT_VERSION}/actionlint"
+    > "$tmp/al-cache/actionlint-${al_ver}/actionlint"
   chk "_ensure_actionlint REFUSES a cached binary that fails the pinned digest" \
     "$(PATH="$tmp/al-path" WORKER_TOOL_CACHE="$tmp/al-cache" \
        _ensure_actionlint "$al_bin_sha" "file://$tmp/no-such-artifact.tar.gz" "$al_tar_sha" \
        2>/dev/null || echo refused)" "refused"
   chk "the tampered cache copy is discarded, not left for a later run to trust" \
-    "$([[ -e "$tmp/al-cache/actionlint-${_ACTIONLINT_VERSION}/actionlint" ]] && echo present || echo absent)" \
+    "$([[ -e "$tmp/al-cache/actionlint-${al_ver}/actionlint" ]] && echo present || echo absent)" \
     "absent"
+
+  # --- [issue #431] the actionlint pin is SINGLE-SOURCED in scripts/actionlint.pin. Two lanes
+  # provision actionlint — this script's _ensure_actionlint and .github/workflows/pr-gate.yml — and
+  # while each hard-coded its own copy of the version+checksum a bump could land in one and not the
+  # other, silently linting the same workflows with two different actionlints. Both directions are
+  # asserted: the real pin file parses into the three usable values, every malformed/duplicated/
+  # absent/unknown-key shape REFUSES (so a poisoned pin can never yield an unverifiable download),
+  # the REAL pr-gate.yml passes the single-source check, and a drifted fixture that re-inlines its
+  # own version+checksum FAILS it (that failure is what makes the check non-vacuous). ---
+  chk "the real pin file yields a usable pinned version" \
+    "$([[ "$(_actionlint_pin ACTIONLINT_VERSION)" =~ ^[0-9]+(\.[0-9]+)+$ ]] && echo ok || echo bad)" "ok"
+  chk "the real pin file yields a 64-hex tarball digest" \
+    "$([[ "$(_actionlint_pin ACTIONLINT_TARBALL_SHA256_LINUX_AMD64)" =~ ^[0-9a-f]{64}$ ]] \
+      && echo ok || echo bad)" "ok"
+  chk "the real pin file yields a 64-hex binary digest" \
+    "$([[ "$(_actionlint_pin ACTIONLINT_BIN_SHA256_LINUX_AMD64)" =~ ^[0-9a-f]{64}$ ]] \
+      && echo ok || echo bad)" "ok"
+  chk "an unknown pin key is refused (no silent empty value)" \
+    "$(_actionlint_pin ACTIONLINT_TOTALLY_MADE_UP 2>/dev/null || echo refused)" "refused"
+  chk "a missing pin file is refused" \
+    "$(_actionlint_pin ACTIONLINT_VERSION "$tmp/no-such.pin" 2>/dev/null || echo refused)" "refused"
+  printf 'ACTIONLINT_VERSION=1.7.7\n' > "$tmp/pin-ok.pin"
+  chk "a well-formed fixture pin parses (the refusals below are not vacuous)" \
+    "$(_actionlint_pin ACTIONLINT_VERSION "$tmp/pin-ok.pin" 2>/dev/null || echo refused)" "1.7.7"
+  printf 'ACTIONLINT_VERSION=1.7.7 ; rm -rf /\n' > "$tmp/pin-shell.pin"
+  chk "a pin value carrying shell metacharacters is refused, not passed through" \
+    "$(_actionlint_pin ACTIONLINT_VERSION "$tmp/pin-shell.pin" 2>/dev/null || echo refused)" "refused"
+  printf 'ACTIONLINT_VERSION=1.7.7\nACTIONLINT_VERSION=9.9.9\n' > "$tmp/pin-dup.pin"
+  chk "a DUPLICATED pin key is refused (a good line must not launder a second one)" \
+    "$(_actionlint_pin ACTIONLINT_VERSION "$tmp/pin-dup.pin" 2>/dev/null || echo refused)" "refused"
+  printf 'ACTIONLINT_TARBALL_SHA256_LINUX_AMD64=%s\n' "$(printf 'a%.0s' {1..63})" > "$tmp/pin-short.pin"
+  chk "a short (63-hex) digest pin is refused" \
+    "$(_actionlint_pin ACTIONLINT_TARBALL_SHA256_LINUX_AMD64 "$tmp/pin-short.pin" 2>/dev/null \
+      || echo refused)" "refused"
+  printf 'ACTIONLINT_VERSION=1.7.7\n' > "$tmp/pin-nokey.pin"
+  chk "an absent digest key is refused even when the file exists and parses" \
+    "$(_actionlint_pin ACTIONLINT_BIN_SHA256_LINUX_AMD64 "$tmp/pin-nokey.pin" 2>/dev/null \
+      || echo refused)" "refused"
+  # _ensure_actionlint inherits that refusal: with no actionlint on PATH and an unreadable pin there
+  # is NO fallback version to download — it refuses and the gate dies (fail closed), rather than
+  # silently provisioning some other actionlint.
+  chk "_ensure_actionlint REFUSES when the single-source pin cannot be read" \
+    "$( (PATH="$tmp/al-path" _ACTIONLINT_PIN_FILE="$tmp/no-such.pin" WORKER_TOOL_CACHE="$tmp/al-none" \
+        _ensure_actionlint "$al_bin_sha" "file://$tmp/al-good.tar.gz" "$al_tar_sha") 2>/dev/null \
+      || echo refused)" "refused"
+  # the drift guard itself, both directions
+  chk "the REAL pr-gate.yml takes its actionlint pin from scripts/actionlint.pin" \
+    "$(_assert_actionlint_pin_single_sourced "$SCRIPT_DIR/../.github/workflows/pr-gate.yml" \
+      >/dev/null 2>&1 && echo single-sourced || echo drifted)" "single-sourced"
+  { printf 'name: drift\non: push\njobs:\n  j:\n    runs-on: ubuntu-latest\n    steps:\n'
+    printf '      - name: Install actionlint\n        run: |\n'
+    printf '          ver=1.7.6\n'
+    printf '          sha256=%s\n' "$(printf 'b%.0s' {1..64})"
+    printf '          curl -fsSL -o /tmp/a.tgz "https://x/releases/download/v${ver}/actionlint.tgz"\n'
+    printf '          echo "${sha256}  /tmp/a.tgz" | sha256sum -c -\n'
+  } > "$tmp/al-drift.yml"
+  chk "a workflow that re-inlines its OWN actionlint version+checksum FAILS the check" \
+    "$(_assert_actionlint_pin_single_sourced "$tmp/al-drift.yml" >/dev/null 2>&1 \
+      && echo single-sourced || echo drifted)" "drifted"
+  { printf 'name: nostep\non: push\njobs:\n  j:\n    runs-on: ubuntu-latest\n    steps:\n'
+    printf '      - name: lint\n        run: actionlint -color\n'
+  } > "$tmp/al-nostep.yml"
+  chk "a workflow with NO actionlint provisioning step fails closed, not silently passes" \
+    "$(_assert_actionlint_pin_single_sourced "$tmp/al-nostep.yml" >/dev/null 2>&1 \
+      && echo single-sourced || echo drifted)" "drifted"
 
   # --- [issue #145] container base-image pin check (non-vacuous: a mutable-tag base FAILS). Proves
   # the real worker sandbox is digest-pinned, that an unpinned base is rejected, and that a

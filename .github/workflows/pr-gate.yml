@@ -17,7 +17,9 @@
 # be able to break or influence the gate. actionlint is fetched as a pinned release binary verified
 # against the release's published sha256 (the raven-actions installer broke under the runner's
 # forced Node-24 migration, and `go install` is checksum-free — a pinned+checksummed direct
-# download is the sturdiest option).
+# download is the sturdiest option). That pin lives in ONE place, scripts/actionlint.pin (#431),
+# which this gate and the worker lane's scripts/worker-live.sh both parse, so a bump is a single
+# edit and the two lint lanes can never drift onto different actionlints.
 name: pr-gate
 
 on:
@@ -66,8 +68,27 @@ jobs:
       - name: Install actionlint (pinned release, sha256-verified)
         run: |
           set -euo pipefail
-          ver=1.7.7
-          sha256=023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757
+          # [issue #431] The version + tarball checksum are read from scripts/actionlint.pin — the
+          # SINGLE SOURCE shared with scripts/worker-live.sh's _ensure_actionlint. They used to be
+          # hard-coded in both lanes, so a bump could land in one and leave the two lint lanes on
+          # DIFFERENT actionlints; a bump is now one edit, and worker-live.sh's --self-test asserts
+          # this step still reads the pin file and carries no version/checksum literal of its own.
+          # The file is PARSED, never sourced: each key must appear exactly once and its value must
+          # match that key's exact shape, so a missing/duplicated/malformed pin refuses here rather
+          # than fetching an artifact this step could not verify. The pins stay checked in and are
+          # never env-supplied.
+          pin=scripts/actionlint.pin
+          pin_value() {
+            local key=$1 pattern=$2
+            local keyed
+            keyed=$(grep -c -E "^${key}=" -- "$pin") || return 1
+            [ "$keyed" = 1 ] || return 1
+            grep -E "^${key}=${pattern}\$" -- "$pin" | cut -d= -f2-
+          }
+          ver=$(pin_value ACTIONLINT_VERSION '[0-9]+(\.[0-9]+)*') \
+            || { echo "::error::$pin: ACTIONLINT_VERSION missing, duplicated or malformed"; exit 1; }
+          sha256=$(pin_value ACTIONLINT_TARBALL_SHA256_LINUX_AMD64 '[0-9a-f]{64}') \
+            || { echo "::error::$pin: ACTIONLINT_TARBALL_SHA256_LINUX_AMD64 missing, duplicated or malformed"; exit 1; }
           curl -fsSL --retry 3 -o /tmp/actionlint.tar.gz \
             "https://github.com/rhysd/actionlint/releases/download/v${ver}/actionlint_${ver}_linux_amd64.tar.gz"
           echo "${sha256}  /tmp/actionlint.tar.gz" | sha256sum -c -
