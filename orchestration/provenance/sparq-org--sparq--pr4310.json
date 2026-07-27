@@ -1,0 +1,9 @@
+{
+ "head_sha_at_open": "d17ec863bd50de58a295bd7cc68da38feb1a5927",
+ "impl_account_h": "51bde6688e140866",
+ "impl_alias": "opus5",
+ "impl_provider": "anthropic",
+ "issue": 2939,
+ "pr_number": 4310,
+ "recorded_at_run": "backfill:30219183891.1"
+}
