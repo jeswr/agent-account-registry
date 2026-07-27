@@ -53,6 +53,37 @@ jobs:
       - name: Assert the ledger branch is still data-only
         run: python3 scripts/ledger-invariant.py ledger
 
+      # [OPUS-5] ROUTING-CATALOG SKEW REPORT. An account record and the target routing catalogs that
+      # must be able to route it live in DIFFERENT repositories on different merge schedules, and
+      # nothing compared them: the 2026-07-26 yield incident (a pool account whose record omitted
+      # `harness`, so every claim on it burned a lease and then died at worker.yml's fail-closed
+      # boundary) had to be diagnosed from a live log capture because no periodic check named the
+      # offending account. This step names them, every sweep.
+      #
+      # DELIBERATELY REPORT-ONLY, and deliberately in groom (the repair sweep) rather than in
+      # dispatch: the enforcing boundaries already exist and stay where they are (policy-resolve
+      # rejects an unknown model in a chain, the catalog read drops an unroutable record, worker.yml
+      # re-proves every field before a secret is exposed). A reporter wired into the dispatch hot
+      # path that could fail would be a new outage surface — which is why this is also
+      # continue-on-error: a skew report must never abort the dead-lease release that follows it.
+      # `--fail-on-skew` is the opt-in gate mode and is NOT used here.
+      #
+      # It needs no new TOKEN: the ambient token reads this repo's own account issues, and every
+      # enabled target's routing.toml is public. It DOES need PROVENANCE_SALT — privacy (locked
+      # decision 22a/22b): the report references an account only by its salted provenance
+      # fingerprint, never by handle, so without the salt in context every row collapses to one
+      # withheld marker and the report cannot identify the offending record. The salt is already
+      # read by this job (see the SECRET-EXFIL GUARD note above); no new secret is introduced.
+      - name: Report account-catalog / target-routing skew
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
+        run: |
+          set -euo pipefail
+          python3 scripts/select-and-claim.py --audit-catalog \
+            --repo "$GITHUB_REPOSITORY" --policy-file policy/repos.toml
+
       # Per-owner target token mint (issue #168): policy enables targets under TWO distinct owners
       # (sparq-org, jeswr), so a SINGLE App token scoped to one owner 404s every read and fails
       # every write on the other owner's repo — aborting the sweep before dead leases are released.
@@ -177,6 +208,182 @@ jobs:
           # from a dropped production relay (#512). Producer/relay integration is covered by
           # worker-live.sh's stateful contract fixture against this unchanged validator.
           python3 scripts/model-health.py decide --policy-file policy/repos.toml
+
+  # [OPUS-5] WATCH THE WATCHER, half (b): is the metrics snapshot still being DELIVERED?
+  #
+  # metrics.yml's own `metrics-alert` job catches a metrics job that RAN and FAILED. It structurally
+  # cannot catch a metrics job that never ran: a cron that silently under-delivers produces no
+  # failed job to key on, and no workflow can detect its own non-execution. Delivery here is
+  # measurably imperfect — on the live ring at 2026-07-27T15:50Z, 24 snapshots spanned 550.0 min
+  # (23.91 min effective cadence against a */15 schedule, 30.0 min worst gap).
+  #
+  # So the staleness assertion is hosted HERE, in a different workflow on an independent schedule.
+  # That makes the watchers a RING rather than a chain, and a chain of watchers always terminates in
+  # an unwatched one:
+  #   metrics job FAILS     -> metrics.yml   `metrics-alert`
+  #   metrics never RUNS    -> groom.yml     `metrics-stale`      (this job)
+  #   groom never RUNS      -> dashboard.yml `cron-keepalive`     (re-dispatches groom.yml at 1800s)
+  #   dashboard never RUNS  -> metrics.yml   `dashboard-publish`  (staleness fallback)
+  # Deliberately NOT hosted in dashboard.yml: registry #656 (dashboard live-refresh) is in flight
+  # there, and dashboard.yml already hosts the fleet-wide cron keepalive, which would make one
+  # workflow the single point of failure for two independent liveness mechanisms.
+  #
+  # NO `needs:` and NO `if:`, on purpose and asserted by scripts/metrics-alert.py's self-test over
+  # every groom outcome: a watchdog suppressed by the failure of the sweep it happens to share a
+  # workflow file with is not a watchdog. It reads ONE public JSON file's timestamp and holds
+  # contents:read + issues:write — no arming, no merging, no label writes of any kind.
+  metrics-stale:
+    name: WATCHDOG (is the metrics snapshot still being delivered?)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # SECRET-EXFIL GUARD (issue #101): reads ALERT_TOKEN/ALERT_REPO, so it is bound to the
+    # default-branch-only `dispatch-secrets` environment where those secrets live, exactly like the
+    # `groom` and `groom-alert` jobs.
+    environment: dispatch-secrets
+    # Repair authority, never admission authority. Pinned by the self-test.
+    permissions:
+      contents: read  # the two sparse checkouts below (script inputs + the published snapshot)
+      issues: write   # upsert/close the rolling snapshot-staleness ops-alert issue
+    steps:
+      # Same input set as metrics.yml's `metrics-alert` job: the script, plus the three files its
+      # --self-test asserts against (both workflow YAMLs for the `if:`/`needs:`/permissions/call-site
+      # seam, and scripts/metrics.py for the cross-file contract that the path read here is the path
+      # the collector writes). Missing inputs fail LOUD rather than silently skipping the checks.
+      - name: Check out ONLY the watchdog's inputs (pinned, sparse, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: registry
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/metrics-alert.py
+            scripts/metrics.py
+            .github/workflows/metrics.yml
+            .github/workflows/groom.yml
+          sparse-checkout-cone-mode: false
+
+      # The snapshot metrics.py CAS-publishes (scripts/metrics.py PUBLISHED_PATH) lives on the
+      # unprotected `ledger` data-plane branch. Read-only, one file. If this checkout fails the job
+      # goes red and the run is visibly broken; if it succeeds but the file is absent, the script
+      # treats that as STALE (fail-closed) rather than as healthy.
+      - name: Check out ONLY the published metrics snapshot from the ledger branch
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: ledger
+          ref: ledger
+          persist-credentials: false
+          sparse-checkout: data/metrics.json
+          sparse-checkout-cone-mode: false
+
+      - name: Alert maintainer if the published metrics snapshot has gone stale
+        id: metrics-stale
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REGISTRY_REPO: ${{ github.repository }}
+          # The collector's own published file, in the ledger worktree checked out above. The
+          # self-test cross-checks this against scripts/metrics.py's PUBLISHED_PATH, so the two
+          # cannot drift into a permanent false page.
+          SNAPSHOT_PATH: ledger/data/metrics.json
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          MAINTAINER_HANDLE: jeswr
+          # Privacy routing (locked decision 22c, issue #39). The body carries only a timestamp, an
+          # age and two run links — no account handles, no ledger content — so the registry-repo
+          # fallback is safe.
+          ALERT_REPO: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
+          ALERT_TOKEN: ${{ secrets.ALERT_TOKEN || '' }}
+        run: |
+          set -uo pipefail
+          python3 registry/scripts/metrics-alert.py --self-test
+          python3 registry/scripts/metrics-alert.py --stale-check
+
+  # WATCH THE DISPATCHER (issue #819). dispatch.yml already has a per-run failure alert — the
+  # `plan-alert` job — and it fired ZERO times during the 2026-07-27 stall. Measured on run
+  # 30295860510 and repeated on every failing tick from 18:26:17Z: PLAN `failure` (HTTP 403 on an
+  # authenticated read), GUARD `failure` (cannot resolve the repository default branch, over the
+  # SAME exhausted request budget), CLAIM `skipped`, ALERT `skipped`. That alert is gated on
+  # `needs.secrets-guard.result == 'success'` — correctly, since it mounts ALERT_TOKEN and must not
+  # run while the secret-exfil settings are unverified (issue #101) — so the one class of outage
+  # that stops the whole pipeline is exactly the class that also disables its alarm. The gate
+  # cannot be loosened; the alarm has to live outside the workflow it watches.
+  #
+  # Hosted here for the same reason `metrics-stale` is: groom.yml runs on an independent schedule,
+  # is not dispatch, and is itself watched by dashboard.yml's cron keepalive. It costs two API
+  # reads per groom tick.
+  #
+  # NO `needs:` and NO `if:`, on purpose and asserted by scripts/dispatch-stall-alert.py's
+  # self-test: a watchdog suppressed by the failure of the sweep it shares a file with is not a
+  # watchdog — which is the defect above, restated. It reads two listings and holds
+  # contents:read + actions:read + issues:write — no arming, no merging, no label writes.
+  dispatch-stall:
+    name: WATCHDOG (is the dispatcher still completing ticks?)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # SECRET-EXFIL GUARD (issue #101): reads ALERT_TOKEN/ALERT_REPO, so it is bound to the
+    # default-branch-only `dispatch-secrets` environment where those secrets live, exactly like
+    # `groom`, `groom-alert` and `metrics-stale`.
+    environment: dispatch-secrets
+    # Repair authority, never admission authority. Pinned by the self-test.
+    permissions:
+      actions: read   # list dispatch's artifacts + run conclusions (the two signals)
+      contents: read  # the sparse checkout below
+      issues: write   # upsert/close the two rolling ops-alert issues
+    steps:
+      # The script, plus every file its --self-test asserts against: dispatch.yml and groom.yml for
+      # the `if:`/`needs:`/permissions/call-site seam and the two cron cadences, and
+      # dispatch-tick-floor.py for the cross-file threshold contract (the failure-streak threshold
+      # is denominated in TICKS, and how long N ticks take is set entirely by the #819 floor).
+      # Missing inputs fail LOUD rather than silently skipping the checks.
+      # KEEP THIS LIST IN SYNC — REQUIRED_FILES in scripts/dispatch-stall-alert.py is asserted
+      # against this very block.
+      - name: Check out ONLY the watchdog's inputs (pinned, sparse, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: registry
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/dispatch-stall-alert.py
+            scripts/dispatch-tick-floor.py
+            .github/workflows/dispatch.yml
+            .github/workflows/groom.yml
+          sparse-checkout-cone-mode: false
+
+      # PyYAML backs the workflow-parse assertions (regex-over-YAML is how five permissive
+      # misparses got into the secrets guard). Probe first so the runner image's own copy is used
+      # when present; the install path is version + sha256 locked to the identical pins pr-gate
+      # and the secrets guard use.
+      - name: Ensure PyYAML for the watchdog's workflow-parse assertions
+        run: |
+          set -euo pipefail
+          if python3 -c 'import yaml' 2>/dev/null; then
+            echo "PyYAML already present; no install needed"
+            exit 0
+          fi
+          cat > "$RUNNER_TEMP/stall-requirements.txt" <<'REQ'
+          pyyaml==6.0.2 \
+              --hash=sha256:80bab7bfc629882493af4aa31a4cfa43a4c57c83813253626916b8c7ada83476 \
+              --hash=sha256:1f71ea527786de97d1a0cc0eacd1defc0985dcf6b3f17bb77dcfc8c34bec4dc5
+          REQ
+          python3 -m pip install --disable-pip-version-check --require-hashes \
+            --only-binary=:all: -r "$RUNNER_TEMP/stall-requirements.txt"
+          python3 -c 'import yaml; print("PyYAML", yaml.__version__)'
+
+      - name: Alert maintainer if the dispatch pipeline has stalled
+        id: dispatch-stall
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REGISTRY_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          MAINTAINER_HANDLE: jeswr
+          # Privacy routing (locked decision 22c, issue #39). The body carries only counts, an age
+          # and two run links — no account handles, no ledger content, no byte of any target
+          # payload — so the registry-repo fallback is safe.
+          ALERT_REPO: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
+          ALERT_TOKEN: ${{ secrets.ALERT_TOKEN || '' }}
+        run: |
+          set -uo pipefail
+          python3 registry/scripts/dispatch-stall-alert.py --self-test
+          python3 registry/scripts/dispatch-stall-alert.py
 
   # FAIL-LOUD alert for a HARD GROOM failure (issue #176). The model-access health decision is the
   # LAST step of the `groom` job under the default success() guard, and every other repair happens

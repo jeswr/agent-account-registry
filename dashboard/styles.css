@@ -86,35 +86,22 @@ main > section { padding-top: 42px; }
 .provider-line { display: flex; justify-content: space-between; gap: 12px; font-size: .86rem; }
 .provider-line span:first-child { color: var(--muted); text-transform: capitalize; }
 
-.provider-sections { display: grid; gap: 30px; }
-.provider-section + .provider-section { padding-top: 28px; border-top: 1px solid var(--line); }
-.provider-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; margin-bottom: 13px; }
-.provider-title { margin: 0; font-size: .76rem; font-weight: 760; letter-spacing: .14em; text-transform: uppercase; color: var(--accent-2); }
-.account-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
 .account-card { padding: 19px; border-radius: var(--radius); }
 .card-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 14px; margin-bottom: 14px; }
-.account-label { margin: 3px 0 0; font-family: "SFMono-Regular", Consolas, monospace; font-size: 1.18rem; letter-spacing: .04em; }
-.provider { color: var(--accent-2); font-size: .68rem; font-weight: 750; letter-spacing: .13em; text-transform: uppercase; }
 .badges { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 6px; }
 .badge { padding: 5px 8px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); font-size: .67rem; font-weight: 700; text-transform: uppercase; }
 .badge.available, .badge.healthy { border-color: rgba(85, 209, 135, .32); color: var(--good); background: rgba(85, 209, 135, .08); }
 .badge.capped, .badge.degraded { border-color: rgba(243, 189, 88, .32); color: var(--warn); background: rgba(243, 189, 88, .08); }
 .badge.unavailable, .badge.unhealthy, .badge.failure { border-color: rgba(255, 114, 125, .32); color: var(--bad); background: rgba(255, 114, 125, .08); }
 
-/* --- Provider quota (cumulative): aggregate headroom per provider --- */
+/* --- Provider quota: aggregate headroom per provider (the whole fleet surface
+   since issue #374 removed the per-account cards) --- */
 .quota-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
 .quota-provider { margin: 3px 0 0; font-size: .82rem; font-weight: 760; letter-spacing: .13em; text-transform: uppercase; color: var(--accent-2); }
 .quota-counts { margin: 0 0 14px; padding-bottom: 13px; border-bottom: 1px solid var(--line); font-size: .9rem; font-weight: 650; }
 .quota-note { margin: 10px 0 0; color: var(--muted); font-size: .72rem; line-height: 1.4; }
 .quota-signal { margin: 12px 0 0; color: var(--muted); font-size: .68rem; font-style: italic; line-height: 1.4; }
 
-.weekly-reset { display: grid; grid-template-columns: 1fr auto; align-items: baseline; gap: 4px 12px; margin-bottom: 16px; padding: 13px 14px; border: 1px solid rgba(98, 216, 198, .2); border-radius: 11px; background: rgba(98, 216, 198, .055); }
-.weekly-reset-label { color: var(--accent); font-size: .67rem; font-weight: 760; letter-spacing: .1em; text-transform: uppercase; }
-.weekly-reset-relative { font-size: 1rem; text-align: right; }
-.weekly-reset-utc { grid-column: 1 / -1; color: var(--muted); font-size: .7rem; text-align: right; }
-.agent-count { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 17px; padding-bottom: 15px; border-bottom: 1px solid var(--line); }
-.agent-count span:first-child { color: var(--muted); font-size: .8rem; }
-.agent-count strong { font-size: 1.4rem; }
 .window-list { display: grid; gap: 17px; }
 .window-head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; margin-bottom: 7px; }
 .window-name { color: var(--muted); font-size: .74rem; font-weight: 650; }
@@ -258,7 +245,6 @@ footer { margin-top: 50px; padding: 24px 0 40px; border-top: 1px solid var(--lin
 
 @media (max-width: 900px) {
   .summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .account-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .obs-grid, .quota-grid { grid-template-columns: 1fr; }
 }
 
@@ -267,7 +253,7 @@ footer { margin-top: 50px; padding: 24px 0 40px; border-top: 1px solid var(--lin
   .masthead { align-items: flex-start; flex-direction: column; padding-top: 40px; }
   .section-heading { align-items: flex-start; flex-direction: column; gap: 8px; }
   .section-heading .freshness { text-align: left; }
-  .summary-grid, .account-grid { grid-template-columns: 1fr; }
+  .summary-grid { grid-template-columns: 1fr; }
   .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 

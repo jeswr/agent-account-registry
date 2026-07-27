@@ -19,6 +19,28 @@
 #    fails SOFT — sanitized ::warning:: (payload never echoed) and a graceful no-mutation skip,
 #    never an uncaught JSONDecodeError crashing the alert; the next scheduled tick retries.
 #
+# CLAIM termination (issue #778): the premise above — "every always() step lives inside claim, so
+# a job that never runs is invisible" — has a SECOND instance the PLAN-only key cannot see. GitHub
+# does NOT run a job's `if: always()` steps once the JOB ITSELF is cancelled (its own
+# `timeout-minutes`, or a run-level cancel). CLAIM hosts the CAS lease claim, the worker launch AND
+# the `always()` "Surface + record the dispatch-tick health state" step (the #756 per-tick
+# telemetry), so a cancelled CLAIM records NOTHING: no telemetry row, no defer histogram, no alert.
+# Worse, because PLAN itself SUCCEEDED, the PLAN-only decide() returned `close` and this job
+# actively CLOSED any open ops-alert on the very tick CLAIM was killed mid-write.
+#
+# MEASURED on run 30245515435 (2026-07-27): PLAN success (444 s), then CLAIM cancelled after
+# exactly 1200 s = its `timeout-minutes: 15` plus GitHub's 5-minute post-cancel grace. Step 13
+# ("Strictly validate, CAS claim, and dispatch live workers") never completed; steps 14 (the
+# `always()` health-state recorder) and 15 never ran at all. Run-level conclusion: `cancelled` —
+# byte-identical to the 116 of 117 cancellations in the same window that were FREE
+# concurrency-group coalescing with zero started jobs. No aggregate over run conclusions can tell
+# the two apart, which is why this needs an alert keyed on the JOB result, not the run conclusion.
+#
+# So decide() now keys on BOTH stage results and names the failing stage. Scope, stated honestly:
+# this covers a cancelled CLAIM *job* (the measured case), because a job killed by its own timeout
+# does not cancel the run and `if: always()` dependents still run. It does NOT cover a
+# RUN-level cancellation, which cancels this job too — nothing inside the run can observe that.
+#
 # Pure decide()/_alert_route() + a stubbed-gh flow test run under --self-test (registry-selftest).
 import json
 import os
@@ -27,11 +49,24 @@ import sys
 
 ALERT_LABEL = "ops-alert"
 ALERT_TITLE = "⚠️ Dispatch PLAN job is failing — fleet-wide dispatch is stalled"
+CLAIM_ALERT_TITLE = "⚠️ Dispatch CLAIM job died mid-tick — leases/launches unrecorded"
 # Review r3 residual: dedupe keyed on the TITLE alone breaks the moment anyone (human or a later
 # wording tweak) renames the open alert — the next failing tick files a duplicate and recovery
 # can't find the issue to close. The body carries this stable machine marker; dedupe matches the
 # marker first and falls back to the exact title only for pre-marker legacy alerts.
+#
+# #778 keeps ONE marker for BOTH stages deliberately: a single rolling "the dispatch tick is
+# broken" alert. Splitting markers would let a PLAN alert and a CLAIM alert sit open at once and
+# each close independently, and the recovery condition is joint anyway (both stages green). The
+# marker string is unchanged so alerts opened before #778 still dedupe and still close.
 ALERT_MARKER = "<!-- plan-alert:v1 key=dispatch-plan-failure -->"
+
+STAGE_PLAN = "PLAN"
+STAGE_CLAIM = "CLAIM"
+# `needs.<job>.result` is one of success | failure | cancelled | skipped. Only these two are a
+# fault: `skipped` proves nothing (review r1) and `success` is the healthy case.
+_BAD_RESULTS = ("failure", "cancelled")
+_STAGE_TITLE = {STAGE_PLAN: ALERT_TITLE, STAGE_CLAIM: CLAIM_ALERT_TITLE}
 
 
 def _alert_route(alert_repo, alert_token, registry_repo):
@@ -43,29 +78,118 @@ def _alert_route(alert_repo, alert_token, registry_repo):
     return registry_repo, None
 
 
-def decide(plan_result, has_open_alert):
-    """Pure decision: 'upsert' | 'close' | 'noop'. Upsert on failure/cancelled; close ONLY on an
-    explicit success with an alert open (review r1: `skipped` must NOT close — a skipped PLAN is
-    not a recovery); anything else is a no-op."""
-    if plan_result in ("failure", "cancelled"):
+def failing_stage(plan_result, claim_result):
+    """The dispatch stage that terminated badly, or None if neither did.
+
+    PLAN is tested FIRST on purpose: a bad PLAN *skips* CLAIM, so CLAIM's result is then a
+    consequence, not an independent fault. Naming the consequence would point the maintainer at
+    the wrong job. (`skipped` is not in _BAD_RESULTS, so a PLAN-caused skip cannot be reported
+    as a CLAIM fault either way — the ordering is belt-and-braces for the failure/cancelled case
+    where a run-level cancel marks BOTH jobs cancelled.)"""
+    if plan_result in _BAD_RESULTS:
+        return STAGE_PLAN
+    if claim_result in _BAD_RESULTS:
+        return STAGE_CLAIM
+    return None
+
+
+def decide(plan_result, claim_result, has_open_alert):
+    """Pure decision: 'upsert' | 'close' | 'noop'. Upsert when EITHER stage ended
+    failure/cancelled; close ONLY when BOTH ended in an explicit success with an alert open
+    (review r1: `skipped` must NOT close — it is not a recovery; #778: a green PLAN must not
+    close an alert while CLAIM is the thing that died); anything else is a no-op.
+
+    Requiring BOTH green to close cannot strand an alert: neither `plan` nor `claim` carries a
+    job-level `if:`, so on any tick where this job runs at all (its own `if:` requires
+    secrets-guard success) CLAIM is skipped ONLY when PLAN failed — which is an upsert, not a
+    close."""
+    if failing_stage(plan_result, claim_result) is not None:
         return "upsert"
-    if plan_result == "success" and has_open_alert:
+    if plan_result == "success" and claim_result == "success" and has_open_alert:
         return "close"
     return "noop"
 
 
-def _render_body(result, run_url, maintainer):
+def _render_body(stage, result, run_url, maintainer):
+    if stage == STAGE_CLAIM:
+        detail = (
+            f"@{maintainer} the dispatch **CLAIM** job ended `{result}`. CLAIM holds the CAS "
+            "lease claim, the worker launch, **and** the `always()` per-tick telemetry step "
+            "(#756) — and GitHub does not run `always()` steps once the job itself is "
+            "cancelled. So this tick recorded **nothing**: no telemetry row, no defer "
+            "histogram, and it may have written leases and launched only SOME of the workers "
+            "it claimed.\n\n"
+            "Check for leases claimed against issues with no live worker (groom-leases "
+            "reclaims them on TTL, but not promptly). Common cause: the CAS-claim/dispatch "
+            "step hanging until `timeout-minutes` — the run-level conclusion is then "
+            "`cancelled`, indistinguishable from ordinary concurrency-group coalescing, which "
+            "is why this alert exists.\n\n"
+        )
+    else:
+        detail = (
+            f"@{maintainer} the dispatch **PLAN** job ended `{result}`, so the CLAIM job (and "
+            "every `always()` alert step it hosts) was **skipped** — nothing dispatched this "
+            "tick, and a sustained PLAN failure means **zero dispatching fleet-wide**.\n\n"
+            "Common cause: sustained snapshot 403s / GitHub secondary rate-limit on the "
+            "authenticated snapshot step.\n\n"
+        )
     return (
         f"{ALERT_MARKER}\n"
-        "> 🤖 SPARQ agent — automated ops-alert (issue #38)\n\n"
-        f"@{maintainer} the dispatch **PLAN** job ended `{result}`, so the CLAIM job (and "
-        "every `always()` alert step it hosts) was **skipped** — nothing dispatched this "
-        "tick, and a sustained PLAN failure means **zero dispatching fleet-wide**.\n\n"
-        "Common cause: sustained snapshot 403s / GitHub secondary rate-limit on the "
-        "authenticated snapshot step. Check the run below; the next scheduled tick retries "
-        "automatically and this alert auto-closes once a PLAN succeeds.\n\n"
+        "> 🤖 SPARQ agent — automated ops-alert (issue #38, #778)\n\n"
+        + detail
+        + "Check the run below; the next scheduled tick retries automatically and this alert "
+        "auto-closes once a tick completes with BOTH stages green.\n\n"
         f"- Failing run: {run_url}\n"
     )
+
+
+def workflow_wiring_verdict(workflow_text):
+    """(ok, detail) — does dispatch.yml's `plan-alert` job actually WIRE the CLAIM result?
+
+    Issue #592 asks for a regression test on these alert jobs' wiring, and #778 is precisely a
+    wiring defect: the decision logic below is INERT unless the workflow both depends on `claim`
+    and passes its result in. Every uncaught mutant in this estate has lived at the YAML seam, so
+    this asserts the seam structurally (parsed jobs/needs/step-env), not by substring-scanning the
+    file — a match anywhere in 1600 lines would prove nothing about the plan-alert job."""
+    try:
+        import yaml  # lazy: same shape as dispatch-secrets-guard.py's parse
+    except ImportError as error:  # pragma: no cover - CI installs PyYAML
+        return False, f"cannot import yaml to verify the wiring ({error}) — fail closed"
+    try:
+        document = yaml.safe_load(workflow_text or "")
+    except Exception as error:  # noqa: BLE001 - any parse fault is a fail-closed verdict
+        return False, f"dispatch.yml does not parse as YAML ({type(error).__name__})"
+    jobs = (document or {}).get("jobs")
+    if not isinstance(jobs, dict):
+        return False, "cannot locate a `jobs:` mapping in dispatch.yml (fail closed)"
+    job = jobs.get("plan-alert")
+    if not isinstance(job, dict):
+        return False, "dispatch.yml has no `plan-alert` job (fail closed)"
+    needs = job.get("needs")
+    needs = [needs] if isinstance(needs, str) else list(needs or [])
+    missing = [n for n in ("plan", "secrets-guard", "claim") if n not in needs]
+    if missing:
+        return False, ("the plan-alert job does not depend on " + ", ".join(missing) +
+                       " — it cannot read a result it does not need")
+    steps = job.get("steps")
+    if not isinstance(steps, list) or not steps:
+        return False, "the plan-alert job has no steps (fail closed)"
+    seen = {}
+    for step in steps:
+        env = (step or {}).get("env") if isinstance(step, dict) else None
+        for key in ("PLAN_RESULT", "CLAIM_RESULT"):
+            value = (env or {}).get(key)
+            if isinstance(value, str):
+                seen[key] = value
+    for key, job_name in (("PLAN_RESULT", "plan"), ("CLAIM_RESULT", "claim")):
+        value = seen.get(key)
+        if value is None:
+            return False, f"no plan-alert step sets {key} — the {job_name} result never arrives"
+        # Brace-free assertion text (secret masking mangles braces in Actions logs).
+        if f"needs.{job_name}.result" not in value:
+            return False, (f"{key} is set but does not read needs.{job_name}.result "
+                           f"(got a value that never references it)")
+    return True, "ok"
 
 
 def _gh(args, capture=False, token=None, check=False):
@@ -86,6 +210,17 @@ def main():
     repo, token = _alert_route(
         os.environ.get("ALERT_REPO"), os.environ.get("ALERT_TOKEN"), registry_repo)
     result = os.environ.get("PLAN_RESULT", "")
+    # #778: if CLAIM_RESULT is not wired at all, MIRROR the plan result rather than defaulting it
+    # to "". Mirroring makes decide(p, p, open) reduce EXACTLY to the pre-#778 PLAN-only decision
+    # for every one of the four `needs.<job>.result` values (asserted in the self-test), so a
+    # half-deployed workflow degrades to the old behaviour. Defaulting to "" instead would block
+    # `close` forever and strand an open alert with no machine exit. The miswiring is still caught
+    # BEFORE it ships: the self-test asserts the live dispatch.yml wires this env var.
+    claim_result = os.environ.get("CLAIM_RESULT")
+    if claim_result is None:
+        print("::warning::plan-alert: CLAIM_RESULT is not wired by the workflow — falling back "
+              "to PLAN-only alerting; a cancelled CLAIM will NOT be reported")
+        claim_result = result
     run_url = os.environ.get("RUN_URL", "")
     maintainer = os.environ.get("MAINTAINER_HANDLE", "jeswr")
 
@@ -116,36 +251,49 @@ def main():
     # second (legacy alerts filed before the marker existed).
     num = next((i["number"] for i in found if ALERT_MARKER in (i.get("body") or "")), None)
     if num is None:
-        num = next((i["number"] for i in found if i.get("title") == ALERT_TITLE), None)
+        # #778: match EITHER stage title here. Every alert this script writes carries the marker,
+        # so in practice only pre-marker legacy alerts reach this line — but an alert whose body
+        # was hand-edited past the marker must still dedupe rather than spawn a twin.
+        num = next((i["number"] for i in found
+                    if i.get("title") in _STAGE_TITLE.values()), None)
 
-    action = decide(result, num is not None)
+    action = decide(result, claim_result, num is not None)
     if action == "upsert":
+        stage = failing_stage(result, claim_result)
+        stage_result = result if stage == STAGE_PLAN else claim_result
+        title = _STAGE_TITLE[stage]
         _gh(["label", "create", ALERT_LABEL, "-R", repo, "--color", "d73a4a",
              "--description", "Autonomous ops alert (maintainer action)"],
             capture=True, token=token)  # idempotent; pre-existing label is fine
-        body = _render_body(result, run_url, maintainer)
+        body = _render_body(stage, stage_result, run_url, maintainer)
         if num:
-            wrote = _gh(["issue", "edit", str(num), "-R", repo, "--body", body],
+            # #778: retitle on edit as well. One rolling alert covers both stages, so an alert
+            # opened for a PLAN failure that is now a CLAIM failure must not keep announcing the
+            # wrong job. Dedupe already happened above (marker-first), so retitling is safe.
+            wrote = _gh(["issue", "edit", str(num), "-R", repo, "--title", title,
+                         "--body", body],
                         capture=True, token=token, check=True)
         else:
-            wrote = _gh(["issue", "create", "-R", repo, "--title", ALERT_TITLE,
+            wrote = _gh(["issue", "create", "-R", repo, "--title", title,
                          "--label", ALERT_LABEL, "--body", body],
                         capture=True, token=token, check=True)
         if wrote.returncode != 0:
             return 1
-        print("::warning::plan-alert: PLAN job {} — maintainer alerted".format(result))
+        print("::warning::plan-alert: {} job {} — maintainer alerted".format(stage, stage_result))
         return 0
     if action == "close":
         commented = _gh(["issue", "comment", str(num), "-R", repo, "--body",
-                         "✅ Recovered — the dispatch PLAN job succeeded again. Auto-closing."],
+                         "✅ Recovered — the dispatch PLAN and CLAIM jobs both succeeded again. "
+                         "Auto-closing."],
                         capture=True, token=token, check=True)
         closed = _gh(["issue", "close", str(num), "-R", repo],
                      capture=True, token=token, check=True)
         if commented.returncode != 0 or closed.returncode != 0:
             return 1
-        print("plan-alert: PLAN recovered — closed the alert")
+        print("plan-alert: PLAN+CLAIM recovered — closed the alert")
         return 0
-    print("plan-alert: PLAN result={} — nothing to do".format(result or "unknown"))
+    print("plan-alert: PLAN result={} CLAIM result={} — nothing to do".format(
+        result or "unknown", claim_result or "unknown"))
     return 0
 
 
@@ -167,20 +315,64 @@ def _self_test():
         _alert_route("org/private", None, "org/registry"), ("org/registry", None))
     chk("route: no repo -> registry",
         _alert_route("", "tok", "org/registry"), ("org/registry", None))
-    # decide(): success-only closure (review r1 — `skipped` must not close), upsert on hard fail
-    chk("decide: failure -> upsert", decide("failure", False), "upsert")
-    chk("decide: failure w/ open -> upsert", decide("failure", True), "upsert")
-    chk("decide: cancelled -> upsert", decide("cancelled", True), "upsert")
-    chk("decide: success + open -> close", decide("success", True), "close")
-    chk("decide: success + none -> noop", decide("success", False), "noop")
-    chk("decide: SKIPPED + open -> noop (not a recovery)", decide("skipped", True), "noop")
-    chk("decide: empty result + open -> noop", decide("", True), "noop")
+    # decide(): success-only closure (review r1 — `skipped` must not close), upsert on hard fail.
+    # PLAN axis, CLAIM green throughout (the pre-#778 matrix, preserved exactly).
+    chk("decide: PLAN failure -> upsert", decide("failure", "success", False), "upsert")
+    chk("decide: PLAN failure w/ open -> upsert", decide("failure", "success", True), "upsert")
+    chk("decide: PLAN cancelled -> upsert", decide("cancelled", "success", True), "upsert")
+    chk("decide: both success + open -> close", decide("success", "success", True), "close")
+    chk("decide: both success + none -> noop", decide("success", "success", False), "noop")
+    chk("decide: PLAN SKIPPED + open -> noop (not a recovery)",
+        decide("skipped", "success", True), "noop")
+    chk("decide: PLAN empty + open -> noop", decide("", "success", True), "noop")
+    # ---- #778: the CLAIM axis. THE defect: a green PLAN with a dead CLAIM used to read as a
+    # healthy tick and CLOSE the alert. Each of these is red against the pre-#778 PLAN-only decide.
+    chk("decide[#778]: PLAN success + CLAIM CANCELLED -> upsert (NOT close)",
+        decide("success", "cancelled", True), "upsert")
+    chk("decide[#778]: PLAN success + CLAIM cancelled + no open alert -> upsert",
+        decide("success", "cancelled", False), "upsert")
+    chk("decide[#778]: PLAN success + CLAIM FAILURE -> upsert (NOT close)",
+        decide("success", "failure", True), "upsert")
+    chk("decide[#778]: PLAN success + CLAIM skipped + open -> noop (never a close)",
+        decide("success", "skipped", True), "noop")
+    # Attribution: a bad PLAN skips CLAIM, so PLAN is the CAUSE and must be the named stage even
+    # when a run-level cancel marks BOTH jobs cancelled.
+    chk("failing_stage: PLAN failure + CLAIM skipped -> PLAN",
+        failing_stage("failure", "skipped"), STAGE_PLAN)
+    chk("failing_stage: BOTH cancelled -> PLAN (the cause, not the consequence)",
+        failing_stage("cancelled", "cancelled"), STAGE_PLAN)
+    chk("failing_stage: PLAN success + CLAIM cancelled -> CLAIM",
+        failing_stage("success", "cancelled"), STAGE_CLAIM)
+    chk("failing_stage: both green -> None", failing_stage("success", "success"), None)
+    # main() mirrors PLAN into CLAIM when CLAIM_RESULT is unwired. Prove that reduction is exact
+    # over EVERY `needs.<job>.result` value, so a half-deployed workflow keeps the old behaviour
+    # (and in particular keeps its `close` machine-exit) rather than stranding an alert open.
+    def _legacy_decide(plan_result, has_open):
+        if plan_result in ("failure", "cancelled"):
+            return "upsert"
+        if plan_result == "success" and has_open:
+            return "close"
+        return "noop"
+    mirrored = {(r, o): (decide(r, r, o), _legacy_decide(r, o))
+                for r in ("success", "failure", "cancelled", "skipped", "")
+                for o in (True, False)}
+    chk("mirror: decide(p, p, open) == pre-#778 PLAN-only decide, for all 10 (result, open)",
+        [k for k, (new, old) in mirrored.items() if new != old], [])
     # body: run link + maintainer mention, no secrets/handles by construction
-    body = _render_body("failure", "https://example.test/run/1", "jeswr")
+    body = _render_body(STAGE_PLAN, "failure", "https://example.test/run/1", "jeswr")
     chk("body carries run url + mention",
         ("https://example.test/run/1" in body, "@jeswr" in body), (True, True))
     # r3 residual: every rendered body must carry the stable dedupe marker.
     chk("body carries the stable dedupe marker", ALERT_MARKER in body, True)
+    # #778: the CLAIM body must name CLAIM (not PLAN) as the dead stage and must carry the same
+    # marker, or the two stages cannot share one rolling alert.
+    claim_body = _render_body(STAGE_CLAIM, "cancelled", "https://example.test/run/2", "jeswr")
+    chk("CLAIM body names CLAIM, carries marker + run url, does not blame PLAN",
+        ("**CLAIM**" in claim_body, ALERT_MARKER in claim_body,
+         "https://example.test/run/2" in claim_body, "**PLAN**" in claim_body),
+        (True, True, True, False))
+    chk("PLAN and CLAIM alert titles are distinct",
+        _STAGE_TITLE[STAGE_PLAN] != _STAGE_TITLE[STAGE_CLAIM], True)
     # Stubbed-gh flow (review r1 finding 4 + r2 finding 2): full main() paths with a fake
     # subprocess.run that records the COMPLETE command and env per call, and can inject a failure
     # for any individual gh subcommand — so repo/token wiring and every mutation return-code check
@@ -208,10 +400,16 @@ def _self_test():
         return [tuple(c[1:3]) for c, _e in calls]
 
     real_run = subprocess.run
-    base_env = {"REGISTRY_REPO": "org/registry", "PLAN_RESULT": "", "RUN_URL": "u",
-                "MAINTAINER_HANDLE": "m", "ALERT_REPO": "", "ALERT_TOKEN": ""}
+    # #778: CLAIM_RESULT is wired HERE, defaulting to `success`, for two reasons. (1) It keeps
+    # every pre-#778 flow assertion below semantically identical (PLAN drives the outcome).
+    # (2) Leaving it unset would take main()'s unwired-mirror path, whose ::warning:: would make
+    # the "sanitized warning" assertions below pass VACUOUSLY. The mirror path is exercised in its
+    # own case instead, where the warning is the thing under test.
+    base_env = {"REGISTRY_REPO": "org/registry", "PLAN_RESULT": "", "CLAIM_RESULT": "success",
+                "RUN_URL": "u", "MAINTAINER_HANDLE": "m", "ALERT_REPO": "", "ALERT_TOKEN": ""}
 
-    def run_main(plan_result, list_json="[]", fail=(), alert_repo="", alert_token=""):
+    def run_main(plan_result, list_json="[]", fail=(), alert_repo="", alert_token="",
+                 claim_result="success", wire_claim=True):
         calls.clear()
         responses.clear()
         responses[("issue", "list")] = _Result(1 if ("issue", "list") in fail else 0, list_json)
@@ -222,6 +420,10 @@ def _self_test():
         os.environ["PLAN_RESULT"] = plan_result
         os.environ["ALERT_REPO"] = alert_repo
         os.environ["ALERT_TOKEN"] = alert_token
+        if wire_claim:
+            os.environ["CLAIM_RESULT"] = claim_result
+        else:
+            os.environ.pop("CLAIM_RESULT", None)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             rc = main()
@@ -317,10 +519,112 @@ def _self_test():
         list_cmd_k, _ = find(("issue", "list"))
         chk("dedupe: list fetches number,title,body",
             "number,title,body" in (list_cmd_k or []), True)
+        # ---- #778 end-to-end: the measured run-30245515435 shape (PLAN green, CLAIM cancelled).
+        # Pre-#778 this took the CLOSE path; it must now file/keep an alert naming CLAIM.
+        rc_p, out_p = run_main("success", "[]", claim_result="cancelled")
+        create_p, _ = find(("issue", "create"))
+        chk("flow[#778]: PLAN success + CLAIM cancelled -> CREATE a CLAIM alert, never close",
+            (rc_p, ("issue", "create") in subs(), ("issue", "close") in subs(),
+             create_p is not None and CLAIM_ALERT_TITLE in create_p,
+             "CLAIM job cancelled" in out_p),
+            (0, True, False, True, True))
+        # The regression in its sharpest form: an OPEN alert must SURVIVE a green PLAN whose
+        # CLAIM died. Pre-#778 this closed the alert on the very tick the fleet was broken.
+        open_marked = json.dumps([{"number": 7, "title": ALERT_TITLE,
+                                   "body": ALERT_MARKER + "\nbody"}])
+        rc_q, _ = run_main("success", open_marked, claim_result="cancelled")
+        edit_q, _ = find(("issue", "edit"))
+        chk("flow[#778]: green PLAN + cancelled CLAIM must NOT close an OPEN alert -> edit it",
+            (rc_q, ("issue", "close") in subs(), ("issue", "comment") in subs(),
+             edit_q is not None and "7" in edit_q,
+             edit_q is not None and CLAIM_ALERT_TITLE in edit_q),
+            (0, False, False, True, True))
+        # Recovery still works once BOTH stages are green — the alert has a machine exit.
+        rc_r, _ = run_main("success", open_marked, claim_result="success")
+        chk("flow[#778]: both stages green -> comment+close (the machine exit survives)",
+            (rc_r, ("issue", "comment") in subs(), ("issue", "close") in subs()),
+            (0, True, True))
+        # Unwired CLAIM_RESULT: warn LOUDLY and degrade to pre-#778 PLAN-only behaviour, including
+        # keeping the close path (a stranded-open alert would be a hold with no machine exit).
+        rc_s, out_s = run_main("success", open_marked, wire_claim=False)
+        chk("flow[#778]: UNWIRED CLAIM_RESULT -> warns + still closes on a green PLAN",
+            (rc_s, "CLAIM_RESULT is not wired" in out_s, ("issue", "close") in subs()),
+            (0, True, True))
     finally:
         subprocess.run = real_run
         for key in base_env:
             os.environ.pop(key, None)
+
+    # ---- THE YAML SEAM (#778, and the regression test issue #592 asks for) ----------------
+    # Everything above is inert unless dispatch.yml wires it. Synthetic accept + each reject
+    # direction first, then the LIVE workflow.
+    wired_sample = "\n".join([
+        "jobs:",
+        "  plan-alert:",
+        "    needs: [plan, secrets-guard, claim]",
+        "    steps:",
+        "      - run: python3 scripts/plan-alert.py",
+        "        env:",
+        "          PLAN_RESULT: ${{ needs.plan.result }}",
+        "          CLAIM_RESULT: ${{ needs.claim.result }}",
+    ])
+    chk("seam: fully wired plan-alert job -> ok", workflow_wiring_verdict(wired_sample),
+        (True, "ok"))
+
+    def _drop(sample, needle):
+        """Delete the one line containing `needle`. Raises if it matches 0 or >1 lines — a
+        mutation helper that silently no-ops produces a green 'the mutant was refused' assertion
+        that proves nothing. (This caught a real vacuous case while writing these tests: a
+        trailing-newline `.replace` matched nothing on the sample's LAST line.)"""
+        lines = sample.split("\n")
+        hits = [i for i, line in enumerate(lines) if needle in line]
+        if len(hits) != 1:
+            raise AssertionError(f"mutation helper matched {len(hits)} lines for {needle!r}")
+        return "\n".join(lines[:hits[0]] + lines[hits[0] + 1:])
+
+    verdict_need = workflow_wiring_verdict(
+        wired_sample.replace("[plan, secrets-guard, claim]", "[plan, secrets-guard]"))
+    chk("seam: `needs` without claim -> REFUSE (cannot read a result it does not need)",
+        (verdict_need[0], "claim" in verdict_need[1]), (False, True))
+    verdict_env = workflow_wiring_verdict(_drop(wired_sample, "CLAIM_RESULT:"))
+    chk("seam: CLAIM_RESULT env deleted -> REFUSE (the claim result never arrives)",
+        (verdict_env[0], "CLAIM_RESULT" in verdict_env[1]), (False, True))
+    rewired = wired_sample.replace("CLAIM_RESULT: ${{ needs.claim.result }}",
+                                   "CLAIM_RESULT: ${{ needs.plan.result }}")
+    chk("seam: CLAIM_RESULT set from the PLAN result -> REFUSE (silently re-reports PLAN)",
+        workflow_wiring_verdict(rewired)[0], False)
+    chk("seam: PLAN_RESULT env deleted -> REFUSE (the pre-#778 contract still holds)",
+        workflow_wiring_verdict(_drop(wired_sample, "PLAN_RESULT:"))[0], False)
+    chk("seam: whole plan-alert job renamed away -> REFUSE",
+        workflow_wiring_verdict(wired_sample.replace("  plan-alert:", "  some-other-job:"))[0],
+        False)
+    chk("seam: unparseable workflow -> REFUSE (fail closed, never skip)",
+        workflow_wiring_verdict("jobs:\n  plan-alert:\n   - [unbalanced")[0], False)
+    chk("seam: empty workflow -> REFUSE (fail closed)", workflow_wiring_verdict("")[0], False)
+    # LIVE. The plan-alert JOB sparse-checks-out only scripts/plan-alert.py, so at dispatch
+    # runtime there is no workflow tree to read; that must not go red every tick. Discriminate on
+    # the WORKFLOWS DIRECTORY, not on dispatch.yml itself: no directory => sparse checkout (skip
+    # with a notice); directory present but dispatch.yml missing => it was renamed or moved, which
+    # is a real defect and fails. A bare `exists(dispatch.yml)` guard would silently skip on
+    # exactly the rename it is supposed to catch.
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    workflows_dir = os.path.join(root, ".github", "workflows")
+    live_path = os.path.join(workflows_dir, "dispatch.yml")
+    if not os.path.isdir(workflows_dir):
+        print(f"  note .github/workflows absent at {root} — sparse checkout, live seam check "
+              "not applicable (the pr-gate full checkout enforces it)")
+    else:
+        try:
+            with open(live_path, encoding="utf-8") as handle:
+                live_text = handle.read()
+        except OSError as error:
+            live_text = None
+            chk("seam: LIVE dispatch.yml is readable (a rename must fail, not skip)",
+                f"{type(error).__name__}", None)
+        if live_text is not None:
+            chk("seam: LIVE dispatch.yml wires plan-alert -> needs claim + CLAIM_RESULT",
+                workflow_wiring_verdict(live_text), (True, "ok"))
+
     print("plan-alert self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 

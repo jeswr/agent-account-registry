@@ -12,7 +12,8 @@ of changed Python and YAML blobs before the push; semantic validation belongs to
 
 import argparse
 import ast
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 import importlib.util
 import json
 import os
@@ -48,6 +49,19 @@ SAFE_BRANCH = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*")
 SAFE_SHA = re.compile(r"[0-9a-f]{40}")
 MAX_API_PAGES = 50
 DEFAULT_REBASE_CAP = 5
+# Issue #753. The two-distinct-head escalation is the ONLY exit from a recorded conflict attempt,
+# and a second distinct head exists only if somebody PUSHES to the branch. An abandoned worker PR
+# therefore parks in `head already has a recorded conflict attempt` FOREVER: no label, no
+# escalation, no error, so a run that skipped it is byte-identical to a run that had nothing to do.
+# This window is the MACHINE exit: after it elapses with the head unmoved, the single attempt
+# escalates exactly as a second failed attempt would. It is a grace period for the author to push
+# a fix, not a hold.
+DEFAULT_STUCK_GRACE_HOURS = 6.0
+# A conflicting PR that is neither parked by a hard label nor repairable nor escalatable is in a
+# state with NO exit. That is a defect in this program, not a property of the fleet, so the run
+# FAILS on it. It is self-clearing: the grace-window escalation drains the population into the
+# human `needs:user` queue, which the hard-exclusion filter then owns.
+DEFAULT_NO_EXIT_ALERT_THRESHOLD = 0
 
 
 class ResolverError(RuntimeError):
@@ -304,14 +318,46 @@ def _self_authored_comments(comments, bot_login):
     ]
 
 
+def _comment_epoch(value):
+    """POSIX seconds for a GitHub ``created_at``; None when it is absent or unparseable."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        stamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return stamp.timestamp()
+
+
+def attempt_records(comments, bot_login):
+    """Distinct attempted heads with the EARLIEST marker timestamp for each.
+
+    Ordered oldest-marker-first, exactly as ``attempt_heads`` was. The timestamp is what makes
+    the single-attempt state exitable: without it the only escalation trigger is a second
+    distinct head, which an abandoned PR never produces.
+    """
+    stamps = {}
+    order = []
+    for comment in _self_authored_comments(comments, bot_login):
+        body = comment.get("body")
+        if not isinstance(body, str):
+            continue
+        epoch = _comment_epoch(comment.get("created_at"))
+        for match in ATTEMPT_RE.finditer(body):
+            head = match.group(2)
+            if head not in stamps:
+                order.append(head)
+                stamps[head] = epoch
+            elif epoch is not None and (stamps[head] is None or epoch < stamps[head]):
+                stamps[head] = epoch
+    return [(head, stamps[head]) for head in order]
+
+
 def attempt_heads(comments, bot_login):
     """Distinct heads attempted by this App; user-spoofed markers never consume budget."""
-    heads = []
-    for body in _comment_bodies(_self_authored_comments(comments, bot_login)):
-        for match in ATTEMPT_RE.finditer(body):
-            if match.group(2) not in heads:
-                heads.append(match.group(2))
-    return heads
+    return [head for head, _ in attempt_records(comments, bot_login)]
 
 
 def prior_conflicting_files(comments, bot_login):
@@ -518,9 +564,94 @@ class MechanicalRebaser:
             _cleanup_tempdir(tmp)
 
 
+@dataclass
+class RepoCensus:
+    """Per-repository population counts for ONE sweep.
+
+    The point of this object is that ``actions=0 errors=0`` is ambiguous: it is what a run that
+    repaired the whole fleet and a run that silently skipped a growing backlog both print. These
+    counts separate the two, and every PR the sweep sees lands in exactly one ``skipped`` bucket
+    or one outcome counter, so the buckets must sum to ``considered``.
+    """
+
+    repo: str
+    considered: int = 0
+    conflicting: int = 0
+    conflicting_draft: int = 0
+    selected: int = 0
+    attempted: int = 0
+    resolved: int = 0
+    escalated: int = 0
+    awaiting_author: int = 0
+    no_exit: int = 0
+    errors: int = 0
+    skipped: dict = field(default_factory=dict)
+
+    def skip(self, key):
+        self.skipped[key] = self.skipped.get(key, 0) + 1
+
+    def as_dict(self):
+        return {
+            "repo": self.repo,
+            "considered": self.considered,
+            "conflicting": self.conflicting,
+            "conflicting_draft": self.conflicting_draft,
+            "conflicting_ready": self.conflicting - self.conflicting_draft,
+            "selected": self.selected,
+            "attempted": self.attempted,
+            "resolved": self.resolved,
+            "escalated": self.escalated,
+            "awaiting_author": self.awaiting_author,
+            "no_exit": self.no_exit,
+            "errors": self.errors,
+            "skipped": dict(sorted(self.skipped.items())),
+        }
+
+
+def _aggregate_census(rows):
+    total = {
+        key: sum(row[key] for row in rows)
+        for key in ("considered", "conflicting", "conflicting_draft", "conflicting_ready",
+                    "selected", "attempted", "resolved", "escalated", "awaiting_author",
+                    "no_exit", "errors")
+    }
+    skipped = {}
+    for row in rows:
+        for key, count in row["skipped"].items():
+            skipped[key] = skipped.get(key, 0) + count
+    total["repos"] = len(rows)
+    total["skipped"] = dict(sorted(skipped.items()))
+    return total
+
+
+def render_census_summary(rows, total):
+    """Markdown for ``$GITHUB_STEP_SUMMARY`` — the operator-facing form of the census."""
+    lines = [
+        "### conflict-resolver census",
+        "",
+        "| repo | considered | conflicting (ready/draft) | attempted | resolved | escalated "
+        "| awaiting author | no exit | errors |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for row in [*rows, {**total, "repo": f"**all {total['repos']} repo(s)**"}]:
+        lines.append(
+            f"| {row['repo']} | {row['considered']} | "
+            f"{row['conflicting']} ({row['conflicting_ready']}/{row['conflicting_draft']}) | "
+            f"{row['attempted']} | {row['resolved']} | {row['escalated']} | "
+            f"{row['awaiting_author']} | {row['no_exit']} | {row['errors']} |"
+        )
+    if total["skipped"]:
+        lines += ["", "Skip reasons:", ""]
+        lines += [f"- `{key}`: {count}" for key, count in total["skipped"].items()]
+    return "\n".join(lines) + "\n"
+
+
 class ConflictResolver:
     def __init__(self, api, snapshot, claim, repos, bot_login, apply=False,
-                 max_rebases=DEFAULT_REBASE_CAP, rebaser=None):
+                 max_rebases=DEFAULT_REBASE_CAP, rebaser=None,
+                 stuck_grace_hours=DEFAULT_STUCK_GRACE_HOURS,
+                 no_exit_threshold=DEFAULT_NO_EXIT_ALERT_THRESHOLD,
+                 clock=time.time, summary_path=None):
         self.api = api
         self.snapshot = snapshot
         self.claim = claim
@@ -529,24 +660,58 @@ class ConflictResolver:
         self.apply = apply
         self.max_rebases = max_rebases
         self.rebaser = rebaser
+        self.stuck_grace_hours = stuck_grace_hours
+        self.no_exit_threshold = no_exit_threshold
+        self.clock = clock
+        self.summary_path = summary_path
         self.actions = []
         self.errors = []
         self.rebases = 0
         self.budget_used = 0
+        self.census = []
+        self.current = RepoCensus("")
 
     def _record(self, kind, repo, number, detail=""):
         self.actions.append((kind, repo, number, detail))
         mode = "APPLY" if self.apply else "DRY-RUN"
         print(f"{mode} {repo}#{number}: {kind}{(': ' + detail) if detail else ''}")
 
-    @staticmethod
-    def _skip(repo, number, reason):
+    def _skip(self, repo, number, reason, key=None):
+        self.current.skip(key or reason)
         print(f"SKIP {repo}#{number}: {reason}")
 
     def _error(self, target, exc):
         cause = str(exc) or type(exc).__name__
         self.errors.append(f"{target}: {cause}")
+        self.current.errors += 1
         print(f"::error::conflict-resolver {target}: {cause}", file=sys.stderr)
+
+    def _no_exit(self, repo, number, reason):
+        """A conflicting, unparked PR this sweep can neither repair nor escalate.
+
+        Counted, annotated, and STICKY: nothing later in the sweep can retract it, so a
+        clean repository scanned afterwards cannot launder the run back to green.
+        """
+        self.current.no_exit += 1
+        print(
+            f"::warning::conflict-resolver {repo}#{number} is conflicting with no automated "
+            f"exit: {reason}",
+            file=sys.stderr,
+        )
+
+    def _attempt_age_hours(self, records, head_sha):
+        """Hours since the earliest attempt marker for ``head_sha``; None when unusable.
+
+        A clock skew that puts the marker in the future yields 0.0, never a negative age, so a
+        bad timestamp can never *shorten* the grace window into an instant escalation.
+        """
+        for attempted, epoch in records:
+            if attempted != head_sha:
+                continue
+            if epoch is None:
+                return None
+            return max(0.0, (self.clock() - epoch) / 3600.0)
+        return None
 
     def _post(self, repo, number, body):
         if self.apply:
@@ -651,6 +816,8 @@ class ConflictResolver:
                     is_human=lambda login: _is_human_maintainer(self.api, repo, login)):
                 self._record("needs:user-suppressed", repo, number,
                              "sticky human unpark (or unreadable timeline)")
+                # A human who un-parked this PR OWNS it: the exit is theirs, not a missing one.
+                self.current.escalated += 1
                 return
             # #684: the label is written through the disarm so the auto-merge latch is PROVEN
             # gone first. Ordered after the sticky-unpark veto (a suppressed park writes no
@@ -662,6 +829,7 @@ class ConflictResolver:
             self._disarm_before_park(
                 repo, number, lambda: self.api.add_label(repo, number, "needs:user")
             )
+        self.current.escalated += 1
         self._record("needs:user", repo, number, ", ".join(conflicts))
 
     def _handle_conflict(self, repo, pr, conflicts, comments):
@@ -672,7 +840,8 @@ class ConflictResolver:
             if len(heads) >= 2:
                 self._escalate(repo, pr, comments, conflicts)
             else:
-                self._skip(repo, number, "this head already has a recorded conflict attempt")
+                self._skip(repo, number, "this head already has a recorded conflict attempt",
+                           "duplicate-attempt-this-run")
             return
         attempt = len(heads) + 1
         marker = f"<!-- conflict-resolver attempt={attempt} head={head} -->"
@@ -693,7 +862,7 @@ class ConflictResolver:
     def _process_pr(self, repo, default_branch, listed_pr):
         number = listed_pr.get("number")
         if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
-            self._skip(repo, "unknown", "invalid PR number in listing")
+            self._skip(repo, "unknown", "invalid PR number in listing", "invalid-pr-number")
             return
         detail_url = f"{API_ROOT}/repos/{repo}/pulls/{number}"
         detail = self.snapshot.resolve_mergeable_detail(self.api.fetch, detail_url)
@@ -701,23 +870,33 @@ class ConflictResolver:
             raise ResolverError(f"PR detail is malformed for {repo}#{number}")
         mergeable = detail.get("mergeable")
         if mergeable is not False:
-            reason = "mergeability is still computing" if mergeable is None else "base is not conflicting"
-            self._skip(repo, number, reason)
+            if mergeable is None:
+                self._skip(repo, number, "mergeability is still computing",
+                           "mergeability-computing")
+            else:
+                self._skip(repo, number, "base is not conflicting", "not-conflicting")
             return
+        self.current.conflicting += 1
+        if detail.get("draft") is True:
+            self.current.conflicting_draft += 1
         labels = _label_names(detail)
         holds = sorted(labels & HARD_EXCLUDE_LABELS)
         if holds:
-            self._skip(repo, number, f"hard exclusion label(s): {', '.join(holds)}")
+            self._skip(repo, number, f"hard exclusion label(s): {', '.join(holds)}",
+                       "hard-exclusion-label")
             return
         head = detail.get("head") or {}
         base = detail.get("base") or {}
         head_repo = (head.get("repo") or {}).get("full_name")
         base_repo = (base.get("repo") or {}).get("full_name")
         if head_repo != repo or base_repo != repo:
-            self._skip(repo, number, "fork PR (head/base repository differs)")
+            # Out of scope by construction, not a broken edge: counted in the census, never a
+            # run failure. Only states this program is SUPPOSED to drain can be no-exit.
+            self._skip(repo, number, "fork PR (head/base repository differs)", "fork-pr")
             return
         if base.get("ref") != default_branch:
-            self._skip(repo, number, "base branch is not the repository default branch")
+            self._skip(repo, number, "base branch is not the repository default branch",
+                       "non-default-base")
             return
         head_sha = str(head.get("sha", ""))
         if SAFE_SHA.fullmatch(head_sha) is None:
@@ -727,12 +906,16 @@ class ConflictResolver:
             comments = self.api.comments(repo, number)
             marker = DEPENDABOT_MARKER.format(head=head_sha)
             if any(marker in body for body in _comment_bodies(comments)):
-                self._skip(repo, number, "dependabot rebase already requested for this head")
+                self._skip(repo, number, "dependabot rebase already requested for this head",
+                           "dependabot-already-requested")
                 return
             if self.budget_used >= self.max_rebases:
-                self._skip(repo, number, f"per-run rebase request cap ({self.max_rebases}) reached")
+                self._skip(repo, number,
+                           f"per-run rebase request cap ({self.max_rebases}) reached",
+                           "rebase-cap-reached")
                 return
             self.budget_used += 1
+            self.current.selected += 1
             self._post(repo, number, f"@dependabot rebase\n\n{marker}")
             self._record("dependabot-comment", repo, number, head_sha)
             return
@@ -741,17 +924,44 @@ class ConflictResolver:
                 repo,
                 number,
                 "review-lane worker PR belongs to the needs-rebase/rebase fix lane",
+                "review-lane-owned",
             )
             return
         comments = self.api.comments(repo, number)
-        heads = attempt_heads(comments, self.bot_login)
+        records = attempt_records(comments, self.bot_login)
+        heads = [attempted for attempted, _ in records]
         if head_sha in heads:
             if len(heads) >= 2:
                 self._escalate(
                     repo, detail, comments, prior_conflicting_files(comments, self.bot_login)
                 )
-            else:
-                self._skip(repo, number, "this head already has a recorded conflict attempt")
+                return
+            # THE MACHINE EXIT (issue #753). One attempt, head unmoved. The two-distinct-head
+            # rule can never fire here on its own, so bound the wait on the clock instead: inside
+            # the grace window the author may still push; past it, this is the same conclusion the
+            # second failed attempt would reach — a human must resolve it.
+            age_hours = self._attempt_age_hours(records, head_sha)
+            if age_hours is None:
+                self._skip(repo, number,
+                           "recorded conflict attempt has no usable timestamp",
+                           "attempt-timestamp-unusable")
+                self._no_exit(repo, number,
+                              "the recorded attempt marker carries no parseable created_at, so "
+                              "the grace window cannot be evaluated")
+                return
+            if age_hours >= self.stuck_grace_hours:
+                self._record("stuck-attempt-escalation", repo, number,
+                             f"single attempt {age_hours:.1f}h old "
+                             f"(grace {self.stuck_grace_hours}h)")
+                self._escalate(
+                    repo, detail, comments, prior_conflicting_files(comments, self.bot_login)
+                )
+                return
+            self.current.awaiting_author += 1
+            self._skip(repo, number,
+                       f"single conflict attempt is {age_hours:.1f}h old; author grace window "
+                       f"is {self.stuck_grace_hours}h",
+                       "awaiting-author-grace")
             return
         if len(heads) >= 2:
             self._escalate(
@@ -759,16 +969,22 @@ class ConflictResolver:
             )
             return
         if self.budget_used >= self.max_rebases:
-            self._skip(repo, number, f"per-run mechanical rebase cap ({self.max_rebases}) reached")
+            self._skip(repo, number,
+                       f"per-run mechanical rebase cap ({self.max_rebases}) reached",
+                       "rebase-cap-reached")
             return
         self.budget_used += 1
+        self.current.selected += 1
         self.rebases += 1
+        self.current.attempted += 1
         result = self.rebaser(repo, detail, default_branch)
         if result.outcome == "conflict":
             self._handle_conflict(repo, detail, result.conflicting_files, comments)
         elif result.outcome == "unchanged":
-            self._skip(repo, number, "local rebase was a no-op; nothing to push")
+            self._skip(repo, number, "local rebase was a no-op; nothing to push",
+                       "rebase-no-op")
         elif result.outcome == "clean":
+            self.current.resolved += 1
             body = (
                 "> 🤖 SPARQ agent — this conflicting PR was mechanically auto-rebased "
                 f"onto `{default_branch}`. CI, not this privileged job, validates semantics.\n\n"
@@ -779,21 +995,36 @@ class ConflictResolver:
         else:
             raise ResolverError(f"unknown rebase outcome for {repo}#{number}")
 
+    def _publish_census(self, rows, total):
+        print(f"CENSUS-TOTAL {json.dumps(total, separators=(',', ':'), sort_keys=True)}")
+        if not self.summary_path:
+            return
+        try:
+            with open(self.summary_path, "a", encoding="utf-8") as handle:
+                handle.write(render_census_summary(rows, total))
+        except OSError as exc:
+            # The census is already on stdout; a summary-file failure must not change the verdict.
+            print(f"::warning::conflict-resolver could not write the step summary: {exc}",
+                  file=sys.stderr)
+
     def run(self):
         for repo in self.repos:
             action_start = len(self.actions)
             budget_start = self.budget_used
             rebase_start = self.rebases
             error_start = len(self.errors)
+            self.current = RepoCensus(repo)
             try:
                 if not self.api.has_token(repo):
                     print(f"SKIP {repo}: no target App token was minted for owner")
+                    self.current.skip("no-owner-token")
                     continue
                 metadata = self.api.repository(repo)
                 default_branch = metadata.get("default_branch") if isinstance(metadata, dict) else None
                 if not _valid_branch(str(default_branch or "")):
                     raise ResolverError(f"repository default branch is unsafe for {repo}")
                 pulls = self.api.pulls(repo)
+                self.current.considered = len(pulls)
                 print(f"SCAN {repo}: {len(pulls)} open PR(s), default={default_branch}")
                 for pr in pulls:
                     try:
@@ -807,6 +1038,9 @@ class ConflictResolver:
             except Exception as exc:
                 self._error(repo, exc)
             finally:
+                # Appended UNCONDITIONALLY, including on the failure and no-token paths: a
+                # repository missing from the census would be a state exit with no record.
+                self.census.append(self.current.as_dict())
                 print(
                     f"SUMMARY repo={repo} mode={'apply' if self.apply else 'dry-run'} "
                     f"actions={len(self.actions) - action_start} "
@@ -814,12 +1048,30 @@ class ConflictResolver:
                     f"mechanical-rebases={self.rebases - rebase_start} "
                     f"errors={len(self.errors) - error_start}"
                 )
+                print(
+                    "CENSUS "
+                    + json.dumps(self.census[-1], separators=(",", ":"), sort_keys=True)
+                )
+        total = _aggregate_census(self.census)
         print(
             f"SUMMARY mode={'apply' if self.apply else 'dry-run'} actions={len(self.actions)} "
             f"rebase-requests={self.budget_used}/{self.max_rebases} "
             f"mechanical-rebases={self.rebases} errors={len(self.errors)}"
         )
-        return 1 if self.errors else 0
+        self._publish_census(self.census, total)
+        # The population alarm. A per-run exit code cannot express "the backlog is growing", so
+        # it expresses the thing this program is actually accountable for instead: how many
+        # conflicting PRs it left in a state with no forward edge. Both terms are sticky — a
+        # later clean repository adds zero and can never subtract an earned failure.
+        if total["no_exit"] > self.no_exit_threshold:
+            print(
+                f"::error::conflict-resolver left {total['no_exit']} conflicting pull "
+                f"request(s) with no automated exit (threshold {self.no_exit_threshold}); "
+                f"{total['conflicting_ready']} ready + {total['conflicting_draft']} draft "
+                f"conflicting PR(s) were seen across {total['repos']} repository/ies",
+                file=sys.stderr,
+            )
+        return 1 if (self.errors or total["no_exit"] > self.no_exit_threshold) else 0
 
 
 def _self_test():
@@ -843,28 +1095,47 @@ def _self_test():
         if not passed:
             print(f"  expected: {expected!r}\n  actual:   {actual!r}")
 
-    def pull(number, head, *, labels=(), author="alice", head_repo=repo, ref=None):
+    # A fixed wall clock so every age assertion below is exact rather than flaky.
+    base_now = 1_800_000_000.0
+    grace = 6.0
+
+    def iso(epoch):
+        return datetime.fromtimestamp(epoch, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def pull(number, head, *, labels=(), author="alice", head_repo=None, ref=None,
+             owner_repo=repo, draft=False):
         return {
             "number": number,
             "state": "open",
+            "draft": draft,
             "mergeable": False,
             "labels": [{"name": label} for label in labels],
             "user": {"login": author},
             "head": {
                 "sha": head,
                 "ref": ref or f"topic-{number}",
-                "repo": {"full_name": head_repo},
+                "repo": {"full_name": head_repo or owner_repo},
             },
             "base": {
                 "sha": base_sha,
                 "ref": "main",
-                "repo": {"full_name": repo},
+                "repo": {"full_name": owner_repo},
             },
         }
 
+    def attempt_comment(head, created_at):
+        """A durable attempt marker exactly as _handle_conflict writes one."""
+        return {
+            "body": f"<!-- conflict-resolver attempt=1 head={head} -->\n"
+                    "- conflict-file: \"src/value.py\"",
+            "user": {"login": bot_login},
+            **({} if created_at is None else {"created_at": created_at}),
+        }
+
     class FakeAPI:
-        def __init__(self, pulls, sequences=None, timelines=None):
+        def __init__(self, pulls, sequences=None, timelines=None, now=base_now):
             self.tokens = {"example": "test-token"}
+            self.now = now
             self.prs = {pr["number"]: deepcopy(pr) for pr in pulls}
             self.sequences = {number: [deepcopy(value) for value in values]
                               for number, values in (sequences or {}).items()}
@@ -914,7 +1185,9 @@ def _self_test():
             raise AssertionError(f"unexpected FakeAPI request: {method} {url}")
 
         def comment(self, _repo, number, body):
-            self.comment_rows[number].append({"body": body, "user": {"login": bot_login}})
+            self.comment_rows[number].append(
+                {"body": body, "user": {"login": bot_login}, "created_at": iso(self.now)}
+            )
 
         def graphql(self, _repo, query, variables):
             if query.startswith("mutation"):
@@ -1328,6 +1601,199 @@ def _self_test():
         (["callback", "retry", "final-pass"], 1, [((0.1,), {})], True),
     )
 
+    # (k) THE MACHINE EXIT (issue #753). ONE recorded attempt on a head nobody ever pushes to was
+    # a hold with NO exit: the two-distinct-head escalation cannot fire without a second head, so
+    # the sweep re-skipped those PRs ~3x/hour forever — unlabelled, uncounted, and invisible to
+    # every label-driven lane. Inside the grace window that wait is correct (the author may still
+    # push); past it, it is the same conclusion a second failed attempt reaches. BOTH directions
+    # are asserted: deleting the age branch reds the second check, inverting the comparison reds
+    # the first, and widening the grace to infinity reds the second.
+    def stuck_sweep(elapsed_hours):
+        stuck_api = FakeAPI([pull(80, "b" * 40)], now=base_now)
+        stuck_rebaser = FakeRebaser("conflict")
+        with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+            ConflictResolver(
+                stuck_api, snapshot, claim, [repo], bot_login, True, 5, stuck_rebaser,
+                stuck_grace_hours=grace, clock=lambda: base_now,
+            ).run()
+        later = base_now + elapsed_hours * 3600.0
+        sweep = ConflictResolver(
+            stuck_api, snapshot, claim, [repo], bot_login, True, 5, stuck_rebaser,
+            stuck_grace_hours=grace, clock=lambda: later,
+        )
+        sweep_stdout, sweep_stderr = StringIO(), StringIO()
+        with redirect_stdout(sweep_stdout), redirect_stderr(sweep_stderr):
+            sweep_rc = sweep.run()
+        sweep_bodies = _comment_bodies(stuck_api.comment_rows[80])
+        return {
+            "rc": sweep_rc,
+            "labels": list(stuck_api.labels_added),
+            "escalations": sum(ESCALATION_MARKER in body for body in sweep_bodies),
+            "attempts": sum(bool(ATTEMPT_RE.search(body)) for body in sweep_bodies),
+            "row": sweep.census[0],
+            "rebase_calls": len(stuck_rebaser.calls),
+        }
+
+    within = stuck_sweep(grace - 0.5)
+    past = stuck_sweep(grace + 0.5)
+    check(
+        "inside the grace window a lone attempt is left to its author, and is COUNTED",
+        (within["rc"], within["labels"], within["escalations"], within["rebase_calls"],
+         within["row"]["awaiting_author"], within["row"]["escalated"], within["row"]["no_exit"],
+         within["row"]["skipped"].get("awaiting-author-grace")),
+        (0, [], 0, 1, 1, 0, 0, 1),
+    )
+    check(
+        "past the grace window the lone attempt escalates itself with no second head",
+        (past["rc"], past["labels"], past["escalations"], past["attempts"],
+         past["rebase_calls"], past["row"]["escalated"], past["row"]["awaiting_author"],
+         past["row"]["no_exit"]),
+        (0, [(80, "needs:user")], 1, 1, 1, 1, 0, 0),
+    )
+
+    # (l) A marker we cannot date is NOT silently treated as forever-young: the grace window is
+    # unevaluable, so the PR is a loud no-exit and the run reds. Fail-LOUD, never fail-open.
+    undated_api = FakeAPI([pull(81, "c" * 40)], now=base_now)
+    undated_api.comment_rows[81] = [attempt_comment("c" * 40, None)]
+    undated = ConflictResolver(
+        undated_api, snapshot, claim, [repo], bot_login, True, 5, FakeRebaser("conflict"),
+        stuck_grace_hours=grace, clock=lambda: base_now + 100 * 3600.0)
+    stderr = StringIO()
+    with redirect_stdout(StringIO()), redirect_stderr(stderr):
+        undated_rc = undated.run()
+    check(
+        "an undatable attempt marker is a loud no-exit failure, never a silent skip",
+        (undated_rc, undated.census[0]["no_exit"], undated_api.labels_added,
+         "no automated exit" in stderr.getvalue(),
+         "::error::conflict-resolver left 1 conflicting pull request(s)" in stderr.getvalue()),
+        (1, 1, [], True, True),
+    )
+
+    # (m) STICKINESS. `exit 0` swallowing an already-earned failure has bitten this repo
+    # repeatedly, always as a later clean pass discarding an earlier hard one — so assert the
+    # INTERLEAVING in both orders, not just the single-repository case.
+    class MultiRepoAPI(FakeAPI):
+        def __init__(self, pulls_by_repo, now=base_now):
+            super().__init__(
+                [row for rows in pulls_by_repo.values() for row in rows], now=now
+            )
+            self.pulls_by_repo = pulls_by_repo
+
+        def repository(self, repo_name):
+            return {"full_name": repo_name, "default_branch": "main"}
+
+        def pulls(self, repo_name):
+            return [deepcopy(row) for row in self.pulls_by_repo.get(repo_name, [])]
+
+    no_exit_pr = pull(90, "d" * 40, owner_repo=repo_a)
+    clean_pr = pull(91, "e" * 40, owner_repo=repo_b)
+    clean_pr["mergeable"] = True
+
+    def sticky_sweep(order):
+        multi = MultiRepoAPI({repo_a: [no_exit_pr], repo_b: [clean_pr]})
+        multi.comment_rows[90] = [attempt_comment("d" * 40, None)]
+        sweep = ConflictResolver(
+            multi, snapshot, claim, list(order), bot_login, True, 5, FakeRebaser("conflict"),
+            stuck_grace_hours=grace, clock=lambda: base_now + 100 * 3600.0)
+        with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+            return sweep.run(), sweep.census
+
+    rc_failure_first, census_failure_first = sticky_sweep((repo_a, repo_b))
+    rc_failure_last, census_failure_last = sticky_sweep((repo_b, repo_a))
+    check(
+        "a clean repository scanned after a no-exit one cannot launder the failure",
+        (rc_failure_first, rc_failure_last,
+         sum(row["no_exit"] for row in census_failure_first),
+         sum(row["no_exit"] for row in census_failure_last),
+         [row["repo"] for row in census_failure_last]),
+        (1, 1, 1, 1, [repo_b, repo_a]),
+    )
+
+    # (n) A run that resolved nothing must be distinguishable from a run that had nothing to
+    # resolve. Every considered PR lands in exactly ONE bucket, so the buckets sum to considered,
+    # and the whole census is emitted machine-readably plus into the job step summary.
+    mixed = [
+        pull(100, "1" * 40),                            # eligible -> attempted -> resolved
+        pull(101, "2" * 40, labels=("needs:user",)),    # conflicting, parked for a human
+        pull(102, "3" * 40, head_repo="fork/repo"),     # conflicting, out of scope
+        pull(103, "4" * 40, draft=True),                # conflicting draft, capped out below
+        pull(104, "5" * 40),                            # not conflicting at all
+    ]
+    mixed[4]["mergeable"] = True
+    mixed_api = FakeAPI(mixed, now=base_now)
+    summary_dir = Path(tempfile.mkdtemp(prefix="conflict-resolver-self-test-"))
+    summary_file = summary_dir / "step-summary.md"
+    mixed_resolver = ConflictResolver(
+        mixed_api, snapshot, claim, [repo], bot_login, True, 1, FakeRebaser("clean"),
+        stuck_grace_hours=grace, clock=lambda: base_now, summary_path=str(summary_file))
+    stdout = StringIO()
+    with redirect_stdout(stdout), redirect_stderr(StringIO()):
+        mixed_rc = mixed_resolver.run()
+    mixed_row = mixed_resolver.census[0]
+    mixed_total = _aggregate_census(mixed_resolver.census)
+    summary_text = summary_file.read_text(encoding="utf-8")
+    real_rmtree(summary_dir, ignore_errors=True)
+    check(
+        "the census accounts for every considered PR exactly once",
+        (mixed_rc, mixed_row["considered"], mixed_row["conflicting"],
+         mixed_row["conflicting_draft"], mixed_row["conflicting_ready"],
+         mixed_row["attempted"], mixed_row["resolved"],
+         sum(mixed_row["skipped"].values()) + mixed_row["resolved"]),
+        (0, 5, 4, 1, 3, 1, 1, 5),
+    )
+    check(
+        "a no-op sweep is machine-distinguishable from an effective one",
+        "CENSUS-TOTAL " + json.dumps(mixed_total, separators=(",", ":"), sort_keys=True)
+        in stdout.getvalue(), True,
+    )
+    check(
+        "the census reaches the job step summary",
+        ("### conflict-resolver census" in summary_text
+         and "| awaiting author | no exit |" in summary_text
+         and "rebase-cap-reached" in summary_text), True,
+    )
+
+    # (o) THE YAML SEAM. Every uncaught mutant in this repo's measured mutation runs lived in a
+    # workflow `if:`/step/call-site, not the Python — so pin the CALL SITE itself. Deleting the
+    # invocation, dropping --apply or either machine-exit flag, adding continue-on-error, or
+    # appending `|| true` reds one of these two checks.
+    import yaml as workflow_yaml
+
+    workflow_path = (
+        Path(__file__).resolve().parent.parent / ".github/workflows/conflict-resolver.yml"
+    )
+    workflow_text = workflow_path.read_text(encoding="utf-8")
+    workflow_steps = workflow_yaml.safe_load(workflow_text)["jobs"]["resolve"]["steps"]
+    resolver_steps = [
+        step for step in workflow_steps if "resolve-conflicts.py" in str(step.get("run", ""))
+    ]
+    # Shell COMMENTS are stripped before the assertion. Measured while writing this check: the
+    # first draft matched the flag names in the rationale comment above the invocation, so
+    # deleting the actual `--stuck-grace-hours 6 \` line left the test green. A guard that a
+    # comment can satisfy is not a guard.
+    resolver_body = "\n".join(
+        line for line in str(resolver_steps[0].get("run", "")).splitlines()
+        if not line.strip().startswith("#")
+    ) if resolver_steps else ""
+    resolver_run = " ".join(resolver_body.replace("\\\n", " ").split())
+    check(
+        "the workflow call site wires the resolver and its machine-exit flags",
+        (len(resolver_steps),
+         [flag for flag in ("python3 scripts/resolve-conflicts.py --self-test",
+                            "python3 scripts/resolve-conflicts.py --apply",
+                            "--stuck-grace-hours", "--no-exit-threshold",
+                            "--registry-repo", "--bot-slug")
+          if flag not in resolver_run]),
+        (1, []),
+    )
+    check(
+        "the resolver step can neither continue-on-error nor swallow its exit code",
+        (resolver_steps[0].get("continue-on-error") if resolver_steps else "no step",
+         "|| true" in resolver_run, "set +e" in resolver_run,
+         "set -euo pipefail" in resolver_run),
+        (None, False, False, True),
+    )
+
     # Syntax-only validators are direct and non-executing.
     validate_syntax_blob("ok.py", b"value = 1\n")
     validate_syntax_blob("ok.yml", b"key: value\n")
@@ -1375,6 +1841,16 @@ def main():
     parser.add_argument("--bot-slug", default="")
     parser.add_argument("--max-rebases", type=int, default=DEFAULT_REBASE_CAP)
     parser.add_argument(
+        "--stuck-grace-hours", type=float, default=DEFAULT_STUCK_GRACE_HOURS,
+        help="hours a single recorded conflict attempt may sit on an unmoved head before it "
+             "escalates to needs:user (the machine exit from the single-attempt state)",
+    )
+    parser.add_argument(
+        "--no-exit-threshold", type=int, default=DEFAULT_NO_EXIT_ALERT_THRESHOLD,
+        help="fail the run when more than this many conflicting PRs are left in a state the "
+             "resolver can neither repair nor escalate",
+    )
+    parser.add_argument(
         "--workspace", default=os.environ.get("RUNNER_TEMP", tempfile.gettempdir()),
         help="runner-local parent directory for full-history temporary clones",
     )
@@ -1383,6 +1859,10 @@ def main():
         return _self_test()
     if args.max_rebases <= 0:
         parser.error("--max-rebases must be positive")
+    if not args.stuck_grace_hours > 0:
+        parser.error("--stuck-grace-hours must be positive")
+    if args.no_exit_threshold < 0:
+        parser.error("--no-exit-threshold must not be negative")
     if not args.bot_slug or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", args.bot_slug):
         parser.error("--bot-slug is required and must be a safe GitHub App slug")
     try:
@@ -1406,6 +1886,9 @@ def main():
             args.apply,
             args.max_rebases,
             rebaser,
+            stuck_grace_hours=args.stuck_grace_hours,
+            no_exit_threshold=args.no_exit_threshold,
+            summary_path=os.environ.get("GITHUB_STEP_SUMMARY") or None,
         ).run()
     except (OSError, ResolverError, tomllib.TOMLDecodeError) as exc:
         print(f"conflict-resolver: {exc}", file=sys.stderr)

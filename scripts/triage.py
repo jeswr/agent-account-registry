@@ -61,7 +61,7 @@ ROLE_LABELS = frozenset({"docs", "impl", "ci", "research", "site"})
 # `match_labels` security rule is evaluated before ANY role route. The security rule's keyword list
 # is IDENTICAL to SEC_KEYWORDS below (asserted by the self-test), so every issue this branch fires
 # on is — by construction — matched by the Phase-1 security override and routed to
-# model_chain ["opus5", "opus"] / agent registry-reviewer / escalate=true, and its eventual PR is
+# model_chain ["opus5"] / agent registry-reviewer / escalate=true, and its eventual PR is
 # HUMAN-armed (worker-pr.py / dispatch-claim.py read the same match_labels keywords). The role
 # label's own chain is NEVER consulted for these issues, so the role label only has to (a) exist
 # and (b) be a configured role route so route-resolve does not raise UnknownRoleError.
@@ -871,7 +871,7 @@ def _self_test():
         sorted(SEC_KEYWORDS), sorted({k for rule in sec_rules for k in rule["match_labels"]}))
     chk("the security route human-escalates + runs the soundness chain",
         [(rule["model_chain"], rule["agent"], bool(rule.get("escalate"))) for rule in sec_rules],
-        [(["opus5", "opus"], "registry-reviewer", True)])
+        [(["opus5"], "registry-reviewer", True)])
     chk("TRUST_PLANE_ROLE has a configured role route in routing.toml",
         TRUST_PLANE_ROLE in {route.get("role") for route in doc.get("route", [])
                              if "match_labels" not in route}, True)
@@ -1123,7 +1123,7 @@ def _self_test():
     policy_resolve = load_sibling("policy-resolve.py", "registry_policy_resolve")
     policy_doc = tomllib.load(open(os.path.join(root, "policy/repos.toml"), "rb"))
     SELF_REPO = "jeswr/agent-account-registry"
-    SOUNDNESS = (["opus5", "opus"], "registry-reviewer", True)
+    SOUNDNESS = (["opus5"], "registry-reviewer", True)
 
     def resolved(labels):
         """(derived role, route-resolve verdict, policy-resolve verdict) for a POST-TRIAGE label
@@ -1157,9 +1157,18 @@ def _self_test():
             (TRUST_PLANE_ROLE, SOUNDNESS, SOUNDNESS))
     # DISCRIMINATION: the enumeration above is not vacuously true — a NON-trust-plane kind must NOT
     # escalate (otherwise the check would pass even if every issue were force-escalated).
+    # [OPUS-5] `kind:research` was the second sample here and now escalates BY DESIGN: the
+    # 2026-07-26 deprecation collapsed role=research to a single rung (opus5), and a one-rung
+    # chain with no `escalate` has no exit at all — on an opus5 outage it could only defer
+    # forever with no human notified. It is replaced by `kind:site`, which is still a genuine
+    # non-escalating route, so the discrimination remains real rather than being dropped.
     chk("[#595 f1] a non-trust-plane kind is NOT escalated (the enumeration discriminates)",
         [resolved(["priority:P1", "area:usage", "kind:docs"])[1][2],
-         resolved(["priority:P1", "area:usage", "kind:research"])[1][2]], [False, False])
+         resolved(["priority:P1", "area:usage", "kind:site"])[1][2]], [False, False])
+    # ...and research DOES escalate now — asserted so the change above is a pinned decision, not
+    # an unnoticed side effect of the deprecation.
+    chk("[OPUS-5] role:research escalates (single-rung chain must have a human exit)",
+        resolved(["priority:P1", "area:usage", "kind:research"])[1][2], True)
 
     # -----------------------------------------------------------------------------------------------
     # [PR #595 finding 2] THE ARGV ENTRYPOINT IS PINNED TO THE WORKFLOW'S OWN ARGUMENT LIST.
