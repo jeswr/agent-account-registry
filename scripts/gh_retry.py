@@ -181,9 +181,11 @@ def scrub_debug_trace(text):
 
     This is the credential/PII boundary, and it is deliberately structural rather than a redaction
     list: everything up to and including the last `* Request took …` line is dropped, which removes
-    every request header (`> Authorization: …`), every response header, AND the response body gh
-    dumps for a failed request. Only the parsed 3-digit status escapes the trace, via
-    `trace_status`. gh 2.94.0 does redact `Authorization` itself (measured: `token ████…`, zero
+    every request header (`> Authorization: …`), every response header, AND the response body.
+    Measured on gh 2.94.0: the trace carries the body of ANY request — not only a failed one —
+    below gh's own dump limit, above which gh substitutes `* body is too long, skipping (contains
+    more than 100000 bytes)`. Both forms sit inside the dropped block. Only the parsed 3-digit
+    status escapes the trace, via `trace_status`. gh 2.94.0 does redact `Authorization` itself (measured: `token ████…`, zero
     hits for the live token) — but these run logs are PUBLIC and unrecoverable once written, so the
     guarantee here must not depend on a vendor behaviour that a gh upgrade could change."""
     raw = text or ""
@@ -806,6 +808,68 @@ def _self_test():
               debug_env({**ambient}).get("GH_DEBUG"), want)
     check("#748 debug_env preserves the rest of the caller's env",
           debug_env({"GH_TOKEN": "t"}).get("GH_TOKEN"), "t")
+
+    # G7b — THE WIRING. Everything in G7 tests `debug_env` as a PURE FUNCTION; nothing above
+    # establishes that `run_gh` ever calls it. Review of 6f69e0e0 proved the hole by execution:
+    #   * `child_env = debug_env(env) if debug_status else env`  ->  `child_env = env`
+    #   * `debug_status=True` in the signature                   ->  `debug_status=False`
+    # Either one-line edit left BOTH suites 100% green while, through the real gh binary, every
+    # failure came back `status=None reason='statusless'` — the discriminating pair stopped
+    # discriminating, `_gh_error_detail`'s whole point evaporated, and a permanent 404 burned the
+    # full retry budget. The `#748` guards elsewhere mock `subprocess.run` with a signature that
+    # swallows `**kwargs`, so not one of them ever looked at the `env=` handed to the child.
+    #
+    # So: capture the ACTUAL child env, on the DEFAULT call (no `debug_status=` passed), which is
+    # what production uses and what the signature-default mutant changes.
+    child_envs = []
+
+    def _capture_env(cmd, **kwargs):
+        child_envs.append(kwargs.get("env"))
+        return subprocess.CompletedProcess(cmd, 0, stdout="{}", stderr="")
+
+    saved_ambient = os.environ.get("GH_DEBUG")
+    try:
+        subprocess.run = _capture_env
+        # (i) explicit caller env, default debug_status.
+        run_gh(["api", "repos/o/r/pulls/7"], env={"GH_TOKEN": "t"})
+        # (ii) env=None — run_gh must still hand the child a widened env, not `None`, or gh
+        #      inherits an ambient GH_DEBUG that may be unset/empty.
+        run_gh(["api", "repos/o/r/pulls/7"])
+        # (iii) the YAML seam, executed rather than asserted structurally: an ambient
+        #       `GH_DEBUG: ""` (the exact pin `pat-validity.py` establishes the idiom for) must
+        #       be WIDENED in the child, not obeyed.
+        os.environ["GH_DEBUG"] = ""
+        run_gh(["api", "repos/o/r/pulls/7"])
+    finally:
+        subprocess.run = real_run
+        if saved_ambient is None:
+            os.environ.pop("GH_DEBUG", None)
+        else:
+            os.environ["GH_DEBUG"] = saved_ambient
+    check("#748 run_gh ACTUALLY hands gh a GH_DEBUG containing `api` — on the default call, with "
+          "an explicit env, with env=None, and against an ambient GH_DEBUG='' pin",
+          (len(child_envs),
+           [(env or {}).get("GH_TOKEN") for env in child_envs[:1]],
+           [GH_DEBUG_MODE in re.split(r"[,\s]+", (env or {}).get("GH_DEBUG") or "")
+            for env in child_envs]),
+          (3, ["t"], [True, True, True]))
+    # ...and the flag still MEANS something: with it off explicitly, the caller's env goes through
+    # untouched. This is the control — without it the row above could be satisfied by a `run_gh`
+    # that ignores `debug_status` entirely and always widens, which is a different function.
+    control_envs = []
+
+    def _capture_control(cmd, **kwargs):
+        control_envs.append(kwargs.get("env"))
+        return subprocess.CompletedProcess(cmd, 0, stdout="{}", stderr="")
+
+    try:
+        subprocess.run = _capture_control
+        run_gh(["api", "repos/o/r/pulls/7"], env={"GH_TOKEN": "t"}, debug_status=False)
+    finally:
+        subprocess.run = real_run
+    check("#748 CONTROL: debug_status=False passes the caller's env through unwidened, so the "
+          "row above is asserting the DEFAULT and not an unconditional widen",
+          control_envs, [{"GH_TOKEN": "t"}])
 
     # G8 — registry #731, fixed here because this PR's whole retry-direction justification rests on
     # "a write never reaches the widened branch". ATTACHED method/field forms are real methods.

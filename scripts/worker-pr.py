@@ -4622,8 +4622,21 @@ def provenance_workflow_seam_report():
         # `GH_DEBUG:` pinned at the workflow/job/step level is still the seam where someone would
         # try, and `scripts/pat-validity.py` already establishes the strip-GH_DEBUG idiom in this
         # repo — so the absence is asserted structurally instead of trusted.
-        "gh_debug_env_sites": sorted(_workflow_gh_debug_sites()),
+        #
+        # The scanned ROOT travels with the sites, from the same call. Review of 6f69e0e0 showed
+        # why: re-pointing this call site at an empty directory satisfied `sites == []` VACUOUSLY,
+        # and the paired "reads the LIVE workflow tree" check could not notice, because it
+        # re-derived `.github/workflows` INDEPENDENTLY of the report. An assertion about a scan
+        # has to read what the scan says it scanned.
+        **dict(zip(("gh_debug_scanned_root", "gh_debug_env_sites"), _workflow_gh_debug_scan())),
     }
+
+
+def _workflow_gh_debug_scan(root=None):
+    """`(scanned root as a str, sites)` — the pair, from ONE call, so a consumer cannot assert the
+    sites of one directory against the identity of another."""
+    root = Path(root) if root else Path(__file__).resolve().parents[1] / ".github" / "workflows"
+    return str(root), sorted(_workflow_gh_debug_sites(root))
 
 
 def _workflow_gh_debug_sites(root=None):
@@ -5996,7 +6009,7 @@ def _self_test():
     check("#748 YAML seam: NO workflow, job or step pins GH_DEBUG — status recovery depends on it "
           "reaching gh's child env, and this is the seam where a pin would silently restore the "
           "statusless blindness with nothing going red",
-          seam["gh_debug_env_sites"], [])
+          seam.get("gh_debug_env_sites", "KEY MISSING"), [])
     seam_probe = Path(tempfile.mkdtemp())
     (seam_probe / "probe.yml").write_text(
         "env:\n  GH_DEBUG: ''\njobs:\n"
@@ -6006,9 +6019,24 @@ def _self_test():
           "(an always-empty scanner would satisfy the emptiness check above vacuously)",
           sorted(_workflow_gh_debug_sites(seam_probe)),
           ["probe.yml:a", "probe.yml:a:step1", "probe.yml:workflow"])
-    check("#748 YAML seam: the scanner reads the LIVE workflow tree, not an empty directory",
-          len(list((Path(__file__).resolve().parents[1] / ".github" / "workflows").glob("*.yml")))
-          >= 5, True)
+    # The emptiness above is only meaningful if the scan that produced it looked at the live
+    # workflow tree. This reads the root OUT OF THE REPORT — never re-derives it — so a call site
+    # re-pointed at an empty or fabricated directory goes red here instead of satisfying
+    # `gh_debug_env_sites == []` vacuously. The two properties are the identity of the directory
+    # and the fact that it actually holds this repo's workflows.
+    scanned_root = Path(seam.get("gh_debug_scanned_root") or "/nonexistent/unset")
+    check("#748 YAML seam: the emptiness above is about the LIVE workflow tree — asserted from "
+          "the root the SCAN reports, not from a path the test re-derives for itself",
+          (scanned_root,
+           scanned_root.is_dir(),
+           len(list(scanned_root.glob("*.yml"))) >= 5,
+           (scanned_root / "worker.yml").is_file()),
+          (Path(__file__).resolve().parents[1] / ".github" / "workflows", True, True, True))
+    # ...and the pair really does travel together: a scan of the probe tree reports the probe
+    # tree, so `gh_debug_scanned_root` cannot be a constant that ignores its argument.
+    check("#748 YAML seam: the reported root is the one that WAS scanned (it tracks the argument)",
+          _workflow_gh_debug_scan(seam_probe),
+          (str(seam_probe), ["probe.yml:a", "probe.yml:a:step1", "probe.yml:workflow"]))
     check("#748 and even a pinned GH_DEBUG cannot disable recovery: debug_env is widen-only",
           (gh_retry.debug_env({"GH_DEBUG": ""})["GH_DEBUG"],
            gh_retry.debug_env({"GH_DEBUG": "false"})["GH_DEBUG"]), ("api", "false,api"))
