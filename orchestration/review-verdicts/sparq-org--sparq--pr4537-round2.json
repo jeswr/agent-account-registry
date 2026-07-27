@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4537,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "9211d6f60ba33e5386e6ff82323609ad347ac530",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`sketch_predicate` still passes each object ID as the provenance key, so it weights the neighboring entity rather than the `(node, predicate, object)` contribution. The USE-1 design defines `w(t)` per triple and requires confidence-weighted pooling of predicate contributions. The revised prose now accurately labels this as an entity-quality proxy, but that is a different heuristic and does not complete the stated integration point. The new grounding test validates object-entity weighting, not assertion-weighted pooling.",
+    "file": "crates/sparq-vectors/src/grounding.rs",
+    "fix_hint": "Represent or resolve provenance for each contributing assertion (for example through an explicit reified or RDF-star statement mapping) and pass that assertion's `w(t)` into pooling. If statement provenance is unavailable, keep this axis uniform/no-op and report the design point as unimplemented rather than substituting object-entity provenance.",
+    "severity": "major",
+    "title": "Structural pooling still does not consume the required per-triple weight"
+   },
+   {
+    "body": "`predicate_block_weight` computes one graph-wide predicate average and `weight_header` stores it in a shared header, so every grounded node receives the same multiplier, including nodes with no incident edge for that predicate. The USE-1 design requires scaling a node's modality from that node's incident-edge provenance. The revised documentation explicitly admits this is only partial, and the end-to-end test pins the known mismatch; consequently the requested integration remains incomplete.",
+    "file": "crates/sparq-vectors/src/provenance.rs",
+    "fix_hint": "Compute modality weights at grounding/query time from the grounded node's contributing incident edges, or add per-row/per-node weight storage and persistence. Test at least two nodes with distinct incident-edge provenance and assert distinct weights derived only from each node's own contributions.",
+    "severity": "major",
+    "title": "Graph-global block defaults do not implement per-node incident-edge fusion"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 2 is improving: the non-canonical performance conclusions were removed, and the code and documentation now candidly describe the implemented entity-level and graph-global heuristics. However, the two load-bearing design requirements remain unimplemented. The authoritative USE-1 design requires per-triple weighting for structural pooling and per-node incident-edge provenance for fusion. Renaming those substitutions as proxies or partial wiring makes the claims more honest but does not make the requested integration correct or complete. The new tests are mechanically non-vacuous, yet deliberately pin the substitute semantics rather than the design invariants.",
+  "verdict": "request_changes"
+ }
+}
