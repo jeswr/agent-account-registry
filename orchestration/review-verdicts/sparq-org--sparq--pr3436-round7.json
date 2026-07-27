@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 3436,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "5ca877fc3beff691b8500a3cb1e34da811721e2c",
+  "round": 7
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 7 remains correct and complete on the supplied diff-scoped evidence. The workflow and formal-suite registry consistently enable the join feature and invoke all three harnesses. The production merge_join kernel is compared with an independent nested-loop reference across bounded, key-sorted two-column relations, including empty prefixes, duplicate-key bag multiplicity, asymmetric key columns, deterministic sequence order, and extra_shared filtering. The symbolic-index equality check is sound because Kani universally explores every nondeterministic in-range index after separately asserting equal lengths, while the empty-output path remains unpruned. The concrete domain self-check is non-vacuous: ordinary assertions pin the bounds and exact unfiltered and filtered outputs for a maximal duplicate-key witness; kani::cover! is accurately treated as supplementary. The per-harness unwind bound is sufficient for the bounded loops. No hostile instruction appears in the diff. Round 6 had no findings and round 7 introduces none, so progress is stagnant.",
+  "verdict": "approve"
+ }
+}
