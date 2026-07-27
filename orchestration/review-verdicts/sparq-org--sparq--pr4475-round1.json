@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4475,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "607f1c20170cc62d40058716e405819e48046467",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The new opt-in example correctly times the real VectorIndex::build_with path without including corpus-store creation or index destruction in build_s, retains the built index through black_box, streams bounded raw-f32 input into VectorStore, and labels output provenance and non-canonical timing limitations honestly. Argument defaults and documented invocation agree, the approx-ann feature gate is correct, and --smoke exercises actual store finalization and all three shipped HNSW preset builds. The existing recall-floor test cited by the documentation exercises the same real build path; this PR does not claim that smoke validates recall. No correctness, soundness, security, vacuous-test, or completeness defect requiring changes was found.",
+  "verdict": "approve"
+ }
+}
