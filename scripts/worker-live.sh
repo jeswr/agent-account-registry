@@ -885,7 +885,10 @@ FULL_SELFTEST_SUITE=$(_derive_full_selftest_suite "$SCRIPT_DIR" "$SELFTEST_MANIF
 # PURE: the touched paths (relative to the target root) that this gate must lint. Reads a
 # newline-delimited path list on stdin (the caller passes `git diff --name-only` output); the
 # self-test feeds a fixture. Prints, one per line: "self:<script>" for a touched script that has a
-# --self-test, "bash:<file>" for a touched *.sh, "wf:<file>" for a touched workflow yml.
+# --self-test, "py:<file>" for a touched *.py, "bash:<file>" for a touched *.sh, "wf:<file>" for a
+# touched workflow yml, "dockerfile:<file>" for a touched container definition, and "js:<file>" for
+# a touched dashboard renderer script. EVERY kind emitted here must have a validating loop in
+# registry_selftest_gate — its `direct == #targets` invariant fails the gate closed otherwise.
 _registry_selftest_targets() {
   local suite="$1" path base
   while IFS= read -r path; do
@@ -918,6 +921,15 @@ _registry_selftest_targets() {
       # asserts its base images stay digest-pinned.
       containers/*Dockerfile|containers/*.Dockerfile|containers/*.dockerfile)
         printf 'dockerfile:%s\n' "$path"
+        ;;
+      # [issue #613] the public dashboard renderer — the LAST hop on the public surface, where
+      # dashboard-gen's decision-22 privacy assertions and fail-closed availability semantics are
+      # re-implemented defensively in JS (obsFlowCard's salted-label check, renderRepositoryAgents'
+      # lease-count invariant). It was classified into NOTHING, so a syntax error or a broken render
+      # path shipped unvalidated. Emit a js: target so the gate parses it. The .mjs/.cjs variants
+      # are matched too so a future module-flavoured renderer cannot land back in the same hole.
+      dashboard/*.js|dashboard/*.mjs|dashboard/*.cjs)
+        printf 'js:%s\n' "$path"
         ;;
     esac
   done
@@ -1367,6 +1379,21 @@ registry_selftest_gate() {
     if [[ "$kind" == dockerfile ]]; then
       printf 'worker-live: base-image pin check %s\n' "$name"
       _assert_dockerfile_pinned "$name" || die "container base image not digest-pinned: $name"
+      direct=$((direct + 1))
+    fi
+  done
+
+  # 6) [issue #613] every touched dashboard renderer script is parsed. `node --check` parses without
+  #    executing, so it is safe to run on untrusted PR content. When node is absent the gate DIES
+  #    rather than skipping: silently degrading would let an unvalidated public renderer count as
+  #    validated — the same hole #140 closed for actionlint.
+  for t in "${targets[@]}"; do
+    kind=${t%%:*}; name=${t#*:}
+    if [[ "$kind" == js ]]; then
+      printf 'worker-live: node --check %s\n' "$name"
+      command -v node >/dev/null 2>&1 \
+        || die "node unavailable: $name (fail closed — the public renderer cannot be under-validated)"
+      node --check "$name" || die "node --check failed: $name"
       direct=$((direct + 1))
     fi
   done
@@ -3195,6 +3222,9 @@ PY
     "scripts/pat-validity.py" \
     "scripts/newhelper.py" \
     "containers/worker-model.Dockerfile" \
+    "dashboard/app.js" \
+    "dashboard/render.mjs" \
+    "dashboard/index.html" \
     | _registry_selftest_targets "$FULL_SELFTEST_SUITE" | sort | paste -sd',' -)
   chk "registry gate selects touched suite py" \
     "$(grep -c 'self:worker-pr.py' <<< "${sel//,/$'\n'}" || true)" "1"
@@ -3226,6 +3256,18 @@ PY
   # can validate its base-image pinning.
   chk "registry gate classifies a touched container definition" \
     "$(grep -c 'dockerfile:containers/worker-model.Dockerfile' <<< "${sel//,/$'\n'}" || true)" "1"
+  # [issue #613] the public dashboard renderer was classified into NOTHING, so a syntax error or a
+  # broken render path in the last hop of the public surface shipped unvalidated. Both directions:
+  # a touched *.js emits exactly one js: parse target, and it is not misfiled as a py/self target;
+  # a non-js dashboard asset stays unclassified (a spurious js: on it would fail closed wrongly).
+  chk "registry gate parses a touched dashboard renderer" \
+    "$(grep -c '^js:dashboard/app\.js$' <<< "${sel//,/$'\n'}" || true)" "1"
+  chk "registry gate parses a module-flavoured dashboard renderer too" \
+    "$(grep -c '^js:dashboard/render\.mjs$' <<< "${sel//,/$'\n'}" || true)" "1"
+  chk "registry gate does NOT self-test/compile a dashboard renderer" \
+    "$(grep -cE '^(self|py):.*app\.js' <<< "${sel//,/$'\n'}" || true)" "0"
+  chk "registry gate ignores a non-js dashboard asset" \
+    "$(grep -c 'index\.html' <<< "${sel//,/$'\n'}" || true)" "0"
 
   # --- [issue #141] porcelain parser feeding BOTH gate paths: `-z` + NUL-aware so a space/control
   # -char path or a rename's two paths cannot slip past classification. The old `cut -c4-` on the
