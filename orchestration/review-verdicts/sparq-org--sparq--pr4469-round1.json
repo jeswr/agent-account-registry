@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4469,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "8a09e53bcf79f4cb67ba619bbb2950b802d3a714",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change is documentation-only and consistently records the duplicate dependency families, their known upstream blockers, and the rationale for retaining cargo-deny's warning policy. The versions named for the surveyed families match the lockfile, and no build behavior, dependency resolution, public API, or security boundary is changed. No hostile instruction is present in the diff.",
+  "verdict": "approve"
+ }
+}
