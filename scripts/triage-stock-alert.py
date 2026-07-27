@@ -490,6 +490,37 @@ def _self_test():
     chk("exactly one label-create call site", len(creates), 1)
     chk("and it creates ALERT_LABEL, never a literal", "ALERT_LABEL" in creates[0], True)
 
+    # ---- THE YAML SEAM ------------------------------------------------------------------------
+    # Every guard above is Python, and Python mutants die easily. MEASURED across this estate: the
+    # mutants that SURVIVE live in a workflow `if:`, a step, or a call site — the wiring that
+    # decides whether the Python runs at all. `retriage.py --self-test` asserts its own step body
+    # against `retriage.yml` for exactly this reason; this does the same for the watchdog job, so
+    # deleting the job, the `always()` guard, the `needs:` edge or the invocation is a RED gate
+    # and not a silently-disarmed alert.
+    workflow = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "retriage.yml"
+    if not workflow.exists():
+        chk("retriage.yml is present to assert against", str(workflow), "a readable file")
+    else:
+        import yaml  # noqa: PLC0415 — self-test only; the runner image ships PyYAML
+        spec = yaml.safe_load(workflow.read_text(encoding="utf-8"))
+        jobs = spec.get("jobs", {})
+        job = jobs.get("stock-alert", {})
+        chk("retriage.yml hosts a `stock-alert` job", "stock-alert" in jobs, True)
+        # `True` because YAML parses a bare `on:`/`always()`-style scalar as a string; compare the
+        # rendered text, not a truthiness.
+        chk("...guarded by if: always(), so a FAILED or CANCELLED sweep still gets censused",
+            str(job.get("if", "")).strip(), "always()")
+        chk("...and sequenced AFTER the sweep it watches",
+            job.get("needs"), "retriage")
+        steps = job.get("steps", []) or []
+        runs = [str(step.get("run", "")) for step in steps]
+        chk("...whose steps actually INVOKE this script (not just its self-test)",
+            any(r.strip() == "python3 scripts/triage-stock-alert.py" for r in runs), True)
+        chk("...and verify it first",
+            any("--self-test" in r for r in runs), True)
+        chk("the watchdog is a SEPARATE job from the sweep (a step inside it cannot see its "
+            "own job being cancelled)", "stock-alert" != "retriage" and "retriage" in jobs, True)
+
     print(("triage-stock-alert self-test: FAILED " + ", ".join(failures)) if failures
           else "triage-stock-alert self-test: all checks passed")
     return 1 if failures else 0
