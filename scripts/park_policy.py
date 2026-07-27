@@ -1330,7 +1330,14 @@ def age_park_episode(labels, comments, bot_login, superseding_markers=(), log=pr
     for comment in comments if isinstance(comments, list) else []:
         if not isinstance(comment, dict):
             continue
-        login = str((comment.get("user") or {}).get("login", ""))
+        # `(comment.get("user") or {}).get(...)` is the house spelling, but it raises on a
+        # non-empty non-dict `user` — and this predicate runs inside the re-admission sweep's
+        # per-PR `try`, which catches DispatchError/WorkerPrError only, so an AttributeError here
+        # would abort the WHOLE tick rather than skip one PR. Production `_pr_comments` validates
+        # the shape, so this is unreachable today; it is written so that it stays a REFUSAL rather
+        # than a head-of-line abort if that ever stops being true.
+        user = comment.get("user")
+        login = str(user.get("login", "")) if isinstance(user, dict) else ""
         if login.casefold() != str(bot_login).casefold():
             continue
         body = str(comment.get("body", ""))
@@ -2922,6 +2929,15 @@ def _self_test():
     _ladder = "<!-- sparq-park-generation:v1 gen=1 cutoff=none -->"
     _sup = ("<!-- sparq-park-generation:v1", PARK_REASON_MARKER)
     _live = (MACHINE_PARK_PR_LABEL,)
+
+    def _total(labels, comments, bot):
+        """age_park_episode, but TOTAL: a raise becomes a value. An assertion that crashes on a
+        mutant reports a crash-kill, which hides which guard failed."""
+        try:
+            return age_park_episode(labels, comments, bot, _sup)
+        except Exception as exc:      # noqa: BLE001 — the point is to name the class
+            return type(exc).__name__
+
     # CLAUSE 0 first, because it is the one that decides whether the question is even asked. A PR
     # with no live PR-side park still reaches the re-admission sweep through its source issue's
     # `status:parked`, and it can still carry an age receipt from an EARLIER, already-closed
@@ -2980,10 +2996,17 @@ def _self_test():
                             _epi(_ladder, None)], _epi_bot, _sup, log=logs.append)[0],
           True)
     check("age_park_episode: no bot identity, a non-list and a malformed row are all inert",
-          [age_park_episode(_live, [_epi(_age, "2026-07-26T10:00:00Z")], "", _sup),
-           age_park_episode(_live, "not a list", _epi_bot, _sup),
-           age_park_episode(_live, [None, "x", {"user": None, "body": None}], _epi_bot, _sup)],
-          [(False, ""), (False, ""), (False, "")])
+          [_total(_live, [_epi(_age, "2026-07-26T10:00:00Z")], ""),
+           _total(_live, "not a list", _epi_bot),
+           _total(_live, [None, "x", {"user": None, "body": None}], _epi_bot),
+           # A non-empty NON-DICT `user` is the shape the house spelling raises on. This runs
+           # inside the sweep's per-PR try, which catches DispatchError only — so an exception
+           # here would abort the whole tick instead of skipping one PR. `_total` turns a raise
+           # into a VALUE so this reports WHICH guard failed rather than a bare traceback.
+           _total(_live, [{"user": ["nope"], "body": _age},
+                          {"user": "nope", "body": _age}], _epi_bot),
+           _total(_live, [{"body": _age}], _epi_bot)],
+          [(False, ""), (False, ""), (False, ""), (False, ""), (False, "")])
     check("age_park_episode: `foreign-episode` is a declared code and is EXIT-REACHABLE — the "
           "census must never file it as needing a human",
           (PARK_REFUSAL_FOREIGN_EPISODE in PARK_REFUSAL_CODES,
