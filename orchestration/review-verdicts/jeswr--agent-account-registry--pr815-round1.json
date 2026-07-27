@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 815,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "94de86b4fdbab00295db8820344001b7716fce35",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change makes quiesce retries genuinely idempotent without weakening the trust boundary: a failed disable is accepted only after an authenticated workflow-state read proves the exact required `disabled_manually` postcondition, while unreadable, active, and `disabled_inactivity` states fail closed before the drain check or any secret operation. The existing disable-then-drain ordering remains intact, and the workflow token stays least-privileged with Actions write (which includes read access). The self-tests are non-vacuous: they model the repeat-disable selector failure, pin the retry API sequence, exercise the production grant, and cover both rejected state directions. No security check, audit binding, label route, or trust-surface classifier is weakened.",
+  "verdict": "approve"
+ }
+}
