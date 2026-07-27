@@ -789,6 +789,15 @@ def execute_plan(repo: str, mutations: list[Mutation], token: str, apply: bool) 
     closed = 0
     mode = "apply" if apply else "dry-run"
     for mutation in mutations:
+        # THE STRIP BOUND, checked on the PLAN before any I/O and before the dry-run print, so a
+        # malformed plan is refused identically in `--dry-run` and `--apply` and cannot be
+        # discovered only after a live fetch. The curator may remove exactly one label,
+        # `status:untriaged`, and only from a `stage`.
+        for label in mutation.remove:
+            if mutation.kind != "stage" or label != UNSTAGED_STATUS:
+                raise CuratorError(
+                    f"refusing to strip {label!r} from {repo}#{mutation.number}: the curator "
+                    f"may only remove {UNSTAGED_STATUS!r}, and only when staging")
         if mutation.kind == "needs-ec2":
             description = "add needs:ec2"
         elif mutation.kind == "close":
@@ -836,13 +845,8 @@ def execute_plan(repo: str, mutations: list[Mutation], token: str, apply: bool) 
             command = ["issue", "edit", str(mutation.number), "--repo", repo]
             for label in mutation.labels:
                 command.extend(["--add-label", label])
-            # Strictly bounded: only `stage` sets `remove`, and only ever to `status:untriaged`.
-            # Enforced here rather than by convention so no future action can acquire a strip.
+            # Bounded by the plan-shape guard at the top of this loop.
             for label in mutation.remove:
-                if mutation.kind != "stage" or label != UNSTAGED_STATUS:
-                    raise CuratorError(
-                        f"refusing to strip {label!r} from {repo}#{mutation.number}: the curator "
-                        f"may only remove {UNSTAGED_STATUS!r}, and only when staging")
                 command.extend(["--remove-label", label])
         try:
             subprocess.run(["gh", *command], check=True, env=_gh_env(token))
@@ -1303,15 +1307,27 @@ def _self_test() -> int:
                    and any(m.kind == "stage" and m.number == 74 for m in parked_plan)
                    and not any(m.kind == "stage" and m.number == 74 for m in unparked_plan)))
 
-    # (e) A status:* duplicate and a status:* EC2 issue are protected from every mutation kind.
+    # (e) A STAGED duplicate and a STAGED EC2 issue are protected from every mutation kind.
+    #
+    # registry #799 changed what "staged" means: this fixture previously used `status:untriaged`
+    # for #202 as a stand-in for "the pipeline already owns this", which is precisely the
+    # conflation that starved the board — `status:untriaged` is the assertion that NOTHING owns
+    # it. #202 now carries a real staging status, and the untriaged EC2 case is asserted
+    # positively below: it is FENCED (`needs:ec2`), which is a machine exit, rather than left to
+    # sit forever with no label and no owner.
     status_fixture = [
         issue(200, "Repair frontier collision detector", ("area:alpha",)),
         issue(201, "Repair frontier collision detector", ("status:ready", "area:alpha")),
-        issue(202, "Run quiet-box EC2 gather", ("status:untriaged", "area:bench")),
+        issue(202, "Run quiet-box EC2 gather", ("status:in-progress", "area:bench")),
     ]
     planned, _ = plan_repository(status_fixture, all_labels, automation)
     touched = {m.number for m in planned}
-    checks.append(("already-status issues are never touched", not ({201, 202} & touched)))
+    checks.append(("already-staged issues are never touched", not ({201, 202} & touched)))
+
+    untriaged_ec2 = [issue(203, "Run quiet-box EC2 gather", ("status:untriaged", "area:bench"))]
+    planned, _ = plan_repository(untriaged_ec2, all_labels | {"status:untriaged"}, automation)
+    checks.append(("an untriaged EC2 measurement is FENCED, not staged and not ignored",
+                   [(m.kind, m.labels) for m in planned] == [("needs-ec2", ("needs:ec2",))]))
 
     # (f) A non-collaborator, non-allowlisted author cannot be staged or dedupe-closed.
     untrusted = [issue(210, "Improve gamma parser", ("area:gamma",), author="outsider")]
@@ -1434,6 +1450,121 @@ def _self_test() -> int:
     checks.append(("area-limited frontier is logged loudly",
                    len([m for m in planned if m.kind == "stage"]) == 1
                    and "frontier: area-limited at 1/4 (1 areas busy)" in logs))
+
+    # ============================================================================================
+    # registry #799 — `status:untriaged` IS AN ADMISSIBLE CANDIDATE STATE.
+    #
+    # Every check below is bound to a specific guard, and each was confirmed RED by deleting or
+    # inverting that guard (see the PR body's mutation table).
+    # ============================================================================================
+    untriaged_labels = all_labels | {"status:untriaged", "status:available"}
+
+    # (u1) THE HEADLINE GUARD. An issue carrying only `status:untriaged` is unstaged work, and the
+    # curator is the ONLY lane that mints priority/area/status:ready. Inverting `is_staged` back
+    # to `has_status` turns this stage into zero mutations.
+    stuck = [issue(900, "Improve alpha parser behavior", ("status:untriaged", "area:alpha"))]
+    planned, _ = plan_repository(stuck, untriaged_labels, automation)
+    staged_now = [m for m in planned if m.kind == "stage"]
+    checks.append(("a status:untriaged issue IS a staging candidate", len(staged_now) == 1))
+
+    # (u2) ...and the SAME mutation strips it. `status:untriaged` is in
+    # `ready-issues.BUSY_STATUS`, so an add-only stage leaves the issue unenumerable and the
+    # repair drains nothing. Deleting the `remove=strip` argument makes this red while (u1)
+    # stays green — which is exactly the vacuous-fix shape this guards against.
+    checks.append(("...and the stage mutation strips status:untriaged",
+                   bool(staged_now) and staged_now[0].remove == ("status:untriaged",)
+                   and "status:ready" in staged_now[0].labels))
+
+    # (u3) Only `status:untriaged` is unstaged. Any OTHER status — including untriaged ALONGSIDE
+    # one (the `status:available` acctNN inventory records, and the contradictory
+    # untriaged+ready pair `retriage.py` owns) — is still staged and never touched here.
+    for label in ("status:ready", "status:in-progress", "status:blocked"):
+        other = [issue(901, "Improve beta parser behavior", ("status:untriaged", label,
+                                                            "area:beta"))]
+        planned, _ = plan_repository(other, untriaged_labels, automation)
+        checks.append((f"status:untriaged + {label} is staged, never re-staged",
+                       not any(m.kind == "stage" for m in planned)))
+    inventory = [issue(902, "acct09", ("status:untriaged", "status:available", "area:beta"))]
+    planned, _ = plan_repository(inventory, untriaged_labels, automation)
+    checks.append(("a status:available account record is never staged",
+                   not any(m.kind == "stage" for m in planned)))
+
+    # (u4) THE CLOSE PATH IS NOT WIDENED. `has_status` still guards duplicate closure, so
+    # admitting 274 untriaged issues as staging candidates must not newly expose any of them to
+    # automated closing. Replacing `has_status` with `is_staged` in the close branch makes this
+    # red (the untriaged duplicate becomes closable).
+    dupes = [
+        issue(910, "Improve alpha parser behavior", ("status:untriaged", "area:alpha")),
+        issue(911, "Improve alpha parser behavior", ("status:untriaged", "area:alpha")),
+    ]
+    planned, _ = plan_repository(dupes, untriaged_labels, automation)
+    checks.append(("an untriaged duplicate is never auto-closed",
+                   not any(m.kind == "close" for m in planned)))
+
+    # (u5) THE STRIP IS BOUNDED AT THE MUTATION BOUNDARY, not by convention. execute_plan refuses
+    # any removal that is not `status:untriaged` on a `stage`. Deleting the raise lets a
+    # hand-built mutation strip anything.
+    for bad in (Mutation("stage", 1, issue(1, "x"), ("status:ready",), remove=("needs:user",)),
+                Mutation("needs-ec2", 1, issue(1, "x"), ("needs:ec2",),
+                         remove=("status:untriaged",))):
+        for apply_mode in (False, True):
+            refused = ""
+            try:
+                execute_plan("o/r", [bad], "tok", apply=apply_mode)
+            except CuratorError as exc:
+                refused = str(exc)
+            checks.append((f"execute_plan(apply={apply_mode}) refuses to strip "
+                           f"{bad.remove[0]} on a {bad.kind}", "may only remove" in refused))
+
+    # (u6) THE TARGET'S OWN AREA TAXONOMY. A repository's `area:*` labels are its declared surface
+    # vocabulary; before this rule only sparq-shaped hints (`sparq-*` crates, `site/`, `gui/`,
+    # `bench/`, `scripts/`) resolved, so every registry issue collapsed into `area:ci` and the
+    # one-issue-per-package wave rule pinned the whole target at one stage per run. Deleting the
+    # `declared` block makes this red.
+    declared_area, reason = derive_area(
+        issue(920, "The gamma sweep drops rows", ()), set(), all_labels)
+    checks.append(("an issue whose title names a declared area resolves to it",
+                   (declared_area, reason) == ("area:gamma", "title names a declared area")))
+    # Fail-closed on ambiguity, exactly like every other branch of derive_area.
+    ambiguous, reason = derive_area(
+        issue(921, "Make gamma and delta agree", ()), set(), all_labels)
+    checks.append(("two declared areas in one title is UNRESOLVED, never a coin flip",
+                   ambiguous is None and reason == "multiple declared areas named in title"))
+    # Word-boundary, not substring: `area:alpha` must not match "alphabetically". The body is
+    # neutral on purpose — `long_body` mentions `scripts/`, which the LATER path-hint rule
+    # resolves to `area:ci`, and a fixture that lets a different rule answer proves nothing about
+    # this one.
+    boundary, reason = derive_area(
+        issue(922, "Sort the output alphabetically", (), body="No paths here. " * 20),
+        set(), all_labels)
+    checks.append(("a declared area matches on word boundaries, not substrings",
+                   boundary is None and "declared" not in reason))
+    # An EXISTING area label still wins — the new rule is a last resort, not an override.
+    existing, reason = derive_area(
+        issue(923, "The gamma sweep drops rows", ("area:beta",)), {"area:beta"}, all_labels)
+    checks.append(("an existing area label still wins over the title",
+                   (existing, reason) == ("area:beta", "existing")))
+
+    # (u7) A FENCE WHOSE LABEL THE TARGET LACKS skips the ISSUE (never admits it) and fails the
+    # RUN — it no longer aborts the whole target's plan. Deleting the `continue`/log makes the
+    # first assertion red; deleting main()'s FENCE_UNAVAILABLE scan makes a silent pass possible,
+    # which the second assertion pins by requiring the marker in the log.
+    without_ec2 = all_labels - {"needs:ec2"} | {"status:untriaged"}
+    mixed = [
+        issue(930, "Benchmark the alpha loader on a dedicated EC2 instance and report ns/op",
+              ("status:untriaged",),
+              body="Run the benchmark on EC2 hardware and record the measured numbers. "
+                   + "Detailed acceptance criteria. " * 12),
+        issue(931, "Improve gamma parser behavior", ("status:untriaged", "area:gamma")),
+    ]
+    planned, logs = plan_repository(mixed, without_ec2, automation)
+    fence_lines = [line for line in logs if line.startswith(FENCE_UNAVAILABLE)]
+    checks.append(("an unavailable fence never admits its issue",
+                   not any(m.number == 930 for m in planned)))
+    checks.append(("an unavailable fence is logged for main() to fail the run on",
+                   len(fence_lines) == 1 and "needs:ec2" in fence_lines[0]))
+    checks.append(("...and the REST of the target is still curated",
+                   any(m.kind == "stage" and m.number == 931 for m in planned)))
 
     ok = all(result for _, result in checks)
     for name, result in checks:

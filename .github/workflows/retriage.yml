@@ -154,3 +154,45 @@ jobs:
             echo "::error::one or more issues failed their fail-closed retriage post-condition (registry #582)"
             exit 1
           fi
+
+  # ALERT ON THE STOCK, NOT THE RUN.
+  #
+  # The `retriage` job above reported `success` on every one of its ~48 scheduled runs a day while
+  # the population it exists to drain grew for two weeks. Nothing was wrong with any individual
+  # run: each swept its window and each genuinely decided, per issue, to do nothing. MEASURED on
+  # run 30288369320 — 80 issues visited, 80 skips, ZERO writes (65 `classifier-incomplete`).
+  # A per-run success signal STRUCTURALLY CANNOT express a missing state exit.
+  #
+  # A SEPARATE JOB, with `if: always()`, deliberately:
+  #   * `needs: retriage` + `if: always()` runs it whether the sweep passed, failed or was
+  #     cancelled — the sweep's SILENCE is exactly what this is watching, and a watcher hosted as
+  #     an `always()` STEP inside the watched job does not run when that job fails early or is
+  #     killed by its own `timeout-minutes` (plan-alert.py, issue #778).
+  #   * it re-reads the board itself rather than consuming the sweep's snapshot, so a sweep that
+  #     died before producing one still gets censused.
+  # `continue-on-error` is deliberately NOT set: an alert lane that cannot report must be visible.
+  stock-alert:
+    needs: retriage
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REGISTRY_REPO: ${{ github.repository }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Verify the stock watchdog
+        run: python3 scripts/triage-stock-alert.py --self-test
+
+      # ONE deduped `ops-alert` issue, upserted on a breached census and auto-closed on a healthy
+      # one. It never touches a work issue's labels (asserted by the self-test above), so it
+      # cannot stampede the installation's hourly request budget.
+      - name: Census the status:untriaged stock and upsert/close the alert
+        # The maintainer handle rides the STEP env, not the job env: the `env` context is not
+        # available in `jobs.<job_id>.env`, so a job-level `${{ env.MAINTAINER_LOGIN }}` would
+        # silently expand to the empty string and the alert would @-mention nobody.
+        env:
+          MAINTAINER_HANDLE: ${{ env.MAINTAINER_LOGIN }}
+        run: python3 scripts/triage-stock-alert.py
