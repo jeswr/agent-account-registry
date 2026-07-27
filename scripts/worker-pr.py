@@ -3891,13 +3891,20 @@ def _queue_disarm_mutation(mutation, node_id):
         raise WorkerPrError(f"GraphQL {mutation} failed for the queued pull request")
 
 
-def disarm(repo, pr_number, when, preserve_review_state=False):
+def disarm(repo, pr_number, when, preserve_review_state=False, bot_login=""):
     """Defuse a worker PR's GitHub-side arm/ready state, fail-closed on LIVE data only (the plan
     row that requested this is hostile — every precondition is re-derived from the API here).
 
-    Trust surface mirrors the review enumerator: only an open, same-repo, bot-authored
-    `sparq-agent/*` PR is ever touched. A PR labelled review:needs-user OR needs:user is
-    human-owned, and when=always (the autonomous-fix defuse) stands down on it entirely — as it
+    Trust surface mirrors the review enumerator: only an open, same-repo, `sparq-agent/*` PR
+    authored by the EXACT App identity named in ``bot_login`` is ever touched (issue #570 — the
+    author gate used to accept ANY `[bot]` login, so a forged plan row could redraft, disable
+    auto-merge on, and relabel a same-repo PR belonging to a DIFFERENT GitHub App; the exact-
+    identity standard is the same one the re-post suppression already uses, see
+    ``verify_bot_login``). An EMPTY ``bot_login`` proves nothing and therefore disarms nothing:
+    both ``when=mismatch`` and ``when=always`` stand down rather than fall back to any-`[bot]`.
+
+    A PR labelled review:needs-user OR needs:user is human-owned, and when=always (the
+    autonomous-fix defuse) stands down on it entirely — as it
     does on a `needs:*`-parked head-ref-linked SOURCE issue, which it additionally consults so a
     fix push never rides into that human's territory. But when=mismatch — the issue #42 safety
     invariant, retracting a latch that would merge a never-reviewed tree — must NOT be blocked by
@@ -3945,6 +3952,15 @@ def disarm(repo, pr_number, when, preserve_review_state=False):
     if head_repo != repo or not head_match or not login.endswith("[bot]"):
         _write_outputs({"disarmed": False})
         print("disarm skipped: not a same-repo bot worker PR")
+        return
+    # Issue #570: EXACT App identity, both modes, no any-`[bot]` fallback. The three mutations
+    # below (dequeue/disable-auto, redraft, relabel) are writes to someone's PR; `[bot]` is a
+    # SUFFIX shared by every GitHub App with write access to this repo, so authorising on it let a
+    # forged `disarm_items` row aim the safety net at a foreign App's PR. An unsupplied identity
+    # is unprovable, not permissive — it fails closed here rather than widening the gate.
+    if not bot_login or login != bot_login:
+        _write_outputs({"disarmed": False})
+        print("disarm skipped: the PR author is not the expected App identity")
         return
     if preserve_review_state and not ({"review:needs", "review:changes"} & labels):
         raise WorkerPrError(
@@ -7986,7 +8002,8 @@ def _self_test():
         return argparse.Namespace(returncode=code, stdout="", stderr="")
 
     def run_disarm(base_ref="main", draft=False, armed=True, labels=(), when="mismatch",
-                   preserve_review_state=False, **overrides):
+                   preserve_review_state=False, bot_login="sparq[bot]",
+                   author="sparq[bot]", **overrides):
         disarm_calls.clear()
         compare_paths.clear()
         fake_outputs.clear()
@@ -7994,7 +8011,7 @@ def _self_test():
         net.update({
             "live": {"state": "open", "draft": draft,
                      "auto_merge": {"merge_method": "squash"} if armed else None,
-                     "user": {"login": "sparq[bot]"},
+                     "user": {"login": author},
                      "labels": [{"name": name} for name in labels],
                      "body": f"pr body\n\n<!-- sparq-reviewed-sha:{rev_sha} -->\n",
                      "head": {"sha": head_69, "ref": "sparq-agent/issue-7-fix",
@@ -8005,7 +8022,8 @@ def _self_test():
                         for key, doc in identical_compares.items()},
             "graphql_auto_merge": armed,
         }, **overrides)
-        disarm("o/r", 41, when, preserve_review_state=preserve_review_state)
+        disarm("o/r", 41, when, preserve_review_state=preserve_review_state,
+               bot_login=bot_login)
 
     try:
         wiring_globals["_gh_json"] = fake_gh_json
@@ -8237,6 +8255,46 @@ def _self_test():
             run_disarm(labels=(hold,), when="always")
             check(f"held always-defuse ({hold}) stands down untouched",
                   (disarm_calls, fake_outputs.get("disarmed")), ([], False))
+
+        # ---- Issue #570: the author gate is the EXACT App identity, never any `[bot]` ----
+        # POSITIVE CONTROL FIRST, so every zero-mutation assertion below is non-vacuous: the
+        # identical live state under the TRUSTED identity really does disarm. If the gate were
+        # inverted (or the fixture stopped producing a mismatch), this goes red first.
+        run_disarm(compare=json.loads(json.dumps(evil)))
+        check("#570 control: the trusted App identity still disarms a real mismatch",
+              ("pr merge 41 -R o/r --disable-auto" in disarm_calls
+               and "pr ready 41 -R o/r --undo" in disarm_calls,
+               fake_outputs.get("disarmed")), (True, True))
+        for mode in ("mismatch", "always"):
+            # A DIFFERENT App's PR (same repo, same worker-shaped head ref, no reviewed-sha
+            # binding it) is the exact #570 attack: pre-fix, `login.endswith("[bot]")` passed and
+            # the forged row redrafted + relabelled a foreign App's pull request.
+            run_disarm(when=mode, compare=json.loads(json.dumps(evil)),
+                       author="mallory[bot]")
+            check(f"#570 ({mode}): a foreign App author mutates nothing",
+                  (disarm_calls, fake_outputs.get("disarmed"),
+                   "disarm_error" in fake_outputs), ([], False, False))
+            # No identity supplied is UNPROVABLE, not permissive — it must not degrade to the old
+            # any-`[bot]` gate. Red the moment `bot_login` is treated as optional again.
+            run_disarm(when=mode, compare=json.loads(json.dumps(evil)), bot_login="")
+            check(f"#570 ({mode}): an empty expected identity fails closed",
+                  (disarm_calls, fake_outputs.get("disarmed"),
+                   "disarm_error" in fake_outputs), ([], False, False))
+            # Near-miss identities (a prefix of the trusted login, and the bare account without
+            # the App suffix) are foreign apps too — the comparison is equality, not membership.
+            for impostor in ("sparq-bot[bot]", "sparq"):
+                run_disarm(when=mode, compare=json.loads(json.dumps(evil)),
+                           bot_login=impostor)
+                check(f"#570 ({mode}): {impostor} is not the trusted App identity",
+                      (disarm_calls, fake_outputs.get("disarmed")), ([], False))
+        # Issue #105 must survive the new gate: a genuinely stale latch on a HUMAN-HELD PR of the
+        # TRUSTED App is still retracted (latch off + redraft), with the hold label preserved.
+        run_disarm(compare=json.loads(json.dumps(evil)), labels=("review:needs-user",))
+        check("#570 does not regress #105: a held trusted-App mismatch is still retracted",
+              ("pr merge 41 -R o/r --disable-auto" in disarm_calls
+               and "pr ready 41 -R o/r --undo" in disarm_calls,
+               "state:needs" in disarm_calls, fake_outputs.get("disarmed")),
+              (True, False, True))
     finally:
         wiring_globals.update(real_disarm_io)
 
@@ -9822,6 +9880,11 @@ def main():
     dis.add_argument("--preserve-review-state", action="store_true",
                      help="redraft safely without changing review:needs/review:changes "
                           "(when=always label re-entry only)")
+    # Issue #570: mandatory, so a caller that forgets the trusted identity fails LOUDLY at argv
+    # instead of silently no-opping. An explicitly EMPTY value still fails closed inside disarm().
+    dis.add_argument("--bot-login", required=True,
+                     help="the exact App login that must author the PR (any other author, "
+                          "including another [bot], is skipped)")
 
     # The live reviewer handle arrives via env WORKER_REVIEWER_ACCOUNT (not argv — argv is echoed
     # into public logs) and is compared against the recorded hash under PROVENANCE_SALT.
@@ -9979,7 +10042,8 @@ def main():
                        park_cause=args.park_cause)
         elif args.command == "disarm":
             disarm(args.repo, args.pr, args.when,
-                   preserve_review_state=args.preserve_review_state)
+                   preserve_review_state=args.preserve_review_state,
+                   bot_login=args.bot_login)
         elif args.command == "ready-and-arm":
             ready_and_arm(args.repo, args.pr, args.reviewed_sha, args.impl_provider,
                           args.impl_account_h, args.reviewer_provider,
