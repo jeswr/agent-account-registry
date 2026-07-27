@@ -1165,11 +1165,18 @@ def busy_packages_of_pulls(repo, pulls, issue_labels, provenance, pr_status=None
 #   global-reservation  an occupant reserves `__global__`, which defers EVERY row regardless of
 #                       the row's own crate. THE ROW'S CRATE IS NOT CONTENDED.
 #   cross-cutting-item  the ROW is `__global__` and so cannot co-run with any reservation at all.
+#                       Its held area is one the named occupant GENUINELY holds — never
+#                       `__global__`, which this case has proved nobody holds (finding B2).
 #   crate-conflict      a genuine one-crate overlap: an occupant holds this row's own package.
 #   sibling-lease       the lease ledger holds a live sibling lease on this row's package.
 #
 # Ordered by CAUSAL DOMINANCE, not by convenience: `global-reservation` outranks the rest
 # because it alone is sufficient, so removing anything else changes nothing.
+#
+# INVARIANT ACROSS EVERY REASON the helper produces: the reported `held_area` is an area that is
+# actually reserved on this board (`held_area in busy`). The field is named for what is HELD; a
+# branch that puts the dropped row's own package there is the misattribution this enum exists to
+# prevent, wearing a different label.
 PARTITION_DEFER_REASONS = (
     "global-reservation", "cross-cutting-item", "crate-conflict", "sibling-lease")
 
@@ -1205,32 +1212,54 @@ def partition_defer_attribution(package, busy, occupancy):
     if not busy:
         return None
     def holder_of(predicate):
-        """The lowest-numbered BUSY occupant satisfying `predicate`, with its park state."""
-        matches = [(pr_number, reason)
+        """The lowest-numbered BUSY occupant satisfying `predicate`, with its park state and the
+        packages it actually reserves."""
+        matches = [(pr_number, reason, packages)
                    for decision, pr_number, packages, reason, *_ in occupancy
                    if decision == "busy" and predicate(packages)]
         if not matches:
             # The busy union is derived from these same occupancy rows, so a reservation with no
             # occupant behind it means the caller passed a `busy` set and an `occupancy` list that
             # disagree. Say `unknown` rather than silently naming an unrelated PR.
-            return ("unknown", "unknown")
+            return ("unknown", "unknown", frozenset())
         return min(matches, key=lambda match: match[0]
                    if isinstance(match[0], int) and not isinstance(match[0], bool) else 1 << 62)
     if GLOBAL_PACKAGE in busy:
-        holder, state = holder_of(lambda packages: GLOBAL_PACKAGE in packages)
+        holder, state, _packages = holder_of(lambda packages: GLOBAL_PACKAGE in packages)
         return ("global-reservation", GLOBAL_PACKAGE, holder, state)
     if package == GLOBAL_PACKAGE:
-        holder, state = holder_of(lambda _packages: True)
-        return ("cross-cutting-item", GLOBAL_PACKAGE, holder, state)
+        # The ROW is cross-cutting, so ANY live reservation defers it and the named holder is a
+        # genuine blocker. The HELD AREA, though, must be an area somebody actually reserves.
+        #
+        # [registry #758, second-challenger finding B2] This branch first shipped reporting
+        # `__global__` as the held area — the ROW's own package, which this branch has just
+        # PROVED nobody holds (`GLOBAL_PACKAGE in busy` was false one line above). That is the
+        # very confusion the fix exists to remove, reintroduced one branch over: it printed
+        # `held area __global__ reserved by pr#4100` for a pr#4100 that reserves no such thing,
+        # and it collided the `cross-cutting-item` rows into the same `by_held_area` bucket as
+        # genuine `global-reservation` rows — two different repairs, one indistinguishable
+        # number on the Gate A feed. It is routinely reachable: `plan_package([])` and
+        # `plan_package(["a", "b"])` are both `__global__`, so every ready issue carrying 0 or
+        # >=2 `area:` labels lands here.
+        #
+        # The invariant now holds for EVERY reason: the reported held area is genuinely
+        # reserved on this board. `& busy` guards an occupancy row carrying a package the busy
+        # union does not; `sorted(...)[0]` keeps it a deterministic function of the board rather
+        # than of the fetch, exactly like the lowest-PR rule.
+        holder, state, packages = holder_of(lambda _packages: True)
+        held = sorted(set(packages) & set(busy)) or sorted(busy)
+        return ("cross-cutting-item", held[0], holder, state)
     if package in busy:
-        holder, state = holder_of(lambda packages: package in packages)
+        holder, state, _packages = holder_of(lambda packages: package in packages)
         return ("crate-conflict", package, holder, state)
     return None
 
 
 def record_partition_defer(census, reason, held_area, holder):
-    """Fold ONE drop into a caller-supplied census dict, in place. No-op when `census` is not a
-    dict, so every call site can pass its optional sink unconditionally.
+    """Fold ONE drop into a caller-supplied census dict, in place. Once `reason` is accepted this
+    is a no-op when `census` is not a dict, so every call site can pass its optional sink
+    unconditionally — but note the ORDER: an undeclared `reason` raises FIRST, whatever `census`
+    is, so a call site that passes no sink cannot smuggle an unnamed reason past the whitelist.
 
     [registry #758] Counted HERE, at the branch that makes the decision — the same discipline
     `starvation` already follows — because a count re-derived downstream from the surviving rows
@@ -10216,10 +10245,40 @@ def _self_test():
             "crate-a", {"crate-a"}, [occupant(12, "crate-a")]),
     }
     assert covered["global-reservation"] == ("global-reservation", GLOBAL_PACKAGE, 10, "not-parked")
-    assert covered["cross-cutting-item"] == ("cross-cutting-item", GLOBAL_PACKAGE, 11, "not-parked")
+    # [registry #758, finding B2] This case previously asserted `__global__` as the held area.
+    # That was the fix's own mistake one branch over: this branch is reached ONLY when
+    # `GLOBAL_PACKAGE not in busy`, so `__global__` is precisely the one area nobody holds, and
+    # naming it made the line say `held area __global__ reserved by pr#11` about a pr#11 that
+    # reserves no such thing — plus it collided these rows into the same `by_held_area` bucket as
+    # genuine global reservations, which need a different repair. The held area is now an area
+    # pr#11 actually holds. Deliberately re-pinned, not silently flipped.
+    assert covered["cross-cutting-item"] == ("cross-cutting-item", "crate-a", 11, "not-parked")
     assert covered["crate-conflict"] == ("crate-conflict", "crate-a", 12, "not-parked")
     for reason, attribution in covered.items():
         assert attribution[0] == reason, (reason, attribution)
+    # THE INVARIANT THE FIELD NAME PROMISES, over every branch and both multi-occupant orders:
+    # the reported held area is genuinely reserved on this board. Pre-B2 the cross-cutting branch
+    # violated it unconditionally. `held_area in busy` is what makes `by_held_area` actionable —
+    # an area nobody holds is not a thing an operator can go and clear.
+    for held_board in (
+            ("crate-a", {GLOBAL_PACKAGE, "crate-a"}, [occupant(10, GLOBAL_PACKAGE),
+                                                      occupant(9, "crate-a")]),
+            (GLOBAL_PACKAGE, {"crate-a", "crate-b"}, [occupant(11, "crate-b"),
+                                                      occupant(12, "crate-a")]),
+            (GLOBAL_PACKAGE, {"crate-a", "crate-b"}, [occupant(12, "crate-a"),
+                                                      occupant(11, "crate-b")]),
+            ("crate-a", {"crate-a", "crate-b"}, [occupant(13, "crate-a", "crate-b")]),
+    ):
+        held_attribution = partition_defer_attribution(*held_board)
+        assert held_attribution is not None, held_board
+        assert held_attribution[1] in held_board[1], (held_attribution, held_board)
+    # ...and it is a function of the BOARD, not of the fetch: the two orders above name the same
+    # held area even though a different occupant is listed first.
+    assert partition_defer_attribution(
+        GLOBAL_PACKAGE, {"crate-a", "crate-b"},
+        [occupant(11, "crate-b"), occupant(12, "crate-a")])[1] == partition_defer_attribution(
+        GLOBAL_PACKAGE, {"crate-a", "crate-b"},
+        [occupant(12, "crate-a"), occupant(11, "crate-b")])[1]
     # `sibling-lease` is produced by the two filter call sites rather than by the pure helper;
     # both are asserted below. Coverage is checked against the DECLARED enum, so a new reason
     # with no case here goes red.
@@ -10487,12 +10546,17 @@ def _self_test():
             "held area __global__ reserved by pr#60 [not-parked]",
             "claim-revalidation defer #71 [global-reservation]: row crate crate-b; "
             "held area __global__ reserved by pr#60"),
+        # [finding B2] The held area here is `crate-c` — the area pr#77 GENUINELY reserves (its
+        # source issue 82 carries `area:crate-c`) — and emphatically NOT `__global__`, which this
+        # branch has proved nobody holds. The row's own crate IS `__global__`, so this line is
+        # also the one place where "row crate" and "held area" must be seen to differ in the
+        # OPPOSITE direction from the global-reservation case above.
         "cross-cutting-item": (
             [enum_row_global], [enum_other_holder], [],
             "assembler defer #79 [cross-cutting-item]: row crate __global__; "
-            "held area __global__ reserved by pr#77 [not-parked]",
+            "held area crate-c reserved by pr#77 [not-parked]",
             "claim-revalidation defer #79 [cross-cutting-item]: row crate __global__; "
-            "held area __global__ reserved by pr#77"),
+            "held area crate-c reserved by pr#77"),
         "crate-conflict": (
             [enum_row_crate], [enum_crate_holder], [],
             "assembler defer #71 [crate-conflict]: row crate crate-b; "
