@@ -311,19 +311,59 @@ def _gh_json(args, label="dispatch-stall"):
         return None
 
 
-def read_signals(repo, runner=None):
-    """The two API reads this watchdog costs, and no more. -> (executed_ids, plan_epoch, runs).
+def page_covers_threshold(payload, now, threshold=STALE_THRESHOLD_SECONDS):
+    """Does this artifact page reach back FURTHER than the staleness threshold?
+
+    The listing is repo-wide — dispatch's artifacts share it with `dashboard-usage-*`,
+    `publish-bundle-*` and `github-pages` (measured 2026-07-27: 34 of 100 on page one, which
+    reached back 6h45m). "No plan artifact on page one" therefore means "no plan artifact
+    recently" ONLY if page one reaches back past the threshold; under an artifact storm from some
+    unrelated workflow it would instead mean "the plan artifact got crowded off", and firing on
+    that is a false page. This is the predicate that turns the difference into a fact instead of
+    an assumption, and it is why read_signals pages until it is true.
+
+    Uses the MINIMUM created_at on the page, not the last element: the endpoint returns
+    newest-first today, but a watchdog should not have a correctness dependency on an undocumented
+    ordering."""
+    stamps = [parse_rfc3339(entry.get("created_at")) for entry in _artifacts(payload)]
+    stamps = [s for s in stamps if s is not None]
+    if not stamps:
+        return False
+    return (int(now) - min(stamps)) > threshold
+
+
+ARTIFACT_MAX_PAGES = 3
+
+
+def read_signals(repo, now=None, runner=None):
+    """The API reads this watchdog costs. -> (executed_ids, plan_epoch, runs).
+
+    Normally TWO requests. The artifact listing pages only while it has neither found a plan
+    artifact nor proven it reached back past the staleness threshold — at today's density page one
+    covers ~7 hours, so the loop exits after one request; the bound exists so an artifact storm
+    costs a couple more requests instead of producing a false page.
 
     `runner` is resolved at CALL time, not bound as a default: a default argument captures the
     function object at definition, which makes the live path unpatchable and every stubbed-flow
     assertion below quietly exercise the real `gh`."""
     runner = runner or _gh_json
-    artifacts = runner(["api", "-H", "Accept: application/vnd.github+json",
-                        f"/repos/{repo}/actions/artifacts?per_page={ARTIFACT_PAGE_SIZE}"])
+    now = _now() if now is None else now
+    executed, plan_epoch = set(), None
+    for page in range(1, ARTIFACT_MAX_PAGES + 1):
+        payload = runner(["api", "-H", "Accept: application/vnd.github+json",
+                          f"/repos/{repo}/actions/artifacts"
+                          f"?per_page={ARTIFACT_PAGE_SIZE}&page={page}"])
+        entries = _artifacts(payload)
+        executed |= executed_tick_runs(payload)
+        found = newest_plan_epoch(payload)
+        if found is not None and (plan_epoch is None or found > plan_epoch):
+            plan_epoch = found
+        if plan_epoch is not None or page_covers_threshold(payload, now) or not entries:
+            break
     runs = runner(["api", "-H", "Accept: application/vnd.github+json",
                    f"/repos/{repo}/actions/workflows/dispatch.yml/runs"
                    f"?per_page={RUN_PAGE_SIZE}"])
-    return executed_tick_runs(artifacts), newest_plan_epoch(artifacts), runs
+    return executed, plan_epoch, runs
 
 
 def _find_open_alert(repo, token, marker, title, label):
@@ -386,7 +426,8 @@ def main():
     server = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
     workflow_url = f"{server}/{registry_repo}/actions/workflows/dispatch.yml"
 
-    executed_ids, plan_epoch, runs = read_signals(registry_repo)
+    now = _now()
+    executed_ids, plan_epoch, runs = read_signals(registry_repo, now=now)
     streak = failure_streak(runs, executed_ids)
     streak_state = streak_verdict(streak)
     stale_state, stale_reason, age = stale_verdict(plan_epoch, _now())
@@ -534,6 +575,7 @@ def _self_test():
     _test_decide(chk)
     _test_thresholds_agree_with_the_floor(chk)
     _test_threshold_vs_cadence(chk)
+    _test_page_coverage(chk)
     _test_gh_flows(chk)
     _test_no_hold_labels(chk)
     _test_workflow_seam(chk)
@@ -671,6 +713,52 @@ def _test_threshold_vs_cadence(chk):
         (groom_period, 3 * groom_period <= STALE_THRESHOLD_SECONDS // 60), (15, True))
 
 
+def _test_page_coverage(chk):
+    """The listing is repo-wide and shared with three other workflows' artifacts. Without this
+    predicate, "no plan artifact on page one" is an ASSUMPTION about density, and an artifact storm
+    from an unrelated workflow turns it into a page at 3am."""
+    now = 1_800_000_000
+    stamp = lambda ago: datetime.fromtimestamp(now - ago, tz=timezone.utc).strftime(  # noqa: E731
+        "%Y-%m-%dT%H:%M:%SZ")
+    deep = {"artifacts": [_artifact("publish-bundle-1-1", created_at=stamp(6 * 3600))]}
+    shallow = {"artifacts": [_artifact("publish-bundle-1-1", created_at=stamp(5 * 60))]}
+    chk("coverage: a page reaching back 6 h proves the threshold window",
+        page_covers_threshold(deep, now), True)
+    chk("coverage: a page reaching back only 5 min proves NOTHING (the plan artifact could be one "
+        "entry off it) — and must not be read as staleness",
+        page_covers_threshold(shallow, now), False)
+    chk("coverage: an empty page proves nothing", page_covers_threshold({"artifacts": []}, now),
+        False)
+
+    # And the paging behaviour that predicate drives, against a stubbed listing.
+    pages = {1: shallow, 2: shallow,
+             3: {"artifacts": [_artifact(f"{PLAN_ARTIFACT_PREFIX}9-1", created_at=stamp(600))]}}
+    seen = []
+
+    def crowded(args, label=""):
+        if "/artifacts" in args[-1]:
+            page = int(args[-1].rsplit("page=", 1)[1])
+            seen.append(page)
+            return pages.get(page, {"artifacts": []})
+        return {"workflow_runs": []}
+
+    _executed, plan_epoch, _runs = read_signals("o/r", now=now, runner=crowded)
+    chk("coverage: an artifact STORM makes the watchdog page on rather than fire a false alarm",
+        (seen, plan_epoch == now - 600), ([1, 2, 3], True))
+
+    uncovered = []
+
+    def storm(args, label=""):
+        if "/artifacts" in args[-1]:
+            uncovered.append(args[-1])
+            return shallow
+        return {"workflow_runs": []}
+
+    read_signals("o/r", now=now, runner=storm)
+    chk("coverage: ... but the paging is BOUNDED, so a pathological storm costs a few requests, "
+        "never an unbounded walk", len(uncovered), ARTIFACT_MAX_PAGES)
+
+
 def _test_gh_flows(chk):
     """The live path over a stubbed `gh`: the signal reads, and the alert flow for both halves."""
     calls = []
@@ -682,15 +770,16 @@ def _test_gh_flows(chk):
                                   _artifact(f"{PLAN_ARTIFACT_PREFIX}101-1")]}
         return {"workflow_runs": [{"id": 101, "run_number": 1, "conclusion": "failure"}]}
 
-    executed_ids, plan_epoch, runs = read_signals("o/r", runner=fake)
-    chk("live: the watchdog costs exactly TWO API requests", len(calls), 2)
+    executed_ids, plan_epoch, runs = read_signals("o/r", now=1_800_000_000, runner=fake)
+    chk("live: the watchdog costs exactly TWO API requests in the normal case", len(calls), 2)
     chk("live: ... the artifacts listing and the dispatch runs listing",
         [("/artifacts" in calls[0]), ("workflows/dispatch.yml/runs" in calls[1])], [True, True])
     chk("live: it derives both signals from them",
         (executed_ids, plan_epoch is not None, failure_streak(runs, executed_ids)),
         ({101}, True, 1))
     chk("live: a REFUSED listing degrades to no signal rather than raising",
-        read_signals("o/r", runner=lambda *a, **k: None), (set(), None, None))
+        read_signals("o/r", now=1_800_000_000, runner=lambda *a, **k: None),
+        (set(), None, None))
 
     # The alert flow, end to end, with `gh` stubbed at the subprocess boundary.
     class _Result:
