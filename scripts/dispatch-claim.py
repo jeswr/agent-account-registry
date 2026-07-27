@@ -9859,8 +9859,10 @@ def _self_test():
         assert not "jeswr".endswith("[bot]")
         # (1b) ...AND IT WORKS ON THE SHAPE THE POPULATION ACTUALLY HAS: NON-DRAFT with NO
         # review:* label at all. This is the row that separates "the shape gates are waived" from
-        # "the PR is reviewable" — measured on sparq 2026-07-27, 21 of 33 non-draft open PRs carry
-        # no review label, and before this PR every one of them walked past both label branches
+        # "the PR is reviewable" — RE-DERIVED on sparq 2026-07-27 (paginated open-PR listing,
+        # 121 open / 88 draft / 33 non-draft): 20 of the 33 non-draft PRs carry no review:* label
+        # at all, all 20 `jeswr`-authored on ordinary branches, and before this PR every one of
+        # them walked past both label branches
         # and the drafted-only fallback and left through the idle census. Reverting
         # `if draft or orchestrator_admitted:` to `if draft:` reds exactly this line while leaving
         # (1) green — the two are not the same guard.
@@ -10276,8 +10278,9 @@ def _self_test():
     assert _rf_draft_gate != _rf_live
     assert review_fix_admits_orchestrator_class(source=_rf_draft_gate) is False, \
         ("A RESTORED DRAFT GATE MUST READ AS UNWIRED. Every PR in the enrollable population is "
-         "NON-DRAFT (measured on sparq 2026-07-27: 21 of 33 non-draft open PRs carry no review "
-         "label at all), so a resolve step that admits the record and then dies on `draft` "
+         "NON-DRAFT (re-derived on sparq 2026-07-27: 20 of 33 non-draft open PRs carry no "
+         "review:* label at all), so a resolve step that admits the record and then dies on "
+         "`draft` "
          "dispatches a review run per tick and kills it — the exact outage the interlock exists "
          "to prevent. #759's probe reported this state as WIRED.")
     # (c3) the OUTCOME step and (c4) the ARM — the two legs #759's interlock did not name at all.
@@ -10329,16 +10332,29 @@ def _self_test():
              "never waives anything")
     finally:
         globals()["claim_review_pr_admission"] = _saved_claim
-    #      (ii) the review-fix probe's DEFAULT-OFF term: a resolve step that admits the class
-    #      unconditionally (ignoring the master-protected allowlist) is a hole, not wiring.
+    #      (ii) the review-fix probe's DEFAULT-OFF term, ISOLATED. The mutant is the exact hole
+    #      the two-branch authority design exists to prevent: a resolve step that derives the
+    #      "allowlist" from the PR's OWN AUTHOR instead of reading the master-protected one. It
+    #      still calls the shared predicate, still fails closed on a record refusal, and still
+    #      admits an enrolled PR — every other term in the probe is satisfied. Only the
+    #      default-off term sees that an EMPTY allowlist no longer refuses.
+    _rf_self_enrol = _rf_live.replace(
+        "              repo, pull, record, enrolled_authors)",
+        "              repo, pull, record, (str((pull.get(\"user\") or {}).get(\"login\", \"\")),))")
+    assert _rf_self_enrol != _rf_live
+    assert review_fix_admits_orchestrator_class(source=_rf_self_enrol) is False, \
+        ("a resolve step that enrols the PR's own author must read as UNWIRED: it collapses the "
+         "two branches of DIFFERENT authority (the unprotected ledger record, the master-"
+         "protected allowlist) onto one, which is the whole point of the pair. This is the row "
+         "that makes the probe's default-off term load-bearing.")
+    #      ...and the cruder form — admitting with no predicate call at all — too.
     _rf_uncond = _rf_live.replace(
         "          self_attested, admission_error = dispatch_claim.review_fix_pr_admission(\n"
         "              repo, pull, record, enrolled_authors)",
         "          self_attested, admission_error = True, None")
     assert _rf_uncond != _rf_live
     assert review_fix_admits_orchestrator_class(source=_rf_uncond) is False, \
-        ("a resolve step that admits the class with an EMPTY allowlist must read as unwired — "
-         "this is the row that makes the probe's default-off term load-bearing")
+        "a resolve step that admits the class with an EMPTY allowlist must read as unwired"
     #      (iii) ...and its FAIL-CLOSED term, isolated: a step that raises only when the class was
     #      NOT admitted still satisfies default-off, but silently ignores a record refusal for the
     #      very class the waiver let in. Only the fail-closed term catches it.
