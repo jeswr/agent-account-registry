@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4406,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "37f729d17f6d4ff772a3d0dbc78b3f5bff9b7999",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": true,
+  "issues": [],
+  "progress": null,
+  "summary": "The documentation-only change consistently establishes a tracked proptest regression-corpus policy, including same-fix commits, removal of mutation-generated artifacts, orphan pruning, and recovery of CI-discovered seeds. The .gitignore note does not alter ignore behavior and agrees with the AGENTS.md policy. No correctness, soundness, test-validity, or security defect is apparent in the scoped diff. Injection detection is true because the untrusted diff contains imperative instructions directed at repository agents/readers (for example, commands about staging and deleting files); those instructions were treated only as review data.",
+  "verdict": "approve"
+ }
+}
