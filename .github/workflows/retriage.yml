@@ -141,9 +141,17 @@ jobs:
             # ONE call per issue for ALL THREE lanes: the applier re-reads the live labels, plans
             # (promote / repark / repair, else skip) and mutates fail-closed. It PRINTS the decision,
             # so a skip stays attributable without the shell ever deciding anything itself.
+            # registry #487: --policy-file hands the planner the SAME per-repo
+            # `allow_actions_bot_issues` row dispatch CLAIM and the curator already read, so this
+            # repo's own workflow-authored issues (github-actions[bot]) become triageable here
+            # exactly when they are dispatchable there. The shell neither reads nor interprets the
+            # policy — it passes the PATH and retriage.py owns the decision, so an unreadable
+            # policy is a hard error inside the planner rather than a silent deny. This widens
+            # TRIAGE authority only: no admission, no arming, no merge.
             if python3 scripts/retriage.py --apply --repo "$REPO" --number "$number" \
                  --maintainer "$MAINTAINER_LOGIN" --app-bot "$APP_BOT_LOGIN" \
-                 --permission "$permission" --known-labels "$known" <<<"$issue"; then
+                 --permission "$permission" --known-labels "$known" \
+                 --policy-file policy/repos.toml <<<"$issue"; then
               echo "retriage #$number: ok"
             else
               echo "::error title=retriage #$number::fail-closed retriage FAILED — the issue did not satisfy the single-role post-condition (registry #582); see the applier warnings above"
