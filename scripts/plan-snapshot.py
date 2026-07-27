@@ -35,10 +35,18 @@ churn, the exact scenario this file exists for). So:
   is a GitHub API outage/malformed-response condition, not attacker-inducible by
   inflating check-run volume on a head.
 
-Blowup reduced at source: the check-run read is gate-filtered (check_name=CI_GATE_CHECK,
-the d2c0dd0 pattern — an unfiltered listing both grows without bound under churn and can
-lose the gate run entirely); the unfiltered walk that names advisory failing legs runs
-ONLY when the filtered gate is a concluded failure (the only state that admits a ci-fix).
+Blowup reduced at source: the check-run read is gate-filtered (the d2c0dd0 pattern — an
+unfiltered listing both grows without bound under churn and can lose the gate run
+entirely); the unfiltered walk that names advisory failing legs runs ONLY when the
+filtered gate is a concluded failure (the only state that admits a ci-fix).
+
+The filter is applied ONCE PER TIER NAME (claim.CI_REPAIR_GATE_CHECKS) because the REST
+`check_name` parameter takes exactly one value and sparq's aggregator is named
+`gate, draft-tier` on a DRAFT head — which is what every worker PR is for the whole
+review loop. Reading only the strict name returned zero rows on every measured sparq
+worker head, and "zero rows" is indistinguishable from "this head has no gate".
+Each walk is cross-checked against the endpoint's own `total_count` so a partial read
+degrades the record loudly instead of impersonating an absent aggregator.
 
 Repo-level listings (issues / pulls) keep their sweep-fatal 5000-entry ceiling: the
 target planner step requires a complete issue snapshot for every manifest repo, so a
@@ -54,6 +62,7 @@ import re
 import sys
 import time
 from urllib.error import HTTPError, URLError
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 RETRYABLE = {403, 429, 500, 502, 503, 504}
@@ -147,18 +156,38 @@ def _paginated(fetch, path):
 def _fetch_check_runs(fetch, repo, sha, check_name=None):
     """Per-SHA check-runs walk. Every failure mode here is PER-ITEM (SnapshotItemError):
     the ceiling is a backstop, not a sweep-killer. check_name filtering keeps the common
-    case to one small page even on churned heads with hundreds of runs."""
-    filter_query = f"&check_name={check_name}" if check_name else ""
+    case to one small page even on churned heads with hundreds of runs — the name is
+    URL-QUOTED because a tier-marked aggregator name (`gate, draft-tier`) carries a comma
+    and a space.
+
+    The walk is CROSS-CHECKED against the endpoint's own `total_count`: a listing that ends
+    short of what GitHub says exists is a partial read, and a partial read that happens to
+    omit the aggregator is indistinguishable from "this head has no gate" — the exact silent
+    failure that stands every gate-dependent admission down. A disagreement (or an
+    absent/garbage count) degrades the record instead.
+
+    The filter is emitted FIRST in the query string, so the encoded name is always followed by a
+    `&` delimiter. `check_name=gate` is a strict PREFIX of `check_name=gate%2C%20draft-tier`;
+    trailing it made every name test in a fixture (or in a log grep, or in any future
+    request-matching double) prefix-shaped and therefore ORDER-dependent for its correctness.
+    Putting it first makes the parameter BOUNDARY available to any matcher, which is what
+    dispatch-claim's live read already relies on. [round-2 review, finding 3]"""
+    filter_query = f"check_name={quote(check_name, safe='')}&" if check_name else ""
     runs_out = []
+    raw_seen = 0
+    total = None
     for page in range(1, CHECK_RUN_PAGE_LIMIT + 1):
         try:
             doc = fetch(f"https://api.github.com/repos/{repo}/commits/{sha}"
-                        f"/check-runs?per_page=100&page={page}{filter_query}")
+                        f"/check-runs?{filter_query}per_page=100&page={page}")
         except FetchError as exc:
             raise SnapshotItemError("check-runs-read-failed") from exc
         runs = doc.get("check_runs") if isinstance(doc, dict) else None
         if not isinstance(runs, list):
             raise SnapshotItemError("check-runs-malformed")
+        if page == 1:
+            total = doc.get("total_count")
+        raw_seen += len(runs)
         runs_out.extend({
             "name": run.get("name"),
             "status": run.get("status"),
@@ -166,6 +195,8 @@ def _fetch_check_runs(fetch, repo, sha, check_name=None):
             "started_at": run.get("started_at"),
         } for run in runs if isinstance(run, dict))
         if len(runs) < 100:
+            if not isinstance(total, int) or isinstance(total, bool) or total != raw_seen:
+                raise SnapshotItemError("check-runs-malformed")
             return runs_out
     raise SnapshotItemError("check-runs-overflow")
 
@@ -227,8 +258,15 @@ def _pr_status_record(fetch, claim, repo, number):
         record["auto_merge"] = detail["auto_merge"]
     if SAFE_SHA.fullmatch(sha):
         try:
-            check_runs = _fetch_check_runs(fetch, repo, sha, check_name=claim.CI_GATE_CHECK)
-            if claim.interpret_check_runs(check_runs)["gate"] == "failure":
+            # BOTH aggregator tier names (the REST check_name filter takes exactly one). A
+            # worker PR is DRAFT for the whole review loop and sparq names the draft
+            # aggregator `gate, draft-tier`, so reading only claim.CI_GATE_CHECK returned zero
+            # rows on every measured sparq worker head — indistinguishable from "no gate",
+            # which stands the whole ci-fix admission down. See claim.CI_REPAIR_GATE_CHECKS.
+            check_runs = []
+            for gate_name in claim.CI_REPAIR_GATE_CHECKS:
+                check_runs += _fetch_check_runs(fetch, repo, sha, check_name=gate_name)
+            if claim.repair_gate_conclusion(check_runs) == "failure":
                 check_runs = check_runs + _fetch_check_runs(fetch, repo, sha)
             record["check_runs"] = check_runs
         except SnapshotItemError as exc:
@@ -299,11 +337,32 @@ def _self_test():
 
     claim = _load_claim()
     gate = claim.CI_GATE_CHECK
+    draft_gate = claim.CI_GATE_DRAFT_TIER_CHECK
     repo = "example/repo"
 
-    def gate_run(conclusion="success", status="completed", name=None):
+    def gate_run(conclusion="success", status="completed", name=None,
+                 started_at="2026-07-17T00:00:00Z"):
         return {"name": gate if name is None else name, "status": status,
-                "conclusion": conclusion, "started_at": "2026-07-17T00:00:00Z"}
+                "conclusion": conclusion, "started_at": started_at}
+
+    def page(runs, total=None):
+        """A well-formed check-runs page: GitHub always reports `total_count` for the
+        (optionally filtered) set, and _fetch_check_runs now cross-checks it."""
+        return {"check_runs": runs, "total_count": len(runs) if total is None else total}
+
+    def requested_name(url):
+        """Which tier name this filtered read asked for ('' = the unfiltered legs walk),
+        matched to the parameter BOUNDARY. `check_name=gate` is a strict PREFIX of
+        `check_name=gate%2C%20draft-tier`, so a bare substring test answers every draft-tier
+        request with the strict name's rows — the fixture bug that would fake this whole defect
+        away. This is boundary-safe rather than merely ordering-safe because _fetch_check_runs
+        emits the filter FIRST, so a `&` always terminates the encoded name; dropping that `&`
+        here (or moving the filter back to the end of the query) reds the tier assertions
+        below. [round-2 review, finding 3]"""
+        for name in (gate, draft_gate):
+            if f"check_name={quote(name, safe='')}&" in url:
+                return name
+        return ""
 
     def worker_pull(number, sha):
         return {"number": number, "state": "open",
@@ -312,6 +371,7 @@ def _self_test():
 
     sha_ok, sha_red, sha_over, sha_legs_over, sha_conflict = (
         "1" * 40, "2" * 40, "3" * 40, "4" * 40, "5" * 40)
+    sha_draft_red, sha_short = "6" * 40, "7" * 40
     pulls = [
         worker_pull(7, sha_over),        # gate-filtered listing never shortens -> overflow
         worker_pull(9, sha_ok),          # healthy sibling: must still be planned
@@ -320,6 +380,8 @@ def _self_test():
         worker_pull(15, sha_legs_over),  # gate failure but the unfiltered legs walk overflows
         worker_pull(17, sha_ok),         # detail WITHOUT an auto_merge field (round-6 P2)
         worker_pull(19, sha_conflict),   # mergeable null first, then DIRTY (issue #464)
+        worker_pull(21, sha_draft_red),  # DRAFT-TIER aggregator only: no `gate` row exists
+        worker_pull(23, sha_short),      # page ends short of total_count -> partial read
         {"number": 90, "state": "open",  # non-worker head: excluded from the census entirely
          "head": {"ref": "topic", "sha": sha_ok, "repo": {"full_name": repo}}},
     ]
@@ -343,29 +405,55 @@ def _self_test():
             return {"head": {"sha": sha_conflict},
                     "mergeable": None if conflict_detail_reads == 1 else False,
                     "draft": True, "auto_merge": None}
-        for number, sha in ((7, sha_over), (9, sha_ok), (11, sha_red), (15, sha_legs_over)):
+        for number, sha in ((7, sha_over), (9, sha_ok), (11, sha_red), (15, sha_legs_over),
+                            (21, sha_draft_red), (23, sha_short)):
             if url.split("?")[0].endswith(f"/pulls/{number}"):
                 # PR 7 is ARMED (auto_merge latched) — the round-1 disarm-under-overflow case.
                 # PR 9 is a DRAFT on the detail read — the round-4 carve-out confirmation bit.
                 return {"head": {"sha": sha}, "mergeable": True, "draft": number == 9,
                         "auto_merge": {"merge_method": "squash"} if number == 7 else None}
+        # BOUNDARY, not ordering: every filtered read must terminate its encoded check_name
+        # with a `&` so a matcher can tell `gate` from the name it is a strict prefix of.
+        # Moving the filter back to the end of the query string reds this.
+        if "/check-runs?" in url and "check_name=" in url:
+            assert re.search(r"[?&]check_name=[^&]+&", url), url
+        wanted = requested_name(url)
         if f"/commits/{sha_over}/" in url:
-            return {"check_runs": [gate_run() for _ in range(100)]}     # never a short page
+            return page([gate_run() for _ in range(100)], total=1000)   # never a short page
         if f"/commits/{sha_ok}/" in url:
             assert "check_name=" in url, "healthy head must be read gate-filtered"
-            return {"check_runs": [gate_run()]}
+            return page([gate_run()] if wanted == gate else [])
         if f"/commits/{sha_red}/" in url:
-            if "check_name=" in url:
-                return {"check_runs": [gate_run(conclusion="failure")]}
-            return {"check_runs": [gate_run(conclusion="failure"),
-                                   gate_run(conclusion="failure", name="leg-a")]}
+            if wanted == gate:
+                return page([gate_run(conclusion="failure")])
+            if wanted == draft_gate:
+                return page([])
+            return page([gate_run(conclusion="failure"),
+                         gate_run(conclusion="failure", name="leg-a")])
         if f"/commits/{sha_legs_over}/" in url:
-            if "check_name=" in url:
-                return {"check_runs": [gate_run(conclusion="failure")]}
-            return {"check_runs": [gate_run(conclusion="failure") for _ in range(100)]}
+            if wanted == gate:
+                return page([gate_run(conclusion="failure")])
+            if wanted == draft_gate:
+                return page([])
+            return page([gate_run(conclusion="failure") for _ in range(100)], total=1000)
         if f"/commits/{sha_conflict}/" in url:
             assert "check_name=" in url, "conflicting head must be read gate-filtered"
-            return {"check_runs": [gate_run()]}
+            return page([gate_run()] if wanted == gate else [])
+        if f"/commits/{sha_draft_red}/" in url:
+            # The live sparq shape since draft-tier CI: the head is a DRAFT, so the ONLY
+            # aggregator run present is `gate, draft-tier` and a `check_name=gate` read is
+            # legitimately EMPTY. Reading only the strict name yields "no gate row" and
+            # stands the whole ci-fix admission down on a provably red head.
+            if wanted == gate:
+                return page([])
+            if wanted == draft_gate:
+                return page([gate_run(conclusion="failure", name=draft_gate)])
+            return page([gate_run(conclusion="failure", name=draft_gate),
+                         gate_run(conclusion="failure", name="leg-b")])
+        if f"/commits/{sha_short}/" in url:
+            # A page that ENDS (short read) while the endpoint itself reports more rows exist:
+            # unprovable, and indistinguishable from "this head has no aggregator" if trusted.
+            return page([gate_run()], total=42)
         raise AssertionError(f"unexpected fetch {url}")
 
     with patch.object(time, "sleep") as sleep, tempfile.TemporaryDirectory() as out_dir:
@@ -376,7 +464,8 @@ def _self_test():
     assert doc["complete"] is True
     assert doc["skips"] == [{"pr_number": 7, "reason": "check-runs-overflow"},
                             {"pr_number": 13, "reason": "pr-detail-read-failed"},
-                            {"pr_number": 15, "reason": "check-runs-overflow"}], doc["skips"]
+                            {"pr_number": 15, "reason": "check-runs-overflow"},
+                            {"pr_number": 23, "reason": "check-runs-malformed"}], doc["skips"]
     assert all(skip["reason"] in claim.SNAPSHOT_SKIP_REASONS for skip in doc["skips"])
     # (ii) siblings are still planned, and their records interoperate with the PURE
     # claim-side interpreters (a pre-detail-skipped PR has NO record: nothing to guess from).
@@ -385,10 +474,31 @@ def _self_test():
     assert healthy["check_runs_degraded"] is False
     red = claim.pr_ci_status(doc["items"]["11"])
     assert red["gate"] == "failure" and red["failing_legs"] == ["leg-a"]
+    # (ii-b) DRAFT-TIER head: the strict merge-required `gate` context genuinely does not
+    # exist on it, but the tiered read sees the red aggregator. Deleting either tier name
+    # from CI_REPAIR_GATE_CHECKS (or dropping the second _fetch_check_runs call) turns
+    # repair_gate back into "missing" and reds this assertion — which is exactly the live
+    # defect: the ci-fix admission was unreachable on every sparq worker head.
+    draft_red = claim.pr_ci_status(doc["items"]["21"])
+    assert draft_red["gate"] == "missing", draft_red
+    assert draft_red["repair_gate"] == "failure", draft_red
+    # ...and the aggregator itself is never handed to the fixer as a leg to repair.
+    assert draft_red["failing_legs"] == ["leg-b"], draft_red
+    # (ii-c) the strict-name heads keep BOTH readings consistent, so the new field cannot
+    # silently diverge from `gate` where `gate` is actually present.
+    assert healthy["repair_gate"] == "success" and red["repair_gate"] == "failure"
+    # (ii-d) PARTIAL READ != "no gate row": PR 23's page ended short of the endpoint's own
+    # total_count, so the record DEGRADES (visible skip + marker) rather than reporting a
+    # head with no aggregator. Deleting the total_count cross-check makes this read
+    # "success"/planned and the skip row disappears.
+    short = claim.pr_ci_status(doc["items"]["23"])
+    assert doc["items"]["23"]["check_runs_degraded"] == "check-runs-malformed"
+    assert short["gate"] == "missing" and short["repair_gate"] == "missing", short
     # (iii) POST-detail degradation (PR #60 round-1 fix): a check-run overflow KEEPS the
     # detail record — check_runs EMPTY + an explicit marker — while the pre-detail
     # failure (13) stays a full skip with no record at all.
-    assert sorted(doc["items"]) == ["11", "15", "17", "19", "7", "9"], sorted(doc["items"])
+    assert sorted(doc["items"]) == ["11", "15", "17", "19", "21", "23", "7", "9"], \
+        sorted(doc["items"])
     assert doc["items"]["7"] == {"head_sha": sha_over, "mergeable": True, "draft": False,
                                  "auto_merge": {"merge_method": "squash"},
                                  "check_runs": [],
