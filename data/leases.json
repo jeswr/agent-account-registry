@@ -133,12 +133,12 @@
   {
    "account": "58b7c92faa5b5ca5",
    "claim_id": "7c2726a8d35f434ba411ec6bfceeda59",
-   "holder": "sparq-org/sparq#3387@dispatch-30297999008.1",
+   "holder": "sparq-org/sparq#3387@30298485614.1",
    "package": "sparq-gpu",
    "role": "research",
    "model": "opus5",
-   "issued_at": 1785180585,
-   "expires_at": 1785186885
+   "issued_at": 1785180620,
+   "expires_at": 1785186920
   }
  ]
 }
