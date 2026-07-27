@@ -2268,21 +2268,28 @@ def enrolment_enable_error(policy_doc, claim_admits, rf_admits):
 # saw would be a new throughput regression dressed up as safety. Once the backlog drains the bound
 # is inert.
 #
-# [#762] THE GREEN LANE'S OWN NUMBER, and whether the two ramps compose. Same census, same box,
-# same predicates (2026-07-27, 84 worker drafts, 41 393 check-runs paginated, 0 unprovable reads):
-# running THIS branch's full guard set rather than aggregator colour alone, 12 heads reach
-# needs-ci-fix of which the strict reading already saw 5 (so #761 newly reaches 7), and 20 reach
-# `stranded` of which the strict reading already saw 2 (so this half newly reaches 18). The two
-# figures are consistent with #761's 29 upper bound: 29 counts red aggregator colour, 12 is what
-# survives the human-hold / unreviewed-head / conflicting-base / live-lease guards.
+# [#762] THE GREEN LANE'S OWN NUMBER, and whether the two ramps compose. MEASURED by running THIS
+# TREE's own enumerate_review_items over live sparq-org/sparq data — the real guard set, not
+# aggregator colour — on 2026-07-27T14:47Z: 119 open PRs paginated, 85 worker-shaped heads, every
+# head's check-run listing walked per tier name and cross-checked against the endpoint's own
+# total_count (456 pages, 26 576 rows, ZERO short/unprovable reads, zero snapshot skips).
+#
+# Uncapped first-tick population: 7 needs-ci-fix (#761's half), 17 stranded (this half), plus 2
+# ordinary needs-review. Of those 24 repair rows the STRICT merge-required reading sees exactly
+# ZERO — only 20 of the 85 heads publish a `gate` row at all, and none of those 20 is among the 24.
+# So both halves are 100% newly reachable on the live fleet, and every stranded row's evidence
+# grade is `green:draft-tier`; `stranded:green:merge-required` is 0.
+#
+# With the bound below actually applied, tick 1 emits 5 + 5 + 2 = 12 and holds 2 fix / 12 review
+# for the following ticks. (Six worker PRs carry no provenance record on either branch and are
+# excluded upstream of all of this, so these figures UNDERSTATE the population.)
 #
 # THEY COMPOSE, and the reason is asymmetric rather than additive: only the FIX lane pushes
-# commits. 5/lane/tick therefore caps CI at +5 pushes per tick no matter what the review lane is
-# doing, which is the quantity the congestion-collapse mode is a function of. The review lane's 18
-# add reviewer ACCOUNT demand, not CI load, and that is bounded independently and earlier by the
-# account allocator (~28 slots across three lanes; 22 review-loop items already compete for them),
-# which returns no-slot and defers without mutating anything. At the ~10-minute cadence the 7
-# clears in 2 ticks and the 18 in 4 — full drain under 40 minutes.
+# commits. 5/lane/tick caps CI at +5 pushes per tick no matter what the review lane is doing, and
+# that push rate is the quantity the congestion-collapse mode is a function of. The review lane's
+# 17 add reviewer ACCOUNT demand, not CI load, and that is bounded independently and EARLIER by
+# the account allocator, which returns no-slot and defers without mutating anything. At the
+# ~10-minute cadence the 7 clears in 2 ticks and the 17 in 4 — full drain under 40 minutes.
 DRAFT_TIER_BACKLOG_PER_TICK_MAX = 5
 _DRAFT_TIER_NEW = "_draft_tier_newly_reachable"   # private; stripped before the plan row is built
 
