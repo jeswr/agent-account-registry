@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 858,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "039beabd069050237610f2882b29890a2fc22b07",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_fix_chain_model_pin` claims to return a pin only when `ladder[ladder.index(pin):]` is exactly the dispatcher intersection, but it compares the two with `set(...)`. In the live OpenAI tables, `fix_chain == [\"sol\", \"luna\"]` while `ESCALATION_LADDERS[\"openai\"] == [\"luna\", \"sol\"]`. The helper therefore returns `\"luna\"`, and review-fix.yml expands that pin to `[\"luna\", \"sol\"]`: the same members but the opposite preference order from the chain used by `allocator.claim`. This violates the documented equal-derivation/adopt contract and can change which tier is preferred if the workflow ever consumes the expanded chain independently. The self-tests exercise singleton, empty, unknown, and non-suffix intersections, but never assert the live full-chain expansion is order-identical, so they do not catch the defect.",
+    "file": "scripts/dispatch-claim.py",
+    "fix_hint": "Validate ordered equality, e.g. compare `ladder[ladder.index(floor):] == fix_chain`, not set equality. Add a non-vacuous test for the live full OpenAI chain that asserts either exact ordered round-trip through `model_pin` or fail-closed refusal when the existing floor-only input cannot represent that order.",
+    "severity": "major",
+    "title": "Model-pin validation ignores chain order and accepts a different workflow chain"
+   }
+  ],
+  "progress": null,
+  "summary": "The route intersection itself is fail-closed and the end-to-end tests cover the important singleton and empty-intersection cases. However, the model-pin representability check compares sets rather than ordered chains. For the live OpenAI full chain, this accepts a workflow expansion in the opposite order, contradicting the change's stated requirement that the dispatcher and workflow derive the same chain. Because routing chains encode preference order, this is a major soundness defect and the new tests leave that case uncovered.",
+  "verdict": "request_changes"
+ }
+}
