@@ -10667,7 +10667,7 @@ def _self_test():
     assert _wiring == [], _wiring
     _emission = _every_pass_emission_violations(
         _claim_scope, "dispatch(): the claim-census emission",
-        _is_census_print("claim-census"), "plan['repositories']")
+        _is_formatted_census_print("claim-census"), "plan['repositories']")
     assert _emission == [], _emission
     # The AST helpers are themselves mutation-tested HERE, on this leg's real source, so this pin
     # cannot become another guard that is merely asserted to work. Each edit below is a mutation a
@@ -10693,6 +10693,8 @@ def _self_test():
             None,  # handled below: needs the loop node, not a body statement
         "deleted outright, with a comment left naming it":
             "# print(format_partition_census('claim-census', repo, claim_census))\npass",
+        "the shared formatter replaced by a hand-rolled print of the same label":
+            "print('claim-census', repo, claim_census)",
         "preceded by a bare `continue` the emission can never survive":
             None,  # handled below: inserted BEFORE, not in place of
     }
@@ -10700,7 +10702,7 @@ def _self_test():
                        if isinstance(node, ast.For) and ast.unparse(node.iter)
                        == "plan['repositories']")
     _probe_index = next(i for i, node in enumerate(_probe_loop.body)
-                        if _is_census_print("claim-census")(node))
+                        if _is_formatted_census_print("claim-census")(node))
     for _probe, _replacement in _emission_probes.items():
         _scope = ast.parse(textwrap.dedent(inspect.getsource(dispatch))).body[0].body
         _loop = next(node for node in _scope if isinstance(node, ast.For)
@@ -10712,7 +10714,8 @@ def _self_test():
         else:
             _loop.body.insert(_probe_index, ast.parse("if True:\n    continue").body[0])
         _found = _every_pass_emission_violations(
-            _scope, "probe", _is_census_print("claim-census"), "plan['repositories']")
+            _scope, "probe", _is_formatted_census_print("claim-census"),
+            "plan['repositories']")
         assert _found, (
             f"the claim-census emission guard is VACUOUS against the mutation {_probe!r}: it "
             "returned no violation, which is exactly how the `^\\s*print\\(...\\)$` regex it "
@@ -12741,6 +12744,25 @@ def _is_census_print(label):
                 and _callee_name(node.value.func) == "print"
                 and any(isinstance(child, ast.Constant) and child.value == label
                         for child in ast.walk(node.value)))
+    return predicate
+
+
+def _is_formatted_census_print(label):
+    """`print(format_partition_census(<label>, ...))` as a bare STATEMENT. Stricter than
+    `_is_census_print`, and deliberately so on the `dispatch()` leg: dispatch.yml's assemble step
+    builds its line inline (it cannot import the helper), but the CLAIM leg must route through the
+    SHARED formatter or the two legs can seal and format differently — which is the divergence
+    `registry-758 (e)` exists to prevent. Replacing the call with a hand-rolled
+    `print("claim-census", ...)` would otherwise satisfy the locator while losing the sealing."""
+    located = _is_census_print(label)
+
+    def predicate(node):
+        return located(node) and any(
+            isinstance(child, ast.Call)
+            and _callee_name(child.func) == "format_partition_census"
+            and child.args and isinstance(child.args[0], ast.Constant)
+            and child.args[0].value == label
+            for child in ast.walk(node.value))
     return predicate
 
 
