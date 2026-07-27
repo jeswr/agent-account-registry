@@ -5011,6 +5011,28 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                 print(f"::warning::starvation park FAILED {repo}#{starvation_target}: {exc}; the "
                       f"`{GLOBAL_PACKAGE}` partition is still held")
 
+        # [registry #772] The starved lane's MISSING EDGE. The park sweep above declines every
+        # holder that is not an un-parked provably-inert draft — correctly, because parking an
+        # ACTIVE holder frees nothing — and the tick used to END THERE. A lane annihilated by a PR
+        # with no registry provenance record therefore sat at zero indefinitely, uncounted and
+        # unattributed. This does NOT free the partition (the PR's crates are genuinely unknowable
+        # and under-serialising them is the corrupting direction); it gives the class a COUNTED,
+        # CAPPED, NAMED terminal state that says which PR, why, and which recovery closes it.
+        for _escalated in starvation_provenance_escalation(
+                repository["items"], starved, live_occupancy):
+            defer_reasons["partition-starvation-unprovenanced"] += 1
+            print(f"::warning title=unprovenanced __global__ holder::"
+                  + starvation_provenance_escalation_body(repo, _escalated, starved).replace(
+                      "\n", " "))
+        if starved:
+            # The full holder census, once per starved tick: "why is the partition held" is now
+            # answerable from the run log alone, for every holder, not just the one escalated.
+            _census = global_reservation_census(live_occupancy)
+            if _census:
+                print(f"partition census {repo}: {starved} row(s) deferred behind "
+                      f"{sum(_census.values())} `{GLOBAL_PACKAGE}` holder(s) — "
+                      + ", ".join(f"{cause}={_census[cause]}" for cause in sorted(_census)))
+
         for item in repository["items"]:
             number = item["number"]
             lanes["worker"]["planned"] += 1
@@ -12277,6 +12299,36 @@ def _starvation_row(number, *, packages, parked=False, inactive=True, decision="
             "detail" if parked else "not-parked", inactive, cause)
 
 
+def _escalation_call_site(source):
+    """[registry #772] STRUCTURAL proof that some PRODUCTION function both iterates
+    `starvation_provenance_escalation(...)` and counts each result into the shared
+    `defer_reasons` bucket. Returns that function's name, or None.
+
+    Walks the parsed tree, not the text: the property is "a live `for` over this call whose body
+    increments this counter", which survives reflow/renaming of locals and cannot be satisfied by
+    a string appearing in a comment, a docstring, or a dead branch."""
+    import ast
+    tree = ast.parse(source)
+    for func in ast.walk(tree):
+        if not isinstance(func, ast.FunctionDef) or func.name.endswith("_self_test"):
+            continue
+        for loop in ast.walk(func):
+            if not isinstance(loop, ast.For):
+                continue
+            call = loop.iter
+            if not (isinstance(call, ast.Call)
+                    and getattr(call.func, "id", None) == "starvation_provenance_escalation"):
+                continue
+            for stmt in ast.walk(loop):
+                if (isinstance(stmt, ast.AugAssign) and isinstance(stmt.op, ast.Add)
+                        and isinstance(stmt.target, ast.Subscript)
+                        and getattr(stmt.target.value, "id", None) == "defer_reasons"
+                        and isinstance(stmt.target.slice, ast.Constant)
+                        and stmt.target.slice.value == "partition-starvation-unprovenanced"):
+                    return func.name
+    return None
+
+
 def _starvation_sweep_self_test():
     item = {"number": 900, "package": "crate-a", "deferred": False}
     holder = _starvation_row(41, packages={GLOBAL_PACKAGE})
@@ -12975,6 +13027,20 @@ def _starvation_sweep_self_test():
             "terminal or count park generations toward it")
     print("  ok   #677 call-site seam (source-level): the production loop CALLS the sweep, reads "
           "the plan evidence, and writes MACHINE_PARK_PR_LABEL — never the human terminal")
+
+    # ---- [registry #772] THE CALL-SITE SEAM, on the PARSED tree --------------------------------
+    # Every escalation assertion above exercises a PURE function. All of them stay green if the
+    # production tick simply never calls it — the mutant that leaves the feature perfectly tested
+    # and completely inert. Asserted structurally rather than textually on purpose: a six-character
+    # call-site edit can leave every string in place, and a regex anchored `(?m)^\s*...` matches at
+    # ANY indentation, so it cannot tell a live statement from one buried in a dead branch.
+    seam = _escalation_call_site(Path(__file__).resolve().read_text(encoding="utf-8"))
+    assert seam == "dispatch", (
+        "the production tick must iterate starvation_provenance_escalation(...) AND count each "
+        "escalated holder into defer_reasons['partition-starvation-unprovenanced'] — without "
+        f"both, an unprovenanced __global__ holder is silent again (found {seam!r})")
+    print("  ok   #772 call-site seam (AST): the production tick ITERATES the escalation and "
+          "COUNTS every escalated holder — a deleted call site or a dropped counter reds here")
 
     # ---- THE YAML SEAM: structural, on PARSED nodes ------------------------------------------
     _starvation_yaml_seam_self_test()
