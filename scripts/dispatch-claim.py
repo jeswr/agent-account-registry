@@ -3932,6 +3932,12 @@ def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_logi
         if isinstance(page, list):
             rows.extend(row for row in page if isinstance(row, dict))
     readmitted = migrated = 0
+    # [G5] One census row per admission DECISION, aggregated into a single population line at the
+    # end of the sweep. Per-PR "park stands" lines already exist; what did not exist is any
+    # aggregate that can tell a self-healing park from one no tick will ever clear, so the
+    # 20-hour stall of a HUMAN-APPLIED `review:parked` cohort was expressible only by reading
+    # every line of a 3,400-line run log. A per-run success signal cannot express a missing edge.
+    park_census = []
     for row in sorted(rows, key=lambda row: row.get("number") or 0):
         number = row.get("number")
         if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
@@ -3990,6 +3996,13 @@ def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_logi
                     f"{readmitted} park(s) (cap {AUTO_READMISSION_PER_TICK_MAX}) — the park "
                     "stands until the next tick so the re-entry cannot starve the allocator "
                     "whose starvation parked most of them")
+                # [G5] CENSUSED even though it never reaches the admission: this PR IS in the
+                # parked population, and a census that counts only what the admission decided
+                # sums to the ADMISSIONS, not to the population it claims to describe.
+                _park_policy.park_census_record(
+                    park_census, repo, number, _park_policy.PARK_REFUSAL_TICK_DEFERRED,
+                    f"this tick's automatic re-admission cap "
+                    f"({AUTO_READMISSION_PER_TICK_MAX}) is spent")
                 continue
             # ONE spelling of the hold rule (park_policy.human_owned_holds), shared with
             # capacity_park_admission's own refusal and the migration precondition, so the
@@ -4012,7 +4025,8 @@ def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_logi
                 consumed=worker_pr.park_generation_cutoffs(comments, bot_login),
                 auto_receipts=worker_pr.auto_readmission_records(comments, bot_login),
                 auto_marker_count=worker_pr.auto_readmission_marker_count(comments, bot_login),
-                auto_evidence=evidence_probe, live_holds=holds, log=log)
+                auto_evidence=evidence_probe, live_holds=holds, log=log,
+                census=park_census)
             if action == "auto-mint":
                 # RECEIPT FIRST, then the labels (see the docstring).
                 post_comment(repo, number, worker_pr.auto_readmission_receipt(
@@ -4032,7 +4046,58 @@ def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_logi
         except (DispatchError, worker_pr.WorkerPrError) as exc:
             log(f"::warning::auto-readmit skipped for {repo}#{number}: {exc}; the capacity "
                 "park stands")
+            # [G5] The exit that MOST needed counting. A per-PR read that fails on this tick can
+            # fail on every tick, and such a PR is stuck forever — the exact shape this census
+            # exists to make expressible — yet it left no row at all, because the failure
+            # precedes the admission call. It is counted conservatively: the read failure may
+            # have preceded the machine-park check, so this row can include a PR whose park
+            # status could not be ESTABLISHED. That is the fail-visible direction; unreadable is
+            # unknown, and unknown must be counted rather than silently dropped. It has its own
+            # code, so it pollutes neither the human-terminal cohort nor any other count.
+            _park_policy.park_census_record(
+                park_census, repo, number, _park_policy.PARK_REFUSAL_READ_FAILED,
+                f"the PR's own GitHub state could not be read ({exc})")
+    # The `continue`s ABOVE the try — a non-bot author, a fork head, a closed PR, a PR with no
+    # live machine park — are deliberately NOT censused: those PRs are not in the parked
+    # population, and counting them would make the aggregate describe the board instead of the
+    # parks. Every exit taken by a PR that IS parked now writes exactly one row.
+    _log_park_census(repo, park_census, log=log)
     return readmitted
+
+
+def _log_park_census(repo, census, log=print):
+    """[G5] Emit the parked-population census for ONE repository's re-admission sweep.
+
+    Three lines at most, and the split is the point:
+
+    - the always-on aggregate, so "how many parks, in what state" is one grep rather than a
+      reconstruction from per-PR lines;
+    - a ``::warning::`` naming the HUMAN-TERMINAL population, because that is the cohort no
+      later tick can clear — the sweep is declining CORRECTLY and will keep declining forever,
+      which is precisely the state a per-run success signal cannot express. Naming the PR
+      numbers is what makes it actionable instead of merely true;
+    - a ``::warning::`` for any UNCLASSIFIED code, which can only mean a writer added a refusal
+      the taxonomy does not know about. That is taxonomy drift, and the fail direction is to say
+      so loudly rather than to file it as self-healing.
+
+    Emits NOTHING for an empty census: a sweep that considered no parked PR has no population to
+    report, and a zero line every tick would train the reader to skip it."""
+    counts, terminal, unclassified = _park_policy.park_census_summary(census)
+    if not counts:
+        return
+    log(f"park census {repo}: " + ", ".join(f"{code}={count}" for code, count in counts.items()))
+    if terminal:
+        log(f"::warning::park census {repo}: {len(terminal)} parked PR(s) are in a HUMAN-TERMINAL "
+            "state that no automatic re-admission can clear — "
+            + ", ".join(f"#{number}" for number in terminal)
+            + ". These are declining CORRECTLY (a human-owned hold is live, a proven human "
+            "applied the park, or the automatic cap is spent); they need a HUMAN gesture, and "
+            "they will stay parked until one arrives.")
+    if unclassified:
+        log(f"::warning::park census {repo}: refusal code(s) outside the G5 taxonomy on "
+            + ", ".join(f"#{number}" for number in unclassified)
+            + " — a park writer has drifted from park_policy.PARK_REFUSAL_CODES and its "
+            "population is uncounted")
 
 
 # [registry #677] How many partition-starvation parks ONE tick may UN-park, per repository. The
@@ -5594,6 +5659,35 @@ STARVE_ALERT_MARKER = "<!-- sparq-escalate-starved:v1 -->"
 STARVE_RESET_MARKER = "<!-- sparq-escalate-recovered:v1 -->"
 
 
+def deferred_issue_ladder(cutoff, receipts, already_labeled=False):
+    """[registry #797] The deferred-issue lane's park-escalation ladder call, WITH the window
+    attribution it is entitled to claim — module level so it is EXECUTABLE by the self-test.
+
+    `park_ladder_decision` now requires `window_authority`, and this lane is entitled to
+    `WINDOW_AUTHORITY_HUMAN` for one specific reason: its `cutoff` comes STRAIGHT from
+    `park_policy.readmission_cutoff` over the issue's own label timeline, under the strict
+    maintainer probe, with NO automatic-re-admission stamps folded in (contrast the worker-PR
+    lane, which composes them through `readmission_window` and is where #797's false pages came
+    from). Every window this lane can mint is therefore one a proven human opened — which is
+    exactly the claim its terminal comment ("exhausted AGAIN after a human readmission") makes to
+    the maintainer.
+
+    IT IS A FUNCTION, NOT A LITERAL AT THE CALL SITE, DELIBERATELY. A bare
+    `window_authority=WINDOW_AUTHORITY_HUMAN` argument buried in the middle of the 400-line
+    dispatch loop is unreachable by any executable test — measured: swapping that literal for
+    WINDOW_AUTHORITY_UNKNOWN left the whole registry suite green while silently converting this
+    lane's human escalation into a `machine-terminal` the lane does not handle (it would fall
+    through to the `park` arm and mis-bucket itself). Here the claim has a name, a stated reason,
+    and the tests below.
+
+    The MACHINE terminal is unreachable from this lane BY CONSTRUCTION, and the self-test asserts
+    it: a lane that could reach it would need handling for it, and silently taking the `park` arm
+    instead is precisely the failure mode this extraction exists to make impossible."""
+    return _park_policy.park_ladder_decision(
+        cutoff, receipts, window_authority=_park_policy.WINDOW_AUTHORITY_HUMAN,
+        already_labeled=already_labeled)
+
+
 def absorbing_park_leg(repo, number, action, window_key, comments, bot_login, now,
                        linked_open_pr, worker_pr, attempt_marker, post_comment,
                        needs_user_landed, vetoed, log=print,
@@ -6247,11 +6341,10 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                                   "allocation re-enabled")
                             # fall through: the allocator + the `retry` label flip run again.
                         else:
-                            action, window_key, generation = (
-                                _park_policy.park_ladder_decision(
-                                    cutoff,
-                                    worker_pr.park_generation_cutoffs(comments, bot_login),
-                                    already_labeled="status:parked" in item["labels"]))
+                            action, window_key, generation = deferred_issue_ladder(
+                                cutoff,
+                                worker_pr.park_generation_cutoffs(comments, bot_login),
+                                already_labeled="status:parked" in item["labels"])
                             if action == "freeze":
                                 # Unreadable timeline: the ladder never advances on unproven
                                 # data — no window, no receipt, no label, no comment. NOT an
@@ -13846,19 +13939,30 @@ def _self_test():
         7: [],
     }
 
-    def readmit_sweep(window, rows=None, labels=None, comments=(), holds=None, timeline=None):
-        """Run the sweep with every GitHub seam injected; returns (count, posted, cleared)."""
+    def readmit_sweep(window, rows=None, labels=None, comments=(), holds=None, timeline=None,
+                      provenance=None, comments_fn=None):
+        """Run the sweep with every GitHub seam injected; returns (count, posted, cleared).
+
+        The sweep's OWN log is captured on `readmit_sweep.log` rather than discarded. It used to
+        go to `lambda _line: None`, which threw away the only output the [G5] census produces —
+        so every census assertion had to call `_log_park_census` directly with hand-built rows,
+        and NOTHING bound the sweep to the emitter except a shape check. See the
+        "[G5] END-TO-END" block below for the two argument-only mutants that survived because of
+        it."""
         posted, cleared = [], []
+        readmit_sweep.log = []
         count = _readmit_capacity_parks(
             "example/repo", rows if rows is not None else [[parked_row]],
             labels if labels is not None else {7: ["status:in-progress-review"]},
-            {41: {"issue": 7}}, readmit_bot, Path("."), worker_pr_mod,
+            provenance if provenance is not None else {41: {"issue": 7}},
+            readmit_bot, Path("."), worker_pr_mod,
             _capacity_recovery_probe(model_health_mod, window, readmit_now),
-            comments_fn=lambda _repo, _number: list(comments),
+            comments_fn=(comments_fn if comments_fn is not None
+                         else lambda _repo, _number: list(comments)),
             timeline_fn=lambda _repo, number: list((timeline or park_timeline).get(number, [])),
             post_comment=lambda _repo, number, body: posted.append((number, body)),
             clear_labels=lambda pr, issue: cleared.append((pr, issue)),
-            log=lambda _line: None)
+            log=readmit_sweep.log.append)
         return count, posted, cleared
 
     # A(a): the machine park + a post-park success on the failing account => re-admitted ONCE,
@@ -13922,6 +14026,104 @@ def _self_test():
         count, posted, cleared = readmit_sweep(recovered_window, timeline=human_park)
         assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
         print("  ok   auto-readmit (e): a MAINTAINER-applied park is never auto-re-admitted")
+
+        # ------------------------------------------------------------------------------------
+        # [G5] END-TO-END: the census the REAL sweep emits, from the REAL sweep's own log.
+        #
+        # The AST guard further down proves a `census=` keyword EXISTS and that
+        # `_log_park_census` is called exactly once. It never checks WHAT is passed, and review
+        # of 69535be8 demonstrated the hole by execution: `census=park_census` -> `census=[]`,
+        # and `_log_park_census(repo, park_census, ...)` -> `_log_park_census(repo, [], ...)`,
+        # each a one-argument edit, left the AST guard satisfied and EVERY check in both suites
+        # green while the entire headline deliverable vanished from the output — the same
+        # "a per-run success signal cannot express a missing edge" shape this PR exists to
+        # remove, reintroduced in the fix for it. A third mutant (the emitter moved INSIDE the
+        # per-PR loop) survived for the same reason.
+        #
+        # So this asserts the sweep's OWN log, on a MIXED population, and it is the only place
+        # that does: PR #41 is a MAINTAINER-applied park (human-terminal) and PR #42 is a
+        # machine park whose starvation cause has not recovered (exit-reachable). The `[:2]`
+        # window is still broken, so nothing is re-admitted and both PRs reach a refusal.
+        census_row_42 = dict(parked_row, number=42,
+                             head={**parked_row["head"], "ref": "sparq-agent/issue-8-def"})
+        census_timeline = dict(human_park)
+        census_timeline[42] = [{"event": "labeled",
+                                "label": {"name": MACHINE_PARK_PR_LABEL},
+                                "created_at": park_stamp, "actor": {"login": readmit_bot},
+                                "performed_via_github_app": {"slug": "app"}}]
+        census_timeline[8] = []
+        count, posted, cleared = readmit_sweep(
+            still_broken_window, rows=[[parked_row, census_row_42]],
+            labels={7: ["status:in-progress-review"], 8: ["status:in-progress-review"]},
+            timeline=census_timeline, provenance={41: {"issue": 7}, 42: {"issue": 8}})
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        sweep_log = readmit_sweep.log
+        aggregates = [line for line in sweep_log if line.startswith("park census example/repo: ")]
+        terminal_warnings = [line for line in sweep_log
+                             if line.startswith("::warning::park census ")
+                             and "HUMAN-TERMINAL" in line]
+        # EXACTLY ONE aggregate for the whole sweep: an emitter moved inside the per-PR loop
+        # emits one per PR, which is a different (and useless) artefact.
+        assert len(aggregates) == 1, sweep_log
+        # The aggregate is computed from the rows the ADMISSION wrote — nulling either argument
+        # empties `counts` and `_log_park_census` returns before printing anything at all.
+        assert aggregates[0] == "park census example/repo: human-applied=1, no-evidence=1", \
+            aggregates[0]
+        # ...and the human-terminal cohort is NAMED. #41 is the maintainer-applied park; #42 is
+        # exit-reachable and must NOT be swept into the warning, or the warning stops
+        # distinguishing "no tick will ever clear this" from "a later tick will".
+        assert len(terminal_warnings) == 1, sweep_log
+        assert "1 parked PR(s)" in terminal_warnings[0], terminal_warnings[0]
+        assert "#41" in terminal_warnings[0] and "#42" not in terminal_warnings[0], \
+            terminal_warnings[0]
+        print("  ok   [G5] END-TO-END: the REAL sweep's own log carries the aggregate census "
+              "(human-applied=1, no-evidence=1) and NAMES the human-terminal PR (#41, not #42)")
+
+        # ------------------------------------------------------------------------------------
+        # [G5] THE ROWS SUM TO THE POPULATION — 8 parked PRs in, 8 rows out.
+        #
+        # Review measured this exact scenario on the first round of the taxonomy and got 8 in
+        # and 5 counted: the per-tick pacing defer and a failed per-PR read both `continue`
+        # BEFORE the admission call, so neither wrote a row and the aggregate summed to the
+        # ADMISSIONS instead of the population. The read-failure case is the one that matters —
+        # a PR whose GitHub read fails on this tick can fail on every tick, which is a
+        # stuck-forever population that the one aggregate built to express it could not see.
+        #
+        # #41's comments read raises (read-failed); #42..#46 re-admit on proven recovery and
+        # spend AUTO_READMISSION_PER_TICK_MAX; #47 and #48 are then paced off (tick-deferred).
+        crowd = [dict(parked_row, number=n,
+                      head={**parked_row["head"], "ref": f"sparq-agent/issue-{n - 34}-abc"})
+                 for n in range(41, 49)]
+        crowd_provenance = {n: {"issue": n - 34} for n in range(41, 49)}
+        crowd_timeline = {n: [{"event": "labeled",
+                               "label": {"name": MACHINE_PARK_PR_LABEL},
+                               "created_at": park_stamp, "actor": {"login": readmit_bot},
+                               "performed_via_github_app": {"slug": "app"}}]
+                          for n in range(41, 49)}
+        crowd_timeline.update({n - 34: [] for n in range(41, 49)})
+
+        def crowd_comments(_repo, number):
+            if number == 41:
+                raise DispatchError("comments page unreadable")
+            return []
+
+        count, posted, cleared = readmit_sweep(
+            recovered_window, rows=[crowd], labels={n - 34: [] for n in range(41, 49)},
+            timeline=crowd_timeline, provenance=crowd_provenance, comments_fn=crowd_comments)
+        assert count == AUTO_READMISSION_PER_TICK_MAX == 5, count
+        crowd_aggregates = [line for line in readmit_sweep.log
+                            if line.startswith("park census example/repo: ")]
+        assert len(crowd_aggregates) == 1, readmit_sweep.log
+        assert crowd_aggregates[0] == (
+            "park census example/repo: admitted-auto-mint=5, read-failed=1, tick-deferred=2"), \
+            crowd_aggregates[0]
+        # 8 PRs entered the parked population; 8 rows came out. Nothing is human-terminal here,
+        # so no operator is paged for a transient read failure or a paced defer.
+        assert not [line for line in readmit_sweep.log if "HUMAN-TERMINAL" in line], \
+            readmit_sweep.log
+        print("  ok   [G5] END-TO-END: the census rows SUM TO THE POPULATION — 8 parked PRs in, "
+              "8 rows out (5 admitted + 1 read-failed + 2 tick-deferred), none paged as "
+              "human-terminal")
         # A(g): the per-PR cap terminates — AUTO_READMISSION_MAX markers (well-formed or not)
         # refuse the next re-admission even with fresh evidence.
         capped = [{"user": {"login": readmit_bot},
@@ -14900,6 +15102,7 @@ def _self_test():
 
     _starvation_sweep_self_test()
     _absorbing_park_leg_self_test()
+    _deferred_issue_ladder_self_test()
 
     print("dispatch-claim self-test PASSED")
 
@@ -15063,6 +15266,74 @@ def _starvation_sweep_self_test():
     assert _park_policy.HUMAN_PARK_LABEL not in body.splitlines()[0], body.splitlines()[0]
     print("  ok   #677 starvation park: writes review:parked + ONE receipt and NOTHING else — "
           "never needs:user, review:needs-user or status:parked")
+
+    # ---- [G5] the parked-population census -------------------------------------------------
+    #
+    # The sweep emits one "park stands" line per PR per tick and NO aggregate, so a cohort that
+    # is declining correctly-but-forever is indistinguishable from one about to self-heal.
+    # MEASURED on sparq-org/sparq (dispatch run 30262478746, 2026-07-27T11:53Z): 21 parked PRs,
+    # reported by the only existing aggregate as a single "machine capacity park stands ...=13".
+    census_log = []
+    _log_park_census("o/r", [], log=census_log.append)
+    assert census_log == [], census_log
+    print("  ok   [G5] an EMPTY census emits nothing — no zero line to train the reader to skip")
+
+    census_log.clear()
+    _log_park_census("o/r", [
+        {"repo": "o/r", "number": 4197, "code": _park_policy.PARK_REFUSAL_HUMAN_APPLIED,
+         "exit": "human-terminal", "detail": "x"},
+        {"repo": "o/r", "number": 3577, "code": _park_policy.PARK_REFUSAL_HUMAN_APPLIED,
+         "exit": "human-terminal", "detail": "x"},
+        {"repo": "o/r", "number": 4519, "code": _park_policy.PARK_REFUSAL_NO_EVIDENCE,
+         "exit": "exit-reachable", "detail": "x"},
+    ], log=census_log.append)
+    aggregate = census_log[0]
+    assert aggregate == "park census o/r: human-applied=2, no-evidence=1", aggregate
+    warning = census_log[1]
+    assert warning.startswith("::warning::park census o/r: 2 parked PR(s) are in a "
+                              "HUMAN-TERMINAL state"), warning
+    # The population must be NAMED. A count alone is true and useless — an operator cannot act
+    # on "2 PRs", and the whole defect being fixed is that this cohort was unidentifiable.
+    assert "#3577" in warning and "#4197" in warning, warning
+    # ... and the exit-reachable PR must NOT be swept into the human-terminal warning: conflating
+    # them is the exact bucket this census exists to split.
+    assert "#4519" not in warning, warning
+    assert len(census_log) == 2, census_log
+    print("  ok   [G5] the census splits human-terminal from exit-reachable and NAMES the "
+          "cohort a human must clear")
+
+    census_log.clear()
+    _log_park_census("o/r", [{"repo": "o/r", "number": 99, "code": "some-future-code"}],
+                     log=census_log.append)
+    assert any("outside the G5 taxonomy" in line and "#99" in line for line in census_log), \
+        census_log
+    print("  ok   [G5] a refusal code outside the taxonomy is reported as drift, never filed "
+          "as self-healing")
+
+    # THE WIRING, asserted on the PARSED TREE — not on the source text. A comment mentioning
+    # `census` cannot satisfy an AST query, and neither can a docstring; the keyword argument and
+    # the call have to genuinely be there. (Measured repeatedly on this repo: wiring assertions
+    # that grep source text stay green when the wiring is deleted but the comment survives.)
+    import ast as _ast
+    _sweep_tree = _ast.parse(textwrap.dedent(inspect.getsource(_readmit_capacity_parks)))
+    _admission_census_kw = [
+        call for call in _ast.walk(_sweep_tree)
+        if isinstance(call, _ast.Call)
+        and isinstance(call.func, _ast.Attribute)
+        and call.func.attr == "capacity_park_admission"
+        and any(kw.arg == "census" for kw in call.keywords)]
+    assert len(_admission_census_kw) == 1, \
+        f"_readmit_capacity_parks must pass census= to capacity_park_admission exactly once; " \
+        f"found {len(_admission_census_kw)}"
+    _census_emitters = [
+        call for call in _ast.walk(_sweep_tree)
+        if isinstance(call, _ast.Call) and isinstance(call.func, _ast.Name)
+        and call.func.id == "_log_park_census"]
+    assert len(_census_emitters) == 1, \
+        f"_readmit_capacity_parks must emit the census exactly once; found " \
+        f"{len(_census_emitters)}"
+    print("  ok   [G5] the sweep is WIRED to the census (AST-asserted: census= keyword + one "
+          "emitter, immune to a comment that merely names it)")
 
     # RECEIPT-FIRST: a crash between the two leaves an explained PR with no label, never a
     # mysterious label with no explanation.
@@ -16360,6 +16631,74 @@ def _starvation_yaml_seam_self_test():
 # The discriminating fixtures are the ones where the leg must do NOTHING it did not earn: a clock
 # inside the grace, a window whose terminal is already receipted, an issue with an open worker PR,
 # and a ladder action that is not absorbing at all.
+def _deferred_issue_ladder_self_test():
+    """[registry #797] The deferred-issue lane's ladder call, EXECUTED.
+
+    Every assertion here died when the window authority was swapped for
+    WINDOW_AUTHORITY_UNKNOWN — the mutant that survived the whole registry suite while the
+    authority was an inline literal at an untestable call site."""
+    policy = _park_policy
+    human = "2026-07-23T09:18:19Z"
+
+    def chk(name, got, want):
+        assert got == want, f"{name}: {got!r} != {want!r}"
+        print(f"  ok   {name}")
+
+    chk("[#797] the deferred-issue lane's window is HUMAN-authorised, so its second consumed "
+        "window still reaches the human terminal — the escalation this lane is entitled to",
+        deferred_issue_ladder(human, {policy.PARK_WINDOW_NONE}),
+        ("terminal", human, policy.PARK_ESCALATION_GENERATIONS))
+    chk("[#797] ...and the first one still parks rather than escalating",
+        deferred_issue_ladder(human, set()), ("park", human, 1))
+    # The MACHINE terminal is unreachable from this lane. The lane has no arm for it, so a
+    # `machine-terminal` here would silently fall through to the `park` arm and mis-bucket
+    # itself — the exact silent-fall-through the extraction exists to make impossible.
+    reachable = {deferred_issue_ladder(cutoff, receipts, already_labeled=labeled)[0]
+                 for cutoff in (None, human, "2026-07-24T00:00:00Z", policy.WINDOW_UNREADABLE)
+                 for receipts in (set(), {policy.PARK_WINDOW_NONE},
+                                  {policy.PARK_WINDOW_NONE, human},
+                                  {policy.PARK_WINDOW_NONE, human, "2026-07-24T00:00:00Z"})
+                 for labeled in (False, True)}
+    chk("[#797] `machine-terminal` is UNREACHABLE from the deferred-issue lane (it has no arm "
+        "for it, so reaching it would fall through to `park` and mis-bucket the exit)",
+        "machine-terminal" in reachable, False)
+    chk("[#797] ...and every action it CAN reach is one the lane actually handles",
+        reachable - {"freeze", "dedupe", "unchanged", "legacy-quiet", "terminal", "park"},
+        set())
+    # Whatever it returns must be a DECLARED census bucket — the closed enum raises otherwise,
+    # so a future action reaching this lane cannot vanish from the tick summary.
+    for action in sorted(reachable):
+        if action in policy.PARK_ABSORBING_ACTIONS:
+            continue
+        policy.budget_exhausted_bucket(action)
+    print("  ok   [#797] every action the lane can reach maps to a declared census bucket")
+
+    # THE CALL-SITE SEAM. Everything above tests the helper; none of it can see the dispatch loop
+    # calling `park_ladder_decision` DIRECTLY with its own (wrong) authority and bypassing the
+    # helper entirely — measured, that mutant survived the whole registry suite. The property is
+    # therefore proved STRUCTURALLY over the parsed tree: this module may reach the ladder in
+    # exactly ONE place, and that place is `deferred_issue_ladder`. Walking the AST (not the
+    # text) means a call cannot hide in a lambda, a nested def, a dead branch or a reflow, and a
+    # matching string in a comment or docstring proves nothing.
+    import ast
+    source = Path(__file__).resolve().read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    owner = next(node for node in ast.walk(tree)
+                 if isinstance(node, ast.FunctionDef) and node.name == "deferred_issue_ladder")
+    inside = {id(node) for node in ast.walk(owner)}
+    strays = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if getattr(node.func, "attr", None) != "park_ladder_decision":
+            continue
+        if id(node) not in inside:
+            strays.append(node.lineno)
+    chk("[#797] dispatch-claim reaches park_ladder_decision through deferred_issue_ladder and "
+        "NOWHERE else — the authority claim cannot be bypassed at the call site",
+        strays, [])
+
+
 def _absorbing_park_leg_self_test():
     here = Path(__file__).resolve()
     policy = _park_policy

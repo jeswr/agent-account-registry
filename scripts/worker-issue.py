@@ -771,6 +771,17 @@ STATUS_TRANSITIONS = {
     "readmitted": ({"status:in-progress-review"},
                    {"status:parked", "status:deferred", "status:ready",
                     "status:in-progress"}),
+    # `handback` [registry #797]: the SOURCE-ISSUE half of a MACHINE-TERMINAL retirement
+    # (worker-pr._retire_worker_pr). Its worker PR consumed two full budgets and has just been
+    # CLOSED, so — unlike `readmitted`, which restores the in-progress-review posture of a PR
+    # that is still open — the issue goes back to the implementable frontier for a FRESH attempt,
+    # normally on a decomposed `role:research` route the caller swapped in first. It clears the
+    # machine park and every in-flight posture and restores `status:ready`. It applies NO park
+    # label, so it is not veto-gated: like `readmitted`, clearing a machine park points the same
+    # way a human unpark does. `status:ready` here is dispatchability, never approval (issue #31).
+    "handback": ({"status:ready"},
+                 {"status:parked", "status:deferred", "status:in-progress",
+                  "status:in-progress-review"}),
     "complete": (set(), {"status:in-progress", "status:in-progress-review",
                          "status:deferred", "status:parked"}),
 }
@@ -1588,6 +1599,21 @@ def _self_test():
         assert any(path.endswith("labels/status:parked") for path in deletes), deletes
         assert any(path.endswith("labels/status:deferred") for path in deletes), deletes
         assert all("status:ready" not in labels for labels in posts), posts
+        # (x-vi-c) [registry #797] `handback`: the source-issue half of a MACHINE-TERMINAL
+        # retirement. Its worker PR has just been CLOSED, so — unlike `readmitted`, whose PR is
+        # still open — the issue goes back to the IMPLEMENTATION frontier: status:ready, with the
+        # machine park AND every in-flight posture cleared. Each removal is load-bearing: a
+        # handback that left `status:parked` (or `status:deferred`, or the in-progress-review
+        # posture of the PR it just closed) standing would be gated straight back out of the
+        # ready engine, and the work the retirement was supposed to preserve would be lost
+        # silently — which is exactly the absorbing state the retirement exists to escape.
+        posts.clear(); deletes.clear()
+        timeline.clear()
+        set_status("o/r", 9, "handback")
+        assert posts == [["status:ready"]], posts
+        for cleared in ("status:parked", "status:deferred", "status:in-progress",
+                        "status:in-progress-review"):
+            assert any(path.endswith(f"labels/{cleared}") for path in deletes), (cleared, deletes)
         # (x-vii) STRICT human probe (park-policy hygiene finding): an unlabel by an actor the
         # collaborator probe cannot confirm as a maintainer mints NO veto — the park proceeds.
         posts.clear(); deletes.clear()
@@ -1780,10 +1806,10 @@ def main():
     trust.add_argument("--forbid-gate-root", default=None)
 
     status = subparsers.add_parser("status", parents=[common])
-    status.add_argument("--status", choices=("in-progress", "in-progress-review", "retry",
-                                             "deferred", "needs-user", "parked", "readmitted",
-                                             "complete"),
-                        required=True)
+    # Derived from STATUS_TRANSITIONS, never re-declared: a transition added to the table without
+    # a CLI choice is unreachable from every helper call site (worker-pr, dispatch-claim), and
+    # this list silently drifting out of date is exactly how a new exit becomes a no-op.
+    status.add_argument("--status", choices=tuple(sorted(STATUS_TRANSITIONS)), required=True)
 
     receipt = subparsers.add_parser("claim-receipt", parents=[common])
     receipt.add_argument("--model", required=True)

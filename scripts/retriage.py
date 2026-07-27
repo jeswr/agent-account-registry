@@ -18,6 +18,24 @@ directions:
               is repaired in place. Strictly better than a re-park — it needs no human — and it is
               the SAME classifier verdict, not a second notion of completeness.
 
+WHO MAY BE RETRIAGED (registry #487). The author trust gate is the FIRST thing `plan()` checks,
+and until now it recognised exactly two automation identities: the maintainer and the orchestrator
+App bot. `github-actions[bot]` — the login every one of THIS repo's own workflows authors issues as
+— is neither, and reads a repo permission of `none`, so a lane-labelled issue our own automation
+opened would return `untrusted-author` and be neither promotable out of `status:untriaged` nor
+demotable on a label regression. #487 already shipped the per-repo `allow_actions_bot_issues`
+opt-in and wired it into dispatch CLAIM (`dispatch-claim._issue_is_trusted`) and the curator
+(`curate-frontier.trusted_author`); this sweep was the residual consumer. It now reads the SAME
+policy row, so triage trust cannot drift from admission trust. This is a LATENT-CONSISTENCY fix
+and is INERT on this repo today: the sweep's board is exactly the `status:untriaged` and
+`status:ready` lane queries, and nothing labels a `github-actions[bot]` issue onto either lane
+(see the "[registry #487] THE ACTIONS-BOT TRIAGE OPT-IN" block in the self-test for the executed
+board-membership assertion and the upstream unit this waits on). The opt-in admits the EXACT login
+`github-actions[bot]` and nothing else — never a `<x>[bot]` suffix match, which is the defect #487
+closed on the dispatch side, since a suffix would admit any unrelated or compromised GitHub App.
+It widens TRIAGE only: it grants no admission, no arming and no merge, and every park below is
+still evaluated afterwards, unchanged.
+
 FAIL CLOSED. `triage.triage()` is the only completeness classifier and `ready-issues` is the only
 enumerability predicate; if the drift does not PROVE one of the three transitions the plan is a
 no-op skip. Park policy is load-bearing and checked BEFORE any classification: an untrusted author,
@@ -45,6 +63,7 @@ import importlib.util
 import json
 import os
 import sys
+import tomllib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -65,6 +84,12 @@ _ready = _load("ready_issues", "ready-issues.py")
 
 HOLD_MARKER = "<!-- orchestration:hold -->"
 TRUSTED_PERMISSIONS = {"admin", "maintain", "write"}
+# registry #487. The EXACT login every workflow in one of our own repositories authors issues as.
+# Compared with `==`, never a suffix/prefix/case-folded test: a `<x>[bot]` suffix match is what
+# admitted arbitrary GitHub Apps into dispatch before #487, and `curate-frontier.ACTIONS_BOT_LOGIN`
+# / `dispatch-claim._issue_is_trusted` spell the same string for the same reason. The self-test
+# asserts this constant is still IDENTICAL to the curator's, so the three cannot drift apart.
+ACTIONS_BOT_LOGIN = "github-actions[bot]"
 # Claim-owned states: groom's orphan/lease repair owns these, never this sweep (a re-park here
 # would race a live worker and strip the claim its PR is bound to).
 CLAIM_OWNED = {"status:in-progress", "status:in-progress-review"}
@@ -87,8 +112,55 @@ class SweepError(RuntimeError):
     """A snapshot this sweep refuses to act on (runaway size, or a partial/malformed page)."""
 
 
+def actions_bot_trust(policy_file, repo):
+    """Is `github-actions[bot]` a trusted TRIAGE author for `repo`? (registry #487)
+
+    policy/repos.toml's per-repo `allow_actions_bot_issues` is the ONE source of truth — the same
+    row `dispatch-claim._issue_is_trusted` and `curate-frontier.trusted_author` already read — so
+    this sweep cannot grant (or withhold) triage trust that admission does not.
+
+    Three outcomes, and the difference between them is load-bearing:
+
+      * NO policy requested (an empty `--policy-file`) -> False. Nothing was declared, so nothing
+        is widened; this is the pre-#487 behaviour and remains the default for every caller that
+        does not opt in.
+      * A policy that names `repo` -> that row's boolean, defaulting False when the key is absent
+        (`_allow_actions_bot_issues_of`'s contract, mirrored). A repo the policy does not mention
+        at all is likewise False — unmentioned is not opted in.
+      * A policy we were TOLD to read and could NOT (missing file, undecodable TOML, no `[repos]`
+        table, a non-table row, a non-boolean flag) -> SweepError, which the caller turns into a
+        red step. Silently returning False there would rebuild the exact invisible starvation #487
+        is about: an unreadable policy would be indistinguishable from "not allowed" and nobody
+        would ever be told which one happened.
+
+    `enabled` is deliberately NOT consulted. It declares whether a repo is a DISPATCH target;
+    this flag declares who may author an issue in it. Coupling them would silently switch triage
+    trust off as a side effect of pausing dispatch — a second invisible-starvation shape.
+    """
+    if not policy_file:
+        return False
+    try:
+        with open(policy_file, "rb") as handle:
+            document = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise SweepError(f"repository policy {policy_file!r} could not be read, so the "
+                         f"actions-bot triage opt-in cannot be resolved: {exc}") from exc
+    rows = document.get("repos") if isinstance(document, dict) else None
+    if not isinstance(rows, dict) or not rows:
+        raise SweepError(f"repository policy {policy_file!r} has no [repos] target rows")
+    row = rows.get(repo)
+    if row is None:
+        return False
+    if not isinstance(row, dict):
+        raise SweepError(f"repository policy row for {repo!r} is not a table")
+    value = row.get("allow_actions_bot_issues", False)
+    if not isinstance(value, bool):
+        raise SweepError(f"allow_actions_bot_issues for {repo!r} must be boolean")
+    return value
+
+
 def plan(issue, maintainer, app_bot, permission, classify=static_triage.triage,
-         known_labels=None):
+         known_labels=None, allow_actions_bot_issues=False):
     """`known_labels` (optional): the target repo's ACTUAL label set. Supplying it makes the role
     transition fail-closed (registry #582) — the classifier never plans an add of a label the repo
     does not have, and never plans a strip of the last role label for one. Without a role the
@@ -97,9 +169,19 @@ def plan(issue, maintainer, app_bot, permission, classify=static_triage.triage,
     labels = {item["name"] if isinstance(item, dict) else item
               for item in issue.get("labels", [])}
     author = (issue.get("author") or {}).get("login", "")
-    trusted = (author in {maintainer, app_bot} or permission in TRUSTED_PERMISSIONS)
+    trusted = (author in {maintainer, app_bot} or permission in TRUSTED_PERMISSIONS
+               # registry #487: the ONE narrow per-repo opt-in. Fork-PR workflows get read-only
+               # tokens and cannot create issues, so this login can only author an issue in one of
+               # our own repositories through a workflow that repository already controls. EXACT
+               # equality — `my-github-actions[bot]` and `evil[bot]` must both still be refused.
+               or (allow_actions_bot_issues and author == ACTIONS_BOT_LOGIN))
     if not trusted:
         return {"action": "skip", "reason": "untrusted-author"}
+    # Everything below this line is UNCHANGED by the opt-in. It widens who may be CLASSIFIED, not
+    # what a classification may do: every `needs:*` / `trust:untrusted` gate, the hold marker, the
+    # dispatcher-owned `status:deferred`, the machine-owned `status:parked`, the claim-owned
+    # in-progress states and `kind:epic` are all still evaluated, in the same order, for an
+    # actions-bot author exactly as for the maintainer.
     gates = sorted(label for label in labels
                    if label.startswith("needs:") or label == "trust:untrusted")
     if gates:
@@ -427,7 +509,8 @@ def read_live_body(repo, number):
     return {"title": title, "body": body, "state": state.strip().upper()}
 
 
-def _apply_cli(repo, number, issue, maintainer, app_bot, permission, known_labels):
+def _apply_cli(repo, number, issue, maintainer, app_bot, permission, known_labels,
+               allow_actions_bot_issues=False):
     """`--apply`: re-read the LIVE labels AND the LIVE body, plan against them, mutate fail-closed.
 
     Planning against the live read (not the possibly-stale board snapshot the sweep passed on
@@ -470,7 +553,8 @@ def _apply_cli(repo, number, issue, maintainer, app_bot, permission, known_label
         print(json.dumps({"action": "skip", "reason": "closed-since-snapshot"}, sort_keys=True))
         return 0
     known = list(known_labels) if known_labels else static_triage.repo_label_set(repo)
-    decision = plan(fresh, maintainer, app_bot, permission, known_labels=known)
+    decision = plan(fresh, maintainer, app_bot, permission, known_labels=known,
+                    allow_actions_bot_issues=allow_actions_bot_issues)
     print(json.dumps(decision, sort_keys=True))
     if decision["action"] not in WRITING_ACTIONS:
         return 0
@@ -608,6 +692,81 @@ def _self_test():
     chk("a promotion carries the INTENDED single role for the applier",
         plan(issue("status:untriaged"), "owner", "app[bot]", "none",
              known_labels=real).get("role"), "ci")
+
+    # -------------------------------------------------------------------------------------------
+    # [registry #487] THE ACTIONS-BOT TRIAGE OPT-IN — a LATENT-CONSISTENCY fix, not a live one.
+    # `github-actions[bot]` is neither the maintainer nor the App bot and reads a repo permission
+    # of `none`, so this sweep's trust gate returns `untrusted-author` for it while
+    # `dispatch-claim._issue_is_trusted` and `curate-frontier.trusted_author` — reading the SAME
+    # per-repo policy row — admit it. What #487 closes here is that DISAGREEMENT: triage trust can
+    # no longer refuse what admission trust already grants for the same repo.
+    #
+    # It changes no decision on this repo today, and the honest reason is worth writing down
+    # because a green sweep will otherwise be misread as coverage. The sweep's board is EXACTLY
+    # the two lane queries (`labels=status:untriaged` and `labels=status:ready` — asserted by
+    # EXECUTION in the "[#487] the sweep board is EXACTLY the two lane queries" row below), and
+    # nothing puts a `github-actions[bot]` issue on either lane: `triage-issue.yml` is the only
+    # thing that applies a lane label and it fires on `issues: [opened, edited, reopened]`, while
+    # events written with the repository's own `GITHUB_TOKEN` do not start workflow runs — so the
+    # alert issues `metrics.py` opens on `github.token` are never triaged at all. `plan()` is
+    # therefore never called on them and this gate is never reached. Making the alert-responder
+    # class actually triageable needs the UPSTREAM unit (open those issues as the App bot, for
+    # which `triage-issue.yml` does fire, or have `metrics.py` apply the triage labels itself);
+    # this diff is the consumer that will be correct when that lands, and inert until it does.
+    # -------------------------------------------------------------------------------------------
+    def authored(login, *names, body=""):
+        doc = issue(*names, body=body) if names else issue("status:untriaged", body=body)
+        doc["author"] = {"login": login}
+        return doc
+
+    chk("[#487] actions-bot is UNTRUSTED with no opt-in (the shipped default)",
+        plan(authored(ACTIONS_BOT_LOGIN), "owner", "app[bot]", "none"),
+        {"action": "skip", "reason": "untrusted-author"})
+    chk("[#487] ...and TRIAGEABLE with it — the whole point of the unit",
+        plan(authored(ACTIONS_BOT_LOGIN), "owner", "app[bot]", "none",
+             allow_actions_bot_issues=True)["action"], "promote")
+    # NEGATIVE CONTROLS. Each impostor kills a DIFFERENT sloppy implementation of the same test:
+    # `endswith`, `startswith`, a case-folded compare, an `in` containment, and the bare "<x>[bot]"
+    # suffix match that #487 removed from dispatch. Only `==` passes all five.
+    for impostor in ("my-github-actions[bot]",      # dies on .endswith(ACTIONS_BOT_LOGIN)
+                     "github-actions[bot]-evil",    # dies on .startswith(ACTIONS_BOT_LOGIN)
+                     "GitHub-Actions[bot]",         # dies on a .lower() compare
+                     "github-actions",              # dies on `login in ACTIONS_BOT_LOGIN`
+                     "evil-app[bot]"):              # dies on the pre-#487 "[bot]" suffix match
+        chk(f"[#487] NEGATIVE: {impostor!r} is refused even WITH the opt-in",
+            plan(authored(impostor), "owner", "app[bot]", "none", allow_actions_bot_issues=True),
+            {"action": "skip", "reason": "untrusted-author"})
+    # SCOPE. The opt-in widens who may be CLASSIFIED and nothing else: every park check runs after
+    # it, unchanged, for an actions-bot author exactly as for the maintainer. `needs:user` is the
+    # terminal HUMAN hold (park_policy invariant 3) and must never be re-admitted by this widening.
+    for reason, names, body in (
+            ("gated:needs:user", ("status:untriaged", "needs:user"), ""),
+            ("gated:trust:untrusted", ("status:untriaged", "trust:untrusted"), ""),
+            ("explicit-hold", ("status:untriaged",), HOLD_MARKER),
+            ("not-retriageable", ("status:deferred",), ""),
+            ("machine-parked", ("status:untriaged", park_policy.MACHINE_PARK_LABEL), ""),
+            ("claim-owned", ("status:untriaged", "status:in-progress"), ""),
+            ("epic", ("status:untriaged", NON_DISPATCHABLE), "")):
+        chk(f"[#487] the opt-in widens TRIAGE only — {reason} still stands for the bot author",
+            plan(authored(ACTIONS_BOT_LOGIN, *names, body=body), "owner", "app[bot]", "none",
+                 allow_actions_bot_issues=True),
+            {"action": "skip", "reason": reason})
+    # ...and the same park set is refused identically for the MAINTAINER, so the rows above are
+    # asserting the park checks' reach and not merely re-asserting the trust gate they sit behind.
+    chk("[#487] POSITIVE CONTROL: those parks are the SHARED path, not a bot-only branch",
+        [plan(authored("owner", *names, body=body), "owner", "app[bot]", "none")["reason"]
+         for reason, names, body in (
+             ("gated:needs:user", ("status:untriaged", "needs:user"), ""),
+             ("explicit-hold", ("status:untriaged",), HOLD_MARKER),
+             ("machine-parked", ("status:untriaged", park_policy.MACHINE_PARK_LABEL), ""))],
+        ["gated:needs:user", "explicit-hold", "machine-parked"])
+    # The login string is duplicated across three trust surfaces (this sweep, the curator, CLAIM).
+    # Pin it to the curator's copy so a one-sided edit cannot silently split triage from admission.
+    _curator = _load("curate_frontier_for_test", "curate-frontier.py")
+    chk("[#487] the trusted login is IDENTICAL to the curator's — no per-file drift",
+        (ACTIONS_BOT_LOGIN, _curator.ACTIONS_BOT_LOGIN),
+        ("github-actions[bot]", "github-actions[bot]"))
+
 
     # ---- #586: the label-lost half. A `status:ready` issue the readiness engine cannot
     # enumerate is re-parked; a healthy one is left completely untouched. ----
@@ -975,7 +1134,7 @@ def _self_test():
     stale = {"author": {"login": "owner"}, "body": "", "labels": [{"name": "stale:snapshot"}]}
 
     def run_apply_argv(gh, stdin_doc=None, live_body="", body_error=None, live_document=None,
-                       live_state="OPEN", live_title="Ordinary registry task"):
+                       live_state="OPEN", live_title="Ordinary registry task", argv=None):
         """Drive main(apply_argv) end-to-end against a fake GitHub. Returns (exit code, spied).
 
         THE STUB BOUNDARY IS `triage._gh_read`, NOT `read_live_body` (#605 review round 4, MAJOR).
@@ -995,11 +1154,14 @@ def _self_test():
         saved_stdin, saved_stdout = sys.stdin, sys.stdout
 
         def spy_plan(issue_doc, maintainer, app_bot, permission,
-                     classify=static_triage.triage, known_labels=None):
+                     classify=static_triage.triage, known_labels=None,
+                     allow_actions_bot_issues=False):
             seen.update(known_labels=known_labels, maintainer=maintainer, permission=permission,
                         labels=list(issue_doc.get("labels", ())), body=issue_doc.get("body"),
-                        title=issue_doc.get("title"))
-            return saved_plan(issue_doc, maintainer, app_bot, permission, classify, known_labels)
+                        title=issue_doc.get("title"),
+                        allow_actions_bot_issues=allow_actions_bot_issues)
+            return saved_plan(issue_doc, maintainer, app_bot, permission, classify, known_labels,
+                              allow_actions_bot_issues)
 
         def fake_read(args):
             """The one shared read layer, faked at the boundary the production code really calls."""
@@ -1021,7 +1183,7 @@ def _self_test():
             sys.stdin = io.StringIO(json.dumps(stdin_doc if stdin_doc is not None else stale))
             sys.stdout = io.StringIO()
             try:
-                code = main(apply_argv)
+                code = main(apply_argv if argv is None else argv)
             except SystemExit as exc:  # argparse exits 2 on an undeclared flag — that is the defect
                 code = exc.code
             finally:
@@ -1045,6 +1207,164 @@ def _self_test():
                    "stale:snapshot" not in (seen.get("labels") or [])))
     checks.append(("[#595 f2] the workflow-shaped invocation actually applied the promotion",
                    (roles_of(gh.labels), "status:ready" in gh.labels) == ({"role:impl"}, True)))
+
+    # -------------------------------------------------------------------------------------------
+    # [registry #487] THE OPT-IN IS WIRED, END TO END, FROM THE YAML. Everything above this point
+    # passes `allow_actions_bot_issues` to plan() DIRECTLY — which is exactly how a policy flag can
+    # be "consumed" by a script that production never hands it to (the shape #487's own dispatch
+    # half and PR #595 finding 2 both hit). So the argument list is READ OUT OF retriage.yml and
+    # driven through the REAL entrypoint (main -> actions_bot_trust -> _apply_cli -> plan ->
+    # apply_decision) against fixture policies, and the ISSUE IS ACTUALLY PROMOTED OR NOT.
+    #
+    # The mutations these rows die on:
+    #   * delete `--policy-file policy/repos.toml` from retriage.yml       -> SweepError below
+    #   * typo the path                                                    -> the EXISTS row
+    #   * drop `allow_actions_bot_issues=...` from _apply_cli's plan() call -> the grant rows
+    #   * hardcode the flag True                                           -> the deny rows
+    #   * hardcode it False                                                -> the grant rows
+    # -------------------------------------------------------------------------------------------
+    import tempfile
+
+    def workflow_policy_path(argv):
+        """The policy path retriage.yml ACTUALLY passes — or a legible refusal.
+
+        Raised, not returned-False, and deliberately BEFORE anything indexes the argv: a bare
+        `ValueError: '--policy-file' is not in list` from a later index() is a kill with no name
+        on it. Same idiom as run_snapshot_argv's missing-`--snapshot` refusal below."""
+        if "--policy-file" not in argv:
+            raise SweepError(
+                "retriage.yml no longer passes `--policy-file` to `retriage.py --apply` — the "
+                "registry #487 actions-bot triage opt-in would silently revert to DENY and every "
+                "issue this repo's own workflows open would go back to `untrusted-author` with a "
+                "perfectly green sweep; refusing")
+        return argv[argv.index("--policy-file") + 1]
+
+    def apply_argv_for(policy_path, permission="none"):
+        """retriage.yml's OWN apply argv with the two values production computes PER RUN: the
+        collaborator permission (the shell probes it per issue) and the policy file. The policy
+        path is a repo-relative literal rather than a `$VAR`, so it is swapped here instead of
+        env-substituted; every other token is exactly what the workflow writes."""
+        argv = next((candidate for candidate in static_triage.workflow_argvs(
+            workflow, "retriage.py",
+            {"MAINTAINER_LOGIN": "owner", "APP_BOT_LOGIN": "app[bot]", "permission": permission,
+             "known": ",".join(sorted(known)), "REPO": "o/r", "number": "7"})
+            if "--apply" in candidate), None)
+        if argv is None:
+            raise SweepError("retriage.yml no longer invokes `retriage.py --apply` — refusing")
+        argv = list(argv)
+        workflow_policy_path(argv)              # refuse legibly before indexing
+        argv[argv.index("--policy-file") + 1] = policy_path
+        return argv
+
+    # The path retriage.yml ACTUALLY names must exist and be a usable policy. `root` is the repo
+    # root; production resolves the same relative path against the step's cwd, which actions/
+    # checkout makes that same directory.
+    declared_policy = workflow_policy_path(apply_argv)
+    live_policy = (declared_policy if os.path.isabs(declared_policy)
+                   else os.path.join(root, declared_policy))
+    live_rows = {}
+    try:
+        with open(live_policy, "rb") as handle:
+            live_rows = tomllib.load(handle).get("repos") or {}
+    except (OSError, tomllib.TOMLDecodeError, AttributeError):
+        live_rows = {}
+    checks.append((f"[#487] retriage.yml names a policy file that EXISTS and parses: "
+                   f"{declared_policy}", isinstance(live_rows, dict) and bool(live_rows)))
+    # ...and EVERY row in the live policy resolves to a boolean rather than raising, so a malformed
+    # row in the file production actually reads is caught here and not at 07:07 on a Sunday.
+    checks.append(("[#487] every live policy row resolves to a boolean opt-in (no malformed row)",
+                   isinstance(live_rows, dict)
+                   and all(isinstance(actions_bot_trust(live_policy, name), bool)
+                           for name in live_rows)))
+
+    with tempfile.TemporaryDirectory() as policy_dir:
+        def policy(text, name):
+            path = os.path.join(policy_dir, name)
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(text)
+            return path
+
+        grant = policy('[repos."o/r"]\nenabled = true\nallow_actions_bot_issues = true\n',
+                       "grant.toml")
+        deny = policy('[repos."o/r"]\nenabled = true\n', "deny.toml")
+        bot_doc = {"author": {"login": ACTIONS_BOT_LOGIN}, "body": "",
+                   "labels": [{"name": "stale:snapshot"}]}
+
+        granted = FakeGh(start, known)
+        code, seen = run_apply_argv(granted, stdin_doc=bot_doc, argv=apply_argv_for(grant))
+        checks.append(("[#487] the workflow's OWN argv carries the opt-in into plan()",
+                       (code, seen.get("allow_actions_bot_issues")) == (0, True)))
+        checks.append(("[#487] ...and an own-workflow issue is ACTUALLY PROMOTED (permission=none, "
+                       "author=github-actions[bot])",
+                       (roles_of(granted.labels), "status:ready" in granted.labels,
+                        "status:untriaged" in granted.labels)
+                       == ({"role:impl"}, True, False)))
+
+        denied = FakeGh(start, known)
+        code, seen = run_apply_argv(denied, stdin_doc=bot_doc, argv=apply_argv_for(deny))
+        checks.append(("[#487] a policy WITHOUT the opt-in refuses the same issue and writes "
+                       "nothing",
+                       (code, seen.get("allow_actions_bot_issues"), denied.calls,
+                        denied.labels == set(start),
+                        "untrusted-author" in seen.get("stdout", ""))
+                       == (0, False, [], True, True)))
+        # The maintainer's own issue is unaffected by either policy — the widening is additive.
+        for label, path in (("granting", grant), ("denying", deny)):
+            control = FakeGh(start, known)
+            code, _seen = run_apply_argv(control, argv=apply_argv_for(path))
+            checks.append((f"[#487] CONTROL: a maintainer-authored issue still promotes under a "
+                           f"{label} policy", (code, "status:ready" in control.labels) == (0, True)))
+        # An unreadable policy is a RED RUN, not a silent deny: main() must exit non-zero and write
+        # nothing. A silent False here is indistinguishable from "not opted in" — the invisible
+        # starvation #487 exists to close.
+        unreadable = FakeGh(start, known)
+        code, seen = run_apply_argv(
+            unreadable, stdin_doc=bot_doc,
+            argv=apply_argv_for(os.path.join(policy_dir, "does-not-exist.toml")))
+        checks.append(("[#487] a policy production cannot READ fails the run, never denies quietly",
+                       (code, unreadable.calls, unreadable.labels == set(start))
+                       == (1, [], True)))
+
+    # ---- the policy resolver itself: where that opt-in comes FROM (registry #487) ----
+    with tempfile.TemporaryDirectory() as policy_dir:
+        def policy(text, name):
+            path = os.path.join(policy_dir, name)
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(text)
+            return path
+
+        grant = policy('[repos."o/r"]\nenabled = true\nallow_actions_bot_issues = true\n',
+                       "grant.toml")
+        chk("[#487] the policy row grants the opt-in", actions_bot_trust(grant, "o/r"), True)
+        chk("[#487] an absent key defaults to DENY",
+            actions_bot_trust(policy('[repos."o/r"]\nenabled = true\n', "deny.toml"), "o/r"), False)
+        chk("[#487] an explicit false denies",
+            actions_bot_trust(policy(
+                '[repos."o/r"]\nallow_actions_bot_issues = false\n', "explicit.toml"), "o/r"),
+            False)
+        chk("[#487] a repo the policy does not mention is NOT opted in",
+            actions_bot_trust(grant, "other/repo"), False)
+        chk("[#487] no policy file requested means no widening", actions_bot_trust("", "o/r"), False)
+        # `enabled` is deliberately NOT consulted: pausing DISPATCH must not silently switch TRIAGE
+        # trust off as a side effect (that would be a second invisible-starvation shape).
+        chk("[#487] the opt-in does not silently depend on `enabled`",
+            actions_bot_trust(policy(
+                '[repos."o/r"]\nenabled = false\nallow_actions_bot_issues = true\n', "off.toml"),
+                "o/r"), True)
+        for label, path in (
+                ("a missing file", os.path.join(policy_dir, "nope.toml")),
+                ("undecodable TOML", policy("[repos.\n", "broken.toml")),
+                ("no [repos] table", policy("other = 1\n", "norows.toml")),
+                ("an EMPTY [repos] table", policy("[repos]\n", "empty.toml")),
+                ("a non-table row", policy('[repos]\n"o/r" = 7\n', "notable.toml")),
+                ("a non-boolean flag",
+                 policy('[repos."o/r"]\nallow_actions_bot_issues = "yes"\n', "nonbool.toml"))):
+            try:
+                actions_bot_trust(path, "o/r")
+                raised = False
+            except SweepError:
+                raised = True
+            chk(f"[#487] {label} RAISES rather than silently denying", raised)
 
     # -------------------------------------------------------------------------------------------
     # [issue #586 x PR #595 finding 3] BOTH DIRECTIONS OF THE SWEEP GO THROUGH THAT SAME APPLIER.
@@ -1351,16 +1671,22 @@ if rest[:1] == ["label"]:
 if rest[:1] != ["api"]:
     sys.exit(f"stub gh_retry saw an unexpected call: {args}")
 target = rest[1]
+with open(os.environ["STUB_TARGET_LOG"], "a", encoding="utf-8") as handle:
+    handle.write(target + "\\n")
 if "/collaborators/" in target:
     print("write")
     sys.exit(0)
 if os.environ["STUB_PAYLOAD"] == "object":
     print(json.dumps({"message": "Not Found"}))
     sys.exit(0)
-label = target.split("labels=")[1].split("&")[0]
+# A lane-LESS board query is SERVED, not refused: the stub must not be the thing that catches an
+# unfiltered sweep, or the "[#487] the sweep board is EXACTLY the two lane queries" row below would
+# be asserting the stub's strictness instead of the workflow's. It answers with a short page so the
+# page accounting the #605 rows check is undisturbed and that row is the ONLY thing that goes red.
+label = target.split("labels=")[1].split("&")[0] if "labels=" in target else ""
 page = int(target.split("&page=")[1])   # NOT "page=" — `per_page=100` matches that first
-base = 1000000 if label.endswith("ready") else 0
-count = 100 if page <= int(os.environ["STUB_FULL_PAGES"]) else 7
+base = 1000000 if label.endswith("ready") else (2000000 if not label else 0)
+count = 7 if not label else (100 if page <= int(os.environ["STUB_FULL_PAGES"]) else 7)
 print(json.dumps([{"number": base + page * 1000 + index, "user": {"login": "owner"},
                    "body": "", "labels": [{"name": label}],
                    "updated_at": "2026-07-01T00:00:00Z"} for index in range(count)]))
@@ -1375,7 +1701,7 @@ with open(os.environ["STUB_APPLY_LOG"], "a", encoding="utf-8") as handle:
 
     def run_sweep_step(full_pages=2, payload="array", run_number=3):
         """Execute the REAL sweep step body. Returns (exit code, log text, page-file names,
-        window line count, applier invocation count)."""
+        window line count, applier invocation count, API targets the step actually requested)."""
         with tempfile.TemporaryDirectory() as directory:
             root = os.path.join(directory, "repo")
             os.makedirs(os.path.join(root, "scripts"))
@@ -1385,11 +1711,12 @@ with open(os.environ["STUB_APPLY_LOG"], "a", encoding="utf-8") as handle:
             temp = os.path.join(directory, "runner-temp")
             os.makedirs(temp)
             log = os.path.join(directory, "apply.log")
+            targets_path = os.path.join(directory, "targets.log")
             environment = dict(os.environ, RUNNER_TEMP=temp, REPO="o/r",
                                MAINTAINER_LOGIN="owner", APP_BOT_LOGIN="app[bot]",
                                GITHUB_RUN_NUMBER=str(run_number),
                                STUB_FULL_PAGES=str(full_pages), STUB_PAYLOAD=payload,
-                               STUB_APPLY_LOG=log,
+                               STUB_APPLY_LOG=log, STUB_TARGET_LOG=targets_path,
                                STUB_REAL_RETRIAGE=os.path.abspath(__file__))
             completed = subprocess.run(["bash", "-c", sweep_script], cwd=root, env=environment,
                                        capture_output=True, text=True, timeout=600, check=False)
@@ -1406,13 +1733,17 @@ with open(os.environ["STUB_APPLY_LOG"], "a", encoding="utf-8") as handle:
             if os.path.isfile(log):
                 with open(log, encoding="utf-8") as handle:
                     applies = sum(1 for line in handle if line.strip())
+            targets = []
+            if os.path.isfile(targets_path):
+                with open(targets_path, encoding="utf-8") as handle:
+                    targets = [line.strip() for line in handle if line.strip()]
             return (completed.returncode, completed.stdout + completed.stderr, pages, window,
-                    applies)
+                    applies, targets)
 
     # 2 full pages + a short third page per lane = 207 issues per lane, 414 in all, cap 80.
     # `got=0` (the truncation mutation) fetches ONE page per lane and applies a truncated board:
     # the page-file list and the reported board total both change, so this row dies on it.
-    code, log, pages, window, applies = run_sweep_step(full_pages=2)
+    code, log, pages, window, applies, targets = run_sweep_step(full_pages=2)
     checks.append(("[#605 r2 f2] the step reads until a SHORT page arrives, on BOTH lanes",
                    (code, pages) == (0, ["page-ready-1.json", "page-ready-2.json",
                                          "page-ready-3.json", "page-untriaged-1.json",
@@ -1421,16 +1752,31 @@ with open(os.environ["STUB_APPLY_LOG"], "a", encoding="utf-8") as handle:
                    "414 board issue(s)" in log))
     checks.append(("[#605 r2 f2] ...and the capped window is what the applier is actually fed",
                    (window, applies) == (80, 80)))
+    # [registry #487] BOARD MEMBERSHIP — the honest scope of the opt-in, asserted by EXECUTION.
+    # The rows above prove the widening WORKS on a document handed to plan(); this one proves WHICH
+    # documents production can ever hand it. Every board request the real step body issues carries
+    # a `labels=` filter, and the filter values are exactly the two lanes — so an issue carrying
+    # NEITHER lane label is never fetched, never snapshotted, never passed to `--apply`, and
+    # `plan()` (hence the #487 trust gate) is never reached for it. That is why this unit is inert
+    # on this repo today rather than "covering" the alert-responder class, and it is what a reader
+    # must not be allowed to forget. Dies on: dropping `labels=$label` from the board query
+    # (an unfiltered board would sweep every open issue), and on adding/renaming/removing a lane.
+    board = [target for target in targets if "/issues?" in target]
+    lanes = {target.split("labels=")[1].split("&")[0] for target in board if "labels=" in target}
+    checks.append(("[#487] the sweep board is EXACTLY the two lane queries — an issue on no lane "
+                   "is never fetched, so plan() and its trust gate are never reached for it",
+                   (bool(board), all("labels=" in target for target in board), lanes)
+                   == (True, True, {"status:untriaged", "status:ready"})))
     # The REQUEST ceiling: 25 full pages against max_pages=20. Deleting the ceiling's own `exit 1`,
     # or `if false`, or a raised max_pages all let the loop run to the short page and exit 0.
-    code, log, pages, _window, applies = run_sweep_step(full_pages=25)
+    code, log, pages, _window, applies, _targets = run_sweep_step(full_pages=25)
     checks.append(("[#605 r2 f2] a board past the REQUEST ceiling fails the step CLOSED at page 20",
                    (code != 0, "larger than 20 pages" in log,
                     len([name for name in pages if name.startswith("page-untriaged-")]), applies)
                    == (True, True, 20, 0)))
     # The page-SHAPE guard: `jq 'length'` alone returns 2 for {"message": "Not Found"}, which is
     # `-lt 100`, so an error document used to break the loop and be swept as a complete board.
-    code, log, _pages, _window, applies = run_sweep_step(payload="object")
+    code, log, _pages, _window, applies, _targets = run_sweep_step(payload="object")
     checks.append(("[#605 r2 f2] a non-array page payload fails the step CLOSED, never sweeps",
                    (code != 0, "not a JSON array" in log, applies) == (True, True, 0)))
 
@@ -1464,6 +1810,11 @@ def build_parser():
     parser.add_argument("--known-labels", default="",
                         help="comma-separated target-repo label set; enables the registry #582 "
                              "existence check so a non-existent role:* label is never planned")
+    parser.add_argument("--policy-file", default="",
+                        help="policy/repos.toml — the ONE source of the per-repo "
+                             "`allow_actions_bot_issues` triage opt-in (registry #487). Empty "
+                             "means no opt-in; an unreadable/malformed one is a hard error, never "
+                             "a silent deny")
     parser.add_argument("--apply", action="store_true",
                         help="plan AND apply the promotion FAIL-CLOSED (needs --repo/--number)")
     parser.add_argument("--repo", default="")
@@ -1502,14 +1853,24 @@ def main(argv=None):
             print(json.dumps(issue, sort_keys=True))
         return 0
     known = [item for item in args.known_labels.split(",") if item.strip()] or None
+    # registry #487. Resolved ONCE, here, for both the plan-only and the --apply paths, so the two
+    # cannot disagree about who is trusted. A policy we were asked to read and could not is a hard
+    # exit, not a silent deny (see actions_bot_trust) — the silent deny is the starvation bug.
+    try:
+        allow_actions_bot = actions_bot_trust(args.policy_file, args.repo)
+    except SweepError as exc:
+        print(f"::error title=retriage::refusing to retriage against an unusable repository "
+              f"policy: {exc}", file=sys.stderr)
+        return 1
     issue = json.load(sys.stdin)
     if args.apply:
         if not args.repo or not args.number:
             parser.error("--apply requires --repo and --number")
         return _apply_cli(args.repo, args.number, issue, args.maintainer, args.app_bot,
-                          args.permission, known)
+                          args.permission, known, allow_actions_bot)
     print(json.dumps(plan(issue, args.maintainer, args.app_bot, args.permission,
-                          known_labels=known), sort_keys=True))
+                          known_labels=known, allow_actions_bot_issues=allow_actions_bot),
+                     sort_keys=True))
     return 0
 
 

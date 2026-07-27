@@ -485,6 +485,8 @@ def plan_repository(
     logs: list[str] = []
     gate_actions: list[Mutation] = []
     safe_candidates: dict[int, dict[str, Any]] = {}
+    # [OPUS-5] issues the curator can never stage because no area can be attributed to them.
+    unattributable: list[int] = []
 
     for issue in open_issues:
         labels = labels_of(issue)
@@ -634,6 +636,20 @@ def plan_repository(
             continue
         area, area_reason = derive_area(issue, labels, repo_labels)
         if area is None:
+            # [OPUS-5] The fail-closed refusal is CORRECT — an area is never guessed. Its
+            # SILENCE was not. This skip line scrolls past every 30 minutes and the issue is
+            # re-skipped forever with no label, no count, and no route back to a human. It is a
+            # LARGE standing class on sparq-org/sparq, not a rounding error — but no figure is
+            # written here on purpose: a count pasted into a source comment is stale the day
+            # after it is written, and the first draft of this comment carried one (142 of 218)
+            # that matched no run anyone could reproduce, including this PR's own evidence. The
+            # report emitted below is the number, measured every tick.
+            #
+            # Recorded here and reported as an always-printed total, with the SEVERITY of the
+            # precedent it cites: dispatch.yml's roleless-report emits a `::warning::` on the
+            # non-zero branch and a plain line at zero, which is what puts the class on the run
+            # page instead of at line ~207 of a 543-line log nothing reads.
+            unattributable.append(number)
             logs.append(f"skip #{number}: no confident area ({area_reason})")
             continue
         role = role_for(labels, area)
@@ -679,6 +695,37 @@ def plan_repository(
         selected_areas.add(area)
         stage_actions.append(Mutation("stage", number, issue, desired))
         logs.append(f"stage #{number}: {','.join(desired)}")
+
+    # [OPUS-5] ALWAYS emitted, including the zero case — a report that only appears when the
+    # number is non-zero cannot be told apart from a report that stopped running.
+    #
+    # The non-zero branch is a `::warning::`, the zero branch a plain line. That is not
+    # cosmetic and it is the difference two reviews of the first draft both blocked on: a
+    # plain `print` puts this class at roughly line 207 of a 543-line log, in a 30-minute cron
+    # with no `workflow_run` consumer, no metrics/dashboard reader, and no label — so the class
+    # became distinguishable-if-you-open-the-log rather than VISIBLE, which is the same
+    # state-with-no-exit shape the report exists to remove, one layer shallower. `::warning::`
+    # surfaces it on the run page without opening the log, exactly as the cited precedent
+    # (dispatch.yml's roleless-report, `.github/workflows/dispatch.yml`) does. It is an
+    # annotation, not a route: draining the class still wants a label or a deduped roll-up
+    # issue, which is deliberately NOT in this diff.
+    #
+    # "no confident area" is not one condition: `derive_area` returns None both for NO signal
+    # and for AMBIGUOUS signal (multiple area labels / multiple crate areas in a title /
+    # multiple path hints), and those want different remediation. The per-issue skip line still
+    # carries `area_reason`, so the split stays recoverable; the roll-up deliberately does not
+    # claim otherwise, hence "cannot be staged until an area is attributed" rather than the
+    # first draft's "can never stage", which overstated a state that clears the moment an
+    # `area:` label lands.
+    shown = ", ".join(f"#{n}" for n in unattributable[:20])
+    more = f" (+{len(unattributable) - 20} more)" if len(unattributable) > 20 else ""
+    if unattributable:
+        logs.append(f"::warning::unattributable: {len(unattributable)} issue(s) have NO "
+                    f"confident area and cannot be staged until an area is attributed: "
+                    f"{shown}{more}")
+    else:
+        logs.append("unattributable: 0 issue(s) have NO confident area and cannot be staged "
+                    "until an area is attributed")
 
     if area_limited and len(stage_actions) < depth:
         resulting_ready = current_ready + len(stage_actions)
@@ -1587,6 +1634,64 @@ def _self_test() -> int:
     checks.append(("area-limited frontier is logged loudly",
                    len([m for m in planned if m.kind == "stage"]) == 1
                    and "frontier: area-limited at 1/4 (1 areas busy)" in logs))
+
+    # [OPUS-5] The unattributable class must be REPORTED, not silently re-skipped forever.
+    # "Zebra component" matches no crate, path or area label, so derive_area refuses it.
+    # NB: a body with NO path and NO crate token — the shared long_body names scripts/frontier.py,
+    # which would itself supply an area:ci path hint and make this fixture attributable.
+    # A function+line reference satisfies is_well_specified WITHOUT naming a path, so the
+    # fixture reaches derive_area and is refused there (rather than being filtered earlier).
+    blind_body = ("Rework zebra_behaviour() at line 42 so the documented outcome holds. "
+                  "Acceptance criteria: the described outcome is verified by a test. " * 6)
+    blind = [issue(500, "Zebra component needs rework", body=blind_body),
+             issue(501, "Quokka component needs rework", body=blind_body)]
+    _planned, blind_logs = plan_repository(blind, all_labels, automation)
+    # Matched on the payload, so the SEVERITY prefix is a separate, asserted property rather
+    # than something the matcher quietly tolerates either way.
+    report = [line for line in blind_logs if "unattributable: " in line]
+    checks.append((
+        "unattributable issues are counted and named, not silently skipped",
+        len(report) == 1 and "unattributable: 2 issue(s)" in report[0]
+        and "#500" in report[0] and "#501" in report[0]))
+    # ...and the non-zero branch is an ANNOTATION. A plain print leaves the class at line ~207
+    # of a 543-line log in a cron nothing reads — distinguishable-if-you-open-the-log, not
+    # visible. This is the severity channel of the precedent the comment cites
+    # (dispatch.yml's roleless-report), and dropping the prefix must red HERE.
+    checks.append((
+        "a NON-ZERO unattributable count is a ::warning:: annotation, not a buried log line "
+        "(the severity channel of the cited dispatch.yml precedent)",
+        len(report) == 1 and report[0].startswith("::warning::unattributable: ")))
+    # The always-printed half: a report that only appears when non-zero is indistinguishable
+    # from a report that stopped running. Deleting the zero case must red THIS check.
+    _planned, clean_logs = plan_repository(
+        [issue(502, "Improve alpha component behavior", ("area:alpha",))],
+        all_labels, automation)
+    clean_report = [line for line in clean_logs if "unattributable: " in line]
+    checks.append((
+        "the unattributable report is emitted even when the count is ZERO",
+        clean_report == ["unattributable: 0 issue(s) have NO confident area and cannot be "
+                         "staged until an area is attributed"]))
+    # ...and at ZERO it is a PLAIN line, exactly as dispatch.yml does it. A `::warning::` every
+    # tick on a healthy board is how an annotation stops being read, which would undo the row
+    # above by a different route.
+    checks.append((
+        "a ZERO count is NOT annotated — an every-tick warning trains the reader to skip it",
+        len(clean_report) == 1 and not clean_report[0].startswith("::warning::")))
+    # THE BRANCH THAT ACTUALLY FIRES. Every fixture above is under the 20-issue display cap, so
+    # `len(unattributable) > 20` had ZERO coverage while being true on every live tick — the
+    # marquee path, untested. 21 issues: 20 named, one folded into the suffix.
+    many = [issue(600 + index, f"Zebra component {index} needs rework", body=blind_body)
+            for index in range(21)]
+    _planned, many_logs = plan_repository(many, all_labels, automation)
+    many_report = [line for line in many_logs if "unattributable: " in line]
+    checks.append((
+        "the >20 display cap names exactly 20 and folds the REST into an accurate (+N more) "
+        "suffix — the only branch that fires on the live board",
+        len(many_report) == 1
+        and "unattributable: 21 issue(s)" in many_report[0]
+        and many_report[0].count("#") == 20
+        and many_report[0].endswith("(+1 more)")
+        and "#619" in many_report[0] and "#620" not in many_report[0]))
 
     ok = all(result for _, result in checks)
     for name, result in checks:
