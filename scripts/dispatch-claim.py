@@ -10027,6 +10027,54 @@ def _self_test():
     for _junk_pull in (None, "nope", {}, {"head": None}, {"head": {"repo": None}}, 7):
         assert claim_review_pr_admission(repo, 41, _junk_pull, _orch, bot, _ENROLLED)[0] is False
 
+    # (8d) THE review-fix.yml RESOLVE PREDICATE, driven directly. It lives in this module rather
+    # than in the workflow's `run:` script precisely so these rows exist — #759's probe stubbed it
+    # and could therefore not see three of its four gates.
+    def _rf_pull(*, number=41, ref="fix/readiness-visibility-opus5", login="jeswr",
+                 head_repo=repo, draft=False):
+        return {"number": number, "state": "open", "draft": draft,
+                "user": {"login": login},
+                "head": {"ref": ref, "sha": sha_a, "repo": {"full_name": head_repo}}}
+
+    assert review_fix_pr_admission(repo, _rf_pull(), _orch, _ENROLLED) == (True, None), \
+        ("THE HEADLINE ROW: a NON-DRAFT, human-authored, ordinary-branch PR is admitted by "
+         "review-fix.yml's resolve step. Restoring any of the three shape gates unconditionally "
+         "reds exactly this line — and the draft one is the gate EVERY enrollable PR fails.")
+    # Each waived gate, one at a time, with the waiver switched off. These are the exact
+    # SystemExit reasons the resolve step raised before #657 — unchanged, byte for byte.
+    assert review_fix_pr_admission(repo, _rf_pull(), _orch, ()) \
+        == (False, "pull request is not an open draft")
+    assert review_fix_pr_admission(repo, _rf_pull(draft=True), _orch, ()) \
+        == (False, "pull request head is not a worker branch")
+    assert review_fix_pr_admission(
+        repo, _rf_pull(draft=True, ref="sparq-agent/issue-7-1-1"), _orch, ()) \
+        == (False, "pull request author is not a bot")
+    # THE FORK GATE IS NOT WAIVABLE HERE EITHER, and it reports FIRST — an enrolled author with a
+    # perfect record on an attacker-controlled head is stopped by the fork gate, by name.
+    assert review_fix_pr_admission(
+        repo, _rf_pull(head_repo="attacker/repo"), _orch, _ENROLLED) \
+        == (False, "pull request head is a fork; refusing to run models on it"), \
+        ("the fork gate is the single attacker-facing predicate in the resolve step and no "
+         "waiver may reach it; deleting it, or moving it below the waiver, reds this line")
+    assert review_fix_pr_admission(
+        repo, _rf_pull(head_repo="attacker/repo", ref="sparq-agent/issue-7-1-1", login=bot,
+                       draft=True), provenance[41], ()) \
+        == (False, "pull request head is a fork; refusing to run models on it"), \
+        "...on a plain WORKER PR too — the fork gate is unconditional, not class-scoped"
+    # A third party is never admitted, and a machine-attested record waives nothing.
+    assert review_fix_pr_admission(repo, _rf_pull(login="mallory"), _orch, _ENROLLED)[0] is False
+    assert review_fix_pr_admission(repo, _rf_pull(), provenance[41], _ENROLLED)[0] is False
+    # A record minted for ANOTHER PR waives nothing at the waiver decision.
+    assert review_fix_pr_admission(
+        repo, _rf_pull(), dict(_orch, pr_number=40), _ENROLLED)[0] is False
+    # The pre-#657 worker population is unchanged, allowlist on or off.
+    _rf_worker = _rf_pull(draft=True, ref="sparq-agent/issue-7-1-1", login=bot)
+    assert review_fix_pr_admission(repo, _rf_worker, provenance[41], ()) \
+        == review_fix_pr_admission(repo, _rf_worker, provenance[41], _ENROLLED) == (False, None)
+    # TOTAL — it is called from a workflow step where an exception is an unactionable traceback.
+    for _junk_pull in (None, "nope", {}, {"number": True}, {"number": 0}, {"head": None}):
+        assert review_fix_pr_admission(repo, _junk_pull, _orch, _ENROLLED)[0] is False
+
     # (3b) THE FORK GATE'S POSITION, pinned by the REPORTED REASON. The ordering claim attached to
     # (3) was measured untrue in review of #759: for an ADMITTED PR the head-ref gate is waived, so
     # the fork gate is reached wherever it sits and moving it changed no outcome. The position IS
@@ -10266,6 +10314,90 @@ def _self_test():
         assert "self-attested" in str(_exc), str(_exc)
     else:
         raise AssertionError("ready_and_arm must REFUSE the self-attested class outright")
+    # (c5) THE PROBES' OWN COMPOSITION. Each probe is a conjunction of sub-facts, and a
+    #      conjunction is exactly the shape where one term quietly stops being load-bearing. Each
+    #      row below removes ONE sub-fact's justification and demands the probe change its answer,
+    #      so dropping any term from any probe reds a named line.
+    #      (i) the CLAIM probe requires ADMISSION, not merely the absence of an error: a leg that
+    #      declines to waive but reports no error is NOT wired, it is the pre-feature behaviour.
+    _saved_claim = globals()["claim_review_pr_admission"]
+    try:
+        globals()["claim_review_pr_admission"] = lambda *a, **k: (False, None)
+        assert claim_admits_orchestrator_class() is False, \
+            ("a CLAIM leg that returns 'no waiver, no error' must read as UNWIRED — dropping the "
+             "`admitted is True` term from the probe makes the interlock stand down on a leg that "
+             "never waives anything")
+    finally:
+        globals()["claim_review_pr_admission"] = _saved_claim
+    #      (ii) the review-fix probe's DEFAULT-OFF term: a resolve step that admits the class
+    #      unconditionally (ignoring the master-protected allowlist) is a hole, not wiring.
+    _rf_uncond = _rf_live.replace(
+        "          self_attested, admission_error = dispatch_claim.review_fix_pr_admission(\n"
+        "              repo, pull, record, enrolled_authors)",
+        "          self_attested, admission_error = True, None")
+    assert _rf_uncond != _rf_live
+    assert review_fix_admits_orchestrator_class(source=_rf_uncond) is False, \
+        ("a resolve step that admits the class with an EMPTY allowlist must read as unwired — "
+         "this is the row that makes the probe's default-off term load-bearing")
+    #      (iii) ...and its FAIL-CLOSED term, isolated: a step that raises only when the class was
+    #      NOT admitted still satisfies default-off, but silently ignores a record refusal for the
+    #      very class the waiver let in. Only the fail-closed term catches it.
+    _rf_half_closed = _rf_live.replace(
+        "          if admission_error:\n              raise SystemExit(admission_error)",
+        "          if admission_error and not self_attested:\n"
+        "              raise SystemExit(admission_error)")
+    assert _rf_half_closed != _rf_live
+    assert review_fix_admits_orchestrator_class(source=_rf_half_closed) is False, \
+        ("a resolve step that swallows the record refusal for the ADMITTED class must read as "
+         "unwired — this is the row that makes the probe's fail-closed term load-bearing rather "
+         "than subsumed by default-off")
+    #      (iv) the ARM probe requires BOTH refusals. A state machine that stops routing the class
+    #      to the arm, while the arm itself would still accept it, is one deleted branch away from
+    #      a merge on a self-attested record.
+    _saved_probe_wp = globals()["_probe_worker_pr"]
+    try:
+        globals()["_probe_worker_pr"] = lambda: types.SimpleNamespace(
+            WorkerPrError=_wp.WorkerPrError,
+            decide_review=lambda *a, **k: ("needs-user" if k.get("self_attested") else "arm"),
+            ready_and_arm=lambda *a, **k: None)
+        assert arm_refuses_orchestrator_class() is False, \
+            ("the arm probe must require ready_and_arm's OWN refusal — with only the state "
+             "machine refusing, deleting one branch merges a self-attested PR")
+        globals()["_probe_worker_pr"] = lambda: types.SimpleNamespace(
+            WorkerPrError=_wp.WorkerPrError,
+            decide_review=lambda *a, **k: "arm",
+            ready_and_arm=lambda *a, **k: (_ for _ in ()).throw(
+                _wp.WorkerPrError("refusing to arm: ... self-attested ...")))
+        assert arm_refuses_orchestrator_class() is False, \
+            ("...and the state-machine refusal too: an approve that still routes to the arm step "
+             "makes every enrolled review end in a hard workflow failure")
+    finally:
+        globals()["_probe_worker_pr"] = _saved_probe_wp
+    assert arm_refuses_orchestrator_class() is True, "the arm probe fixture leaked"
+    # (c6) THE CLAIM CALL SITE, pinned on the PARSED module (never a regex over its own source —
+    #      #759 measured that class of probe failing permissive under a reflow). `_dispatch_review_
+    #      items` takes `enrolled_authors` as a REQUIRED keyword-only parameter, so omitting it is
+    #      a TypeError; what a signature cannot catch is passing the WRONG value, and hard-coding
+    #      an empty allowlist there disables the CLAIM leg silently. So the argument EXPRESSION is
+    #      asserted: it must be a call to the policy module's `review_enrolment_authors`.
+    _dispatch_fn = next(
+        node for node in ast.walk(ast.parse(
+            Path(__file__).resolve().read_text(encoding="utf-8")))
+        if isinstance(node, ast.FunctionDef) and node.name == "dispatch")
+    _enrol_args = [
+        keyword.value for node in ast.walk(_dispatch_fn) if isinstance(node, ast.Call)
+        and getattr(node.func, "id", "") == "_dispatch_review_items"
+        for keyword in node.keywords if keyword.arg == "enrolled_authors"]
+    assert len(_enrol_args) == 1, \
+        f"expected exactly one enrolled_authors argument in dispatch(), got {len(_enrol_args)}"
+    assert (isinstance(_enrol_args[0], ast.Call)
+            and getattr(_enrol_args[0].func, "attr", "") == "review_enrolment_authors"
+            and [getattr(a, "id", "") for a in _enrol_args[0].args] == ["repo", "policy_doc"]), \
+        ("dispatch() must pass CLAIM the repo's MASTER-protected allowlist, resolved live from "
+         "the policy document it already validated. Hard-coding `()` here turns the whole CLAIM "
+         "leg off with nothing red anywhere else — every enrolled PR then defers on the "
+         "plan/CLAIM self_attested disagreement, every tick, forever. Found: "
+         f"{ast.dump(_enrol_args[0])}")
     print(f"  ok   #657 enable interlock: CLAIM={_claim_admits}, review-fix resolve={_rf_admits}, "
           f"outcome={_outcome_admits}, arm-refuses={_arm_refuses} — ALL FOUR derived by execution "
           f"and fail-closed; policy/repos.toml enables enrolment for NOBODY (the minting path, "

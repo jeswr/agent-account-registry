@@ -9463,7 +9463,7 @@ def _self_test():
                          "sha": oc_state.get("head", "b" * 40)}}
 
     def run_review_outcome(verdict, labels=(), issue_labels=(), injection=False,
-                           reviewed_sha="b" * 40, **live_over):
+                           reviewed_sha="b" * 40, self_attested=False, **live_over):
         oc_calls.clear(); oc_outputs.clear(); oc_state.clear()
         oc_state.update(labels=labels, issue_labels=issue_labels, **live_over)
         with tempfile.TemporaryDirectory() as tmp:
@@ -9479,7 +9479,8 @@ def _self_test():
                 repo="o/r", pr=41, verdict_file=str(verdict_file),
                 files_file=str(files_file), round=1, max_rounds=3, security=False,
                 surface_path=[], issue=7, impl_provider="anthropic",
-                bot_login="sparq[bot]", run_key="9.1", reviewed_sha=reviewed_sha))
+                bot_login="sparq[bot]", run_key="9.1", reviewed_sha=reviewed_sha,
+                self_attested=self_attested))
 
     def run_fix_outcome(labels=(), issue_labels=(), injection="false",
                         reviewed_sha="b" * 40, **live_over):
@@ -9525,6 +9526,33 @@ def _self_test():
         check("unheld injection outcome still parks needs-user",
               (oc_calls, oc_outputs.get("decision")),
               (["post-findings", "needs-user"], "needs-user"))
+
+        # ---- [registry #657] THE ORCHESTRATOR CLASS, THROUGH THE REAL OUTCOME PATH -------
+        # (a) BASELINE, and the whole reason the outcome leg is part of the #657 enable
+        #     interlock: a NON-DRAFT PR without the class flag is DROPPED as `undrafted`,
+        #     with findings unposted and reviewed-sha left unbound — while the round budget
+        #     still charges. Every enrollable PR is non-draft, so an unwired outcome step
+        #     turns each review into a silent per-round burn ending in a terminal park.
+        run_review_outcome("approve", draft=False)
+        check("a non-draft PR is DROPPED as undrafted without the class flag",
+              (oc_calls, oc_outputs.get("decision"), oc_outputs.get("stale_reason")),
+              ([], "stale", "undrafted"))
+        # (b) ...and WITH it the outcome applies: findings posted, and the approve becomes a
+        #     HUMAN hand-off rather than an arm. Dropping `self_attested` anywhere between
+        #     argv and revalidate_outcome_head restores (a) here.
+        run_review_outcome("approve", draft=False, self_attested=True)
+        check("an orchestrator-class non-draft approve applies, and hands off to a human",
+              (oc_calls, oc_outputs.get("decision")),
+              (["post-findings", "needs-user"], "needs-user"))
+        # (c) the waiver is DRAFT-ONLY: a moved head is still stale for the class.
+        run_review_outcome("approve", draft=False, self_attested=True, head="d" * 40)
+        check("...and the class does not waive head freshness",
+              (oc_calls, oc_outputs.get("decision"), oc_outputs.get("stale_reason")),
+              (["round-void"], "stale", "head-moved"))
+        # (d) a DRAFT worker PR is unaffected by the flag existing at all.
+        run_review_outcome("approve")
+        check("the worker lane still arms on an approve",
+              (oc_calls, oc_outputs.get("decision")), (["post-findings"], "arm"))
 
         # the fix outcome paths drop the same way (re-review + injection->needs-user)
         for injection, park_name in (("false", "re-review"), ("true", "needs-user")):
