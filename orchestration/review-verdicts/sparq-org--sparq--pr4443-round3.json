@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4443,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "7a12a27fee2e02d58877c3e3d6b818e01ba32588",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 3 remains correct and complete on the supplied diff. The Bloom model is pinned against the shipped filter, the feature-off range oracle is compared against the real feature-on path across many keys, and the ignored latency harness includes non-vacuity, per-arm equivalence, warmup, black-boxing, and order reversal. The revised claims consistently limit the demonstrated benefit to synthetic, host-independent skip opportunity for absent-key lookups and explicitly disclaim latency and real-workload conclusions. The feature remains opt-in and in-memory only. No correctness, soundness, test-validity, security, or instruction-injection issue was found. Because round 2 also had no findings, progress is stagnant rather than improving.",
+  "verdict": "approve"
+ }
+}
