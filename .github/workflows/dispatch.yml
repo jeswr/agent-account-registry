@@ -1560,16 +1560,33 @@ jobs:
   # ZERO dispatching fleet-wide yet presents only as skipped jobs on a cron nobody watches. This
   # standalone job keys on `needs.plan.result` and, on failure/cancelled, upserts a rolling
   # `ops-alert` issue @-mentioning the maintainer via the SAME ALERT_REPO/ALERT_TOKEN routing the
-  # account-availability alert uses (locked decision 22c). It never runs when plan succeeds, so a
-  # healthy tick auto-closes any prior open plan-alert. No token or snapshot data reaches this job
-  # (it downloads no PLAN artifact); it only reads the plan JOB RESULT.
+  # account-availability alert uses (locked decision 22c). The JOB runs every tick; it is the
+  # SCRIPT that decides, so a healthy tick auto-closes any prior open plan-alert (as of #778 that
+  # needs BOTH stages green, not PLAN alone). No token or snapshot data reaches this job
+  # (it downloads no PLAN artifact); it only reads the plan/claim JOB RESULTS.
+  #
+  # #778 extends the same argument to CLAIM. GitHub does NOT run a job's `if: always()` steps once
+  # the JOB itself is cancelled (its own `timeout-minutes`, or a run-level cancel), and CLAIM hosts
+  # the CAS lease claim, the worker launch AND the `always()` per-tick telemetry recorder (#756).
+  # Measured on run 30245515435: PLAN success, then CLAIM cancelled at exactly 1200 s
+  # (timeout-minutes 15 + GitHub's 5-minute post-cancel grace); the CAS-claim step never finished
+  # and the telemetry step never ran. The run-level conclusion was `cancelled` — identical to the
+  # 116/117 cancellations in that window that were FREE concurrency coalescing with zero started
+  # jobs, so no run-conclusion aggregate can see it. Worse: PLAN had SUCCEEDED, so the PLAN-only
+  # decision CLOSED any open alert on the very tick CLAIM died mid-write. Hence `needs: claim` and
+  # CLAIM_RESULT below — the ONLY way to observe a cancelled job is from outside it.
   plan-alert:
-    name: ALERT (hard PLAN-job failure)
-    needs: [plan, secrets-guard]
-    # Runs every tick regardless of the PLAN result so a healthy PLAN can auto-close a prior
-    # alert; scripts/plan-alert.py keys on needs.plan.result — close happens ONLY on an explicit
-    # success (a skipped PLAN is not a recovery, review r1), and a success tick with no open alert
-    # does only a bare `gh issue list`, so a green tick stays cheap and side-effect-free.
+    name: ALERT (hard PLAN/CLAIM termination)
+    # `claim` is a dependency purely to READ its result. `always()` keeps this job running when
+    # claim fails/cancels/skips. It costs ~6 s serialized after CLAIM (measured ALERT median 6.4 s
+    # over 25 runs) on a ~595 s tick.
+    needs: [plan, secrets-guard, claim]
+    # Runs every tick regardless of the PLAN/CLAIM results so a healthy tick can auto-close a prior
+    # alert; scripts/plan-alert.py keys on needs.plan.result + needs.claim.result — close happens
+    # ONLY when BOTH are an explicit success (a skipped stage is not a recovery, review r1; and a
+    # green PLAN must not close an alert while CLAIM is what died, #778), and a success tick with
+    # no open alert does only a bare `gh issue list`, so a green tick stays cheap and
+    # side-effect-free.
     # secrets-guard gate (issue #101 review round 1): this job mounts ALERT_TOKEN/ALERT_REPO, so
     # it must NOT run while the secret-exfil settings are unverified — a guard failure skips it
     # (fail closed; the guard-red tick is itself the loud signal).
@@ -1603,6 +1620,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REGISTRY_REPO: ${{ github.repository }}
           PLAN_RESULT: ${{ needs.plan.result }}
+          # #778: the CLAIM result is the ONLY in-run signal that the lease/launch half of the
+          # tick died. Its `always()` telemetry step cannot report its own cancellation.
+          CLAIM_RESULT: ${{ needs.claim.result }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           MAINTAINER_HANDLE: jeswr
           # Privacy routing (locked decision 22c): scripts/plan-alert.py routes to a maintainer-set
