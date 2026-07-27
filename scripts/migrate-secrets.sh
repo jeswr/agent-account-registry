@@ -187,6 +187,12 @@
 #         migrate-run SELF-resume path only fires behind needs.cleanup-bootstrap.result ==
 #         'success' (C4 just proved the repo scope empty), so R0 passes trivially there — it
 #         is load-bearing for the STANDALONE phase: resume dispatch.
+#         The ALL-14-PRESENT shape (issue #329: quiesce succeeded, then the main phase's mint
+#         failed before mutating anything, stranding the writers disabled) is REFUSED like any
+#         other, but with its own diagnosis and runbook — it is NOT an accept. The writers'
+#         write-back is `gh secret set --env dispatch-secrets`, an UPSERT that CREATES the
+#         environment copy, so resuming from a pre-migration state manufactures the same
+#         env-newer/repo-stale pair; see assert_repo_scope_clear_for_resume.
 #     R.  re-enable the four quiesced writer workflows. Tries ALL four before failing (one
 #         failure never leaves the rest disabled) and any failure names the manual remediation.
 #
@@ -300,7 +306,14 @@
 # listing with zero enables; and the mint contract pins `permission-secrets: read` on the
 # reenable mint (removing it goes red). MUTATION CHECK: comment out the
 # assert_repo_scope_clear_for_resume call in phase_resume and the refusal scenario goes red
-# (rc 0, 4 enables issued from the dual-scope state). Round 15 (sol — the composed
+# (rc 0, 4 enables issued from the dual-scope state). ISSUE #329 (the PRE-MIGRATION abort —
+# all 14 still at repo scope because the main phase died before mutating anything): also
+# REFUSED, rc 1 with ZERO enables and the repo listing the only gh call, but carrying its OWN
+# diagnosis (`this is a PRE-MIGRATION abort`, naming the `gh secret set --env` upsert that
+# makes resuming — here or by hand — unsafe) rather than the partial-dual-scope one; a
+# 13-of-14 repo scope still takes the PARTIAL message, so the two shapes cannot collapse into
+# one. MUTATION CHECK: swap either die for the other (or drop the all-present branch) and the
+# 14/14 or 13/14 scenario goes red on the message assertion. Round 15 (sol — the composed
 # refused-resume denial): the CLEANUP phase drops the queue-time ordering attestation (it
 # consumes no queue-time S_* snapshot — see phase_cleanup's C0 comment); the composed
 # regression seeds the KEY-only mid-cleanup state with a REFUSED `phase: resume` event (R0
@@ -831,16 +844,45 @@ phase_cleanup() {
 # C4 has just proven the repo scope empty), so this gate passes trivially there; it is
 # load-bearing for the STANDALONE phase: resume dispatch. The listing needs the resume
 # mint's round-14 Secrets: READ grant (pinned by the mint contract below).
+#
+# ISSUE #329 — WHY THE PRE-MIGRATION ABORT IS *NAMED* BUT STILL REFUSED (do not "fix" this by
+# accepting it). The reported state is a real one (live run 29674201638): `phase: quiesce`
+# disabled the four writers, then the main phase's MINT failed on missing installation grants
+# BEFORE any mutation, leaving all 14 at repo scope with the writers stuck disabled. It is
+# TEMPTING to accept that shape — "the environment holds none of the 14, so there is no env
+# copy for a writer to rotate ahead of the repo original". THAT PREMISE IS FALSE: the writers'
+# rotation write-back is `gh secret set <NAME> --repo <repo> --env dispatch-secrets`
+# (scripts/worker-live.sh write_back; set-up-account.yml's enrolment upsert is the same shape),
+# and `gh secret set --env` is an UPSERT — it CREATES the environment copy when none exists.
+# So a resumed writer in the pre-migration state manufactures exactly the env-newer/repo-stale
+# pair this gate exists to prevent: env <name>=V2 (rotated, the value everything now resolves,
+# because an environment copy shadows the repo one) beside a surviving repo <name>=V1, which
+# the next quiesce+migrate snapshots into S_<name>, writes over env V2 at M3, and deletes at
+# M5. An emptiness check taken at R0 cannot bound that: it describes the instant it was taken,
+# while the enables it would authorise let a writer mutate the environment at any point before
+# the migration runs. Accepting the shape therefore needs a mechanism that makes the env write
+# IMPOSSIBLE (or makes the next migrate fail closed on it) — no such mechanism exists here, so
+# the gate stays as round 14 left it and the state gets a NAMED refusal instead: an accurate
+# diagnosis plus the recovery that is actually safe (converge the migration, then resume).
+# NOTE the same hazard applies to re-enabling the writers BY HAND from this state, which is
+# why the refusal says so rather than leaving `gh workflow enable` as folklore.
 assert_repo_scope_clear_for_resume() {
-  local repo_names name held=0
+  local repo_names name held=0 absent=0
   repo_names=$(_repo_names) \
     || die 'could not list repo-scope secrets — cannot prove the migration converged, so the writers must not resume (fail closed before any enable; NOTE: this listing needs the App token'"'"'s round-14 Secrets: read grant)'
   for name in "${SECRET_NAMES[@]}"; do
     if _has_name "$name" "$repo_names"; then
       printf '::error::migrate-secrets: %s still present at repo scope — a resumed post-cutover writer would rotate the ENVIRONMENT copy while this stale repo copy survives, and the next migrate would overwrite the newer environment value from it (repo-presence-is-authoritative) then delete it: newest-credential loss\n' "$name" >&2
       held=1
+    else
+      absent=$((absent + 1))
     fi
   done
+  # ALL 14 still at repo scope: the migration mutated nothing (issue #329's pre-migration
+  # abort). Same refusal, distinct diagnosis + runbook — the shape is recovered by converging
+  # the migration, never by re-enabling the writers (here or by hand) ahead of it.
+  [[ "$held" -eq 0 || "$absent" -ne 0 ]] \
+    || die 'all 14 are still at repo scope — this is a PRE-MIGRATION abort (the migrate mutated nothing; e.g. its mint failed on missing installation grants), NOT a converged cutover, and the writers must not resume from it: the rotation write-back is `gh secret set --env dispatch-secrets`, an UPSERT that CREATES the environment copy, so a resumed writer would leave env <name>=V2 beside the surviving repo <name>=V1 and the next migrate would overwrite V2 from that stale repo copy (repo-presence-is-authoritative) then delete it — newest-credential loss. Recovery: grant the App installation what the main phase needs, re-dispatch phase: migrate (then cleanup-bootstrap), and only then phase: resume. Re-enabling the writers BY HAND from here carries the identical hazard (fail closed before any enable)'
   [[ "$held" -eq 0 ]] \
     || die 'repo scope not empty — writers must not resume from a partial dual-scope state; re-dispatch phase: migrate (then cleanup-bootstrap) to converge first, and only then dispatch phase: resume (fail closed before any enable)'
   printf 'resume precondition: repo scope holds none of the 14 (cleanup converged — clean cutover state, writers safe to resume)\n'
@@ -2668,6 +2710,58 @@ FAKE
     "$(cat "$s28/calls.log")" "api repos/o/r/actions/secrets --paginate --jq .secrets[].name"
   chk "resume refusal: the newer env V2 values survive untouched (resume mutates no secret in any state)" \
     "$(grep -c '=v2-' "$s28/env_values")" 14
+
+  # --- scenario 28b: THE PRE-MIGRATION ABORT (issue #329) — REFUSED, WITH ITS OWN DIAGNOSIS.
+  # The modeled state is the live one from run 29674201638: `phase: quiesce` disabled the four
+  # writers, then the main phase's MINT failed BEFORE any mutation (missing App installation
+  # grants), so all 14 are still at repo scope and the environment holds none of them (only the
+  # unrelated broker PAT / canary). It is tempting to ACCEPT this as "nothing was copied, so
+  # there is no env copy for a writer to rotate" — but the writers' write-back is
+  # `gh secret set <NAME> --repo <repo> --env dispatch-secrets`, an UPSERT that CREATES the
+  # environment copy (scripts/worker-live.sh write_back), so a resumed writer would manufacture
+  # env <name>=V2 beside the surviving repo <name>=V1 and the next migrate would overwrite V2
+  # from that stale repo copy (M3) and delete it (M5): the scenario-28 loss, reached from the
+  # "clean" pre-migration state. R0 therefore REFUSES here too — the accept would authorise
+  # enables whose hazard begins the instant the listing that "proved" emptiness goes stale.
+  # What #329 gets is the DIAGNOSIS: the state named, the upsert named, the safe recovery
+  # spelled out, and the by-hand `gh workflow enable` explicitly marked as carrying the same
+  # hazard. MUTATION CHECK: turn this shape into an accept (or swap its die for the partial
+  # one) and this scenario goes red — on the enables, or on the message.
+  local s28b="$tmp/s28b"
+  mkdir -p "$s28b"
+  printf '%s\n' "${names[@]}" > "$s28b/repo_secrets"
+  printf 'REGISTRY_SECRETS_PAT\nPAT_VALIDITY_CANARY\n' > "$s28b/env_secrets"
+  rc=$(run_case "$s28b" "$tmp/s28b.out" resume-writers none)
+  chk "resume from the PRE-MIGRATION abort (all 14 at repo scope, env holds none of them) -> REFUSED (issue #329)" "$rc" 1
+  chk "resume pre-migration refusal: its OWN diagnosis (not the partial-dual-scope one)" \
+    "$(grep -c 'this is a PRE-MIGRATION abort' "$tmp/s28b.out")" 1
+  chk "resume pre-migration refusal: names the env UPSERT that makes the accept unsafe" \
+    "$(grep -c 'an UPSERT that CREATES the environment copy' "$tmp/s28b.out")" 1
+  chk "resume pre-migration refusal: warns that re-enabling BY HAND carries the identical hazard" \
+    "$(grep -c 'BY HAND from here carries the identical hazard' "$tmp/s28b.out")" 1
+  chk "resume pre-migration refusal: does NOT emit the partial-dual-scope message" \
+    "$(grep -c 'partial dual-scope state' "$tmp/s28b.out")" 0
+  chk "resume pre-migration refusal: ZERO enables, and the R0 repo listing is the ONLY gh call" \
+    "$(cat "$s28b/calls.log")" "api repos/o/r/actions/secrets --paginate --jq .secrets[].name"
+
+  # --- scenario 28c: the BOUNDARY between the two refusals — a 13-of-14 repo scope (one
+  # non-bootstrap name already deleted: a migrate that died MID-deletion) is PARTIAL, not a
+  # pre-migration abort, and must keep the round-14 message. Pins the all-present branch to
+  # EXACTLY 14, so a "most of them are present" relaxation cannot smuggle a mid-deletion state
+  # into the #329 diagnosis (whose runbook — re-dispatch migrate — is right either way, but
+  # whose "the migrate mutated nothing" claim would be false).
+  local s28c="$tmp/s28c"
+  mkdir -p "$s28c"
+  printf '%s\n' "${names[@]}" | grep -vxF -- ACCT01_TOKEN > "$s28c/repo_secrets"
+  printf '%s\n' "${names[@]}" > "$s28c/env_secrets"
+  rc=$(run_case "$s28c" "$tmp/s28c.out" resume-writers none)
+  chk "resume from a 13-of-14 repo scope (died mid-deletion) -> REFUSED as PARTIAL, not as the #329 abort" "$rc" 1
+  chk "resume 13-of-14 refusal: the partial-dual-scope runbook message" \
+    "$(grep -c 'repo scope not empty — writers must not resume from a partial dual-scope state' "$tmp/s28c.out")" 1
+  chk "resume 13-of-14 refusal: does NOT claim the migrate mutated nothing (#329 diagnosis withheld)" \
+    "$(grep -c 'PRE-MIGRATION abort' "$tmp/s28c.out")" 0
+  chk "resume 13-of-14 refusal: names all 13 survivors, ZERO enables" \
+    "$(grep -c 'still present at repo scope' "$tmp/s28c.out")-$(grep -cE '^workflow enable ' "$s28c/calls.log" || true)" 13-0
 
   # --- scenario 29: SOL'S COMPOSED ROUND-15 REGRESSION — REFUSED RESUME MUST NOT BRICK THE
   # KEY-ONLY CLEANUP RECOVERY. Composition of rounds 13+14+the old C0: the mid-cleanup
