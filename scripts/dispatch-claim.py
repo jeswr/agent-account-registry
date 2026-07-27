@@ -384,6 +384,27 @@ def repair_gate_checks_for(draft):
     return CI_REPAIR_GATE_CHECKS if draft is True else (CI_GATE_CHECK,)
 
 
+def module_scope_shadowing(source):
+    """PURE: the sorted module-scope names `source` binds MORE THAN ONCE at the top level.
+
+    Python accepts a duplicate top-level definition silently — the later one replaces the earlier,
+    which becomes unreachable dead code. In a 14k-line module edited by two stacked PRs that is a
+    realistic merge artifact, and it is invisible to every behavioural test: if the two bodies
+    agree nothing fails, and mutating the SHADOWED copy cannot change any outcome, so a mutation
+    run reports it killed-by-nothing. (Registry #762 hit exactly this: rebasing #765 onto #761
+    left two `unknown_aggregator_tiers`.) Module scope only — a name rebound inside a function, or
+    under an `if`, is ordinary code, not a lost definition."""
+    counts = Counter()
+    for node in ast.parse(source).body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            counts[node.name] += 1
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    counts[target.id] += 1
+    return sorted(name for name, count in counts.items() if count > 1)
+
+
 # ---- EVIDENCE GRADE (issue #762) ------------------------------------------------------------
 # TWO AUTHORITIES read an aggregator conclusion, and they need different things from it:
 #
@@ -6761,29 +6782,26 @@ def review_fix_admits_orchestrator_class(source=None):
 def _self_test():
     # ---- NO MODULE-SCOPE SHADOWING (registry #762, found by rebasing #765 onto #761) ----------
     # This module is 14k lines and two PRs edited overlapping regions of it. The merge left TWO
-    # top-level `def unknown_aggregator_tiers` — the later one silently shadowed the earlier, so
-    # one PR's function was DEAD and the other PR's tests were, unknowingly, exercising the
-    # survivor. The bodies happened to agree, so nothing failed and no mutation could find it:
-    # mutating the shadowed copy is a no-op by construction, which is precisely why a behavioural
-    # suite cannot see this class at all. Python has no duplicate-definition error, so assert it.
-    _module_names = Counter()
-    for _node in ast.parse(Path(__file__).resolve().read_text(encoding="utf-8")).body:
-        if isinstance(_node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            _module_names[_node.name] += 1
-        elif isinstance(_node, ast.Assign):
-            for _t in _node.targets:
-                if isinstance(_t, ast.Name):
-                    _module_names[_t.id] += 1
-    _shadowed = sorted(name for name, count in _module_names.items() if count > 1)
-    assert not _shadowed, (
-        f"module-scope shadowing in dispatch-claim.py: {_shadowed} — a later top-level "
-        "definition silently replaces an earlier one, so the earlier is dead code no test can "
-        "reach and no mutant can kill (this is what a bad three-way merge leaves behind)")
-    # ...and NON-VACUOUS: the check must actually see a duplicate when one exists.
-    assert sorted(
-        name for name, count in Counter(
-            node.name for node in ast.parse("def a():\n    pass\n\n\ndef a():\n    pass\n").body
-            if isinstance(node, ast.FunctionDef)).items() if count > 1) == ["a"]
+    # top-level `def unknown_aggregator_tiers` — the later silently shadowed the earlier, so one
+    # PR's function was DEAD and the other PR's tests were, unknowingly, exercising the survivor.
+    # The bodies happened to agree, so nothing failed; and mutating the SHADOWED copy is a no-op
+    # by construction, so no behavioural mutation run can reach this class at all. Python raises
+    # nothing for a duplicate top-level definition, so it is asserted here — over the PURE
+    # predicate below, exercised in BOTH directions, so that neutering the predicate reds a named
+    # test rather than silently disarming a tripwire on a tree that happens to be clean.
+    assert module_scope_shadowing(
+        Path(__file__).resolve().read_text(encoding="utf-8")) == [], (
+        "module-scope shadowing in dispatch-claim.py — a later top-level definition silently "
+        "replaces an earlier one, so the earlier is dead code no test can reach and no mutant "
+        "can kill (this is what a bad three-way merge leaves behind)")
+    # ...and the predicate DOES fire, on every module-scope binding form, so the assertion above
+    # is ruling something out rather than describing a predicate that can only ever say "clean".
+    assert module_scope_shadowing("def a():\n    pass\n\n\ndef a():\n    pass\n") == ["a"]
+    assert module_scope_shadowing("class B: pass\n\n\ndef B():\n    pass\n") == ["B"]
+    assert module_scope_shadowing("C = 1\nC = 2\n") == ["C"]
+    assert module_scope_shadowing("def d():\n    x = 1\n    x = 2\n") == []   # nested, not shadowed
+    assert module_scope_shadowing("if True:\n    e = 1\ne = 2\n") == []       # not module-scope body
+    assert module_scope_shadowing("def f():\n    pass\n\n\ndef g():\n    pass\n") == []
 
     # _run_gh_target_api MUST return the CompletedProcess on success — callers read .stdout
     # (decline reroute re-read, #505). A missing `return result` made it fall off to None and
