@@ -747,11 +747,13 @@ agent = "docs-agent"
     check("resolve() output is unchanged by enrolment", "review_enrolment_authors" in impl, False)
 
     # ---- [registry #657 / #759] THE ENABLE INTERLOCK, from the OTHER SIDE OF THE SEAM ----------
-    # This module owns the master-protected allowlist; dispatch-claim owns the two downstream
-    # wiring facts (does CLAIM admit the orchestrator class? does review-fix.yml's resolve step?).
-    # While EITHER consumer still refuses, a repo that ships the key enabled turns every enrolled
-    # PR into a PLAN-enumerate / CLAIM-refuse loop that repeats every tick forever, with a generic
-    # defer counter as its only symptom (research/657-orchestrator-pr-admission.md §7.4).
+    # This module owns the master-protected allowlist; dispatch-claim owns the downstream wiring
+    # facts. While ANY consumer is not ready, a repo that ships the key enabled turns every
+    # enrolled PR into a loop that repeats every tick forever — refused at CLAIM, SystemExit'd at
+    # review-fix `resolve`, or silently DROPPED at the outcome step — with a generic defer counter
+    # as its only symptom (research/657-orchestrator-pr-admission.md §7.4). The fourth fact is
+    # INVERTED: the ARM must REFUSE the class, because that leg's failure mode is not a stall, it
+    # is a MERGE authorised by a provenance record the implementer wrote about itself.
     #
     # The same consistency check lives in dispatch-claim's self-test. It is DUPLICATED here on
     # purpose, and this is the one duplication in this area that is not drift: both copies call the
@@ -759,23 +761,27 @@ agent = "docs-agent"
     # the rule — only about whether it is checked at all. MEASURED reason: with dispatch-claim's
     # copy alone, a single diff that enabled the key AND deleted that one assertion stayed green
     # (mutant E4). Two enrolled scripts now have to be edited to get an enabling diff past `gate`.
-    # (Production is protected independently: dispatch-claim.admits_orchestrator_pr conjoins the
-    # live CLAIM wiring fact, so an enabled key admits nothing even if both tests are deleted.)
     _dc = _import_sibling("registry_dispatch_claim_enrolment_interlock", "dispatch-claim.py")
     _live_policy = tomllib.loads(Path(__file__).resolve().parent.parent
                                  .joinpath(POLICY_PATH).read_text(encoding="utf-8"))
-    _interlock_error = _dc.enrolment_enable_error(
-        _live_policy, _dc.claim_admits_orchestrator_class(),
-        _dc.review_fix_admits_orchestrator_class())
+    _wiring = (_dc.claim_admits_orchestrator_class(),
+               _dc.review_fix_admits_orchestrator_class(),
+               _dc.outcome_admits_orchestrator_class(),
+               _dc.arm_refuses_orchestrator_class())
     check("the SHIPPED policy enables no enrolment the review lane cannot yet serve",
-          _interlock_error, None)
-    # NON-VACUOUS: the check above passes today because nothing is enabled, so prove the predicate
-    # actually reds on an enabling policy rather than being a constant None.
-    check("...and an enabling policy WOULD be refused while a consumer refuses the class",
-          _dc.enrolment_enable_error(
-              {"repos": {"o/r": {"review_enrolment_authors": ["jeswr"]}}},
-              _dc.claim_admits_orchestrator_class(),
-              _dc.review_fix_admits_orchestrator_class()) is not None, True)
+          _dc.enrolment_enable_error(_live_policy, *_wiring), None)
+    # NON-VACUOUS, and per-leg: the check above passes today because nothing is enabled, so prove
+    # the predicate reds on an enabling policy for EVERY leg independently. A single truthy row
+    # would let three of the four facts be dropped from the conjunction with nothing red.
+    _enabling = {"repos": {"o/r": {"review_enrolment_authors": ["jeswr"]}}}
+    for _index, _leg in enumerate(
+            ("CLAIM", "review-fix.yml resolve", "review-fix.yml outcome", "the arm refusal")):
+        _broken = list(_wiring)
+        _broken[_index] = not _broken[_index]
+        check(f"...and an enabling policy WOULD be refused with {_leg} not ready",
+              _dc.enrolment_enable_error(_enabling, *_broken) is not None, True)
+    check("...and an enabling policy is permitted once every leg is ready",
+          _dc.enrolment_enable_error(_enabling, True, True, True, True), None)
 
     # Issue #487: the exact actions-bot exception is a validated, per-repo opt-in. Missing means
     # false so a newly onboarded repository cannot inherit this author class accidentally.
