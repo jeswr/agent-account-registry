@@ -1,36 +1,36 @@
 {
-  "generated_at": "2026-07-27T13:55:22Z",
+  "generated_at": "2026-07-27T14:17:58Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
-      "issues_open": 1473,
+      "issues_open": 1475,
       "issues_ready": 359,
       "issues_closed_1h": 0,
-      "issues_closed_24h": 82,
-      "prs_open": 119,
+      "issues_closed_24h": 81,
+      "prs_open": 120,
       "prs_draft": 88,
-      "prs_opened_1h": 1,
+      "prs_opened_1h": 2,
       "prs_closed_1h": 0,
-      "prs_merged_1h": 1,
-      "prs_merged_24h": 90,
-      "review_changes_backlog": 7,
+      "prs_merged_1h": 0,
+      "prs_merged_24h": 89,
+      "review_changes_backlog": 8,
       "needs_user_parked": 22,
       "review_lane_health": "ok",
-      "review_lane_runs_1h": 3,
-      "worker_attempts_1h": 4,
-      "worker_success_rate_1h": 0.25,
-      "pr_open_rate": 1.0,
-      "pr_close_rate": 1.0,
-      "net_pr_flow": 0.0
+      "review_lane_runs_1h": 5,
+      "worker_attempts_1h": 3,
+      "worker_success_rate_1h": 0.3333,
+      "pr_open_rate": 2.0,
+      "pr_close_rate": 0.0,
+      "net_pr_flow": 2.0
     },
     "jeswr/agent-account-registry": {
-      "issues_open": 327,
+      "issues_open": 329,
       "issues_ready": 76,
       "issues_closed_1h": 0,
-      "issues_closed_24h": 10,
-      "prs_open": 34,
+      "issues_closed_24h": 9,
+      "prs_open": 36,
       "prs_draft": 18,
-      "prs_opened_1h": 0,
+      "prs_opened_1h": 2,
       "prs_closed_1h": 0,
       "prs_merged_1h": 1,
       "prs_merged_24h": 17,
@@ -40,20 +40,40 @@
       "review_lane_runs_1h": 0,
       "worker_attempts_1h": 0,
       "worker_success_rate_1h": null,
-      "pr_open_rate": 0.0,
+      "pr_open_rate": 2.0,
       "pr_close_rate": 1.0,
-      "net_pr_flow": -1.0
+      "net_pr_flow": 1.0
     }
   },
   "alerts": [
     {
       "target": "sparq-org/sparq",
+      "classification": "ready-starved",
+      "fire": true,
+      "summary": "ready frontier 359 > 60 but 0 issues closed over 2 snapshots \u2014 the drain has stalled",
+      "metrics": {
+        "issues_ready": 359,
+        "issues_closed_1h": 0
+      }
+    },
+    {
+      "target": "sparq-org/sparq",
       "classification": "worker-failing",
       "fire": true,
-      "summary": "worker success rate 25% < 50% floor over 2 snapshots (4 attempts this hour)",
+      "summary": "worker success rate 33% < 50% floor over 2 snapshots (3 attempts this hour)",
       "metrics": {
-        "worker_success_rate_1h": 0.25,
-        "worker_attempts_1h": 4
+        "worker_success_rate_1h": 0.3333,
+        "worker_attempts_1h": 3
+      }
+    },
+    {
+      "target": "jeswr/agent-account-registry",
+      "classification": "ready-starved",
+      "fire": true,
+      "summary": "ready frontier 76 > 30 but 0 issues closed over 2 snapshots \u2014 the drain has stalled",
+      "metrics": {
+        "issues_ready": 76,
+        "issues_closed_1h": 0
       }
     }
   ]
