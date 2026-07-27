@@ -175,17 +175,36 @@ scope holds all 14; `dispatch-secrets` holds none of them (plus the unrelated
 `gh secret list -R … --env dispatch-secrets`, `gh workflow list -R … --all`). If the observed state
 differs, stop — the phases below assume it.
 
-### S1 — grant the App installation what the main phase mints (this is what failed)
+### S1 — grant the App installation the UNION of what the five mint steps request (this is what failed)
 
-The `migrate` job mints with `permission-secrets: write`, `permission-environments: write`,
-`permission-actions: read` (`migrate-secrets-to-env.yml:306-315`). All three are load-bearing: the
-repo-scope list + DELETE are Secrets, the environment PUT/list/public-key are Environments (a
-Secrets-only token 403s on every env-secret call), and the quiesce gate's workflow-state reads are
-Actions **read**. Grant these on the `sparq-orchestrator` installation for
-`jeswr/agent-account-registry` **first**; without them the run dies at the mint again, exactly as
-before. The other phases mint narrower subsets of the same set (`quiesce`: actions write only;
-`cleanup-bootstrap`: secrets write + environments read + actions read; `reenable-writers`: actions
-write + secrets read), so satisfying `migrate` satisfies all four.
+Grant these three repository permissions on the `sparq-orchestrator` installation for
+`jeswr/agent-account-registry` **first**; without them a run dies at the mint again, exactly as
+before. This is the union across every phase, and it is what
+`migrate-secrets-to-env.yml:175-183` already documents:
+
+| repository permission | level | why |
+|---|---|---|
+| Secrets | **Read and write** | the repo-scope list + DELETE (`migrate`, both cleanup jobs) |
+| Environments | **Read and write** | the environment list / public-key / PUT (`migrate`) — a Secrets-only token 403s on every env-secret call |
+| Actions | **Read and write** | `quiesce` runs `gh workflow disable` and `reenable-writers` runs `enable`, both Actions **write**; the migrate/cleanup gates' workflow-state reads are Actions read |
+
+**Take the union, not `migrate`'s row.** The five `permission-*` blocks are deliberately per-phase
+least privilege and no single one dominates the others:
+
+| mint step | requests |
+|---|---|
+| `quiesce` (`:262-268`) | actions **write** |
+| `migrate` (`:307-315`) | secrets write + environments write + actions **read** |
+| `cleanup-bootstrap` (`:376-384`), `cleanup-standalone` (`:435-443`) | secrets write + environments read + actions read |
+| `reenable-writers` (`:495-502`) | actions **write** + secrets read |
+
+Actions **write** is not below Actions **read**, so an installation granted exactly `migrate`'s set
+would mint `migrate` and then fail at S4's `quiesce` — the *first* dispatch in this runbook.
+Granting write at each of the three covers every read in the table too, since a write level implies
+read in GitHub's permission model; nothing else in the union needs a fourth permission. (Note this
+does not widen any *token*: each mint still requests only its own row, and those rows are pinned by
+the workflow-mint-contract assertion in `scripts/migrate-secrets.sh --self-test`. The installation
+grant is the ceiling, not the token.)
 
 ### S2 — pre-flight the repo scope for names outside the closed set
 
