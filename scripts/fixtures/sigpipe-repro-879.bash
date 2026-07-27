@@ -14,8 +14,9 @@
 #   * ONE process. An earlier draft of this fixture used `printf; awk` — two sequential writers —
 #     and inverted 53/60 even at 16 lines, because the consumer can exit in the gap BETWEEN them.
 #     That version passed the "large enough" assertion on a 1 KiB input, i.e. it was satisfied by a
-#     weaker input and proved nothing about size. A mutation run caught it; do not reintroduce a
-#     second writer here.
+#     weaker input and proved nothing about size. A mutation run caught it. worker-live.sh now
+#     asserts the produced stream is >= 4 MiB DIRECTLY as well, so a weak fixture cannot pass by
+#     manufacturing an inversion — do not reintroduce a second writer here.
 #
 # `probe` runs THE BROKEN SHAPE (`producer | grep -Fq`) over that same stream and prints the
 # pipeline's status. The needle is the FIRST line, so grep always matches; a non-zero status

@@ -4201,6 +4201,12 @@ PY
   chk "the SIGPIPE fixture is large enough to FORCE the race (old shape inverts a REAL match)" \
     "$([[ "$sp_rc" -ne 0 ]] && echo inverted || echo "not-forced(rc=$sp_rc)")" "inverted"
   sp_cap="$(bash "$sp_repro" produce "$sp_needle")"
+  # ...and the SIZE is asserted DIRECTLY, not merely inferred from the inversion above. A mutation
+  # run showed why: an inversion can be produced by a WEAK fixture (two sequential writers let the
+  # consumer exit in the gap between them, inverting 53/60 on ~1 KiB), so the inversion alone does
+  # not establish that this input exceeds the pipe buffer. Measuring the stream cannot be faked.
+  chk "...and that fixture really is >= 4 MiB, i.e. past the 64 KiB pipe buffer (size IS the claim)" \
+    "$([[ "${#sp_cap}" -ge 4194304 ]] && echo big-enough || echo "only-${#sp_cap}-bytes")" "big-enough"
   chk "...and the capture-then-test idiom still SEES that match on the identical input (#879)" \
     "$([[ "$sp_cap" == *"$sp_needle"* ]] && echo match || echo MISSED)" "match"
   chk "..._first_match_line too: no consumer process, so nothing can early-exit (#879)" \
