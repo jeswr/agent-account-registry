@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4627,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ba305f229ba1c18173703f1b2bc4b14c4bd01e38",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior major finding. The backend contract now consistently requires lazy start and drop-abandonment for both streams and futures, while the module, README, skill, and proposal reference carefully distinguish the wrapper's unconditional behavior from backend-dependent cancellation of remote work. The focused lifecycle test observes Idle before polling, Active after the first poll, and Cancelled when the wrapper stream is dropped, so it exercises the real NodeStream-to-backend Drop path rather than only checking a wrapper-side poll counter. The implementation remains default-off and runtime-independent, validates invalid literal subjects before backend calls, forwards polling and errors without collecting, and includes a feature-matrix test leg. No correctness, soundness, test-validity, or security issue remains in the supplied diff.",
+  "verdict": "approve"
+ }
+}
