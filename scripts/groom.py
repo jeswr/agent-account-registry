@@ -461,8 +461,7 @@ def _read_provenance_json(
         return None  # unreadable/malformed JSON — the review loop fails closed on it too
 
 
-def _orchestrator_admission(repo: str, number: int, pull: dict[str, Any],
-                            enrolled_authors: Any) -> Any:
+def _orchestrator_admission(repo: str, pull: dict[str, Any], enrolled_authors: Any) -> Any:
     """[registry #835] The #657 orchestrator-class admission PREDICATE for one open PR, as a
     ``(record, number) -> bool`` callable — or None when this PR is not even a candidate.
 
@@ -510,7 +509,7 @@ def _orchestrator_source_issue(
     binding for a worker PR either (``HEAD_REF_RE``'s capture group is not consumed anywhere in
     this repository). A worker PR additionally cross-checks branch-vs-record because it HAS a
     branch to cross-check; an orchestrator PR has an ordinary branch by definition."""
-    admits = _orchestrator_admission(repo, number, pull, enrolled_authors)
+    admits = _orchestrator_admission(repo, pull, enrolled_authors)
     if admits is None:
         return None
     record = _read_provenance_json(repo, number, registry_root, ledger_root=ledger_root)
@@ -636,7 +635,7 @@ def _live_issue_admission(
             # admitted, on the SAME terms the on-disk admission applies. `None` here means "not
             # even a candidate" (a fork head, an unenrolled author, an empty allowlist), which
             # is the pre-#835 outcome for every PR.
-            admits = _orchestrator_admission(repo, pr_number, pull, enrolled_authors)
+            admits = _orchestrator_admission(repo, pull, enrolled_authors)
             if admits is None:
                 continue
         state, record = _live_provenance_record(
