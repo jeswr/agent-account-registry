@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4514,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e644998f9b3683419ee0e11b48bb93f7a20b2884",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The outcome table states that \u201cthe recomposition half is free,\u201d yet the companion record consistently describes that as a source-derived expectation and says the \u00a74.2 measurement can still change the answer if recomposition is not free. Linearity suggests low gate cost, but does not establish zero ACIR opcodes or zero backend gates after optimization. The summary therefore turns a deliberately unmeasured hypothesis into a factual program outcome.",
+    "file": "research/noir-optimization-program.md",
+    "fix_hint": "Describe the result as a prediction pending \u00a74.2 measurement (for example, \u201cexpected to add no gates; not measured\u201d), or run the controlled opcode/gate comparison and report the evidence before calling it free.",
+    "severity": "major",
+    "title": "Unmeasured #6313 prediction is reported as a settled result"
+   },
+   {
+    "body": "The document says the bead\u2019s deliverable is a measurement comment upstream, but no measurement was run and none of the three live issue bodies was read. Nevertheless it declares source analysis \u201cCOMPLETE,\u201d applies the bead exit condition, and decides that no follow-up bead is warranted. The drafts themselves correctly require live-thread checks and measurement, so the terminal bead conclusion is premature and could close work against stale or mischaracterized asks.",
+    "file": "research/noir-investigation-on-ramps-upstream.md",
+    "fix_hint": "Keep sq-eesz3 explicitly in a provisional/blocked-on-empirical state until the live issues are checked and the promised measurements are run, or revise the documented bead scope/exit condition so a source-only findings record is genuinely the complete deliverable. Do not make the no-follow-up decision final for #6313 until \u00a74.2 is measured.",
+    "severity": "major",
+    "title": "The bead is declared complete before its stated deliverable is validated"
+   }
+  ],
+  "progress": null,
+  "summary": "The record is admirably explicit about its environmental limits, but its headline outcome overstates what the source-only investigation establishes. In particular, it promotes the unmeasured prediction that byte recomposition is free into a settled fact, while its own measurement protocol says that this is the one result that could change the answer. It also marks a measurement-comment deliverable complete without running measurements or checking the live issue asks. These conclusions should remain provisional until the specified empirical and upstream-thread checks are performed.",
+  "verdict": "request_changes"
+ }
+}
