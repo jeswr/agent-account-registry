@@ -50,6 +50,24 @@ def _load_gh_retry() -> Any:
 _gh_retry = _load_gh_retry()
 
 
+def _load_measurement_gate() -> Any:
+    spec = importlib.util.spec_from_file_location(
+        "registry_measurement_gate", Path(__file__).resolve().with_name("measurement_gate.py"))
+    if spec is None or spec.loader is None:
+        raise RuntimeError("cannot load the shared measurement gate")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+# The measurement-RUN classifier (registry #466). This module's EC2 fence and the triage/readiness
+# path's `needs:ec2` gate must never drift apart into two keyword lists, so the keywords and the
+# code-only exemption now live in ONE place. curate keeps the UNSCOPED, narrow predicate — it runs
+# on brand-new, status-less issues that have no `area:*` label yet — while triage.py uses the
+# bench-SCOPED one. `measurement_gate`'s self-test pins both and their containment.
+_measurement_gate = _load_measurement_gate()
+
+
 TARGET_READY = 12
 MAX_CLOSES = 5
 GATE_LABELS = ("needs:", "trust:untrusted")
@@ -66,10 +84,7 @@ TRUST_KEYWORDS = (
     "issuer", "credential", "trust anchor", "zero-knowledge", "multi-party", "snark",
     "garbled", "proving key", "witness commitment", "trusted setup",
 )
-EC2_KEYWORDS = (
-    "quiet-box", "ec2", "canonical gather", "same-box", "full-scale",
-    "nightly gather", "gather run",
-)
+EC2_KEYWORDS = _measurement_gate.EC2_KEYWORDS
 WELL_SPECIFIED_LABELS = {"self-improvement", "from:agent", "drift"}
 SAFE_REPO = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*"
@@ -93,13 +108,7 @@ _LINE = re.compile(
     r"|\b[A-Za-z0-9_./-]+\.[A-Za-z0-9]+:[1-9][0-9]*\b",
     re.IGNORECASE,
 )
-_CODE_ONLY_BENCH = re.compile(
-    r"\b(?:fix|wire|repair|refactor|update|change|implement|add|modify)\b"
-    r".{0,80}\b(?:scripts?|harness)\b"
-    r"|\b(?:scripts?|harness)\b.{0,80}"
-    r"\b(?:fix|wire|repair|refactor|update|change|implement|add|modify)\b",
-    re.IGNORECASE | re.DOTALL,
-)
+_CODE_ONLY_BENCH = _measurement_gate.CODE_ONLY_BENCH
 _P2 = re.compile(
     r"\bci(?:\s+is)?\s+red\b|\bdeadlock(?:ed|s|ing)?\b|\bbricks?\b"
     r"|\bblocks\s+all\b",
@@ -260,12 +269,17 @@ def is_trust_surface(issue: dict[str, Any], labels: set[str]) -> bool:
 
 
 def is_ec2_measurement(issue: dict[str, Any]) -> bool:
-    text = issue_text(issue)
-    folded = text.casefold()
+    """The UNSCOPED EC2 fence, delegated to the shared classifier (registry #466).
+
+    `issue_text` is still called first so a malformed title/body raises CuratorError — this
+    module's own error type — before the shared module ever sees it; the delegation therefore
+    cannot change which exception a malformed issue produces here.
+    """
+    issue_text(issue)
     title = issue.get("title")
     if not isinstance(title, str):
         raise CuratorError("issue title is malformed")
-    return any(keyword in folded for keyword in EC2_KEYWORDS) and not _CODE_ONLY_BENCH.search(title)
+    return _measurement_gate.is_ec2_measurement(title, issue.get("body"))
 
 
 def is_well_specified(issue: dict[str, Any], labels: set[str]) -> bool:
@@ -1230,6 +1244,25 @@ def _self_test() -> int:
     checks.append(("measurement work is gated while code-only bench work remains stageable",
                    any(m.kind == "needs-ec2" and m.number == 230 for m in planned)
                    and any(m.kind == "stage" and m.number == 231 for m in planned)))
+
+    # Registry #466: the fence delegates to measurement_gate but keeps the UNSCOPED, narrow
+    # keyword list. This runs THROUGH plan_repository, so it fails if curate is ever re-pointed at
+    # the bench-SCOPED list — which would fence every status-less issue whose body says "measured".
+    scoped_only = [
+        issue(232, "Fix the MEASURED parser regression", ("area:alpha",),
+              body=long_body + " A measurement run on the nightly tier would confirm it."),
+    ]
+    planned, _ = plan_repository(scoped_only, all_labels, automation)
+    checks.append(("curate's fence stays UNSCOPED-narrow (a scoped-only keyword never fences)",
+                   not any(m.kind == "needs-ec2" for m in planned)
+                   and any(m.kind == "stage" and m.number == 232 for m in planned)))
+    malformed_raised = False
+    try:
+        is_ec2_measurement({"title": None, "body": ""})
+    except CuratorError:
+        malformed_raised = True
+    checks.append(("curate's fence still raises CuratorError on a malformed title",
+                   malformed_raised))
 
     # Policy controls the ready-depth target. Thirty distinct eligible areas prove the policy
     # value reaches the planner instead of leaving the former hard-coded cap of twelve in place.

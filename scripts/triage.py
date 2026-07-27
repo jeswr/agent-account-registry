@@ -41,10 +41,30 @@ Two layers now enforce the invariant:
     remains — restoring the previous role label (or demoting `status:ready`) and failing loudly if
     the post-condition is violated.
 """
+import importlib.util
 import json
+import os
 import re
 import subprocess
 import sys
+
+
+def _load_measurement_gate():
+    spec = importlib.util.spec_from_file_location(
+        "registry_measurement_gate",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "measurement_gate.py"))
+    if spec is None or spec.loader is None:
+        raise RuntimeError("cannot load the shared measurement gate")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+# The measurement-RUN classifier (registry #466). SHARED with curate-frontier.py so the fence and
+# this gate can never drift into two keyword lists. See measurement_gate.py for why the two
+# predicates have deliberately different scopes; triage uses the bench-SCOPED one, which fires only
+# on an issue already attributed to the benchmark surface.
+measurement_gate = _load_measurement_gate()
 
 ROLE_LABELS = frozenset({"docs", "impl", "ci", "research", "site"})
 
@@ -262,7 +282,7 @@ def _assert_role_invariant(current, add, remove, ready):
             "registry #582: that state is silently undispatchable and terminal")
 
 
-def triage(labels, issue_type="task", trusted=True, known_labels=None):
+def triage(labels, issue_type="task", trusted=True, known_labels=None, title="", body=""):
     """Return {add:set, remove:set, ready:bool, role:str|None, warnings:list}.
 
     Untrusted -> a no-op (the trust layer quarantines/notifies; content is never inspected here).
@@ -273,12 +293,47 @@ def triage(labels, issue_type="task", trusted=True, known_labels=None):
     keeps the role it has (or, if it has none, stays `status:untriaged`, which retriage can still
     recover) and a loud warning names the issue's missing label. `None` means "label set unknown"
     and keeps the pure-logic behaviour; the applier below always supplies it.
+
+    `title`/`body` (optional, registry #466): the issue TEXT, the only input that can tell a bench
+    MEASUREMENT RUN apart from bench code work. Both default to "" so every existing label-only
+    caller keeps its exact behaviour — an empty text carries no measurement signal, so the gate
+    below simply never fires. Callers that CAN read the text (triage.py --apply, retriage.py
+    --apply) pass it; see the gate's own comment for why an absent text is safe here and is not the
+    fail-open direction it looks like.
     """
     labels = set(labels)
     if not trusted or "trust:untrusted" in labels:
         return {"add": set(), "remove": set(), "ready": False, "role": None, "warnings": []}
     role = _role(labels, issue_type)
     add, remove, warnings = set(), set(), []
+    # [OPUS-5] registry #466 — THE MEASUREMENT-RUN GATE. An `area:bench` issue whose deliverable is
+    # an EC2 quiet-box measurement RUN is structurally impossible on a standard GitHub-Actions
+    # runner: no dedicated quiet box, no orphan-proof provisioning, no multi-GB datasets, and a
+    # result gathered anywhere else is non-canonical anyway. Measured 2026-07-19: ~75% of worker
+    # runs died on `model produced no repository changes` against exactly this class, and because
+    # the retriage sweep re-promotes `status:deferred` -> ready, the SAME impossible issue was
+    # re-dispatched forever. The gate is a `needs:*` HOLD, so it can only remove the issue from the
+    # frontier — it never grants anything.
+    #
+    # WHY AN ABSENT TEXT IS NOT FAIL-OPEN. `title`/`body` default to "" and an empty text never
+    # matches, so a caller that cannot read the text plans no gate. That is the SAME posture the
+    # rest of this function holds: it is not an admission (readiness still requires the full
+    # positive attestation set), it is the absence of one extra hold. The two live appliers both
+    # read the text, and a text read that FAILS raises out of the applier rather than degrading to
+    # "" — the degradation would be silent, and a silent degradation here reopens the loop.
+    measurement = measurement_gate.is_measurement_run(labels, title, body)
+    if measurement:
+        gate = measurement_gate.GATE_LABEL
+        if known_labels is not None and gate not in set(known_labels):
+            # FAIL-CLOSED (same shape as the #582 role check): the label cannot be written, so say
+            # so loudly — but the issue still must NOT be ready. `measurement` alone forces that
+            # below, independently of whether the hold could be recorded.
+            warnings.append(
+                f"measurement-run gate label {gate!r} does not exist in the repository label set "
+                f"— the issue is held NOT-ready anyway (registry #466); create the label so the "
+                f"hold becomes visible on the issue itself")
+        else:
+            add.add(gate)
     existing = _roles_of(labels)
     if role:
         target = f"{ROLE_PREFIX}{role}"
@@ -301,7 +356,10 @@ def triage(labels, issue_type="task", trusted=True, known_labels=None):
             remove |= {lb for lb in existing if lb != target}
     has_area = any(lb.startswith("area:") for lb in labels)
     # ANY needs:* gate (needs:design B2, needs:user, needs:area) blocks ready. kind:epic too.
-    gated = any(lb.startswith("needs:") for lb in labels)
+    # `measurement` is unioned in rather than read back off `add`, so the hold binds even when the
+    # target repo has no `needs:ec2` label to write (registry #466) — the not-ready verdict must
+    # not depend on a label write succeeding.
+    gated = any(lb.startswith("needs:") for lb in labels) or measurement
     ready = (bool(role) and _valid_priority(labels) and has_area and not gated
              and "kind:epic" not in labels)
     if ready:
@@ -551,6 +609,27 @@ def live_gh(repo, number, title="triage"):
     return read_state, view, edit, warn
 
 
+def live_text(repo, number):
+    """The live issue TITLE and BODY, for the measurement-run gate (registry #466). FAIL-LOUD.
+
+    Deliberately a SEPARATE read from `live_gh`'s `read_state`: that tuple's shape is the
+    revision-bound post-condition contract `apply_triage` and `retriage.py --apply` both depend on,
+    and widening it to carry text would put a decision input inside a consistency token.
+
+    A missing/malformed `title` or `body` RAISES. `triage()` defaults the text to "" — which plans
+    NO gate — so degrading a failed read to "" here would silently re-open the #466 dispatch loop
+    the gate exists to close; the read must fail the step instead.
+    """
+    out = _gh_read(["issue", "view", str(number), "-R", repo, "--json", "title,body"])
+    doc = json.loads(out)
+    if not isinstance(doc, dict) or "title" not in doc or "body" not in doc:
+        raise RuntimeError(f"issue view for #{number} is missing title/body (schema drift)")
+    title, body = doc["title"], doc["body"]
+    if not isinstance(title, str) or not isinstance(body, (str, type(None))):
+        raise RuntimeError(f"issue #{number} has a malformed title/body")
+    return title, body or ""
+
+
 def _apply_cli(repo, number, issue_type):
     """`--apply`: read the live issue + label set, plan, and mutate fail-closed. Exit 1 loudly on
     any invariant/post-condition failure so the workflow step turns red instead of silently
@@ -560,7 +639,16 @@ def _apply_cli(repo, number, issue_type):
     current = view()
     known = repo_label_set(repo)
     try:
-        result = triage(current, issue_type, trusted=True, known_labels=known)
+        title, body = live_text(repo, number)
+    except (RuntimeError, ValueError, OSError) as exc:
+        # FAIL THE STEP, never classify against an empty text: "" plans no measurement-run gate,
+        # so degrading here would silently re-admit exactly the class #466 exists to exclude.
+        print(f"::error title=triage #{number}::cannot read the live issue title/body, so the "
+              f"measurement-run gate cannot be evaluated — refusing to act (fail closed): {exc}")
+        return 1
+    try:
+        result = triage(current, issue_type, trusted=True, known_labels=known,
+                        title=title, body=body)
     except RoleInvariantError as exc:
         print(f"::error title=triage #{number}::{exc}")
         return 1
@@ -1245,6 +1333,94 @@ def _self_test():
     chk("the label mutation argv is one `gh issue edit` with per-label flags",
         calls, [["gh", "issue", "edit", "7", "-R", "o/r", "--add-label", "role:impl",
                  "--remove-label", "role:docs"]])
+
+    # -----------------------------------------------------------------------------------------------
+    # REGISTRY #466 — THE MEASUREMENT-RUN GATE, asserted END TO END against the readiness engine
+    # rather than against this function's own return value. `compute_ready` is the thing that
+    # actually feeds dispatch, so a gate that stops short of it would be a gate on paper only.
+    ready_engine = load_sibling("ready-issues.py", "registry_ready_issues")
+    bench_labels = ["priority:P2", "area:bench", "role:impl"]
+    run_title = "same-box MEASURED PyKEEN run FB15k-237/WN18RR"
+    run_body = ("**Deliverable:** a canonical quiet-box gather run on a dedicated EC2 instance "
+                "with the real datasets.")
+    code_title = "write a wasm micro-bench for the triple parser"
+
+    def frontier(result, labels=bench_labels):
+        """The issue's post-triage label set, run through the REAL readiness engine."""
+        post = sorted((set(labels) | result["add"]) - result["remove"])
+        rows = [{"number": 466, "state": "OPEN", "labels": post, "open_blockers": 0}]
+        return post, [row["number"] for row in ready_engine.compute_ready(rows, log=lambda _m: None)]
+
+    measured = triage(bench_labels, "task", title=run_title, body=run_body)
+    post, seen = frontier(measured)
+    chk("[#466] a MEASURED quiet-box bench run is gated needs:ec2 and is NOT ready",
+        (measured["ready"], measurement_gate.GATE_LABEL in measured["add"],
+         "status:ready" in measured["add"], seen), (False, True, False, []))
+    chk("[#466] ...and the readiness engine names the gate as the exclusion reason",
+        ready_engine.exclusion_reason(set(post) | {"status:ready"}),
+        "gated by " + measurement_gate.GATE_LABEL)
+    # THE OTHER HALF, and the reason this is a classifier and not a blanket `area:bench` gate:
+    # code-only bench work must still reach the frontier. Deleting the code-only exemption (or
+    # gating on the label alone) turns this red.
+    code_only = triage(bench_labels, "task", title=code_title, body="add a criterion micro-bench")
+    _post, seen = frontier(code_only)
+    chk("[#466] a code-only bench issue stays ready and REACHES compute_ready",
+        (code_only["ready"], measurement_gate.GATE_LABEL in code_only["add"], seen),
+        (True, False, [466]))
+    # MUTATION CHECK: the gate is what removes it. Without the text the SAME labels are ready, so
+    # the assertion above cannot be passing for some unrelated reason.
+    textless = triage(bench_labels, "task")
+    chk("[#466] the same labels with NO text are ready — the TEXT is what gates",
+        (textless["ready"], frontier(textless)[1]), (True, [466]))
+    # SCOPE: a dispatch-surface issue quoting the same words is untouched (this very issue's body).
+    dispatch_labels = ["priority:P1", "area:dispatch", "role:impl"]
+    quoting = triage(dispatch_labels, "task", title="dispatch waste: EC2 bench RUN issues leak",
+                     body="MEASURED 2026-07-19: the quiet-box gather run loopers #3067/#3068.")
+    chk("[#466] a non-bench issue quoting quiet-box/MEASURED/EC2 is NOT gated",
+        (quoting["ready"], measurement_gate.GATE_LABEL in quoting["add"],
+         frontier(quoting, dispatch_labels)[1]), (True, False, [466]))
+    # FAIL-CLOSED: a repo without the `needs:ec2` label still holds the issue NOT-ready, loudly.
+    no_label = triage(bench_labels, "task", known_labels=set(bench_labels) | {"status:ready"},
+                      title=run_title, body=run_body)
+    chk("[#466] a missing needs:ec2 label holds the issue not-ready and WARNS",
+        (no_label["ready"], measurement_gate.GATE_LABEL in no_label["add"],
+         any("needs:ec2" in w for w in no_label["warnings"]), frontier(no_label)[1]),
+        (False, False, True, []))
+    # A `status:ready` bench run is DEMOTED, not left attested — this is the lane that drains the
+    # ten already-ready loopers #466 measured.
+    attested = triage(bench_labels + ["status:ready"], "task", title=run_title, body=run_body)
+    chk("[#466] an already-ready measurement run is demoted out of the frontier",
+        ("status:ready" in attested["remove"], "status:untriaged" in attested["add"],
+         frontier(attested, bench_labels + ["status:ready"])[1]), (True, True, []))
+    # The gate is a HOLD, never a grant: it can only ever ADD a `needs:*` label.
+    chk("[#466] the gate never plans a removal",
+        [lb for lb in measured["remove"] if lb.startswith("needs:")], [])
+    # An UNTRUSTED issue is still a no-op — content is never inspected on that path.
+    chk("[#466] an untrusted measurement run is still a pure no-op",
+        triage(bench_labels, "task", trusted=False, title=run_title, body=run_body),
+        {"add": set(), "remove": set(), "ready": False, "role": None, "warnings": []})
+    # `live_text` FAILS the read rather than degrading to "" (which would plan no gate at all).
+    def _fake_read(payload):
+        return lambda args: payload
+    real_gh_read = globals()["_gh_read"]
+    try:
+        globals()["_gh_read"] = _fake_read(json.dumps({"title": run_title, "body": run_body}))
+        chk("[#466] live_text returns the live title/body", live_text("o/r", 7),
+            (run_title, run_body))
+        globals()["_gh_read"] = _fake_read(json.dumps({"title": run_title, "body": None}))
+        chk("[#466] a null body normalises to the empty string", live_text("o/r", 7),
+            (run_title, ""))
+        for broken in ('{"title": "t"}', '{"body": "b"}', '{"title": 7, "body": ""}',
+                       '{"title": "t", "body": 5}', "[]", "null"):
+            globals()["_gh_read"] = _fake_read(broken)
+            try:
+                live_text("o/r", 7)
+            except RuntimeError:
+                chk(f"[#466] live_text REFUSES {broken}", True, True)
+            else:
+                chk(f"[#466] live_text REFUSES {broken}", "degraded", "raised")
+    finally:
+        globals()["_gh_read"] = real_gh_read
 
     print("triage self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1

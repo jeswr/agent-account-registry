@@ -122,8 +122,15 @@ def plan(issue, maintainer, app_bot, permission, classify=static_triage.triage,
     untriaged = "status:untriaged" in labels
     if not untriaged and "status:ready" not in labels:
         return {"action": "skip", "reason": "not-retriageable"}
+    # The issue TEXT rides into the classifier (registry #466). It is what tells an `area:bench`
+    # MEASUREMENT RUN — impossible on a standard runner — apart from bench code work, and this
+    # sweep is the exact lane that kept re-promoting the impossible ones: a `status:deferred`
+    # looper aged back to `status:untriaged`, the label-only classifier called it complete, and it
+    # re-entered `compute_ready` to fail again. `_apply_cli` supplies both fields from the LIVE
+    # read; they default to "" (no signal, no gate) for the pure label-drift callers.
     try:
-        result = classify(labels, "task", trusted=True, known_labels=known_labels)
+        result = classify(labels, "task", trusted=True, known_labels=known_labels,
+                          title=issue.get("title") or "", body=issue.get("body") or "")
     except Exception:
         return {"action": "skip", "reason": "classifier-failure"}
     add, remove = set(result["add"]), set(result["remove"])
@@ -360,8 +367,15 @@ def workflow_step_script(text, step_id):
 
 
 def read_live_body(repo, number):
-    """The issue's LIVE `{"body": str, "state": "OPEN"|"CLOSED"}`, through the shared bounded-retry
-    READ layer. RAISES on anything it cannot positively interpret.
+    """The issue's LIVE `{"title": str, "body": str, "state": "OPEN"|"CLOSED"}`, through the shared
+    bounded-retry READ layer. RAISES on anything it cannot positively interpret.
+
+    `title` rides this same read (registry #466): it is the other half of the text the
+    measurement-run gate classifies, it is MUTABLE — so the pre-pagination board copy would be
+    exactly the stale-decision-input this function exists to eliminate — and it is validated with
+    the same fail-closed shape rule as `body`. A title that cannot be positively read raises, so
+    `_apply_cli` refuses to act rather than classifying an issue against an empty title (an empty
+    text carries no measurement signal, i.e. degradation here would plan NO gate).
 
     #605 review round 2 (a fail-OPEN race): `_apply_cli` refreshed only `labels` from the live
     read, while the `body` that decides the `<!-- orchestration:hold -->` park still came from the
@@ -388,7 +402,7 @@ def read_live_body(repo, number):
     a stub that replaces them (round-4 MAJOR: stubbing this function left `return ""` and a read of
     issue `1` both green)."""
     raw = static_triage._gh_read(                          # noqa: SLF001 — the one shared read layer
-        ["issue", "view", str(number), "-R", repo, "--json", "body,state"])
+        ["issue", "view", str(number), "-R", repo, "--json", "title,body,state"])
     try:
         document = json.loads(raw)
     except (TypeError, ValueError) as exc:
@@ -406,7 +420,11 @@ def read_live_body(repo, number):
     state = document.get("state")
     if not isinstance(state, str) or state.strip().upper() not in {"OPEN", "CLOSED"}:
         raise SweepError(f"issue #{number}: the live read carries no usable `state` ({state!r})")
-    return {"body": body, "state": state.strip().upper()}
+    title = document.get("title")
+    if not isinstance(title, str):
+        raise SweepError(f"issue #{number}: the live `title` is {type(title).__name__}, not a "
+                         "string — the measurement-run gate cannot be evaluated (registry #466)")
+    return {"title": title, "body": body, "state": state.strip().upper()}
 
 
 def _apply_cli(repo, number, issue, maintainer, app_bot, permission, known_labels):
@@ -441,6 +459,10 @@ def _apply_cli(repo, number, issue, maintainer, app_bot, permission, known_label
               f"orchestration hold cannot be honoured — refusing to act (fail closed): {exc}")
         return 1
     fresh["body"] = document["body"]
+    # The TITLE is a decision input too (registry #466: the measurement-run gate), and it is
+    # mutable, so it rides the same live read rather than the board snapshot — which never carried
+    # it in the first place.
+    fresh["title"] = document["title"]
     if document["state"] != "OPEN":
         # #605 review round 4 (MINOR): open/closed was the last eligibility input still taken from
         # the pre-pagination board query, so an issue closed during the sweep could still be
@@ -495,6 +517,46 @@ def _self_test():
     chk("status:untriaged promotion",
         got["action"] == "promote" and "status:ready" in got["add"]
         and "status:untriaged" in got["remove"])
+    # ---- REGISTRY #466: THIS SWEEP IS THE LANE THAT LOOPED. A deferred EC2 measurement run aged
+    # back to `status:untriaged`, the label-only classifier called its label set complete, and the
+    # promotion below put the structurally-impossible issue back on the frontier to fail again.
+    # The classifier now sees the TEXT, so the promotion never happens.
+    RUN_TITLE = "same-box MEASURED PyKEEN run FB15k-237/WN18RR"
+    RUN_BODY = "Deliverable: a canonical quiet-box gather run on a dedicated EC2 instance."
+
+    def bench(status, *extra, title=RUN_TITLE, body=RUN_BODY):
+        doc = labelled("priority:P2", "area:bench", "role:impl", status, *extra, body=body)
+        doc["title"] = title
+        return doc
+
+    chk("[#466] an untriaged MEASURED bench run is NOT promoted onto the frontier",
+        plan(bench("status:untriaged"), "owner", "app[bot]", "none"),
+        {"action": "skip", "reason": "classifier-incomplete"})
+    # MUTATION CHECK: the same labels with a code-only title ARE promoted, so the row above is not
+    # passing because of some unrelated incompleteness in the fixture.
+    code_only = plan(bench("status:untriaged", title="write a wasm micro-bench",
+                           body="add a criterion micro-bench for the parser"),
+                     "owner", "app[bot]", "none")
+    chk("[#466] ...while a code-only bench issue with the SAME labels IS promoted",
+        (code_only["action"], "status:ready" in code_only["add"]), ("promote", True))
+    # The already-`status:ready` loopers (#466 measured ten of them) are demoted AND gated by the
+    # re-park lane, which is what drains them without a human sweep.
+    reparked = plan(bench("status:ready"), "owner", "app[bot]", "none")
+    chk("[#466] an already-ready measurement run is re-parked WITH the needs:ec2 gate",
+        (reparked["action"], "status:untriaged" in reparked["add"],
+         static_triage.measurement_gate.GATE_LABEL in reparked["add"],
+         "status:ready" in reparked["remove"]), ("repark", True, True, True))
+    # ...and once gated it is invisible to this sweep forever after, so the loop cannot restart.
+    chk("[#466] the gated issue is then skipped by the sweep itself (no re-promotion path)",
+        plan(applied(bench("status:ready"), reparked), "owner", "app[bot]", "none"),
+        {"action": "skip", "reason": "gated:needs:ec2"})
+    # SCOPE: a non-bench issue quoting the same words is promoted exactly as before.
+    quoting = labelled("priority:P2", "area:dispatch", "role:impl", "status:untriaged",
+                       body="MEASURED: the quiet-box EC2 gather run loopers.")
+    quoting["title"] = "dispatch waste: EC2 bench RUN issues leak into the frontier"
+    chk("[#466] a non-bench issue quoting the keywords is still promoted",
+        plan(quoting, "owner", "app[bot]", "none")["action"], "promote")
+
     chk("dispatcher-owned deferred rejected",
         plan(issue("status:deferred"), "owner", "app[bot]", "none"),
         {"action": "skip", "reason": "not-retriageable"})
@@ -629,7 +691,7 @@ def _self_test():
     # (terminally unenumerable) or adds the park without leaving the ready lane (a contradiction).
     # Both halves, from a stub whose verdict is otherwise well-formed.
     def drifted(add, remove):
-        def classify(labels, kind, trusted=True, known_labels=None):
+        def classify(labels, kind, trusted=True, known_labels=None, title="", body=""):
             return {"ready": False, "add": list(add), "remove": list(remove), "role": None,
                     "warnings": []}
         return classify
@@ -913,7 +975,7 @@ def _self_test():
     stale = {"author": {"login": "owner"}, "body": "", "labels": [{"name": "stale:snapshot"}]}
 
     def run_apply_argv(gh, stdin_doc=None, live_body="", body_error=None, live_document=None,
-                       live_state="OPEN"):
+                       live_state="OPEN", live_title="Ordinary registry task"):
         """Drive main(apply_argv) end-to-end against a fake GitHub. Returns (exit code, spied).
 
         THE STUB BOUNDARY IS `triage._gh_read`, NOT `read_live_body` (#605 review round 4, MAJOR).
@@ -935,7 +997,8 @@ def _self_test():
         def spy_plan(issue_doc, maintainer, app_bot, permission,
                      classify=static_triage.triage, known_labels=None):
             seen.update(known_labels=known_labels, maintainer=maintainer, permission=permission,
-                        labels=list(issue_doc.get("labels", ())), body=issue_doc.get("body"))
+                        labels=list(issue_doc.get("labels", ())), body=issue_doc.get("body"),
+                        title=issue_doc.get("title"))
             return saved_plan(issue_doc, maintainer, app_bot, permission, classify, known_labels)
 
         def fake_read(args):
@@ -946,7 +1009,7 @@ def _self_test():
                 raise RuntimeError(f"gh {' '.join(args)} failed: {body_error}")
             if live_document is not None:
                 return live_document
-            return json.dumps({"body": live_body, "state": live_state})
+            return json.dumps({"title": live_title, "body": live_body, "state": live_state})
 
         try:
             globals()["plan"] = spy_plan
@@ -1078,11 +1141,17 @@ def _self_test():
     code, seen = run_apply_argv(probe, live_body=f"prose\n{HOLD_MARKER}\n")
     body_reads = [args for args in seen.get("reads", []) if args[:2] == ["issue", "view"]]
     checks.append(("[#605 r4 M1] the live body read really goes through the shared read layer, "
-                   "for THIS issue, asking for body+state",
+                   "for THIS issue, asking for title+body+state",
                    (code, probe.calls, body_reads)
-                   == (0, [], [["issue", "view", "7", "-R", "o/r", "--json", "body,state"]])))
+                   == (0, [], [["issue", "view", "7", "-R", "o/r", "--json", "title,body,state"]])))
     checks.append(("[#605 r4 M1] ...and its RESULT is what planning saw (not a constant)",
                    seen.get("body") == f"prose\n{HOLD_MARKER}\n"))
+    # [#466] the TITLE rides the same read and is what planning saw — never the board snapshot,
+    # which does not carry a title at all.
+    titled = FakeGh(start, known)
+    code, seen = run_apply_argv(titled, live_title="A live title the snapshot never carried")
+    checks.append(("[#466] the LIVE title reaches plan() (the snapshot carries none)",
+                   (code, seen.get("title")) == (0, "A live title the snapshot never carried")))
 
     # [#605 review ROUND 4, MAJOR 2] A MALFORMED *SUCCESSFUL* READ FAILS CLOSED. Measured on the
     # round-3 head: `{}` (key missing), `{"body": 123}` and `{"data": {"body": ...}}` each returned
@@ -1097,7 +1166,12 @@ def _self_test():
             ("not an object", '["' + HOLD_MARKER + '"]'),
             ("not JSON at all", 'Not Found'),
             ("state MISSING", '{"body": ""}'),
-            ("alien state", '{"body": "", "state": "MERGED"}')):
+            ("alien state", '{"body": "", "state": "MERGED"}'),
+            # [#466] the title is a decision input on the same read, held to the same shape rule:
+            # an absent or non-string title must stop the write, never classify against "".
+            ("title MISSING", '{"body": "", "state": "OPEN"}'),
+            ("null title", '{"title": null, "body": "", "state": "OPEN"}'),
+            ("non-string title", '{"title": 42, "body": "", "state": "OPEN"}')):
         malformed = FakeGh(start, known)
         code, seen = run_apply_argv(malformed, live_document=shape)
         checks.append((f"[#605 r4 M2] a malformed live read ({shape_name}) refuses to act, "
@@ -1105,7 +1179,8 @@ def _self_test():
                        (code, malformed.calls, malformed.labels == set(start))
                        == (1, [], True)))
     nulled = FakeGh(start, known)
-    code, seen = run_apply_argv(nulled, live_document='{"body": null, "state": "OPEN"}')
+    code, seen = run_apply_argv(
+        nulled, live_document='{"title": "t", "body": null, "state": "OPEN"}')
     checks.append(("[#605 r4 M2] an explicit JSON null body IS an empty body (the one tolerance)",
                    (code, seen.get("body"), roles_of(nulled.labels),
                     "status:ready" in nulled.labels) == (0, "", {"role:impl"}, True)))

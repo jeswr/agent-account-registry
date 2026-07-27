@@ -128,6 +128,13 @@ DISPATCH_LANES = ("worker", "review", "fix", "disarm")
 # no-change can trigger the distinct needs:user escalation.
 DECLINE_ESCALATION_MIN = 2
 DECLINE_ESCALATION_MARKER = "sparq-task-decline-escalation:v1"
+# [#466] The durable escalation for a MEASUREMENT RUN. `GATE_ACTION` is written into the audit
+# marker, so it is a WIRE VALUE: an existing receipt must keep reconciling to the same action
+# forever. `GATE_RESULT` is the caller-visible outcome and becomes the `decline-<result>` defer
+# counter — i.e. the per-issue telemetry that makes the wasted-run rate observable. The two
+# historical actions (`research`, `needs-user`) are untouched.
+GATE_ACTION = "needs-ec2"
+GATE_RESULT = "gated-needs-ec2"
 # The review-loop lane owns needs-review re-reviews and the stranded recovery re-review; every
 # other REVIEW_STATE (needs-fix / needs-ci-fix / needs-rebase) is a fix-loop launch.
 REVIEW_LANE_STATES = {"needs-review", "stranded"}
@@ -571,6 +578,12 @@ _lease_schema = _load_module(
 # worker-live.sh (production).
 _no_change_routing = _load_module(
     "registry_no_change_routing", Path(__file__).resolve().with_name("no_change_routing.py"))
+
+# [OPUS-5] registry #466. The measurement-RUN classifier, shared with triage.py and
+# curate-frontier.py so the frontier's gate and this escalation's gate can never be two different
+# opinions about the same issue. Dispatch consumes it READ-ONLY, exactly like the routing module.
+_measurement_gate = _load_module(
+    "registry_measurement_gate", Path(__file__).resolve().with_name("measurement_gate.py"))
 
 
 def _require_exact_fields(value, fields, where):
@@ -3496,6 +3509,42 @@ def _replace_issue_role_with_research(repo, item):
         repo, "PATCH", f"repos/{repo}/issues/{item['number']}", {"labels": desired})
 
 
+def _gate_issue_as_measurement_run(repo, item):
+    """ADD `needs:ec2` to the target issue — the DURABLE escalation for a measurement run (#466).
+
+    Deliberately the ADDITIVE labels endpoint, not the full-labels PATCH the role swap uses. A
+    PATCH has to re-send every label, so it races any concurrent human edit; this call can only
+    ever add one label and therefore needs no re-read-then-replace window at all. It is also the
+    honest shape for what this is: a HOLD, never a re-routing.
+    """
+    _run_gh_target_api(
+        repo, "POST", f"repos/{repo}/issues/{item['number']}/labels",
+        {"labels": [_measurement_gate.GATE_LABEL]})
+
+
+def _issue_is_measurement_run(repo, item):
+    """Is this deferred issue's deliverable a measurement RUN a standard runner cannot perform?
+
+    Reads the LIVE title/body (the plan row carries only a body HASH) and classifies it with the
+    shared gate. Returns ``(verdict, note)``; `note` is a non-empty explanation ONLY when the read
+    or the classification could not be completed.
+
+    FAIL-CLOSED IS THE ORDINARY LADDER HERE, and the direction is worth stating because it looks
+    like the opposite. A failed read yields ``False``, which means the escalation falls back to the
+    pre-existing reroute/park behaviour — NOT to a dispatch. `False` withholds one EXTRA hold from
+    an issue the caller has already decided to stop; it can never admit anything. Raising instead
+    would abort a tick that is in the middle of an escalation, which is strictly worse.
+    """
+    try:
+        issue = _gh_json(["api", f"repos/{repo}/issues/{item['number']}"])
+        if not isinstance(issue, dict):
+            return False, "the live issue read is not an object"
+        return _measurement_gate.is_measurement_run(
+            set(item["labels"]), issue.get("title"), issue.get("body")), ""
+    except Exception as exc:                       # noqa: BLE001 — never abort a live escalation
+        return False, f"the measurement-run classification could not be completed: {exc}"
+
+
 def _pr_comments(repo, pr_number):
     """All conversation comments of a target PR/issue (paginated). A malformed PAGE must
     RAISE, never be silently dropped (round-3 finding 3): a discarded page could hide a
@@ -4305,9 +4354,13 @@ def _decline_marker_action(comments, bot_login, key):
     Third parties cannot forge an idempotence marker: as elsewhere in the worker control plane,
     only the orchestration bot's own durable comments are receipts.
     """
+    # The action alternation is a CLOSED vocabulary on purpose: an unrecognised action reads as
+    # "no receipt", which re-posts the comment rather than reconciling something we cannot name.
+    # `needs-ec2` (registry #466) is appended; the two historical values keep their exact spelling
+    # so every pre-existing receipt still reconciles.
     pattern = re.compile(
         rf"<!-- {re.escape(DECLINE_ESCALATION_MARKER)} key={re.escape(key)} "
-        r"action=(research|needs-user) -->"
+        rf"action=(research|needs-user|{re.escape(GATE_ACTION)}) -->"
     )
     actions = {
         match.group(1)
@@ -4327,7 +4380,7 @@ def _decline_outcome_name(record):
 
 def _escalate_repeated_declines(repo, item, outcomes, comments, bot_login, script_dir,
                                 apply_action=None, post_comment=None,
-                                min_outcomes=DECLINE_ESCALATION_MIN):
+                                min_outcomes=DECLINE_ESCALATION_MIN, measurement_run=False):
     """Apply or reconcile one repeated-decline escalation.
 
     Returns ``proceed`` below threshold and after a previously completed impl->research reroute;
@@ -4342,6 +4395,31 @@ def _escalate_repeated_declines(repo, item, outcomes, comments, bot_login, scrip
     that has not already produced a `no_change` for this issue, so the only remaining choices are
     "run the failed tier again" or "decompose". The caller — never this function — decides that,
     from `no_change_routing.retry_decision`.
+
+    `measurement_run` (registry #466) selects the DURABLE gate instead of either ordinary action,
+    and it is the whole reason this parameter exists rather than being inferred here: BOTH ordinary
+    actions are self-clearing, so on a structurally-impossible issue they are a loop, not a ladder.
+      * `role:impl -> role:research` re-dispatches the issue on a different route — but no model on
+        any route can provision a quiet box, mount multi-GB datasets, or make a result gathered on
+        a shared runner canonical. Two more no_change outcomes follow, by construction.
+      * the machine-owned `status:parked` soft hold CLEARS AUTOMATICALLY once the evidence ages out
+        of the model-health window, which re-admits the issue and restarts the same loop. Measured
+        2026-07-19: ~75% of worker runs were being spent on exactly this class.
+    `needs:ec2` is neither: it is a `needs:*` hold both readiness engines treat as a hard gate and
+    `retriage.plan` refuses to sweep, so the issue leaves the frontier and STAYS out until an
+    EC2-capable lane or a human clears it. The caller decides the verdict — from the same shared
+    classifier the triage path uses — because only it can read the live issue text.
+
+    TWO CONSEQUENCES OF WRITING A `needs:*` LABEL, named rather than left to be rediscovered:
+      * `park_policy.human_owned_holds` counts EVERY `needs:*` as a human-owned hold, so a live
+        `needs:ec2` REFUSES the automatic capacity re-admission sweep. That is the intended
+        durability, and it is the property the two self-clearing actions lack.
+      * registry #703's rule — a decline-driven escalation must not write `needs:user` — is
+        specifically about the human QUESTION terminal, which becomes a conveyor onto the
+        maintainer's desk. This is a CAPABILITY gate, not a question: it states which lane can run
+        the issue, curate-frontier.py already writes exactly this label for exactly this shape, and
+        the label's own `labeled` event is bot-authored, so `label_application_machine_owned` can
+        still prove it clearable later. Nothing here ever REMOVES a label.
     """
     if len(outcomes) < min_outcomes:
         return "proceed"
@@ -4354,6 +4432,8 @@ def _escalate_repeated_declines(repo, item, outcomes, comments, bot_login, scrip
         def apply_action(action):
             if action == "research":
                 _replace_issue_role_with_research(repo, item)
+            elif action == GATE_ACTION:
+                _gate_issue_as_measurement_run(repo, item)
             else:
                 # Repeated honest declines are decline-driven, not a human question: the issue
                 # takes the MACHINE-owned status:parked soft hold (park_policy.py defect 1).
@@ -4384,13 +4464,32 @@ def _escalate_repeated_declines(repo, item, outcomes, comments, bot_login, scrip
         if "status:parked" not in labels and "needs:user" not in labels:
             apply_action("needs-user")
         return "parked"
+    if marked_action == GATE_ACTION:
+        # Reconcile a crashed gate write for THIS evidence pair (#466). Idempotent: the label is
+        # written only when it is genuinely absent, and the ADD-only endpoint makes a repeat
+        # harmless anyway.
+        if _measurement_gate.GATE_LABEL not in labels:
+            apply_action(GATE_ACTION)
+        return GATE_RESULT
 
-    action = "research" if item.get("role") == "impl" else "needs-user"
+    if measurement_run:
+        action = GATE_ACTION
+    else:
+        action = "research" if item.get("role") == "impl" else "needs-user"
     outcome_lines = "\n".join(
         f"- Outcome {index}: {_decline_outcome_name(record)}"
         for index, record in enumerate(evidence, 1)
     )
-    if action == "research":
+    if action == GATE_ACTION:
+        action_text = (
+            f"**Action:** gated this issue with `{_measurement_gate.GATE_LABEL}`. Its deliverable "
+            "is a MEASUREMENT RUN (a quiet-box / dedicated-instance gather against real datasets), "
+            "which a standard GitHub-Actions runner structurally cannot perform — and a result "
+            "gathered anywhere else would not be canonical. Rerouting or parking would re-admit it "
+            "and repeat these outcomes, so the hold is DURABLE: the issue leaves the dispatchable "
+            "frontier until an EC2-capable lane or a human clears the label. Nothing else about "
+            "the issue is changed (registry #466).")
+    elif action == "research":
         action_text = ("**Action:** swapped `role:impl` → `role:research` for architect "
                        "decomposition. The cached implementation claim is cancelled; only the "
                        "new research route may dispatch.")
@@ -4410,6 +4509,8 @@ def _escalate_repeated_declines(repo, item, outcomes, comments, bot_login, scrip
         f"{action_text}\n\n{marker}"
     )
     apply_action(action)
+    if action == GATE_ACTION:
+        return GATE_RESULT
     return "rerouted" if action == "research" else "parked"
 
 
@@ -6047,13 +6148,26 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                         1 if nc_decision == _no_change_routing.DECOMPOSE else DECLINE_ESCALATION_MIN)
                     if len(no_changes) >= decline_threshold:
                         comments = _pr_comments(repo, number)
+                        # [#466] The escalation's ACTION depends on whether this issue is even
+                        # completable by a worker. Both ordinary actions self-clear, so on a
+                        # measurement RUN they re-admit the issue and reproduce these same
+                        # outcomes forever; the classification happens HERE because only the
+                        # dispatcher can read the live issue text (the plan row carries a body
+                        # HASH, never the text). An unreadable/unclassifiable issue keeps the
+                        # historical ladder — see _issue_is_measurement_run on why that direction
+                        # withholds a hold rather than granting a dispatch.
+                        measurement_run, gate_note = _issue_is_measurement_run(repo, item)
+                        if gate_note:
+                            print(f"::warning::{repo}#{number}: {gate_note}; the repeated-decline "
+                                  "escalation falls back to the ordinary reroute/park ladder")
                         decline_result = _escalate_repeated_declines(
                             repo, item, no_changes, comments, bot_login, script_dir,
-                            min_outcomes=decline_threshold)
+                            min_outcomes=decline_threshold, measurement_run=measurement_run)
                         if decline_result != "proceed":
                             defer_reasons[f"decline-{decline_result}"] += 1
-                            print(f"escalated {repo}#{number}: repeated no_change outcomes -> "
-                                  f"{decline_result}; cached {item['role']} claim cancelled")
+                            print(f"escalated {repo}#{number}: {len(no_changes)} no_change "
+                                  f"outcome(s) in the validated health window -> {decline_result}; "
+                                  f"cached {item['role']} claim cancelled")
                             continue
                         # `proceed` after a DECOMPOSE decision means the reroute for this exact
                         # evidence is already applied and reconciled — the issue is on its new
@@ -7196,14 +7310,19 @@ def _self_test():
         issue=500, input_tokens=12, output_tokens=3, wall_seconds=6)
 
     def run_decline_tripwire(records, role="impl", comments=(), malformed=False,
-                             unreadable=False, model_chain=("sol",)):
-        """One complete deferred dispatch tick with fake GitHub transports and real validators."""
+                             unreadable=False, model_chain=("sol",), area="dispatch",
+                             title="Implement the dispatch boundary",
+                             body="Investigate and implement the dispatch boundary."):
+        """One complete deferred dispatch tick with fake GitHub transports and real validators.
+
+        `area`/`title`/`body` are parameterised for the #466 measurement-run tripwire: the gate's
+        verdict is read off the LIVE issue text, so the fixture has to be able to supply one.
+        """
         labels = sorted([
-            "area:dispatch", "priority:P1", f"role:{role}", "status:deferred",
+            f"area:{area}", "priority:P1", f"role:{role}", "status:deferred",
         ])
-        body = "Investigate and implement the dispatch boundary."
         item = {
-            "number": 500, "priority": 1, "package": "dispatch", "role": role,
+            "number": 500, "priority": 1, "package": area, "role": role,
             "model_chain": list(model_chain), "agent": "registry-impl", "escalate": False,
             "labels": labels, "author": "maintainer",
             "body_sha": hashlib.sha256(body.encode()).hexdigest(), "deferred": True,
@@ -7211,7 +7330,7 @@ def _self_test():
         live_issue = {
             "number": 500, "state": "open", "user": {"login": "maintainer"},
             "author_association": "MEMBER", "labels": [{"name": label} for label in labels],
-            "body": body,
+            "title": title, "body": body,
         }
         plan = {
             "schema": SCHEMA, "generated_at": "2026-07-21T00:00:00Z",
@@ -7578,6 +7697,69 @@ def _self_test():
     assert trip_l["api_calls"] == [] and trip_l["helper_calls"] == [], trip_l
     assert trip_l["claim_calls"] == 1 and trip_l["claimed_chains"] == [["opus5"]], trip_l
     print("  ok   #701 (l): a receipted reroute does not strand the new route on an empty chain")
+
+    # -----------------------------------------------------------------------------------------------
+    # REGISTRY #466 — THE NO-CHANGE SELF-GATE. Two no_change outcomes on a MEASUREMENT-RUN issue
+    # must leave the frontier DURABLY. Both pre-existing actions self-clear, so on this class they
+    # are a loop: the reroute re-dispatches on a route no model can complete either, and the
+    # machine park is re-admitted as soon as the evidence ages out. Driven through the REAL
+    # dispatch() call site so a change that stops consulting the classifier turns these red.
+    _466_title = "same-box MEASURED PyKEEN run FB15k-237/WN18RR"
+    _466_body = ("Deliverable: a canonical quiet-box gather run on a dedicated EC2 instance with "
+                 "the real datasets. Results gathered anywhere else are not canonical.")
+    trip_m = run_decline_tripwire([no_change_a, no_change_b], area="bench",
+                                  title=_466_title, body=_466_body)
+    assert [call[0] for call in trip_m["api_calls"]] == ["POST", "POST"], trip_m
+    assert DECLINE_ESCALATION_MARKER in trip_m["api_calls"][0][2]["body"], trip_m
+    assert f"action={GATE_ACTION} -->" in trip_m["api_calls"][0][2]["body"], trip_m
+    # The mutation is the ADDITIVE labels endpoint carrying exactly the one gate label — never a
+    # full-labels PATCH (which would race a concurrent human edit) and never a role swap.
+    assert trip_m["api_calls"][1][:2] == (
+        "POST", "repos/example/repo/issues/500/labels"), trip_m
+    assert trip_m["api_calls"][1][2] == {"labels": [_measurement_gate.GATE_LABEL]}, trip_m
+    assert trip_m["helper_calls"] == [] and trip_m["claim_calls"] == 0, trip_m
+    assert f"-> {GATE_RESULT}" in trip_m["output"], trip_m["output"]
+    print("  ok   #466 (m): two no_change outcomes on a MEASUREMENT RUN gate it with "
+          f"`{_measurement_gate.GATE_LABEL}` and cancel the claim")
+
+    # (n) THE MUTATION CHECK the acceptance criterion asks for. The SAME two outcomes on the SAME
+    # `area:bench` issue, with a CODE-ONLY title, must take the historical ladder — i.e. it is the
+    # classifier, not the label and not the outcome count, that decides. Deleting the
+    # `measurement_run` branch makes (m) look like this row; blanket-gating `area:bench` makes this
+    # row look like (m).
+    trip_n = run_decline_tripwire([no_change_a, no_change_b], area="bench",
+                                  title="write a wasm micro-bench for the triple parser",
+                                  body="Add a criterion micro-bench under benches/.")
+    assert [call[0] for call in trip_n["api_calls"]] == ["POST", "GET", "PATCH"], trip_n
+    assert "action=research -->" in trip_n["api_calls"][0][2]["body"], trip_n
+    assert trip_n["api_calls"][-1][2]["labels"] == [
+        "area:bench", "priority:P1", "role:research", "status:deferred"], trip_n
+    assert _measurement_gate.GATE_LABEL not in json.dumps(trip_n["api_calls"]), trip_n
+    print("  ok   #466 (n): the SAME labels with a code-only title still take the ordinary "
+          "reroute — the classifier decides, not the area label")
+
+    # (o) THE GATE IS ONE-SHOT AND RECONCILABLE. A receipted gate whose label write crashed is
+    # re-applied with NO second comment; once the label is present nothing is written at all. This
+    # is what stops the escalation itself from becoming the new loop.
+    _, _466_key = _decline_escalation_evidence([no_change_a, no_change_b])
+    _466_receipt = [{"user": {"login": "sparq[bot]"},
+                     "body": f"<!-- {DECLINE_ESCALATION_MARKER} key={_466_key} "
+                             f"action={GATE_ACTION} -->",
+                     "created_at": "2026-07-26T09:00:00Z"}]
+    trip_o = run_decline_tripwire([no_change_a, no_change_b], area="bench", title=_466_title,
+                                  body=_466_body, comments=_466_receipt)
+    assert [call[0] for call in trip_o["api_calls"]] == ["POST"], trip_o
+    assert trip_o["api_calls"][0][1] == "repos/example/repo/issues/500/labels", trip_o
+    assert trip_o["claim_calls"] == 0, trip_o
+    print("  ok   #466 (o): a crashed gate write reconciles with NO second comment")
+
+    # (p) BELOW THRESHOLD the gate does not fire either — one no_change is not evidence of an
+    # impossible issue, and the ordinary deferred claim stays live. Dropping the threshold check
+    # would gate every measurement-shaped issue on its FIRST outcome.
+    trip_p = run_decline_tripwire([no_change_a], area="bench", title=_466_title, body=_466_body)
+    assert trip_p["api_calls"] == [] and trip_p["helper_calls"] == [], trip_p
+    assert trip_p["claim_calls"] == 1, trip_p
+    print("  ok   #466 (p): ONE no_change never gates — the second outcome is what binds")
 
     # (m) THE LADDER TERMINATES, driven through the REAL call site rather than argued about.
     # Walk a THREE-rung impl chain: every tick must either dispatch on a strictly smaller chain or
