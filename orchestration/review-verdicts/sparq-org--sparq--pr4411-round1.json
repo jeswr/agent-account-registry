@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4411,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a9f8fd3a2da5515d70a0d09bf45cab4a566fe4e2",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The token chain is consistently applied to both Release-PR creation and tag creation, checkout explicitly disables persisted GITHUB_TOKEN credentials, and the containment remains fail-closed: it tolerates the known 403 only on the unprivileged fallback while surfacing every privileged-token failure. The skipped App-token step falls through cleanly, the selected token is reused for the live probe, and the documentation accurately distinguishes the repo-setting workaround from privileged-token behavior needed to trigger the downstream tag workflow. No correctness, soundness, test-validity, or security defect is evident in the diff.",
+  "verdict": "approve"
+ }
+}
