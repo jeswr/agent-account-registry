@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4574,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "181108bbc9c0b6d54401dfed035c4aeb530b56bf",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new `inserting` hand-off branch runs only inside `propagate`, but `insert` constructs `pending` with `filter(|f| !self.index.contains(f))`. The exact insertion-direction case claimed here\u2014asserting a fact already derived by a recursive layer\u2014is therefore omitted from `pending`; `propagate([], true)` exits without recomputing the layer, so the fact remains in `layer_derived` instead of being charged to base. This contradicts the new ownership invariant and the CHANGELOG claim that mutating the base copy hands ownership in both directions.",
+    "file": "crates/sparq-reason/src/incremental.rs",
+    "fix_hint": "Ensure an asserted, layer-owned fact causes the relevant layer to recompute even though closure membership does not change, without treating it as a positive closure delta for counted rules. Add a narrowly separated ownership-transfer input or otherwise invoke the layer maintenance while suppressing downstream delta/count changes.",
+    "severity": "major",
+    "title": "Insertion-side ownership transfer is unreachable for an already-derived fact"
+   },
+   {
+    "body": "After the deletion hand-off, the test calls `g.insert` on a fact that is already in the closure, then checks only closure membership, mode, and rebuild count. Those all pass when insertion performs no layer maintenance at all. The randomized differential likewise observes public closure/base/rebuild state, not the claimed base-versus-layer ownership, so it cannot prove the insertion hand-off happened.",
+    "file": "crates/sparq-reason/tests/incremental_n3_prop.rs",
+    "fix_hint": "Add a test-visible invariant or a behavioral witness that fails when the asserted fact remains layer-owned. For example, expose an appropriate test-only ownership probe, or construct a subsequent mutation whose incremental bookkeeping differs depending on whether the insertion transfer occurred. Include a mutation check showing the test fails if the insertion hand-off is disabled.",
+    "severity": "major",
+    "title": "The insertion-direction regression assertion is vacuous"
+   }
+  ],
+  "progress": null,
+  "summary": "The deletion-side hand-off is exercised, but the claimed insertion-side ownership transfer is not implemented for the ordinary case and its new assertion is vacuous. MaterializedN3Graph::insert filters an already-derived fact out of pending because it is already in index, then propagate receives an empty vector and never runs the new layer-first logic. Thus asserting an already layer-derived fact leaves it owned by layer_derived rather than charging it to base as the changelog and algorithm comments claim. Closure answers can remain correct because both supports exist, but the stated ownership invariant and insertion-direction coverage are false, so this reasoner-correctness change is incomplete.",
+  "verdict": "request_changes"
+ }
+}
