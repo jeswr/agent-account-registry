@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4428,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d139cd5ff8fdec25fc28fba3adb00ccb4bf49082",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves both prior major findings. The seven evaluator-dependent graph-pattern rows now become Coverage::Gap without the engine feature, their probes return false, and the feature-off floor is reduced to 23 with a focused test verifying that none can be counted as demonstrated. With engine enabled, the probes execute real SPARQL over a GeoSPARQL-shaped fixture and validate the returned bindings. R1's Protocol conjunct is now backed by a dedicated server test that loads geo:Feature/geo:hasGeometry/geo:asWKT data, queries it through the real HTTP /sparql endpoint, checks HTTP success, and verifies the expected binding. The changes are internally consistent, non-vacuous, and complete for the stated scope.",
+  "verdict": "approve"
+ }
+}
