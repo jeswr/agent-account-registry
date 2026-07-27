@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4472,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "8f49c2a1d74d643b14d54bca785d8a84653eec1c",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Step 3 says to compile `@g` through the existing term-argument path, while the preceding text relies on grammar-signature typing. At the pinned upstream revision, however, gen-rs `termArg()` only distinguishes `str` from the erased `term` representation; it does not retain or validate `graphT`. Thus an `emits quads` v0.1 grammar can pass a literal (or another non-graph RDF term) as `g`, and the proposed `Option<Term>` representation accepts it. N-Quads/TriG graph names must be blank nodes or IRIs. The v0.2 positional-typing rule cited in the record is not an implemented safeguard for the v0.1 backend work being designed here.",
+    "file": "research/shuttle-gen-rs-backend-gaps-2026-07.md",
+    "fix_hint": "Specify and test a real enforcement point for the v0.1 path: either add compile-time semantic-type checking for the graph expression or introduce a graph-name type/validated conversion that can represent only named nodes and blank nodes. Add negative generator tests proving literal and triple-term graph expressions are rejected in both backends, while `None` remains the default graph.",
+    "severity": "major",
+    "title": "Quad design does not enforce the RDF graph-name value space"
+   },
+   {
+    "body": "The proposed `pub struct Quad` cannot be implemented solely through the three listed gen-rs files. At the pinned revision, `Triple` is declared in `packages/gen-rs/src/runtime.inc.rs`, which `generate.js` splices into every artifact. The inventory calls itself the set of triple-shaped touch points but omits the source that owns the public emitted-item struct, making the scoped implementation plan incomplete.",
+    "file": "research/shuttle-gen-rs-backend-gaps-2026-07.md",
+    "fix_hint": "Add `packages/gen-rs/src/runtime.inc.rs` to the touch-point table and state how generation conditionally emits or transforms the Triple/Quad runtime declarations while preserving byte identity for triple-shaped artifacts.",
+    "severity": "minor",
+    "title": "The gen-rs touch-point inventory omits runtime.inc.rs"
+   }
+  ],
+  "progress": null,
+  "summary": "The status correction is well supported, but the proposed quad-emission design is not complete enough to serve as the implementation record. It omits a generated-runtime touch point and, more importantly, proposes compiling the graph expression through the generic term path without preserving or enforcing RDF graph-name constraints. At upstream HEAD, v0.1 semantic types are erased to the same compiler type and termArg accepts any Term, so the proposed implementation can emit invalid quads whose graph name is a literal or triple term.",
+  "verdict": "request_changes"
+ }
+}
