@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4409,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "9ae9e2fdf9df9eee11fa93363b7a150437cb1113",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The record labels the gap CONFIRMED and the draft says aggregation \"did not map\" and that MAX has \"no direct spelling,\" but the same record demonstrates mappings for grouping, SUM, COUNT, and AVG and explicitly identifies recursion or list:member plus negation as encodings for MIN/MAX. A construct that requires composition or recursion is still expressible in N3. What is actually established is narrower: there is no dedicated aggregate-expression/builtin family, and sparq's deliberately restricted compiled first-order profile excludes the formula/list idiom. That profile restriction cannot support the headline conclusion that N3 itself is not expressive enough or that RDFox aggregation does not map.",
+    "file": "research/n3-aggregate-gap-upstream.md",
+    "fix_hint": "Reframe the record and companion summary as a missing convenience/first-order aggregate primitive, not a confirmed N3 expressivity gap. Replace claims such as \"did not map,\" \"inexpressible,\" and \"no direct spelling\" with precise statements about the absence of a dedicated primitive and the incompatibility of the existing encodings with sparq's chosen compiled profile. If semantic non-expressibility is still claimed, provide a rigorous reason the admitted recursion/NAF encodings do not implement the relevant RDFox semantics.",
+    "severity": "major",
+    "title": "The claimed N3 expressivity gap is contradicted by the documented encodings"
+   },
+   {
+    "body": "The table calls the inventory complete and reports log: (22), but the cited Final CG Report defines 18 log builtins: collectAllIn, conclusion, conjunction, content, dtlit, equalTo, forAllIn, includes, langlit, notEqualTo, notIncludes, outputString, parsedAsN3, rawType, semantics, semanticsOrError, skolem, and uri. This suggests the namespace-prefix extraction counted references or other non-definition occurrences.",
+    "file": "research/n3-aggregate-gap-upstream.md",
+    "fix_hint": "Generate counts from the report's builtin definition headings (or list every counted term) and correct the log count; recheck the other namespace counts using the same definition-based method.",
+    "severity": "minor",
+    "title": "The claimed complete builtin inventory miscounts the log builtins"
+   }
+  ],
+  "progress": null,
+  "summary": "The verification usefully narrows the available builtin vocabulary, but its central conclusion does not follow from its own evidence. The document shows that N3 can express grouping and SUM/COUNT/AVG via collectAllIn, and says MIN/MAX can be encoded with recursion or member plus negation. That establishes an inconvenience/profile mismatch, not that aggregation is inexpressible in N3 or that the RDFox construct cannot map. The proposed upstream text repeatedly overstates this as a confirmed N3 language gap. There is also a concrete error in the claimed complete builtin inventory.",
+  "verdict": "request_changes"
+ }
+}
