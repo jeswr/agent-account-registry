@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 3995,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c664aa94e195153d30732169c3ec411e2f270042",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`container`, `boundBy`, and `scopedNodes` still give each node's own class and attribute patterns one owner. When independent incoming groups share a target, only the first binder receives those patterns. Thus, if `?person OPTIONAL worksAt ?organisation` leaves the variable unbound, a second `?company OPTIONAL partnerOf ?organisation` may bind a non-Organisation. Likewise, a FILTER NOT EXISTS group tests arbitrary partners rather than only partners satisfying the shared target's declared constraints. This changes query answers and does not preserve the canvas node's semantics.",
+    "file": "gui/app/src/lib/query-builder.ts",
+    "fix_hint": "Emit a shared target's class and attribute constraints in every independently scoped incoming group that can bind or test that target, while retaining the existing nesting for dependent chains and avoiding duplicate emission within one scope. In the two-OPTIONAL case, both blocks must contain the Organisation constraint; in the OPTIONAL plus FILTER NOT EXISTS case, the exclusion block must contain it too.",
+    "severity": "major",
+    "title": "Shared scoped targets still enforce constraints in only one incoming group"
+   },
+   {
+    "body": "The two shared-target tests still expect the Organisation type triple only in the first OPTIONAL and explicitly omit it from the second OPTIONAL or FILTER NOT EXISTS group. They therefore validate the known defect. Exact-string serialization checks alone also do not demonstrate result equivalence for this load-bearing scoping invariant.",
+    "file": "gui/app/src/lib/query-builder.test.ts",
+    "fix_hint": "Update the expected SPARQL so every independent incoming scope includes the target class and attribute patterns. Add executable fixtures with both matching and non-matching target resources for the second edge, covering two OPTIONALs and OPTIONAL plus FILTER NOT EXISTS, such that omitting the repeated constraints makes the tests fail.",
+    "severity": "minor",
+    "title": "Shared-target tests continue to codify the incorrect single-owner behavior"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 5 remains materially unchanged from round 4. The serializer still assigns a shared scoped target's class and attribute patterns to only the first incoming binder. A later independent OPTIONAL or FILTER NOT EXISTS can therefore match or reject values without enforcing the target node's declared constraints. The corresponding tests still assert this single-owner output instead of requiring each independent scope to carry the target constraints, and they provide no executable result-equivalence fixture that would expose the wrong answers. Because the same major correctness defect and supporting test-validity defect remain at the same severities, progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
