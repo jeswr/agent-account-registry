@@ -40,7 +40,7 @@ unfiltered listing both grows without bound under churn and can lose the gate ru
 entirely); the unfiltered walk that names advisory failing legs runs ONLY when the
 filtered gate is a concluded failure (the only state that admits a ci-fix).
 
-The filter is applied ONCE PER TIER NAME (claim.CI_TIERED_GATE_CHECKS) because the REST
+The filter is applied ONCE PER TIER NAME (claim.CI_REPAIR_GATE_CHECKS) because the REST
 `check_name` parameter takes exactly one value and sparq's aggregator is named
 `gate, draft-tier` on a DRAFT head — which is what every worker PR is for the whole
 review loop. Reading only the strict name returned zero rows on every measured sparq
@@ -255,11 +255,11 @@ def _pr_status_record(fetch, claim, repo, number):
             # worker PR is DRAFT for the whole review loop and sparq names the draft
             # aggregator `gate, draft-tier`, so reading only claim.CI_GATE_CHECK returned zero
             # rows on every measured sparq worker head — indistinguishable from "no gate",
-            # which stands the whole ci-fix admission down. See claim.CI_TIERED_GATE_CHECKS.
+            # which stands the whole ci-fix admission down. See claim.CI_REPAIR_GATE_CHECKS.
             check_runs = []
-            for gate_name in claim.CI_TIERED_GATE_CHECKS:
+            for gate_name in claim.CI_REPAIR_GATE_CHECKS:
                 check_runs += _fetch_check_runs(fetch, repo, sha, check_name=gate_name)
-            if claim.tiered_gate_conclusion(check_runs) == "failure":
+            if claim.repair_gate_conclusion(check_runs) == "failure":
                 check_runs = check_runs + _fetch_check_runs(fetch, repo, sha)
             record["check_runs"] = check_runs
         except SnapshotItemError as exc:
@@ -458,24 +458,24 @@ def _self_test():
     assert red["gate"] == "failure" and red["failing_legs"] == ["leg-a"]
     # (ii-b) DRAFT-TIER head: the strict merge-required `gate` context genuinely does not
     # exist on it, but the tiered read sees the red aggregator. Deleting either tier name
-    # from CI_TIERED_GATE_CHECKS (or dropping the second _fetch_check_runs call) turns
-    # tiered_gate back into "missing" and reds this assertion — which is exactly the live
+    # from CI_REPAIR_GATE_CHECKS (or dropping the second _fetch_check_runs call) turns
+    # repair_gate back into "missing" and reds this assertion — which is exactly the live
     # defect: the ci-fix admission was unreachable on every sparq worker head.
     draft_red = claim.pr_ci_status(doc["items"]["21"])
     assert draft_red["gate"] == "missing", draft_red
-    assert draft_red["tiered_gate"] == "failure", draft_red
+    assert draft_red["repair_gate"] == "failure", draft_red
     # ...and the aggregator itself is never handed to the fixer as a leg to repair.
     assert draft_red["failing_legs"] == ["leg-b"], draft_red
     # (ii-c) the strict-name heads keep BOTH readings consistent, so the new field cannot
     # silently diverge from `gate` where `gate` is actually present.
-    assert healthy["tiered_gate"] == "success" and red["tiered_gate"] == "failure"
+    assert healthy["repair_gate"] == "success" and red["repair_gate"] == "failure"
     # (ii-d) PARTIAL READ != "no gate row": PR 23's page ended short of the endpoint's own
     # total_count, so the record DEGRADES (visible skip + marker) rather than reporting a
     # head with no aggregator. Deleting the total_count cross-check makes this read
     # "success"/planned and the skip row disappears.
     short = claim.pr_ci_status(doc["items"]["23"])
     assert doc["items"]["23"]["check_runs_degraded"] == "check-runs-malformed"
-    assert short["gate"] == "missing" and short["tiered_gate"] == "missing", short
+    assert short["gate"] == "missing" and short["repair_gate"] == "missing", short
     # (iii) POST-detail degradation (PR #60 round-1 fix): a check-run overflow KEEPS the
     # detail record — check_runs EMPTY + an explicit marker — while the pre-detail
     # failure (13) stays a full skip with no record at all.
