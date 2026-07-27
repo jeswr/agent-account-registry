@@ -51,16 +51,6 @@
    "expires_at": 1785179010
   },
   {
-   "account": "dc2d751954080e13",
-   "claim_id": "53e13e32c49a41b4b39dca00e2b916df",
-   "holder": "review:sparq-org/sparq#4519@dispatch-30290888331.1",
-   "package": "sparq-vectors",
-   "role": "review",
-   "model": "sol",
-   "issued_at": 1785174877,
-   "expires_at": 1785179077
-  },
-  {
    "account": "488920c2efe2b3fb",
    "claim_id": "229fd8dd56c347cd9c3f57c7df1d4a48",
    "holder": "jeswr/agent-account-registry#806@30291398254.1",
