@@ -4737,8 +4737,8 @@ def _missed_fix_budget(worker_pr, comments, bot_login, round_number, cutoff_fn, 
 
 def _dispatch_review_items(review_items, repo, policy, routing, allocator, worker_pr,
                            registry_repo, registry_root, workflow_ref, bot_login, usage, margin,
-                           defer_reasons, lanes=None, ledger_root="", fix_dispatch=None,
-                           enrolled_authors=()):
+                           defer_reasons, lanes=None, ledger_root="", fix_dispatch=None, *,
+                           enrolled_authors):
     """Hostile re-validation + claim + launch for the review/fix loop. Every item failure SKIPS
     that item (per-item resilience, like the issue loop). `defer_reasons` is the tick's SHARED
     histogram: allocator lease errors here must fold into the same `lease-error` counter the
@@ -11418,7 +11418,8 @@ def _self_test():
                 "user": {"login": bot, "type": "Bot"},
                 "labels": [{"name": name} for name in labels]}
 
-    def run_items(items, allocator=None, routing=None, policy=None, usage=None):
+    def run_items(items, allocator=None, routing=None, policy=None, usage=None,
+                  enrolled_authors=()):
         helper_calls.clear()
         reasons = Counter()
         # Issue #108: a fresh per-lane accumulator each call; run_items.lanes exposes it for the
@@ -11429,7 +11430,8 @@ def _self_test():
             items, repo, policy or {"max_review_rounds": 3, "account_pool": []},
             routing or {}, allocator, wiring_worker_pr, "reg/repo",
             wiring_root, "main", bot, usage, 0.10, reasons, lanes=lanes,
-            ledger_root=wiring_ledger_root, fix_dispatch=fix_dispatch)
+            ledger_root=wiring_ledger_root, fix_dispatch=fix_dispatch,
+            enrolled_authors=enrolled_authors)
         run_items.lanes = lanes
         run_items.fix_dispatch = fix_dispatch
         return launched, reasons
@@ -11785,6 +11787,56 @@ def _self_test():
                                               routing=strand_routing)
                 assert launched == 1 and reasons["review-noop-head-already-bound"] == 0, \
                     (launched, reasons)
+
+                # ==== #657: THE CLAIM LEG, THROUGH THE REAL DISPATCH LOOP ====================
+                # Everything above this point exercises PLAN. These four rows drive
+                # `_dispatch_review_items` itself — the live PR re-read, the record re-read off
+                # disk, the waiver, and the plan-agreement check — so the leg named in this PR's
+                # title is proven where it runs, not only in the pure function it calls.
+                _orch_record = dict(provenance[41], recorded_at_run="orchestrator:30209757201.1")
+                record_file.write_text(json.dumps(_orch_record), encoding="utf-8")
+                _orch_pull = {
+                    "number": 41, "state": "open", "draft": False, "body": "",
+                    "mergeable": True, "auto_merge": None,
+                    "head": {"ref": "fix/readiness-visibility-opus5", "sha": sha_a,
+                             "repo": {"full_name": repo}},
+                    "base": {"ref": "main", "repo": {"default_branch": "main"}},
+                    "user": {"login": "jeswr", "type": "User"},
+                    "labels": [{"name": "review:needs"}]}
+                _orch_item = dict(ci_item, state="needs-review", context="",
+                                  self_attested=True)
+
+                def _claim_log(item, authors):
+                    fake.update(pull=dict(_orch_pull))
+                    buffer = io.StringIO()
+                    with contextlib.redirect_stdout(buffer):
+                        run_items([item], allocator=LaunchingAllocator(),
+                                  routing=strand_routing, enrolled_authors=authors)
+                    return buffer.getvalue()
+
+                # (i) ENROLLED: the two shape gates stand down and CLAIM proceeds past them.
+                _admitted_log = _claim_log(_orch_item, ("jeswr",))
+                assert "head is not a same-repo worker branch" not in _admitted_log, _admitted_log
+                assert "PR author is not the App bot" not in _admitted_log, _admitted_log
+                # (ii) NOT ENROLLED — the pre-#657 refusal, by name. Restoring either gate
+                #      unconditionally makes (i) print this line.
+                _off_log = _claim_log(dict(_orch_item, self_attested=False), ())
+                assert "head is not a same-repo worker branch" in _off_log, _off_log
+                # (iii) THE PLAN FLAG IS NOT AN AUTHORITY. A plan row claiming the waiver that
+                #      CLAIM cannot re-derive defers — it does not inherit the waiver from the
+                #      artifact. This is the row that makes CLAIM's re-derivation load-bearing
+                #      rather than decorative.
+                _forged_log = _claim_log(_orch_item, ())
+                assert "head is not a same-repo worker branch" in _forged_log, _forged_log
+                # (iv) ...and the disagreement is refused in the OTHER direction too: a row
+                #      planned under worker semantics must not be silently re-classified into the
+                #      review-only class by a PLAN->CLAIM window edit.
+                _stale_log = _claim_log(dict(_orch_item, self_attested=False), ("jeswr",))
+                assert "disagrees with CLAIM's live re-derivation" in _stale_log, _stale_log
+                record_file.write_text(json.dumps(provenance[41]), encoding="utf-8")
+                print("  ok   #657 CLAIM leg (real dispatch loop): an enrolled orchestrator PR "
+                      "passes the shape gates, an unenrolled one is refused by the PRE-FEATURE "
+                      "reason, and the plan's self_attested flag buys nothing on its own")
             finally:
                 globals()["_run_gh"] = real_launch_gh
                 os.environ.pop("PROVENANCE_SALT", None)
