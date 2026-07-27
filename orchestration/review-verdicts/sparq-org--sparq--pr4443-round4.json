@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4443,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "6781f0c7acee21d02eb2cfd504de7355a8b22fc6",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 4 remains correct and complete on the supplied diff. The shipped Bloom implementation is pinned against the parametric model, the feature-off range oracle is compared with the real feature-on path over many keys, and the ignored timing harness checks non-vacuity, result equivalence, stable checksums, warmup, black-box observability, and reversed execution order. The documentation consistently limits the demonstrated benefit to synthetic, host-independent block-skip opportunity for absent-key lookups, explicitly disclaims latency and real-workload conclusions, and keeps the feature opt-in and in-memory only. No correctness, soundness, test-validity, security, or instruction-injection issue was found. Because round 3 also had no findings, progress is stagnant.",
+  "verdict": "approve"
+ }
+}
