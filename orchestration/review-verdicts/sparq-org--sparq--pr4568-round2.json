@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4568,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "044b98cff0f4bb8c98c1fbaceab814df17860e14",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 1's macOS portability defect is fixed: the archive-digest step now selects GNU sha256sum when available and falls back to macOS's shasum -a 256, while retaining the expected digest-record shape. The new structural contract test explicitly covers the macOS matrix and includes a mutation that removes the portable branch; the test passes and the mutation is detected. The isolated provenance workflow remains fail-closed, threads archive digests into the tagged generic SLSA generator, and the compliance text consistently limits the claim to wired-but-unexercised archive provenance while retaining Build L2 as the published level.",
+  "verdict": "approve"
+ }
+}
