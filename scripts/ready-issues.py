@@ -10,7 +10,7 @@ issue is READY iff, in priority order, ALL hold:
   * OPEN, and
   * carries `status:ready` (positive attestation the triage/trust pipeline set), and
   * carries exactly ONE valid `priority:P0..P4` (ambiguous/invalid priority -> excluded), and
-  * carries a `role:*` label, and
+  * carries exactly ONE `role:*` label (roleless -> excluded; MULTI-role -> excluded), and
   * carries NO gate label (`needs:*` — INCLUDING `needs:design` and `needs:user` —, or
     `trust:untrusted`) and is NOT busy
     (`status:in-progress|in-progress-review|blocked|deferred|untriaged`), and
@@ -25,6 +25,7 @@ prefix rule below — no design-heavy issue can be dispatched until a human clea
 """
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -39,6 +40,7 @@ GLOBAL = "__global__"  # the cross-cutting partition (serializes against everyth
 _PRIO = re.compile(r"^priority:P([0-4])$")   # only P0..P4 are valid
 _PKG = re.compile(r"^area:(.+)$")
 _ROLE = re.compile(r"^role:.+$")
+ROLE_PREFIX = "role:"
 
 
 # --- open blockers: NATIVE GitHub dependencies UNIONED with the legacy body markers -------------
@@ -140,6 +142,25 @@ def has_role(labels):
     return any(_ROLE.match(lb) for lb in labels)
 
 
+def roles_of(labels):
+    """Every DISTINCT declared role VALUE, sorted (empty when roleless).
+
+    PREFIX-matched (`role:` + anything, including the empty value), NOT `_ROLE`-matched
+    (`role:` + at least one char). That is deliberate and load-bearing: this is the same rule
+    `dispatch-plan._roles_of` uses to decide whether the PLANNER rejects an issue, and the
+    readiness gate must never be LAXER than the stage downstream of it. Under the `_ROLE` regex
+    the pair {`role:`, `role:impl`} counts as ONE role and would sail through the gate straight
+    into the planner's rejection — precisely the hole this predicate exists to close. Prefix
+    matching over-counts (a bare `role:` is not a usable role) only in the fail-closed direction:
+    the roleless check below refuses that label set anyway.
+
+    `has_role` keeps the `_ROLE` regex on purpose — it answers "is there a USABLE role label",
+    which a bare `role:` does not satisfy. The two predicates answer different questions and the
+    self-test pins both, including the label set where they disagree.
+    """
+    return sorted({lb[len(ROLE_PREFIX):] for lb in labels if lb.startswith(ROLE_PREFIX)})
+
+
 def is_gated(labels):
     return any(lb == g or lb.startswith(g) for lb in labels for g in GATE_LABELS)
 
@@ -175,6 +196,12 @@ def exclusion_reason(labels, open_blockers=0):
     complete", and an area regression is caught only by the second. What must never happen is a
     THIRD, divergent copy of either rule.
 
+    `routing_refusal` (registry #122) is a genuinely different third question — "can the PLANNER
+    build a row from it" — and is deliberately NOT folded in here, because `retriage.plan()` reads
+    THIS predicate as "the issue is stranded, repair it". See that function's docstring for the
+    measurement. `ready_candidates` composes both; anything asking "is this issue on the frontier"
+    must ask `ready_candidates`, not this predicate alone.
+
     Package SERIALIZATION drops (compute_ready's one-per-package concurrency width) are
     deliberately NOT reported here: they are transient by design — the issue is still on the
     frontier next tick — and the assembler already names them (`assembler defer #N: crate ...`).
@@ -200,9 +227,54 @@ def exclusion_reason(labels, open_blockers=0):
     return None
 
 
+def routing_refusal(labels):
+    """The ROUTABILITY predicate: None when the PLANNER can turn this label set into a plan row,
+    else a short attributable string naming why it refuses. Currently one condition — MORE THAN
+    ONE `role:*` label (registry issue #122).
+
+    THE PARTITION-KILLER. This rule already existed, in `dispatch-plan.plan_dispatch`, which runs
+    AFTER `compute_ready` has serialized the candidate set down to one row per `area:` package. A
+    malformed issue therefore WON its partition slot and was only THEN rejected, taking the whole
+    partition down with it and offering no backfill: three such issues (each carrying `role:ci`
+    AND `role:impl`) held the registry's plan rows at ZERO for 8 days while every individual run
+    stayed green. `ready_candidates` applies this predicate alongside `exclusion_reason`, so
+    (a) such an issue can never be a partition head — the next candidate in the package backfills
+    — and (b) because it still holds `status:ready`, the drop emits an attributable
+    `readiness defer #N:` line (the #586 idiom) and the outage is VISIBLE in a green run.
+
+    It REFUSES; it never GUESSES. The pair is named, never collapsed to one role: no layer here
+    can read which role a human meant, and silently picking one reroutes the work to a different
+    model chain. `plan_dispatch`'s rejection STAYS as the fail-closed backstop — this is a
+    layering correction (the one #113 applied to the trust/linked filters), not a move.
+
+    WHY THIS IS NOT A BRANCH OF `exclusion_reason` (measured, not stylistic). That predicate has a
+    SECOND consumer with a different question: `retriage.plan()` treats "not enumerable" as "this
+    issue is STRANDED — repair or re-park it". Folding ambiguity in there was tried and measured:
+    `retriage.plan()` flipped from `skip/ready-consistent` to `repair`, whose write STRIPS one of
+    the two role labels — the classifier re-derives a role from `area:`, which on the three live
+    heads kept `role:impl` and dropped the `role:ci` a human had applied deliberately. That is the
+    auto-collapse this docstring refuses, arrived at through the back door, and retriage's own
+    self-test ("an enumerable status:ready issue is left alone despite unrelated classifier
+    drift") reds on it. Enumerability, triage-completeness and routability are three questions;
+    `exclusion_reason`'s docstring already separates the first two. This is the third.
+    """
+    roles = roles_of(labels)
+    if len(roles) > 1:
+        # FULL label names (`role:ci, role:impl`), not the bare values the planner's skip line
+        # prints: a bare `role:` has the EMPTY value, which `', '.join` renders as a leading comma
+        # and nothing else — unreadable in the one line a human gets. The phrase "ambiguous role
+        # labels" is kept verbatim so the gate and the planner grep as one class.
+        return ("ambiguous role labels: "
+                + ", ".join(ROLE_PREFIX + role for role in roles)
+                + " — exactly one role:* required (registry issue #122)")
+    return None
+
+
 def ready_candidates(issues, log=None):
     """Every issue that passes the FAIL-CLOSED readiness LABEL gate (open + status:ready + exactly
-    one priority + a role + no gate/busy label + zero open blockers), priority-then-number ordered.
+    one priority + exactly one role + no gate/busy label + zero open blockers), priority-then-number
+    ordered. THE gate is this function, not `exclusion_reason` alone: it composes that predicate
+    with `routing_refusal` (registry #122), which the planner would otherwise apply too late.
 
     This is the DRAINABLE set — every issue a fleet could work through — BEFORE the conflict-free
     one-per-package concurrency serialization that compute_ready() layers on top. The two answer
@@ -220,7 +292,11 @@ def ready_candidates(issues, log=None):
         if str(it.get("state", "OPEN")).upper() != "OPEN":
             continue
         L = labels_of(it)
-        reason = exclusion_reason(L, it.get("open_blockers", 0))
+        # The label gate is the ENUMERABILITY predicate followed by the ROUTABILITY one, in that
+        # order: a gated-AND-ambiguous issue reports the gate, which is the earlier and more
+        # actionable condition. Both emit the same attributable defer line, so the caller cannot
+        # tell — and must not care — which layer refused.
+        reason = (exclusion_reason(L, it.get("open_blockers", 0)) or routing_refusal(L))
         if reason is not None:
             if "status:ready" in L:
                 log(f"readiness defer #{it.get('number', 0)}: {reason}")
@@ -254,6 +330,36 @@ def compute_ready(issues, in_progress_packages=None, log=None):
     return ready
 
 
+def _planner_role_rule():
+    """(callable|None, bool): the PLANNER's role-counting rule, and whether it consumes ours.
+
+    Returns `dispatch-plan._roles_of` compiled from its AST in an isolated namespace — importing
+    the module itself would drag in route-resolve + routing.toml, which this engine's self-test
+    has no business depending on. AST, not a source grep: only the function's actual BODY is
+    executed, so a comment or a docstring naming the rule cannot satisfy the parity check.
+
+    Second element is True when dispatch-plan has been collapsed onto `_ready.roles_of` (the
+    end state this duplication should reach). The caller asserts one or the other; a file with
+    NEITHER a private `_roles_of` NOR a reference to the shared one fails closed.
+    """
+    import ast
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dispatch-plan.py")
+    if not os.path.exists(path):
+        return None, False
+    with open(path, encoding="utf-8") as fh:
+        tree = ast.parse(fh.read(), path)
+    uses_shared = any(isinstance(n, ast.Attribute) and n.attr == "roles_of"
+                      and isinstance(n.value, ast.Name) and n.value.id == "_ready"
+                      for n in ast.walk(tree))
+    fn = next((n for n in tree.body
+               if isinstance(n, ast.FunctionDef) and n.name == "_roles_of"), None)
+    if fn is None:
+        return None, uses_shared
+    namespace = {}
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), path, "exec"), namespace)  # noqa: S102
+    return namespace["_roles_of"], uses_shared
+
+
 def _self_test():
     def iss(n, labels, blk=0, state="OPEN"):
         return {"number": n, "state": state, "labels": labels, "open_blockers": blk}
@@ -275,6 +381,11 @@ def _self_test():
         iss(12, R + ["priority:P1", "area:groom"]),                          # groom (free)
         iss(13, R + ["priority:P0", "area:docs", "kind:epic"]),              # epic -> excluded
         iss(14, ["status:ready", "priority:P1", "area:usage"]),              # #586: lost its role
+        # [#122] AMBIGUOUS ROLE. Deliberately given an otherwise-PERFECT ready label set on a FREE
+        # package, so that deleting the ambiguity branch does not merely lose a defer line — it
+        # puts #15 on the FRONTIER and changes `ready order`. That is a behaviour-kill of the
+        # headline claim, not a helper-only kill.
+        iss(15, R + ["role:ci", "priority:P1", "area:review-loop"]),
     ]
     ok = True
 
@@ -371,11 +482,28 @@ def _self_test():
     compute_ready(F, log=lines.append)
     check("every dropped status:ready candidate emits one attributable defer line",
           sorted(int(re.search(r"#(\d+)", line).group(1)) for line in lines),
-          [4, 5, 7, 9, 10, 13, 14, 40])
+          [4, 5, 7, 9, 10, 13, 14, 15, 40])
     reasons = {int(re.search(r"#(\d+)", line).group(1)): line for line in lines}
     check("#586 lost-priority names the priority condition",
           "no single valid priority:P0..P4" in reasons[9], True)
     check("#586 lost-role names the role condition", "no role:* label" in reasons[14], True)
+    # ---- [#122] the AMBIGUOUS-ROLE class: refused at the READINESS gate, not at the planner ----
+    # Asserting only "#15 is absent from the frontier" is how #586 hid for months, so every claim
+    # below is asserted positively: the frontier row, the DEFER LINE's content, and the backfill.
+    check("[#122] an ambiguous-role issue is never a partition head",
+          15 in [i["number"] for i in ready], False)
+    check("[#122] the ambiguity defer line names the issue number AND both role labels",
+          (reasons.get(15, "").startswith("readiness defer #15: "),
+           "ambiguous role labels: role:ci, role:impl" in reasons.get(15, ""),
+           "exactly one role:* required" in reasons.get(15, "")),
+          (True, True, True))
+    # THE OUTAGE, in one assertion. Pre-fix, #30 (P0, ambiguous) WON the `usage` partition and was
+    # only then rejected by plan_dispatch — 0 plan rows, and #31 never got a turn, every tick, for
+    # 8 days. The fix is not "#30 is excluded"; it is that its partition slot BACKFILLS.
+    backfill = compute_ready([iss(30, R + ["role:ci", "priority:P0", "area:usage"]),
+                              iss(31, R + ["priority:P1", "area:usage"])], log=lambda _line: None)
+    check("[#122] the ambiguous head frees its partition — the next candidate backfills",
+          [i["number"] for i in backfill], [31])
     check("gated defer names the gate", "gated by needs:design" in reasons[40], True)
     check("busy defer names the status", "busy: status:in-progress-review" in reasons[10], True)
     check("blocked defer names the blocker count", "2 open blocker(s)" in reasons[5], True)
@@ -399,6 +527,67 @@ def _self_test():
           exclusion_reason({"priority:P1", "role:impl"}), "no status:ready attestation")
     check("exclusion_reason: an area-less set is still enumerable (it reserves __global__)",
           exclusion_reason({"status:ready", "priority:P1", "role:impl"}), None)
+    # ---- [#122] the ROUTABILITY predicate itself ----
+    check("routing_refusal: a routable single-role set is accepted",
+          routing_refusal({"status:ready", "priority:P1", "role:impl", "area:usage"}), None)
+    check("routing_refusal: an ambiguous role set is REFUSED and both roles are named",
+          routing_refusal({"status:ready", "priority:P1", "area:usage", "role:ci", "role:impl"}),
+          "ambiguous role labels: role:ci, role:impl — exactly one role:* required "
+          "(registry issue #122)")
+    check("routing_refusal: it REFUSES, it does not collapse — three roles are all named",
+          routing_refusal({"status:ready", "priority:P1", "role:ci", "role:docs", "role:impl"}),
+          "ambiguous role labels: role:ci, role:docs, role:impl — exactly one role:* required "
+          "(registry issue #122)")
+    # THE SEPARATION, asserted rather than merely commented. `retriage.plan()` reads
+    # `exclusion_reason` as "this issue is STRANDED, repair it", and its repair STRIPS a role
+    # label — measured: folding ambiguity into `exclusion_reason` flipped retriage from
+    # skip/ready-consistent to repair/remove-a-role on the very fixture retriage's own self-test
+    # pins ("an enumerable status:ready issue is left alone despite unrelated classifier drift").
+    # An agent that "simplifies" the two predicates back into one must red HERE, next to the
+    # reason, not three files away.
+    AMBIG = {"status:ready", "priority:P1", "area:usage", "role:ci", "role:impl"}
+    check("[#122] ambiguity is REFUSED by the frontier yet INVISIBLE to exclusion_reason — so "
+          "retriage cannot 'repair' it by picking a role",
+          (exclusion_reason(AMBIG), routing_refusal(AMBIG) is not None),
+          (None, True))
+    # The gate must not jump the DOCUMENTED priority order: a gated ambiguous issue reports the
+    # GATE, which is the earlier and more actionable condition.
+    gated_lines = []
+    ready_candidates([iss(60, sorted(AMBIG | {"needs:user"}))], log=gated_lines.append)
+    check("[#122] a GATED ambiguous issue reports the gate first (documented priority order)",
+          gated_lines, ["readiness defer #60: gated by needs:user"])
+    check("roles_of counts DISTINCT role values by PREFIX, sorted",
+          (roles_of({"role:impl"}), roles_of({"role:impl", "role:ci"}), roles_of({"role:"}),
+           roles_of({"area:usage", "status:ready"})),
+          (["impl"], ["ci", "impl"], [""], []))
+    # `has_role` (regex `role:` + at least one char) and `roles_of` (prefix) DISAGREE on a bare
+    # `role:` — deliberately, and both fail closed. If `roles_of` were switched to the `_ROLE`
+    # regex, this pair would count as ONE role, sail through the gate, and be rejected by the
+    # planner exactly as before: the hole this unit closes, re-opened.
+    check("[#122] a bare `role:` beside a real role is AMBIGUOUS (prefix rule, as CLAIM counts)",
+          (has_role({"role:", "role:impl"}),
+           routing_refusal({"status:ready", "priority:P1", "role:", "role:impl"})),
+          (True, "ambiguous role labels: role:, role:impl — exactly one role:* required "
+                 "(registry issue #122)"))
+    check("[#122] a LONE bare `role:` is roleless, not ambiguous (one reason, the right one)",
+          (has_role({"role:"}), exclusion_reason({"status:ready", "priority:P1", "role:"}),
+           routing_refusal({"status:ready", "priority:P1", "role:"})),
+          (False, "no role:* label", None))
+    # ---- [#122] CROSS-FILE PARITY: the gate must never count roles more loosely than the stage
+    # downstream of it. `dispatch-plan._roles_of` is the planner's copy of this rule; its BODY is
+    # extracted by AST and executed here, so a textual re-word cannot satisfy the check and a
+    # semantic divergence cannot pass it. (The rule belongs in this module — dispatch-plan already
+    # imports it as `_ready` — but that file is owned by another change; see the PR body.)
+    planner_roles_of, planner_uses_shared = _planner_role_rule()
+    corpus = [set(), {"role:impl"}, {"role:ci", "role:impl"}, {"role:"}, {"role:", "role:impl"},
+              {"area:usage", "status:ready"}, {"role:a", "role:b", "role:c"}, {"roles:impl"}]
+    if planner_roles_of is not None:
+        check("[#122] the readiness gate counts roles EXACTLY as dispatch-plan's planner does",
+              [roles_of(labels) == planner_roles_of(labels) for labels in corpus],
+              [True] * len(corpus))
+    else:
+        check("[#122] dispatch-plan dropped its private _roles_of — it must consume this module's",
+              planner_uses_shared, True)
     check("flatten pages drops PRs", _flatten_pages(
         [[{"number": 1}, {"number": 2, "pull_request": {}}], [{"number": 3}], "junk", [None]]),
         [{"number": 1}, {"number": 3}])

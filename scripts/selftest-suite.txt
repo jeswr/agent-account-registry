@@ -17,6 +17,7 @@ lease_schema.py
 ledger-invariant.py
 ledger_retry.py
 measurement_gate.py
+metrics-alert.py
 metrics.py
 migrate-secrets.sh
 model-health.py
