@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4437,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "8c869c8b6e17725064b6a171d7b68d82096e8bcd",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "try_local_service validates only duplicate columns and arity, then accepts rows.vars unchanged. LocalServiceRows explicitly documents out-of-scope variables as allowed, but they can join with an identically named variable outside the SERVICE group. For example, VALUES ?x { 1 } SERVICE <h> { ?s ?p ?o } must not let the SERVICE bind ?x; a handler returning header ?x with value 2 makes join_bindings drop the outer row. This is not equivalent to evaluating the SERVICE group or to the advertised remote SERVICE relation semantics.",
+    "file": "crates/sparq-engine/src/exec.rs",
+    "fix_hint": "Before interning, reject any returned header variable not present in the inner pattern's in-scope vars (or otherwise project it away according to a clearly specified semantic rule). Update the public documentation that currently says such variables are allowed, and add a real query test where an outer-only variable has the same name as an extra returned header and verify the outer solution is not altered.",
+    "severity": "major",
+    "title": "Handler rows may bind variables outside the SERVICE group's scope"
+   },
+   {
+    "body": "local_services::install overwrites ACTIVE, while Guard::drop always calls take() instead of restoring the previous value. Thus with_local_services(&outer, || { with_local_services(&inner, ...); query_using_outer() }) loses the outer registry after the inner closure. A formerly local endpoint can then become unsupported or fall through to HTTP for the remainder of a scope that promises the outer registry is installed.",
+    "file": "crates/sparq-engine/src/exec.rs",
+    "fix_hint": "Store the previous Option<Arc<LocalServiceRegistry>> in Guard during install and restore it on Drop, matching WorkerGuard and the repository's other nest-safe scoped state. Add a nested-scope test that exercises the outer handler before, during/around, and after an inner installation, including unwind restoration if scoped registries promise RAII behavior.",
+    "severity": "major",
+    "title": "Nested local-service scopes discard the outer registry"
+   }
+  ],
+  "progress": null,
+  "summary": "The local SERVICE seam has two correctness defects in its scope and registry handling. Returned headers can inject variables that the SERVICE group cannot bind, changing joins with surrounding solutions, and nested registry scopes erase the outer registry when the inner guard drops. The current tests do not cover either load-bearing case.",
+  "verdict": "request_changes"
+ }
+}
