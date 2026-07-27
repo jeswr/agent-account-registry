@@ -1769,6 +1769,51 @@ def is_enumerable_provenance(record, pr_number):
     return provenance_admission_error(record, pr_number) is None
 
 
+# ---- FIRST-TICK VOLUME BOUND -----------------------------------------------------------------
+# Reviving a repair lane that has been dead for ten days releases its whole accumulated backlog at
+# once. Measured on the live fleet the day this landed: 25/78 open sparq worker drafts carry a
+# concluded-RED aggregator that ONLY the tiered read can see, and 7 of them clear every other
+# guard and reach `needs-ci-fix` on the first tick (the rest are held by a human hold, an
+# unreviewed head, a conflicting base or an existing review:changes claim).
+#
+# Only the FIX lane pushes commits, and this repo has a documented congestion-collapse mode where
+# over-dispatched pushes saturate the target's runners and manufacture FALSE gate failures — which
+# would corrupt the very signal this PR exists to read. So the newly-reachable rows drain at a
+# bounded rate, OLDEST PR FIRST, and the held rows are LOGGED rather than silently dropped.
+#
+# Scoped to the previously-unreachable rows only: throttling traffic the strict reading already
+# saw would be a new throughput regression dressed up as safety. Once the backlog drains the bound
+# is inert. (Registry #765, stacked on this PR, extends the same bound to the `stranded` lane it
+# revives; the cap is per-lane so the two backlogs cannot share — or steal — one budget.)
+DRAFT_TIER_BACKLOG_PER_TICK_MAX = 5
+_DRAFT_TIER_NEW = "_draft_tier_newly_reachable"   # private; stripped before the plan row is built
+
+
+def _cap_draft_tier_backlog(items, log=print):
+    """PURE-ish (logs only): hold newly-reachable draft-tier rows above
+    DRAFT_TIER_BACKLOG_PER_TICK_MAX per LANE per tick, oldest PR first. The private marker is
+    always stripped, so the emitted plan row shape is identical with and without a cap."""
+    admitted, kept = Counter(), set()
+    for item in sorted((i for i in items if i.get(_DRAFT_TIER_NEW)),
+                       key=lambda i: (str(i.get("repo") or ""), i.get("pr_number") or 0)):
+        lane = _review_item_lane(item["state"])
+        admitted[lane] += 1
+        if admitted[lane] <= DRAFT_TIER_BACKLOG_PER_TICK_MAX:
+            kept.add(id(item))
+    survivors, held = [], Counter()
+    for item in items:
+        newly = item.pop(_DRAFT_TIER_NEW, False)
+        if newly and id(item) not in kept:
+            held[_review_item_lane(item["state"])] += 1
+            continue
+        survivors.append(item)
+    for lane in sorted(held):
+        log(f"review-enumeration: draft-tier backlog cap held {held[lane]} newly-reachable "
+            f"{lane}-lane item(s) this tick (max {DRAFT_TIER_BACKLOG_PER_TICK_MAX}/lane, oldest "
+            "PR first); they re-enumerate next tick")
+    return survivors
+
+
 def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, bot_login="",
                            pr_status=None, exclusions=None):
     """PURE review_items enumerator (called by the dispatch.yml PLAN step against its own data;
@@ -1944,8 +1989,8 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
         reviewed = REVIEWED_SHA_RE.search(pull.get("body") or "")
         reviewed_match = bool(reviewed and reviewed.group(1) == sha)
 
-        def emit(state, context=""):
-            items.append({
+        def emit(state, context="", newly_reachable=False):
+            row = {
                 "pr_number": number,
                 "head_sha": sha,
                 "state": state,
@@ -1954,7 +1999,12 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
                 "package": plan_package(areas),
                 "security": _security_flagged(set(labels) | set(source_labels)),
                 "context": context[:CI_CONTEXT_MAX],
-            })
+            }
+            if newly_reachable:
+                # Private, stripped by _cap_draft_tier_backlog before this list is returned —
+                # the plan row that reaches the workflow must not grow a field.
+                row[_DRAFT_TIER_NEW] = True
+            items.append(row)
 
         # GAP-B: conflict repair FIRST and alone — CI on a conflicted base is noise. This is
         # REVIEW-STATE-AGNOSTIC by design (issue #351, the #256 limbo): a review:pass PR is
@@ -2021,7 +2071,10 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
         # argument, and TIER-APPROPRIATE per repair_gate_of: a READY PR is still judged on the
         # strict name alone, so a stale draft-tier row can never defuse a valid arm.
         if repair_gate_of(status, draft) == "failure" and lease_free:
-            emit("needs-ci-fix", context=", ".join(status.get("failing_legs") or []))
+            # NEWLY REACHABLE = the strict merge-required reading would NOT have seen this row,
+            # i.e. it is part of the ten-day backlog this PR releases. Only those are bounded.
+            emit("needs-ci-fix", context=", ".join(status.get("failing_legs") or []),
+                 newly_reachable=status.get("gate") != "failure")
         elif (draft and reviewed_match and lease_free
                 and status.get("gate") == "success"
                 and status.get("conflicting") is False
@@ -2042,8 +2095,22 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
             exclude_signalled(
                 "head already reviewed; no live repair trigger (gate not concluded-red, "
                 "posture not stranded)")
+    # AGGREGATOR-NAME DRIFT: loud, unconditional, and independent of whether the PR was emitted —
+    # the point is to notice the THIRD rename on the tick it appears, not after another ten days
+    # of quiet "missing". Alarm only; nothing above consulted it.
+    drifted = sorted({
+        name
+        for status in (pr_status or {}).values() if isinstance(status, dict)
+        for name in (status.get("gate_tier_drift") or [])
+    })
+    if drifted:
+        print(f"::warning::{repo}: check-run(s) {drifted} are shaped like a tier of the "
+              f"aggregator job but are NOT in CI_REPAIR_GATE_CHECKS {list(CI_REPAIR_GATE_CHECKS)} "
+              "— the target has renamed or re-tiered its aggregator and this repo is blind to "
+              "that head's CI (see unknown_aggregator_tiers; adding a name requires inspecting "
+              "what its LEG SET runs, not just the spelling)")
     items.sort(key=lambda item: (item["repo"], item["pr_number"]))
-    return items
+    return _cap_draft_tier_backlog(items)
 
 
 def filter_deferred_items(items, repo, leases, now):
@@ -8662,6 +8729,81 @@ def _self_test():
     assert [i["state"] for i in enumerate_review_items(
         repo, [_ready], provenance, [], issue_labels, now,
         pr_status={41: status_of(sha_a, gate="failure", legs=["js"])})] == ["needs-ci-fix"]
+
+    # ---- FIRST-TICK VOLUME BOUND on the revived backlog ----
+    def _cap_row(pr_number, state="needs-ci-fix", newly=True, item_repo=repo):
+        row = {"pr_number": pr_number, "state": state, "repo": item_repo}
+        if newly:
+            row[_DRAFT_TIER_NEW] = True
+        return row
+
+    _batch = [_cap_row(n) for n in (90, 12, 31, 7, 55, 3, 44, 21)]
+    _capped = _cap_draft_tier_backlog(list(_batch), log=lambda _m: None)
+    # OLDEST PR FIRST (lowest number), exactly DRAFT_TIER_BACKLOG_PER_TICK_MAX of them, and the
+    # caller's ordering is preserved for whichever survive (reversing the drain order to
+    # newest-first reds this: {44, 55, 90} would replace {3, 7, 12}).
+    assert [r["pr_number"] for r in _capped] == [12, 31, 7, 3, 21], _capped
+    assert len(_capped) == DRAFT_TIER_BACKLOG_PER_TICK_MAX
+    assert sorted(r["pr_number"] for r in _capped) == [3, 7, 12, 21, 31], _capped
+    # ...and the private marker NEVER survives into a plan row, capped or not.
+    assert all(_DRAFT_TIER_NEW not in r for r in _capped), _capped
+    # ALREADY-REACHABLE traffic is not throttled: re-throttling what the strict reading already
+    # saw would be a new throughput regression dressed up as safety.
+    _old = [_cap_row(n, newly=False) for n in range(1, 20)]
+    assert len(_cap_draft_tier_backlog(list(_old), log=lambda _m: None)) == 19
+    _mixed = _cap_draft_tier_backlog(_old + [_cap_row(n) for n in range(100, 112)],
+                                     log=lambda _m: None)
+    assert len(_mixed) == 19 + DRAFT_TIER_BACKLOG_PER_TICK_MAX, len(_mixed)
+    # PER LANE, not one shared budget: a full fix backlog cannot starve the review lane (this is
+    # what lets registry #765's revived `stranded` lane drain alongside this one).
+    _two_lane = _cap_draft_tier_backlog(
+        [_cap_row(n) for n in range(1, 9)]
+        + [_cap_row(n, state="stranded") for n in range(20, 28)], log=lambda _m: None)
+    assert Counter(r["state"] for r in _two_lane) == Counter({
+        "needs-ci-fix": DRAFT_TIER_BACKLOG_PER_TICK_MAX,
+        "stranded": DRAFT_TIER_BACKLOG_PER_TICK_MAX}), _two_lane
+    # HELD ROWS ARE COUNTED, never dropped silently.
+    _cap_log = io.StringIO()
+    _cap_draft_tier_backlog([_cap_row(n) for n in range(1, 9)],
+                            log=lambda m: _cap_log.write(m + "\n"))
+    assert "draft-tier backlog cap held 3 newly-reachable fix-lane item(s)" \
+        in _cap_log.getvalue(), _cap_log.getvalue()
+    # ...and the bound is WIRED into the enumerator, not merely defined. Deleting the
+    # `_cap_draft_tier_backlog(items)` call reds this (the item survives with the cap at 0),
+    # and marking already-reachable rows as newly-reachable reds the control below it.
+    _real_cap = DRAFT_TIER_BACKLOG_PER_TICK_MAX
+    globals()["DRAFT_TIER_BACKLOG_PER_TICK_MAX"] = 0
+    try:
+        _wire_log = io.StringIO()
+        with contextlib.redirect_stdout(_wire_log):
+            assert enumerate_review_items(repo, [starved], provenance, [], issue_labels, now,
+                                          pr_status=draft_tier_red) == []
+        assert "draft-tier backlog cap held 1 newly-reachable fix-lane" in _wire_log.getvalue()
+        # the STRICT-red row was reachable all along: the bound must not touch it
+        assert [i["state"] for i in enumerate_review_items(
+            repo, [starved], provenance, [], issue_labels, now, pr_status=red)] \
+            == ["needs-ci-fix"]
+    finally:
+        globals()["DRAFT_TIER_BACKLOG_PER_TICK_MAX"] = _real_cap
+
+    # ---- DRIFT ALARM at the enumeration boundary ----
+    # Alarm only, and it fires on a tick where NOTHING was emitted — the whole point is to
+    # notice the third rename before another ten days of quiet "missing". Deleting the warning
+    # block, or feeding drift into an admission, reds this.
+    _drift_log = io.StringIO()
+    with contextlib.redirect_stdout(_drift_log):
+        assert enumerate_review_items(
+            repo, [starved], provenance, [], issue_labels, now,
+            pr_status={41: {**status_of(sha_a, gate="missing", repair_gate="missing"),
+                            "gate_tier_drift": ["gate, some-future-tier"]}}) == []
+    assert "::warning::" in _drift_log.getvalue()
+    assert "gate, some-future-tier" in _drift_log.getvalue(), _drift_log.getvalue()
+    assert "NOT in CI_REPAIR_GATE_CHECKS" in _drift_log.getvalue()
+    _quiet = io.StringIO()
+    with contextlib.redirect_stdout(_quiet):
+        enumerate_review_items(repo, [starved], provenance, [], issue_labels, now,
+                               pr_status=draft_tier_red)
+    assert "::warning::" not in _quiet.getvalue(), _quiet.getvalue()
 
     # ... while a concluded-GREEN gate on a drafted, unarmed, reviewed head is the STRANDED
     # posture (no other autonomous exit exists) — enumerated so CLAIM can hand it to a human

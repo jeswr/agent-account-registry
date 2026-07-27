@@ -164,15 +164,22 @@ def _fetch_check_runs(fetch, repo, sha, check_name=None):
     short of what GitHub says exists is a partial read, and a partial read that happens to
     omit the aggregator is indistinguishable from "this head has no gate" — the exact silent
     failure that stands every gate-dependent admission down. A disagreement (or an
-    absent/garbage count) degrades the record instead."""
-    filter_query = f"&check_name={quote(check_name, safe='')}" if check_name else ""
+    absent/garbage count) degrades the record instead.
+
+    The filter is emitted FIRST in the query string, so the encoded name is always followed by a
+    `&` delimiter. `check_name=gate` is a strict PREFIX of `check_name=gate%2C%20draft-tier`;
+    trailing it made every name test in a fixture (or in a log grep, or in any future
+    request-matching double) prefix-shaped and therefore ORDER-dependent for its correctness.
+    Putting it first makes the parameter BOUNDARY available to any matcher, which is what
+    dispatch-claim's live read already relies on. [round-2 review, finding 3]"""
+    filter_query = f"check_name={quote(check_name, safe='')}&" if check_name else ""
     runs_out = []
     raw_seen = 0
     total = None
     for page in range(1, CHECK_RUN_PAGE_LIMIT + 1):
         try:
             doc = fetch(f"https://api.github.com/repos/{repo}/commits/{sha}"
-                        f"/check-runs?per_page=100&page={page}{filter_query}")
+                        f"/check-runs?{filter_query}per_page=100&page={page}")
         except FetchError as exc:
             raise SnapshotItemError("check-runs-read-failed") from exc
         runs = doc.get("check_runs") if isinstance(doc, dict) else None
@@ -344,11 +351,17 @@ def _self_test():
         return {"check_runs": runs, "total_count": len(runs) if total is None else total}
 
     def requested_name(url):
-        """Which tier name this filtered read asked for ('' = the unfiltered legs walk)."""
-        if f"check_name={quote(draft_gate, safe='')}" in url:
-            return draft_gate
-        if f"check_name={quote(gate, safe='')}" in url:
-            return gate
+        """Which tier name this filtered read asked for ('' = the unfiltered legs walk),
+        matched to the parameter BOUNDARY. `check_name=gate` is a strict PREFIX of
+        `check_name=gate%2C%20draft-tier`, so a bare substring test answers every draft-tier
+        request with the strict name's rows — the fixture bug that would fake this whole defect
+        away. This is boundary-safe rather than merely ordering-safe because _fetch_check_runs
+        emits the filter FIRST, so a `&` always terminates the encoded name; dropping that `&`
+        here (or moving the filter back to the end of the query) reds the tier assertions
+        below. [round-2 review, finding 3]"""
+        for name in (gate, draft_gate):
+            if f"check_name={quote(name, safe='')}&" in url:
+                return name
         return ""
 
     def worker_pull(number, sha):
@@ -399,6 +412,11 @@ def _self_test():
                 # PR 9 is a DRAFT on the detail read — the round-4 carve-out confirmation bit.
                 return {"head": {"sha": sha}, "mergeable": True, "draft": number == 9,
                         "auto_merge": {"merge_method": "squash"} if number == 7 else None}
+        # BOUNDARY, not ordering: every filtered read must terminate its encoded check_name
+        # with a `&` so a matcher can tell `gate` from the name it is a strict prefix of.
+        # Moving the filter back to the end of the query string reds this.
+        if "/check-runs?" in url and "check_name=" in url:
+            assert re.search(r"[?&]check_name=[^&]+&", url), url
         wanted = requested_name(url)
         if f"/commits/{sha_over}/" in url:
             return page([gate_run() for _ in range(100)], total=1000)   # never a short page
