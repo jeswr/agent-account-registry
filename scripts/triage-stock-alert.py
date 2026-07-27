@@ -68,6 +68,11 @@ UNTRIAGED = "status:untriaged"
 # evidence of a broken machine exit. `kind:epic` is deliberately never dispatchable. The remaining
 # `status:*` labels mean some other lane already owns the row.
 GATE_PREFIXES = ("needs:", "trust:untrusted")
+# The one gate label in GATE_PREFIXES that a MACHINE writes (`curate-frontier.is_ec2_measurement`)
+# and that no lane ever removes. Excluded from `machine_owed` like every other `needs:*` — a
+# genuine EC2 hold really does await a human's spend decision — but COUNTED and reported, because
+# a one-way hold that the starvation alarm cannot see is the very defect this alert measures.
+MACHINE_WRITTEN_GATE = "needs:ec2"
 NON_DISPATCHABLE = "kind:epic"
 OTHER_OWNED_STATUS = {"status:deferred", "status:parked", "status:in-progress",
                       "status:in-progress-review", "status:blocked", "status:available",
@@ -116,11 +121,24 @@ def census(issues, now, classify=static_triage.triage, known_labels=None):
     """The POPULATION measurement, per state, with timestamps. Pure.
 
     Returns a dict with `machine_owed` (the count this alert keys on), `unclassifiable` (the
-    subset the classifier provably can never complete — see the module header), `oldest_*`, and
-    the raw `untriaged` total. `machine_owed` deliberately EXCLUDES every row a human or another
-    lane owns, so the number that goes loud is only ever the machine's own debt.
+    subset the classifier provably can never complete — see the module header), `machine_gated`
+    / `gated_ec2` (see below), `oldest_*`, and the raw `untriaged` total. `machine_owed`
+    deliberately EXCLUDES every row a human or another lane owns, so the number that goes loud is
+    only ever the machine's own debt.
+
+    `machine_gated` / `gated_ec2` — THE EXCLUSION IS REPORTED, NOT SILENT. A `needs:*` gate
+    normally means a human owes the row its next move, which is why it is excluded from
+    `machine_owed` and why counting it there would fire this alert on work the machine does not
+    owe. But `needs:ec2` is written by a MACHINE (`curate-frontier.is_ec2_measurement`) and no
+    lane in this estate removes it, so a mis-fenced row is a ONE-WAY hold that the alert's own
+    key cannot see — the same missing-state-exit shape this whole alert exists to measure, one
+    layer up. Making the population COUNTABLE is the honest fix available here: the number stays
+    out of `breached()` (so the alarm never fires on human-owed work) and appears in the body (so
+    a growing pile of machine-written holds is visible instead of invisible). Giving `needs:ec2`
+    a real machine exit is a separate, reviewed diff; this is what makes it noticeable.
     """
     untriaged = machine_owed = unclassifiable = 0
+    machine_gated = gated_ec2 = 0
     oldest_age = None
     oldest_number = None
     for issue in issues:
@@ -132,6 +150,9 @@ def census(issues, now, classify=static_triage.triage, known_labels=None):
         untriaged += 1
         if any(label == gate or label.startswith(gate)
                for label in labels for gate in GATE_PREFIXES):
+            machine_gated += 1                         # counted, never keyed on
+            if MACHINE_WRITTEN_GATE in labels:
+                gated_ec2 += 1
             continue                                   # a human owes this one its next move
         if NON_DISPATCHABLE in labels or (labels & OTHER_OWNED_STATUS):
             continue                                   # another lane owns the row
@@ -150,6 +171,8 @@ def census(issues, now, classify=static_triage.triage, known_labels=None):
         "untriaged": untriaged,
         "machine_owed": machine_owed,
         "unclassifiable": unclassifiable,
+        "machine_gated": machine_gated,
+        "gated_ec2": gated_ec2,
         "oldest_age_days": oldest_age,
         "oldest_number": oldest_number,
     }
@@ -207,6 +230,13 @@ def render_body(counts, reasons, run_url, maintainer):
         "— `triage.triage()` can never mint a `priority:*` or an `area:*` label, and requires "
         "both to declare an issue ready, so for these rows `classifier-incomplete` is a FIXED "
         "POINT, not a slow lane",
+        f"- excluded as gated (a human or the spend budget owes the next move): "
+        f"**{counts['machine_gated']}**, of which **{counts['gated_ec2']}** carry "
+        f"`{MACHINE_WRITTEN_GATE}` — a gate a MACHINE writes and no lane removes. This number is "
+        "reported, never keyed on: it must not fire this alert (the hold can be legitimate), but "
+        "a one-way machine-written hold that the alert cannot see is the same missing-exit shape "
+        "this alert exists to measure. If it grows, audit "
+        "`curate-frontier.is_ec2_measurement`",
     ]
     if counts["oldest_age_days"] is not None:
         lines.append(
@@ -408,7 +438,24 @@ def _self_test():
         census([iss(1, ["status:untriaged", "status:available"])], now)["machine_owed"], 0)
     chk("a PR row is never censused", census([iss(1, ["status:untriaged"], pr=True)], now),
         {"untriaged": 0, "machine_owed": 0, "unclassifiable": 0,
+         "machine_gated": 0, "gated_ec2": 0,
          "oldest_age_days": None, "oldest_number": None})
+
+    # THE MACHINE-WRITTEN ONE-WAY HOLD IS COUNTED, NOT KEYED ON. `needs:ec2` is written by
+    # `curate-frontier.is_ec2_measurement` and removed by nothing, so a mis-fenced row leaves the
+    # `machine_owed` population silently — the same missing-exit shape this alert measures. It
+    # must be REPORTED (so a growing pile is visible) and must NOT be counted as owed (so the
+    # alert never fires on work a human or the spend budget genuinely owes).
+    ec2_gated = census([iss(1, ["status:untriaged", "needs:ec2"])], now)
+    chk("a needs:ec2 row is NOT machine-owed", ec2_gated["machine_owed"], 0)
+    chk("...but it IS counted as gated", ec2_gated["machine_gated"], 1)
+    chk("...and attributed to the machine-written gate", ec2_gated["gated_ec2"], 1)
+    human_gated = census([iss(1, ["status:untriaged", "needs:user"])], now)
+    chk("a human-owned gate is counted as gated but NOT attributed to needs:ec2",
+        (human_gated["machine_gated"], human_gated["gated_ec2"]), (1, 0))
+    chk("a gate exclusion never inflates the count the alert keys on",
+        breached({**census([iss(n, ["status:untriaged", "needs:ec2"]) for n in range(60)], now),
+                  "oldest_age_days": 0.0}), [])
     chk("a triage-COMPLETE untriaged row is machine-owed but NOT unclassifiable",
         census([iss(1, ["status:untriaged", "role:impl", "priority:P2", "area:ci"])],
                now)["unclassifiable"], 0)
@@ -491,6 +538,16 @@ def _self_test():
     chk("the body carries the dedupe marker", ALERT_MARKER in body, True)
     chk("the body carries the SPARQ agent self-id", "🤖 SPARQ agent" in body, True)
     chk("the body names the fixed-point count", str(live["unclassifiable"]) in body, True)
+    # The one-way machine-written hold is VISIBLE in the artifact a human actually reads, not just
+    # in the returned dict. Deleting the census line from render_body reds this.
+    gated_body = render_body(
+        census([iss(1, ["status:untriaged", "needs:ec2"]),
+                iss(2, ["status:untriaged", "needs:user"]),
+                iss(3, ["status:untriaged", "needs:ec2"])], now),
+        ["stock: x"], "", "jeswr")
+    chk("the body reports the gated exclusion and attributes the machine-written half",
+        ("**3**" in gated_body and "**2**" in gated_body
+         and MACHINE_WRITTEN_GATE in gated_body and "never keyed on" in gated_body), True)
 
     # ---- AUTHORITY: this script writes no work-issue label ------------------------------------
     # Scan the OPERATIONAL half only — everything above `def _self_test(` — so the assertion is
