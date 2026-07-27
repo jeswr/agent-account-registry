@@ -133,7 +133,131 @@ LABELS = {
                       "Machine-owned capacity park (soft hold; human unlabel, proven recovery, "
                       "or capped retry)"),
     "needs:user": ("b60205", "Human attention required"),
+    # The PR-side machine park (park_policy.MACHINE_PARK_PR_LABEL). Groom now writes it for the
+    # age hand-off, so groom must be able to CREATE it on a target that has never seen one.
+    "review:parked": ("1d76db",
+                      "Machine-owned capacity park (soft hold; human unlabel, proven recovery, "
+                      "or capped retry)"),
 }
+
+# ---- the age-park CLASS split (a TIMEOUT is not a human question) --------------------------------
+# Age says "this took too long". It does NOT say "a human must answer a question". Every reason
+# THIS sweep derives comes from an age threshold crossing plus a MACHINE-READABLE cause, and each
+# such cause has a MACHINE-CHECKABLE recovery predicate (age_park_cause_recovered), so the park it
+# writes is park_policy's MACHINE-owned soft hold, not the human-owned terminal.
+#
+# Why this mattered enough to change: `needs:user` / `review:needs-user` are exactly the labels
+# park_policy.capacity_park_admission treats as a HUMAN-OWNED hold and refuses to auto-re-admit
+# ("ANY `needs:*` label or `review:needs-user` among them ... blocks the automatic path
+# outright"). Stamping one on a PR that ALREADY carried the machine soft hold therefore did not
+# merely mislabel it — it DISABLED the automatic cause-recovery exit registry #614/#691 built, and
+# handed the item to the maintainer permanently. Measured on sparq-org/sparq 2026-07-27: of 11 open
+# age-parks, 6 also carried `review:parked`, and 3 (#3912/#3916/#3942) had a PROVABLY recovered
+# cause — an admissible provenance record on the live ledger ref — yet were still human-held.
+#
+# The mapping is CLOSED and keyed on the exact reason strings stale_worker_pr_reason returns.
+# An UNMAPPED reason keeps the HUMAN hand-off: a cause this table cannot name is a cause
+# age_park_cause_recovered cannot prove recovered, and a soft hold with no provable exit is a
+# SILENT permanent hold — strictly worse than a visible one.
+AGE_PARK_CAUSES: dict[str, str] = {ORPHAN_DRAFT_REASON: "orphan-draft"}
+AGE_PARK_CAUSES.update(
+    {reason: f"merge-{state}" for state, reason in BAD_MERGE_STATES.items()}
+)
+# At most this many AUTOMATIC re-admissions may ever be granted to one PR by the age sweep, and
+# the cap is enforced ONCE, at park time: a park in generation N > AGE_UNPARK_MAX is written in
+# the HUMAN class outright, so the un-park sweep can never see an over-cap park. A PR that keeps
+# re-entering the same machine-recoverable cause is not a capacity blip — it is a genuine human
+# question ("this flaps"), and the right disposition is escalation, not another retry.
+AGE_UNPARK_MAX = 2
+# Machine-readable park/un-park receipts. Bot-authored, durable, and the ONLY record the un-park
+# sweep reads: it never infers a park's class from prose or from label state alone. `cause` is an
+# AGE_PARK_CAUSES value, `head` the head SHA at park time, `gen` the 1-based park generation.
+# The (cause, head, gen) triple is the CONSUME-ONCE key: an un-park is granted for a given triple
+# at most once, so the same recovery can never be re-earned.
+AGE_PARK_MARKER = "<!-- registry-groom-age-park:v1"
+AGE_UNPARK_MARKER = "<!-- registry-groom-age-unpark:v1"
+_AGE_RECEIPT = re.compile(
+    r"cause=(?P<cause>[a-z-]{1,40}) head=(?P<head>[0-9a-f]{40}) gen=(?P<gen>[1-9][0-9]{0,3}) -->"
+)
+
+
+def age_park_cause(reason: str) -> str | None:
+    """The machine-readable cause token for an age-park reason, or None when unmapped."""
+    return AGE_PARK_CAUSES.get(reason)
+
+
+def age_park_label(reason: str, generation: int) -> str:
+    """The park label this age hand-off must write — the ONE place the class is decided.
+
+    MACHINE (`review:parked`) when the reason names a cause with a machine recovery predicate AND
+    the PR is still within its automatic-re-admission cap; HUMAN (`needs:user`) otherwise, i.e.
+    for an unmapped cause (no provable exit) or a park past AGE_UNPARK_MAX (a flap)."""
+    if age_park_cause(reason) is None:
+        return park_policy.HUMAN_PARK_LABEL
+    if generation > AGE_UNPARK_MAX:
+        return park_policy.HUMAN_PARK_LABEL
+    return park_policy.MACHINE_PARK_PR_LABEL
+
+
+def age_receipts(comments: list[dict[str, Any]], marker: str, bot_login: str
+                 ) -> list[dict[str, Any]]:
+    """Well-formed BOT-AUTHORED receipts of one kind, oldest-first.
+
+    Trust filter first (the worker-pr receipt-parser pattern): a receipt any other actor could
+    author is not a durable record of what THIS loop did, so a non-bot comment carrying the
+    marker is ignored entirely. A malformed receipt is DROPPED here but still counted by
+    age_park_generation, so a corrupt receipt can never buy an extra automatic re-admission."""
+    found: list[dict[str, Any]] = []
+    if not bot_login:
+        return found
+    for comment in comments:
+        if comment["user"]["login"].casefold() != bot_login.casefold():
+            continue
+        body = comment["body"]
+        index = body.find(marker)
+        if index < 0:
+            continue
+        match = _AGE_RECEIPT.match(body[index + len(marker):].lstrip(), 0)
+        if match is None:
+            continue
+        found.append({"cause": match.group("cause"), "head": match.group("head"),
+                      "gen": int(match.group("gen"))})
+    return found
+
+
+def age_park_generation(comments: list[dict[str, Any]], bot_login: str) -> int:
+    """The generation a NEW age-park would occupy: one past every park receipt already on record.
+
+    Counts MARKERS, not well-formed records — a malformed receipt still consumed a generation,
+    exactly as park_policy's `auto_marker_count` counts markers rather than parsed records."""
+    if not bot_login:
+        return 1
+    return 1 + sum(
+        1 for comment in comments
+        if comment["user"]["login"].casefold() == bot_login.casefold()
+        and AGE_PARK_MARKER in comment["body"]
+    )
+
+
+def age_unpark_owed(comments: list[dict[str, Any]], bot_login: str
+                    ) -> dict[str, Any] | None:
+    """The age-park receipt whose recovery is still UNCONSUMED, or None.
+
+    The newest park receipt is owed an un-park iff no un-park receipt carries the SAME
+    (cause, head, gen) triple. That is the consume-exactly-once invariant: once granted, the same
+    recovery can never be re-earned — a further re-admission requires a NEW park (a new
+    generation) at a new fingerprint."""
+    parks = age_receipts(comments, AGE_PARK_MARKER, bot_login)
+    if not parks:
+        return None
+    latest = parks[-1]
+    if latest["gen"] > AGE_UNPARK_MAX:
+        return None  # over cap: never automatically re-admitted (age_park_label wrote HUMAN)
+    consumed = {(r["cause"], r["head"], r["gen"])
+                for r in age_receipts(comments, AGE_UNPARK_MARKER, bot_login)}
+    if (latest["cause"], latest["head"], latest["gen"]) in consumed:
+        return None
+    return latest
 
 
 class GroomError(RuntimeError):
