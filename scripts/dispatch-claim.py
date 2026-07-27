@@ -4851,6 +4851,127 @@ STARVE_ALERT_MARKER = "<!-- sparq-escalate-starved:v1 -->"
 STARVE_RESET_MARKER = "<!-- sparq-escalate-recovered:v1 -->"
 
 
+def absorbing_park_leg(repo, number, action, window_key, comments, bot_login, now,
+                       linked_open_pr, worker_pr, attempt_marker, post_comment,
+                       needs_user_landed, vetoed, log=print,
+                       grace=_park_policy.PARK_ABSORBING_GRACE_SECONDS):
+    """[registry #764] THE MACHINE EXIT FOR AN ABSORBING PARK — the deferred-issue budget leg's
+    terminal disposition. Returns the ONE census bucket this item leaves through.
+
+    THE DEFECT. `park_ladder_decision` has five outcomes; three of them
+    (park_policy.PARK_ABSORBING_ACTIONS) neither attempt work nor advance the generation
+    counter, and the budget leg used to `continue` on each of them unconditionally:
+
+      dedupe        the window key is already receipted, and a NEW key is minted only by a
+                    human unlabel (readmission_cutoff) — so with no gesture, forever.
+      legacy-quiet  a pre-receipt park returns BEFORE `generation = len(receipts) + 1`, so no
+                    receipt is ever written, so `receipts` stays empty, so the next tick takes
+                    the same branch. The ladder it promises to start is unreachable.
+      unchanged     a fresh window whose park fingerprint has not moved.
+
+    MEASURED, registry dispatch run 30263179462 (2026-07-27T12:00Z): those first two arms took
+    7 of 7 planned worker rows and launched 0. They are NOT free telemetry noise — the readiness
+    engine serializes ONE row per `area:` package, so each stuck item RESERVED its package
+    against every sibling. Eleven deferred candidates (nine still holding a live attempt budget)
+    sat behind those seven packages; re-running the frontier with the seven removed admits three
+    of them immediately.
+
+    THE EXIT is bounded, receipted, and consumed once per window:
+
+      observe        no receipt for this window yet — write exactly ONE `observing` receipt and
+                     start the clock. No label, no escalation.
+      wait           the clock is running, the grace has not elapsed — write NOTHING, count it.
+      retire         the absorbing state persisted past `grace` — the question-class terminal.
+                     RECEIPT-FIRST (probe the veto, post the receipt, then the veto-checked
+                     `needs:user` write), so a crash leaves receipt-no-label, never the reverse.
+      hold-linked-pr the issue has an OPEN worker PR: retiring it would apply `needs:user`,
+                     which terminally strips that PR from the review loop (the 2026-07-18 mass
+                     park). The park stands, in its OWN bucket so the refusal is visible.
+
+    WHY `needs:user` IS THE DISPOSITION AND NOT MERELY A LABEL: dispatch.yml's PLAN filter drops
+    any `needs:*` candidate from the deferred-retry lane, so the terminal and the partition
+    release are the SAME act. That is deliberate — the alternative (quietly skipping the item in
+    the planner) trades a visible stall for an invisible one. Here the item leaves the lane with
+    a comment on the issue, a durable receipt, and a census bucket.
+
+    RE-ADMISSION IS CONSUMED EXACTLY ONCE AND CAPPED. The receipt is keyed on the ladder WINDOW
+    and only a human gesture mints a new window key, so a re-admitted item starts a brand-new
+    streak with zero receipts and exactly one fresh grace; and `absorbing_park_streak` returns
+    "" for a window already receipted `retired`, so one window can never retire twice. The
+    STREAK ALSO RESETS on a newer worker attempt: an item that was genuinely re-attempted since
+    its last observation begins a fresh clock rather than inheriting an age it did not earn."""
+    since = max((str(c.get("created_at")) for c in comments
+                 if str(c.get("user", {}).get("login", "")).casefold() == bot_login.casefold()
+                 and attempt_marker in str(c.get("body", ""))), default="")
+    window = window_key or _park_policy.PARK_WINDOW_NONE
+    streak = worker_pr.absorbing_park_streak(comments, bot_login, window, since=since, log=log)
+    disposition, streak = _park_policy.absorbing_park_disposition(
+        action, streak, now, linked_open_pr=linked_open_pr,
+        already_retired=worker_pr.absorbing_park_retired(comments, bot_login, window, log=log),
+        grace=grace, log=log)
+    bucket = _park_policy.budget_exhausted_bucket(action, disposition)
+    if disposition == "spent":
+        log(f"defer {repo}#{number}: deferred-retry budget exhausted ({action}); this window's "
+            "question-class terminal is already receipted — the disposition was taken once and "
+            "stands (a vetoed label never buys a second retirement)")
+        return bucket
+    if disposition == "hold-linked-pr":
+        log(f"defer {repo}#{number}: deferred-retry budget exhausted ({action}); an OPEN worker "
+            "PR is linked to this issue, so the absorbing-park retirement stands down (a "
+            "needs:user hold here would strip that PR from the review loop) — the PR's own "
+            "review lane owns the outcome")
+        return bucket
+    if disposition == "wait":
+        log(f"defer {repo}#{number}: deferred-retry budget exhausted ({action}); absorbing park "
+            f"held, retirement clock running since {streak or 'an unreadable receipt'}")
+        return bucket
+    if disposition == "observe":
+        post_comment(
+            repo, number,
+            "> 🤖 SPARQ agent — this item's attempt budget is spent and its park ladder is "
+            f"ABSORBING (`{action}`): no further attempt can be made, and no machine event can "
+            "advance the ladder without a human gesture. It still reserves its `area:` partition "
+            "against every sibling issue on that area, on every tick, so it is now on a bounded "
+            f"{int(grace) // 3600}h clock — if nothing changes it will be RETIRED to a human "
+            "question and released from the dispatch lane. Un-parking it (remove "
+            "`status:parked`) restarts both the attempt budget and this clock.\n\n"
+            + worker_pr.absorbing_park_receipt("observing", window, _iso_now(now)))
+        log(f"defer {repo}#{number}: deferred-retry budget exhausted ({action}); absorbing park "
+            f"OBSERVED — retirement clock started for window {window}")
+        return bucket
+    suppressed = bool(vetoed())
+    note = (" Escalated as a human question (`needs:user`; the label write follows this "
+            "receipt), which also releases this issue's `area:` partition to its siblings."
+            if not suppressed else
+            " The retirement is TERMINAL, but the `needs:user` label write was SUPPRESSED by a "
+            "standing human unlabel (sticky veto) — no label was applied; this receipt alone "
+            "records it, and the partition is NOT released.")
+    post_comment(
+        repo, number,
+        "> 🤖 SPARQ agent — RETIRED from the deferred-retry lane. The attempt budget is spent, "
+        f"the park ladder has been absorbing (`{action}`) since {streak}, and no machine event "
+        "can advance it — meanwhile it reserved its `area:` partition against every sibling "
+        f"issue on that area, on every tick.{note} "
+        f"@{os.environ.get('MAINTAINER_HANDLE', 'jeswr')}: this item needs a decision — "
+        "decompose it, re-route it, or close it as not implementable as specified. Removing "
+        "`needs:user`/`status:parked` re-admits it with a fresh attempt budget and a fresh "
+        "clock.\n\n"
+        + worker_pr.absorbing_park_receipt("retired", window, _iso_now(now)))
+    landed = False if suppressed else bool(needs_user_landed())
+    log(f"retired {repo}#{number}: absorbing park ({action}) persisted past the bounded grace "
+        f"since {streak} -> question-class terminal"
+        f"{'' if landed else ' (label suppressed)'}")
+    return bucket
+
+
+def _iso_now(now=None):
+    """The canonical UTC stamp a receipt written THIS tick carries. One spelling, one place: the
+    absorbing-park clock compares parsed instants, so every writer must emit a form
+    park_policy.parse_ts accepts (compact Z-form, T separator)."""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                         time.gmtime(int(time.time() if now is None else now)))
+
+
 def _receipt_instants(comments, bot, marker):
     """(instant, created_at-string) pairs — instants PARSED to aware datetimes via
     park_policy.parse_ts (round-5 finding 2: receipt ordering is by parsed instant, never raw
@@ -5340,32 +5461,44 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                                     already_labeled="status:parked" in item["labels"]))
                             if action == "freeze":
                                 # Unreadable timeline: the ladder never advances on unproven
-                                # data — no window, no receipt, no label, no comment.
-                                defer_reasons["budget-exhausted"] += 1
+                                # data — no window, no receipt, no label, no comment. NOT an
+                                # absorbing action: it must prove nothing, so it can neither
+                                # start nor age a retirement clock.
+                                defer_reasons[_park_policy.budget_exhausted_bucket(action)] += 1
                                 print(f"defer {repo}#{number}: deferred-retry budget "
                                       "exhausted and the label timeline is unreadable — "
                                       "ladder frozen (no readmission credit, no generation "
                                       "receipt) until the timeline reads clean")
                                 continue
-                            if action == "dedupe":
-                                # This window is already receipted (its park or terminal was
-                                # recorded once, honestly): re-defer QUIETLY until a FRESH
-                                # human gesture. Dedupe covers comments/labels only — the
-                                # generation progression is already durable in the receipts.
-                                defer_reasons["budget-exhausted"] += 1
-                                print(f"defer {repo}#{number}: deferred-retry budget "
-                                      f"exhausted; window {window_key} already consumed "
-                                      "(receipted)")
+                            # >>> absorbing-park-arm — EXTRACTED AND EXECUTED by
+                            # _absorbing_park_leg_self_test. Source-level substring assertions on
+                            # this arm are VACUOUS: `if False and action in ...` and
+                            # `linked_open_pr=False` both leave every searched string intact while
+                            # destroying the fix (measured, mutants C1/C2). The sentinels delimit
+                            # the block the self-test runs against stub writers; removing either
+                            # one makes that extraction FAIL CLOSED.
+                            if action in _park_policy.PARK_ABSORBING_ACTIONS:
+                                # [registry #764] THE MACHINE EXIT FOR AN ABSORBING PARK.
+                                # The whole leg is `absorbing_park_leg` (module level, every
+                                # writer injected) so it can be EXECUTED by the self-test —
+                                # this arm is the only thing that routes an absorbing ladder
+                                # action into it, and deleting this `if` is what the
+                                # call-site seam assertions below are for.
+                                defer_reasons[absorbing_park_leg(
+                                    repo, number, action, window_key, comments, bot_login,
+                                    int(time.time()),
+                                    linked_open_pr=number in linked_open_prs,
+                                    worker_pr=worker_pr,
+                                    attempt_marker=worker_issue.ATTEMPT_MARKER,
+                                    post_comment=_run_gh_target_comment,
+                                    needs_user_landed=lambda: _issue_needs_user_landed(
+                                        script_dir, repo, number),
+                                    vetoed=lambda: _park_policy.park_vetoed(
+                                        repo, number, "needs:user", _issue_timeline_events,
+                                        is_human=lambda login: _target_is_human_maintainer(
+                                            repo, login)))] += 1
                                 continue
-                            if action == "legacy-quiet":
-                                # Pre-receipt park: already status:parked, no gesture, no
-                                # receipts — stay quiet; the ladder starts counting with the
-                                # first receipted window.
-                                defer_reasons["budget-exhausted"] += 1
-                                print(f"defer {repo}#{number}: deferred-retry budget "
-                                      "exhausted; already status:parked (legacy "
-                                      "pre-receipt park)")
-                                continue
+                            # <<< absorbing-park-arm
                             if action == "terminal":
                                 # Bounded escalation: PARK_ESCALATION_GENERATIONS windows
                                 # consumed — repeated post-readmission failure IS a human
@@ -5405,7 +5538,8 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                                     f"gen={generation} cutoff={window_key} -->")
                                 landed = (False if vetoed else
                                           _issue_needs_user_landed(script_dir, repo, number))
-                                defer_reasons["budget-exhausted-escalated"] += 1
+                                defer_reasons[
+                                    _park_policy.budget_exhausted_bucket(action)] += 1
                                 print(f"escalated {repo}#{number}: deferred-retry budget "
                                       f"exhausted post-readmission (generation "
                                       f"{generation}) -> question-class terminal"
@@ -5444,7 +5578,8 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                                 f"gen={generation} cutoff={window_key} -->")
                             parked = (False if vetoed else
                                       _park_source_issue(script_dir, repo, number))
-                            defer_reasons["budget-exhausted"] += 1
+                            defer_reasons[
+                                _park_policy.budget_exhausted_bucket(action)] += 1
                             print(f"escalated {repo}#{number}: deferred-retry budget "
                                   f"exhausted (generation {generation}"
                                   f"{'' if parked else ', label suppressed'})")
@@ -12941,6 +13076,7 @@ def _self_test():
     assert any("clock unreadable" in line and "freezing" in line for line in freeze_logs)
 
     _starvation_sweep_self_test()
+    _absorbing_park_leg_self_test()
 
     print("dispatch-claim self-test PASSED")
 
@@ -13674,6 +13810,344 @@ def _starvation_yaml_seam_self_test():
     assert not survivors, f"dispatch.yml seam mutants NOT caught: {survivors}"
     print(f"  ok   #677 YAML seam: all {len(seam_mutants)} structural dispatch.yml mutants are "
           "caught as named violations")
+
+
+# ---- [registry #764] THE ABSORBING-PARK MACHINE EXIT ----------------------------------
+# Every guard below has a NAMED test that goes RED when the guard is deleted or inverted, and the
+# tests drive `absorbing_park_leg` ITSELF — the leg named in the fix — not only its pure helpers.
+# The discriminating fixtures are the ones where the leg must do NOTHING it did not earn: a clock
+# inside the grace, a window whose terminal is already receipted, an issue with an open worker PR,
+# and a ladder action that is not absorbing at all.
+def _absorbing_park_leg_self_test():
+    here = Path(__file__).resolve()
+    policy = _park_policy
+    wp = _load_module("registry_worker_pr", here.with_name("worker-pr.py"))
+    wi = _load_module("registry_worker_issue", here.with_name("worker-issue.py"))
+    repo, number, bot = "o/t", 42, "app[bot]"
+    grace = policy.PARK_ABSORBING_GRACE_SECONDS
+    t0 = 1_800_000_000
+
+    def stamp(at):
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(at))
+
+    def observing(at, window="none"):
+        return {"user": {"login": bot}, "created_at": stamp(at),
+                "body": "prose\n\n" + wp.absorbing_park_receipt("observing", window, stamp(at))}
+
+    def retired(at, window="none"):
+        return {"user": {"login": bot}, "created_at": stamp(at),
+                "body": "prose\n\n" + wp.absorbing_park_receipt("retired", window, stamp(at))}
+
+    def attempt(at):
+        return {"user": {"login": bot}, "created_at": stamp(at),
+                "body": f"x {wi.ATTEMPT_MARKER} run=1 -->"}
+
+    class Run:
+        """One invocation of the LEG with every write captured instead of performed."""
+
+        def __init__(self, comments, now, action="legacy-quiet", window_key=None,
+                     linked=False, veto=False):
+            self.comments, self.logs, self.needs_user = [], [], 0
+            self.bucket = absorbing_park_leg(
+                repo, number, action, window_key, comments, bot, now,
+                linked_open_pr=linked, worker_pr=wp,
+                attempt_marker=wi.ATTEMPT_MARKER,
+                post_comment=lambda _r, _n, body: self.comments.append(body),
+                needs_user_landed=lambda: (self.__setattr__(
+                    "needs_user", self.needs_user + 1) or True),
+                vetoed=lambda: veto, log=self.logs.append)
+
+    def chk(name, got, want):
+        assert got == want, f"{name}: {got!r} != {want!r}"
+        print(f"  ok   {name}")
+
+    # (1) TERMINAL DISPOSITION REACHED. A legacy pre-receipt park — the exact class 6 of the 7
+    # measured issues sat in — observes once, waits inside the grace, and RETIRES past it.
+    first = Run([], t0)
+    chk("[#764] a budget-exhausted item on an absorbing ladder action OBSERVES first",
+        (first.bucket, len(first.comments), first.needs_user),
+        ("budget-exhausted-absorbing", 1, 0))
+    clock = [observing(t0)]
+    # TWO observations for one window: the streak is the OLDEST, so a later re-observation can
+    # never RESET the clock and postpone the terminal indefinitely (mutant R2: min -> max).
+    chk("[#764] the retirement clock reads the OLDEST observation, never the newest",
+        wp.absorbing_park_streak([observing(t0), observing(t0 + grace - 5)], bot, "none"),
+        stamp(t0))
+    chk("[#764] ...so a re-observation inside the grace cannot postpone the terminal",
+        Run([observing(t0), observing(t0 + grace - 5)], t0 + grace).bucket,
+        "budget-exhausted-retired")
+    inside = Run(clock, t0 + grace - 60)
+    chk("[#764] ...WAITS silently inside the bounded grace (no comment, no label)",
+        (inside.bucket, inside.comments, inside.needs_user),
+        ("budget-exhausted-absorbing", [], 0))
+    past = Run(clock, t0 + grace)
+    chk("[#764] ...and REACHES A TERMINAL DISPOSITION once the grace elapses",
+        (past.bucket, len(past.comments), past.needs_user),
+        ("budget-exhausted-retired", 1, 1))
+    # Non-vacuous pairing: the pre-fix leg returned "budget-exhausted" and wrote NOTHING on every
+    # one of these three ticks, so each row above dies on restoring the unconditional `continue`.
+    chk("[#764] the three ticks are DISTINCT dispositions (a constant answer cannot pass)",
+        len({first.bucket, inside.bucket, past.bucket}), 2)
+
+    # (2) THE DISPOSITION IS RECORDED ON THE ISSUE **AND** COUNTED. Both halves, because either
+    # alone is the failure this fix exists to prevent: a silent drop, or an uncounted comment.
+    body = past.comments[0]
+    chk("[#764] the retirement comment self-identifies, names the terminal and the decision",
+        ("> 🤖 SPARQ agent" in body, "RETIRED from the deferred-retry lane" in body,
+         "needs:user" in body, "decompose it, re-route it, or close it" in body),
+        (True, True, True, True))
+    chk("[#764] ...and carries a MACHINE-READABLE retired receipt a later tick can read back",
+        wp.absorbing_park_retired([{"user": {"login": bot}, "body": body}], bot, "none"), True)
+    chk("[#764] ...and the leg RETURNS the census bucket rather than counting nothing",
+        past.bucket, "budget-exhausted-retired")
+
+    # (3) NOT RE-PLANNED / NOT RE-RETIRED: the terminal is consumed EXACTLY ONCE per window. A
+    # sticky human unpark can VETO the needs:user write, which leaves the item in the lane — the
+    # receipt, not the label, is what caps it.
+    vetoed = Run(clock, t0 + grace, veto=True)
+    chk("[#764] a VETOED terminal still receipts, writes no label, and says so honestly",
+        (vetoed.bucket, vetoed.needs_user,
+         "SUPPRESSED by a standing human unlabel" in vetoed.comments[0]),
+        ("budget-exhausted-retired", 0, True))
+    again = Run(clock + [retired(t0 + grace)], t0 + grace * 4)
+    chk("[#764] ...and the SAME window can never retire twice (receipt is the cap, not the label)",
+        (again.bucket, again.comments, again.needs_user),
+        ("budget-exhausted-retired", [], 0))
+
+    # (4) RE-ADMISSION IS CONSUMED EXACTLY ONCE AND CAPPED. A human unlabel mints a NEW window
+    # key, so the old window's receipts — including its terminal — cannot age or cap the new one:
+    # the re-admitted item gets exactly one fresh grace, never an inherited clock.
+    fresh_window = "2026-07-27T09:00:00Z"
+    readmitted = Run(clock + [retired(t0 + grace)], t0 + grace * 4,
+                     action="dedupe", window_key=fresh_window)
+    chk("[#764] a human re-admission starts a FRESH clock (no inherited age, no inherited cap)",
+        (readmitted.bucket, len(readmitted.comments), readmitted.needs_user),
+        ("budget-exhausted-absorbing", 1, 0))
+    chk("[#764] ...and its observing receipt is keyed on the NEW window, not the old one",
+        (wp.absorbing_park_streak(
+            [{"user": {"login": bot}, "body": readmitted.comments[0]}], bot,
+            policy.canonical_ts(fresh_window)) != "",
+         wp.absorbing_park_streak(
+             [{"user": {"login": bot}, "body": readmitted.comments[0]}], bot, "none")),
+        (True, ""))
+    # The streak also resets on a newer worker ATTEMPT: an item genuinely re-attempted since its
+    # last observation must not retire on a clock it did not earn.
+    reattempted = Run([observing(t0), attempt(t0 + 60)], t0 + grace)
+    chk("[#764] a worker attempt AFTER the observation resets the clock (no unearned retirement)",
+        (reattempted.bucket, reattempted.needs_user),
+        ("budget-exhausted-absorbing", 0))
+
+    # (5) THE LINKED-OPEN-PR GUARD. needs:user on a source issue terminally strips its open PR
+    # from the review loop — the 2026-07-18 mass park. An expired clock must still stand down.
+    held = Run(clock, t0 + grace * 4, linked=True)
+    chk("[#764] an issue with an OPEN worker PR is NEVER retired, and gets its own bucket",
+        (held.bucket, held.comments, held.needs_user),
+        ("budget-exhausted-absorbing-linked-pr", [], 0))
+
+    # (6) FAIL-CLOSED CLOCKS. An unreadable receipt stamp can prove no elapsed time, so it must
+    # DELAY retirement, never fabricate one; and `freeze` (an unreadable label timeline) is not
+    # an absorbing action at all, so it can neither start nor age a clock.
+    corrupt = [{"user": {"login": bot}, "created_at": stamp(t0),
+                "body": f"{wp.ABSORBING_PARK_MARKER} state=observing window=none at=nope -->"}]
+    blind = Run(corrupt, t0 + grace * 4)
+    chk("[#764] a corrupt clock receipt DELAYS retirement (re-observes) rather than firing it",
+        (blind.bucket, blind.needs_user), ("budget-exhausted-absorbing", 0))
+    chk("[#764] `freeze` is not absorbing — an unreadable timeline proves nothing either way",
+        policy.absorbing_park_disposition("freeze", "", t0), ("not-absorbing", ""))
+    # The corrupt-receipt fixture above is filtered by the RECEIPT READER, so it never reaches the
+    # decision's own unparseable-clock arm. Exercise that arm directly (mutant P2: flipping its
+    # `return ("wait", "")` to a retire left every leg-level row green).
+    frozen_logs = []
+    chk("[#764] an UNPARSEABLE streak stamp freezes the decision — it can never retire",
+        policy.absorbing_park_disposition("dedupe", "not-a-timestamp", t0 + grace * 9,
+                                          log=frozen_logs.append), ("wait", ""))
+    chk("[#764] ...and says so loudly rather than failing silently",
+        any("clock unreadable" in line and "freezing" in line for line in frozen_logs), True)
+    # A NAIVE (offset-free) stamp is equally unprovable and must take the same arm.
+    chk("[#764] ...as does an offset-free stamp that cannot be ordered against `now`",
+        policy.absorbing_park_disposition("dedupe", "2026-07-27 09:00:00", t0 + grace * 9,
+                                          log=lambda _line: None), ("wait", ""))
+    # --- P1: the GRACE ITSELF. Every behaviour row above is written relative to
+    # PARK_ABSORBING_GRACE_SECONDS, so setting it to 0 moves the fixtures with it and the suite
+    # stays green while the "bounded chance" this exit promises is gone — the item retires on the
+    # very first observation. Pin the constant, and pin the property that makes it meaningful.
+    chk("[#764] the bounded grace is a REAL window, not zero (a 0 grace retires on sight)",
+        (grace >= 3600, grace <= 7 * 24 * 3600), (True, True))
+    chk("[#764] ...and at a FIXED one-hour age nothing retires under that grace",
+        policy.absorbing_park_disposition("dedupe", stamp(t0), t0 + 3600 - 1)[0], "wait")
+    forged = Run([dict(observing(t0), user={"login": "attacker"})], t0 + grace * 4)
+    chk("[#764] a NON-bot receipt cannot age a streak toward the terminal",
+        (forged.bucket, forged.needs_user), ("budget-exhausted-absorbing", 0))
+
+    # (7) THE CENSUS IS A CLOSED ENUM THAT SUMS TO THE POPULATION. Every ladder action crossed
+    # with every disposition it can produce maps to exactly one bucket, an undeclared pair RAISES
+    # rather than counting as nothing, and a population of N items totals N.
+    ladder = ("freeze", "park", "terminal") + tuple(sorted(policy.PARK_ABSORBING_ACTIONS))
+    census, population = Counter(), 0
+    for act in ladder:
+        if act in policy.PARK_ABSORBING_ACTIONS:
+            for disp in policy.PARK_ABSORBING_DISPOSITIONS:
+                if disp == "not-absorbing":
+                    continue
+                census[policy.budget_exhausted_bucket(act, disp)] += 1
+                population += 1
+        else:
+            census[policy.budget_exhausted_bucket(act)] += 1
+            population += 1
+    chk("[#764] every (ladder action, disposition) pair has a declared census bucket",
+        sum(census.values()), population)
+    chk("[#764] ...the buckets SUM to the population entering the leg (no silent edge)",
+        (population, sorted(census)),
+        (18, ["budget-exhausted", "budget-exhausted-absorbing",
+              "budget-exhausted-absorbing-linked-pr", "budget-exhausted-escalated",
+              "budget-exhausted-frozen", "budget-exhausted-retired"]))
+    try:
+        policy.budget_exhausted_bucket("dedupe", "invented-disposition")
+        raise AssertionError("an undeclared census key must RAISE, not count as nothing")
+    except KeyError:
+        pass
+    chk("[#764] ...and an UNDECLARED pair raises instead of vanishing from the tick summary",
+        True, True)
+
+    # (8) THE CALL-SITE SEAM. Everything above runs the extracted leg; none of it proves the
+    # production loop still ROUTES an absorbing ladder action into it. Comments are stripped
+    # first — this file's own prose names the function, and a claim in a comment must never
+    # satisfy a wiring check.
+    source = here
+    executable = "\n".join(line for line in source.read_text(encoding="utf-8").splitlines()
+                           if not line.lstrip().startswith("#"))
+    chk("[#764] the production budget leg ROUTES absorbing actions into absorbing_park_leg",
+        ("if action in _park_policy.PARK_ABSORBING_ACTIONS:" in executable,
+         "defer_reasons[absorbing_park_leg(" in executable,
+         "linked_open_pr=number in linked_open_prs" in executable),
+        (True, True, True))
+    # The needle is ASSEMBLED at runtime so this assertion cannot match its own source line —
+    # a check that finds itself is the purest form of a vacuous test.
+    raw_counter = "defer_reasons[" + chr(34) + "budget-exhausted"
+    chk("[#764] ...and no arm of that leg counts a raw string instead of the closed enum",
+        [line.strip() for line in executable.splitlines()
+         if raw_counter in line and "raw_counter" not in line], [])
+
+    # ...but the two substring rows above are, on their own, VACUOUS — measured. `if False and
+    # action in _park_policy.PARK_ABSORBING_ACTIONS:` and `linked_open_pr=False` each leave every
+    # searched string intact while destroying the fix. So the ARM ITSELF is extracted between its
+    # sentinels and EXECUTED against stub writers, in a one-shot loop so its `continue` is legal.
+    arm = _python_sentinel_block(source, "absorbing-park-arm")
+
+    def run_arm(ladder_action, linked=(42,), block_source=arm):
+        seen, counted = {}, Counter()
+
+        def spy(*args, **kwargs):
+            seen["args"], seen["kwargs"] = args, kwargs
+            return "budget-exhausted-absorbing"
+
+        namespace = {
+            "action": ladder_action, "_park_policy": policy, "defer_reasons": counted,
+            "absorbing_park_leg": spy, "repo": repo, "number": 42, "window_key": None,
+            "comments": [], "bot_login": bot, "time": time, "linked_open_prs": set(linked),
+            "worker_pr": wp, "worker_issue": wi, "_run_gh_target_comment": lambda *a: None,
+            "_issue_needs_user_landed": lambda *a: True, "script_dir": here.parent,
+            "_issue_timeline_events": lambda *a, **k: [],
+            "_target_is_human_maintainer": lambda *a: False,
+        }
+        exec("for _seam_once in (0,):\n" +
+             "\n".join("    " + line for line in block_source.split("\n")),
+             namespace)  # noqa: S102 — the production arm, run verbatim
+        return seen, counted
+
+    fired, counted = run_arm("legacy-quiet")
+    chk("[#764] SEAM (executed): the production arm ROUTES an absorbing action into the leg",
+        (bool(fired), counted["budget-exhausted-absorbing"]), (True, 1))
+    chk("[#764] SEAM (executed): ...and passes the LIVE linked-open-PR set, not a constant",
+        (fired["kwargs"]["linked_open_pr"], run_arm("legacy-quiet", linked=())[0]["kwargs"]
+         ["linked_open_pr"]), (True, False))
+    chk("[#764] SEAM (executed): ...and forwards the ladder action and window it was given",
+        (fired["args"][2], fired["args"][3]), ("legacy-quiet", None))
+    for _quiet in ("freeze", "park", "terminal"):
+        _skipped, _none = run_arm(_quiet)
+        chk(f"[#764] SEAM (executed): a NON-absorbing action (`{_quiet}`) never enters the leg",
+            (_skipped, sum(_none.values())), ({}, 0))
+
+    # (9) THE YAML SEAM — the half that actually releases the partition. Applying `needs:user` is
+    # only a terminal because dispatch.yml's PLAN filter drops `needs:*` from the deferred-retry
+    # lane; delete that clause and a retired item keeps starving its siblings while every test
+    # above stays green. So the block is EXTRACTED and EXECUTED, then mutated.
+    workflow = source.parent.parent / ".github" / "workflows" / "dispatch.yml"
+    block = _dispatch_yaml_block(workflow, "readiness", "deferred-retry-filter")
+
+    def run_filter(labels, block_source=block):
+        rows = [{"number": 1, "state": "OPEN", "labels": sorted(labels), "open_blockers": 0}]
+        namespace = {"readiness_input": rows, "linked": set(),
+                     "details": {1: ({"author_association": "OWNER"}, sorted(labels), "")},
+                     "trusted": lambda _issue, _bots: True, "repo_trusted_bots": set()}
+        exec(block_source, namespace)  # noqa: S102 — the workflow's own block
+        return [row["number"] for row in namespace["deferred_input"]]
+
+    parked = ["status:deferred", "status:parked", "priority:P2", "role:impl", "area:x"]
+    chk("[#764] the PLAN filter ADMITS a parked+deferred item (the park is a readmission hook)",
+        run_filter(parked), [1])
+    chk("[#764] ...and DROPS it once retirement applied needs:user — this is the lane exit",
+        run_filter(parked + ["needs:user"]), [])
+    mutated = block.replace('any(l.startswith("needs:") for l in labels)', "False")
+    assert mutated != block, "the needs:* clause moved — this mutation must stay live"
+    chk("[#764] YAML seam: deleting the needs:* clause RESTORES the defect (retired item planned)",
+        run_filter(parked + ["needs:user"], mutated), [1])
+
+
+def _dispatch_yaml_block(path, step_id, marker):
+    """The dedented python between `# >>> <marker>` and `# <<< <marker>` inside the ONE workflow
+    step whose `id:` is `step_id` — the same fail-closed extractor dispatch-plan.py uses for the
+    roleless-report block. Raises on anything it cannot resolve uniquely: an assertion that
+    cannot find its target must FAIL, never pass vacuously."""
+    lines = Path(path).read_text(encoding="utf-8").split("\n")
+    ids = [i for i, line in enumerate(lines) if line.strip() == f"id: {step_id}"]
+    if len(ids) != 1:
+        raise AssertionError(f"expected one workflow step `id: {step_id}`, found {len(ids)}")
+    starts = [i for i in range(ids[0], -1, -1) if lines[i].lstrip().startswith("- ")]
+    indent = len(lines[starts[0]]) - len(lines[starts[0]].lstrip())
+    end = len(lines)
+    for i in range(starts[0] + 1, len(lines)):
+        if not lines[i].strip():
+            continue
+        here = len(lines[i]) - len(lines[i].lstrip())
+        if here < indent or (here == indent and lines[i].lstrip().startswith("- ")):
+            end = i
+            break
+    block = lines[starts[0]:end]
+    opens = [i for i, line in enumerate(block) if line.strip().startswith(f"# >>> {marker}")]
+    closes = [i for i, line in enumerate(block) if line.strip() == f"# <<< {marker}"]
+    if len(opens) != 1 or len(closes) != 1 or closes[0] <= opens[0]:
+        raise AssertionError(
+            f"step `id: {step_id}` must contain exactly one `# >>> {marker}` ... `# <<< {marker}` "
+            f"pair, found {len(opens)}/{len(closes)} — refusing")
+    body = [line for line in block[opens[0] + 1:closes[0]]
+            if line.strip() and not line.lstrip().startswith("#")]
+    if not body:
+        raise AssertionError(f"the `{marker}` block extracted to nothing — refusing")
+    pad = min(len(line) - len(line.lstrip()) for line in body)
+    source = "\n".join(line[pad:] for line in body)
+    compile(source, f"<{marker}>", "exec")
+    return source
+
+def _python_sentinel_block(path, marker):
+    """The dedented python between `# >>> <marker>` and `# <<< <marker>` in a PYTHON source file
+    — the same fail-closed contract as the YAML extractor above, for a production block that
+    lives too deep inside a function for any test to reach it otherwise. Raises on anything it
+    cannot resolve uniquely: an assertion that cannot find its target must FAIL, never pass
+    vacuously."""
+    lines = Path(path).read_text(encoding="utf-8").split("\n")
+    opens = [i for i, line in enumerate(lines) if line.strip().startswith(f"# >>> {marker}")]
+    closes = [i for i, line in enumerate(lines) if line.strip() == f"# <<< {marker}"]
+    if len(opens) != 1 or len(closes) != 1 or closes[0] <= opens[0]:
+        raise AssertionError(
+            f"{Path(path).name} must contain exactly one `# >>> {marker}` ... `# <<< {marker}` "
+            f"pair, found {len(opens)}/{len(closes)} — refusing")
+    body = [line for line in lines[opens[0] + 1:closes[0]]
+            if line.strip() and not line.lstrip().startswith("#")]
+    if not body:
+        raise AssertionError(f"the `{marker}` block extracted to nothing — refusing")
+    pad = min(len(line) - len(line.lstrip()) for line in body)
+    return "\n".join(line[pad:] for line in body)
 
 
 def main():

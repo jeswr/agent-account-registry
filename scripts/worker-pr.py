@@ -600,6 +600,125 @@ def auto_readmission_records(comments, bot_login, log=print):
     return records
 
 
+# The ABSORBING-PARK receipt (registry #764) — the THIRD member of the park-receipt family, and
+# again a DISTINCT marker for the same reason AUTO_READMIT_MARKER is: the generation receipts ARE
+# the escalation ladder's counter, so a receipt written on a tick that consumed NO window must not
+# be able to advance it. Fields: `state=<observing|retired> window=<ladder window key> at=<canonical
+# stamp>`.
+#
+# It records that the item landed on an ABSORBING ladder action (park_policy.PARK_ABSORBING_ACTIONS
+# — an outcome with no exit of its own) and starts the bounded clock that
+# park_policy.absorbing_park_disposition ages. Two properties carry the whole bound:
+#   - it is keyed on the ladder WINDOW, and only a human gesture mints a new window key, so a
+#     re-admitted item cannot inherit the aged clock of the park it was admitted out of; and
+#   - the OLDEST live receipt for a window is the streak start, so the grace is consumed exactly
+#     once per window no matter how many ticks observe it.
+ABSORBING_PARK_MARKER = "<!-- sparq-park-absorb:v1"
+# Every `state` an absorbing-park receipt may carry. `observing` starts the bounded clock;
+# `retired` is the durable record that the question-class terminal was reached for that window.
+ABSORBING_PARK_STATES = ("observing", "retired")
+
+
+def absorbing_park_records(comments, bot_login, log=print):
+    """Every WELL-FORMED bot-authored absorbing-park receipt as
+    {"state": str, "window": key, "at": canonical stamp}.
+
+    Bot-authored only, like every marker parser: a forged receipt must be able neither to age a
+    streak toward retirement nor to suppress the observation that starts one.
+
+    Malformed-field direction, matching park_generation_records: a receipt whose `at` will not
+    parse is DROPPED with a loud log. It can prove no elapsed time, so the streak reads as
+    younger (or absent) and the next tick re-observes — retirement is DELAYED, never fabricated.
+    An unrecognised `state` is likewise dropped: a value this code does not understand must not
+    be assumed to mean "still waiting"."""
+    pattern = (re.escape(ABSORBING_PARK_MARKER)
+               + r" state=(\S+) window=(.+?) at=(\S+) -->")
+    policy = _park_policy()
+    records = []
+    for comment in _bot_comments(comments, bot_login):
+        for match in re.finditer(pattern, str(comment.get("body", ""))):
+            state, window, stamp = match.group(1), match.group(2), match.group(3)
+            if state not in ABSORBING_PARK_STATES:
+                log(f"::warning::absorbing-park receipt state {state!r} is unrecognised — "
+                    "treated as absent; the next tick re-observes")
+                continue
+            if not policy.valid_timestamp(stamp):
+                log(f"::warning::malformed absorbing-park receipt stamp {stamp!r} treated as "
+                    "absent — the retirement clock counts only well-formed receipts")
+                continue
+            if window != PARK_WINDOW_NONE:
+                if not policy.valid_timestamp(window):
+                    log(f"::warning::malformed absorbing-park receipt window {window!r} treated "
+                        "as absent — it can key no streak")
+                    continue
+                window = policy.canonical_ts(window)
+            records.append({"state": state, "window": window,
+                            "at": policy.canonical_ts(stamp)})
+    return records
+
+
+def absorbing_park_retired(comments, bot_login, window, log=print):
+    """True when this window's question-class terminal is ALREADY receipted — the durable "this
+    disposition was taken" record that caps retirement at exactly ONE per window.
+
+    Without it the terminal is only capped when the `needs:user` write LANDS: a sticky human
+    unpark vetoes the label, the item stays in the deferred-retry lane, and the next expired
+    clock retires it all over again. The receipt is the cap; the label is best-effort UI on top
+    — the same split the generation ladder already makes."""
+    return any(record["state"] == "retired"
+               for record in absorbing_park_records(comments, bot_login, log)
+               if record["window"] == window)
+
+
+def absorbing_park_streak(comments, bot_login, window, since=None, log=print):
+    """The canonical stamp of the OLDEST live `observing` receipt for `window` — the streak start
+    park_policy.absorbing_park_disposition ages — or "" when the clock is not running.
+
+    `since` (optional) is a canonical stamp BEFORE which receipts are stale: the caller passes the
+    most recent worker ATTEMPT stamp, so a park whose item was actually attempted again begins a
+    FRESH streak instead of inheriting the age of a pre-attempt observation. This is the same
+    "after the last failure" reset idiom escalate_persist_decision uses; without it, capacity that
+    recovered, dispatched, and re-parked would retire on a clock it never earned.
+
+    ALREADY-RETIRED WINDOWS RETURN "": once a window's terminal is receipted, its streak is spent.
+    Re-running the clock on it would let a single window retire twice (two `needs:user` writes,
+    two comments) — the receipt is the record that the disposition was already taken."""
+    policy = _park_policy()
+    records = [record for record in absorbing_park_records(comments, bot_login, log)
+               if record["window"] == window]
+    if any(record["state"] == "retired" for record in records):
+        return ""
+    live = [record["at"] for record in records if record["state"] == "observing"]
+    if since:
+        try:
+            floor = policy.parse_ts(since)
+            live = [stamp for stamp in live if policy.parse_ts(stamp) > floor]
+        except ValueError:
+            log(f"::warning::absorbing-park streak reset stamp {since!r} is unreadable — "
+                "ignoring every receipt for this window (the next tick re-observes)")
+            return ""
+    if not live:
+        return ""
+    return min(live, key=policy.parse_ts)
+
+
+def absorbing_park_receipt(state, window, at):
+    """The receipt BODY marker a caller appends (RECEIPT-FIRST) when an absorbing park is observed
+    or retired. ONE writer, one format — the reader above is keyed on exactly this shape."""
+    policy = _park_policy()
+    if state not in ABSORBING_PARK_STATES:
+        raise WorkerPrError(
+            f"absorbing-park receipt state {state!r} is not one of "
+            f"{', '.join(ABSORBING_PARK_STATES)}")
+    if not policy.valid_timestamp(at):
+        raise WorkerPrError("absorbing-park receipt needs a strict ISO-8601 stamp")
+    if window != PARK_WINDOW_NONE and not policy.valid_timestamp(window):
+        raise WorkerPrError("absorbing-park receipt window must be a cutoff or PARK_WINDOW_NONE")
+    key = window if window == PARK_WINDOW_NONE else policy.canonical_ts(window)
+    return (f"{ABSORBING_PARK_MARKER} state={state} window={key} "
+            f"at={policy.canonical_ts(at)} -->")
+
+
 def auto_readmission_marker_count(comments, bot_login):
     """How many bot-authored AUTO_READMIT_MARKER receipts a PR carries, WELL-FORMED OR NOT — the
     per-PR automatic-readmission cap counter (park_policy.AUTO_READMISSION_MAX). Counting markers

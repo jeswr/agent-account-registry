@@ -146,6 +146,149 @@ MACHINE_PARK_DESCRIPTION = (
 # even though each individual re-admission already needs its own fresh, unconsumed recovery
 # evidence; the two bounds are independent on purpose.
 AUTO_READMISSION_MAX = 2
+# ---------------------------------------------------------------------------------------------
+# [registry #764] THE ABSORBING-PARK EXIT. `park_ladder_decision` has five outcomes; three of them
+# neither attempt work nor advance the generation counter, so an item that lands on one lands on
+# it FOREVER unless a human intervenes:
+#
+#   legacy-quiet  a pre-receipt park: `not cutoff and already_labeled and not receipts`. It
+#                 returns BEFORE `generation = len(receipts) + 1`, so no receipt is ever minted,
+#                 so `receipts` stays empty, so the next tick takes the same branch. The stated
+#                 intent ("the ladder starts counting with the first receipted window") is
+#                 unreachable: nothing on this path ever writes that first receipt.
+#   dedupe        the window key is already receipted. A NEW key is minted only by a human
+#                 unlabel (readmission_cutoff), so with no gesture this repeats indefinitely.
+#   unchanged     a fresh window whose park fingerprint has not moved. Correct as idempotence,
+#                 but with nothing else attempting the item it too has no self-clearing exit.
+#
+# MEASURED 2026-07-27, registry dispatch run 30263179462: seven sparq issues (#2392 dedupe,
+# #2640/#2642/#2685/#2714/#2868/#2951 legacy-quiet) were 7 of 7 planned worker rows, launched 0.
+# They are NOT free: `compute_ready` serializes one row per `area:` package, so each one RESERVES
+# its package against every sibling. Eleven deferred candidates (nine still holding a live attempt
+# budget) sat behind those seven packages, and re-running the frontier with the seven removed
+# admits three of them immediately. An item that can never launch was holding the partition of
+# items that can.
+#
+# `freeze` is DELIBERATELY absent: an unreadable timeline must prove nothing at all (the ladder
+# never advances on unproven data), so it can neither start nor age an absorbing streak.
+PARK_ABSORBING_ACTIONS = frozenset({"legacy-quiet", "dedupe", "unchanged"})
+# Bounded grace before an absorbing park is RETIRED to the question-class terminal. The unit is
+# wall-clock, not ticks: the dispatch cron is every 10 minutes but an item is only OBSERVED on a
+# tick where it also won its package, so a tick count would measure contention rather than
+# stuckness. Six hours is ~36 scheduled ticks — long enough that a transient (a capacity dip, a
+# groom pass mid-flight, a human about to unpark) resolves on its own, short enough that a
+# genuinely stuck partition frees inside one working session.
+PARK_ABSORBING_GRACE_SECONDS = 6 * 3600
+# Every disposition absorbing_park_disposition can return. Closed set: the census map below
+# raises on anything outside it, so a new disposition cannot be added without also being counted.
+PARK_ABSORBING_DISPOSITIONS = ("observe", "wait", "retire", "spent", "hold-linked-pr",
+                               "not-absorbing")
+# The CLOSED census enum for the deferred-issue budget-exhaustion leg. Every population entering
+# the leg leaves through exactly one of these buckets, so the buckets SUM to the population and a
+# future missing edge shows as a growing bucket rather than as silence. Keyed by
+# (ladder action, absorbing disposition) — `None` where the action has no absorbing disposition.
+BUDGET_EXHAUSTED_CENSUS = {
+    ("freeze", None): "budget-exhausted-frozen",
+    ("park", None): "budget-exhausted",
+    ("terminal", None): "budget-exhausted-escalated",
+    ("legacy-quiet", "observe"): "budget-exhausted-absorbing",
+    ("legacy-quiet", "wait"): "budget-exhausted-absorbing",
+    ("legacy-quiet", "retire"): "budget-exhausted-retired",
+    ("legacy-quiet", "spent"): "budget-exhausted-retired",
+    ("legacy-quiet", "hold-linked-pr"): "budget-exhausted-absorbing-linked-pr",
+    ("dedupe", "observe"): "budget-exhausted-absorbing",
+    ("dedupe", "wait"): "budget-exhausted-absorbing",
+    ("dedupe", "retire"): "budget-exhausted-retired",
+    ("dedupe", "spent"): "budget-exhausted-retired",
+    ("dedupe", "hold-linked-pr"): "budget-exhausted-absorbing-linked-pr",
+    ("unchanged", "observe"): "budget-exhausted-absorbing",
+    ("unchanged", "wait"): "budget-exhausted-absorbing",
+    ("unchanged", "retire"): "budget-exhausted-retired",
+    ("unchanged", "spent"): "budget-exhausted-retired",
+    ("unchanged", "hold-linked-pr"): "budget-exhausted-absorbing-linked-pr",
+}
+
+
+def budget_exhausted_bucket(action, disposition=None):
+    """The ONE census bucket for a budget-exhaustion outcome — a CLOSED enum that RAISES on an
+    undeclared (action, disposition) pair rather than inventing a counter nobody reads.
+
+    This is what makes "the counts sum to the population" checkable: every path out of the
+    deferred-issue budget-exhaustion leg must name its bucket through this function, so a new
+    exit added without a bucket fails loudly at the call site instead of vanishing from the
+    tick summary."""
+    key = (action, disposition)
+    if key not in BUDGET_EXHAUSTED_CENSUS:
+        raise KeyError(
+            f"undeclared budget-exhaustion census key {key!r}: every exit from the "
+            "deferred-issue budget leg must map to exactly one bucket (declare it in "
+            "BUDGET_EXHAUSTED_CENSUS) — refusing to count it as nothing")
+    return BUDGET_EXHAUSTED_CENSUS[key]
+
+
+def absorbing_park_disposition(action, streak_started_at, now, linked_open_pr=False,
+                               already_retired=False,
+                               grace=PARK_ABSORBING_GRACE_SECONDS, log=print):
+    """PURE. What to do about a park that has landed on an ABSORBING ladder action — the exit
+    `park_ladder_decision` structurally cannot provide for itself.
+
+    `action` is the ladder action; `streak_started_at` is the canonical stamp of the OLDEST
+    still-live absorbing receipt for this window ("" or None when none has been written yet);
+    `now` is a unix instant; `linked_open_pr` says whether the source issue has an open worker PR.
+
+    Returns (disposition, streak_started_at) with disposition one of:
+
+    - "not-absorbing": `action` is not in PARK_ABSORBING_ACTIONS (`freeze` and `park` and
+      `terminal` all own their own exits). The caller's existing behaviour is unchanged.
+    - "hold-linked-pr": the issue has an OPEN worker PR. Retiring it would apply `needs:user`,
+      which is exactly the 2026-07-18 mass-park failure — a human hold on the source issue
+      terminally strips its open PR from the review loop. The park stands, uncounted-as-retired
+      and separately bucketed, and the PR's own review lane owns the outcome. FAIL-CLOSED: the
+      caller passes True whenever it cannot PROVE the issue has no linked open PR.
+    - "observe": no receipt for this window yet — START the clock. The caller writes exactly ONE
+      durable observation receipt. Nothing else: no label, no escalation.
+    - "wait": the clock is running and the grace has NOT elapsed. Write nothing (the receipt is
+      already durable); count it and stay quiet.
+    - "spent": this window's terminal is ALREADY receipted. Stay quiet — the disposition was
+      taken once and is durable. This is what caps retirement at one per window even when a
+      sticky human unpark VETOED the `needs:user` write, leaving the item in the lane: without
+      it, every later expired clock would retire it again.
+    - "retire": the absorbing state has PERSISTED past `grace`. The caller escalates to the
+      question-class terminal — receipt first, then the veto-checked `needs:user` write — which
+      both records the disposition on the issue and removes it from the deferred-retry lane
+      (dispatch.yml's PLAN filter drops any `needs:*` label), releasing its package.
+
+    UNPROVABLE TIME FREEZES, it never retires: a `streak_started_at` that will not parse returns
+    ("wait", "") with a loud log. The conservative residue is that the next tick re-observes and
+    writes a good receipt — the streak restarts, escalation is delayed, never fabricated. This is
+    the same direction park_generation_records takes on a malformed cutoff.
+
+    RE-ADMISSION IS CONSUMED ONCE AND CAPPED, and this function is why: the caller keys the
+    receipt on the ladder's WINDOW, and only a human gesture mints a new window key
+    (readmission_cutoff). So a re-admitted item starts a brand-new streak with zero receipts, gets
+    exactly one fresh grace, and cannot inherit the aged clock of the park it was admitted out of.
+    """
+    if action not in PARK_ABSORBING_ACTIONS:
+        return ("not-absorbing", "")
+    if already_retired:
+        return ("spent", "")
+    if linked_open_pr:
+        return ("hold-linked-pr", streak_started_at or "")
+    if not streak_started_at:
+        return ("observe", "")
+    try:
+        # Ordering by PARSED instants, never raw strings (round-5 finding 2): a space-separator
+        # stamp sorts lexicographically before a `T` one of a LATER instant, which would read a
+        # minutes-old streak as hours old and retire it on the spot.
+        started = parse_ts(streak_started_at)
+        threshold = datetime.fromtimestamp(int(now) - int(grace), tz=timezone.utc)
+    except (ValueError, TypeError, OSError, OverflowError):
+        log(f"::warning::absorbing-park clock unreadable ({streak_started_at!r}) — freezing: "
+            "no retirement on unprovable time; the next tick re-observes")
+        return ("wait", "")
+    if started <= threshold:
+        return ("retire", streak_started_at)
+    return ("wait", streak_started_at)
 
 
 class MalformedTimelineError(RuntimeError):
