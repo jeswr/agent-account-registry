@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4568,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b7464de19c64a4edf4f0fbe4cb27e99f099d2a55",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The round-2 portability fix remains intact and the change is correct as scoped. The archive matrix emits basename-scoped SHA-256 records with a macOS-compatible shasum fallback; the collector validates non-empty, well-formed records and exports the expected base64 subjects; and release provenance is fail-closed through the package output, isolated reusable generator, release dependency, artifact download, and SHA256SUMS ordering. The compliance and release text consistently retain Build L2 as the published level, describe the isolated archive lane as wired but unexercised, and avoid claiming a hardened build or broader artifact coverage. The focused structural test passes, and its mutation suite demonstrates that the load-bearing isolation, portability, hand-off, privilege, and attachment checks are non-vacuous. No correctness, soundness, test-validity, or security issue was found. Progress is stagnant because round 2 also had no findings.",
+  "verdict": "approve"
+ }
+}
