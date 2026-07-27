@@ -52,8 +52,27 @@ def _load_gh_retry() -> Any:
 _gh_retry = _load_gh_retry()
 
 
+def _load_ready_issues() -> Any:
+    spec = importlib.util.spec_from_file_location(
+        "registry_ready_issues", Path(__file__).resolve().with_name("ready-issues.py"))
+    if spec is None or spec.loader is None:
+        raise RuntimeError("cannot load the shared readiness engine")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+# THE readiness engine (`ready-issues.py`), imported for the SAME reason metrics.py imports it
+# (`_ready_count`: "so the label-gate definition can never drift from the dispatcher's"). The
+# curator was the last component still keeping a PRIVATE copy of "how much ready work exists" —
+# a bare `"status:ready" in labels` count — and that copy is what `depth` was computed from.
+_ready = _load_ready_issues()
+
+
 TARGET_READY = 12
 MAX_CLOSES = 5
+# How many per-issue readiness refusals the frontier census prints verbatim before summarising.
+MAX_REFUSAL_LINES = 20
 GATE_LABELS = ("needs:", "trust:untrusted")
 TRUSTED_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
 ACTIONS_BOT_LOGIN = "github-actions[bot]"
@@ -223,6 +242,71 @@ def is_staged(labels: set[str]) -> bool:
     THAT would newly expose 274 issues to automated closure, which is the opposite of the repair.
     """
     return any(label.startswith("status:") and label != UNSTAGED_STATUS for label in labels)
+
+
+def drainable_ready(open_issues: list[dict[str, Any]]) -> tuple[int, list[str]]:
+    """How much ready work the READINESS ENGINE can actually enumerate, plus the reason for
+    every `status:ready` issue it refuses. Returns `(count, defer_lines)`.
+
+    THE MEASUREMENT THAT DRIVES `depth`. It used to be `sum("status:ready" in labels)` — a raw
+    count of the positive ATTESTATION, which is not the same set as the work the dispatcher can
+    see. MEASURED on the live registry board 2026-07-27T16:34Z, against the curator's own
+    `== jeswr/agent-account-registry: ready=14 target=12 ==` line: 14 issues carried
+    `status:ready`, and SIX of them (#32 #33 #34 #35 #36 #43) carried `status:deferred` at the
+    same time. `ready-issues.BUSY_STATUS` contains `status:deferred`, so the dispatcher refused
+    all six on that same tick and said so — `readiness defer #43: busy: status:deferred`, once per
+    issue, in the PLAN log of every run for days. The curator read 14, the engine could see 8, and
+    `depth = max(0, 12 - 14)` was therefore 0 while the frontier was starved: a measurement defect
+    driving a control decision. Raising `target_ready` would have papered over it and then
+    over-stocked the frontier the moment the count became honest.
+
+    The count is delegated to `ready-issues.ready_candidates`, never re-derived here, for the
+    reason `metrics._ready_count` gives for delegating the identical question: "so the label-gate
+    definition can never drift from the dispatcher's". Delegating to `ready_candidates` rather
+    than to `exclusion_reason` is deliberate — `ready_candidates` is THE gate, and a rule composed
+    into it later (registry #122's routability refusal) is inherited here for free instead of
+    silently leaving this the laxest reader again.
+
+    ADVISORY, and only ever in the fail-safe direction. `dispatch.yml` plans each target with THAT
+    TARGET's own copy of the engine, which may lag this one; a disagreement moves `depth` by a row
+    or two and self-corrects on the next tick, because nothing here is remembered.
+    """
+    open_numbers = {issue["number"] for issue in open_issues}
+    # `open_blocker_count` unions BOTH blocker channels — the native `issue_dependencies_summary`
+    # GitHub already ships in this very list payload, and the legacy `Blocked-by: #NN` body
+    # marker. The curator fetches `issues?state=open`, the same endpoint the dispatcher snapshots,
+    # so both channels are present here and neither has to be re-derived.
+    prepared = [{**issue, "open_blockers": _ready.open_blocker_count(issue, open_numbers)}
+                for issue in open_issues]
+    defers: list[str] = []
+    count = len(_ready.ready_candidates(prepared, log=defers.append))
+    # COUNTS SUM TO THE POPULATION. `ready_candidates` emits exactly one defer line per
+    # `status:ready` issue it drops and admits only `status:ready` issues, so this identity holds
+    # by construction — and its breach means the engine's logging contract moved under us, which
+    # is precisely when the curator must stop rather than plan from a number it cannot account
+    # for. Fail-loud (main() prints and exits 1); never silently continue on an unexplained count.
+    attested = sum(1 for issue in open_issues if "status:ready" in labels_of(issue))
+    if count + len(defers) != attested:
+        raise CuratorError(
+            f"readiness census does not account for the board: {count} drainable + "
+            f"{len(defers)} refused != {attested} status:ready issue(s)"
+        )
+    return count, defers
+
+
+def frontier_header(repo: str, issues: list[dict[str, Any]], target_ready: int) -> str:
+    """The operator-facing `== repo: ready=N target=M ==` line.
+
+    Extracted so the number a human reads is PROVABLY the number `depth` is computed from — one
+    call to `drainable_ready`, one definition, testable without a live fetch. The old header
+    counted raw `status:ready` over the UNFILTERED fetch (which carries PR rows too, since
+    `issues?state=open` returns both), so it could not agree with the control input even in
+    principle. `ready=14 target=12` was the only frontier signal an operator got while the
+    dispatcher could enumerate eight of those fourteen; a report that disagrees with the decision
+    it describes is how the pin stayed invisible.
+    """
+    ready, _refusals = drainable_ready([issue for issue in issues if is_open_issue(issue)])
+    return f"== {repo}: ready={ready} target={target_ready} =="
 
 
 def author_login(issue: dict[str, Any]) -> str:
@@ -576,14 +660,33 @@ def plan_repository(
     if len(close_options) > close_limit:
         logs.append(f"defer {len(close_options) - close_limit} duplicate close(s): run cap is {close_limit}")
 
-    # NOTE: the depth MEASUREMENT (raw `status:ready` count vs what the readiness engine can
-    # actually enumerate) is a separate, live defect owned by PR #799 — deliberately not touched
-    # here so the two repairs stay reviewable apart. This change is upstream of it: it decides
-    # WHICH ISSUES ARE CANDIDATES AT ALL. Both are required; neither subsumes the other.
-    current_ready = sum(
-        1 for issue in open_issues if "status:ready" in labels_of(issue)
-    )
+    # `drainable_ready` (PR #799, merged) is the depth MEASUREMENT: what the readiness ENGINE can
+    # enumerate, not the raw `status:ready` attestation. This PR is UPSTREAM of it — it decides
+    # WHICH ISSUES ARE CANDIDATES AT ALL. Both are required; neither subsumes the other, and
+    # neither moves the drain off zero alone (see the PR body's 2x2 matrix).
+    current_ready, ready_refusals = drainable_ready(open_issues)
     depth = max(0, target_ready - current_ready)
+    # The number `depth` was computed from, ATTRIBUTABLE, and printed on EVERY tick including the
+    # healthy one — the #597 idiom: a check that is silent when it passes is a check nobody
+    # notices has stopped running. A curator that admits nothing must say, in the log a human
+    # already reads, whether that is because the frontier is genuinely stocked or because the
+    # number it stocked against counts work the dispatcher has already refused. `ready=14
+    # target=12` was true, and told nobody that eight was the real figure.
+    logs.append(
+        f"frontier: {current_ready} drainable of "
+        f"{current_ready + len(ready_refusals)} status:ready attested, "
+        f"depth {depth}/{target_ready}"
+    )
+    # The engine's OWN refusal lines, verbatim (never re-derived, never re-worded here): the same
+    # `readiness defer #N: <reason>` text `dispatch.yml` prints, so the two logs grep as one class.
+    # Capped like the roleless report in `dispatch.yml` — sparq attests ~470 `status:ready` issues
+    # and refuses most of them, and burying the curate log under hundreds of lines it already
+    # prints elsewhere is how a signal stops being read. The COUNT above is never truncated.
+    for line in sorted(ready_refusals)[:MAX_REFUSAL_LINES]:
+        logs.append(f"  {line}")
+    if len(ready_refusals) > MAX_REFUSAL_LINES:
+        logs.append(f"  (+{len(ready_refusals) - MAX_REFUSAL_LINES} more refused; the full list is "
+                    "the PLAN log's `readiness defer` lines)")
     in_flight_blockers: dict[str, list[dict[str, Any]]] = {}
     for issue in open_issues:
         labels = labels_of(issue)
@@ -1230,9 +1333,13 @@ def _self_test() -> int:
 
     # (d) Ten existing ready issues leave depth two. Alpha is selected once, beta fills slot two,
     # and delta is excluded because an in-progress issue already owns that area.
+    # Each existing lane carries a COMPLETE ready label set (priority + role), because `depth` is
+    # computed from the readiness ENGINE's count and the engine refuses an attested issue that is
+    # missing either — ten priority-less rows are ten refusals, i.e. depth twelve, not depth two,
+    # and this fixture would then be testing the pin instead of the cap it is named for.
     depth_fixture = [
         issue(100 + n, f"Existing ready lane unique{n}",
-              ("status:ready", f"area:ready{n}"))
+              ("status:ready", "priority:P2", "role:impl", f"area:ready{n}"))
         for n in range(10)
     ]
     all_labels.update(f"area:ready{n}" for n in range(10))
@@ -1250,6 +1357,135 @@ def _self_test() -> int:
     checks.append(("depth cap and one-per-area/in-flight rules hold",
                    len(stages) == 2 and len(stage_areas) == len(set(stage_areas))
                    and {m.number for m in stages} == {40, 42} and "area:delta" not in stage_areas))
+
+    # (d2) THE PIN (this PR's leg). `depth` must be computed from the ready work the READINESS
+    # ENGINE can enumerate, not from the raw `status:ready` attestation. The fixture is the live
+    # 2026-07-27 registry board in miniature: every attested issue is ALSO `status:deferred`, which
+    # `ready-issues.BUSY_STATUS` refuses (the dispatcher printed `readiness defer #N: busy:
+    # status:deferred` for six real issues on every tick for days). Raw count = 12 = target, so a
+    # raw reader computes depth 0 and stages NOTHING while the frontier is empty; the engine's
+    # count is 0, so depth is 12 and the one viable candidate is staged.
+    #
+    # DELIBERATELY end-to-end through `plan_repository`, not a direct `drainable_ready` call:
+    # reverting ONLY the call site to `sum(1 for i in open_issues if "status:ready" in ...)`
+    # leaves every direct test of the helper green while fully restoring the outage. Each
+    # undrainable issue gets its OWN area so area-serialization cannot be what suppresses the
+    # stage, and the candidate's area is held by nothing.
+    all_labels.update({"status:deferred", "area:pinned"})
+    all_labels.update(f"area:pin{n}" for n in range(12))
+    # Complete ready label sets APART from `status:deferred`, so the single difference between
+    # this fixture and `healthy_fixture` below is the one label under test. A priority-less or
+    # role-less row would be refused for that reason instead and the pair would no longer isolate
+    # the busy-status rule.
+    pin_fixture = [
+        issue(200 + n, f"Attested but undrainable lane unique{n}",
+              ("status:ready", "priority:P2", "role:impl", "status:deferred", f"area:pin{n}"))
+        for n in range(12)
+    ]
+    pin_candidate = issue(299, "Repair the pinned-area snapshot writer", ("area:pinned",))
+    planned, pin_logs = plan_repository(
+        pin_fixture + [pin_candidate], all_labels, automation, target_ready=12)
+    pin_stages = [m for m in planned if m.kind == "stage"]
+    checks.append((
+        "depth reads DRAINABLE readiness: 12 attested-but-deferred do not pin the curator",
+        len(pin_stages) == 1 and pin_stages[0].number == 299))
+    # The count itself, and the fact that the refusal is ATTRIBUTED rather than silent.
+    checks.append((
+        "the pinned fixture reports 0 drainable of 12 attested at full depth",
+        any(line == "frontier: 0 drainable of 12 status:ready attested, depth 12/12"
+            for line in pin_logs)
+        and sum(1 for line in pin_logs
+                if line.strip().startswith("readiness defer #")
+                and line.strip().endswith("busy: status:deferred")) == 12))
+    # The refusal list is CAPPED but the COUNT is not: sparq attests ~470 ready issues and refuses
+    # most of them, so an uncapped census would bury the curate log. 25 refusals -> 20 lines + one
+    # summary naming the missing 5, and the header still says 25.
+    all_labels.update(f"area:cap{n}" for n in range(25))
+    cap_fixture = [
+        issue(400 + n, f"Attested but undrainable cap lane unique{n}",
+              ("status:ready", "priority:P2", "role:impl", "status:deferred", f"area:cap{n}"))
+        for n in range(25)
+    ]
+    _planned, cap_logs = plan_repository(cap_fixture, all_labels, automation, target_ready=12)
+    cap_defers = [line for line in cap_logs if line.strip().startswith("readiness defer #")]
+    checks.append((
+        "the refusal census is capped at 20 lines but never truncates the count",
+        len(cap_defers) == MAX_REFUSAL_LINES
+        and any(line == "frontier: 0 drainable of 25 status:ready attested, depth 12/12"
+                for line in cap_logs)
+        and any(line.strip() == "(+5 more refused; the full list is the PLAN log's "
+                                "`readiness defer` lines)" for line in cap_logs)))
+
+    # A HEALTHY frontier must still pin the curator — the fix must not turn `depth` into "always
+    # top up". Same twelve issues, same target, `status:deferred` removed: all twelve are now
+    # drainable, so depth is 0 and the identical candidate is NOT staged.
+    healthy_fixture = [
+        issue(200 + n, f"Attested but undrainable lane unique{n}",
+              ("status:ready", "priority:P2", "role:impl", f"area:pin{n}"))
+        for n in range(12)
+    ]
+    healthy_planned, _ = plan_repository(
+        healthy_fixture + [pin_candidate], all_labels, automation, target_ready=12)
+    checks.append((
+        "a genuinely stocked frontier still admits nothing (depth stays 0)",
+        not any(m.kind == "stage" for m in healthy_planned)))
+
+    # (d3) COUNTS SUM TO THE POPULATION, over every class the engine refuses for a DIFFERENT
+    # reason. Each row below carries the `status:ready` attestation and is refused on another
+    # ground, so `drainable + refused == attested` is a real partition, not an identity over an
+    # empty set. `status:parked` is deliberately in the DRAINABLE column: `ready-issues` does not
+    # list it in BUSY_STATUS, the dispatcher therefore does enumerate such an issue, and this
+    # function's whole contract is to agree with the engine rather than to hold a private opinion
+    # about it. If that is wrong it is now wrong in ONE place.
+    all_labels.update({"status:parked", "status:untriaged", "kind:epic", "priority:P1"})
+    census_ready = ("status:ready", "priority:P1", "role:impl", "area:alpha")
+    census_fixture = [
+        issue(300, "Drainable", census_ready),
+        issue(301, "Drainable while machine-parked", census_ready + ("status:parked",)),
+        issue(302, "Refused deferred", census_ready + ("status:deferred",)),
+        issue(303, "Refused blocked", census_ready + ("status:blocked",)),
+        issue(304, "Refused untriaged", census_ready + ("status:untriaged",)),
+        issue(305, "Refused in-progress", census_ready + ("status:in-progress",)),
+        issue(306, "Refused gated", census_ready + ("needs:user",)),
+        issue(307, "Refused epic", census_ready + ("kind:epic",)),
+        issue(308, "Refused roleless", ("status:ready", "priority:P1", "area:alpha")),
+        issue(309, "Refused ambiguous priority",
+              census_ready + ("priority:P2",)),
+        issue(310, "Not attested at all", ("area:alpha",)),
+    ]
+    census_count, census_refusals = drainable_ready(census_fixture)
+    attested_rows = sum(1 for row in census_fixture if "status:ready" in labels_of(row))
+    checks.append((
+        "readiness census partitions the attested population exactly",
+        (census_count, len(census_refusals), attested_rows) == (2, 8, 10)
+        and census_count + len(census_refusals) == attested_rows))
+    checks.append((
+        "every refusal names the issue it refused",
+        {int(line.split("#", 1)[1].split(":", 1)[0]) for line in census_refusals}
+        == {302, 303, 304, 305, 306, 307, 308, 309}))
+    # A census that does not add up must STOP the tick, not plan from a number it cannot account
+    # for. `ready_candidates` is stubbed to admit a row it never logged and never returned.
+    _real_candidates = _ready.ready_candidates
+    try:
+        _ready.ready_candidates = lambda rows, log=None: []
+        raised = False
+        try:
+            drainable_ready([issue(311, "Attested", census_ready)])
+        except CuratorError as exc:
+            raised = "does not account for the board" in str(exc)
+        checks.append(("an unaccounted-for readiness census fails the tick loudly", raised))
+    finally:
+        _ready.ready_candidates = _real_candidates
+
+    # (d4) The operator-facing header is the SAME measurement as the control input, over the SAME
+    # population. A raw reader prints 12 here (and 13 if it also miscounts the PR row the
+    # `issues?state=open` fetch carries); the engine's answer is 0.
+    header_pr_row = {**issue(320, "A pull request row", ("status:ready", "area:pinned")),
+                     "pull_request": {}}
+    checks.append((
+        "the ready= header reports drainable readiness over open ISSUES only",
+        frontier_header("o/t", pin_fixture + [header_pr_row], 12) == "== o/t: ready=0 target=12 =="
+        and frontier_header("o/t", healthy_fixture, 12) == "== o/t: ready=12 target=12 =="))
 
     # Issue #509: the area predicate is snapshot-derived and terminal park labels alone remove an
     # otherwise active artifact. PR-shaped fixtures pin the label boundary even though the
@@ -1605,8 +1841,7 @@ def main() -> int:
             target_ready=target_ready,
             allow_actions_bot_issues=allow_actions_bot_issues,
         )
-        print(f"== {repo}: ready={sum('status:ready' in labels_of(i) for i in issues)} "
-              f"target={target_ready} ==")
+        print(frontier_header(repo, issues, target_ready))
         for line in logs:
             print(line)
             if line.startswith(FENCE_UNAVAILABLE):
