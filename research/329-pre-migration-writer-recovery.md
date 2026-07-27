@@ -188,11 +188,19 @@ At M2 (pre-mutation, before any `gh secret set`), for every name present in **bo
 ```
 accept  if  env.updated_at < repo.updated_at        # repo genuinely newer — the round-7 late-writer case
 accept  if  env.updated_at > T_q                    # env copy is migrate-authored (writers provably quiesced)
-REFUSE  otherwise                                   # env-newer AND pre-quiesce: a writer may have authored it
+REFUSE as R-STALE-REPO  if  env.updated_at > repo.updated_at   # env strictly newer AND pre-quiesce
+REFUSE as R-TIE         otherwise                              # env == repo AND pre-quiesce: unorderable
 ```
 
 Equality falls to REFUSE on both comparisons: second-granularity timestamps cannot order a tie,
-and the fail-closed side of an unorderable pair is refusal.
+and the fail-closed side of an unorderable pair is refusal. But the refusal set is **not**
+homogeneous, and §5.4 must not treat it as if it were. On `env > repo` the ordering is proven and
+the env copy is the newer one. On `env == repo` **both intra-second write orders are reachable** —
+a writer's env upsert at `HH:MM:SS` followed by a repo-scope write carrying a different, newer
+credential in that same second, or the reverse — and the rule has no evidence to pick between
+them. Both cases refuse (which is sound: refusing mutates nothing), but they earn **different
+diagnoses** because they earn different repairs. Collapsing them is how a fail-closed refusal
+turns back into value loss, one operator command later.
 
 `T_q` must be **exported** from `assert_quiesce_completed_before_queue` (today `newest_updated`
 is a function-local). That coupling is deliberate and should be asserted: the rule is unsound
@@ -202,15 +210,47 @@ unparseable value rather than defaulting.
 
 ### 5.4 What the refusal says, and how the operator repairs it
 
-The refusal must name the specific secret and the specific repair. The repair is short and
-safe: **the env copy is the newest value, so delete the stale repo copy** —
-`gh secret delete <NAME> -R <owner>/<repo>` — after which M1 sees repo-absent + env-present,
-which is the genuine resume path M2 already accepts with no value required, M3 skips, and M5 has
-nothing to delete. The migration then converges on its own.
+The refusal must name the specific secret, the diagnosis that fired, and the repair **for that
+diagnosis**. There are two, and they are not interchangeable.
 
-The script must **not** auto-delete. That would be an M5-shaped deletion without the M3 copy
-that normally justifies it, resting entirely on the timestamp inference being right. Refuse and
-name the repair; let a human hold the irreversible step.
+**R-STALE-REPO (`env.updated_at > repo.updated_at`, pre-quiesce).** The ordering is proven, so
+the env copy is the newest value: **delete the stale repo copy** —
+`gh secret delete <NAME> -R <owner>/<repo>` — then re-dispatch migrate. M1 then sees
+repo-absent + env-present, which is the genuine resume path M2 already accepts with no value
+required, M3 skips, and M5 has nothing to delete. The migration converges on its own.
+
+**R-TIE (`env.updated_at == repo.updated_at`, pre-quiesce).** Here the R-STALE-REPO repair is
+**unsafe**: if the repo write was the later one within that second, deleting the repo copy
+destroys the genuinely newest credential — the exact loss the invariant exists to prevent, now
+issued as an instruction. Nor is the mirror-image repair (delete the env copy, or simply accept
+and let M3 overwrite) any better: that destroys the env value if the writer's upsert was last.
+No ordering evidence exists, so the repair must not need any — it must be **value-independent**:
+supersede both copies with a credential the operator can attest is valid, rather than promoting
+one of two indistinguishable ones.
+
+1. Establish an authoritative value out of band — validate a plaintext the operator still holds
+   against the provider, or, where the credential is one-time-use and cannot be re-derived
+   (§3.2.2), re-enrol the account to mint a fresh one.
+2. Write it to the **repo** scope: `gh secret set <NAME> -R <owner>/<repo>`. Repo scope is the
+   one M3 treats as authoritative, and the name already exists there, so this adds no new
+   offending key to dispatch-guard check 1.
+3. Re-dispatch migrate. The rewrite makes `repo.updated_at` strictly greater than
+   `env.updated_at`, so accept-1 fires, M3 copies the attested value into the environment, and M5
+   drains the repo copy.
+
+The re-dispatch is load-bearing in **both** repairs, not a formality: M2 requires `S_<name>` for
+a repo-present name and that snapshot is fixed at the run's queue instant, so a repo-scope write
+made after this run was queued is not carried by this run's inputs.
+
+What R-TIE preserves is therefore not "the newest bytes survive" — nothing can establish which
+those are — but the strictly stronger property that **the surviving value is one an operator
+authenticated**, and that nothing is deleted on the strength of a guess. The rule is idempotent:
+if the step-2 write happens to land in the same second again, the next run simply refuses R-TIE
+again and no value is lost.
+
+The script must **not** auto-delete under either diagnosis. That would be an M5-shaped deletion
+without the M3 copy that normally justifies it, resting entirely on the timestamp inference being
+right. Refuse and name the repair; let a human hold the irreversible step.
 
 ### 5.5 Soundness, and the known false-positive class
 
@@ -221,14 +261,26 @@ which completes at some T_q > T_w. At the next migrate: `env.updated_at = T_w`,
 fails) → **REFUSE**. The newer credential is not overwritten. This is exactly the acceptance
 condition of #806.
 
+The same argument covers the degenerate case `T_w == T_r`, in **both** intra-second write orders.
+The rule's own behaviour is order-independent — `env >= repo` and `env <= T_q` hold whichever
+write landed first, so it refuses either way and issues zero mutations, leaving both values
+intact. What the order does change is which value is the valid one, and that is precisely why the
+R-TIE repair is specified not to pick one: it supersedes both with an attested credential (§5.4),
+so the branch the rule cannot observe is also the branch the recovery does not depend on. Note
+that a tie can only refuse *inside* the pre-quiesce window: if both writes carry
+`updated_at > T_q` the writers were provably disabled, no writer authored the env copy, and
+accept-2 fires — correctly.
+
 The false-positive class is a migrate-authored env copy that predates the last quiesce — i.e.
 migrate copies at T_c, someone re-enables the writers, a fresh quiesce completes at T_q > T_c,
 and the next migrate now sees `env(T_c) > repo`, `T_c <= T_q` → refuse, though the values are
 identical. Reaching it requires the writers to have been re-enabled while the repo copy still
 existed, which R0 refuses through the workflow — so it needs an out-of-band `gh workflow enable`,
 the actor class M0a already documents as an accepted residual. When it does fire it fails
-**closed**, names the secret, and its repair (delete the stale repo copy) is still correct,
-because at that point env and repo hold the same value.
+**closed**, names the secret, and its repair is still correct: it lands on R-STALE-REPO
+(`T_c > repo`, strictly), and deleting the stale repo copy is safe there because at that point env
+and repo hold the same value. If the migrate copy happened to land in the same second as the repo
+write it lands on R-TIE instead, which is merely more expensive, never unsafe.
 
 ### 5.6 Sequencing — and why the R0 relaxation is unsound on its own
 
@@ -252,9 +304,28 @@ never "resume".
 
 ## 6. The composed self-test that must ship with step 2
 
-Step 1 needs its own scenarios (env-newer-pre-quiesce refuses; env-newer-post-T_q converges — the
-existing interrupted-after-partial-copy path must stay green; repo-newer converges — the existing
-round-7 late-writer V1/V2 path must stay green; tie refuses; unset/unparseable `T_q` refuses).
+Step 1 needs its own scenarios (env-newer-pre-quiesce refuses **as R-STALE-REPO**;
+env-newer-post-T_q converges — the existing interrupted-after-partial-copy path must stay green;
+repo-newer converges — the existing round-7 late-writer V1/V2 path must stay green;
+unset/unparseable `T_q` refuses).
+
+It also needs the tie proved in **both** write orders, and — as in step 6 below — proved through
+the prescribed repair rather than stopping at the refusal, since the repair is where a
+misclassified tie does its damage. Two scenarios, identical except for which value the fake `gh`
+records last within one `updated_at` second:
+
+- **env-written-last**: repo `<NAME>`=V1, then a writer's env upsert `<NAME>`=V2, same second,
+  pre-quiesce;
+- **repo-written-last**: env `<NAME>`=V2, then a repo-scope write `<NAME>`=V3, same second,
+  pre-quiesce.
+
+Each must refuse **as R-TIE** with rc 1, zero mutations, both stored values intact, and the
+message must name `<NAME>` and the R-TIE repair — never the `gh secret delete` repair. Then drive
+that repair (write an attested V4 to repo scope at a strictly later second; re-dispatch) and
+assert convergence with **V4** in the environment. This is what proves the tie recovery preserves
+the valid newest credential: in the repo-written-last order the R-STALE-REPO repair would have
+deleted V3, and the R-TIE repair reaches a good state without ever needing to know that.
+
 Step 2 needs the **composed** one #806 asks for, end to end in a single scenario:
 
 1. **Seed the pre-migration accept state.** Repo holds all 14 at `T_r`; env holds none of them
@@ -283,7 +354,10 @@ composed scenario **red**, with the harness showing V2 being destroyed:
   *interrupted-after-partial-copy* scenario red — it proves the threshold is load-bearing in
   both directions);
 - remove the M2 refusal call entirely (rc 0, mutations issued, V2 destroyed);
-- let an unset `T_q` default to accept rather than die.
+- let an unset `T_q` default to accept rather than die;
+- collapse R-TIE into R-STALE-REPO, i.e. emit the `gh secret delete` repair for an equal-timestamp
+  pair (the **repo-written-last** tie scenario must go red, with the harness showing V3 destroyed
+  by the repair the refusal itself prescribed).
 
 Step 6 is what distinguishes this from a pure refusal test: it proves the invariant leaves a
 **convergent** system, not a new brick.
