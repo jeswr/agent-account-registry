@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4133,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "24735e51bb7ee28bef7fe5ad594b800cd9e09374",
+  "round": 7
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "No findings. Note the tree is unchanged since round 6 (HEAD is still 24735e51), so this diff is byte-identical to the one round 6 approved with zero findings \u2014 hence 'stagnant' mechanically, i.e. stagnant-at-clean, not stalled with open issues. I re-derived the verdict independently and empirically rather than deferring to the prior round.\n\nSoundness. Every shape is decided exactly once. Block 1 (exec.rs:5923) matches only sfWithin/sfIntersects with the variable FIRST and returns; the new match's arm 1 requires the variable SECOND and arm 2 requires sfContains variable-first, so the three sets are disjoint and no shape is routed twice or lost to arm ordering (sfContains(?g,?h) hits arm 1 and returns None via `?`; both-constant and arity!=2 fall to `_ => None`). within_region is computed only for sfContains with a constant FIRST \u2014 it cannot collide with arm 2, which requires a Variable first, so the cfg-ordering hazard from earlier rounds is genuinely closed. All five newly recognised orientations imply a non-empty intersection with the constant region, hence AABB intersection, so the bbox scan is a valid candidate superset; only sfContains(REGION,?g) is flagged exact, and contains(a,b) <=> within(b,a) holds exactly for geo's IntersectionMatrix (is_contains on M(a,b) is is_within on the transpose), which is what candidates_exact/within_region_literals compute.\n\nProvider contract. bbox_candidate_literals (index.rs:711) uses locate_in_envelope_intersecting \u2014 true AABB intersection, not a containment window \u2014 so a geometry strictly containing the region IS returned. lib.rs and SKILL.md now state that obligation explicitly; no doc drift found elsewhere.\n\nRan it. Green: sparq-engine spatial_superset_orientations (default 2/2, feature-on 1/1), spatial_exact_pushdown feature-on 6/6, sparq-geo pushdown 18/18. Tests are non-vacuous \u2014 three mutations in an off-repo copy, each red for the right reason: (1) relaxing within_region to `iri == GEOF_SF_CONTAIN\u2026 [truncated 601 chars]",
+  "verdict": "approve"
+ }
+}
