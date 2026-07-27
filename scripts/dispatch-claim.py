@@ -4512,6 +4512,14 @@ STARVE_ALERT_MARKER = "<!-- sparq-escalate-starved:v1 -->"
 STARVE_RESET_MARKER = "<!-- sparq-escalate-recovered:v1 -->"
 
 
+def _iso_now(now=None):
+    """The canonical UTC stamp a receipt written THIS tick carries. One spelling, one place: the
+    absorbing-park clock compares parsed instants, so every writer must emit a form
+    park_policy.parse_ts accepts (compact Z-form, T separator)."""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                         time.gmtime(int(time.time() if now is None else now)))
+
+
 def _receipt_instants(comments, bot, marker):
     """(instant, created_at-string) pairs — instants PARSED to aware datetimes via
     park_policy.parse_ts (round-5 finding 2: receipt ordering is by parsed instant, never raw
@@ -5001,31 +5009,135 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                                     already_labeled="status:parked" in item["labels"]))
                             if action == "freeze":
                                 # Unreadable timeline: the ladder never advances on unproven
-                                # data — no window, no receipt, no label, no comment.
-                                defer_reasons["budget-exhausted"] += 1
+                                # data — no window, no receipt, no label, no comment. NOT an
+                                # absorbing action: it must prove nothing, so it can neither
+                                # start nor age a retirement clock.
+                                defer_reasons[_park_policy.budget_exhausted_bucket(action)] += 1
                                 print(f"defer {repo}#{number}: deferred-retry budget "
                                       "exhausted and the label timeline is unreadable — "
                                       "ladder frozen (no readmission credit, no generation "
                                       "receipt) until the timeline reads clean")
                                 continue
-                            if action == "dedupe":
-                                # This window is already receipted (its park or terminal was
-                                # recorded once, honestly): re-defer QUIETLY until a FRESH
-                                # human gesture. Dedupe covers comments/labels only — the
-                                # generation progression is already durable in the receipts.
-                                defer_reasons["budget-exhausted"] += 1
-                                print(f"defer {repo}#{number}: deferred-retry budget "
-                                      f"exhausted; window {window_key} already consumed "
-                                      "(receipted)")
-                                continue
-                            if action == "legacy-quiet":
-                                # Pre-receipt park: already status:parked, no gesture, no
-                                # receipts — stay quiet; the ladder starts counting with the
-                                # first receipted window.
-                                defer_reasons["budget-exhausted"] += 1
-                                print(f"defer {repo}#{number}: deferred-retry budget "
-                                      "exhausted; already status:parked (legacy "
-                                      "pre-receipt park)")
+                            if action in _park_policy.PARK_ABSORBING_ACTIONS:
+                                # [registry #764] THE MACHINE EXIT FOR AN ABSORBING PARK. Both
+                                # of these arms used to `continue` unconditionally, forever:
+                                #   dedupe        the window is receipted and only a HUMAN
+                                #                 gesture mints a new key;
+                                #   legacy-quiet  a pre-receipt park returns BEFORE
+                                #                 `generation = len(receipts) + 1`, so the
+                                #                 "ladder starts counting with the first
+                                #                 receipted window" it promises is unreachable
+                                #                 — nothing on this path ever writes one.
+                                # MEASURED (run 30263179462): these two arms took 7 of 7 planned
+                                # worker rows, launched 0. They are not free — compute_ready
+                                # serializes ONE row per `area:` package, so each held its
+                                # package against eleven sibling candidates, nine of which still
+                                # had a live attempt budget. Retiring them admits three
+                                # immediately.
+                                #
+                                # The exit is BOUNDED and RECEIPTED: one `observing` receipt
+                                # starts a clock keyed on the ladder WINDOW, and only once that
+                                # clock passes PARK_ABSORBING_GRACE_SECONDS does the item reach
+                                # the question-class terminal. `needs:user` is what frees the
+                                # partition (dispatch.yml's PLAN filter drops any `needs:*`), so
+                                # the disposition and the partition release are the SAME act —
+                                # the item leaves the lane with a comment, a receipt and a
+                                # census bucket, never silently.
+                                _absorb_since = max(
+                                    (str(_c.get("created_at")) for _c in comments
+                                     if str(_c.get("user", {}).get("login", "")).casefold()
+                                     == bot_login.casefold()
+                                     and worker_issue.ATTEMPT_MARKER in str(_c.get("body", ""))),
+                                    default="")
+                                _absorb_window = window_key or _park_policy.PARK_WINDOW_NONE
+                                _streak = worker_pr.absorbing_park_streak(
+                                    comments, bot_login, _absorb_window, since=_absorb_since)
+                                # FAIL-CLOSED on the retirement guard: an issue with an open
+                                # worker PR must NEVER be retired. `needs:user` on a source issue
+                                # terminally strips its open PR from the review loop — the exact
+                                # 2026-07-18 mass-park failure this file already warns about.
+                                _disposition, _streak = (
+                                    _park_policy.absorbing_park_disposition(
+                                        action, _streak, int(time.time()),
+                                        linked_open_pr=number in linked_open_prs))
+                                defer_reasons[_park_policy.budget_exhausted_bucket(
+                                    action, _disposition)] += 1
+                                if _disposition == "hold-linked-pr":
+                                    print(f"defer {repo}#{number}: deferred-retry budget "
+                                          f"exhausted ({action}); an OPEN worker PR is linked "
+                                          "to this issue, so the absorbing-park retirement "
+                                          "stands down (a needs:user hold here would strip "
+                                          "that PR from the review loop) — the PR's own "
+                                          "review lane owns the outcome")
+                                    continue
+                                if _disposition == "observe":
+                                    _run_gh_target_comment(
+                                        repo, number,
+                                        "> 🤖 SPARQ agent — this item's attempt budget is "
+                                        f"spent and its park ladder is ABSORBING ({action}): "
+                                        "no further attempt can be made, and no machine event "
+                                        "can advance the ladder without a human gesture. It "
+                                        "still reserves its `area:` partition against sibling "
+                                        "issues every tick, so it is now on a bounded "
+                                        f"{_park_policy.PARK_ABSORBING_GRACE_SECONDS // 3600}h "
+                                        "clock: if nothing changes it will be retired to a "
+                                        "human question and released from the dispatch lane. "
+                                        "Un-parking it (remove `status:parked`) restarts the "
+                                        "budget and this clock.\n\n"
+                                        + worker_pr.absorbing_park_receipt(
+                                            "observing", _absorb_window,
+                                            _iso_now()))
+                                    print(f"defer {repo}#{number}: deferred-retry budget "
+                                          f"exhausted ({action}); absorbing park OBSERVED — "
+                                          f"retirement clock started for window "
+                                          f"{_absorb_window}")
+                                    continue
+                                if _disposition == "wait":
+                                    print(f"defer {repo}#{number}: deferred-retry budget "
+                                          f"exhausted ({action}); absorbing park held, "
+                                          f"retirement clock running since {_streak or 'now'}")
+                                    continue
+                                # _disposition == "retire": the absorbing state PERSISTED past
+                                # the bounded grace. RECEIPT-FIRST ordering, exactly as the
+                                # `terminal` arm below: probe the sticky veto so the receipt is
+                                # honest about a suppressed write, post the durable receipt
+                                # SECOND, and the veto-checked needs:user write LAST — a crash
+                                # after the receipt leaves receipt-no-label, which the
+                                # receipt-driven reads cover.
+                                _vetoed = _park_policy.park_vetoed(
+                                    repo, number, "needs:user", _issue_timeline_events,
+                                    is_human=lambda login: _target_is_human_maintainer(
+                                        repo, login))
+                                _note = (
+                                    " Escalated as a human question (`needs:user`; the label "
+                                    "write follows this receipt), which also releases this "
+                                    "issue's `area:` partition to its siblings."
+                                    if not _vetoed else
+                                    " The retirement is TERMINAL, but the `needs:user` label "
+                                    "write was SUPPRESSED by a standing human unlabel (sticky "
+                                    "veto) — no label was applied; this receipt alone records "
+                                    "it, and the partition is NOT released.")
+                                _run_gh_target_comment(
+                                    repo, number,
+                                    "> 🤖 SPARQ agent — RETIRED from the deferred-retry lane. "
+                                    f"The attempt budget is spent, the park ladder has been "
+                                    f"absorbing ({action}) since {_streak}, and no machine "
+                                    "event can advance it — meanwhile it reserved its `area:` "
+                                    "partition against every sibling issue on that area, every "
+                                    f"tick.{_note} "
+                                    f"@{os.environ.get('MAINTAINER_HANDLE', 'jeswr')}: this "
+                                    "item needs a decision — decompose it, re-route it, or "
+                                    "close it as not implementable as specified. Removing "
+                                    "`needs:user`/`status:parked` re-admits it with a fresh "
+                                    "attempt budget and a fresh clock.\n\n"
+                                    + worker_pr.absorbing_park_receipt(
+                                        "retired", _absorb_window, _iso_now()))
+                                _landed = (False if _vetoed else
+                                           _issue_needs_user_landed(script_dir, repo, number))
+                                print(f"retired {repo}#{number}: absorbing park ({action}) "
+                                      f"persisted past the bounded grace since {_streak} -> "
+                                      f"question-class terminal"
+                                      f"{'' if _landed else ' (label suppressed)'}")
                                 continue
                             if action == "terminal":
                                 # Bounded escalation: PARK_ESCALATION_GENERATIONS windows
@@ -5066,7 +5178,8 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                                     f"gen={generation} cutoff={window_key} -->")
                                 landed = (False if vetoed else
                                           _issue_needs_user_landed(script_dir, repo, number))
-                                defer_reasons["budget-exhausted-escalated"] += 1
+                                defer_reasons[
+                                    _park_policy.budget_exhausted_bucket(action)] += 1
                                 print(f"escalated {repo}#{number}: deferred-retry budget "
                                       f"exhausted post-readmission (generation "
                                       f"{generation}) -> question-class terminal"
@@ -5105,7 +5218,8 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                                 f"gen={generation} cutoff={window_key} -->")
                             parked = (False if vetoed else
                                       _park_source_issue(script_dir, repo, number))
-                            defer_reasons["budget-exhausted"] += 1
+                            defer_reasons[
+                                _park_policy.budget_exhausted_bucket(action)] += 1
                             print(f"escalated {repo}#{number}: deferred-retry budget "
                                   f"exhausted (generation {generation}"
                                   f"{'' if parked else ', label suppressed'})")
