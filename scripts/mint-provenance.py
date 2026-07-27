@@ -608,9 +608,10 @@ def mint_workflow_seam_report(workflow=None):
             re.search(r"run.?key|recorded.?at.?run|attestation", name, re.I)
             for name in list(inputs) + list(step_env)),
         "no_run_key_argument": not re.search(r"--run-key|--recorded-at-run|--attestation", run),
-        "step_env_bindings": {key: step_env.get(key) for key in
-                              ("TARGET_REPO", "PR_NUMBER", "ISSUE_NUMBER", "IMPL_ALIAS", "APPLY",
-                               "ALLOW_GLOBAL")},
+        # EVERY env name the step declares, not a chosen subset: the self-test compares the whole
+        # mapping, so ADDING a binding is as red as rebinding one. That is what keeps a new
+        # secret, token or input from being handed to this job unnoticed.
+        "step_env_bindings": step_env,
     }
 
 
@@ -951,14 +952,18 @@ def _self_test():                                                       # noqa: 
     # THE WRONG-INPUT SEAM: `APPLY: ${{ inputs.allow_global_partition }}` is valid YAML, lints
     # clean, and silently turns a dry run into a write. Assert the exact expression each env name
     # is bound to, never merely that the name appears.
-    check("every env name is bound to its OWN input expression", seam["step_env_bindings"], {
-        "TARGET_REPO": "${{ inputs.target_repo }}",
-        "PR_NUMBER": "${{ inputs.pr_number }}",
-        "ISSUE_NUMBER": "${{ inputs.issue_number }}",
-        "IMPL_ALIAS": "${{ inputs.impl_alias }}",
-        "APPLY": "${{ inputs.apply }}",
-        "ALLOW_GLOBAL": "${{ inputs.allow_global_partition }}",
-    })
+    check("every env name is bound to its OWN expression, and there are no others",
+          seam["step_env_bindings"], {
+              "GH_TOKEN": "${{ github.token }}",
+              "PROVENANCE_SALT": "${{ secrets.PROVENANCE_SALT }}",
+              "TARGET_REPO": "${{ inputs.target_repo }}",
+              "PR_NUMBER": "${{ inputs.pr_number }}",
+              "ISSUE_NUMBER": "${{ inputs.issue_number }}",
+              "IMPL_ALIAS": "${{ inputs.impl_alias }}",
+              "APPLY": "${{ inputs.apply }}",
+              "ALLOW_GLOBAL": "${{ inputs.allow_global_partition }}",
+              "ROUTING_FILE": "${{ steps.policy.outputs.routing_file }}",
+          })
 
     # ---- the YAML-seam MUTANT TABLE ----------------------------------------------------------
     # Asserting the happy path proves the report can read a correct workflow, not that it would
