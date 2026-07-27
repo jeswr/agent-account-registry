@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 843,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "a9e95ecec0876a15c10fe24dc2f185df68b54fc1",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly makes the self-claim review/fix caps explicit, cross-checks the workflow literals against named constants, and verifies that the cap is actually passed to the allocator. The added mutation checks are non-vacuous: they prove each parsed cap changes when the real workflow text is mutated, and prove removal of the allocator argument makes extraction fail. The existing dispatcher path remains independently pinned to account_slot_bound=True with no static holder cap, so this does not weaken the live-slot dispatcher behavior. The checks fail closed on missing literals, missing wiring, mismatched values, and non-positive caps. No security, correctness, or completeness issue is evident in the diff.",
+  "verdict": "approve"
+ }
+}
