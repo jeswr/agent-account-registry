@@ -1,26 +1,6 @@
 {
  "leases": [
   {
-   "account": "efb4eb2781de6958",
-   "claim_id": "7329128e89e7494984555539d163ab00",
-   "holder": "fix:sparq-org/sparq#4159@dispatch-30292733119.1",
-   "package": "sparq-bench",
-   "role": "fix",
-   "model": "opus5",
-   "issued_at": 1785176364,
-   "expires_at": 1785182664
-  },
-  {
-   "account": "efb4eb2781de6958",
-   "claim_id": "cb4ec9539be749338d6a9d74c8aaa7cd",
-   "holder": "fix:sparq-org/sparq#4574@dispatch-30292733119.1",
-   "package": "sparq-reason",
-   "role": "fix",
-   "model": "opus5",
-   "issued_at": 1785176374,
-   "expires_at": 1785182674
-  },
-  {
    "account": "9e13ea21abf27e68",
    "claim_id": "6f422d593f1b42a0948ff9af4bee63b4",
    "holder": "fix:sparq-org/sparq#4555@dispatch-30293233911.1",
@@ -39,26 +19,6 @@
    "model": "opus5",
    "issued_at": 1785176815,
    "expires_at": 1785183115
-  },
-  {
-   "account": "efb4eb2781de6958",
-   "claim_id": "c1bc6c2d1da64b1f89005c2dfd2770dc",
-   "holder": "jeswr/agent-account-registry#567@30297167948.1",
-   "package": "review-loop",
-   "role": "impl",
-   "model": "opus5",
-   "issued_at": 1785179525,
-   "expires_at": 1785182225
-  },
-  {
-   "account": "51bde6688e140866",
-   "claim_id": "2333b17bcf894e2eb55598c6e97eecab",
-   "holder": "sparq-org/sparq#2768@30298463534.1",
-   "package": "sparq-jsonld",
-   "role": "research",
-   "model": "opus5",
-   "issued_at": 1785180597,
-   "expires_at": 1785186897
   },
   {
    "account": "51bde6688e140866",
