@@ -8,6 +8,8 @@ import re
 from typing import Any
 
 
+GLOBAL_PACKAGE = "__global__"   # the serializing partition (excludes against every area)
+
 ACCOUNT = re.compile(r"[0-9a-f]{16}")
 CLAIM = re.compile(r"[0-9a-f]{32}")
 REPOSITORY = r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*"
@@ -21,6 +23,47 @@ class LeaseSchemaError(ValueError):
 
 def is_repair_holder(value: Any) -> bool:
     return isinstance(value, str) and REPAIR_HOLDER.fullmatch(value) is not None
+
+
+def plan_package(areas: Any) -> str:
+    """THE canonical reduction from a row's `area:*` sections to the ONE `package` partition its
+    lease reserves (registry issue #112). EXACTLY ONE distinct area -> that area; ZERO OR MULTIPLE
+    -> the serializing global partition, so a multi-area row can never co-run with in-flight work
+    in ANY of its areas. Fail-closed: over-serialize a multi-area row rather than free a busy
+    sibling crate. Takes BARE area names (no `area:` prefix); non-string / empty entries are
+    ignored.
+
+    Canonical HERE — beside `validate_ledger`, which owns the `package` field's other invariant —
+    because this value is derived INDEPENDENTLY by the dispatcher that MINTS a claim and by the
+    review/fix (or worker) run that ADOPTS it, and both adopt steps compare the two for EQUALITY.
+    Every derivation must therefore be the SAME function, not a prose promise that four copies
+    "mirror byte-for-byte".
+
+    THE INCIDENT this exists to prevent (LIVE 2026-07-26): review-fix.yml's `resolve` job still
+    carried the pre-#112 alphabetically-first reduction (`packages[0] if packages else
+    "__global__"`) while dispatch-claim.py had migrated to this one. A PR whose provenance source
+    issue carried TWO `area:*` labels (sparq-org/sparq#3528 <- issue #2582: `area:ci` + `area:site`)
+    therefore had its claim minted as `__global__` and re-derived as `ci`, so the adopt step
+    rejected its OWN dispatcher's claim, released the lease, and exited 1 — every tick, forever:
+    53 of the 77 review-fix failures that day, 47+ of them on that one PR, ~20% of the review
+    lane's capacity burned on a loop that could never converge. The equality check was RIGHT; one
+    derivation was wrong. So there is now exactly one derivation, and every consumer that CAN
+    import it does (`plan_package_csv` below is the entry point for shell callers, so even a
+    `run:` script has no reason to re-implement it)."""
+    unique = {area for area in (areas or ()) if isinstance(area, str) and area}
+    return next(iter(unique)) if len(unique) == 1 else GLOBAL_PACKAGE
+
+
+def plan_package_csv(csv: Any) -> str:
+    """`plan_package` over the resolve jobs' sorted, de-duplicated area CSV (`packages`), so a
+    workflow `run:` SHELL step can reach the canonical reduction with one `python3` call instead of
+    open-coding it in bash — which is exactly what worker.yml's self-claim step used to do. Area
+    names are comma-free by construction (the resolve step rejects any `area:*` label outside
+    `[A-Za-z0-9][A-Za-z0-9_.-]*`), so splitting on `,` is lossless. A non-string / empty CSV
+    reduces to the serializing partition (fail-closed)."""
+    if not isinstance(csv, str):
+        return GLOBAL_PACKAGE
+    return plan_package([area.strip() for area in csv.split(",")])
 
 
 def validate_ledger(document: Any) -> list[dict[str, Any]]:
@@ -94,16 +137,51 @@ def _self_test() -> int:
         else:
             rejected = False
         check(name, rejected)
+
+    # ---- plan_package: THE partition reduction (registry issue #112 / the 2026-07-26 adopt loop).
+    # Each case below is the counterfactual for one property of the reduction; the pre-#112
+    # `sorted(areas)[0] if areas else GLOBAL_PACKAGE` REVERSES exactly the multi-area row.
+    check("one area reserves that area", plan_package(["site"]) == "site")
+    check("no area reserves the global partition", plan_package([]) == GLOBAL_PACKAGE)
+    check("MULTI-area reserves the global partition (not the alphabetically-first area)",
+          plan_package(["ci", "site"]) == GLOBAL_PACKAGE
+          and plan_package(["site", "ci"]) == GLOBAL_PACKAGE)
+    check("a duplicate area collapses to one area", plan_package(["ci", "ci"]) == "ci")
+    check("order does not change a single-area reduction",
+          plan_package(["site"]) == plan_package(("site",)))
+    check("non-string / empty entries are ignored, not counted as areas",
+          plan_package(["ci", "", None, 0]) == "ci"          # type: ignore[list-item]
+          and plan_package([None, ""]) == GLOBAL_PACKAGE)    # type: ignore[list-item]
+    check("None reduces to the global partition rather than raising",
+          plan_package(None) == GLOBAL_PACKAGE)
+    # The reduction is a PARTITION name, so it must satisfy the ledger's `package` field invariant
+    # (non-empty str) for every input — otherwise a multi-area claim writes an unvalidatable lease.
+    check("every reduction is a valid ledger package field",
+          all(isinstance(plan_package(a), str) and plan_package(a)
+              for a in ([], ["a"], ["a", "b"], None, ["", None])))
+    # The CSV entry point workflow SHELL steps call. Same reduction, same fail-closed direction.
+    check("the CSV entry point agrees with plan_package on every shape",
+          plan_package_csv("") == GLOBAL_PACKAGE
+          and plan_package_csv("site") == "site"
+          and plan_package_csv("ci,site") == GLOBAL_PACKAGE
+          and plan_package_csv("ci,ci") == "ci"
+          and plan_package_csv(None) == GLOBAL_PACKAGE)   # type: ignore[arg-type]
     return 0 if ok else 1
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--self-test", action="store_true")
+    # The reduction as a CLI so a workflow SHELL step never re-implements it (see plan_package_csv).
+    parser.add_argument("--plan-package", metavar="AREA_CSV",
+                        help="print the canonical package partition for a sorted area CSV")
     args = parser.parse_args()
     if args.self_test:
         return _self_test()
-    parser.error("--self-test is required")
+    if args.plan_package is not None:
+        print(plan_package_csv(args.plan_package))
+        return 0
+    parser.error("--self-test or --plan-package is required")
 
 
 if __name__ == "__main__":

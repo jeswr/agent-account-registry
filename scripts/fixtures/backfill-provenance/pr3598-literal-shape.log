@@ -1,0 +1,23 @@
+Claim live account lease	UNKNOWN STEP	2026-07-19T11:14:00.6661226Z ^[[36;1mif account != os.environ["EXPECTED_ACCOUNT"] or account not in pool:^[[0m
+Claim live account lease	UNKNOWN STEP	2026-07-19T11:14:00.6683613Z ^[[36;1mprint(f"dispatcher lease adopted: model={model}, claim={claim_id[:8]}")^[[0m
+Claim live account lease	UNKNOWN STEP	2026-07-19T11:14:00.6778266Z   EXPECTED_ACCOUNT: acct2css
+Claim live account lease	UNKNOWN STEP	2026-07-19T11:14:03.3740288Z dispatcher lease adopted: model=opus, claim=7c84bac5
+Reconcile + record implementer provenance (no target code runs here)	UNKNOWN STEP	2026-07-19T11:29:48.8434309Z ##[group]Run python3 registry/scripts/worker-pr.py reconcile-provenance \
+Reconcile + record implementer provenance (no target code runs here)	UNKNOWN STEP	2026-07-19T11:29:48.8435310Z ^[[36;1mpython3 registry/scripts/worker-pr.py reconcile-provenance \^[[0m
+Reconcile + record implementer provenance (no target code runs here)	UNKNOWN STEP	2026-07-19T11:29:48.8436087Z ^[[36;1m  --registry-repo "$GITHUB_REPOSITORY" \^[[0m
+Reconcile + record implementer provenance (no target code runs here)	UNKNOWN STEP	2026-07-19T11:29:48.8436774Z ^[[36;1m  --target-repo "sparq-org/sparq" \^[[0m
+Reconcile + record implementer provenance (no target code runs here)	UNKNOWN STEP	2026-07-19T11:29:48.8437452Z ^[[36;1m  --head-branch "$HEAD_BRANCH" \^[[0m
+Reconcile + record implementer provenance (no target code runs here)	UNKNOWN STEP	2026-07-19T11:29:48.8438432Z ^[[36;1m  --impl-provider "anthropic" \^[[0m
+Reconcile + record implementer provenance (no target code runs here)	UNKNOWN STEP	2026-07-19T11:29:48.8439091Z ^[[36;1m  --impl-alias "opus" \^[[0m
+Reconcile + record implementer provenance (no target code runs here)	UNKNOWN STEP	2026-07-19T11:29:48.8439725Z ^[[36;1m  --issue "3235" \^[[0m
+Reconcile + record implementer provenance (no target code runs here)	UNKNOWN STEP	2026-07-19T11:29:48.8440390Z ^[[36;1m  --run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT" \^[[0m
+Reconcile + record implementer provenance (no target code runs here)	UNKNOWN STEP	2026-07-19T11:29:48.8441097Z ^[[36;1m  --verify-bot-login "$VERIFY_BOT_LOGIN"^[[0m
+Reconcile + record implementer provenance (no target code runs here)	UNKNOWN STEP	2026-07-19T11:29:48.8483400Z shell: /usr/bin/bash -e {0}
+Reconcile + record implementer provenance (no target code runs here)	UNKNOWN STEP	2026-07-19T11:29:48.8484051Z env:
+Reconcile + record implementer provenance (no target code runs here)	UNKNOWN STEP	2026-07-19T11:29:48.8486372Z   GH_TOKEN: ***
+Reconcile + record implementer provenance (no target code runs here)	UNKNOWN STEP	2026-07-19T11:29:48.8486975Z   WORKER_IMPL_ACCOUNT: acct2css
+Reconcile + record implementer provenance (no target code runs here)	UNKNOWN STEP	2026-07-19T11:29:48.8488052Z   PROVENANCE_SALT: ***
+Reconcile + record implementer provenance (no target code runs here)	UNKNOWN STEP	2026-07-19T11:29:48.8488743Z   HEAD_BRANCH: sparq-agent/issue-3235-29684750417-1
+Reconcile + record implementer provenance (no target code runs here)	UNKNOWN STEP	2026-07-19T11:29:48.8489435Z   VERIFY_BOT_LOGIN: sparq-orchestrator[bot]
+Reconcile + record implementer provenance (no target code runs here)	UNKNOWN STEP	2026-07-19T11:29:48.8490074Z ##[endgroup]
+Reconcile + record implementer provenance (no target code runs here)	UNKNOWN STEP	2026-07-19T11:29:50.4581579Z worker-pr: GitHub API request failed for repos/sparq-org/sparq/pulls/3598

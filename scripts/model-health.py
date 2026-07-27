@@ -53,6 +53,17 @@ if _retry_spec is None or _retry_spec.loader is None:
 ledger_retry = importlib.util.module_from_spec(_retry_spec)
 _retry_spec.loader.exec_module(ledger_retry)
 
+# [OPUS-5] registry #701. The `why_no_diff` vocabulary is DECLARED ONCE, in the routing module that
+# consumes it, and imported here — the producer (worker-live.sh), this ledger, and the dispatcher's
+# decision must agree on the index<->name mapping or a stored reason decodes to a different reason.
+_nc_spec = importlib.util.spec_from_file_location(
+    "registry_no_change_routing", os.path.join(os.path.dirname(__file__), "no_change_routing.py"))
+if _nc_spec is None or _nc_spec.loader is None:
+    raise RuntimeError("cannot load the shared no_change routing vocabulary")
+no_change_routing = importlib.util.module_from_spec(_nc_spec)
+_nc_spec.loader.exec_module(no_change_routing)
+NO_CHANGE_REASONS = no_change_routing.NO_CHANGE_REASONS
+
 LEDGER_PATH = "data/model-health.json"
 # Mutable data plane lives on a dedicated non-code branch (issue #28): required-status-check
 # protection on the default branch rejects the bot's contents-API PUTs, so every ledger read and
@@ -75,8 +86,9 @@ FUTURE_SKEW_SECONDS = 5 * 60
 
 # --- exit-class taxonomy. worker-live.sh emits {session-limit, rate-limit, auth, setup, unknown}
 # from nonzero HOST-observable signals, plus `no_change` after a clean model exit with no tree edit;
-# never model-authored stdout. A changed-tree run records `success`. We fold those into decision
-# classes.
+# never model-authored stdout. A changed-tree run records `success`. worker-prep.sh additionally
+# emits {credential-remint-required, credential-refresh-transient} from the host-side credential
+# pre-flight, before any model runs. We fold those into decision classes.
 # `limit` == the account's usage window is exhausted (maintainer must RESET it, not retry);
 # `transient` == a retryable API blip (429/529/overloaded); `auth`/`billing` == a credential/credit
 # problem (rotate/top up); `unknown` == the host observed a failure but could not attribute it to
@@ -98,12 +110,26 @@ CLASS_ZERO_DISPATCH = "zero-dispatch"  # dispatch planned >0 but launched 0 (fle
 # never written to the ledger. This is the fail-closed backstop behind the workflow change that
 # stopped interpolating this string into `run:` shell source.
 VALID_RECORD_PROVIDERS = frozenset({"anthropic", "openai", "fleet"})
+# The PSEUDO-provider: `fleet` is not a worker account, it is the fleet-wide dispatch signal, and
+# its records carry a FIXED sentinel account hash rather than a salted handle. Named here because
+# any predicate that counts DISTINCT ACCOUNTS as a proxy for "more than one real account" has to
+# exclude it or the dispatcher itself satisfies the count (review of PR #697).
+FLEET_PSEUDO_PROVIDER = "fleet"
 
 # raw worker-live.sh exit-class -> decision class
 _EXIT_CLASS_MAP = {
     "session-limit": CLASS_LIMIT,
     "rate-limit": CLASS_TRANSIENT,
     "auth": CLASS_AUTH,
+    # Host-side credential pre-flight classes (issue #596). worker-prep.sh emits these BEFORE any
+    # model runs, so they are deliberately distinct RAW classes — `auth` is the bucket every
+    # in-container provider rejection lands in and reads as "the provider refused the model call".
+    # They fold onto the existing decision classes so the whole health/backoff/outage machinery
+    # applies unchanged: a dead stored grant IS an auth-class inability to reach a working model
+    # (maintainer-actionable, counts toward a provider-outage page), while an unreachable token
+    # endpoint IS transient (earns the reactive backoff, never pages a re-mint).
+    "credential-remint-required": CLASS_AUTH,
+    "credential-refresh-transient": CLASS_TRANSIENT,
     "billing": CLASS_BILLING,
     "setup": CLASS_SETUP,
     "no_change": CLASS_NO_CHANGE,
@@ -134,6 +160,26 @@ _EXIT_CLASS_MAP = {
 LAUNCH_FAIL_CLASSES = frozenset({CLASS_AUTH, CLASS_BILLING, CLASS_LIMIT, CLASS_TRANSIENT})
 # The classes that count toward the PERSISTENT burst (transient-for-persistence).
 PERSISTENCE_CLASSES = frozenset({CLASS_TRANSIENT, CLASS_UNKNOWN})
+# The starvation causes a MACHINE CAPACITY PARK can be attributed to, for the automatic
+# re-admission gate ONLY (capacity_recovery_evidence). Deliberately a SEPARATE set from
+# LAUNCH_FAIL_CLASSES, which drives provider-outage and backoff decisions and must not change.
+#
+# WHY zero-dispatch belongs here and nowhere else (sparq-org/sparq#3809). The park class this
+# gate exists to release includes DISPATCH STARVATION — "N consecutive fix dispatches missed",
+# which dispatch-claim parks as a capacity park precisely because the allocator found no slot.
+# That cause is recorded, on the `fleet` pseudo-account, as `zero-dispatch` (dispatch planned >0
+# but launched 0), and its recovery is recorded as a `success` on that same pseudo-account. But
+# `zero-dispatch` is not a LAUNCH failure, so condition 1 below rejected it and a
+# dispatch-starvation park could never prove its cause had cleared — the automatic re-admission
+# could only ever fire for an account-credential outage.
+#
+# MEASURED against the live ledger (2026-07-25, 200 records): the fleet account carried 36
+# zero-dispatch records and 43 successes, and was excluded by condition 1 alone — it satisfied
+# the recovery and cooldown conditions already. Every other condition (a success strictly after
+# BOTH the park and the account's own last failure, and no active auth cooldown) applies to
+# zero-dispatch unchanged, so this widens WHICH outage can be proven recovered, never HOW
+# strictly recovery must be proven.
+PARK_STARVATION_CLASSES = LAUNCH_FAIL_CLASSES | frozenset({CLASS_ZERO_DISPATCH})
 
 # The full set of decision classes a stored record's `exit_class` may hold: every fold TARGET of
 # _EXIT_CLASS_MAP (SUCCESS/zero-dispatch are among its values). make_record only ever writes a
@@ -191,6 +237,44 @@ NO_CHANGE_LIMIT_MIN_ISSUES = 2
 BACKOFF_BASE_SECONDS = 15 * 60
 BACKOFF_CAP_SECONDS = 5 * 3600
 BACKOFF_CLASSES = frozenset({CLASS_LIMIT, CLASS_TRANSIENT})
+# --- AUTH COOLDOWN (registry #596). `auth` was DELIBERATELY absent from BACKOFF_CLASSES above: a
+# credential problem is not a usage window, and retrying it sooner is harmless. But acct01's codex
+# OAuth access token expires HOURLY while the fleet stores a static snapshot of it, so the fleet's
+# ONLY cross-provider review account fails `auth` for a whole window at a time (observed live for
+# fingerprint dc2d7519: 5 × auth against 5 × success interleaved in one window, then 2 more auth
+# plus 1 rate in the next). Handing that credential to the allocator every tick converts a
+# maintainer-fixable credential outage into a stream of dead review lanes.
+#
+# So a RUN of consecutive `auth` outcomes for ONE account now yields a bounded COOLDOWN through the
+# EXISTING probe-exempt backoff primitive (issue #29: account_backoffs -> account-usage's
+# `backoff_until` overlay -> usage_eligible skips the account). No parallel mechanism, no new
+# ledger, no new write path.
+#
+# NOT A DISABLE — deliberately (#596 nuance). acct01 is currently the ONLY cross-provider review
+# account, so marking it permanently unavailable would mean ZERO verdicts fleet-wide, which is
+# strictly worse than a ~50% success rate. The cooldown is therefore a SHORT, SINGLE-STEP,
+# NON-DOUBLING TTL: exactly BACKOFF_BASE_SECONDS (15 min ~= one or two of dispatch's 10-minute
+# ticks), never the 5 h exponential the limit/transient chain can reach, and it expires on its own
+# with no maintainer action. The account comes back automatically; the ALERT is what asks the
+# maintainer to re-mint the token.
+#
+# WHY N=2 (AUTH_COOLDOWN_MIN). One `auth` is exactly what the hourly expiry boundary looks like,
+# and the very next claim may pick up a freshly-uploaded secret — sidelining the sole reviewer on a
+# single blip costs more verdict supply than it saves. TWO CONSECUTIVE auth outcomes with NO
+# interleaved success is credential ROT, not a boundary flap. N=3 was considered and rejected: with
+# one reviewer, three consecutive auth failures already means ~30 min of zero fleet-wide verdicts
+# before anything signals, and the observed pattern is interleaved, so a 3-run is rarer than the
+# outage it is supposed to catch.
+#
+# SCOPE (honest): account_backoffs is consumed by account-usage.py for PROBE-EXEMPT providers only
+# (openai/codex), so the cooldown governs allocation for exactly those. That is not a gap — it is
+# where the gap WAS. A metered provider's rejected credential already fails the usage probe, so its
+# entry never reaches status `allowed` and select-and-claim's fail-closed arm excludes it (this is
+# why the two revoked anthropic accounts publish as `unknown` and are already skipped). Probe-exempt
+# accounts have no probe to fail closed on, which is precisely why acct01 kept being handed out.
+# The ALERT below fires for either provider regardless of allocation.
+AUTH_COOLDOWN_MIN = 2
+AUTH_COOLDOWN_SECONDS = BACKOFF_BASE_SECONDS
 # The consecutive-hit count at which the exponential arm saturates the 5 h cap (smallest n with
 # BASE * 2**(n-1) >= CAP). prune's active-backoff retention (issue #82) keeps at most this many
 # tail records of a live chain: past saturation, extra chain records cannot change the derived
@@ -259,7 +343,8 @@ def _decision_class(exit_class):
 
 
 def make_record(provider, account_h, model_alias, exit_class, run_id, now, reset_hint=None,
-                input_tokens=None, output_tokens=None, wall_seconds=None, issue=None):
+                input_tokens=None, output_tokens=None, wall_seconds=None, issue=None,
+                why_no_diff=None):
     """Build one health record. `account_h` MUST already be the salted hash (a raw handle here is a
     privacy bug — the caller salts). reset_hint (a provider reset time string) is kept ONLY for the
     limit + transient (rate-limit) classes, where it is actionable (maintainer alert body / the
@@ -288,6 +373,10 @@ def make_record(provider, account_h, model_alias, exit_class, run_id, now, reset
         "output_tokens": output_tokens,
         "wall_seconds": wall_seconds,
         "issue": issue,
+        # [#701] The model's own declared reason it produced no diff. Stored as the VOCABULARY NAME
+        # (the wire index is an envelope detail); the validator below admits nothing else, so this
+        # is a closed enum in the public ledger, not free text.
+        "why_no_diff": why_no_diff,
     }
     for field, value in no_change_fields.items():
         if value is not None:
@@ -311,8 +400,12 @@ def prune(records, now):
     tail of its current consecutive chain (the limit/transient records since its last success,
     truncated to BACKOFF_CHAIN_KEEP — past cap-saturation extra records cannot change the
     derived backoff_until) is preserved. A derived no_change limit additionally retains its
-    minimal three source observations. Earlier ordinary backoff records cannot affect the derived
-    state (a success resets them), so re-deriving backoff_until on the pruned window is exact.
+    minimal three source observations, and a live AUTH COOLDOWN (registry #596) retains the
+    AUTH_COOLDOWN_MIN tail of its consecutive `auth` run. Earlier ordinary backoff records cannot
+    affect the derived state (a success resets them), so re-deriving backoff_until on the pruned
+    window is exact. A PROVEN-DEAD credential (registry #639, `credential_states`) retains the same
+    auth-run tail even though its cooldown has long expired — that evidence is the ONLY thing keeping
+    a dead probe-exempt account out of dispatch, so the cap must not be able to erase it.
 
     BOUND CONTRACT (PR #85 finding 1): preserved records spend the MAX_RECORDS budget first and
     the newest non-preserved records fill only the REMAINING budget, so the total is bounded by
@@ -322,9 +415,11 @@ def prune(records, now):
     and a ::warning::
     diagnostic surfaces the overshoot (that many simultaneously backed-off accounts is a
     fleet-wide rate-limit saturation signal the maintainer must see, not a bookkeeping detail).
-    len(preserved) itself is bounded by live_accounts * (BACKOFF_CHAIN_KEEP +
-    NO_CHANGE_LIMIT_MIN - 1), and every backoff expires within BACKOFF_CAP_SECONDS, so the
-    overshoot is transient, not unbounded growth."""
+    len(preserved) itself is bounded by held_accounts * (BACKOFF_CHAIN_KEEP +
+    NO_CHANGE_LIMIT_MIN - 1 + max(AUTH_COOLDOWN_MIN, CREDENTIAL_DEAD_MIN)) — `held` being the
+    accounts with a live backoff or a proven-dead credential — and every backoff expires within
+    BACKOFF_CAP_SECONDS (an auth cooldown within the much shorter AUTH_COOLDOWN_SECONDS) while a dead
+    run ages out with WINDOW_SECONDS, so the overshoot is transient, not unbounded growth."""
     kept = [r for r in records if isinstance(r, dict)
             and isinstance(r.get("ts"), int)
             and (now - r["ts"]) <= WINDOW_SECONDS
@@ -334,25 +429,48 @@ def prune(records, now):
         return kept
     preserved = set()
     active = account_backoffs(kept, now)
-    if active:
+    # PROVEN-DEAD CREDENTIAL RETENTION (registry #639), the same argument as the #82 active-backoff
+    # retention one level up: a credential proven dead (credential_states) is held OUT of dispatch by
+    # that evidence alone — its #596 cooldown expired long ago, so nothing in `active` protects its
+    # records. A flood of later unrelated records (a healthy anthropic fleet's successes) would evict
+    # the auth run, the state would silently revert to `unproven`, and the dead account would be
+    # handed to the allocator again. Preserving the run's tail is what makes the ineligibility hold
+    # for the whole window instead of only until the cap fills.
+    dead = {account for account, entry in credential_states(kept, now).items()
+            if entry["state"] == CREDENTIAL_DEAD}
+    if active or dead:
         derived, no_change_evidence = _no_change_limit_view(kept, now)
         chains = {}                 # account -> indices of its current consecutive chain
+        auth_runs = {}              # account -> indices of its current consecutive auth run (#596)
         for index, r in enumerate(derived):
             acct, cls = r.get("account"), r.get("exit_class")
             if cls == SUCCESS:
                 chains.pop(acct, None)      # a success resets the chain — and the derived state
+                auth_runs.pop(acct, None)
             elif cls in BACKOFF_CLASSES:
                 chains.setdefault(acct, []).append(index)
-        for acct in active:
-            chain = chains.get(acct, ())
-            preserved.update(chain[-BACKOFF_CHAIN_KEEP:])
-            # A derived no_change limit needs all three source observations after pruning; keeping
-            # only the newest (derived) member would erase the discriminator and readmit the capped
-            # account on the next ledger read. Preserve this bounded evidence only when the derived
-            # member is still in the account's live post-success chain.
-            nc_evidence = no_change_evidence.get(acct, set())
-            if any(index in chain for index in nc_evidence):
-                preserved.update(nc_evidence)
+            elif cls == CLASS_AUTH:
+                auth_runs.setdefault(acct, []).append(index)
+        for acct in set(active) | dead:
+            if acct in active:
+                chain = chains.get(acct, ())
+                preserved.update(chain[-BACKOFF_CHAIN_KEEP:])
+                # A derived no_change limit needs all three source observations after pruning;
+                # keeping only the newest (derived) member would erase the discriminator and readmit
+                # the capped account on the next ledger read. Preserve this bounded evidence only
+                # when the derived member is still in the account's live post-success chain.
+                nc_evidence = no_change_evidence.get(acct, set())
+                if any(index in chain for index in nc_evidence):
+                    preserved.update(nc_evidence)
+            # A live AUTH COOLDOWN (registry #596) — and a PROVEN-DEAD credential (registry #639) —
+            # are derived from `auth` records, which are NOT in BACKOFF_CLASSES and so appear in no
+            # `chain`: without this a flood of later unrelated records would evict the run and
+            # readmit the account mid-cooldown (the exact bug issue #82 fixed for rate limits) or
+            # revert a dead credential to `unproven`. Kept in its own bucket so the limit/transient
+            # tail above (whose length determines the re-derived exponential) is byte-for-byte
+            # unchanged, and sized by whichever consumer needs the longer tail.
+            preserved.update(
+                auth_runs.get(acct, ())[-max(AUTH_COOLDOWN_MIN, CREDENTIAL_DEAD_MIN):])
     budget = MAX_RECORDS - len(preserved)
     if budget < 0:
         # Live backoffs alone exceed the nominal cap: keep them all (correctness over the cap),
@@ -438,7 +556,7 @@ def _validate_record(r):
     blob into the PUBLIC ledger."""
     if not isinstance(r, dict):
         raise ValueError("model-health ledger contains a non-object entry")
-    no_change_fields = {"input_tokens", "output_tokens", "wall_seconds", "issue"}
+    no_change_fields = {"input_tokens", "output_tokens", "wall_seconds", "issue", "why_no_diff"}
     extra = set(r) - ({"ts", "provider", "account", "model_alias", "exit_class", "run_id",
                        "reset_hint"} | no_change_fields)
     if extra:
@@ -475,6 +593,12 @@ def _validate_record(r):
             raise ValueError(f"model-health no_change {field} is malformed")
     if "wall_seconds" in r and not _is_bounded_int(r["wall_seconds"], 0, MAX_WALL_SECONDS):
         raise ValueError("model-health no_change wall_seconds is malformed")
+    # [#701] why_no_diff is a CLOSED ENUM, not a bounded string: the value originates in a
+    # model-authored file, so admitting "any safe token" here would put attacker-chosen text into
+    # the PUBLIC ledger and into the escalation comment that republishes it. Membership is the
+    # whole check.
+    if "why_no_diff" in r and r["why_no_diff"] not in NO_CHANGE_REASONS:
+        raise ValueError("model-health no_change why_no_diff is not a known reason")
 
 
 def _per_account_tail_failures(records, window_seconds, now):
@@ -579,6 +703,529 @@ def _no_change_limit_view(records, now):
     return derived, evidence
 
 
+def auth_cooldowns(records, now):
+    """PURE per-account AUTH COOLDOWN (registry #596), derived from the same health window as
+    account_backoffs. Walks ts-ordered records: a SUCCESS clears the account's auth run (and any
+    cooldown it earned — the credential works again); the AUTH_COOLDOWN_MIN'th consecutive `auth`
+    and every one after it (re)start a cooldown of AUTH_COOLDOWN_SECONDS from that record.
+
+    Consecutiveness follows the same convention as _per_account_tail_failures: only a SUCCESS on the
+    SAME account breaks the run — an interleaved limit/transient/setup/unknown record neither counts
+    toward it nor clears it (the credential state is unchanged by an unrelated failure).
+
+    Bounded by construction: no doubling, no reset-hint arm (an auth failure carries no provider
+    reset time), and the end is clamped to now + AUTH_COOLDOWN_SECONDS, so a forged or clock-skewed
+    record can sideline an account for at most that one short TTL — which matters because the
+    account it will most often name is the fleet's ONLY cross-provider reviewer.
+
+    Returns only ACTIVE cooldowns, in the same shape account_backoffs returns:
+    {account_hash: {"backoff_until", "consecutive", "saturated", "last_signal", "last_ts"}}."""
+    runs, state = {}, {}
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        acct, cls, ts = record.get("account"), record.get("exit_class"), record.get("ts")
+        if not isinstance(acct, str) or not isinstance(ts, (int, float)) or isinstance(ts, bool):
+            continue
+        if ts != ts or ts in (float("inf"), float("-inf")) or ts > now + FUTURE_SKEW_SECONDS:
+            continue                    # non-finite / future-forged stamp: skip fail-open
+        if cls == SUCCESS:
+            runs.pop(acct, None)
+            state.pop(acct, None)       # the credential authenticated again — cooldown cleared
+        elif cls == CLASS_AUTH:
+            run = runs.get(acct, 0) + 1
+            runs[acct] = run
+            if run >= AUTH_COOLDOWN_MIN:
+                until = min(ts + AUTH_COOLDOWN_SECONDS, now + AUTH_COOLDOWN_SECONDS)
+                state[acct] = {"backoff_until": int(until), "consecutive": run,
+                               # never truncated by prune's chain cap (the run is retained whole),
+                               # so the count is exact — unlike a saturated limit/transient chain
+                               "saturated": False,
+                               "last_signal": CLASS_AUTH, "last_ts": int(ts)}
+    return {acct: cd for acct, cd in state.items() if cd["backoff_until"] > now}
+
+
+# --- CREDENTIAL REACHABILITY (registry #639). auth_cooldowns above answers "hold this account for a
+# short TTL"; this answers the DIFFERENT question the probe-exemption seam needs: "is there evidence
+# this credential can reach its provider at all?"
+#
+# WHY A SECOND PREDICATE AND NOT A LONGER COOLDOWN. The #596 cooldown is deliberately SHORT,
+# single-step and self-clearing because the account it names is the fleet's only cross-provider
+# reviewer and its codex access token expires HOURLY — the observed pattern was INTERLEAVED (5 auth
+# against 5 success in one window), where a ~50% success rate beats sidelining the sole reviewer.
+# That reasoning has a PREMISE: at least one success in the window. When the stored grant itself is
+# dead (`credential-remint-required`, registry #596 / alert #622) the run is MONOTONE — no success at
+# all — so the account produces ZERO verdicts either way, and re-admitting it every 15 minutes buys
+# nothing while spending a runner and a lease per dispatch tick. This predicate bites exactly where
+# the cooldown's premise is false, so it does not overturn that decision — a single success clears it
+# instantly, which is precisely the interleaved case the cooldown was calibrated on.
+#
+# BOUNDED AND SELF-HEALING, not a disable: the state is derived from the same 48 h rolling window as
+# everything else, so once the auth run ages out the account is `unproven` again and gets another
+# CREDENTIAL_DEAD_MIN trial dispatches. Nothing here requires maintainer action to recover, and a
+# `success` record clears it immediately.
+CREDENTIAL_LIVE = "live"          # positive evidence: the credential authenticated in the window
+CREDENTIAL_DEAD = "dead"          # decisive negative: a run of auth rejections, no later success
+CREDENTIAL_UNPROVEN = "unproven"  # no decisive record — asserted by NEITHER side (the absent case)
+# Same threshold as the cooldown, for the same reason (see WHY N=2 above): ONE `auth` is what the
+# hourly expiry boundary looks like and must not condemn a credential; TWO consecutive with no
+# interleaved success is credential rot.
+CREDENTIAL_DEAD_MIN = AUTH_COOLDOWN_MIN
+
+
+def credential_states(records, now):
+    """PURE per-account credential REACHABILITY, derived from the same health window as
+    account_backoffs / auth_cooldowns. Returns ONLY decisive states —
+    {account_hash: {"state": CREDENTIAL_LIVE|CREDENTIAL_DEAD, "consecutive": n, "last_ts": ts}} —
+    so an account ABSENT from the map is CREDENTIAL_UNPROVEN: this function never guesses, and the
+    absence is meaningful to its consumers (account-usage stamps `reachability: unproven`).
+
+    The walk, in ts order, mirrors auth_cooldowns' consecutiveness convention exactly:
+      * a `success` proves reachability -> CREDENTIAL_LIVE, and clears any run;
+      * the CREDENTIAL_DEAD_MIN'th consecutive `auth` (and every one after it) -> CREDENTIAL_DEAD;
+      * a SINGLE `auth` after a success clears the LIVE claim without asserting DEAD (unproven) —
+        the credential's fate is genuinely unknown at that point (it is what an expiry boundary
+        looks like), and laundering it back to `live` would be the false claim this predicate
+        exists to prevent;
+      * any other class (limit/transient/setup/billing/unknown) neither counts toward the run nor
+        clears it and leaves the state untouched: a rate limit says nothing about whether the
+        credential is valid.
+
+    Unlike auth_cooldowns this carries NO TTL: it is an evidence question, not a hold duration. The
+    window itself is the bound (mh.prune's WINDOW_SECONDS), and prune preserves a dead run's tail
+    against the MAX_RECORDS cap so a flood of unrelated records cannot silently readmit it."""
+    runs, state = {}, {}
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        acct, cls, ts = record.get("account"), record.get("exit_class"), record.get("ts")
+        if not isinstance(acct, str) or not isinstance(ts, (int, float)) or isinstance(ts, bool):
+            continue
+        if ts != ts or ts in (float("inf"), float("-inf")) or ts > now + FUTURE_SKEW_SECONDS:
+            continue                    # non-finite / future-forged stamp: skip fail-open
+        if cls == SUCCESS:
+            runs.pop(acct, None)
+            state[acct] = {"state": CREDENTIAL_LIVE, "consecutive": 0, "last_ts": int(ts)}
+        elif cls == CLASS_AUTH:
+            run = runs.get(acct, 0) + 1
+            runs[acct] = run
+            if run >= CREDENTIAL_DEAD_MIN:
+                state[acct] = {"state": CREDENTIAL_DEAD, "consecutive": run, "last_ts": int(ts)}
+            else:
+                # Below the threshold the evidence is INCONCLUSIVE: drop any prior `live` claim
+                # rather than keep asserting reachability off a superseded success.
+                state.pop(acct, None)
+    return state
+
+
+def credential_state(states, account):
+    """The three-valued reachability for ONE account hash: the decisive state from
+    `credential_states`, or CREDENTIAL_UNPROVEN when it has no decisive record. One helper so no
+    consumer has to re-implement "absent means unproven" (and drift into "absent means fine")."""
+    entry = states.get(account) if isinstance(states, dict) else None
+    if isinstance(entry, dict) and entry.get("state") in (CREDENTIAL_LIVE, CREDENTIAL_DEAD):
+        return entry["state"]
+    return CREDENTIAL_UNPROVEN
+
+
+def _iso_z(ts):
+    """One decision-logic timestamp spelling for the park surface: compact ISO-8601 Z-form UTC
+    (park_policy.canonical_ts's canonical spelling), so a recovery stamp orders and dedupes
+    against park/receipt window keys with no spelling ambiguity."""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(ts)))
+
+
+def capacity_recovery_evidence(records, parked_at, now):
+    """POSITIVE per-account evidence that the STARVATION CAUSE of a machine capacity park has
+    CLEARED — the automatic-readmission gate of park_policy.capacity_park_admission (registry
+    #614). PURE, and derived from the SAME rolling health window as auth_cooldowns /
+    account_backoffs: there is no parallel health store.
+
+    The predicate, exactly (an account qualifies iff ALL of these hold):
+      1. its NEWEST record at or before `parked_at` (epoch seconds of the park application) is a
+         PARK-STARVATION class — auth/billing/limit/transient, or `zero-dispatch` (the fleet
+         pseudo-account's dispatch-starvation signal; see PARK_STARVATION_CLASSES) — i.e. that
+         account WAS failing, or the allocator WAS starved, when the park landed, with no
+         interleaved success between the failure and the park. This is what makes the evidence
+         specific to the park's cause instead of "the fleet looks healthy now";
+      2. it has recorded a `success` strictly after BOTH `parked_at` and its own LAST launch
+         failure in the window — the earliest such run is the recovery event. Requiring the
+         success to out-date the last failure is what keeps a FLAPPING account from claiming
+         recovery: the cause must have cleared and STAYED cleared, not merely blinked green once;
+         and
+      3. it is NOT in an ACTIVE auth cooldown right now (#604's auth_cooldowns): a credential the
+         allocator is still holding back has demonstrably NOT recovered. This deliberately
+         OVERLAPS condition 2 (a live cooldown implies a recent auth failure) — both are required,
+         neither is relied on alone, and both are cheap.
+    The earliest qualifying recovery across accounts wins (ties broken by account fingerprint) so
+    the answer is deterministic for a given window.
+
+    Returns None — "no proven recovery, stay parked" — for EVERY ambiguity: no records, an
+    absent/non-finite `parked_at` (a park whose application instant is unknown can never be
+    out-dated by anything), or ANY record that fails the shared _validate_record contract (an
+    unreadable window is never read optimistically). Records stamped implausibly far in the
+    FUTURE are skipped exactly as elsewhere, so a forged-future `success` cannot spring a park.
+
+    The returned `key` is the RECOVERY EVENT's durable identity — provider/account/run — which the
+    caller receipts on the PR; park_policy consumes it exactly once and can never re-earn a
+    re-admission from it. It carries no raw handle (the account is the salted hash, locked
+    decision 22a) and only park-receipt-safe characters."""
+    if not isinstance(records, list) or not records:
+        return None
+    if (not isinstance(parked_at, (int, float)) or isinstance(parked_at, bool)
+            or parked_at != parked_at or parked_at in (float("inf"), float("-inf"))):
+        return None
+    for record in records:
+        try:
+            _validate_record(record)
+        except ValueError:
+            return None
+    cooldowns = auth_cooldowns(records, now)
+    window = [record for record in sorted(records, key=lambda r: r["ts"])
+              if record["ts"] <= now + FUTURE_SKEW_SECONDS]  # future-forged stamps prove nothing
+    cause, last_fail = {}, {}
+    for record in window:
+        account = record["account"]
+        if record["ts"] <= parked_at:
+            cause[account] = record      # newest record at/before the park application
+        if record["exit_class"] in PARK_STARVATION_CLASSES:
+            last_fail[account] = record["ts"]
+    recovery = {}
+    for record in window:
+        account = record["account"]
+        if (record["exit_class"] == SUCCESS and account not in recovery
+                and record["ts"] > parked_at
+                and record["ts"] > last_fail.get(account, float("-inf"))):
+            recovery[account] = record   # earliest success after the park AND the last failure
+    candidates = [
+        (record["ts"], account, record)
+        for account, record in recovery.items()
+        if account in cause
+        and cause[account]["exit_class"] in PARK_STARVATION_CLASSES
+        and account not in cooldowns
+    ]
+    if not candidates:
+        return None
+    ts, account, record = min(candidates)
+    return {
+        "key": f"{record['provider']}/{account}/{record.get('run_id') or int(ts)}",
+        "recovered_at": _iso_z(ts),
+        "provider": record["provider"],
+        "account": account,
+        "cause": cause[account]["exit_class"],
+    }
+
+
+def park_cause_provable(records, parked_at, now):
+    """True when a capacity park applied at `parked_at` could EVER prove its cause recovered —
+    i.e. SOME account's newest record at or before `parked_at` is a PARK_STARVATION_CLASSES
+    signal, so a later success can satisfy capacity_recovery_evidence.
+
+    This exists for ONE caller: the legacy-park migration (sparq-org/sparq#3809). Converting a
+    park from the human terminal into the machine class is only an improvement if the machine
+    class can actually release it. capacity_recovery_evidence fixes the park's cause at the
+    park's application instant: if the fleet was HEALTHY at that instant, no account's
+    newest-at-park record is a starvation signal, condition 1 can never be satisfied, and NO
+    future success can ever recover that park. Converting then would trade a VISIBLE stall
+    (`review:needs-user`, which a human sees and can clear) for a SILENT one (`review:parked`,
+    which nothing will ever clear) — strictly worse.
+
+    So the migration converts only while the starvation cause is still OBSERVABLE, and defers to
+    a later tick otherwise. It is a precondition check, never a grant: it proves the exit is
+    REACHABLE, and capacity_recovery_evidence still has to be satisfied on its own terms before
+    anything is actually re-admitted.
+
+    Fails toward False (do not migrate) on every ambiguity, exactly like the evidence gate."""
+    if not isinstance(records, list) or not records:
+        return False
+    if (not isinstance(parked_at, (int, float)) or isinstance(parked_at, bool)
+            or parked_at != parked_at or parked_at in (float("inf"), float("-inf"))):
+        return False
+    for record in records:
+        try:
+            _validate_record(record)
+        except ValueError:
+            return False
+    cause = {}
+    for record in sorted(records, key=lambda r: r["ts"]):
+        if record["ts"] > now + FUTURE_SKEW_SECONDS:
+            continue                    # future-forged stamps prove nothing
+        if record["ts"] <= parked_at:
+            cause[record["account"]] = record
+    return any(record["exit_class"] in PARK_STARVATION_CLASSES for record in cause.values())
+
+
+def _readable_window(records, now):
+    """The validated, non-future slice of a health window, or None when ANY record fails the
+    shared _validate_record contract (an unreadable window is never read optimistically) or the
+    window is empty/not a list. One helper so every aged-out-park predicate below fails closed in
+    exactly the same way capacity_recovery_evidence / park_cause_provable already do."""
+    if not isinstance(records, list) or not records:
+        return None
+    for record in records:
+        try:
+            _validate_record(record)
+        except ValueError:
+            return None
+    return sorted((record for record in records
+                   if record["ts"] <= now + FUTURE_SKEW_SECONDS),
+                  key=lambda r: r["ts"])
+
+
+def _account_newest(window):
+    """{account: newest record} over an already-sorted, already-validated window."""
+    newest = {}
+    for record in window:
+        newest[record["account"]] = record
+    return newest
+
+
+# --- [registry #691] THE AGED-OUT PARK EXIT ---------------------------------------------------
+#
+# THE LIVENESS GAP. capacity_recovery_evidence fixes a park's cause at its APPLICATION INSTANT:
+# condition 1 asks "was some account failing at `parked_at`?". park_cause_provable is the honest
+# precondition that stops the legacy migration converting a park whose condition 1 can never be
+# satisfied. Both are correct. Together they leave a park with NO machine exit in exactly the
+# state the loop spends most of its life in — a HEALTHY fleet:
+#   * a park applied while the fleet was healthy can never satisfy condition 1 (measured
+#     2026-07-25: every one of the 32 sparq legacy parks deferred with "cause is machine-owned,
+#     but no starvation cause is observable"), and
+#   * a park older than the window (prune's WINDOW_HOURS = 48) has no record at or before
+#     `parked_at` AT ALL, so its cause is unobtainable forever (registry #691).
+# A hold with no machine exit turns a transient outage into a PERMANENT stall. So an aged-out
+# park needs an exit whose precondition is provable from state that STILL EXISTS.
+#
+# THIS IS A HEURISTIC, NOT EVIDENCE — SAY SO. capacity_recovery_evidence proves a specific claim
+# ("the account that was failing when this park landed has since succeeded"). The predicate below
+# proves a DIFFERENT, WEAKER claim: "the fleet is demonstrably healthy now and has been for
+# SUSTAINED_HEALTH_SPAN_SECONDS". That is a PROXY for "whatever starved this PR is not starving
+# the fleet any more" — the same kind of labelled proxy as the burn-rate estimate elsewhere in
+# this repo, and it is labelled here for the same reason. It is deliberately used ONLY where the
+# genuine proof is unobtainable (see dispatch-claim._capacity_recovery_probe: the strong gate is
+# tried first, and the proxy is refused outright while the strong gate is still REACHABLE).
+#
+# WHY EACH BOUND (all measured against the live ledger, 2026-07-25/26, 200 records / 19.1 h):
+#  * SPAN 6 h > BACKOFF_CAP_SECONDS (5 h). An account sidelined by a MAXIMAL reactive backoff
+#    records nothing while it is held; a span shorter than the cap could therefore be entirely
+#    covered by one account's silence. Six hours means a maximally-backed-off account has had to
+#    come back and record something inside the span.
+#  * COVERAGE. The retained window must itself reach back to the start of the span. prune's
+#    MAX_RECORDS = 200 cap evicts the OLDEST records first, so on a busy ledger the window can
+#    cover less than the span — and claiming six healthy hours from three observed ones is the
+#    exact dishonesty this predicate must not commit. Under-coverage DEFERS; it never releases.
+#
+#    KNOWN LIVE LIMITATION, MEASURED, AND NOT A HYPOTHETICAL (registry #699). Coverage >= SPAN
+#    requires the ledger's record rate to stay at or below MAX_RECORDS / SPAN = 200/6h = ~33
+#    records/h. Both sides of that line were observed on 2026-07-26 within one hour: at 11.2
+#    rec/h (200 records / 17.9 h) this predicate fired; at 61.5 rec/h (200 records / 3.25 h) it
+#    correctly refused, because covering 6 h at that rate would need ~369 records and the cap is
+#    200. An EARLIER version of this comment estimated the trip point at "~3x the observed peak"
+#    — that estimate was wrong by about 2x and the live fleet crossed it the same day.
+#    CONSEQUENCE, stated plainly rather than buried: while the fleet sustains more than ~33
+#    records/h, the aged-out exit does not open. The failure direction is the safe one and the
+#    park simply waits for a quieter window, but a PERMANENTLY busy fleet would reinstate the
+#    stall this exit exists to remove. That is a LEDGER-RETENTION bound, not a predicate bound —
+#    fixing it means a time-based retention floor in prune (or a larger MAX_RECORDS), which is a
+#    change to the shared health window every other consumer reads and is deliberately NOT made
+#    here. Tracked in registry #699.
+#  * FRESHNESS 1 h. Silence is NOT health: a fleet that recorded nothing for hours is unobserved,
+#    not proven. Requiring a SUCCESS inside the last hour is what makes "the fleet works" a
+#    present-tense claim. (Measured: the live ledger contains a 4.6 h silent gap; during it this
+#    predicate correctly yields nothing.)
+#  * >=6 SUCCESSES from >=2 DISTINCT REAL ACCOUNTS. One account succeeding proves that account
+#    works, not that the fleet does. Measured over the last 6 h: 47 successes across 3 accounts.
+#    THE `fleet` PSEUDO-PROVIDER IS EXCLUDED FROM THE DISTINCT-ACCOUNT COUNT (review of PR #697).
+#    It writes its records under a FIXED sentinel hash (sha256("fleet-zero-dispatch")[:16]) which
+#    is a valid `account` value like any other, so without this exclusion ONE real account plus
+#    the dispatcher clears a floor whose entire stated purpose is that one account is not a
+#    fleet. Counterexample against the first cut, by execution: 6 successes / 2 distinct
+#    `account` values / 1 distinct REAL account minted `{"cause": "aged-out"}`. Live prevalence
+#    makes it load-bearing rather than theoretical: 43 of today's 200 records are `fleet`
+#    successes. Its successes still count toward MIN_SUCCESSES and toward freshness — a `fleet`
+#    success means the allocator PLANNED AND LAUNCHED work, which is genuine evidence about the
+#    dispatch starvation these parks are mostly made of; it simply is not a second ACCOUNT.
+#    NOTE the floor is deliberately NOT described as mirroring OUTAGE_MIN_ACCOUNTS: the two
+#    cannot be symmetric, because the recorder refuses any `fleet` record outside
+#    {zero-dispatch, success}, so the pseudo-provider can inflate the HEALTH side and by
+#    construction never the OUTAGE side.
+#  * ZERO LAUNCH_FAIL_CLASSES IN THE SPAN, and NO account whose NEWEST record in the WHOLE window
+#    is a launch failure. The first says nothing broke during the proven-healthy stretch; the
+#    second catches the account that failed just BEFORE the span and has been silent since (its
+#    backoff expired but it never came back). Measured: the last launch failure is 17.2 h old, so
+#    the live fleet passes — and it correctly FAILED throughout the 2026-07-25 acct01 auth outage.
+#  * NO ACTIVE auth cooldown (#604), exactly as capacity_recovery_evidence condition 3: a
+#    credential the allocator is still holding back has demonstrably not recovered.
+# `zero-dispatch` is deliberately NOT disqualifying. It is the allocator legitimately finding
+# nothing to launch and fires constantly in normal operation (34 of 200 records); treating it as
+# ill health would make this predicate unsatisfiable, which is a stall dressed as a guard. It is
+# covered instead by the POSITIVE requirement that real successes accumulate.
+SUSTAINED_HEALTH_SPAN_SECONDS = 6 * 3600
+SUSTAINED_HEALTH_FRESH_SECONDS = 60 * 60
+SUSTAINED_HEALTH_MIN_SUCCESSES = 6
+SUSTAINED_HEALTH_MIN_ACCOUNTS = 2
+# The `cause` this evidence reports. Never a decision class: it is NOT a cleared exit class, it is
+# "the park's own cause aged out of the window and the fleet is healthy instead".
+SUSTAINED_HEALTH_CAUSE = "aged-out"
+# The evidence-key namespace. Distinct from capacity_recovery_evidence's `provider/account/run`
+# so the two can never collide in the receipt set a PR consumes (park_policy refuses an evidence
+# key it has already receipted), and so a receipt says on its face WHICH gate released the park.
+SUSTAINED_HEALTH_KEY_PREFIX = "fleet-health"
+
+
+def _fleet_health_ok(window, now):
+    """The FLEET-side half of the aged-out exit, shared by the evidence gate and its reachability
+    twin: no launch failure inside the proven span, no account left sitting on a launch failure,
+    and no active auth cooldown. Returns True/False; never raises."""
+    if not window:
+        return False
+    span_start = now - SUSTAINED_HEALTH_SPAN_SECONDS
+    if any(record["exit_class"] in LAUNCH_FAIL_CLASSES
+           for record in window if record["ts"] > span_start):
+        return False                    # something broke inside the proven-healthy stretch
+    if any(record["exit_class"] in LAUNCH_FAIL_CLASSES
+           for record in _account_newest(window).values()):
+        return False                    # an account that failed and never came back
+    return not auth_cooldowns(window, now)
+
+
+def sustained_fleet_health_evidence(records, parked_at, now):
+    """HEURISTIC (not proof of THIS park's cause) evidence that a capacity park whose own
+    starvation cause is unobtainable may be re-admitted: the fleet has been demonstrably healthy
+    for SUSTAINED_HEALTH_SPAN_SECONDS and is producing successful runs right now.
+
+    Returns the same shape capacity_recovery_evidence returns — {"key", "recovered_at",
+    "provider", "account", "cause"} — so park_policy.capacity_park_admission consumes it through
+    the IDENTICAL path: same strictly-after-the-park ordering check, same receipt, same
+    consumed-exactly-once rule (the key is the anchoring success's durable identity, so it can
+    never be re-earned), same AUTO_READMISSION_MAX cap, and the same unconditional refusal on any
+    human-owned hold or human-applied park. This adds an evidence SOURCE; it widens no gate.
+
+    The predicate, exactly (ALL must hold):
+      0. the window is readable and every record passes _validate_record, and `parked_at` is
+         finite — every ambiguity yields None, as everywhere else here;
+      1. the park is at least SUSTAINED_HEALTH_SPAN_SECONDS old. A fresh park is the STRONG
+         gate's business, not this one;
+      2. the retained window reaches back to the start of the span (coverage — see the block
+         comment: an under-covered window cannot honestly claim a full span of health);
+      3. no LAUNCH_FAIL_CLASSES record inside the span, no account whose newest record in the
+         window is a launch failure, and no ACTIVE auth cooldown (_fleet_health_ok);
+      4. at least SUSTAINED_HEALTH_MIN_SUCCESSES success records inside the span, from at least
+         SUSTAINED_HEALTH_MIN_ACCOUNTS distinct REAL accounts — the `fleet` pseudo-provider's
+         fixed sentinel hash is excluded from the DISTINCT count (it is the dispatcher, not a
+         second account) while its successes still count toward the total; and
+      5. the NEWEST of those successes is within SUSTAINED_HEALTH_FRESH_SECONDS of `now` — the
+         fleet works in the present tense, not merely at some point in the span.
+    The newest qualifying success anchors the evidence (ties broken by account fingerprint then
+    run id) so the answer is deterministic. Every counted success is strictly after `parked_at`
+    BY CONSTRUCTION rather than by a separate test — condition 1 already forces
+    `parked_at <= span_start` and condition 4 only counts records after `span_start` — and
+    capacity_park_admission re-checks the ordering independently anyway. A redundant
+    `ts > parked_at` clause here would be a guard no input could ever exercise.
+
+    HONESTY NOTE on the no-active-cooldown clause of condition 3: it is DELIBERATELY REDUNDANT
+    with the no-launch-failure-in-span clause. An active auth cooldown lasts
+    AUTH_COOLDOWN_SECONDS, so it always implies an `auth` record inside a span this long, which
+    the earlier clause has already refused. It is kept for the same reason
+    capacity_recovery_evidence keeps its deliberately-overlapping condition 3 (both are cheap,
+    neither is relied on alone, and it would survive a future narrowing of LAUNCH_FAIL_CLASSES) —
+    but it is NOT an independently reachable guard and the self-test does not pretend it is.
+
+    Records stamped implausibly far in the FUTURE are skipped exactly as elsewhere, so a
+    forged-future success can neither anchor this evidence nor manufacture freshness."""
+    window = _readable_window(records, now)
+    if window is None:
+        return None
+    if (not isinstance(parked_at, (int, float)) or isinstance(parked_at, bool)
+            or parked_at != parked_at or parked_at in (float("inf"), float("-inf"))):
+        return None
+    span_start = now - SUSTAINED_HEALTH_SPAN_SECONDS
+    if parked_at > span_start:
+        return None                     # too fresh: the strong gate owns this park
+    if window[0]["ts"] > span_start:
+        return None                     # the window does not cover the span it would claim
+    if not _fleet_health_ok(window, now):
+        return None
+    successes = [record for record in window
+                 if record["exit_class"] == SUCCESS and record["ts"] > span_start]
+    if len(successes) < SUSTAINED_HEALTH_MIN_SUCCESSES:
+        return None
+    if len({record["account"] for record in successes
+            if record["provider"] != FLEET_PSEUDO_PROVIDER}) < SUSTAINED_HEALTH_MIN_ACCOUNTS:
+        return None
+    anchor = max(successes,
+                 key=lambda r: (r["ts"], r["account"], r.get("run_id") or ""))
+    if anchor["ts"] < now - SUSTAINED_HEALTH_FRESH_SECONDS:
+        return None                     # silence is not health
+    return {
+        "key": (f"{SUSTAINED_HEALTH_KEY_PREFIX}/{anchor['provider']}/{anchor['account']}/"
+                f"{anchor.get('run_id') or int(anchor['ts'])}"),
+        "recovered_at": _iso_z(anchor["ts"]),
+        "provider": anchor["provider"],
+        "account": anchor["account"],
+        "cause": SUSTAINED_HEALTH_CAUSE,
+    }
+
+
+def sustained_health_exit_reachable(records, now):
+    """True when the aged-out exit above CAN open for a park applied now — the MIGRATION-side
+    twin of sustained_fleet_health_evidence, and never a grant.
+
+    It asks the reachability question only: is the health ledger readable, does it COVER the span
+    the evidence gate will have to claim, is the fleet OBSERVED working right now (a success
+    inside SUSTAINED_HEALTH_FRESH_SECONDS), and is nothing currently broken (_fleet_health_ok)?
+
+    WHICH OF THE EVIDENCE GATE'S CONDITIONS BELONG HERE, AND WHY (review round 3 of PR #697 — I
+    got this wrong, and the correction is the useful part). The gate has three conditions this
+    twin might omit, and the test is NOT "is it required?" but "can a park WAIT for it?":
+      * SPAN — WAITABLE. It is a clock property: the park ages into it by doing nothing. Omitted.
+      * COUNT (successes / distinct real accounts) — WAITABLE. Successes accumulate while the
+        fleet keeps working, which is exactly what the freshness probe below has just observed.
+        Omitted.
+      * COVERAGE — **NOT WAITABLE, AND THIS IS THE WHOLE POINT.** Coverage is
+        MAX_RECORDS / record-rate: a property of the LEDGER'S RETENTION, not of elapsed time.
+        Waiting never improves it, and a BUSIER fleet makes it strictly worse. Omitting it made
+        this predicate fail OPEN: at a measured 62 rec/h (coverage 3.2 h) it returned True while
+        sustained_fleet_health_evidence returned None at +1, +2, +4 AND +8 spans — so the
+        migration would convert a park into a class with BOTH exits shut. That is verbatim the
+        harm park_exit_reachable exists to prevent: a VISIBLE stall a human can clear traded for
+        a SILENT one nothing will ever clear. REQUIRED here.
+    THE GENERAL RULE, because this was the third instance of one reasoning error in this PR:
+    "condition X is deliberately not required here" is a claim about EVERY path that consumes the
+    predicate. Establish waitability for X specifically, on each path — never generalise it from
+    a sibling condition that happens to be waitable.
+
+    Fails toward False on every ambiguity (unreadable/empty window, a window too short to cover
+    the span, a stale or absent success, a live cooldown, an account sitting on a launch
+    failure), exactly like park_cause_provable."""
+    window = _readable_window(records, now)
+    if window is None:
+        return False
+    if window[0]["ts"] > now - SUSTAINED_HEALTH_SPAN_SECONDS:
+        return False                    # the ledger cannot supply the span; waiting never fixes it
+    if not _fleet_health_ok(window, now):
+        return False
+    return any(record["exit_class"] == SUCCESS
+               and record["ts"] >= now - SUSTAINED_HEALTH_FRESH_SECONDS
+               for record in window)
+
+
+def park_exit_reachable(records, parked_at, now):
+    """Does a capacity park applied at `parked_at` have ANY machine exit that can still open?
+
+    THE ONE precondition the legacy-park migration asks (dispatch-claim), and the reason it is
+    one function rather than two call-site booleans: the migration and the admission must agree
+    about what "releasable" means or the migration converts parks into a class that cannot
+    release them. It is the disjunction of exactly the two exits the admission probe offers, in
+    the same order the probe tries them:
+      * park_cause_provable — the STRONG exit: this park's own starvation cause is observable, so
+        a later success can prove it recovered; or
+      * sustained_health_exit_reachable — the AGED-OUT exit: the park's own cause is (or will be)
+        unobtainable, but the labelled fleet-health proxy can open for it.
+    False on every ambiguity, so an unreadable ledger defers the migration exactly as before."""
+    return bool(park_cause_provable(records, parked_at, now)
+                or sustained_health_exit_reachable(records, now))
+
+
 def account_backoffs(records, now):
     """Reactive per-account backoff for probe-exempt providers (maintainer decision 2026-07-17,
     registry issue #29), DERIVED purely from the pruned health window. Walks records in ts order:
@@ -633,8 +1280,18 @@ def account_backoffs(records, now):
                            # render a saturated count as "x6+", never as an exact "x6".
                            "saturated": consecutive >= BACKOFF_CHAIN_KEEP,
                            "last_signal": cls, "last_ts": int(ts)}
-        # other classes (auth/setup/unknown/raw no_change) neither extend nor clear a backoff
-    return {acct: b for acct, b in state.items() if b["backoff_until"] > now}
+        # other classes (auth/setup/unknown/raw no_change) neither extend nor clear THIS chain
+    active = {acct: b for acct, b in state.items() if b["backoff_until"] > now}
+    # AUTH COOLDOWN overlay (registry #596). Derived in a SEPARATE pass and merged by LATEST end so
+    # the limit/transient exponential chain above is untouched: folding `auth` into that walk would
+    # have let an interleaved auth record inflate the `consecutive` multiplier (and therefore the
+    # 5 h-capped exponential) of an unrelated rate-limit chain. A cooldown never SHORTENS a live
+    # backoff — only extends when it ends later.
+    for acct, cooldown in auth_cooldowns(valid, now).items():
+        current = active.get(acct)
+        if current is None or cooldown["backoff_until"] > current["backoff_until"]:
+            active[acct] = cooldown
+    return active
 
 
 def classify_records(records, provider_accounts, now, open_alerts=()):
@@ -659,9 +1316,14 @@ def classify_records(records, provider_accounts, now, open_alerts=()):
                            distinct accounts, per-account runs unbroken by their OWN success.
       persistent-transient: >=5 transient/unknown fails in 15 min (even one account).
       provider-capped    : EVERY enabled account's LATEST limit/success outcome is limit-class.
+      account-auth-cooldown: >=AUTH_COOLDOWN_MIN consecutive `auth` outcomes put one or more of the
+                           provider's accounts in a bounded credential cooldown (registry #596).
       zero-dispatch      : >=3 consecutive zero-dispatch ticks (provider == 'fleet').
     """
     records, _ = _no_change_limit_view(records, now)
+    # Live per-account credential cooldowns (registry #596), derived from the SAME window. Keyed by
+    # salted fingerprint; mapped onto providers inside the per-provider loop below.
+    cooldowns = auth_cooldowns(records, now)
     actions = []
     providers = {r["provider"] for r in records if isinstance(r.get("provider"), str)}
 
@@ -750,6 +1412,30 @@ def classify_records(records, provider_accounts, now, open_alerts=()):
                        else "transient failures are within blip tolerance"),
         })
 
+        # ---- account-auth-cooldown (registry #596) ----------------------------------------------
+        # A run of consecutive `auth` outcomes on one account is a CREDENTIAL OUTAGE the maintainer
+        # must fix (re-mint the setup-token) — it is NOT a model decline, and it never self-heals by
+        # retrying. The action is keyed on (condition, provider) like every other, so the upsert
+        # raises the alert EXACTLY ONCE for the whole outage and refreshes it thereafter rather than
+        # commenting per failed run; it recovers (fire=False -> the issue closes) as soon as the
+        # account authenticates again, which is also when the cooldown clears.
+        #
+        # The body names only the SALTED FINGERPRINT (locked decision 22a) — never the acctNN handle
+        # or the account email — and the fingerprints ride the same private-route redaction as every
+        # other count in render_body.
+        cooled = sorted(acct for acct in cooldowns if acct in observed)
+        actions.append({
+            "condition": "account-auth-cooldown",
+            "provider": provider,
+            "fire": bool(cooled),
+            "accounts": cooled,
+            "reason": (f"{len(cooled)} {provider} account(s) hit >= "
+                       f"{AUTH_COOLDOWN_MIN} consecutive `auth` failures and are in a bounded "
+                       "credential cooldown"
+                       if cooled
+                       else "no account is in a credential cooldown"),
+        })
+
         # ---- provider-capped -------------------------------------------------------------------
         # Every ENABLED account of the provider is usage-limited within the window. STALENESS
         # (review defect #1): a limit record is invalidated by any LATER success from the SAME
@@ -824,6 +1510,7 @@ def _alert_title(condition, provider):
         "provider-outage": f"model access OUTAGE — provider `{provider}`",
         "persistent-transient": f"persistent transient model errors — provider `{provider}`",
         "provider-capped": f"provider `{provider}` fully usage-CAPPED",
+        "account-auth-cooldown": (f"`{provider}` worker credential is REJECTED — re-mint required"),
         "zero-dispatch": "dispatcher launched nothing while work was ready",
     }
     return f"⚠️ {labels.get(condition, condition)}"
@@ -881,6 +1568,29 @@ def render_body(action, maintainer, redact=False):
         if action.get("reset_hint"):
             lines.append(f"\nEarliest known reset: **{action['reset_hint']}** — capacity should "
                          "self-restore then. Reset a subscription window sooner to unblock.")
+    elif cond == "account-auth-cooldown":
+        # Fingerprints ONLY (locked decision 22a): the salted 16-hex hash is what the ledger holds,
+        # and it is what the maintainer's own email->reset fingerprint map resolves. The raw acctNN
+        # handle and the account email NEVER appear here. This branch is unreachable on the public
+        # route — `redact` returns above — so the fingerprints only ever land on a verified private
+        # repository.
+        fingerprints = ", ".join(f"`{a}`" for a in (action.get("accounts") or [])) or "(unknown)"
+        lines.append(
+            f"🔑 **A `{action['provider']}` worker credential is being REJECTED, not "
+            f"rate-limited.** {action['reason']}. Account fingerprint(s): {fingerprints}.")
+        lines.append(
+            "\n**Maintainer action required — re-mint the credential** (`claude setup-token` for "
+            "anthropic, `codex login --device-auth` for openai) and re-upload the account secret. "
+            "See jeswr/agent-account-registry#596: a codex OAuth **access** token expires hourly, "
+            "so a static snapshot of one dies within the hour no matter how it was minted — the "
+            "durable fix is storing refresh-capable material.")
+        lines.append(
+            f"\nUntil then the allocator skips the account for a bounded "
+            f"{AUTH_COOLDOWN_SECONDS // 60}-minute cooldown and then tries again — deliberately "
+            "NOT a permanent disable, because this may be the only cross-provider review account "
+            "and zero reviews is worse than a partial success rate. Nothing about this counts as a "
+            "model decline: `auth` outcomes consume no review round and no attempt budget "
+            "(registry #596), so no PR or issue is parked on account of it.")
     elif cond == "zero-dispatch":
         lines.append(f"🚨 **The dispatcher planned ready work but launched NOTHING.** "
                      f"{action['reason']}. Ready issues exist but no worker started — a capacity, "
@@ -1540,6 +2250,11 @@ _NO_CHANGE_ENVELOPE_FIELDS = {
     "input": "input_tokens",
     "output": "output_tokens",
     "wall": "wall_seconds",
+    # [#701] The declared why-no-diff reason, carried as its VOCABULARY INDEX. The envelope grammar
+    # is ASCII-decimal only on purpose (it rides the sanitized reset-hint handoff out of a step that
+    # has seen model-controlled text), so the reason travels as a number and is decoded to a name
+    # against the closed vocabulary below — a forged index is REFUSED, never folded to a default.
+    "why": "why_no_diff",
 }
 
 
@@ -1558,6 +2273,15 @@ def _parse_no_change_envelope(value):
         parsed[field] = int(raw)
     if "issue" not in parsed:
         raise ValueError("model-health no_change telemetry envelope has no issue")
+    if "why_no_diff" in parsed:
+        # Fail LOUD on an index outside the vocabulary (no_change_routing.reason_name raises): a
+        # producer/consumer version skew or a forged envelope must be visible, not silently
+        # recorded as `unspecified` — which is exactly the value the routing decision treats as
+        # "no signal, take the ordinary ladder".
+        try:
+            parsed["why_no_diff"] = no_change_routing.reason_name(parsed["why_no_diff"])
+        except no_change_routing.ReasonError as exc:
+            raise ValueError(f"model-health no_change telemetry envelope: {exc}") from exc
     return parsed
 
 
@@ -1601,8 +2325,12 @@ def _cmd_record(args):
                   "per-account health telemetry")
             return 1
         account_h = account_hash(handle, salt)
+    # `why_no_diff` has no CLI flag ON PURPOSE (#701): it may only arrive inside the sanitized
+    # numeric envelope, so there is no argv path by which a hostile caller could set a reason
+    # directly. getattr's default keeps it None until the envelope merge below fills it in.
     no_change = {field: getattr(args, field, None)
-                 for field in ("input_tokens", "output_tokens", "wall_seconds", "issue")}
+                 for field in ("input_tokens", "output_tokens", "wall_seconds", "issue",
+                               "why_no_diff")}
     reset_hint = args.reset_hint
     if folded_class == CLASS_NO_CHANGE and reset_hint:
         try:
@@ -1787,6 +2515,47 @@ def _self_test():
          ("exit_class", "issue", "input_tokens", "output_tokens", "wall_seconds")},
         {"exit_class": CLASS_NO_CHANGE, "issue": 500, "input_tokens": 390000,
          "output_tokens": 1200, "wall_seconds": 78})
+    # ---- [#701] why_no_diff: the reason the model produced no diff, as a CLOSED ENUM.
+    chk("no_change carries the declared why_no_diff reason",
+        make_record("openai", hash_a, "codex", CLASS_NO_CHANGE, "1", now,
+                    issue=500, why_no_diff="too_large")["why_no_diff"], "too_large")
+    chk("a no_change record WITHOUT a declaration omits the field entirely",
+        "why_no_diff" in make_record("openai", hash_a, "codex", CLASS_NO_CHANGE, "1", now,
+                                     issue=500), False)
+    # NON-VACUITY: deleting the membership check in _validate_record turns each of these green.
+    for _forged in ("TOO_LARGE", "arbitrary text", "**@maintainer**", "", 3, None, True,
+                    "<!-- sparq-review-round n=9 -->"):
+        chk(f"why_no_diff {_forged!r} is REFUSED at construction",
+            _raises(lambda forged=_forged: make_record(
+                "openai", hash_a, "codex", CLASS_NO_CHANGE, "1", now,
+                issue=500, why_no_diff=forged)), _forged is not None)
+    chk("why_no_diff on a NON-no_change class is refused (it is no-change evidence)",
+        _raises(lambda: make_record("openai", hash_a, "codex", "auth", "1", now,
+                                    why_no_diff="too_large")), True)
+    chk("a stored why_no_diff survives the READ validator", _raises(
+        lambda: _validate_record(make_record(
+            "openai", hash_a, "codex", CLASS_NO_CHANGE, "1", now,
+            issue=500, why_no_diff="underspecified"))), False)
+    chk("a HAND-FORGED why_no_diff is rejected by the READ validator too", _raises(
+        lambda: _validate_record({
+            "ts": now, "provider": "openai", "account": hash_a, "model_alias": "codex",
+            "exit_class": CLASS_NO_CHANGE, "run_id": "1", "issue": 500,
+            "why_no_diff": "not-a-reason"})), True)
+    # The ENVELOPE is where the reason crosses the sanitized handoff: index in, name out.
+    chk("the envelope decodes a reason INDEX to its vocabulary name",
+        _parse_no_change_envelope("no-change-v1 issue:500,why:3")["why_no_diff"], "too_large")
+    chk("the envelope decodes index 0 to the unspecified default",
+        _parse_no_change_envelope("no-change-v1 issue:500,why:0")["why_no_diff"], "unspecified")
+    chk("an OUT-OF-VOCABULARY reason index is REFUSED, never folded to a default",
+        _raises(lambda: _parse_no_change_envelope(
+            f"no-change-v1 issue:500,why:{len(NO_CHANGE_REASONS)}")), True)
+    chk("a non-numeric reason value cannot smuggle text through the envelope",
+        _raises(lambda: _parse_no_change_envelope("no-change-v1 issue:500,why:too_large")), True)
+    chk("an envelope with NO why field simply omits the reason",
+        "why_no_diff" in _parse_no_change_envelope("no-change-v1 issue:500"), False)
+    chk("the ledger vocabulary IS the routing module's (one declaration, not two)",
+        NO_CHANGE_REASONS is no_change_routing.NO_CHANGE_REASONS, True)
+
     chk("no_change rejects non-numeric usage at construction (#500 tripwire)",
         _raises(lambda: make_record("openai", hash_a, "codex", CLASS_NO_CHANGE, "1", now,
                                     issue=500, input_tokens="390000")), True)
@@ -2149,6 +2918,564 @@ def _self_test():
     # transient (rate-limit) records now KEEP their reset hint (the backoff needs it)
     chk("rate-limit record keeps reset_hint",
         "reset_hint" in rec("openai", "codex01", "rate-limit", reset="in 20s"), True)
+
+    # ---- [registry #596] AUTH COOLDOWN: N consecutive auth outcomes sideline ONE account, BOUNDED,
+    # and raise the ops alert exactly once. Reuses the issue-#29 probe-exempt backoff primitive
+    # (account_backoffs -> account-usage's backoff_until overlay), NOT a parallel mechanism. ------
+    one_auth = [rec("openai", "codex01", "auth", dt=0)]
+    chk(f"a SINGLE auth does NOT cool down the account (N={AUTH_COOLDOWN_MIN})",
+        auth_cooldowns(one_auth, now + 60), {})
+    chk("a single auth leaves account_backoffs untouched too",
+        account_backoffs(one_auth, now + 60), {})
+    two_auth = [rec("openai", "codex01", "auth", dt=0, run="a1"),
+                rec("openai", "codex01", "auth", dt=60, run="a2")]
+    cd = auth_cooldowns(two_auth, now + 120)
+    chk(f"{AUTH_COOLDOWN_MIN} consecutive auth outcomes cool the account down",
+        (cd.get(ah, {}).get("backoff_until"), cd.get(ah, {}).get("last_signal"),
+         cd.get(ah, {}).get("consecutive")),
+        (now + 60 + AUTH_COOLDOWN_SECONDS, CLASS_AUTH, 2))
+    chk("the cooldown surfaces through the SAME account_backoffs primitive the allocator reads",
+        account_backoffs(two_auth, now + 120).get(ah, {}).get("last_signal"), CLASS_AUTH)
+    # BOUNDED, not a disable: it is one short non-doubling TTL and it EXPIRES on its own — the sole
+    # cross-provider reviewer must come back without maintainer action.
+    chk("the cooldown EXPIRES (no permanent unavailable flag)",
+        (auth_cooldowns(two_auth, now + 60 + AUTH_COOLDOWN_SECONDS + 1),
+         account_backoffs(two_auth, now + 60 + AUTH_COOLDOWN_SECONDS + 1)), ({}, {}))
+    chk("the cooldown never doubles (a long auth run stays one short TTL)",
+        auth_cooldowns([rec("openai", "codex01", "auth", dt=i * 10, run=f"a{i}")
+                        for i in range(12)], now + 200).get(ah, {}).get("backoff_until"),
+        now + 110 + AUTH_COOLDOWN_SECONDS)
+    chk("the cooldown end is clamped to now + AUTH_COOLDOWN_SECONDS even on a skewed stamp",
+        auth_cooldowns([{"account": ah, "exit_class": CLASS_AUTH, "ts": now + FUTURE_SKEW_SECONDS,
+                         "provider": "openai"},
+                        {"account": ah, "exit_class": CLASS_AUTH, "ts": now + FUTURE_SKEW_SECONDS,
+                         "provider": "openai"}], now).get(ah, {}).get("backoff_until"),
+        now + AUTH_COOLDOWN_SECONDS)
+    # A SUCCESS between the auths breaks the run: the interleaved 5-auth/5-success live pattern must
+    # not cool the account down on every other run.
+    chk("an interleaved success breaks the auth run",
+        auth_cooldowns([rec("openai", "codex01", "auth", dt=0, run="a1"),
+                        rec("openai", "codex01", SUCCESS, dt=30, run="s1"),
+                        rec("openai", "codex01", "auth", dt=60, run="a2")], now + 120), {})
+    chk("a later success CLEARS a cooldown already earned",
+        auth_cooldowns(two_auth + [rec("openai", "codex01", SUCCESS, dt=90, run="s2")],
+                       now + 120), {})
+    # Per-ACCOUNT: another account's auth failures never sideline this one.
+    other_h = account_hash("codex02", salt)
+    two_acct = two_auth + [rec("openai", "codex02", "auth", dt=10, run="b1")]
+    chk("the cooldown is per-account (the other account is untouched)",
+        sorted(auth_cooldowns(two_acct, now + 120)), sorted([ah]))
+    chk("the other account's fingerprint is absent", other_h in auth_cooldowns(two_acct, now + 120),
+        False)
+    # The auth pass must NOT perturb the limit/transient exponential chain (why it is a separate
+    # pass): an interleaved auth record used to be able to inflate `consecutive`.
+    mixed_chain = [rec("openai", "codex01", "rate-limit", dt=0, run="r1"),
+                   rec("openai", "codex01", "auth", dt=10, run="a1"),
+                   rec("openai", "codex01", "rate-limit", dt=20, run="r2")]
+    chk("an interleaved auth does not inflate the rate-limit consecutive count",
+        account_backoffs(mixed_chain, now + 30).get(ah, {}).get("consecutive"), 2)
+    # A LONGER live rate-limit backoff wins over the short cooldown (never shortened).
+    long_then_auth = [rec("openai", "codex01", "rate-limit", dt=0, run="r1"),
+                      rec("openai", "codex01", "rate-limit", dt=10, run="r2"),
+                      rec("openai", "codex01", "rate-limit", dt=20, run="r3"),
+                      rec("openai", "codex01", "auth", dt=30, run="a1"),
+                      rec("openai", "codex01", "auth", dt=40, run="a2")]
+    merged = account_backoffs(long_then_auth, now + 50).get(ah, {})
+    chk("a longer live rate-limit backoff is never SHORTENED by the auth cooldown",
+        (merged.get("last_signal"), merged.get("backoff_until")),
+        (CLASS_TRANSIENT, now + 20 + BACKOFF_BASE_SECONDS * 4))
+    # prune must not evict a live cooldown's evidence (the issue-#82 bug, for auth).
+    auth_flood = two_auth + [rec("anthropic", f"a{i:03d}", SUCCESS, dt=100 + i)
+                             for i in range(MAX_RECORDS + 5)]
+    auth_window = prune(auth_flood, now + 200)
+    chk("prune retains a live auth cooldown's evidence (no mid-cooldown readmission)",
+        (len(auth_window) <= MAX_RECORDS,
+         auth_cooldowns(auth_window, now + 200).get(ah, {}).get("last_signal")),
+        (True, CLASS_AUTH))
+    # ---- [registry #639] CREDENTIAL REACHABILITY: the evidence question the probe-exemption seam
+    # needs, distinct from the bounded #596 hold. "Exempt from the quota probe" must never imply
+    # "reachable", so this predicate must be able to say DEAD — and must never say `live` off
+    # anything but a success. --------------------------------------------------------------------
+    chk("no records at all -> UNPROVEN (never a reachability claim in either direction)",
+        (credential_states([], now), credential_state(credential_states([], now), ah)),
+        ({}, CREDENTIAL_UNPROVEN))
+    chk("a success PROVES reachability (live)",
+        credential_state(credential_states([rec("openai", "codex01", SUCCESS, dt=0)], now + 60), ah),
+        CREDENTIAL_LIVE)
+    chk(f"a SINGLE auth is inconclusive, not dead (N={CREDENTIAL_DEAD_MIN})",
+        credential_state(credential_states(one_auth, now + 60), ah), CREDENTIAL_UNPROVEN)
+    # THE behavioural heart of #639: a monotone auth run is a DEAD credential, with no TTL.
+    chk(f"{CREDENTIAL_DEAD_MIN} consecutive auth outcomes prove the credential DEAD",
+        (credential_state(credential_states(two_auth, now + 120), ah),
+         credential_states(two_auth, now + 120)[ah]["consecutive"]),
+        (CREDENTIAL_DEAD, 2))
+    # ...and unlike the #596 cooldown it does NOT expire on its own: re-admitting a credential that
+    # has produced only rejections buys zero verdicts and spends a runner + a lease every tick.
+    chk("the dead state does NOT expire with the cooldown TTL (the #596 hold does)",
+        (credential_state(credential_states(two_auth, now + 60 + AUTH_COOLDOWN_SECONDS + 1), ah),
+         auth_cooldowns(two_auth, now + 60 + AUTH_COOLDOWN_SECONDS + 1)),
+        (CREDENTIAL_DEAD, {}))
+    # Recovery is automatic and immediate on positive evidence — this is what keeps the predicate
+    # compatible with #596's "NOT a disable" decision for the INTERLEAVED pattern it was calibrated
+    # on (5 auth against 5 success in one window).
+    chk("a later success clears DEAD instantly (interleaved pattern stays live)",
+        credential_state(credential_states(
+            two_auth + [rec("openai", "codex01", SUCCESS, dt=90, run="s2")], now + 120), ah),
+        CREDENTIAL_LIVE)
+    chk("an auth AFTER a success drops the live claim without asserting dead",
+        credential_state(credential_states(
+            [rec("openai", "codex01", SUCCESS, dt=0, run="s1"),
+             rec("openai", "codex01", "auth", dt=30, run="a1")], now + 60), ah),
+        CREDENTIAL_UNPROVEN)
+    # A rate limit says NOTHING about credential validity, in either direction.
+    chk("limit/transient records neither prove nor disprove reachability",
+        credential_state(credential_states(
+            [rec("openai", "codex01", "rate-limit", dt=0, run="r1"),
+             rec("openai", "codex01", "rate-limit", dt=10, run="r2")], now + 20), ah),
+        CREDENTIAL_UNPROVEN)
+    chk("an interleaved rate-limit does not break a dead auth run",
+        credential_state(credential_states(
+            [rec("openai", "codex01", "auth", dt=0, run="a1"),
+             rec("openai", "codex01", "rate-limit", dt=10, run="r1"),
+             rec("openai", "codex01", "auth", dt=20, run="a2")], now + 30), ah),
+        CREDENTIAL_DEAD)
+    chk("dead is PER-ACCOUNT (another account's rejections never condemn this one)",
+        credential_state(credential_states(two_acct, now + 120), other_h), CREDENTIAL_UNPROVEN)
+    chk("a future-forged auth stamp is skipped fail-open (cannot fabricate DEAD)",
+        credential_state(credential_states(
+            [{"account": ah, "exit_class": CLASS_AUTH, "ts": now + FUTURE_SKEW_SECONDS + 60},
+             {"account": ah, "exit_class": CLASS_AUTH, "ts": now + FUTURE_SKEW_SECONDS + 61}],
+            now), ah),
+        CREDENTIAL_UNPROVEN)
+    # prune must not let the MAX_RECORDS cap erase the evidence: the dead run is the ONLY thing
+    # holding the account out, and its #596 cooldown has already expired here (unlike the live-
+    # cooldown row above, whose `active` entry is what used to protect these records).
+    dead_flood = two_auth + [rec("anthropic", f"d{i:03d}", SUCCESS, dt=100 + i)
+                             for i in range(MAX_RECORDS + 5)]
+    dead_now = now + 60 + AUTH_COOLDOWN_SECONDS + 1
+    dead_window = prune(dead_flood, dead_now)
+    chk("prune retains a PROVEN-DEAD run under a 200+ record flood (no silent readmission)",
+        (len(dead_window) <= MAX_RECORDS,
+         auth_cooldowns(dead_window, dead_now),
+         credential_state(credential_states(dead_window, dead_now), ah)),
+        (True, {}, CREDENTIAL_DEAD))
+    # ---- the ops alert: ONE alert per (condition, provider), naming FINGERPRINTS only -----------
+    openai_fleet = {"openai": {ah}}
+    auth_actions = classify_records(two_auth, openai_fleet, now + 120)
+    chk("the auth cooldown FIRES the account-auth-cooldown alert",
+        fires(auth_actions, "account-auth-cooldown", "openai"), True)
+    auth_action = next(a for a in auth_actions if a["condition"] == "account-auth-cooldown")
+    chk("the firing action carries the salted fingerprint", auth_action["accounts"], [ah])
+    # Idempotence is the (condition, provider) marker: the SAME single action for a 5-run outage,
+    # so _upsert_alert refreshes ONE issue instead of alerting per failed run.
+    many_auth = [rec("openai", "codex01", "auth", dt=i * 10, run=f"a{i}") for i in range(5)]
+    many_actions = [a for a in classify_records(many_auth, openai_fleet, now + 60)
+                    if a["condition"] == "account-auth-cooldown"]
+    chk("5 auth runs still produce exactly ONE alert action (not one per run)",
+        (len(many_actions), many_actions[0]["fire"], many_actions[0]["accounts"]),
+        (1, True, [ah]))
+    chk("the alert marker is keyed per (condition, provider) so the upsert dedupes",
+        _marker("account-auth-cooldown", "openai"),
+        f"<!-- {MARKER_PREFIX}:account-auth-cooldown:openai -->")
+    # RECOVERY: the credential works again -> the action recovers and the alert closes.
+    chk("a success recovers the cooldown alert (fire=False)",
+        [a["fire"] for a in classify_records(
+            two_auth + [rec("openai", "codex01", SUCCESS, dt=90, run="s2")], openai_fleet,
+            now + 120) if a["condition"] == "account-auth-cooldown"], [False])
+    chk("a single auth does not fire the alert",
+        fires(classify_records(one_auth, openai_fleet, now + 60),
+              "account-auth-cooldown", "openai"), False)
+    # BODY: fingerprint + the required maintainer action; NEVER a raw handle or email; and the
+    # public route redacts it entirely.
+    auth_body = render_body(auth_action, "jeswr")
+    chk("the alert body names the fingerprint", ah in auth_body, True)
+    chk("the alert body carries NO raw handle",
+        any(h in auth_body for h in ("codex01", "acct01", "@gmail", "acct0")), False)
+    chk("the alert body names the required maintainer action",
+        "re-mint" in auth_body.lower() and "#596" in auth_body, True)
+    chk("the alert body says it is a bounded cooldown, not a disable",
+        "cooldown" in auth_body and "NOT a permanent disable" in auth_body, True)
+    chk("the PUBLIC (redacted) route suppresses the fingerprint",
+        ah in render_body(auth_action, "jeswr", redact=True), False)
+    # LADDER SEPARATION: an auth outcome is NOT a decline. The #500 no-change discriminator and the
+    # dispatch decline ladder both key on CLASS_NO_CHANGE, so auth records can never advance them.
+    # Structurally, an auth record cannot even CARRY the decline evidence field the ladders read.
+    chk("make_record refuses to attach no-change decline evidence to an auth record",
+        _raises(lambda: rec("openai", "codex01", "auth", issue=500)), True)
+    # And a hand-forged one (bypassing make_record) still cannot advance either ladder.
+    auth_as_declines = [dict(rec("openai", "codex01", "auth", dt=i * 10, run=f"d{i}"), issue=500)
+                        for i in range(NO_CHANGE_LIMIT_MIN + 2)]
+    chk("auth records never satisfy the #500 no-change limit discriminator",
+        _no_change_limit_view(auth_as_declines, now + 60)[1], {})
+    chk("auth records are never derived to limit-class (no capped-account escalation)",
+        {r["exit_class"] for r in _no_change_limit_view(auth_as_declines, now + 60)[0]},
+        {CLASS_AUTH})
+    chk("a genuine no_change run of the same length DOES satisfy it (ladder still works)",
+        bool(_no_change_limit_view(
+            [rec("openai", "codex01", CLASS_NO_CHANGE, dt=i * 10, run=f"n{i}", issue=500 + i)
+             for i in range(NO_CHANGE_LIMIT_MIN)], now + 60)[1]), True)
+
+    # ---- [registry #614] capacity_recovery_evidence: the CAUSE-RECOVERY gate that lets a
+    # MACHINE capacity park re-admit itself. Derived from THIS window (no parallel health store);
+    # every ambiguity yields None, which park_policy reads as "stay parked". ------------------
+    parked = now + 100            # the park application instant, epoch seconds
+    outage_then_fix = [rec("openai", "codex01", "auth", dt=0, run="6001.1"),
+                       rec("openai", "codex01", "auth", dt=50, run="6002.1"),
+                       rec("openai", "codex01", SUCCESS, dt=200, run="6003.1")]
+    evidence = capacity_recovery_evidence(outage_then_fix, parked, now + 300)
+    chk("the failing-then-recovered account is proven recovery evidence",
+        (evidence or {}).get("key"), f"openai/{ah}/6003.1")
+    chk("the evidence names the recovery instant in canonical Z-form and the cleared cause",
+        ((evidence or {}).get("recovered_at"), (evidence or {}).get("cause")),
+        (_iso_z(now + 200), CLASS_AUTH))
+    chk("the evidence key carries NO raw handle (locked decision 22a)",
+        "codex01" in (evidence or {}).get("key", ""), False)
+    chk("the evidence key is park-receipt safe (no whitespace, no marker terminator)",
+        bool(re.fullmatch(r"[A-Za-z0-9._=/:-]{1,120}", (evidence or {}).get("key", ""))), True)
+    # (c) NO post-park success => no evidence (the cause has not demonstrably cleared).
+    chk("an account still failing after the park yields NO evidence",
+        capacity_recovery_evidence(outage_then_fix[:2], parked, now + 300), None)
+    chk("a success BEFORE the park proves nothing (it predates the starvation)",
+        capacity_recovery_evidence(
+            [rec("openai", "codex01", "auth", dt=0, run="a1"),
+             rec("openai", "codex01", SUCCESS, dt=50, run="s1")], parked, now + 300), None)
+    chk("a success exactly AT the park instant is not STRICTLY after it",
+        capacity_recovery_evidence(
+            [rec("openai", "codex01", "auth", dt=0, run="a1"),
+             rec("openai", "codex01", SUCCESS, dt=100, run="s1")], parked, now + 300), None)
+    # SPECIFICITY: a success from an account that was NOT failing when the park landed is not
+    # evidence about this park's cause — otherwise "the fleet looks healthy" would clear any park.
+    chk("a healthy account's success is not evidence about the park's cause",
+        capacity_recovery_evidence(
+            [rec("openai", "codex01", SUCCESS, dt=0, run="s0"),
+             rec("openai", "codex01", SUCCESS, dt=200, run="s1")], parked, now + 300), None)
+    chk("an account with no record at all before the park proves nothing",
+        capacity_recovery_evidence(
+            [rec("openai", "codex01", SUCCESS, dt=200, run="s1")], parked, now + 300), None)
+    chk("a success that FOLLOWS a success on the failing account still counts once the "
+        "pre-park record is a launch failure",
+        (capacity_recovery_evidence(outage_then_fix + [
+            rec("openai", "codex01", SUCCESS, dt=260, run="6004.1")], parked,
+            now + 300) or {}).get("key"), f"openai/{ah}/6003.1")
+    # #604 INTEGRATION: an account the auth cooldown is still holding back has NOT recovered.
+    cooling = [rec("openai", "codex01", "auth", dt=0, run="a1"),
+               rec("openai", "codex01", SUCCESS, dt=200, run="s1"),
+               rec("openai", "codex01", "auth", dt=250, run="a2"),
+               rec("openai", "codex01", "auth", dt=260, run="a3")]
+    chk("an ACTIVE auth cooldown (#604) blocks the recovery claim",
+        (bool(auth_cooldowns(cooling, now + 300)),
+         capacity_recovery_evidence(cooling, parked, now + 300)), (True, None))
+    chk("a FLAPPING account proves nothing even once the cooldown expires: the success must "
+        "out-date the LAST failure, not merely blink green once",
+        capacity_recovery_evidence(cooling, parked,
+                                   now + 260 + AUTH_COOLDOWN_SECONDS + 1), None)
+    chk("... and a success AFTER that flap does prove recovery (cause cleared and stayed clear)",
+        (capacity_recovery_evidence(
+            cooling + [rec("openai", "codex01", SUCCESS, dt=400, run="s2")], parked,
+            now + 500) or {}).get("key"), f"openai/{ah}/s2")
+    # (d) an UNREADABLE / ambiguous window yields None — never an optimistic read.
+    chk("a malformed record anywhere in the window => NO evidence (stay parked)",
+        capacity_recovery_evidence(
+            outage_then_fix + [{"ts": "nope", "provider": "openai", "account": ah,
+                                "exit_class": SUCCESS, "run_id": "x", "model_alias": ""}],
+            parked, now + 300), None)
+    chk("a hand-forged unknown exit_class anywhere => NO evidence",
+        capacity_recovery_evidence(
+            outage_then_fix + [dict(rec("openai", "codex01", SUCCESS, dt=210, run="s9"),
+                                    exit_class="totally-new")], parked, now + 300), None)
+    chk("an unreadable window (None / not a list / empty) => NO evidence",
+        [capacity_recovery_evidence(bad, parked, now + 300)
+         for bad in (None, {}, [], "records")], [None] * 4)
+    chk("an unknown park instant can never be out-dated => NO evidence",
+        [capacity_recovery_evidence(outage_then_fix, bad, now + 300)
+         for bad in (None, "2026-07-25T02:19:49Z", float("nan"), float("inf"), True)],
+        [None] * 5)
+    # A forged-FUTURE success cannot spring a park (same skew rule as every other walk).
+    chk("a future-forged success is not recovery evidence",
+        capacity_recovery_evidence(
+            [rec("openai", "codex01", "auth", dt=0, run="a1"),
+             rec("openai", "codex01", SUCCESS, dt=FUTURE_SKEW_SECONDS + 3600, run="s1")],
+            parked, now + 300), None)
+    # DETERMINISM: the EARLIEST qualifying recovery wins, across accounts.
+    two_recoveries = [rec("openai", "codex01", "auth", dt=0, run="a1"),
+                      rec("openai", "codex02", "auth", dt=10, run="b1"),
+                      rec("openai", "codex02", SUCCESS, dt=150, run="b2"),
+                      rec("openai", "codex01", SUCCESS, dt=200, run="a2")]
+    chk("the earliest qualifying recovery wins deterministically",
+        (capacity_recovery_evidence(two_recoveries, parked, now + 300) or {}).get("key"),
+        f"openai/{other_h}/b2")
+    chk("every launch-fail class can be the cleared cause (auth/billing/limit/transient)",
+        [bool(capacity_recovery_evidence(
+            [rec("openai", "codex01", cls, dt=0, run="f1"),
+             rec("openai", "codex01", SUCCESS, dt=200, run="s1")], parked, now + 300))
+         for cls in sorted(LAUNCH_FAIL_CLASSES)], [True] * len(LAUNCH_FAIL_CLASSES))
+    chk("a SETUP failure (runner fault, not provider access) is not a starvation cause",
+        capacity_recovery_evidence(
+            [rec("openai", "codex01", CLASS_SETUP, dt=0, run="f1"),
+             rec("openai", "codex01", SUCCESS, dt=200, run="s1")], parked, now + 300), None)
+    # ---- DISPATCH STARVATION is a park cause too (sparq-org/sparq#3809) ----------------------
+    # The park class this gate exists to release includes "N consecutive fix dispatches missed",
+    # whose recorded cause is `zero-dispatch` on the fleet pseudo-account, NOT a launch failure.
+    # Before this, such a park could never prove its cause cleared and stayed parked forever
+    # (MEASURED: every capacity park in production logged "no recorded recovery of the park's
+    # starvation cause" on every tick since the automatic path shipped).
+    starved_then_dispatched = [rec("fleet", "fleet01", CLASS_ZERO_DISPATCH, dt=0, run="z1"),
+                               rec("fleet", "fleet01", SUCCESS, dt=200, run="d1")]
+    chk("a DISPATCH-STARVATION park proves recovery when dispatch launches again",
+        (capacity_recovery_evidence(starved_then_dispatched, parked, now + 300)
+         or {}).get("cause"), CLASS_ZERO_DISPATCH)
+    chk("zero-dispatch is a park starvation cause but NOT a provider-outage launch failure",
+        (CLASS_ZERO_DISPATCH in PARK_STARVATION_CLASSES,
+         CLASS_ZERO_DISPATCH in LAUNCH_FAIL_CLASSES), (True, False))
+    chk("every launch-fail class remains a park starvation cause",
+        LAUNCH_FAIL_CLASSES <= PARK_STARVATION_CLASSES, True)
+    # The widening changes WHICH outage can be proven recovered, never HOW strictly: every other
+    # condition applies to zero-dispatch unchanged.
+    chk("a still-starved fleet (no post-park dispatch) yields NO evidence",
+        capacity_recovery_evidence(starved_then_dispatched[:1], parked, now + 300), None)
+    chk("a dispatch success BEFORE the park proves nothing",
+        capacity_recovery_evidence(
+            [rec("fleet", "fleet01", CLASS_ZERO_DISPATCH, dt=0, run="z1"),
+             rec("fleet", "fleet01", SUCCESS, dt=50, run="d1")], parked, now + 300), None)
+    chk("a FLAPPING fleet (starved again after the success) yields NO evidence",
+        capacity_recovery_evidence(
+            starved_then_dispatched
+            + [rec("fleet", "fleet01", CLASS_ZERO_DISPATCH, dt=250, run="z2")],
+            parked, now + 300), None)
+
+    # ---- park_cause_provable: the legacy-migration precondition -----------------------------
+    # Converting a park out of the human terminal is only an improvement if the machine class can
+    # release it. A park applied while the fleet was HEALTHY can never satisfy condition 1, so
+    # migrating then would trade a visible stall for a silent one.
+    chk("a park applied while the cause is OBSERVABLE is provable (migration admitted)",
+        park_cause_provable(starved_then_dispatched, parked, now + 300), True)
+    chk("a park applied while the fleet is HEALTHY is NOT provable (migration deferred)",
+        park_cause_provable(
+            [rec("fleet", "fleet01", CLASS_ZERO_DISPATCH, dt=0, run="z1"),
+             rec("fleet", "fleet01", SUCCESS, dt=50, run="d1")], parked, now + 300), False)
+    chk("a park applied BEFORE every record in the window is NOT provable "
+        "(the outage aged out — no future success can recover it)",
+        park_cause_provable(starved_then_dispatched, now - WINDOW_SECONDS - 1, now + 300), False)
+    chk("an empty/unreadable window is NOT provable (fail toward not migrating)",
+        [park_cause_provable([], parked, now + 300),
+         park_cause_provable([{"account": "x"}], parked, now + 300),
+         park_cause_provable(starved_then_dispatched, None, now + 300)], [False, False, False])
+    # The precondition must AGREE with the gate it is a precondition for: anything the evidence
+    # gate can ever admit must be reported provable.
+    chk("provable is implied by actual evidence (the precondition never contradicts the gate)",
+        all(park_cause_provable(window, parked, now + 300)
+            for window in ([rec("openai", "codex01", cls, dt=0, run="f1"),
+                            rec("openai", "codex01", SUCCESS, dt=200, run="s1")]
+                           for cls in sorted(PARK_STARVATION_CLASSES))), True)
+
+    # ---- [registry #691] THE AGED-OUT PARK EXIT ---------------------------------------------
+    # The gap the two predicates above leave: a park whose own cause is UNOBTAINABLE (older than
+    # the 48 h window, or applied while the fleet was healthy) has no machine exit at all, so a
+    # transient outage becomes a permanent stall. sustained_fleet_health_evidence is the LABELLED
+    # HEURISTIC that gives it one. Every check below is a guard whose deletion or inversion makes
+    # a NAMED line here go red.
+    h_now = now + 7 * 3600                          # the instant the predicate is evaluated
+    h_span_start = h_now - SUSTAINED_HEALTH_SPAN_SECONDS
+    aged_park = now - WINDOW_SECONDS - 1            # the #691 shape: older than the whole window
+    # COVERAGE ANCHOR: one record older than the span, so the window reaches back as far as the
+    # health claim does. It sits OUTSIDE the span, so it is never counted as span evidence.
+    h_base = [rec("fleet", "fleet01", SUCCESS, dt=0, run="z0")]
+    # Six successes across two accounts, ending 5 minutes before the evaluation instant.
+    h_wins = ([rec("openai", "codex01", SUCCESS, dt=7 * 3600 - 300 - 600 * k, run=f"s{k}")
+               for k in range(3)]
+              + [rec("anthropic", "acct02", SUCCESS, dt=7 * 3600 - 600 - 600 * k, run=f"t{k}")
+                 for k in range(3)])
+    healthy = h_base + h_wins
+    aged_evidence = sustained_fleet_health_evidence(healthy, aged_park, h_now)
+    ah2 = account_hash("acct02", salt)
+    chk("a park whose cause aged out is released by SUSTAINED fleet health (the #691 liveness "
+        "fix): the anchor is the newest success",
+        (aged_evidence or {}).get("key"), f"fleet-health/openai/{ah}/s0")
+    chk("the aged-out evidence is namespaced, labelled `aged-out`, and stamped at the anchor",
+        ((aged_evidence or {}).get("cause"), (aged_evidence or {}).get("recovered_at")),
+        (SUSTAINED_HEALTH_CAUSE, _iso_z(now + 7 * 3600 - 300)))
+    chk("the aged-out evidence key carries NO raw handle and is receipt-safe",
+        ("codex01" in (aged_evidence or {}).get("key", ""),
+         bool(re.fullmatch(r"[A-Za-z0-9._=/:-]{1,120}", (aged_evidence or {}).get("key", "")))),
+        (False, True))
+    chk("the recovery stamp is strictly after the park application (by construction — condition "
+        "1 forces parked_at <= span_start and only post-span_start successes are counted)",
+        (now + 7 * 3600 - 300) > aged_park, True)
+    # zero-dispatch is DELIBERATELY not ill health: the allocator finding nothing to launch fires
+    # constantly in normal operation (measured: 34 of the live ledger's 200 records). Widen
+    # _fleet_health_ok from LAUNCH_FAIL_CLASSES to PARK_STARVATION_CLASSES and this goes red —
+    # and the predicate becomes unsatisfiable in production, which is a stall dressed as a guard.
+    chk("a zero-dispatch tick INSIDE the span does not refuse the aged-out exit",
+        bool(sustained_fleet_health_evidence(
+            healthy + [rec("fleet", "fleet01", CLASS_ZERO_DISPATCH, dt=7 * 3600 - 2000,
+                           run="z9")],
+            aged_park, h_now)), True)
+    # GUARD: a LAUNCH FAILURE INSIDE THE SPAN. Delete the span clause of _fleet_health_ok and
+    # this goes red. One `auth` is below AUTH_COOLDOWN_MIN, so this exercises the span clause
+    # alone, not the (deliberately redundant) cooldown clause.
+    chk("a single launch failure INSIDE the proven span refuses the aged-out exit",
+        sustained_fleet_health_evidence(
+            healthy + [rec("openai", "codex01", CLASS_AUTH, dt=7 * 3600 - 4000, run="f9")],
+            aged_park, h_now), None)
+    # GUARD: an account that failed just BEFORE the span and never came back. Its failure is
+    # outside the span, so only the newest-record-per-account clause catches it.
+    chk("an account still SITTING on a launch failure (failed before the span, silent since) "
+        "refuses the aged-out exit",
+        sustained_fleet_health_evidence(
+            healthy + [rec("anthropic", "acct09", CLASS_LIMIT, dt=1200, run="f8")],
+            aged_park, h_now), None)
+    # GUARD: the positive-evidence counts. ASSERT THE BOUNDS THEMSELVES FIRST, then size every
+    # fixture from a LITERAL. A fixture sized from the constant under test shrinks with the
+    # constant and keeps passing when the floor is lowered — the mutant survives (measured: it
+    # did, on the first cut of this very test).
+    chk("the positive-evidence floors are the documented ones",
+        (SUSTAINED_HEALTH_MIN_SUCCESSES, SUSTAINED_HEALTH_MIN_ACCOUNTS), (6, 2))
+    chk("FIVE successes in the span refuses the exit (the floor is 6)",
+        sustained_fleet_health_evidence(h_base + h_wins[:5], aged_park, h_now), None)
+    chk("EIGHT successes from ONE account refuses the exit (the floor is 2 distinct accounts)",
+        sustained_fleet_health_evidence(
+            h_base + [rec("openai", "codex01", SUCCESS, dt=7 * 3600 - 300 - 600 * k, run=f"o{k}")
+                      for k in range(8)],
+            aged_park, h_now), None)
+    # THE `fleet` PSEUDO-PROVIDER IS NOT A SECOND ACCOUNT (review of PR #697). It writes under a
+    # FIXED sentinel hash, so counting raw `account` values let ONE real account plus the
+    # dispatcher clear a floor that exists precisely to require more than one real account.
+    # Demonstrated by execution against the first cut, and live-prevalent: 43 of today's 200
+    # records are `fleet` successes. Delete the provider filter and this goes red.
+    fleet_sentinel = hashlib.sha256(b"fleet-zero-dispatch").hexdigest()[:16]
+
+    def fleet_rec(cls, dt, run):
+        return make_record(FLEET_PSEUDO_PROVIDER, fleet_sentinel, "", cls, run, now + dt)
+
+    one_real_plus_fleet = (
+        h_base
+        + [rec("openai", "codex01", SUCCESS, dt=7 * 3600 - 300 - 600 * k, run=f"p{k}")
+           for k in range(3)]
+        + [fleet_rec(SUCCESS, 7 * 3600 - 600 - 600 * k, f"q{k}") for k in range(3)])
+    chk("the `fleet` PSEUDO-account is not a second real account: one real account plus the "
+        "dispatcher does NOT clear the distinct-account floor",
+        sustained_fleet_health_evidence(one_real_plus_fleet, aged_park, h_now), None)
+    # ...but its successes still COUNT toward the total, because a `fleet` success means the
+    # allocator planned AND launched work — genuine evidence about the dispatch starvation these
+    # parks are mostly made of. Two real accounts + fleet must still fire.
+    chk("a `fleet` success still counts toward MIN_SUCCESSES once two REAL accounts are present",
+        bool(sustained_fleet_health_evidence(
+            h_base + h_wins[:4] + [fleet_rec(SUCCESS, 7 * 3600 - 900 - 600 * k, f"u{k}")
+                                   for k in range(2)],
+            aged_park, h_now)), True)
+    # ...and it may also ANCHOR freshness on its own. This half was documented intent but
+    # untested (review round 3 of PR #697 caught it as a surviving mutant). It is deliberate and
+    # live-reachable: a `fleet` success means the allocator PLANNED AND LAUNCHED work, which is a
+    # present-tense claim about the dispatch starvation these parks are mostly made of. Here the
+    # two REAL accounts' successes are all older than SUSTAINED_HEALTH_FRESH_SECONDS, so the only
+    # fresh success — and therefore the anchor, the key and the stamp — is the dispatcher's.
+    fleet_anchored = (
+        h_base
+        + [rec("openai", "codex01", SUCCESS, dt=7 * 3600 - 3700 - 600 * k, run=f"v{k}")
+           for k in range(2)]
+        + [rec("anthropic", "acct02", SUCCESS, dt=7 * 3600 - 4000 - 600 * k, run=f"x{k}")
+           for k in range(2)]
+        + [fleet_rec(SUCCESS, 7 * 3600 - 300 - 60 * k, f"y{k}") for k in range(2)])
+    fleet_ev = sustained_fleet_health_evidence(fleet_anchored, aged_park, h_now)
+    chk("a `fleet` success may ANCHOR freshness alone when every real account's success is older "
+        "(the dispatcher launching work IS a present-tense health claim)",
+        ((fleet_ev or {}).get("key"), (fleet_ev or {}).get("provider")),
+        (f"{SUSTAINED_HEALTH_KEY_PREFIX}/{FLEET_PSEUDO_PROVIDER}/{fleet_sentinel}/y0",
+         FLEET_PSEUDO_PROVIDER))
+    # GUARD: freshness. SILENCE IS NOT HEALTH — the same six successes, all early in the span.
+    stale = h_base + [rec("openai", "codex01", SUCCESS, dt=3700 + 60 * k, run=f"e{k}")
+                      for k in range(3)] \
+        + [rec("anthropic", "acct02", SUCCESS, dt=3900 + 60 * k, run=f"g{k}") for k in range(3)]
+    chk("a fleet that succeeded early in the span and went SILENT refuses the exit "
+        "(freshness: health is a present-tense claim)",
+        sustained_fleet_health_evidence(stale, aged_park, h_now), None)
+    chk("a FORGED FUTURE success cannot manufacture that freshness",
+        sustained_fleet_health_evidence(
+            stale + [rec("openai", "codex01", SUCCESS, dt=7 * 3600 + 4000, run="fut")],
+            aged_park, h_now), None)
+    # GUARD: coverage. Drop the anchor and the window no longer reaches back as far as the claim.
+    chk("a window that does not COVER the span it would claim refuses the exit "
+        "(no claiming six healthy hours from four observed ones)",
+        sustained_fleet_health_evidence(h_wins, aged_park, h_now), None)
+    # GUARD: the park must be older than the span — a fresh park is the STRONG gate's business.
+    chk("a park younger than the span is refused here (the cause-recovery gate owns it)",
+        sustained_fleet_health_evidence(healthy, h_span_start + 1, h_now), None)
+    chk("a park exactly at the span boundary is admitted (the bound is <=, not <)",
+        bool(sustained_fleet_health_evidence(healthy, h_span_start, h_now)), True)
+    # GUARD: fail closed on every ambiguity, exactly like the gate it sits beside.
+    chk("an unreadable / empty / malformed window and an unusable park stamp all refuse",
+        [sustained_fleet_health_evidence([], aged_park, h_now),
+         sustained_fleet_health_evidence("nope", aged_park, h_now),
+         sustained_fleet_health_evidence(healthy + [{"account": "x"}], aged_park, h_now),
+         sustained_fleet_health_evidence(healthy, None, h_now),
+         sustained_fleet_health_evidence(healthy, float("inf"), h_now)],
+        [None, None, None, None, None])
+    # ---- the MIGRATION-side reachability twins ----------------------------------------------
+    chk("the aged-out exit is REACHABLE while the fleet is observed healthy",
+        sustained_health_exit_reachable(healthy, h_now), True)
+    chk("it is NOT reachable on an unreadable/empty window, a stale fleet, or an account "
+        "sitting on a launch failure",
+        [sustained_health_exit_reachable([], h_now),
+         sustained_health_exit_reachable(healthy + [{"account": "x"}], h_now),
+         sustained_health_exit_reachable(stale, h_now),
+         sustained_health_exit_reachable(
+             healthy + [rec("anthropic", "acct09", CLASS_LIMIT, dt=1200, run="f8")], h_now)],
+        [False, False, False, False])
+    # park_exit_reachable is the disjunction the migration asks. Each disjunct alone suffices,
+    # and neither being available defers the migration exactly as before #691.
+    strong_only = [rec("openai", "codex01", CLASS_AUTH, dt=7 * 3600 - 60, run="a1")]
+    chk("the STRONG exit alone makes a park reachable (an observable cause, unhealthy fleet)",
+        (park_cause_provable(strong_only, h_now, h_now),
+         sustained_health_exit_reachable(strong_only, h_now),
+         park_exit_reachable(strong_only, h_now, h_now)), (True, False, True))
+    chk("the AGED-OUT exit alone makes a park reachable (healthy fleet, no observable cause) — "
+        "this is precisely the case that could not migrate before #691",
+        (park_cause_provable(healthy, h_now, h_now),
+         sustained_health_exit_reachable(healthy, h_now),
+         park_exit_reachable(healthy, h_now, h_now)), (False, True, True))
+    chk("neither exit reachable => the migration still defers (an unreadable ledger)",
+        [park_exit_reachable([], h_now, h_now),
+         park_exit_reachable(stale, h_now, h_now)], [False, False])
+    # THE BUSY-LEDGER FAIL-OPEN (review round 3 of PR #697). COVERAGE is not waitable: it is
+    # MAX_RECORDS / record-rate, so a park can never age into it and a busier fleet makes it
+    # worse. Omitting it from the reachability twin let the migration convert a park into a class
+    # whose evidence gate returns None FOREVER — measured None at +1, +2, +4 and +8 spans on a
+    # 62 rec/h window. This fixture is that window: MAX_RECORDS perfectly healthy successes
+    # across two real accounts, arriving fast enough that the retained window covers only ~3.2 h.
+    busy_rate_gap = 3600.0 / 62.1
+    busy = sorted(
+        (rec("openai" if i % 2 else "anthropic", "codex01" if i % 2 else "acct02", SUCCESS,
+             dt=int(7 * 3600 - i * busy_rate_gap), run=f"b{i}") for i in range(MAX_RECORDS)),
+        key=lambda r: r["ts"])
+    busy_coverage_h = round((h_now - busy[0]["ts"]) / 3600.0, 2)
+    chk("the busy-ledger fixture really is under-covered (the fixture, not the guard, is what "
+        "makes this case real)",
+        (busy_coverage_h < SUSTAINED_HEALTH_SPAN_SECONDS / 3600, len(busy)),
+        (True, MAX_RECORDS))
+    chk("a fleet HEALTHY but too BUSY to cover the span makes the aged-out exit UNREACHABLE — "
+        "the migration must not convert a park whose exit can never open",
+        (sustained_fleet_health_evidence(busy, aged_park, h_now),
+         sustained_health_exit_reachable(busy, h_now),
+         park_exit_reachable(busy, h_now, h_now)), (None, False, False))
+    # ...and it stays shut however long the park waits, which is what makes it a SILENT stall
+    # rather than a delay. Delete the coverage check in the twin and this pair goes red.
+    chk("waiting does not open it: the same rate yields no evidence at +1 and +4 spans",
+        [sustained_fleet_health_evidence(
+            [dict(r, ts=r["ts"] + k * SUSTAINED_HEALTH_SPAN_SECONDS) for r in busy],
+            h_now, h_now + k * SUSTAINED_HEALTH_SPAN_SECONDS) for k in (1, 4)],
+        [None, None])
+    # THE AGREEMENT INVARIANT. The migration precondition and the admission probe must not drift:
+    # a park the migration converts NOW must actually be releasable LATER. Simulate it — convert
+    # at h_now (reachable above), then run the window forward one span with the same health.
+    later = h_now + SUSTAINED_HEALTH_SPAN_SECONDS
+    continued = healthy + [
+        rec("openai", "codex01", SUCCESS, dt=13 * 3600 - 300 - 600 * k, run=f"c{k}")
+        for k in range(3)] + [
+        rec("anthropic", "acct02", SUCCESS, dt=13 * 3600 - 600 - 600 * k, run=f"d{k}")
+        for k in range(3)]
+    chk("a park the migration converts on a reachable exit IS released one span later "
+        "(precondition and admission agree end to end)",
+        bool(sustained_fleet_health_evidence(continued, h_now, later)), True)
 
     # ---- prune / window bound ---------------------------------------------------------------
     many = [rec("anthropic", "acct01", CLASS_TRANSIENT, dt=i) for i in range(MAX_RECORDS + 50)]
@@ -2830,6 +4157,14 @@ def _test_record_provider_guard(chk):
             _cmd_record(_rec("openai", "no_change", "no-change-v1 issue:500,input:not-a-number")),
             1)
         chk("malformed no_change handoff writes NO record", _CountingAPI.put_count, 5)
+        # [#701] the why_no_diff reason travels the SAME sanitized handoff, as an index.
+        chk("record expands a declared why_no_diff reason",
+            _cmd_record(_rec("openai", "no_change", "no-change-v1 issue:500,why:1")), 0)
+        chk("declared-reason handoff writes one record", _CountingAPI.put_count, 6)
+        chk("record REFUSES an out-of-vocabulary reason index",
+            _cmd_record(_rec("openai", "no_change",
+                             f"no-change-v1 issue:500,why:{len(NO_CHANGE_REASONS)}")), 1)
+        chk("a forged reason index writes NO record", _CountingAPI.put_count, 6)
     finally:
         GitHubAPI = real_api
         for k, v in saved.items():

