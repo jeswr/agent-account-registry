@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4517,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f9c40c44e6af682692fde315e0d37ac9b07c78ab",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The revision candidly says there is no `_comment_sq_uii0` snapshot entry and that the probes are off-tree and one-shot, but it nevertheless changes the record from \"measure first\" to \"PROBED\" and makes substantive empirical claims: re-commitment dominates, the ABI-only integer floor is substantial, the benefit is only a small constant factor, and Alt-A should remain deferred until two stated reopening conditions. None of the probe circuits, methodology, raw gate counts, or regression snapshot is present, so reviewers cannot verify that the probes isolate the claimed costs, use representative public inputs, or support the resulting decision. On this ZK design surface, \"provisional\" accurately scopes uncertainty but does not supply the missing evidence needed to publish a measurement-driven verdict.",
+    "file": "research/zk-hidden-join-design.md",
+    "fix_hint": "Either land the probe circuits/methodology and `_comment_sq_uii0` regression-gated snapshot evidence in this PR, then retain only conclusions supported by that artifact; or remove the measurement-derived verdict and claims for now, restoring a genuinely undecided \"measure first\" state until `sq-uii0` lands. A provisional label may accompany evidence, but should not substitute for it.",
+    "severity": "major",
+    "title": "Off-tree probes still drive the design verdict without reviewable evidence"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 2 removes the hard-coded benchmark ratios and explicitly acknowledges that the probe artifacts are absent, so it improves on one of the two prior major findings. However, the document still uses unreviewable off-tree, one-shot probes to change the design decision: it labels Alt-A \"PROBED\" and deferred, asserts that re-commitment dominates and that the integer-input floor limits the gain, and prescribes reopening conditions. Calling those conclusions provisional does not make their methodology or results independently checkable, regression-gated, or suitable evidence for a soundness-critical ZK design record. The remaining major issue is materially the first round's missing-evidence finding.",
+  "verdict": "request_changes"
+ }
+}
