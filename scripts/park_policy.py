@@ -2102,6 +2102,100 @@ def _self_test():
           capacity_park_admission("o/r", 41, 7, fetch, is_human=trusted),
           (None, None, "no unconsumed human gesture and no recovery evidence offered"))
 
+    # ---- G5 census: every decision lands in a VISIBLE, COUNTED state with a reason ----------
+    #
+    # The population these guard is real. MEASURED on sparq-org/sparq at 2026-07-27T11:53Z
+    # (dispatch run 30262478746): 21 open PRs on `review:parked`, reported by the only aggregate
+    # that exists as one undifferentiated "machine capacity park stands (...)=13" — inside which
+    # 3 PRs were waiting on recovery evidence that a later tick can genuinely supply, and 4 were
+    # frozen behind a maintainer's own hand-applied `review:parked` that NO tick will ever clear.
+    # A per-run success signal cannot express the difference; these checks make it structural.
+    fresh = "2026-07-25T03:10:00Z"
+
+    def admission_census(**kwargs):
+        """One admission call, returning (action, the single census row it recorded)."""
+        rows = []
+        action = capacity_park_admission("o/r", 41, 7, fetch, is_human=trusted,
+                                         log=logs.append, census=rows, **kwargs)[0]
+        return action, (rows[0] if len(rows) == 1 else rows)
+
+    # THE HEADLINE GUARD. A maintainer's hand-applied `review:parked` is refused (unchanged) AND
+    # is now counted as HUMAN-TERMINAL rather than disappearing into the capacity bucket.
+    timelines[41] = [event("labeled", "review:parked", "2026-07-25T02:19:47Z", "jeswr")]
+    timelines[7] = []
+    check("census: a HUMAN-APPLIED park is refused and counted as human-terminal",
+          admission_census(auto_evidence=evidence_at("openai/a/1", fresh)),
+          (None, {"repo": "o/r", "number": 41, "code": PARK_REFUSAL_HUMAN_APPLIED,
+                  "exit": "human-terminal",
+                  "detail": "the latest park application is HUMAN-owned — only a human "
+                            "clears it"}))
+    # ... and the CONTRAST that gives the taxonomy its meaning: the same PR, parked by the
+    # MACHINE with no recovery yet, is the SAME refusal answer but a DIFFERENT exit class.
+    timelines[41] = [machine_park]
+    check("census: a machine park awaiting recovery is refused but EXIT-REACHABLE",
+          admission_census(auto_evidence=lambda _parked_at: None),
+          (None, {"repo": "o/r", "number": 41, "code": PARK_REFUSAL_NO_EVIDENCE,
+                  "exit": "exit-reachable",
+                  "detail": "no recorded recovery of the park's starvation cause"}))
+    check("census: a live needs:user is refused and counted as human-terminal",
+          admission_census(live_holds=["needs:user"],
+                           auto_evidence=evidence_at("openai/a/1", fresh)),
+          (None, {"repo": "o/r", "number": 41, "code": PARK_REFUSAL_HUMAN_HOLD,
+                  "exit": "human-terminal",
+                  "detail": "human-owned hold(s) live (needs:user) — never auto-re-admitted"}))
+    check("census: the CAP is human-terminal — a flapping account is a human question",
+          admission_census(auto_marker_count=AUTO_READMISSION_MAX,
+                           auto_evidence=evidence_at("openai/a/9", fresh))[1]["exit"],
+          "human-terminal")
+    unreadable_rows = []
+    capacity_park_admission("o/r", 41, 404, fetch, is_human=trusted, log=logs.append,
+                            census=unreadable_rows,
+                            auto_evidence=evidence_at("openai/a/1", fresh))
+    check("census: an unreadable timeline is COUNTED, not silent",
+          [(row["code"], row["exit"]) for row in unreadable_rows],
+          [(PARK_REFUSAL_TIMELINE_UNREADABLE, "exit-reachable")])
+    # An ADMISSION is censused too, so the rows sum to the population rather than to the
+    # refusals alone, and it belongs to NEITHER blocked class.
+    check("census: an auto-mint is recorded under an admit code with no exit class",
+          admission_census(auto_evidence=evidence_at("openai/a/1", fresh)),
+          ("auto-mint", {"repo": "o/r", "number": 41, "code": "admitted-auto-mint",
+                         "exit": None,
+                         "detail": "recovery evidence 'openai/a/1' recorded at "
+                                   "2026-07-25T03:10:00Z, strictly after the park application "
+                                   "at 2026-07-25T02:19:47Z"}))
+    # EXACTLY ONE ROW PER DECISION. A census that double-counts or silently skips is worse than
+    # none, so the arity is pinned over a mixed batch rather than assumed.
+    batch = []
+    for holds, probe in ((["needs:user"], evidence_at("openai/a/1", fresh)),
+                         ([], lambda _parked_at: None),
+                         ([], evidence_at("openai/a/1", fresh))):
+        capacity_park_admission("o/r", 41, 7, fetch, is_human=trusted, log=logs.append,
+                                live_holds=holds, auto_evidence=probe, census=batch)
+    check("census: exactly one row per decision, none skipped, none doubled", len(batch), 3)
+    check("census: summary counts by code and names the human-terminal population",
+          park_census_summary(batch),
+          ({"admitted-auto-mint": 1, PARK_REFUSAL_HUMAN_HOLD: 1, PARK_REFUSAL_NO_EVIDENCE: 1},
+           [41], []))
+    # The FAIL DIRECTION of the classifier: an unrecognised code must never be filed as
+    # self-healing. Silently reading "exit-reachable" for a code nobody registered is exactly how
+    # a stalled population goes missing again.
+    check("census: an UNKNOWN refusal code is not silently self-healing",
+          park_refusal_exit_class("some-future-code"), None)
+    check("census: an unknown code surfaces in the UNCLASSIFIED population",
+          park_census_summary([{"repo": "o/r", "number": 99, "code": "some-future-code"}]),
+          ({"some-future-code": 1}, [], [99]))
+    check("census: malformed rows are COUNTED, never dropped",
+          park_census_summary(["garbage", {"number": 1}, {"code": "", "number": 2}])[0],
+          {"malformed": 3})
+    # TAXONOMY DRIFT GUARD: every registered code classifies, and the two classes partition it.
+    check("census: every registered refusal code has an exit class",
+          sorted(code for code in PARK_REFUSAL_CODES
+                 if park_refusal_exit_class(code) is None), [])
+    check("census: the human-terminal set is a strict subset of the registered codes",
+          PARK_REFUSAL_HUMAN_TERMINAL < PARK_REFUSAL_CODES, True)
+    check("census: an admit code is never mistaken for a refusal code",
+          sorted(set(PARK_ADMIT_CODES.values()) & PARK_REFUSAL_CODES), [])
+
     # ---- effective_readmission_cutoff: an automatic re-admission grants the SAME real budget
     # window a human gesture grants (without it the cleared park is inert — every tick
     # re-derives the same exhausted starvation counters and quietly re-defers forever) ----
