@@ -25,7 +25,9 @@
 #
 # SCOPE + AUTHORITY. This script may create/edit/comment/close ONE `ops-alert` issue and nothing
 # else. It writes no `needs:`/`status:`/`role:`/`priority:`/`area:` label to any work issue —
-# asserted by _test_no_work_labels below rather than by convention — and it has no arming, merge
+# asserted by the "no code path adds or removes a label on a work issue" check in `_self_test`
+# (which scans this file's own operational half) rather than by convention — and it has no arming,
+# merge
 # or PR path. `needs:user` in particular is HUMAN-owned (park_policy.py invariant 3) and appears
 # here only as a READ that EXCLUDES an issue from the machine-owed count.
 #
@@ -41,6 +43,7 @@
 # Mirrors scripts/groom-alert.py / scripts/plan-alert.py hardening exactly: `_alert_route` privacy
 # routing, close-ONLY-on-an-explicitly-healthy-census, sanitized fail-loud `gh` wrapper, and a
 # soft-fail on a successful-but-malformed `gh issue list`.
+import argparse
 import json
 import os
 import subprocess
@@ -274,9 +277,20 @@ def read_board(repo, max_pages=20):
         "run could not read completely (fail closed)")
 
 
+def build_parser():
+    parser = argparse.ArgumentParser(description=__doc__)
+    # The registry-selftest gate (worker-live.sh) discovers a script's self-test entrypoint by
+    # scanning for exactly this declaration, so it must stay an argparse option and not a hand
+    # rolled sys.argv probe — the manifest validation fails CLOSED on a script it cannot see one
+    # in, which is what keeps `scripts/selftest-suite.txt` honest.
+    parser.add_argument("--self-test", action="store_true",
+                        help="run the pure-logic + stubbed-gh checks and exit")
+    return parser
+
+
 def main(argv=None):
-    argv = list(sys.argv[1:] if argv is None else argv)
-    if "--self-test" in argv:
+    args = build_parser().parse_args(list(sys.argv[1:] if argv is None else argv))
+    if args.self_test:
         return _self_test()
 
     registry_repo = os.environ["REGISTRY_REPO"]
