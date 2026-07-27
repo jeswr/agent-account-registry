@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 875,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "9271497c4a1c8c593d294fa5e0468edfe506970c",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly carries the normalized probe verdict into provider-quota rendering and gives an unmeasured verdict precedence over labels derived from the rejected usage snapshot. It does not alter capacity or quota counts, preserves fail-closed behavior, and keeps the prior behavior for direct callers that provide no verdict and for fresh measured snapshots. The added self-tests are non-vacuous: they separately pin failed, stale, and unknown wording, verify distrusted precedence even with apparently live usage, protect measured-label behavior, and exercise the build_dashboard wiring for failed, absent, and fresh sidecars. No hostile reviewer-directed instruction or security regression is present in the diff.",
+  "verdict": "approve"
+ }
+}
