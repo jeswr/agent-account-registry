@@ -4512,6 +4512,112 @@ STARVE_ALERT_MARKER = "<!-- sparq-escalate-starved:v1 -->"
 STARVE_RESET_MARKER = "<!-- sparq-escalate-recovered:v1 -->"
 
 
+def absorbing_park_leg(repo, number, action, window_key, comments, bot_login, now,
+                       linked_open_pr, worker_pr, attempt_marker, post_comment,
+                       needs_user_landed, vetoed, log=print,
+                       grace=_park_policy.PARK_ABSORBING_GRACE_SECONDS):
+    """[registry #764] THE MACHINE EXIT FOR AN ABSORBING PARK — the deferred-issue budget leg's
+    terminal disposition. Returns the ONE census bucket this item leaves through.
+
+    THE DEFECT. `park_ladder_decision` has five outcomes; three of them
+    (park_policy.PARK_ABSORBING_ACTIONS) neither attempt work nor advance the generation
+    counter, and the budget leg used to `continue` on each of them unconditionally:
+
+      dedupe        the window key is already receipted, and a NEW key is minted only by a
+                    human unlabel (readmission_cutoff) — so with no gesture, forever.
+      legacy-quiet  a pre-receipt park returns BEFORE `generation = len(receipts) + 1`, so no
+                    receipt is ever written, so `receipts` stays empty, so the next tick takes
+                    the same branch. The ladder it promises to start is unreachable.
+      unchanged     a fresh window whose park fingerprint has not moved.
+
+    MEASURED, registry dispatch run 30263179462 (2026-07-27T12:00Z): those first two arms took
+    7 of 7 planned worker rows and launched 0. They are NOT free telemetry noise — the readiness
+    engine serializes ONE row per `area:` package, so each stuck item RESERVED its package
+    against every sibling. Eleven deferred candidates (nine still holding a live attempt budget)
+    sat behind those seven packages; re-running the frontier with the seven removed admits three
+    of them immediately.
+
+    THE EXIT is bounded, receipted, and consumed once per window:
+
+      observe        no receipt for this window yet — write exactly ONE `observing` receipt and
+                     start the clock. No label, no escalation.
+      wait           the clock is running, the grace has not elapsed — write NOTHING, count it.
+      retire         the absorbing state persisted past `grace` — the question-class terminal.
+                     RECEIPT-FIRST (probe the veto, post the receipt, then the veto-checked
+                     `needs:user` write), so a crash leaves receipt-no-label, never the reverse.
+      hold-linked-pr the issue has an OPEN worker PR: retiring it would apply `needs:user`,
+                     which terminally strips that PR from the review loop (the 2026-07-18 mass
+                     park). The park stands, in its OWN bucket so the refusal is visible.
+
+    WHY `needs:user` IS THE DISPOSITION AND NOT MERELY A LABEL: dispatch.yml's PLAN filter drops
+    any `needs:*` candidate from the deferred-retry lane, so the terminal and the partition
+    release are the SAME act. That is deliberate — the alternative (quietly skipping the item in
+    the planner) trades a visible stall for an invisible one. Here the item leaves the lane with
+    a comment on the issue, a durable receipt, and a census bucket.
+
+    RE-ADMISSION IS CONSUMED EXACTLY ONCE AND CAPPED. The receipt is keyed on the ladder WINDOW
+    and only a human gesture mints a new window key, so a re-admitted item starts a brand-new
+    streak with zero receipts and exactly one fresh grace; and `absorbing_park_streak` returns
+    "" for a window already receipted `retired`, so one window can never retire twice. The
+    STREAK ALSO RESETS on a newer worker attempt: an item that was genuinely re-attempted since
+    its last observation begins a fresh clock rather than inheriting an age it did not earn."""
+    since = max((str(c.get("created_at")) for c in comments
+                 if str(c.get("user", {}).get("login", "")).casefold() == bot_login.casefold()
+                 and attempt_marker in str(c.get("body", ""))), default="")
+    window = window_key or _park_policy.PARK_WINDOW_NONE
+    streak = worker_pr.absorbing_park_streak(comments, bot_login, window, since=since, log=log)
+    disposition, streak = _park_policy.absorbing_park_disposition(
+        action, streak, now, linked_open_pr=linked_open_pr, grace=grace, log=log)
+    bucket = _park_policy.budget_exhausted_bucket(action, disposition)
+    if disposition == "hold-linked-pr":
+        log(f"defer {repo}#{number}: deferred-retry budget exhausted ({action}); an OPEN worker "
+            "PR is linked to this issue, so the absorbing-park retirement stands down (a "
+            "needs:user hold here would strip that PR from the review loop) — the PR's own "
+            "review lane owns the outcome")
+        return bucket
+    if disposition == "wait":
+        log(f"defer {repo}#{number}: deferred-retry budget exhausted ({action}); absorbing park "
+            f"held, retirement clock running since {streak or 'an unreadable receipt'}")
+        return bucket
+    if disposition == "observe":
+        post_comment(
+            repo, number,
+            "> 🤖 SPARQ agent — this item's attempt budget is spent and its park ladder is "
+            f"ABSORBING (`{action}`): no further attempt can be made, and no machine event can "
+            "advance the ladder without a human gesture. It still reserves its `area:` partition "
+            "against every sibling issue on that area, on every tick, so it is now on a bounded "
+            f"{int(grace) // 3600}h clock — if nothing changes it will be RETIRED to a human "
+            "question and released from the dispatch lane. Un-parking it (remove "
+            "`status:parked`) restarts both the attempt budget and this clock.\n\n"
+            + worker_pr.absorbing_park_receipt("observing", window, _iso_now(now)))
+        log(f"defer {repo}#{number}: deferred-retry budget exhausted ({action}); absorbing park "
+            f"OBSERVED — retirement clock started for window {window}")
+        return bucket
+    suppressed = bool(vetoed())
+    note = (" Escalated as a human question (`needs:user`; the label write follows this "
+            "receipt), which also releases this issue's `area:` partition to its siblings."
+            if not suppressed else
+            " The retirement is TERMINAL, but the `needs:user` label write was SUPPRESSED by a "
+            "standing human unlabel (sticky veto) — no label was applied; this receipt alone "
+            "records it, and the partition is NOT released.")
+    post_comment(
+        repo, number,
+        "> 🤖 SPARQ agent — RETIRED from the deferred-retry lane. The attempt budget is spent, "
+        f"the park ladder has been absorbing (`{action}`) since {streak}, and no machine event "
+        "can advance it — meanwhile it reserved its `area:` partition against every sibling "
+        f"issue on that area, on every tick.{note} "
+        f"@{os.environ.get('MAINTAINER_HANDLE', 'jeswr')}: this item needs a decision — "
+        "decompose it, re-route it, or close it as not implementable as specified. Removing "
+        "`needs:user`/`status:parked` re-admits it with a fresh attempt budget and a fresh "
+        "clock.\n\n"
+        + worker_pr.absorbing_park_receipt("retired", window, _iso_now(now)))
+    landed = False if suppressed else bool(needs_user_landed())
+    log(f"retired {repo}#{number}: absorbing park ({action}) persisted past the bounded grace "
+        f"since {streak} -> question-class terminal"
+        f"{'' if landed else ' (label suppressed)'}")
+    return bucket
+
+
 def _iso_now(now=None):
     """The canonical UTC stamp a receipt written THIS tick carries. One spelling, one place: the
     absorbing-park clock compares parsed instants, so every writer must emit a form
@@ -5019,125 +5125,25 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                                       "receipt) until the timeline reads clean")
                                 continue
                             if action in _park_policy.PARK_ABSORBING_ACTIONS:
-                                # [registry #764] THE MACHINE EXIT FOR AN ABSORBING PARK. Both
-                                # of these arms used to `continue` unconditionally, forever:
-                                #   dedupe        the window is receipted and only a HUMAN
-                                #                 gesture mints a new key;
-                                #   legacy-quiet  a pre-receipt park returns BEFORE
-                                #                 `generation = len(receipts) + 1`, so the
-                                #                 "ladder starts counting with the first
-                                #                 receipted window" it promises is unreachable
-                                #                 — nothing on this path ever writes one.
-                                # MEASURED (run 30263179462): these two arms took 7 of 7 planned
-                                # worker rows, launched 0. They are not free — compute_ready
-                                # serializes ONE row per `area:` package, so each held its
-                                # package against eleven sibling candidates, nine of which still
-                                # had a live attempt budget. Retiring them admits three
-                                # immediately.
-                                #
-                                # The exit is BOUNDED and RECEIPTED: one `observing` receipt
-                                # starts a clock keyed on the ladder WINDOW, and only once that
-                                # clock passes PARK_ABSORBING_GRACE_SECONDS does the item reach
-                                # the question-class terminal. `needs:user` is what frees the
-                                # partition (dispatch.yml's PLAN filter drops any `needs:*`), so
-                                # the disposition and the partition release are the SAME act —
-                                # the item leaves the lane with a comment, a receipt and a
-                                # census bucket, never silently.
-                                _absorb_since = max(
-                                    (str(_c.get("created_at")) for _c in comments
-                                     if str(_c.get("user", {}).get("login", "")).casefold()
-                                     == bot_login.casefold()
-                                     and worker_issue.ATTEMPT_MARKER in str(_c.get("body", ""))),
-                                    default="")
-                                _absorb_window = window_key or _park_policy.PARK_WINDOW_NONE
-                                _streak = worker_pr.absorbing_park_streak(
-                                    comments, bot_login, _absorb_window, since=_absorb_since)
-                                # FAIL-CLOSED on the retirement guard: an issue with an open
-                                # worker PR must NEVER be retired. `needs:user` on a source issue
-                                # terminally strips its open PR from the review loop — the exact
-                                # 2026-07-18 mass-park failure this file already warns about.
-                                _disposition, _streak = (
-                                    _park_policy.absorbing_park_disposition(
-                                        action, _streak, int(time.time()),
-                                        linked_open_pr=number in linked_open_prs))
-                                defer_reasons[_park_policy.budget_exhausted_bucket(
-                                    action, _disposition)] += 1
-                                if _disposition == "hold-linked-pr":
-                                    print(f"defer {repo}#{number}: deferred-retry budget "
-                                          f"exhausted ({action}); an OPEN worker PR is linked "
-                                          "to this issue, so the absorbing-park retirement "
-                                          "stands down (a needs:user hold here would strip "
-                                          "that PR from the review loop) — the PR's own "
-                                          "review lane owns the outcome")
-                                    continue
-                                if _disposition == "observe":
-                                    _run_gh_target_comment(
-                                        repo, number,
-                                        "> 🤖 SPARQ agent — this item's attempt budget is "
-                                        f"spent and its park ladder is ABSORBING ({action}): "
-                                        "no further attempt can be made, and no machine event "
-                                        "can advance the ladder without a human gesture. It "
-                                        "still reserves its `area:` partition against sibling "
-                                        "issues every tick, so it is now on a bounded "
-                                        f"{_park_policy.PARK_ABSORBING_GRACE_SECONDS // 3600}h "
-                                        "clock: if nothing changes it will be retired to a "
-                                        "human question and released from the dispatch lane. "
-                                        "Un-parking it (remove `status:parked`) restarts the "
-                                        "budget and this clock.\n\n"
-                                        + worker_pr.absorbing_park_receipt(
-                                            "observing", _absorb_window,
-                                            _iso_now()))
-                                    print(f"defer {repo}#{number}: deferred-retry budget "
-                                          f"exhausted ({action}); absorbing park OBSERVED — "
-                                          f"retirement clock started for window "
-                                          f"{_absorb_window}")
-                                    continue
-                                if _disposition == "wait":
-                                    print(f"defer {repo}#{number}: deferred-retry budget "
-                                          f"exhausted ({action}); absorbing park held, "
-                                          f"retirement clock running since {_streak or 'now'}")
-                                    continue
-                                # _disposition == "retire": the absorbing state PERSISTED past
-                                # the bounded grace. RECEIPT-FIRST ordering, exactly as the
-                                # `terminal` arm below: probe the sticky veto so the receipt is
-                                # honest about a suppressed write, post the durable receipt
-                                # SECOND, and the veto-checked needs:user write LAST — a crash
-                                # after the receipt leaves receipt-no-label, which the
-                                # receipt-driven reads cover.
-                                _vetoed = _park_policy.park_vetoed(
-                                    repo, number, "needs:user", _issue_timeline_events,
-                                    is_human=lambda login: _target_is_human_maintainer(
-                                        repo, login))
-                                _note = (
-                                    " Escalated as a human question (`needs:user`; the label "
-                                    "write follows this receipt), which also releases this "
-                                    "issue's `area:` partition to its siblings."
-                                    if not _vetoed else
-                                    " The retirement is TERMINAL, but the `needs:user` label "
-                                    "write was SUPPRESSED by a standing human unlabel (sticky "
-                                    "veto) — no label was applied; this receipt alone records "
-                                    "it, and the partition is NOT released.")
-                                _run_gh_target_comment(
-                                    repo, number,
-                                    "> 🤖 SPARQ agent — RETIRED from the deferred-retry lane. "
-                                    f"The attempt budget is spent, the park ladder has been "
-                                    f"absorbing ({action}) since {_streak}, and no machine "
-                                    "event can advance it — meanwhile it reserved its `area:` "
-                                    "partition against every sibling issue on that area, every "
-                                    f"tick.{_note} "
-                                    f"@{os.environ.get('MAINTAINER_HANDLE', 'jeswr')}: this "
-                                    "item needs a decision — decompose it, re-route it, or "
-                                    "close it as not implementable as specified. Removing "
-                                    "`needs:user`/`status:parked` re-admits it with a fresh "
-                                    "attempt budget and a fresh clock.\n\n"
-                                    + worker_pr.absorbing_park_receipt(
-                                        "retired", _absorb_window, _iso_now()))
-                                _landed = (False if _vetoed else
-                                           _issue_needs_user_landed(script_dir, repo, number))
-                                print(f"retired {repo}#{number}: absorbing park ({action}) "
-                                      f"persisted past the bounded grace since {_streak} -> "
-                                      f"question-class terminal"
-                                      f"{'' if _landed else ' (label suppressed)'}")
+                                # [registry #764] THE MACHINE EXIT FOR AN ABSORBING PARK.
+                                # The whole leg is `absorbing_park_leg` (module level, every
+                                # writer injected) so it can be EXECUTED by the self-test —
+                                # this arm is the only thing that routes an absorbing ladder
+                                # action into it, and deleting this `if` is what the
+                                # call-site seam assertions below are for.
+                                defer_reasons[absorbing_park_leg(
+                                    repo, number, action, window_key, comments, bot_login,
+                                    int(time.time()),
+                                    linked_open_pr=number in linked_open_prs,
+                                    worker_pr=worker_pr,
+                                    attempt_marker=worker_issue.ATTEMPT_MARKER,
+                                    post_comment=_run_gh_target_comment,
+                                    needs_user_landed=lambda: _issue_needs_user_landed(
+                                        script_dir, repo, number),
+                                    vetoed=lambda: _park_policy.park_vetoed(
+                                        repo, number, "needs:user", _issue_timeline_events,
+                                        is_human=lambda login: _target_is_human_maintainer(
+                                            repo, login)))] += 1
                                 continue
                             if action == "terminal":
                                 # Bounded escalation: PARK_ESCALATION_GENERATIONS windows
