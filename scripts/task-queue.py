@@ -1260,18 +1260,39 @@ def _self_test():
     # fixtures into a false red while the membership/uniqueness properties they assert stay live.
     claim_mod = _claim_module()
 
+    # Fields the PLAN schema has gained since these fixtures were written, each with the value a
+    # worker-lane PLAN really emits. Kept as an EXPLICIT table, not a blanket "default anything
+    # missing to empty": a silent auto-fill would let a future required field — one whose value
+    # actually changes routing — slip in defaulted the safe-looking way, which is exactly the
+    # failure `_require_exact_fields` exists to prevent. The assertions below make an unlisted
+    # new field a LOUD red here instead.
+    _PLAN_DEFAULTS = {"partition_starvation": []}   # registry #677
+    _REVIEW_ITEM_DEFAULTS = {"self_attested": False}  # registry #657 — false for worker-lane items
+
     def _plan_doc(reviews, disarms, repos=("o/r",), **overrides):
         document = {
             "schema": claim_mod.SCHEMA,
             "generated_at": "2026-07-18T00:00:00Z",
             "repositories": [{"target_repo": repo, "target_sha": "0" * 40, "items": []}
                              for repo in repos],
-            "review_items": list(reviews),
+            "review_items": [dict(_REVIEW_ITEM_DEFAULTS, **item) for item in reviews],
             "disarm_items": list(disarms),
             "snapshot_skips": [],
         }
+        document.update(_PLAN_DEFAULTS)
         document.update(overrides)
         return document
+
+    # The fixture must cover EVERY field the live validator requires. Without this, a new required
+    # PLAN or review-item field would surface as a confusing "missing X" inside an unrelated
+    # assertion (measured: `missing partition_starvation`) rather than as a named failure here.
+    _missing_plan = claim_mod.PLAN_FIELDS - set(_plan_doc([], []))
+    check("the plan fixture covers every field the live validator requires", _missing_plan, set())
+    _missing_item = claim_mod.REVIEW_ITEM_FIELDS - set(_REVIEW_ITEM_DEFAULTS) - {
+        "pr_number", "head_sha", "state", "impl_provider", "repo", "package", "security",
+        "context"}
+    check("the review-item fixture covers every field the live validator requires",
+          _missing_item, set())
 
     # END TO END: the supersession the projection docstring claims. The row PLAN emitted for the
     # old head is DROPPED once the PR's live head moves, so it can never be routed as live work.

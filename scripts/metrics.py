@@ -81,6 +81,13 @@ _gh_retry_spec.loader.exec_module(gh_retry)
 LEDGER_REF = os.environ.get("REGISTRY_LEDGER_REF", "ledger")
 LEDGER_PATH = os.environ.get("REGISTRY_METRICS_PATH", "data/metrics-history.json")
 PUBLISHED_PATH = "data/metrics.json"  # data-only ledger source for dashboard site/metrics.json
+# [OPUS-5] This repository is PUBLIC and this document is served verbatim at
+# jeswr.github.io/agent-account-registry/metrics.json, so the published snapshot is a CLOSED key
+# set enforced at the write boundary rather than trusted from the caller. Widening it is how fleet
+# internals reach a public page, and it is not hypothetical: build_snapshot carries the ring's
+# internal `_ts` tick identity, which run() has to strip by hand on the way here. Adding a key
+# below is a deliberate, reviewable act; adding one upstream is an accident.
+PUBLIC_SNAPSHOT_KEYS = frozenset({"generated_at", "schema_version", "targets", "alerts"})
 # The rolling ring: enough snapshots (at */15 cron => ~6h) to derive a rate from history and to
 # evaluate a SUSTAINED (K-snapshot) backlog condition without unbounded growth.
 MAX_SNAPSHOTS = int(os.environ.get("REGISTRY_METRICS_RING", "24"))
@@ -886,7 +893,19 @@ def publish_snapshot(api, registry_repo, snapshot, retries=6):
     """CAS-write the current public snapshot to ledger:`data/metrics.json`.
 
     dashboard.yml is the sole Pages deploy owner; it copies this ledger data file to
-    `site/metrics.json` in its generated artifact. This writer never invents a second deployment."""
+    `site/metrics.json` in its generated artifact. This writer never invents a second deployment —
+    it asks dashboard.yml to run (metrics.yml `dashboard-publish`), which is what keeps the
+    published copy on THIS collector's cadence instead of the sum of both crons.
+
+    Refuses, before the first byte is encoded, any snapshot whose key set is not exactly
+    PUBLIC_SNAPSHOT_KEYS: the destination is a public page, so an unrecognised key is a leak and a
+    missing one is a broken contract."""
+    keys = set(snapshot) if isinstance(snapshot, dict) else set()
+    if keys != set(PUBLIC_SNAPSHOT_KEYS):
+        raise MetricsError(
+            "published metrics key set drifted from the public contract — "
+            f"unexpected: {sorted(keys - PUBLIC_SNAPSHOT_KEYS)}, "
+            f"missing: {sorted(PUBLIC_SNAPSHOT_KEYS - keys)}")
     for _ in range(retries):
         path = f"/repos/{registry_repo}/contents/{PUBLISHED_PATH}?ref={LEDGER_REF}"
         current = api.request("GET", path, allow_404=True)
@@ -1184,11 +1203,18 @@ def main():
 def _self_test():
     ok = True
 
-    def chk(name, got, want):
+    def chk(name, got, want, diag=None):
         nonlocal ok
         good = got == want
         ok = ok and good
         print(f"  {'ok  ' if good else 'FAIL'} {name}: {got!r} (want {want!r})")
+        # #616 lesson (the halted dispatch run): a harness that discards the output of a body it
+        # EXECUTED makes the next failure unreadable — the real cause never reaches the log and the
+        # failure gets misattributed. Printed only on failure, so a green run stays quiet.
+        if not good and diag:
+            print("       executed-body diagnostics:")
+            for line in str(diag).splitlines():
+                print(f"       | {line}")
 
     _test_metric_computation(chk)
     _test_rate_derivation(chk)
@@ -1727,6 +1753,203 @@ def _test_ledger_cas(chk):
         read_history(_StubAPI(seed=None), "o/r"), ([], None))
 
 
+def _load_dashboard_gen():
+    """dashboard-gen's workflow-step extraction primitives (#612), shared rather than re-implemented:
+    ONE implementation of "locate exactly this step, fail closed if you cannot", so a wiring
+    assertion can never pass vacuously against a step it failed to find."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard-gen.py")
+    spec = importlib.util.spec_from_file_location("registry_dashboard_gen", path)
+    if spec is None or spec.loader is None:
+        raise MetricsError("cannot load dashboard-gen.py for workflow-step extraction")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+# Hermetic `gh` stub for the publish-decision harness (the #533 reconcile-harness pattern): keyed on
+# the EXACT api path so a reshaped step fails LOUDLY (exit 64) instead of quietly satisfying every
+# assertion. The REAL jq evaluates the step's REAL `--jq` filter over a fixture, so a mutated filter
+# — dropping the self-exclusion, or reading the run rollup instead of the deploy job — is caught
+# here too, not merely the surrounding shell.
+_PUBLISH_DECISION_GH_STUB = r'''#!/usr/bin/env bash
+filter=""
+want=0
+for a in "$@"; do
+  if [ "$want" = 1 ]; then filter="$a"; want=0; fi
+  if [ "$a" = "--jq" ]; then want=1; fi
+done
+case "$2" in
+  "repos/o/r/actions/workflows/dashboard.yml/runs?per_page=5")
+    if [ "${STUB_RUNS_FAIL:-0}" = 1 ]; then
+      printf 'gh-stub: runs read failed\n' >&2
+      exit 1
+    fi
+    printf '%s' "${STUB_RUNS_JSON}" | jq -r "$filter"
+    ;;
+  repos/o/r/actions/runs/*/jobs)
+    if [ "${STUB_JOBS_FAIL:-0}" = 1 ]; then
+      printf 'gh-stub: jobs read failed\n' >&2
+      exit 1
+    fi
+    printf '%s' "${STUB_JOBS_JSON}" | jq -r "$filter"
+    ;;
+  *)
+    printf 'gh-stub: unexpected argv: %s\n' "$*" >&2
+    exit 64
+    ;;
+esac
+'''
+
+# Hermetic `gh` stub for the publish-KICK harness. Every dispatch POST is appended verbatim to
+# $STUB_CALLS so the test can assert WHICH workflow was kicked and with which marker.
+_PUBLISH_KICK_GH_STUB = r'''#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${STUB_CALLS}"
+case "$*" in
+  *"/dispatches"*)  : ;;
+  *"runs?per_page=30"*) printf '0\n' ;;
+  *"runs?per_page=1"*)  printf '%s\n' "${STUB_LAST_RUN_AT}" ;;
+  *) printf 'gh-stub: unexpected argv: %s\n' "$*" >&2; exit 64 ;;
+esac
+'''
+
+
+def _stub_bin(tmp, name, body):
+    """Write an executable stub onto a private PATH directory and return that directory."""
+    binpath = os.path.join(tmp, "bin")
+    os.makedirs(binpath, exist_ok=True)
+    target = os.path.join(binpath, name)
+    with open(target, "w", encoding="utf-8") as handle:
+        handle.write(body)
+    os.chmod(target, 0o755)
+    return binpath
+
+
+def _iso_at(offset_seconds):
+    """An RFC3339 UTC stamp `offset_seconds` in the past — the shape the runs API returns."""
+    moment = datetime.fromtimestamp(time.time() - offset_seconds, tz=timezone.utc)
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _run_publish_decision(script, *, reason="", runs=(), jobs=(),
+                          runs_fail=False, jobs_fail=False):
+    """EXECUTE dashboard.yml's extracted publish-decision body. -> (exit code, publish, log)."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        binpath = _stub_bin(tmp, "gh", _PUBLISH_DECISION_GH_STUB)
+        body = os.path.join(tmp, "publish-decision.sh")
+        with open(body, "w", encoding="utf-8") as handle:
+            handle.write(script)
+        out_file = os.path.join(tmp, "github-output")
+        with open(out_file, "w", encoding="utf-8"):
+            pass
+        env = dict(os.environ)
+        env.update({"PATH": binpath + os.pathsep + env.get("PATH", ""),
+                    "GITHUB_REPOSITORY": "o/r", "GITHUB_RUN_ID": "999",
+                    "GITHUB_EVENT_NAME": "schedule", "GITHUB_OUTPUT": out_file,
+                    "GH_TOKEN": "stub", "KICK_REASON": reason,
+                    "FRESH_WINDOW_SECONDS": "900",
+                    "STUB_RUNS_JSON": json.dumps({"workflow_runs": list(runs)}),
+                    "STUB_JOBS_JSON": json.dumps({"jobs": list(jobs)}),
+                    "STUB_RUNS_FAIL": "1" if runs_fail else "0",
+                    "STUB_JOBS_FAIL": "1" if jobs_fail else "0"})
+        proc = subprocess.run(["bash", body], capture_output=True, text=True, env=env)
+        with open(out_file, encoding="utf-8") as handle:
+            emitted = handle.read()
+    values = re.findall(r"^publish=(\S+)$", emitted, re.M)
+    return proc.returncode, (values[-1] if values else None), proc.stdout + proc.stderr
+
+
+def _run_publish_kick(script, *, metrics_result, last_run_age=60):
+    """EXECUTE metrics.yml's extracted dashboard-publish body. -> (exit code, [gh argv], log)."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        binpath = _stub_bin(tmp, "gh", _PUBLISH_KICK_GH_STUB)
+        body = os.path.join(tmp, "dashboard-publish.sh")
+        with open(body, "w", encoding="utf-8") as handle:
+            handle.write(script)
+        calls_file = os.path.join(tmp, "calls")
+        with open(calls_file, "w", encoding="utf-8"):
+            pass
+        env = dict(os.environ)
+        env.update({"PATH": binpath + os.pathsep + env.get("PATH", ""),
+                    "GITHUB_REPOSITORY": "o/r", "GH_TOKEN": "stub",
+                    "METRICS_RESULT": metrics_result, "STUB_CALLS": calls_file,
+                    "STUB_LAST_RUN_AT": _iso_at(last_run_age)})
+        proc = subprocess.run(["bash", body], capture_output=True, text=True, env=env)
+        with open(calls_file, encoding="utf-8") as handle:
+            calls = [line for line in handle.read().splitlines() if line.strip()]
+    return proc.returncode, calls, proc.stdout + proc.stderr
+
+
+# [OPUS-5] round-2 review: the ONE grammar of job-level `if:` this repo's publish chain uses.
+# Anchored and single-comparison on purpose — see _eval_job_if for why an unmodelled rewrite must
+# raise rather than be waved through.
+_JOB_IF_COMPARISON = re.compile(
+    r"^needs\.([A-Za-z0-9_-]+)\.(result|outputs\.[A-Za-z0-9_.-]+)\s*(==|!=)\s*'([^']*)'$")
+
+
+def _eval_job_if(expr, needs):
+    """EVALUATE a job-level `if:` against a hypothetical `needs` context. -> bool.
+
+    Round-2 review finding (mutants A and C): the wiring assertions here matched job conditions by
+    SUBSTRING, which is polarity-blind by construction. `==` -> `!=` on the publish gate made the
+    dashboard publish only when the dedupe decided to SKIP — the freshness fix becoming a freshness
+    outage — and every check in the repo stayed green. Deletion was caught; inversion was not. So
+    the gate is now evaluated over the outcomes that matter instead of pattern-matched.
+
+    `expr is None` models GitHub's default for a job with `needs:` and no `if:` — an implicit
+    `success()` over the needed jobs. That is what makes dropping `if: always()` visible here.
+
+    Only `always()`, a boolean literal, `success()`, and ONE
+    `needs.<job>.(result|outputs.<key>) (==|!=) '<literal>'` comparison are modelled. Anything else
+    raises: a gate rewritten into a form this harness cannot reason about must fail LOUDLY rather
+    than silently stop being checked, which is the failure mode that produced this function."""
+    def _success():
+        return all((ctx or {}).get("result") == "success" for ctx in needs.values())
+
+    if expr is None:
+        return _success()
+    if isinstance(expr, bool):  # `if: false` parses as a YAML boolean, not the string "false"
+        return expr
+    text = str(expr).strip()
+    if text.startswith("${{") and text.endswith("}}"):
+        text = text[3:-2].strip()
+    if text == "always()":
+        return True
+    if text in ("true", "false"):
+        return text == "true"
+    if text == "success()":
+        return _success()
+    match = _JOB_IF_COMPARISON.match(text)
+    if not match:
+        raise MetricsError(
+            f"unmodelled job `if:` expression {expr!r} — this harness only evaluates the restricted "
+            "grammar the publish chain uses, and an expression it cannot evaluate is an UNCHECKED "
+            "polarity on a surface that cannot be reviewed at runtime (round-2 mutants A and C). "
+            "Extend _eval_job_if deliberately, or keep the gate in the modelled grammar.")
+    job, field, operator, want = match.groups()
+    context = needs.get(job)
+    if context is None:
+        raise MetricsError(
+            f"job `if:` reads needs.{job}, which is not among the modelled needs {sorted(needs)} — "
+            "a gate that names a job it does not depend on always reads the empty string")
+    if field == "result":
+        got = context.get("result", "")
+    else:
+        got = (context.get("outputs") or {}).get(field.split(".", 1)[1], "")
+    return (got == want) if operator == "==" else (got != want)
+
+
+def _job_step(job, step_id):
+    """The parsed step mapping with `id: step_id` inside a parsed job. Fails closed."""
+    found = [step for step in (job.get("steps") or []) if step.get("id") == step_id]
+    if len(found) != 1:
+        raise MetricsError(
+            f"expected exactly one step with `id: {step_id}`, found {len(found)} — refusing to "
+            "assert against a step that cannot be located")
+    return found[0]
+
+
 def _test_publish_cas_and_wiring(chk):
     snapshot = {"generated_at": "2026-07-21T00:00:00Z", "schema_version": 1,
                 "targets": {}, "alerts": []}
@@ -1755,6 +1978,213 @@ def _test_publish_cas_and_wiring(chk):
     chk("dashboard's sole Pages build publishes ledger metrics at site/metrics.json",
         ("ledger/data/metrics.json" in dashboard_workflow
          and "site/metrics.json" in dashboard_workflow), True)
+
+    # --- the PUBLIC key contract at the write boundary --------------------------------------
+    # The repository is public and this document is served verbatim at
+    # jeswr.github.io/agent-account-registry/metrics.json. Both directions are asserted, because
+    # only one of them is a leak but both are contract breaks.
+    chk("the public contract is exactly the key set the site serves today",
+        sorted(PUBLIC_SNAPSHOT_KEYS), ["alerts", "generated_at", "schema_version", "targets"])
+    widened = False
+    try:
+        publish_snapshot(_StubAPI(seed=[]), "o/r", {**snapshot, "account_handles": ["acct01"]})
+    except MetricsError:
+        widened = True
+    chk("a WIDENED snapshot is refused before a byte is encoded (a public page never learns a new "
+        "key by accident)", widened, True)
+    narrowed = False
+    try:
+        publish_snapshot(_StubAPI(seed=[]),
+                         "o/r", {k: v for k, v in snapshot.items() if k != "generated_at"})
+    except MetricsError:
+        narrowed = True
+    chk("a snapshot MISSING a contracted key is refused too (the freshness stamp is the one field "
+        "the whole publish path exists to move)", narrowed, True)
+    stripped = {k: v for k, v in build_snapshot([], {}, None, 0).items() if k != "_ts"}
+    chk("run()'s `_ts` strip is what keeps build_snapshot publishable — the standing proof that "
+        "the boundary check has something real to catch",
+        ("_ts" in build_snapshot([], {}, None, 0), set(stripped) <= set(PUBLIC_SNAPSHOT_KEYS)),
+        (True, True))
+
+    # --- the CAUSAL publish path (#656 follow-up) -------------------------------------------
+    # A ledger snapshot is not published until dashboard.yml copies it into its Pages artifact.
+    # On independent crons that copy inherited BOTH cadences; metrics.yml now kicks the dashboard
+    # the moment the snapshot exists. These assertions pin the wire contract, the dedupe that
+    # stops the retained cron fallback doubling the deploys, and the liveness mesh the dedupe is
+    # forbidden to touch.
+    import yaml  # lazy, self-test only: already a hard self-test-suite dep (resolve-conflicts.py)
+    dg = _load_dashboard_gen()
+    dash = yaml.safe_load(dashboard_workflow)
+    coll = yaml.safe_load(collector_workflow)
+    # PyYAML is YAML 1.1, where the `on:` key parses as the boolean True.
+    triggers = dash.get("on", dash.get(True)) or {}
+    dispatch_inputs = ((triggers.get("workflow_dispatch") or {}).get("inputs") or {})
+
+    kick_script = dg._workflow_step_script(collector_workflow, "dashboard-publish")
+    decision_script = dg._workflow_step_script(dashboard_workflow, "publish-decision")
+    # NESTED, not flat. Verified against an echo server: `gh api -f reason=x` builds the FLAT body
+    # {"ref":...,"reason":"x"}, which the dispatch API does not read as an input — the kicked run
+    # would start with an EMPTY reason, be indistinguishable from a keepalive dispatch, and be
+    # deduped away, so the causal publish would silently never happen. gh's documented nesting
+    # syntax is `key[subkey]=value`, and this assertion is the only thing standing between the two.
+    sent = re.search(r"-f\s+'inputs\[reason\]=([^']+)'", kick_script)
+    marker = sent.group(1) if sent else ""
+    chk("the publish kick carries a causal-leg marker, sent as a NESTED workflow_dispatch input "
+        "(a flat `-f reason=` is accepted by gh, ignored by the API, and fails silently)",
+        bool(marker), True)
+    chk("dashboard DECLARES the input the kick sends — an undeclared input makes the dispatch POST "
+        "a 422 and the whole causal path a silent no-op",
+        marker and marker != "" and "reason" in dispatch_inputs, True)
+    chk("the dashboard's dedupe tests the SAME marker metrics.yml sends (cross-file wire contract: "
+        "renaming either side goes red here rather than in production)",
+        bool(marker) and re.search(rf"KICK_REASON[^\n]*=\s*{re.escape(marker)}\b",
+                                   decision_script) is not None, True)
+    chk("that marker reaches the decision from the dispatch input, not from thin air",
+        "github.event.inputs.reason"
+        in dg._workflow_step_env(dashboard_workflow, "publish-decision").get("KICK_REASON", ""),
+        True)
+    chk("the metrics-driven kick fires on the METRICS JOB's result, not the workflow rollup (a "
+        "rollup also carries this very job, so a keepalive failure would suppress a good publish)",
+        (coll["jobs"]["dashboard-publish"].get("needs"),
+         "needs.metrics.result" in dg._workflow_step_env(
+             collector_workflow, "dashboard-publish").get("METRICS_RESULT", "")),
+        ("metrics", True))
+
+    # The retained cron is the liveness fallback; the whole publish chain — and ONLY the publish
+    # chain — hangs off the dedupe.
+    chk("dashboard KEEPS its own schedule (a dashboard triggered only by the kick would make "
+        "metrics a single point of failure for the fleet-wide cron-keepalive mesh)",
+        "schedule" in triggers, True)
+    chk("the publish chain is gated on the dedupe, transitively through probe -> build -> deploy",
+        (dash["jobs"]["probe"].get("needs"),
+         "needs.publish-decision.outputs.publish" in str(dash["jobs"]["probe"].get("if", "")),
+         dash["jobs"]["build"].get("needs"), dash["jobs"]["deploy"].get("needs")),
+        ("publish-decision", True, "probe", "build"))
+
+    # --- THE YAML `if:` SEAM (round-2 review, mutants A and C) ------------------------------
+    # The assertion above catches DELETION of the gate and nothing else: it is a substring test, so
+    # `== 'true'` -> `!= 'true'` survived it, and the dashboard would then publish only when the
+    # dedupe decided to SKIP. `if: always()` on the kick job was pinned by nothing at all, so
+    # deleting it survived too — and with the NEW `needs: metrics` edge that silently kills the
+    # mutual cron-delivery keepalive on exactly the failure path it exists for (the 2026-07-22
+    # stall). Both mutants live one level ABOVE the executed shell bodies, on a surface no runtime
+    # check can reach. So each condition is pinned EXACTLY and then EVALUATED.
+    publish_gate = dash["jobs"]["probe"].get("if")
+    chk("the publish gate is the EXACT positive polarity (an inverted dedupe publishes only when it "
+        "decided to skip — the freshness fix becoming a freshness outage)",
+        str(publish_gate).strip(), "needs.publish-decision.outputs.publish == 'true'")
+    chk("...and the gate is EVALUATED, not merely matched: publish=true runs the chain, "
+        "publish=false skips it, and an absent output skips (fail-closed if the decision job itself "
+        "dies — one cron of no publish, never a wedge)",
+        tuple(_eval_job_if(publish_gate,
+                           {"publish-decision": {"result": "success", "outputs": outputs}})
+              for outputs in ({"publish": "true"}, {"publish": "false"}, {})),
+        (True, False, False))
+    chk("no OTHER job in the publish chain carries a condition of its own — a second gate anywhere "
+        "on publish-decision/build/deploy (`if: false` being the cheapest) stops the site "
+        "publishing while every dedupe assertion above stays green",
+        {job: dash["jobs"][job].get("if") for job in ("publish-decision", "build", "deploy")},
+        {"publish-decision": None, "build": None, "deploy": None})
+    chk("...and neither EXECUTED step body is itself conditional — a step-level `if:` would leave "
+        "this harness exercising a body production can skip",
+        (_job_step(dash["jobs"]["publish-decision"], "publish-decision").get("if"),
+         _job_step(coll["jobs"]["dashboard-publish"], "dashboard-publish").get("if")),
+        (None, None))
+    keepalive_gate = coll["jobs"]["dashboard-publish"].get("if")
+    chk("the kick job runs even when the metrics job FAILS: `needs: metrics` is NEW here, so "
+        "without `always()` the mutual cron-delivery keepalive dies on precisely the failure path "
+        "it was built for (2026-07-22: dashboard 44+ min overdue, nothing kicked it)",
+        str(keepalive_gate).strip(), "always()")
+    chk("...evaluated across every metrics-job outcome, so DELETING the condition (leaving GitHub's "
+        "implicit success()) or pinning it false goes red here, not in production",
+        {result: _eval_job_if(keepalive_gate, {"metrics": {"result": result}})
+         for result in ("success", "failure", "cancelled", "skipped")},
+        {"success": True, "failure": True, "cancelled": True, "skipped": True})
+    unmodelled = False
+    try:
+        _eval_job_if("github.event_name == 'schedule' && needs.publish-decision.result == 'success'",
+                     {"publish-decision": {"result": "success"}})
+    except MetricsError:
+        unmodelled = True
+    chk("a gate rewritten outside the modelled grammar RAISES rather than silently stopping being "
+        "checked — the evaluator above must not be the next thing that fails open", unmodelled, True)
+
+    chk("cron-keepalive is NEVER gated by the dedupe — the liveness mesh that revives every other "
+        "scheduled workflow must run on every scheduled fire, publish or skip",
+        ("needs" in dash["jobs"]["cron-keepalive"], "if" in dash["jobs"]["cron-keepalive"]),
+        (False, False))
+    window = int(re.search(r"FRESH_WINDOW_SECONDS:\s*'(\d+)'", dashboard_workflow).group(1))
+    cadence = re.search(r"- cron: '(\S+)", collector_workflow).group(1)
+    step_minutes = int(cadence.split("/")[1]) if "/" in cadence else 60
+    chk("the dedupe window never exceeds the metrics cadence it defers to (a wider window lets a "
+        "stalled kick suppress the very fallback that covers that stall)",
+        window <= step_minutes * 60, True)
+    deploy_job_name = dash["jobs"]["deploy"]["name"]
+    chk("the dedupe interrogates the deploy job by its REAL name (renaming the job must not "
+        "silently turn the freshness check into a coin flip)",
+        deploy_job_name in decision_script, True)
+
+    # --- and now EXECUTE both bodies. Neither `bash -n` nor actionlint can see polarity. -----
+    chk("jq is available for the hermetic harness below (a missing dependency must be NAMED, "
+        "never silently skipped into a green run)",
+        subprocess.run(["jq", "--version"], capture_output=True).returncode, 0)
+    self_run = {"id": 999, "status": "in_progress", "conclusion": None,
+                "created_at": _iso_at(10)}
+    fresh_prev = {"id": 12, "status": "completed", "conclusion": "success",
+                  "created_at": _iso_at(120)}
+    deployed = [{"name": deploy_job_name, "conclusion": "success"}]
+    skipped = [{"name": deploy_job_name, "conclusion": "skipped"}]
+
+    rc, published, log = _run_publish_decision(
+        decision_script, runs=[self_run, fresh_prev], jobs=deployed)
+    chk("a scheduled run DEFERS when the previous run deployed inside the window — and finds that "
+        "previous run only because it excludes ITSELF from the listing",
+        (rc, published), (0, "false"), log)
+    rc, published, log = _run_publish_decision(
+        decision_script, reason=marker, runs=[self_run, fresh_prev], jobs=deployed)
+    chk("the CAUSAL leg publishes regardless — a deploy seconds old carried the PREVIOUS snapshot, "
+        "which is the whole lag being removed", (rc, published), (0, "true"), log)
+    rc, published, log = _run_publish_decision(
+        decision_script, runs=[self_run, fresh_prev], jobs=skipped)
+    chk("a previous run that CONCLUDED success while skipping its deploy does not count as a "
+        "publish — deferring to one would make the skip self-sustaining and freeze the site",
+        (rc, published), (0, "true"), log)
+    rc, published, log = _run_publish_decision(
+        decision_script,
+        runs=[self_run, {**fresh_prev, "created_at": _iso_at(window + 60)}], jobs=deployed)
+    chk("a previous deploy OLDER than the window does not suppress the scheduled fallback",
+        (rc, published), (0, "true"), log)
+    for label, kwargs in (
+            ("the runs listing is unreadable", {"runs": [self_run, fresh_prev],
+                                                "jobs": deployed, "runs_fail": True}),
+            ("the deploy-job read is unreadable", {"runs": [self_run, fresh_prev],
+                                                   "jobs": deployed, "jobs_fail": True}),
+            ("no other run is visible at all", {"runs": [self_run], "jobs": deployed}),
+            ("the previous run's timestamp is garbage",
+             {"runs": [self_run, {**fresh_prev, "created_at": "not-a-date"}], "jobs": deployed}),
+            ("the previous run failed", {"runs": [self_run, {**fresh_prev,
+                                                             "conclusion": "failure"}],
+                                         "jobs": deployed}),
+            ("the previous run has not settled", {"runs": [self_run, {**fresh_prev,
+                                                                      "status": "in_progress"}],
+                                                  "jobs": deployed})):
+        rc, published, log = _run_publish_decision(decision_script, **kwargs)
+        chk(f"FAIL-OPEN: {label} -> the run still publishes (a dedupe that can wedge itself shut "
+            "turns a freshness fix into a freshness outage)", (rc, published), (0, "true"), log)
+
+    rc, calls, log = _run_publish_kick(kick_script, metrics_result="success")
+    chk("a SUCCESSFUL metrics job kicks dashboard.yml exactly once, carrying the causal marker in "
+        "the nested-input form the dispatch API actually reads",
+        (rc, len(calls), calls and "dashboard.yml/dispatches" in calls[0],
+         calls and f"inputs[reason]={marker}" in calls[0]), (0, 1, True, True), log)
+    rc, calls, log = _run_publish_kick(kick_script, metrics_result="failure", last_run_age=60)
+    chk("a FAILED metrics job publishes nothing and does not fake a causal kick",
+        (rc, [c for c in calls if "dispatches" in c]), (0, []), log)
+    rc, calls, log = _run_publish_kick(kick_script, metrics_result="failure", last_run_age=9000)
+    chk("...but the pre-existing MUTUAL keepalive survives: a stale dashboard is still revived, "
+        "without the causal marker", (rc, len([c for c in calls if "dispatches" in c]),
+                                      any(f"reason={marker}" in c for c in calls)),
+        (0, 1, False), log)
 
 
 def _test_upsert_dedupe(chk):

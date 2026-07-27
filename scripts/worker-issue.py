@@ -53,6 +53,19 @@ ATTEMPT_MARKER = "<!-- sparq-worker-attempt:v1"
 #
 # Bot-authored only, like every other durable marker: a third party cannot forge one to mint budget.
 ATTEMPT_VOID_MARKER = "<!-- sparq-worker-attempt-void:v1"
+# [issue #568] OWNERSHIP receipt — the compare-and-swap half of the shared `status:in-progress`
+# label. The label alone proves only that SOME run claimed the issue; this run-key-bound receipt
+# proves WHICH. It is posted BEFORE the label flip (see worker.yml's claim step) so a run's
+# ownership is durable from the very first mutation it makes: an older run reaching the
+# pre-publish re-check therefore sees a newer run's ownership receipt even during the long
+# pre-attempt interval (claim -> worker-prep -> record-attempt), where the ATTEMPT receipt alone
+# left a window in which the older run still looked authorized.
+#
+# DELIBERATELY a distinct marker from ATTEMPT_MARKER: the attempt receipt is the BUDGET unit
+# (count_attempts) and the maintainer-approval staleness anchor. Reusing it here would charge a
+# second attempt per run and move the approval anchor — so ownership gets its own marker, and the
+# budget/approval surfaces are untouched. Bot-authored only, like every other durable marker.
+CLAIM_MARKER = "<!-- sparq-worker-claim:v1"
 # Maintainer-approval convention (issue #31): a HUMAN maintainer approves a retry by commenting
 # the word "approved" on the issue AFTER the worker's most recent attempt receipt. The trusted
 # human set is derived the same way the triage trust-gate derives it — repo collaborator
@@ -93,6 +106,77 @@ def body_sha(body):
 def _attempt_run_keys(body):
     """The run keys carried by the attempt receipts in one comment body."""
     return set(re.findall(re.escape(ATTEMPT_MARKER) + r" run=(\S+) -->", body))
+
+
+def _ownership_receipt(body):
+    """(is_receipt, run_keys) for one comment body (issue #568).
+
+    Ownership evidence is EITHER marker: the CLAIM receipt (posted before the label flip) or the
+    ATTEMPT receipt (posted before the model). Taking the union is the conservative direction —
+    it can only ever add FOREIGN claims to out-rank, never drop one — and it keeps a run launched
+    from an older workflow revision, which posts only an attempt receipt, visible as a claimant.
+    A receipt whose run key is unreadable stays a receipt with NO key, so it is attributable to
+    nobody and is treated as foreign below."""
+    keys = set(re.findall(re.escape(CLAIM_MARKER) + r" run=(\S+) -->", body))
+    keys |= _attempt_run_keys(body)
+    return (bool(keys) or CLAIM_MARKER in body or ATTEMPT_MARKER in body), keys
+
+
+def holds_live_claim(comments, bot_login, current_run_key, log=print):
+    """True iff the NEWEST worker ownership receipt on the issue is THIS run's own (issue #568).
+
+    The pre-publish re-check cannot demand `status:ready` — the workflow itself moved the issue to
+    `status:in-progress` at claim time — so the accepted in-progress state is instead bound to an
+    immutable per-run receipt. `status:in-progress` is a SHARED label: it proves only that some run
+    claimed the issue, so on its own it is not a compare-and-swap. The newest ownership receipt is:
+    a newer receipt from any other run means this run's claim was superseded (redispatch after a
+    deferral, a concurrent worker) and this run must not publish over it.
+
+    Ordering is over PARSED aware instants (park_policy.parse_ts), never raw strings — the
+    round-5 lesson: an equally-valid space-separator spelling sorts lexicographically before every
+    'T'-form stamp of the same day, so a string compare could read a NEWER foreign receipt as
+    older and authorize the superseded run.
+
+    Every fail direction is CLOSED: no run key supplied, no receipt of our own, an unparseable
+    stamp on ANY receipt (ownership becomes unprovable), and an exact instant tie with a foreign
+    receipt all return False. Only bot-authored comments count, so a human quoting the marker text
+    can neither steal nor forge a claim.
+
+    Known residues, stated honestly rather than papered over — both are LIVENESS costs or
+    seconds-wide, never a silent grant:
+      * GitHub comment timestamps are second-granular, so two runs whose receipts land in the SAME
+        second both refuse. Safe (nobody publishes), rare (the upstream lease CAS already
+        serialises dispatch), and the next tick re-dispatches.
+      * This is a check, not a server-side compare-and-swap on the push itself: a foreign receipt
+        landing between this read and `git push` is not seen. That window is seconds wide instead
+        of the tens of minutes the pre-model-only check left, and closing it entirely needs the
+        publish to be transactional with the claim.
+    """
+    if not current_run_key:
+        return False
+    parse_ts = _park_policy().parse_ts
+    bot = bot_login.casefold()
+    ours, foreign = [], []
+    for comment in comments:
+        if str(comment.get("user", {}).get("login", "")).casefold() != bot:
+            continue
+        is_receipt, keys = _ownership_receipt(str(comment.get("body", "")))
+        if not is_receipt:
+            continue
+        try:
+            stamp = parse_ts(comment.get("created_at"))
+        except ValueError:
+            log(f"::warning::worker ownership receipt carries an unparseable created_at "
+                f"{comment.get('created_at')!r} — this run cannot prove it still holds the "
+                "claim; the pre-publish check fails closed")
+            return False
+        # Ours ONLY when the receipt names this run and nothing else: a body carrying a foreign
+        # key too is attributable to that run as well, so it can never establish our ownership.
+        (ours if keys == {current_run_key} else foreign).append(stamp)
+    if not ours:
+        return False
+    newest_own = max(ours)
+    return all(stamp < newest_own for stamp in foreign)
 
 
 def attempt_voids(comments, bot_login):
@@ -184,7 +268,8 @@ def count_attempts_since(comments, bot_login, since, log=print):
     return charged
 
 
-def find_maintainer_approval(comments, bot_login, is_human_maintainer, log=print):
+def find_maintainer_approval(comments, bot_login, is_human_maintainer, log=print,
+                             current_run_key=None):
     """Return the approving comment, or None when the retry must fail closed.
 
     Evidence of maintainer approval (issue #31) is a comment by a HUMAN maintainer whose body
@@ -206,6 +291,16 @@ def find_maintainer_approval(comments, bot_login, is_human_maintainer, log=print
     "strictly after the last failure" unprovable for EVERY candidate — no approval stands
     (loud log); an approval whose created_at cannot be parsed can never prove it postdates
     the failure — that comment never approves.
+
+    `current_run_key` (issue #568) excludes THIS run's own attempt receipt from the staleness
+    anchor. record-attempt posts that receipt at the START of a run, long before the pre-publish
+    re-check runs — so without the exclusion the re-check would read this run's own start marker
+    as "the last failure" and reject the very approval that authorised the run, making publication
+    impossible for every third-party issue. The receipt marks a start, not a failure; the
+    staleness rule (an approval must postdate the last FAILED attempt) governs FUTURE retries, so
+    dropping ONLY the current run's marker cannot mask a real failure from a different run. It is
+    passed exclusively on the pre-publish path; dispatch-mode admission still anchors on every
+    receipt, this run's included.
     """
     bot = bot_login.casefold()
     parse_ts = _park_policy().parse_ts
@@ -213,6 +308,9 @@ def find_maintainer_approval(comments, bot_login, is_human_maintainer, log=print
     for comment in comments:
         if (str(comment.get("user", {}).get("login", "")).casefold() != bot
                 or ATTEMPT_MARKER not in str(comment.get("body", ""))):
+            continue
+        if (current_run_key
+                and _attempt_run_keys(str(comment.get("body", ""))) == {current_run_key}):
             continue
         try:
             stamp = parse_ts(comment.get("created_at"))
@@ -465,7 +563,67 @@ def void_attempt_on_outage(repo, issue, bot_login, run_key, exit_class):
     return True
 
 
-def reverify(repo, issue, expected_author, expected_body_sha, trust_gate, bot_login, issue_file):
+def _assert_verifier_immutable(trust_gate, forbid_gate_root):
+    """The pre-publish verifier must NOT resolve into the CANDIDATE-CONTROLLED tree (issue #568).
+
+    Executing a trust gate the candidate change supplied would let that change control the very
+    program authorizing its own publication — and a trust-surface issue legitimately edits
+    `scripts/trust-gate.py`, so this is a live shape, not a hypothetical. The caller names the tree
+    to exclude, because which tree that is depends on where the re-check runs:
+
+      * in the isolated `publish` job (issue #575, the current call site) it is the extracted
+        publish BUNDLE — the only candidate-controlled bytes on that runner — and the gate itself
+        comes from the target checkout pinned to the pre-gate base, digest-bound to the pre-model
+        record;
+      * when the re-check lived in the worker job it was the post-model `target` working tree, and
+        the gate came from a pre-model RUNNER_TEMP snapshot.
+
+    Either way this is the runtime proof of the property, not merely a convention. Resolution is
+    over REAL paths (Path.resolve follows symlinks and collapses `..`), so a symlink or a
+    `dir/../dir` spelling cannot smuggle the excluded tree back in. Fail-closed in every direction:
+    a missing forbidden root, an unresolvable path, or a gate at/under the root all raise."""
+    if not forbid_gate_root:
+        raise WorkerIssueError("pre-publish reverify requires the model-mutable root to exclude")
+    try:
+        root = Path(forbid_gate_root).resolve()
+        gate = Path(trust_gate).resolve()
+    except OSError as exc:                      # unresolvable path — never assume it is outside
+        raise WorkerIssueError(f"cannot resolve the pre-publish trust-gate path: {exc}") from exc
+    if gate == root or root in gate.parents:
+        raise WorkerIssueError(
+            "pre-publish trust gate resolves inside the model-mutable tree — the candidate "
+            "change would authorize its own publication; refusing")
+
+
+def reverify(repo, issue, expected_author, expected_body_sha, trust_gate, bot_login, issue_file,
+             current_run_key=None, mode="dispatch", forbid_gate_root=None):
+    """Re-prove the issue's live trust, revision, and status against the LIVE API.
+
+    `mode="dispatch"` is the pre-model admission check: the issue must still carry its positive
+    `status:ready` attestation and no busy/gated label.
+
+    `mode="pre-publish"` (issue #568) is the SAME check re-run in the fresh publisher, seconds
+    before push/PR creation, so a maintainer who closed, rewrote, or human-parked the issue during
+    the (tens-of-minutes) model + gate span is not published over from a stale snapshot. It cannot
+    demand `status:ready`: the workflow ITSELF moved the issue ready -> in-progress at claim time,
+    so dispatch mode would refuse every real run and publication would be non-functional. It
+    accepts exactly one extra state — THIS run's own still-live claim, proven by the ownership
+    receipt CAS (holds_live_claim), never a blanket `status:in-progress` — and additionally proves
+    the verifier is immutable. Everything else (another run's claim, human parking, deferral, a
+    re-opened pool state, a closed or rewritten issue) fails closed exactly as in dispatch mode.
+
+    It MUTATES no issue state: it only reads the issue + comments and runs the read-only trust
+    gate, so an aborted publish leaves a maintainer's intervention exactly as they left it and the
+    separate final_state job converges the issue back into the redispatch pool.
+    """
+    if mode not in {"dispatch", "pre-publish"}:
+        raise WorkerIssueError(f"unknown reverify mode {mode!r}")
+    if mode == "pre-publish":
+        # Both bindings are mandatory here: without the run key there is no claim CAS, and
+        # without the forbidden root there is no proof the verifier is out of the model's reach.
+        if not current_run_key:
+            raise WorkerIssueError("pre-publish reverify requires the current run key")
+        _assert_verifier_immutable(trust_gate, forbid_gate_root)
     item = _gh_json(["api", f"repos/{repo}/issues/{issue}"])
     if not isinstance(item, dict) or "pull_request" in item:
         raise WorkerIssueError("target number is not an issue")
@@ -481,11 +639,30 @@ def reverify(repo, issue, expected_author, expected_body_sha, trust_gate, bot_lo
         for label in item.get("labels", [])
         if isinstance(label, dict) and isinstance(label.get("name"), str)
     }
-    if "status:ready" not in labels:
-        raise WorkerIssueError("target issue lost its positive status:ready attestation")
-    blockers = sorted(label for label in labels if label in BUSY_OR_GATED or label.startswith("needs:"))
-    if blockers:
-        raise WorkerIssueError(f"target issue became gated or busy: {', '.join(blockers)}")
+    gating = sorted(label for label in labels
+                    if label in BUSY_OR_GATED or label.startswith("needs:"))
+    if mode == "pre-publish":
+        # status:ready RE-appearing means the issue re-entered the dispatch pool (a deferral +
+        # retry flip): this run's claim is no longer exclusive, so it must not publish.
+        if "status:ready" in labels:
+            raise WorkerIssueError(
+                "target issue returned to the dispatch pool (status:ready) — this run's claim is "
+                "no longer exclusive")
+        if "status:in-progress" not in labels:
+            raise WorkerIssueError("target issue lost this run's status:in-progress claim")
+        blockers = [label for label in gating if label != "status:in-progress"]
+        if blockers:
+            raise WorkerIssueError(f"target issue became gated or busy: {', '.join(blockers)}")
+        # The shared label is NOT the claim; the ownership receipt CAS is (issue #568).
+        if not holds_live_claim(_paginated(repo, issue, "comments"), bot_login, current_run_key):
+            raise WorkerIssueError(
+                "the newest worker ownership receipt is not this run's own — another run holds "
+                "or has superseded the claim")
+    else:
+        if "status:ready" not in labels:
+            raise WorkerIssueError("target issue lost its positive status:ready attestation")
+        if gating:
+            raise WorkerIssueError(f"target issue became gated or busy: {', '.join(gating)}")
 
     command = [
         sys.executable,
@@ -507,6 +684,7 @@ def reverify(repo, issue, expected_author, expected_body_sha, trust_gate, bot_lo
             _paginated(repo, issue, "comments"),
             bot_login,
             lambda login: _is_human_maintainer(repo, login),
+            current_run_key=current_run_key if mode == "pre-publish" else None,
         )
         if approval is None:
             raise WorkerIssueError(
@@ -548,6 +726,67 @@ def _remove_label(repo, issue, label):
         raise WorkerIssueError(f"GitHub API could not remove issue label {label}")
 
 
+# The status -> (labels to add, labels to remove) table set_status applies. Module-level (issue
+# #568) so the self-test can model the REAL workflow lifecycle — ready -> this run's in-progress
+# claim -> the pre-publish re-check — from the very table production uses, instead of a
+# hand-written label set that could silently drift from it and make the test vacuous.
+#
+# `in-progress-review`: the worker published a DRAFT PR that is cycling through the
+# cross-provider review loop — the issue completes only when the review-fix ARM path fires.
+# `retry`: the dispatcher re-enumerates a deferred issue (deferred-retry, locked decision 20)
+# — status:deferred is stripped and status:ready restored so the worker's reverify passes.
+# `retry` also clears `status:parked`: the deferred-retry dispatch IS the machine park's
+# readmission — reaching it proves capacity exists (the allocator granted a claim), so the
+# soft hold lifts exactly then.
+# `parked`: the MACHINE-owned capacity/decline/budget park (park_policy.py). Unlike
+# `needs-user` it is a SOFT hold cleared by a human readmission gesture (or the `retry`
+# flip) rather than a terminal question — but it DOES park the whole PR surface while it
+# stands (round-3 finding 2, the one-predicate rule): a PR is capacity-parked iff EITHER
+# machine label is live (review:parked on the PR OR status:parked on the source), so
+# enumerate_review_items excludes on it and CLAIM re-proves any readmission from the
+# durable receipts + label timelines.
+# `needs-user` stays reserved for genuine human questions and supersedes a machine park.
+# NOTE (issue #31): status:ready written here is dispatchability only, never maintainer
+# approval — the reverify third-party path demands separate human evidence.
+STATUS_TRANSITIONS = {
+    "in-progress": ({"status:in-progress"}, {"status:ready", "status:deferred"}),
+    "in-progress-review": ({"status:in-progress-review"},
+                           {"status:ready", "status:in-progress", "status:deferred"}),
+    "retry": ({"status:ready"}, {"status:deferred", "status:parked"}),
+    "deferred": ({"status:deferred"},
+                 {"status:ready", "status:in-progress", "status:in-progress-review"}),
+    "needs-user": ({"needs:user", "status:deferred"},
+                   {"status:ready", "status:in-progress", "status:in-progress-review",
+                    "status:parked"}),
+    "parked": ({"status:parked", "status:deferred"},
+               {"status:ready", "status:in-progress", "status:in-progress-review"}),
+    # `readmitted`: the SOURCE-ISSUE half of re-admitting a MACHINE capacity park on a
+    # PR-backed issue (registry #614 — the automatic cause-recovery path writes exactly what a
+    # human's unlabel gesture leads CLAIM to write). It CLEARS status:parked/status:deferred
+    # and restores the in-progress-review posture the open worker PR is actually in. It applies
+    # NO park label, so it is not veto-gated: the sticky human-unpark veto guards park
+    # APPLICATION, and clearing a machine park points the same way a human unpark does.
+    # Deliberately NOT `retry`, whose status:ready is the IMPLEMENTATION-dispatch posture —
+    # wrong for an issue whose worker PR is already open and cycling through review.
+    "readmitted": ({"status:in-progress-review"},
+                   {"status:parked", "status:deferred", "status:ready",
+                    "status:in-progress"}),
+    # `handback` [registry #797]: the SOURCE-ISSUE half of a MACHINE-TERMINAL retirement
+    # (worker-pr._retire_worker_pr). Its worker PR consumed two full budgets and has just been
+    # CLOSED, so — unlike `readmitted`, which restores the in-progress-review posture of a PR
+    # that is still open — the issue goes back to the implementable frontier for a FRESH attempt,
+    # normally on a decomposed `role:research` route the caller swapped in first. It clears the
+    # machine park and every in-flight posture and restores `status:ready`. It applies NO park
+    # label, so it is not veto-gated: like `readmitted`, clearing a machine park points the same
+    # way a human unpark does. `status:ready` here is dispatchability, never approval (issue #31).
+    "handback": ({"status:ready"},
+                 {"status:parked", "status:deferred", "status:in-progress",
+                  "status:in-progress-review"}),
+    "complete": (set(), {"status:in-progress", "status:in-progress-review",
+                         "status:deferred", "status:parked"}),
+}
+
+
 def set_status(repo, issue, status):
     # `in-progress-review`: the worker published a DRAFT PR that is cycling through the
     # cross-provider review loop — the issue completes only when the review-fix ARM path fires.
@@ -566,33 +805,9 @@ def set_status(repo, issue, status):
     # `needs-user` stays reserved for genuine human questions and supersedes a machine park.
     # NOTE (issue #31): status:ready written here is dispatchability only, never maintainer
     # approval — the reverify third-party path demands separate human evidence.
-    transitions = {
-        "in-progress": ({"status:in-progress"}, {"status:ready", "status:deferred"}),
-        "in-progress-review": ({"status:in-progress-review"},
-                               {"status:ready", "status:in-progress", "status:deferred"}),
-        "retry": ({"status:ready"}, {"status:deferred", "status:parked"}),
-        "deferred": ({"status:deferred"},
-                     {"status:ready", "status:in-progress", "status:in-progress-review"}),
-        "needs-user": ({"needs:user", "status:deferred"},
-                       {"status:ready", "status:in-progress", "status:in-progress-review",
-                        "status:parked"}),
-        "parked": ({"status:parked", "status:deferred"},
-                   {"status:ready", "status:in-progress", "status:in-progress-review"}),
-        # `readmitted`: the SOURCE-ISSUE half of re-admitting a MACHINE capacity park on a
-        # PR-backed issue (registry #614 — the automatic cause-recovery path writes exactly what a
-        # human's unlabel gesture leads CLAIM to write). It CLEARS status:parked/status:deferred
-        # and restores the in-progress-review posture the open worker PR is actually in. It applies
-        # NO park label, so it is not veto-gated: the sticky human-unpark veto guards park
-        # APPLICATION, and clearing a machine park points the same way a human unpark does.
-        # Deliberately NOT `retry`, whose status:ready is the IMPLEMENTATION-dispatch posture —
-        # wrong for an issue whose worker PR is already open and cycling through review.
-        "readmitted": ({"status:in-progress-review"},
-                       {"status:parked", "status:deferred", "status:ready",
-                        "status:in-progress"}),
-        "complete": (set(), {"status:in-progress", "status:in-progress-review",
-                             "status:deferred", "status:parked"}),
-    }
-    add, remove = transitions[status]
+    # The table itself is STATUS_TRANSITIONS above (module-level so the pre-publish lifecycle
+    # self-test derives its label state from the same source production writes from).
+    add, remove = STATUS_TRANSITIONS[status]
     park_label = PARK_STATUS_LABELS.get(status)
     if park_label and _park_policy().park_vetoed(
             repo, issue, park_label, lambda r, n: _paginated(r, n, "timeline"),
@@ -616,23 +831,42 @@ def set_status(repo, issue, status):
     print(f"target issue state: {status}")
 
 
-def claim_receipt(repo, issue, model, run_url):
-    """Post a visible 'the orchestrator is actively working this' receipt. A GitHub App bot user CANNOT
-    be an issue assignee, so this receipt + the `status:in-progress` label ARE the assignment: they show
-    WHO is working the issue, on WHAT model, and link the LIVE run — filterable via the label."""
+def claim_receipt(repo, issue, model, run_url, run_key, bot_login):
+    """Post the run's OWNERSHIP receipt. A GitHub App bot user CANNOT be an issue assignee, so this
+    receipt + the `status:in-progress` label ARE the assignment: they show WHO is working the
+    issue, on WHAT model, and link the LIVE run — filterable via the label.
+
+    [issue #568] It is also the compare-and-swap half of that shared label, and worker.yml posts it
+    BEFORE the ready -> in-progress flip. The label is shared, so it cannot say WHICH run owns the
+    claim; this run-key-bound marker can, and holds_live_claim reads it at pre-publish time. Posting
+    it FIRST is the ordering property that closes the supersession race: a newer run's ownership is
+    durable from its first mutation, so an older run reaching pre-publish refuses even inside the
+    long pre-attempt interval (claim -> worker-prep -> record-attempt). The failure ordering points
+    the same way — a receipt that cannot be posted RAISES here, before the label flip, so a run that
+    fails to record ownership never takes the label and never becomes authorized to publish.
+
+    Idempotent per run key, like record_attempt: a re-entered step re-uses its existing receipt
+    instead of stacking a second one."""
+    marker = f"{CLAIM_MARKER} run={run_key} -->"
+    for comment in _paginated(repo, issue, "comments"):
+        if (str(comment.get("user", {}).get("login", "")).casefold() == bot_login.casefold()
+                and marker in str(comment.get("body", ""))):
+            print(f"claim ownership receipt already posted (run {run_key})")
+            return
     body = (
         "> 🤖 **SPARQ orchestrator** has claimed this issue and is actively working it.\n\n"
         f"- Model: `{model}`\n"
         f"- Live worker run: {run_url}\n\n"
         "Active autonomous work is filterable with `is:issue label:status:in-progress`. A pull request "
         "will link back here when it opens. (A GitHub App cannot be a literal assignee — this receipt + "
-        "the `status:in-progress` label are the equivalent.)"
+        "the `status:in-progress` label are the equivalent.)\n\n"
+        f"{marker}"
     )
     _gh_json(
         ["api", "-X", "POST", f"repos/{repo}/issues/{issue}/comments", "--input", "-"],
         input_doc={"body": body},
     )
-    print("claim receipt posted")
+    print(f"claim ownership receipt posted (run {run_key})")
 
 
 def create_followups(repo, source_issue, spec_file):
@@ -810,6 +1044,20 @@ def _self_test():
     assert simulate_attempts(["success"])[0] == 1
     # DOCUMENTED #596 DECISION: rate-limit is non-chargeable, exactly like auth.
     assert simulate_attempts(["rate-limit"])[0] == 0
+    # #614's HOST-SIDE credential pre-flight classes. This is the task-side half of the #604/#614
+    # allow-list gap the retro-review found: `void-attempt` reads the RAW class, and model-health's
+    # fold onto auth/transient happens LATER in the model_health job — so until the drift lock in
+    # worker-pr.CREDENTIAL_OUTAGE_EXIT_CLASSES these CHARGED an attempt (and, on a final attempt,
+    # parked the issue) for a failure that happened before the model container existed.
+    for preflight_class in ("credential-remint-required", "credential-refresh-transient"):
+        pf_charged, pf_outs, pf_bodies = simulate_attempts([preflight_class])
+        assert pf_charged == 0, (preflight_class, pf_charged)
+        assert pf_outs == ["true"], (preflight_class, pf_outs)
+        assert any(f"exit-class={preflight_class}" in b for b in pf_bodies), pf_bodies
+    # The budget consequence, end to end: three host-side pre-flight failures against
+    # max_attempts=3 leave the attempt budget UNSPENT instead of exhausting it.
+    assert simulate_attempts(["credential-remint-required"] * 3)[0] == 0
+    assert simulate_attempts(["credential-refresh-transient"] * 3)[0] == 0
     # ...but an UNATTRIBUTABLE failure still charges, so the bounded-crash accounting survives.
     assert simulate_attempts(["unknown"])[0] == 1
     assert simulate_attempts(["setup"])[0] == 1
@@ -966,6 +1214,27 @@ def _self_test():
     assert find_maintainer_approval(
         [failure, human_after, failure2, after_both], "sparq[bot]", maintainers) is after_both
 
+    # (ix-b) issue #568: the PRE-PUBLISH re-check must not read THIS run's own start receipt as
+    # the failure being retried. record-attempt posts it before the long model+gate span, so at
+    # publish time it is the newest receipt and the approval that authorised this very run looks
+    # stale — third-party publication would be impossible. Excluding only the current run key
+    # restores it, and a DIFFERENT run's later receipt still bounds staleness (no masking).
+    own_start = {"user": {"login": "sparq[bot]", "type": "Bot"},
+                 "body": f"starting {ATTEMPT_MARKER} run=77.1 -->",
+                 "created_at": "2026-07-12T00:00:00Z"}
+    other_start = {**own_start, "body": f"starting {ATTEMPT_MARKER} run=88.1 -->"}
+    assert find_maintainer_approval([failure, human_after, own_start],
+                                    "sparq[bot]", maintainers) is None
+    assert find_maintainer_approval([failure, human_after, own_start], "sparq[bot]", maintainers,
+                                    current_run_key="77.1") is human_after
+    assert find_maintainer_approval([failure, human_after, other_start], "sparq[bot]", maintainers,
+                                    current_run_key="77.1") is None
+    # The exclusion is exact-key: a receipt naming this run AND another still anchors staleness.
+    shared_start = {**own_start,
+                    "body": f"{ATTEMPT_MARKER} run=77.1 --> {ATTEMPT_MARKER} run=88.1 -->"}
+    assert find_maintainer_approval([failure, human_after, shared_start], "sparq[bot]",
+                                    maintainers, current_run_key="77.1") is None
+
     # (ix) reverify exit-3 wiring (review r1): the fail-closed guard itself, not just the pure
     # helper. A stub trust-gate exits 3 (third-party author); real subprocess wiring, with only
     # the GitHub API seams patched. Without fresh approval reverify must raise the approval
@@ -1003,6 +1272,226 @@ def _self_test():
             reverify("o/r", 1, "third-party", body_sha("task"), str(gate),
                      "sparq[bot]", str(issue_file))
             assert json.loads(issue_file.read_text(encoding="utf-8")) == item
+        finally:
+            globals().update(saved)
+
+    # (xiii) issue #568 — the OWNERSHIP compare-and-swap behind the shared status:in-progress
+    # label. holds_live_claim answers "is the newest worker ownership receipt on this issue mine?"
+    def _rcpt(key, stamp, marker=CLAIM_MARKER, login="sparq[bot]"):
+        return {"user": {"login": login, "type": "Bot"},
+                "body": f"claimed {marker} run={key} -->", "created_at": stamp}
+
+    own_claim = _rcpt("77.1", "2026-07-19T01:00:00Z")
+    own_attempt = _rcpt("77.1", "2026-07-19T02:00:00Z", ATTEMPT_MARKER)
+    newer_foreign = _rcpt("88.1", "2026-07-19T03:00:00Z")
+    older_foreign = _rcpt("88.1", "2026-07-19T00:00:00Z")
+    assert holds_live_claim([own_claim], "sparq[bot]", "77.1")
+    # Marker INDEPENDENCE is load-bearing: ownership gets its OWN marker precisely so it is not a
+    # budget unit. If CLAIM_MARKER ever contained ATTEMPT_MARKER (or vice versa) every run would
+    # charge two attempts and the approval staleness anchor would move onto the claim receipt.
+    assert ATTEMPT_MARKER not in CLAIM_MARKER and CLAIM_MARKER not in ATTEMPT_MARKER
+    assert count_attempts([own_claim], "sparq[bot]") == 0
+    assert count_attempts([own_attempt], "sparq[bot]") == 1
+    # ...and the credential-outage VOID receipt is not ownership evidence either (its marker is
+    # adjacent enough to ATTEMPT_MARKER that a careless rename would make a void look like a claim).
+    void_rcpt = {"user": {"login": "sparq[bot]", "type": "Bot"},
+                 "body": f"voided {ATTEMPT_VOID_MARKER} run=88.1 -->",
+                 "created_at": "2026-07-19T08:00:00Z"}
+    assert _ownership_receipt(void_rcpt["body"]) == (False, set())
+    assert holds_live_claim([own_claim, void_rcpt], "sparq[bot]", "77.1")
+    assert find_maintainer_approval(
+        [own_claim, human_after], "sparq[bot]", maintainers) is human_after
+    # Either marker is ownership evidence: a run launched from an older workflow revision posts
+    # only the ATTEMPT receipt and must still register as a claimant.
+    assert holds_live_claim([own_attempt], "sparq[bot]", "77.1")
+    assert holds_live_claim([older_foreign, own_claim, own_attempt], "sparq[bot]", "77.1")
+    # A NEWER foreign receipt means the claim was superseded — refuse.
+    assert not holds_live_claim([own_claim, own_attempt, newer_foreign], "sparq[bot]", "77.1")
+    # Instant ties fail closed; an unbound in-progress state (no receipt of ours) refuses; so does
+    # an absent run key and an empty issue.
+    assert not holds_live_claim([own_claim, _rcpt("88.1", own_claim["created_at"])],
+                                "sparq[bot]", "77.1")
+    assert not holds_live_claim([newer_foreign], "sparq[bot]", "77.1")
+    assert not holds_live_claim([], "sparq[bot]", "77.1")
+    assert not holds_live_claim([own_claim], "sparq[bot]", "")
+    # Only BOT-authored comments count: a human pasting the marker text can neither steal a claim
+    # (their newer "receipt" is ignored) nor forge one.
+    human_paste = _rcpt("88.1", "2026-07-19T09:00:00Z", login="jeswr")
+    assert holds_live_claim([own_claim, human_paste], "sparq[bot]", "77.1")
+    assert not holds_live_claim([_rcpt("77.1", "2026-07-19T09:00:00Z", login="jeswr")],
+                                "sparq[bot]", "77.1")
+    # A receipt naming BOTH this run and another is attributable to that other run too — it can
+    # never establish our exclusive ownership, so it counts as foreign.
+    shared_body = {"user": {"login": "sparq[bot]", "type": "Bot"},
+                   "created_at": "2026-07-19T04:00:00Z",
+                   "body": f"{CLAIM_MARKER} run=77.1 --> {CLAIM_MARKER} run=88.1 -->"}
+    assert not holds_live_claim([own_claim, shared_body], "sparq[bot]", "77.1")
+    # Ordering is over PARSED instants, never raw strings (round-5 finding 2): this foreign
+    # receipt is LATER by instant but its space-separator spelling sorts lexicographically BEFORE
+    # our 'T'-form stamp — a string compare would authorize the superseded run.
+    space_foreign = _rcpt("88.1", "2026-07-19 05:00:00Z")
+    assert space_foreign["created_at"] < own_claim["created_at"]      # the trap, spelled out
+    assert not holds_live_claim([own_claim, space_foreign], "sparq[bot]", "77.1")
+    # An unparseable stamp on ANY receipt makes "mine is newest" unprovable — refuse, loudly.
+    claim_logs = []
+    assert not holds_live_claim([own_claim, _rcpt("88.1", "not-a-timestamp")],
+                                "sparq[bot]", "77.1", log=claim_logs.append)
+    assert any("fails closed" in line for line in claim_logs)
+    # An unkeyed receipt is attributable to nobody: it is foreign, and a newer one refuses.
+    unkeyed = {"user": {"login": "sparq[bot]", "type": "Bot"}, "body": CLAIM_MARKER,
+               "created_at": "2026-07-19T06:00:00Z"}
+    assert not holds_live_claim([own_claim, unkeyed], "sparq[bot]", "77.1")
+
+    # (xiii-a) THE SUPERSESSION ORDERING PROPERTY the ownership receipt exists for (issue #568,
+    # PR #442 option 1). worker.yml posts the CLAIM receipt BEFORE flipping the shared
+    # status:in-progress label, so a newer run owns the issue from its very first mutation —
+    # including the whole pre-attempt interval (claim -> worker-prep -> record-attempt) during
+    # which it has posted NO attempt receipt yet. The old run must refuse in exactly that window.
+    old_claim = _rcpt("77.1", "2026-07-19T01:00:00Z")
+    old_attempt = _rcpt("77.1", "2026-07-19T02:00:00Z", ATTEMPT_MARKER)
+    new_claim = _rcpt("88.1", "2026-07-19T03:00:00Z")           # newer run, pre-attempt interval
+    mid_flight = [old_claim, old_attempt, new_claim]
+    assert not holds_live_claim(mid_flight, "sparq[bot]", "77.1")
+    # ...and it is the CLAIM receipt doing that work: with the claim receipts stripped (the
+    # attempt-receipt-only world this issue's carried-over race describes) the old run's own
+    # attempt receipt is the newest evidence and it would have published over the newer claim.
+    assert holds_live_claim([c for c in mid_flight if CLAIM_MARKER not in c["body"]],
+                            "sparq[bot]", "77.1")
+    # The newer run itself holds the claim throughout that interval.
+    assert holds_live_claim(mid_flight, "sparq[bot]", "88.1")
+
+    # (xiii-b) the receipt POSTER is the other end of that binding: claim_receipt must embed the
+    # run key in a form holds_live_claim actually recognizes (a receipt the CAS cannot read is a
+    # silently unowned claim), and it must be idempotent per run so a re-entered step does not
+    # stack duplicates.
+    posted = []
+    receipt_seams = {
+        "_gh_json": lambda args, *, input_doc=None: posted.append(str(input_doc["body"])),
+        "_paginated": lambda repo, issue, resource: [
+            {"user": {"login": "sparq[bot]"}, "body": body, "created_at": "2026-07-19T01:00:00Z"}
+            for body in posted],
+    }
+    saved_receipt = {name: globals()[name] for name in receipt_seams}
+    globals().update(receipt_seams)
+    try:
+        claim_receipt("o/r", 1, "opus", "https://example/run/1", "77.1", "sparq[bot]")
+        assert len(posted) == 1 and f"{CLAIM_MARKER} run=77.1 -->" in posted[0]
+        assert holds_live_claim(
+            [{"user": {"login": "sparq[bot]"}, "body": posted[0],
+              "created_at": "2026-07-19T01:00:00Z"}], "sparq[bot]", "77.1")
+        claim_receipt("o/r", 1, "opus", "https://example/run/1", "77.1", "sparq[bot]")
+        assert len(posted) == 1                     # idempotent per run key
+        claim_receipt("o/r", 1, "opus", "https://example/run/2", "88.1", "sparq[bot]")
+        assert len(posted) == 2                     # a different run posts its own
+    finally:
+        globals().update(saved_receipt)
+
+    # (xiv) issue #568 — the WIRED pre-publish re-check over the REAL label lifecycle. The claim
+    # step moves the issue ready -> in-progress before the model runs, so a dispatch-mode reverify
+    # (which demands status:ready) would deterministically refuse every legitimate publish. Label
+    # state is derived from STATUS_TRANSITIONS — the table set_status itself applies — so this
+    # tracks the real lifecycle instead of a hand-written set that could drift. Real trust-gate
+    # subprocess; only the GitHub API seams are stubbed, and those stubs RAISE on any mutating
+    # call so "aborts without mutating human-owned issue state" is proven, not asserted in prose.
+    with tempfile.TemporaryDirectory() as tmp:
+        model_tree = Path(tmp) / "target"
+        (model_tree / "scripts").mkdir(parents=True)
+        model_gate = model_tree / "scripts" / "trust-gate.py"
+        model_gate.write_text("print('trusted')\n", encoding="utf-8")
+        pinned = Path(tmp) / "pinned"
+        pinned.mkdir()
+        gate_ok = pinned / "trust-gate.py"
+        gate_ok.write_text("print('trusted')\n", encoding="utf-8")
+        gate_dead = pinned / "gate-dead.py"
+        gate_dead.write_text("import sys\nsys.exit(1)\n", encoding="utf-8")
+        symlinked = pinned / "looks-pinned.py"
+        symlinked.symlink_to(model_gate)
+
+        add, remove = STATUS_TRANSITIONS["in-progress"]
+        live_labels = ({"status:ready", "role:impl"} | add) - (remove - add)
+        assert live_labels == {"status:in-progress", "role:impl"}   # the claim step's real output
+        item = {"state": "open", "user": {"login": "jeswr"}, "body": "task",
+                "labels": [{"name": name} for name in sorted(live_labels)]}
+        comments = [own_claim, own_attempt]
+        issue_file = Path(tmp) / "issue.json"
+
+        def read_only_gh_json(args, *, input_doc=None):
+            # Any mutating verb here would be a state change on the maintainer's issue.
+            assert "-X" not in args, f"pre-publish reverify mutated issue state: {args}"
+            return json.loads(json.dumps(item))
+
+        def read_only_run_gh(args, *, input_text=None, check=True):
+            raise AssertionError(f"pre-publish reverify shelled out to a mutation: {args}")
+
+        seams = {"_gh_json": read_only_gh_json,
+                 "_run_gh": read_only_run_gh,
+                 "_paginated": lambda repo, issue, resource: list(comments),
+                 "_is_human_maintainer": lambda repo, login: login == "jeswr"}
+        saved = {name: globals()[name] for name in seams}
+        globals().update(seams)
+        try:
+            def prepub(gate=gate_ok, key="77.1", mode="pre-publish", root=model_tree,
+                       author="jeswr", body="task"):
+                try:
+                    reverify("o/r", 1, author, body_sha(body), str(gate), "sparq[bot]",
+                             str(issue_file), key, mode, root and str(root))
+                    return "accepted"
+                except WorkerIssueError as exc:
+                    return f"refused: {exc}"
+
+            # The live path: this run's bound ready -> in-progress claim publishes, and the
+            # snapshot the publisher reads is re-attested seconds earlier.
+            assert prepub() == "accepted"
+            assert json.loads(issue_file.read_text(encoding="utf-8")) == item
+            snapshot = issue_file.read_text(encoding="utf-8")
+            # The SAME live state still fails DISPATCH mode: the fix is a dedicated bound mode,
+            # never a loosened dispatch check (and the r2 always-reject regression stays visible).
+            assert "status:ready" in prepub(mode="dispatch")
+
+            # --- criterion 2: the verifier may never resolve into the model-mutable tree. The
+            # model rewrote `target/` (a trust-surface issue legitimately edits trust-gate.py
+            # there), so executing that copy would let the candidate change authorize its own
+            # publication. Direct path, `..` traversal, and a symlink all refuse; the pinned
+            # snapshot is what passes, and a missing forbidden root refuses too.
+            assert "model-mutable tree" in prepub(gate=model_gate)
+            assert "model-mutable tree" in prepub(
+                gate=pinned / ".." / "target" / "scripts" / "trust-gate.py")
+            assert "model-mutable tree" in prepub(gate=symlinked)
+            assert "model-mutable root" in prepub(root=None)
+
+            # --- criterion 3/6: fail-closed against every other claim + gate state, while this
+            # run's own claim keeps working. Each case restores the accepting state afterwards,
+            # so a stuck refusal cannot silently pass the next assertion.
+            comments.append(newer_foreign)
+            assert "another run" in prepub()
+            comments[:] = [newer_foreign]
+            assert "another run" in prepub()
+            comments[:] = [own_claim, own_attempt]
+            assert prepub() == "accepted"
+            assert "run key" in prepub(key=None)
+
+            # --- criterion 1/4: live human intervention during the model+gate span aborts.
+            for extra, needle in (("needs:user", "needs:user"),
+                                  ("status:blocked", "status:blocked"),
+                                  ("status:parked", "status:parked"),
+                                  ("status:ready", "dispatch pool")):
+                item["labels"] = [{"name": n} for n in sorted(live_labels | {extra})]
+                assert needle in prepub(), extra
+            item["labels"] = [{"name": n} for n in sorted(live_labels - {"status:in-progress"})]
+            assert "status:in-progress claim" in prepub()
+            item["labels"] = [{"name": n} for n in sorted(live_labels)]
+            item["state"] = "closed"
+            assert "no longer open" in prepub()
+            item["state"] = "open"
+            item["body"] = "rewritten by the maintainer"
+            assert "body changed" in prepub()
+            item["body"] = "task"
+            # The trust gate stays load-bearing on the pre-publish path.
+            assert "trust gate" in prepub(gate=gate_dead)
+            # Every refusal above left the publisher's snapshot exactly as it was: no mutation of
+            # the issue (the seams would have raised) and no re-freshened stale snapshot.
+            assert issue_file.read_text(encoding="utf-8") == snapshot
+            assert prepub() == "accepted"
         finally:
             globals().update(saved)
 
@@ -1110,6 +1599,21 @@ def _self_test():
         assert any(path.endswith("labels/status:parked") for path in deletes), deletes
         assert any(path.endswith("labels/status:deferred") for path in deletes), deletes
         assert all("status:ready" not in labels for labels in posts), posts
+        # (x-vi-c) [registry #797] `handback`: the source-issue half of a MACHINE-TERMINAL
+        # retirement. Its worker PR has just been CLOSED, so — unlike `readmitted`, whose PR is
+        # still open — the issue goes back to the IMPLEMENTATION frontier: status:ready, with the
+        # machine park AND every in-flight posture cleared. Each removal is load-bearing: a
+        # handback that left `status:parked` (or `status:deferred`, or the in-progress-review
+        # posture of the PR it just closed) standing would be gated straight back out of the
+        # ready engine, and the work the retirement was supposed to preserve would be lost
+        # silently — which is exactly the absorbing state the retirement exists to escape.
+        posts.clear(); deletes.clear()
+        timeline.clear()
+        set_status("o/r", 9, "handback")
+        assert posts == [["status:ready"]], posts
+        for cleared in ("status:parked", "status:deferred", "status:in-progress",
+                        "status:in-progress-review"):
+            assert any(path.endswith(f"labels/{cleared}") for path in deletes), (cleared, deletes)
         # (x-vii) STRICT human probe (park-policy hygiene finding): an unlabel by an actor the
         # collaborator probe cannot confirm as a maintainer mints NO veto — the park proceeds.
         posts.clear(); deletes.clear()
@@ -1292,16 +1796,29 @@ def main():
     trust.add_argument("--trust-gate", required=True)
     trust.add_argument("--bot-login", required=True)
     trust.add_argument("--issue-file", required=True)
+    # [issue #568] The pre-publish re-check, run in the fresh publisher immediately before
+    # push/PR. `--mode pre-publish` accepts THIS run's own ready -> in-progress claim (dispatch
+    # mode demands status:ready, which the workflow itself removed at claim time, so it would
+    # refuse every real publish) bound to the run key below; `--forbid-gate-root` is the
+    # model-mutable tree the verifier must NOT resolve into. Both are mandatory in that mode.
+    trust.add_argument("--current-run-key", default=None)
+    trust.add_argument("--mode", choices=("dispatch", "pre-publish"), default="dispatch")
+    trust.add_argument("--forbid-gate-root", default=None)
 
     status = subparsers.add_parser("status", parents=[common])
-    status.add_argument("--status", choices=("in-progress", "in-progress-review", "retry",
-                                             "deferred", "needs-user", "parked", "readmitted",
-                                             "complete"),
-                        required=True)
+    # Derived from STATUS_TRANSITIONS, never re-declared: a transition added to the table without
+    # a CLI choice is unreachable from every helper call site (worker-pr, dispatch-claim), and
+    # this list silently drifting out of date is exactly how a new exit becomes a no-op.
+    status.add_argument("--status", choices=tuple(sorted(STATUS_TRANSITIONS)), required=True)
 
     receipt = subparsers.add_parser("claim-receipt", parents=[common])
     receipt.add_argument("--model", required=True)
     receipt.add_argument("--run-url", required=True)
+    # [issue #568] The receipt is the ownership half of the shared status:in-progress label, so it
+    # carries this run's key and is posted BEFORE the label flip; --bot-login scopes the
+    # idempotency probe to the bot's own comments.
+    receipt.add_argument("--run-key", required=True)
+    receipt.add_argument("--bot-login", required=True)
 
     followup = subparsers.add_parser("followup", parents=[common])
     followup.add_argument("--spec-file", required=True, help="JSONL of {title, body, labels} the model wrote")
@@ -1324,11 +1841,13 @@ def main():
                                    args.exit_class)
         elif args.command == "reverify":
             reverify(args.repo, args.issue, args.expected_author, args.expected_body_sha,
-                     args.trust_gate, args.bot_login, args.issue_file)
+                     args.trust_gate, args.bot_login, args.issue_file, args.current_run_key,
+                     args.mode, args.forbid_gate_root)
         elif args.command == "status":
             set_status(args.repo, args.issue, args.status)
         elif args.command == "claim-receipt":
-            claim_receipt(args.repo, args.issue, args.model, args.run_url)
+            claim_receipt(args.repo, args.issue, args.model, args.run_url, args.run_key,
+                          args.bot_login)
         elif args.command == "followup":
             create_followups(args.repo, args.issue, args.spec_file)
         else:

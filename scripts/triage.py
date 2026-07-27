@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-# [OPUS-4.8] Registry self-management: static (no-LLM) issue triage for jeswr/agent-account-registry.
+# Registry self-management: static (no-LLM) issue triage for jeswr/agent-account-registry.
 # Modeled on the sparq target's scripts/triage.py, adjusted for the registry's area:* sections and
 # its trust-surface soundness lane. Applied by .github/workflows/triage-issue.yml.
 """triage.py — the deterministic, no-LLM part of issue triage.
 
 Given an issue's labels + type, decide the labels to ADD/REMOVE and whether it is triage-complete:
-  * role     — from a `kind:*` label or the issue type; a trust-surface area forces the
-               trust-plane role (see TRUST_PLANE_ROLE).
+  * role     — from a `kind:*` label, the issue type, or (last resort, issue #225) the issue's
+               `area:*` default; a trust-surface area forces the trust-plane role (see
+               TRUST_PLANE_ROLE).
   * priority — kept if a valid single `priority:P0..P4` is present; else triage is incomplete.
   * package  — the existing `area:<section>` labels are the package. A NO-area issue is parked
                `needs:area` (it would otherwise reserve the serializing __global__ partition).
@@ -45,6 +46,8 @@ import re
 import subprocess
 import sys
 
+ROLE_LABELS = frozenset({"docs", "impl", "ci", "research", "site"})
+
 # ---------------------------------------------------------------------------------------------------
 # TRUST-PLANE ROLE — INTERIM MAPPING (TODO: registry #582 / #225).
 #
@@ -58,7 +61,7 @@ import sys
 # `match_labels` security rule is evaluated before ANY role route. The security rule's keyword list
 # is IDENTICAL to SEC_KEYWORDS below (asserted by the self-test), so every issue this branch fires
 # on is — by construction — matched by the Phase-1 security override and routed to
-# model_chain ["opus5", "opus"] / agent registry-reviewer / escalate=true, and its eventual PR is
+# model_chain ["opus5"] / agent registry-reviewer / escalate=true, and its eventual PR is
 # HUMAN-armed (worker-pr.py / dispatch-claim.py read the same match_labels keywords). The role
 # label's own chain is NEVER consulted for these issues, so the role label only has to (a) exist
 # and (b) be a configured role route so route-resolve does not raise UnknownRoleError.
@@ -94,7 +97,6 @@ TRUST_PLANE_ROLE = "impl"
 # SEC_KEYWORD as a substring, and the set of ROLE_BY_KIND keys mapped to TRUST_PLANE_ROLE must be
 # EXACTLY this tuple — adding a trust-plane kind without Phase-1 coverage fails the suite.
 TRUST_PLANE_KINDS = ("security",)
-
 ROLE_BY_KIND = {"docs": "docs", "research": "research", "ci": "ci", "site": "site",
                 **{kind: TRUST_PLANE_ROLE for kind in TRUST_PLANE_KINDS}}
 ROLE_BY_TYPE = {"feature": "impl", "bug": "impl", "task": "impl", "chore": "ci",
@@ -128,6 +130,51 @@ UI_SURFACE_LABELS = ("area:dashboard", "dashboard", "surface:frontend")
 # forced to the trust-plane lane by SEC_KEYWORDS above, which WINS — opus + human arm is stricter
 # than the frontier floor. role:ci covers the residual: .github/workflows + non-trust CI plumbing.
 INFRA_SURFACE_LABELS = ("area:ci", "area:workflows")
+# [OPUS-5] issue #225 — the DEFAULT role for each of the registry's OWN areas: the LAST fallback
+# in _role(), consulted only when the security/UI/infra lanes, an explicit `role:*`, a `kind:*` AND
+# the type map have all come up empty. `ROLE_BY_TYPE.get()` returns None for an issue with no
+# GitHub type or a type outside its keys, and a ROLELESS issue is INVISIBLE to the dispatch
+# enumerator (ready-issues.has_role requires `role:.+`, so the frontier drops it with no signal):
+# 117 `status:ready` issues sat silently undrainable. Keys are area VALUES matched EXACTLY — never
+# substrings; substring semantics belong to SEC_KEYWORDS / routing match_labels, which human-arm
+# whatever they match. Every value MUST be a role configured in orchestration/routing.toml, else
+# the row this enables is rejected by the planner (route-resolve.RoleResolutionError).
+# The first three groups are REDUNDANT today — an earlier lane short-circuits before the fallback
+# is reached — and are listed anyway so a future narrowing of SEC_KEYWORDS/UI/INFRA cannot silently
+# reopen the roleless hole.
+# WHAT "COMPLETE" DOES AND DOES NOT MEAN (#597 review round 2). The first form of this comment
+# called the table "the one complete registry-area map"; nothing established that, and nothing in
+# this repository can — the authoritative `area:*` inventory is the live repo's label set, which a
+# pure self-test cannot read. So the claim is scoped to what IS verified: every area named by an
+# AUTHORITATIVE in-repo source (SEC_KEYWORDS — asserted identical to routing.toml's trust-surface
+# match_labels — plus UI_SURFACE_LABELS and INFRA_SURFACE_LABELS) is a key here with the role that
+# source implies, cross-checked both ways by `_self_test`. That covers 8 of the 10 rows. The two
+# residual rows (`usage`, `docs`) are reachable ONLY through this table and have no other source, so
+# for them the pinned literal in `_self_test` IS the contract. An area outside the table fails
+# closed either way (see _area_default), so an unlisted surface is never silently mis-routed — it
+# simply is not derivable, which is the safe direction.
+# `_self_test`
+# asserts each entry AGREES with the lane that actually wins, so the redundancy can never drift, and
+# (#597 review finding 3) pins this map — keys and values — to an INDEPENDENT literal plus a
+# per-area lane attribution, so neither an added/removed row nor a re-pointed value can pass by
+# supplying its own expectation. An area OUTSIDE this map makes the whole derivation fail closed
+# (see _area_default): a surface the map cannot classify is unresolved, not absent.
+# Trust-plane entries reference TRUST_PLANE_ROLE rather than a literal: #582 established that
+# `role:soundness` DOES NOT EXIST in this repository, and that constant is the single place that
+# decision lands. Hard-coding the literal here would let this table write a nonexistent label and
+# reopen the very stranding hole #582 closed.
+AREA_ROLE_DEFAULT = {
+    # trust-plane script surfaces — SEC_KEYWORDS already forces the trust-plane role (stricter,
+    # and it wins)
+    "dispatch": TRUST_PLANE_ROLE, "worker": TRUST_PLANE_ROLE, "groom": TRUST_PLANE_ROLE,
+    "review-loop": TRUST_PLANE_ROLE, "set-up-account": TRUST_PLANE_ROLE,
+    # workflow/CI plumbing — INFRA_SURFACE_LABELS already derives `ci`
+    "ci": "ci", "workflows": "ci",
+    # the UI surface — UI_SURFACE_LABELS already derives `site`
+    "dashboard": "site",
+    # the residual registry surfaces, reachable ONLY through this table
+    "usage": "impl", "docs": "docs",
+}
 _PRIO = re.compile(r"^priority:P([0-4])$")
 ROLE_PREFIX = "role:"
 
@@ -150,6 +197,31 @@ def _valid_priority(labels):
     return len(ps) == 1
 
 
+def _area_default(labels):
+    """The role ALL of the issue's `area:<value>` labels agree on; None whenever that cannot be
+    established — the mapped areas disagree, no `area:*` label is present, or ANY `area:*` label is
+    OUTSIDE the table.
+
+    FAIL-CLOSED ON PARTIAL CLASSIFICATION TOO (#597 cross-provider review finding 1). The first
+    form of this predicate SILENTLY DROPPED unmapped `area:*` labels and let the single mapped role
+    win, so `["area:usage", "area:mystery"]` derived `impl`: an issue spanning one understood surface
+    and one this map does not describe was admitted to `status:ready` under a role nobody chose for
+    the unknown half. That is an admission predicate failing toward the PERMISSIVE side, which is
+    the opposite of the posture the rest of this module holds — and it is the direction that hurts,
+    because the fail-closed outcome (stay `status:untriaged` until a human labels it) is cheap and
+    reversible while a mis-routed dispatch is not. An area this table cannot classify is an
+    UNRESOLVED area, not an absent one."""
+    areas = [lb[len("area:"):] for lb in labels if lb.startswith("area:")]
+    if not areas:
+        return None
+    roles = set()
+    for area in areas:
+        if area not in AREA_ROLE_DEFAULT:
+            return None
+        roles.add(AREA_ROLE_DEFAULT[area])
+    return next(iter(roles)) if len(roles) == 1 else None
+
+
 def _role(labels, issue_type):
     # a trust-surface keyword forces the trust-plane lane regardless of kind/type/explicit role.
     if any(k in lb for lb in labels for k in SEC_KEYWORDS):
@@ -169,7 +241,11 @@ def _role(labels, issue_type):
     # same precedence slot: after security (the trust-plane role wins), explicit role:*, and kind.
     if any(lb in INFRA_SURFACE_LABELS for lb in labels):
         return "ci"
-    return ROLE_BY_TYPE.get(issue_type)
+    # [OPUS-5] issue #225: the area-derived default is the LAST resort, so an issue with no GitHub
+    # type (or a type outside ROLE_BY_TYPE) still derives a role instead of silently becoming
+    # undispatchable. Strictly a WIDENING — it fires only where the type map returned None, so no
+    # existing derivation changes.
+    return ROLE_BY_TYPE.get(issue_type) or _area_default(labels)
 
 
 def _assert_role_invariant(current, add, remove, ready):
@@ -515,7 +591,12 @@ def load_sibling(filename, name):
 # "unrecognized arguments", yet the enrolled suite was GREEN because every self-test called plan()
 # DIRECTLY. The fix is not just the missing option — it is deriving the argument list under test
 # from the WORKFLOW FILE, so a future workflow/CLI drift cannot hide behind a direct-call test.
-_SHELL_STOP = re.compile(r"<<<|<<|\||>|;|&&|\)")
+# A bare `<` stdin redirect ends the argv too (#605 review round 2). It was missing, so
+# `retriage.py --snapshot ... < pages.json > issues.jsonl` yielded an argv carrying the literal
+# tokens `<` and the path — harmless for a "which flags are passed" assertion, fatal for a self-test
+# that wants to REPLAY the workflow's own argv through main(). `<<<`/`<<` stay listed first so the
+# heredoc forms still win at the same position.
+_SHELL_STOP = re.compile(r"<<<|<<|<|\||>|;|&&|\)")
 
 
 def workflow_argvs(workflow_path, script, subst=None):
@@ -575,6 +656,21 @@ def _self_test():
         triage(["priority:P1", "area:worker"], "feature")["role"], TRUST_PLANE_ROLE)
     chk("dispatch -> trust-plane role", triage(["priority:P1", "area:dispatch"], "feature")["role"],
         TRUST_PLANE_ROLE)
+    # The shared catalog pins every role this planner may derive. Every derivation source must
+    # remain representable.
+    derived_roles = set(ROLE_BY_KIND.values()) | set(ROLE_BY_TYPE.values()) | {
+        _role([label], "task") for label in UI_SURFACE_LABELS + INFRA_SURFACE_LABELS
+    } | set(AREA_ROLE_DEFAULT.values())
+    chk("all derived roles have labels", derived_roles <= set(ROLE_LABELS), True)
+    # Exact regression: applying the plan for a trust-surface issue which starts at role:impl
+    # leaves exactly one representable role, never a transiently planned roleless end state.
+    labels = {"role:impl", "area:worker", "priority:P2", "from:agent"}
+    r = triage(labels)
+    final_labels = (labels | r["add"]) - r["remove"]
+    final_roles = {lb for lb in final_labels if lb.startswith("role:")}
+    chk("trust role replacement is exactly-one", final_roles, {f"role:{TRUST_PLANE_ROLE}"})
+    chk("trust role replacement plans no churn when the target is already present",
+        (f"role:{TRUST_PLANE_ROLE}" in r["add"], "role:impl" in r["remove"]), (False, False))
     # [FABLE-5] UI-surface ownership: dashboard work derives role:site (codex-led chain, e4098b9);
     # kind:docs about the dashboard stays docs.
     chk("dashboard -> site", triage(["priority:P2", "area:dashboard"], "feature")["role"], "site")
@@ -588,6 +684,122 @@ def _self_test():
         triage(["priority:P3", "kind:docs", "area:ci"], "task")["role"], "docs")
     chk("infra+trust surface -> trust-plane role",
         triage(["priority:P1", "area:ci", "area:dispatch"], "feature")["role"], TRUST_PLANE_ROLE)
+    # [OPUS-5] issue #225: EVERY registry area derives a role even when the issue TYPE is unknown
+    # (an untyped issue fell through `ROLE_BY_TYPE.get(...)` to None, and a roleless issue is
+    # invisible to the dispatch enumerator).
+    #
+    # #597 review finding 3: the inventory AND the expectations used to come from AREA_ROLE_DEFAULT
+    # itself — deleting an entry deleted its own test, and changing a value changed actual and
+    # expected together — so it substantiated neither "the one complete registry-area map" nor the
+    # redundancy claim in the table's comment. The map is therefore PINNED to an INDEPENDENT literal
+    # here: adding, removing or re-pointing an area now requires editing this test deliberately.
+    # (The trust-plane rows are pinned to TRUST_PLANE_ROLE by NAME on purpose — #582 established
+    # that `role:soundness` does not exist and that constant is the single place that decision
+    # lands; the "every derivable role is a real label" check below is what proves it names a label
+    # this repository actually has.)
+    chk("[#225] AREA_ROLE_DEFAULT is exactly this map (pinned independently of the table)",
+        dict(sorted(AREA_ROLE_DEFAULT.items())),
+        {"ci": "ci", "dashboard": "site", "dispatch": TRUST_PLANE_ROLE, "docs": "docs",
+         "groom": TRUST_PLANE_ROLE, "review-loop": TRUST_PLANE_ROLE,
+         "set-up-account": TRUST_PLANE_ROLE, "usage": "impl", "workflows": "ci",
+         "worker": TRUST_PLANE_ROLE})
+
+    # The table's comment claims the first three groups are REDUNDANT TODAY (an earlier lane
+    # short-circuits before the fallback is reached) and that only the residual surfaces are
+    # reachable THROUGH the table. That claim is now asserted, not asserted-about: this is which
+    # lane actually decides each area for an untyped issue. A future narrowing of
+    # SEC_KEYWORDS/UI/INFRA moves a row here and flips this check red — which is precisely the
+    # drift the comment says the redundancy guards against.
+    def _lane(area):
+        label = f"area:{area}"
+        if any(keyword in label for keyword in SEC_KEYWORDS):
+            return "trust"
+        if label in UI_SURFACE_LABELS:
+            return "ui"
+        if label in INFRA_SURFACE_LABELS:
+            return "infra"
+        return "fallback"
+
+    # #597 review round 2: "the one complete registry-area map" was unsubstantiated — no
+    # authoritative `area:*` inventory was compared, so the pinned literal above only proved the
+    # table equals itself-as-written. There IS no in-repo inventory of every live label (the
+    # authoritative source is the repo's label set, unreadable from a pure self-test), so the claim
+    # is scoped in the table's comment AND the strongest available cross-reference is asserted here:
+    # every area named by an authoritative in-repo source must be a KEY of the table carrying the
+    # role that source implies, and — the other direction — the table must not claim a trust-plane
+    # default for an area the trust-surface source does not name. SEC_KEYWORDS is itself asserted
+    # IDENTICAL to routing.toml's trust-surface match_labels elsewhere in this suite, so this chains
+    # to a real config file rather than to a duplicated expectation.
+    # Keyed on the AREA, never on the role STRING: TRUST_PLANE_ROLE is currently the same literal
+    # as the generic impl role (see the constant's own comment), so `value == TRUST_PLANE_ROLE`
+    # cannot discriminate `area:usage` -> impl from a trust-plane row.
+    _REGISTRY_TRUST_AREAS = ("dispatch", "worker", "set-up-account", "review-loop", "groom")
+    chk("[#597 r2] every trust-surface AREA keyword is a mapped key, on the trust-plane role",
+        (sorted(set(_REGISTRY_TRUST_AREAS) - set(SEC_KEYWORDS)),
+         {area: AREA_ROLE_DEFAULT.get(area, "UNMAPPED") for area in _REGISTRY_TRUST_AREAS}),
+        ([], {area: TRUST_PLANE_ROLE for area in _REGISTRY_TRUST_AREAS}))
+    # ...and the OTHER direction, which is what actually detects drift: the partition of
+    # SEC_KEYWORDS into registry AREAS vs crypto/domain keywords is pinned, so adding a new
+    # trust-surface registry area to SEC_KEYWORDS (or to routing.toml, which SEC_KEYWORDS is
+    # asserted identical to) turns this red until it is given a row above.
+    chk("[#597 r2] SEC_KEYWORDS' non-area half is pinned, so a NEW trust area cannot slip past",
+        sorted(set(SEC_KEYWORDS) - set(_REGISTRY_TRUST_AREAS)),
+        ["auth", "crypto", "e2ee", "mpc", "security", "zk"])
+    chk("[#597 r2] every UI/INFRA surface LABEL is a mapped area with that lane's role",
+        {label[len("area:"):]: AREA_ROLE_DEFAULT.get(label[len("area:"):], "UNMAPPED")
+         for label in UI_SURFACE_LABELS + INFRA_SURFACE_LABELS if label.startswith("area:")},
+        {"dashboard": "site", "ci": "ci", "workflows": "ci"})
+    chk("[#597 r2] ...and only `usage`/`docs` rest on the pinned literal alone",
+        sorted(set(AREA_ROLE_DEFAULT)
+               - set(_REGISTRY_TRUST_AREAS)
+               - {label[len("area:"):] for label in UI_SURFACE_LABELS + INFRA_SURFACE_LABELS
+                  if label.startswith("area:")}),
+        ["docs", "usage"])
+    chk("[#225] exactly which areas REACH the fallback (the rest short-circuit earlier)",
+        {area: _lane(area) for area in sorted(AREA_ROLE_DEFAULT)},
+        {"ci": "infra", "dashboard": "ui", "dispatch": "trust", "docs": "fallback",
+         "groom": "trust", "review-loop": "trust", "set-up-account": "trust",
+         "usage": "fallback", "workflows": "infra", "worker": "trust"})
+    # Every row exercises the TABLE itself (not just the two rows that reach the fallback in
+    # _role()), so a wrong value cannot hide behind an earlier lane...
+    for _area, _want in sorted(AREA_ROLE_DEFAULT.items()):
+        chk(f"_area_default resolves area:{_area} through the table",
+            _area_default([f"area:{_area}"]), _want)
+    # ...and each area still derives the SAME role end to end through triage(), so the table can
+    # never disagree with the lane that actually wins.
+    for _area, _want in sorted(AREA_ROLE_DEFAULT.items()):
+        chk(f"area:{_area} derives a role when untyped",
+            triage(["priority:P2", f"area:{_area}"], "")["role"], _want)
+    # the consequence that matters: such an issue is now READY (it was parked status:untriaged and
+    # never entered any dispatch plan).
+    r = triage(["priority:P2", "area:usage"], "")
+    chk("untyped registry issue becomes ready", (r["ready"], "role:impl" in r["add"]), (True, True))
+    # AMBIGUOUS area defaults -> no role at all (fail closed), never an arbitrary pick.
+    chk("conflicting area defaults -> no role",
+        triage(["priority:P2", "area:usage", "area:docs"], "")["role"], None)
+    # #597 review finding 1: a MIXED mapped/unmapped area set is ALSO ambiguous. The first form let
+    # the one mapped role win here (`impl`) — an admission predicate failing toward the permissive
+    # side on PARTIAL classification. Non-vacuous: it derived "impl" before the fix, and the issue
+    # therefore went `status:ready` under a role nobody chose for its unknown surface.
+    chk("[#597] mapped + UNMAPPED area -> no role (partial classification fails closed)",
+        (triage(["priority:P2", "area:usage", "area:mystery"], "")["role"],
+         triage(["priority:P2", "area:usage", "area:mystery"], "")["ready"]),
+        (None, False))
+    chk("[#597] and _area_default itself refuses the mixed set, in both label orders",
+        (_area_default(["area:usage", "area:mystery"]),
+         _area_default(["area:mystery", "area:usage"]),
+         _area_default(["area:usage", "area:usage"]),
+         _area_default(["area:"]), _area_default([])),
+        (None, None, "impl", None, None))
+    # the area default is LAST: an explicit role, a kind, the UI/infra lanes and the type map win.
+    chk("type map wins over area default",
+        triage(["priority:P3", "area:usage"], "spike")["role"], "research")
+    chk("explicit role wins over area default",
+        triage(["priority:P2", "role:research", "area:usage"], "")["role"], "research")
+    chk("kind wins over area default",
+        triage(["priority:P2", "kind:docs", "area:usage"], "")["role"], "docs")
+    # an unknown area is NOT invented into a role — an untyped, unmapped issue stays untriaged.
+    chk("unknown area derives nothing", triage(["priority:P2", "area:mystery"], "")["role"], None)
     # B2: a needs:design issue is NOT ready even with a full role+priority+area label-set.
     r = triage(["priority:P2", "role:impl", "area:review-loop", "needs:design"], "task")
     chk("needs:design not ready (B2)", r["ready"], False)
@@ -623,6 +835,9 @@ def _self_test():
             "area:dispatch", "area:worker", "area:usage", "area:docs", "area:ci",
             "area:workflows", "area:dashboard", "area:review-loop", "area:groom",
             "trust:untrusted"}
+    chk("catalog == the pinned live role labels",
+        {f"role:{role}" for role in ROLE_LABELS},
+        {label for label in REAL if label.startswith("role:")})
     chk("trust-plane role label EXISTS in the registry label set",
         f"role:{TRUST_PLANE_ROLE}" in REAL, True)
     chk("role:soundness is NOT a registry label (the #582 root cause)",
@@ -633,8 +848,13 @@ def _self_test():
         (r["role"], f"role:{r['role']}" in REAL, r["remove"], r["ready"]),
         (TRUST_PLANE_ROLE, True, set(), True))
     # every derivable role must be a REAL label — otherwise triage can still strand an issue.
+    # AREA_ROLE_DEFAULT (#225) is a THIRD producer of role labels, so it belongs in this existence
+    # check alongside the kind/type maps — a table entry naming a label the repo lacks strands the
+    # issue exactly as the #582 root cause did. Non-vacuous: with the pre-merge literal
+    # `"soundness"` entries restored, this goes red.
     chk("every derivable role is a real label",
         sorted({f"role:{v}" for v in list(ROLE_BY_KIND.values()) + list(ROLE_BY_TYPE.values())
+                + list(AREA_ROLE_DEFAULT.values())
                 + [TRUST_PLANE_ROLE, "site", "ci"]} - REAL), [])
     # POSTURE: TRUST_PLANE_ROLE is only safe because routing.toml's Phase-1 security keywords are
     # IDENTICAL to SEC_KEYWORDS, so every trust-plane match is human-armed/opus-routed regardless
@@ -651,7 +871,7 @@ def _self_test():
         sorted(SEC_KEYWORDS), sorted({k for rule in sec_rules for k in rule["match_labels"]}))
     chk("the security route human-escalates + runs the soundness chain",
         [(rule["model_chain"], rule["agent"], bool(rule.get("escalate"))) for rule in sec_rules],
-        [(["opus5", "opus"], "registry-reviewer", True)])
+        [(["opus5"], "registry-reviewer", True)])
     chk("TRUST_PLANE_ROLE has a configured role route in routing.toml",
         TRUST_PLANE_ROLE in {route.get("role") for route in doc.get("route", [])
                              if "match_labels" not in route}, True)
@@ -679,6 +899,16 @@ def _self_test():
         (1, True, True))
     chk("[#582] missing target label still leaves exactly one role on the issue",
         _roles_of((fixture | r["add"]) - r["remove"]), {"role:docs"})
+    # An explicit role on a NON-trust surface reaches the same live-label check. It is preserved
+    # verbatim and diagnosed when the repository does not have that label; a static catalog must
+    # never silently pre-empt this fail-closed path.
+    fixture = {"priority:P2", "role:soundness", "area:docs"}
+    r = triage(fixture, "task", known_labels=REAL)
+    warning = r["warnings"][0] if r["warnings"] else ""
+    chk("[#582] missing explicit role is preserved and warned on a non-trust surface",
+        (r["role"], _roles_of((fixture | r["add"]) - r["remove"]), len(r["warnings"]),
+         "role:soundness" in warning),
+        ("soundness", {"role:soundness"}, 1, True))
     # missing target AND no existing role -> NOT ready (recoverable untriaged), never ready+roleless.
     r = triage(["priority:P1", "area:dispatch"], "task",
                known_labels=REAL - {f"role:{TRUST_PLANE_ROLE}"})
@@ -893,7 +1123,7 @@ def _self_test():
     policy_resolve = load_sibling("policy-resolve.py", "registry_policy_resolve")
     policy_doc = tomllib.load(open(os.path.join(root, "policy/repos.toml"), "rb"))
     SELF_REPO = "jeswr/agent-account-registry"
-    SOUNDNESS = (["opus5", "opus"], "registry-reviewer", True)
+    SOUNDNESS = (["opus5"], "registry-reviewer", True)
 
     def resolved(labels):
         """(derived role, route-resolve verdict, policy-resolve verdict) for a POST-TRIAGE label
@@ -927,9 +1157,18 @@ def _self_test():
             (TRUST_PLANE_ROLE, SOUNDNESS, SOUNDNESS))
     # DISCRIMINATION: the enumeration above is not vacuously true — a NON-trust-plane kind must NOT
     # escalate (otherwise the check would pass even if every issue were force-escalated).
+    # [OPUS-5] `kind:research` was the second sample here and now escalates BY DESIGN: the
+    # 2026-07-26 deprecation collapsed role=research to a single rung (opus5), and a one-rung
+    # chain with no `escalate` has no exit at all — on an opus5 outage it could only defer
+    # forever with no human notified. It is replaced by `kind:site`, which is still a genuine
+    # non-escalating route, so the discrimination remains real rather than being dropped.
     chk("[#595 f1] a non-trust-plane kind is NOT escalated (the enumeration discriminates)",
         [resolved(["priority:P1", "area:usage", "kind:docs"])[1][2],
-         resolved(["priority:P1", "area:usage", "kind:research"])[1][2]], [False, False])
+         resolved(["priority:P1", "area:usage", "kind:site"])[1][2]], [False, False])
+    # ...and research DOES escalate now — asserted so the change above is a pinned decision, not
+    # an unnoticed side effect of the deprecation.
+    chk("[OPUS-5] role:research escalates (single-rung chain must have a human exit)",
+        resolved(["priority:P1", "area:usage", "kind:research"])[1][2], True)
 
     # -----------------------------------------------------------------------------------------------
     # [PR #595 finding 2] THE ARGV ENTRYPOINT IS PINNED TO THE WORKFLOW'S OWN ARGUMENT LIST.

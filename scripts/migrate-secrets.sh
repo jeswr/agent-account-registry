@@ -23,7 +23,11 @@
 #     token cannot read or move any secret):
 #     Q1. `gh workflow disable` each of the four secret-WRITER workflows (worker / review-fix /
 #         set-up-account / pat-validity) — a disabled workflow cannot start a NEW run (and a
-#         `gh run rerun` of an old pre-env-binding snapshot is refused too). Idempotent.
+#         `gh run rerun` of an old pre-env-binding snapshot is refused too). Idempotent by
+#         ASSERTION (#328): gh resolves `workflow disable` against ACTIVE workflows only, so it
+#         errors on an already-disabled one; a nonzero disable is inconclusive and Q1 accepts it
+#         only when the workflow's state reads back `disabled_manually`. That is what makes a
+#         quiesce re-dispatch after a Q2 drain refusal converge instead of dying at Q1.
 #     Q2. COHERENT drain check (round-8 finding 2): ONE unfiltered `gh run list --all --limit
 #         1000 --json status,databaseId` snapshot per writer workflow, with the five
 #         NONTERMINAL statuses (queued / in_progress / requested / waiting / pending, round-6
@@ -187,6 +191,12 @@
 #         migrate-run SELF-resume path only fires behind needs.cleanup-bootstrap.result ==
 #         'success' (C4 just proved the repo scope empty), so R0 passes trivially there — it
 #         is load-bearing for the STANDALONE phase: resume dispatch.
+#         The ALL-14-PRESENT shape (issue #329: quiesce succeeded, then the main phase's mint
+#         failed before mutating anything, stranding the writers disabled) is REFUSED like any
+#         other, but with its own diagnosis and runbook — it is NOT an accept. The writers'
+#         write-back is `gh secret set --env dispatch-secrets`, an UPSERT that CREATES the
+#         environment copy, so resuming from a pre-migration state manufactures the same
+#         env-newer/repo-stale pair; see assert_repo_scope_clear_for_resume.
 #     R.  re-enable the four quiesced writer workflows. Tries ALL four before failing (one
 #         failure never leaves the rest disabled) and any failure names the manual remediation.
 #
@@ -300,7 +310,14 @@
 # listing with zero enables; and the mint contract pins `permission-secrets: read` on the
 # reenable mint (removing it goes red). MUTATION CHECK: comment out the
 # assert_repo_scope_clear_for_resume call in phase_resume and the refusal scenario goes red
-# (rc 0, 4 enables issued from the dual-scope state). Round 15 (sol — the composed
+# (rc 0, 4 enables issued from the dual-scope state). ISSUE #329 (the PRE-MIGRATION abort —
+# all 14 still at repo scope because the main phase died before mutating anything): also
+# REFUSED, rc 1 with ZERO enables and the repo listing the only gh call, but carrying its OWN
+# diagnosis (`this is a PRE-MIGRATION abort`, naming the `gh secret set --env` upsert that
+# makes resuming — here or by hand — unsafe) rather than the partial-dual-scope one; a
+# 13-of-14 repo scope still takes the PARTIAL message, so the two shapes cannot collapse into
+# one. MUTATION CHECK: swap either die for the other (or drop the all-present branch) and the
+# 14/14 or 13/14 scenario goes red on the message assertion. Round 15 (sol — the composed
 # refused-resume denial): the CLEANUP phase drops the queue-time ordering attestation (it
 # consumes no queue-time S_* snapshot — see phase_cleanup's C0 comment); the composed
 # regression seeds the KEY-only mid-cleanup state with a REFUSED `phase: resume` event (R0
@@ -397,14 +414,33 @@ NONTERMINAL_FILTER='[.[] | select(.status == "queued" or .status == "in_progress
 
 # Quiesce (round-8: the SECRET-FREE first run of the two-run protocol): disable every writer
 # workflow so no NEW writer run — including a `gh run rerun` of an old pre-env-binding snapshot
-# — can start. Idempotent (disabling a disabled workflow succeeds). Re-enabled by `--phase
-# resume-writers` (self-resume after a COMPLETED migrate, or a standalone phase: resume).
+# — can start. Re-enabled by `--phase resume-writers` (self-resume after a COMPLETED migrate,
+# or a standalone phase: resume).
+#
+# IDEMPOTENCE IS ASSERTED, NOT ASSUMED (issue #328, run 29674141477): `gh workflow disable`
+# resolves its selector against ACTIVE workflows ONLY, so it EXITS NONZERO ("could not find
+# any workflows named ...") on an already-disabled one. Q2 (the drain check) legitimately
+# refuses a first quiesce attempt whose writers were already disabled by Q1, and the operator's
+# re-dispatch then died at Q1 on every writer the first attempt had disabled — the retry could
+# never converge. A nonzero disable is therefore INCONCLUSIVE, not fatal: read the workflow's
+# state and accept ONLY the exact postcondition Q1 owes the migrate phase's M0a gate —
+# `disabled_manually`. Anything else — active (a genuine failure: a 403 from a mint without
+# Actions: write, or a transient), `disabled_inactivity` (which M0a rejects), or a state that
+# cannot be read at all — fails closed before Q2 and before any mutation. The state read sits
+# under Actions: READ, which the quiesce mint's Actions: WRITE grant includes, so the retry
+# path needs no new permission (pinned by the self-test's production-grant retry scenario).
 quiesce_writers() {
-  local wf
+  local wf wf_state
   for wf in "${WRITER_WORKFLOWS[@]}"; do
-    gh workflow disable "$wf" -R "$REPO" \
-      || die "gh workflow disable ${wf} failed — cannot quiesce the secret writers, refusing before any listing or mutation (fail closed; NOTE: workflow disable needs the App token's Actions: write grant)"
-    printf 'quiesced (workflow disabled): %s\n' "$wf"
+    if gh workflow disable "$wf" -R "$REPO"; then
+      printf 'quiesced (workflow disabled): %s\n' "$wf"
+      continue
+    fi
+    wf_state=$(gh api "repos/${REPO}/actions/workflows/${wf}" --jq .state) \
+      || die "gh workflow disable ${wf} failed and its state could not be read — cannot prove ${wf} is quiesced, refusing before any listing or mutation (fail closed; NOTE: the disable needs the App token's Actions: write grant, which includes the Actions: read this state check uses)"
+    [[ "$wf_state" == "disabled_manually" ]] \
+      || die "gh workflow disable ${wf} failed and the workflow is '${wf_state}', not disabled_manually — cannot quiesce the secret writers, refusing before any listing or mutation (fail closed; NOTE: workflow disable needs the App token's Actions: write grant)"
+    printf 'quiesced (already disabled_manually — the disable was a selector miss on a workflow a previous quiesce attempt disabled): %s\n' "$wf"
   done
 }
 
@@ -831,16 +867,45 @@ phase_cleanup() {
 # C4 has just proven the repo scope empty), so this gate passes trivially there; it is
 # load-bearing for the STANDALONE phase: resume dispatch. The listing needs the resume
 # mint's round-14 Secrets: READ grant (pinned by the mint contract below).
+#
+# ISSUE #329 — WHY THE PRE-MIGRATION ABORT IS *NAMED* BUT STILL REFUSED (do not "fix" this by
+# accepting it). The reported state is a real one (live run 29674201638): `phase: quiesce`
+# disabled the four writers, then the main phase's MINT failed on missing installation grants
+# BEFORE any mutation, leaving all 14 at repo scope with the writers stuck disabled. It is
+# TEMPTING to accept that shape — "the environment holds none of the 14, so there is no env
+# copy for a writer to rotate ahead of the repo original". THAT PREMISE IS FALSE: the writers'
+# rotation write-back is `gh secret set <NAME> --repo <repo> --env dispatch-secrets`
+# (scripts/worker-live.sh write_back; set-up-account.yml's enrolment upsert is the same shape),
+# and `gh secret set --env` is an UPSERT — it CREATES the environment copy when none exists.
+# So a resumed writer in the pre-migration state manufactures exactly the env-newer/repo-stale
+# pair this gate exists to prevent: env <name>=V2 (rotated, the value everything now resolves,
+# because an environment copy shadows the repo one) beside a surviving repo <name>=V1, which
+# the next quiesce+migrate snapshots into S_<name>, writes over env V2 at M3, and deletes at
+# M5. An emptiness check taken at R0 cannot bound that: it describes the instant it was taken,
+# while the enables it would authorise let a writer mutate the environment at any point before
+# the migration runs. Accepting the shape therefore needs a mechanism that makes the env write
+# IMPOSSIBLE (or makes the next migrate fail closed on it) — no such mechanism exists here, so
+# the gate stays as round 14 left it and the state gets a NAMED refusal instead: an accurate
+# diagnosis plus the recovery that is actually safe (converge the migration, then resume).
+# NOTE the same hazard applies to re-enabling the writers BY HAND from this state, which is
+# why the refusal says so rather than leaving `gh workflow enable` as folklore.
 assert_repo_scope_clear_for_resume() {
-  local repo_names name held=0
+  local repo_names name held=0 absent=0
   repo_names=$(_repo_names) \
     || die 'could not list repo-scope secrets — cannot prove the migration converged, so the writers must not resume (fail closed before any enable; NOTE: this listing needs the App token'"'"'s round-14 Secrets: read grant)'
   for name in "${SECRET_NAMES[@]}"; do
     if _has_name "$name" "$repo_names"; then
       printf '::error::migrate-secrets: %s still present at repo scope — a resumed post-cutover writer would rotate the ENVIRONMENT copy while this stale repo copy survives, and the next migrate would overwrite the newer environment value from it (repo-presence-is-authoritative) then delete it: newest-credential loss\n' "$name" >&2
       held=1
+    else
+      absent=$((absent + 1))
     fi
   done
+  # ALL 14 still at repo scope: the migration mutated nothing (issue #329's pre-migration
+  # abort). Same refusal, distinct diagnosis + runbook — the shape is recovered by converging
+  # the migration, never by re-enabling the writers (here or by hand) ahead of it.
+  [[ "$held" -eq 0 || "$absent" -ne 0 ]] \
+    || die 'all 14 are still at repo scope — this is a PRE-MIGRATION abort (the migrate mutated nothing; e.g. its mint failed on missing installation grants), NOT a converged cutover, and the writers must not resume from it: the rotation write-back is `gh secret set --env dispatch-secrets`, an UPSERT that CREATES the environment copy, so a resumed writer would leave env <name>=V2 beside the surviving repo <name>=V1 and the next migrate would overwrite V2 from that stale repo copy (repo-presence-is-authoritative) then delete it — newest-credential loss. Recovery: grant the App installation what the main phase needs, re-dispatch phase: migrate (then cleanup-bootstrap), and only then phase: resume. Re-enabling the writers BY HAND from here carries the identical hazard (fail closed before any enable)'
   [[ "$held" -eq 0 ]] \
     || die 'repo scope not empty — writers must not resume from a partial dual-scope state; re-dispatch phase: migrate (then cleanup-bootstrap) to converge first, and only then dispatch phase: resume (fail closed before any enable)'
   printf 'resume precondition: repo scope holds none of the 14 (cleanup converged — clean cutover state, writers safe to resume)\n'
@@ -1202,12 +1267,34 @@ printf '%s\n' "$*" >> "$state/calls.log"
 # a scenario red here. Workflow disable/enable (the round-5 quiesce) sit under Actions: WRITE.
 _grant() {
   [[ ! -f "$state/grants" ]] && return 0
-  grep -qxF -- "$1" "$state/grants"
+  grep -qxF -- "$1" "$state/grants" && return 0
+  # GitHub's fine-grained permissions are LEVELS, not a set: write INCLUDES read. The quiesce
+  # mint declares Actions: WRITE only, and its #328 retry path issues an Actions:READ
+  # workflow-state read — so a read requirement is satisfied by a write grant, and the
+  # production-grant retry scenario stays a real test of the production token rather than of a
+  # fictional read+write one. A missing grant ENTIRELY still 403s (scenario 16).
+  [[ "$1" == *:read ]] && grep -qxF -- "${1%:read}:write" "$state/grants"
+}
+# The modeled state of workflow $1: an explicit `state_<wf>` override (used to model
+# disabled_inactivity), else disabled_manually once a `workflow disable` has touched it, else
+# active. Shared by `workflow disable`'s selector resolution and the workflow-state endpoint so
+# the two can never disagree.
+_wf_state() {
+  if [[ -f "$state/state_$1" ]]; then cat "$state/state_$1"
+  elif [[ -f "$state/disabled_$1" ]]; then echo disabled_manually
+  else echo active; fi
 }
 case "$*" in
   "workflow disable "*" -R o/r")
     _grant actions:write \
       || { echo "HTTP 403: Resource not accessible by integration (workflow disable needs Actions: write)" >&2; exit 1; }
+    # #328: gh resolves `workflow disable` against ACTIVE workflows ONLY — disabling an
+    # already-disabled (or inactivity-disabled) workflow is a selector MISS, not a no-op.
+    [[ "$(_wf_state "$3")" == active ]] \
+      || { echo "could not find any workflows named $3" >&2; exit 1; }
+    # A modeled transient/denied disable of an ACTIVE workflow (state unchanged) — the reject
+    # direction of the #328 idempotence rule.
+    [[ -f "$state/fail_disable_$3" ]] && { echo "HTTP 502: Bad Gateway" >&2; exit 1; }
     touch "$state/disabled_$3"   # model gh state: the workflow is now DISABLED
     exit 0 ;;
   "workflow enable "*" -R o/r")
@@ -1222,7 +1309,7 @@ case "$*" in
     _grant actions:read \
       || { echo "HTTP 403: Resource not accessible by integration (workflow-state read needs Actions: read)" >&2; exit 1; }
     wfname=${2#repos/o/r/actions/workflows/}
-    if [[ -f "$state/disabled_${wfname}" ]]; then echo disabled_manually; else echo active; fi
+    _wf_state "$wfname"
     exit 0 ;;
   "api repos/o/r/actions/runs/"*" --jq .created_at")
     # Round-9 ordering attestation: the MIGRATE gate fetches ITS OWN run's created_at (the
@@ -1462,6 +1549,22 @@ FAKE
     printf 'run list --all -R o/r --workflow %s --limit 1000 --json status,databaseId --jq %s\n' \
       "$wf" "$NONTERMINAL_FILTER" >> "$expected_quiesce"
   done
+  # ISSUE #328 — the RETRY shape of the same phase: every writer is ALREADY disabled, so each
+  # `gh workflow disable` is a selector MISS (nonzero) and is followed by the workflow-state
+  # read that proves the postcondition; then the identical 4 drain snapshots. Pinning this
+  # sequence keeps the idempotence path from silently degrading into a blanket swallow of
+  # disable failures (no state check) or into an unconditional pre-read on the happy path
+  # (which would break the scenario-0 pin above).
+  local expected_quiesce_retry="$tmp/expected-quiesce-retry.log"
+  : > "$expected_quiesce_retry"
+  for wf in worker.yml review-fix.yml set-up-account.yml pat-validity.yml; do
+    printf 'workflow disable %s -R o/r\n' "$wf" >> "$expected_quiesce_retry"
+    printf 'api repos/o/r/actions/workflows/%s --jq .state\n' "$wf" >> "$expected_quiesce_retry"
+  done
+  for wf in worker.yml review-fix.yml set-up-account.yml pat-validity.yml; do
+    printf 'run list --all -R o/r --workflow %s --limit 1000 --json status,databaseId --jq %s\n' \
+      "$wf" "$NONTERMINAL_FILTER" >> "$expected_quiesce_retry"
+  done
   # Seed the state a SUCCESSFUL quiesce run leaves behind (writers disabled), plus the round-9
   # GOOD ORDERING: this run (id 7777) was queued at 12:00 and the newest successful quiesce
   # run COMPLETED at 11:50 — strictly before the queue instant, so the ordering attestation
@@ -1547,6 +1650,61 @@ FAKE
     "$rc-$(grep -c "pat-validity.yml is 'active'" "$tmp/s0d.out")" 1-1
   chk "partially-quiesced migrate: zero mutations" \
     "$(grep -cE '^secret (set|delete) ' "$s0d/calls.log" || true)" 0
+
+  # --- scenario 0e: ISSUE #328 — the QUIESCE RETRY. This resumes exactly where scenario 0b
+  # stopped: that attempt disabled all 4 writers and then REFUSED at Q2 (a live writer run),
+  # deliberately leaving them disabled. The operator waits for the run to finish and
+  # re-dispatches quiesce — and in run 29674141477 that retry DIED at Q1, because gh resolves
+  # `workflow disable` against ACTIVE workflows only and errored on every already-disabled
+  # writer, so 0b's "re-dispatch quiesce converges" claim was false. The retry must now
+  # converge on the ALREADY-DISABLED state. The grants file is the PRODUCTION quiesce mint
+  # verbatim — Actions: WRITE and nothing else — so the scenario also proves the postcondition
+  # read needs no grant the secret-free mint lacks.
+  local s0e="$tmp/s0e"
+  mkdir -p "$s0e"
+  for wf in worker.yml review-fix.yml set-up-account.yml pat-validity.yml; do touch "$s0e/disabled_$wf"; done
+  printf 'actions:write\n' > "$s0e/grants"
+  rc=$(run_case "$s0e" "$tmp/s0e.out" quiesce none)
+  chk "#328 quiesce RETRY over already-disabled writers CONVERGES (the 29674141477 failure)" "$rc" 0
+  chk "#328 retry: EXACT gh argv (4 missed disables each PROVEN by a state read -> 4 drain snapshots)" \
+    "$(diff -q "$expected_quiesce_retry" "$s0e/calls.log" >/dev/null 2>&1 && echo same || echo diff)" same
+  chk "#328 retry: all 4 writers accepted as already disabled_manually" \
+    "$(grep -c 'already disabled_manually' "$tmp/s0e.out")" 4
+  chk "#328 retry: reaches QUIESCE PHASE COMPLETE (Q2 ran — the drain is re-proven, not skipped)" \
+    "$(grep -c 'QUIESCE PHASE COMPLETE' "$tmp/s0e.out")" 1
+  chk "#328 retry: all 4 writers still DISABLED afterwards" \
+    "$(find "$s0e" -name 'disabled_*' | wc -l)" 4
+  chk "#328 retry: still touches NO secret endpoint under the Actions:write-only production grant" \
+    "$(grep -cE '(^secret |/secrets)' "$s0e/calls.log" || true)" 0
+
+  # --- scenario 0f: #328 REJECT DIRECTION 1 — a failed disable whose workflow is
+  # disabled_inactivity (GitHub's own 60-day auto-disable of a scheduled workflow) is NOT the
+  # postcondition Q1 owes M0a, which accepts disabled_manually ONLY. Accepting any non-active
+  # state here would hand the migrate phase a gate it must then reject — fail closed at Q1,
+  # before the drain check and before any mutation.
+  local s0f="$tmp/s0f"
+  mkdir -p "$s0f"
+  touch "$s0f/disabled_worker.yml" "$s0f/disabled_review-fix.yml"
+  printf 'disabled_inactivity\n' > "$s0f/state_set-up-account.yml"
+  rc=$(run_case "$s0f" "$tmp/s0f.out" quiesce none)
+  chk "#328 disabled_inactivity is NOT accepted as quiesced -> fail closed" "$rc" 1
+  chk "#328 disabled_inactivity: message names the state and the required disabled_manually" \
+    "$(grep -c "set-up-account.yml failed and the workflow is 'disabled_inactivity', not disabled_manually" "$tmp/s0f.out")" 1
+  chk "#328 disabled_inactivity: ZERO drain listings (fail closed before Q2) and pat-validity never reached" \
+    "$(grep -cE '^run list ' "$s0f/calls.log" || true)-$(grep -cE '^workflow disable pat-validity' "$s0f/calls.log" || true)" 0-0
+
+  # --- scenario 0g: #328 REJECT DIRECTION 2 — a disable that fails while the workflow is still
+  # ACTIVE (a transient 5xx, or a mint without Actions: write) is a REAL failure: the writer is
+  # NOT quiesced. The idempotence rule must not degrade into swallowing every nonzero disable.
+  local s0g="$tmp/s0g"
+  mkdir -p "$s0g"
+  touch "$s0g/fail_disable_review-fix.yml"
+  rc=$(run_case "$s0g" "$tmp/s0g.out" quiesce none)
+  chk "#328 disable failing on a still-ACTIVE writer -> fail closed (idempotence is not a blanket swallow)" "$rc" 1
+  chk "#328 still-active writer: message names the active state" \
+    "$(grep -c "review-fix.yml failed and the workflow is 'active', not disabled_manually" "$tmp/s0g.out")" 1
+  chk "#328 still-active writer: review-fix stays ENABLED and ZERO drain listings ran" \
+    "$([[ -f "$s0g/disabled_review-fix.yml" ]] && echo disabled || echo active)-$(grep -cE '^run list ' "$s0g/calls.log" || true)" active-0
 
   # --- scenario 1: FRESH MAIN PHASE — a quiesce run has succeeded (writers disabled +
   # drained), env empty, repo holds all 14. Also the exact argv-sequence assertion (the
@@ -1882,6 +2040,18 @@ FAKE
     > "$tmp/s12c-snap-all.out" 2>&1 || snap_all_rc=$?
   chk "fake-gh model: SNAPSHOT listing with --all serves the filtered count on the disabled workflow" \
     "$snap_all_rc-$(cat "$tmp/s12c-snap-all.out")" 0-0
+  # ISSUE #328 non-vacuity: the same ACTIVE-only selector resolution applies to `workflow
+  # disable` itself — a REPEAT disable of the workflow just disabled above ERRORS, which is
+  # exactly what killed the quiesce retry in run 29674141477. Without this modeled failure the
+  # retry scenarios (0e/0f/0g) would be vacuous: every disable would trivially succeed.
+  local dis2_rc=0
+  FAKE_GH_STATE="$s12c" "$tmp/bin/gh" workflow disable worker.yml -R o/r > "$tmp/s12c-dis2.out" 2>&1 || dis2_rc=$?
+  chk "fake-gh model: a REPEAT workflow disable on the already-disabled workflow ERRORS (#328: gh resolves the selector against ACTIVE workflows only)" \
+    "$dis2_rc" 1
+  chk "fake-gh model: the repeat-disable failure names the selector miss" \
+    "$(grep -c 'could not find any workflows named worker.yml' "$tmp/s12c-dis2.out")" 1
+  chk "fake-gh model: the failed repeat disable leaves the workflow disabled_manually (the state Q1's postcondition check reads)" \
+    "$(FAKE_GH_STATE="$s12c" "$tmp/bin/gh" api repos/o/r/actions/workflows/worker.yml --jq .state)" disabled_manually
 
   # --- scenario 12d: TRANSITIONING RUN (round-8 finding 2 — the non-atomic drain check): a
   # writer run moves between nonterminal statuses (requested -> queued, the real forward
@@ -2668,6 +2838,58 @@ FAKE
     "$(cat "$s28/calls.log")" "api repos/o/r/actions/secrets --paginate --jq .secrets[].name"
   chk "resume refusal: the newer env V2 values survive untouched (resume mutates no secret in any state)" \
     "$(grep -c '=v2-' "$s28/env_values")" 14
+
+  # --- scenario 28b: THE PRE-MIGRATION ABORT (issue #329) — REFUSED, WITH ITS OWN DIAGNOSIS.
+  # The modeled state is the live one from run 29674201638: `phase: quiesce` disabled the four
+  # writers, then the main phase's MINT failed BEFORE any mutation (missing App installation
+  # grants), so all 14 are still at repo scope and the environment holds none of them (only the
+  # unrelated broker PAT / canary). It is tempting to ACCEPT this as "nothing was copied, so
+  # there is no env copy for a writer to rotate" — but the writers' write-back is
+  # `gh secret set <NAME> --repo <repo> --env dispatch-secrets`, an UPSERT that CREATES the
+  # environment copy (scripts/worker-live.sh write_back), so a resumed writer would manufacture
+  # env <name>=V2 beside the surviving repo <name>=V1 and the next migrate would overwrite V2
+  # from that stale repo copy (M3) and delete it (M5): the scenario-28 loss, reached from the
+  # "clean" pre-migration state. R0 therefore REFUSES here too — the accept would authorise
+  # enables whose hazard begins the instant the listing that "proved" emptiness goes stale.
+  # What #329 gets is the DIAGNOSIS: the state named, the upsert named, the safe recovery
+  # spelled out, and the by-hand `gh workflow enable` explicitly marked as carrying the same
+  # hazard. MUTATION CHECK: turn this shape into an accept (or swap its die for the partial
+  # one) and this scenario goes red — on the enables, or on the message.
+  local s28b="$tmp/s28b"
+  mkdir -p "$s28b"
+  printf '%s\n' "${names[@]}" > "$s28b/repo_secrets"
+  printf 'REGISTRY_SECRETS_PAT\nPAT_VALIDITY_CANARY\n' > "$s28b/env_secrets"
+  rc=$(run_case "$s28b" "$tmp/s28b.out" resume-writers none)
+  chk "resume from the PRE-MIGRATION abort (all 14 at repo scope, env holds none of them) -> REFUSED (issue #329)" "$rc" 1
+  chk "resume pre-migration refusal: its OWN diagnosis (not the partial-dual-scope one)" \
+    "$(grep -c 'this is a PRE-MIGRATION abort' "$tmp/s28b.out")" 1
+  chk "resume pre-migration refusal: names the env UPSERT that makes the accept unsafe" \
+    "$(grep -c 'an UPSERT that CREATES the environment copy' "$tmp/s28b.out")" 1
+  chk "resume pre-migration refusal: warns that re-enabling BY HAND carries the identical hazard" \
+    "$(grep -c 'BY HAND from here carries the identical hazard' "$tmp/s28b.out")" 1
+  chk "resume pre-migration refusal: does NOT emit the partial-dual-scope message" \
+    "$(grep -c 'partial dual-scope state' "$tmp/s28b.out")" 0
+  chk "resume pre-migration refusal: ZERO enables, and the R0 repo listing is the ONLY gh call" \
+    "$(cat "$s28b/calls.log")" "api repos/o/r/actions/secrets --paginate --jq .secrets[].name"
+
+  # --- scenario 28c: the BOUNDARY between the two refusals — a 13-of-14 repo scope (one
+  # non-bootstrap name already deleted: a migrate that died MID-deletion) is PARTIAL, not a
+  # pre-migration abort, and must keep the round-14 message. Pins the all-present branch to
+  # EXACTLY 14, so a "most of them are present" relaxation cannot smuggle a mid-deletion state
+  # into the #329 diagnosis (whose runbook — re-dispatch migrate — is right either way, but
+  # whose "the migrate mutated nothing" claim would be false).
+  local s28c="$tmp/s28c"
+  mkdir -p "$s28c"
+  printf '%s\n' "${names[@]}" | grep -vxF -- ACCT01_TOKEN > "$s28c/repo_secrets"
+  printf '%s\n' "${names[@]}" > "$s28c/env_secrets"
+  rc=$(run_case "$s28c" "$tmp/s28c.out" resume-writers none)
+  chk "resume from a 13-of-14 repo scope (died mid-deletion) -> REFUSED as PARTIAL, not as the #329 abort" "$rc" 1
+  chk "resume 13-of-14 refusal: the partial-dual-scope runbook message" \
+    "$(grep -c 'repo scope not empty — writers must not resume from a partial dual-scope state' "$tmp/s28c.out")" 1
+  chk "resume 13-of-14 refusal: does NOT claim the migrate mutated nothing (#329 diagnosis withheld)" \
+    "$(grep -c 'PRE-MIGRATION abort' "$tmp/s28c.out")" 0
+  chk "resume 13-of-14 refusal: names all 13 survivors, ZERO enables" \
+    "$(grep -c 'still present at repo scope' "$tmp/s28c.out")-$(grep -cE '^workflow enable ' "$s28c/calls.log" || true)" 13-0
 
   # --- scenario 29: SOL'S COMPOSED ROUND-15 REGRESSION — REFUSED RESUME MUST NOT BRICK THE
   # KEY-ONLY CLEANUP RECOVERY. Composition of rounds 13+14+the old C0: the mid-cleanup

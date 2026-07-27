@@ -8,14 +8,17 @@
 # an always() step shreds all auth state.
 #
 # `|| true` DISPOSITION (PR #595 finding 5 audit — the repo-wide sweep for swallowed label/state
-# mutations). Every remaining `|| true` in this workflow is on a NOTIFICATION COMMENT, never on a
-# label/state mutation: each one sits inside a fail-closed `fail()`/`reject()` helper that follows it
-# with an explicit `exit 1`, or reports an outcome whose STATE transition is separately fail-loud and
-# post-read verified (the status:pending -> status:available flip below fails the step and then
-# PROVES the flip landed). A comment that cannot post must not resurrect an aborted enrollment or
-# mask a verified transition. The two courtesy `gh issue close` calls and the label-create
-# ensure-exists pair carry their own inline justifications. NO label mutation in this repo is
-# `|| true`-swallowed any more (triage-issue.yml's quarantine write was the last one).
+# mutations; tightened again by #616 review finding 5). NO `gh issue comment` in this workflow is
+# `|| true`-swallowed any more: every notification comment now falls back to an explicit
+# `::warning title=set-up-account::` line, so a comment that cannot post is VISIBLE in the run
+# rather than silently erasing the only issue-side explanation of a refusal or an activation. Their
+# fail direction is unchanged and still safe — each sits inside a fail-closed `fail()`/`reject()`
+# helper that follows it with an explicit `exit 1`, or reports an outcome whose STATE transition is
+# separately fail-loud and post-read verified (the status:pending -> status:available flip below
+# fails the step and then PROVES the flip landed). A comment that cannot post must not resurrect an
+# aborted enrollment or mask a verified transition. The two courtesy `gh issue close` calls and the
+# label-create ensure-exists pair carry their own inline justifications. NO label mutation in this
+# repo is `|| true`-swallowed any more (triage-issue.yml's quarantine write was the last one).
 #
 # COMPLETION fixes (audit-2026-07-17): the captured secret is stored on THIS registry repo — the
 # only place any consumer reads it (worker.yml `secrets[secret_ref]`, the dispatch usage probe,
@@ -79,6 +82,40 @@
 # environment — an account issue can outlive a deleted or never-created secret, and resuming on
 # the secret_ref LINE alone would flip status:available around a credential no worker can use.
 # A 404, a missing PAT, or an unprovable probe fails closed before resume is ever granted.
+#
+# GRANT-SCOPING fix (#579, re-filed from #190; the closed PR #260 preserves six prior review
+# rounds): enrollment used to append the new handle to EVERY `account_pool` row in
+# policy/repos.toml — one unanchored global regex substitution over all rows, disabled and future
+# rows included — and then "prove" the write with an EXISTENTIAL check ("some row now contains the
+# handle"). `account_pool` IS the credential-authorization boundary (policy-resolve validates it,
+# select-and-claim.claim() filters on it, worker.yml independently re-checks it), so one web
+# sign-in silently granted the credential to every enabled target, and a partial or wrong-row edit
+# satisfied the postcondition. Enrollment is now EXPLICITLY SCOPED, with every decision in the
+# shared, self-tested helper scripts/grant-account.py:
+#   * the request must carry `grant:<owner>/<repo>` labels; no label => no enrollment (refused
+#     BEFORE any login, like the other preflights), and an unparseable grant label is a refusal,
+#     never an ignored one;
+#   * every target must be an `enabled = true` row of the policy being edited (never created,
+#     never defaulted);
+#   * the append touches ONLY those rows' account_pool lines, located by their own table header;
+#   * the postcondition is EXACT and PER-TARGET, proved by PARSING the proposed document (each
+#     requested row lists the handle exactly once, every other row byte-identical) — including on
+#     the "already present / no-op" path and in the post-merge `activate` job, so a duplicate or a
+#     pre-existing entry can never be reported as a successful grant;
+#   * SHAPE IS NOT PROVENANCE (#616 review finding 1): on the no-op path the membership must also be
+#     accounted for by a MERGED `account-pool/<handle>` PR into master whose diff is that one policy
+#     document and nothing else — otherwise a handle seeded into the policy by any other means would
+#     let a freshly captured credential skip the checked PR and activate inline;
+#   * and the post-merge `activate` job re-runs the TWO-DOCUMENT postcondition against the merged
+#     commit's first parent (#616 review finding 2) — verify_membership alone cannot see the
+#     non-target rows, and feature branches are unprotected, so a branch push after the pre-PR proof
+#     would otherwise merge and activate outside every scoping check;
+#   * the authorization is RE-READ LIVE immediately before the policy write and must EXACTLY equal
+#     the pre-login snapshot — the sign-in takes minutes, and a target removed during that window
+#     fails closed;
+#   * untrusted issue text (labels, bodies) crosses into these privileged `run:` blocks as DATA
+#     (JSON/env), never interpolated — this workflow's App token holds contents:write, and PR #260
+#     round 4 was a shell-injection blocker on exactly that interpolation.
 name: set-up-account
 on:
   issues:
@@ -198,6 +235,25 @@ jobs:
           secret=$(printf '%s\n' "$body" | sed -n 's/^secret_ref:[[:space:]]*\([A-Za-z0-9_]*\).*/\1/p' | head -1)
           models=$(printf '%s\n' "$body" | sed -n 's/^models:[[:space:]]*\(.*\)$/\1/p' | head -1 | tr -d '\r')
           fmt=$(printf '%s\n' "$body" | sed -n 's/^credential_format:[[:space:]]*\([A-Za-z0-9._-]*\).*/\1/p' | head -1)
+          # #579: the authorized target set recorded on the bound account issue. It is the RESUMED
+          # request's authorization snapshot — the grant step below requires it to still equal the
+          # live `grant:` labels — so a record without a readable `grant_targets:` line cannot be
+          # resumed (its grant could never be proven). The body crosses into python as env DATA.
+          if ! targets=$(ACCOUNT_BODY="$body" python3 - <<'PY'
+          import importlib.util, json, os, sys
+          spec = importlib.util.spec_from_file_location(
+              "registry_grant_account", "scripts/grant-account.py")
+          grant = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(grant)
+          try:
+              print(json.dumps(grant.parse_record_line(os.environ["ACCOUNT_BODY"])))
+          except grant.GrantError as exc:
+              print(str(exc), file=sys.stderr)
+              sys.exit(1)
+          PY
+          ); then
+            echo "::error::account issue #$num ($handle) is bound to request #$ISSUE but its authorized target repositories cannot be read (see above) — a grant that cannot be proven must not be resumed (fail closed). Add a valid \`grant_targets:\` line to the issue body, then re-apply set-up-account."; exit 1
+          fi
           if [ -z "$secret" ]; then
             echo "::error::account issue #$num ($handle) is bound to request #$ISSUE but carries no secret_ref line — a malformed record can be neither resumed nor safely superseded (fail closed). Fix the issue body, then re-apply set-up-account."; exit 1
           fi
@@ -234,10 +290,61 @@ jobs:
             printf 'secret=%s\n' "$secret"
             printf 'models=%s\n' "$models"
             printf 'fmt=%s\n' "${fmt:-unknown}"
+            printf 'targets=%s\n' "$targets"
           } >> "$GITHUB_OUTPUT"
           gh issue comment "$ISSUE" -R "$REPO" \
-            --body "♻️ Resuming the existing enrollment of **$handle** for this request — its credential is already captured, so there is no new sign-in and no new slot. Completing validation and the account_pool policy PR now." || true
+            --body "♻️ Resuming the existing enrollment of **$handle** for this request — its credential is already captured, so there is no new sign-in and no new slot. Completing validation and the account_pool policy PR now." || echo "::warning title=set-up-account::the resume notice failed to post — the refusal/outcome above is the authoritative record"
           echo "resuming $handle (account issue #$num) for request #$ISSUE — login/store/register are skipped"
+
+      # [#579] AUTHORIZATION PREFLIGHT — which repositories may use this account. `account_pool` is
+      # the credential-authorization boundary, so the request must NAME its targets: one
+      # `grant:<owner>/<repo>` label per repository, each an `enabled = true` row of the CHECKED-OUT
+      # policy/repos.toml. This runs BEFORE the secrets preflight and the login (like every other
+      # fail-closed gate here): a request with no authorization choice must never reach a
+      # credential capture, because that capture is irreversible. On the #211 resume path the bound
+      # account issue's recorded target set must ALSO still equal the live labels — a resumed
+      # enrollment inherits its original authorization, and a changed one is a refusal.
+      # The resolved set is the pre-login SNAPSHOT; the policy-write step re-reads the labels LIVE
+      # and requires exact equality (the sign-in can take ~13 minutes).
+      # Untrusted label names cross into python as JSON in env — never interpolated into this
+      # privileged run: block (PR #260 round 4 blocker).
+      - name: Authorize the target repositories from the request's grant labels (#579)
+        id: grant
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LABELS_JSON: ${{ toJSON(github.event.issue.labels.*.name) }}
+          RESUME: ${{ steps.reconcile.outputs.resume }}
+          RECORDED: ${{ steps.reconcile.outputs.targets }}
+          ISSUE: ${{ github.event.issue.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          err="$RUNNER_TEMP/grant-authorize.err"
+          if ! targets=$(python3 - 2>"$err" <<'PY'
+          import importlib.util, json, os, sys
+          spec = importlib.util.spec_from_file_location(
+              "registry_grant_account", "scripts/grant-account.py")
+          grant = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(grant)
+          with open("policy/repos.toml", encoding="utf-8") as fh:
+              policy = fh.read()
+          labels = json.loads(os.environ["LABELS_JSON"])
+          snapshot = (json.loads(os.environ["RECORDED"] or "[]")
+                      if os.environ.get("RESUME") == "true" else None)
+          try:
+              print(json.dumps(grant.authorize(labels, policy, snapshot)))
+          except grant.GrantError as exc:
+              print(str(exc), file=sys.stderr)
+              sys.exit(1)
+          PY
+          ); then
+            reason=$(cat "$err" 2>/dev/null || true)
+            gh issue comment "$ISSUE" -R "$REPO" \
+              --body "❌ Enrollment refused — this request carries no valid authorization for a target repository: ${reason:-the grant labels could not be resolved}. \`account_pool\` in \`policy/repos.toml\` is the allow-list every enforcement point checks, so an account is granted ONLY to the repositories the request explicitly names — never to all of them by default. **Fix:** add one \`grant:<owner>/<repo>\` label per authorized repository (each must be an \`enabled = true\` row of \`policy/repos.toml\`), then re-apply the \`set-up-account\` label. No login was started and no credential was captured." || echo "::warning title=set-up-account::the enrollment-refusal explanation failed to post — the refusal/outcome above is the authoritative record"
+            echo "::error::no valid grant:<owner>/<repo> authorization on request #$ISSUE — refusing to enroll (fail closed)"; exit 1
+          fi
+          printf 'targets=%s\n' "$targets" >> "$GITHUB_OUTPUT"
+          echo "authorized target repositories for request #$ISSUE: $targets"
 
       # The workflow's own github.token cannot write Actions secrets; REGISTRY_SECRETS_PAT is the
       # jeswr-owned fine-grained PAT on THIS registry repo (already proven by the rotation
@@ -274,7 +381,7 @@ jobs:
           set -euo pipefail
           fail() {
             gh issue comment "${{ github.event.issue.number }}" -R "${{ github.repository }}" \
-              --body "❌ $1 Refusing to start login — no sign-in URL is surfaced until the broker has proven it can store what the login captures (fail closed). **Fix:** mint a fine-grained PAT on \`${{ github.repository }}\` with repository **Secrets: read** + **Environments: read and write** (least privilege — the broker only lists/reads repo-scope secrets and writes environment secrets), store it with \`gh secret set REGISTRY_SECRETS_PAT --repo ${{ github.repository }} --env dispatch-secrets\` (the dispatch-secrets ENVIRONMENT is its canonical home — a repo-scope copy would re-trip the secrets-guard), then re-apply the \`set-up-account\` label." || true
+              --body "❌ $1 Refusing to start login — no sign-in URL is surfaced until the broker has proven it can store what the login captures (fail closed). **Fix:** mint a fine-grained PAT on \`${{ github.repository }}\` with repository **Secrets: read** + **Environments: read and write** (least privilege — the broker only lists/reads repo-scope secrets and writes environment secrets), store it with \`gh secret set REGISTRY_SECRETS_PAT --repo ${{ github.repository }} --env dispatch-secrets\` (the dispatch-secrets ENVIRONMENT is its canonical home — a repo-scope copy would re-trip the secrets-guard), then re-apply the \`set-up-account\` label." || echo "::warning title=set-up-account::the secrets-preflight refusal explanation failed to post — the refusal/outcome above is the authoritative record"
             exit 1
           }
           # Invoke pat-validity.py's probe() directly (as the register/validate steps import
@@ -311,16 +418,29 @@ jobs:
         if: steps.reconcile.outputs.resume != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          # #579: label names are UNTRUSTED text and this step holds an issues:write token, so they
+          # cross as JSON in env — never `join(github.event.issue.labels.*.name)` interpolated into
+          # this `run:` script, which would execute a label named `$(...)` (the PR #260 round-4
+          # blocker class). Exactly ONE provider label is required: the old loop let the last
+          # matching label win, so a request labelled with BOTH providers silently picked one.
+          LABELS_JSON: ${{ toJSON(github.event.issue.labels.*.name) }}
         run: |
-          prov=""
-          for lb in ${{ join(github.event.issue.labels.*.name, ' ') }}; do
-            case "$lb" in provider:openai) prov=openai;; provider:anthropic) prov=anthropic;; esac
-          done
+          set -euo pipefail
+          # >>> provider-label — EXECUTED by scripts/grant-account.py --self-test. #616 review round
+          # 2 (MAJOR): this predicate had NO test at all, so replacing the body with `true`,
+          # restoring last-label-wins (`.[-1]` instead of the length-1 requirement) or dropping the
+          # `unique` all passed. These sentinels delimit the fragment the self-test extracts and runs
+          # against label fixtures; removing either makes that extraction FAIL CLOSED. `$LABELS_JSON`
+          # is its only input and `$prov` its only output.
+          prov=$(printf '%s' "$LABELS_JSON" | jq -r '
+            [.[] | select(. == "provider:openai" or . == "provider:anthropic")] | unique
+            | if length == 1 then (.[0] | ltrimstr("provider:")) else "" end')
           if [ -z "$prov" ]; then
             gh issue comment "${{ github.event.issue.number }}" -R "${{ github.repository }}" \
-              --body "❌ Add a \`provider:openai\` or \`provider:anthropic\` label, then re-apply \`set-up-account\`." || true
+              --body "❌ Add exactly one \`provider:openai\` or \`provider:anthropic\` label (never both), then re-apply \`set-up-account\`." || echo "::warning title=set-up-account::the provider-label refusal explanation failed to post — the refusal/outcome above is the authoritative record"
             exit 1
           fi
+          # <<< provider-label
           # The models line the allocator requires (read_accounts drops model-less accounts),
           # derived from the provider (mirrors orchestration/routing.toml's [models] catalog).
           # openai mints the FULL codex alias set [sol, luna, terra]: select-and-claim's
@@ -334,7 +454,10 @@ jobs:
           # during which another (non-serialized) writer may claim this number, so the store step
           # derives the real slot from complete live state and atomically claims it (an acct-claims
           # ref) before writing (#186). This hint only makes a retry converge on the same slot.
-          n=$(gh issue list -R "${{ github.repository }}" --state all --json title \
+          # `--limit 500` is LOAD-BEARING (#238): gh caps `issue list` at 30 results by default, so
+          # without it this `max` undercounts once >30 acctNN issues exist and the hint points at an
+          # already-taken slot. 500 matches select-and-claim.py's read_accounts/audit_catalog window.
+          n=$(gh issue list -R "${{ github.repository }}" --state all --limit 500 --json title \
                 --jq '[.[].title|select(test("^acct[0-9]+$"))|ltrimstr("acct")|tonumber]|max // 0' 2>/dev/null || echo 0)
           {
             printf 'provider=%s\n' "$prov"
@@ -384,14 +507,14 @@ jobs:
                  --jq '.[].raw_key | select(. != null and . != "")' > "$keyfile" 2>/dev/null \
              || ! [ -s "$keyfile" ]; then
             gh issue comment "$ISSUE" -R "$REPO" \
-              --body "❌ Cannot deliver the sign-in challenge confidentially: \`@$REQUESTER\` has no public GPG key on GitHub. On a public repository the device code / sign-in URL is a redeemable authorization challenge and must never be posted in the clear (any observer could redeem it first and bind an attacker-controlled account), so no login was started. **Fix:** add a GPG key to your GitHub account (Settings → SSH and GPG keys), then re-apply the \`set-up-account\` label — the challenge will be encrypted to that key and you decrypt it locally with \`gpg -d\`." || true
+              --body "❌ Cannot deliver the sign-in challenge confidentially: \`@$REQUESTER\` has no public GPG key on GitHub. On a public repository the device code / sign-in URL is a redeemable authorization challenge and must never be posted in the clear (any observer could redeem it first and bind an attacker-controlled account), so no login was started. **Fix:** add a GPG key to your GitHub account (Settings → SSH and GPG keys), then re-apply the \`set-up-account\` label — the challenge will be encrypted to that key and you decrypt it locally with \`gpg -d\`." || echo "::warning title=set-up-account::the GPG-key refusal explanation failed to post — the refusal/outcome above is the authoritative record"
             echo "::error::requester has no GPG key — cannot deliver challenge confidentially, refusing (fail closed)"; exit 1
           fi
           # Import into an isolated, disposable keyring under LOGIN_DIR (shredded by the always() step).
           export GNUPGHOME="$LOGIN_DIR/gnupg"; mkdir -p "$GNUPGHOME"; chmod 700 "$GNUPGHOME"
           if ! gpg --batch --import "$keyfile" >/dev/null 2>&1; then
             gh issue comment "$ISSUE" -R "$REPO" \
-              --body "❌ \`@$REQUESTER\`'s published GPG key could not be imported, so the sign-in challenge cannot be encrypted to it. No login was started (fail closed). **Fix:** ensure a valid GPG public key is on your GitHub account, then re-apply \`set-up-account\`." || true
+              --body "❌ \`@$REQUESTER\`'s published GPG key could not be imported, so the sign-in challenge cannot be encrypted to it. No login was started (fail closed). **Fix:** ensure a valid GPG public key is on your GitHub account, then re-apply \`set-up-account\`." || echo "::warning title=set-up-account::the GPG-import refusal explanation failed to post — the refusal/outcome above is the authoritative record"
             echo "::error::requester GPG key failed to import — refusing (fail closed)"; exit 1
           fi
           # Prove at least one imported key can actually ENCRYPT (a sign-only / malformed key would
@@ -404,7 +527,7 @@ jobs:
           done
           if ! [ -s "$LOGIN_DIR/recipient.fpr" ]; then
             gh issue comment "$ISSUE" -R "$REPO" \
-              --body "❌ \`@$REQUESTER\`'s published GPG key cannot be used to encrypt (no encryption-capable key/subkey). The sign-in challenge cannot be delivered confidentially, so no login was started (fail closed). **Fix:** publish an encryption-capable GPG key on GitHub, then re-apply \`set-up-account\`." || true
+              --body "❌ \`@$REQUESTER\`'s published GPG key cannot be used to encrypt (no encryption-capable key/subkey). The sign-in challenge cannot be delivered confidentially, so no login was started (fail closed). **Fix:** publish an encryption-capable GPG key on GitHub, then re-apply \`set-up-account\`." || echo "::warning title=set-up-account::the GPG-encryption refusal explanation failed to post — the refusal/outcome above is the authoritative record"
             echo "::error::no encryption-capable GPG key for requester — refusing (fail closed)"; exit 1
           fi
           echo "preflight: challenge will be delivered encrypted to @$REQUESTER's GPG key"
@@ -469,7 +592,7 @@ jobs:
           fmt=$(cat "$LOGIN_DIR/credential_format" 2>/dev/null || true)
           reject() {
             gh issue comment "$ISSUE" -R "$REPO" \
-              --body "❌ Captured credential format \`${fmt:-<none>}\` is incompatible with the routing aliases for this account ($1). The account was **not** registered (no secret stored). $2" || true
+              --body "❌ Captured credential format \`${fmt:-<none>}\` is incompatible with the routing aliases for this account ($1). The account was **not** registered (no secret stored). $2" || echo "::warning title=set-up-account::the credential-format refusal explanation failed to post — the refusal/outcome above is the authoritative record"
             echo "::error::$1 — refusing to store (fail closed)"; exit 1
           }
           [ -n "$fmt" ] || reject "no credential_format was captured" "Re-apply \`set-up-account\` to retry the login."
@@ -618,11 +741,27 @@ jobs:
           HANDLE: ${{ steps.store.outputs.handle }}
           SECRET_NAME: ${{ steps.store.outputs.secret }}
           ISSUE: ${{ github.event.issue.number }}
+          GRANT_TARGETS: ${{ steps.grant.outputs.targets }}
         run: |
           set -euo pipefail
           fmt=$(cat "$LOGIN_DIR/credential_format" 2>/dev/null || echo unknown)
           harness=$([ "$PROVIDER" = openai ] && echo codex || echo claude)
-          body=$(printf 'provider: %s\nharness: %s\nmodels: %s\ncredential_format: %s\nmax_concurrent_workers: 1\nsecret_ref: %s\nrequest_issue: %s\nnotes: registered via set-up-account broker; pending account_pool PR merge\n' "$PROVIDER" "$harness" "$MODELS" "$fmt" "$SECRET_NAME" "$ISSUE")
+          # #579: record the authorized target repositories ON the account record. The post-merge
+          # `activate` job runs on a different event with no access to this request's labels, so
+          # this line is what it re-proves the merged account_pool against (per-target, exactly
+          # once). Every entry is shape-validated by format_record_line before it is written, and
+          # select-and-claim._parse_account ignores unknown keys, so the schema guard below still
+          # accepts the record.
+          grant_line=$(python3 - <<'PY'
+          import importlib.util, json, os
+          spec = importlib.util.spec_from_file_location(
+              "registry_grant_account", "scripts/grant-account.py")
+          grant = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(grant)
+          print(grant.format_record_line(json.loads(os.environ["GRANT_TARGETS"])))
+          PY
+          )
+          body=$(printf 'provider: %s\nharness: %s\nmodels: %s\ncredential_format: %s\nmax_concurrent_workers: 1\nsecret_ref: %s\nrequest_issue: %s\n%s\nnotes: registered via set-up-account broker; pending account_pool PR merge\n' "$PROVIDER" "$harness" "$MODELS" "$fmt" "$SECRET_NAME" "$ISSUE" "$grant_line")
           # Validate the exact bytes about to be persisted through the allocator's schema guard.
           # A malformed producer output must fail this step before gh can create a corrupt record.
           printf '%s\n' "$body" | python3 scripts/select-and-claim.py \
@@ -694,9 +833,27 @@ jobs:
       # (data/README.md), so the append goes out as a CHECKED PR on an `account-pool/<handle>`
       # feature branch (branches other than master are unprotected). The App-authored PR runs the
       # `gate` check; on merge the `activate` job flips the account status:pending ->
-      # status:available. The handle is appended to EVERY account_pool row (each protected repo
-      # shares the pool), and the edited policy is re-parsed with tomllib before the PR is opened
-      # (never propose an unparseable policy).
+      # status:available.
+      #
+      # #579: the handle is appended ONLY to the account_pool rows this request is authorized for —
+      # never to every row. Every scoping decision lives in the shared, self-tested helper
+      # scripts/grant-account.py (nothing here knows the document's location, so this survives the
+      # #325 relocation), and the sequence is:
+      #   1. read master's policy (the PR merge base);
+      #   2. RE-READ the request's `grant:` labels LIVE and require them to still equal the
+      #      pre-login snapshot — the sign-in can take ~13 minutes, so the authorization that was
+      #      captured must be re-proved immediately before the write (a removed target fails
+      #      closed). The App token below carries only contents+pull-requests write, so the issue
+      #      read runs under the workflow's own token and the label names come back as DATA;
+      #   3. render the ROW-SCOPED edit and prove the EXACT per-target postcondition by parsing the
+      #      proposed document (each requested row lists the handle exactly once; every other row
+      #      byte-identical; nothing else in the file moved) — a `subn` count proves nothing about
+      #      WHICH rows changed;
+      #   4. on the "already present in master" no-op path, prove the same exactness with
+      #      verify_membership BEFORE reporting a landed grant (an existential check would accept a
+      #      wrong-row or duplicate entry);
+      #   5. after the PUT, re-read the BRANCH blob and re-prove it — the bytes the PR carries, not
+      #      just the bytes we computed, must satisfy the postcondition.
       - name: Open a checked account_pool PR (never a master PUT) (#185)
         id: policy_pr
         # #211 resume re-enters here: the branch/PUT/PR logic below is idempotent (reuses the
@@ -705,28 +862,53 @@ jobs:
         if: steps.login.outputs.status == 'ok' || steps.reconcile.outputs.resume == 'true'
         env:
           GH_TOKEN: ${{ steps.app-token-pool.outputs.token }}
+          # The issue read for the LIVE authorization re-check (#579 step 2): the App token has no
+          # issues scope, so the label read runs under the workflow's own least-privilege token.
+          ISSUE_TOKEN: ${{ github.token }}
           NEW_HANDLE: ${{ steps.store.outputs.handle || steps.reconcile.outputs.handle }}
+          GRANT_TARGETS: ${{ steps.grant.outputs.targets }}
           REQUEST_ISSUE: ${{ github.event.issue.number }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
           import base64
+          import importlib.util
           import json
           import os
           import re
           import subprocess
-          import tomllib
 
           repo = os.environ["GITHUB_REPOSITORY"]
+          owner = repo.split("/")[0]
           handle = os.environ["NEW_HANDLE"]
           request_issue = os.environ["REQUEST_ISSUE"]
+          # The pre-login authorized set, as DATA. An absent/empty value cannot authorize anything:
+          # authorize() then refuses on "no authorized target set was captured" (fail closed).
+          snapshot = json.loads(os.environ.get("GRANT_TARGETS") or "[]")
           if not re.fullmatch(r"acct[0-9a-z]{2,}", handle):
               raise SystemExit("unsafe handle")
           path = "policy/repos.toml"
-          branch = f"account-pool/{handle}"
 
-          def run(args, input_str=None, check=True):
-              result = subprocess.run(args, capture_output=True, text=True, input=input_str)
+          # #579: every scoping/postcondition decision comes from the shared helper (self-tested;
+          # the checkout ran long before this step, so the import cannot race it — PR #260 round 6).
+          spec = importlib.util.spec_from_file_location(
+              "registry_grant_account", "scripts/grant-account.py")
+          grant = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(grant)
+          # One source of truth for the grant branch namespace: `activate` keys off it and the
+          # provenance proof below treats it as the carrier of a reviewed grant.
+          branch = grant.grant_branch(handle)
+
+          def proven(fn, *args):
+              """Run one grant decision, turning any unprovable outcome into a refusal."""
+              try:
+                  return fn(*args)
+              except grant.GrantError as exc:
+                  raise SystemExit(f"::error::account_pool grant refused (fail closed): {exc}")
+
+          def run(args, input_str=None, check=True, env=None):
+              result = subprocess.run(args, capture_output=True, text=True, input=input_str,
+                                      env=env)
               if check and result.returncode != 0:
                   raise SystemExit(f"{args[:3]} failed: {result.stderr.strip()}")
               return result
@@ -736,6 +918,13 @@ jobs:
                          input_str=json.dumps(input_doc) if input_doc is not None else None,
                          check=check)
 
+          def gh_pages(args):
+              """Every page of a paginated list endpoint, flattened. `--slurp` keeps `--paginate`'s
+              one-array-per-page output a single JSON document; a capped read would silently make an
+              absent record look like a proven negative."""
+              pages = json.loads(gh_api([*args, "--paginate", "--slurp"]).stdout)
+              return [entry for page in pages for entry in page]
+
           def set_output(key, value):
               with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
                   fh.write(f"{key}={value}\n")
@@ -743,25 +932,91 @@ jobs:
           # Compute the appended policy from master's current content (the PR merge base).
           document = json.loads(gh_api([f"repos/{repo}/contents/{path}?ref=master"]).stdout)
           text = base64.b64decode("".join(document["content"].split())).decode()
-          pattern = re.compile(r"(?m)^(account_pool\s*=\s*\[)([^\]]*)(\])")
-          def append(match):
-              entries = match.group(2)
-              if f'"{handle}"' in entries:
-                  return match.group(0)
-              separator = ", " if entries.strip() else ""
-              return f'{match.group(1)}{entries}{separator}"{handle}"{match.group(3)}'
-          new_text, count = pattern.subn(append, text)
-          if count == 0:
-              raise SystemExit("no account_pool line found in policy/repos.toml")
+
+          # (#579 step 2) RE-PROVE the authorization from LIVE issue state, immediately before the
+          # write. Fully paginated; the names cross back as DATA (one per line), and the read uses
+          # the workflow's own token because the App token holds no issues scope. Anything but exact
+          # equality with the pre-login snapshot — a target dropped or added during the sign-in
+          # window — is a refusal, never a silently narrowed grant.
+          issue_env = {**os.environ, "GH_TOKEN": os.environ["ISSUE_TOKEN"]}
+          live = run(["gh", "api", "--paginate",
+                      f"repos/{repo}/issues/{request_issue}/labels", "--jq", ".[].name"],
+                     env=issue_env).stdout.splitlines()
+          targets = proven(grant.authorize,
+                           [name.strip() for name in live if name.strip()], text, snapshot)
+
+          # (#579 step 3) The ROW-SCOPED edit. render_grant edits only these rows' account_pool
+          # lines and re-proves the exact per-target postcondition on the result (it refuses a
+          # policy the resolver could not parse, too), so no `subn` count is ever trusted.
+          new_text = proven(grant.render_grant, text, handle, targets)
           if new_text == text:
-              # Already in master account_pool (a prior run merged it) — safe to activate now; no PR.
-              print(f"{handle} already present in master account_pool — no PR needed")
+              # (#579 step 4) Already in master's account_pool for every requested target (a prior
+              # run's PR merged) — activation may proceed with no PR, but ONLY after the same exact
+              # per-target proof: the old existential check reported a wrong-row entry, a partial
+              # grant, or a pre-existing DUPLICATE as a success.
+              proven(grant.verify_membership, text, handle, targets)
+              # #616 review finding 1: SHAPE IS NOT PROVENANCE. verify_membership proves the handle
+              # occurs exactly once in each authorized row and nowhere else; it cannot prove HOW it
+              # got there. Without the check below, a handle already seeded into the policy by any
+              # other means (a hand edit, a leftover row from a retired account, an unrelated merged
+              # PR) would let a freshly captured credential skip the CHECKED account_pool PR
+              # entirely and activate inline — the two-phase review checkpoint (#185) silently
+              # bypassed on exactly the path that reports a "successful grant". So the membership
+              # must be accounted for by a MERGED `account-pool/<handle>` PR into master whose diff
+              # is that one policy document and nothing else. Not provable => refuse: the account
+              # stays status:pending and the always() alarm hands the case to a human (the capture is
+              # irreversible, so recovery is forward, never a silent inline activation).
+              pulls = gh_pages([f"repos/{repo}/pulls?head={owner}:{branch}&state=all&per_page=100"])
+              merged = proven(grant.merged_grant_prs, pulls, handle)
+              # #616 review round 2: the branch name plus the changed-file list prove the SHAPE of
+              # the provenance, NOT that the PR added THIS handle — and picking `merged[-1]` assumed
+              # the newest merged PR on the branch was the grant. Every merged candidate is now
+              # examined and each requested target must be traced to one that provably granted THAT
+              # ROW.
+              #
+              # #616 review round 4 (MAJOR 3): the diff-level proof carries no row identity, so a
+              # historical checked PR that added the handle to row C validated later UNCHECKED
+              # membership in rows A and B once C was cleaned up — zero current targets traced to a
+              # checked PR, while the notice claimed "membership traced to a checked PR". Row
+              # identity comes from each candidate's OWN pre/post documents (its merge commit and
+              # that commit's first parent), which is the same two-document proof the live path uses;
+              # `trace_membership_provenance` then requires EVERY requested target to appear in some
+              # candidate's established rows. Any read that fails here aborts the step (`check=True`)
+              # — a provenance we cannot read is a refusal, never an assumption.
+              candidates = []
+              for candidate in merged:
+                  meta = json.loads(gh_api([f"repos/{repo}/pulls/{candidate}"]).stdout)
+                  merge_sha = meta.get("merge_commit_sha")
+                  if not isinstance(merge_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", merge_sha):
+                      raise SystemExit(
+                          "::error::account_pool grant refused (fail closed): merged PR "
+                          f"#{candidate} reports no usable merge commit, so the rows it granted "
+                          "cannot be established")
+                  parents = json.loads(
+                      gh_api([f"repos/{repo}/commits/{merge_sha}"]).stdout).get("parents") or []
+                  if not parents or not isinstance(parents[0], dict):
+                      raise SystemExit(
+                          "::error::account_pool grant refused (fail closed): merge commit "
+                          f"{merge_sha} of PR #{candidate} has no first parent")
+                  def policy_at(ref):
+                      return base64.b64decode("".join(json.loads(gh_api(
+                          [f"repos/{repo}/contents/{path}?ref={ref}"]).stdout)["content"].split())
+                      ).decode()
+                  candidates.append({
+                      "number": candidate,
+                      "changed": gh_pages([f"repos/{repo}/pulls/{candidate}/files?per_page=100"]),
+                      "before": policy_at(parents[0]["sha"]),
+                      "after": policy_at(merge_sha),
+                  })
+              evidence = proven(grant.trace_membership_provenance, handle, targets, candidates,
+                                path)
+              print(f"{handle} already granted to exactly {targets} in master account_pool; every "
+                    f"one of those rows was established by a merged, row-scoped grant PR "
+                    f"({evidence}) — no new PR needed. NOTE: that traces each row to a checked PR, "
+                    "not the CURRENT bytes of the row (an unchecked later edit could have removed "
+                    "and re-added the handle); today's shape is proved by verify_membership above.")
               set_output("pr", "none")
               raise SystemExit(0)
-          parsed = tomllib.loads(new_text)  # refuse to propose a policy the resolver can't parse
-          if not any(handle in (row.get("account_pool") or [])
-                     for row in parsed.get("repos", {}).values()):
-              raise SystemExit("edited policy does not contain the new handle; refusing")
 
           # Create the feature branch at master HEAD and PUT the edit on THAT branch. Feature
           # branches are unprotected, so this never touches master directly. Both are idempotent so
@@ -784,18 +1039,30 @@ jobs:
                          "branch": branch,
                      })
 
+          # (#579 step 5) Re-read the BRANCH blob and prove THOSE bytes — the document the PR
+          # actually carries, not just the one computed above — satisfy the exact per-target
+          # postcondition against master. A PUT that landed on the wrong branch, a concurrent
+          # writer, or a reused branch carrying an unrelated edit is caught here, before any PR
+          # claims the grant is scoped.
+          landed = json.loads(gh_api([f"repos/{repo}/contents/{path}?ref={branch}"]).stdout)
+          landed_text = base64.b64decode("".join(landed["content"].split())).decode()
+          proven(grant.verify_grant, text, landed_text, handle, targets)
+
           # Reuse an open PR for this branch on a retry; otherwise open one.
-          owner = repo.split("/")[0]
           existing = json.loads(gh_api(
               [f"repos/{repo}/pulls?head={owner}:{branch}&state=open"]).stdout)
           if existing:
               number = existing[0]["number"]
           else:
-              body = (f"Adds `{handle}` to `policy/repos.toml` account_pool (set-up-account broker).\n\n"
-                      f"account_handle: {handle}\nrequest_issue: {request_issue}\n\n"
-                      f"On merge, the `activate` job flips `{handle}` status:pending -> "
-                      f"status:available and closes #{request_issue}. This is a trust-surface change "
-                      f"(account_pool is the allocator allow-list) — it merges only when `gate` is green.")
+              body = (f"Adds `{handle}` to the `policy/repos.toml` account_pool of the repositories "
+                      f"this enrollment was authorized for — and no others (#579).\n\n"
+                      f"account_handle: {handle}\nrequest_issue: {request_issue}\n"
+                      f"{grant.format_record_line(targets)}\n\n"
+                      f"On merge, the `activate` job re-proves that every target above lists "
+                      f"`{handle}` exactly once in the MERGED policy, then flips `{handle}` "
+                      f"status:pending -> status:available and closes #{request_issue}. This is a "
+                      f"trust-surface change (account_pool is the allocator allow-list) — it merges "
+                      f"only when `gate` is green.")
               created = json.loads(gh_api(
                   [f"repos/{repo}/pulls", "-X", "POST", "--input", "-"],
                   input_doc={"title": f"Register {handle} in account_pool",
@@ -816,6 +1083,10 @@ jobs:
           RESUME_FMT: ${{ steps.reconcile.outputs.fmt }}
           PR: ${{ steps.policy_pr.outputs.pr }}
           ISSUE: ${{ github.event.issue.number }}
+          # #579: the authorized target set, for the audit trail in the notices below. It is a
+          # validated owner/repo list (never raw label text) and is used only as report data — the
+          # binding proof happened in the policy-write step.
+          TARGETS: ${{ steps.grant.outputs.targets }}
         run: |
           set -euo pipefail
           # #211 resume: no LOGIN_DIR capture exists — the format recorded on the account issue is
@@ -857,13 +1128,13 @@ jobs:
             # direction (visible, hand-closable, and it never un-quarantines or un-labels anything),
             # so it stays non-fatal — but it now emits a ::warning instead of vanishing silently.
             gh issue comment "$ISSUE" -R "${{ github.repository }}" \
-              --body "✅ Account **$HANDLE** registered and activated: secret \`$SECRET\` (format \`$fmt\`), \`models: $MODELS\`, already present in \`policy/repos.toml\` account_pool — flipped to \`status:available\`. Closing." \
+              --body "✅ Account **$HANDLE** registered and activated: secret \`$SECRET\` (format \`$fmt\`), \`models: $MODELS\`, already present in the \`policy/repos.toml\` account_pool of its authorized targets \`$TARGETS\` (and no other row), with that membership traced to a merged, checked \`account-pool/$HANDLE\` PR — flipped to \`status:available\`. Closing." \
               || echo "::warning title=set-up-account::activation notice comment failed to post on #$ISSUE"
             gh issue close "$ISSUE" -R "${{ github.repository }}" \
               || echo "::warning title=set-up-account::could not close request issue #$ISSUE (it stays open — close it by hand)"
           else
             gh issue comment "$ISSUE" -R "${{ github.repository }}" \
-              --body "⏳ Account **$HANDLE** captured (secret \`$SECRET\` stored, format \`$fmt\`, \`models: $MODELS\`) and registered **status:pending** — NOT yet allocatable. Policy PR #$PR adds \`$HANDLE\` to \`policy/repos.toml\` account_pool; **merge #$PR to activate** — the \`activate\` job then flips it to \`status:available\` and closes this request. This stays open until then." || true
+              --body "⏳ Account **$HANDLE** captured (secret \`$SECRET\` stored, format \`$fmt\`, \`models: $MODELS\`) and registered **status:pending** — NOT yet allocatable. Policy PR #$PR adds \`$HANDLE\` to the \`policy/repos.toml\` account_pool of its authorized targets \`$TARGETS\` only; **merge #$PR to activate** — the \`activate\` job then flips it to \`status:available\` and closes this request. This stays open until then." || echo "::warning title=set-up-account::the pending-activation notice failed to post — the refusal/outcome above is the authoritative record"
           fi
 
       - name: Report failure
@@ -873,7 +1144,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh issue comment "${{ github.event.issue.number }}" -R "${{ github.repository }}" \
-            --body "⚠️ Sign-in did not complete in time (device code expires ~15 min). Re-apply \`set-up-account\` to retry." || true
+            --body "⚠️ Sign-in did not complete in time (device code expires ~15 min). Re-apply \`set-up-account\` to retry." || echo "::warning title=set-up-account::the sign-in timeout notice failed to post — the refusal/outcome above is the authoritative record"
 
       # #185: after a captured credential (login ok), report EVERY partial enrollment state so a
       # human can recover — never a silent abort. Ordered by how far the pipeline got; the first
@@ -895,7 +1166,7 @@ jobs:
           ACTIVATE_INLINE: ${{ steps.activate_inline.outcome }}
         run: |
           set -uo pipefail
-          comment() { gh issue comment "$ISSUE" -R "${{ github.repository }}" --body "$1" || true; }
+          comment() { gh issue comment "$ISSUE" -R "${{ github.repository }}" --body "$1" || echo "::warning title=set-up-account::a partial-enrollment alarm notice failed to post on #$ISSUE — the step log is the authoritative record"; }
           # #211: on the resume path store/register were deliberately skipped (their work is done —
           # the resumed handle proves both), so only the resumed stages can be partial.
           if [ "$RESUME" != true ] && [ "$STORE" != success ]; then
@@ -905,7 +1176,7 @@ jobs:
           elif [ "$VALIDATE" != success ]; then
             comment "🚨 **$HANDLE** was stored and the pending issue created, but read_accounts validation failed (\`$VALIDATE\`) — the account body may be malformed, so no policy PR was opened. **Recovery:** fix the \`$HANDLE\` issue body (models / secret_ref), then re-apply \`set-up-account\` — enrollment resumes \`$HANDLE\` (#211) and opens the account_pool PR."
           elif [ "$POLICY_PR" != success ]; then
-            comment "🚨 **$HANDLE** is registered \`status:pending\` (secret \`$SECRET\` stored) but the account_pool policy PR was NOT opened (policy-PR: \`$POLICY_PR\`). The account is safely non-allocatable but will never activate until it is in \`policy/repos.toml\` account_pool. **Recovery:** re-apply \`set-up-account\` — enrollment resumes \`$HANDLE\` on the same slot and re-drives the PR (#211); or open it manually (head branch \`account-pool/$HANDLE\`) — on merge it activates automatically."
+            comment "🚨 **$HANDLE** is registered \`status:pending\` (secret \`$SECRET\` stored) but the account_pool policy PR was NOT opened (policy-PR: \`$POLICY_PR\`). The account is safely non-allocatable but will never activate until it is in \`policy/repos.toml\` account_pool. **Recovery:** check the step log first — if the grant was REFUSED (#579), the \`grant:<owner>/<repo>\` labels on this request no longer match the targets recorded on the \`$HANDLE\` account issue, or they no longer name \`enabled = true\` policy rows; restore them to exactly that set. If instead the refusal says \`$HANDLE\` is ALREADY in the policy account_pool but no merged, ROW-SCOPED \`account-pool/$HANDLE\` PR accounts for **each authorized row**, the membership of the untraced rows was not established by a checked grant PR — that is deliberate (#616 review finding 1: shape is not provenance; round 4: and a checked PR for a DIFFERENT row is not provenance for this one). Establish it properly: open an \`account-pool/$HANDLE\` PR editing ONLY the granted rows (if the entry is stale, remove it first in its own PR), let it merge, and activation follows. Then re-apply \`set-up-account\` — enrollment resumes \`$HANDLE\` on the same slot and re-drives the PR (#211); or open it manually (head branch \`account-pool/$HANDLE\`, editing ONLY the granted rows) — on merge it activates automatically."
           elif [ "$ACTIVATE_INLINE" != success ]; then
             comment "🚨 **$HANDLE** was stored, registered \`status:pending\`, and its handle was ALREADY in master \`account_pool\` (no policy PR needed), but the INLINE activation FAILED (activate: \`$ACTIVATE_INLINE\`) — the account may still be \`status:pending\` and this request may still be open despite policy being in place, so no false success was claimed. **Recovery:** confirm there is exactly one \`$HANDLE\` account issue and flip it to \`status:available\` (or re-apply \`set-up-account\`); re-merging/re-triggering the account_pool PR also drives the \`activate\` job to flip it."
           else
@@ -923,8 +1194,11 @@ jobs:
   # pull_request closed(merged) for an `account-pool/*` head branch, and re-verifies the handle is
   # genuinely in MERGED master account_pool before flipping anything (fail closed) — a merged PR
   # that does not actually add the handle, or has no matching status:pending account issue, activates
-  # nothing. Least privilege: issues:write + contents:read only, github.token (no PAT, no secrets,
-  # no environment — activation only relabels/closes issues and reads the merged policy).
+  # nothing. #579: that re-verification is EXACT and PER-TARGET against the target set recorded on
+  # the account issue (`grant_targets:`), not an existential "some row has it" check — a merged PR
+  # whose edit landed on the wrong rows, granted only some of them, or duplicated an entry activates
+  # nothing either. Least privilege: issues:write + contents:read only, github.token (no PAT, no
+  # secrets, no environment — activation only relabels/closes issues and reads the merged policy).
   activate:
     if: >-
       github.event_name == 'pull_request' &&
@@ -953,27 +1227,19 @@ jobs:
           persist-credentials: false
 
       - name: Activate the pending account now that account_pool merged (fail closed)
+        id: activate_merged
+        env:
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
         run: |
           set -euo pipefail
           handle="${HEAD_REF#account-pool/}"
           if ! printf '%s' "$handle" | grep -qE '^acct[0-9a-z]{2,}$'; then
             echo "::error::head ref '$HEAD_REF' does not encode a valid account handle — refusing"; exit 1
           fi
-          # Re-verify the handle is genuinely in the MERGED account_pool. The checkout IS the merge
-          # commit; parse policy/repos.toml with tomllib — never trust the PR title/diff.
-          HANDLE="$handle" python3 - <<'PY'
-          import os, sys, tomllib
-          handle = os.environ["HANDLE"]
-          with open("policy/repos.toml", "rb") as fh:
-              policy = tomllib.load(fh)
-          if not any(handle in (row.get("account_pool") or [])
-                     for row in policy.get("repos", {}).values()):
-              print(f"::error::{handle} is not in merged master account_pool — refusing to activate",
-                    file=sys.stderr)
-              sys.exit(1)
-          print(f"{handle} confirmed present in merged account_pool")
-          PY
-          # Resolve the account issue by EXACT title. It must exist (only the trust-gated broker
+          # Resolve the account issue by EXACT title FIRST (#579): its `grant_targets:` line records
+          # which repositories this enrollment was authorized for, and the merged policy is verified
+          # against THAT set — an existential "some row has the handle" check would activate an
+          # account whose grant landed on the wrong rows. It must exist (only the trust-gated broker
           # creates acctNN issues); if already available this is an idempotent re-trigger (no-op).
           # Require EXACTLY ONE exact-title match, matching the inline activation invariant: a
           # `[...][0]` first-match pick would silently relabel an arbitrary duplicate (duplicate
@@ -986,6 +1252,105 @@ jobs:
             echo "::error::expected exactly one account issue titled '$handle' in any state, found ${#nums[@]} — refusing to activate (fail closed)"; exit 1
           fi
           num=${nums[0]}
+          body=$(gh issue view "$num" -R "$REPO" --json body --jq '.body')
+          # Re-verify the MERGED policy against the recorded target set (#579). The checkout IS the
+          # merge commit; the shared helper parses policy/repos.toml and requires every authorized
+          # target to list the handle EXACTLY once and no other row to list it at all — never the PR
+          # title/diff, never an existential check. The issue body crosses in as env DATA, never
+          # interpolated into this privileged run: block. A record with no readable `grant_targets:`
+          # line cannot be proven and so is never activated (fail closed).
+          #
+          # #616 review finding 2: MEMBERSHIP IS A ONE-DOCUMENT PROOF, and the activation notice used
+          # to claim "every other row was verified unchanged" — which verify_membership cannot see.
+          # The two-document verify_grant DID run in the login job, but BEFORE the PR was opened, and
+          # feature branches are unprotected: any later push to the branch (or a reused branch
+          # carrying an unrelated edit) merged outside that proof, so a PR with the correct scoped
+          # membership PLUS edits to other rows' pools or other policy fields could merge and still
+          # activate. So the final trust-boundary check is now the same EXACT two-document
+          # postcondition, run here against the merged commit's FIRST PARENT — master immediately
+          # before this merge, for merge/squash/single-commit-rebase strategies alike, and the
+          # correct base even when other policy PRs landed after this one was opened (the PR's own
+          # `base.sha` would false-refuse on that). Read through the contents API rather than git so
+          # a shallow checkout cannot make it unresolvable. Anything unprovable — an unresolvable
+          # parent, an unreadable blob, a diff reaching beyond the granted rows — refuses, leaving
+          # the account status:pending for a human.
+          if ! parent=$(gh api "repos/$REPO/commits/$MERGE_SHA" --jq '.parents[0].sha') \
+             || ! printf '%s' "$parent" | grep -qE '^[0-9a-f]{40}$'; then
+            echo "::error::could not resolve the first parent of merge commit $MERGE_SHA, so the pre-merge policy cannot be read and the grant's scope cannot be re-proved — refusing to activate $handle (fail closed)"; exit 1
+          fi
+          # Raw media type + a FILE, never a command substitution: `$(...)` strips trailing newlines,
+          # which would make the before/after line counts differ and false-refuse a correct grant.
+          before="$RUNNER_TEMP/pre-merge-policy.toml"
+          if ! gh api "repos/$REPO/contents/policy/repos.toml?ref=$parent" \
+                 -H "Accept: application/vnd.github.raw" > "$before"; then
+            echo "::error::could not read policy/repos.toml at the pre-merge commit $parent — refusing to activate $handle (fail closed)"; exit 1
+          fi
+          # #616 review round 2, BOTH MAJORS. The first-parent read above is master-immediately-before
+          # for a merge commit, a squash and a SINGLE-commit rebase — but this repo has
+          # `allow_rebase_merge: true`, and for a MULTI-COMMIT rebase the final commit's first parent
+          # is an earlier commit OF THE SAME PR, hiding that PR's earlier policy edits from the
+          # comparison. And `verify_grant` used to accept a NO-DELTA pair, so a PR that established
+          # nothing could activate a credential. Both are closed by proving the PR'S OWN DIFF:
+          # `pulls/N/files` is computed against the merge base, so it sees every commit of the PR
+          # whatever strategy merged it, and an absent/empty patch is a refusal. Fully paginated —
+          # a truncated file listing would let an extra file hide from require_grant_pr_scope, which
+          # is the one direction that fails OPEN. `--slurp` keeps `--paginate` a single document.
+          files="$RUNNER_TEMP/merged-pr-files.json"
+          if ! gh api "repos/$REPO/pulls/$PR_NUMBER/files?per_page=100" --paginate --slurp \
+                 > "$files"; then
+            echo "::error::could not read the changed-file listing for merged PR #$PR_NUMBER, so it cannot be proven that the grant edited only policy/repos.toml — refusing to activate $handle (fail closed)"; exit 1
+          fi
+          HANDLE="$handle" ACCOUNT_BODY="$body" BEFORE_POLICY_FILE="$before" \
+            PR_FILES_FILE="$files" python3 - <<'PY'
+          import importlib.util, json, os, sys
+          spec = importlib.util.spec_from_file_location(
+              "registry_grant_account", "scripts/grant-account.py")
+          grant = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(grant)
+          handle = os.environ["HANDLE"]
+          with open("policy/repos.toml", encoding="utf-8") as fh:
+              policy = fh.read()
+          with open(os.environ["BEFORE_POLICY_FILE"], encoding="utf-8") as fh:
+              before = fh.read()
+          with open(os.environ["PR_FILES_FILE"], encoding="utf-8") as fh:
+              pages = json.load(fh)
+          changed = [entry for page in pages for entry in page]
+          path = "policy/repos.toml"
+          try:
+              targets = grant.parse_record_line(os.environ["ACCOUNT_BODY"])
+              grant.verify_membership(policy, handle, targets)
+              grant.verify_grant(before, policy, handle, targets)
+              # The merged PR touched EXACTLY the policy document (nothing sits outside the proof)...
+              grant.require_grant_pr_scope(int(os.environ["PR_NUMBER"]), changed, path)
+              # ...and its OWN diff ADDED this handle and moved nothing else. Strategy-independent,
+              # so a multi-commit rebase cannot hide an earlier commit's policy edit behind the
+              # first-parent read, and a no-delta PR can never license an activation.
+              records = [entry for entry in changed
+                         if isinstance(entry, dict) and entry.get("filename") == path]
+              if len(records) != 1:
+                  raise grant.GrantError(
+                      f"merged PR #{os.environ['PR_NUMBER']} carries {len(records)} diffs of {path}, "
+                      "expected exactly 1 — refusing")
+              # `patch_changed_lines` is the TRUNCATION oracle (#616 review round 4): `--paginate`
+              # proves every file RECORD was listed, never that a record's `patch` string is that
+              # file's whole diff, and GitHub truncates large patches. The API's own additions +
+              # deletions for this file must equal the changed lines the patch carries.
+              grant.verify_grant_patch(records[0].get("patch"), handle,
+                                       grant.patch_changed_lines(records[0]))
+          except grant.GrantError as exc:
+              print(f"::error::refusing to activate {handle}: {exc}", file=sys.stderr)
+              sys.exit(1)
+          # Stated as exactly what the four proofs establish (#616 review round 4 corrected an
+          # F-class overclaim here): "byte-identical to the pre-merge policy" is only true of the
+          # document at the merge commit's FIRST PARENT, which under a multi-commit rebase is a
+          # commit of this same PR — which is why the PR's own merge-base diff is proved separately,
+          # position by position.
+          print(f"{handle} confirmed granted to exactly {targets} in the merged account_pool; every "
+                f"other row is byte-identical to the policy at the merge commit's first parent, and "
+                f"PR #{os.environ['PR_NUMBER']}'s own complete merge-base diff touched only {path} "
+                f"and added {handle} to account_pool lines while moving no other member")
+          PY
+          granted=$(printf '%s\n' "$body" | sed -n 's/^grant_targets:[[:space:]]*\(.*\)$/\1/p' | head -1 | tr -d '\r')
           labels=$(gh issue view "$num" -R "$REPO" --json labels --jq '[.labels[].name]|join(" ")')
           case " $labels " in
             *" status:available "*) echo "$handle (issue #$num) already status:available — nothing to do"; exit 0 ;;
@@ -993,17 +1358,30 @@ jobs:
             *) echo "::error::issue #$num for $handle is neither pending nor available (labels: $labels) — refusing"; exit 1 ;;
           esac
           gh issue edit "$num" -R "$REPO" --remove-label status:pending --add-label status:available
+          # #616 review round 2 (MINOR): this file's header claims the status:pending ->
+          # status:available flip "fails the step and then PROVES the flip landed", and no
+          # post-mutation read existed — the claim was true of the OTHER transitions in this
+          # workflow, not of this one. It is true here now: a label write that reported success but
+          # did not land must never be followed by a success notice on the issue.
+          post=$(gh issue view "$num" -R "$REPO" --json labels --jq '[.labels[].name]|join(" ")')
+          case " $post " in
+            *" status:available "*) : ;;
+            *) echo "::error::the status:available flip on issue #$num did NOT land (labels: $post) — refusing to report an activation that did not happen (fail closed)"; exit 1 ;;
+          esac
+          case " $post " in
+            *" status:pending "*) echo "::error::issue #$num still carries status:pending after the flip (labels: $post) — the account is in an ambiguous state; refusing (fail closed)"; exit 1 ;;
+          esac
           gh issue comment "$num" -R "$REPO" \
-            --body "✅ Activated: \`$handle\` is now \`status:available\` (account_pool PR #$PR_NUMBER merged)." || true
+            --body "✅ Activated: \`$handle\` is now \`status:available\` for its authorized targets \`$granted\` (account_pool PR #$PR_NUMBER merged; the merged policy was re-proved against the pre-merge commit — the handle appears exactly once in each authorized row, and every other row and field is byte-identical)." || echo "::warning title=set-up-account::the activation notice failed to post — the refusal/outcome above is the authoritative record"
           # Close the linked request issue (request_issue: <n> in the account issue body).
-          req=$(gh issue view "$num" -R "$REPO" --json body --jq '.body' \
+          req=$(printf '%s\n' "$body" \
                   | sed -n 's/^request_issue:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1)
           if [ -n "$req" ]; then
             # PR #595 finding 5 audit: same disposition as the activate path above — the label flip
             # is fail-loud, the request-issue close is a courtesy whose failure leaves the issue OPEN
             # (the safe direction) and is now surfaced as a ::warning rather than swallowed.
             gh issue comment "$req" -R "$REPO" \
-              --body "✅ Account **$handle** activated: added to \`policy/repos.toml\` account_pool (PR #$PR_NUMBER merged) and flipped to \`status:available\`. Closing." \
+              --body "✅ Account **$handle** activated: added to the \`policy/repos.toml\` account_pool of \`$granted\` — and no other row (PR #$PR_NUMBER merged) — and flipped to \`status:available\`. Closing." \
               || echo "::warning title=set-up-account::activation notice comment failed to post on #$req"
             gh issue close "$req" -R "$REPO" \
               || echo "::warning title=set-up-account::could not close request issue #$req (it stays open — close it by hand)"

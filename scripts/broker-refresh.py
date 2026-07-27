@@ -25,16 +25,18 @@ token (or any key whose name implies a refresh/long-lived secret)."""
 import argparse
 import base64
 import datetime
+import http.client
 import importlib.util
 import json
 import os
 import re
 import stat
 import subprocess
+import socket
+import ssl
 import sys
 import tempfile
-import urllib.error
-import urllib.request
+import urllib.parse
 
 PROVIDERS = ("openai", "anthropic")
 
@@ -170,6 +172,59 @@ CLASS_REFRESH_TRANSIENT = "credential-refresh-transient"   # retried, still fail
 # (OpenAI rotates refresh tokens and detects replay) ALREADY USED. No amount of retrying fixes it;
 # only an interactive re-login can. 429 and 5xx are throttle/availability and ARE retried.
 _REMINT_STATUSES = frozenset({400, 401, 403})
+# THE RESEND ALLOWLIST (post-merge retro-review of #629, F5(a)). The one-time-use grant may be
+# re-POSTed ONLY when the previous attempt provably did not deliver it. Two cases qualify:
+#   * `STATUS_NOT_SENT` — the fault was raised strictly before the request write (see the phase
+#     boundary below), so no byte reached the provider;
+#   * HTTP 429 — a documented THROTTLE contract, i.e. an explicit "I rejected this without processing
+#     it". The retro-review accepted this one narrowly and rejected the rest.
+# Everything else means A RESPONSE WAS ACTUALLY RECEIVED, and no observed status proves the rotation
+# did not commit: a backend or intermediary can 5xx after an upstream commit, and — MEASURED on the
+# merged tree — a **2xx** with a truncated / unparseable / access_token-less body re-POSTed the grant
+# 3× on the single strongest possible evidence that the provider DID commit it. So the resend decision
+# is now made HERE, from the allowlist, and is deliberately independent of the reported CLASS below:
+# the class says whether a LATER attempt is worth making, this set says whether THIS run may send the
+# same grant again. A later attempt is safe because it re-reads the stored secret and a spent grant
+# fails closed with `invalid_grant` — resending inside one run is not, because it replays the grant
+# the provider may just have consumed.
+_RESEND_SAFE_STATUSES = frozenset({429})
+# --- IDEMPOTENCY of the exchange (retro-review of #614) -------------------------------------------
+# The refresh token is ONE-TIME-USE and the provider detects replay. So "did this request reach the
+# provider?" is a load-bearing question, and the old code could not ask it: every timeout, URLError
+# and OSError collapsed to `(0, "")` — indistinguishable from "never sent" — was classified TRANSIENT,
+# and the SAME grant was posted again, up to REFRESH_ATTEMPTS times. If the provider had already
+# committed the rotation and only the response was lost, the retry replays a spent grant and kills
+# the account permanently. Retrying is therefore only safe when the outcome is OBSERVED.
+#
+# Two sentinel statuses stand in for "no HTTP status":
+#   STATUS_NOT_SENT (0)       — the failure PROVES nothing was transmitted (DNS failure, connection
+#                               refused, a TLS handshake that never completed, a malformed URL). The
+#                               grant is untouched, so this is genuinely retryable.
+#   STATUS_INDETERMINATE (-1) — the request may have been transmitted and no response was observed
+#                               (timeout, connection reset, broken pipe, any other I/O fault). The
+#                               grant MAY already be consumed, so it must NOT be sent again. Fail
+#                               loudly to the maintainer instead: a false re-mint page costs minutes,
+#                               a replayed grant costs the account.
+STATUS_NOT_SENT = 0
+STATUS_INDETERMINATE = -1
+# POST-MERGE RETRO-REVIEW OF #629, findings F5(b) + F6 — WHY THE PHASE IS NOW STRUCTURAL.
+# #629 decided "was this request transmitted?" from the EXCEPTION TYPE, via
+#     _NOT_SENT_ERRORS = (socket.gaierror, ConnectionRefusedError, ssl.SSLError)
+# and that cannot work, in both directions:
+#   * `ssl.SSLError` is an `OSError` subclass and is raised from the RESPONSE READ as well as from the
+#     handshake, so a TLS fault after the grant was delivered classified STATUS_NOT_SENT and the
+#     one-time-use grant was re-POSTed 3× — MEASURED: `_post_token_endpoint(...) -> (0, '')`,
+#     `classify_refresh_failure(0, '') -> credential-refresh-transient`, transmissions = 3;
+#   * conversely CPython's urllib wraps connect **and send** in one `URLError`, so a connect-phase
+#     timeout — which provably transmitted nothing — was indistinguishable from a response-phase one
+#     and both paged an immediate re-mint (F6's availability regression).
+# No exception type can decide the phase, so the phase is no longer inferred from it. The exchange is
+# driven through `http.client` with an EXPLICIT `connect()` before the request write, and the phase is
+# whichever call was in flight: everything up to and including `connect()` is provably PRE-SEND, and
+# everything from the request write onward is treated as POST-SEND. That boundary is a property of the
+# code's structure, not of an exception hierarchy, and it cannot drift.
+_PHASE_PRE_SEND = "pre-send"
+_PHASE_POST_SEND = "post-send"
 # Fixed allowlist of provider error codes safe to echo into a PUBLIC log. Anything outside it is
 # never printed (no provider free text, no token material, ever reaches a log line).
 _REMINT_CODES = frozenset({
@@ -188,10 +243,39 @@ class RefreshFailure(Exception):
     assembled from fixed strings + the allowlisted code ONLY — never provider free text, never any
     token material."""
 
-    def __init__(self, kind, code=None):
+    # Why the grant may already be spent, when it may. Selects the operator-facing wording so a
+    # maintainer reading the log knows WHICH remint cause this is; `indeterminate` stays the single
+    # boolean the rest of the code branches on.
+    CAUSE_UNOBSERVED = "unobserved"
+    CAUSE_UNUSABLE_SUCCESS = "unusable-success"
+    CAUSE_OBSERVED_ERROR = "observed-error"
+    _CAUSE_DETAIL = {
+        CAUSE_UNOBSERVED: (
+            " — the token-endpoint request was written and no response was observed, so this "
+            "ONE-TIME-USE grant may already be consumed"),
+        CAUSE_UNUSABLE_SUCCESS: (
+            " — the provider returned a SUCCESS status with a body this code could not use, which is "
+            "the STRONGEST evidence that the rotation DID commit, so this ONE-TIME-USE grant must be "
+            "assumed consumed"),
+        CAUSE_OBSERVED_ERROR: (
+            " — the provider returned an error status AFTER the request was delivered, which does not "
+            "prove the rotation did not commit, so this ONE-TIME-USE grant may already be consumed"),
+    }
+
+    def __init__(self, kind, code=None, indeterminate=False, cause=None):
         self.kind = kind
         self.code = code if code in _REMINT_CODES else None
+        # INDETERMINATE (retro-review of #614, refined by the post-merge retro-review of #629): the
+        # grant's fate is unknown. Carried on the exception so the operator-facing message can say
+        # which remint cause this is ("the grant is dead" vs "the grant's fate is unknown and must not
+        # be gambled again"), and so worker-prep.sh's `::error::` line can stop asserting the wrong one.
+        self.indeterminate = bool(indeterminate)
+        self.cause = cause if self.indeterminate else None
         detail = f" (provider code: {self.code})" if self.code else ""
+        if self.indeterminate:
+            detail += self._CAUSE_DETAIL.get(self.cause or self.CAUSE_UNOBSERVED,
+                                             self._CAUSE_DETAIL[self.CAUSE_UNOBSERVED])
+            detail += "; it was NOT re-sent (replaying it would permanently kill the account)"
         super().__init__(f"host-side credential refresh failed: {kind}{detail}")
 
 
@@ -308,10 +392,22 @@ def merge_refreshed(provider, stored, response, now):
 def classify_refresh_failure(status, body=""):
     """Map a token-endpoint failure onto exactly one of the two new classes.
 
-    `status` is the HTTP status, or 0 for "no response" (DNS/TCP/TLS/timeout). A recognised remint
-    error CODE wins over the status so a provider that reports `invalid_grant` with an unusual
-    status is still routed to the maintainer instead of being retried forever."""
+    `status` is the HTTP status, `STATUS_NOT_SENT` (0) for "provably never transmitted", or
+    `STATUS_INDETERMINATE` (-1) for "may have been transmitted, no response observed". A recognised
+    remint error CODE wins over the status so a provider that reports `invalid_grant` with an unusual
+    status is still routed to the maintainer instead of being retried forever.
+
+    INDETERMINATE is REMINT, not transient (retro-review of #614): an unobserved outcome leaves the
+    grant's fate unknown, so it routes to a maintainer instead of being retried.
+
+    THE CLASS IS NOT THE RESEND DECISION (post-merge retro-review of #629, F5). This function answers
+    "is a LATER attempt worth making?", which is why 429 and 5xx stay transient. Whether THIS run may
+    re-POST the same one-time-use grant is a strictly narrower question answered by
+    `_RESEND_SAFE_STATUSES` in `refresh_access_token` — #629 conflated the two, and the 2xx arm did not
+    consult either."""
     if refresh_error_code(body) in _DECISIVE_REMINT_CODES:
+        return CLASS_REMINT
+    if int(status) == STATUS_INDETERMINATE:
         return CLASS_REMINT
     if int(status) in _REMINT_STATUSES:
         return CLASS_REMINT
@@ -341,24 +437,66 @@ def refresh_error_code(body):
     return None
 
 
+def _open_token_connection(url, timeout):
+    """The PRE-SEND half of one exchange: parse the URL and establish the connection. Returns
+    (connection, path). Every fault raised from here — a malformed URL, DNS failure, refused
+    connection, connect timeout, failed TLS handshake — provably transmitted nothing, because no
+    request byte has been written yet. Kept a separate function so that boundary is visible."""
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise ValueError(f"unsupported token endpoint scheme in {parts.scheme!r}")
+    path = urllib.parse.urlunsplit(("", "", parts.path or "/", parts.query, ""))
+    if parts.scheme == "https":
+        connection = http.client.HTTPSConnection(
+            parts.hostname, parts.port, timeout=timeout,
+            context=ssl.create_default_context())
+    else:
+        # http is reachable ONLY through the loopback-pinned self-test override (token_endpoint
+        # refuses any non-loopback override), so no credential ever crosses a network in the clear.
+        connection = http.client.HTTPConnection(parts.hostname, parts.port, timeout=timeout)
+    connection.connect()
+    return connection, path
+
+
 def _post_token_endpoint(url, payload, timeout=REFRESH_TIMEOUT_SECONDS):
     """One token-endpoint exchange. Returns (status, body_text). Never raises for an HTTP error
     status, and never logs: the body may echo request material, so only the CALLER's allowlisted
-    code extraction ever looks at it."""
-    request = urllib.request.Request(
-        url, data=json.dumps(payload).encode("utf-8"), method="POST",
-        headers={"Content-Type": "application/json", "Accept": "application/json"})
+    code extraction ever looks at it.
+
+    A failure with no HTTP status is reported as `STATUS_NOT_SENT` when it was raised STRICTLY BEFORE
+    the request was written, and `STATUS_INDETERMINATE` when it was raised at or after the write — the
+    grant may then already be spent. THE PHASE IS DECIDED BY WHICH CALL WAS IN FLIGHT, never by the
+    exception's type (retro-review of #629, F5(b)/F6): `ssl.SSLError` is an `OSError` and is raised
+    from both the handshake and the response read, and urllib's `URLError` conflates connect with
+    send, so no type-based test can be sound in both directions.
+
+    Deliberately does NOT follow redirects (urllib's opener did). A 3xx now surfaces as its observed
+    status, which stops the resend and is the right outcome twice over: re-POSTing the grant to a
+    redirect target is a credential-forwarding hazard, and the token endpoint is a fixed URL that has
+    no legitimate reason to move mid-flight."""
+    connection = None
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 (fixed https URL)
-            return response.status, response.read(REFRESH_MAX_BYTES).decode("utf-8", "replace")
-    except urllib.error.HTTPError as exc:
+        connection, path = _open_token_connection(url, timeout)
+    except (ValueError, OSError):
+        if connection is not None:                                  # pragma: no cover - defensive
+            connection.close()
+        return STATUS_NOT_SENT, ""       # PRE-SEND by construction: nothing was ever transmitted
+    try:
+        connection.request(
+            "POST", path, body=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Accept": "application/json",
+                     "Host": urllib.parse.urlsplit(url).netloc})
+        response = connection.getresponse()
+        return response.status, response.read(REFRESH_MAX_BYTES).decode("utf-8", "replace")
+    except (OSError, http.client.HTTPException, ValueError):
+        # POST-SEND by construction: the request write has begun, so the provider MAY have received
+        # and committed the rotation. Never retryable with the same grant.
+        return STATUS_INDETERMINATE, ""
+    finally:
         try:
-            body = exc.read(REFRESH_MAX_BYTES).decode("utf-8", "replace")
-        except OSError:
-            body = ""
-        return exc.code, body
-    except (urllib.error.URLError, OSError, ValueError):
-        return 0, ""   # no response at all: DNS / TCP / TLS / timeout => transient
+            connection.close()
+        except OSError:                                             # pragma: no cover - defensive
+            pass
 
 
 def token_endpoint(provider, environ=None):
@@ -380,7 +518,20 @@ def refresh_access_token(provider, refresh_token, *, poster=_post_token_endpoint
 
     Bounded retry on TRANSIENT classes only, reusing gh_retry's exponential-with-jitter sleep
     mechanics. A remint class fails immediately — retrying a dead grant just delays the maintainer
-    signal (the exact misclassification gh_retry's docstring calls out)."""
+    signal (the exact misclassification gh_retry's docstring calls out).
+
+    IDEMPOTENCY-AWARE (retro-review of #614, corrected by the POST-MERGE retro-review of #629 F5):
+    the retry re-POSTS the SAME one-time-use grant, so it is performed ONLY when the previous attempt
+    PROVABLY did not deliver it — `_RESEND_SAFE_STATUSES`. Any response actually received means the
+    provider may have committed the rotation, and a 2xx is the strongest possible evidence that it DID:
+    #629 treated a 2xx with a truncated / unparseable / access_token-less body as transient and
+    re-POSTed the grant 3× (MEASURED: `200 + truncated JSON -> grant transmissions=3`). That arm now
+    raises on the spot with the remint class and the "unusable success" cause.
+
+    The RESEND decision and the reported CLASS are deliberately separate. A 5xx still reports
+    `credential-refresh-transient` — a LATER attempt is worth making, and it is safe because it
+    re-reads the stored secret and a spent grant then fails closed with `invalid_grant` — but this run
+    will not send the same grant again."""
     url = token_endpoint(provider, environ)
     client_id = OAUTH_CLIENT_IDS.get(provider)
     if not url or not client_id:
@@ -400,13 +551,31 @@ def refresh_access_token(provider, refresh_token, *, poster=_post_token_endpoint
                 document = None
             if isinstance(document, dict) and document.get("access_token"):
                 return document
-            last = RefreshFailure(CLASS_REFRESH_TRANSIENT)
-        else:
-            kind = classify_refresh_failure(status, body)
-            failure = RefreshFailure(kind, refresh_error_code(body))
-            if kind == CLASS_REMINT:
-                raise failure
-            last = failure
+            # A 2xx WITH AN UNUSABLE BODY. The provider reported success, so the rotation almost
+            # certainly committed and the stored grant is spent; re-POSTing it is the single most
+            # certain way to trip replay detection and kill the account. Raise, never resend.
+            raise RefreshFailure(CLASS_REMINT, refresh_error_code(body), indeterminate=True,
+                                 cause=RefreshFailure.CAUSE_UNUSABLE_SUCCESS)
+        numeric, code = int(status), refresh_error_code(body)
+        kind = classify_refresh_failure(status, body)
+        # May the SAME grant be sent again? Only if this attempt provably did not deliver it.
+        resend_safe = numeric == STATUS_NOT_SENT or numeric in _RESEND_SAFE_STATUSES
+        # Is the grant PROVABLY dead (as opposed to of unknown fate)? Only a decisive provider code or
+        # a grant-rejecting status says so; everything else observed leaves the fate open.
+        decisive_dead = code in _DECISIVE_REMINT_CODES or numeric in _REMINT_STATUSES
+        indeterminate = not resend_safe and not decisive_dead
+        failure = RefreshFailure(
+            kind, code, indeterminate=indeterminate,
+            cause=(RefreshFailure.CAUSE_UNOBSERVED if numeric == STATUS_INDETERMINATE
+                   else RefreshFailure.CAUSE_OBSERVED_ERROR))
+        if kind == CLASS_REMINT:
+            # A dead grant is not worth retrying, and an INDETERMINATE grant must not be retried.
+            raise failure
+        last = failure
+        # THE RESEND GATE. Reached only on a transient class, and it still refuses to re-POST the
+        # one-time-use grant unless this attempt provably did not deliver it (F5(a)).
+        if not resend_safe:
+            raise last
         if attempt < max(1, int(attempts)):
             sleep(attempt)
     raise last
@@ -622,8 +791,150 @@ def _self_test():
     chk("503 classifies as transient", classify_refresh_failure(503, "") == CLASS_REFRESH_TRANSIENT)
     chk("429 classifies as transient (throttle, not a dead grant)",
         classify_refresh_failure(429, "") == CLASS_REFRESH_TRANSIENT)
-    chk("no response at all (DNS/TCP/TLS/timeout) classifies as transient",
-        classify_refresh_failure(0, "") == CLASS_REFRESH_TRANSIENT)
+    chk("a PROVABLY-unsent request (DNS/connection-refused/TLS) classifies as transient",
+        classify_refresh_failure(STATUS_NOT_SENT, "") == CLASS_REFRESH_TRANSIENT)
+    # --- IDEMPOTENCY (retro-review of #614). An UNOBSERVED outcome is not transient: "transient"
+    # licenses re-POSTing the same ONE-TIME-USE grant, and that is exactly what must not happen when
+    # the provider may already have consumed it. ---
+    chk("an INDETERMINATE outcome (request may have landed, no response seen) classifies as "
+        "remint-required, NOT transient — so it is never re-sent",
+        classify_refresh_failure(STATUS_INDETERMINATE, "") == CLASS_REMINT)
+    chk("the two no-status sentinels are distinct (a lost response is not an unsent request)",
+        STATUS_NOT_SENT != STATUS_INDETERMINATE
+        and classify_refresh_failure(STATUS_NOT_SENT, "")
+        != classify_refresh_failure(STATUS_INDETERMINATE, ""))
+    chk("an indeterminate RefreshFailure says the grant may already be consumed and was NOT re-sent",
+        "may already be consumed" in str(RefreshFailure(CLASS_REMINT, indeterminate=True))
+        and "NOT re-sent" in str(RefreshFailure(CLASS_REMINT, indeterminate=True))
+        and RefreshFailure(CLASS_REMINT, indeterminate=True).indeterminate is True
+        and RefreshFailure(CLASS_REMINT).indeterminate is False)
+    # --- THE PHASE BOUNDARY (post-merge retro-review of #629, F5(b) + F6). The phase is decided by
+    # WHICH CALL was in flight, never by the exception's type, so the probe drives a fake connection
+    # that raises from a chosen method and injects the SAME exception types at BOTH phases. Under
+    # #629's type-based `_NOT_SENT_ERRORS` an `ssl.SSLError` raised from `response.read()` classified
+    # STATUS_NOT_SENT and the one-time-use grant was re-POSTed 3× (MEASURED), while a CONNECT-phase
+    # timeout — which provably transmits nothing — was reported INDETERMINATE and paged an immediate
+    # re-mint. Both are corrected here, and neither can be corrected by a type test. ---
+    def phase_probe(failing_method, error, status=200, body=b'{"access_token": "A"}'):
+        class FakeResponse:
+            def __init__(self):
+                self.status = status
+
+            def read(self, _limit=None):
+                if failing_method == "read":
+                    raise error
+                return body
+
+        class FakeConnection:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def connect(self):
+                if failing_method == "connect":
+                    raise error
+
+            def request(self, *_args, **_kwargs):
+                if failing_method == "request":
+                    raise error
+
+            def getresponse(self):
+                if failing_method == "getresponse":
+                    raise error
+                return FakeResponse()
+
+            def close(self):
+                pass
+
+        saved = http.client.HTTPSConnection
+        http.client.HTTPSConnection = FakeConnection
+        try:
+            return _post_token_endpoint("https://auth.example/oauth/token", {"grant_type": "x"})
+        finally:
+            http.client.HTTPSConnection = saved
+
+    for method, error, expected_status, label in (
+            ("connect", socket.gaierror(-2, "Name or service not known"), STATUS_NOT_SENT,
+             "DNS failure"),
+            ("connect", ConnectionRefusedError(111, "refused"), STATUS_NOT_SENT,
+             "connection refused"),
+            ("connect", ssl.SSLCertVerificationError("bad cert"), STATUS_NOT_SENT,
+             "TLS certificate verification failure"),
+            ("connect", ssl.SSLError(1, "handshake failure"), STATUS_NOT_SENT,
+             "ssl.SSLError raised from the HANDSHAKE"),
+            ("connect", TimeoutError("timed out"), STATUS_NOT_SENT,
+             "CONNECT-phase timeout (F6: an unreachable endpoint keeps its bounded retry)"),
+            ("request", BrokenPipeError(32, "broken pipe"), STATUS_INDETERMINATE,
+             "broken pipe while WRITING the request"),
+            ("request", TimeoutError("timed out"), STATUS_INDETERMINATE, "send-phase timeout"),
+            ("getresponse", TimeoutError("timed out"), STATUS_INDETERMINATE,
+             "RESPONSE-phase timeout (F6: distinguished from the connect phase)"),
+            ("getresponse", ConnectionResetError(104, "reset by peer"), STATUS_INDETERMINATE,
+             "connection reset while waiting for the response"),
+            ("read", ssl.SSLError(1, "decryption failed or bad record mac"), STATUS_INDETERMINATE,
+             "ssl.SSLError raised from response.read() — F5(b) VERBATIM"),
+            ("read", TimeoutError("timed out"), STATUS_INDETERMINATE,
+             "timeout reading the response body"),
+            ("read", http.client.IncompleteRead(b"{"), STATUS_INDETERMINATE,
+             "truncated response body")):
+        chk(f"transport: {label} at `{method}` -> "
+            f"{'NOT_SENT (retryable)' if expected_status == STATUS_NOT_SENT else 'INDETERMINATE'}",
+            phase_probe(method, error) == (expected_status, ""))
+    chk("transport (F5(b)): the SAME `ssl.SSLError` classifies NOT_SENT from the handshake and "
+        "INDETERMINATE from the response read — the phase, not the exception type, decides",
+        (phase_probe("connect", ssl.SSLError(1, "x"))[0],
+         phase_probe("read", ssl.SSLError(1, "x"))[0]) == (STATUS_NOT_SENT, STATUS_INDETERMINATE))
+    chk("transport (F6): the SAME `TimeoutError` classifies NOT_SENT at connect (nothing "
+        "transmitted, so the bounded retry is preserved) and INDETERMINATE at the response",
+        (phase_probe("connect", TimeoutError())[0],
+         phase_probe("getresponse", TimeoutError())[0])
+        == (STATUS_NOT_SENT, STATUS_INDETERMINATE))
+    chk("transport: a malformed endpoint URL is PRE-SEND (nothing was ever transmitted)",
+        _post_token_endpoint("not-a-url", {"grant_type": "x"}) == (STATUS_NOT_SENT, ""))
+    chk("transport: the happy path returns the observed status and body",
+        phase_probe(None, None) == (200, '{"access_token": "A"}'))
+    chk("transport: an HTTP error status is RETURNED, never raised",
+        phase_probe(None, None, status=503, body=b"upstream") == (503, "upstream"))
+    # REAL SOCKETS, loopback only, zero network egress. Two cases that pin the STRUCTURAL claim the
+    # phase boundary rests on — that `_open_token_connection` completes before any request byte is
+    # written — against a live kernel rather than a stub:
+    #   * nothing listening -> refused during connect -> PRE-SEND, and the bounded retry is preserved
+    #     (F6: #629 reported the analogous connect-phase timeout INDETERMINATE and paged a re-mint on
+    #     attempt 1, because urllib wraps connect AND send in one URLError);
+    #   * a server that ACCEPTS the request and then closes without answering -> POST-SEND, so the
+    #     grant may be spent and must never be re-POSTed.
+    import threading
+    _probe = socket.socket()
+    _probe.bind(("127.0.0.1", 0))
+    closed_port = _probe.getsockname()[1]
+    _probe.close()
+    chk("transport (F6, real socket): nothing listening -> refused during CONNECT -> NOT_SENT, so an "
+        "unreachable endpoint keeps its bounded retry instead of paging a re-mint",
+        _post_token_endpoint(f"http://127.0.0.1:{closed_port}/oauth/token",
+                             {"grant_type": "x"}, timeout=2) == (STATUS_NOT_SENT, ""))
+    listener = socket.socket()
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    silent_port = listener.getsockname()[1]
+
+    def accept_then_close():
+        try:
+            connection, _peer = listener.accept()
+            connection.close()          # accepted the request, answered nothing
+        except OSError:                                            # pragma: no cover - teardown race
+            pass
+
+    thread = threading.Thread(target=accept_then_close, daemon=True)
+    thread.start()
+    try:
+        silent = _post_token_endpoint(f"http://127.0.0.1:{silent_port}/oauth/token",
+                                      {"grant_type": "x"}, timeout=5)
+    finally:
+        thread.join(timeout=5)
+        listener.close()
+    chk("transport (F5, real socket): a server that ACCEPTS the request and answers nothing -> "
+        "INDETERMINATE (the grant may already be spent, so it must never be re-POSTed)",
+        silent == (STATUS_INDETERMINATE, ""))
     chk("the two new classes are distinct from `auth`",
         CLASS_REMINT != "auth" and CLASS_REFRESH_TRANSIENT != "auth"
         and CLASS_REMINT != CLASS_REFRESH_TRANSIENT)
@@ -642,12 +953,12 @@ def _self_test():
     def flaky(url, payload):
         calls.append(payload["grant_type"])
         if len(calls) < 3:
-            return 503, ""
+            return 429, ""          # documented THROTTLE: the only observed status safe to resend on
         return 200, json.dumps({"access_token": _jwt(now + 864000), "refresh_token": "REFRESH_v2",
                                 "id_token": "ID_v2"})
     response = refresh_access_token("openai", "REFRESH_long", poster=flaky,
                                     sleeper=lambda attempt: sleeps.append(attempt))
-    chk("transient token-endpoint failures retry then succeed",
+    chk("throttled (429) token-endpoint failures retry then succeed",
         (len(calls), sleeps, response["refresh_token"]) == (3, [1, 2], "REFRESH_v2"))
     calls.clear(); sleeps.clear()
     kind = None
@@ -659,17 +970,110 @@ def _self_test():
         kind = exc.kind
     chk("a dead grant fails on the FIRST attempt with the remint class",
         (kind, len(calls), sleeps) == (CLASS_REMINT, 1, []))
+    # --- THE #614 IDEMPOTENCY DEFECT, end to end through the real retry loop. A lost response used to
+    # replay the SAME one-time-use grant REFRESH_ATTEMPTS times; the grant must now be TRANSMITTED
+    # EXACTLY ONCE, and the failure must say the account may need a re-mint. ---
+    calls.clear(); sleeps.clear()
+    sent, failure = [], None
+    try:
+        refresh_access_token(
+            "openai", "REFRESH_ONE_TIME_USE",
+            poster=lambda url, payload: (sent.append(payload["refresh_token"]),
+                                         (STATUS_INDETERMINATE, ""))[1],
+            sleeper=lambda attempt: sleeps.append(attempt))
+    except RefreshFailure as exc:
+        failure = exc
+    chk("a LOST RESPONSE transmits the one-time-use grant EXACTLY ONCE (never replayed)",
+        sent == ["REFRESH_ONE_TIME_USE"])
+    chk("a LOST RESPONSE never sleeps for a retry it must not perform", sleeps == [])
+    chk("a LOST RESPONSE raises the remint class, flagged indeterminate",
+        failure is not None and failure.kind == CLASS_REMINT and failure.indeterminate is True)
+    chk("REFRESH_ATTEMPTS > 1, so the exactly-once assertion above is NON-VACUOUS",
+        REFRESH_ATTEMPTS > 1)
+    # ...and the contrast: a genuinely-unsent request (connection refused) IS still retried, so the
+    # fix did not simply disable the bounded retry the transient class exists for.
+    sent.clear(); sleeps.clear()
+    kind = None
+    try:
+        refresh_access_token(
+            "openai", "REFRESH_ONE_TIME_USE",
+            poster=lambda url, payload: (sent.append(payload["refresh_token"]),
+                                         (STATUS_NOT_SENT, ""))[1],
+            sleeper=lambda attempt: sleeps.append(attempt))
+    except RefreshFailure as exc:
+        kind = exc.kind
+    chk("a PROVABLY-unsent request is still retried to the bound (the grant was never spent)",
+        (len(sent), sleeps, kind)
+        == (REFRESH_ATTEMPTS, list(range(1, REFRESH_ATTEMPTS)), CLASS_REFRESH_TRANSIENT))
     calls.clear(); sleeps.clear()
     kind = None
     try:
         refresh_access_token("openai", "REFRESH_long",
-                            poster=lambda url, payload: (calls.append(1), (503, ""))[1],
+                            poster=lambda url, payload: (calls.append(1), (429, ""))[1],
                             sleeper=lambda attempt: sleeps.append(attempt))
     except RefreshFailure as exc:
         kind = exc.kind
-    chk("a persistent transient exhausts the bounded retry then reports transient",
+    chk("a persistent THROTTLE exhausts the bounded retry then reports transient",
         (kind, len(calls), sleeps) == (CLASS_REFRESH_TRANSIENT, REFRESH_ATTEMPTS,
                                       list(range(1, REFRESH_ATTEMPTS))))
+    # --- POST-MERGE RETRO-REVIEW OF #629, F5(a): NEVER RE-POST THE GRANT AFTER A RESPONSE ARRIVED.
+    # MEASURED on the merged tree:
+    #     200 + truncated JSON  -> grant transmissions=3  (raised credential-refresh-transient)
+    #     200 + no access_token -> grant transmissions=3
+    #     204 + empty body      -> grant transmissions=3
+    # A 2xx is the STRONGEST possible evidence the provider committed the rotation, so those three are
+    # the highest-certainty replay cases in the file. A 5xx does not prove no grant was issued either
+    # (a backend or intermediary can 5xx after an upstream commit), so it also stops the resend while
+    # keeping the honest transient CLASS: a later attempt re-reads the stored secret, and a spent grant
+    # then fails closed with `invalid_grant`. ---
+    for status, body, expect_kind, expect_indeterminate, label in (
+            (200, '{"access_to', CLASS_REMINT, True, "200 with a TRUNCATED body"),
+            (200, '{"token_type": "bearer"}', CLASS_REMINT, True, "200 with NO access_token"),
+            (204, "", CLASS_REMINT, True, "204 with an EMPTY body"),
+            (299, "not json at all", CLASS_REMINT, True, "299 with an unparseable body"),
+            (500, "", CLASS_REFRESH_TRANSIENT, True, "500 (an intermediary can 5xx post-commit)"),
+            (503, "", CLASS_REFRESH_TRANSIENT, True, "503"),
+            (404, "", CLASS_REFRESH_TRANSIENT, True, "404")):
+        sent, sleeps, failure = [], [], None
+        try:
+            refresh_access_token(
+                "openai", "REFRESH_ONE_TIME_USE",
+                poster=lambda url, payload: (sent.append(payload["refresh_token"]), (status, body))[1],
+                sleeper=lambda attempt: sleeps.append(attempt))
+        except RefreshFailure as exc:
+            failure = exc
+        chk(f"F5(a): {label} transmits the one-time-use grant EXACTLY ONCE, never replays it, and "
+            f"reports {expect_kind}",
+            (sent, sleeps, failure is not None and failure.kind,
+             failure is not None and failure.indeterminate)
+            == (["REFRESH_ONE_TIME_USE"], [], expect_kind, expect_indeterminate))
+    chk("F5(a): a 2xx-unusable failure names the SUCCESS status as the reason the grant must be "
+        "assumed spent (not the generic unobserved wording)",
+        "STRONGEST evidence" in str(RefreshFailure(
+            CLASS_REMINT, indeterminate=True,
+            cause=RefreshFailure.CAUSE_UNUSABLE_SUCCESS)))
+    chk("F5(a): 429 is the ONLY observed status the grant may be re-POSTed on, and NOT_SENT the only "
+        "unobserved one — so the resend allowlist is not silently widened",
+        _RESEND_SAFE_STATUSES == frozenset({429}) and STATUS_NOT_SENT not in _RESEND_SAFE_STATUSES)
+    # F5(b) end to end: a TLS fault from the response read used to classify NOT_SENT and replay the
+    # grant 3×. Driven through the REAL poster, so it exercises the phase boundary, not a stub.
+    sent_probe = []
+
+    def counting_poster(url, payload):
+        sent_probe.append(payload["refresh_token"])
+        return phase_probe("read", ssl.SSLError(1, "decryption failed or bad record mac"))
+
+    failure = None
+    try:
+        refresh_access_token("openai", "REFRESH_ONE_TIME_USE", poster=counting_poster,
+                             sleeper=lambda attempt: None)
+    except RefreshFailure as exc:
+        failure = exc
+    chk("F5(b): an `ssl.SSLError` from response.read() transmits the grant EXACTLY ONCE and reports "
+        "the remint class (it used to be classified NOT_SENT and re-POSTed 3×)",
+        (sent_probe, failure is not None and failure.kind,
+         failure is not None and failure.indeterminate)
+        == (["REFRESH_ONE_TIME_USE"], CLASS_REMINT, True))
     calls.clear()
     kind = None
     try:
