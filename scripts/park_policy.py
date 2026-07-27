@@ -951,13 +951,21 @@ PARK_CAUSES = {
     "history-rewritten": PARK_CLASS_QUESTION,  # head no longer descends from the opened commit
     "marker-corrupt": PARK_CLASS_QUESTION,    # durable round/model/pin markers failed validation
     "routing-unresolvable": PARK_CLASS_QUESTION,  # no concrete provider model in the catalog
+    # The stuck-escalation auto-adjudicator's terminal outcome (registry #446,
+    # scripts/stuck_adjudicator.py): a cross-provider orchestrator-tier adjudication READ this
+    # standoff and judged it a policy/ZK/security/trust decision only the maintainer can make.
+    # It exists so the park that SURVIVES adjudication is finally attributable — #446's measured
+    # backlog was 36 PRs whose parks nothing could explain, and an unexplainable park has no
+    # machine exit by construction. It is HUMAN-ONLY below: adjudication is the last automatic
+    # word on a park, so re-opening its own verdict would make the loop unbounded.
+    "adjudicated-human": PARK_CLASS_QUESTION,
 }
 
 # Causes NO machine path may ever re-classify, re-admit, or convert out of the human terminal —
 # not on a marker, not on prose, not on a cap, not ever. These are the parks that exist BECAUSE a
 # judgement was made; unparking them automatically would present un-reviewed (or actively
 # hostile) work as ready. Consulted by every automatic path; see reclassify_legacy_park.
-PARK_HUMAN_ONLY_CAUSES = frozenset({"injection", "human-arm"})
+PARK_HUMAN_ONLY_CAUSES = frozenset({"injection", "human-arm", "adjudicated-human"})
 
 
 def park_cause_class(cause):

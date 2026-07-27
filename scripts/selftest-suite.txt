@@ -30,6 +30,7 @@ resolve-conflicts.py
 retriage.py
 route-resolve.py
 select-and-claim.py
+stuck_adjudicator.py
 triage.py
 trust-gate.py
 usage-alert.py
