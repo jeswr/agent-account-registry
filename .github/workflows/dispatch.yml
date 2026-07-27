@@ -749,10 +749,30 @@ jobs:
               # [registry #677] `starvation` is filled BY the filter, at the branch that makes
               # each drop decision — never recounted afterwards from a different view.
               starvation = {}
+              # [registry #758] The assemble leg is where the frontier actually dies, and it had
+              # no counter: `frontier_size` downstream is assigned the POST-filter count, so the
+              # whole loss sat between "the frontier was wide" and "nothing was planned". The
+              # per-reason / per-HELD-AREA census is filled BY the filter, at the branch that makes
+              # each drop decision — never re-derived here from the surviving rows, which cannot
+              # see which reservation ate the others.
+              partition_census = {}
+              rows_before_assemble = len(repository["items"])
               repository["items"] = claim_mod.filter_busy_area_items(
                   claim_mod.filter_deferred_items(repository["items"], repo, leases, now),
                   repo, pulls, issue_labels, provenance, pr_status, leases, now,
-                  starvation=starvation)
+                  starvation=starvation, census=partition_census)
+              # BRACE-FREE by construction: GitHub's secret masker rewrites `{`/`}` to `***` in log
+              # output, so a JSON dump of this census would arrive corrupted. Flat key=value only.
+              print("assemble-census " + " ".join(
+                  [repo, "rows_before=" + str(rows_before_assemble),
+                   "deferred=" + str(partition_census.get("total", 0)),
+                   "kept=" + str(partition_census.get("kept", 0))]
+                  + ["reason." + reason + "=" + str(count) for reason, count
+                     in sorted((partition_census.get("by_reason") or {}).items())]
+                  + ["area." + area + "=" + str(count) for area, count
+                     in sorted((partition_census.get("by_held_area") or {}).items())]
+                  + ["holder.pr" + holder + "=" + str(count) for holder, count
+                     in sorted((partition_census.get("by_holder") or {}).items())]))
               # Recorded ONLY for a genuinely starved lane: nothing survived AND rows were dropped
               # behind the serializing partition. A healthy or empty lane records nothing, so the
               # sweep on the CLAIM side has no starvation to act on at all.
