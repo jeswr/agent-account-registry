@@ -5443,6 +5443,10 @@ def _self_test() -> int:
                 return {"data": {"repository": {"pullRequest": {
                     "mergeQueueEntry": None, "autoMergeRequest": None}}}}
             terminal_sweep_env["writes"].append((method, path))
+            # The BODY, recorded separately so the pre-existing (method, path) assertions keep
+            # their shape. Asserting only that a POST to .../labels happened is what let the age
+            # hand-off's label go untested through every round of this file's history.
+            terminal_sweep_env.setdefault("write_bodies", []).append((method, path, body))
             return {}
 
         def paginate(self, path):
@@ -5450,7 +5454,7 @@ def _self_test() -> int:
                 return terminal_sweep_env["planned_issues"]
             if path == "/repos/owner/repo/pulls?state=open":
                 return terminal_sweep_env.get("pulls", [])
-            return []
+            return terminal_sweep_env.get("pages", {}).get(path, [])
 
     terminal_sweep_releases: list[set[str]] = []
 
@@ -5713,6 +5717,7 @@ def _self_test() -> int:
             pulls: tuple[dict[str, Any], ...] = (),
             issues: tuple[dict[str, Any], ...] = (),
             details: tuple[dict[str, Any], ...] | None = None,
+            extra_gets: dict[str, Any] | None = None,
         ) -> tuple[str, str, list[set[str]]]:
             """Run the REAL run_sweep with the given per-object refusals; report (log, error, releases).
 
@@ -5726,13 +5731,17 @@ def _self_test() -> int:
                 "issued_at": 1,
                 "expires_at": 2,
             }]
+            terminal_sweep_env.setdefault("write_bodies", []).clear()
             terminal_sweep_env.update(
                 planned_issues=list(issues),
                 fresh_issues={issue["number"]: issue for issue in issues},
                 pulls=list(pulls),
                 gets={
-                    f"/repos/owner/repo/pulls/{pull['number']}": pull
-                    for pull in (pulls if details is None else details)
+                    **{
+                        f"/repos/owner/repo/pulls/{pull['number']}": pull
+                        for pull in (pulls if details is None else details)
+                    },
+                    **(extra_gets or {}),
                 },
                 writes=[],
                 http_failures=dict(refusals),
@@ -5847,6 +5856,250 @@ def _self_test() -> int:
                 "Bad credentials for token *** (***) while adding labels" in masked_log,
             ),
             (False, False, True),
+        )
+
+        # ---- THE AGE-PARK CLASS SPLIT, driven END-TO-END through the real run_sweep ------------
+        # Every check below is on the LEG THIS CHANGE IS NAMED FOR — the label the hand-off
+        # actually POSTs — not on a helper. The pre-existing #647 checks above assert only that a
+        # POST to `.../labels` HAPPENED, which is exactly why swapping `needs:user` for
+        # `review:parked` left this whole file green: the body was never read. `write_bodies` is
+        # the seam that closes that.
+        def _park_bodies() -> list[Any]:
+            # `/issues/<n>/labels` only — `POST /repos/<r>/labels` is _ensure_label CREATING
+            # the label definition, which is not a park write.
+            return [body for method, path, body in terminal_sweep_env.get("write_bodies", [])
+                    if method == "POST" and "/issues/" in path and path.endswith("/labels")]
+
+        def _comment_bodies() -> list[str]:
+            return [body["body"] for method, path, body
+                    in terminal_sweep_env.get("write_bodies", [])
+                    if method == "POST" and path.endswith("/comments")]
+
+        # (A1) A machine-recoverable cause (a wedged merge state) age-parks into the MACHINE class.
+        # Invert age_park_label's return and this reds on the very first tuple element.
+        machine_log, _e, _r = _sweep_with_refusals({}, pulls=(_stale_worker_pr(31),))
+        machine_receipt = (f"{AGE_PARK_MARKER} cause=merge-dirty head={31:040x} gen=1 -->")
+        check(
+            "an AGE/timeout park lands in the MACHINE class: the hand-off POSTs review:parked, "
+            "never the human-owned needs:user, and mints a cause/head/gen receipt",
+            (
+                _park_bodies(),
+                any(machine_receipt in body for body in _comment_bodies()),
+                any("No action is required from you." in body for body in _comment_bodies()),
+                "labels=review:parked" in machine_log,
+            ),
+            ([{"labels": ["review:parked"]}], True, True, True),
+        )
+        check(
+            "the age hand-off writes NO human-owned label for a machine-recoverable cause "
+            "(the whole defect: needs:user is what park_policy refuses to auto-re-admit)",
+            [body for body in _park_bodies()
+             if park_policy.HUMAN_PARK_LABEL in body.get("labels", [])],
+            [],
+        )
+
+        # (A2) FAIL-CLOSED DEFAULT. A cause the taxonomy cannot name has no recovery predicate, so
+        # it keeps the HUMAN hand-off — a soft hold with no provable exit would be a SILENT
+        # permanent hold. Deleting the `age_park_cause(reason) is None` branch reds this.
+        _saved_dirty = AGE_PARK_CAUSES.pop(BAD_MERGE_STATES["dirty"])
+        try:
+            _unmapped_log, _e, _r = _sweep_with_refusals({}, pulls=(_stale_worker_pr(31),))
+            check(
+                "a cause with NO machine recovery predicate still lands in needs:user "
+                "(fail-closed: an unprovable exit stays a VISIBLE human hold)",
+                (
+                    _park_bodies(),
+                    any(AGE_PARK_MARKER in body for body in _comment_bodies()),
+                ),
+                ([{"labels": ["needs:user"]}], False),
+            )
+        finally:
+            AGE_PARK_CAUSES[BAD_MERGE_STATES["dirty"]] = _saved_dirty
+
+        # (A3) THE CAP, at the only place it is enforced. Two park receipts already on record means
+        # this park is generation 3 — past AGE_UNPARK_MAX — so the machine has already granted every
+        # automatic re-admission it may, and the disposition becomes ESCALATION to the human class.
+        # Raise AGE_UNPARK_MAX (or drop the generation comparison) and this reds.
+        def _park_receipt_comment(gen: int, number: int = 31, cause: str = "merge-dirty") -> dict:
+            return {"user": {"login": "app[bot]"},
+                    "body": f"> 🤖 SPARQ agent\n\n{AGE_PARK_MARKER} cause={cause} "
+                            f"head={number:040x} gen={gen} -->"}
+
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/31/comments": [
+                _park_receipt_comment(1), _park_receipt_comment(2)]}
+        capped_log, _e, _r = _sweep_with_refusals({}, pulls=(_stale_worker_pr(31),))
+        check(
+            "re-admission is CAPPED: an age park past AGE_UNPARK_MAX escalates to needs:user and "
+            "the comment names the REPEATED FAILURE rather than the timeout",
+            (
+                _park_bodies(),
+                any("age-park generation 3" in body for body in _comment_bodies()),
+                any("a repeated failure — not a timeout" in body
+                    for body in _comment_bodies()),
+            ),
+            ([{"labels": ["needs:user"]}], True, True),
+        )
+        terminal_sweep_env["pages"] = {}
+
+        # ---- the MACHINE EXIT: cause-gated, consumed exactly once, never over a human hold ------
+        def _machine_parked_pr(number: int, merge_state: str, labels: tuple[str, ...],
+                               *, fresh: bool = False) -> dict[str, Any]:
+            """An already-age-parked worker PR, as the open-PR listing shows it.
+
+            `fresh` puts it inside the age threshold, which the hand-off skips — so a scenario can
+            exercise the EXIT phase in isolation. That it still runs is itself the point: the
+            re-admission sweep is deliberately NOT age-gated, because a cause that recovers five
+            minutes after the park must be re-admitted five minutes after the park."""
+            return {
+                "number": number,
+                "state": "open",
+                "draft": False,
+                "labels": [{"name": name} for name in labels],
+                "updated_at": datetime.fromtimestamp(
+                    int(time.time()) if fresh else 1_000, timezone.utc).isoformat(),
+                "head": {"sha": f"{number:040x}", "ref": f"sparq-agent/issue-9{number}-fix"},
+                "user": {"login": "app[bot]"},
+                "body": f"{WORKER_PR_MARKER}\n\nautomated work",
+                "mergeable_state": merge_state,
+                "auto_merge": None,
+            }
+
+        recovered_pr = _machine_parked_pr(33, "clean", ("review:parked",))
+        unpark_receipt = f"{AGE_UNPARK_MARKER} cause=merge-dirty head={33:040x} gen=1 -->"
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/33/comments": [_park_receipt_comment(1, 33)]}
+        unpark_log, _e, _r = _sweep_with_refusals({}, pulls=(recovered_pr,))
+        unpark_writes = terminal_sweep_env["writes"]
+        _label_delete = ("DELETE", "/repos/owner/repo/issues/33/labels/review%3Aparked")
+        check(
+            "PROVEN CAUSE-RECOVERY re-admits the machine age park: the receipt is posted FIRST, "
+            "then review:parked is deleted — and the un-park is reported",
+            (
+                any(unpark_receipt in body for body in _comment_bodies()),
+                _label_delete in unpark_writes,
+                unpark_writes.index(("POST", "/repos/owner/repo/issues/33/comments"))
+                < unpark_writes.index(_label_delete),
+                "age_unparked=1" in unpark_log,
+            ),
+            (True, True, True, True),
+        )
+
+        # Consume-exactly-once: replay the SAME recovery with the un-park receipt already on
+        # record. Drop the `consumed` set from age_unpark_owed and this reds — the recovery would
+        # be re-earned every tick, i.e. the infinite-retry failure that is worse than a hold.
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/33/comments": [
+                _park_receipt_comment(1, 33),
+                {"user": {"login": "app[bot]"}, "body": unpark_receipt}]}
+        replay_log, _e, _r = _sweep_with_refusals({}, pulls=(recovered_pr,))
+        check(
+            "a re-admission is CONSUMED EXACTLY ONCE: the same (cause, head, gen) recovery grants "
+            "nothing on a later tick — no receipt, no unlabel",
+            (terminal_sweep_env["writes"], "age_unparked=0" in replay_log),
+            ([], True),
+        )
+
+        # The cause has NOT recovered: the park stands, and it says why. Invert
+        # age_park_cause_recovered's merge branch and this reds.
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/34/comments": [_park_receipt_comment(1, 34)]}
+        stands_log, _e, _r = _sweep_with_refusals(
+            {}, pulls=(_machine_parked_pr(34, "dirty", ("review:parked",), fresh=True),))
+        check(
+            "an UNRECOVERED cause is never re-admitted, and the sweep NAMES the standing park "
+            "(a park with no stated reason is the state nothing can audit)",
+            (
+                terminal_sweep_env["writes"],
+                "age park stands owner/repo#34" in stands_log,
+                "the merge state is still dirty" in stands_log,
+            ),
+            ([], True, True),
+        )
+
+        # A GENUINE human-question park is never auto-re-admitted — it carries no machine label,
+        # so the exit phase never even considers it. Drop the MACHINE_PARK_PR_LABEL membership
+        # test at the top of _execute_age_unpark_actions and this reds.
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/35/comments": [_park_receipt_comment(1, 35)]}
+        human_log, _e, _r = _sweep_with_refusals(
+            {}, pulls=(_machine_parked_pr(35, "clean", ("needs:user",), fresh=True),))
+        check(
+            "a GENUINE needs:user park is NEVER auto-re-admitted, even with a recovered cause and "
+            "a receipt on record (park_policy invariant 3, preserved exactly)",
+            (terminal_sweep_env["writes"], "age_unparked=0" in human_log),
+            ([], True),
+        )
+
+        # A machine label a PROVEN HUMAN applied is likewise never auto-cleared: the actor decides,
+        # not the label. Remove the park_applications human_park check and this reds.
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/36/comments": [_park_receipt_comment(1, 36)],
+            "/repos/owner/repo/issues/36/timeline": [
+                {"event": "labeled", "label": {"name": "review:parked"},
+                 "created_at": "2026-07-26T10:00:00Z", "actor": {"login": "jeswr"}}],
+        }
+        human_applied_log, _e, _r = _sweep_with_refusals(
+            {}, pulls=(_machine_parked_pr(36, "clean", ("review:parked",), fresh=True),),
+            extra_gets={"/repos/owner/repo/collaborators/jeswr/permission":
+                        {"permission": "admin"}},
+        )
+        check(
+            "a machine park a PROVEN HUMAN applied is never auto-cleared — only a human clears it",
+            (
+                terminal_sweep_env["writes"],
+                "the latest park application is HUMAN-owned" in human_applied_log,
+            ),
+            ([], True),
+        )
+        terminal_sweep_env["pages"] = {}
+
+        # An UNKNOWN cause token can never be proven recovered, so it never re-admits. This is the
+        # quantifier direction that matters: "some causes recover" must not become "re-admit unless
+        # we can show it did not".
+        check(
+            "an UNRECOGNISED cause token is NEVER re-admitted (no predicate ⇒ no proof ⇒ parked)",
+            age_park_cause_recovered("teleported", {"mergeable_state": "clean"},
+                                     lambda: ("admits", {}))[0],
+            False,
+        )
+        check(
+            "an INDETERMINATE live provenance read keeps the orphan-draft park (never re-admit on "
+            "an unusable read)",
+            (age_park_cause_recovered("orphan-draft", {}, lambda: ("indeterminate", None))[0],
+             age_park_cause_recovered("orphan-draft", {}, lambda: ("denies", None))[0],
+             age_park_cause_recovered("orphan-draft", {}, lambda: ("admits", {}))[0]),
+            (False, False, True),
+        )
+        check(
+            "a MALFORMED live merge state keeps the park (fail-closed, never a re-admission)",
+            age_park_cause_recovered("merge-blocked", {"mergeable_state": 7},
+                                     lambda: ("denies", None))[0],
+            False,
+        )
+        # A malformed receipt still CONSUMES a generation — otherwise a corrupt comment buys an
+        # extra automatic re-admission (park_policy's auto_marker_count rule).
+        check(
+            "a MALFORMED park receipt still consumes a generation (it cannot buy an extra grant)",
+            age_park_generation(
+                [{"user": {"login": "app[bot]"}, "body": f"{AGE_PARK_MARKER} garbage -->"}],
+                "app[bot]"),
+            2,
+        )
+        check(
+            "a receipt authored by anyone but the bot proves nothing",
+            age_receipts(
+                [{"user": {"login": "mallory"},
+                  "body": f"{AGE_PARK_MARKER} cause=merge-dirty head={'a' * 40} gen=1 -->"}],
+                AGE_PARK_MARKER, "app[bot]"),
+            [],
+        )
+        check(
+            "every reason stale_worker_pr_reason can return is CLASSIFIED — a new bad merge state "
+            "cannot silently fall through to the human terminal",
+            sorted({age_park_cause(reason) for reason in
+                    [ORPHAN_DRAFT_REASON, *BAD_MERGE_STATES.values()]} - {None}),
+            sorted({"orphan-draft", *(f"merge-{state}" for state in BAD_MERGE_STATES)}),
         )
 
         # (2) ISSUE-REPAIR LOOP, head-of-line refusal. Same shape: the lower-numbered issue's
