@@ -860,9 +860,8 @@ def _gate_state_of(gate_entry):
 
 def tiered_gate_conclusion(check_runs, log=print):
     """PURE, TIER-AWARE aggregator resolution over CI_TIERED_GATE_CHECKS — the ONE predicate
-    every DRAFT-head red-gate decision reads (the review-dispatch precondition in
-    the GAP-A needs-ci-fix admission in enumerate_review_items and CLAIM's live
-    re-derivation of it).
+    every DRAFT-head red-gate decision reads: the GAP-A needs-ci-fix admission in
+    enumerate_review_items, and CLAIM's live re-derivation of it (_live_tiered_gate).
 
     Same failure|pending|success|missing|unknown vocabulary as interpret_check_runs, resolved
     newest-run-wins ACROSS the tiered names — a full-tier `gate` run started after a
