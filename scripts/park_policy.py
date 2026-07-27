@@ -1433,48 +1433,180 @@ _INJECTION_AFFIRMATIVE = (
     re.compile(r"prompt[- ]injection\s+(?:attempt|attack|payload|vector)\b", re.IGNORECASE),
 )
 
-# TIER B machinery. Sentence scoping is DELIBERATELY over-eager (a bare `.`, `|` or newline ends a
-# sentence): over-splitting can only shrink the window a negator is allowed to reach across, and a
-# negator that cannot reach its mention leaves the mention DENYING. Over-splitting is fail-closed.
+# TIER B machinery — A POLARITY MODEL, NOT A NEGATOR SEARCH.
+#
+# THE PROPOSITION THIS MUST PROVE. The release condition is "the text asserts that injection is
+# ABSENT". It is emphatically NOT "a negator governs the mention's predicate": those two come
+# apart, and every case where they do releases text that asserts injection EXISTS —
+#
+#     "Prompt injection was not ruled out."          a negator, and it means PRESENT
+#     "The prompt-injection risk was not mitigated." a negator, and it means PRESENT
+#     "There is no evidence that prompt injection is absent."      likewise
+#     "no doubt that prompt injection exists"                      likewise
+#     "not sure whether prompt injection is present"               likewise
+#     'The author claims: "No prompt injection was detected." That claim is false.'
+#
+# So Tier B computes a POLARITY over a SMALL CLOSED VOCABULARY and DENIES ON ANYTHING OUTSIDE IT.
+# Three inputs, combined by one explicit table (_INJECTION_POLARITY):
+#
+#   1. VOICE — is the mention in the bot's OWN voice? A negation the bot merely REPORTS someone
+#      else making is not the bot's finding of absence (and can be repudiated in the very next
+#      sentence). A mention inside a quotation, or downstream of an attribution verb, DENIES.
+#   2. PRE — does a recognised negator GOVERN the mention's noun phrase? It must sit in the
+#      mention's own sentence, within a bounded reach, with nothing between the two that breaks
+#      its reach: a contrast word, a coordination, a COMPLEMENTIZER ("no evidence THAT ...",
+#      "not sure WHETHER ..." — where the negator negates the matrix noun, not the mention), a
+#      verb starting a fresh predicate, or a comma that is not part of a coordinated noun list
+#      ("No gate failures, prompt-injection content is present." is two clauses, not one).
+#   3. TAIL — the polarity of the mention's OWN predicate, parsed against closed verb sets. The
+#      load-bearing distinction is PRESENCE verbs (detected / found / appears / remains) against
+#      ABSENCE verbs (ruled out / mitigated / fixed / addressed / resolved / absent). Negating a
+#      PRESENCE verb yields absence; negating an ABSENCE verb yields PRESENCE. A tail the closed
+#      grammar cannot parse at all is UNKNOWN, and UNKNOWN denies.
+#
+# "Cannot prove a negation" is not "is a negation" — everything unproven denies.
+#
+# Sentence scoping is DELIBERATELY over-eager (a bare `.`, `|` or newline ends a sentence):
+# over-splitting can only shrink the window a negator is allowed to reach across, and a negator
+# that cannot reach its mention leaves the mention DENYING. Over-splitting is fail-closed. It is
+# also exactly why Tier A scans the WHOLE text: Tier A is the backstop for an affirmative marker
+# that an over-eager split put out of Tier B's reach.
 _INJECTION_SENTENCE_BOUNDARY = re.compile(r"[.!?;\n\r|]")
 
 _INJECTION_NEGATOR = re.compile(
     r"(?:\b(?:no|not|none|neither|nor|never|without|nothing|absent|lacks|lacking|zero)\b"
     r"|\bfree\s+(?:of|from)\b|\bdevoid\s+of\b|n't\b)", re.IGNORECASE)
 
+# VOICE. An attribution verb before the mention means the negation is REPORTED, not asserted —
+# "The author claims ... no prompt injection ..." is compatible with the bot going on to say the
+# claim is false. Reported denials deny.
+_INJECTION_ATTRIBUTION = re.compile(
+    r"\b(?:claim|claims|claimed|claiming|allege|alleges|alleged|allegedly|assert|asserts|"
+    r"asserted|say|says|said|state|states|stated|argue|argues|argued|insist|insists|insisted|"
+    r"maintain|maintains|maintained|purport|purports|purported|contend|contends|contended|"
+    r"reportedly|supposedly|according|quoted|quoting|per)\b", re.IGNORECASE)
+
 # What BREAKS a negator's reach. If any of these sits between the negator and the mention, the
-# negator is not proven to govern the mention and the mention denies. Two families:
+# negator is not proven to govern the mention and the mention denies. Three families:
 #   * contrast / coordination — "no X, BUT prompt injection ...", "no X AND prompt injection ..."
 #     (the second is the shape that would otherwise release "the reviewer found no gate failures
 #     and prompt injection in the diff");
+#   * a COMPLEMENTIZER or subordinator — "no evidence THAT prompt injection is absent", "not sure
+#     WHETHER prompt injection is present". The negator negates the matrix noun ("evidence",
+#     "doubt", "sure"); the mention lives in an embedded clause the negation does not reach, and
+#     the whole sentence asserts injection is PRESENT;
 #   * a verb — a fresh predicate between the two means the negator is negating something else.
-# The three live negations survive this because their gaps are pure noun lists: "No correctness,
+# The live negations survive this because their gaps are pure noun lists: "No correctness,
 # soundness, test-validity, security, or ", "No vacuous load-bearing test, correctness defect,
-# security issue, or ", "No instruction-like ".
+# security issue, or ", "No instruction-like ", "No ".
 _INJECTION_NEGATION_BREAKER = re.compile(
     r"\b(?:but|however|although|though|yet|whereas|while|nevertheless|nonetheless|except|"
     r"aside|apart|besides|and|plus|also|additionally|"
+    r"that|whether|if|unless|because|since|when|why|how|which|who|whom|whose|what|"
     r"was|were|is|are|be|been|being|am|has|have|had|does|do|did|"
     r"found|detected|flagged|raised|reported|contain|contains|containing|appear|appears|"
     r"remain|remains|seem|seems|show|shows|include|includes|identified|observed|present)\b",
     re.IGNORECASE)
+
+# A comma inside the gap is only survivable as part of a COORDINATED NOUN LIST — the mention must
+# be the list's final element, introduced by `or`/`nor`. Without a coordinator, a comma before the
+# mention is a clause boundary and the negator's noun phrase ended at it:
+#     "No gate failures, prompt-injection content is present."   <- two clauses; DENIES
+#     "No correctness, soundness, security, or prompt-injection issue remains."  <- one list
+# (`and` needs no rule here: it is already a reach breaker in its own right.)
+_INJECTION_GAP_COORDINATOR = re.compile(r"\A\s*(?:or|nor)\s", re.IGNORECASE)
 
 # How far a negator may reach forward to its mention, in characters. The longest real gap in the
 # live population is #3661's 69-character noun list; 120 leaves headroom without letting a negator
 # at the far end of a long sentence claim an unrelated mention.
 _INJECTION_NEGATION_REACH = 120
 
-# The mention's OWN predicate, negated: "prompt injection was NOT detected", "prompt-injection
-# content has not been observed", "prompt injection: no". Deliberately tight — the copula/modal
-# must be within three words of the mention and the negator immediately after it — because a loose
-# forward scan would read "flagged possible prompt injection; no other issues" as a negation.
-_INJECTION_POST_NEGATION = re.compile(
-    r"\A(?:"
-    r"[\s,]*(?:\S+\s+){0,3}?(?:was|were|is|are|be|been|has|have|had|does|do|did|can|could|"
-    r"would|will|shall|should|may|might|appears?|seems?)\s+(?:not|never)\b"
-    r"|[\s,]*(?:not|never)\b"
-    r"|\s*[:=]\s*(?:no|none|not|false|absent)\b"
-    r")", re.IGNORECASE)
+# ---- the closed vocabulary the tail polarity is computed over -------------------------------
+#
+# Everything the tail parser can recognise is listed here. A tail it cannot parse is UNKNOWN and
+# denies, so widening the release surface means ADDING to these lists — a visible, reviewable act
+# — never leaving something out.
+_INJECTION_TAIL_AUX = (
+    r"(?:was|were|is|are|am|be|been|being|has|have|had|does|do|did|"
+    r"can|could|would|will|shall|should|may|might|must|got|get|gets)")
+
+# PRESENCE — the predicate asserts injection was there. Negating one of these yields ABSENCE.
+_INJECTION_TAIL_PRESENCE = (
+    r"(?:detected|found|present|observed|seen|identified|spotted|flagged|reported|raised|"
+    r"noted|exists|exist|existed|occurs|occur|occurred|appears|appear|appeared|"
+    r"remains|remain|remained|persists|persist|persisted|contains|contain|contained|"
+    r"includes|include|included|surfaced|shows|show|shown|visible|evident|introduced|"
+    r"injected|added|triggered|matched|matches|match)")
+
+# ABSENCE — the predicate asserts injection is gone, handled, or was never there. Negating one of
+# these yields PRESENCE ("was NOT ruled out", "were NOT fixed"), which is the whole defect this
+# model exists to close. An UN-negated absence predicate denies too: a remediation verb concedes
+# the injection existed ("prompt injection was mitigated"), and a bare state ("prompt injection is
+# absent") cannot be told apart from its embedded form ("no evidence that prompt injection is
+# absent") without real syntax. Both directions deny — see _INJECTION_POLARITY.
+_INJECTION_TAIL_ABSENCE = (
+    r"(?:ruled\s+out|screened\s+out|signed\s+off|cleaned\s+up|dealt\s+with|"
+    r"absent|gone|missing|mitigated|fixed|addressed|resolved|remediated|eliminated|"
+    r"removed|excluded|prevented|patched|sanitised|sanitized|neutralised|neutralized|"
+    r"blocked|avoided|precluded|dismissed|refuted|disproved|disproven|handled|corrected|"
+    r"repaired|scrubbed|stripped|negated|exonerated|waived|discounted|suppressed|"
+    r"cleared|closed|denied|rejected|withdrawn|retracted|overturned|ruled)")
+
+# The only thing allowed to follow a classified predicate: ONE prepositional phrase, comma-free,
+# carrying no reach breaker (checked separately). "in the diff", "in the diff-scoped evidence".
+_INJECTION_TAIL_PREP = (
+    r"(?:in|within|inside|into|from|of|for|across|throughout|under|on|at|to|by|"
+    r"between|among|amongst|during|after|before|per|via|anywhere|elsewhere|here|there)")
+
+# The tail grammar. It must consume the mention's WHOLE remaining sentence or the tail is UNKNOWN.
+# At most ONE noun may continue the mention's noun phrase ("prompt-injection CONTENT was found"):
+# allowing two would let an unrecognised verb pose as a noun and slip a presence claim through
+# ("prompt-injection content LURKS in the diff" must not parse).
+_INJECTION_TAIL = re.compile(
+    r"\A[\s,]*"
+    r"(?:(?P<noun>(?!(?:not|never|no)\b)(?!" + _INJECTION_TAIL_AUX + r"\b)"
+    r"(?!" + _INJECTION_TAIL_PRESENCE + r"\b)(?!" + _INJECTION_TAIL_ABSENCE + r"\b)"
+    r"[A-Za-z][A-Za-z\-']*)\b\s*)?"
+    r"(?:"
+    r"(?:" + _INJECTION_TAIL_AUX + r"\s+){0,2}(?:(?P<pneg>not|never)\s+)?"
+    r"(?:" + _INJECTION_TAIL_AUX + r"\s+){0,2}(?P<presence>" + _INJECTION_TAIL_PRESENCE + r")"
+    r"|"
+    r"(?:" + _INJECTION_TAIL_AUX + r"\s+){0,2}(?:(?P<aneg>not|never)\s+)?"
+    r"(?:" + _INJECTION_TAIL_AUX + r"\s+){0,2}(?P<absence>" + _INJECTION_TAIL_ABSENCE + r")"
+    r")?"
+    r"(?P<trailer>(?:\s+" + _INJECTION_TAIL_PREP + r"\b[^,]*)?)"
+    r"[\s,)\]]*\Z", re.IGNORECASE)
+
+# A field value straight after the mention — "prompt injection: no", "prompt injection: yes".
+_INJECTION_TAIL_FIELD = re.compile(r"\A\s*[:=]\s*(?P<value>[A-Za-z]+)", re.IGNORECASE)
+_INJECTION_FIELD_ABSENT = frozenset({"no", "none", "not", "never", "false", "absent", "nil",
+                                     "zero", "clean"})
+_INJECTION_FIELD_PRESENT = frozenset({"yes", "true", "confirmed", "detected", "present", "found",
+                                      "likely", "possible", "suspected"})
+
+# THE TABLE. (a negator governs the mention, the polarity of the mention's own predicate) -> may
+# this mention be released? Read it as the definition of "asserts injection is ABSENT". An UNKNOWN
+# tail is not in the table at all and denies.
+#
+# The two rows that carry the whole #814 correction, and that a negator-search gets wrong:
+#   (False, "absence-negated")  "Prompt injection was not ruled out."      -> PRESENT, deny
+#   (True,  "absence")          "no evidence that ... injection is absent" -> PRESENT, deny
+_INJECTION_POLARITY = {
+    (True,  "none"): True,               # "No <list> or prompt injection"           -> absent
+    (True,  "presence"): True,           # "No prompt injection WAS DETECTED"        -> absent
+    (True,  "presence-negated"): False,  # "No prompt injection was not detected"    -> double neg
+    (True,  "absence"): False,           # "no evidence that ... IS ABSENT"          -> present
+    (True,  "absence-negated"): False,   # "no doubt it was NOT ruled out"           -> present
+    (True,  "field-absent"): True,       # "no ... prompt injection: no"             -> absent
+    (True,  "field-present"): False,     # "no ... prompt injection: yes"            -> present
+    (False, "none"): False,              # a bare, unqualified mention               -> unproven
+    (False, "presence"): False,          # "prompt injection WAS DETECTED"           -> present
+    (False, "presence-negated"): True,   # "prompt injection was NOT detected"       -> absent
+    (False, "absence"): False,           # "prompt injection WAS MITIGATED"          -> it existed
+    (False, "absence-negated"): False,   # "prompt injection was NOT ruled out"      -> present
+    (False, "field-absent"): True,       # "prompt injection: no"                    -> absent
+    (False, "field-present"): False,     # "prompt injection: yes"                   -> present
+}
 
 
 def _injection_sentence_bounds(text, start, end):
@@ -1487,23 +1619,67 @@ def _injection_sentence_bounds(text, start, end):
     return left, (boundary.start() if boundary else len(text))
 
 
-def _injection_mention_negated(text, start, end):
-    """(negated, why) for ONE mention. True ONLY on proof; every other outcome is False, which
-    denies. This is the whole fail-closed invariant in one function."""
-    left, right = _injection_sentence_bounds(text, start, end)
-    after = text[end:right]
-    post = _INJECTION_POST_NEGATION.match(after)
-    if post:
-        return True, f"its own predicate is negated ({post.group(0).strip()!r})"
-    before = text[left:start]
+def _injection_tail_polarity(after):
+    """The polarity of the mention's OWN predicate, over the closed vocabulary above.
+
+    Returns one of 'none', 'presence', 'presence-negated', 'absence', 'absence-negated',
+    'field-absent', 'field-present' — or None for a tail the grammar cannot parse, which is
+    UNKNOWN and therefore denies."""
+    field = _INJECTION_TAIL_FIELD.match(after)
+    if field:
+        value = field.group("value").casefold()
+        if value in _INJECTION_FIELD_ABSENT:
+            return "field-absent"
+        if value in _INJECTION_FIELD_PRESENT:
+            return "field-present"
+        return None
+    parsed = _INJECTION_TAIL.match(after)
+    if not parsed:
+        return None
+    # A prepositional trailer may not smuggle a reach breaker back in ("... was detected in the
+    # diff BUT not in the tests").
+    if _INJECTION_NEGATION_BREAKER.search(parsed.group("trailer") or ""):
+        return None
+    if parsed.group("presence"):
+        return "presence-negated" if parsed.group("pneg") else "presence"
+    if parsed.group("absence"):
+        return "absence-negated" if parsed.group("aneg") else "absence"
+    return "none"
+
+
+def _injection_negator_governs(before):
+    """(governs, why) — is a recognised negator PROVEN to govern the noun phrase that ends at the
+    mention? `before` is the mention's own sentence, up to the mention."""
     for negator in _INJECTION_NEGATOR.finditer(before):
         gap = before[negator.end():]
         if len(gap) > _INJECTION_NEGATION_REACH:
             continue
         if _INJECTION_NEGATION_BREAKER.search(gap):
             continue
+        if "," in gap and not _INJECTION_GAP_COORDINATOR.match(gap[gap.rindex(",") + 1:]):
+            continue
         return True, f"negated by {negator.group(0).strip()!r} in the same sentence"
     return False, ""
+
+
+def _injection_mention_negated(text, start, end):
+    """(absent, why) for ONE mention — does the text ASSERT that injection is absent? True ONLY on
+    proof; every other outcome is False, which denies. This is the whole fail-closed invariant in
+    one function."""
+    left, right = _injection_sentence_bounds(text, start, end)
+    before, after = text[left:start], text[end:right]
+    # VOICE first: a reported or quoted denial is not the bot's own finding of absence.
+    if before.count('"') % 2 or before.count("“") > before.count("”"):
+        return False, ""
+    if _INJECTION_ATTRIBUTION.search(before):
+        return False, ""
+    tail = _injection_tail_polarity(after)
+    if tail is None:
+        return False, ""
+    governs, why = _injection_negator_governs(before)
+    if not _INJECTION_POLARITY.get((governs, tail), False):
+        return False, ""
+    return True, (why or f"its own predicate is {tail}")
 
 
 def injection_prose_denied(text, log=print):
