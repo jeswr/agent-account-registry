@@ -8173,6 +8173,131 @@ def _self_test():
     assert pr_ci_status(record)["check_runs_degraded"] is False
     assert pr_ci_status({**record, "check_runs_degraded": True})["gate"] == "missing"
 
+    # ---- TIERED aggregator resolution (the draft-tier defect) ----
+    # THE LIVE SHAPE, verified against sparq on 2026-07-27: on all 5 open worker DRAFTS a
+    # `check_name=gate` read returned 0 rows while `check_name=gate, draft-tier` returned 1
+    # (2 of them CONCLUDED FAILURE). ci-summary.yml names the aggregator job
+    #   gate${{ github.event.pull_request.draft == true && ', draft-tier' || '' }}
+    # so on a draft head the merge-required `gate` context does not exist AT ALL. The strict
+    # interpreter therefore reports "missing" — indistinguishable from a head with no CI —
+    # and the whole GAP-A repair admission was unreachable on sparq from 2026-07-17.
+    def _agg(name, conclusion="failure", status="completed", started="2026-07-23T01:00:00Z"):
+        return {"name": name, "status": status, "conclusion": conclusion,
+                "started_at": started}
+
+    def _requested_gate_name(path):
+        """Which tier name a fixture request asked for, matched to the parameter BOUNDARY.
+        `check_name=gate` is a strict PREFIX of `check_name=gate%2C%20draft-tier`, so a
+        substring test silently answers every draft-tier request with the strict name's
+        rows — a fixture bug that would fake the whole defect away."""
+        for name in CI_TIERED_GATE_CHECKS:
+            if f"check_name={urllib.parse.quote(name, safe='')}&" in path:
+                return name
+        return None
+
+    _draft_only = [_agg(CI_GATE_DRAFT_TIER_CHECK)]
+    assert interpret_check_runs(_draft_only)["gate"] == "missing", "strict read must not widen"
+    assert tiered_gate_conclusion(_draft_only) == "failure", _draft_only
+    # Inverting CI_TIERED_GATE_CHECKS to the strict name alone reds the line above; keeping
+    # only the draft name reds this one (the full-tier head must still resolve).
+    assert tiered_gate_conclusion([_agg(CI_GATE_CHECK)]) == "failure"
+    # NEWEST-RUN RESOLUTION ACROSS TIERS. A cancelled draft-tier twin must not decide a head
+    # whose real full-tier run is newer and green...
+    _twin_then_green = [_agg(CI_GATE_DRAFT_TIER_CHECK, "cancelled", started="2026-07-23T01:00:00Z"),
+                        _agg(CI_GATE_CHECK, "success", started="2026-07-23T02:00:00Z")]
+    assert tiered_gate_conclusion(_twin_then_green) == "success", _twin_then_green
+    assert tiered_gate_conclusion(list(reversed(_twin_then_green))) == "success"
+    # ...and symmetrically, a stale GREEN draft-tier run must not mask a newer red full-tier
+    # one (the same masking bug in the other direction).
+    assert tiered_gate_conclusion([
+        _agg(CI_GATE_DRAFT_TIER_CHECK, "success", started="2026-07-23T01:00:00Z"),
+        _agg(CI_GATE_CHECK, "failure", started="2026-07-23T02:00:00Z")]) == "failure"
+    # A cancelled run that IS the newest is a concluded non-pass (BROKEN_CONCLUSIONS, #160) —
+    # required checks in that state will not merge, so it takes the repair path.
+    assert tiered_gate_conclusion([_agg(CI_GATE_DRAFT_TIER_CHECK, "cancelled")]) == "failure"
+    # PENDING IS NOT RED — the load-bearing fail-open. Measured over the 2026-07-19..26 verdict
+    # ledger, 70/277 (25.3%) of round-1 review heads had the aggregator still in progress at
+    # dispatch; treating that as red would stand a quarter of the lane down.
+    assert tiered_gate_conclusion([_agg(CI_GATE_DRAFT_TIER_CHECK, None, "in_progress")]) \
+        == "pending"
+    assert tiered_gate_conclusion([]) == "missing"
+    assert tiered_gate_conclusion("junk") == "unknown"
+    # QUANTIFIER DIRECTION: the draft tier is a strict SUBSET of the full leg set, so a GREEN
+    # draft-tier result must NEVER stand in for the merge-required context. `stranded`'s
+    # concluded-GREEN precondition reads `gate`, which stays "missing" here.
+    _draft_green = pr_ci_status({**record, "check_runs": [_agg(CI_GATE_DRAFT_TIER_CHECK,
+                                                               "success")]})
+    assert (_draft_green["gate"], _draft_green["tiered_gate"]) == ("missing", "success")
+    # pr_ci_status ALWAYS emits the field (no consumer may silently read a missing key and
+    # fall back to the old strict behaviour), including on a degraded record.
+    assert "tiered_gate" in degraded_ci and degraded_ci["tiered_gate"] == "missing"
+    assert "tiered_gate" in pr_ci_status(record)
+    # The aggregator is never handed to the fixer as an advisory leg to repair, in EITHER
+    # spelling (dropping CI_GATE_DRAFT_TIER_CHECK from the exclusion reds this).
+    _legs = pr_ci_status({**record, "check_runs": [
+        _agg(CI_GATE_DRAFT_TIER_CHECK), _agg("js")]})
+    assert _legs["failing_legs"] == ["js"], _legs
+
+    # ---- _live_tiered_gate: CLAIM's live re-derivation (pagination + total_count) ----
+    # Serves ONE name per request the way REST does, honouring page= and reporting the
+    # endpoint's own total_count for the FILTERED set.
+    _NO_OVERRIDE = object()
+    _MISSING_TOTAL = object()      # the endpoint omitted total_count entirely
+
+    def _live_fetch(by_name, total_override=_NO_OVERRIDE, page_cap=None):
+        seen = []
+
+        def fetch(path):
+            seen.append(path)
+            name = _requested_gate_name(path)
+            rows = list(by_name.get(name, []))
+            page = int(re.search(r"[?&]page=([0-9]+)", path).group(1))
+            if page_cap is not None:
+                return {"check_runs": [_agg(name)] * 100, "total_count": 100 * page_cap}
+            chunk = rows[(page - 1) * 100:page * 100]
+            total = len(rows) if total_override is _NO_OVERRIDE else total_override
+            if total is _MISSING_TOTAL:
+                return {"check_runs": chunk}
+            return {"check_runs": chunk, "total_count": total}
+
+        fetch.seen = seen
+        return fetch
+
+    # (a) DRAFT-TIER ONLY — the live sparq shape. The strict name legitimately answers with an
+    # EMPTY page; only reading BOTH names finds the red aggregator. Dropping either name from
+    # CI_TIERED_GATE_CHECKS reds this.
+    _f = _live_fetch({CI_GATE_DRAFT_TIER_CHECK: [_agg(CI_GATE_DRAFT_TIER_CHECK)]})
+    assert _live_tiered_gate("o/r", "a" * 40, fetch=_f) == "failure"
+    assert any(urllib.parse.quote(CI_GATE_DRAFT_TIER_CHECK, safe="") in p for p in _f.seen)
+    assert any(_requested_gate_name(p) == CI_GATE_CHECK for p in _f.seen), _f.seen
+    # (b) PAGINATION: >100 runs of ONE name. An unpaginated read stops at page 1 and cannot
+    # satisfy the total_count cross-check, so truncation can never masquerade as a conclusion.
+    _many = [_agg(CI_GATE_DRAFT_TIER_CHECK, "failure",
+                  started=f"2026-07-23T{hour:02d}:00:00Z") for hour in range(23)]
+    _many += [_agg(CI_GATE_DRAFT_TIER_CHECK, "success", started="2026-07-24T00:00:00Z")]
+    _many *= 5                     # 120 rows > one page; the newest is a SUCCESS
+    _f = _live_fetch({CI_GATE_DRAFT_TIER_CHECK: _many})
+    assert len(_many) > 100 and _live_tiered_gate("o/r", "a" * 40, fetch=_f) == "success"
+    assert sum(1 for p in _f.seen
+               if urllib.parse.quote(CI_GATE_DRAFT_TIER_CHECK, safe="") in p) == 2, _f.seen
+    # (c) A SHORT READ IS NOT "NO GATE ROW". The page ends while the endpoint says more exist:
+    # UNKNOWN (the caller defers), never "missing" (which would silently skip forever).
+    _f = _live_fetch({CI_GATE_CHECK: [_agg(CI_GATE_CHECK)]}, total_override=9)
+    assert _live_tiered_gate("o/r", "a" * 40, fetch=_f) == "unknown"
+    # An absent or garbage total_count is equally unprovable.
+    for _bad in (_MISSING_TOTAL, None, "17", True):
+        assert _live_tiered_gate("o/r", "a" * 40, fetch=_live_fetch(
+            {CI_GATE_CHECK: [_agg(CI_GATE_CHECK)]}, total_override=_bad)) == "unknown", _bad
+    # (d) A run of full pages past the bound is UNKNOWN, not a conclusion drawn from a prefix.
+    assert _live_tiered_gate("o/r", "a" * 40,
+                             fetch=_live_fetch({}, page_cap=99)) == "unknown"
+    # (e) malformed payloads degrade to UNKNOWN, never crash the sweep
+    for _junk in (None, [], {"check_runs": "nope", "total_count": 0}):
+        assert _live_tiered_gate("o/r", "a" * 40, fetch=lambda _p, j=_junk: j) == "unknown"
+    # (f) A genuinely gateless head still reads "missing" — the cross-check must not turn an
+    # honestly EMPTY listing into UNKNOWN (that would defer every clean head forever).
+    assert _live_tiered_gate("o/r", "a" * 40, fetch=_live_fetch({})) == "missing"
+
     # ---- GAP-A/B enumeration: zero-manual repair states over the same surface ----
     def status_of(status_sha, gate="success", conflicting=False, armed=False, legs=(),
                   tiered_gate=None):
@@ -8232,6 +8357,38 @@ def _self_test():
         assert "timeline read failed" in cutoff_log.getvalue()
     finally:
         globals()["_gh_json"] = real_timeline_json
+    # THE DRAFT-TIER SHAPE, end to end. `starved` is a DRAFT whose head is already reviewed —
+    # the merge-queue-starver posture. On a real sparq draft the strict merge-required `gate`
+    # context does not exist (gate="missing") and only the tiered read sees the red aggregator.
+    # Reverting GAP-A to `status.get("gate")` reds this: the item vanishes and the PR sits in
+    # the "no live repair trigger" fall-through every tick, which is what has actually been
+    # happening on sparq since 2026-07-17.
+    draft_tier_red = {41: status_of(sha_a, gate="missing", tiered_gate="failure",
+                                    legs=["workspace clippy"])}
+    draft_tier_items = enumerate_review_items(repo, [starved], provenance, [], issue_labels,
+                                              now, pr_status=draft_tier_red)
+    assert [(item["state"], item["context"]) for item in draft_tier_items] == [
+        ("needs-ci-fix", "workspace clippy")], draft_tier_items
+    assert _review_item_lane(draft_tier_items[0]["state"]) == "fix", draft_tier_items
+    # ...and the same head with the aggregator still IN PROGRESS is DO-NOTHING, not a repair
+    # (pending is never red — the 25.3%-of-heads fail-open).
+    assert enumerate_review_items(
+        repo, [starved], provenance, [], issue_labels, now,
+        pr_status={41: status_of(sha_a, gate="missing", tiered_gate="pending")}) == []
+    # QUANTIFIER DIRECTION at the enumeration boundary: a GREEN draft-tier reading is NOT the
+    # stranded posture, because subset-green does not prove the full leg set green. Only the
+    # strict `gate` may satisfy it (the assertion just below is the positive control).
+    assert enumerate_review_items(
+        repo, [starved], provenance, [], issue_labels, now,
+        pr_status={41: status_of(sha_a, gate="missing", tiered_gate="success")}) == []
+    # POLICY UNCHANGED by this fix (measured, see the PR body): an UN-reviewed draft on a
+    # red DRAFT-TIER head is still a REVIEW item — the loop's own work comes first. The
+    # review lane's ordering is not a function of the aggregator's tier.
+    _unreviewed = pull(41, "sparq-agent/issue-7-1-1", sha_a, labels=["review:needs"])
+    assert [item["state"] for item in enumerate_review_items(
+        repo, [_unreviewed], provenance, [], issue_labels, now,
+        pr_status=draft_tier_red)] == ["needs-review"]
+
     # ... while a concluded-GREEN gate on a drafted, unarmed, reviewed head is the STRANDED
     # posture (no other autonomous exit exists) — enumerated so CLAIM can hand it to a human
     green = {41: status_of(sha_a, gate="success")}
@@ -8468,8 +8625,7 @@ def _self_test():
             # fixture's rows are keyed by their own `name`, so a head whose only aggregator
             # is `gate, draft-tier` answers the strict `check_name=gate` request with an
             # EMPTY page — exactly the live sparq draft shape.
-            wanted = next((name for name in CI_TIERED_GATE_CHECKS
-                           if f"check_name={urllib.parse.quote(name, safe='')}" in path), None)
+            wanted = _requested_gate_name(path)
             served = [run for run in fake["check_runs"]
                       if wanted is None or run.get("name") == wanted]
             return {"check_runs": served, "total_count": len(served)}
@@ -9611,7 +9767,7 @@ def _self_test():
                     return fanout_pulls[int(match.group(1))]
                 if "/check-runs" in path:
                     served = [run for run in gate_red
-                              if f"check_name={urllib.parse.quote(run['name'], safe='')}" in path]
+                              if run["name"] == _requested_gate_name(path)]
                     return {"check_runs": served, "total_count": len(served)}
                 match = re.search(r"/issues/([0-9]+)/comments(?:\?.*)?$", path)
                 if match:
