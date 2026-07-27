@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 828,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "0de80a2a6b8bd76ad3ad2ed8a1efe780151ac28d",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 5 says every secret must live in `dispatch-secrets` and that there must be no second secret-bearing environment, but section 6 concedes that the guard neither enumerates other environments nor fails if they contain secrets. As the document itself explains, a secret in another environment can then be exposed by a consumer bound to that environment at an attacker-controlled ref without the verified branch policy. This is the same default-allow class the strategy claims to eliminate, so recording it as a follow-up is insufficient for a complete pre-cutover trust strategy.",
+    "file": "research/266-protected-environment-strategy.md",
+    "fix_hint": "Make the cutover contingent on a guard that paginates the repository environment listing, fails closed on any unreadable/incomplete response, enumerates secrets for every environment, and rejects secret-bearing environments other than `dispatch-secrets`; add non-vacuous self-tests for an alternate environment containing a secret and for failed/truncated pagination. Alternatively, narrow this document so it does not establish or rely on the unenforced invariant and explicitly state that #266 remains blocked until that guard lands.",
+    "severity": "major",
+    "title": "The chosen strategy leaves its single-environment invariant unenforced"
+   }
+  ],
+  "progress": null,
+  "summary": "The shared `dispatch-secrets` choice is reasoned clearly, and the document accurately calls out its loss of per-job least privilege. However, the proposed repo-wide strategy is not complete or fail-closed: it establishes \u201cno second secret-bearing environment\u201d as a security rule while explicitly acknowledging that no guard verifies that rule. That leaves an unprotected alternate environment as a default-allow secret-exfiltration path. A trust-plane strategy should not authorize the value cutover while its own stated invariant is merely advisory.",
+  "verdict": "request_changes"
+ }
+}
