@@ -2897,6 +2897,76 @@ def _self_test():
           park_applications("o/r", 41, 404, fetch, is_human=trusted, log=logs.append),
           (None, False, False))
 
+    # ---- [registry #769] age_park_episode: which mechanism's park is this `review:parked`? ----
+    # The consumer is dispatch-claim's automatic re-admission sweep, which drives this END TO END
+    # against the real groom module; these are the unit-level directions, including the ones the
+    # sweep's fixtures cannot cheaply reach.
+    logs.clear()
+    _epi_bot = "app[bot]"
+
+    def _epi(body, at, login=_epi_bot):
+        return {"user": {"login": login}, "body": body, "created_at": at}
+
+    _age = f"{GROOM_AGE_PARK_MARKER} cause=orphan-draft head={'c' * 40} gen=1 -->"
+    _ladder = "<!-- sparq-park-generation:v1 gen=1 cutoff=none -->"
+    _sup = ("<!-- sparq-park-generation:v1", PARK_REASON_MARKER)
+    check("age_park_episode: INERT with no age receipt — the entire existing capacity "
+          "population reaches no new branch (this is what keeps #691's exit intact)",
+          age_park_episode([_epi("nothing here", "2026-07-26T10:00:00Z"),
+                            _epi(_ladder, "bad-stamp")], _epi_bot, _sup, log=logs.append),
+          (False, ""))
+    check("age_park_episode: ...and an inert answer parses no stamps at all, so a malformed one "
+          "cannot make a non-age park unreadable", logs, [])
+    check("age_park_episode: a bot age receipt with no later foreign park receipt is groom's",
+          age_park_episode([_epi(_age, "2026-07-26T10:00:00Z")], _epi_bot, _sup)[0], True)
+    check("age_park_episode: TRUST FILTER — a third party cannot forge an age receipt and "
+          "freeze a genuine capacity park",
+          age_park_episode([_epi(_age, "2026-07-26T10:00:00Z", login="drive-by")],
+                           _epi_bot, _sup),
+          (False, ""))
+    check("age_park_episode: a STRICTLY newer foreign park receipt CLOSES the episode — the "
+          "label is that mechanism's park now, and the capacity path must resume",
+          age_park_episode([_epi(_age, "2026-07-26T10:00:00Z"),
+                            _epi(_ladder, "2026-07-26T11:00:00Z")], _epi_bot, _sup)[0],
+          False)
+    check("age_park_episode: a TIE does NOT close it — the ambiguous case leaves the park alone",
+          age_park_episode([_epi(_age, "2026-07-26T10:00:00Z"),
+                            _epi(_ladder, "2026-07-26T10:00:00Z")], _epi_bot, _sup)[0],
+          True)
+    check("age_park_episode: an OLDER foreign receipt does not close a NEWER age park",
+          age_park_episode([_epi(_ladder, "2026-07-26T09:00:00Z"),
+                            _epi(_age, "2026-07-26T10:00:00Z")], _epi_bot, _sup)[0],
+          True)
+    check("age_park_episode: the NEWEST age receipt is the boundary, not the oldest",
+          age_park_episode([_epi(_age, "2026-07-26T09:00:00Z"),
+                            _epi(_ladder, "2026-07-26T10:00:00Z"),
+                            _epi(_age, "2026-07-26T11:00:00Z")], _epi_bot, _sup)[0],
+          True)
+    check("age_park_episode: groom's OWN un-park receipt is not a foreign park — receipt-first "
+          "ordering makes receipt-no-label groom's convergence to complete, not this sweep's",
+          age_park_episode(
+              [_epi(_age, "2026-07-26T10:00:00Z"),
+               _epi(f"{GROOM_AGE_UNPARK_MARKER} cause=orphan-draft head={'c' * 40} gen=1 -->",
+                    "2026-07-26T11:00:00Z")], _epi_bot, _sup)[0],
+          True)
+    check("age_park_episode: FAIL CLOSED — once an age receipt exists, an unreadable bot stamp "
+          "leaves the boundary unprovable and the park stays with groom",
+          age_park_episode([_epi(_age, "2026-07-26T10:00:00Z"),
+                            _epi(_ladder, None)], _epi_bot, _sup, log=logs.append)[0],
+          True)
+    check("age_park_episode: no bot identity, a non-list and a malformed row are all inert",
+          [age_park_episode([_epi(_age, "2026-07-26T10:00:00Z")], "", _sup),
+           age_park_episode("not a list", _epi_bot, _sup),
+           age_park_episode([None, "x", {"user": None, "body": None}], _epi_bot, _sup)],
+          [(False, ""), (False, ""), (False, "")])
+    check("age_park_episode: `foreign-episode` is a declared code and is EXIT-REACHABLE — the "
+          "census must never file it as needing a human",
+          (PARK_REFUSAL_FOREIGN_EPISODE in PARK_REFUSAL_CODES,
+           park_refusal_exit_class(PARK_REFUSAL_FOREIGN_EPISODE),
+           PARK_REFUSAL_FOREIGN_EPISODE in PARK_REFUSAL_HUMAN_TERMINAL),
+          (True, "exit-reachable", False))
+    logs.clear()
+
     # ---- probe_maintainer (round-3 Opus finding): a probe-call FAILURE warns loudly and
     # fails toward not-human; a genuine not-a-maintainer stays quiet ----
     logs.clear()
