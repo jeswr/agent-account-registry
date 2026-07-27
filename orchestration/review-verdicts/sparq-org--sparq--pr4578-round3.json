@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4578,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "7b30d26a849cb5a560e057f473d6e85018daf8c5",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The Reference conversion calls into_iri(raw), and the emitted reference type stores only a String described as an IRI. But SHACL sh:class applies to value nodes, and a blank node can conform when it has rdf:type C (directly or through rdfs:subClassOf*). The loader therefore rejects a valid sh:class value with TermType before ValueSource::is_instance_of can evaluate membership. The current real-path test covers classified and unclassified IRIs only, so it does not expose this narrowing. This conflicts with the crate's faithful-mapping and membership-enforcement claims.",
+    "file": "crates/sparq-wrapper-shacl/src/emit.rs",
+    "fix_hint": "Represent a class reference as a node identity that distinguishes NamedNode from BlankNode, change the membership API to accept that node representation, and have conversion accept both RDF node kinds while still rejecting literals. Add a compiled-harness case where a blank node with the required rdf:type loads successfully, plus an unclassified blank-node rejection. Alternatively, explicitly decline shapes whose sh:class values may be blank nodes, but an IRI-only implementation must not be documented as faithful sh:class enforcement.",
+    "severity": "major",
+    "title": "sh:class incorrectly rejects conforming blank-node instances"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 3 materially fixes both round-2 findings: generated sh:class loads now call a source-supplied rdf:type/rdfs:subClassOf* membership check, with real-path acceptance cases for unrelated and subclass-entailed IRIs; xsd:integer and xsd:decimal now use exact canonical lexical newtypes, with beyond-i64, precision-collision, and overflow tests. However, the new sh:class implementation narrows value nodes to IRIs. SHACL permits blank-node value nodes to satisfy sh:class, so a conforming blank-node instance is rejected before membership is consulted. This is a new major correctness gap, making progress regressing under the mandated scale.",
+  "verdict": "request_changes"
+ }
+}
