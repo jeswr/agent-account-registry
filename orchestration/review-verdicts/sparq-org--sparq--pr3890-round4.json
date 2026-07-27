@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3890,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "0726f0409bc10efcf72c12b835da1568f5456a73",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "build_join_index still puts every parent subject into JoinIndex::all when parent_cols is empty, and JoinIndex::lookup returns that entire list for every child row. The added test r2rml_join_no_conditions_is_cross_product asserts the same incorrect semantics. With no rr:joinCondition, R2RML requires the child and parent triples maps to use the same logical table, and the referencing object is the parent subject generated from that same current row. For two self-table rows, the expected links are row1->row1 and row2->row2, not all four pairs. The implementation also fails to reject omitted conditions when the logical tables differ.",
+    "file": "crates/sparq-cli/src/tabular.rs",
+    "fix_hint": "Represent the omitted-condition same-logical-table case separately and evaluate the parent subject map using the current child row, preserving row correspondence without building a cross-product bucket. Reject a referencing object map with no rr:joinCondition when child and parent logical tables differ. Replace r2rml_join_no_conditions_is_cross_product with a real-path two-row same-table test asserting only row-correlated objects, and add a failure test for different logical tables without rr:joinCondition. Update the module and CLI skill text that currently claims zero conditions means cross product.",
+    "severity": "major",
+    "title": "Omitted join conditions still incorrectly produce a cross product"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 4 is stagnant. The round-3 major correctness finding remains unchanged: the implementation and its documentation still define an omitted rr:joinCondition as a cross product, and r2rml_join_no_conditions_is_cross_product explicitly locks in that behavior. R2RML permits omission only when child and parent triples maps use the same logical table; the referencing object must then be the parent subject generated from the current logical row. The current JoinIndex instead returns every deduplicated parent subject for every child row and also accepts omission across different logical tables, silently generating spurious relationships.",
+  "verdict": "request_changes"
+ }
+}
