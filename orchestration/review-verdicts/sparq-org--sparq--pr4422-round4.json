@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4422,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "1b62233d5cf1a46df9e70df37d816a310dabb943",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "join_eq_r_repeated_pair_pads_and_accepts still uses two_pair_universe(), which commits A rows with join keys JK and JK2 and matching B rows with both keys. The true join cardinality at slots A[2] x B[0] is therefore 2, not 1 as the test commentary states. Repeating the first pair tests lane reuse, but the fixture still does not exercise the claimed one-genuine-pair graph.",
+    "file": "zk/compose/compose_core/src/tests.nr",
+    "fix_hint": "Construct JR2 from committed graphs having exactly one genuine joined pair, or include additional rows whose selected join slots do not match. Compute and pass those commitments, then repeat that sole genuine pair across both R=2 lanes with distinct blinders. Keep JR1 on two_pair_universe() for the distinct-pair case.",
+    "severity": "minor",
+    "title": "JR2 still claims N=1 while committing a two-match graph"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 4 is stagnant. The sole round-3 finding remains unchanged: JR2 still calls two_pair_universe(), whose committed A and B graphs contain two genuine joined pairs at A slot 2 x B slot 0, while the test says the true join cardinality is N=1 and presents itself as the one-match padding witness. Repeating a genuine pair across both lanes does validate lane reuse and fresh-blinder commitments, but this fixture does not validate the specifically claimed case that a graph with exactly one genuine joined pair can fill R=2 lanes. The circuit relation and surrounding caveats remain consistent with the limited existential statement, but this honesty-sensitive test description still does not match its committed fixture.",
+  "verdict": "request_changes"
+ }
+}
