@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 858,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "e3cf52df285091a26a632077671ec09b1da6f4f1",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "The prior round's order concern is resolved by the demonstrated claim/adopt contract: FIX_CHAIN order controls allocator preference before launch, while review-fix.yml receives a ladder-floor representation only to reconstruct the authorized membership set and adopt the already-selected SHA/claim-bound model. The adopt path does not independently choose from that reconstructed sequence; it rejects any claimed model outside it. The new full-chain test covers the formerly missing live OpenAI case and proves that the floor expansion contains exactly the claimed tiers, while the singleton/non-suffix tests prove excluded tiers are not readmitted. The implementation re-resolves the source issue's live labels through the registry policy resolver, intersects fail-closed with the provider fix walk, distinguishes escalation from defer on empty intersections, refuses unrepresentable constraints, and leaves cross-provider review dispatch independent. The wiring and end-to-end tests are non-vacuous and cover resolver failure, empty intersections, ladder-floor widening, transmitted model_pin, and live routing rows.",
+  "verdict": "approve"
+ }
+}
