@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 810,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "1dd14101ce8254937495d20b84c03ca2afc233f2",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 5.3 sends equality to REFUSE because second-granularity timestamps cannot order the writes, but sections 5.4 and 6 then prescribe deleting the repository copy on refusal and assert that the environment value is newest. In a tie, an environment write can occur first and a repository write with a newer credential later within the same timestamp second. The proposed rule cannot distinguish that state, so deleting the repository secret can destroy the genuinely newest value. The refusal itself is fail-closed; the claimed specific repair and convergence path are not sound across the rule's full refusal set.",
+    "file": "research/329-pre-migration-writer-recovery.md",
+    "fix_hint": "Split the refusal cases. Only recommend deleting the repository copy when the timestamps strictly prove env.updated_at > repo.updated_at and the pre-quiesce threshold identifies the writer-hazard case. For equality, give a separate fail-closed recovery that does not assume either value is newer (for example, require authoritative credential validation/re-enrolment or another value-independent reconciliation procedure). Add a self-test for both possible write orders within an equal timestamp and prove the tie recovery preserves the valid newest credential.",
+    "severity": "major",
+    "title": "The prescribed repair is unsafe for equal timestamps"
+   }
+  ],
+  "progress": null,
+  "summary": "The proposed timestamp invariant is plausibly fail-closed at the overwrite point, but the documented recovery is not sound for every state that the rule deliberately refuses. In particular, timestamp equality is correctly treated as unorderable, yet the record then prescribes deleting the repository copy as though the environment copy were proven newer. That can discard the newest credential. Because this document is intended to make the implementing PR mechanical, the unsafe recovery specification is a major design defect.",
+  "verdict": "request_changes"
+ }
+}
