@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 4133,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "cbd82d6798275efeeb95cffda56d5bc03b49faf2",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "In the new block, `constant_first` includes `GEOF_SF_CONTAINS`. When `spatial-exact-pushdown` is enabled, the `#[cfg]` block immediately above already returns for `sfContains(REGION, ?g)` with `within_region: true`, so the `constant_first` handling of that same shape is dead code in that feature state; it is the live path only when the feature is off.\n\nThis is currently correct, but the two blocks silently disagree on the soundness-critical `within_region` flag for the identical syntactic shape, and which one wins depends purely on statement order plus a cfg. A future edit that adds an early-decline path to the cfg block (for example returning None instead of falling through on an unparsable region) would silently reroute `sfContains(REGION, ?g)` to the `within_region: false` arm, or conversely a reordering could route a converse orientation into the exact path. Nothing in the code or tests pins the ordering dependency.",
+    "file": "crates/sparq-engine/src/exec.rs",
+    "fix_hint": "Make the exclusion explicit rather than order-dependent: exclude `GEOF_SF_CONTAINS` from `constant_first` under `#[cfg(feature = \"spatial-exact-pushdown\")]`, or compute a single `within_region` value per (iri, operand-order) pair in one match and build the `SpatialPushdown` once. At minimum, extend the comment to state that the constant-first sfContains arm is reachable only when the feature is off, and that the cfg block above must return unconditionally for that shape.",
+    "severity": "minor",
+    "title": "constant_first arm for sfContains is unreachable under spatial-exact-pushdown; the mutual exclusion is implicit"
+   },
+   {
+    "body": "The new test exercises the orientations only through `SupersetProvider`, a mock whose `candidates` ignores the query shape entirely and returns a fixed two-element vector. It validates engine plumbing and the `within_region` discipline, but by construction it cannot detect a provider whose `BboxIntersects` implementation is narrower than true AABB intersection.\n\nThe converse orientations are precisely where that would bite: `sfWithin(REGION, ?g)` and `sfContains(?g, REGION)` have true answers that are geometries strictly LARGER than the constant region, so a containment-style window scan would drop them while leaving all pre-existing variable-first shapes green. `crates/sparq-geo/tests/pushdown.rs` -- the real-provider suite -- only exercises `geof:sfWithin(?wkt, <const>)`, `geof:sfIntersects(?wkt, <const>)` and distance shapes; no constant-first or sfContains case appears there.\n\nRelatedly, the public doc on `SpatialQuery::BboxIntersects` (crates/sparq-engine/src/lib.rs:512-514) still describes the variant as serving only `geof:sfWithin(?g, box)` / `geof:sfIntersects(?g, box)`. After this change the variant also serves sfContains and both converse orientations, so the doc understates what a third-party provider must satisfy.",
+    "file": "crates/sparq-engine/src/exec.rs",
+    "fix_hint": "Add a case to crates/sparq-geo/tests/pushdown.rs using the real GeoIndexProvider: index a large polygon that strictly contains a small constant region, then assert `FILTER(geof:sfWithin(<region>, ?wkt))` and `FILTER(geof:sfContains(?wkt, <region>))` return the same rows as the post-hoc plan and that the large polygon survives the pushdown. Also update the `SpatialQuery::BboxIntersects` doc comment in lib.rs to state the contract the engine now relies on: return every indexed geometry whose bounding box intersects `arg_wkt`'s bounding box, including geometries that strictly contain it.",
+    "severity": "minor",
+    "title": "No end-to-end coverage of the new orientations against the real GeoIndexProvider"
+   },
+   {
+    "body": "The `constant_first` and `variable_first` blocks differ only in which operand is matched as the variable and which as the WKT constant; the constructed `SpatialPushdown` is byte-identical otherwise. Duplicating the struct literal means a future field added to `SpatialKind::BboxIntersects` has to be updated in four places in this function rather than one.\n\nThis is also the shape clippy's collapsible_if family tends to flag for `if cond { if let ... }`. I could not verify the lint gate here because cargo-clippy is not installed for the active toolchain (1.88.0), so this may or may not trip `-D warnings` in CI.",
+    "file": "crates/sparq-engine/src/exec.rs",
+    "fix_hint": "Collapse to something like: for (a, b) in [(&cargs[0], &cargs[1]), (&cargs[1], &cargs[0])] { if !orientation_allowed(iri, ...) { continue } if let (Expression::Variable(v), Some(arg)) = (a, wkt_const(b)) { return Some(...) } } with a single struct literal, or use let-chains (`if constant_first && let (Some(arg), Expression::Variable(v)) = ...`) to flatten the nesting. Confirm `cargo clippy -p sparq-engine --all-targets -- -D warnings` is green in both feature states before arming.",
+    "severity": "nit",
+    "title": "The two new if-let blocks are near-identical and could be one loop over operand orders"
+   }
+  ],
+  "progress": null,
+  "summary": "Correct and complete. recognise_spatial now accepts sfWithin/sfIntersects/sfContains between a geometry variable and a constant WKT literal in either operand order, routing them to a superset-only BboxIntersects scan with within_region:false.\n\nSoundness holds. Each newly-recognised orientation implies the two geometries intersect -- intersects(REGION,?g) directly; within(REGION,?g) means REGION is a subset of ?g; contains(REGION,?g) means ?g is a subset of REGION; contains(?g,REGION) is the converse of within(REGION,?g) -- so their AABBs intersect and the candidate set is a genuine superset. within_region stays false on all four, so apply_spatial_pushdown_exact returns Declined (exec.rs:6104 requires within_region:true) and the residual geof: FILTER remains authoritative. Only the pre-existing feature-gated sfContains(REGION,?g) keeps within_region:true, legitimate as it equals within(?g,REGION), matching SpatialExactQuery::WithinRegion.\n\nTraced to the real provider: GeoIndexProvider::candidates sends BboxIntersects to GeoIndex::bbox_candidate_literals = locate_in_envelope_intersecting over TreeItem envelopes carrying each geometry's full AABB (index.rs:95-105, 247-249, 699-715). True AABB intersection, not a containment window, so a large geometry containing the region IS returned and the converse orientations cannot silently drop rows. The pre-existing sfIntersects(?g, box) shape already required this, so no new provider obligation.\n\nTests are non-vacuous; I ran both feature states (2 pass default, 1 with spatial-exact-pushdown). They differential each orientation against the post-hoc plan, assert the pushdown fired (calls == 1), assert the residual FILTER runs over a strictly smaller input (4 < 5), and -- the load-bearing guard -- assert exact_calls == 0, which goes red if anyone sets within_region:true here. Existing suites pass (spatial_exact_pushdown 6/6, geo pushdown 16/16). Caveat: cargo-clippy is not installed here, so the lint gate is unverified.",
+  "verdict": "approve"
+ }
+}
