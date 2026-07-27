@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 810,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "29159294035c686a4d00d0c31312f7190a9c7793",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "The round-1 defect is resolved. The record now splits the strictly ordered stale-repository case from the equal-timestamp case, keeps both fail-closed before mutation, and prescribes a value-independent, operator-attested replacement for ties rather than deleting either indistinguishable copy. The required self-tests cover both intra-second write orders, assert zero mutations at refusal, exercise the distinct diagnosis and repair text, and drive the tie repair through convergence to an attested fresh value. The composed resume/rotate/re-quiesce/migrate/repair scenario and its mutation checks are non-vacuous. The remaining live-API timestamp assumptions are explicitly identified as pre-implementation verification gates with fail-closed fallback, appropriate for this behavior-free design record.",
+  "verdict": "approve"
+ }
+}
