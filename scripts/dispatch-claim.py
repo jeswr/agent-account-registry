@@ -1132,7 +1132,14 @@ def repair_gate_of(status, draft):
     if not isinstance(status, dict):
         return "unknown"
     if draft is True and status.get("draft") is not False:
-        return status.get("repair_gate", "unknown")
+        repair = status.get("repair_gate", "unknown")
+        # The bare ADMISSION spelling cannot legitimately reach this field — repair_gate_conclusion
+        # grades every green — so a record carrying it is FORGED or PRE-#762 (a snapshot written by
+        # the older code during a rolling deploy). Neither is evidence: degrade to unknown, on
+        # which both admissions fail open, rather than hand an UNGRADED green to a repair decision.
+        # Without this the enforcement property would hold of the resolver but not of the accessor,
+        # and a poisoned snapshot could make `repair_gate_of(...) == "success"` true after all.
+        return "unknown" if repair == "success" else repair
     strict = status.get("gate", "unknown")
     return GATE_GREEN_MERGE_REQUIRED if strict == "success" else strict
 
@@ -9753,6 +9760,34 @@ def _self_test():
     # and keeps its own "success"/"missing" vocabulary on the very same rows.
     assert interpret_check_runs([_agg(CI_GATE_CHECK, "success")])["gate"] == "success"
     assert interpret_check_runs([_agg(CI_GATE_DRAFT_TIER_CHECK, "success")])["gate"] == "missing"
+    # ---- THE ENFORCEMENT PROPERTY, OVER THE WHOLE REPAIR SURFACE ----------------------------
+    # "Neither tier-reachable green is spelled 'success'" is worth nothing unless it holds of
+    # EVERY repair accessor rather than of the one field a spot assertion happens to name. It is
+    # `repair_gate_of` — not the raw field — that repair decisions actually call, and its READY
+    # branch reads status["gate"], whose green IS the bare admission spelling. Un-grading that
+    # fallback survived this entire suite until this block existed (measured). So drive both
+    # accessors over a CLOSED input space, hostile records included, and assert neither can ever
+    # emit the admission spelling.
+    _vocab = ("success", "failure", "pending", "missing", "unknown", None,
+              GATE_GREEN_MERGE_REQUIRED, GATE_GREEN_DRAFT_TIER, "", 7)
+    for _tier_name in (CI_GATE_CHECK, CI_GATE_DRAFT_TIER_CHECK):
+        for _concl in ("success", "failure", "cancelled", "neutral", None):
+            assert repair_gate_conclusion([_agg(_tier_name, _concl)]) != "success", \
+                (_tier_name, _concl)
+    for _g in _vocab:
+        for _r in _vocab:
+            for _d in (True, False, None, "true"):
+                for _sd in (True, False, None):
+                    _probe = {"gate": _g, "repair_gate": _r, "draft": _sd}
+                    assert repair_gate_of(_probe, _d) != "success", (_probe, _d)
+    # ...and it is NOT vacuous: the same closed space DOES yield a graded green on BOTH branches,
+    # so the loop above rules something out instead of describing an accessor that never greens.
+    assert repair_gate_of({"repair_gate": GATE_GREEN_DRAFT_TIER}, True) == GATE_GREEN_DRAFT_TIER
+    assert repair_gate_of({"gate": "success"}, False) == GATE_GREEN_MERGE_REQUIRED
+    # A FORGED or PRE-#762 record carrying the admission spelling in the REPAIR field is not
+    # evidence: it degrades to unknown, on which both admissions fail open. Across a rolling
+    # deploy that is one no-op tick, never a stranded emitted on stale semantics.
+    assert repair_gate_of({"repair_gate": "success"}, True) == "unknown"
     # (the drift detector and its alarm-only property are #761's — asserted there, not here.)
     # The aggregator is never handed to the fixer as an advisory leg to repair, in EITHER
     # spelling (dropping CI_GATE_DRAFT_TIER_CHECK from the exclusion reds this).
@@ -10166,6 +10201,19 @@ def _self_test():
         _visible = enumerate_review_items(repo, _vis_pulls, _vis_prov, [], _vis_labels, now,
                                           pr_status=_vis_status)
     assert len(_visible) == 12, [i["pr_number"] for i in _visible]
+    # ...and the SAME scoping on the GREEN half, which is this PR's lane. A stranded whose green
+    # IS the merge-required context was already enumerable before either PR — steady-state
+    # traffic — so it must not be throttled either. Marking the stranded emit newly_reachable
+    # UNCONDITIONALLY survived this whole suite until this block existed (measured): the fix-lane
+    # assertion directly above says nothing about the review lane, and the mixed-lane assertion
+    # below feeds the review lane only draft-tier greens, so neither could see it.
+    _vg_pulls, _vg_status, _vg_prov, _vg_labels = _backlog(
+        12, first=300, tiered=GATE_GREEN_MERGE_REQUIRED, strict="success")
+    with contextlib.redirect_stdout(io.StringIO()):
+        _vis_green = enumerate_review_items(repo, _vg_pulls, _vg_prov, [], _vg_labels, now,
+                                            pr_status=_vg_status)
+    assert [i["state"] for i in _vis_green] == ["stranded"] * 12, \
+        [(i["pr_number"], i["state"]) for i in _vis_green]
     # The two lanes are bounded INDEPENDENTLY: 12 draft-tier reds and 12 draft-tier greens in one
     # tick yield 5 fix items and 5 review items, not 5 in total (the fix lane's cost is CI runs,
     # the review lane's is reviewer accounts — one budget cannot stand in for the other).
