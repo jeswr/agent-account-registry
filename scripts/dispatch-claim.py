@@ -10253,22 +10253,72 @@ def _self_test():
     # (7) THE CENSUS IS ATTRIBUTED TO THE HELD AREA, NOT THE ROW'S OWN CRATE. This is the exact
     #     shape the Gate A feed publishes: on the measured board it must read ONE held area with
     #     every row behind it, not N crate names with one row each.
+    #
+    # THE FIXTURE'S ORDER IS LOAD-BEARING, and this is the second thing this test got wrong.
+    # It first shipped as `[pull(60, ...__global__...), pull(41, ...area:ci...)]` — the
+    # `__global__` occupant listed FIRST — so a first-match scan and the lowest-PR rule picked the
+    # SAME occupant on every row, and the assertions below could not tell the defect apart from
+    # the fix. A fixture on which the broken and the fixed implementation produce identical output
+    # is worse than no fixture: it reads as coverage. The crate occupant is now listed FIRST and
+    # is the LOWER number (41 < 60), so on row #2606 (`ci`) the two rules DISAGREE:
+    #
+    #   first-match (pre-fix) -> pr#41, the `ci` holder it happens to reach first;
+    #   lowest qualifying     -> pr#60, the `__global__` holder that actually defers the row.
+    #
+    # `by_holder == {"60": 3}` is therefore a real discriminator here, and the permutation loop
+    # proves listing order cannot move it either way.
     stall_rows = [{"number": 2586, "package": "sparq-server", "deferred": False},
                   {"number": 2392, "package": "sparq-crdt", "deferred": False},
                   {"number": 2606, "package": "ci", "deferred": False}]
-    stall_pulls = [pull(60, "sparq-agent/issue-8-1-1", sha_a, labels=["review:needs"]),
-                   pull(41, "sparq-agent/issue-7-1-1", sha_a, labels=["area:ci"])]
+    stall_pulls = [pull(41, "sparq-agent/issue-7-1-1", sha_a, labels=["area:ci"]),
+                   pull(60, "sparq-agent/issue-8-1-1", sha_a, labels=["review:needs"])]
+    stall_labels = {8: ["role:impl"], 7: ["area:ci", "role:impl"]}
+    # The ROW's crate and the HELD area differ on every line here (`ci`/`sparq-server`/`sparq-crdt`
+    # vs `__global__`), so printing one where the other belongs is VISIBLE — which the previous
+    # only-assertion-on-an-assemble-line, a single-occupant `crate-conflict` fixture where
+    # `held_area == package == "crate-b"`, could not be by construction.
+    expected_stall_log = [
+        "assembler defer #2586 [global-reservation]: row crate sparq-server; "
+        "held area __global__ reserved by pr#60 [not-parked]",
+        "assembler defer #2392 [global-reservation]: row crate sparq-crdt; "
+        "held area __global__ reserved by pr#60 [not-parked]",
+        "assembler defer #2606 [global-reservation]: row crate ci; "
+        "held area __global__ reserved by pr#60 [not-parked]",
+    ]
     stall_census = {}
-    with contextlib.redirect_stdout(io.StringIO()):
-        stall_kept = filter_busy_area_items(
-            stall_rows, repo, stall_pulls, {8: ["role:impl"], 7: ["area:ci", "role:impl"]},
-            busy_prov, leases=[], now=now, census=stall_census)
-    assert stall_kept == [], stall_kept
-    assert stall_census["by_reason"] == {"global-reservation": 3, "cross-cutting-item": 0,
-                                         "crate-conflict": 0, "sibling-lease": 0}, stall_census
-    assert stall_census["by_held_area"] == {GLOBAL_PACKAGE: 3}, stall_census
-    assert stall_census["by_holder"] == {"60": 3}, stall_census
-    assert (stall_census["total"], stall_census["kept"]) == (3, 0), stall_census
+    for stall_order in (stall_pulls, list(reversed(stall_pulls))):
+        stall_output = io.StringIO()
+        stall_census = {}
+        with contextlib.redirect_stdout(stall_output):
+            stall_kept = filter_busy_area_items(
+                stall_rows, repo, stall_order, stall_labels,
+                busy_prov, leases=[], now=now, census=stall_census)
+        assert stall_kept == [], stall_kept
+        # THE PRINTED LINE IS ITSELF ASSERTED, exactly, not merely swallowed. The census is built
+        # from the same locals as the log line, so census-only assertions leave the emitted
+        # sentence — the thing an operator actually reads, and the thing that told the wrong story
+        # for four production ticks — completely unguarded.
+        assert stall_output.getvalue().splitlines() == expected_stall_log, \
+            (stall_output.getvalue(), [p["number"] for p in stall_order])
+        assert stall_census["by_reason"] == {"global-reservation": 3, "cross-cutting-item": 0,
+                                             "crate-conflict": 0, "sibling-lease": 0}, stall_census
+        assert stall_census["by_held_area"] == {GLOBAL_PACKAGE: 3}, stall_census
+        assert stall_census["by_holder"] == {"60": 3}, \
+            (stall_census, [p["number"] for p in stall_order])
+        assert (stall_census["total"], stall_census["kept"]) == (3, 0), stall_census
+        # THE LOG AND THE CENSUS MUST TELL THE SAME STORY. Re-derive the census straight from the
+        # emitted text: an operator reading the log and Gate A reading the census must never be
+        # able to disagree about which area is held or which PR holds it.
+        from_log = {}
+        for line in stall_output.getvalue().splitlines():
+            parsed = re.match(
+                r"assembler defer #\d+ \[([a-z-]+)\]: row crate (\S+); "
+                r"held area (\S+) reserved by pr#(\S+) \[", line)
+            assert parsed, line
+            record_partition_defer(from_log, parsed.group(1), parsed.group(3), parsed.group(4))
+        assert from_log["by_held_area"] == stall_census["by_held_area"], (from_log, stall_census)
+        assert from_log["by_holder"] == stall_census["by_holder"], (from_log, stall_census)
+        assert from_log["by_reason"] == stall_census["by_reason"], (from_log, stall_census)
     # The bucket sum is the row count: no row may be counted twice, and none may go missing.
     assert sum(stall_census["by_reason"].values()) == len(stall_rows) == stall_census["total"]
     # A leg that dropped NOTHING still publishes every bucket at zero — "never instrumented" and
@@ -10291,11 +10341,10 @@ def _self_test():
     assert lease_census["total"] == 1 and lease_census["kept"] == 0, lease_census
     # Passing NO census must not change the partition — telemetry is observation only.
     with contextlib.redirect_stdout(io.StringIO()):
-        assert filter_busy_area_items(stall_rows, repo, stall_pulls,
-                                      {8: ["role:impl"], 7: ["area:ci", "role:impl"]},
+        assert filter_busy_area_items(stall_rows, repo, stall_pulls, stall_labels,
                                       busy_prov, leases=[], now=now) == stall_kept
-    print("  ok   registry-758 (c): the census counts HELD areas, sums to the row count, "
-          "and never moves the partition")
+    print("  ok   registry-758 (c): the assemble leg PRINTS the held area, not the row's crate, "
+          "and its census counts HELD areas order-independently")
     # source-issue parks compose the same way: issue 80 is needs:user-parked; its
     # NON-draft worker PR still reserves crate-a...
     assert busy_packages_of_pulls(
