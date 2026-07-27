@@ -1449,6 +1449,23 @@ def _gh_error_detail(result):
     }
 
 
+def gh_error_class(detail):
+    """The operator-facing CLASS of a failed `gh` call: `throttled` | `transient` | `permanent`.
+
+    Registry #710. Two classes could not express the failure that actually lost the records. An
+    exhausted API budget is not an availability blip (`transient` — "it wobbled, it will pass") and
+    it is certainly not a refusal (`permanent` — "GitHub said no, retrying cannot help"); it is a
+    CAPACITY fact about the fleet, and it has a different lever from either. Reading `class=permanent`
+    on six consecutive provenance losses is what sent two prior diagnoses at this defect to the wrong
+    layer, so the third class is the one that names the real one.
+
+    Keyed on `gh_retry.RATE_LIMIT_READ_REASONS`, never on substring-matching the reason text, so a
+    future rate-limit reason is classified by being added to that set and cannot drift silently."""
+    if detail.get("reason") in gh_retry.RATE_LIMIT_READ_REASONS:
+        return "throttled"
+    return "transient" if detail.get("transient") else "permanent"
+
+
 def _gh_error_message(args, result, *, attempts=1):
     """The fail-LOUD message for a failed `gh` call. Keeps the historical
     `GitHub API request failed for <endpoint>` prefix (log greps and backfill-provenance.py's
@@ -1458,7 +1475,7 @@ def _gh_error_message(args, result, *, attempts=1):
     detail = _gh_error_detail(result)
     return (f"GitHub API request failed for {endpoint} "
             f"(exit={detail['exit']} http={detail['status'] or 'unknown'} "
-            f"class={'transient' if detail['transient'] else 'permanent'} "
+            f"class={gh_error_class(detail)} "
             f"reason={detail['reason']} "
             f"attempts={attempts}): {detail['excerpt'] or 'no stderr'}")
 
@@ -1564,7 +1581,7 @@ def _provenance_read(args, *, target_repo, subject, env=None):
         except json.JSONDecodeError as exc:
             raise WorkerPrError("GitHub API returned malformed JSON") from exc
     detail = _gh_error_detail(result)
-    klass = "transient" if detail["transient"] else "permanent"
+    klass = gh_error_class(detail)
     endpoint = args[1] if len(args) > 1 else "request"
     summary = (f"{PROVENANCE_READ_FAILURE_MARKER} repo={target_repo} {subject} "
                f"endpoint={endpoint} http={detail['status'] or 'unknown'} class={klass} "
@@ -1594,8 +1611,12 @@ def _provenance_read(args, *, target_repo, subject, env=None):
                f"That PR is invisible to the review sweep and reserves the `__global__` partition "
                f"in `dispatch-claim.busy_packages_of_pulls` until `scripts/backfill-provenance.py` "
                f"recovers it. Last API error: {detail['excerpt'] or 'no stderr'}\n\n"
-               f"`class=transient` means the bounded retry budget was exhausted (availability); "
-               f"`class=permanent` means GitHub refused (404/permission) and retrying cannot help.")
+               f"`class=throttled` means the registry's GitHub API budget was exhausted — the "
+               f"bounded in-job retry cannot span a primary rate-limit window, so the repair is the "
+               f"scheduled `backfill-provenance` run, and the lever is API call volume, not "
+               f"availability (registry #710); `class=transient` means the bounded retry budget was "
+               f"exhausted against a wobbling API (availability); `class=permanent` means GitHub "
+               f"refused (404/permission) and retrying cannot help.")
     raise WorkerPrError(_gh_error_message(args, result, attempts=attempts))
 
 
@@ -5828,6 +5849,12 @@ def _self_test():
     _T503 = (1, "", "gh: Service Unavailable (HTTP 503)")
     _T403_RATE = (1, "", "HTTP 403: You have exceeded a secondary rate limit")
     _P403_PERM = (1, "", "HTTP 403: Resource not accessible by integration")
+    # [registry #710] The VERBATIM stderr of a measured provenance loss (worker run 30297094506).
+    # Carried whole — debug trace included — so this fixture exercises the REAL composition
+    # `_provenance_read` performs: scrub the trace, recover the status off it (gh's own message has
+    # none), then classify. A hand-written "HTTP 403: ..." string would skip the recovery step that
+    # is exactly where the defect lived.
+    _T403_PRIMARY = (1, "", gh_retry.MEASURED_PRIMARY_RATE_LIMIT_STDERR)
     _P404 = (1, "", "gh: Not Found (HTTP 404)")
     _OK = (0, _PULL_JSON, "")
 
@@ -5928,6 +5955,78 @@ def _self_test():
               (err_rate, rate_calls, isinstance(err_perm, WorkerPrError),
                len(prov_state["calls"]), "class=permanent" in perm_marker),
               (None, 3, True, 1, True))
+
+        # GUARD 4b [registry #710] — THE MEASURED FAILURE, end to end. The PRIMARY rate-limit 403
+        # is the shape that actually lost 6/6 provenance records on 2026-07-27, and it is a THIRD
+        # class: same status as the two 403s above, retryable like the secondary one, but with a
+        # different lever from either (API budget, not availability, not permission). Driven through
+        # the whole real path — fake `subprocess.run` only — so the trace-recovered status, the
+        # classifier, the emitted class and the operator guidance are all asserted together.
+        err_primary = _run_prov([_T403_PRIMARY, _T403_PRIMARY, _OK])
+        primary_calls, primary_recorded = len(prov_state["calls"]), [d["pr_number"] for d in _stored()]
+        err_exhausted = _run_prov([_T403_PRIMARY] * gh_retry.MAX_ATTEMPTS)
+        primary_marker = next((line for line in prov_state["printed"]
+                               if PROVENANCE_READ_FAILURE_MARKER in line
+                               and not line.startswith("::")), "")
+        primary_alert = next((body for _t, body in prov_state["alerts"]
+                              if "primary-rate-limit-403" in body), "")
+        check("#710 the MEASURED primary-rate-limit 403 is RETRIED (it was refused in one attempt, "
+              "which is how the record was lost) and the record IS then written",
+              (err_primary, primary_calls, primary_recorded), (None, 3, [42]))
+        check("#710 an exhausted primary rate limit is reported as its OWN class — `throttled`, "
+              "with the reason and the recovered status — never as `permanent` or `transient`",
+              ("class=throttled" in primary_marker, "reason=primary-rate-limit-403" in primary_marker,
+               "http=403" in primary_marker, "class=permanent" in primary_marker,
+               "class=transient" in primary_marker,
+               isinstance(err_exhausted, WorkerPrError)),
+              (True, True, True, False, False, True))
+        check("#710 the ops-alert legend explains the THROTTLED class and points at the repair that "
+              "can actually fix it (an in-job retry cannot span a primary rate-limit window)",
+              ("`class=throttled`" in primary_alert, "backfill-provenance" in primary_alert),
+              (True, True))
+        # The CLASS function itself, unit-tested, so the three-way mapping cannot be re-collapsed
+        # by editing only the call sites.
+        check("#710 gh_error_class maps the three read verdicts, keyed on RATE_LIMIT_READ_REASONS",
+              (gh_error_class({"reason": "primary-rate-limit-403", "transient": True}),
+               gh_error_class({"reason": "secondary-rate-limit-403", "transient": True}),
+               gh_error_class({"reason": "transient-http-502", "transient": True}),
+               gh_error_class({"reason": "refused-http-404", "transient": False})),
+              ("throttled", "throttled", "transient", "permanent"))
+        # ...AND EVERY CALL SITE, which is the converse hole and was a REAL SURVIVOR. The two
+        # checks above pin `_provenance_read`'s summary line and `gh_error_class` itself, and BOTH
+        # stay green while `_gh_error_message` — the OTHER emitter, and the second of the two lines
+        # the six losses actually printed — is reverted to its old two-way ternary. Measured: that
+        # revert left the whole suite at 889 ok / 0 FAIL / rc=0 while emitting
+        # `GitHub API request failed for … class=transient` for a throttle. So the assertion is
+        # made per-EMITTER, driven off the same measured stderr through a real result object.
+        class _ThrottledResult:
+            returncode, stdout = 1, ""
+            stderr = gh_retry.MEASURED_PRIMARY_RATE_LIMIT_STDERR
+
+        _throttled_msg = _gh_error_message(["api", "repos/o/r/pulls?head=x"], _ThrottledResult(),
+                                           attempts=1)
+        check("#710 `_gh_error_message` — the SECOND emitter, and the `GitHub API request failed "
+              "for …` line the six losses printed — also names the throttle. Reverting just this "
+              "one call site to the old `transient`/`permanent` ternary reds HERE and nowhere else",
+              ("class=throttled" in _throttled_msg, "reason=primary-rate-limit-403" in _throttled_msg,
+               "http=403" in _throttled_msg, "class=transient" in _throttled_msg,
+               "class=permanent" in _throttled_msg),
+              (True, True, True, False, False))
+        # CONTROL: the other two classes still come out of that same emitter unchanged, so the row
+        # above is asserting a three-way mapping and not an unconditional "always throttled".
+        class _RefusedResult:
+            returncode, stdout = 1, ""
+            stderr = "gh: Not Found (HTTP 404)"
+
+        class _WobbleResult:
+            returncode, stdout = 1, ""
+            stderr = "gh: Service Unavailable (HTTP 503)"
+
+        check("#710 CONTROL: the same emitter still says `permanent` for a refusal and `transient` "
+              "for a wobble — the throttle row above is a discrimination, not a constant",
+              ("class=permanent" in _gh_error_message(["api", "x"], _RefusedResult()),
+               "class=transient" in _gh_error_message(["api", "x"], _WobbleResult())),
+              (True, True))
 
         # A read that SUCCEEDS but returns a non-object payload must fail CLOSED as a WorkerPrError
         # (which every caller already degrades to its documented conservative result), never crash
