@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4610,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "9736b0bd880ec25841a36cd48ca01a25073efdf9",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 3 resolves the prior major finding. `is_absolute_iri` now validates the RFC 3987 component structure relevant to the reported acceptance gap: authority/userinfo/host/port boundaries, IPv6 and IPvFuture literals, IPv4 tails, percent escapes, query/fragment placement, and component-specific Unicode classes. The previously cited witnesses (`http://[` and a non-numeric port) are rejected both by focused predicate tests and through the real datatype-expansion path, while representative valid authority and authority-less IRIs are protected against over-rejection. The bracket exception outside authority is explicitly bounded, justified by a pinned positive W3C case, and tested. The negative conformance runners compare exact error codes and include non-vacuity/scope-pin tests. No correctness, soundness, security, or test-validity defect remains in the diff-scoped change.",
+  "verdict": "approve"
+ }
+}
