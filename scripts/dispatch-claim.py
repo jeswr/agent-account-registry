@@ -3772,6 +3772,16 @@ def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_logi
             # SELF-CLEARING, with no human in the loop: `provenance` is re-read from the ledger
             # checkout every tick, so the tick after the record lands this branch is not taken
             # and the park re-admits on its own ordinary evidence.
+            #
+            # COMPOSES WITH registry #775 rather than duplicating it. That change names the same
+            # class on the RESERVATION side (GLOBAL_CAUSE_NO_PROVENANCE) and escalates an
+            # unprovenanced holder the park sweep cannot help; this is the RELEASE side, and both
+            # read the one shared predicate `is_enumerable_provenance`, so the two halves cannot
+            # disagree about which PRs are recordless. #775 lowers the rate at which records are
+            # lost; it cannot remove the exposure, because any residual loss re-creates it. A
+            # parked-but-ACTIVE recordless holder is visible to both — #775 reports that it holds
+            # the partition, this reports that its park will not be released — and both name the
+            # same single recovery.
             if readmission_park_exit_candidate(labels, source_labels) \
                     and not is_enumerable_provenance(record, number):
                 record_readmit_refusal(refusals, READMIT_REFUSAL_NO_PROVENANCE)
