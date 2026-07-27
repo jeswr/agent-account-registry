@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4133,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b794e0bf5d90ab1a167c2f41615370f1c5db7470",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The comment added above the `Expression::FunctionCall(Function::Custom(nn), cargs)` arm reads:\n\n  \"Simple Features relation as the whole FILTER. Every orientation below necessarily intersects the constant region, so its bbox scan is a candidate SUPERSET and the residual FILTER remains authoritative.\"\n\nThe superset half is correct for all five orientations. The second half is not. With `spatial-exact-pushdown` enabled, the two within-region orientations -- `geof:sfWithin(?g, REGION)`, handled by the `if` block directly below this comment, and `geof:sfContains(REGION, ?g)`, handled by the new match -- carry `within_region: true`, so `apply_spatial_pushdown_exact` can return `AllCertified` and the call site at exec.rs:4891-4893 does `continue`, SKIPPING the residual `geof:` FILTER entirely. For those two shapes the residual FILTER is explicitly not authoritative; the provider's exact certificate is.\n\nNo behavioural consequence -- the code is right, and two nearby comments state the truth (the `within_region` comment in the new struct literal, and the `SpatialKind::within_region` doc at exec.rs:5828-5836). But this is the top-of-arm comment a future reader hits first, and it asserts precisely the invariant that would make adding a sixth orientation with `within_region: true` look safe. Given round 4's finding was about implicit soundness assumptions in this same function, it is worth making the summary comment agree with the two that follow it.",
+    "file": "crates/sparq-engine/src/exec.rs",
+    "fix_hint": "Scope the second clause, e.g.: \"Simple Features relation as the whole FILTER. Every orientation below necessarily intersects the constant region, so its bbox scan is a candidate SUPERSET. The residual FILTER remains authoritative for all of them EXCEPT the within-region orientations flagged by `within_region` below, which an installed provider may certify exactly (see `apply_spatial_pushdown_exact`).\"",
+    "severity": "nit",
+    "title": "New block comment claims the residual FILTER \"remains authoritative\" for every orientation, which is false for the two within-region ones under spatial-exact-pushdown"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Correct and complete; all three round-4 findings are addressed. Verified by running the code.\n\nSoundness: recognise_spatial now decides each shape in exactly ONE place, so round-4's ordering hazard is gone by construction -- block 1 matches only WITHIN/INTERSECTS variable-first; the new match's arm 1 requires the variable SECOND, arm 2 requires CONTAINS variable-first. The sets are disjoint, so no shape is routed twice. within_region is true only for sfContains(REGION,?g) (== within(?g,REGION), matching SpatialExactQuery::WithinRegion); the other four get false, so apply_spatial_pushdown_exact Declines (exec.rs:6078) and the residual geof: FILTER stays authoritative. The `?` in the match arms is safe: sfX(?g,?h), sfX(const,const), non-wktLiteral constants and arity != 2 all fall through to None.\n\nProvider contract confirmed at source: bbox_candidate_literals uses locate_in_envelope_intersecting (index.rs:711) -- true AABB intersection, not a containment window -- so a geometry strictly containing the region IS returned; lib.rs and SKILL.md now state that obligation.\n\nTests non-vacuous, proven by two mutations in an isolated copy: (1) forcing within_region:true turns the new engine test RED on both the result differential and exact_calls; (2) swapping the geo index to locate_in_envelope (containment) makes converse_containment_orientations_keep_larger_indexed_geometry the ONLY one of 17 to go red -- exactly the detector round 4 requested.\n\nGreen: sparq-engine full suite in BOTH feature states; sparq-geo full suite default AND --features topology_index (lights the exact seam end-to-end, confirming the converse orientations keep their residual FILTER); build warning-free both states; rustdoc clean. Working tree untouched.\n\nCaveat: clippy cannot be installed here (read-only FS), so -D warnings is unverified; rustc is warning-free and the refactor removed the lint shapes round 4 flagged.",
+  "verdict": "approve"
+ }
+}
