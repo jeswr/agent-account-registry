@@ -3,12 +3,17 @@
 # A copy of the sparq target's scripts/route-resolve.py; dispatch-plan.py imports resolve().
 """route-resolve.py — resolve an issue's labels to (model_chain, agent, escalate).
 
-PRECEDENCE: security-label override > explicit role > [defaults], FIRST MATCH WINS. `match_labels`
-rules match if any listed keyword is a SUBSTRING of any issue label (so `worker` matches
-`area:worker`, `dispatch` matches `area:dispatch`, etc.). Because the registry's routing.toml
-lists its trust-surface security rule first, an `impl` issue that also touches `area:worker`
-routes to Opus (soundness), not Fable.
+PRECEDENCE: security-label override > explicit role > [defaults]. This MUST match the CLAIM-side
+resolver (policy-resolve.resolve) exactly, or a plan the PLANNER computes is rejected by CLAIM. The
+resolution is TWO-PHASE and ORDER-INDEPENDENT: EVERY security-label rule (`match_labels`) is
+evaluated before ANY role rule, so a security surface wins even when a role block happens to be
+listed before it in routing.toml. Within each phase the first match wins. `match_labels` rules match
+if any listed keyword is a SUBSTRING of any issue label (so `worker` matches `area:worker`,
+`dispatch` matches `area:dispatch`, etc.). An `impl` issue that also touches `area:worker` therefore
+routes to Opus (soundness), not Fable, regardless of where the security block sits in the file.
 """
+import importlib.util
+from pathlib import Path
 import sys
 
 try:
@@ -17,26 +22,128 @@ except ModuleNotFoundError:  # pragma: no cover
     import tomli as tomllib
 
 
+def _sibling(module_name, filename):
+    """Import a sibling script by path — these scripts are invoked standalone, so there is no
+    package to import from, but a SHARED rule must still be imported rather than re-declared."""
+    path = Path(__file__).resolve().with_name(filename)
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_DEP = _sibling("registry_deprecated_models", "deprecated_models.py")
+# [OPUS-5] The chain-order preference MECHANISM — the identical module policy-resolve.py (the CLAIM
+# side) imports. The rule itself is DATA in this routing table's `[[chain_preference]]` block, so
+# PLAN and CLAIM read one declaration and cannot drift apart about what it says.
+_PREF = _sibling("registry_chain_preference", "chain_preference.py")
+
+
+def validate_catalog(doc):
+    """[OPUS-5] FAIL CLOSED on a retired model in the [models] CATALOG.
+
+    Found by mutation-testing this very change: re-adding `[models.fable]` to
+    orchestration/routing.toml SURVIVED every registry self-test. policy-resolve rejects an unknown
+    model in a CHAIN, and the shared register guards REVIEW_CHAIN/FIX_CHAIN/ESCALATION_LADDERS —
+    but nothing guarded the catalog itself. A resurrected catalog entry is the first half of a
+    resurrected route: it makes `fable` resolvable again, so the next edit that adds it to a chain
+    passes every check. Guard the catalog, not only the chains.
+    """
+    _DEP.assert_catalog_clean(doc.get("models", {}))
+
+
+class RoleResolutionError(ValueError):
+    """Base for a fail-closed role-validation failure: a malformed role:* set must DEFER/DIE, never
+    resolve to a permissive default. resolve() raises a SUBCLASS so a caller (dispatch-plan) can
+    reject the issue as one class. Mirrors policy-resolve.resolve (the CLAIM-side resolver), which
+    raises PolicyError on the SAME three malformed-role cases — empty value, ambiguous set, unknown
+    role — all BEFORE any route match, so PLAN and CLAIM agree on which issues never route (#122).
+    """
+
+
+class AmbiguousRoleError(RoleResolutionError):
+    """More than one distinct role:* label — reject, never guess. Mirrors policy-resolve's
+    ``len(roles) > 1`` check. resolve() distinguishes this from a ROLELESS issue (which legitimately
+    routes to security/defaults) so ambiguous input can never fall to a permissive default (#122).
+    """
+
+
+class EmptyRoleError(RoleResolutionError):
+    """A role:* label with an EMPTY value (a bare ``role:``). Mirrors policy-resolve's
+    ``any(not role ...)`` check. Without it ``role`` became "" and, matching no role route, fell
+    through to Phase-3 defaults — a permissive route CLAIM rejects (empty role value).
+    """
+
+
+class UnknownRoleError(RoleResolutionError):
+    """A single role with NO explicit role route in routing.toml. Mirrors policy-resolve's
+    ``role not in role_routes`` check. Without it an unconfigured role fell through to Phase-3
+    defaults (or became a default-routed planner row), only to be rejected downstream at CLAIM —
+    the exact PLAN/CLAIM divergence this resolver exists to prevent. Must DIE here, not route.
+    """
+
+
 def resolve(labels, doc):
-    """Return (model_chain, agent, escalate). `labels`: iterable of the issue's labels."""
+    """Return (model_chain, agent, escalate). `labels`: iterable of the issue's labels.
+
+    Two-phase precedence, identical to policy-resolve.resolve (the CLAIM-side resolver) so PLAN and
+    CLAIM never diverge on a reordered routing.toml (#121): ALL security-label rules are evaluated
+    before ANY role rule; within each phase the first match wins. The old single-pass first-match
+    let a role block that preceded a matching security block win, planning a chain CLAIM rejects.
+
+    RAISES a RoleResolutionError subclass for a MALFORMED role:* set — more than one distinct role
+    (AmbiguousRoleError), an empty value like a bare ``role:`` (EmptyRoleError), or a single role
+    with no explicit role route (UnknownRoleError). All three checks precede route matching (exactly
+    as in policy-resolve.resolve: empty > ambiguous > unknown, then routing), so a malformed issue
+    can never resolve to a security/role/defaults route regardless of a caller's own precheck.
+    """
+    validate_catalog(doc)   # [OPUS-5] a retired model must not even be RESOLVABLE
+    # [OPUS-5] Parsed BEFORE any route match, so a malformed declaration refuses to resolve rather
+    # than resolving to a chain CLAIM would reject. ChainPreferenceError is a ValueError, the same
+    # fail-closed class dispatch-plan already handles.
+    preferences = _PREF.parse_preferences(doc, set(doc.get("models", {})))
     labels = set(labels)
+    routes = doc.get("route", [])
+    # The explicit role routes declared in routing.toml (role blocks, never security blocks); the
+    # unknown-role guard rejects any role absent from this set, mirroring policy-resolve's role_routes.
+    role_routes = {r.get("role") for r in routes if "match_labels" not in r and "role" in r}
 
-    def role_of(lbs):
-        for lb in lbs:
-            if lb.startswith("role:"):
-                return lb[5:]
-        return None
+    # SINGLE declared role, or None when ROLELESS. A malformed set fails closed here, BEFORE any
+    # route match (same order as policy-resolve.resolve), so it can never slip into a security/role/
+    # defaults route: returning None collapsed ambiguity/empty/unknown into the roleless case and let
+    # a malformed issue fall to a permissive default — a chain CLAIM rejects, stranding the issue.
+    roles = {lb[5:] for lb in labels if lb.startswith("role:")}
+    if any(not r for r in roles):
+        raise EmptyRoleError("empty role:* value — exactly one non-empty role:* required")
+    if len(roles) > 1:
+        raise AmbiguousRoleError(
+            f"ambiguous role labels: {', '.join(sorted(roles))} — exactly one role:* required")
+    role = next(iter(roles)) if roles else None
+    if role is not None and role not in role_routes:
+        raise UnknownRoleError(
+            f"unknown role {role!r} — no matching role route in routing.toml")
 
-    role = role_of(labels)
-    for r in doc.get("route", []):
+    # Phase 1 — security-label overrides: any keyword is a substring of any label; first match wins.
+    # Returned UNMODIFIED: a chain-order preference expresses which IMPLEMENTOR is preferred and
+    # must never re-order a soundness chain. policy-resolve (CLAIM) makes the same exemption.
+    for r in routes:
         kws = r.get("match_labels")
-        if kws:  # security-label rule: any keyword is a substring of any label
-            if any(k in lb for lb in labels for k in kws):
-                return r["model_chain"], r["agent"], bool(r.get("escalate"))
-        elif "role" in r and role is not None and r["role"] == role:
+        if kws and any(k in lb for lb in labels for k in kws):
             return r["model_chain"], r["agent"], bool(r.get("escalate"))
+    # Phase 2 — explicit role route (only role blocks, never a security block).
+    if role is not None:
+        for r in routes:
+            if "match_labels" not in r and r.get("role") == role:
+                # `role=` is what lets a preference's `inject_roles` allow-list be evaluated (adding
+                # the lead to a chain that lacks it is legal only for the roles the DECLARATION
+                # names). policy-resolve passes the same value at the same point.
+                return (_PREF.apply_preferences(labels, r["model_chain"], preferences, role=role),
+                        r["agent"], bool(r.get("escalate")))
+    # Phase 3 — defaults (no security match and no role). role is None here BY CONSTRUCTION, so a
+    # roleless issue can never be injected into — passed explicitly rather than left to the default.
     d = doc.get("defaults", {})
-    return d.get("model_chain", []), d.get("agent"), False
+    return (_PREF.apply_preferences(labels, d.get("model_chain", []), preferences, role=None),
+            d.get("agent"), False)
 
 
 def _self_test():
@@ -49,27 +156,199 @@ def _self_test():
         ok = ok and good
         print(f"  {'ok  ' if good else 'FAIL'} {n}: {got} (want {want})")
 
-    # impl + a trust surface (area:worker) -> security rule wins over role -> Opus, escalate.
+    def raises(n, exc_type, fn):
+        nonlocal ok
+        try:
+            fn()
+        except exc_type as exc:
+            good, detail = True, f"raised {exc_type.__name__}: {exc}"
+        except Exception as exc:  # a DIFFERENT exception is still a failure (wrong fail-closed class)
+            good, detail = False, f"raised {type(exc).__name__} (want {exc_type.__name__})"
+        else:
+            good, detail = False, "did NOT raise (routed instead)"
+        ok = ok and good
+        print(f"  {'ok  ' if good else 'FAIL'} {n}: {detail}")
+
+    # impl + a trust surface (area:worker) -> security rule wins over role -> Opus-5-led
+    # (opus tail fallback, 2026-07-24), escalate.
     mc, ag, esc = resolve(["role:impl", "area:worker"], doc)
-    chk("impl+worker -> opus/escalate", (mc, ag, esc), (["opus"], "registry-reviewer", True))
+    chk("impl+worker -> opus5-led/escalate", (mc, ag, esc),
+        (["opus5"], "registry-reviewer", True))
     # dispatch is a trust surface too.
     mc, ag, esc = resolve(["role:impl", "area:dispatch"], doc)
-    chk("impl+dispatch -> opus/escalate", (mc, esc), (["opus"], True))
-    # a NON-trust area (usage) -> plain impl -> sol-led chain (sol-first routing, 2026-07-18).
+    chk("impl+dispatch -> opus5/escalate", (mc, esc), (["opus5"], True))
+    # [OPUS-5] a NON-trust area (usage) -> plain impl -> OPUS5-ONLY + escalate (maintainer decision
+    # 2026-07-26 on the registry #738 measurement: "Remove sol from impl fallback"; sol converted
+    # 18% vs opus5 86% in-cell, n=74). The FULL tuple is asserted, not just the head, so demoting
+    # sol back to a second rung reds this instead of passing on `mc[0] == "opus5"`.
     mc, ag, esc = resolve(["role:impl", "area:usage"], doc)
-    chk("impl+usage -> sol-led", (mc[0], ag, esc), ("sol", "registry-impl", False))
-    # docs -> haiku-led.
-    chk("docs -> haiku", resolve(["role:docs", "area:docs"], doc)[0][0], "haiku")
+    chk("impl+usage -> OPUS5-ONLY, escalating", (mc, ag, esc),
+        (["opus5"], "registry-impl", True))
+    chk("role:impl names NO openai tier at all (exclusion, not a demotion)",
+        sorted({doc["models"][m]["provider"] for m in mc}), ["anthropic"])
+    chk("role:impl ESCALATES, so a single-rung chain has a machine exit rather than deferring "
+        "forever with nobody notified", esc, True)
+    # [OPUS-5] docs -> SOL-led (maintainer 2026-07-26: "deprecate sonnet and haiku for docs
+    # writing in favor of gpt 5.6 sol"). The second assertion is the one that reds if either
+    # cheap anthropic tier is put back into the docs chain.
+    chk("docs -> sol", resolve(["role:docs", "area:docs"], doc)[0][0], "sol")
+    chk("docs chain has no cheap anthropic tier",
+        sorted(set(resolve(["role:docs", "area:docs"], doc)[0]) & {"haiku", "sonnet"}), [])
     # [FABLE-5] frontier-tier infra authorship (standing rule 2026-07-17): ci -> sol-led
-    # (sol/fable, 2026-07-18), FRONTIER-ONLY chain — no sub-frontier model (sonnet/haiku), so
+    # (sol/opus5/fable — opus5 primary anthropic tier since 2026-07-24, fable its tail
+    # fallback), FRONTIER-ONLY chain — no sub-frontier model (sonnet/haiku), so
     # chain exhaustion DEFERS at the claim step (defer-not-fallback) instead of degrading tier.
     mc, ag, esc = resolve(["role:ci", "area:ci"], doc)
-    chk("ci -> frontier-only sol-first (terra is docs-only)", (mc, ag, esc), (["sol", "fable"], "registry-ci", False))
+    chk("ci -> frontier-only opus5-first (terra is docs-only)", (mc, ag, esc),
+        (["opus5", "sol"], "registry-ci", False))
     chk("ci chain has no sub-frontier tier", sorted(set(mc) & {"sonnet", "haiku"}), [])
-    # no role -> defaults (sol-led, 2026-07-18).
-    chk("no role -> defaults", resolve(["area:usage"], doc)[0][0], "sol")
+    # [OPUS-5] no role -> defaults, now OPUS5-led (maintainer 2026-07-26: opus5 is preferred over
+    # sol wherever both are viable implementors). This repo has no `area:gui`, so it carries no
+    # sol carve-out — every implementor route here takes the opus5-first default.
+    chk("no role -> defaults", resolve(["area:usage"], doc)[0][0], "opus5")
+    # `role:impl` is deliberately NOT in this loop since 2026-07-26 — it is the one implementor
+    # route where sol was REMOVED rather than demoted, and it is asserted separately above. Every
+    # OTHER implementor route keeps sol as a reachable fallback (preference, not exclusion).
+    for _role in ("site", "ci"):
+        _mc = resolve([f"role:{_role}"], doc)[0]
+        chk(f"role:{_role} prefers opus5 over sol", _mc[0], "opus5")
+        chk(f"role:{_role} keeps sol reachable (preference, not exclusion)", "sol" in _mc, True)
+        chk(f"role:{_role} chain is cross-provider (terminates under either outage)",
+            sorted({doc["models"][m]["provider"] for m in _mc}), ["anthropic", "openai"])
+    # ...and the exclusion is EXACTLY role:impl. This is the guard that reds if a future edit
+    # copies the exclusion onto a route the maintainer did not scope it to.
+    chk("the ONLY route with no openai rung among the implementor routes is role:impl",
+        sorted(r for r in ("impl", "site", "ci", "docs")
+               if not any(doc["models"][m]["provider"] == "openai"
+                          for m in resolve([f"role:{r}"], doc)[0])),
+        ["impl"])
+    chk("docs KEEPS its sol lead (the separate docs-writing directive)",
+        resolve(["role:docs"], doc)[0][0], "sol")
+
+    # [OPUS-5] THE CATALOG GUARD, mutation-found. Re-adding [models.fable] to the LIVE routing
+    # table survived every registry self-test before this assertion existed.
+    import copy as _copy
+    _resurrected = _copy.deepcopy(doc)
+    _resurrected["models"]["fable"] = {"provider": "anthropic", "harness": "claude",
+                                       "provider_model": "claude-fable-5",
+                                       "credential_format": "claude-oauth-token"}
+    try:
+        resolve(["role:impl"], _resurrected)
+    except _DEP.DeprecatedModelError as exc:
+        chk("a resurrected [models.fable] catalog entry REFUSES to resolve",
+            "retired alias" in str(exc), True)
+    else:
+        chk("a resurrected [models.fable] catalog entry REFUSES to resolve", "resolved", "refused")
+    _smuggled = _copy.deepcopy(doc)
+    _smuggled["models"]["legacy"] = {"provider": "anthropic", "harness": "claude",
+                                     "provider_model": "claude-opus-4-8",
+                                     "credential_format": "claude-oauth-token"}
+    try:
+        resolve(["role:impl"], _smuggled)
+    except _DEP.DeprecatedModelError as exc:
+        chk("a retired provider id under a fresh alias REFUSES to resolve",
+            "retired provider_model" in str(exc), True)
+    else:
+        chk("a retired provider id under a fresh alias REFUSES to resolve", "resolved", "refused")
+    chk("the LIVE catalog defines no retired alias",
+        sorted(set(doc["models"]) & _DEP.DEPRECATED_ALIASES), [])
+    # [#122] an AMBIGUOUS multi-role set is REJECTED, never silently routed. An earlier resolver
+    # returned None for >1 role, collapsing ambiguity into the roleless case so the set fell to a
+    # security/defaults route (a default-allow path for any caller that skips the planner precheck).
+    # resolve now RAISES AmbiguousRoleError, mirroring policy-resolve.resolve (CLAIM), which raises
+    # PolicyError on multiple roles. Non-vacuous: the pre-fix code returned ("sol", ...) here.
+    raises("ambiguous roles rejected, not routed to a default", AmbiguousRoleError,
+           lambda: resolve(["role:impl", "role:docs", "area:usage"], doc))
+    # the guard precedes route matching (as in policy-resolve), so a security label present on the
+    # malformed issue does NOT let it slip past the ambiguity check into a security route.
+    raises("ambiguous roles rejected even with a security label present", AmbiguousRoleError,
+           lambda: resolve(["role:impl", "role:docs", "area:worker"], doc))
+    # [#122 r2] a bare `role:` (EMPTY value) and an UNCONFIGURED `role:<name>` are ALSO rejected,
+    # not routed to Phase-3 defaults — the CLAIM-side policy-resolve.resolve rejects an empty role
+    # value and a role absent from role_routes, so PLAN must too or the two diverge. Non-vacuous:
+    # the pre-fix resolver returned the permissive defaults chain (("sol", ...)) for BOTH inputs.
+    raises("empty role value rejected, not routed to defaults", EmptyRoleError,
+           lambda: resolve(["role:", "area:usage"], doc))
+    raises("unknown role rejected, not routed to defaults", UnknownRoleError,
+           lambda: resolve(["role:unknown", "area:usage"], doc))
+    # like ambiguity, both malformed-single-role guards PRECEDE route matching, so a security label
+    # on the malformed issue cannot let it slip into a security route (matches policy-resolve order).
+    raises("empty role rejected even with a security label present", EmptyRoleError,
+           lambda: resolve(["role:", "area:worker"], doc))
+    raises("unknown role rejected even with a security label present", UnknownRoleError,
+           lambda: resolve(["role:unknown", "area:worker"], doc))
+    # a CONFIGURED single role with a matching route still resolves (guards do not over-reject).
+    chk("configured role still routes", resolve(["role:research"], doc)[1], "registry-researcher")
     # review role -> opus + escalate.
     chk("review -> opus/escalate", resolve(["role:review"], doc)[1:], ("registry-reviewer", True))
+
+    # [#121] ORDER-INDEPENDENCE: security beats a role block listed BEFORE it. This is the exact
+    # PLAN/CLAIM divergence — policy-resolve is two-phase, so route-resolve MUST be too. The fixture
+    # deliberately puts the role route first: the old single-pass first-match returned the ROLE
+    # chain here (would FAIL), the two-phase resolver returns the SECURITY chain. Non-vacuous: the
+    # first check flips red on the pre-fix code.
+    reordered = tomllib.loads('''
+[defaults]
+model_chain = ["fable"]
+agent = "default-agent"
+
+[[route]]
+role = "impl"
+model_chain = ["fable", "haiku"]
+agent = "impl-agent"
+
+[[route]]
+match_labels = ["worker", "dispatch"]
+model_chain = ["opus"]
+agent = "security-agent"
+escalate = true
+''')
+    chk("security beats a role listed before it (order-independent)",
+        resolve(["role:impl", "area:worker"], reordered), (["opus"], "security-agent", True))
+    chk("role still resolves when no security label matches",
+        resolve(["role:impl", "area:usage"], reordered), (["fable", "haiku"], "impl-agent", False))
+    chk("no security + no matching role -> defaults",
+        resolve(["area:usage"], reordered), (["fable"], "default-agent", False))
+
+    # ---- [OPUS-5] THE DOCS-ONLY BOUND ON `inject_roles`, ON THE PLAN SIDE.
+    # THIS resolver has NO docs-only rule of its own: `_reject_docs_only` is a CLAIM-side
+    # (policy-resolve) control over statically declared chains. That is precisely why the bound on
+    # the INJECTED lead lives in the SHARED `chain_preference` module — enforcing it only on the
+    # CLAIM side would make CLAIM refuse while PLAN routed, which `_route_matches` turns into a
+    # permanent per-tick `route-policy-failed` defer rather than a closed hole. These rows assert
+    # PLAN refuses the identical declaration, so the two sides cannot split.
+    _pref_doc = _copy.deepcopy(doc)
+    _pref_doc["route"] = [r for r in _pref_doc["route"] if "match_labels" not in r]
+    _attack = _copy.deepcopy(_pref_doc)
+    _attack["chain_preference"] = [{"labels": ["area:gui"], "lead": "terra",
+                                    "requires": ["terra", "opus5"], "inject_roles": ["impl"]}]
+    raises("PLAN refuses a DOCS-ONLY lead injected into role:impl, at parse time — the same "
+           "refusal the CLAIM-side resolver gives, from the same shared module",
+           _PREF.ChainPreferenceError,
+           lambda: resolve(["area:gui", "role:impl"], _attack))
+    raises("...and refuses it for an issue the selector does NOT even match, because a bad "
+           "DECLARATION is refused when the table is READ, not when an issue happens to select it",
+           _PREF.ChainPreferenceError,
+           lambda: resolve(["area:usage", "role:impl"], _attack))
+    _docs_ok = _copy.deepcopy(_pref_doc)
+    _docs_ok["chain_preference"] = [{"labels": ["area:gui"], "lead": "terra",
+                                     "requires": ["terra", "opus5"], "inject_roles": ["docs"]}]
+    _docs_ok["route"] = [({**r, "model_chain": ["opus5"]} if r.get("role") == "docs" else r)
+                         for r in _docs_ok["route"]]
+    chk("...but a docs-only lead injected into role:docs still RESOLVES at PLAN (the bound mirrors "
+        "the _reject_docs_only EXEMPTION, so it is not a blanket ban)",
+        resolve(["area:gui", "role:docs"], _docs_ok)[0], ["terra", "opus5"])
+    # THE LIVE SHAPE sparq SHIPS: `lead = "sol"` + `inject_roles = ["impl"]`. Unchanged by the
+    # bound.
+    _live_shape = _copy.deepcopy(_pref_doc)
+    _live_shape["chain_preference"] = [{"labels": ["area:gui"], "lead": "sol",
+                                        "requires": ["sol", "opus5"], "inject_roles": ["impl"]}]
+    chk("the LIVE area:gui carve-out (lead = sol, inject_roles = [impl]) still injects sol-first "
+        "into the single-rung impl chain at PLAN",
+        resolve(["area:gui", "role:impl"], _live_shape)[0], ["sol", "opus5"])
+    chk("...and a non-gui impl issue is still OPUS5-ONLY under that same declaration",
+        resolve(["area:usage", "role:impl"], _live_shape)[0], ["opus5"])
+
     print("route-resolve self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 

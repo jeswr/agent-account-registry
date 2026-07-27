@@ -15,10 +15,31 @@ disabled, malformed, or ambiguously labelled repositories/roles fail closed.
 """
 import argparse
 import copy
+import importlib.util
+import re
+import pathlib
 import json
 from pathlib import Path, PurePosixPath
 import sys
 import tomllib
+
+
+def _import_sibling(module_name, filename):
+    """Import a sibling script by path. These scripts are invoked standalone (and loaded by
+    dispatch-claim via importlib), so there is no package to import from — but a SHARED rule must
+    still be imported rather than re-declared (the #715 idiom)."""
+    path = Path(__file__).resolve().with_name(filename)
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+# [OPUS-5] The CHAIN-ORDER PREFERENCE mechanism, imported — never re-declared. The rule itself
+# (which labels, which lead) lives in the TARGET's protected routing table, so PLAN's resolver and
+# this CLAIM-side resolver read the same declaration and cannot disagree about it.
+_chain_preference = _import_sibling("registry_chain_preference", "chain_preference.py")
+ChainPreferenceError = _chain_preference.ChainPreferenceError
 
 
 POLICY_PATH = "policy/repos.toml"
@@ -33,9 +54,16 @@ TRUST_MODES = {"collaborators"}
 # carrying one is a routing-document defect and fails CLOSED at validation time — structural
 # enforcement for ROUTING (sol r2 f3), mirroring the review-loop exclusion in worker-pr.py
 # ESCALATION_LADDERS / dispatch-claim.py REVIEW_CHAIN+FIX_CHAIN / review-fix.yml.
-DOCS_ONLY_MODELS = frozenset({"terra", "sonnet"})
+#
+# [OPUS-5] IMPORTED, never re-declared. `chain_preference` re-applies this same rule to an INJECTED
+# chain lead — the one thing that can put a model into a resolved chain that `_reject_docs_only`
+# below never saw, because injection happens AFTER validation. Two copies of the list would put the
+# CLAIM-side control and the injection bound either side of the very seam the bound closes: add a
+# third docs-only alias to one copy and the bypass silently returns. The self-test asserts these are
+# the SAME objects, so re-declaring them here reds.
+DOCS_ONLY_MODELS = _chain_preference.DOCS_ONLY_MODELS
 # Roles whose routes may legitimately carry the docs-only aliases.
-DOCS_ROLES = frozenset({"docs"})
+DOCS_ROLES = _chain_preference.DOCS_ROLES
 POLICY_FIELDS = {
     "enabled",
     "routing",
@@ -64,10 +92,77 @@ POLICY_FIELDS = {
 # [OPUS-4.8] security_paths (B3 / defects #2,#4): the additive FILE-level trust-surface control
 # for the review lane. A worker PR whose diff touches ANY listed path/prefix routes its ARM to a
 # HUMAN even for a benign-labelled PR — CONSUMED by review-fix.yml (review-outcome + ready-and-arm
-# pass it to worker-pr.trust_surface_paths_touched). NOT a dead tier: an empty/absent list simply
-# means the worker-pr.py DEFAULT_TRUST_SURFACE_PATHS applies (the guard is never silently off).
+# pass it to worker-pr.trust_surface_paths_touched). NOT a dead tier: [issue #166] this list is
+# UNIONED onto the mandatory worker-pr.py DEFAULT_TRUST_SURFACE_PATHS (resolve_trust_surface_paths)
+# — it EXTENDS the built-in floor, it never replaces it, so a non-empty list only ADDS per-target
+# surfaces and an empty/absent one leaves the defaults in force (the guard is never silently off).
+# trusted_bots (registry issue #111): the EXACT, policy-controlled allowlist of trusted App bot
+# logins (or App-derived login strings) that the dispatcher admits as issue authors ALONGSIDE the
+# `trust = "collaborators"` associations (OWNER/MEMBER/COLLABORATOR). It exists to give the declared
+# `trust` field teeth: without it the dispatcher suffix-matched any "<x>[bot]" login and admitted
+# unrelated or compromised GitHub Apps. CLAIM unions this list with the RUNTIME-resolved worker App
+# bot login (dispatch-claim `bot_login`) so an empty/absent list still trusts our own App bot; it is
+# for ADDITIONAL known bots. Absent => empty (fail-closed: no bot is trusted by suffix).
+# allow_actions_bot_issues (registry issue #487): per-repo opt-in for ONLY the exact
+# `github-actions[bot]` issue-author login. It defaults false. Fork-PR workflows receive read-only
+# tokens and cannot create issues, so that login can author an issue in one of our own repositories
+# only through a workflow controlled by that repository; this does not broaden any other bot or
+# author class.
+# [FABLE-5] Observability-only sub-tables consumed by scripts/metrics.py (throughput alert
+# thresholds + the per-target readiness-engine selector). policy-resolve accepts-and-ignores them
+# so the dispatch/groom resolver never rejects a policy augmented for the metrics collector; the
+# collector does its own strict validation of their contents.
+# [OPUS-5] review_enrolment_authors (issue #657, research/657-orchestrator-pr-admission.md §6):
+# the MASTER-PROTECTED half of orchestrator-PR admission.
+#
+# The review lane's shape gates — a `sparq-agent/issue-N-` head ref and a `[bot]` author — select
+# the population the WORKER lane produces. A PR the orchestrator authored itself, on an ordinary
+# branch under the maintainer's token, is therefore structurally unreachable by review however
+# correct it is: not deferred, not parked, invisible. Admission re-admits that class, and needs
+# BOTH halves:
+#   1. a provenance record whose attestation class is `orchestrator` (per-PR, `ledger` branch),
+#      and
+#   2. the PR author's login appearing in THIS list (per-repo, master).
+# Both are required because the two branches carry DIFFERENT authority. Provenance records live
+# on `ledger` precisely because master's required `gate` check rejects direct contents-API PUTs
+# (issue #96), so minting a record is a LOW-authority act available to anything holding the App
+# token. This list sits on master, behind the gate and branch protection, so the SET of logins
+# that can ever be admitted is a reviewed change even when an individual record is not. A record
+# naming a login absent from here admits NOTHING (fail-closed; absent => empty list => the shape
+# gates stand exactly as they do today).
+#
+# Entries are canonical lowercase GitHub USER logins. A `[bot]` login is REFUSED: a bot already
+# satisfies the author gate, so listing one could only widen it to an unrelated App.
+#
+# This list NEVER waives the fork gate (`head.repo == target`), the provenance-record field
+# admission, the human holds, the machine parks, or any lease rule. Nor does it make the class
+# equal to a worker PR: per the design record's Option 2(b) the class is REVIEW-ONLY, and its
+# reviewer side is a CONSTANT, never resolved by inverting the record's self-declared
+# `impl_provider` — for a self-authored PR that field is an assertion by the implementer about
+# itself, and inverting it yields a same-provider review that merely LOOKS cross-provider.
 OPTIONAL_POLICY_FIELDS = {"require_usage", "usage_safety_margin", "max_review_rounds",
-                          "review_queue_ttl_minutes", "cross_provider_fallback", "security_paths"}
+                          "review_queue_ttl_minutes", "cross_provider_fallback", "security_paths",
+                          "trusted_bots", "allow_actions_bot_issues", "throughput", "readiness",
+                          "review_enrolment_authors"}
+
+# A canonical GitHub USER login: ASCII alphanumeric with internal single hyphens, <= 39 chars.
+# Deliberately excludes the "[bot]" suffix — see the OPTIONAL_POLICY_FIELDS note above.
+GITHUB_LOGIN_RE = re.compile(r"[a-z0-9](?:-?[a-z0-9]){0,38}")
+
+
+# Slots whose underlying account is dead and which must never appear in an account_pool again.
+# Retiring an account removes it from policy/repos.toml; this is the guard that keeps it out.
+# Each entry is permanent — set-up-account's slot-allocation union counts acctNN issues in ANY
+# state, so a retired name can never be legitimately re-enrolled, and a reappearance in a pool is
+# always an error rather than a re-enrolment.
+# The canonical account-handle form. Same shape as grant-account.HANDLE_RE — deliberately
+# duplicated rather than imported, since these scripts are invoked standalone.
+ACCOUNT_HANDLE_RE = re.compile(r"acct[0-9a-z]{2,}")
+
+RETIRED_ACCOUNTS = frozenset({
+    "acct03",  # amydouglas1@hotmail.com — cancelled 2026-07-25
+    "acct06",  # jwrightwho — expired 2026-07-25
+})
 
 
 class PolicyError(ValueError):
@@ -110,8 +205,44 @@ def _policy_row(target_repo, policy_doc):
     if (not isinstance(pool, list) or not pool
             or any(not isinstance(account, str) or not account.strip() for account in pool)):
         raise PolicyError(f"account_pool for {target_repo!r} must be a non-empty string list")
+    # CANONICAL FORM IS AN INVARIANT, enforced here at the boundary rather than normalised at
+    # each comparison site. Cross-provider review round 3 on #660: the retirement guard below
+    # intersected the RAW values while this validation only required `.strip()` to be non-empty,
+    # so `" acct03"` passed as a legal handle AND evaded the retirement intersection. The
+    # consequence went further than a bypass — select-and-claim STRIPS before matching, so the
+    # padded entry became eligible, a CAS lease was created, the raw post-claim comparison then
+    # failed before publishing `acquired`, and the release job (gated on `acquired == 'true'`)
+    # never ran: the lease LEAKED until its 4200/6300s TTL.
+    #
+    # Rejecting non-canonical handles fixes the whole family at once. Normalising instead would
+    # leave every present and future comparison site obliged to remember, and one that forgets
+    # reintroduces exactly this bug. Pattern matches grant-account.HANDLE_RE.
+    noncanonical = [a for a in pool if ACCOUNT_HANDLE_RE.fullmatch(a) is None]
+    if noncanonical:
+        raise PolicyError(
+            f"account_pool for {target_repo!r} contains non-canonical handle(s) "
+            f"{noncanonical!r} — handles must match {ACCOUNT_HANDLE_RE.pattern} exactly, with "
+            f"no surrounding whitespace or case variation, so that every downstream comparison "
+            f"(retirement, claim, secret lookup) operates on the same value")
     if len(set(pool)) != len(pool):
         raise PolicyError(f"account_pool for {target_repo!r} contains duplicates")
+    # A RETIRED slot must never reappear in a pool. Retirement removes the account from
+    # policy/repos.toml, but nothing structurally stopped a later edit — or a revert — from
+    # putting it back, at which point dispatch burns claims on a dead credential and the review
+    # lane stalls. Cross-provider review of the acct06 retirement (#660) named exactly this gap:
+    # "the unchanged baseline already contained acct06, so the self-tests evidently do not
+    # enforce its retirement; re-adding it would not be caught."
+    #
+    # This is deliberately a HARD refusal rather than a warning: the failure mode it prevents is
+    # silent, and the slot names are permanently reserved anyway (set-up-account counts acctNN
+    # issues in ANY state, so a retired slot can never be legitimately re-enrolled under the same
+    # name — a reappearance is always a mistake).
+    retired = sorted(set(pool) & RETIRED_ACCOUNTS)
+    if retired:
+        raise PolicyError(
+            f"account_pool for {target_repo!r} names RETIRED account(s) {retired} — "
+            f"these credentials are dead and their slot names are permanently reserved; "
+            f"enrol a NEW slot instead of reusing one")
 
     for field in ("max_concurrent", "worker_timeout_minutes", "max_attempts"):
         if not _positive_int(row[field]):
@@ -133,6 +264,29 @@ def _policy_row(target_repo, policy_doc):
             raise PolicyError(f"{field} for {target_repo!r} must be a positive integer")
     if "cross_provider_fallback" in row and not isinstance(row["cross_provider_fallback"], bool):
         raise PolicyError(f"cross_provider_fallback for {target_repo!r} must be boolean")
+    if ("allow_actions_bot_issues" in row
+            and not isinstance(row["allow_actions_bot_issues"], bool)):
+        raise PolicyError(f"allow_actions_bot_issues for {target_repo!r} must be boolean")
+    if "review_enrolment_authors" in row:
+        authors = row["review_enrolment_authors"]
+        # CANONICAL FORM IS AN INVARIANT here for the same reason it is for account_pool: the
+        # consumer (dispatch-claim.admits_orchestrator_pr) compares casefolded, so " JesWR" would
+        # match at the comparison site while reading as a different value in review. Rejecting
+        # non-canonical entries at the boundary keeps the reviewed text and the matched value
+        # the same string.
+        if not isinstance(authors, list) or any(not isinstance(a, str) for a in authors):
+            raise PolicyError(
+                f"review_enrolment_authors for {target_repo!r} must be a list of login strings")
+        noncanonical = [a for a in authors if GITHUB_LOGIN_RE.fullmatch(a) is None]
+        if noncanonical:
+            raise PolicyError(
+                f"review_enrolment_authors for {target_repo!r} contains non-canonical "
+                f"login(s) {noncanonical!r} — each entry must match "
+                f"{GITHUB_LOGIN_RE.pattern} exactly (lowercase, no whitespace, no '[bot]' "
+                f"suffix: a bot already satisfies the author gate and needs no enrolment)")
+        if len(set(authors)) != len(authors):
+            raise PolicyError(
+                f"review_enrolment_authors for {target_repo!r} contains duplicates")
     if "security_paths" in row:
         paths = row["security_paths"]
         if (not isinstance(paths, list)
@@ -142,7 +296,36 @@ def _policy_row(target_repo, policy_doc):
                 f"security_paths for {target_repo!r} must be a list of non-empty strings")
         if len(set(paths)) != len(paths):
             raise PolicyError(f"security_paths for {target_repo!r} contains duplicates")
-    return row
+    if "trusted_bots" in row:
+        bots = row["trusted_bots"]
+        if (not isinstance(bots, list)
+                or any(not isinstance(b, str) or not b.strip() or "\n" in b or "\r" in b
+                       for b in bots)):
+            raise PolicyError(
+                f"trusted_bots for {target_repo!r} must be a list of non-empty login strings")
+        if len(set(bots)) != len(bots):
+            raise PolicyError(f"trusted_bots for {target_repo!r} contains duplicates")
+    # Return the same validated policy shape every consumer sees. In particular, CLAIM reads this
+    # row directly before route resolution, so the security-sensitive #487 default must live in
+    # this shared loader rather than be independently guessed at each call site.
+    normalized = dict(row)
+    normalized.setdefault("allow_actions_bot_issues", False)
+    normalized.setdefault("review_enrolment_authors", [])
+    return normalized
+
+
+def review_enrolment_authors(target_repo, policy_doc):
+    """The master-protected set of logins this repo may enrol into the review lane (casefolded).
+
+    Read by the PLAN assemble step and handed to enumerate_review_items. Deliberately NOT
+    surfaced through resolve(): resolve's output dict is compared field-by-field by
+    dispatch-claim._route_matches against the TARGET-side resolver, so adding a key there
+    would be a cross-repo contract change; this is a separate, registry-only read.
+
+    Absent / empty => empty frozenset, i.e. enrolment is OFF and the shape gates stand exactly
+    as before. _policy_row has already refused a malformed or non-canonical list, so reaching
+    here means every entry is a canonical login."""
+    return frozenset(_policy_row(target_repo, policy_doc)["review_enrolment_authors"])
 
 
 def _normalise_labels(role_or_labels):
@@ -232,7 +415,16 @@ def _validated_routing(routing_doc):
             if role not in DOCS_ROLES:
                 _reject_docs_only(value[0], f"{where} (role {role!r})")
             role_routes[role] = value
-    return default_value, security_routes, role_routes
+    # [OPUS-5] Chain-order preferences, declared BY THE TARGET in its protected routing table and
+    # validated here against that table's own [models] catalog. A malformed declaration is raised
+    # as a PolicyError so every caller keeps ONE fail-closed error class: silently ignoring it
+    # would make CLAIM resolve a chain PLAN did not plan — which is not a lost preference but a
+    # permanent per-item defer.
+    try:
+        preferences = _chain_preference.parse_preferences(routing_doc, set(models))
+    except ChainPreferenceError as exc:
+        raise PolicyError(f"routing chain_preference is invalid: {exc}") from exc
+    return default_value, security_routes, role_routes, preferences
 
 
 def resolve(target_repo, role_or_labels, policy_doc, routing_doc):
@@ -243,7 +435,7 @@ def resolve(target_repo, role_or_labels, policy_doc, routing_doc):
     """
     policy = _policy_row(target_repo, policy_doc)
     labels = _normalise_labels(role_or_labels)
-    defaults, security_routes, role_routes = _validated_routing(routing_doc)
+    defaults, security_routes, role_routes, preferences = _validated_routing(routing_doc)
 
     roles = sorted({label[5:] for label in labels if label.startswith("role:")})
     if any(not role for role in roles):
@@ -259,9 +451,19 @@ def resolve(target_repo, role_or_labels, policy_doc, routing_doc):
         if any(keyword in label for label in labels for keyword in keywords):
             routed = value
             break
-    if routed is None:
+    if routed is not None:
+        # A SECURITY surface is returned UNMODIFIED. An implementor-preference rule must never
+        # re-order a soundness chain: `area:gui` + `area:sparq-zk` is a ZK issue first. This
+        # matches the target-side resolver, which also returns its security route untouched.
+        model_chain, agent, escalate = routed
+    else:
         routed = role_routes[role] if role is not None else defaults
-    model_chain, agent, escalate = routed
+        model_chain, agent, escalate = routed
+        # `role` is passed so a preference's `inject_roles` allow-list can be evaluated: adding the
+        # lead to a chain that lacks it is legal only for the roles the DECLARATION names. `role` is
+        # None for a ROLELESS issue (the defaults branch), which can never be injected into.
+        model_chain = _chain_preference.apply_preferences(labels, model_chain, preferences,
+                                                         role=role)
 
     return {
         "target_repo": target_repo,
@@ -279,6 +481,8 @@ def resolve(target_repo, role_or_labels, policy_doc, routing_doc):
         "review_queue_ttl_minutes": int(policy.get("review_queue_ttl_minutes", 30)),
         "cross_provider_fallback": bool(policy.get("cross_provider_fallback", False)),
         "security_paths": list(policy.get("security_paths", [])),
+        "trusted_bots": list(policy.get("trusted_bots", [])),
+        "allow_actions_bot_issues": policy["allow_actions_bot_issues"],
         "worker_timeout_minutes": policy["worker_timeout_minutes"],
         "max_attempts": policy["max_attempts"],
         "trust": policy["trust"],
@@ -297,7 +501,7 @@ def routing_security_keywords(target_repo, policy_file=POLICY_PATH, target_root=
     """
     policy = _policy_row(target_repo, _load_toml(policy_file, "policy file"))
     routing_file = Path(target_root).joinpath(*PurePosixPath(policy["routing"]).parts)
-    _, security_routes, _ = _validated_routing(_load_toml(routing_file, "routing file"))
+    _, security_routes, _, _ = _validated_routing(_load_toml(routing_file, "routing file"))
     keywords = set()
     for match_keywords, _value in security_routes:
         keywords.update(match_keywords)
@@ -414,8 +618,188 @@ agent = "docs-agent"
                               'max_concurrent=1\nworker_timeout_minutes=30\ngate_profile="lint-only"\n'
                               'arm_auto_merge=false\nmax_attempts=1\ntrust="collaborators"\n'
                               'security_paths=["ok", ""]\n')
+    # A RETIRED slot reappearing in a pool must be a HARD refusal (#660 review finding 1: the
+    # retirement was enforced by nothing, so re-adding acct06 would have gone unnoticed). Both
+    # halves are asserted: the retired name is refused, AND the otherwise-identical live pool is
+    # accepted — without the second, the check would also pass if resolve() rejected everything.
+    def _policy_with_pool(pool):
+        doc = copy.deepcopy(policy)
+        doc["repos"]["sparq-org/sparq"]["account_pool"] = pool
+        return doc
+
+    # Pinned explicitly. The loop below iterates OVER the registry, so emptying the registry
+    # would silently reduce it to zero assertions and stay green — found by mutation, and the
+    # same "test derives its cases from the implementation" shape as the #659 r2 finding.
+    check("the retired registry holds the known retirements (emptying it must not silently "
+          "disable every check below)",
+          sorted(RETIRED_ACCOUNTS), ["acct03", "acct06"])
+    # NON-CANONICAL handles are refused outright (#660 review r3). Padding is the case that
+    # bit us: `" acct03"` was a legal handle to the old validation AND invisible to the raw
+    # retirement intersection, and downstream select-and-claim strips before matching, so it
+    # became claimable and leaked a CAS lease to its TTL. Every variant that could reach a
+    # different value at a different comparison site is pinned here.
+    for bad in (" acct03", "acct03 ", "\tacct03", "acct03\n", "ACCT03", "Acct03",
+                " acct02", "acct02 ", "ACCT02", "acct 02", "acct03;acct01"):
+        rejects(f"non-canonical handle {bad!r} is refused", "non-canonical",
+                lambda h=bad: resolve("sparq-org/sparq", "impl",
+                                      _policy_with_pool(["acct01", h]), routing))
+    # "" is refused too, but by the EARLIER non-empty check with a different message — asserted
+    # separately so this does not read as a gap in the canonical-handle check.
+    rejects("an empty handle is refused (by the non-empty guard, not the shape guard)",
+            "non-empty string list",
+            lambda: resolve("sparq-org/sparq", "impl", _policy_with_pool(["acct01", ""]), routing))
+    check("a canonical pool is still accepted (the handle check is a shape check, not a "
+          "blanket refusal)",
+          resolve("sparq-org/sparq", "impl",
+                  _policy_with_pool(["acct01", "acct2css"]), routing)["account_pool"],
+          ["acct01", "acct2css"])
+    # The shipped config must itself be canonical, or the retirement intersection below is
+    # comparing against values that may not be what downstream sees.
+    check("every account in the SHIPPED policy/repos.toml is canonical",
+          sorted({a for row in tomllib.loads(
+                      pathlib.Path(__file__).resolve().parent.parent
+                      .joinpath("policy/repos.toml").read_text(encoding="utf-8"))["repos"].values()
+                  for a in row.get("account_pool", [])
+                  if ACCOUNT_HANDLE_RE.fullmatch(a) is None}),
+          [])
+
+    for retired_slot in sorted(RETIRED_ACCOUNTS):
+        rejects(f"a RETIRED slot ({retired_slot}) in an account_pool is refused", "RETIRED",
+                lambda slot=retired_slot: resolve(
+                    "sparq-org/sparq", "impl", _policy_with_pool(["acct01", slot]), routing))
+    check("the same pool WITHOUT a retired slot is accepted (the refusal is specific, not a "
+          "blanket rejection)",
+          resolve("sparq-org/sparq", "impl",
+                  _policy_with_pool(["acct01", "acct02"]), routing)["account_pool"],
+          ["acct01", "acct02"])
+    # The guard is worthless if the SHIPPED configuration still names a dead account.
+    _live = tomllib.loads(pathlib.Path(__file__).resolve().parent.parent
+                          .joinpath("policy/repos.toml").read_text(encoding="utf-8"))
+    check("the SHIPPED policy/repos.toml names no retired account",
+          sorted({a for row in _live["repos"].values()
+                  for a in row.get("account_pool", [])} & RETIRED_ACCOUNTS),
+          [])
+
     rejects("security_paths rejects empty entry", "security_paths",
             lambda: resolve("o/r", "impl", bad_paths, routing))
+    # trusted_bots (issue #111): validated exact-login allowlist, default empty, surfaced.
+    check("trusted_bots default empty", impl["trusted_bots"], [])
+    tb = tomllib.loads('[repos."o/r"]\nenabled=true\nrouting="r.toml"\naccount_pool=["acct01"]\n'
+                       'max_concurrent=1\nworker_timeout_minutes=30\ngate_profile="lint-only"\n'
+                       'arm_auto_merge=false\nmax_attempts=1\ntrust="collaborators"\n'
+                       'trusted_bots=["reg-app[bot]", "groom[bot]"]\n')
+    check("trusted_bots surfaced", resolve("o/r", "impl", tb, routing)["trusted_bots"],
+          ["reg-app[bot]", "groom[bot]"])
+    bad_bots = tomllib.loads('[repos."o/r"]\nenabled=true\nrouting="r.toml"\naccount_pool=["acct01"]\n'
+                             'max_concurrent=1\nworker_timeout_minutes=30\ngate_profile="lint-only"\n'
+                             'arm_auto_merge=false\nmax_attempts=1\ntrust="collaborators"\n'
+                             'trusted_bots=["ok", ""]\n')
+    rejects("trusted_bots rejects empty entry", "trusted_bots",
+            lambda: resolve("o/r", "impl", bad_bots, routing))
+    dup_bots = tomllib.loads('[repos."o/r"]\nenabled=true\nrouting="r.toml"\naccount_pool=["acct01"]\n'
+                             'max_concurrent=1\nworker_timeout_minutes=30\ngate_profile="lint-only"\n'
+                             'arm_auto_merge=false\nmax_attempts=1\ntrust="collaborators"\n'
+                             'trusted_bots=["dup[bot]", "dup[bot]"]\n')
+    rejects("trusted_bots rejects duplicates", "trusted_bots",
+            lambda: resolve("o/r", "impl", dup_bots, routing))
+    # ---- [OPUS-5 #657] review_enrolment_authors: the master-protected half of orchestrator-PR
+    # admission. Absent => empty => admission is OFF, which is the shipped state of every repo. ----
+    def _authors(body):
+        return review_enrolment_authors("o/r", tomllib.loads(
+            '[repos."o/r"]\nenabled=true\nrouting="r.toml"\naccount_pool=["acct01"]\n'
+            'max_concurrent=1\nworker_timeout_minutes=30\ngate_profile="lint-only"\n'
+            'arm_auto_merge=false\nmax_attempts=1\ntrust="collaborators"\n' + body))
+
+    check("review_enrolment_authors defaults EMPTY (admission off)", _authors(""), frozenset())
+    check("review_enrolment_authors surfaced",
+          _authors('review_enrolment_authors=["jeswr"]\n'), frozenset({"jeswr"}))
+    check("review_enrolment_authors accepts an explicitly empty list",
+          _authors("review_enrolment_authors=[]\n"), frozenset())
+    # A `[bot]` login is REFUSED. A bot already satisfies the review lane's author gate, so the
+    # only thing listing one could do is widen that gate to some OTHER App — the exact
+    # suffix-matching hole issue #111 closed for trusted_bots. Deleting the pattern check
+    # re-opens it, and this line goes red.
+    rejects("review_enrolment_authors refuses a [bot] login", "non-canonical",
+            lambda: _authors('review_enrolment_authors=["some-app[bot]"]\n'))
+    # CANONICAL FORM IS AN INVARIANT (the account_pool lesson): the consumer compares
+    # casefolded, so a padded or upper-case entry would MATCH at the comparison site while
+    # reading as a different value in review. Reject at the boundary instead.
+    for _bad, _why in (('" jeswr"', "leading space"), ('"JesWR"', "upper case"),
+                       ('"jeswr "', "trailing space"), ('""', "empty"),
+                       ('"-jeswr"', "leading hyphen"), ('"a b"', "space"),
+                       ('"jeswr\\n"', "newline"), ("7", "non-string")):
+        rejects(f"review_enrolment_authors refuses {_why}",
+                "review_enrolment_authors",
+                lambda body=f"review_enrolment_authors=[{_bad}]\n": _authors(body))
+    rejects("review_enrolment_authors refuses duplicates", "duplicates",
+            lambda: _authors('review_enrolment_authors=["jeswr", "jeswr"]\n'))
+    rejects("review_enrolment_authors must be a list", "must be a list",
+            lambda: _authors('review_enrolment_authors="jeswr"\n'))
+    # The field must be a RECOGNISED optional key: an unknown key is a hard refusal here, so a
+    # typo in policy/repos.toml fails the whole tick loudly instead of silently enrolling nobody.
+    check("review_enrolment_authors is a recognised optional field",
+          "review_enrolment_authors" in OPTIONAL_POLICY_FIELDS, True)
+    rejects("a TYPO'd enrolment key is refused, not ignored", "unknown fields",
+            lambda: _authors('review_enrolment_author=["jeswr"]\n'))
+    # It is NOT surfaced through resolve(): that dict is compared field-by-field against the
+    # TARGET-side resolver by dispatch-claim._route_matches, so an extra key there would be a
+    # cross-repo contract change causing permanent per-tick defers.
+    check("resolve() output is unchanged by enrolment", "review_enrolment_authors" in impl, False)
+
+    # ---- [registry #657 / #759] THE ENABLE INTERLOCK, from the OTHER SIDE OF THE SEAM ----------
+    # This module owns the master-protected allowlist; dispatch-claim owns the downstream wiring
+    # facts. While ANY consumer is not ready, a repo that ships the key enabled turns every
+    # enrolled PR into a loop that repeats every tick forever — refused at CLAIM, SystemExit'd at
+    # review-fix `resolve`, or silently DROPPED at the outcome step — with a generic defer counter
+    # as its only symptom (research/657-orchestrator-pr-admission.md §7.4). The fourth fact is
+    # INVERTED: the ARM must REFUSE the class, because that leg's failure mode is not a stall, it
+    # is a MERGE authorised by a provenance record the implementer wrote about itself.
+    #
+    # The same consistency check lives in dispatch-claim's self-test. It is DUPLICATED here on
+    # purpose, and this is the one duplication in this area that is not drift: both copies call the
+    # SAME `enrolment_enable_error` with the SAME probe functions, so they cannot disagree about
+    # the rule — only about whether it is checked at all. MEASURED reason: with dispatch-claim's
+    # copy alone, a single diff that enabled the key AND deleted that one assertion stayed green
+    # (mutant E4). Two enrolled scripts now have to be edited to get an enabling diff past `gate`.
+    _dc = _import_sibling("registry_dispatch_claim_enrolment_interlock", "dispatch-claim.py")
+    _live_policy = tomllib.loads(Path(__file__).resolve().parent.parent
+                                 .joinpath(POLICY_PATH).read_text(encoding="utf-8"))
+    _wiring = (_dc.claim_admits_orchestrator_class(),
+               _dc.review_fix_admits_orchestrator_class(),
+               _dc.outcome_admits_orchestrator_class(),
+               _dc.arm_refuses_orchestrator_class())
+    check("the SHIPPED policy enables no enrolment the review lane cannot yet serve",
+          _dc.enrolment_enable_error(_live_policy, *_wiring), None)
+    # NON-VACUOUS, and per-leg: the check above passes today because nothing is enabled, so prove
+    # the predicate reds on an enabling policy for EVERY leg independently. A single truthy row
+    # would let three of the four facts be dropped from the conjunction with nothing red.
+    _enabling = {"repos": {"o/r": {"review_enrolment_authors": ["jeswr"]}}}
+    for _index, _leg in enumerate(
+            ("CLAIM", "review-fix.yml resolve", "review-fix.yml outcome", "the arm refusal")):
+        _broken = list(_wiring)
+        _broken[_index] = not _broken[_index]
+        check(f"...and an enabling policy WOULD be refused with {_leg} not ready",
+              _dc.enrolment_enable_error(_enabling, *_broken) is not None, True)
+    check("...and an enabling policy is permitted once every leg is ready",
+          _dc.enrolment_enable_error(_enabling, True, True, True, True), None)
+
+    # Issue #487: the exact actions-bot exception is a validated, per-repo opt-in. Missing means
+    # false so a newly onboarded repository cannot inherit this author class accidentally.
+    check("allow_actions_bot_issues defaults false", impl["allow_actions_bot_issues"], False)
+    actions_opt_in = tomllib.loads(
+        '[repos."o/r"]\nenabled=true\nrouting="r.toml"\naccount_pool=["acct01"]\n'
+        'max_concurrent=1\nworker_timeout_minutes=30\ngate_profile="lint-only"\n'
+        'arm_auto_merge=false\nmax_attempts=1\ntrust="collaborators"\n'
+        'allow_actions_bot_issues=true\n')
+    check("allow_actions_bot_issues surfaced",
+          resolve("o/r", "impl", actions_opt_in, routing)["allow_actions_bot_issues"], True)
+    bad_actions_opt_in = tomllib.loads(
+        '[repos."o/r"]\nenabled=true\nrouting="r.toml"\naccount_pool=["acct01"]\n'
+        'max_concurrent=1\nworker_timeout_minutes=30\ngate_profile="lint-only"\n'
+        'arm_auto_merge=false\nmax_attempts=1\ntrust="collaborators"\n'
+        'allow_actions_bot_issues="yes"\n')
+    rejects("allow_actions_bot_issues requires a boolean", "allow_actions_bot_issues",
+            lambda: resolve("o/r", "impl", bad_actions_opt_in, routing))
     bad_rounds = tomllib.loads('[repos."o/r"]\nenabled=true\nrouting="r.toml"\naccount_pool=["acct01"]\n'
                                'max_concurrent=1\nworker_timeout_minutes=30\ngate_profile="lint-only"\n'
                                'arm_auto_merge=false\nmax_attempts=1\ntrust="collaborators"\n'
@@ -520,6 +904,147 @@ agent = "docs-agent"
         rejects("structurally invalid routing yields NO keyword set (fail closed)",
                 "routing defaults table is required",
                 lambda: routing_security_keywords("o/r", tmp_policy, tmp_target))
+    # ---- [OPUS-5] CHAIN-ORDER PREFERENCES (sparq PR #4211 / the area:gui carve-out).
+    # THIS resolver is the CLAIM side. PLAN runs the TARGET's route-resolve.py and
+    # dispatch-claim._route_matches then demands EXACT equality of the chain, so a preference this
+    # resolver does not implement is a permanent `route-policy-failed` defer for every issue it
+    # selects — 34 of sparq's 35 open `area:gui` issues, on every tick, forever. The rule is read
+    # from the TARGET's protected routing table (data), never hard-coded here.
+    pref_routing = copy.deepcopy(routing)
+    pref_routing["models"]["opus5"] = {"provider": "anthropic"}
+    pref_routing["models"]["sol"] = {"provider": "openai"}
+    pref_routing["defaults"]["model_chain"] = ["opus5", "sol"]
+    pref_routing["route"][0]["model_chain"] = ["opus5", "sol"]        # role = impl
+    pref_routing["route"][1]["model_chain"] = ["opus5"]               # the security override
+    pref_routing["route"].append({"role": "research", "model_chain": ["opus5"],
+                                  "agent": "research-agent", "escalate": True})
+    pref_routing["route"].append({"role": "perf", "model_chain": ["opus5", "sol"],
+                                  "agent": "impl-agent"})
+    pref_routing["route"].append({"role": "site", "model_chain": ["opus5", "sol"],
+                                  "agent": "site-agent"})
+    pref_routing["chain_preference"] = [
+        {"labels": ["area:gui"], "lead": "sol", "requires": ["sol", "opus5"]}]
+
+    def pref_chain(labels):
+        return resolve("sparq-org/sparq", labels, policy, pref_routing)["model_chain"]
+
+    check("area:gui + role:impl -> SOL-first at CLAIM (the 33-issue case)",
+          pref_chain(["area:gui", "role:impl", "priority:P2"]), ["sol", "opus5"])
+    check("area:gui + role:perf -> SOL-first at CLAIM (the 34th issue)",
+          pref_chain(["area:gui", "role:perf"]), ["sol", "opus5"])
+    check("area:gui with NO role -> defaults, SOL-first",
+          pref_chain(["area:gui", "priority:P2"]), ["sol", "opus5"])
+    check("PREFERENCE, NOT EXCLUSION: opus5 stays reachable behind sol",
+          "opus5" in pref_chain(["area:gui", "role:impl"]), True)
+    check("the carve-out re-orders the chain and NEVER re-routes the agent",
+          resolve("sparq-org/sparq", ["area:gui", "role:impl"], policy, pref_routing)["agent"],
+          "impl-agent")
+    check("area:gui + role:research is UNTOUCHED (both-implementors condition declines, so a "
+          "single-provider escalating route is not silently made cross-provider)",
+          (pref_chain(["area:gui", "role:research"]),
+           resolve("sparq-org/sparq", ["area:gui", "role:research"], policy,
+                   pref_routing)["escalate"]),
+          (["opus5"], True))
+    check("area:gui + a SECURITY surface -> soundness route, UNMODIFIED",
+          (pref_chain(["area:gui", "role:impl", "area:sparq-zk"]),
+           resolve("sparq-org/sparq", ["area:gui", "role:impl", "area:sparq-zk"], policy,
+                   pref_routing)["agent"]),
+          (["opus5"], "security-agent"))
+    # ...AND THE SAME EXEMPTION WITH A CROSS-PROVIDER SOUNDNESS CHAIN. Found by mutation: with
+    # today's single-model security chain (["opus5"]) the `requires` condition declines anyway, so
+    # applying the preference to the security branch was an UNDETECTABLE mutation — the exemption
+    # was defence-in-depth with no red test, exactly the shape a reviewer flagged as "worth an
+    # assertion if a security route ever becomes cross-provider". This fixture makes it one now,
+    # rather than after some future edit makes the soundness lane cross-provider.
+    xprov_sec = copy.deepcopy(pref_routing)
+    xprov_sec["route"][1]["model_chain"] = ["opus5", "sol"]
+    check("a CROSS-PROVIDER security route is STILL returned unmodified under area:gui (the "
+          "exemption is the ROUTE CLASS, not an accident of that chain being single-model)",
+          resolve("sparq-org/sparq", ["area:gui", "role:impl", "area:sparq-zk"], policy,
+                  xprov_sec)["model_chain"], ["opus5", "sol"])
+    check("...and the same table still applies the preference on the ROLE branch, so the check "
+          "above is an exemption and not a dead fixture",
+          resolve("sparq-org/sparq", ["area:gui", "role:impl"], policy,
+                  xprov_sec)["model_chain"], ["sol", "opus5"])
+    for outside in ("area:site", "area:site-specs", "area:site-papers", "area:sitemap",
+                    "surface:frontend", "dashboard", "area:guide", "area:guidance"):
+        check(f"{outside} is OUTSIDE the carve-out (opus5-first)",
+              pref_chain([outside, "role:impl"]), ["opus5", "sol"])
+    check("a plain crate area is unaffected", pref_chain(["area:sparq-core", "role:impl"]),
+          ["opus5", "sol"])
+    # THE SAFE-TO-DEPLOY-FIRST PROPERTY, asserted rather than asserted-in-prose: against a routing
+    # table with NO declaration this resolver returns exactly what it returned before this change,
+    # which is what makes landing the registry side ahead of the target side a strict no-op.
+    no_decl = copy.deepcopy(pref_routing)
+    del no_decl["chain_preference"]
+    check("NO declaration in the target's table -> the pre-change chain, unchanged",
+          resolve("sparq-org/sparq", ["area:gui", "role:impl"], policy, no_decl)["model_chain"],
+          ["opus5", "sol"])
+    # Fail-closed: a malformed declaration must REFUSE, not resolve past it. A dropped preference
+    # is precisely a PLAN/CLAIM divergence.
+    bad_pref = copy.deepcopy(pref_routing)
+    bad_pref["chain_preference"] = [
+        {"labels": ["area:gui"], "lead": "sol", "requires": ["opus5"]}]
+    rejects("a lead outside requires REFUSES to resolve (it could INJECT a model)",
+            "chain_preference is invalid",
+            lambda: resolve("sparq-org/sparq", ["area:gui", "role:impl"], policy, bad_pref))
+    ghost_pref = copy.deepcopy(pref_routing)
+    ghost_pref["chain_preference"] = [
+        {"labels": ["area:gui"], "lead": "ghost", "requires": ["ghost"]}]
+    rejects("a preference naming an uncatalogued model REFUSES to resolve",
+            "chain_preference is invalid",
+            lambda: resolve("sparq-org/sparq", ["area:gui", "role:impl"], policy, ghost_pref))
+    # ---- [OPUS-5] THE DOCS-ONLY BOUND ON `inject_roles`, END TO END THROUGH resolve().
+    # `_reject_docs_only` above inspects STATICALLY DECLARED chains only. `inject_roles` writes the
+    # lead into the chain AFTER that validation, so without the parse-time bound in
+    # chain_preference a table could lead `role:impl` with `terra` — a route the very same
+    # `_reject_docs_only` refuses outright when it is DECLARED — and, because the target's PLAN
+    # resolver reads the identical declaration, both sides would AGREE on it and no divergence
+    # check would fire. Asserted here, on the CLAIM side, and mirrored in route-resolve (PLAN) and
+    # cross-resolver-agreement (symmetry).
+    check("the docs-only tier rule is the SAME OBJECT as the shared mechanism's, not a second copy "
+          "(re-declaring it here would let the two drift either side of the injection bound)",
+          (DOCS_ONLY_MODELS is _chain_preference.DOCS_ONLY_MODELS,
+           DOCS_ROLES is _chain_preference.DOCS_ROLES), (True, True))
+    docs_lead = copy.deepcopy(pref_routing)
+    docs_lead["models"]["terra"] = {"provider": "openai"}
+    docs_lead["route"][0]["model_chain"] = ["opus5"]      # role = impl, single-rung (registry #738)
+    statically_declared = copy.deepcopy(docs_lead)
+    statically_declared["route"][0]["model_chain"] = ["terra", "opus5"]
+    rejects("BASELINE — a STATICALLY declared docs-only lead on role:impl is refused (this is the "
+            "control `inject_roles` must not be able to route around)", "docs-only",
+            lambda: resolve("sparq-org/sparq", ["role:impl"], policy, statically_declared))
+    injected = copy.deepcopy(docs_lead)
+    injected["chain_preference"] = [{"labels": ["area:gui"], "lead": "terra",
+                                     "requires": ["terra", "opus5"], "inject_roles": ["impl"]}]
+    rejects("an INJECTED docs-only lead on role:impl is refused too, at PARSE time — the same "
+            "outcome as the statically declared form, which is the whole point",
+            "chain_preference is invalid",
+            lambda: resolve("sparq-org/sparq", ["area:gui", "role:impl"], policy, injected))
+    rejects("...and the table is refused for EVERY issue that reads it, not only the selected "
+            "ones — a bad DECLARATION is a table defect, not a per-issue routing surprise",
+            "chain_preference is invalid",
+            lambda: resolve("sparq-org/sparq", ["area:sparq-core", "role:impl"], policy, injected))
+    docs_target = copy.deepcopy(docs_lead)
+    docs_target["chain_preference"] = [{"labels": ["area:gui"], "lead": "terra",
+                                        "requires": ["terra", "opus5"], "inject_roles": ["docs"]}]
+    docs_target["route"][2]["model_chain"] = ["opus5"]    # the docs role route, single-rung
+    check("a docs-only lead injected into role:docs still RESOLVES (the bound is the "
+          "_reject_docs_only exemption, mirrored — not a blanket ban on docs-only leads)",
+          resolve("sparq-org/sparq", ["area:gui", "role:docs"], policy,
+                  docs_target)["model_chain"], ["terra", "opus5"])
+    # THE LIVE DECLARATION IS UNTOUCHED. `lead = "sol"` + `inject_roles = ["impl"]` is the shape
+    # sparq ships for the area:gui carve-out; the bound must not perturb it.
+    live_shape = copy.deepcopy(docs_lead)
+    live_shape["chain_preference"] = [{"labels": ["area:gui"], "lead": "sol",
+                                       "requires": ["sol", "opus5"], "inject_roles": ["impl"]}]
+    check("the LIVE area:gui declaration (lead = sol) resolves sol-first, unchanged by the bound",
+          (resolve("sparq-org/sparq", ["area:gui", "role:impl"], policy,
+                   live_shape)["model_chain"],
+           resolve("sparq-org/sparq", ["area:sparq-core", "role:impl"], policy,
+                   live_shape)["model_chain"]),
+          (["sol", "opus5"], ["opus5"]))
+
     check("pure core leaves fixtures unchanged",
           policy == policy_before and routing == routing_before, True)
     print("policy-resolve self-test", "PASSED" if ok else "FAILED")

@@ -56,6 +56,25 @@ def _parse_rate_headers(header_text):
     return hdr
 
 
+def _probe_curl_command(token, model, claude_code=False):
+    """Build the (argv, stdin) pair for one probe. The bearer token is fed through curl's STDIN
+    header stream (`-H @-`), NEVER placed in argv (issue #195) — so the credential cannot leak via
+    process inspection (`ps`/`/proc/<pid>/cmdline`) or diagnostic command capture. Only non-secret
+    headers appear on the command line. Pure — unit-tested by --self-test."""
+    body = {"model": model, "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}
+    args = ["curl", "-s", "-D", "-", "-o", "/dev/null", "--max-time", "20", "-X", "POST",
+            "https://api.anthropic.com/v1/messages",
+            "-H", "@-",  # read the (secret-bearing) Authorization header from stdin, not argv
+            "-H", "anthropic-version: 2023-06-01",
+            "-H", "content-type: application/json",
+            "-H", "anthropic-beta: oauth-2025-04-20"]
+    if claude_code:
+        body["system"] = [{"type": "text", "text": _CLAUDE_CODE_SYSTEM}]
+        args += ["-H", "user-agent: " + _CLAUDE_CODE_UA]
+    args += ["-d", json.dumps(body)]
+    return args, "Authorization: Bearer " + token + "\n"
+
+
 def _probe_headers(token, model, claude_code=False):
     """POST a max_tokens:1 message and return the parsed anthropic-ratelimit-unified-* header map
     (lowercased keys, 'anthropic-ratelimit-unified-' prefix stripped), or None on any transport error.
@@ -66,19 +85,10 @@ def _probe_headers(token, model, claude_code=False):
     token = (token or "").strip()
     if not token:
         return None
-    body = {"model": model, "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}
-    args = ["curl", "-s", "-D", "-", "-o", "/dev/null", "--max-time", "20", "-X", "POST",
-            "https://api.anthropic.com/v1/messages",
-            "-H", "Authorization: Bearer " + token,
-            "-H", "anthropic-version: 2023-06-01",
-            "-H", "content-type: application/json",
-            "-H", "anthropic-beta: oauth-2025-04-20"]
-    if claude_code:
-        body["system"] = [{"type": "text", "text": _CLAUDE_CODE_SYSTEM}]
-        args += ["-H", "user-agent: " + _CLAUDE_CODE_UA]
-    args += ["-d", json.dumps(body)]
+    args, stdin = _probe_curl_command(token, model, claude_code)
     try:
-        proc = subprocess.run(args, capture_output=True, text=True, timeout=30, check=False)
+        proc = subprocess.run(args, input=stdin, capture_output=True, text=True,
+                              timeout=30, check=False)
     except (subprocess.SubprocessError, OSError):
         return None
     return _parse_rate_headers(proc.stdout)
@@ -98,11 +108,17 @@ def _assemble_usage(hdr):
 
 
 def _probe_anthropic(token):
-    """Whole-account 5h/7d usage via a cheap, ungated haiku probe. None -> fail-closed omit."""
+    """Whole-account 5h/7d usage via a cheap, ungated haiku probe. None -> fail-closed omit.
+    A well-SHAPED entry is required: a base window that drifts to `nan`/`-1`/'' (or an empty
+    status) is OMITTED here (issue #196) instead of being emitted to fail open as eligible
+    capacity downstream — see _valid_base_usage."""
     hdr = _probe_headers(token, "claude-haiku-4-5")
     if hdr is None or hdr.get("status") is None:
         return None  # transport error or no rate-limit headers (e.g. 401/blocked) -> fail-closed omit
-    return _assemble_usage(hdr)
+    entry = _assemble_usage(hdr)
+    if not _valid_base_usage(entry):
+        return None  # malformed status / base-utilization shape (issue #196) -> fail-closed omit
+    return entry
 
 
 def _valid_utilization(val):
@@ -117,6 +133,25 @@ def _valid_utilization(val):
     except (TypeError, ValueError):
         return False
     return 0.0 <= num <= 1.0
+
+
+def _valid_base_usage(entry):
+    """True iff the whole-account base entry is well-SHAPED enough to gate dispatch (issue #196).
+    The strict [0,1] utilization validator above was used ONLY for the Fable sub-quota, so a
+    provider shape drift that left a BASE 5h/7d window as `nan`, `-1`, `1.5`, `''` — or an empty
+    status — was emitted UNCHANGED and failed open downstream: a NaN compares false in every
+    direction (so the `(1 - util) < margin` headroom test never fires) and a negative utilization
+    looks like excess headroom, so choose_account admitted the account as eligible capacity.
+    Require a NON-EMPTY status and BOTH base windows to be finite fractions in [0,1]; a caller
+    OMITS the account (fail-closed) on any mismatch. A well-formed NON-`allowed` status (e.g.
+    `throttled`) is a valid provider state, NOT a shape mismatch — it is kept so usage-alert can
+    report it precisely, and the eligibility gate (select-and-claim.usage_eligible) is what
+    requires status exactly `allowed`. Pure — unit-tested by --self-test."""
+    if not isinstance(entry, dict):
+        return False
+    if not str(entry.get("status") or "").strip():
+        return False  # empty/missing status is a shape mismatch (an empty status once read as allowed)
+    return _valid_utilization(entry.get("5h_util")) and _valid_utilization(entry.get("7d_util"))
 
 
 def _assemble_fable(hdr):
@@ -152,12 +187,31 @@ def _probe_fable(token):
     return _assemble_fable(hdr)
 
 
-def _load_accounts(script_dir, registry_repo):
+def _load_account_catalog(script_dir):
     spec = importlib.util.spec_from_file_location(
         "registry_select_and_claim", os.path.join(script_dir, "select-and-claim.py"))
+    if spec is None or spec.loader is None:
+        raise RuntimeError("cannot load shared account catalog")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.read_accounts(registry_repo)
+    return module
+
+
+def _load_accounts(script_dir, registry_repo):
+    return _load_account_catalog(script_dir).read_accounts(registry_repo)
+
+
+def _load_sibling(script_dir, filename, module_name):
+    """Load a hyphen-named sibling script as a module (the _load_model_health pattern). Used by
+    --self-test for CROSS-SCRIPT parity and wiring assertions — the reachability vocabulary, the probe
+    sidecar contract, and dashboard-gen's workflow-step extraction primitives are shared rather than
+    re-implemented here, where they would drift (registry #639)."""
+    spec = importlib.util.spec_from_file_location(module_name, os.path.join(script_dir, filename))
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load {filename}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _load_model_health(script_dir):
@@ -166,6 +220,39 @@ def _load_model_health(script_dir):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _load_health_state(mh, now, api=None):
+    """ONE ledger read -> ONE pruned window -> BOTH derivations the exempt lane needs:
+
+        {"backoffs": {hash: backoff}, "credentials": {hash: {"state", ...}}}
+
+    Split out for registry #639 so the reachability question (credential_states) does not have to
+    re-read the ledger and does not enter `_load_backoffs`' scope, which stays exactly what it was
+    documented to be — rate-limit/cooldown BACKOFFS only. Same FAIL-OPEN contract, for any failure
+    class, with the same single loud line: both derivations come back empty, which for the backoff
+    means "no backoff" (as before) and for reachability means `unproven` (no decisive record), never
+    a fabricated `live`."""
+    try:
+        path = os.environ.get("MODEL_HEALTH_FILE")
+        if path:
+            with open(path, encoding="utf-8") as handle:
+                records = mh.validate_ledger(json.load(handle))
+        else:
+            if api is None:
+                api = mh.GitHubAPI(os.environ.get("GH_TOKEN")
+                                   or os.environ.get("GITHUB_TOKEN", ""))
+            records, _sha = mh.read_ledger(api, os.environ["REGISTRY_REPO"])
+        window = mh.prune(records, now)
+        return {"backoffs": mh.account_backoffs(window, now),
+                "credentials": mh.credential_states(window, now)}
+    except Exception:
+        # Broad by design: the fail-open contract above must hold no matter what the ledger
+        # read raises (mh.HealthError, OSError, ValueError, KeyError, ...).
+        print("::warning::account-usage: model-health ledger unreadable — exempt accounts admitted "
+              "WITHOUT rate-limit backoff this tick (fail-open; fix the ledger to restore backoff)",
+              file=sys.stderr)
+        return {"backoffs": {}, "credentials": {}}
 
 
 def _load_backoffs(mh, now, api=None):
@@ -180,25 +267,13 @@ def _load_backoffs(mh, now, api=None):
     by design, for ANY failure class (unreadable file, API/transport error, missing ledger
     branch, missing token/env): return {} after a LOUD log line — a lost backoff ledger merely
     admits a possibly rate-limited openai account (one wasted run), while failing closed here
-    would starve the whole exempt provider, the exact regression the exemption removes."""
-    try:
-        path = os.environ.get("MODEL_HEALTH_FILE")
-        if path:
-            with open(path, encoding="utf-8") as handle:
-                records = mh.validate_ledger(json.load(handle))
-        else:
-            if api is None:
-                api = mh.GitHubAPI(os.environ.get("GH_TOKEN")
-                                   or os.environ.get("GITHUB_TOKEN", ""))
-            records, _sha = mh.read_ledger(api, os.environ["REGISTRY_REPO"])
-        return mh.account_backoffs(mh.prune(records, now), now)
-    except Exception:
-        # Broad by design: the fail-open contract above must hold no matter what the ledger
-        # read raises (mh.HealthError, OSError, ValueError, KeyError, ...).
-        print("::warning::account-usage: model-health ledger unreadable — exempt accounts admitted "
-              "WITHOUT rate-limit backoff this tick (fail-open; fix the ledger to restore backoff)",
-              file=sys.stderr)
-        return {}
+    would starve the whole exempt provider, the exact regression the exemption removes.
+
+    SCOPE IS UNCHANGED by registry #639: this still returns ONLY backoff records (rate-limit chain +
+    the #596 auth cooldown that already rides the same primitive). It is now a thin projection of
+    `_load_health_state` so the reachability derivation costs no second ledger read; nothing about
+    what a backoff means, or its fail-open direction, moves."""
+    return _load_health_state(mh, now, api=api)["backoffs"]
 
 
 # The exempt PROVIDER allowlist (cross-provider review r1): the maintainer decision names openai;
@@ -211,6 +286,14 @@ EXEMPT_PROVIDERS = frozenset({"openai"})
 def _is_exempt_provider(provider):
     """True only for the explicitly probe-exempt providers (pure; whitespace/case tolerant)."""
     return str(provider or "").strip().lower() in EXEMPT_PROVIDERS
+
+
+# The reachability an exempt entry carries when nothing decisive is known (registry #639): no salt, an
+# unreadable ledger, or a fleet with no run outcomes in the window. It is the value this script must
+# be able to emit WITHOUT the model-health module loaded, hence a local literal; --self-test asserts
+# it equals model-health.CREDENTIAL_UNPROVEN and select-and-claim.USAGE_REACHABILITY_UNPROVEN, so the
+# three spellings cannot drift.
+REACHABILITY_UNPROVEN = "unproven"
 
 
 def _probe_account(account, secrets, probe=None, fable_probe=None):
@@ -255,7 +338,12 @@ def _probe_account(account, secrets, probe=None, fable_probe=None):
 def _apply_backoff(entry, backoff):
     """Annotate one exempt usage entry with an ACTIVE backoff record (pure). Tolerant fail-open:
     a malformed/forged record (non-dict, non-numeric/non-finite backoff_until) leaves the entry
-    untouched — never crashes the sweep, never blocks the account."""
+    untouched — never crashes the sweep, never blocks the account.
+
+    `backoff_signal` is the model-health class that produced the hold: `limit`/`transient` for the
+    reactive rate-limit chain, and (registry #596) `auth` for the bounded CREDENTIAL COOLDOWN after
+    AUTH_COOLDOWN_MIN consecutive auth failures. Both arrive in the same shape through the same
+    account_backoffs read, so nothing here needs to distinguish them."""
     if not isinstance(backoff, dict):
         return entry
     try:
@@ -293,6 +381,22 @@ def _load_secrets():
     return data if isinstance(data, dict) else {}
 
 
+def _usable_secret_refs(secrets):
+    """The worker-token names in `secrets` whose value is a NON-EMPTY string, sorted.
+
+    The same predicate the workflow's subset validator applies, in Python where it is unit-testable
+    (registry #612 review round 4 measured that `grep -q '"ACCT'` proved neither valid JSON nor a
+    non-empty token: `{"ACCT01_TOKEN":""}` and the truncated `{"ACCT01_TOKEN":` both passed it).
+    `_load_secrets` already collapses an unreadable or unparseable subset to `{}`, so an empty return
+    here covers malformed, empty, and token-less documents alike. Pure — unit-tested by
+    --self-test."""
+    if not isinstance(secrets, dict):
+        return []
+    return sorted(key for key, value in secrets.items()
+                  if isinstance(key, str) and SECRET_REF_RE.fullmatch(key)
+                  and isinstance(value, str) and value.strip())
+
+
 # --- tier-limit persistence (capacity model, 2026-07-17 measurement) ------------------------------
 LIMIT_KEYS = ("5h_limit", "7d_limit", "fable_7d_oi_limit")
 
@@ -326,40 +430,154 @@ def _upsert_limits_line(body, line):
     return "\n".join(out), changed
 
 
-def persist_limits(usage_path):
+PERSIST_ATTEMPTS = 3  # bounded re-merge attempts when a writer lands AFTER our edit (issue #198)
+
+# One GraphQL read serves body + the body-edit count. userContentEdits counts BODY revisions only
+# (title renames / labels / comments do not increment it), and every `gh issue edit --body` adds
+# exactly one — so totalCount is the version stamp the guarded write below keys on.
+_ISSUE_READ_QUERY = (
+    "query($owner:String!,$name:String!,$number:Int!){"
+    "repository(owner:$owner,name:$name){issue(number:$number){"
+    "body userContentEdits(first:1){totalCount}}}}")
+
+
+def _issue_view(number, registry_repo, run):
+    """(body, edit_count, ok) for one issue read. edit_count is the issue's body-edit count
+    (GraphQL userContentEdits.totalCount) — the version stamp for the write-window guard in
+    _persist_one. ok=False on a non-zero gh returncode or an unparseable/ill-typed response so the
+    caller PROPAGATES the failure rather than mistaking a failed read for an empty body (issue
+    #198)."""
+    owner, _, name = (registry_repo or "").partition("/")
+    if not owner or not name:
+        return "", 0, False
+    proc = run(["gh", "api", "graphql", "-f", "query=" + _ISSUE_READ_QUERY,
+                "-f", "owner=" + owner, "-f", "name=" + name, "-F", "number=" + str(number)],
+               capture_output=True, text=True, timeout=60, check=False)
+    if proc.returncode != 0:
+        return "", 0, False
+    try:
+        doc = json.loads(proc.stdout or "null")
+    except json.JSONDecodeError:
+        return "", 0, False
+    issue = doc.get("data") if isinstance(doc, dict) else None
+    issue = issue.get("repository") if isinstance(issue, dict) else None
+    issue = issue.get("issue") if isinstance(issue, dict) else None
+    if not isinstance(issue, dict):
+        return "", 0, False
+    count = (issue.get("userContentEdits") or {}).get("totalCount")
+    if not isinstance(count, int):
+        return "", 0, False
+    return issue.get("body") or "", count, True
+
+
+def _persist_one(number, handle, line, registry_repo, run, schema_errors):
+    """Merge the single `limits:` line into ONE account issue via a GUARDED read-merge-write (issue
+    #198). `gh issue edit --body` REPLACES the whole body and GitHub's issue API has no conditional
+    (If-Match/CAS) write, so a plain read->merge->write can clobber a provider / credential-format /
+    secret-reference / notes edit landing inside the read->write window — and a body-only confirm
+    cannot see that: it reads back exactly our merge and calls the loss success. The body-edit
+    count is the version stamp that closes the hole: success is claimed ONLY when the confirm shows
+    our merged body AND exactly ONE body edit (ours) happened since the fresh read. When the count
+    proves a foreign edit landed inside the window (our write replaced it), FAIL LOUDLY instead of
+    retrying — a retry would re-read our own body, find nothing to change and launder the loss into
+    a false 'refreshed'; the replaced revision stays recoverable from the issue's edit history and
+    the caller surfaces a red annotation. A foreign edit strictly AFTER ours (confirm body is
+    theirs, exactly two edits) clobbered nothing, so the merge is re-applied onto their fresh body,
+    bounded by PERSIST_ATTEMPTS. Automated writers cannot even reach the window — dispatch.yml
+    self-serializes (`registry-dispatcher`, cancel-in-progress: false) and set-up-account only
+    CREATES catalog issues (fail-closed on re-registration) — so this guard covers out-of-band
+    manual edits, and its soundness does not depend on that workflow config. Returns True on
+    success (incl. an idempotent no-op), False otherwise — the caller PROPAGATES it."""
+    for _ in range(PERSIST_ATTEMPTS):
+        body0, count0, ok = _issue_view(number, registry_repo, run)
+        if not ok:
+            return False
+        new_body, changed = _upsert_limits_line(body0, line)
+        if not changed:
+            return True  # the live body already carries this exact limits line — nothing to write
+        # WRITE GUARD (#521): validate the complete replacement body through the allocator's exact
+        # schema before `gh issue edit --body` can persist it. This catches both a malformed live
+        # record and any corruption introduced by this merge. Keep the annotation handle-free.
+        if schema_errors(handle, new_body):
+            print("::warning::account-usage: account-record write rejected by schema guard")
+            return False
+        edit = run(["gh", "issue", "edit", str(number), "-R", registry_repo, "--body", new_body],
+                   capture_output=True, text=True, timeout=60, check=False)
+        if edit.returncode != 0:
+            return False
+        body2, count2, ok = _issue_view(number, registry_repo, run)
+        if not ok:
+            return False
+        if count2 - count0 == 1:
+            # ours was provably the ONLY edit in the read->write->confirm window; a body mismatch
+            # here is an inconsistent read -> fail closed
+            return body2 == new_body
+        if count2 - count0 == 2 and body2 != new_body:
+            # ours is not the live body, so the one foreign edit landed strictly AFTER ours:
+            # nothing was lost -> re-merge the limits line onto the writer's fresh body
+            continue
+        # any other shape (our body live with >=2 edits, or >=3 edits) means a foreign edit may
+        # have landed INSIDE our read->write window and been replaced by our write -> fail loudly
+        return False
+    return False
+
+
+def persist_limits(usage_path, run=None):
     """Write probed tier limits into the account issues' front-matter (title == handle) so the
-    capacity model stops flying blind. Best-effort: never fails the caller; per-account errors are
-    swallowed. select-and-claim's _parse_account ignores unknown keys, so the extra line is inert
-    for the allocator. Privacy: prints carry no handles or counts (locked decision 22b); the
-    account issues themselves already enumerate the catalog (task #325 seam: they move private)."""
+    capacity model stops flying blind. Best-effort but HONEST (issue #198): every gh failure is
+    PROPAGATED as a non-zero return (the step is continue-on-error, so this surfaces the failure as a
+    red annotation instead of a false 'refreshed'), and each per-issue write goes through _persist_one
+    so a concurrent metadata edit is never silently overwritten (a clobber inside the write window is
+    detected via the body-edit count and surfaced as failure, not confirmed as success). select-and-claim's _parse_account
+    ignores unknown keys, so the extra line is inert for the allocator. Privacy: prints carry no
+    handles or counts (locked decision 22b). `run` is injectable for the self-test ONLY."""
+    run = run or subprocess.run
     registry_repo = os.environ["REGISTRY_REPO"]
+    try:
+        account_catalog = _load_account_catalog(os.path.dirname(os.path.abspath(__file__)))
+    except Exception:
+        print("::warning::account-usage: shared account schema unavailable; refusing tier-limit "
+              "writes")
+        return 1
     try:
         with open(usage_path, encoding="utf-8") as handle:
             usage = json.load(handle)
     except (OSError, json.JSONDecodeError):
         print("account-usage: no usage snapshot; tier-limit persistence skipped")
         return 0
-    try:
-        raw = subprocess.run(
-            ["gh", "issue", "list", "-R", registry_repo, "--state", "open", "--limit", "500",
-             "--json", "number,title,body"],
-            capture_output=True, text=True, timeout=60, check=False).stdout
-        issues = json.loads(raw or "[]")
-    except (subprocess.SubprocessError, OSError, json.JSONDecodeError):
-        print("account-usage: account catalog read failed; tier-limit persistence skipped")
+    if not isinstance(usage, dict):
+        print("account-usage: usage snapshot is not a map; tier-limit persistence skipped")
         return 0
+    listing = run(["gh", "issue", "list", "-R", registry_repo, "--state", "open", "--limit", "500",
+                   "--json", "number,title"],
+                  capture_output=True, text=True, timeout=60, check=False)
+    if listing.returncode != 0:
+        # PROPAGATE (issue #198): the old code swallowed a failed catalog read and still printed
+        # 'refreshed'. A non-zero return makes the (continue-on-error) step surface the failure.
+        print("::warning::account-usage: account catalog read failed; tier-limit persistence skipped")
+        return 1
+    try:
+        issues = json.loads(listing.stdout or "[]")
+    except json.JSONDecodeError:
+        print("::warning::account-usage: account catalog read unparseable; tier-limit persistence "
+              "skipped")
+        return 1
+    failures = 0
     for issue in issues:
         handle = str(issue.get("title", "")).strip()
-        line = _limits_line(usage.get(handle)) if isinstance(usage, dict) else None
+        line = _limits_line(usage.get(handle))
         if not line:
             continue
-        new_body, changed = _upsert_limits_line(issue.get("body") or "", line)
-        if not changed:
-            continue
-        subprocess.run(
-            ["gh", "issue", "edit", str(issue.get("number")), "-R", registry_repo,
-             "--body", new_body],
-            capture_output=True, text=True, timeout=60, check=False)
+        if not _persist_one(issue.get("number"), handle, line, registry_repo, run,
+                            account_catalog.account_record_schema_errors):
+            failures += 1
+    if failures:
+        # No count (locked decision 22b) — only that at least one write did not land.
+        print("::warning::account-usage: one or more tier-limit writes failed (gh error, or a "
+              "concurrent catalog edit landed inside the write window — the prior revision is "
+              "recoverable from the issue's edit history) — capacity model may be stale for "
+              "those accounts")
+        return 1
     print("account-usage: tier-limit lines refreshed")
     return 0
 
@@ -372,37 +590,69 @@ def main():
     pool = json.loads(os.environ.get("ACCOUNT_POOL", "[]"))  # optional handle allow-list
     now = time.time()
     salt = os.environ.get("PROVENANCE_SALT", "")
-    backoffs = None    # lazily loaded on the first probe-exempt account
+    health = None      # lazily loaded on the first probe-exempt account
     mh = None          # the model-health module once loaded (None until then / on load failure)
     salt_warned = False
     usage = {}
-    for account in _load_accounts(script_dir, registry_repo):
+    accounts = [account for account in _load_accounts(script_dir, registry_repo)
+                if not pool or account.get("handle") in pool]
+
+    # MATERIALIZATION PROOF GATE (registry #639). This MUST precede the loop, and specifically the
+    # exempt branch below. Pre-fix, the exempt branch ran BEFORE `secrets` was ever touched, so a
+    # failed/never-run ACCT_* materialization still produced a NON-EMPTY map (`{"acct01": {"exempt":
+    # true}}`) — every wholesale-outage detector keys on emptiness (usage-alert's `probe_empty=not
+    # usage`, dashboard-gen's no-measurement branch), so precisely WHEN measurement had not happened,
+    # nothing fired and dispatch launched on an unmeasured fleet. An unusable subset must therefore
+    # yield an EMPTY document and a nonzero exit, not a partial one.
+    #
+    # SCOPED like the workflow guard it backs up (#612 round 4's own recommendation): the proof is
+    # required only when the fleet actually CONTAINS a token-needing account. An all-exempt catalog
+    # legitimately needs no token, and refusing there would degrade a healthy steady state. Today the
+    # catalog is anthropic-majority by construction, so this condition is always true in production;
+    # it exists so the guard cannot become a false alarm if that ever changes.
+    if any(not _is_exempt_provider(account.get("provider")) for account in accounts) \
+            and not _usable_secret_refs(secrets):
+        # No counts, no names (locked decision 22b) — the condition, not the fleet.
+        print("::error::account-usage: the ACCT_* token subset carries no usable worker token — "
+              "refusing to emit ANY usage entry (an unproven materialization must read as "
+              "UNMEASURED, never as free capacity)", file=sys.stderr)
+        json.dump({}, sys.stdout)
+        return 1
+
+    for account in accounts:
         handle = account["handle"]
-        if pool and handle not in pool:
-            continue
         if _is_exempt_provider(account.get("provider")):
-            # Probe-exempt provider (decision 2026-07-17, issue #29): eligible without usage data,
+            # Probe-exempt provider (decision 2026-07-17, issue #29): needs no usage DATA, and is
             # reactively backed off via the model-health rate-limit records. No salt -> no hash
             # mapping -> loud fail-open (backoff disabled, exemption intact). Any provider NOT on
             # the explicit allowlist (incl. missing/misspelled) is fail-closed OMITTED by
             # _probe_account below — never probed — and surfaces as UNAVAILABLE in usage-alert.
-            entry = {"exempt": True}
+            #
+            # [#639] The entry CARRIES its reachability, because needing no token is not evidence of
+            # being reachable. `live`/`dead`/`unproven` come from the health record
+            # (model-health.credential_states) — the same window the backoff is derived from — and
+            # select-and-claim.usage_eligible admits only the two non-dead values. Without a salt (or
+            # with an unreadable ledger) there is no hash mapping, so the honest answer is `unproven`,
+            # never `live`.
+            entry = {"exempt": True, "reachability": REACHABILITY_UNPROVEN}
             if salt:
-                if backoffs is None:
+                if health is None:
                     # Guarded module load (cross-provider review r1): an import failure here must
                     # fail OPEN like an unreadable ledger — an uncaught exception would crash the
                     # probe, the shell would write '{}', and EVERY account (anthropic included)
                     # would fail closed: the exact starvation the exemption exists to prevent.
                     try:
                         mh = _load_model_health(script_dir)
-                        backoffs = _load_backoffs(mh, now)
+                        health = _load_health_state(mh, now)
                     except Exception:
                         print("::warning::account-usage: model-health module unavailable — exempt "
                               "accounts admitted WITHOUT rate-limit backoff this tick (fail-open)",
                               file=sys.stderr)
-                        mh, backoffs = None, {}
+                        mh, health = None, {"backoffs": {}, "credentials": {}}
                 if mh is not None:
-                    entry = _apply_backoff(entry, backoffs.get(mh.account_hash(handle, salt)))
+                    hashed = mh.account_hash(handle, salt)
+                    entry["reachability"] = mh.credential_state(health["credentials"], hashed)
+                    entry = _apply_backoff(entry, health["backoffs"].get(hashed))
             elif not salt_warned:
                 # Once, not per account: a per-account repeat would leak the exempt-account COUNT
                 # into the public log (locked decision 22b) and drown the signal.
@@ -444,6 +694,21 @@ def _self_test():
     chk("header parse status", hdr.get("status"), "allowed")
     chk("header parse limit trimmed", hdr.get("5h-limit"), "1000000")
     chk("header parse ignores others", "x-other" in hdr, False)
+    # credential never lands in argv (issue #195): the bearer token is fed through curl's stdin
+    # (-H @-), so process inspection / diagnostic command capture see only non-secret headers.
+    args, stdin = _probe_curl_command("sk-secret-tok", "claude-haiku-4-5")
+    chk("probe: token absent from argv", any("sk-secret-tok" in a for a in args), False)
+    chk("probe: token carried on stdin only", stdin, "Authorization: Bearer sk-secret-tok\n")
+    chk("probe: argv reads the auth header from stdin", "@-" in args, True)
+    chk("probe: no literal Authorization header in argv",
+        any(a.lower().startswith("authorization:") for a in args), False)
+    chk("probe: body still carries the model", any('"claude-haiku-4-5"' in a for a in args), True)
+    #   the fable variant adds the Claude-Code UA but STILL keeps the token off argv
+    fargs, fstdin = _probe_curl_command("sk-secret-tok", "claude-fable-5", claude_code=True)
+    chk("fable probe: token still absent from argv",
+        any("sk-secret-tok" in a for a in fargs), False)
+    chk("fable probe: token on stdin", fstdin, "Authorization: Bearer sk-secret-tok\n")
+    chk("fable probe: Claude-Code UA present in argv", any(_CLAUDE_CODE_UA in a for a in fargs), True)
     # usage assembly includes limits ONLY when the provider exposes them
     entry = _assemble_usage(hdr)
     chk("assemble includes exposed limit", entry.get("5h_limit"), "1000000")
@@ -493,6 +758,24 @@ def _self_test():
         "anthropic-ratelimit-unified-7d_oi-utilization: 0.3\r\n"))
     chk("fable good sans limit: fable_ok", (fable_nolimit or {}).get("fable_ok"), True)
     chk("fable good sans limit: no limit key", "fable_7d_oi_limit" in (fable_nolimit or {}), False)
+    # [ISSUE #196] the SAME strict validator now guards the BASE 5h/7d windows (previously only the
+    # Fable sub-quota): a malformed base window / empty status OMITS the account (fail-closed) rather
+    # than being emitted to fail open as eligible capacity downstream. `good_base` is the parsed
+    # allowed/0.42/0.1 header from above.
+    good_base = _assemble_usage(hdr)
+    chk("base usage: well-formed allowed entry is usable", _valid_base_usage(good_base), True)
+    chk("base usage: well-formed throttled entry kept (valid state, not a shape mismatch)",
+        _valid_base_usage({**good_base, "status": "throttled"}), True)
+    chk("base usage: empty status -> omit", _valid_base_usage({**good_base, "status": ""}), False)
+    chk("base usage: missing status -> omit",
+        _valid_base_usage({"5h_util": "0.4", "7d_util": "0.1"}), False)
+    chk("base usage: NaN 5h util -> omit", _valid_base_usage({**good_base, "5h_util": "nan"}), False)
+    chk("base usage: negative 7d util -> omit", _valid_base_usage({**good_base, "7d_util": "-1"}), False)
+    chk("base usage: >1 util -> omit", _valid_base_usage({**good_base, "5h_util": "1.5"}), False)
+    chk("base usage: non-numeric util -> omit",
+        _valid_base_usage({**good_base, "7d_util": "unknown"}), False)
+    chk("base usage: missing window -> omit", _valid_base_usage({**good_base, "5h_util": None}), False)
+    chk("base usage: non-dict -> omit", _valid_base_usage(None), False)
     # ---- probe-exempt backoff overlay (decision 2026-07-17, registry issue #29) ----
     import tempfile
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -685,8 +968,618 @@ def _self_test():
         (_probe_account({"provider": "anthropic", "secret_ref": "ACCT01_TOKEN", "models": ["haiku"]},
                         {"ACCT01_TOKEN": "tok"}, probe=_rec_probe, fable_probe=_rec_probe)), None)
     probe_calls.clear()
+    # ---- tier-limit persistence: honest failure propagation + no silent overwrite (issue #198) ----
+    class _R:  # a tiny CompletedProcess stand-in for the fake gh runner
+        def __init__(self, rc, out=""):
+            self.returncode, self.stdout, self.stderr = rc, out, ""
+
+    def _fake_gh(script):
+        """(run, edits). `script` keys:
+          'list': (rc, stdout_json)                     -> the bulk `issue list` response
+          'view': {num: [(body, edit_count)|None, ...]} -> successive GraphQL issue reads
+                                                           (None = gh failure)
+          'edit': {num: [rc, ...]}                      -> successive `issue edit` returncodes
+                                                           (default 0)
+        Every `issue edit` records (num, body) into the returned `edits` list."""
+        edits = []
+
+        def run(args, **_kw):
+            if args[1] == "api" and args[2] == "graphql":  # _issue_view read (body + edit count)
+                num = next(a.split("=", 1)[1] for a in args if a.startswith("number="))
+                queue = script.get("view", {}).get(num, [])
+                entry = queue.pop(0) if queue else ("", 0)
+                if entry is None:
+                    return _R(1, "")               # simulate a failed read
+                body, count = entry
+                return _R(0, json.dumps({"data": {"repository": {"issue": {
+                    "body": body, "userContentEdits": {"totalCount": count}}}}}))
+            sub = args[2]  # ["gh", "issue", <sub>, <num?>, ...]
+            if sub == "list":
+                rc, out = script.get("list", (0, "[]"))
+                return _R(rc, out)
+            if sub == "edit":
+                num = args[3]
+                body = args[args.index("--body") + 1]
+                edits.append((num, body))
+                queue = script.get("edit", {}).get(num, [])
+                return _R(queue.pop(0) if queue else 0)
+            return _R(0, "")
+        return run, edits
+
+    def _usage_file(obj):
+        fh = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+        json.dump(obj, fh)
+        fh.close()
+        return fh.name
+
+    saved_repo = os.environ.get("REGISTRY_REPO")
+    os.environ["REGISTRY_REPO"] = "o/r"
+    limits_usage = {"acct01": {"5h_limit": "100", "7d_limit": "700"}}
+    upath = _usage_file(limits_usage)
+    limits_line = "limits: 5h_limit=100 7d_limit=700"
+    # `harness` is a REQUIRED account-record field (2026-07-26 acct02 lease-burn regression):
+    # select-and-claim's write guard rejects a replacement body without it, so these VALID fixtures
+    # must declare it or they would assert the guard's failure path instead of the merge behaviour.
+    valid_anthropic = ("provider: anthropic\nharness: claude\nmodels: [haiku]\n"
+                       "credential_format: claude-oauth-token\nsecret_ref: ACCT01_TOKEN\n")
+    valid_openai = ("provider: openai\nharness: codex\nmodels: [sol]\n"
+                    "credential_format: codex-auth-json\nsecret_ref: ACCT01_TOKEN\n")
+
+    #   (i) the concurrent-overwrite regression: a provider edit lands between the bulk `list` and the
+    #   mutation. The write MUST merge onto the FRESH view body (preserving `provider: openai`),
+    #   never the stale snapshot. This is the core #198 assertion — it flips red if the merge reads a
+    #   stale body or drops the concurrent field.
+    fresh = valid_openai
+    merged = _upsert_limits_line(fresh, limits_line)[0]
+    run, edits = _fake_gh({"list": (0, json.dumps([{"number": 7, "title": "acct01"}])),
+                           "view": {"7": [(fresh, 0), (merged, 1)]}})
+    rc = persist_limits(upath, run=run)
+    chk("persist: success returns 0", rc, 0)
+    chk("persist: merges limits onto the FRESH body (no stale overwrite)",
+        (len(edits), "provider: openai" in edits[0][1], limits_line in edits[0][1]),
+        (1, True, True))
+
+    #   (ii) idempotent no-op: the live body already carries the exact line -> zero edits, still 0
+    run, edits = _fake_gh({"list": (0, json.dumps([{"number": 7, "title": "acct01"}])),
+                           "view": {"7": [(valid_anthropic + limits_line + "\n", 0)]}})
+    chk("persist: idempotent live body writes nothing", (persist_limits(upath, run=run), edits),
+        (0, []))
+
+    #   (iii) a failed bulk catalog read is PROPAGATED (was swallowed with a false 'refreshed')
+    run, edits = _fake_gh({"list": (1, "")})
+    chk("persist: list failure propagates (rc=1, no edits)", (persist_limits(upath, run=run), edits),
+        (1, []))
+
+    #   (iv) an `issue edit` failure is PROPAGATED as a non-zero return, BEFORE the confirm read.
+    #   The confirm view is queued to MATCH new_body, so swallowing the edit returncode would
+    #   confirm-match and wrongly return 0 — this asserts the returncode is honoured immediately.
+    edit_body0 = valid_anthropic
+    edit_merged = _upsert_limits_line(edit_body0, limits_line)[0]
+    run, edits = _fake_gh({"list": (0, json.dumps([{"number": 7, "title": "acct01"}])),
+                           "view": {"7": [(edit_body0, 0), (edit_merged, 1)]},
+                           "edit": {"7": [1]}})
+    chk("persist: edit failure propagates (rc=1, no confirm swallow)",
+        (persist_limits(upath, run=run), len(edits)), (1, 1))
+
+    #   (v) a failed re-read (view rc!=0) is PROPAGATED, not treated as an empty body
+    run, edits = _fake_gh({"list": (0, json.dumps([{"number": 7, "title": "acct01"}])),
+                           "view": {"7": [None]}})
+    chk("persist: view failure propagates (rc=1)", persist_limits(upath, run=run), 1)
+
+    #   (vi) retry-merges-on-change: a concurrent writer lands strictly AFTER our edit (their body
+    #   is live, edit count shows exactly ours + theirs — nothing lost); the merge is re-applied
+    #   onto the writer's NEW body, then confirmed as the only edit of the second window.
+    body0 = valid_anthropic
+    clob = valid_anthropic + "notes: touched-by-other\n"              # concurrent notes edit
+    merged2 = _upsert_limits_line(clob, limits_line)[0]
+    run, edits = _fake_gh({"list": (0, json.dumps([{"number": 7, "title": "acct01"}])),
+                           "view": {"7": [(body0, 0), (clob, 2), (clob, 2), (merged2, 3)]}})
+    rc = persist_limits(upath, run=run)
+    chk("persist: retries the merge after a concurrent clobber, then succeeds",
+        (rc, len(edits), "notes: touched-by-other" in edits[-1][1], limits_line in edits[-1][1]),
+        (0, 2, True, True))
+
+    #   (vii) an unrecoverable writer that keeps reverting our line: retries are BOUNDED and the
+    #   exhausted state PROPAGATES as failure (never a false 'refreshed')
+    revert_seq = []
+    for i in range(PERSIST_ATTEMPTS):
+        revert_seq += [(body0, 2 * i), (body0, 2 * i + 2)]
+    run, edits = _fake_gh({"list": (0, json.dumps([{"number": 7, "title": "acct01"}])),
+                           "view": {"7": revert_seq}})
+    chk("persist: exhausted retries propagate as failure, bounded edit attempts",
+        (persist_limits(upath, run=run), len(edits)), (1, PERSIST_ATTEMPTS))
+
+    #   (ix) THE losing interleaving (#198 review round 2): a concurrent metadata edit lands
+    #   BETWEEN our fresh read and our unconditional write, so our write replaces it and the
+    #   confirm reads back exactly our merged body. A body-only confirm calls that success and the
+    #   loss is silent; the edit-count guard sees TWO body edits since the fresh read and must
+    #   FAIL (rc=1) after exactly one write — and never retry, because a retry would find nothing
+    #   left to change and launder the loss into a false 'refreshed'.
+    run, edits = _fake_gh({"list": (0, json.dumps([{"number": 7, "title": "acct01"}])),
+                           "view": {"7": [(fresh, 0), (merged, 2)]}})
+    chk("persist: writer clobbered inside the read->write window fails loudly (no silent loss)",
+        (persist_limits(upath, run=run), len(edits)), (1, 1))
+
+    #   (x) a confirm that counts OUR edit as the only one but shows a non-matching body is an
+    #   inconsistent read — fail closed, no retry
+    run, edits = _fake_gh({"list": (0, json.dumps([{"number": 7, "title": "acct01"}])),
+                           "view": {"7": [(fresh, 0), (fresh, 1)]}})
+    chk("persist: single-edit confirm with mismatched body fails closed",
+        (persist_limits(upath, run=run), len(edits)), (1, 1))
+
+    #   (xi) WRITE GUARD (#521): a selected account whose live replacement body is missing a
+    #   required schema field is rejected BEFORE `gh issue edit`; no corrupt record is persisted.
+    # Exactly ONE field short (secret_ref) so this row still discriminates the guard it was
+    # written for: without `harness` it would be rejected for the harness requirement too and would
+    # keep passing with the secret_ref check deleted.
+    invalid_body = ("provider: openai\nharness: codex\nmodels: [sol]\n"
+                    "credential_format: codex-auth-json\n")
+    run, edits = _fake_gh({"list": (0, json.dumps([{"number": 7, "title": "acct01"}])),
+                           "view": {"7": [(invalid_body, 0)]}})
+    chk("persist: schema-invalid account body is rejected before write",
+        (persist_limits(upath, run=run), len(edits)), (1, 0))
+
+    #   (viii) a non-dict usage snapshot is handled (no probed limits) without touching the catalog
+    lpath = _usage_file(["not", "a", "map"])
+    run, edits = _fake_gh({"list": (0, json.dumps([{"number": 7, "title": "acct01"}]))})
+    chk("persist: non-map usage snapshot skips cleanly", (persist_limits(lpath, run=run), edits),
+        (0, []))
+    os.unlink(lpath)
+    os.unlink(upath)
+    if saved_repo is None:
+        os.environ.pop("REGISTRY_REPO", None)
+    else:
+        os.environ["REGISTRY_REPO"] = saved_repo
+
+    ok = _self_test_ledgergate(chk) and ok
     print("account-usage self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
+
+
+# --- [registry #639] THE DISPATCH LEDGERGATE ------------------------------------------------------
+# The subset fixtures the workflow validator must judge. The last four are #612 review round 4's
+# measurement: each PASSES a `grep -q '"ACCT'` substring test while leaving the probe with no usable
+# token, which is how the probe-EXEMPT accounts were published as free capacity off an unusable
+# subset. Shared by the Python predicate rows and the executed workflow-body rows below, so the two
+# layers are judged on the SAME documents.
+SUBSET_FIXTURES = {
+    "tokens": '{"ACCT01_TOKEN": "redacted"}',
+    "empty-subset": "{}",
+    "empty-value": '{"ACCT01_TOKEN": ""}',
+    "blank-value": '{"ACCT01_TOKEN": "   "}',
+    "non-string-value": '{"ACCT01_TOKEN": 1234}',
+    "wrong-key": '{"NOT_AN_ACCT_TOKEN": "redacted", "ACCTLOOKALIKE": "redacted"}',
+    "truncated": '{"ACCT01_TOKEN":',
+    "not-an-object": '["ACCT01_TOKEN"]',
+}
+# (fixture, expected recorded detail) for every shape that must be REFUSED by the workflow probe step.
+SUBSET_REFUSALS = (("empty-subset", "secret-subset-empty"), ("empty-value", "secret-subset-empty"),
+                   ("blank-value", "secret-subset-empty"),
+                   ("non-string-value", "secret-subset-empty"),
+                   ("wrong-key", "secret-subset-empty"),
+                   ("truncated", "secret-subset-malformed"),
+                   ("not-an-object", "secret-subset-malformed"))
+
+
+def _self_test_ledgergate(chk):
+    """The registry #639 seam: the probe lane that SPENDS capacity must PROVE its materialization, and
+    exemption must not imply reachability.
+
+    Split into its own function only for size. It is the WIRING half of the suite, which is where a
+    mutation harness measured this repo to be weakest: 18/18 mutations against Python guards were
+    caught while every uncaught one was a workflow `if:` condition, a workflow step body, or a
+    production call site. So the workflow step bodies are EXTRACTED FROM dispatch.yml AND EXECUTED,
+    the step-level `continue-on-error` shape is asserted, the env wiring is read as a mapping, and
+    main() is driven end to end rather than through its helpers."""
+    import contextlib
+    import io
+    import tempfile
+    import time
+    ok = True
+
+    def sub(name, got, want):
+        nonlocal ok
+        chk(name, got, want)
+        ok = ok and got == want
+
+    # ---- (1) the subset predicate, in Python where it is unit-testable ---------------------------
+    for fixture, document in sorted(SUBSET_FIXTURES.items()):
+        try:
+            parsed = json.loads(document)
+        except json.JSONDecodeError:
+            parsed = None            # _load_secrets collapses an unparseable subset to {}
+        sub(f"[#639] usable refs in the {fixture!r} subset",
+            bool(_usable_secret_refs(parsed if isinstance(parsed, dict) else {})),
+            fixture == "tokens")
+    sub("[#639] the predicate returns the NAMES, so it cannot be satisfied by a stray key",
+        _usable_secret_refs({"ACCT01_TOKEN": "a", "ACCT7X_TOKEN": " b ", "ACCT02_TOKEN": "",
+                            "GITHUB_TOKEN": "c", "ACCTLOOKALIKE": "d", 7: "e"}),
+        ["ACCT01_TOKEN", "ACCT7X_TOKEN"])
+
+    # ---- (2) one reachability vocabulary across the three scripts that speak it -------------------
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    mh = _load_model_health(script_dir)
+    allocator = _load_account_catalog(script_dir)
+    sub("[#639] the unproven spelling is identical in probe / health record / allocator",
+        (REACHABILITY_UNPROVEN, mh.CREDENTIAL_UNPROVEN),
+        (allocator.USAGE_REACHABILITY_UNPROVEN, allocator.USAGE_REACHABILITY_UNPROVEN))
+    sub("[#639] the live/dead spellings are identical too",
+        (mh.CREDENTIAL_LIVE, mh.CREDENTIAL_DEAD),
+        (allocator.USAGE_REACHABILITY_LIVE, allocator.USAGE_REACHABILITY_DEAD))
+    sub("[#639] the allocator admits exactly {live, unproven} — dead is not admissible",
+        (sorted(allocator.USAGE_REACHABILITY_ADMITTED),
+         mh.CREDENTIAL_DEAD in allocator.USAGE_REACHABILITY_ADMITTED),
+        ([mh.CREDENTIAL_LIVE, mh.CREDENTIAL_UNPROVEN], False))
+
+    # ---- (3) main() END TO END: the ordering fix and the reachability stamp -----------------------
+    # Driven through main() rather than its helpers because both defects live in main's STRUCTURE: the
+    # exempt branch ran before `secrets` was ever consulted, and the entry it built asserted
+    # availability with no reachability evidence at all.
+    exempt_account = {"handle": "acctexempt", "provider": "openai", "models": ["sol"],
+                      "secret_ref": "ACCTEXEMPT_TOKEN", "available": True,
+                      "max_concurrent_workers": 1}
+    # The probed account's secret_ref matches the `tokens` subset fixture, so the healthy row below
+    # exercises a real token handoff rather than the fail-closed omit.
+    probed_account = {"handle": "acct01", "provider": "anthropic", "models": ["haiku"],
+                      "secret_ref": "ACCT01_TOKEN", "available": True,
+                      "max_concurrent_workers": 1}
+    e2e_salt = "e2e-salt"
+    exempt_hash = mh.account_hash(exempt_account["handle"], e2e_salt)
+    stamp = int(time.time())
+
+    def record(exit_class, offset, run):
+        return {"ts": stamp - offset, "provider": "openai", "account": exempt_hash,
+                "model_alias": "sol", "exit_class": exit_class, "run_id": run}
+
+    def run_main(subset="tokens", accounts=(exempt_account, probed_account), records=(),
+                 salt=e2e_salt, ledger="records"):
+        """(rc, usage map | "MALFORMED", stderr) from a real main() call over a stubbed catalog and a
+        stubbed per-account probe. Only the two IO edges are stubbed; the gate, the ordering and the
+        stamping under test are the production code path."""
+        saved_env = {name: os.environ.get(name) for name in
+                     ("REGISTRY_REPO", "PROVENANCE_SALT", "MODEL_HEALTH_FILE", "SECRETS_FILE",
+                      "SECRETS_JSON", "ACCOUNT_POOL")}
+        saved_catalog, saved_probe = globals()["_load_accounts"], globals()["_probe_account"]
+        out, err = io.StringIO(), io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            secrets_path = os.path.join(directory, "acct-secrets.json")
+            with open(secrets_path, "w", encoding="utf-8") as handle:
+                handle.write(SUBSET_FIXTURES[subset])
+            ledger_path = os.path.join(directory, "model-health.json")
+            with open(ledger_path, "w", encoding="utf-8") as handle:
+                if ledger == "records":
+                    json.dump({"records": list(records)}, handle)
+                else:
+                    handle.write(ledger)          # a malformed ledger: fail-open, never `live`
+            os.environ.update(REGISTRY_REPO="o/r", PROVENANCE_SALT=salt,
+                              MODEL_HEALTH_FILE=ledger_path, SECRETS_FILE=secrets_path)
+            os.environ.pop("SECRETS_JSON", None)
+            os.environ.pop("ACCOUNT_POOL", None)
+            globals()["_load_accounts"] = lambda _dir, _repo: [dict(a) for a in accounts]
+            globals()["_probe_account"] = lambda account, secrets: (
+                {"status": "allowed", "5h_util": "0.1", "5h_reset": stamp + 3600,
+                 "7d_util": "0.1", "7d_reset": stamp + 86400}
+                if secrets.get(account.get("secret_ref")) else None)
+            try:
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    code = main()
+            finally:
+                globals()["_load_accounts"], globals()["_probe_account"] = saved_catalog, saved_probe
+                for name, value in saved_env.items():
+                    if value is None:
+                        os.environ.pop(name, None)
+                    else:
+                        os.environ[name] = value
+        try:
+            snapshot = json.loads(out.getvalue())
+        except json.JSONDecodeError:
+            snapshot = "MALFORMED"
+        return code, snapshot, err.getvalue()
+
+    # (a) THE ORDERING FIX. An unusable subset must yield an EMPTY document and a nonzero exit. Before
+    # the fix the exempt branch ran first, so this returned {"acctexempt": {"exempt": true}} — a
+    # NON-EMPTY map, which is exactly what makes every wholesale-outage detector (usage-alert's
+    # `probe_empty = not usage`, dashboard-gen's no-measurement branch) stay silent.
+    for subset, _detail in SUBSET_REFUSALS:
+        code, snapshot, err = run_main(subset=subset)
+        sub(f"[#639] an unusable ({subset}) subset yields an EMPTY map, not an exempt entry",
+            (code, snapshot, "::error::" in err), (1, {}, True))
+    sub("[#639] the refusal names the condition and leaks no token/handle/count",
+        [token for token in ("redacted", "ACCT01_TOKEN", "acctexempt", "1 ")
+         if token in run_main(subset="empty-value")[2]], [])
+    # ...and that empty map is what MAKES the outage detection fire. Asserted through the real
+    # consumer, so "empty map" is not merely asserted to be empty but shown to be actionable.
+    alerts = _load_sibling(script_dir, "usage-alert.py", "registry_usage_alert")
+    empty_code, empty_snapshot, _err = run_main(subset="empty-subset")
+    eligible, rows = alerts.classify([exempt_account["handle"], probed_account["handle"]],
+                                     empty_snapshot, 0.10, now=stamp)
+    sub("[#639] the empty map fires wholesale-outage detection (every account UNAVAILABLE)",
+        (empty_code, empty_snapshot, eligible, [row[2] for row in rows],
+         "did NOT measure" in alerts.render(eligible, rows, ["a", "b"], 2, "m", probe_empty=True)),
+        (1, {}, 0, [False, False], True))
+    # A USABLE subset still measures the whole fleet — the gate must not degrade the healthy path.
+    code, snapshot, err = run_main()
+    sub("[#639] a usable subset still probes the fleet (the gate is not a blanket refusal)",
+        (code, sorted(snapshot), snapshot.get(probed_account["handle"], {}).get("status")),
+        (0, ["acct01", "acctexempt"], "allowed"))
+    # An ALL-EXEMPT fleet legitimately needs no token (the #612-round-4 scoping recommendation), so
+    # the Python gate does not fire there — and the entry it emits is still reachability-stamped.
+    code, snapshot, err = run_main(subset="empty-subset", accounts=(exempt_account,))
+    sub("[#639] an all-exempt fleet needs no token, and is still not assumed reachable",
+        (code, snapshot), (0, {"acctexempt": {"exempt": True,
+                                             "reachability": REACHABILITY_UNPROVEN}}))
+
+    # (b) THE BEHAVIOURAL HEART: a probe-exempt account whose credential is KNOWN DEAD is INELIGIBLE.
+    # `acct01` is live in this state right now (`credential-remint-required`, #596 / alert #622) and is
+    # the fleet's only cross-provider review account, so pre-fix every review dispatch was launched
+    # against a credential the system had already diagnosed as unusable.
+    # The rejections are stamped OLDER than AUTH_COOLDOWN_SECONDS on purpose: the #596 cooldown has
+    # already EXPIRED, so nothing but the reachability verdict can be holding the account out. With a
+    # fresh run the active cooldown would satisfy every allocator row below for the wrong reason (a
+    # vacuity this harness measured on itself), and it would not model the live case anyway —
+    # `acct01` has been `credential-remint-required` for days, far past any 15-minute hold.
+    dead_records = [record(mh.CLASS_AUTH, mh.AUTH_COOLDOWN_SECONDS + 600, "a1"),
+                    record(mh.CLASS_AUTH, mh.AUTH_COOLDOWN_SECONDS + 300, "a2")]
+    for label, records, want_reach in (
+            ("DEAD (a run of auth rejections, no later success)", dead_records, mh.CREDENTIAL_DEAD),
+            ("LIVE (a success in the window)", [record(mh.SUCCESS, 60, "s1")], mh.CREDENTIAL_LIVE),
+            ("LIVE again (a success AFTER the rejections clears it)",
+             dead_records + [record(mh.SUCCESS, 30, "s2")], mh.CREDENTIAL_LIVE),
+            ("UNPROVEN (no decisive record at all)", [], mh.CREDENTIAL_UNPROVEN)):
+        code, snapshot, _err = run_main(records=records)
+        entry = snapshot.get(exempt_account["handle"], {})
+        sub(f"[#639] exempt entry is stamped {label}",
+            (code, entry.get("exempt"), entry.get("reachability"), entry.get("backoff_until")),
+            (0, True, want_reach, None))
+        sub(f"[#639] ...and the ALLOCATOR agrees for {want_reach}",
+            allocator.usage_eligible(dict(entry), now=stamp),
+            want_reach != mh.CREDENTIAL_DEAD)
+    # The dead account must not be selectable through the real selection call site either.
+    dead_entry = run_main(records=dead_records)[1]
+    saved_salt = os.environ.get("PROVENANCE_SALT")
+    os.environ["PROVENANCE_SALT"] = e2e_salt      # the allocator hashes handles for lease identity
+    try:
+        selected = allocator.choose_account([exempt_account], [], ["sol"], "p", "r", stamp,
+                                            usage=dead_entry)
+        live_selected = allocator.choose_account(
+            [exempt_account], [], ["sol"], "p", "r", stamp,
+            usage=run_main(records=[record(mh.SUCCESS, 60, "s1")])[1])
+    finally:
+        if saved_salt is None:
+            os.environ.pop("PROVENANCE_SALT", None)
+        else:
+            os.environ["PROVENANCE_SALT"] = saved_salt
+    # The PAIR is what makes this non-vacuous: the same call site must still select the account when
+    # its credential is proven live, so `None` above is the reachability gate and not a broken fixture.
+    sub("[#639] choose_account refuses the DEAD exempt account and still takes the LIVE one",
+        (selected, live_selected), (None, exempt_account["handle"]))
+    # FAIL-OPEN must never fabricate `live`: no salt and an unreadable ledger both mean UNPROVEN.
+    no_salt_code, no_salt, no_salt_err = run_main(records=dead_records, salt="")
+    sub("[#639] with no salt there is no hash mapping -> unproven (loudly), never live",
+        (no_salt_code, no_salt[exempt_account["handle"]]["reachability"],
+         "::warning::" in no_salt_err),
+        (0, REACHABILITY_UNPROVEN, True))
+    bad_code, bad_ledger, bad_err = run_main(records=dead_records, ledger='{"records": "nope"}')
+    sub("[#639] an unreadable ledger fails open to unproven (loudly), never live",
+        (bad_code, bad_ledger[exempt_account["handle"]]["reachability"],
+         "::warning::" in bad_err),
+        (0, REACHABILITY_UNPROVEN, True))
+
+    # ---- (4) THE WORKFLOW WIRING: extracted from dispatch.yml and EXECUTED -----------------------
+    # This is the seam the mutation harness found uncaught. The extraction primitives are dashboard-
+    # gen's (#612) deliberately: ONE implementation of "locate exactly this step, fail closed if you
+    # cannot", so a wiring assertion can never pass vacuously.
+    dg = _load_sibling(script_dir, "dashboard-gen.py", "registry_dashboard_gen")
+    dispatch_yml = dg._repo_file(".github", "workflows", "dispatch.yml")
+    dashboard_yml = dg._repo_file(".github", "workflows", "dashboard.yml")
+    materialize_step = dg._workflow_step(dispatch_yml, "acct-secrets")
+    probe_step = dg._workflow_step(dispatch_yml, "usage-probe")
+
+    def continue_on_error(step_text):
+        return re.findall(r"^\s*continue-on-error:\s*(\S+)", step_text, re.M)
+
+    # (f) RESTORING `continue-on-error: true` on the materialization must go RED. The neighbouring
+    # probe step DOES carry one (deliberately — a probe failure must not block dispatch), and reading
+    # it with the same predicate is what proves this assertion is not vacuous.
+    sub("[#639] the materialization step carries NO continue-on-error (and the probe step does)",
+        (continue_on_error(materialize_step), continue_on_error(probe_step)), ([], ["true"]))
+    # The env wiring: execution can never catch its deletion, because the harness supplies the
+    # variable from the process environment. Read as a MAPPING, and the step id it names must resolve.
+    probe_env = dg._workflow_step_env(dispatch_yml, "usage-probe")
+    wired = re.fullmatch(r"\$\{\{\s*steps\.([A-Za-z0-9_-]+)\.outcome\s*\}\}",
+                         probe_env.get("SECRETS_STEP_OUTCOME") or "")
+    probe_script = dg._workflow_step_script(dispatch_yml, "usage-probe")
+    sub("[#639] the probe step's gate is WIRED to the materialization step's outcome, by id",
+        (wired.group(1) if wired else None,
+         '"${SECRETS_STEP_OUTCOME}" != "success"' in probe_script,
+         bool(wired) and dg._workflow_step_script(dispatch_yml, wired.group(1)) != ""),
+        ("acct-secrets", True, True))
+    # The laundering itself: `|| printf '{}'` on the materialization/probe invocation is what made a
+    # failure indistinguishable from an idle fleet. Asserted scoped to THIS step.
+    sub("[#639] the probe step no longer launders a failure into an empty-but-valid document",
+        ("|| printf" in probe_script, "usage-probe.json" in probe_script), (False, True))
+    # The sidecar's only consumer in this job is the alert step; deleting the env line silently
+    # reverts to inferring an outage from an empty map.
+    alert_env = dg._workflow_step_env(dispatch_yml, "usage-alert")
+    sub("[#639] the probe sidecar is WIRED into the alert step that consumes it",
+        (alert_env.get("USAGE_PROBE_STATUS_FILE"),
+         "usage-probe.json" in (alert_env.get("USAGE_PROBE_STATUS_FILE") or "")),
+        ("${{ runner.temp }}/usage-probe.json", True))
+
+    probe_stub = ("import json, os, sys\n"
+                  "if '--self-test' in sys.argv:\n"
+                  "    sys.exit(int(os.environ['STUB_SELFTEST_EXIT']))\n"
+                  "json.dump({'acct-fixture': {'status': 'allowed'}}, sys.stdout)\n"
+                  "sys.exit(int(os.environ['STUB_PROBE_EXIT']))\n")
+
+    def run_probe_step(script, stub_relpath, secrets_outcome="success", secrets_file="tokens",
+                       selftest_exit=0, probe_exit=0):
+        """Execute a REAL probe step body. Returns (exit code, sidecar|"MALFORMED"|None, snapshot
+        text|None, combined log). The stub prints a snapshot even when it EXITS NONZERO: real probes
+        are incremental, so a dropped `!` must be caught by the recorded OUTCOME, not by an
+        accidentally-empty file."""
+        with tempfile.TemporaryDirectory() as directory:
+            stub = os.path.join(directory, stub_relpath)
+            os.makedirs(os.path.dirname(stub), exist_ok=True)
+            with open(stub, "w", encoding="utf-8") as handle:
+                handle.write(probe_stub)
+            temp = os.path.join(directory, "runner-temp")
+            os.mkdir(temp)
+            secrets_path = os.path.join(directory, "acct-secrets.json")
+            # "missing": the materialization body was replaced by `true` — it reports success and
+            # leaves no file behind.
+            if secrets_file != "missing":
+                with open(secrets_path, "w", encoding="utf-8") as handle:
+                    handle.write(SUBSET_FIXTURES[secrets_file])
+            completed = subprocess.run(
+                ["bash", "-c", script], cwd=directory, capture_output=True, text=True, timeout=120,
+                check=False,
+                env=dict(os.environ, RUNNER_TEMP=temp, SECRETS_STEP_OUTCOME=secrets_outcome,
+                         SECRETS_FILE=secrets_path, STUB_SELFTEST_EXIT=str(selftest_exit),
+                         STUB_PROBE_EXIT=str(probe_exit), GH_TOKEN="", PROVENANCE_SALT="",
+                         REGISTRY_REPO="owner/repo",
+                         MODEL_HEALTH_FILE=os.path.join(directory, "absent.json")))
+            sidecar = None
+            sidecar_path = os.path.join(temp, "usage-probe.json")
+            if os.path.isfile(sidecar_path):
+                with open(sidecar_path, encoding="utf-8") as handle:
+                    body = handle.read()
+                try:
+                    sidecar = json.loads(body)
+                except json.JSONDecodeError:
+                    sidecar = "MALFORMED"
+            snapshot_path = os.path.join(temp, "usage.json")
+            snapshot = None
+            if os.path.isfile(snapshot_path):
+                with open(snapshot_path, encoding="utf-8") as handle:
+                    snapshot = handle.read()
+            return (completed.returncode, sidecar, snapshot,
+                    completed.stdout + completed.stderr)
+
+    def dispatch_probe(**kwargs):
+        code, sidecar, snapshot, _log = run_probe_step(
+            probe_script, os.path.join("registry", "scripts", "account-usage.py"), **kwargs)
+        marker = sidecar if isinstance(sidecar, dict) else {}
+        return code, marker.get("outcome"), marker.get("detail"), snapshot
+
+    sub("[#639] probe step: a succeeding probe records ok and keeps its real snapshot",
+        dispatch_probe(), (0, "ok", "probe-succeeded", '{"acct-fixture": {"status": "allowed"}}'))
+    # THE polarity mutation: without the `!` this row reads ("ok", "probe-succeeded", <stub json>).
+    sub("[#639] probe step: a NONZERO probe is recorded failed and its output discarded",
+        dispatch_probe(probe_exit=1), (0, "failed", "probe-exited-nonzero", "{}"))
+    sub("[#639] probe step: a failing probe self-test is recorded failed",
+        dispatch_probe(selftest_exit=1), (0, "failed", "probe-self-test-failed", "{}"))
+    sub("[#639] probe step: a failed secret materialization is recorded failed",
+        dispatch_probe(secrets_outcome="failure"),
+        (0, "failed", "secret-materialization-failed", "{}"))
+    # (a) THE `true`-BODY MUTATION on the materialization step: outcome `success`, no file. Pre-fix
+    # this measured nothing, exited 0, and left the exempt accounts published as free capacity.
+    sub("[#639] probe step: `success` with NO subset file is refused, not measured",
+        dispatch_probe(secrets_file="missing"), (0, "failed", "secret-file-missing", "{}"))
+    # (c)+(d) the round-4 shapes a substring test accepts: an empty-string token value and truncated
+    # JSON. Each of these reads ("ok", "probe-succeeded", <stub json>) under a `grep -q '"ACCT'` guard.
+    for subset, detail in SUBSET_REFUSALS:
+        sub(f"[#639] probe step: a `{subset}` subset is refused, not measured",
+            dispatch_probe(secrets_file=subset), (0, "failed", detail, "{}"))
+    # The refusal must stay SILENT about the document, for every shape.
+    for subset in sorted(SUBSET_FIXTURES):
+        code, _sidecar, _snapshot, logged = run_probe_step(
+            probe_script, os.path.join("registry", "scripts", "account-usage.py"),
+            secrets_file=subset)
+        sub(f"[#639] probe step: the `{subset}` refusal leaks no subset bytes to the log",
+            (code, "ACCT01_TOKEN" in logged, "redacted" in logged, "Traceback" in logged),
+            (0, False, False, False))
+    # PARITY with the page lane (#612/#219): the two probe bodies are separate shell copies, so assert
+    # they return the IDENTICAL verdict for every fixture — a fix to one lane cannot drift from the
+    # other, which is how this lane came to be missing the gate in the first place.
+    dashboard_probe_script = dg._workflow_step_script(dashboard_yml, "usage-probe")
+
+    def dashboard_probe(**kwargs):
+        code, sidecar, snapshot, _log = run_probe_step(
+            dashboard_probe_script, os.path.join("scripts", "account-usage.py"), **kwargs)
+        marker = sidecar if isinstance(sidecar, dict) else {}
+        return code, marker.get("outcome"), marker.get("detail"), snapshot
+
+    for kwargs in [{}, {"probe_exit": 1}, {"selftest_exit": 1}, {"secrets_outcome": "failure"},
+                   {"secrets_file": "missing"}] + [{"secrets_file": name}
+                                                   for name, _d in SUBSET_REFUSALS]:
+        sub(f"[#639] dispatch and dashboard probe bodies agree on {kwargs or 'the healthy path'}",
+            dispatch_probe(**kwargs), dashboard_probe(**kwargs))
+    # The sidecar the step really wrote must be what the ALERT's fail-closed parser accepts/refuses —
+    # the shell -> python contract, which no substring assertion could express.
+    sub("[#639] the sidecar the dispatch step writes is what usage-alert accepts/refuses",
+        [alerts.probe_outcome(run_probe_step(
+            probe_script, os.path.join("registry", "scripts", "account-usage.py"), **kwargs)[1],
+            time.time())[0]
+         for kwargs in ({}, {"probe_exit": 1}, {"secrets_file": "missing"},
+                        {"secrets_file": "empty-value"}, {"secrets_file": "truncated"})],
+        [True, False, False, False, False])
+    # (i) The PRODUCER: the materialization body is EXECUTED against a fake complete secret map. It is
+    # also the filter that keeps every NON-worker secret away from the probe, so assert the exact
+    # subset and the 0600 mode, not merely that a file appeared. `run: true` writes no file.
+    materialize_script = dg._workflow_step_script(dispatch_yml, "acct-secrets")
+    with tempfile.TemporaryDirectory() as directory:
+        temp = os.path.join(directory, "runner-temp")
+        os.mkdir(temp)
+        all_secrets = {"ACCT01_TOKEN": "worker-one", "ACCT7X_TOKEN": "worker-two",
+                       "PROVENANCE_SALT": "not-a-worker-token", "GITHUB_TOKEN": "not-a-worker-token",
+                       "ACCT01_TOKEN_BACKUP": "not-exactly-the-shape", "ACCTLOOKALIKE": "no-suffix",
+                       "ACCT02_TOKEN": ["not", "a", "string"]}
+        completed = subprocess.run(
+            ["bash", "-c", materialize_script], cwd=directory, capture_output=True, text=True,
+            timeout=120, check=False,
+            env=dict(os.environ, RUNNER_TEMP=temp, ALL_SECRETS=json.dumps(all_secrets)))
+        written = os.path.join(temp, "acct-secrets.json")
+        subset_doc, mode = None, None
+        if os.path.isfile(written):
+            with open(written, encoding="utf-8") as handle:
+                subset_doc = json.load(handle)
+            mode = oct(os.stat(written).st_mode & 0o777)
+        sub("[#639] materialization step: EXECUTED, it writes exactly the ACCT*_TOKEN string subset",
+            (completed.returncode, subset_doc, mode),
+            (0, {"ACCT01_TOKEN": "worker-one", "ACCT7X_TOKEN": "worker-two"}, "0o600"))
+        sub("[#639] materialization step: no secret VALUE of any kind reaches its own step log",
+            [value for value in ("worker-one", "worker-two", "not-a-worker-token")
+             if value in completed.stdout + completed.stderr], [])
+        # The two halves MEET: whatever the filter writes must be judged by BOTH the workflow probe
+        # body and the Python predicate identically. A token-less secret map is a real production
+        # shape (a repo with no worker tokens yet).
+        empty_temp = os.path.join(directory, "runner-temp-empty")
+        os.mkdir(empty_temp)
+        empty_run = subprocess.run(
+            ["bash", "-c", materialize_script], cwd=directory, capture_output=True, text=True,
+            timeout=120, check=False,
+            env=dict(os.environ, RUNNER_TEMP=empty_temp, ALL_SECRETS=json.dumps(
+                {"PROVENANCE_SALT": "salt"})))
+        empty_written = os.path.join(empty_temp, "acct-secrets.json")
+        # A body replaced by `true` leaves NO file: report that as a value the row below can NAME,
+        # never as a crash inside the harness.
+        empty_subset = None
+        if os.path.isfile(empty_written):
+            with open(empty_written, encoding="utf-8") as handle:
+                empty_subset = json.load(handle)
+    with tempfile.TemporaryDirectory() as directory:
+        stub = os.path.join(directory, "registry", "scripts", "account-usage.py")
+        os.makedirs(os.path.dirname(stub))
+        with open(stub, "w", encoding="utf-8") as handle:
+            handle.write(probe_stub)
+        handoff = os.path.join(directory, "acct-secrets.json")
+        with open(handoff, "w", encoding="utf-8") as handle:
+            json.dump(empty_subset if empty_subset is not None else {"unwritten": True}, handle)
+        handoff_run = subprocess.run(
+            ["bash", "-c", probe_script], cwd=directory, capture_output=True, text=True, timeout=120,
+            check=False,
+            env=dict(os.environ, RUNNER_TEMP=directory, SECRETS_STEP_OUTCOME="success",
+                     SECRETS_FILE=handoff, STUB_SELFTEST_EXIT="0", STUB_PROBE_EXIT="0",
+                     GH_TOKEN="", PROVENANCE_SALT="", REGISTRY_REPO="owner/repo",
+                     MODEL_HEALTH_FILE=os.path.join(directory, "absent.json")))
+        with open(os.path.join(directory, "usage-probe.json"), encoding="utf-8") as handle:
+            handoff_sidecar = json.load(handle)
+    sub("[#639] the two step bodies MEET: a token-less filter output is refused by the probe",
+        (empty_run.returncode, empty_subset, _usable_secret_refs(empty_subset),
+         handoff_run.returncode, handoff_sidecar["outcome"], handoff_sidecar["detail"]),
+        (0, {}, [], 0, "failed", "secret-subset-empty"))
+    return ok
 
 
 if __name__ == "__main__":

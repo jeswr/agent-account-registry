@@ -13,6 +13,15 @@ on:
 permissions:
   contents: write   # CAS-update data/leases.json on the `ledger` data-plane branch (issue #28)
 
+# Scheduler-singleton semantics (#559 dup-dispatch storms; registry #563 adoption item 1): this
+# cron previously had NO concurrency group, so an overlapping fire (cron + keepalive/manual kick)
+# ran two concurrent ledger CAS writers — the #558 write-burst trigger. A singleton group with
+# cancel-in-progress:false makes a new fire QUEUE behind a live run (GitHub keeps exactly one
+# pending run, superseding older pendings) instead of duplicating or cancel-storming.
+concurrency:
+  group: groom-leases-singleton
+  cancel-in-progress: false
+
 jobs:
   reclaim:
     runs-on: ubuntu-latest

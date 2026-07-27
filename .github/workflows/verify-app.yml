@@ -8,6 +8,12 @@ on:
 permissions:
   contents: read
 
+# Manual-only diagnostic; singleton so a double manual fire queues instead of interleaving
+# two App-token mint probes (#559 concurrency-hygiene audit; registry #563 item 1).
+concurrency:
+  group: verify-app-singleton
+  cancel-in-progress: false
+
 jobs:
   verify:
     runs-on: ubuntu-latest

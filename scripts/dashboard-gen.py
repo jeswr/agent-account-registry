@@ -5,7 +5,6 @@ import argparse
 import copy
 import datetime as dt
 import hashlib
-import hmac
 import importlib.util
 import io
 import json
@@ -40,9 +39,12 @@ DEFERRED_RE = re.compile(r"^\S+\s+defer(?:red)?\s", re.MULTILINE)
 # (data/observability.json); dashboard.yml hands it in via --observability and
 # _normalize_observability() validates it FAIL-CLOSED here before it may reach the public
 # data.json (rendered by the dashboard's Observability panels; absent file => hidden panel).
-# Decision 22: no raw account handles anywhere on the public surface — lease rows must already
-# carry the 8-hex salted label (the _salted_labels shape); anything else dies loudly, and
-# _assert_private additionally backstops every known raw handle over the finished document.
+# Decision 22: no raw account handles anywhere on the public surface — observability lease rows
+# must already carry the collector's 8-hex salted label (OBS_SALTED_LABEL_RE below); anything else
+# dies loudly, and _assert_private additionally backstops every known raw handle over the finished
+# document. Issue #374 additionally stops the SALTED per-account rows being published at all — see
+# the fleet-composition block below — but the label validation stays, because a raw handle reaching
+# the collector output is a privacy incident whether or not this build would have published it.
 OBS_SCHEMA = "registry-observability/v1"
 OBS_SALTED_LABEL_RE = re.compile(r"[0-9a-f]{8}")
 OBS_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:+-]{0,63}")
@@ -52,9 +54,81 @@ OBS_EVIDENCE_RE = re.compile(r"https://github\.com/[A-Za-z0-9_.~!$&'()*+,;=:@/?#
 OBS_THRESHOLD_KEYS = {"workflow_failure_rate", "defer_reason_hourly",
                       "queue_age_clamp_minutes", "merge_stall_minutes"}
 
+# Usage-probe outcome sidecar (issue #219). dashboard.yml's secret-materialization and probe steps
+# are `continue-on-error`, and a failed probe used to be replaced by `{}` — indistinguishable from
+# "every account is idle". The probe job now PERSISTS its outcome next to the snapshot and the
+# build hands it in via --usage-status; anything that is not an explicit, FRESH `ok` means the
+# measurement did not happen, so no account may be published as usable capacity on its basis.
+PROBE_SCHEMA = "account-usage-probe/v1"
+# The probe runs on dashboard.yml's */15 cron; one hour is four missed slots. Beyond it the
+# snapshot describes a fleet state nobody has observed recently, so it stops counting as measured.
+PROBE_MAX_AGE_SECONDS = 3600
+# Runner/generator clock skew is seconds, not minutes; a stamp further in the future than this is
+# not a clock artifact but a bogus stamp, and bogus == unmeasured.
+PROBE_MAX_SKEW_SECONDS = 300
+
+# FLEET-COMPOSITION MINIMIZATION (issue #374, closing the sol-audit finding #184 deferred).
+#
+# The line this repo had already accepted is model-health.render_body's PUBLIC-registry route
+# (sol-audit #204): when an alert lands on the public registry it carries the provider and the
+# condition and SUPPRESSES the failure/fleet counts, reset hints and diagnostics, because those
+# "would compositionally disclose the worker-account fleet". The dashboard was the loud version of
+# the very same disclosure and had never been held to that line: it published one row per account
+# (salted label, provider, availability, live windows, active-agent count) plus
+# accounts_total/available/capped/unavailable/unknown, single_account, per-window
+# accounts_reporting/remaining_account_windows/limit_remaining/limits_known, and
+# fleet.capacity {eligible, total}. Every one of those is a direct read of the fleet's CARDINALITY,
+# and the salted labels were stable across builds, so the page also tracked individual accounts
+# over time.
+#
+# The counts are NOT deleted — they remain the internal single source of truth for "is there usable
+# headroom" (_provider_quota / the capacity tally in build_dashboard), still unit-tested here, still
+# the one predicate shared with the allocator. They are PROJECTED AWAY at publication time by
+# _public_provider_quota + _public_capacity, which keep the operational answer (has this provider
+# headroom, how full are its windows on average, when does it refill) while being invariant under
+# cloning the fleet. _assert_no_fleet_composition then backstops the FINISHED document fail-closed,
+# so a future field cannot silently re-open the surface this closes.
+#
+# KNOWN RESIDUAL, stated rather than hidden: `fleet.active_agents` (and the per-repository model
+# counts it summarizes) is a count of LIVE LEASES, not of accounts — but because the catalog's
+# `max_concurrent_workers` is 1, N concurrent agents implies at least N accounts, so it is a lower
+# BOUND on the fleet size. It is kept because it is the dashboard's core operational number and
+# because the same count is already public on the `ledger` branch (`data/leases.json`); removing it
+# is a product call for the maintainer, tracked separately, not something to decide inside a
+# minimization pass.
+#
+# So the property this change actually establishes is "the public payload carries no ACCOUNT CENSUS
+# and no per-account row", NOT "no fleet count" — and both halves are load-bearing statements that
+# the suite pins: the clone-invariance test below runs each fleet size WITH one live lease per
+# account, so it asserts the invariance where the residual is live, and asserts the residual itself
+# (the agent counts DO scale) rather than avoiding load and implying it does not. The page footer is
+# worded to the same scope; do not restore an absolute "no fleet counts are published" claim while
+# `active_agents` ships.
+FLEET_COMPOSITION_KEYS = frozenset({
+    "accounts", "accounts_total", "accounts_available", "accounts_capped", "accounts_unavailable",
+    "accounts_unknown", "accounts_reporting", "single_account", "remaining_account_windows",
+    "limit_remaining", "limits_known", "eligible", "total", "label",
+})
+
 
 class DashboardError(RuntimeError):
     pass
+
+
+_LEASE_SCHEMA_MODULE = None
+
+
+def _lease_schema_module():
+    global _LEASE_SCHEMA_MODULE
+    if _LEASE_SCHEMA_MODULE is None:
+        path = Path(__file__).resolve().with_name("lease_schema.py")
+        spec = importlib.util.spec_from_file_location("registry_lease_schema", path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError("cannot load shared lease schema")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _LEASE_SCHEMA_MODULE = module
+    return _LEASE_SCHEMA_MODULE
 
 
 def _utc_iso(value):
@@ -195,16 +269,16 @@ def _catalog(issues):
     return accounts, private_values
 
 
-def _salted_labels(handles, salt):
-    if not salt:
-        return {handle: "salt-missing" for handle in handles}
-    labels = {
-        handle: hmac.new(salt.encode(), handle.encode(), hashlib.sha256).hexdigest()[:8]
-        for handle in handles
-    }
-    if len(set(labels.values())) != len(labels):
-        raise DashboardError("salted account label collision")
-    return labels
+def _require_salt(salt):
+    """Issue #184's fail-closed salt precondition, RETAINED after #374 removed the last
+    handle-derived label from the payload. It no longer guards a value this build publishes; it
+    guards the ENVIRONMENT. A dashboard that builds happily with PROVENANCE_SALT unset is exactly
+    the environment in which a re-added account label would be published unsalted (the pre-#184 bug
+    deployed literal `salt-missing` rows, pinning a public row to a single account with no salt at
+    all). One string check, and the whole build dies rather than proceeding unsalted."""
+    if not isinstance(salt, str) or not salt.strip() or not salt.isprintable():
+        raise DashboardError(
+            "the dashboard build requires a non-empty printable PROVENANCE_SALT (issue #184)")
 
 
 def _percent(value):
@@ -220,8 +294,14 @@ def _percent(value):
 def _availability(account, usage_entry):
     if not account["catalog_available"]:
         return "unavailable"
-    if not isinstance(usage_entry, dict):
-        return "available"
+    if not isinstance(usage_entry, dict) or not usage_entry:
+        # NO measurement exists for this account (issue #219). account-usage.py fail-closed OMITS an
+        # account whose token is missing or whose probe failed, and a wholly failed probe publishes
+        # an EMPTY map — so this branch is exactly the "measurement did not happen" case. It used to
+        # return "available", which is why a failed probe rendered the entire catalog as fresh
+        # usable capacity. Dispatch (select-and-claim.usage_eligible) treats the omission as
+        # INELIGIBLE, so the honest public label is "unknown", never "available".
+        return "unknown"
     status = str(usage_entry.get("status") or "").strip().lower()
     if status not in {"", "allowed"}:
         return "unavailable"
@@ -229,26 +309,6 @@ def _availability(account, usage_entry):
     if any(value is not None and value >= 100 for value in known):
         return "capped"
     return "available"
-
-
-def _window_rows(account, usage_entry):
-    usage_entry = usage_entry if isinstance(usage_entry, dict) else {}
-    rows = []
-    for prefix, name in WINDOWS:
-        used = _percent(usage_entry.get(f"{prefix}_util"))
-        reset = _utc_iso(usage_entry.get(f"{prefix}_reset"))
-        limit = usage_entry.get(f"{prefix}_limit")
-        if limit is None:
-            limit = account["limits"].get(f"{prefix}_limit")
-        if prefix == "fable_7d_oi" and used is None and reset is None and limit is None:
-            continue
-        rows.append({
-            "name": name,
-            "used_percent": used,
-            "reset_at": reset,
-            "limit": str(limit) if limit is not None else None,
-        })
-    return rows
 
 
 _SELECT_AND_CLAIM_MODULE = None
@@ -282,12 +342,14 @@ def _backoff_epoch(value):
 
 
 def _quota_state(account, entry, now):
-    """Availability for the CUMULATIVE provider view: the per-account trichotomy from
-    _availability, except that (a) a catalog-available account with NO usage entry — the probe
-    fail-closed OMITS an account whose token is missing or whose probe failed — is "unknown":
-    dispatch (select-and-claim.usage_eligible) and usage-alert treat that omission as
-    UNAVAILABLE, so counting it free here would advertise quota the allocator will never use
-    (sol finding 2, PR #281 fix round); (b) a probe-exempt account under an ACTIVE reactive
+    """Availability for the CUMULATIVE provider view AND (since issue #219) for the per-account
+    cards + `fleet.capacity.eligible`, so one predicate decides every "is this capacity usable"
+    claim on the public page: the per-account state from _availability — where (a) a
+    catalog-available account with NO usage entry is already "unknown", because the probe
+    fail-closed OMITS an account whose token is missing or whose probe failed and dispatch
+    (select-and-claim.usage_eligible) plus usage-alert treat that omission as UNAVAILABLE, so
+    counting it free would advertise quota the allocator will never use (sol finding 2, PR #281
+    fix round) — refined so that (b) a probe-exempt account under an ACTIVE reactive
     backoff (its only quota signal — issue #29) counts as capped until the backoff expires,
     with the stamp parsed by the allocator's shared `_backoff_epoch` semantics; and (c) a
     non-exempt account counts "available" only with BOTH mandatory windows (5h AND 7d) validly
@@ -297,12 +359,27 @@ def _quota_state(account, entry, now):
     rendering it free would again advertise quota the allocator will never use (sol finding 1,
     PR #281 fix round 3); partial ⇒ "unknown". Returns (state, backoff_epoch_or_None).
     Pure — unit-tested by --self-test."""
+    if not isinstance(entry, dict) or not entry:
+        # No measurement at all. _availability already answers "unknown"/"unavailable" here; the
+        # restatement keeps this function TOTAL (every dict access below is unreachable on a
+        # non-dict) rather than resting on a caller-invisible coupling to that branch.
+        return _availability(account, entry), None
     availability = _availability(account, entry)
     if availability != "available":
         return availability, None
-    if not isinstance(entry, dict) or not entry:
-        return "unknown", None
     if entry.get("exempt") is True:
+        # [registry #639] Exemption skips the QUOTA probe; it never asserts reachability. The page
+        # must not publish as capacity what dispatch refuses to use, in EITHER direction (sol finding
+        # 2, PR #281), so the same allowlist the allocator applies decides here: a credential the
+        # health record proves dead is `unavailable` (a rejected credential, exactly like a non-allowed
+        # probe status), and an entry that states no reachability at all is `unknown` (the producer did
+        # not evaluate it — no measurement to publish), never `available`.
+        reachability = entry.get("reachability")
+        if reachability == _select_and_claim_module().USAGE_REACHABILITY_DEAD:
+            return "unavailable", None
+        if not isinstance(reachability, str) or \
+                reachability not in _select_and_claim_module().USAGE_REACHABILITY_ADMITTED:
+            return "unknown", None
         until = _backoff_epoch(entry.get("backoff_until"))
         if until is not None and until > now:
             return "capped", until
@@ -341,7 +418,12 @@ def _provider_quota(accounts, usage, now):
     every known window-reset/backoff stamp for the provider: soonest = the first moment ANY
     quota refills, oldest = when the last known window has refilled. Pure — unit-tested by
     --self-test; rows carry provider names + counts only (decision 22: no account identifiers,
-    salted or otherwise, on this surface)."""
+    salted or otherwise, on this surface).
+
+    These rows are INTERNAL as of issue #374. The counts below are the source of truth for the
+    capacity decision and are asserted in both directions by the suite, but they are never
+    published: build_dashboard emits `_public_provider_quota(_provider_quota(...))`, which keeps the
+    operational answer and drops every field that reads out the fleet's size."""
     groups = {}
     for account in accounts:
         groups.setdefault(account["provider"], []).append(account)
@@ -447,6 +529,373 @@ def _provider_quota(accounts, usage, now):
             "oldest_reset": max(provider_resets, default=None),
         })
     return rows
+
+
+def _provider_headroom(row):
+    """The cardinality-free replacement for a provider row's five-number account census (#374):
+    WHETHER this provider has usable headroom right now and, when it does not, why. A strict
+    function of the same counts `fleet.capacity` and the allocator key off — so the page still
+    cannot advertise capacity dispatch would refuse — but four words instead of a fleet census.
+    Precedence is "can we dispatch?" first, then the most actionable reason: capped refills at
+    `soonest_reset`, unknown means the probe told us nothing, unavailable means the catalog or a
+    dead credential took the provider out."""
+    if row["accounts_available"]:
+        return "available"
+    if row["accounts_capped"]:
+        return "capped"
+    if row["accounts_unknown"]:
+        return "unknown"
+    return "unavailable"
+
+
+def _public_provider_quota(rows):
+    """Project the internal provider rows onto the published payload (#374).
+
+    Dropped outright: accounts_total/available/capped/unavailable/unknown, single_account,
+    accounts_reporting, limit_remaining, limits_known. Every one is either a count of accounts or
+    a sum whose magnitude scales with the number of accounts (`limit_remaining` is Σ limit×remaining
+    over reporting accounts, so a publicly-known plan limit divides straight back out to a fleet
+    size). `remaining_account_windows` was itself Σ of per-account fractions and therefore bounded
+    ABOVE by the fleet size — 2.4 said "at least 3 accounts" out loud — so it is published as the
+    MEAN remaining fraction instead: same headroom reading, invariant under cloning the fleet."""
+    public = []
+    for row in rows:
+        windows = []
+        for window in row["windows"]:
+            reporting = window["accounts_reporting"]
+            if reporting <= 0:
+                continue    # _provider_quota never emits one; never divide by it if it ever does
+            windows.append({
+                "name": window["name"],
+                "remaining_fraction": round(
+                    window["remaining_account_windows"] / reporting, 2),
+                "soonest_reset": window["soonest_reset"],
+                "oldest_reset": window["oldest_reset"],
+            })
+        public.append({
+            "provider": row["provider"],
+            "headroom": _provider_headroom(row),
+            "signal": row["signal"],
+            "windows": windows,
+            "soonest_reset": row["soonest_reset"],
+            "oldest_reset": row["oldest_reset"],
+        })
+    return public
+
+
+def _public_capacity(capacity):
+    """fleet.capacity, cardinality-free (#374): per provider, WHETHER the allocator would find an
+    eligible account right now — not how many eligible out of how many held."""
+    return {provider: values["eligible"] > 0 for provider, values in capacity.items()}
+
+
+def _assert_no_fleet_composition(document):
+    """Fail-closed backstop over the FINISHED public document (#374) — the composition twin of
+    _assert_private. Every name in FLEET_COMPOSITION_KEYS was, until this change, a published read
+    of the fleet's size or of one identified account; `accounts` and `label` additionally catch a
+    re-introduced per-account row array (the shape both the account cards and the observability
+    lease rows used). Refusing the build is the point: the projection above is easy to bypass by
+    adding one key to the document literal, and a public-surface regression that only prose forbids
+    is a regression waiting to happen."""
+    found = set()
+
+    def visit(value):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key in FLEET_COMPOSITION_KEYS:
+                    found.add(key)
+                visit(item)
+        elif isinstance(value, list):
+            for item in value:
+                visit(item)
+
+    visit(document)
+    if found:
+        raise DashboardError(
+            "fleet-composition assertion failed: the public dashboard payload may not disclose "
+            f"{sorted(found)} (issue #374)")
+
+
+# --- WIRING ASSERTIONS: reading the workflow / the page script without letting a comment or a
+# neighbouring occurrence stand in for the call site under test. ------------------------------------
+#
+# #612 cross-provider review round 2 (class E). A mutation harness found that 18/18 mutations
+# against this repo's PYTHON guards were caught while EVERY surviving mutation was a workflow `if:`,
+# a workflow step body, or a production call site. Concretely, on this PR: dropping the `!` from the
+# probe step's snapshot condition, replacing the materialization step's body with `true`, deleting
+# `probe_status=probe_status` from `main()`, and deleting `summary.append(probe)` /
+# `updateFreshness(..., data.usage_probe)` from the page script all left the suite green. These
+# helpers exist so the assertions below are scoped to ONE step or ONE function — a whole-file
+# substring search is satisfiable by prose or by any of several other occurrences — and so the
+# probe step's shell body can be EXECUTED rather than pattern-matched (`bash -n` and actionlint
+# cannot see polarity). Every helper raises DashboardError when it cannot resolve its target: a
+# wiring assertion that cannot find what it is asserting about must fail, never pass vacuously.
+def _repo_file(*parts):
+    """Text of a repository file addressed relative to the repo root, independent of cwd."""
+    path = Path(__file__).resolve().parent.parent.joinpath(*parts)
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise DashboardError(f"wiring assertion cannot read {path}") from exc
+
+
+def _strip_yaml_comments(text):
+    """`text` with every whole-line `#` comment removed (YAML comments and, inside `run:` blocks,
+    shell/python comments alike). A claim in prose must never satisfy an assertion about code."""
+    return "\n".join(line for line in text.split("\n") if not line.lstrip().startswith("#"))
+
+
+def _workflow_step(text, step_id):
+    """The full YAML text of the ONE step whose `id:` is `step_id`, comments stripped.
+
+    Bounded by the enclosing `- ` sequence entry's indentation, so a call in a NEIGHBOURING step
+    cannot satisfy an assertion about this one."""
+    lines = text.split("\n")
+    marks = [index for index, line in enumerate(lines) if line.strip() == f"id: {step_id}"]
+    if len(marks) != 1:
+        raise DashboardError(
+            f"expected exactly one workflow step with `id: {step_id}`, found {len(marks)} — "
+            "refusing to assert against a step that cannot be located (fail closed)")
+    starts = [index for index in range(marks[0], -1, -1) if lines[index].lstrip().startswith("- ")]
+    if not starts:
+        raise DashboardError(f"step `id: {step_id}` has no enclosing `- ` sequence entry — refusing")
+    start = starts[0]
+    indent = len(lines[start]) - len(lines[start].lstrip())
+    end = len(lines)
+    for index in range(start + 1, len(lines)):
+        line = lines[index]
+        if not line.strip():
+            continue
+        here = len(line) - len(line.lstrip())
+        if here < indent or (here == indent and line.lstrip().startswith("- ")):
+            end = index
+            break
+    body = _strip_yaml_comments("\n".join(lines[start:end]))
+    if not body.strip():
+        raise DashboardError(f"step `id: {step_id}` extracted to an empty body — refusing")
+    return body
+
+
+def _workflow_step_block(text, step_id, key):
+    """The dedented block-scalar value of `<key>: |` inside the step whose `id:` is `step_id`.
+
+    Raises when the step has no such block or the block is empty — a step body that cannot be
+    recovered must not silently become a no-op the harness then 'passes'."""
+    lines = _workflow_step(text, step_id).split("\n")
+    wanted = {f"{key}: |", f"{key}: |-"}
+    starts = [index for index, line in enumerate(lines) if line.strip() in wanted]
+    if len(starts) != 1:
+        raise DashboardError(
+            f"step `id: {step_id}` has {len(starts)} block `{key}:` values, expected exactly 1")
+    head = starts[0]
+    indent = len(lines[head]) - len(lines[head].lstrip())
+    body = []
+    for line in lines[head + 1:]:
+        if line.strip() and (len(line) - len(line.lstrip())) <= indent:
+            break
+        body.append(line[indent + 2:] if line.strip() else "")
+    value = "\n".join(body)
+    if not value.strip():
+        raise DashboardError(
+            f"step `id: {step_id}` extracted to an empty `{key}:` block — refusing")
+    return value
+
+
+def _workflow_step_script(text, step_id):
+    """The EXECUTABLE `run:` script of the step whose `id:` is `step_id`, dedented.
+
+    Comments are NOT kept — this text comes through _workflow_step, which strips them (the round-4
+    correction of an earlier docstring that claimed otherwise). That is harmless for execution and
+    is the point for pattern-matching, so the two uses share one extractor."""
+    return _workflow_step_block(text, step_id, "run")
+
+
+def _workflow_step_env(text, step_id):
+    """The `env:` mapping of the step whose `id:` is `step_id`, as {NAME: raw expression text}.
+
+    #612 review round 4: deleting `SECRETS_STEP_OUTCOME: ${{ steps.acct-secrets.outcome }}` from the
+    probe step survived the suite, because the executed body reads the variable from the process
+    environment the HARNESS supplies — execution can never see a missing workflow-level wiring. A
+    mapping (rather than a substring search) is what makes "this step defines this variable, from
+    that step's outcome" falsifiable, and resolving the step id it names is what stops the wiring
+    from pointing at a step that no longer exists."""
+    lines = _workflow_step(text, step_id).split("\n")
+    heads = [index for index, line in enumerate(lines) if line.strip() == "env:"]
+    if len(heads) != 1:
+        raise DashboardError(
+            f"step `id: {step_id}` has {len(heads)} `env:` mappings, expected exactly 1")
+    head = heads[0]
+    indent = len(lines[head]) - len(lines[head].lstrip())
+    mapping = {}
+    for line in lines[head + 1:]:
+        if not line.strip():
+            continue
+        if (len(line) - len(line.lstrip())) <= indent:
+            break
+        name, separator, value = line.strip().partition(":")
+        if separator:
+            mapping[name.strip()] = value.strip()
+    if not mapping:
+        raise DashboardError(f"step `id: {step_id}` has an empty `env:` mapping — refusing")
+    return mapping
+
+
+def _js_function_body(text, name):
+    """The brace-matched body of `function <name>(...)` in a JS source, or raise.
+
+    Scoping a call-site assertion to ONE function is the difference between "this file mentions
+    updateFreshness" and "render() passes the probe to it": `grant-account.py` appears 7× in its
+    own workflow, and whole-file greps on repeated tokens are exactly the vacuity #612 round 2
+    flagged."""
+    marks = [match.start() for match in re.finditer(rf"\bfunction\s+{re.escape(name)}\s*\(", text)]
+    if len(marks) != 1:
+        raise DashboardError(
+            f"expected exactly one `function {name}(` definition, found {len(marks)} — refusing")
+    open_brace = text.find("{", marks[0])
+    if open_brace < 0:
+        raise DashboardError(f"`function {name}(` has no body — refusing")
+    depth, index = 0, open_brace
+    while index < len(text):
+        if text[index] == "{":
+            depth += 1
+        elif text[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[open_brace:index + 1]
+        index += 1
+    raise DashboardError(f"`function {name}(` body is unbalanced — refusing")
+
+
+def _js_code_count(text, needle):
+    """Occurrences of `needle` at CODE positions of `text`: comments are blanked out first, and a
+    match that BEGINS inside a string/template literal does not count.
+
+    #612 review round 4 (MINOR, class E): the round-3 UI assertions were satisfiable by a COMMENT —
+    commenting out `summary.append(probe)` kept the suite green while the operator warning was gone —
+    and by any string literal that happened to contain the needle. Counting only code positions
+    closes both, and asserting an exact COUNT (rather than presence) is what stops a neighbouring
+    branch's occurrence from standing in for the one under test."""
+    chars = list(text)
+    in_string = [False] * len(text)
+    index, quote, comment = 0, None, None
+    while index < len(text):
+        char, pair = text[index], text[index:index + 2]
+        if comment == "line":
+            if char == "\n":
+                comment = None
+            else:
+                chars[index] = " "
+            index += 1
+        elif comment == "block":
+            if pair == "*/":
+                chars[index] = chars[index + 1] = " "
+                comment = None
+                index += 2
+                continue
+            if char != "\n":
+                chars[index] = " "
+            index += 1
+        elif quote:
+            in_string[index] = True
+            if char == "\\":
+                if index + 1 < len(text):
+                    in_string[index + 1] = True
+                index += 2
+                continue
+            if char == quote:
+                quote = None
+            index += 1
+        elif pair == "//":
+            comment = "line"
+        elif pair == "/*":
+            comment = "block"
+        elif char in "\"'`":
+            quote, in_string[index] = char, True
+            index += 1
+        else:
+            index += 1
+    code = "".join(chars)
+    hits, at = 0, code.find(needle)
+    while at >= 0:
+        if not in_string[at]:
+            hits += 1
+        at = code.find(needle, at + 1)
+    return hits
+
+
+def _node_json(script, payload):
+    """Run `script` under `node` with `payload` on stdin and parse its stdout as JSON, or raise.
+
+    #612 review round 4: the page's consumption of the probe marker was asserted LEXICALLY, so
+    flipping `if (!measured)` to `if (measured)` survived. `node` is present on every runner this
+    suite runs on (ubuntu-latest, and the worker image copies it in), so the two call sites are
+    EXECUTED instead — and a missing interpreter fails the suite loudly rather than skipping a
+    check, which would be the same false pass in a different costume."""
+    try:
+        completed = subprocess.run(["node", "-e", script], input=json.dumps(payload),
+                                   capture_output=True, text=True, timeout=120, check=False)
+    except OSError as exc:
+        raise DashboardError(
+            "`node` is required to EXECUTE the dashboard page's probe call sites — refusing to "
+            f"skip that assertion ({exc})") from exc
+    if completed.returncode != 0:
+        raise DashboardError(
+            f"the page-script harness exited {completed.returncode}: {completed.stderr.strip()}")
+    try:
+        return json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise DashboardError(
+            f"the page-script harness printed no parseable result: {completed.stdout!r}") from exc
+
+
+def _probe_epoch(value):
+    """`value` as a UTC epoch second, reusing _utc_iso's tolerant epoch/ISO parsing, or None."""
+    iso = _utc_iso(value)
+    if iso is None:
+        return None
+    return dt.datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+
+
+def _probe_outcome(document, now):
+    """Normalize the probe job's persisted outcome sidecar, FAIL-CLOSED (issue #219).
+
+    `measured` is True ONLY for an explicit, correctly-schema'd `ok` outcome with a fresh
+    attempt stamp. Every other shape — a `failed` outcome, an absent/empty/alien document, an
+    unparseable or missing stamp, a stamp older than PROBE_MAX_AGE_SECONDS or implausibly far in
+    the future — is "we did not measure", and build_dashboard then refuses to publish ANY account
+    as usable capacity on the strength of a snapshot nobody produced. Pure — unit-tested by
+    --self-test.
+
+    `None` (no sidecar supplied at all) is the WEAKEST evidence of the lot and normalizes to the
+    same unmeasured verdict as `{}` — #612 review finding 1: treating it as measured was a
+    fail-open branch inside the capacity decision itself."""
+    outcome, detail, attempted = "unknown", "probe outcome was not persisted", None
+    if isinstance(document, dict) and document.get("schema") == PROBE_SCHEMA:
+        raw = str(document.get("outcome") or "").strip().lower()
+        outcome = raw if raw in {"ok", "failed"} else "unknown"
+        # `detail` reaches the PUBLIC page and arrives from another job's artifact, so it is held
+        # to the same bounded safe-token shape this generator uses for every externally-sourced
+        # label — never published as free text.
+        text = str(document.get("detail") or "").strip()
+        detail = text if OBS_TOKEN_RE.fullmatch(text) else ""
+        attempted = _probe_epoch(document.get("attempted_at"))
+    # #612 review round 4 (MINOR): the freshness comparison runs on the EXACT age, not on a
+    # truncated one — `int()` rounds toward zero, so an attempt 3600.9s old (or 300.9s in the
+    # future) used to compare as 3600/-300 and stay `measured` at the nominal limit. Production
+    # writes integer epochs (`date -u +%s`) so nothing was mismeasured in practice, but the
+    # predicate now implements the boundary it documents. The PUBLISHED age stays an integer.
+    exact_age = (now - attempted) if attempted is not None else None
+    age = int(exact_age) if exact_age is not None else None
+    stale = (exact_age is None or exact_age > PROBE_MAX_AGE_SECONDS
+             or exact_age < -PROBE_MAX_SKEW_SECONDS)
+    return {
+        "outcome": outcome,
+        "detail": detail,
+        "attempted_at": _utc_iso(attempted),
+        "age_seconds": age,
+        "stale": stale,
+        "measured": outcome == "ok" and not stale,
+    }
 
 
 def _parse_dispatch_log(log_text):
@@ -757,9 +1206,10 @@ def _obs_exit_rows(items):
 
 
 def _obs_flow(flow):
-    """Queue depth/age per class, salted lease utilization, review rounds, park rates, arm→merge
-    latency, target-CI congestion. A lease row whose label is not the 8-hex salted shape is a raw
-    account identity reaching the collector output — a decision-22 privacy incident, fatal."""
+    """Queue depth/age per class, fleet-wide lease utilization, review rounds, park rates,
+    arm→merge latency, target-CI congestion. A lease row whose label is not the 8-hex salted shape
+    is a raw account identity reaching the collector output — a decision-22 privacy incident,
+    fatal — and since issue #374 the rows themselves are aggregated away rather than republished."""
     if not isinstance(flow, dict):
         return None
     queue = []
@@ -775,7 +1225,14 @@ def _obs_flow(flow):
                       "oldest_age_minutes": _obs_minutes(item.get("oldest_age_minutes"))})
     queue.sort(key=lambda row: row["class"])
 
-    leases = []
+    # Issue #374: the per-account lease rows are validated but NOT published. A list of up to 40
+    # {label, provider, utilization} rows is a per-account row array by another name — it reads out
+    # the fleet's size directly and its labels are stable across builds, which is exactly what the
+    # `accounts` array was removed for. The load-balance question the panel answers ("is one account
+    # carrying the fleet?") survives as summary statistics that are invariant under cloning the
+    # fleet. The decision-22 label check still runs on every INPUT row: a raw handle in the
+    # collector's output is a privacy incident regardless of what this build would have published.
+    lease_utilizations = []
     for item in flow.get("leases") if isinstance(flow.get("leases"), list) else []:
         if not isinstance(item, dict):
             continue
@@ -783,10 +1240,15 @@ def _obs_flow(flow):
         if not isinstance(label, str) or OBS_SALTED_LABEL_RE.fullmatch(label) is None:
             raise DashboardError(
                 "observability lease row does not carry a salted account label (decision 22)")
-        provider = str(item.get("provider") or "").lower()
-        leases.append({"label": label,
-                       "provider": provider if SAFE_PROVIDER_RE.fullmatch(provider) else None,
-                       "utilization_1h": _obs_fraction(item.get("utilization_1h"))})
+        utilization = _obs_fraction(item.get("utilization_1h"))
+        if utilization is not None:
+            lease_utilizations.append(utilization)
+    lease_utilization = None
+    if lease_utilizations:
+        lease_utilization = {
+            "mean": round(sum(lease_utilizations) / len(lease_utilizations), 2),
+            "max": round(max(lease_utilizations), 2),
+        }
 
     rounds = flow.get("review_rounds")
     review_rounds = None
@@ -826,7 +1288,8 @@ def _obs_flow(flow):
             continue
         ci_queue.append({"repository": repository, "depth": depth})
 
-    return {"queue": queue[:12], "leases": leases[:40], "review_rounds": review_rounds,
+    return {"queue": queue[:12], "lease_utilization_1h": lease_utilization,
+            "review_rounds": review_rounds,
             "parks_1h": parks_1h, "arm_to_merge_minutes_24h": arm_to_merge,
             "target_ci_queue": ci_queue[:12]}
 
@@ -916,63 +1379,80 @@ def _normalize_observability(document):
 
 
 def build_dashboard(issues, leases_document, usage, dispatch_history, model_health, now, salt,
-                    observability=None):
+                    observability=None, probe_status=None):
     accounts, private_values = _catalog(issues)
-    handles = [account["handle"] for account in accounts]
-    labels = _salted_labels(handles, salt)
+    _require_salt(salt)
     usage = usage if isinstance(usage, dict) else {}
-    leases = leases_document.get("leases") if isinstance(leases_document, dict) else None
-    if not isinstance(leases, list):
-        raise DashboardError("lease ledger must contain a leases array")
+    try:
+        leases = _lease_schema_module().validate_ledger(leases_document)
+    except ValueError as exc:
+        raise DashboardError(f"lease ledger is malformed: {exc}") from exc
     live = _live_leases(leases, now)
-    private_values.update(str(lease.get("account")) for lease in leases if lease.get("account"))
+    # Only the AGGREGATE lease count reaches the payload (#374); lease identities never do. Raw
+    # handles come only from the catalog/usage inputs and remain in the privacy deny-set.
     private_values.update(str(handle) for handle in usage)
 
-    rows = []
+    # Issue #219: a snapshot the probe did not actually produce is not evidence of anything. When
+    # the persisted outcome is not a fresh `ok`, the usage map is DISCARDED for every rendering
+    # decision — accounts, per-provider aggregates and eligible capacity all fall back to
+    # "unknown" — rather than being published as fresh available capacity.
+    #
+    # #612 review finding 1: NO SIDECAR AT ALL IS THE WEAKEST EVIDENCE OF THE LOT, so it degrades
+    # exactly like an unusable one. The first form made `probe_status=None` mean MEASURED, which put
+    # a fail-OPEN branch inside the very function that decides capacity: a caller could hand
+    # build_dashboard a (possibly stale) non-empty usage map with no sidecar and get every account
+    # rendered "available", `fleet.capacity.eligible` positive, and — because the degradation key was
+    # omitted in that same branch — NO warning anywhere on the page. That is the #219 failure mode
+    # reachable through a different door. `main()`'s `--usage-status`-is-required check guards only
+    # the CLI; the invariant belongs here, where the decision is made. The sidecar is now the ONLY
+    # thing that can license publishing usage as capacity, and the marker is ALWAYS emitted so no
+    # code path can drop the page's degradation notice.
+    probe = _probe_outcome(probe_status, now)
+    usage_rendered = usage if probe["measured"] else {}
+
+    # The internal capacity tally. ONE predicate for the provider row and eligible capacity: an
+    # account is counted eligible only where the allocator would also admit it. Issue #374: this
+    # stays a count internally — it is what decides "is there headroom" — but only the boolean
+    # projection of it is published.
     capacity = {}
     for account in accounts:
-        entry = usage.get(account["handle"])
-        availability = _availability(account, entry)
+        entry = usage_rendered.get(account["handle"])
+        availability, _backoff_until = _quota_state(account, entry, now)
         provider_capacity = capacity.setdefault(
             account["provider"], {"eligible": 0, "total": 0})
         provider_capacity["total"] += 1
         if availability == "available":
             provider_capacity["eligible"] += 1
-        weekly_reset_at = _utc_iso(entry.get("7d_reset")) if isinstance(entry, dict) else None
-        rows.append({
-            "label": labels[account["handle"]],
-            "provider": account["provider"],
-            "availability": availability,
-            "active_agents": sum(1 for lease in live if lease.get("account") == account["handle"]),
-            "weekly_reset_at": weekly_reset_at,
-            "windows": _window_rows(account, entry),
-        })
-    rows.sort(key=lambda row: (
-        row["provider"], row["weekly_reset_at"] is None,
-        row["weekly_reset_at"] or "", row["label"]))
     history = dispatch_history if isinstance(dispatch_history, list) else []
     document = {
         "schema": SCHEMA,
         "generated_at": _utc_iso(now),
-        "accounts": rows,
-        # Cumulative per-provider headroom (maintainer request 2026-07-18) — rendered by the
-        # dashboard's "Provider quota (cumulative)" section, above the per-account cards.
-        "provider_quota": _provider_quota(accounts, usage, now),
+        # Per-provider headroom (maintainer request 2026-07-18), MINIMIZED for the public payload
+        # (issue #374). The per-account `accounts` array that used to sit under this key is gone;
+        # this section is now the whole quota surface.
+        "provider_quota": _public_provider_quota(
+            _provider_quota(accounts, usage_rendered, now)),
         "fleet": {
             "active_agents": len(live),
-            "capacity": capacity,
+            "capacity": _public_capacity(capacity),
             "last_sweep_at": history[0].get("at") if history else None,
             "dispatch_outcomes": history,
         },
         "active_by_repository": _repository_activity(live),
         "model_health": _normalize_model_health(model_health),
     }
+    # Degradation marker (issue #219): the page renders probe age + failure so a stale or failed
+    # measurement is visible instead of silently looking like a fresh, idle fleet. ALWAYS present
+    # (#612 review finding 1) — it used to be omitted on exactly the branch that also trusted the
+    # usage map unconditionally, so the one state that most needed a warning carried none.
+    document["usage_probe"] = probe
     observability = _normalize_observability(observability)
     if observability is not None:
         # Optional key (absent => the dashboard hides the Observability panels), placed INSIDE the
         # document so the raw-identity assertion below covers every observability string too.
         document["observability"] = observability
     _assert_private(document, private_values)
+    _assert_no_fleet_composition(document)
     return document
 
 
@@ -1014,7 +1494,24 @@ def _self_test():
         ok = ok and good
         print(f"  {'ok  ' if good else 'FAIL'} {name}: {got!r} (want {want!r})")
 
+    def _raises_dashboard(thunk):
+        try:
+            thunk()
+        except DashboardError:
+            return True
+        return False
+
     now = 1_750_000_000
+    # #612 review finding 1: since a build with NO sidecar publishes nothing as capacity (correct —
+    # an unsupplied measurement is the weakest evidence of all), every fixture below that means to
+    # exercise the real CAPACITY/rendering path must SAY the probe measured. That this whole golden
+    # block previously ran through the sidecar-less branch is itself the evidence that the fail-open
+    # branch was load-bearing for the suite: the tests were mostly exercising the unguarded path.
+    measured_sidecar = {"schema": PROBE_SCHEMA, "outcome": "ok", "detail": "probe-succeeded",
+                        "attempted_at": now - 30}
+    measured_marker = {"outcome": "ok", "detail": "probe-succeeded",
+                       "attempted_at": _utc_iso(now - 30), "age_seconds": 30, "stale": False,
+                       "measured": True}
     handle = "acct-fixture"
     email = "private@example.invalid"
     issues = [{
@@ -1023,48 +1520,41 @@ def _self_test():
         "body": ("provider: anthropic\nmodels: [opus]\nsecret_ref: ACCTFIXTURE_TOKEN\n"
                  f"email: {email}\nlimits: 5h_limit=1000 7d_limit=7000\n"),
     }]
+    lease_account = hashlib.sha256(f"{handle}:fixture-salt".encode()).hexdigest()[:16]
     leases = {"leases": [
-        {"account": handle, "holder": "owner/repo#7@run.1", "model": "opus",
-         "expires_at": now + 60},
-        {"account": handle, "expires_at": now - 1},
+        {"account": lease_account, "claim_id": "a" * 32,
+         "holder": "owner/repo#7@run.1", "package": "pkg", "role": "impl", "model": "opus",
+         "issued_at": now - 60, "expires_at": now + 60},
+        {"account": lease_account, "claim_id": "b" * 32,
+         "holder": "owner/repo#8@run.1", "package": "pkg", "role": "impl", "model": "opus",
+         "issued_at": now - 60, "expires_at": now - 1},
     ]}
     usage = {handle: {"status": "allowed", "5h_util": "0.42", "5h_reset": now + 3600,
                       "7d_util": "0.8", "7d_reset": now + 86400}}
     history = [{"at": "2025-06-15T15:05:00Z", "conclusion": "success",
                 "dispatched": 2, "deferred": 3}]
-    got = build_dashboard(issues, leases, usage, history, None, now, "fixture-salt")
+    got = build_dashboard(issues, leases, usage, history, None, now, "fixture-salt",
+                          probe_status=measured_sidecar)
     expected = {
         "schema": SCHEMA,
         "generated_at": "2025-06-15T15:06:40Z",
-        "accounts": [{
-            "label": "b01f153c", "provider": "anthropic", "availability": "available",
-            "active_agents": 1,
-            "weekly_reset_at": "2025-06-16T15:06:40Z",
-            "windows": [
-                {"name": "5 hour", "used_percent": 42.0,
-                 "reset_at": "2025-06-15T16:06:40Z", "limit": "1000"},
-                {"name": "7 day", "used_percent": 80.0,
-                 "reset_at": "2025-06-16T15:06:40Z", "limit": "7000"},
-            ],
-        }],
+        # Issue #374: NO `accounts` array, and the provider row carries a headroom WORD plus mean
+        # window fractions instead of the five-number account census + Σ-over-accounts sums.
         "provider_quota": [{
-            "provider": "anthropic", "accounts_total": 1, "accounts_available": 1,
-            "accounts_capped": 0, "accounts_unavailable": 0, "accounts_unknown": 0,
-            "single_account": True,
+            "provider": "anthropic",
+            "headroom": "available",
             "signal": "live rate-limit-header probe (per-window utilization)",
             "windows": [
-                {"name": "5 hour", "accounts_reporting": 1, "remaining_account_windows": 0.58,
-                 "limit_remaining": 580, "limits_known": 1,
+                {"name": "5 hour", "remaining_fraction": 0.58,
                  "soonest_reset": "2025-06-15T16:06:40Z", "oldest_reset": "2025-06-15T16:06:40Z"},
-                {"name": "7 day", "accounts_reporting": 1, "remaining_account_windows": 0.2,
-                 "limit_remaining": 1400, "limits_known": 1,
+                {"name": "7 day", "remaining_fraction": 0.2,
                  "soonest_reset": "2025-06-16T15:06:40Z", "oldest_reset": "2025-06-16T15:06:40Z"},
             ],
             "soonest_reset": "2025-06-15T16:06:40Z", "oldest_reset": "2025-06-16T15:06:40Z",
         }],
         "fleet": {
             "active_agents": 1,
-            "capacity": {"anthropic": {"eligible": 1, "total": 1}},
+            "capacity": {"anthropic": True},
             "last_sweep_at": "2025-06-15T15:05:00Z",
             "dispatch_outcomes": history,
         },
@@ -1073,6 +1563,10 @@ def _self_test():
             "repositories": [{"repository": "owner/repo", "counts": {"opus": 1}}],
         },
         "model_health": None,
+        # The degradation marker is now on EVERY document (#612 review finding 1), so the golden
+        # fixture carries it too — and a measured build must say `measured: True` rather than omit
+        # the key, which is what let a sidecar-less build look indistinguishable from a healthy one.
+        "usage_probe": measured_marker,
     }
     check("fixture leases + limits -> expected JSON", got, expected)
     check("dispatch log counts", _parse_dispatch_log(
@@ -1081,7 +1575,7 @@ def _self_test():
         "2025-01-01Z dispatcher complete: 1 worker/review/fix run(s) launched\n"), (1, 1))
     check("raw identity absent", handle not in json.dumps(got) and email not in json.dumps(got), True)
     leaky = copy.deepcopy(got)
-    leaky["accounts"][0]["debug"] = handle
+    leaky["provider_quota"][0]["debug"] = handle
     try:
         _assert_private(leaky, {handle})
     except DashboardError:
@@ -1089,8 +1583,120 @@ def _self_test():
     else:
         rejected = False
     check("privacy assertion rejects injected raw handle", rejected, True)
-    no_salt = build_dashboard(issues, {"leases": []}, {}, [], None, now, "")
-    check("missing salt fails closed", no_salt["accounts"][0]["label"], "salt-missing")
+    try:
+        build_dashboard(issues, {"leases": []}, {}, [], None, now, "")
+    except DashboardError:
+        salt_missing_failed = True
+    else:
+        salt_missing_failed = False
+    check("missing salt fails closed (no dashboard is built without PROVENANCE_SALT)",
+          salt_missing_failed, True)
+    invalid_salts_rejected = []
+    for invalid_salt in (None, "", "   ", "salt\nvalue"):
+        try:
+            _require_salt(invalid_salt)
+        except DashboardError:
+            invalid_salts_rejected.append(True)
+        else:
+            invalid_salts_rejected.append(False)
+    check("invalid salts fail closed", invalid_salts_rejected, [True, True, True, True])
+    check("a real salt is accepted (the precondition is not vacuously fatal)",
+          _require_salt("fixture-salt"), None)
+
+    # --- Issue #374: NO FLEET COMPOSITION ON THE PUBLIC PAYLOAD. -------------------------------
+    # The sharpest statement of the property, and the one that goes red on any partial revert: two
+    # fleets that differ ONLY in how many accounts they contain must publish the same document apart
+    # from the live-agent counts named as the KNOWN RESIDUAL above. The three-account fixture below
+    # is three clones of the one-account fixture — same provider, same limits, same probe numbers,
+    # same resets — so every surviving field is one an observer cannot count accounts with, and it
+    # is run both idle and at full occupancy. Pre-#374 this was red on accounts (1 row vs 3),
+    # accounts_total (1 vs 3),
+    # single_account (True vs False), accounts_available (1 vs 3), remaining_account_windows
+    # (0.58 vs 1.74), limit_remaining (580 vs 1740), limits_known/accounts_reporting (1 vs 3) and
+    # fleet.capacity (eligible/total 1/1 vs 3/3) — i.e. on every field this change touched.
+    def clone_fleet(size, busy=0):
+        """`size` identical accounts, the first `busy` of them holding one live lease each."""
+        clone_issues, clone_usage, clone_leases = [], {}, []
+        for index in range(size):
+            clone_handle = f"acct-clone-{index}"
+            clone_issues.append({
+                "title": clone_handle,
+                "labels": [{"name": "status:available"}],
+                "body": ("provider: anthropic\nmodels: [opus]\n"
+                         f"secret_ref: ACCTCLONE{index}_TOKEN\n"
+                         "limits: 5h_limit=1000 7d_limit=7000\n"),
+            })
+            clone_usage[clone_handle] = {"status": "allowed", "5h_util": "0.42",
+                                         "5h_reset": now + 3600, "7d_util": "0.8",
+                                         "7d_reset": now + 86400}
+            if index < busy:
+                clone_leases.append({
+                    "account": hashlib.sha256(
+                        f"{clone_handle}:fixture-salt".encode()).hexdigest()[:16],
+                    "claim_id": f"{index:x}" * 32, "holder": f"owner/repo#{index + 1}@run.1",
+                    "package": "pkg", "role": "impl", "model": "opus",
+                    "issued_at": now - 60, "expires_at": now + 60})
+        built = build_dashboard(clone_issues, {"leases": clone_leases}, clone_usage, history, None,
+                                now, "fixture-salt", probe_status=measured_sidecar)
+        return {"provider_quota": built["provider_quota"], "fleet": built["fleet"],
+                "active_by_repository": built["active_by_repository"]}
+
+    def without_agent_counts(published):
+        """The payload minus the KNOWN RESIDUAL (see the FLEET-COMPOSITION block at the top): the
+        live-lease counts, which are not claimed to be invariant and are not published as if they
+        were."""
+        trimmed = copy.deepcopy(published)
+        trimmed["fleet"].pop("active_agents")
+        trimmed.pop("active_by_repository")
+        return trimmed
+
+    check("[#374] a 1-account and a 3-account IDLE fleet publish a byte-identical payload",
+          clone_fleet(1), clone_fleet(3))
+    # #839 review round 1, finding 1: idle fleets exercise the property at ZERO load, where nothing
+    # about the fleet is in play — which is precisely the state the residual cannot be seen from.
+    # Re-run it with one live agent per account, so each fixture is a fleet at full occupancy and
+    # the per-account census fields (accounts_total 1 vs 3, remaining_account_windows 0.58 vs 1.74,
+    # limit_remaining 580 vs 1740, capacity 1/1 vs 3/3) are all live and would diverge on a partial
+    # revert.
+    check("[#374] ...and so do a BUSY 1-account and 3-account fleet, one live agent per account",
+          without_agent_counts(clone_fleet(1, busy=1)),
+          without_agent_counts(clone_fleet(3, busy=3)))
+    # The residual, ASSERTED rather than implied by omission: the counts trimmed above really do
+    # scale with the fleet under load, so the property is "no account census", not "no fleet count".
+    # This row is what keeps the page footer and the block comment honest — a change that removes
+    # `active_agents` (or one that quietly restores an absolute no-fleet-count claim) has to come
+    # through here.
+    check("[#374] KNOWN RESIDUAL: the live-agent counts DO scale with the fleet under load",
+          [(clone_fleet(size, busy=size)["fleet"]["active_agents"],
+            clone_fleet(size, busy=size)["active_by_repository"]["repositories"][0]["counts"])
+           for size in (1, 3)],
+          [(1, {"opus": 1}), (3, {"opus": 3})])
+    check("[#374] ...and that payload still reports the headroom honestly (not blanked out)",
+          (clone_fleet(3)["provider_quota"][0]["headroom"],
+           clone_fleet(3)["provider_quota"][0]["windows"][0]["remaining_fraction"],
+           clone_fleet(3)["fleet"]["capacity"]),
+          ("available", 0.58, {"anthropic": True}))
+    check("[#374] the golden document carries none of the composition keys",
+          sorted(FLEET_COMPOSITION_KEYS
+                 & set(re.findall(r'"([^"]+)":', json.dumps(got)))), [])
+    for banned_key, banned_value in (("accounts", []), ("accounts_total", 3),
+                                     ("single_account", True), ("label", "26208fef35e33b14"),
+                                     ("eligible", 1), ("limit_remaining", 580)):
+        poisoned = copy.deepcopy(got)
+        poisoned["fleet"][banned_key] = banned_value
+        try:
+            _assert_no_fleet_composition(poisoned)
+        except DashboardError:
+            composition_rejected = True
+        else:
+            composition_rejected = False
+        check(f"[#374] a re-introduced `{banned_key}` key fails the build closed",
+              composition_rejected, True)
+    check("[#374] ...and the real document passes the same assertion (not vacuously fatal)",
+          _assert_no_fleet_composition(got), None)
+    check("[#374] the assertion reaches keys nested inside lists, not just the top level",
+          _raises_dashboard(lambda: _assert_no_fleet_composition(
+              {"provider_quota": [{"windows": [{"accounts_reporting": 2}]}]})), True)
 
     def issue(account_handle, provider, secret):
         return {
@@ -1112,18 +1718,24 @@ def _self_test():
         "anth-late": {"status": "allowed", "7d_reset": now + 900},
         "anth-unknown": {"status": "allowed"},
         "anth-soon": {"status": "allowed", "7d_reset": now + 100},
-        "openai-one": {"exempt": True},
+        # [#639] the probe stamps reachability on every exempt entry (absent => unknown, so a
+        # fixture without it would exercise the refusal path rather than the healthy one).
+        "openai-one": {"exempt": True, "reachability": "live"},
         "future-one": {"status": "allowed", "7d_reset": now + 500},
     }
     activity_leases = {"leases": [
-        {"account": "anth-soon", "holder": "org/alpha#1@run.1", "model": "sol",
-         "expires_at": now + 30},
-        {"account": "anth-late", "holder": "review:org/alpha#2@run.1", "model": "fable",
-         "expires_at": now + 20},
-        {"account": "anth-unknown", "holder": "fix:org/beta#3@run.1", "model": "opus",
-         "expires_at": now + 10},
-        {"account": "expired-private", "holder": "org/expired#4@old", "model": "terra",
-         "expires_at": now - 1},
+        {"account": "1" * 16, "claim_id": "1" * 32,
+         "holder": "org/alpha#1@run.1", "package": "pkg", "role": "impl", "model": "sol",
+         "issued_at": now - 30, "expires_at": now + 30},
+        {"account": "2" * 16, "claim_id": "2" * 32,
+         "holder": "review:org/alpha#2@run.1", "package": "pkg", "role": "review",
+         "model": "fable", "issued_at": now - 30, "expires_at": now + 20},
+        {"account": "3" * 16, "claim_id": "3" * 32,
+         "holder": "fix:org/beta#3@run.1", "package": "pkg", "role": "fix", "model": "opus",
+         "issued_at": now - 30, "expires_at": now + 10},
+        {"account": "4" * 16, "claim_id": "4" * 32,
+         "holder": "org/expired#4@old", "package": "pkg", "role": "impl", "model": "terra",
+         "issued_at": now - 30, "expires_at": now - 1},
     ]}
     # Live ledger fixture — the exact {"records": [...]} shape model-health.py writes (#218).
     health_ledger = {"records": [
@@ -1138,7 +1750,8 @@ def _self_test():
          "model_alias": "", "exit_class": "zero-dispatch", "run_id": "r4"},
     ]}
     ordered = build_dashboard(
-        ordered_issues, activity_leases, ordered_usage, [], health_ledger, now, "fixture-salt")
+        ordered_issues, activity_leases, ordered_usage, [], health_ledger, now, "fixture-salt",
+        probe_status=measured_sidecar)
     check("canonical records ledger -> per-provider/model checks", ordered["model_health"], {
         "generated_at": _utc_iso(now - 120),
         "checks": [
@@ -1159,17 +1772,11 @@ def _self_test():
         ledger_rejected = False
     check("malformed records ledger fails loudly, never a fabricated check",
           ledger_rejected, True)
-    salted = _salted_labels(ordered_handles, "fixture-salt")
-    check("providers grouped + weekly resets soonest first + unknown last", [
-        (row["provider"], row["label"], row["weekly_reset_at"])
-        for row in ordered["accounts"]
-    ], [
-        ("anthropic", salted["anth-soon"], _utc_iso(now + 100)),
-        ("anthropic", salted["anth-late"], _utc_iso(now + 900)),
-        ("anthropic", salted["anth-unknown"], None),
-        ("future-provider", salted["future-one"], _utc_iso(now + 500)),
-        ("openai", salted["openai-one"], None),
-    ])
+    # Issue #374 replaced the per-account rows this used to order with one row per provider; the
+    # surviving public ordering promise is "one alphabetical row per provider, no account rows".
+    check("one alphabetical provider row, and no per-account rows at all",
+          ([row["provider"] for row in ordered["provider_quota"]], "accounts" in ordered),
+          (["anthropic", "future-provider", "openai"], False))
     check("repo/model table parses impl + review + fix and excludes expired", [
         ordered["fleet"]["active_agents"], ordered["active_by_repository"]
     ], [3, {
@@ -1206,7 +1813,7 @@ def _self_test():
         # multi-c: probe fail-closed omitted — counts in the total and as UNKNOWN/unreported
         # (dispatch treats the omission as unavailable), never in accounts_reporting and
         # never as free (sol finding 2, PR #281 fix round)
-        "solo-openai": {"exempt": True, "backoff_until": now + 300},
+        "solo-openai": {"exempt": True, "reachability": "live", "backoff_until": now + 300},
     }
     quota_rows = _provider_quota(quota_accounts, quota_usage, now)
     check("cumulative quota: multi-account provider aggregates mixed capped/free", quota_rows[0], {
@@ -1260,14 +1867,36 @@ def _self_test():
                                (10 ** 400, False),              # absurd int: float() overflows
                                ("garbage", False), (None, False), ([], False), ({}, False),
                                (True, False)):
-        entry = {"exempt": True, "backoff_until": stamp}
+        entry = {"exempt": True, "reachability": "live", "backoff_until": stamp}
         state, _until = _quota_state(exempt_account, entry, now)
         check(f"backoff stamp {str(stamp)[:24]!r}: dashboard capped == allocator excluded",
               (state == "capped", not allocator.usage_eligible(entry, now=now)),
               (want_capped, want_capped))
+    # [registry #639] EXEMPTION IS NOT REACHABILITY, on the page too. #612 made the page honest about
+    # a failed PROBE; this makes it honest about a dead CREDENTIAL. The pairing is the point: every row
+    # asserts the page state and the allocator verdict TOGETHER, so neither surface can drift into
+    # advertising capacity the other refuses (or vice versa).
+    for reachability, want_state in (("live", "available"), ("unproven", "available"),
+                                     ("dead", "unavailable"),
+                                     (None, "unknown"),          # producer never stated it
+                                     ("LIVE", "unknown"), ("available", "unknown"),
+                                     (True, "unknown"), ({}, "unknown")):
+        reach_entry = {"exempt": True}
+        if reachability is not None:
+            reach_entry["reachability"] = reachability
+        state, _until = _quota_state(exempt_account, reach_entry, now)
+        check(f"[#639] exempt reachability {reachability!r}: page state == allocator verdict",
+              (state, state == "available", allocator.usage_eligible(dict(reach_entry), now=now)),
+              (want_state, want_state == "available", want_state == "available"))
+    check("[#639] a DEAD exempt account contributes no cumulative capacity either",
+          [(row["accounts_available"], row["accounts_capped"], row["accounts_unavailable"])
+           for row in _provider_quota(
+               quota_accounts[3:], {"solo-openai": {"exempt": True, "reachability": "dead"}}, now)],
+          [(0, 0, 1)])
     check("cumulative quota: expired backoff no longer counts as capped",
           [(row["accounts_available"], row["accounts_capped"]) for row in _provider_quota(
-              quota_accounts[3:], {"solo-openai": {"exempt": True, "backoff_until": now - 1}},
+              quota_accounts[3:],
+              {"solo-openai": {"exempt": True, "reachability": "live", "backoff_until": now - 1}},
               now)],
           [(1, 0)])
     # PARTIAL probe entries are never free (sol finding 1, PR #281 fix round 3):
@@ -1360,10 +1989,685 @@ def _self_test():
           _limit_window(["inf", "nan", "-5"]), (0, None, True))
     check("cumulative quota rows carry no raw account identifier (decision 22)",
           all(h not in json.dumps(quota_rows) for h in quota_handles), True)
-    check("ordered fixture publishes one cumulative row per provider, single-account marked",
-          [(row["provider"], row["accounts_total"], row["single_account"])
+    # The INTERNAL rows still carry the census (they are what decides capacity); the PUBLISHED rows
+    # carry the headroom word derived from it. Both halves are asserted so neither can drift.
+    check("ordered fixture: internal census -> published headroom, per provider",
+          [(row["provider"], row["accounts_total"], row["single_account"],
+            _provider_headroom(row))
+           for row in _provider_quota(_catalog(ordered_issues)[0], ordered_usage, now)],
+          # every anthropic/future entry in ordered_usage is a PARTIAL probe row (a reset stamp with
+          # no utilization), which _quota_state files as unknown — so the census is 3/1 accounts,
+          # none of them free, and the headroom word says exactly that without saying how many.
+          [("anthropic", 3, False, "unknown"), ("future-provider", 1, True, "unknown"),
+           ("openai", 1, True, "available")])
+    check("ordered fixture publishes headroom words, never the census behind them",
+          [(row["provider"], row["headroom"]) for row in ordered["provider_quota"]],
+          [("anthropic", "unknown"), ("future-provider", "unknown"),
+           ("openai", "available")])
+    # The headroom precedence, all four branches, both directions: "can we dispatch" wins, then the
+    # most actionable reason. Collapsing any branch into another (or always answering "available")
+    # turns a row red.
+    for census, want_headroom in (
+            ({"accounts_available": 1, "accounts_capped": 9, "accounts_unknown": 9,
+              "accounts_unavailable": 9}, "available"),
+            ({"accounts_available": 0, "accounts_capped": 1, "accounts_unknown": 9,
+              "accounts_unavailable": 9}, "capped"),
+            ({"accounts_available": 0, "accounts_capped": 0, "accounts_unknown": 1,
+              "accounts_unavailable": 9}, "unknown"),
+            ({"accounts_available": 0, "accounts_capped": 0, "accounts_unknown": 0,
+              "accounts_unavailable": 1}, "unavailable")):
+        check(f"headroom precedence resolves to {want_headroom}",
+              _provider_headroom(census), want_headroom)
+
+    # --- usage-probe outcome (issue #219): dashboard.yml's secret-materialization + probe steps
+    # are continue-on-error and a failed probe was replaced by `{}`, so precisely WHEN measurement
+    # failed the public page showed every catalog-available account as fresh usable capacity. Every
+    # case below feeds the IDENTICAL complete usage entry and varies only the persisted outcome.
+    #
+    # WHICH MUTATION EACH ROW KILLS (#612 review finding 3 asked for this to be stated precisely
+    # rather than claimed in aggregate):
+    #   * the REJECT rows (failed / stale / alien schema / unstamped / unknown word / NO sidecar)
+    #     go red on ANY weakening of the gate — including the narrow one that keeps the marker and
+    #     only stops discarding the usage map.
+    #   * the ACCEPT row (fresh `ok`) kills the WHOLE-GATE deletion, because its expected tuple
+    #     includes `usage_probe.measured is True` and a build with no gate emits no marker at all
+    #     (`.get("measured")` -> None). It does NOT — and cannot — kill the narrow "always trust
+    #     usage" mutation: by construction a passing gate and an absent gate agree on a fresh probe.
+    #     Its job there is over-rejection regression cover, which is a real but different job.
+    # -----------------------------------------------------------------------------------------
+    fresh_probe = {"schema": PROBE_SCHEMA, "outcome": "ok", "detail": "probe-succeeded",
+                   "attempted_at": now - 30}
+    failed_probe = {"schema": PROBE_SCHEMA, "outcome": "failed",
+                    "detail": "secret-materialization-failed", "attempted_at": now - 30}
+    stale_probe = {"schema": PROBE_SCHEMA, "outcome": "ok", "detail": "probe-succeeded",
+                   "attempted_at": now - PROBE_MAX_AGE_SECONDS - 1}
+
+    def probe_view(status):
+        built = build_dashboard(issues, leases, usage, history, None, now, "fixture-salt",
+                                probe_status=status)
+        # #374 moved the observable from the per-account row + the census to the headroom word and
+        # the capacity boolean. It is the SAME predicate underneath, so this block still fails on
+        # any weakening of the #219/#612 gate — an unmeasured probe must read `unknown`/no capacity.
+        return (built["provider_quota"][0]["headroom"], built["fleet"]["capacity"],
+                built["provider_quota"][0]["windows"],
+                (built.get("usage_probe") or {}).get("measured"))
+
+    check("fresh ok probe: a real measurement still publishes real capacity",
+          probe_view(fresh_probe),
+          ("available", {"anthropic": True},
+           [{"name": "5 hour", "remaining_fraction": 0.58,
+             "soonest_reset": _utc_iso(now + 3600), "oldest_reset": _utc_iso(now + 3600)},
+            {"name": "7 day", "remaining_fraction": 0.2,
+             "soonest_reset": _utc_iso(now + 86400), "oldest_reset": _utc_iso(now + 86400)}],
+           True))
+    for probe_name, probe_status in (
+            ("failed", failed_probe),
+            ("stale ok", stale_probe),
+            ("empty/absent sidecar", {}),
+            # #612 review finding 1: NO sidecar at all used to mean MEASURED — the usage map was
+            # taken at face value, capacity went positive AND the degradation key was omitted, so
+            # the page carried no warning. Non-vacuous: pre-fix this row read
+            # ("available", eligible 1, 1, 0, None).
+            ("no sidecar supplied at all", None),
+            ("alien schema", {"schema": "wrong/v0", "outcome": "ok", "attempted_at": now}),
+            ("unstamped ok", {"schema": PROBE_SCHEMA, "outcome": "ok"}),
+            ("unknown outcome word", {"schema": PROBE_SCHEMA, "outcome": "maybe",
+                                      "attempted_at": now})):
+        check(f"{probe_name} probe: the SAME usage input is never published as capacity",
+              probe_view(probe_status),
+              ("unknown", {"anthropic": False}, [], False))
+    degraded = build_dashboard(issues, leases, usage, history, None, now, "fixture-salt",
+                               probe_status=failed_probe)
+    check("failed probe publishes no window numbers or reset stamps from the dead snapshot",
+          [(row["windows"], row["soonest_reset"], row["oldest_reset"])
+           for row in degraded["provider_quota"]],
+          [([], None, None)])
+    check("failed probe surfaces its outcome, detail and age on the public document",
+          degraded["usage_probe"],
+          {"outcome": "failed", "detail": "secret-materialization-failed",
+           "attempted_at": _utc_iso(now - 30), "age_seconds": 30, "stale": False,
+           "measured": False})
+    check("stale ok probe surfaces its age and stops counting as measured",
+          _probe_outcome(stale_probe, now),
+          {"outcome": "ok", "detail": "probe-succeeded",
+           "attempted_at": _utc_iso(now - PROBE_MAX_AGE_SECONDS - 1),
+           "age_seconds": PROBE_MAX_AGE_SECONDS + 1, "stale": True, "measured": False})
+    check("free-text probe detail is dropped, never published as-is on the public page",
+          _probe_outcome({"schema": PROBE_SCHEMA, "outcome": "failed",
+                          "attempted_at": now, "detail": "token acct-fixture rejected"},
+                         now)["detail"], "")
+    check("probe age boundary: exactly at the limit is measured, one second past is not",
+          [_probe_outcome({"schema": PROBE_SCHEMA, "outcome": "ok",
+                           "attempted_at": now - probe_age}, now)["measured"]
+           for probe_age in (PROBE_MAX_AGE_SECONDS, PROBE_MAX_AGE_SECONDS + 1)],
+          [True, False])
+    check("future probe stamp: clock skew tolerated, an implausible stamp is not measured",
+          [_probe_outcome({"schema": PROBE_SCHEMA, "outcome": "ok",
+                           "attempted_at": now + skew}, now)["measured"]
+           for skew in (PROBE_MAX_SKEW_SECONDS, PROBE_MAX_SKEW_SECONDS + 1)],
+          [True, False])
+    # #612 review round 4 (MINOR): the comparison used to run on `int(now - attempted)`, which
+    # rounds toward zero — an age of 3600.9s (or a 300.9s future stamp) compared as 3600/-300 and
+    # stayed `measured` past the documented boundary. Production stamps are integers so nothing was
+    # mismeasured, but a caller with a float `now` was outside the predicate's own contract.
+    check("fractional ages obey the documented boundary (not a truncated one)",
+          [_probe_outcome({"schema": PROBE_SCHEMA, "outcome": "ok",
+                           "attempted_at": now - PROBE_MAX_AGE_SECONDS}, now + fraction)["measured"]
+           for fraction in (0.0, 0.9)]
+          + [_probe_outcome({"schema": PROBE_SCHEMA, "outcome": "ok",
+                             "attempted_at": now + PROBE_MAX_SKEW_SECONDS},
+                            now - fraction)["measured"]
+             for fraction in (0.0, 0.9)],
+          [True, False, True, False])
+    check("...while the PUBLISHED age stays an integer",
+          _probe_outcome({"schema": PROBE_SCHEMA, "outcome": "ok",
+                          "attempted_at": now - 30}, now + 0.4)["age_seconds"],
+          30)
+    # #612 review finding 2: this check used to assert "no degradation key" against `got` — a
+    # DIFFERENT document built ~350 lines earlier — so that half would have stayed green even if the
+    # sidecar-less build had started emitting a bogus marker; and its availability half deliberately
+    # pinned the pre-fix PERMISSIVE behaviour, locking in the fail-open of finding 1. It now asserts
+    # against the document the adjacent call actually builds, and pins the fail-CLOSED behaviour:
+    # a build with no sidecar publishes nothing as capacity AND carries the degradation marker.
+    sidecarless = build_dashboard(issues, leases, usage, history, None, now, "fixture-salt")
+    # `.get` on purpose: under the pre-fix code the key is ABSENT, and this check must then go red
+    # with a legible value rather than take the suite down with a KeyError.
+    sidecarless_marker = sidecarless.get("usage_probe") or {}
+    check("[#612] NO sidecar: nothing published as capacity, and the marker IS on the document",
+          (sidecarless["provider_quota"][0]["headroom"],
+           sidecarless["fleet"]["capacity"],
+           "usage_probe" in sidecarless,
+           (sidecarless_marker.get("outcome"), sidecarless_marker.get("measured"),
+            sidecarless_marker.get("stale"), sidecarless_marker.get("attempted_at"))),
+          ("unknown", {"anthropic": False}, True,
+           ("unknown", False, True, None)))
+    check("[#612] and no window numbers or reset stamps leak from the untrusted snapshot",
+          [(row["windows"], row["soonest_reset"]) for row in sidecarless["provider_quota"]],
+          [([], None)])
+    # The core misreport (issue #219): a catalog-available account the probe never reported on used
+    # to render "available" and count toward eligible capacity. It is the allocator's INELIGIBLE
+    # shape, so it is "unknown" and eligible 0 — even with a perfectly healthy probe.
+    unreported = build_dashboard(issues, leases, {}, history, None, now, "fixture-salt",
+                                 probe_status=fresh_probe)
+    check("catalog-available account with NO probe entry is unknown and not eligible capacity",
+          (unreported["provider_quota"][0]["headroom"], unreported["fleet"]["capacity"]),
+          ("unknown", {"anthropic": False}))
+    # The one-shared-predicate parity, restated on the minimized surface (#374): published capacity
+    # is true for exactly the providers whose published headroom is "available". Both projections
+    # read the SAME internal count, so the page cannot advertise capacity dispatch would refuse.
+    check("published capacity agrees with the published headroom word (one shared predicate)",
+          [(row["provider"], row["headroom"] == "available")
            for row in ordered["provider_quota"]],
-          [("anthropic", 3, False), ("future-provider", 1, True), ("openai", 1, True)])
+          sorted(ordered["fleet"]["capacity"].items()))
+    with tempfile.TemporaryDirectory() as directory:
+        usage_file = Path(directory, "usage.json")
+        usage_file.write_text(json.dumps(usage), encoding="utf-8")
+        leases_file = Path(directory, "leases.json")
+        leases_file.write_text(json.dumps(leases), encoding="utf-8")
+        health_file = Path(directory, "model-health.json")
+        health_file.write_text(json.dumps({"records": []}), encoding="utf-8")
+        try:
+            main(["--leases", str(leases_file), "--model-health", str(health_file),
+                  "--usage", str(usage_file)])
+        except DashboardError as exc:
+            # Assert on the MESSAGE, not merely that something raised: main() has several later
+            # fail-closed exits (no REGISTRY_REPO, gh unavailable) that would make a bare
+            # "did it raise" assertion pass with the coupling deleted — i.e. vacuous.
+            status_required = "--usage-status" in str(exc)
+        else:
+            status_required = False
+        check("a usage snapshot without --usage-status is refused (the #219 caller coupling)",
+              status_required, True)
+
+    # --- #612 review round 2, finding 4 (MAJOR): the probe step's shell body is EXECUTED, not
+    # pattern-matched. `bash -n` and actionlint cannot see polarity, so dropping the `!` from
+    # `if [ "$outcome" = ok ] && ! python3 scripts/account-usage.py > "$RUNNER_TEMP/usage.json"`
+    # inverted the whole classification with the full suite green: a NONZERO probe stayed `ok` and
+    # published a fresh `measured` sidecar. The step body is extracted from the real workflow and
+    # run under bash against a stubbed probe, so each row below dies on a one-token change to the
+    # shell — including replacing the body with `true` (no sidecar is written at all).
+    # ------------------------------------------------------------------------------------------
+    dashboard_workflow = _repo_file(".github", "workflows", "dashboard.yml")
+    probe_script = _workflow_step_script(dashboard_workflow, "usage-probe")
+    # The stub prints a snapshot on stdout even when it EXITS NONZERO: real probes are incremental,
+    # so the `!`-dropped mutation must be caught by the recorded OUTCOME rather than by an
+    # accidentally-empty file.
+    probe_stub = ("import json, os, sys\n"
+                  "if '--self-test' in sys.argv:\n"
+                  "    sys.exit(int(os.environ['STUB_SELFTEST_EXIT']))\n"
+                  "json.dump({'acct-fixture': {'status': 'allowed'}}, sys.stdout)\n"
+                  "sys.exit(int(os.environ['STUB_PROBE_EXIT']))\n")
+    # Every document round 3's `grep -q '"ACCT'` accepted, next to the one it should. The last four
+    # are the round-4 measurement: they pass a substring search and still leave the probe with no
+    # usable token, so the exempt accounts were published as free capacity off an unusable subset.
+    SUBSET_FIXTURES = {
+        "tokens": '{"ACCT01_TOKEN": "redacted"}',
+        "empty-subset": "{}",
+        "empty-value": '{"ACCT01_TOKEN": ""}',
+        "blank-value": '{"ACCT01_TOKEN": "   "}',
+        "non-string-value": '{"ACCT01_TOKEN": 1234}',
+        "wrong-key": '{"NOT_AN_ACCT_TOKEN": "redacted", "ACCTLOOKALIKE": "redacted"}',
+        "truncated": '{"ACCT01_TOKEN":',
+        "not-an-object": '["ACCT01_TOKEN"]',
+    }
+
+    def run_probe_step(secrets_outcome="success", secrets_file="tokens",
+                       selftest_exit=0, probe_exit=0):
+        """Execute the REAL probe step body.
+
+        Returns (exit code, sidecar dict|"MALFORMED"|None, snapshot text|None, combined step log,
+        the names of the files the step left in RUNNER_TEMP)."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "scripts").mkdir()
+            (root / "scripts" / "account-usage.py").write_text(probe_stub, encoding="utf-8")
+            temp = root / "runner-temp"
+            temp.mkdir()
+            secrets_path = root / "acct-secrets.json"
+            # "missing": the materialization step's body was replaced by `true` — it reports
+            # `success` and leaves no file behind. Every other shape below is a document that the
+            # round-3 `grep -q '"ACCT'` guard ACCEPTED while `_load_secrets` yielded no usable
+            # token (#612 review round 4, MAJOR).
+            if secrets_file != "missing":
+                secrets_path.write_text(SUBSET_FIXTURES[secrets_file], encoding="utf-8")
+            environment = dict(os.environ,
+                               RUNNER_TEMP=str(temp),
+                               SECRETS_STEP_OUTCOME=secrets_outcome,
+                               SECRETS_FILE=str(secrets_path),
+                               STUB_SELFTEST_EXIT=str(selftest_exit),
+                               STUB_PROBE_EXIT=str(probe_exit),
+                               GH_TOKEN="", PROVENANCE_SALT="", REGISTRY_REPO="owner/repo",
+                               MODEL_HEALTH_FILE=str(root / "absent-model-health.json"))
+            completed = subprocess.run(["bash", "-c", probe_script], cwd=str(root),
+                                       env=environment, capture_output=True, text=True,
+                                       timeout=120, check=False)
+            sidecar_path, snapshot_path = temp / "usage-probe.json", temp / "usage.json"
+            sidecar = None
+            if sidecar_path.is_file():
+                try:
+                    sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+                except json.JSONDecodeError:
+                    sidecar = "MALFORMED"
+            return (completed.returncode, sidecar,
+                    snapshot_path.read_text(encoding="utf-8") if snapshot_path.is_file() else None,
+                    completed.stdout + completed.stderr,
+                    sorted(item.name for item in temp.iterdir()))
+
+    def probe_step_view(**kwargs):
+        code, sidecar, snapshot, _log, _produced = run_probe_step(**kwargs)
+        marker = sidecar if isinstance(sidecar, dict) else {}
+        return (code, marker.get("schema"), marker.get("outcome"), marker.get("detail"), snapshot)
+
+    check("[#612] probe step: a succeeding probe records ok and keeps its real snapshot",
+          probe_step_view(),
+          (0, PROBE_SCHEMA, "ok", "probe-succeeded",
+           '{"acct-fixture": {"status": "allowed"}}'))
+    # THE polarity mutation: without the `!` this row reads ("ok", "probe-succeeded", <stub json>).
+    check("[#612] probe step: a NONZERO probe is recorded failed and its output discarded",
+          probe_step_view(probe_exit=1),
+          (0, PROBE_SCHEMA, "failed", "probe-exited-nonzero", "{}"))
+    check("[#612] probe step: a failing probe self-test is recorded failed",
+          probe_step_view(selftest_exit=1),
+          (0, PROBE_SCHEMA, "failed", "probe-self-test-failed", "{}"))
+    check("[#612] probe step: a failed secret materialization is recorded failed",
+          probe_step_view(secrets_outcome="failure"),
+          (0, PROBE_SCHEMA, "failed", "secret-materialization-failed", "{}"))
+    # The `true`-body mutation on the materialization step: outcome `success`, no file. Pre-fix this
+    # row read ("ok", "probe-succeeded") — a false-healthy probe status with nothing measured, and
+    # the probe-EXEMPT providers published as free capacity off a materialization that never ran.
+    check("[#612] probe step: `success` with NO subset file is recorded failed, not measured",
+          probe_step_view(secrets_file="missing"),
+          (0, PROBE_SCHEMA, "failed", "secret-file-missing", "{}"))
+    check("[#612] probe step: an EMPTY token subset is recorded failed, not measured",
+          probe_step_view(secrets_file="empty-subset"),
+          (0, PROBE_SCHEMA, "failed", "secret-subset-empty", "{}"))
+    # --- #612 review round 4 (MAJOR): `grep -q '"ACCT'` proves NEITHER valid JSON NOR a non-empty
+    # token. Measured: `{"ACCT01_TOKEN":""}` and the truncated `{"ACCT01_TOKEN":` both passed it, so
+    # `outcome` stayed `ok`, the sidecar published `measured=True`, and the probe-EXEMPT accounts
+    # were published as fresh free capacity off a subset carrying no usable token — the SAME
+    # overgrant this PR exists to close, surviving the fix. Each row below reads
+    # ("ok", "probe-succeeded", <stub json>) under the grep guard and dies under the parsing one.
+    # ------------------------------------------------------------------------------------------
+    for subset_name, subset_detail in (("empty-value", "secret-subset-empty"),
+                                       ("blank-value", "secret-subset-empty"),
+                                       ("non-string-value", "secret-subset-empty"),
+                                       ("wrong-key", "secret-subset-empty"),
+                                       ("truncated", "secret-subset-malformed"),
+                                       ("not-an-object", "secret-subset-malformed")):
+        check(f"[#612] probe step: a `{subset_name}` subset is refused, not measured",
+              probe_step_view(secrets_file=subset_name),
+              (0, PROBE_SCHEMA, "failed", subset_detail, "{}"))
+    # ...and the refusal must stay SILENT about the document: the validator's only stdout is one of
+    # three fixed words (captured, never echoed) and it has no traceback path, so no fragment of a
+    # token can reach the step log. Asserted over the union of every stream, for every shape.
+    for subset_name in SUBSET_FIXTURES:
+        code, _sidecar, _snapshot, logged, _produced = run_probe_step(secrets_file=subset_name)
+        check(f"[#612] probe step: the `{subset_name}` refusal leaks no subset bytes to the log",
+              (code, "ACCT01_TOKEN" in logged, "redacted" in logged, "Traceback" in logged),
+              (0, False, False, False))
+    # The shell -> python contract itself: whatever the step actually wrote must parse HERE. This is
+    # what a scoped substring assertion could never do — it ties the printf's schema string, outcome
+    # vocabulary and stamp format to _probe_outcome's fail-closed parser.
+    step_now = int(time.time())
+    check("[#612] the sidecar the step really wrote is what _probe_outcome accepts/refuses",
+          [_probe_outcome(run_probe_step(**kwargs)[1], step_now)["measured"]
+           for kwargs in ({}, {"probe_exit": 1}, {"secrets_file": "missing"},
+                          {"secrets_file": "empty-value"}, {"secrets_file": "truncated"})],
+          [True, False, False, False, False])
+    build_step = _workflow_step(dashboard_workflow, "dashboard-build")
+    check("[#612] the build step passes the sidecar WITH the snapshot (scoped to that one step)",
+          ('--usage "$RUNNER_TEMP/usage.json"' in build_step,
+           '--usage-status "$RUNNER_TEMP/usage-probe.json"' in build_step),
+          (True, True))
+
+    # --- #612 review round 4: the four survivors in the WIRING seam around the probe step. Round 3
+    # executed the probe body; the PRODUCER of the file that body checks, the env wiring that hands
+    # it the producer's outcome, and the transport that carries the sidecar to the build job were all
+    # still assertion-free, so `run: true` on the materialization step, deleting `id: acct-secrets`,
+    # deleting the `SECRETS_STEP_OUTCOME` env line and dropping `usage-probe.json` from the upload
+    # each left the whole suite green.
+    #
+    # (i) The materialization step body is EXECUTED, against a fake complete secret map. This is the
+    # producer, and it is also the filter that keeps every NON-worker secret away from the probe — so
+    # the row asserts the exact subset, not merely that a file appeared. `run: true` writes no file.
+    # ------------------------------------------------------------------------------------------
+    materialize_script = _workflow_step_script(dashboard_workflow, "acct-secrets")
+
+    def run_materialize_step(all_secrets):
+        """Execute the REAL materialization step body; return (exit code, subset|None, mode|None)."""
+        with tempfile.TemporaryDirectory() as directory:
+            temp = Path(directory, "runner-temp")
+            temp.mkdir()
+            completed = subprocess.run(
+                ["bash", "-c", materialize_script], cwd=directory, capture_output=True, text=True,
+                timeout=120, check=False,
+                env=dict(os.environ, RUNNER_TEMP=str(temp), ALL_SECRETS=json.dumps(all_secrets)))
+            written = temp / "acct-secrets.json"
+            if not written.is_file():
+                return completed.returncode, None, None, completed.stdout + completed.stderr
+            return (completed.returncode,
+                    json.loads(written.read_text(encoding="utf-8")),
+                    oct(written.stat().st_mode & 0o777),
+                    completed.stdout + completed.stderr)
+    all_secrets = {"ACCT01_TOKEN": "worker-one", "ACCT7X_TOKEN": "worker-two",
+                   "PROVENANCE_SALT": "not-a-worker-token", "GITHUB_TOKEN": "not-a-worker-token",
+                   "ACCT01_TOKEN_BACKUP": "not-exactly-the-shape", "ACCTLOOKALIKE": "no-suffix",
+                   "ACCT02_TOKEN": ["not", "a", "string"]}
+    code, subset, mode, materialize_log = run_materialize_step(all_secrets)
+    check("[#612] materialization step: EXECUTED, it writes exactly the ACCT*_TOKEN string subset",
+          (code, subset, mode),
+          (0, {"ACCT01_TOKEN": "worker-one", "ACCT7X_TOKEN": "worker-two"}, "0o600"))
+    check("[#612] materialization step: no secret VALUE of any kind reaches its own step log",
+          [value for value in ("worker-one", "worker-two", "not-a-worker-token")
+           if value in materialize_log],
+          [])
+    # A `{}` secret map is a real production shape (a repo with no worker tokens yet): the filter
+    # must still succeed, and the PROBE step must then refuse — the two halves of the seam meeting.
+    empty_code, empty_subset, _mode, _log = run_materialize_step({"PROVENANCE_SALT": "salt"})
+    with tempfile.TemporaryDirectory() as directory:
+        handoff = Path(directory, "acct-secrets.json")
+        handoff.write_text(json.dumps(empty_subset), encoding="utf-8")
+        handoff_state = subprocess.run(
+            ["bash", "-c", probe_script], cwd=str(directory), capture_output=True, text=True,
+            timeout=120, check=False,
+            env=dict(os.environ, RUNNER_TEMP=directory, SECRETS_STEP_OUTCOME="success",
+                     SECRETS_FILE=str(handoff), GH_TOKEN="", PROVENANCE_SALT="",
+                     REGISTRY_REPO="owner/repo",
+                     MODEL_HEALTH_FILE=str(Path(directory, "absent.json"))))
+        handoff_sidecar = json.loads(Path(directory, "usage-probe.json").read_text(encoding="utf-8"))
+    check("[#612] the two step bodies MEET: a token-less filter output is refused by the probe",
+          (empty_code, empty_subset, handoff_state.returncode,
+           handoff_sidecar["outcome"], handoff_sidecar["detail"]),
+          (0, {}, 0, "failed", "secret-subset-empty"))
+    # (ii) The env wiring. Execution can never catch its deletion — the harness supplies
+    # SECRETS_STEP_OUTCOME from the process environment — so the wiring is read as a MAPPING, and
+    # the step id it names must resolve in the same workflow. Deleting the env line makes the first
+    # element None; deleting `id: acct-secrets` makes _workflow_step raise its "found 0" refusal.
+    probe_env = _workflow_step_env(dashboard_workflow, "usage-probe")
+    wired = re.fullmatch(r"\$\{\{\s*steps\.([A-Za-z0-9_-]+)\.outcome\s*\}\}",
+                         probe_env.get("SECRETS_STEP_OUTCOME") or "")
+    check("[#612] the probe step's gate is WIRED to the materialization step's outcome, by id",
+          (probe_env.get("SECRETS_STEP_OUTCOME"),
+           wired.group(1) if wired else None,
+           '"${SECRETS_STEP_OUTCOME}" != "success"' in probe_script,
+           bool(wired) and _workflow_step_script(dashboard_workflow, wired.group(1)) != ""),
+          ("${{ steps.acct-secrets.outcome }}", "acct-secrets", True, True))
+    # (iii) The transport. Deleting `usage-probe.json` from the upload path is invisible to every
+    # generator test — an absent sidecar fails CLOSED, so the loss looks like a healthy refusal
+    # instead of a broken pipeline. Asserted as a PROPERTY rather than a substring: every file the
+    # probe step actually produced (measured by running it) must be listed by the upload step, whose
+    # artifact is what the build step above was just shown to read both flags from.
+    produced = run_probe_step()[4]
+    uploaded = [line.strip().replace("${{ runner.temp }}/", "")
+                for line in _workflow_step_block(
+                    dashboard_workflow, "upload-usage", "path").split("\n") if line.strip()]
+    check("[#612] every file the probe step PRODUCES is carried by the artifact upload",
+          (produced, sorted(uploaded), sorted(set(produced) - set(uploaded))),
+          (["usage-probe.json", "usage.json"], ["usage-probe.json", "usage.json"], []))
+
+    # --- #612 review round 2, finding 5 (MINOR): the successful CLI -> builder handoff. Deleting
+    # `probe_status=probe_status` from main()'s build_dashboard call left every direct-builder test
+    # AND the missing-flag negative test above green, while production parsed a valid sidecar and
+    # then threw it away — publishing zero eligible capacity with an unmeasured warning on every
+    # healthy run. So main() is driven end to end here, and the assertion is a PAIR: the same
+    # entrypoint must publish capacity for a fresh sidecar and refuse it for a failed one, which no
+    # constant return value satisfies. `_fetch_dispatch_history` (a `gh` subprocess) is the only
+    # stub; the probe_status plumbing under test is the real code path.
+    # ------------------------------------------------------------------------------------------
+    live_now = int(time.time())
+    live_usage = {handle: {"status": "allowed", "5h_used": "10", "5h_util": "0.1",
+                           "5h_reset": live_now + 3600, "7d_used": "80", "7d_util": "0.8",
+                           "7d_reset": live_now + 86400}}
+
+    def main_document(sidecar):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, payload in (("issues.json", issues), ("usage.json", live_usage),
+                                  ("leases.json", leases),
+                                  ("model-health.json", {"records": []}),
+                                  ("usage-probe.json", sidecar)):
+                Path(root, name).write_text(json.dumps(payload), encoding="utf-8")
+            saved_history = globals()["_fetch_dispatch_history"]
+            saved_salt = os.environ.get("PROVENANCE_SALT")
+            globals()["_fetch_dispatch_history"] = lambda repo, count: []
+            os.environ["PROVENANCE_SALT"] = "fixture-salt"
+            try:
+                main(["--issues-file", str(root / "issues.json"),
+                      "--usage", str(root / "usage.json"),
+                      "--usage-status", str(root / "usage-probe.json"),
+                      "--leases", str(root / "leases.json"),
+                      "--model-health", str(root / "model-health.json"),
+                      "--assets", str(Path(__file__).resolve().parent.parent / "dashboard"),
+                      "--site", str(root / "site")])
+            finally:
+                globals()["_fetch_dispatch_history"] = saved_history
+                if saved_salt is None:
+                    os.environ.pop("PROVENANCE_SALT", None)
+                else:
+                    os.environ["PROVENANCE_SALT"] = saved_salt
+            published = json.loads(Path(root, "site", "data.json").read_text(encoding="utf-8"))
+            return ((published.get("usage_probe") or {}).get("measured"),
+                    published["provider_quota"][0]["headroom"],
+                    published["fleet"]["capacity"],
+                    # [#374] the END-TO-END statement: whatever else main() writes, the file that
+                    # actually reaches Pages carries no composition key.
+                    sorted(FLEET_COMPOSITION_KEYS
+                           & set(re.findall(r'"([^"]+)":', json.dumps(published)))))
+
+    check("[#612] main() forwards a FRESH sidecar, so a healthy run still publishes capacity",
+          main_document({"schema": PROBE_SCHEMA, "outcome": "ok", "detail": "probe-succeeded",
+                         "attempted_at": live_now}),
+          (True, "available", {"anthropic": True}, []))
+    check("[#612] main() forwards a FAILED sidecar, so the same run publishes none",
+          main_document({"schema": PROBE_SCHEMA, "outcome": "failed",
+                         "detail": "probe-exited-nonzero", "attempted_at": live_now}),
+          (False, "unknown", {"anthropic": False}, []))
+
+    # --- #612 review round 2, finding 5 (MINOR), UI half: the page's call sites. Deleting
+    # `summary.append(probe)` or the SECOND argument of `updateFreshness(...)` removes the promised
+    # operator warning with no Python test affected. Each assertion below is scoped to the ONE
+    # function that must make the call — a whole-file search for `usage_probe` in app.js is
+    # satisfied by any of its several other occurrences, which is precisely the vacuity class here.
+    # ------------------------------------------------------------------------------------------
+    # #612 review round 4 (MINOR, class E): the round-3 form of this block was COMMENT-satisfiable
+    # (`_js_function_body` strips nothing, so commenting the call out kept it green) and could not
+    # see polarity (flipping `if (!measured)` to `if (measured)` survived). Two changes: every
+    # lexical row now counts CODE positions only, with an exact count so a neighbouring branch's
+    # occurrence cannot stand in; and the page script is EXECUTED under node against the document
+    # this generator really builds, which is what actually pins polarity.
+    # ------------------------------------------------------------------------------------------
+    app_js = _repo_file("dashboard", "app.js")
+    summary_body = _js_function_body(app_js, "renderSummary")
+    check("[#612] renderSummary() builds the probe card from data.usage_probe AND appends it",
+          (_js_code_count(summary_body, "usageProbeCard(data.usage_probe)"),
+           _js_code_count(summary_body, "if (probe) summary.append(probe);")),
+          (1, 1))
+    check("[#612] render() hands the probe marker to updateFreshness (both arguments)",
+          _js_code_count(_js_function_body(app_js, "render"),
+                         "updateFreshness(data.generated_at, data.usage_probe)"),
+          1)
+    freshness = _js_function_body(app_js, "updateFreshness")
+    check("[#612] updateFreshness() consumes the marker, on the unmeasured polarity",
+          (_js_code_count(freshness, 'probe.measured !== true'),
+           # NOT a bare `notices.push` count: the stale-generation branch supplies another
+           # occurrence, so deleting the probe branch's push used to pass (round-4 MINOR).
+           _js_code_count(freshness, "notices.push(`Usage probe did not measure the fleet"),
+           _js_code_count(freshness, "warning.hidden = notices.length === 0;")),
+          (1, 1, 1))
+    probe_card = _js_function_body(app_js, "usageProbeCard")
+    check("[#612] the probe card degrades on anything but an explicit measured:true",
+          (_js_code_count(probe_card, "const measured = probe.measured === true;"),
+           _js_code_count(probe_card, 'if (!measured) card.classList.add("degraded");')),
+          (1, 1))
+    # A control on the matcher itself: a commented-out call and a call inside a string literal must
+    # BOTH read as zero, or the rows above are back to being satisfiable by prose.
+    check("[#612] the code-position matcher ignores comments and string literals",
+          (_js_code_count("// if (probe) summary.append(probe);\n", "summary.append(probe)"),
+           _js_code_count('const help = "summary.append(probe)";\n', "summary.append(probe)"),
+           _js_code_count("/* summary.append(probe) */\nsummary.append(probe);\n",
+                          "summary.append(probe)")),
+          (0, 0, 1))
+    # --- ...and the two call sites EXECUTED. The page is loaded into a minimal DOM shim under node
+    # and handed the real generated document, so `if (!measured)` -> `if (measured)`, dropping
+    # `summary.append(probe)`, or dropping updateFreshness's second argument each change an OUTCOME
+    # rather than a substring. `fetch` is stubbed to reject (the page's own load path is not under
+    # test) and `setInterval` to a no-op so node exits.
+    # ------------------------------------------------------------------------------------------
+    page_harness = r"""
+const fs = require("fs");
+const source = fs.readFileSync(__APP_JS__, "utf8");
+const input = JSON.parse(fs.readFileSync(0, "utf8"));
+function element(tag) {
+  const self = {
+    tagName: tag, children: [], attributes: {}, style: {}, hidden: false, textContent: "",
+    className: "", classes: new Set(),
+    append: (...kids) => { for (const kid of kids) self.children.push(kid); },
+    replaceChildren: (...kids) => { self.children = [...kids]; },
+    setAttribute: (name, value) => { self.attributes[name] = value; },
+    classList: { add: (name) => self.classes.add(name), remove: (name) => self.classes.delete(name),
+                 contains: (name) => self.classes.has(name) },
+  };
+  return self;
+}
+const ids = {};
+globalThis.document = {
+  getElementById: (id) => (ids[id] = ids[id] || element("div#" + id)),
+  createElement: element,
+  createElementNS: (_ns, tag) => element(tag),
+  createTextNode: (text) => ({ textContent: text, children: [] }),
+};
+globalThis.fetch = () => Promise.reject(new Error("network is not under test"));
+globalThis.setInterval = () => 0;
+const flat = (node) => [node.textContent || "", ...(node.children || []).flatMap(flat)];
+const text = (node) => flat(node).join(" ");
+const degraded = (node) =>
+  (node.classes && node.classes.has("degraded")) ||
+  (node.children || []).some(degraded);
+(async () => {
+  // Loading the page runs its own `refresh()`, whose stubbed fetch rejects into the page's catch
+  // and writes to #warning; the tick below lets that settle so it cannot be mistaken for the
+  // probe notice under test, and every render below starts from a fresh #warning element.
+  const scope = new Function(source + "; return { usageProbeCard, updateFreshness, render };")();
+  await new Promise((resolve) => setImmediate(resolve));
+  const cards = {};
+  for (const [name, probe] of Object.entries(input.probes)) {
+    const card = scope.usageProbeCard(probe);
+    cards[name] = card === null ? null : { text: text(card), degraded: degraded(card) };
+  }
+  const warnings = {};
+  for (const [name, document_] of Object.entries(input.documents)) {
+    ids.warning = element("div#warning");
+    ids.summary = element("div#summary");
+    ids["provider-quota"] = element("div#provider-quota");
+    scope.render(document_);
+    warnings[name] = {
+      hidden: ids.warning.hidden,
+      // [#374] the rendered quota + summary text, so the assertions below can state what the page
+      // SHOWS rather than what app.js contains: a headroom word and a percentage, never a count of
+      // accounts. `text()` walks children, which is where every one of those strings lives.
+      quota: text(ids["provider-quota"]),
+      capacityLines: text(ids.summary),
+      // `text()`, not `.textContent`: updateFreshness renders each independent degradation as its
+      // own `.warning-line` child (issue #580), so the banner's own textContent is empty and a
+      // direct read would make this row vacuously false for BOTH documents.
+      probeNotice: /Usage probe did not measure the fleet/.test(text(ids.warning)),
+      summaryDegraded: ids.summary.children.some(degraded),
+      // Issue #580: staleness and the probe verdict are independent, so a page carrying both must
+      // render both — as SEPARATE `.warning-line` paragraphs, not one run-together blob.
+      lines: (ids.warning.children || []).filter((kid) => kid.className === "warning-line").length,
+      staleNotice: /Stale data/.test(text(ids.warning)),
+      capacityNote: /Eligible capacity unmeasured/.test(text(ids.summary)),
+    };
+  }
+  process.stdout.write(JSON.stringify({ cards, warnings }));
+})().catch((error) => { console.error(error && error.stack || error); process.exit(1); });
+"""
+    # A LIVE `now`: the page's own staleness notice fires on a year-old fixture stamp, and that
+    # notice would then mask the probe notice this block is about.
+    measured_document = build_dashboard(
+        issues, leases, live_usage, history, None, live_now, "fixture-salt",
+        probe_status={"schema": PROBE_SCHEMA, "outcome": "ok", "detail": "probe-succeeded",
+                      "attempted_at": live_now})
+    failed_document = build_dashboard(
+        issues, leases, live_usage, history, None, live_now, "fixture-salt",
+        probe_status={"schema": PROBE_SCHEMA, "outcome": "failed",
+                      "detail": "secret-materialization-failed", "attempted_at": live_now})
+    # ...and the same failed probe on a STALE generation (the year-old fixture `now`), which is the
+    # one document where both independent degradations fire at once (issue #580).
+    stale_failed_document = build_dashboard(
+        issues, leases, live_usage, history, None, now, "fixture-salt",
+        probe_status={"schema": PROBE_SCHEMA, "outcome": "failed",
+                      "detail": "secret-materialization-failed", "attempted_at": now})
+    page = _node_json(
+        page_harness.replace("__APP_JS__",
+                             json.dumps(str(Path(__file__).resolve().parent.parent
+                                            / "dashboard" / "app.js"))),
+        {"probes": {"measured": measured_document["usage_probe"],
+                    "failed": failed_document["usage_probe"],
+                    "absent": None},
+         "documents": {"measured": measured_document, "failed": failed_document,
+                       "staleFailed": stale_failed_document}})
+    check("[#612] EXECUTED page script: the probe card degrades exactly when nothing was measured",
+          (page["cards"]["measured"]["degraded"],
+           "NOT MEASURED" in page["cards"]["measured"]["text"],
+           page["cards"]["failed"]["degraded"],
+           "NOT MEASURED" in page["cards"]["failed"]["text"],
+           "secret-materialization-failed" in page["cards"]["failed"]["text"],
+           page["cards"]["absent"]),
+          (False, False, True, True, True, None))
+    check("[#612] EXECUTED page script: render() raises the operator warning on a failed probe",
+          (page["warnings"]["measured"]["hidden"],
+           page["warnings"]["measured"]["probeNotice"],
+           page["warnings"]["measured"]["summaryDegraded"],
+           page["warnings"]["failed"]["hidden"],
+           page["warnings"]["failed"]["probeNotice"],
+           page["warnings"]["failed"]["summaryDegraded"]),
+          (True, False, False, False, True, True))
+    # --- issue #580: the banner carries INDEPENDENT degradations as separate lines, and the
+    # unmeasured `eligible` figure is annotated where it is rendered. Both directions are pinned:
+    # a healthy page has zero lines and no capacity note, a failed-but-fresh page has exactly one
+    # line, and a stale+failed page has TWO — so collapsing them back into one joined blob, or
+    # letting either notice mask the other, is red rather than green.
+    check("[#580] EXECUTED page script: independent degradations render as separate lines",
+          (page["warnings"]["measured"]["lines"],
+           page["warnings"]["measured"]["capacityNote"],
+           page["warnings"]["failed"]["lines"],
+           page["warnings"]["failed"]["staleNotice"],
+           page["warnings"]["failed"]["capacityNote"],
+           page["warnings"]["staleFailed"]["hidden"],
+           page["warnings"]["staleFailed"]["lines"],
+           page["warnings"]["staleFailed"]["staleNotice"],
+           page["warnings"]["staleFailed"]["probeNotice"],
+           page["warnings"]["staleFailed"]["capacityNote"]),
+          (0, False, 1, False, True, False, 2, True, True, True))
+    # --- [#374] the SAME executed page, on what the fleet section now shows. The measured document
+    # is the one-anthropic-account fixture: pre-#374 this section rendered "1 account · 1 free ·
+    # 0 capped", a "single account" badge, "0.9 of 1 account-windows free" and a
+    # "1 / 1" capacity line — four independent counts of the fleet. Every row below is red on the
+    # pre-#374 page and on any partial revert of the renderer.
+    quota_text = page["warnings"]["measured"]["quota"]
+    failed_quota_text = page["warnings"]["failed"]["quota"]
+    check("[#374] the page renders a headroom word and a percentage, not an account census",
+          ("capacity available" in quota_text,
+           "anthropic" in quota_text,
+           "% of this window's quota left" in quota_text,
+           re.search(r"\d+\s+accounts?\b", quota_text) is not None,
+           re.search(r"account-windows?\b", quota_text) is not None,
+           "single account" in quota_text,
+           "limit-units left" in quota_text),
+          (True, True, True, False, False, False, False))
+    check("[#374] an unmeasured probe still degrades the rendered headroom (fail-closed on the UI)",
+          ("no usable measurement" in failed_quota_text,
+           "capacity available" in failed_quota_text),
+          (True, False))
+    check("[#374] the summary capacity card states availability, never eligible/total",
+          ("anthropic available" in " ".join(
+              page["warnings"]["measured"]["capacityLines"].split()),
+           "anthropic none free" in " ".join(
+               page["warnings"]["failed"]["capacityLines"].split()),
+           re.search(r"\d+\s*/\s*\d+",
+                     page["warnings"]["measured"]["capacityLines"]) is not None),
+          (True, True, False))
 
     health = _normalize_model_health({
         "generated_at": now,
@@ -1397,7 +2701,10 @@ def _self_test():
                            {"class": "4", "depth": 9, "oldest_age_minutes": 3},
                            {"class": "9z", "depth": 1}],
                  "leases": [{"label": "ab12cd34", "provider": "anthropic",
-                             "utilization_1h": 0.8}],
+                             "utilization_1h": 0.8},
+                            {"label": "ef56ab78", "provider": "anthropic",
+                             "utilization_1h": 0.4},
+                            {"label": "cd90ef12", "provider": "openai"}],
                  "review_rounds": {"mean": 1.44444, "max": 3, "budget_exhausted_1h": 0},
                  "parks_1h": {"needs_user": 2, "needs_orchestrator": 1},
                  "arm_to_merge_minutes_24h": {"p50": 18, "p90": 55.5, "samples": 9},
@@ -1428,8 +2735,10 @@ def _self_test():
                                   {"model": "fable", "exit_class": "success", "count": 3}],
         "flow": {"queue": [{"class": "2a", "depth": 1, "oldest_age_minutes": 12.3},
                            {"class": "4", "depth": 9, "oldest_age_minutes": 3.0}],
-                 "leases": [{"label": "ab12cd34", "provider": "anthropic",
-                             "utilization_1h": 0.8}],
+                 # [#374] three validated lease rows in, ZERO published: only the mean/max of the
+                 # utilizations that parsed (0.8, 0.4 -> 0.6/0.8). The unparseable third row proves
+                 # the aggregate is taken over reporting rows, and the count itself never appears.
+                 "lease_utilization_1h": {"mean": 0.6, "max": 0.8},
                  "review_rounds": {"mean": 1.44, "max": 3, "budget_exhausted_1h": 0},
                  "parks_1h": {"needs_user": 2, "needs_orchestrator": 1},
                  "arm_to_merge_minutes_24h": {"p50": 18.0, "p90": 55.5, "samples": 9},
@@ -1473,6 +2782,23 @@ def _self_test():
         label_rejected = False
     check("raw (non-salted) lease label is a fatal privacy violation (decision 22)",
           label_rejected, True)
+    # [#374] ...and the salted labels are not published either. Two fleets whose lease rows differ
+    # only in COUNT must normalize identically; pre-#374 the row array itself was the disclosure.
+    def obs_leases(rows):
+        fixture = copy.deepcopy(obs_fixture)
+        fixture["flow"]["leases"] = rows
+        return _normalize_observability(fixture)["flow"]
+
+    one_lease = obs_leases([{"label": "ab12cd34", "provider": "anthropic",
+                             "utilization_1h": 0.5}])
+    four_leases = obs_leases([{"label": f"ab12cd3{index}", "provider": "anthropic",
+                               "utilization_1h": 0.5} for index in range(4)])
+    check("[#374] lease rows of different fleet sizes normalize to the same published flow",
+          (one_lease, one_lease == four_leases,
+           "ab12cd34" in json.dumps(one_lease)),
+          (four_leases, True, False))
+    check("[#374] no reported lease utilization publishes nothing rather than a zero",
+          obs_leases([])["lease_utilization_1h"], None)
     with_observability = build_dashboard(
         issues, leases, usage, history, None, now, "fixture-salt", observability=obs_fixture)
     check("build_dashboard publishes the normalized observability key",
@@ -1491,13 +2817,13 @@ def _self_test():
     check("raw handle inside observability text is caught by the privacy assertion",
           leak_rejected, True)
     empty = build_dashboard([], {"leases": []}, None, [], None, now, "fixture-salt")
-    check("do-nothing case", (empty["accounts"], empty["fleet"],
+    check("do-nothing case", (empty["provider_quota"], empty["fleet"],
                               empty["active_by_repository"]),
           ([], {"active_agents": 0, "capacity": {}, "last_sweep_at": None,
                 "dispatch_outcomes": []}, {"models": [], "repositories": []}))
     try:
         build_dashboard([], {"leases": [{
-            "account": "private-live", "holder": "malformed", "model": "sol",
+            "account": "a" * 16, "holder": "malformed", "model": "sol",
             "expires_at": now + 1,
         }]}, {}, [], None, now, "fixture-salt")
     except DashboardError:
@@ -1536,6 +2862,9 @@ def main(argv=None):
     parser.add_argument("--leases")
     parser.add_argument("--issues-file")
     parser.add_argument("--usage")
+    # The probe job's persisted outcome sidecar (issue #219). REQUIRED whenever a usage snapshot is
+    # in play: without it a failed probe's `{}` is indistinguishable from an idle fleet.
+    parser.add_argument("--usage-status")
     parser.add_argument("--model-health")
     # Optional: the collector's observability snapshot from a `ledger`-branch checkout (issue
     # #246). Absent file => the Observability panels stay hidden; a present-but-invalid document
@@ -1554,6 +2883,16 @@ def main(argv=None):
             "see data/README.md)")
     if not 1 <= args.history <= 20:
         raise DashboardError("--history must be between 1 and 20")
+    usage_path = _optional_usage_path(args.usage)
+    if usage_path and not args.usage_status:
+        # Fail-closed coupling (issue #219): dropping --usage-status from the caller would restore
+        # exactly the bug — a FAILED probe's empty/partial snapshot published as fresh capacity
+        # with no degradation marker — so a usage snapshot without its outcome sidecar is refused
+        # rather than rendered on trust.
+        raise DashboardError(
+            "--usage-status is required alongside a usage snapshot (issue #219): without the "
+            "probe's persisted outcome a failed measurement is indistinguishable from an idle "
+            "fleet, and every catalog-available account would be published as fresh capacity")
     repo = os.environ.get("REGISTRY_REPO") or os.environ.get("GITHUB_REPOSITORY") or ""
     if args.issues_file:
         try:
@@ -1564,15 +2903,30 @@ def main(argv=None):
     else:
         issues = _fetch_issues(repo)
     leases = _read_json(args.leases, required=True)
-    usage = _read_json(_optional_usage_path(args.usage), default={})
+    usage = _read_json(usage_path, default={})
+    probe_status = None
+    if args.usage_status:
+        try:
+            # A missing or malformed sidecar degrades to the "unknown" outcome instead of taking
+            # the whole public page down over one unreadable status file. `{}` and `None` are both
+            # unmeasured verdicts (#612 review finding 1), so this degradation cannot publish
+            # capacity either way.
+            probe_status = _read_json(args.usage_status, default={})
+        except DashboardError:
+            probe_status = {}
+        if not isinstance(probe_status, dict):
+            probe_status = {}
     model_health = _read_json(args.model_health, default=None)
     observability = _read_json(args.observability, default=None)
     history = _fetch_dispatch_history(repo, args.history)
     document = build_dashboard(
         issues, leases, usage, history, model_health, int(time.time()),
-        os.environ.get("PROVENANCE_SALT", ""), observability=observability)
+        os.environ.get("PROVENANCE_SALT", ""), observability=observability,
+        probe_status=probe_status)
     _write_site(document, args.assets, args.site)
-    print(f"dashboard-gen: wrote {args.site}/data.json with {len(document['accounts'])} account(s)")
+    # Public workflow log: never disclose the account count (issue #184; the codebase norm in
+    # model-health.py — "the public workflow log never carries provider counts").
+    print(f"dashboard-gen: wrote {args.site}/data.json")
     return 0
 
 

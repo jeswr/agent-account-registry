@@ -1,25 +1,153 @@
 name: account-fleet dashboard
 
+# [OPUS-5] THE PUBLISH PATH (#656 follow-up). metrics.yml CAS-publishes the current throughput
+# snapshot to ledger:data/metrics.json, and THIS workflow is the only thing that copies it into Pages
+# artifact (`cp ledger/data/metrics.json site/metrics.json` in `build`). While the two ran on
+# INDEPENDENT crons, a fresh snapshot had to wait for the dashboard's next fire and then for the
+# Pages deploy, so the published copy inherited the SUM of both cadences rather than the metrics
+# cadence. Measured over the 7 days to 2026-07-25 (297 metrics runs, 370 dashboard runs): the
+# published snapshot's age just before the next publish was p50 38.0 min / p90 53.7 min / worst
+# 79.2 min, and it was already 8.4 min (p50) / 22.3 min (p90) old at the moment it was published.
+#
+# metrics.yml now KICKS this workflow as soon as it has published (`reason: metrics-publish`), so
+# the copy is causally ordered after the snapshot instead of merely hoped to be. The `*/15` cron is
+# RETAINED: it is the liveness fallback for a stalled kick or a stalled metrics cron, and it still
+# carries `cron-keepalive`, the mesh that revives every other scheduled workflow (a dashboard whose
+# only trigger were the kick would make metrics a single point of failure for the whole fleet —
+# exactly the 2026-07-22 stall the mutual keepalive was built to end).
+#
+# To stop that retained fallback DOUBLING the Pages deploys, `publish-decision` below drops the
+# probe/build/deploy of a run whose work another run has just done. That dedupe also collapses
+# redundancy that already exists today: 85 of 376 dashboard runs in the same 7-day window started
+# within 900s of the previous run, each paying a full probe + build + Pages deploy.
 on:
   workflow_dispatch:
+    inputs:
+      reason:
+        description: >-
+          Why this build was kicked. `metrics-publish` marks the CAUSAL leg — metrics.yml has just
+          CAS-published a fresh ledger snapshot that only this workflow can put on the site, so such
+          a run always publishes. Any other value (including the empty default used by the keepalive
+          dispatches and by a manual kick) falls through to the freshness dedupe.
+        required: false
+        default: ''
   schedule:
     - cron: '*/15 * * * *'
 
 permissions: {}
 
+# Scheduler-singleton semantics (#559 dup-dispatch storms; registry #563 adoption item 1):
+# cancel-in-progress flipped true -> false so a new fire QUEUES behind a live run (GitHub keeps
+# exactly one pending run per group, superseding older pendings) instead of cancel-storming a
+# probe/build/deploy mid-flight — a cancelled deploy leg was indistinguishable from a cron stall
+# and re-triggered the keepalive mesh into exactly the duplicate-dispatch loop #559 documents.
 concurrency:
   group: account-fleet-dashboard
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
-  build:
-    name: Build privacy-safe Pages artifact
+  # WHICH runs actually rebuild and deploy. This is a DEDUPE, never a gate: the only thing it is
+  # allowed to conclude is "another run demonstrably published this same content moments ago".
+  # Anything it cannot read, parse, or resolve falls through to publish=true — a dashboard that
+  # silently stops publishing is a far worse failure than one redundant Pages deploy, and a
+  # dedupe that can wedge itself shut is how a freshness fix becomes a freshness outage.
+  publish-decision:
+    name: Decide whether this run rebuilds and deploys
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+    outputs:
+      publish: ${{ steps.publish-decision.outputs.publish }}
+    steps:
+      - name: Skip only when a previous run demonstrably deployed inside the freshness window
+        # `id:` so metrics.py's self-test can EXTRACT and EXECUTE this exact body against hermetic
+        # gh/jq stubs (the #533 / #612 pattern): neither `bash -n` nor actionlint can see the
+        # POLARITY of a dedupe, so inverting one comparison here would stop the dashboard
+        # publishing forever while every other check in this repo stayed green.
+        id: publish-decision
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KICK_REASON: ${{ github.event.inputs.reason }}
+          # One nominal metrics cadence. Deliberately NOT longer: this window is how long a
+          # scheduled run defers to the causal leg, so a window wider than the metrics cadence
+          # would let a stalled kick suppress the very fallback that exists to cover that stall.
+          FRESH_WINDOW_SECONDS: '900'
+        run: |
+          set -uo pipefail
+          publish=true
+          reason=default-publish
+          if [ "${KICK_REASON:-}" = metrics-publish ]; then
+            # The causal leg. A snapshot that is on the ledger but not on the site is precisely the
+            # lag this path exists to remove, so this run NEVER defers — not even to a deploy
+            # seconds old, which by construction carried the PREVIOUS snapshot.
+            reason=causal-metrics-publish
+          else
+            now=$(date -u +%s)
+            # The newest OTHER run of this workflow. The workflow-level concurrency group is a
+            # singleton with cancel-in-progress: false, so a run's jobs do not start until the
+            # previous run has left the group and that run has therefore settled by now.
+            # stderr is NOT discarded: hiding a read error is how a fail-open became invisible
+            # here before (#612 round 4). A failed read leaves `prev` empty -> publish.
+            prev=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/dashboard.yml/runs?per_page=5" \
+                   --jq '[.workflow_runs[] | select(.id != (env.GITHUB_RUN_ID | tonumber))][0]
+                         // empty | [.id, .status, .conclusion, .created_at] | @tsv') || prev=""
+            if [ -z "${prev}" ]; then
+              reason=no-previous-run-visible
+            else
+              pid=$(printf '%s' "${prev}" | cut -f1)
+              pstatus=$(printf '%s' "${prev}" | cut -f2)
+              pconclusion=$(printf '%s' "${prev}" | cut -f3)
+              pcreated=$(printf '%s' "${prev}" | cut -f4)
+              pstart=$(date -u -d "${pcreated}" +%s) || pstart=""
+              case "${pstart}" in
+                ''|*[!0-9]*)
+                  reason=previous-run-timestamp-unreadable
+                  ;;
+                *)
+                  age=$(( now - pstart ))
+                  if [ "${age}" -gt "${FRESH_WINDOW_SECONDS}" ]; then
+                    reason="previous-run-stale-${age}s"
+                  elif [ "${pstatus}" != completed ]; then
+                    reason="previous-run-unsettled-${pstatus}"
+                  elif [ "${pconclusion}" != success ]; then
+                    reason="previous-run-${pconclusion}"
+                  else
+                    # A run rollup of `success` does NOT mean that run published: a run that took
+                    # THIS branch skips probe/build/deploy and still concludes `success`. Deferring
+                    # to one of those would make the skip self-sustaining and freeze the site at
+                    # whatever it last showed. Ask the deploy JOB, never the rollup.
+                    deployed=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${pid}/jobs" \
+                               --jq '[.jobs[] | select(.name == "Deploy GitHub Pages"
+                                     and .conclusion == "success")] | length') || deployed=""
+                    case "${deployed}" in
+                      ''|*[!0-9]*) reason=previous-deploy-unreadable ;;
+                      0)           reason=previous-run-published-nothing ;;
+                      *)           publish=false
+                                   reason="previous-run-deployed-${age}s-ago" ;;
+                    esac
+                  fi
+                  ;;
+              esac
+            fi
+          fi
+          echo "publish-decision: publish=${publish} event=${GITHUB_EVENT_NAME} reason=${reason}"
+          printf 'publish=%s\n' "${publish}" >> "${GITHUB_OUTPUT}"
+
+  probe:
+    name: Probe private account usage
+    needs: publish-decision
+    # `build` needs `probe` and `deploy` needs `build`, so both skip transitively — the whole
+    # publish chain hangs off this one condition. `cron-keepalive` deliberately does NOT, because
+    # the liveness mesh must keep running on every scheduled fire regardless of this decision.
+    if: needs.publish-decision.outputs.publish == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # SECRET-EXFIL GUARD (issue #101): reads toJSON(secrets) (ACCT_* probe subset) and
     # PROVENANCE_SALT, which live in the `dispatch-secrets` environment (deployment-branch
     # policy: default branch only) — full rationale on the `claim` job in dispatch.yml.
-    # The `deploy` job below keeps its own `github-pages` environment (no secrets there).
+    # This job emits only account-usage.py's privacy-safe aggregate artifact. The public
+    # generator runs in a separate job/runner and can never inherit this runner's raw tokens.
     environment: dispatch-secrets
     permissions:
       actions: read
@@ -41,18 +169,14 @@ jobs:
           ref: ledger
           persist-credentials: false
 
-      # Trust guard (review round 1): the ledger branch is DATA-ONLY by design — a
-      # `workflow_dispatch` at `ref: ledger` would execute the LEDGER copy of a workflow file,
-      # so its non-execution property holds only while no executable content exists at that ref.
-      # Fail LOUD if that ever erodes.
+      # Validate the complete Git tree (paths, object types, and modes) against the canonical
+      # data-only allowlist before consuming anything from this unprotected branch.
       - name: Ledger checkout is data-only (trust guard)
-        run: |
-          set -euo pipefail
-          test ! -e ledger/.github
-          test ! -e ledger/scripts
+        run: python3 scripts/ledger-invariant.py ledger
 
       # Only this filter sees the complete secret map; the probe receives an ACCT_* file.
       - name: Materialize the ACCT_* worker-token subset for the probe
+        id: acct-secrets
         continue-on-error: true
         env:
           ALL_SECRETS: ${{ toJSON(secrets) }}
@@ -69,15 +193,32 @@ jobs:
           data = json.loads(os.environ["ALL_SECRETS"])
           subset = {key: value for key, value in data.items()
                     if isinstance(value, str) and allow.fullmatch(key)}
-          with open(path, "w", encoding="utf-8") as handle:
+          # Create atomically 0600 (O_EXCL: fresh runner temp, the file must not pre-exist) so the
+          # token subset is never even transiently readable under the runner's default umask.
+          fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+          with os.fdopen(fd, "w", encoding="utf-8") as handle:
               json.dump(subset, handle)
-          os.chmod(path, 0o600)
           PY
 
+      # PROBE OUTCOME IS PERSISTED (issue #219). This step and the materialization above are
+      # continue-on-error, and a failed probe is replaced by `{}` — which used to be
+      # indistinguishable from "every account is idle", so precisely WHEN measurement failed the
+      # public dashboard published the whole catalog as fresh available capacity. The outcome now
+      # travels with the snapshot as `usage-probe.json` and dashboard-gen (--usage-status) refuses
+      # to render capacity from anything but an explicit, fresh `ok`.
       - name: Probe live account usage (tokens never printed)
+        # `id:` so dashboard-gen's self-test can EXTRACT and EXECUTE this exact step body
+        # (#612 review round 2, finding 4): `bash -n` and actionlint cannot see shell polarity, so
+        # dropping the `!` below — a nonzero probe left classified `ok` — used to survive the whole
+        # suite. The self-test now runs this body against a stubbed probe and asserts the outcome.
+        id: usage-probe
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
+          # A failed materialization leaves NO ACCT_* file, and account-usage._load_secrets returns
+          # {} for an unreadable one — the probe then exits 0 having silently measured nothing.
+          # That is the loudest instance of this bug, so the filter's outcome gates the status.
+          SECRETS_STEP_OUTCOME: ${{ steps.acct-secrets.outcome }}
           # The salt is the probe's ONLY route to the openai quota signal (issue #29): the
           # model-health ledger keys rate-limit backoff records by SALTED account hash, so a
           # salt-less probe emits bare `{"exempt": true}` entries and the reactive backoff never
@@ -90,14 +231,151 @@ jobs:
           SECRETS_FILE: ${{ runner.temp }}/acct-secrets.json
         run: |
           set -uo pipefail
-          python3 scripts/account-usage.py --self-test
+          outcome=ok
+          detail=probe-succeeded
+          if [ "${SECRETS_STEP_OUTCOME}" != "success" ]; then
+            outcome=failed
+            detail=secret-materialization-failed
+          fi
+          # A `success` step outcome does not prove the filter WROTE anything (#612 review round 2,
+          # finding 4): a materialization step whose body were replaced by `true` reports success
+          # and leaves no ACCT_* file, _load_secrets returns {} for an unreadable one, and the probe
+          # then exits 0 having measured nothing — publishing a fresh `measured` sidecar. Worse, the
+          # probe-EXEMPT providers (openai/codex) do not need a token at all, so they would still be
+          # emitted and published as free capacity off a materialization that never ran. So the
+          # subset file is checked POSITIVELY, not merely inferred from a neighbour's outcome.
+          if [ "$outcome" = ok ] && [ ! -s "${SECRETS_FILE}" ]; then
+            outcome=failed
+            detail=secret-file-missing
+          fi
+          # ...and a subset with no USABLE token is measurement-equivalent to no file: every
+          # non-exempt account is fail-closed omitted for want of a token.
+          #
+          # #612 review round 4 (MAJOR) measured that the previous `grep -q '"ACCT'` proved neither
+          # valid JSON nor a non-empty token: `{"ACCT01_TOKEN":""}` and the truncated
+          # `{"ACCT01_TOKEN":` both passed it, and _load_secrets then yields an empty token or (on
+          # JSONDecodeError) `{}` — so the probe measured nothing, kept `outcome=ok`, and published
+          # the probe-EXEMPT accounts as fresh free capacity. That is the very overgrant this step
+          # exists to close. A substring cannot express "at least one ACCT*_TOKEN key whose value is
+          # a non-empty string", so the subset is PARSED instead.
+          #
+          # The no-token-bytes-in-the-log constraint that motivated `grep -q` is kept BY
+          # CONSTRUCTION, not by luck: the validator's only stdout is one of the three fixed words
+          # ok/empty/malformed, that stdout is captured into a variable and never echoed, every
+          # failure is caught so there is no traceback to echo a fragment of the document, and its
+          # stderr is discarded anyway.
+          #
+          # SCOPING (round 4): an all-exempt fleet (openai/codex only — issue #29) needs no token at
+          # all, so a zero-usable-token subset would be a legitimate steady state and this guard
+          # would degrade the page unnecessarily. The catalog is anthropic-majority by construction
+          # (every non-exempt account needs a token), so today that configuration does not exist; if
+          # it ever becomes real, condition this guard on the catalog containing >=1 non-exempt
+          # account rather than weakening it.
+          subset_state=$(python3 -c '
+          import json
+          import re
+          import sys
+
+          try:
+              with open(sys.argv[1], encoding="utf-8") as handle:
+                  document = json.load(handle)
+          except Exception:
+              print("malformed")
+              sys.exit(0)
+          if not isinstance(document, dict):
+              print("malformed")
+              sys.exit(0)
+          usable = [key for key, value in document.items()
+                    if re.fullmatch(r"ACCT[A-Z0-9]+_TOKEN", str(key))
+                    and isinstance(value, str) and value.strip()]
+          print("ok" if usable else "empty")
+          ' "${SECRETS_FILE}" 2>/dev/null) || subset_state=malformed
+          if [ "$outcome" = ok ] && [ "$subset_state" != ok ]; then
+            outcome=failed
+            detail=secret-subset-empty
+            if [ "$subset_state" != empty ]; then
+              # Unparseable, truncated, or not a JSON object at all. Distinguished from `empty`
+              # because it is a different production defect (a broken filter, a truncated write)
+              # and both tokens are fixed literals — neither can carry document bytes.
+              detail=secret-subset-malformed
+            fi
+          fi
+          if [ "$outcome" = ok ] && ! python3 scripts/account-usage.py --self-test; then
+            outcome=failed
+            detail=probe-self-test-failed
+          fi
           # stderr flows to the step log: the probe's fail-open ::warning:: lines are sanitized
           # (no handles/salt/counts — asserted by its self-test), and the old 2>/dev/null is
           # exactly what hid this step's missing-salt gap in production.
-          python3 scripts/account-usage.py > "$RUNNER_TEMP/usage.json" || printf '{}' > "$RUNNER_TEMP/usage.json"
-          echo 'usage-probe: snapshot written'
+          if [ "$outcome" = ok ] && ! python3 scripts/account-usage.py > "$RUNNER_TEMP/usage.json"; then
+            outcome=failed
+            detail=probe-exited-nonzero
+          fi
+          if [ "$outcome" != ok ]; then
+            # Same empty snapshot as before — but now it arrives LABELLED as unmeasured, so the
+            # generator renders unknown/degraded instead of a fleet-wide "available".
+            printf '{}' > "$RUNNER_TEMP/usage.json"
+          fi
+          # `outcome`/`detail` are step-local literals from the fixed sets above — never
+          # attacker-influenced text — so this printf cannot emit malformed JSON.
+          printf '{"schema":"account-usage-probe/v1","outcome":"%s","detail":"%s","attempted_at":%s}\n' \
+            "$outcome" "$detail" "$(date -u +%s)" > "$RUNNER_TEMP/usage-probe.json"
+          echo "usage-probe: snapshot written (outcome=${outcome} detail=${detail})"
+
+      - name: Upload privacy-safe usage snapshot + probe outcome (pinned)
+        # `id:` so the self-test can assert this step's `path:` against the files the probe step
+        # ACTUALLY produced when executed (#612 review round 4): dropping `usage-probe.json` from
+        # the transport left the whole suite green, because the generator's fail-closed handling of
+        # an absent sidecar makes the loss look like a healthy refusal instead of a broken pipeline.
+        id: upload-usage
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dashboard-usage-${{ github.run_id }}
+          # Both files travel together: a snapshot without its outcome sidecar is refused by
+          # dashboard-gen (issue #219) rather than rendered on trust.
+          path: |
+            ${{ runner.temp }}/usage.json
+            ${{ runner.temp }}/usage-probe.json
+          retention-days: 1
+          if-no-files-found: error
+
+  build:
+    name: Build privacy-safe Pages artifact
+    needs: probe
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # The generator needs the privacy salt to label already-sanitized ledger records, but this
+    # fresh runner never receives ACCT*_TOKEN values or the probe's secret file.
+    environment: dispatch-secrets
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Checkout registry (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Checkout the data-plane ledger branch (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: ledger
+          ref: ledger
+          persist-credentials: false
+
+      - name: Ledger checkout is data-only (trust guard)
+        run: python3 scripts/ledger-invariant.py ledger
+
+      - name: Download privacy-safe usage snapshot (pinned)
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: dashboard-usage-${{ github.run_id }}
+          path: ${{ runner.temp }}
 
       - name: Generate privacy-safe dashboard
+        # `id:` so the self-test can assert the --usage/--usage-status pairing against THIS step
+        # rather than against the whole file (#612 review round 2, class E).
+        id: dashboard-build
         env:
           GH_TOKEN: ${{ github.token }}
           PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
@@ -113,9 +391,20 @@ jobs:
           # The observability snapshot (issue #246) is OPTIONAL on the ledger until its collector
           # lands: an absent file keeps the panel hidden, while a present-but-invalid one fails
           # this build loudly inside dashboard-gen (never published on a guess).
+          # --usage-status is MANDATORY alongside --usage (issue #219): dashboard-gen refuses a
+          # usage snapshot with no persisted probe outcome, and treats a missing/failed/stale
+          # outcome as "not measured" — unknown availability, zero eligible capacity, and a
+          # degradation marker on the page — instead of publishing the catalog as fresh capacity.
           python3 scripts/dashboard-gen.py --usage "$RUNNER_TEMP/usage.json" \
+            --usage-status "$RUNNER_TEMP/usage-probe.json" \
             --leases ledger/data/leases.json --model-health ledger/data/model-health.json \
             --observability ledger/data/observability.json
+          # metrics.yml CAS-publishes the optional snapshot under the ledger's whitelisted data/
+          # plane. This build publishes it at the panel's site-relative path and still owns the one
+          # and only Pages deploy; absence keeps the panel hidden until its first snapshot.
+          if [[ -f ledger/data/metrics.json ]]; then
+            cp ledger/data/metrics.json site/metrics.json
+          fi
 
       - name: Upload GitHub Pages artifact (pinned)
         uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3.0.1
@@ -137,3 +426,103 @@ jobs:
       - name: Deploy GitHub Pages (pinned)
         id: deployment
         uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4.0.5
+
+  # KEEP-ALIVE for the newest scheduled workflows: GitHub's cron registration/delivery for
+  # recently-added workflows is unreliable (observed 2026-07-21: metrics missed 3 consecutive
+  # 15-min slots; curate/conflict-resolver intermittent). This job piggybacks on dashboard's
+  # PROVEN */15 schedule and re-dispatches a listed workflow ONLY when its last run is older
+  # than its own cadence + slack (no-op when the native schedule works — self-retiring).
+  # No secrets, no environment; actions:write scoped to this job for the dispatch POST only.
+  cron-keepalive:
+    name: Re-dispatch stale scheduled workflows (cron-delivery fallback)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # dispatch-secrets binding: the cross-repo leg mints from REGISTRY_ADMIN_APP_ID/KEY,
+    # which post-#101 live ONLY in this environment (guard-enforced repo-wide).
+    environment: dispatch-secrets
+    permissions:
+      actions: write
+    steps:
+      - name: Dispatch any listed workflow whose last run is stale
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          now=$(date -u +%s)
+          # workflow-file:stale-threshold-seconds (cadence + slack)
+          for spec in metrics.yml:1200 conflict-resolver.yml:1500 curate.yml:2400 dispatch.yml:1200 groom.yml:1800 retriage.yml:3600; do
+            wf="${spec%%:*}"; limit="${spec##*:}"
+            # LIVE-RUN GUARD (#559): a QUEUED or IN_PROGRESS run of the target counts as FRESH —
+            # kicking a live workflow queues a duplicate behind it that its singleton group then
+            # runs back-to-back, which is exactly the #559 dup-dispatch storm (a long run's
+            # created_at ages past the limit while it is still executing). Same rule as the
+            # orchestrator's local keepalive bridge: skip on any live run; only then consult age.
+            # Fail-open: an unreadable live check falls through to the age check, preserving the
+            # keepalive's liveness job.
+            live=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${wf}/runs?per_page=30" \
+                   --jq '[.workflow_runs[] | select(.status != "completed")] | length' || echo "")
+            if [ -n "$live" ] && [ "$live" -gt 0 ]; then
+              echo "keepalive: ${wf} has ${live} queued/in-progress run(s) — live, skipping kick"
+              continue
+            fi
+            last=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${wf}/runs?per_page=1" \
+                   --jq '.workflow_runs[0].created_at // empty' || true)
+            prev=0
+            [ -n "$last" ] && prev=$(date -u -d "$last" +%s)
+            age=$(( now - prev ))
+            if [ "$age" -gt "$limit" ]; then
+              echo "keepalive: ${wf} last ran ${age}s ago (limit ${limit}s) — dispatching"
+              gh api -X POST \
+                "repos/${GITHUB_REPOSITORY}/actions/workflows/${wf}/dispatches" -f ref=master
+            else
+              echo "keepalive: ${wf} fresh (${age}s <= ${limit}s)"
+            fi
+          done
+
+      # Cross-repo leg: sparq's re-arm sweeper is the merge-queue closure backstop and
+      # runs on a 10-minute cron in sparq-org/sparq — cover its cron-delivery gaps too
+      # (same observed unreliability for recently-added workflows). Fail-soft: if the
+      # App is not configured the mint errors, the guarded step is skipped, and the
+      # native schedule remains the only driver.
+      - name: Mint sparq-org keepalive App token (pinned)
+        id: sparq-keepalive-token
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
+          private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
+          owner: sparq-org
+          repositories: sparq
+          permission-actions: write
+
+      - name: Dispatch stale sparq scheduled workflows (cross-repo keepalive)
+        if: steps.sparq-keepalive-token.outputs.token != ''
+        env:
+          GH_TOKEN: ${{ steps.sparq-keepalive-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          now=$(date -u +%s)
+          # workflow-file:stale-threshold-seconds (cadence + slack)
+          for spec in rearm-sweeper.yml:1200; do
+            wf="${spec%%:*}"; limit="${spec##*:}"
+            # LIVE-RUN GUARD (#559): a queued/in-progress target run is FRESH — never kick a
+            # duplicate behind a live run (same rule as the registry leg above).
+            live=$(gh api "repos/sparq-org/sparq/actions/workflows/${wf}/runs?per_page=30" \
+                   --jq '[.workflow_runs[] | select(.status != "completed")] | length' || echo "")
+            if [ -n "$live" ] && [ "$live" -gt 0 ]; then
+              echo "keepalive: sparq-org/sparq ${wf} has ${live} queued/in-progress run(s) — live, skipping kick"
+              continue
+            fi
+            last=$(gh api "repos/sparq-org/sparq/actions/workflows/${wf}/runs?per_page=1" \
+                   --jq '.workflow_runs[0].created_at // empty' || true)
+            prev=0
+            [ -n "$last" ] && prev=$(date -u -d "$last" +%s)
+            age=$(( now - prev ))
+            if [ "$age" -gt "$limit" ]; then
+              echo "keepalive: sparq-org/sparq ${wf} last ran ${age}s ago (limit ${limit}s) — dispatching"
+              gh api -X POST \
+                "repos/sparq-org/sparq/actions/workflows/${wf}/dispatches" -f ref=main
+            else
+              echo "keepalive: sparq-org/sparq ${wf} fresh (${age}s <= ${limit}s)"
+            fi
+          done

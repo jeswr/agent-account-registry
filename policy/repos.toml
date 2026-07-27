@@ -1,11 +1,16 @@
 # [GPT-5.6] REG-1 per-repository worker policy.
 # PRIVATE. This file contains account names and spend posture, but NEVER tokens or secret values.
 #
-# MODEL NAMING + POLICY (maintainer directive 2026-07-18): sol is the codex-side FRONTIER model
-# (GPT-5.6 sol/codex). terra is a DIFFERENT, sonnet-class GPT model — earlier comments here
+# MODEL NAMING + POLICY (maintainer directive 2026-07-18; amended 2026-07-24): sol is the
+# codex-side FRONTIER model (GPT-5.6 sol/codex). opus5 (Claude Opus 5, claude-opus-5) is the TOP
+# anthropic tier since 2026-07-24 — it replaces fable and opus as the primary model wherever they
+# were used; fable/opus stay as tail fallbacks only (capability order opus < luna < fable <
+# opus5 < sol; cross-provider order unchanged). terra is a DIFFERENT, sonnet-class GPT model —
+# earlier comments here
 # misnamed it "GPT-5.6 sol/codex". terra and sonnet are DOCS-ONLY: they never implement, review,
 # or fix (review-fix.yml / dispatch-claim.py / worker-pr.py assert this structurally). sol
-# reviews anthropic-authored content; opus stays lead reviewer of openai-authored content.
+# reviews anthropic-authored content; opus5 leads review of openai-authored content (opus/fable
+# are its tail fallbacks).
 #
 # [FABLE-5] STANDING RULE for every onboarded target (maintainer decision 2026-07-17): UI/front-end
 # surfaces route to the openai/codex model chain (original-builder ownership: GPT-5.6 sol/codex
@@ -14,9 +19,11 @@
 # orchestration/routing.toml for the canonical form.
 #
 # [FABLE-5] STANDING RULE for every onboarded target (maintainer decision 2026-07-17): frontier-
-# tier agents (fable = Claude Fable, sol = GPT-5.6 sol/codex) author ALL CI/infrastructure work,
+# tier agents (opus5 = Claude Opus 5 — primary anthropic tier since 2026-07-24, fable = Claude
+# Fable as its tail fallback, sol = GPT-5.6 sol/codex) author ALL CI/infrastructure work,
 # incl. the self-draining pipeline itself (.github/workflows, dispatch/worker/gate scripts).
-# Each target's routing table must carry a FRONTIER-ONLY `role = "ci"` chain (["sol", "fable"] —
+# Each target's routing table must carry a FRONTIER-ONLY `role = "ci"` chain
+# (["sol", "opus5", "fable"] —
 # no terra/sonnet/haiku): chain exhaustion then DEFERS at the claim step (defer-not-fallback,
 # retried next tick) instead of degrading tier. Security match_labels overrides still win where
 # they overlap. See README "Standing routing rules"; sparq-org/sparq carries it (sparq PR #3422).
@@ -41,11 +48,53 @@
 #   cross_provider_fallback  = bool (default false)          # opt-in same-provider degrade when the
 #                                                            # opposite provider is starved; false =
 #                                                            # stay queued + alert (honest default)
+#   trusted_bots             = [string, ...] (default [])    # issue #111: the EXACT allowlist of
+#                              trusted App bot issue-author logins, added to the OWNER/MEMBER/
+#                              COLLABORATOR associations of `trust = "collaborators"`. CLAIM unions
+#                              it with the runtime-resolved worker App `bot_login`, so the pipeline's
+#                              own App bot needs NO entry here; list ONLY additional trusted bots.
+#                              Suffix-matching "<x>[bot]" is gone — an unlisted bot is never trusted.
+#   allow_actions_bot_issues = bool (default false)          # issue #487: admit ONLY the exact
+#                              `github-actions[bot]` login for this repo. Fork-PR workflows receive
+#                              read-only tokens and cannot create issues, so issues authored by this
+#                              login in our own repos can only originate from our own workflows.
+#
+# [FABLE-5] Optional per-target THROUGHPUT controls. target_ready is consumed by
+# scripts/curate-frontier.py; the alert thresholds are consumed by scripts/metrics.py, whose
+# defaults live in metrics.DEFAULT_THRESHOLDS. metrics.py collects, per ENABLED target, the
+# maintainer's 6 asks — issues open / ready to
+# drain (via each target's REAL readiness definition, NOT a label count) / drained last hour, PRs
+# open, PR open-rate, PR close/merge-rate — plus derived net_pr_flow + review_lane_health, appends
+# each snapshot to a bounded ring on the `ledger` branch (LEDGER_REF, data/metrics-history.json),
+# and upserts ONE deduped `throughput-alert` issue per (target, classification) when a SUSTAINED
+# backlog-growth-vs-drain condition holds. Classifications: backlog-growing | review-lane-stalled |
+# ready-starved | worker-failing. All fields optional; each must be the type shown:
+#   [repos."owner/name".throughput]
+#   target_ready            = int in [1,100] (default 12) # curate-frontier ready-depth target
+#   open_pr_alert_threshold = positive int (default 20)   # backlog-growing needs prs_open above this
+#   ready_alert_threshold   = positive int (default 40)   # ready-starved needs issues_ready above this
+#   sustain_snapshots       = positive int (default 2)    # K: recent snapshots that must AGREE for
+#                                                         #   ANY of the four rules (all are sustained)
+#   worker_success_floor    = float in [0,1] (default 0.5)# worker-failing below this with attempts
+#   worker_min_samples      = positive int (default 3)    # worker-failing needs >= this many attempts
+#                                                         #   (a single failed run is noise, not a fail)
+#   recover_snapshots       = positive int (default 2)    # hysteresis: auto-close only after the
+#                                                         #   condition is clear this many ticks
+# Optional per-target readiness override (defaults by repo — sparq: status:ready engine via
+# ready-issues.py; registry: its own open `from:agent` backlog):
+#   [repos."owner/name".readiness]
+#   kind = "status-ready" | "from-agent-open"
 
 [repos."sparq-org/sparq"]
 enabled = true
 routing = "orchestration/routing.toml"
-account_pool = ["acct01", "acct02", "acct03", "acct04", "acct2css", "acct3css", "acct4css", "acct05", "acct06", "acct07"]
+# acct03 and acct06 RETIRED 2026-07-25 (maintainer: both underlying accounts cancelled/expired).
+# Removed from the pool so no dispatch tick tries to claim a dead credential. Their `acctNN`
+# issues (#14, #25) stay PRESENT on purpose: set-up-account derives its slot-allocation union
+# from acctNN issues in ANY state, so keeping the records reserves those slot names permanently
+# and a future enrolment can never be handed `acct03`/`acct06` and inherit their lease history,
+# provenance records or salted fingerprints.
+account_pool = ["acct01", "acct02", "acct04", "acct2css", "acct3css", "acct4css", "acct05", "acct07"]
 max_concurrent = 40
 worker_timeout_minutes = 90
 gate_profile = "crate-scoped"
@@ -54,9 +103,21 @@ require_usage = true          # hold (fail-closed) if the usage probe is unavail
 usage_safety_margin = 0.15    # admit only accounts with >=15% headroom in BOTH windows
 max_attempts = 3              # per-issue worker attempts (also bounds the deferred-retry loop)
 trust = "collaborators"
+allow_actions_bot_issues = true # own-workflow drift scanner opens dispatchable issues (#487)
 max_review_rounds = 3         # BASE bound; decide_budget may extend to 6 total (see header)
 review_queue_ttl_minutes = 30 # surface a codex-starved review backlog after this age
 cross_provider_fallback = false  # honest default: stay queued + alert, never silently degrade
+
+# [FABLE-5] Throughput alert thresholds (scripts/metrics.py). sparq is a large, fast repo, so the
+# backlog bar sits above a healthy steady-state (dozens of open + draft PRs is normal); the alert
+# is for GROWTH-with-no-drain, which the 2026-07-18T09:10Z snapshot already trips (52 open PRs,
+# open-rate 5/hr, close-rate 0/hr, 0 merges this hour despite 51 in 24h => review lane stalled).
+[repos."sparq-org/sparq".throughput]
+target_ready            = 30   # stocked frontier for the standing 60/hr throughput goal
+open_pr_alert_threshold = 40   # backlog-growing needs open PRs above this AND close-rate < open-rate
+ready_alert_threshold   = 60   # ready-starved needs this many ready issues AND 0 closed in 1h
+sustain_snapshots       = 2    # anti-spike: 2 consecutive */15 ticks must agree (~30 min)
+worker_success_floor    = 0.5  # worker-failing below 50% success with any worker attempts this hour
 
 # [OPUS-4.8] The registry as a SECOND self-managed target — its OWN pipeline drains its own
 # ~19 open from:agent issues (triage -> ready -> worker -> draft PR -> cross-provider review ->
@@ -65,13 +126,20 @@ cross_provider_fallback = false  # honest default: stay queued + alert, never si
 # docs -> haiku, review cross-provider), and a python/actions gate profile (the crate-scoped cargo gate
 # does not fit a python repo). Its routing.toml (orchestration/routing.toml, in THIS repo) marks
 # every orchestration area (dispatch/worker/set-up-account/review-loop/groom) as a soundness
-# surface (escalate=true) so those routes run on Opus and, on chain-exhaustion, escalate to a
+# surface (escalate=true) so those routes run on the opus5-led soundness chain (opus-4.8 tail
+# fallback, 2026-07-24) and, on chain-exhaustion, escalate to a
 # human — AND the review lane's arm-side classifier reads those same match_labels keywords so an
 # approved trust-surface PR is HUMAN-armed, never auto-armed (defect #3).
 [repos."jeswr/agent-account-registry"]
 enabled = true
 routing = "orchestration/routing.toml"   # THIS repo's own routing (self-managed target)
-account_pool = ["acct01", "acct02", "acct03", "acct04", "acct2css", "acct3css", "acct4css", "acct05", "acct06", "acct07"]
+# acct03 and acct06 RETIRED 2026-07-25 (maintainer: both underlying accounts cancelled/expired).
+# Removed from the pool so no dispatch tick tries to claim a dead credential. Their `acctNN`
+# issues (#14, #25) stay PRESENT on purpose: set-up-account derives its slot-allocation union
+# from acctNN issues in ANY state, so keeping the records reserves those slot names permanently
+# and a future enrolment can never be handed `acct03`/`acct06` and inherit their lease history,
+# provenance records or salted fingerprints.
+account_pool = ["acct01", "acct02", "acct04", "acct2css", "acct3css", "acct4css", "acct05", "acct07"]
 max_concurrent = 3            # SMALL: the trust plane drains slowly + conservatively
 worker_timeout_minutes = 30   # python self-tests + actionlint are fast (no cargo build)
 gate_profile = "registry-selftest"  # python --self-test suite + bash -n + actionlint (see worker-live.sh)
@@ -83,30 +151,46 @@ require_usage = true          # hold (fail-closed) if the usage probe is unavail
 usage_safety_margin = 0.05    # small python jobs — 15% headroom over-delayed registry claims (2026-07-17); sparq keeps 0.15
 max_attempts = 3
 trust = "collaborators"
+allow_actions_bot_issues = true # own trust-plane workflows open dispatchable issues (#487)
 max_review_rounds = 3
 review_queue_ttl_minutes = 30
 cross_provider_fallback = false
+
+# [FABLE-5] Throughput alert thresholds (scripts/metrics.py). The trust plane drains slowly (small
+# max_concurrent) so its healthy backlog is much smaller — a lower open-PR bar. Its readiness is
+# its own open `from:agent` backlog (readiness.kind below), not the sparq status:ready engine.
+[repos."jeswr/agent-account-registry".throughput]
+target_ready            = 12   # conservative trust-plane frontier depth
+open_pr_alert_threshold = 12   # a growing PR backlog is abnormal for the slow-drain trust plane
+ready_alert_threshold   = 30   # a large un-drained from:agent frontier with 0 closed in 1h
+sustain_snapshots       = 2
+worker_success_floor    = 0.5
+
+[repos."jeswr/agent-account-registry".readiness]
+kind = "from-agent-open"       # the registry drains its OWN open from:agent issues (its backlog)
+
 # [OPUS-4.8] B3 / defects #2,#4: the ACTIVE, WIRED trust-surface FILE control. A worker PR whose
 # diff touches ANY of these gate-weakening / orchestration-control paths routes its ARM to a HUMAN
 # even for a benign-labelled PR (area:docs/haiku etc.). CONSUMED by review-fix.yml: the review-
 # outcome + ready-and-arm steps pass this list to worker-pr.trust_surface_paths_touched, and
 # ready-and-arm re-derives the live PR diff (renamed paths included) before ever undrafting/arming.
 # The automated cross-provider review still runs — only the final arm click is a human's here.
+#
+# [issue #145 — sol-audit worker] DIRECTORY PREFIXES, not an enumerated file list. The prior
+# per-script enumeration omitted credential materialization (scripts/worker-prep.sh), the model-
+# isolation container (containers/), and the model-health CAS (scripts/model-health.py) — a benign
+# PR could weaken any of them without the arm gate firing, and every newly added trust-plane script
+# inherited the same hole. Whole-directory prefixes are fail-closed: a NEW file under any of these
+# trees is a trust surface the moment it lands. [issue #166] This list is UNIONED onto (it EXTENDS,
+# it does NOT replace) worker-pr.py DEFAULT_TRUST_SURFACE_PATHS via resolve_trust_surface_paths, so
+# it can only ADD per-target surfaces — a built-in default can never be silently dropped by
+# narrowing this list, and the two lists no longer need manual sync (a default added there protects
+# this target too). Removing a mandatory default requires an explicit, separately-reviewed deny
+# mechanism. Aligns with the worker-live.sh registry-selftest gate.
 security_paths = [
-  "scripts/trust-gate.py",
-  "scripts/dispatch-claim.py",
-  "scripts/worker-live.sh",
-  "scripts/worker-pr.py",
-  "scripts/worker-issue.py",
-  "scripts/select-and-claim.py",
-  "scripts/groom.py",
-  "scripts/broker-refresh.py",
-  "scripts/account-usage.py",
-  "scripts/policy-resolve.py",
-  "scripts/route-resolve.py",
-  "scripts/ready-issues.py",
-  "scripts/dispatch-plan.py",
-  "scripts/triage.py",
+  "scripts/",           # every orchestration/credential/health/provenance control script
+  "dashboard/",         # public dashboard source consumed by the privileged generator
+  "containers/",        # the model-isolation sandbox (worker-model.Dockerfile)
   "policy/",
   "orchestration/",
   ".github/workflows/",

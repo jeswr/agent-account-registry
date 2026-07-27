@@ -57,143 +57,103 @@ function renderSummary(data) {
   const providers = Object.entries(data.fleet.capacity || {}).sort(([left], [right]) => (
     left.localeCompare(right)
   ));
-  for (const [provider, values] of providers) {
+  // Issue #374: `capacity[provider]` is a BOOLEAN — whether the allocator would find an eligible
+  // account for this provider right now — not the `eligible / total` account census it used to be.
+  for (const [provider, hasCapacity] of providers) {
     const line = node("div", "provider-line");
-    line.append(node("span", "", provider), node("strong", "", `${values.eligible} / ${values.total}`));
+    line.append(node("span", "", provider),
+      node("strong", "", hasCapacity ? "available" : "none free"));
     lines.append(line);
   }
   if (!providers.length) lines.append(node("p", "summary-meta", "No provider records"));
   capacity.append(lines);
+  // "none free" is exactly what a failed probe used to overstate in the other direction (issue
+  // #580): with nothing measured EVERY provider reads unavailable, which alone looks like a
+  // fleet-wide outage. Say which of the two it is, right where the misleading value is rendered.
+  if (data.usage_probe && typeof data.usage_probe === "object"
+      && data.usage_probe.measured !== true) {
+    capacity.append(node("p", "summary-meta", "Eligible capacity unmeasured — see the notice above"));
+  }
   summary.append(capacity);
   summary.append(summaryCard(
     "Last dispatch sweep", data.fleet.last_sweep_at ? relative(data.fleet.last_sweep_at) : "unknown",
     data.fleet.last_sweep_at ? utc(data.fleet.last_sweep_at) : "No completed sweep data",
   ));
+  const probe = usageProbeCard(data.usage_probe);
+  if (probe) summary.append(probe);
   summary.append(summaryCard("Data freshness", relative(data.generated_at), utc(data.generated_at)));
 }
 
-function renderWindow(windowData) {
-  const wrapper = node("div", "window");
-  const head = node("div", "window-head");
-  const percent = windowData.used_percent;
-  const known = typeof percent === "number" && Number.isFinite(percent);
-  const limit = windowData.limit ? ` · limit ${windowData.limit}` : "";
-  head.append(
-    node("span", "window-name", windowData.name + limit),
-    node("span", "window-value", known ? `${percent.toFixed(percent % 1 ? 1 : 0)}% used` : "unknown"),
+// --- Usage-probe freshness (issue #219). The probe job's secret materialization and probe steps
+// are continue-on-error, and a failed probe publishes an EMPTY snapshot; without this marker the
+// page could not distinguish "nothing is running" from "nothing was measured", so a broken probe
+// read as a fully idle, fully available fleet. dashboard-gen only sets `measured` for an explicit,
+// FRESH `ok` outcome, and renders every account unknown / zero eligible capacity otherwise — this
+// card says WHY. An absent key (older data.json) simply hides the card. --------------------------
+function usageProbeCard(probe) {
+  if (!probe || typeof probe !== "object") return null;
+  const measured = probe.measured === true;
+  const age = num(probe.age_seconds);
+  const detail = typeof probe.detail === "string" && probe.detail ? ` · ${probe.detail}` : "";
+  const card = summaryCard(
+    "Usage probe",
+    probe.attempted_at ? relative(probe.attempted_at) : "never recorded",
+    measured
+      ? `Measured ok · ${utc(probe.attempted_at)}`
+      : `NOT MEASURED — ${String(probe.outcome || "unknown")}${probe.stale ? " · stale" : ""}${detail}`
+        + `${age === null ? "" : ` · ${age}s old`}`
+        + " · availability shown as unknown, capacity not counted as free",
   );
-  const meter = node("div", "meter");
-  meter.setAttribute("role", "progressbar");
-  meter.setAttribute("aria-label", `${windowData.name} quota utilization`);
-  if (known) {
-    meter.setAttribute("aria-valuenow", String(percent));
-    meter.setAttribute("aria-valuemin", "0");
-    meter.setAttribute("aria-valuemax", "100");
-    const fill = node("span", percent >= 85 ? "high" : "");
-    fill.style.width = `${Math.min(100, Math.max(0, percent))}%`;
-    meter.append(fill);
-  }
-  const resetText = windowData.reset_at
-    ? `Resets ${relative(windowData.reset_at)} · ${utc(windowData.reset_at)}`
-    : "Reset unknown";
-  wrapper.append(head, meter, node("p", "reset", resetText));
-  return wrapper;
-}
-
-function renderWeeklyReset(resetAt) {
-  const reset = node("div", "weekly-reset");
-  reset.append(node("span", "weekly-reset-label", "Weekly reset"));
-  if (parseTime(resetAt)) {
-    reset.append(
-      node("strong", "weekly-reset-relative", relative(resetAt)),
-      node("span", "weekly-reset-utc", utc(resetAt)),
-    );
-  } else {
-    reset.append(
-      node("strong", "weekly-reset-relative", "Unknown"),
-      node("span", "weekly-reset-utc", "No 7 day reset in the latest snapshot"),
-    );
-  }
-  return reset;
-}
-
-function accountCard(account) {
-  const card = node("article", "account-card");
-  const top = node("div", "card-top");
-  top.append(node("h4", "account-label", account.label));
-  const badges = node("div", "badges");
-  badges.append(node("span", `badge ${account.availability}`, account.availability));
-  top.append(badges);
-  const agents = node("div", "agent-count");
-  agents.append(node("span", "", "Active agents"), node("strong", "", String(account.active_agents)));
-  const windows = node("div", "window-list");
-  for (const windowData of account.windows) windows.append(renderWindow(windowData));
-  card.append(top, renderWeeklyReset(account.weekly_reset_at), agents, windows);
+  if (!measured) card.classList.add("degraded");
   return card;
 }
 
-function renderAccounts(accounts) {
-  const container = byId("accounts");
-  container.replaceChildren();
-  byId("account-count").textContent = `${accounts.length} account${accounts.length === 1 ? "" : "s"}`;
-  if (!accounts.length) {
-    container.append(node("p", "empty", "No account records are available."));
-    return;
-  }
+// Issue #374: the per-account cards (salted label, availability badge, active-agent count,
+// weekly reset and live per-window utilization) are GONE, together with renderWindow /
+// renderWeeklyReset / accountCard / renderAccounts. dashboard-gen no longer publishes an
+// `accounts` array at all, so there is nothing left for them to render — the per-provider section
+// below is the whole quota surface now.
 
-  const groups = new Map();
-  for (const account of accounts) {
-    if (!groups.has(account.provider)) groups.set(account.provider, []);
-    groups.get(account.provider).push(account);
-  }
-  for (const [provider, providerAccounts] of groups) {
-    const section = node("section", "provider-section");
-    const heading = node("div", "provider-heading");
-    heading.append(
-      node("h3", "provider-title", provider),
-      node("span", "freshness", `${providerAccounts.length} account${providerAccounts.length === 1 ? "" : "s"}`),
-    );
-    const grid = node("div", "account-grid");
-    for (const account of providerAccounts) grid.append(accountCard(account));
-    section.append(heading, grid);
-    container.append(section);
-  }
-}
+// --- Provider quota: per-provider AGGREGATE headroom, computed server-side by
+// dashboard-gen._provider_quota from the signals that actually exist — live per-window utilization
+// probes where the provider exposes them (anthropic), and only availability + reactive backoff
+// where it does not (probe-exempt openai). Accounts the fail-closed probe OMITTED are never
+// rendered free — dispatch treats that omission as unavailable (sol finding 2, PR #281); so are
+// PARTIAL probe entries (status-only / one window without the other), which dispatch and
+// usage-alert equally reject (sol finding 1, PR #281 fix round 3) and which contribute NOTHING to
+// the aggregate (fix round 4).
+//
+// Issue #374 MINIMIZED what crosses to the page. The card used to print the fleet census —
+// "3 accounts · 1 free · 1 capped · 1 unreported", a "single account" badge, and per-window
+// "0.85 of 2 account-windows free" plus "≈200 provider limit-units left (limits known for 1/2)".
+// Every one of those numbers counted accounts out loud on a public page. The generator now sends
+// a `headroom` WORD (available/capped/unknown/unavailable — the same predicate the allocator uses,
+// so the page still cannot advertise capacity dispatch would refuse) and a per-window
+// `remaining_fraction` in [0,1] (the MEAN across reporting accounts, invariant under fleet size).
+// An absent `provider_quota` key (older data.json) hides the whole section. -----------------------
+const QUOTA_HEADROOM_TEXT = {
+  available: "capacity available",
+  capped: "all quota spent — waiting on a reset",
+  unknown: "no usable measurement — treated unavailable by dispatch",
+  unavailable: "no usable account for this provider",
+};
 
-// --- Provider quota (cumulative): per-provider AGGREGATE headroom across that provider's
-// accounts, computed server-side by dashboard-gen._provider_quota from the signals that actually
-// exist — live per-window utilization probes where the provider exposes them (anthropic), and
-// only the availability counts + reactive backoff where it does not (probe-exempt openai).
-// Accounts the fail-closed probe OMITTED surface as `accounts_unknown` ("unreported") and are
-// never rendered free — dispatch treats that omission as unavailable (sol finding 2, PR #281);
-// so do PARTIAL probe entries (status-only / one window without the other), which dispatch and
-// usage-alert equally reject (sol finding 1, PR #281 fix round 3) and which contribute NOTHING
-// to the window sums, limit estimates, or reset stamps (fix round 4: an unknown account never
-// feeds the headroom rendered next to its own "unreported" badge).
-// The honest aggregate unit is "account-windows free" (Σ remaining window fraction over the
-// accounts that reported), with a PARTIAL limit-weighted sum only where limit headers are known;
-// each card states its signal source, and the section header carries the snapshot freshness.
-// An absent `provider_quota` key (older data.json) hides the whole section. Decision 22: rows
-// contain provider names + counts only — no account identifiers of any form. ---------------------
 function quotaWindowRow(windowData) {
   const wrap = node("div", "window");
   const head = node("div", "window-head");
-  const remaining = typeof windowData.remaining_account_windows === "number"
-    && Number.isFinite(windowData.remaining_account_windows)
-    ? windowData.remaining_account_windows : null;
-  const reporting = Number.isInteger(windowData.accounts_reporting)
-    ? windowData.accounts_reporting : 0;
+  const fraction = typeof windowData.remaining_fraction === "number"
+    && Number.isFinite(windowData.remaining_fraction)
+    ? Math.min(1, Math.max(0, windowData.remaining_fraction)) : null;
   head.append(
     node("span", "window-name", windowData.name),
-    node("span", "window-value", remaining === null || !reporting
+    node("span", "window-value", fraction === null
       ? "unknown"
-      : `${remaining} of ${reporting} account-window${reporting === 1 ? "" : "s"} free`),
+      : `${Math.round(fraction * 100)}% of this window's quota left`),
   );
   const meter = node("div", "meter");
   meter.setAttribute("role", "progressbar");
   meter.setAttribute("aria-label", `${windowData.name} aggregate remaining quota`);
-  if (remaining !== null && reporting > 0) {
-    const fraction = Math.min(1, Math.max(0, remaining / reporting));
+  if (fraction !== null) {
     meter.setAttribute("aria-valuenow", String(Math.round(fraction * 100)));
     meter.setAttribute("aria-valuemin", "0");
     meter.setAttribute("aria-valuemax", "100");
@@ -202,11 +162,6 @@ function quotaWindowRow(windowData) {
     meter.append(fill);
   }
   const notes = [];
-  if (typeof windowData.limit_remaining === "number"
-      && Number.isFinite(windowData.limit_remaining)) {
-    notes.push(`≈${windowData.limit_remaining.toLocaleString()} provider limit-units left`
-      + ` (limits known for ${windowData.limits_known}/${reporting})`);
-  }
   if (windowData.soonest_reset) {
     notes.push(`next reset ${relative(windowData.soonest_reset)}`
       + (windowData.oldest_reset && windowData.oldest_reset !== windowData.soonest_reset
@@ -220,35 +175,19 @@ function providerQuotaCard(row) {
   const card = node("article", "account-card quota-card");
   const top = node("div", "card-top");
   top.append(node("h4", "quota-provider", String(row.provider || "unknown")));
+  const headroom = Object.prototype.hasOwnProperty.call(QUOTA_HEADROOM_TEXT, row.headroom)
+    ? row.headroom : "unknown";
   const badges = node("div", "badges");
-  if (row.single_account) badges.append(node("span", "badge", "single account"));
-  if (Number.isInteger(row.accounts_capped) && row.accounts_capped > 0) {
-    badges.append(node("span", "badge capped", `${row.accounts_capped} capped`));
-  }
-  if (Number.isInteger(row.accounts_unknown) && row.accounts_unknown > 0) {
-    // Distinct neutral badge: an unreported (fail-closed-omitted) account is NOT free — the
-    // muted default badge style separates "no signal" from green/amber/red real states.
-    badges.append(node("span", "badge", `${row.accounts_unknown} unreported`));
-  }
+  badges.append(node("span", `badge ${headroom}`, headroom));
   top.append(badges);
-  const total = Number.isInteger(row.accounts_total) ? row.accounts_total : 0;
-  let countsText = `${total} account${total === 1 ? "" : "s"}`
-    + ` · ${Number.isInteger(row.accounts_available) ? row.accounts_available : 0} free`
-    + ` · ${Number.isInteger(row.accounts_capped) ? row.accounts_capped : 0} capped`;
-  if (Number.isInteger(row.accounts_unavailable) && row.accounts_unavailable > 0) {
-    countsText += ` · ${row.accounts_unavailable} unavailable`;
-  }
-  if (Number.isInteger(row.accounts_unknown) && row.accounts_unknown > 0) {
-    countsText += ` · ${row.accounts_unknown} unreported — treated unavailable by dispatch`;
-  }
   const windows = node("div", "window-list");
   const windowRows = Array.isArray(row.windows) ? row.windows : [];
   for (const windowData of windowRows) windows.append(quotaWindowRow(windowData));
   if (!windowRows.length) {
     windows.append(node("p", "quota-note",
-      "Aggregate remaining quota is not observable for this provider — availability and capped counts above are the only real signal."));
+      "Remaining quota is not observable for this provider — the headroom state above is the only real signal."));
   }
-  card.append(top, node("p", "quota-counts", countsText), windows);
+  card.append(top, node("p", "quota-counts", QUOTA_HEADROOM_TEXT[headroom]), windows);
   if (row.soonest_reset) {
     card.append(node("p", "quota-note",
       `Soonest known reset ${relative(row.soonest_reset)} · all known windows reset by ${utc(row.oldest_reset)}`));
@@ -377,19 +316,257 @@ function renderHealth(health) {
   }
 }
 
-function updateFreshness(generatedAt) {
+function updateFreshness(generatedAt, probe) {
   const generated = parseTime(generatedAt);
   const warning = byId("warning");
   byId("freshness").textContent = generated
     ? `Generated ${relative(generatedAt)} · ${utc(generatedAt)}` : "Generation time unknown";
+  const notices = [];
   if (!generated || Date.now() - generated.getTime() > STALE_MS) {
-    warning.hidden = false;
-    warning.textContent = generated
+    notices.push(generated
       ? `Stale data: this snapshot is ${relative(generatedAt)}. The dashboard pipeline may need attention.`
-      : "Data freshness is unknown. The dashboard pipeline may need attention.";
+      : "Data freshness is unknown. The dashboard pipeline may need attention.");
+  }
+  // Issue #219: a freshly GENERATED page can still carry an unmeasured fleet — the generation
+  // stamp above says only that the build ran, never that the probe succeeded. Say so explicitly,
+  // because "generated 2 minutes ago" was exactly what made a failed probe look healthy.
+  if (probe && typeof probe === "object" && probe.measured !== true) {
+    notices.push(`Usage probe did not measure the fleet (${String(probe.outcome || "unknown")}`
+      + `${probe.stale ? ", stale" : ""}): account availability and provider capacity below are`
+      + " shown as unknown, not as free capacity.");
+  }
+  warning.hidden = notices.length === 0;
+  // Staleness and the probe verdict are INDEPENDENT degradations (issue #580) and both can fire at
+  // once — a failed probe still publishes a FRESH generated_at, so neither notice implies the
+  // other. One `.warning-line` paragraph each (styles.css spaces them); run together in a single
+  // text blob the two read as one confused sentence.
+  warning.replaceChildren(...notices.map((notice) => node("p", "warning-line", notice)));
+}
+
+// --- Throughput panel (backlog-vs-drain). Consumes site/metrics.json, emitted by the separate
+// metrics collector workflow (see the observability-metrics PR). It is optional: if the file is
+// absent (metrics workflow not deployed yet) the panel simply stays hidden — it never blocks the
+// rest of the dashboard. --------------------------------------------------------------------------
+
+const REPO_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9][A-Za-z0-9_.-]*$/;
+const LANE_STATES = new Set(["ok", "idle", "stalled", "unknown"]);
+const SPARK_KEYS = ["net_pr_flow", "issues_ready", "prs_open"];
+// The published site/metrics.json holds only the CURRENT snapshot (the ring history lives on the
+// ledger branch and is not served). We accumulate our own bounded, per-target trend buffer across
+// refreshes — keyed by the snapshot's generated_at so a repeated poll of an unchanged snapshot is
+// not double-counted.
+const SPARK_HISTORY = 24;
+const trendBuffers = new Map();
+
+function num(value, fallback = null) {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function fmtRate(value) {
+  const n = num(value);
+  if (n === null) return "—";
+  return `${n >= 0 ? "" : ""}${n.toFixed(n % 1 ? 1 : 0)}`;
+}
+
+function fmtSigned(value) {
+  const n = num(value);
+  if (n === null) return "—";
+  return `${n > 0 ? "+" : ""}${n.toFixed(n % 1 ? 1 : 0)}`;
+}
+
+function recordTrend(targets, stamp) {
+  const seen = new Set();
+  for (const [repo, metrics] of Object.entries(targets)) {
+    if (!REPO_RE.test(repo)) continue;
+    seen.add(repo);
+    let buffer = trendBuffers.get(repo);
+    if (!buffer) { buffer = { stamp: null, points: [] }; trendBuffers.set(repo, buffer); }
+    if (buffer.stamp === stamp) continue; // same snapshot polled again — do not duplicate
+    buffer.stamp = stamp;
+    const point = {};
+    for (const key of SPARK_KEYS) point[key] = num(metrics[key]);
+    buffer.points.push(point);
+    if (buffer.points.length > SPARK_HISTORY) buffer.points.splice(0, buffer.points.length - SPARK_HISTORY);
+  }
+  for (const repo of [...trendBuffers.keys()]) if (!seen.has(repo)) trendBuffers.delete(repo);
+}
+
+function sparkline(series, { colorForLast } = {}) {
+  const values = series.filter((v) => v !== null && Number.isFinite(v));
+  const wrap = node("div", "spark-wrap");
+  if (values.length < 2) {
+    wrap.append(node("p", "spark-caption", "collecting trend…"));
+    return wrap;
+  }
+  const W = 120;
+  const H = 30;
+  const min = Math.min(...values, 0);
+  const max = Math.max(...values, 0);
+  const span = max - min || 1;
+  const step = W / (values.length - 1);
+  const y = (v) => H - ((v - min) / span) * H;
+  const points = values.map((v, i) => `${(i * step).toFixed(1)},${y(v).toFixed(1)}`).join(" ");
+  const last = values[values.length - 1];
+  const stroke = colorForLast ? colorForLast(last) : "var(--accent)";
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("class", "spark");
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  svg.setAttribute("preserveAspectRatio", "none");
+  svg.setAttribute("aria-hidden", "true");
+  if (min < 0 && max > 0) {
+    const zero = document.createElementNS("http://www.w3.org/2000/svg", "line");
+    zero.setAttribute("x1", "0"); zero.setAttribute("x2", String(W));
+    zero.setAttribute("y1", y(0).toFixed(1)); zero.setAttribute("y2", y(0).toFixed(1));
+    zero.setAttribute("stroke", "var(--line)"); zero.setAttribute("stroke-width", "1");
+    svg.append(zero);
+  }
+  const path = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
+  path.setAttribute("points", points);
+  path.setAttribute("fill", "none");
+  path.setAttribute("stroke", stroke);
+  path.setAttribute("stroke-width", "1.5");
+  path.setAttribute("stroke-linejoin", "round");
+  path.setAttribute("stroke-linecap", "round");
+  svg.append(path);
+  const dot = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+  dot.setAttribute("cx", ((values.length - 1) * step).toFixed(1));
+  dot.setAttribute("cy", y(last).toFixed(1));
+  dot.setAttribute("r", "2");
+  dot.setAttribute("fill", stroke);
+  svg.append(dot);
+  wrap.append(svg);
+  return wrap;
+}
+
+function metricCell(label, value, opts = {}) {
+  const cell = node("div", "metric");
+  cell.append(node("span", "metric-label", label));
+  const v = node("span", `metric-value${opts.tone ? " " + opts.tone : ""}`, value);
+  if (opts.sub !== undefined) v.append(node("span", "metric-sub", opts.sub));
+  cell.append(v);
+  return cell;
+}
+
+function flowIndicator(net) {
+  const n = num(net);
+  const badge = node("span", "flow-badge");
+  if (n === null) { badge.classList.add("steady"); badge.textContent = "flow unknown"; return badge; }
+  if (n > 0) {
+    badge.classList.add("growing");
+    badge.textContent = `▲ backlog growing +${n.toFixed(n % 1 ? 1 : 0)}/hr`;
+  } else if (n < 0) {
+    badge.classList.add("draining");
+    badge.textContent = `▼ draining ${n.toFixed(n % 1 ? 1 : 0)}/hr`;
   } else {
-    warning.hidden = true;
-    warning.textContent = "";
+    badge.classList.add("steady");
+    badge.textContent = "● steady 0/hr";
+  }
+  return badge;
+}
+
+function laneLight(health) {
+  const state = LANE_STATES.has(health) ? health : "unknown";
+  const wrap = node("span", "lane-light");
+  wrap.append(node("span", `lane-dot ${state}`));
+  wrap.append(document.createTextNode("Review lane "));
+  wrap.append(node("strong", "", state));
+  return wrap;
+}
+
+function throughputCard(repo, m, trend) {
+  const card = node("article", "throughput-card");
+  const top = node("div", "card-top");
+  top.append(node("h3", "throughput-target", repo));
+  top.append(flowIndicator(m.net_pr_flow));
+  card.append(top);
+
+  const drained = num(m.issues_closed_1h, 0);
+  const grid = node("div", "metric-grid");
+  grid.append(
+    metricCell("Issues open", String(num(m.issues_open, 0))),
+    metricCell("Ready to drain", String(num(m.issues_ready, 0))),
+    metricCell("Drained / 1h", String(drained), { tone: drained > 0 ? "good" : "" }),
+    metricCell("PRs open", String(num(m.prs_open, 0)), { sub: `${num(m.prs_draft, 0)} draft` }),
+    metricCell("review:changes", String(num(m.review_changes_backlog, 0)),
+      { tone: num(m.review_changes_backlog, 0) > 0 ? "bad" : "" }),
+    metricCell("needs:user", String(num(m.needs_user_parked, 0))),
+  );
+  card.append(grid);
+
+  const rate = node("div", "rate-row");
+  const openCell = node("div", "rate-cell");
+  openCell.append(node("span", "rate-label", "PR open-rate /hr"), node("span", "rate-value", fmtRate(m.pr_open_rate)));
+  const closeCell = node("div", "rate-cell close");
+  closeCell.append(node("span", "rate-label", "close+merge /hr"), node("span", "rate-value", fmtRate(m.pr_close_rate)));
+  rate.append(openCell, node("span", "rate-arrow", "vs"), closeCell);
+  card.append(rate);
+
+  const foot = node("div", "throughput-foot");
+  foot.append(laneLight(m.review_lane_health));
+  const merged = num(m.prs_merged_1h, 0);
+  foot.append(node("span", "lane-light", `${merged} merged / 1h · ${num(m.prs_merged_24h, 0)} / 24h`));
+  card.append(foot);
+
+  // Sparkline for net PR flow (the headline backlog-vs-drain signal), colored by direction.
+  if (trend && trend.points.length) {
+    const netSeries = trend.points.map((p) => p.net_pr_flow);
+    const spark = sparkline(netSeries, {
+      colorForLast: (v) => (v > 0 ? "var(--bad)" : v < 0 ? "var(--good)" : "var(--muted)"),
+    });
+    spark.prepend(node("p", "spark-caption", "net PR flow trend"));
+    card.append(spark);
+  }
+  return card;
+}
+
+function renderThroughput(metrics) {
+  const section = byId("throughput-section");
+  if (!metrics || !metrics.targets || typeof metrics.targets !== "object") {
+    section.hidden = true;
+    return;
+  }
+  const entries = Object.entries(metrics.targets).filter(([repo]) => REPO_RE.test(repo));
+  if (!entries.length) { section.hidden = true; return; }
+  section.hidden = false;
+
+  recordTrend(metrics.targets, metrics.generated_at);
+
+  byId("throughput-time").textContent = metrics.generated_at
+    ? `Snapshot ${relative(metrics.generated_at)} · ${utc(metrics.generated_at)}`
+    : "Snapshot time unknown";
+
+  const alertHost = byId("throughput-alerts");
+  alertHost.replaceChildren();
+  const alerts = Array.isArray(metrics.alerts) ? metrics.alerts.filter((a) => a && a.fire !== false) : [];
+  for (const alert of alerts) {
+    const row = node("div", "alert-row");
+    row.setAttribute("role", "alert");
+    row.append(node("span", "alert-class", String(alert.classification || "alert")));
+    row.append(node("span", "alert-summary", String(alert.summary || "")));
+    if (alert.target) row.append(node("span", "alert-target", String(alert.target)));
+    alertHost.append(row);
+  }
+
+  const host = byId("throughput-targets");
+  host.replaceChildren();
+  entries.sort(([a], [b]) => a.localeCompare(b));
+  for (const [repo, m] of entries) {
+    if (!m || typeof m !== "object") continue;
+    host.append(throughputCard(repo, m, trendBuffers.get(repo)));
+  }
+}
+
+async function refreshThroughput() {
+  try {
+    const response = await fetch(`metrics.json?t=${Date.now()}`, { cache: "no-store" });
+    if (!response.ok) { renderThroughput(null); return; }
+    const metrics = await response.json();
+    if (typeof metrics !== "object" || !metrics || !metrics.targets) { renderThroughput(null); return; }
+    renderThroughput(metrics);
+  } catch (error) {
+    // The throughput panel is optional and independently sourced — a fetch/parse failure hides it
+    // rather than tripping the dashboard-wide warning banner.
+    renderThroughput(null);
   }
 }
 
@@ -404,7 +581,6 @@ const OBS_DEFAULT_THRESHOLDS = {
   workflow_failure_rate: 0.5, defer_reason_hourly: 4,
   queue_age_clamp_minutes: 10, merge_stall_minutes: 90,
 };
-const OBS_SALTED_RE = /^[0-9a-f]{8}$/;
 const OBS_SPARK_POINTS = 24;
 // data.json holds only the current snapshot; trends accumulate client-side across refreshes,
 // keyed by generated_at so re-polling an unchanged snapshot is not double-counted.
@@ -655,21 +831,24 @@ function obsFlowCard(flow, thresholds) {
       { sub: "pending target CI runs" }));
   }
   if (grid.childElementCount) card.append(grid);
-  const leases = Array.isArray(flow.leases) ? flow.leases : [];
-  if (leases.length) {
+  // Issue #374: this used to be one bar PER SALTED ACCOUNT — a per-account row array by another
+  // name, whose length was the fleet size and whose labels were stable across builds. The
+  // generator now sends only the mean and max of the reported utilizations, which is what the
+  // load-balance question ("is one account carrying the fleet?") actually needs.
+  const leaseUtilization = flow.lease_utilization_1h;
+  if (leaseUtilization && typeof leaseUtilization === "object") {
     const list = node("div", "obs-reasons");
-    list.append(node("p", "obs-spark-caption", "lease utilization / 1h (salted accounts)"));
-    for (const lease of leases) {
-      // Defense in depth for decision 22: only the salted 8-hex label shape is ever rendered.
-      if (typeof lease.label !== "string" || !OBS_SALTED_RE.test(lease.label)) continue;
+    list.append(node("p", "obs-spark-caption", "lease utilization / 1h (across the fleet)"));
+    for (const [caption, value] of [["mean", leaseUtilization.mean],
+                                    ["busiest", leaseUtilization.max]]) {
       const rowEl = node("div", "obs-reason-row");
-      rowEl.append(node("span", "obs-lane", `${lease.label}${lease.provider ? ` · ${lease.provider}` : ""}`));
+      rowEl.append(node("span", "obs-lane", caption));
       const meter = node("div", "obs-bar-track wide");
-      const used = obsNum(lease.utilization_1h);
+      const used = obsNum(value);
       const fill = node("span", `obs-bar-fill${used !== null && used >= 0.85 ? " hot" : ""}`);
       fill.style.width = `${used === null ? 0 : Math.min(100, used * 100)}%`;
       meter.append(fill);
-      rowEl.append(meter, node("span", "obs-reason-count", obsPct(lease.utilization_1h)));
+      rowEl.append(meter, node("span", "obs-reason-count", obsPct(value)));
       list.append(rowEl);
     }
     card.append(list);
@@ -712,11 +891,10 @@ function render(data) {
   renderRepositoryAgents(data.active_by_repository, data.fleet.active_agents);
   renderSummary(data);
   renderProviderQuota(data.provider_quota, data.generated_at);
-  renderAccounts(data.accounts || []);
   renderOutcomes(data.fleet.dispatch_outcomes || []);
   renderHealth(data.model_health);
   renderObservability(data.observability);
-  updateFreshness(data.generated_at);
+  updateFreshness(data.generated_at, data.usage_probe);
 }
 
 async function refresh() {
@@ -734,4 +912,6 @@ async function refresh() {
 }
 
 refresh();
+refreshThroughput();
 setInterval(refresh, REFRESH_MS);
+setInterval(refreshThroughput, REFRESH_MS);

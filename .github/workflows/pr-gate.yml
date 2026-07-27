@@ -1,5 +1,6 @@
-# [OPUS-4.8] B1: the registry's own required PR gate. The onboarded review lane arms a PR with
-# `gh pr merge --auto` (allow_auto_merge is enabled live on the repo); that latch only merges when
+# The registry's own required PR gate. The onboarded review lane arms a PR with
+# the sha-bound enablePullRequestAutoMerge mutation (allow_auto_merge is enabled live on the
+# repo; never `gh pr merge --auto`, which direct-merges — sol r4 on #334); that latch only merges when
 # a REQUIRED status check named `gate` is green. This workflow IS that check — a `pull_request`
 # job literally named `gate` running the registry-selftest suite (python --self-test + actionlint).
 # It is also the authoritative check dispatch-claim.py's CI_GATE_CHECK reads (name == "gate").
@@ -9,9 +10,16 @@
 #   worker/review-fix branch pushes — must stay allowed). Do NOT create the ruleset here.
 #
 # Least privilege: contents:read only (the gate reads code + runs tests; it never writes). Actions
-# are SHA-pinned. actionlint is fetched as a pinned release binary verified against the release's
-# published sha256 (the raven-actions installer broke under the runner's forced Node-24 migration,
-# and `go install` is checksum-free — a pinned+checksummed direct download is the sturdiest option).
+# are SHA-pinned, and the gate enforces that policy on itself (sol audit #221): every non-local
+# `uses:` reference in every workflow must be a full 40-hex commit pin — actionlint does not check
+# that, so without the assertion a regression to a mutable tag would pass this REQUIRED check.
+# PyYAML is installed version- and hash-locked for the same reason: a mutable PyPI release must not
+# be able to break or influence the gate. actionlint is fetched as a pinned release binary verified
+# against the release's published sha256 (the raven-actions installer broke under the runner's
+# forced Node-24 migration, and `go install` is checksum-free — a pinned+checksummed direct
+# download is the sturdiest option). That pin lives in ONE place, scripts/actionlint.pin (#431),
+# which this gate and the worker lane's scripts/worker-live.sh both parse, so a bump is a single
+# edit and the two lint lanes can never drift onto different actionlints.
 name: pr-gate
 
 on:
@@ -35,20 +43,52 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
+          fetch-depth: 0
 
       - name: Set up Python (pinned)
         uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
         with:
           python-version: '3.12'
 
-      - name: Install PyYAML for the workflow-yaml lint
-        run: python3 -m pip install --disable-pip-version-check pyyaml
+      - name: Install PyYAML for the workflow-yaml lint (version + hash locked)
+        run: |
+          set -euo pipefail
+          # A REQUIRED gate must not depend on a mutable release (sol audit #221): pin the exact
+          # version AND its PyPI sha256 digests (manylinux cp312 x86_64 + aarch64 wheels).
+          # --only-binary forbids a fallback sdist build, whose isolated build deps pip would
+          # download WITHOUT hash-checking.
+          cat > "$RUNNER_TEMP/gate-requirements.txt" <<'REQ'
+          pyyaml==6.0.2 \
+              --hash=sha256:80bab7bfc629882493af4aa31a4cfa43a4c57c83813253626916b8c7ada83476 \
+              --hash=sha256:1f71ea527786de97d1a0cc0eacd1defc0985dcf6b3f17bb77dcfc8c34bec4dc5
+          REQ
+          python3 -m pip install --disable-pip-version-check --require-hashes \
+            --only-binary=:all: -r "$RUNNER_TEMP/gate-requirements.txt"
 
       - name: Install actionlint (pinned release, sha256-verified)
         run: |
           set -euo pipefail
-          ver=1.7.7
-          sha256=023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757
+          # [issue #431] The version + tarball checksum are read from scripts/actionlint.pin — the
+          # SINGLE SOURCE shared with scripts/worker-live.sh's _ensure_actionlint. They used to be
+          # hard-coded in both lanes, so a bump could land in one and leave the two lint lanes on
+          # DIFFERENT actionlints; a bump is now one edit, and worker-live.sh's --self-test asserts
+          # this step still reads the pin file and carries no version/checksum literal of its own.
+          # The file is PARSED, never sourced: each key must appear exactly once and its value must
+          # match that key's exact shape, so a missing/duplicated/malformed pin refuses here rather
+          # than fetching an artifact this step could not verify. The pins stay checked in and are
+          # never env-supplied.
+          pin=scripts/actionlint.pin
+          pin_value() {
+            local key=$1 pattern=$2
+            local keyed
+            keyed=$(grep -c -E "^${key}=" -- "$pin") || return 1
+            [ "$keyed" = 1 ] || return 1
+            grep -E "^${key}=${pattern}\$" -- "$pin" | cut -d= -f2-
+          }
+          ver=$(pin_value ACTIONLINT_VERSION '[0-9]+(\.[0-9]+)*') \
+            || { echo "::error::$pin: ACTIONLINT_VERSION missing, duplicated or malformed"; exit 1; }
+          sha256=$(pin_value ACTIONLINT_TARBALL_SHA256_LINUX_AMD64 '[0-9a-f]{64}') \
+            || { echo "::error::$pin: ACTIONLINT_TARBALL_SHA256_LINUX_AMD64 missing, duplicated or malformed"; exit 1; }
           curl -fsSL --retry 3 -o /tmp/actionlint.tar.gz \
             "https://github.com/rhysd/actionlint/releases/download/v${ver}/actionlint_${ver}_linux_amd64.tar.gz"
           echo "${sha256}  /tmp/actionlint.tar.gz" | sha256sum -c -
@@ -59,29 +99,39 @@ jobs:
       - name: Run the full registry self-test suite
         run: |
           set -euo pipefail
-          # Every self-testing pipeline script — the same FULL suite worker-live.sh's
-          # registry-selftest gate runs. A missing self-test fails the gate (fail closed).
-          suite="policy-resolve.py route-resolve.py ready-issues.py dispatch-plan.py \
-          plan-snapshot.py triage.py \
-          dispatch-claim.py worker-pr.py worker-issue.py select-and-claim.py groom.py \
-          account-usage.py usage-alert.py model-health.py plan-alert.py groom-alert.py pat-validity.py broker-refresh.py \
-          backfill-provenance.py dashboard-gen.py trust-gate.py dispatch-secrets-guard.py"
+          base_manifest="$RUNNER_TEMP/base-selftest-suite.txt"
+          base_retirements="$RUNNER_TEMP/base-selftest-retirements.txt"
+          base='${{ github.event.pull_request.base.sha }}'
+          if ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            echo "::error::base commit $base is unresolvable; refusing to derive the self-test suite"
+            exit 1
+          fi
+          # Bootstrap only: the introducing PR's base has no shared manifest yet, so its current
+          # complete manifest is the protected baseline. Every later PR reads the base-branch copy.
+          if git cat-file -e "$base:scripts/selftest-suite.txt" 2>/dev/null; then
+            git show "$base:scripts/selftest-suite.txt" > "$base_manifest"
+          else
+            cp scripts/selftest-suite.txt "$base_manifest"
+          fi
+          if git cat-file -e "$base:scripts/selftest-retirements.txt" 2>/dev/null; then
+            git show "$base:scripts/selftest-retirements.txt" > "$base_retirements"
+          else
+            : > "$base_retirements"
+          fi
+          suite=$(bash scripts/worker-live.sh print-selftest-suite "$base_manifest" "$base_retirements")
+          n=0
           for s in $suite; do
-            # An enrolled script that is MISSING is a hard failure (sol r3 on #227): the
-            # silent [[ -f ]] skip would keep this gate green after deleting a security
-            # script — the exact class the trust-gate outage exposed.
-            if [[ ! -f "scripts/$s" ]]; then
-              echo "::error::enrolled self-test script scripts/$s is missing"; exit 1
-            fi
-            if [[ -f "scripts/$s" ]]; then
-              echo "== self-test $s =="
-              python3 "scripts/$s" --self-test
-            fi
+            echo "== self-test $s =="
+            case "$s" in
+              *.py) python3 "scripts/$s" --self-test ;;
+              migrate-secrets.sh) bash "scripts/$s" --self-test ;;
+              *.sh) bash "scripts/$s" self-test ;;
+              *) echo "::error::unsupported self-test suite entry: $s"; exit 1 ;;
+            esac
+            ((n += 1))
           done
-          echo "== self-test worker-live.sh =="
-          bash scripts/worker-live.sh self-test
-          echo "== self-test migrate-secrets.sh =="
-          bash scripts/migrate-secrets.sh --self-test
+          [[ "$n" -gt 0 ]] || { echo "::error::self-test suite ran vacuously"; exit 1; }
+          echo "ran $n self-tests"
 
       - name: bash -n every shell script
         run: |
@@ -102,3 +152,126 @@ jobs:
           done
           echo "== actionlint =="
           actionlint -color
+
+      - name: Assert every workflow-passed CLI flag is declared by its script
+        run: |
+          set -euo pipefail
+          # PR #595 finding 2 (the TEST-VACUITY class, repo-wide): retriage.yml passed
+          # `--known-labels` to a parser that never declared it, so EVERY scheduled sweep exited 2
+          # with "unrecognized arguments" — invisible to the enrolled suite, whose self-tests called
+          # the planner function directly. Nothing structural stopped the whole class, so assert it
+          # statically: every `--flag` a workflow (or a workflow-invoked shell script) passes to a
+          # `scripts/*.py` must be DECLARED there — an argparse add_argument or one of the argv-style
+          # membership tests this repo uses. A literal merely mentioned in a docstring or a test
+          # assertion does not count (that is why the check is AST-based, not a grep). Scanning zero
+          # invocations is itself a failure (fail closed), mirroring the pin check below.
+          python3 - <<'PY'
+          import ast, glob, pathlib, re, sys
+
+          INVOCATION = re.compile(
+              r"python3\s+(?:\"?\$?\{?[\w./$-]*\}?/)?(?:registry(?:-snapshot)?/)?"
+              r"scripts/([\w.-]+\.py)([^\n]*)")
+          FLAG = re.compile(r"(?<![\w-])--[a-z][a-z0-9-]*")
+          # A PASSTHROUGH subcommand hands the rest of its argv verbatim to another program, so the
+          # flags after it are not the script's own contract: `gh_retry.py read <gh args...>`.
+          PASSTHROUGH = {("gh_retry.py", "read")}
+
+          def declared_flags(source):
+              flags, tree = set(), ast.parse(source)
+
+              def literals(nodes):
+                  return {n.value for n in nodes if isinstance(n, ast.Constant)
+                          and isinstance(n.value, str) and n.value.startswith("--")}
+
+              def mentions_argv(node):
+                  return any((isinstance(n, ast.Attribute) and n.attr == "argv")
+                             or (isinstance(n, ast.Name) and n.id == "argv")
+                             for n in ast.walk(node))
+
+              for node in ast.walk(tree):
+                  if isinstance(node, ast.Call):
+                      name = getattr(node.func, "attr", getattr(node.func, "id", ""))
+                      if name == "add_argument" or (name in {"index", "count"}
+                                                    and mentions_argv(node.func)):
+                          flags |= literals(node.args)
+                  elif isinstance(node, ast.Compare) and mentions_argv(node):
+                      flags |= literals([node.left, *node.comparators])
+              return flags
+
+          pairs, bad, cache = set(), [], {}
+          for path in sorted(glob.glob(".github/workflows/*.yml")) + sorted(glob.glob("scripts/*.sh")):
+              text = "\n".join(
+                  line for line in pathlib.Path(path).read_text(encoding="utf-8").splitlines()
+                  if not line.strip().startswith("#")).replace("\\\n", " ")
+              for match in INVOCATION.finditer(text):
+                  script, tail = match.group(1), match.group(2)
+                  if (script, (tail.split() or [""])[0]) in PASSTHROUGH:
+                      continue
+                  for flag in FLAG.findall(tail):
+                      pairs.add((script, flag, path))
+          for script, flag, path in sorted(pairs):
+              source = pathlib.Path("scripts") / script
+              if not source.exists():
+                  bad.append(f"{path} invokes scripts/{script}, which does not exist")
+                  continue
+              if script not in cache:
+                  cache[script] = declared_flags(source.read_text(encoding="utf-8"))
+              if flag not in cache[script]:
+                  bad.append(f"{path}: scripts/{script} is passed {flag}, "
+                             "which the script never declares")
+          for entry in bad:
+              print(f"::error::workflow/CLI signature drift — {entry}")
+          if bad:
+              sys.exit(1)
+          if not pairs:
+              print("::error::CLI flag check scanned zero workflow script invocations (fail closed)")
+              sys.exit(1)
+          print(f"CLI flag check OK: {len(pairs)} workflow-passed flags are declared by their scripts")
+          PY
+
+      - name: Assert every non-local action reference is pinned to a 40-hex commit
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          # actionlint does NOT enforce commit-pinning, so a regression from a 40-hex pin to a
+          # mutable tag would otherwise pass this required gate (sol audit #221). Walk every
+          # parsed workflow and reject any non-local `uses:` whose ref is not exactly 40 hex
+          # (docker refs must pin a sha256 digest). Scanning zero references is itself a
+          # failure — a parser regression must not turn this assertion vacuous (fail closed).
+          python3 - .github/workflows/*.yml .github/workflows/*.yaml <<'PY'
+          import re, sys, yaml
+
+          def walk(node):
+              if isinstance(node, dict):
+                  for key, value in node.items():
+                      if key == "uses" and isinstance(value, str):
+                          yield value
+                      else:
+                          yield from walk(value)
+              elif isinstance(node, list):
+                  for item in node:
+                      yield from walk(item)
+
+          total, bad = 0, []
+          for path in sys.argv[1:]:
+              with open(path, encoding="utf-8") as fh:
+                  doc = yaml.safe_load(fh)
+              for ref in walk(doc):
+                  if ref.startswith("./"):
+                      continue  # local action: already pinned by this PR's own commit
+                  total += 1
+                  if ref.startswith("docker://"):
+                      ok = re.search(r"@sha256:[0-9a-f]{64}$", ref)
+                  else:
+                      ok = re.fullmatch(r"[^@\s]+@[0-9a-f]{40}", ref)
+                  if not ok:
+                      bad.append(f"{path}: uses: {ref}")
+          for entry in bad:
+              print(f"::error::action reference is not commit-pinned (need @<40-hex sha>): {entry}")
+          if bad:
+              sys.exit(1)
+          if total == 0:
+              print("::error::pin check scanned zero non-local action references (fail closed)")
+              sys.exit(1)
+          print(f"pin check OK: all {total} non-local 'uses:' references are 40-hex pinned")
+          PY
