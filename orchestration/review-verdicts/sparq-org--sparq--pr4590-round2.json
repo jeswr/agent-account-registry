@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4590,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "2588661bab703c6c568f0e4a2b3a6aedcb86a621",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves both prior findings. The normative RDF-star probe now requires only Quad-subject support, so conforming implementations that reject Quad objects still execute the subject-position equality, keying, and copy tests. Object-position quoting is independently feature-detected and consistently labelled as a non-normative extension in both source and README. The revised tests exercise the actual factory-produced terms and copies rather than mocks, and the directional-literal checks meaningfully cover datatype, equality, canonical-key discrimination, and fromTerm preservation. No correctness, soundness, security, or test-validity issue remains in the diff.",
+  "verdict": "approve"
+ }
+}
