@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 836,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "05b3f1aa119585e0060fb481d313a5d3af5ec988",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly raises the pre-login reservation hint's issue-list window from gh's default 30 to 500, matching the allocator catalog window. This does not weaken the trust boundary: the value remains only a hint, while the later store step independently enumerates the complete live union of claim refs, account issues, and both secret scopes, fails closed on enumeration errors, and atomically claims the selected slot before writing. No hostile reviewer-directed instruction is present in the diff.",
+  "verdict": "approve"
+ }
+}
