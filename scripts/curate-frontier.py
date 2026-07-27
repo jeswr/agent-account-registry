@@ -3,7 +3,9 @@
 
 The enabled target list and additional trusted automation identities come from
 ``policy/repos.toml``.  The default mode is a read-only dry run; ``--apply`` is the only path
-that mutates target issues.  No issue labels are ever removed.
+that mutates target issues.  Exactly ONE label is ever removed — ``status:untriaged``, and only
+from an issue this run is simultaneously staging (see ``Mutation.remove`` and ``is_staged``);
+``execute_plan`` raises on any other strip.
 """
 import argparse
 from dataclasses import dataclass
@@ -50,6 +52,23 @@ def _load_gh_retry() -> Any:
 _gh_retry = _load_gh_retry()
 
 
+def _load_ready_issues() -> Any:
+    spec = importlib.util.spec_from_file_location(
+        "registry_ready_issues", Path(__file__).resolve().with_name("ready-issues.py"))
+    if spec is None or spec.loader is None:
+        raise RuntimeError("cannot load the shared readiness engine")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+# THE readiness engine, imported rather than re-derived (retriage.py does the same, for the same
+# stated reason: "what must never happen is a THIRD, divergent copy of either rule"). The curator
+# needs it for exactly one question — how deep is the frontier ACTUALLY, right now — and the only
+# authority on that is the predicate the dispatcher itself enumerates with.
+_ready_issues = _load_ready_issues()
+
+
 TARGET_READY = 12
 MAX_CLOSES = 5
 GATE_LABELS = ("needs:", "trust:untrusted")
@@ -57,6 +76,9 @@ TRUSTED_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
 ACTIONS_BOT_LOGIN = "github-actions[bot]"
 IN_FLIGHT_STATUS = {"status:ready", "status:in-progress"}
 PARKED_AREA_LABELS = {"needs:user", "review:needs-user", "status:blocked"}
+# `status:untriaged` is the ONE status label that is not a staging claim — it is the assertion
+# that NOTHING has staged this issue yet. See is_staged() for the measured deadlock this closes.
+UNSTAGED_STATUS = "status:untriaged"
 TRUST_LABEL_PREFIXES = (
     "area:sparq-zk", "area:sparq-mpc", "area:zk", "area:mpc", "area:trust",
     "area:sparq-trust", "area:e2ee", "area:sparq-e2ee", "zk", "mpc",
@@ -138,6 +160,14 @@ class Mutation:
     number: int
     issue: dict[str, Any]
     labels: tuple[str, ...] = ()
+    # The ONLY labels this tool ever strips, and only from the `stage` action: `status:untriaged`
+    # on an issue it is simultaneously staging. Without it the add-only edit leaves BOTH
+    # `status:ready` and `status:untriaged` on the issue, and `status:untriaged` is in
+    # ready-issues.BUSY_STATUS — so the "staged" issue is STILL unenumerable and the repair is
+    # vacuous. `gh issue edit` sends one PATCH carrying the resulting label set, so the add and
+    # the strip land together or not at all; this is not the two-independent-edits shape #582 is
+    # about, and execute_plan still raises on a non-zero return.
+    remove: tuple[str, ...] = ()
     canonical: int | None = None
     canonical_issue: dict[str, Any] | None = None
 
@@ -181,6 +211,35 @@ def has_gate(labels: set[str]) -> bool:
 
 def has_status(labels: set[str]) -> bool:
     return any(label.startswith("status:") for label in labels)
+
+
+def is_staged(labels: set[str]) -> bool:
+    """Whether the pipeline has ALREADY staged this issue — the CANDIDATE-ADMISSION predicate.
+
+    NOT the same question as has_status(), and the difference is the whole of registry #799.
+
+    MEASURED DEADLOCK. `triage-issue.yml` fires on `issues: [opened, edited, reopened]` and stamps
+    `status:untriaged` within seconds of creation — `triage.triage()` always adds either
+    `status:ready` or `status:untriaged`, never neither. The candidate filter used has_status(),
+    so from that moment the curator — the ONLY lane in the estate that mints `priority:*`,
+    `area:*` and `status:ready` — could never look at the issue again. And `retriage.py` cannot
+    rescue it either: its promotion lane fires only when the label set is ALREADY triage-complete,
+    which requires exactly the `priority:*`/`area:*` labels only the curator writes. Two lanes,
+    each reporting `success` on every run, each structurally unable to produce the other's input:
+    on the live board 274 of 339 open issues sat `status:untriaged`, the oldest for two weeks, and
+    retriage run 262 visited 80 of them and wrote NOTHING (80/80 `classifier-incomplete`).
+
+    So `status:untriaged` alone is UNSTAGED and admissible. Every other `status:*` still means
+    staged, and — deliberately — so does `status:untriaged` in COMBINATION with another status:
+    the `status:available` account-inventory records (#1, #2, #14, ...) and any contradictory
+    `status:untriaged`+`status:ready` pair stay untouched here, the latter because `retriage.py`
+    owns that repair.
+
+    has_status() is intentionally left alone. It also guards the duplicate-CLOSE path, where
+    "carries a status label" means "the pipeline has seen it, do not auto-close it" — widening
+    THAT would newly expose 274 issues to automated closure, which is the opposite of the repair.
+    """
+    return any(label.startswith("status:") and label != UNSTAGED_STATUS for label in labels)
 
 
 def author_login(issue: dict[str, Any]) -> str:
@@ -294,6 +353,30 @@ def derive_area(issue: dict[str, Any], labels: set[str], repo_labels: set[str]) 
     if len(crates) > 1:
         return None, "multiple crate areas in title"
 
+    # THE TARGET'S OWN AREA TAXONOMY. The crate rule above and the path hints below are both
+    # sparq-shaped: `sparq-*` crate names, and `site/`/`gui/`/`bench/`/`scripts/` trees. Against
+    # the registry — the estate's SECOND enabled target — that left only `area:ci` reachable, so
+    # 8 of its 10 `area:*` labels (dispatch, groom, worker, review-loop, set-up-account, usage,
+    # dashboard, docs) were invisible to the curator and every issue it could classify collapsed
+    # into the SAME package. Since a wave stages at most one issue per package, the whole target's
+    # drain was pinned at 1 per run regardless of the depth budget.
+    #
+    # Same shape as the crate rule, generalised: a repository's `area:<name>` labels ARE its
+    # declared surface vocabulary, so an issue whose TITLE names exactly one of them is
+    # classified by it. Title-only (not the body) for the same precision reason the crate rule is
+    # title-only, and fail-closed on ambiguity exactly like every other branch here: two named
+    # surfaces are an UNRESOLVED area, not a coin flip.
+    declared = {
+        label for label in repo_labels
+        if label.startswith("area:") and len(label) > len("area:")
+        and re.search(rf"(?<![A-Za-z0-9_-]){re.escape(label[len('area:'):])}(?![A-Za-z0-9_-])",
+                      title, re.IGNORECASE)
+    }
+    if len(declared) == 1:
+        return next(iter(declared)), "title names a declared area"
+    if len(declared) > 1:
+        return None, "multiple declared areas named in title"
+
     text = issue_text(issue)
     hints = set()
     path_hints = (
@@ -371,6 +454,39 @@ def _conflicting_label(labels: set[str], prefix: str, desired: str) -> bool:
     return any(label.startswith(prefix) and label != desired for label in labels)
 
 
+# A fence whose label the target repository does not carry. The line is a LOG entry, not an
+# exception, and main() turns the run red once the whole plan has been printed and applied.
+FENCE_UNAVAILABLE = "FENCE-UNAVAILABLE"
+
+
+def _fence_unavailable(
+    logs: list[str], number: int, fence: str, desired: tuple[str, ...], repo_labels: set[str],
+) -> bool:
+    """True (and logged) when `fence` cannot be applied because the target lacks its label(s).
+
+    This used to `raise CuratorError`, which aborted the ENTIRE target's plan — every other
+    issue's fence and every stage with it — on one unconfigured label. That was invisible while
+    the curator's candidate set was tiny; admitting `status:untriaged` issues (registry #799)
+    makes it reachable on the first tick, and the registry genuinely lacks `needs:ec2` and
+    `status:blocked` today, so the whole-target abort would have replaced a starving lane with a
+    red one and STILL drained nothing.
+
+    Availability and fail-closed are not in tension here, because the two failures are on
+    different axes: the ISSUE is skipped, so it is never admitted (fail-closed, unchanged), while
+    the RUN still curates everything else and then goes red once via main() (loud, unchanged).
+    This is retriage.yml's own "record the per-issue failure, continue the sweep, turn the step
+    red once after the loop" idiom.
+    """
+    missing = sorted(set(desired) - repo_labels)
+    if not missing:
+        return False
+    logs.append(
+        f"{FENCE_UNAVAILABLE} #{number}: {fence} fence needs {','.join(missing)}, which this "
+        f"repository does not have — skipping the issue (never admitted) and failing the run"
+    )
+    return True
+
+
 def plan_repository(
     issues: list[dict[str, Any]],
     repo_labels: set[str],
@@ -392,7 +508,7 @@ def plan_repository(
     for issue in open_issues:
         labels = labels_of(issue)
         number = issue["number"]
-        if has_status(labels) or has_gate(labels):
+        if is_staged(labels) or has_gate(labels):
             continue
         if not trusted_author(issue, automation_logins, allow_actions_bot_issues):
             login = author_login(issue) or "<malformed>"
@@ -407,12 +523,8 @@ def plan_repository(
         if has_conditional_evidence(issue):
             needs_label = "needs:ec2" if "needs:ec2" in repo_labels else "needs:user"
             desired = (needs_label, "status:blocked")
-            missing = sorted(set(desired) - repo_labels)
-            if missing:
-                raise CuratorError(
-                    "target repository is missing conditional-evidence labels: "
-                    + ", ".join(missing)
-                )
+            if _fence_unavailable(logs, number, "CONDITIONAL-EVIDENCE", desired, repo_labels):
+                continue
             gate_actions.append(Mutation(
                 "conditional-evidence", number, issue, desired
             ))
@@ -421,8 +533,9 @@ def plan_repository(
             )
             continue
         if is_steering_question(issue):
-            if "needs:user" not in repo_labels:
-                raise CuratorError("target repository is missing required label needs:user")
+            if _fence_unavailable(logs, number, "QUESTION-SHAPED/steering",
+                                  ("needs:user",), repo_labels):
+                continue
             gate_actions.append(Mutation(
                 "steering-question", number, issue, ("needs:user",)
             ))
@@ -431,8 +544,8 @@ def plan_repository(
             )
             continue
         if is_ec2_measurement(issue):
-            if "needs:ec2" not in repo_labels:
-                raise CuratorError("target repository is missing required label needs:ec2")
+            if _fence_unavailable(logs, number, "EC2-measurement", ("needs:ec2",), repo_labels):
+                continue
             gate_actions.append(Mutation("needs-ec2", number, issue, ("needs:ec2",)))
             logs.append(f"gate #{number}: EC2 measurement work -> needs:ec2")
             continue
@@ -480,8 +593,23 @@ def plan_repository(
     if len(close_options) > close_limit:
         logs.append(f"defer {len(close_options) - close_limit} duplicate close(s): run cap is {close_limit}")
 
+    # THE FRONTIER DEPTH IS WHAT THE DISPATCHER CAN ENUMERATE, not what carries the label.
+    #
+    # A bare `"status:ready" in labels` count includes issues the readiness engine itself refuses:
+    # `status:ready` co-labelled `status:deferred`/`status:blocked`/`status:in-progress` is
+    # `busy:` to ready-issues.exclusion_reason and can never be dispatched from that state. On the
+    # live registry board that was 6 of the 13 counted "ready" issues (#32-#36, #43 — all
+    # `status:deferred`), so the curator read 13 >= target 12, computed depth 0 and staged nothing
+    # — for as long as those six stayed deferred, which is unboundedly. A depth budget that counts
+    # undispatchable work as frontier depth is a starvation latch: the emptier the real frontier
+    # gets (work parks, defers, blocks) the LESS the curator refills it.
+    #
+    # exclusion_reason is the dispatcher's own label-side predicate (open_blockers is deliberately
+    # left at its default here — a blocker count needs the issue payload, and counting a
+    # blocker-held issue as depth is the conservative direction).
     current_ready = sum(
-        1 for issue in open_issues if "status:ready" in labels_of(issue)
+        1 for issue in open_issues
+        if _ready_issues.exclusion_reason(labels_of(issue)) is None
     )
     depth = max(0, target_ready - current_ready)
     in_flight_blockers: dict[str, list[dict[str, Any]]] = {}
@@ -561,8 +689,13 @@ def plan_repository(
             logs.append(f"skip #{number}: this wave already selected {area}")
             continue
         selected_areas.add(area)
-        stage_actions.append(Mutation("stage", number, issue, desired))
-        logs.append(f"stage #{number}: {','.join(desired)}")
+        # Strip `status:untriaged` in the SAME edit that stages: it is in
+        # ready-issues.BUSY_STATUS, so leaving it behind stages an issue the dispatcher still
+        # cannot enumerate — a repair that changes labels and drains nothing.
+        strip = (UNSTAGED_STATUS,) if UNSTAGED_STATUS in labels_of(issue) else ()
+        stage_actions.append(Mutation("stage", number, issue, desired, remove=strip))
+        logs.append(f"stage #{number}: {','.join(desired)}"
+                    + (f" -{','.join(strip)}" if strip else ""))
 
     if area_limited and len(stage_actions) < depth:
         resulting_ready = current_ready + len(stage_actions)
@@ -690,6 +823,8 @@ def execute_plan(repo: str, mutations: list[Mutation], token: str, apply: bool) 
             description = f"close as not planned (duplicate of #{mutation.canonical})"
         else:
             description = "add " + ",".join(mutation.labels)
+            if mutation.remove:
+                description += " / remove " + ",".join(mutation.remove)
         print(f"{mode} {repo}#{mutation.number}: {description}")
         if not apply:
             continue
@@ -729,6 +864,14 @@ def execute_plan(repo: str, mutations: list[Mutation], token: str, apply: bool) 
             command = ["issue", "edit", str(mutation.number), "--repo", repo]
             for label in mutation.labels:
                 command.extend(["--add-label", label])
+            # Strictly bounded: only `stage` sets `remove`, and only ever to `status:untriaged`.
+            # Enforced here rather than by convention so no future action can acquire a strip.
+            for label in mutation.remove:
+                if mutation.kind != "stage" or label != UNSTAGED_STATUS:
+                    raise CuratorError(
+                        f"refusing to strip {label!r} from {repo}#{mutation.number}: the curator "
+                        f"may only remove {UNSTAGED_STATUS!r}, and only when staging")
+                command.extend(["--remove-label", label])
         try:
             subprocess.run(["gh", *command], check=True, env=_gh_env(token))
         except (FileNotFoundError, subprocess.CalledProcessError) as exc:
@@ -1347,6 +1490,7 @@ def main() -> int:
     targets = load_targets(Path(args.policy_file), args.bot_login)
     tokens, ambient = load_tokens()
     remaining_closes = MAX_CLOSES
+    unavailable_fences = 0
     for repo, automation_logins, allow_actions_bot_issues, target_ready in targets:
         owner = repo.split("/", 1)[0]
         token = tokens.get(owner, ambient)
@@ -1358,13 +1502,26 @@ def main() -> int:
             target_ready=target_ready,
             allow_actions_bot_issues=allow_actions_bot_issues,
         )
-        print(f"== {repo}: ready={sum('status:ready' in labels_of(i) for i in issues)} "
+        # Report the DISPATCHABLE depth (what the readiness engine can enumerate), which is the
+        # number the depth budget actually spends, next to the raw label count it is not.
+        enumerable = sum(
+            _ready_issues.exclusion_reason(labels_of(i)) is None for i in issues)
+        print(f"== {repo}: ready={enumerable} "
+              f"(labelled status:ready={sum('status:ready' in labels_of(i) for i in issues)}) "
+              f"untriaged={sum(UNSTAGED_STATUS in labels_of(i) for i in issues)} "
               f"target={target_ready} ==")
         for line in logs:
             print(line)
+            if line.startswith(FENCE_UNAVAILABLE):
+                unavailable_fences += 1
         actual_closes = execute_plan(repo, mutations, token, args.apply)
         used = actual_closes if args.apply else sum(m.kind == "close" for m in mutations)
         remaining_closes -= used
+    if unavailable_fences:
+        print(f"::error::{unavailable_fences} issue(s) matched a fence whose label the target "
+              f"repository does not carry; they were skipped, never admitted — create the "
+              f"missing label(s) named above", file=sys.stderr)
+        return 1
     return 0
 
 
