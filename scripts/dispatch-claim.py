@@ -1806,8 +1806,17 @@ def filter_busy_area_items(items, repo, pulls, issue_labels, provenance, pr_stat
 # request budget rather than from the number 1:
 #
 #   cost of ONE park            <= 5 authenticated requests
-#       the sticky-unpark veto's paginated timeline read (1), up to 2 collaborator-permission
-#       probes behind it, the receipt comment (1) and the label write (1).
+#       ITEMISED in STARVATION_PARK_REQUEST_ITEMS below, because prose cannot be mutation-tested
+#       and this derivation was WRONG on its face in round 1: the sticky-unpark veto's timeline
+#       read was written as "(1)", which is a count of `gh api --paginate` INVOCATIONS, not of
+#       HTTP requests. At `per_page=100` that read costs ceil(events/100) requests.
+#       RE-MEASURED via `Link: rel="last"` on the live target (sparq-org/sparq, 2026-07-27): the
+#       four holders of the measured board (#4360/#4509/#4528/#4571) carry 18 / 12 / 7 / 9
+#       timeline events, and the three OLDEST open PRs (#1487/#1509/#1607) — the worst case the
+#       fleet actually holds — carry 19 / 33 / 24. ONE page each, so the itemised 1 is right
+#       today, AND the bound is not tight on it: at a cap of 12 the spare affords FOUR pages per
+#       holder (12 * (4 + 4) = 96 <= 102) before it binds. The self-test asserts that headroom
+#       rather than assuming it.
 #   spare requests per tick     ~= 102
 #       the floor sizes a clean tick at MEASURED_REQUESTS_PER_TICK=613 and 6 ticks/h = 3,678/h,
 #       against OBSERVED_SAFE_REQUESTS_PER_HOUR = 7*613 = 4,291/h that ran clean for thirteen
@@ -1820,7 +1829,29 @@ def filter_busy_area_items(items, repo, pulls, issue_labels, provenance, pr_stat
 # board wider than the bound is paced onto later ticks exactly as before, loudly. _starvation_sweep_self_test asserts BOTH halves
 # of this arithmetic against dispatch-tick-floor.py's own constants, so neither the floor nor this
 # bound can drift away from the reasoning that produced it.
-STARVATION_PARK_REQUESTS_EACH = 5
+#
+# EVERY MEASURED INPUT THAT ARITHMETIC CONSUMES IS PINNED BY EQUALITY, not merely by the inequality
+# that reads it (registry #871). An inequality pins exactly ONE direction, and for the inputs below
+# the direction it leaves open is the UNSAFE one: `_batch_cost <= _spare_per_tick` reads the park
+# cost only on the LEFT, so understating it makes the assertion strictly EASIER. MEASURED on this
+# file before the pins existed: `STARVATION_PARK_REQUESTS_EACH = 1` SURVIVED the entire self-test,
+# and `= 1` with the cap widened to 100 survived it too — a green suite sanctioning ~500 real
+# requests per tick (6 x 1,113 = 6,678/h) against an OBSERVED-SAFE 4,291/h. Only the OVER-stating
+# mutant (`= 50`) ever died. That is exactly the shape of the MEASURED_STARVED_HOLDER_BOARD hole,
+# one constant over.
+#
+# The per-park request cost, ITEMISED so the total cannot drift away from its own derivation: a
+# mutant that rewrites the total is caught by the equality pin on the total, and one that rewrites
+# a line item is caught by the equality pin on the itemisation.
+STARVATION_PARK_REQUEST_ITEMS = (
+    # the sticky-unpark veto's timeline read: ONE `--paginate` invocation, ceil(events/100)
+    # requests at per_page=100; MEASURED one page for every holder on the live board
+    ("unpark-veto timeline read", 1),
+    ("collaborator-permission probes behind the veto", 2),
+    ("the park receipt comment", 1),
+    ("the machine-park label write", 1),
+)
+STARVATION_PARK_REQUESTS_EACH = sum(_n for _what, _n in STARVATION_PARK_REQUEST_ITEMS)   # == 5
 STARVATION_PARKS_PER_TICK_MAX = 12
 
 # The widest starved `__global__` holder board MEASURED on a live target (sparq-org/sparq,
@@ -16164,6 +16195,67 @@ def _starvation_sweep_self_test():
           f"{STARVATION_PARK_REQUESTS_EACH} requests = {_batch_cost} <= "
           f"{_spare_per_tick:.0f} spare/tick — asserted against dispatch-tick-floor's OWN "
           "constants, so neither can drift alone")
+
+    # ---- ...AND EVERY MEASURED INPUT THAT ARITHMETIC READS IS PINNED BY EQUALITY [#871] -------
+    #
+    # The inequality above can only ever pin ONE direction per input, and for three of the four it
+    # is the SAFE direction that is pinned — the unsafe one runs free:
+    #
+    #   input                             read on   an inequality alone leaves open
+    #   STARVATION_PARK_REQUESTS_EACH     LEFT      UNDERSTATING the per-park cost
+    #   OBSERVED_SAFE_REQUESTS_PER_HOUR   RIGHT     OVERSTATING the ceiling the budget is judged by
+    #   MEASURED_REQUESTS_PER_TICK        RIGHT     OVERSTATING tick cost (spare = M/6 grows with M)
+    #   MIN_TICK_INTERVAL_SECONDS         both      only [600, 614] — the drain asserts floor-divide
+    #                                               by 60, and MEASURED: `= 601` survived them
+    #
+    # MEASURED, on this file before these four assertions existed: `STARVATION_PARK_REQUESTS_EACH
+    # = 1` SURVIVED the whole self-test; so did `= 1` together with `STARVATION_PARKS_PER_TICK_MAX
+    # = 100`, which sanctions ~500 real requests per tick (6 x 1,113 = 6,678/h) against an
+    # OBSERVED-SAFE 4,291/h — the exact outage class #819 is. Only the OVER-stating `= 50` died.
+    # Same shape as MEASURED_STARVED_HOLDER_BOARD, one constant over: if a constant records a
+    # measurement, assert the measurement.
+    assert STARVATION_PARK_REQUEST_ITEMS == (
+        ("unpark-veto timeline read", 1),
+        ("collaborator-permission probes behind the veto", 2),
+        ("the park receipt comment", 1),
+        ("the machine-park label write", 1),
+    ), ("the per-park cost is an ITEMISED MEASUREMENT of the requests park_starved_partition_"
+        "holder issues — the veto's `--paginate` timeline read (MEASURED one page: 18/12/7/9 "
+        "events on the four holders of the measured board, 19/33/24 on the three OLDEST open PRs, "
+        "read from `Link: rel=\"last\"` on sparq-org/sparq 2026-07-27), up to 2 collaborator-"
+        "permission probes behind it, the receipt comment and the label write. Change a line item "
+        "only with a new measurement of that call path, and re-derive "
+        "STARVATION_PARKS_PER_TICK_MAX when you do")
+    assert STARVATION_PARK_REQUESTS_EACH == 5, (
+        "STARVATION_PARK_REQUESTS_EACH is a MEASUREMENT, and it is read only on the LEFT of "
+        "`_batch_cost <= _spare_per_tick`, so an inequality cannot defend it downward: at `= 1` "
+        "the batch is costed at a fifth of what it issues and the bound stops bounding anything")
+    assert _floor.MEASURED_REQUESTS_PER_TICK == 613, (
+        "MEASURED_REQUESTS_PER_TICK is dispatch-tick-floor's instrumented per-tick request count "
+        "(#721). This file's spare is (7M - 6M)/6 = M/6, so it GROWS with M — an overstated tick "
+        "cost silently buys this batch headroom that does not exist")
+    assert _floor.OBSERVED_SAFE_REQUESTS_PER_HOUR == 7 * 613, (
+        "OBSERVED_SAFE_REQUESTS_PER_HOUR is an OBSERVATION — 7 executed ticks in the 10Z hour, "
+        "ran clean; 13 (OBSERVED_BREAKING) did not. It sits only on the RIGHT of every `<=` that "
+        "reads it, in BOTH files, so overstating it is invisible to all of them. This PR is what "
+        "made a second file's bound lean on it, so it is pinned from the consumer")
+    assert _floor.MIN_TICK_INTERVAL_SECONDS == 10 * 60, (
+        "the #822 floor is what turns a per-TICK cap into a per-10-MINUTE cap; if it moves, every "
+        "drain time in this block and the bound they justify must be re-derived")
+
+    # ...and the itemised timeline read is the one line item that is not a constant of the API: a
+    # holder with >100 timeline events costs a page more. The bound must not be tight on it.
+    _pages_afforded = (int(_spare_per_tick) // STARVATION_PARKS_PER_TICK_MAX
+                       - (STARVATION_PARK_REQUESTS_EACH - 1))
+    assert _pages_afforded >= 1, (
+        f"a full batch affords {_pages_afforded} timeline page(s) per holder — at least the one "
+        "MEASURED page must fit, or a single long-lived holder breaks the budget the bound is "
+        "derived from")
+    print(f"  ok   #871 measured inputs PINNED BY EQUALITY: park cost "
+          f"{STARVATION_PARK_REQUESTS_EACH} (itemised), floor {_floor.MIN_TICK_INTERVAL_SECONDS}s, "
+          f"tick {_floor.MEASURED_REQUESTS_PER_TICK} req, safe "
+          f"{_floor.OBSERVED_SAFE_REQUESTS_PER_HOUR}/h — and the batch affords "
+          f"{_pages_afforded} timeline page(s) per holder against a MEASURED 1")
 
     # ...and a board WIDER than the bound is paced, ascending, loudly — never silently truncated.
     paced_logs = []
