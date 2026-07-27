@@ -488,7 +488,11 @@ def _self_test():
     assert draft_red["failing_legs"] == ["leg-b"], draft_red
     # (ii-c) the strict-name heads keep BOTH readings consistent, so the new field cannot
     # silently diverge from `gate` where `gate` is actually present.
-    assert healthy["repair_gate"] == "success" and red["repair_gate"] == "failure"
+    # (the tier-reachable green is GRADED — issue #762 — so it is never the bare "success"
+    # that the merge-required `gate` reading uses; both name the same head here.)
+    assert healthy["gate"] == "success", healthy
+    assert healthy["repair_gate"] == claim.GATE_GREEN_MERGE_REQUIRED, healthy
+    assert red["repair_gate"] == "failure", red
     # (ii-d) PARTIAL READ != "no gate row": PR 23's page ended short of the endpoint's own
     # total_count, so the record DEGRADES (visible skip + marker) rather than reporting a
     # head with no aggregator. Deleting the total_count cross-check makes this read
