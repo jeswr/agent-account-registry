@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 741,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "c4dfafc48a7b95f11908ea51cbfb74cf1ffa33d7",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The Claude branch still computes `content = (event.get(\"message\") or {}).get(\"content\")` and only examines blocks when `content` is a list. A missing/falsey message, missing content, or non-list content leaves `unclassified` false, so a following known `result` satisfies the measurement gates and emits an empty count map as `probe:0`. A truthy non-dict message instead raises at `.get`, preventing best-effort telemetry output. For known tool-bearing blocks, `name = str(block.get(\"name\", \"\"))` converts a missing or non-string protocol field into `other`, preserving a confident zero probe even though the malformed record cannot be safely classified. The new tests exercise an unknown block type, but not these malformed shapes.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Require every Claude `assistant` event to contain an object `message` whose `content` is a list; otherwise set `unclassified = True` without raising. For every block in `CLAUDE_BLOCK_TOOLS`, require `name` to be a string before classification; missing/non-string names must invalidate the measurement. Add negative fixtures followed by `result` for missing/non-list assistant content, a truthy non-object message, and a tool block with missing/non-string name; each must omit `probe`, while the complete tool-free Claude fixture must continue to emit `probe:0`.",
+    "severity": "major",
+    "title": "Malformed Claude assistant payloads can still fabricate probe zero"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round-3 fail-closed finding remains unresolved. Claude `assistant` events still validate neither the `message`/`content` container shape nor the tool-name type. Consequently malformed assistant payloads can still be treated as fully classified and, when followed by `result`, publish a confident `probe:0`; a truthy non-object `message` can additionally crash the parser at `.get`. The added negative fixtures cover renamed block discriminators but not the malformed container/name cases identified previously. This is materially the same major issue at the same severity, so progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
