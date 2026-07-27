@@ -831,6 +831,53 @@ def _self_test():
                                  iss(781, ["status:in-progress", "role:impl", "area:worker"])],
                                 {780: [781]})),
           1)
+    # THE CALL SITE, not the helper. Mutation found this hole: truncating compute_ready's
+    # occupancy loop to `unit_reservations(...)[:1]` — six characters, at the call site — left
+    # EVERY check above green, because no board above had more than ONE reserving unit on it.
+    # That is the exact shape this repo has been burned by, so the fix is a board where the
+    # SECOND unit is the one that matters: both areas must be held, and dropping any unit after
+    # the first offers #822 again.
+    check("[#768] EVERY reserving unit is applied, not just the first (call-site truncation)",
+          [it["number"] for it in compute_ready([
+              pr(820, ["area:worker"]), pr(821, ["area:docs"]),
+              iss(822, R + ["priority:P1", "area:docs"]),
+              iss(823, R + ["priority:P1", "area:worker"]),
+              iss(824, R + ["priority:P1", "area:usage"])])],
+          [824])
+    # THE FETCH PATH, END-TO-END. Mutation found this too: dropping the `pull_request`
+    # carry-through in `_fetch_rows` left everything green, because every check above hand-builds
+    # its rows. `--repo` builds them with `_fetch_rows`, so without this the local preview could
+    # silently lose PR occupancy while the engine kept it. Runs the REAL row builder.
+    _raw_mixed = [raw_issue(830, ["area:usage"], summary=dep_summary(0)),
+                  raw_issue(831, ready_labels, summary=dep_summary(0))]
+    _raw_mixed[0]["pull_request"] = {"url": "u"}
+    _raw_mixed[0].pop(NATIVE_SUMMARY, None)
+    check("[#768] _fetch_rows carries PR rows through, and they RESERVE end-to-end",
+          ([("pull_request" in row) for row in _fetch_rows(_raw_mixed)],
+           [it["number"] for it in compute_ready(_fetch_rows(_raw_mixed))]),
+          ([True, False], []))
+    check("[#768] ...and the same board without the PR row IS offered (not a stopped engine)",
+          [it["number"] for it in compute_ready(_fetch_rows(_raw_mixed[1:]))], [831])
+    # THE ALARM DENOMINATOR. Also a mutation survivor: counting PR rows again left every alarm
+    # check green, because none of them mixed the two row kinds.
+    _pr_raw = raw_issue(840, ["area:worker"])
+    _pr_raw["pull_request"] = {"url": "u"}
+    _pr_raw.pop(NATIVE_SUMMARY, None)
+    check("[#768] the DARK alarm counts open ISSUES, never PR rows, in its denominator",
+          [line.split("none of ")[1].split(" open")[0]
+           for line in native_channel_alarm([_pr_raw, raw_issue(841, []), raw_issue(842, [])])],
+          ["2"])
+    check("[#768] ...and an all-PR snapshot never fabricates a DARK alarm",
+          native_channel_alarm([_pr_raw]), [])
+    # A DEFECT CLASS MUTATION CANNOT REACH (found elsewhere in this repo by AST scan): a duplicated
+    # top-level `def` silently SHADOWS the earlier one, so both bodies parse, the suite passes, and
+    # mutating the shadowed copy changes nothing at all. Scan this module's own source.
+    import ast as _ast
+    _tree = _ast.parse(open(__file__, encoding="utf-8").read())
+    _tops = [node.name for node in _tree.body
+             if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef, _ast.ClassDef))]
+    check("[#768] no top-level def is defined twice (a shadowed copy is unmutatable dead code)",
+          sorted(name for name in set(_tops) if _tops.count(name) > 1), [])
     # MONOTONICITY, BY EXECUTION over every subset of a PR-bearing board: adding PR occupancy can
     # only REMOVE frontier rows, never add one. Under-serialisation is the corrupting direction,
     # so this pins the SIGN of the whole change rather than one example of it.

@@ -1022,14 +1022,20 @@ def _routing_doc():
     # area-less PR row as an issue, which is the ONLY shape 40 of 40 open PRs here have. This row
     # asserts the refusal happens on a board with NO area-declaring rows at all, so deleting
     # `bare_alone` from the probe reds it while (5b) stays green.
-    _plan_bare, _out_bare = _run_readiness(
-        [[_issue(500, _READY, pr=True), _issue(501, _READY + ["area:usage"])]],
-        [_UNGUARDED_PLANNER])
+    # Caught for the same reason case (7) catches: when SAFETY admits this planner, PLAN goes on
+    # to emit a plan row whose `number` is a PR and the downstream assembly dies on it. A crash
+    # reads as "the harness broke"; the fact under test is that the probe must REFUSE, so the
+    # exception is turned into a NAMED red row instead of an abort that hides every later check.
+    try:
+        _plan_bare, _out_bare = _run_readiness(
+            [[_issue(500, _READY, pr=True), _issue(501, _READY + ["area:usage"])]],
+            [_UNGUARDED_PLANNER])
+        _bare_outcome = ("DISPATCHES a pull-request row" in _out_bare,
+                         "PLAN occupancy carries" in _out_bare, _planned(_plan_bare))
+    except Exception as exc:                                       # noqa: BLE001
+        _bare_outcome = f"PLAN DIED on the admitted planner: {type(exc).__name__}: {exc}"
     chk("[#786] an AREA-LESS PR row cannot shield itself — SAFETY still refuses, and plans no PR",
-        ("DISPATCHES a pull-request row" in _out_bare,
-         "PLAN occupancy carries" in _out_bare,
-         _planned(_plan_bare)),
-        (True, False, [501]))
+        _bare_outcome, (True, False, [501]))
 
     # (6) THE PROBE'S SECOND OBLIGATION, on its own. Mutation found this hole: dropping the
     # EFFECT check left every other assertion green, because the only non-PR-aware planner in
