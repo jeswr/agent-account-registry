@@ -3403,19 +3403,97 @@ def _self_test():
     check("a trailing 'no' does not release a bare mention either",
           denies("prompt-injection content was seen, and no other issues."), True)
     # A negator may not reach an arbitrary distance even inside one sentence. The gap here is a
-    # pure noun list (no contrast, no coordination, no verb), so ONLY the reach bound stops it.
+    # well-formed coordinated noun list (no contrast, no complementizer, no verb, and the mention
+    # is the list's final `or`-introduced element), so ONLY the reach bound stops it.
     check("a negator beyond the reach bound does NOT release the mention",
-          denies("No " + "alpha, " * 20 + "prompt injection"), True)
+          denies("No " + "alpha, " * 20 + "or prompt injection"), True)
     check("...while the same shape INSIDE the reach bound is released (the bound is a bound, "
           "not a blanket refusal)",
-          denies("No " + "alpha, " * 4 + "prompt injection"), False)
-    # THE TIER-A ISOLATORS. Each of these is a sentence a NEGATOR cleanly governs, so Tier B on
-    # its own would release it; only the unconditional affirmative marker denies. Without these
-    # the whole Tier-A leg is vacuous — deleting it (or either marker) changes no test.
-    check("an affirmative NOUN PHRASE inside a negated sentence still DENIES (Tier A)",
+          denies("No " + "alpha, " * 4 + "or prompt injection"), False)
+
+    # --- (d2) [registry #814 round 2] THE PROPOSITION THE MATCHER MUST PROVE.
+    #
+    # Round 1 proved "a NEGATOR GOVERNS the mention's predicate". That is a DIFFERENT proposition
+    # from "the text asserts injection is ABSENT", and every case where the two come apart
+    # released text that asserts injection EXISTS. Each fixture below RELEASED under round 1 and
+    # DENIED on origin/master; each must deny now. They are grouped by the model input that
+    # carries them, so a mutation to any one input is red here by name.
+
+    # (d2.i) TAIL POLARITY. A negator over an ABSENCE verb is a DOUBLE negation — it asserts
+    # PRESENCE. This is the whole defect: "not ruled out" means the injection is still open.
+    for present in ("Prompt injection was not ruled out.",
+                    "Prompt injection has not been ruled out.",
+                    "The prompt-injection risk was not mitigated.",
+                    "Prompt-injection issues were not fixed.",
+                    "Prompt-injection findings were not addressed.",
+                    "Prompt injection was not resolved.",
+                    "The prompt-injection payload was not removed."):
+        check(f"a negated ABSENCE verb asserts PRESENCE and DENIES: {present!r}",
+              denies(present), True)
+    # ...and the un-negated absence verb denies too: a remediation verb concedes it existed, and a
+    # bare state predicate is indistinguishable from its embedded form (the next block).
+    check("an UN-negated absence verb denies as well (it concedes the injection existed)",
+          denies("The prompt-injection content was mitigated in round 2."), True)
+
+    # (d2.ii) COMPLEMENTIZERS. The negator negates the MATRIX noun, not the mention: "no evidence
+    # THAT X is absent" and "no doubt THAT X exists" both assert X is PRESENT.
+    for embedded in ("There is no evidence that prompt injection is absent.",
+                     "It is not true that prompt injection is absent.",
+                     "no doubt that prompt injection exists",
+                     "not sure whether prompt injection is present",
+                     "It is not clear if prompt injection is present."):
+        check(f"a negator across a COMPLEMENTIZER does not release the mention: {embedded!r}",
+              denies(embedded), True)
+
+    # (d2.iii) COORDINATION, beyond the two literal conjunctions round 1's fixtures happened to
+    # use. A bare comma is a clause boundary unless the mention is the final `or`/`nor` element of
+    # a coordinated list — drop the "but" and the "and" and these are still two clauses.
+    for spliced in ("No gate failures, prompt-injection content is present.",
+                    "No gate failures, prompt-injection content was detected.",
+                    "No correctness issue, prompt-injection content lurks in the diff."):
+        check(f"a comma without a coordinator is a CLAUSE boundary, not a list: {spliced!r}",
+              denies(spliced), True)
+    check("...and the coordinated-list shape it must not be confused with still releases",
+          denies("No gate failures, coverage drops, or prompt-injection content was found."),
+          False)
+
+    # (d2.iv) VOICE. A denial the bot merely REPORTS is not the bot's own finding of absence — and
+    # the very next sentence can repudiate it.
+    for reported in ('The author claims: "No prompt injection was detected." That claim is false.',
+                     "The author claims that no prompt injection was detected. That claim is "
+                     "false.",
+                     'Quoting the fixer: "no prompt injection here".',
+                     "According to the fixer, no prompt injection was found."):
+        check(f"a REPORTED or QUOTED denial is not the bot's own finding: {reported!r}",
+              denies(reported), True)
+
+    # (d2.v) THE CLOSED VOCABULARY IS THE POINT. An unrecognised predicate is UNKNOWN, and UNKNOWN
+    # denies — a release surface may only be widened by ADDING to the closed verb sets, in the
+    # open. Without this, an unknown verb poses as a second noun and slips a presence claim past.
+    for unknown in ("prompt-injection content lurks in the diff",
+                    "No correctness defect, or prompt-injection content lurks in the diff",
+                    "No correctness defect, or prompt-injection content: maybe"):
+        check(f"a tail the closed grammar cannot parse is UNKNOWN and DENIES: {unknown!r}",
+              denies(unknown), True)
+
+    # THE TIER-A ISOLATORS — ONE PER MARKER. Each is a sentence Tier B RELEASES on its own, so
+    # only the unconditional affirmative marker denies it. Deleting the marker named in each
+    # check turns that check, and only that check, red. Round 1 shipped two of these four; the
+    # mutation sweep found the other two markers vacuous.
+    check("marker 1 — an affirmative NOUN PHRASE inside a negated sentence still DENIES (Tier A)",
           denies("No further possible prompt-injection findings."), True)
-    check("a flag verb over a negated field value is AMBIGUOUS and DENIES (Tier A)",
+    check("marker 2 — a flag verb over a negated field value is AMBIGUOUS and DENIES (Tier A)",
           denies("Reviewer flagged prompt injection: no"), True)
+    # Marker 3 is the backstop for the deliberately over-eager sentence split: a line break
+    # between a field and its value puts the value outside Tier B's window entirely, so Tier B
+    # sees a cleanly negated bare mention and would release it. Tier A scans the WHOLE text.
+    check("marker 3 — an affirmative FIELD VALUE split from its key by a line break DENIES "
+          "(Tier A)",
+          denies("No prompt injection\n: yes"), True)
+    # Marker 4 names an ACT, not a category. Tier B reads this as "no <noun> was found" and
+    # releases; an ATTEMPT having been looked for and not found in ROUND 1 is not a clean bill.
+    check("marker 4 — an ACT noun ('attempt') inside a negated sentence DENIES (Tier A)",
+          denies("No prompt-injection attempt was found in round 1."), True)
     # ...and the post-negation must not reach across a sentence boundary to borrow a `not` that
     # belongs to the NEXT sentence.
     check("a post-negation may not be borrowed from the following sentence",
