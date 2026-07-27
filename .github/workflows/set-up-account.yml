@@ -25,8 +25,13 @@
 # fingerprint-accounts; the old sparq-org/sparq write registered accounts nothing could use). The
 # account issue now carries the `models:` line read_accounts requires (an account with empty models
 # is silently invisible to the allocator), the broker validates its own registration through the
-# real read_accounts parser, and the handle is appended to policy/repos.toml account_pool with a
-# contents-API compare-and-swap (rebase-retry) so no human policy edit is left dangling.
+# real read_accounts parser, and the handle's policy/repos.toml account_pool grant is carried by the
+# broker itself so no human policy edit is left dangling. HISTORICAL: that grant was originally a
+# direct contents-API compare-and-swap (rebase-retry) PUT to `master`. That path is RETIRED — branch
+# protection rejects every github-actions[bot] PUT to `master`, so it could never land (#185). The
+# append now goes out as a CHECKED PR on an `account-pool/*` branch and the account is created
+# `status:pending`, non-allocatable until that PR MERGES; see PENDING-THEN-ACTIVATE (#185) and
+# GRANT-SCOPING (#579) below for the two-phase flow that replaced the CAS.
 #
 # STALE-SNAPSHOT fix (#186, hardened after review round 1 of #236): the handle/secret in `meta`
 # are only a pre-login HINT. A re-read before the write is still a TOCTOU check, so the store step
