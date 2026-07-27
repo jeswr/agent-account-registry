@@ -9,6 +9,8 @@ deprecated_models.py
 dispatch-claim.py
 dispatch-plan.py
 dispatch-secrets-guard.py
+dispatch-stall-alert.py
+dispatch-tick-floor.py
 gh_retry.py
 grant-account.py
 groom-alert.py
