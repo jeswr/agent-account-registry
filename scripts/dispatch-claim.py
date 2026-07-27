@@ -3525,24 +3525,40 @@ def _gate_issue_as_measurement_run(repo, item):
 def _issue_is_measurement_run(repo, item):
     """Is this deferred issue's deliverable a measurement RUN a standard runner cannot perform?
 
-    Reads the LIVE title/body (the plan row carries only a body HASH) and classifies it with the
-    shared gate. Returns ``(verdict, note)``; `note` is a non-empty explanation ONLY when the read
-    or the classification could not be completed.
+    Returns ``(verdict, note)``. `verdict` is True/False when the classification COMPLETED, and
+    ``None`` when it could not — `note` is then a non-empty explanation. `None` is a third state on
+    purpose: an issue we could not read is UNCLASSIFIABLE, never "not a measurement run"
+    (round-2 finding 1). Both ordinary escalation actions SELF-CLEAR — the reroute re-dispatches on
+    another route, and the machine park is re-admitted once the evidence ages out of the health
+    window — so persisting either of them after an unreadable classification is what re-admits the
+    unbounded loop this gate exists to end. The caller therefore HOLDS the whole escalation on
+    ``None`` (no receipt, no label, no role swap, no claim) and reclassifies next tick; that is
+    strictly narrower than raising, which would abort the tick mid-escalation.
 
-    FAIL-CLOSED IS THE ORDINARY LADDER HERE, and the direction is worth stating because it looks
-    like the opposite. A failed read yields ``False``, which means the escalation falls back to the
-    pre-existing reroute/park behaviour — NOT to a dispatch. `False` withholds one EXTRA hold from
-    an issue the caller has already decided to stop; it can never admit anything. Raising instead
-    would abort a tick that is in the middle of an escalation, which is strictly worse.
+    EVERY classifier input comes from ONE live response (round-2 finding 2). The plan row carries a
+    body HASH rather than the text, so the title/body must be read live — and the LABELS must come
+    from that same read, because bench-surface membership is a load-bearing classifier input and
+    the cached plan copy can be stale by the time this runs (`_current_issue_matches` proved the
+    labels several reads ago). Mixing the two classifies a snapshot that never existed: a live
+    `area:bench` addition would be missed and sent down the self-clearing ladder, and a live
+    removal would earn a durable `needs:ec2` hold the issue no longer qualifies for. `_labels`
+    validates that response and RAISES on malformed label data, which lands on the `None` arm.
     """
     try:
         issue = _gh_json(["api", f"repos/{repo}/issues/{item['number']}"])
         if not isinstance(issue, dict):
-            return False, "the live issue read is not an object"
-        return _measurement_gate.is_measurement_run(
-            set(item["labels"]), issue.get("title"), issue.get("body")), ""
-    except Exception as exc:                       # noqa: BLE001 — never abort a live escalation
-        return False, f"the measurement-run classification could not be completed: {exc}"
+            return None, "the live issue read is not an object"
+        title, body = issue.get("title"), issue.get("body")
+        # Validate the WHOLE payload, not just the part this particular verdict consults:
+        # `is_measurement_run` short-circuits on the bench-surface test, so on a non-bench issue a
+        # malformed title/body would never reach the gate's own validation and an unparseable
+        # response would be reported as a COMPLETED `False`. A response we cannot parse is
+        # unclassifiable whichever leg would have decided it.
+        labels = _labels(issue)                            # raises on malformed label data
+        _measurement_gate.issue_text(title, body)          # raises on a malformed title/body
+        return _measurement_gate.is_measurement_run(labels, title, body), ""
+    except Exception as exc:                       # noqa: BLE001 — the caller HOLDS, never guesses
+        return None, f"the measurement-run classification could not be completed: {exc}"
 
 
 def _pr_comments(repo, pr_number):
@@ -4408,7 +4424,10 @@ def _escalate_repeated_declines(repo, item, outcomes, comments, bot_login, scrip
     `needs:ec2` is neither: it is a `needs:*` hold both readiness engines treat as a hard gate and
     `retriage.plan` refuses to sweep, so the issue leaves the frontier and STAYS out until an
     EC2-capable lane or a human clears it. The caller decides the verdict — from the same shared
-    classifier the triage path uses — because only it can read the live issue text.
+    classifier the triage path uses — because only it can read the live issue text. It is always a
+    COMPLETED verdict: an unreadable classification never reaches this function at all, because
+    neither ordinary action is safe on an issue nobody could classify, so the caller holds the
+    whole escalation instead (see `_issue_is_measurement_run`).
 
     TWO CONSEQUENCES OF WRITING A `needs:*` LABEL, named rather than left to be rediscovered:
       * `park_policy.human_owned_holds` counts EVERY `needs:*` as a human-owned hold, so a live
@@ -6152,14 +6171,21 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                         # completable by a worker. Both ordinary actions self-clear, so on a
                         # measurement RUN they re-admit the issue and reproduce these same
                         # outcomes forever; the classification happens HERE because only the
-                        # dispatcher can read the live issue text (the plan row carries a body
-                        # HASH, never the text). An unreadable/unclassifiable issue keeps the
-                        # historical ladder — see _issue_is_measurement_run on why that direction
-                        # withholds a hold rather than granting a dispatch.
+                        # dispatcher can read the live issue (the plan row carries a body HASH,
+                        # never the text, and its label copy can be stale by now).
                         measurement_run, gate_note = _issue_is_measurement_run(repo, item)
-                        if gate_note:
-                            print(f"::warning::{repo}#{number}: {gate_note}; the repeated-decline "
-                                  "escalation falls back to the ordinary reroute/park ladder")
+                        if measurement_run is None:
+                            # UNCLASSIFIABLE -> the escalation is HELD WHOLE (round-2 finding 1).
+                            # Falling back to the ordinary ladder here is not conservative: both of
+                            # its actions self-clear, so persisting one would eventually hand an
+                            # issue we could not even read back to a worker route. Same shape as
+                            # the unreadable-health-window leg above — no receipt, no label
+                            # mutation, no role mutation, no claim; the next tick reclassifies.
+                            defer_reasons["decline-unclassifiable"] += 1
+                            print(f"::error::defer {repo}#{number}: {gate_note}; the "
+                                  "repeated-decline escalation is HELD (no reroute, no park, no "
+                                  "gate) and the cached claim is cancelled")
+                            continue
                         decline_result = _escalate_repeated_declines(
                             repo, item, no_changes, comments, bot_login, script_dir,
                             min_outcomes=decline_threshold, measurement_run=measurement_run)
@@ -7312,11 +7338,18 @@ def _self_test():
     def run_decline_tripwire(records, role="impl", comments=(), malformed=False,
                              unreadable=False, model_chain=("sol",), area="dispatch",
                              title="Implement the dispatch boundary",
-                             body="Investigate and implement the dispatch boundary."):
+                             body="Investigate and implement the dispatch boundary.",
+                             gate_read=None, relabel_live=None):
         """One complete deferred dispatch tick with fake GitHub transports and real validators.
 
         `area`/`title`/`body` are parameterised for the #466 measurement-run tripwire: the gate's
         verdict is read off the LIVE issue text, so the fixture has to be able to supply one.
+
+        `gate_read`/`relabel_live` (round-2 findings) drive the CLASSIFIER's own live read, which
+        happens strictly after the claim revalidation read — the only window in which the live
+        issue can diverge from the plan copy. `gate_read` makes that read fail or return malformed
+        data; `relabel_live` makes it return a different label set (a concurrent human relabel).
+        Both are invisible to the revalidation read, exactly as the real race is.
         """
         labels = sorted([
             f"area:{area}", "priority:P1", f"role:{role}", "status:deferred",
@@ -7405,6 +7438,26 @@ def _self_test():
         api_calls = []
         helper_calls = []
         comment_reads = []
+        issue_reads = []
+
+        def live_issue_now():
+            """The live issue as the CLASSIFIER's read sees it (read #2 onwards). The first read
+            is the claim revalidation and always sees the plan copy, so every divergence below is
+            one that `_current_issue_matches` provably cannot catch."""
+            if len(issue_reads) < 2:
+                return live_issue
+            if gate_read == "error":
+                raise DispatchError("fixture live issue read failed")
+            if gate_read == "non-object":
+                return ["not", "an", "issue", "object"]
+            if gate_read == "malformed-title":
+                return dict(live_issue, title=None)
+            if gate_read == "malformed-labels":
+                return dict(live_issue, labels=[{"name": 7}])
+            if relabel_live is not None:
+                return dict(live_issue,
+                            labels=[{"name": name} for name in sorted(relabel_live)])
+            return live_issue
 
         class FakeResult:
             def __init__(self, stdout=""):
@@ -7425,7 +7478,8 @@ def _self_test():
             if path == "repos/example/repo/issues?state=open&per_page=100":
                 return [[live_issue]]
             if path == "repos/example/repo/issues/500":
-                return live_issue
+                issue_reads.append(path)
+                return live_issue_now()
             if path == "repos/example/repo/issues/500/comments?per_page=100":
                 comment_reads.append(path)
                 return [list(comments)]
@@ -7434,7 +7488,12 @@ def _self_test():
         def fake_target_api(repo, method, path, input_doc=None):
             assert repo == "example/repo"
             api_calls.append((method, path, input_doc))
-            return FakeResult(json.dumps(live_issue) if method == "GET" else "")
+            # The reroute's own last-step re-read sees the SAME live issue the classifier saw, so a
+            # `relabel_live` divergence reaches its exact-match guard too (which is what makes the
+            # role swap fail closed on a concurrent relabel instead of erasing the human's label).
+            current = (dict(live_issue, labels=[{"name": name} for name in sorted(relabel_live)])
+                       if relabel_live is not None else live_issue)
+            return FakeResult(json.dumps(current) if method == "GET" else "")
 
         def fake_target_helper(script_dir, repo, script, args):
             helper_calls.append((script, list(args)))
@@ -7760,6 +7819,59 @@ def _self_test():
     assert trip_p["api_calls"] == [] and trip_p["helper_calls"] == [], trip_p
     assert trip_p["claim_calls"] == 1, trip_p
     print("  ok   #466 (p): ONE no_change never gates — the second outcome is what binds")
+
+    # (q) ROUND-2 FINDING 1 — AN UNREADABLE CLASSIFICATION IS TERMINAL FOR THIS ESCALATION.
+    # The classifier's live read fails (transport, non-object, malformed title, malformed labels)
+    # and the escalation must be HELD WHOLE: no receipt comment, no gate label, no role swap, no
+    # helper park, no allocation. Restoring the old `return False` fallback turns EVERY row red —
+    # the bench rows would post an `action=research` receipt and PATCH the role, and the dispatch
+    # rows likewise — which is precisely the self-clearing action that re-admits an issue nobody
+    # could classify. Both areas are walked because the fallback's damage does not depend on the
+    # verdict it invents.
+    for _q_mode in ("error", "non-object", "malformed-title", "malformed-labels"):
+        for _q_area, _q_title, _q_body in (
+                ("bench", _466_title, _466_body),
+                ("dispatch", "Implement the dispatch boundary",
+                 "Investigate and implement the dispatch boundary.")):
+            trip_q = run_decline_tripwire(
+                [no_change_a, no_change_b], area=_q_area, title=_q_title, body=_q_body,
+                gate_read=_q_mode)
+            _q_why = (_q_mode, _q_area, trip_q)
+            assert trip_q["api_calls"] == [], _q_why
+            assert trip_q["helper_calls"] == [], _q_why
+            assert trip_q["claim_calls"] == 0 and trip_q["claimed_chains"] == [], _q_why
+            assert DECLINE_ESCALATION_MARKER not in trip_q["output"], _q_why
+            assert "::error::defer example/repo#500" in trip_q["output"], _q_why
+            assert "escalation is HELD" in trip_q["output"], _q_why
+    print("  ok   #466 (q): a failed/malformed live classification writes NOTHING and allocates "
+          "NOTHING — no research reroute, no park, no gate, no claim")
+
+    # (r) ROUND-2 FINDING 2 — THE CLASSIFIER READS LABELS FROM THE SAME LIVE RESPONSE AS THE TEXT.
+    # Both directions of the relabel race, in the window AFTER the claim revalidation (the only
+    # window that exists). Passing the cached plan labels instead turns both rows red.
+    #   r1: cached NON-bench, live bench — the gate must fire on the live surface. With stale
+    #       labels the issue takes the self-clearing reroute and the loop survives.
+    trip_r1 = run_decline_tripwire(
+        [no_change_a, no_change_b], area="dispatch", title=_466_title, body=_466_body,
+        relabel_live=["area:bench", "priority:P1", "role:impl", "status:deferred"])
+    assert [call[0] for call in trip_r1["api_calls"]] == ["POST", "POST"], trip_r1
+    assert f"action={GATE_ACTION} -->" in trip_r1["api_calls"][0][2]["body"], trip_r1
+    assert trip_r1["api_calls"][1][:2] == (
+        "POST", "repos/example/repo/issues/500/labels"), trip_r1
+    assert trip_r1["api_calls"][1][2] == {"labels": [_measurement_gate.GATE_LABEL]}, trip_r1
+    assert trip_r1["claim_calls"] == 0, trip_r1
+    #   r2: cached bench, live NON-bench — the durable hold must NOT be written onto an issue that
+    #       is no longer on the bench surface. The ordinary ladder runs instead, and its own
+    #       exact-match re-read then declines the role swap against the relabelled issue.
+    trip_r2 = run_decline_tripwire(
+        [no_change_a, no_change_b], area="bench", title=_466_title, body=_466_body,
+        relabel_live=["area:dispatch", "priority:P1", "role:impl", "status:deferred"])
+    assert _measurement_gate.GATE_LABEL not in json.dumps(trip_r2["api_calls"]), trip_r2
+    assert "action=research -->" in trip_r2["api_calls"][0][2]["body"], trip_r2
+    assert [call[0] for call in trip_r2["api_calls"]] == ["POST", "GET"], trip_r2
+    assert trip_r2["claim_calls"] == 0, trip_r2
+    print("  ok   #466 (r): bench-surface membership is read from the SAME live response as the "
+          "text — a live add gates, a live removal never earns the durable hold")
 
     # (m) THE LADDER TERMINATES, driven through the REAL call site rather than argued about.
     # Walk a THREE-rung impl chain: every tick must either dispatch on a strictly smaller chain or
