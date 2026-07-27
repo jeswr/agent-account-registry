@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4338,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c04833288f869eb8948670d670f4641dda7d39ae",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "In the `isinstance(q, dict) and isinstance(gold_count, dict)` branch, validation checks only `answered != gold_count[part]`. It never requires `part` in `gold_keys` or calls `check_entity_gold` with `t[\"gold_keys\"][part]`. For th03, both gold_keys values are entity lists, so either subquery may return arbitrary entities of the expected cardinality and validation succeeds. The new tests mutate same-count entities only for single-query list-gold tasks (th04 and cc04), leaving this dispatch path untested.",
+    "file": "bench/fo-km/validate_tasks.py",
+    "fix_hint": "After the per-part count check, require a matching `gold_keys` part and, for a non-aggregate subquery with a non-empty entity list, call `check_entity_gold(tid, arm, data, t[\"gold_keys\"][part])`; fail on missing or mismatched part keys. Add an end-to-end mutation test that replaces one th03 entity while preserving that part's row count and asserts `main()` exits non-zero without reporting a gold_count mismatch.",
+    "severity": "major",
+    "title": "Multi-part th03 entity values are still unchecked"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 3's major finding remains materially unchanged. The multi-part dispatch for th03 still validates only each part's row count and never compares the returned first-column entities with the corresponding dict-of-lists gold_keys entry. The added end-to-end entity mutations cover th04 and cc04, but not th03. Thus a th03 arm can return an arbitrary same-cardinality entity set for either truth_bearers or info_bearers and pass, contradicting the validator and README claims that multi-part/entity golds are checked. Progress is stagnant because the same major defect remains at the same severity.",
+  "verdict": "request_changes"
+ }
+}
