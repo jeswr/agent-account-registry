@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4440,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "7087724ee010e3566bba39a62e69a1e26073c750",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change is confined to test-only byte-attribution analysis. The arbitrary-block-size attribution uses the real V1 encoder's chunking model, verifies attributed stream bytes against actual encoded bytes at every swept size, and includes non-vacuous assertions for the monotonic framing trade and the claimed upper bound. Treating count, absolute first-row bytes, and directory bytes as an upper bound on savings is conservative because removed block-first rows must still be encoded as deltas after blocks are merged. No production encoding path, public API, dependency, or security boundary changes. The targeted tests could not be executed in this checkout because cargo is unavailable, but the diff and surrounding encoder/attribution code are internally consistent.",
+  "verdict": "approve"
+ }
+}
