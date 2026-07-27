@@ -4156,6 +4156,43 @@ def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_logi
             # sweep cannot drift from the admission it feeds.
             holds = _park_policy.human_owned_holds(set(labels) | set(source_labels))
             comments = comments_fn(repo, number)
+            # [registry #769] EPISODE BINDING. `review:parked` is a shared multi-writer label, and
+            # groom's AGE park now writes it too. An age park's cause is an orphan draft or a
+            # wedged merge state, which no model-health record can speak to — so the probe below
+            # skips both genuine gates and lands on the labelled sustained-fleet-health HEURISTIC,
+            # whose only condition this park can satisfy is BEING OLD ENOUGH. Measured on the real
+            # sweep with a byte-identical health window: `None` at 3 h, `auto-mint` at 7 h. That
+            # made age its own recovery proof, spent a re-admission budget groom never granted,
+            # and left groom's next hand-off escalating a flap that never happened.
+            #
+            # The heuristic is NOT removed — registry #691 added it for parks with no machine exit
+            # at all, and an age park is not one of those: its exit is groom's own cause proof.
+            # This class is simply made ineligible for health-only clearance. The check sits AFTER
+            # `holds` deliberately: a PR carrying a human-owned hold is HUMAN-TERMINAL, and that
+            # is the census classification a maintainer must see, so the hold keeps precedence.
+            if not holds:
+                age_park, age_detail = _park_policy.age_park_episode(
+                    # `labels` is the PR's own live set. The predicate refuses to answer at all
+                    # without a live `review:parked` — this sweep ALSO admits a PR whose SOURCE
+                    # ISSUE carries `status:parked` and which has no PR-side label, and such a PR
+                    # can still carry an age receipt from an earlier, already-cleared episode.
+                    labels, comments, bot_login,
+                    # The other mechanisms' durable PARK receipts. worker-pr owns the generation
+                    # marker's spelling, so it is passed from the literal this file already pins
+                    # against the real module rather than re-derived inside park_policy.
+                    superseding_markers=(PARK_GENERATION_MARKER_PREFIX,
+                                         _park_policy.PARK_REASON_MARKER),
+                    log=log)
+                if age_park:
+                    log(f"park stands {repo}#{number}: {age_detail}")
+                    # [G5] CENSUSED, like every other pre-admission exit. A refusal that skips the
+                    # census is exactly the invisible hold this whole class of defect is about —
+                    # and the code is EXIT-REACHABLE, which is the honest reading: groom's sweep
+                    # clears it on its own cause proof, with no human gesture required.
+                    _park_policy.park_census_record(
+                        park_census, repo, number,
+                        _park_policy.PARK_REFUSAL_FOREIGN_EPISODE, age_detail)
+                    continue
             # ONE timeline read per surface per PR: the admission consults the timelines several
             # times (the human cutoff, the park applications, the ownership probe) and every read
             # must see the SAME view anyway — a mid-decision change would mix two worlds.
@@ -15875,6 +15912,202 @@ agent = "impl"
         assert chain_cleared == [(41, 7)], chain_cleared
         print("  ok   aged-out exit CHAIN: a legacy park that could not migrate before #691 "
               "migrates AND is actually released one span later (both layers, end to end)")
+
+        # ---- [registry #769] THE AGE-PARK EPISODE BINDING, driven CROSS-MODULE ----------------
+        #
+        # THE DEFECT. groom's age hand-off writes `review:parked`, so an age park lands in exactly
+        # this sweep's candidate population. Its cause is an orphan draft or a wedged merge state,
+        # which no model-health record speaks to, so `capacity_recovery_evidence` finds nothing and
+        # `park_cause_provable` is False — and the probe falls through to the labelled
+        # sustained-fleet-health HEURISTIC, whose only condition such a park can satisfy is being
+        # OLD ENOUGH. The evidence clearing an AGE park was therefore, in substance, MORE AGE.
+        #
+        # THE TEST THAT NAMES IT: the SAME park under the SAME health window at 3 h and at 7 h must
+        # reach the SAME decision. If crossing SUSTAINED_HEALTH_SPAN_SECONDS alone changes the
+        # answer, the binding is absent — that is the whole assertion, and it is why the two
+        # timings are asserted as a PAIR rather than one at a time.
+        #
+        # EVERY FIXTURE BODY IS BUILT FROM groom's OWN CONSTANTS, never a literal copied into this
+        # file. That is what makes this a cross-module test rather than a restatement: the in-file
+        # half of #769 is well tested, so a test that only exercised dispatch-claim would pass for
+        # the same reason the existing ones do. Re-spell groom's marker and these go red.
+        def _load_self_registering(name, path):
+            """`_load_module` plus the `sys.modules` registration `@dataclass` needs.
+
+            groom declares frozen dataclasses under `from __future__ import annotations`, and
+            dataclasses resolves those string annotations through `sys.modules[cls.__module__]` —
+            which is None for a spec-loaded module that was never registered. Kept LOCAL to this
+            test rather than folded into `_load_module`: every production caller of that helper
+            loads a module that does not need it, and widening a shared loader for one test's
+            benefit is how a loader's behaviour drifts from what production exercises."""
+            spec = importlib.util.spec_from_file_location(name, path)
+            if spec is None or spec.loader is None:
+                raise DispatchError(f"cannot load registry helper {Path(path).name}")
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[name] = module
+            try:
+                spec.loader.exec_module(module)
+            except Exception:
+                sys.modules.pop(name, None)
+                raise
+            return module
+
+        groom_mod = _load_self_registering(
+            "registry_groom_agepark", Path(__file__).resolve().parent / "groom.py")
+        # The ONE spelling, asserted in both directions: groom must be writing the marker
+        # park_policy declares, and park_policy's must be the one this sweep reads.
+        assert groom_mod.AGE_PARK_MARKER == _park_policy.GROOM_AGE_PARK_MARKER, (
+            groom_mod.AGE_PARK_MARKER, _park_policy.GROOM_AGE_PARK_MARKER)
+        assert groom_mod.AGE_UNPARK_MARKER == _park_policy.GROOM_AGE_UNPARK_MARKER, (
+            groom_mod.AGE_UNPARK_MARKER, _park_policy.GROOM_AGE_UNPARK_MARKER)
+
+        def age_receipt_body(gen=1, cause="orphan-draft", head="c" * 40):
+            """Byte-faithful to what groom's hand-off POSTs — STALE_PR_MARKER included — so a
+            fixture cannot pass on a shape groom does not actually write."""
+            return (f"> 🤖 SPARQ agent\n\nThis worker PR has been untouched beyond the "
+                    f"maintenance threshold. That is a MACHINE-recoverable cause, not a question "
+                    f"for a human, so this is the machine-owned `{MACHINE_PARK_PR_LABEL}` soft "
+                    f"hold.\n\n{groom_mod.STALE_PR_MARKER}\n"
+                    f"{groom_mod.AGE_PARK_MARKER} cause={cause} head={head} gen={gen} -->")
+
+        def bot_at(body, seconds_ago, login=readmit_bot):
+            return {"user": {"login": login}, "body": body,
+                    "created_at": model_health_mod._iso_z(readmit_now - seconds_ago)}
+
+        def park_at(seconds_ago, actor=readmit_bot):
+            return {41: [{"event": "labeled", "label": {"name": MACHINE_PARK_PR_LABEL},
+                          "created_at": model_health_mod._iso_z(readmit_now - seconds_ago),
+                          "actor": {"login": actor}, "performed_via_github_app": None}], 7: []}
+
+        def census_codes():
+            """The [G5] census line the sweep itself emitted, parsed back to codes. Read from the
+            sweep's OWN log, so an assertion here cannot pass on a hand-built census row."""
+            rows = [line for line in readmit_sweep.log
+                    if line.startswith("park census example/repo: ")]
+            return rows[-1].split(": ", 1)[1] if rows else ""
+
+        young, old = 3 * 3600, 7 * 3600
+        assert young < span_secs < old, (young, span_secs, old)
+        age_comments = [bot_at(age_receipt_body(), 3000)]
+
+        # (1) NON-VACUITY FIRST, and it is load-bearing. The identical PR, identical window and
+        # identical timings WITHOUT groom's receipt must still show the heuristic doing its job:
+        # refuse at 3 h, ADMIT at 7 h. Without this control the pair-assertion below would pass
+        # just as well if the heuristic had been deleted, if `healthy_window` stopped being
+        # healthy, or if the fixture never reached the probe at all — and "removing the heuristic
+        # restores the #691 no-machine-exit stall" is precisely the outcome that must not happen.
+        control = {}
+        for hours, seconds in (("3h", young), ("7h", old)):
+            control[hours] = readmit_sweep(healthy_window, timeline=park_at(seconds))
+        assert control["3h"] == (0, [], []), control["3h"]
+        assert control["7h"][0] == 1 and control["7h"][2] == [(41, 7)], control["7h"]
+        assert "fleet-health" in control["7h"][1][0][1], control["7h"][1]
+        print("  ok   [#769] CONTROL (non-vacuity): with NO age receipt the sustained-health "
+              "heuristic still refuses at 3 h and ADMITS at 7 h — #691's exit is intact")
+
+        # (2) THE RED TEST. The same park, now carrying groom's age receipt, must reach the SAME
+        # decision at 3 h and at 7 h. Delete the `age_park_episode` guard from
+        # `_readmit_capacity_parks` and the 7 h leg admits again while the 3 h leg does not — the
+        # two stop agreeing, which is exactly the shape "crossing the span is the only variable"
+        # has. The decisions are compared to EACH OTHER as well as to the expected value, so a
+        # mutant that broke both legs identically cannot pass either.
+        aged = {}
+        for hours, seconds in (("3h", young), ("7h", old)):
+            aged[hours] = readmit_sweep(healthy_window, comments=age_comments,
+                                        timeline=park_at(seconds))
+            aged[hours + "-census"] = census_codes()
+        assert aged["3h"] == aged["7h"] == (0, [], []), (aged["3h"], aged["7h"])
+        assert aged["3h-census"] == aged["7h-census"] == "foreign-episode=1", aged
+        print("  ok   [#769] RED TEST: a groom AGE park reaches the SAME decision at 3 h and "
+              "7 h — crossing SUSTAINED_HEALTH_SPAN_SECONDS is no longer an exit")
+
+        # (3) The refusal is CENSUSED and classified EXIT-REACHABLE, not human-terminal. A park
+        # that silently drops out of the census is the invisible hold this whole class of defect
+        # is about, and the exit class is a CLAIM: groom's own cause-gated sweep clears it, so no
+        # maintainer should be told to go and look at it.
+        assert _park_policy.park_refusal_exit_class(
+            _park_policy.PARK_REFUSAL_FOREIGN_EPISODE) == "exit-reachable"
+        assert not [line for line in readmit_sweep.log
+                    if line.startswith("::warning::park census")], readmit_sweep.log
+        assert any("groom's cause-gated AGE park" in line for line in readmit_sweep.log), \
+            readmit_sweep.log
+        print("  ok   [#769] the age park is CENSUSED as `foreign-episode` / exit-reachable — "
+              "named every tick, and never reported as needing a human")
+
+        # (4) THE EPISODE CLOSES. worker-pr's capacity ladder parking this PR AFTER the age
+        # receipt means the live label is the LADDER's park, not groom's, and the ordinary
+        # capacity path must resume — otherwise this guard would strand every PR that ever wore a
+        # groom age park. STRICTLY newer closes it; a TIE does not, because a tie is the ambiguous
+        # case and the fail-closed direction is to leave the park alone.
+        ladder_body = f"x {PARK_GENERATION_MARKER_PREFIX} gen=1 cutoff=none -->"
+        reopened = readmit_sweep(
+            healthy_window, comments=age_comments + [bot_at(ladder_body, 2000)],
+            timeline=park_at(old))
+        assert reopened[0] == 1 and reopened[2] == [(41, 7)], reopened
+        tied = readmit_sweep(
+            healthy_window, comments=age_comments + [bot_at(ladder_body, 3000)],
+            timeline=park_at(old))
+        assert tied == (0, [], []), tied
+        # A park-REASON receipt (the legacy migration / the starvation park) closes it too.
+        reason_body = f"x {_park_policy.park_reason_marker(STARVATION_PARK_CAUSE)}"
+        assert readmit_sweep(healthy_window,
+                             comments=age_comments + [bot_at(reason_body, 2000)],
+                             timeline=park_at(old))[0] == 1
+        print("  ok   [#769] the age episode CLOSES on a strictly-newer park receipt from "
+              "another mechanism (a TIE does not) — no PR is stranded by this guard")
+
+        # (5) groom's OWN un-park receipt does NOT close the episode. groom posts it BEFORE it
+        # deletes the label, so a receipt with the label still live is groom's crash residue and
+        # groom's convergence branch owns it. Handing that to this sweep would clear it while
+        # minting a receipt claiming a starvation recovery that never happened.
+        unpark_body = (f"{groom_mod.AGE_UNPARK_MARKER} cause=orphan-draft head={'c' * 40} "
+                       "gen=1 -->")
+        assert readmit_sweep(healthy_window,
+                             comments=age_comments + [bot_at(unpark_body, 2000)],
+                             timeline=park_at(old)) == (0, [], []), "groom converges its own"
+        print("  ok   [#769] groom's own un-park receipt does NOT hand the park to this sweep — "
+              "receipt-no-label is groom's convergence, not a capacity re-admission")
+
+        # (6) TRUST FILTER + FAIL-CLOSED. A third party cannot forge an age receipt to freeze a
+        # genuine capacity park (it is not the bot's comment, so it is not a receipt at all); and
+        # once a REAL age receipt is on record, a bot comment whose stamp cannot be parsed leaves
+        # the episode boundary unprovable, which keeps the park with groom.
+        forged = readmit_sweep(healthy_window,
+                               comments=[bot_at(age_receipt_body(), 3000, login="drive-by")],
+                               timeline=park_at(old))
+        assert forged[0] == 1 and forged[2] == [(41, 7)], forged
+        unstamped = readmit_sweep(
+            healthy_window,
+            comments=age_comments + [{"user": {"login": readmit_bot}, "body": ladder_body,
+                                      "created_at": "not-a-timestamp"}],
+            timeline=park_at(old))
+        assert unstamped == (0, [], []), unstamped
+        print("  ok   [#769] a NON-bot age receipt is not a receipt, and an unreadable bot stamp "
+              "fails CLOSED (the park stays with groom)")
+
+        # (6b) THE PR-SIDE PARK MUST BE LIVE for the binding to speak at all. This sweep ALSO
+        # admits a PR whose SOURCE ISSUE carries `status:parked` with no PR-side label, and such a
+        # PR can still carry an age receipt from an EARLIER, already-closed episode — groom parked
+        # it, the cause recovered, groom cleared the label, the receipt stayed. Judging that
+        # receipt would refuse an issue-side capacity park groom has no exit for, i.e. this guard
+        # would itself become the stranding it exists to prevent. Delete clause 0 and this reds.
+        issue_side = readmit_sweep(
+            healthy_window, comments=age_comments, timeline=park_at(old),
+            rows=[[dict(parked_row, labels=[{"name": "review:needs"}])]],
+            labels={7: ["status:parked"]})
+        assert issue_side[0] == 1 and issue_side[2] == [(41, 7)], issue_side
+        print("  ok   [#769] an ISSUE-side `status:parked` with NO live `review:parked` is "
+              "unaffected — a closed age episode's receipt cannot strand another park")
+
+        # (7) PRECEDENCE. A human-owned hold outranks the episode binding in the census, because
+        # `human-hold` is HUMAN-TERMINAL and is the row a maintainer must actually see. The park
+        # is refused either way; what is asserted here is that the refusal is not misfiled.
+        held = readmit_sweep(healthy_window, comments=age_comments, timeline=park_at(old),
+                             labels={7: ["status:parked", "needs:user"]})
+        assert held == (0, [], []), held
+        assert census_codes() == "human-hold=1", census_codes()
+        print("  ok   [#769] a human-owned hold still outranks the episode binding in the "
+              "census — a human-terminal park is never filed as self-healing")
 
         # ---- [registry #835] THE RE-ADMISSION CANDIDATE FILTER ADMITS THE #657 ORCHESTRATOR
         # CLASS. The defect: `_readmit_capacity_parks` selected candidates on HEAD_REF_RE *and*
