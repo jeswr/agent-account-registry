@@ -642,6 +642,12 @@ def _test_decide(chk):
     chk("decide: ok + none -> noop", decide("ok", False), "noop")
     chk("decide: stale half — stale -> upsert", decide("stale", False, bad="stale"), "upsert")
     chk("decide: stale half — fresh + open -> close", decide("fresh", True, bad="stale"), "close")
+    # Closure requires an EXPLICIT recovery verdict, never merely "not the bad one". Without this
+    # the guard has no red test, and a future third verdict — `unknown`, `degraded`, whatever a
+    # later signal returns when it cannot read — would silently close a live alert.
+    chk("decide: an UNKNOWN verdict never closes an open alert (absence of evidence is not a "
+        "recovery)", decide("unknown", True), "noop")
+    chk("decide: ... on the staleness half either", decide("unknown", True, bad="stale"), "noop")
 
 
 def _test_thresholds_agree_with_the_floor(chk):

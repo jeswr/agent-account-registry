@@ -19,10 +19,26 @@
 #
 #   requests per executed tick  = 613
 #       measured 2026-07-27 by the instrumented run recorded in scripts/plan-snapshot.py's module
-#       docstring (issue #721): 613 requests, 28,334 rows, median request 0.843 s.
+#       docstring (issue #721): 613 requests, 28,334 rows, median request 0.843 s, split
+#       23 listings / 116 PR-detail / 474 check-runs.
 #   observed SAFE band          = 4-7 executed ticks/h, i.e. ~2,450-4,291 requests/h,
 #       sustained for the thirteen hours 04Z-17Z above with zero rate-limit failures.
 #   observed BREAKING rate      = 13 executed ticks/h, i.e. ~7,969 requests/h -> 403 at 18:26:17Z.
+#
+# 613 IS NOT A CONSTANT OF NATURE — it scales with the number of WORKER PRs on the target, because
+# the PR-detail and check-runs legs walk one PR at a time (together ~96% of the requests). Pinning
+# the floor to a single measured total would make it silently wrong the moment the backlog grew,
+# and a backlog spike would become an outage trigger in its own right. So the arithmetic is
+# expressed against `requests_per_tick(worker_prs)` below, and the floor is sized at that
+# function's CEILING rather than at today's backlog.
+#
+# The ceiling exists and is enforced in code, which is what makes this tractable:
+# plan-snapshot.WORKER_PR_STATUS_LIMIT caps per-PR status at 100 worker PRs and degrades the whole
+# repo to NO prstatus above it (`worker-pr-census-overflow`), so per-tick cost cannot grow past
+# ~613 no matter how far the backlog runs. The instrumented run was taken at, or very near, that
+# cap — sparq carried ~121 open PRs at the time — so the measurement IS the worst case, and a
+# backlog reduction only ever moves the real cost DOWN from it. That is the honest direction for
+# an error in a rate limiter to point.
 #
 # So the true ceiling lies somewhere in (4.3k, 8.0k] requests/hour. GitHub does not publish the
 # effective ceiling for this token in this configuration, and `GET /rate_limit` reports a DIFFERENT
@@ -75,7 +91,27 @@ from datetime import datetime, timezone
 # env-overridable (a threshold readable from the workflow is a second place to get it wrong).
 MIN_TICK_INTERVAL_SECONDS = 10 * 60
 
-# The instrumented per-tick request count the arithmetic above is built on (issue #721).
+# The instrumented per-tick request count the arithmetic above is built on (issue #721), and the
+# linear model it calibrates. Splits from the same instrumented run: 23 listings (repo-level, does
+# not scale with PRs) and 590 per-PR requests (116 detail + 474 check-runs) across the worker PRs
+# that run snapshotted.
+SNAPSHOT_LISTING_REQUESTS = 23
+# plan-snapshot.WORKER_PR_STATUS_LIMIT. Duplicated as a plain int rather than imported because
+# this module is loaded in jobs that do not check out plan-snapshot.py; the self-test asserts the
+# two agree whenever that file IS present, so they cannot drift silently.
+WORKER_PR_STATUS_LIMIT = 100
+SNAPSHOT_REQUESTS_PER_WORKER_PR = 5.9   # 590 / 100 worker PRs, the cap the run was taken at
+
+
+def requests_per_tick(worker_prs=WORKER_PR_STATUS_LIMIT):
+    """Authenticated requests one EXECUTED tick issues, as a function of the target's worker-PR
+    count. Above WORKER_PR_STATUS_LIMIT the snapshot stops doing per-PR status entirely
+    (`worker-pr-census-overflow`), so the cost does not keep climbing — it CLAMPS, and the clamp
+    is what makes a floor derived from one measurement stay valid as the backlog moves."""
+    counted = min(max(int(worker_prs), 0), WORKER_PR_STATUS_LIMIT)
+    return SNAPSHOT_LISTING_REQUESTS + SNAPSHOT_REQUESTS_PER_WORKER_PR * counted
+
+
 MEASURED_REQUESTS_PER_TICK = 613
 # The highest hourly request rate observed to run clean, and the rate that broke. Both are
 # measured, both are asserted against the floor by _test_budget_arithmetic.
@@ -406,6 +442,28 @@ def _test_budget_arithmetic(chk):
     ceiling = ticks_per_hour * MEASURED_REQUESTS_PER_TICK
     chk("budget: the floor admits at most 6 executed ticks/hour", ticks_per_hour, 6.0)
     chk("budget: 6 ticks/h x 613 requests = 3678 requests/h", ceiling, 3678.0)
+    # The cost model, and the clamp that makes a floor derived from ONE measurement stay valid as
+    # the backlog moves. Without the clamp assertion, a growing backlog silently invalidates the
+    # arithmetic above and a backlog spike becomes an outage trigger.
+    chk("budget: the cost model reproduces the instrumented measurement at the worker-PR cap",
+        round(requests_per_tick(WORKER_PR_STATUS_LIMIT)), MEASURED_REQUESTS_PER_TICK)
+    chk("budget: per-tick cost is MONOTONE in the worker-PR count (a bigger backlog is a bigger "
+        "tick — the floor is sized at the ceiling, not at today's backlog)",
+        requests_per_tick(20) < requests_per_tick(60) < requests_per_tick(100), True)
+    chk("budget: ... and CLAMPS at the WORKER_PR_STATUS_LIMIT census overflow, so no backlog can "
+        "push a tick past the measured worst case",
+        (requests_per_tick(500), requests_per_tick(5000)),
+        (requests_per_tick(WORKER_PR_STATUS_LIMIT),) * 2)
+    chk("budget: the floor holds at that CEILING, not merely at today's cost",
+        ticks_per_hour * requests_per_tick(WORKER_PR_STATUS_LIMIT)
+        <= OBSERVED_SAFE_REQUESTS_PER_HOUR, True)
+    # Cross-file: the clamp is only real if it is the number plan-snapshot actually enforces.
+    snapshot = os.path.join(_repo_root(), "scripts", "plan-snapshot.py")
+    if os.path.isfile(snapshot):
+        with open(snapshot, encoding="utf-8") as handle:
+            declared = re.search(r"^WORKER_PR_STATUS_LIMIT\s*=\s*(\d+)", handle.read(), re.M)
+        chk("budget: the clamp matches plan-snapshot.py's live WORKER_PR_STATUS_LIMIT",
+            int(declared.group(1)) if declared else None, WORKER_PR_STATUS_LIMIT)
     chk("budget: the ceiling is at or under the highest rate observed to run CLEAN "
         f"({OBSERVED_SAFE_REQUESTS_PER_HOUR}/h)", ceiling <= OBSERVED_SAFE_REQUESTS_PER_HOUR, True)
     chk("budget: the ceiling is at most half the rate that BROKE it "
