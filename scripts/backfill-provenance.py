@@ -656,28 +656,45 @@ def resolve_dispatch_inputs(event_name, requested_target, apply_input, enabled_t
 class BackfillCensus(NamedTuple):
     """What ONE pass left behind. Population census, not a per-stage success rate: a per-stage rate
     cannot express "this PR fell out between two stages", which is how the two uncounted `skip`
-    exits below hid from every report."""
+    exits below hid from every report. The two remainders are kept APART because their responses
+    are (see `machine_remainder` / `human_remainder`), and each carries its PR numbers so the
+    annotation is actionable rather than a bare count."""
 
     written: int
     skipped: int
     needs_human: int
     unresolved: int
     applied: bool
+    needs_human_prs: tuple = ()
+    unresolved_prs: tuple = ()
 
 
-def unrepaired_after(census):
-    """Open worker PRs still holding `__global__` when this pass ended. PURE, so the exit rule has
-    a red test that does not need a fake GitHub.
+def machine_remainder(census):
+    """Open worker PRs this pass COULD have repaired and did not. PURE, so the exit rule has a red
+    test that needs no fake GitHub. This is the one the exit code gates on: it is the machine exit
+    failing to exit, which is a defect in this workflow.
 
-    `written` counts toward the remainder on a DRY RUN and only there: a dry run names records it
-    WOULD write, and a PR whose record was never actually written is still recordless, still
-    invisible to the review sweep, and still serialising the whole fleet. Reporting a dry run as
+    `written` counts here on a DRY RUN and only there: a dry run names records it WOULD write, and
+    a PR whose record was never actually written is still recordless, still invisible to the review
+    sweep, and still able to reserve `__global__` the moment it is un-parked. Reporting a dry run as
     clean because it "handled" those PRs is the precise shape of an exit-zero that swallows the
     finding."""
-    remainder = census.needs_human + census.unresolved
-    if not census.applied:
-        remainder += census.written
-    return remainder
+    return census.unresolved + (0 if census.applied else census.written)
+
+
+def human_remainder(census):
+    """Open worker PRs only a HUMAN can clear — an existing record that the review loop refuses, a
+    run log that cannot be read, sources that disagree. [registry #710]
+
+    DELIBERATELY NOT part of the exit code, and this is a judgement worth stating. This population
+    is standing (2 live examples at the time of writing, sparq-org/sparq#2439 and #2456, both
+    carrying a malformed attestation stamp from before the stamp existed), it is not repairable by
+    any number of reruns, and a 20-minute cron that is red forever for it would train every operator
+    to ignore this workflow — which is precisely how the losses it repairs went unnoticed. So it is
+    reported LOUDLY and every run — named, counted, in an `::warning` and in the census line — but
+    it does not page. A count that only ever moves when a human moves it is a backlog, not an
+    alarm."""
+    return census.needs_human
 
 
 def backfill(target_repo, registry_repo, routing_file, apply_changes, no_draft_convert=False):
@@ -698,6 +715,10 @@ def backfill(target_repo, registry_repo, routing_file, apply_changes, no_draft_c
     if pulls is None:
         raise BackfillError("pull listing is malformed")
     written = skipped = needs_human = unresolved = 0
+    # [registry #710] The census carries the PR NUMBERS, not just counts: an
+    # annotation an operator cannot act on without opening the run log is one step
+    # short of the silence this whole change is about.
+    needs_human_prs, unresolved_prs = [], []
     for pull in pulls:
         if not isinstance(pull, dict):
             continue
@@ -732,6 +753,7 @@ def backfill(target_repo, registry_repo, routing_file, apply_changes, no_draft_c
             body = effective_record_body(pr_probe, worker_pr.LEDGER_REF)
         except worker_pr.WorkerPrError as exc:
             needs_human += 1
+            needs_human_prs.append(number)
             print(f"NEEDS-HUMAN #{number}: cannot establish whether provenance is already "
                   f"recorded ({exc}); leaving untouched — rerun once the registry probe "
                   "succeeds")
@@ -747,6 +769,7 @@ def backfill(target_repo, registry_repo, routing_file, apply_changes, no_draft_c
                               no_draft_convert=no_draft_convert)
                 continue
             needs_human += 1
+            needs_human_prs.append(number)
             print(f"NEEDS-HUMAN #{number}: an existing provenance record is present but NOT "
                   f"admissible by the review loop ({record_error}); a human must repair or "
                   "remove it before this PR becomes visible")
@@ -770,6 +793,7 @@ def backfill(target_repo, registry_repo, routing_file, apply_changes, no_draft_c
             found = run_identity_from_log(log.stdout, target_repo, number, issue, login, ref)
         if isinstance(found, Refusal):
             needs_human += 1
+            needs_human_prs.append(number)
             print(f"NEEDS-HUMAN #{number} [{found.code}]: run {run_id} attempt {attempt}: "
                   f"{found.detail}. {REFUSAL_GUIDANCE[found.code]}. Leaving fail-closed "
                   "invisible — record provenance only after a human establishes the "
@@ -779,6 +803,7 @@ def backfill(target_repo, registry_repo, routing_file, apply_changes, no_draft_c
         provider = provider_of(alias, routing)
         if provider is None:
             needs_human += 1
+            needs_human_prs.append(number)
             print(f"NEEDS-HUMAN #{number}: alias {alias!r} has no provider in routing")
             continue
         if provider != echo_provider:
@@ -786,6 +811,7 @@ def backfill(target_repo, registry_repo, routing_file, apply_changes, no_draft_c
             # disagreement means today's routing was remapped since the run — recording
             # today's provider could flip the cross-provider reviewer gate.
             needs_human += 1
+            needs_human_prs.append(number)
             print(f"NEEDS-HUMAN #{number}: the run recorded provider {echo_provider!r} but "
                   f"today's routing maps {alias!r} to {provider!r}; a human must resolve the "
                   "remap before this identity is recorded")
@@ -797,11 +823,13 @@ def backfill(target_repo, registry_repo, routing_file, apply_changes, no_draft_c
             # incrementing anything, so the completion line under-reported the population it was
             # reporting on. A state a census cannot express is a state nobody acts on.
             unresolved += 1
+            unresolved_prs.append(number)
             print(f"skip #{number}: PR has no commits — left recordless")
             continue
         opened_sha = str((commits[0] or {}).get("sha", ""))
         if not re.fullmatch(r"[0-9a-f]{40}", opened_sha):
             unresolved += 1
+            unresolved_prs.append(number)
             print(f"skip #{number}: first commit sha is malformed — left recordless")
             continue
 
@@ -824,7 +852,9 @@ def backfill(target_repo, registry_repo, routing_file, apply_changes, no_draft_c
     print(f"backfill complete: {mode} {written}, skipped {skipped}, "
           f"needs-human {needs_human}, unresolved {unresolved}")
     return BackfillCensus(written=written, skipped=skipped, needs_human=needs_human,
-                          unresolved=unresolved, applied=bool(apply_changes))
+                          unresolved=unresolved, applied=bool(apply_changes),
+                          needs_human_prs=tuple(needs_human_prs),
+                          unresolved_prs=tuple(unresolved_prs))
 
 
 def identity_from_run_log(log_readable, log_text, target_repo, pr_number, issue, live_author,
@@ -1650,26 +1680,60 @@ def _self_test():
           (e2e_census.written, e2e_census.skipped, e2e_census.needs_human, e2e_census.applied),
           (2, 0, 0, False))
     e2e_lines = []
-    check("#710 E2E: this pass left 3 open worker PRs with no record, so it exits NON-ZERO with an "
-          "`::error` naming the population — a DRY RUN repairs nothing, and reporting it clean "
-          "because it 'handled' those PRs is exactly the exit-zero that swallows the finding",
+    check("#710 E2E: this DRY RUN left 3 open worker PRs with no record, so it exits NON-ZERO with "
+          "an `::error` NAMING them — a dry run repairs nothing, and reporting it clean because it "
+          "'handled' those PRs is exactly the exit-zero that swallows the finding",
           (report_census(e2e_census, "sparq-org/sparq", emit=e2e_lines.append),
            len(e2e_lines) == 1 and e2e_lines[0].startswith("::error title=recordless worker PRs"),
            "3 open worker pull request(s)" in e2e_lines[0],
-           "__global__" in e2e_lines[0]),
-          (EXIT_UNREPAIRED, True, True, True))
+           "#9003" in e2e_lines[0], "__global__" in e2e_lines[0]),
+          (EXIT_UNREPAIRED, True, True, True, True))
     clean_lines = []
-    check("#710 a pass that left NOTHING behind exits 0 with a `::notice`, so the red state above "
-          "is a real signal and not the permanent condition of the workflow",
+    check("#710 a pass that left NOTHING repairable behind exits 0 with a `::notice`, so the red "
+          "state above is a real signal and not the permanent condition of the workflow",
           (report_census(BackfillCensus(written=4, skipped=70, needs_human=0, unresolved=0,
                                         applied=True), "sparq-org/sparq", emit=clean_lines.append),
            clean_lines[0].startswith("::notice title=provenance census clean")),
           (EXIT_OK, True))
-    check("#710 unrepaired_after: an APPLIED pass banks its writes, a DRY RUN does not",
-          (unrepaired_after(BackfillCensus(6, 0, 0, 0, True)),
-           unrepaired_after(BackfillCensus(6, 0, 0, 0, False)),
-           unrepaired_after(BackfillCensus(0, 70, 2, 1, True))),
-          (0, 6, 3))
+
+    # THE ALARM-FATIGUE SPLIT. `needs_human` is a STANDING population — sparq-org/sparq#2439 and
+    # #2456 have carried a malformed attestation stamp since before the stamp existed, and the
+    # 2026-07-27T15:44Z apply=true pass reported `needs-human 2` for exactly them. Gating the exit
+    # code on that count would make a 20-minute cron red forever, which trains the operator to
+    # ignore the workflow that exists to catch a silent failure — the same mistake, one level up.
+    human_lines = []
+    check("#710 a HUMAN-terminal remainder is LOUD and NAMED on every run but does NOT page: "
+          "rerunning cannot clear it, and a cron that is red forever is not a signal",
+          (report_census(BackfillCensus(written=6, skipped=70, needs_human=2, unresolved=0,
+                                        applied=True, needs_human_prs=(2439, 2456)),
+                         "sparq-org/sparq", emit=human_lines.append),
+           [line.split("::")[1] for line in human_lines],
+           any("#2439, #2456" in line for line in human_lines)),
+          (EXIT_OK,
+           ["warning title=provenance records only a human can repair",
+            "notice title=provenance census clean"],
+           True))
+    both_lines = []
+    check("#710 the two remainders COEXIST: a run with a standing human backlog AND a fresh "
+          "machine failure emits BOTH lines and still reds (an `else` would hide the backlog on "
+          "exactly the runs that had something new to report)",
+          (report_census(BackfillCensus(written=1, skipped=70, needs_human=2, unresolved=3,
+                                        applied=True, needs_human_prs=(2439, 2456),
+                                        unresolved_prs=(11, 12, 13)),
+                         "sparq-org/sparq", emit=both_lines.append),
+           [line.split("::")[1] for line in both_lines],
+           any("#11, #12, #13" in line for line in both_lines)),
+          (EXIT_UNREPAIRED,
+           ["warning title=provenance records only a human can repair",
+            "error title=recordless worker PRs remain"],
+           True))
+    check("#710 machine_remainder gates the EXIT (an APPLIED pass banks its writes, a DRY RUN does "
+          "not) while human_remainder is reported separately and never folded into it",
+          (machine_remainder(BackfillCensus(6, 0, 0, 0, True)),
+           machine_remainder(BackfillCensus(6, 0, 0, 0, False)),
+           machine_remainder(BackfillCensus(0, 70, 2, 1, True)),
+           human_remainder(BackfillCensus(0, 70, 2, 1, True))),
+          (0, 6, 1, 2))
 
     # --- effective ledger-first record + admission before any skip (sol #217) ------------------
     # The REAL review-loop admission function, imported — not a replica — so these red if the
@@ -1754,25 +1818,45 @@ def main():
 def report_census(census, target_repo, *, emit=print):
     """Emit the terminal census and return the process exit code. [registry #710]
 
-    A recordless open worker PR reserves `__global__` in `dispatch-claim.busy_packages_of_pulls`,
-    which vetoes EVERY row in the repo — so "this pass ended with holders left" is an active fleet
-    outage, not a backlog item, and it gets an `::error` annotation plus a non-zero exit. It is not
-    alarm fatigue: the steady state is zero, and a standing red means real un-repaired holders that
-    only a human can clear."""
-    remainder = unrepaired_after(census)
-    if not remainder:
-        emit(f"::notice title=provenance census clean::{target_repo}: every open worker PR has an "
-             f"admissible provenance record (recorded {census.written}, already had one "
-             f"{census.skipped})")
-        return EXIT_OK
-    emit(f"::error title=recordless worker PRs remain::{target_repo}: {remainder} open worker "
-         f"pull request(s) still have NO admissible provenance record after this pass "
-         f"(needs-human {census.needs_human}, unresolved {census.unresolved}, "
-         f"{'would-record ' + str(census.written) + ' (DRY RUN — nothing was written)'
-            if not census.applied else 'recorded ' + str(census.written)}). Each one reserves the "
-         f"`__global__` partition in dispatch-claim.busy_packages_of_pulls, which defers every "
-         f"issue-lane row fleet-wide until it is cleared (registry #677/#710).")
-    return EXIT_UNREPAIRED
+    A recordless open worker PR reserves `__global__` in `dispatch-claim.busy_packages_of_pulls`
+    the moment it is not a provably-inert parked draft, and that vetoes EVERY row in the repo. So
+    both remainders are always emitted and always named — but they get DIFFERENT signals, because
+    they have different responses:
+
+      * `machine_remainder` -> `::error` + EXIT_UNREPAIRED. The repair could have run and did not;
+        that is this workflow failing at its job, and it must red.
+      * `human_remainder`   -> `::warning`, exit unchanged. Standing, unfixable by rerunning, and
+        paging on it every 20 minutes would train the operator to ignore the workflow that exists
+        to catch the silent failure. Loud, named, counted — not an alarm.
+
+    Emitting the human line UNCONDITIONALLY (not as an `else`) is deliberate: the two populations
+    coexist, and an `else` would hide the standing backlog on exactly the runs that had a fresh
+    machine failure to report."""
+    machine, human = machine_remainder(census), human_remainder(census)
+    written = (f"recorded {census.written}" if census.applied
+               else f"would-record {census.written} (DRY RUN — nothing was written)")
+    if human:
+        emit(f"::warning title=provenance records only a human can repair::{target_repo}: "
+             f"{human} open worker pull request(s) have a provenance record the review loop "
+             f"refuses, or an identity this recovery may not invent: "
+             f"{_pr_list(census.needs_human_prs)}. Rerunning cannot clear these — see the "
+             f"per-PR NEEDS-HUMAN lines above for the specific reason each was refused.")
+    if machine:
+        emit(f"::error title=recordless worker PRs remain::{target_repo}: {machine} open worker "
+             f"pull request(s) were left with NO provenance record by a pass that could have "
+             f"written one ({written}, unresolved {census.unresolved}: "
+             f"{_pr_list(census.unresolved_prs)}). Each one reserves the `__global__` partition in "
+             f"dispatch-claim.busy_packages_of_pulls as soon as it is un-parked, which defers "
+             f"every issue-lane row fleet-wide (registry #677/#710).")
+        return EXIT_UNREPAIRED
+    emit(f"::notice title=provenance census clean::{target_repo}: this pass left no repairable "
+         f"gap ({written}, already recorded {census.skipped}, human-terminal {human})")
+    return EXIT_OK
+
+
+def _pr_list(numbers):
+    """`#1, #2, #3` — or an explicit `none`, never an empty string that reads as a formatting bug."""
+    return ", ".join(f"#{n}" for n in numbers) or "none"
 
 
 if __name__ == "__main__":
