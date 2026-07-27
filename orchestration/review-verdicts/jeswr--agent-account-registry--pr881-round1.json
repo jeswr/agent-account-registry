@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 881,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "f00012fd9ca24697c369d5d17d2d43f3faaaccff",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The added Anthropic test requires `[opus5, fable, opus, sonnet, haiku]`, while `orchestration/routing.toml` states that `fable` and `opus` were removed and that `opus5` is the sole Anthropic tier (with sonnet/haiku retained only for their limited routes). Extra account capability aliases do not create a route or weaken allocation checks, so this does not make the worker-cap fix unsafe, but the test's claim that it mirrors the catalog is inaccurate and will actively prevent the mint defaults from being cleaned up to match current routing policy.",
+    "file": "scripts/grant-account.py",
+    "fix_hint": "Derive or assert the Anthropic mint list against the current supported routing catalog, or explicitly document and test why account capability metadata intentionally remains a superset of dispatchable aliases. Avoid pinning retired aliases as a required invariant without that policy.",
+    "severity": "minor",
+    "title": "New exact default assertion pins aliases removed from the routing catalog"
+   }
+  ],
+  "progress": null,
+  "summary": "The workflow now derives the per-provider worker cap alongside the existing model metadata, transports it through a step output, rejects a missing value before persistence, and writes the derived value into the schema-validated account record. The new self-tests execute the real derivation for both providers, validate the resulting records through the real allocator parser, and check the register-step transport and consumption, so the core regression coverage is non-vacuous. One non-blocking inconsistency remains: the new exact Anthropic expectation preserves aliases that the current routing catalog declares removed.",
+  "verdict": "approve"
+ }
+}
