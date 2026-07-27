@@ -3,7 +3,9 @@
 
 The enabled target list and additional trusted automation identities come from
 ``policy/repos.toml``.  The default mode is a read-only dry run; ``--apply`` is the only path
-that mutates target issues.  No issue labels are ever removed.
+that mutates target issues.  Exactly ONE label is ever removed — ``status:untriaged``, and only
+from an issue this run is simultaneously staging (see ``Mutation.remove`` and ``is_staged``);
+``execute_plan`` raises on any other strip.
 """
 import argparse
 from dataclasses import dataclass
@@ -76,6 +78,9 @@ TRUSTED_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
 ACTIONS_BOT_LOGIN = "github-actions[bot]"
 IN_FLIGHT_STATUS = {"status:ready", "status:in-progress"}
 PARKED_AREA_LABELS = {"needs:user", "review:needs-user", "status:blocked"}
+# `status:untriaged` is the ONE status label that is not a staging claim — it is the assertion
+# that NOTHING has staged this issue yet. See is_staged() for the measured deadlock this closes.
+UNSTAGED_STATUS = "status:untriaged"
 TRUST_LABEL_PREFIXES = (
     "area:sparq-zk", "area:sparq-mpc", "area:zk", "area:mpc", "area:trust",
     "area:sparq-trust", "area:e2ee", "area:sparq-e2ee", "zk", "mpc",
@@ -88,6 +93,23 @@ TRUST_KEYWORDS = (
 EC2_KEYWORDS = (
     "quiet-box", "ec2", "canonical gather", "same-box", "full-scale",
     "nightly gather", "gather run",
+)
+# `ec2` is the ONE entry in EC2_KEYWORDS that is a BARE TOKEN rather than a phrase, so it is the
+# only one a label (`needs:ec2`, `blocked:ec2`), a path (`research/ci-ec2-design.md`,
+# `.github/workflows/bench-ec2.yml`, `scripts/ec2-buildfarm.sh`), a branch name
+# (`chore/sq-uhqah-formalize-codex-ec2`) or an identifier (`AWSServiceRoleForEC2Spot`) can
+# swallow. Every one of those is the issue TALKING ABOUT the fence, not announcing work that has
+# to run on dedicated hardware. See is_ec2_measurement for the measured false-positive census.
+EC2_BARE_KEYWORD = "ec2"
+EC2_PHRASE_KEYWORDS = tuple(k for k in EC2_KEYWORDS if k != EC2_BARE_KEYWORD)
+# Free-word `ec2`: not glued into a label (`:` before), a path segment (`/` before), a compound
+# (`-`/`_` either side), an identifier (alnum either side), or a filename extension (`.yml`).
+# `/` is deliberately NOT excluded AFTER the token, so prose like `EC2/nightly tier` and
+# `CANONICAL/EC2 measurement` still match; and a trailing `.` only blocks when an extension
+# follows, so a sentence ending "…runs on EC2." still matches.
+_EC2_FREE_WORD = re.compile(
+    rf"(?<![A-Za-z0-9_:/-]){re.escape(EC2_BARE_KEYWORD)}(?![A-Za-z0-9_-]|\.[A-Za-z0-9])",
+    re.IGNORECASE,
 )
 WELL_SPECIFIED_LABELS = {"self-improvement", "from:agent", "drift"}
 SAFE_REPO = re.compile(
@@ -157,6 +179,14 @@ class Mutation:
     number: int
     issue: dict[str, Any]
     labels: tuple[str, ...] = ()
+    # The ONLY labels this tool ever strips, and only from the `stage` action: `status:untriaged`
+    # on an issue it is simultaneously staging. Without it the add-only edit leaves BOTH
+    # `status:ready` and `status:untriaged` on the issue, and `status:untriaged` is in
+    # ready-issues.BUSY_STATUS — so the "staged" issue is STILL unenumerable and the repair is
+    # vacuous. `gh issue edit` sends one PATCH carrying the resulting label set, so the add and
+    # the strip land together or not at all; this is not the two-independent-edits shape #582 is
+    # about, and execute_plan still raises on a non-zero return.
+    remove: tuple[str, ...] = ()
     canonical: int | None = None
     canonical_issue: dict[str, Any] | None = None
 
@@ -200,6 +230,35 @@ def has_gate(labels: set[str]) -> bool:
 
 def has_status(labels: set[str]) -> bool:
     return any(label.startswith("status:") for label in labels)
+
+
+def is_staged(labels: set[str]) -> bool:
+    """Whether the pipeline has ALREADY staged this issue — the CANDIDATE-ADMISSION predicate.
+
+    NOT the same question as has_status(), and the difference is the whole of registry #799.
+
+    MEASURED DEADLOCK. `triage-issue.yml` fires on `issues: [opened, edited, reopened]` and stamps
+    `status:untriaged` within seconds of creation — `triage.triage()` always adds either
+    `status:ready` or `status:untriaged`, never neither. The candidate filter used has_status(),
+    so from that moment the curator — the ONLY lane in the estate that mints `priority:*`,
+    `area:*` and `status:ready` — could never look at the issue again. And `retriage.py` cannot
+    rescue it either: its promotion lane fires only when the label set is ALREADY triage-complete,
+    which requires exactly the `priority:*`/`area:*` labels only the curator writes. Two lanes,
+    each reporting `success` on every run, each structurally unable to produce the other's input:
+    on the live board 274 of 339 open issues sat `status:untriaged`, the oldest for two weeks, and
+    retriage run 262 visited 80 of them and wrote NOTHING (80/80 `classifier-incomplete`).
+
+    So `status:untriaged` alone is UNSTAGED and admissible. Every other `status:*` still means
+    staged, and — deliberately — so does `status:untriaged` in COMBINATION with another status:
+    the `status:available` account-inventory records (#1, #2, #14, ...) and any contradictory
+    `status:untriaged`+`status:ready` pair stay untouched here, the latter because `retriage.py`
+    owns that repair.
+
+    has_status() is intentionally left alone. It also guards the duplicate-CLOSE path, where
+    "carries a status label" means "the pipeline has seen it, do not auto-close it" — widening
+    THAT would newly expose 274 issues to automated closure, which is the opposite of the repair.
+    """
+    return any(label.startswith("status:") and label != UNSTAGED_STATUS for label in labels)
 
 
 def drainable_ready(open_issues: list[dict[str, Any]]) -> tuple[int, list[str]]:
@@ -344,12 +403,55 @@ def is_trust_surface(issue: dict[str, Any], labels: set[str]) -> bool:
 
 
 def is_ec2_measurement(issue: dict[str, Any]) -> bool:
+    """Whether the issue announces work that has to RUN on dedicated measurement hardware.
+
+    The bare `ec2` keyword now matches as a FREE WORD, not as a substring. That is the repair,
+    and it is the only behaviour change: the phrase keywords, the title-only `_CODE_ONLY_BENCH`
+    escape, and the fail-loud malformed-payload contract are all untouched.
+
+    WHY THIS IS A BLOCKING DEFECT AND NOT A PRECISION NICETY. `needs:ec2` is a ONE-WAY hold: no
+    lane in this estate removes it, and `triage-stock-alert.census()` — the alarm THIS PR adds —
+    excludes every `needs:*` row from `machine_owed`, because a `needs:` gate normally means a
+    HUMAN owes the issue its next move. So a false fence does not merely delay an issue, it moves
+    the issue OUT of the population the starvation alarm keys on. That is exactly the
+    missing-state-exit defect this PR exists to close, re-created one layer up by the fix for it.
+    Admitting `status:untriaged` as a candidate (`is_staged`) is what made it reachable at scale.
+
+    MEASURED, frozen snapshots of BOTH enabled targets, 2026-07-27 (1501 + 350 open issues).
+    The three live registry false positives are code issues that match ONLY because the literal
+    label `needs:ec2` appears in a body discussing this very fence:
+
+        #803  "…with only #3314 correctly carrying `needs:ec2`…"
+        #802  "…asks the worker to auto-gate `needs:ec2` when…"
+        #471  "…auto-gate EC2-measurement bench issues with needs:ec2…"
+
+    Predicate population, base -> this rule: registry 4 -> 1, sparq 102 -> 84. All 18 sparq drops
+    are the same class — `bench-ec2.yml`, `scripts/ec2-buildfarm.sh`, `research/ci-ec2-design.md`,
+    `chore/sq-uhqah-formalize-codex-ec2`, `blocked:ec2`, `AWSServiceRoleForEC2Spot`,
+    `work-box/EC2 timings are NON-canonical`. NOTHING that says it must run on a box is dropped:
+    #4040/#4056/#4352/#4370/#3314/#2764/#2810/#2822/#3163/#3164 all still fence.
+
+    REJECTED ALTERNATIVE, on the measurement. Title-scoping the keyword scan (so match and escape
+    share a scope) removes all three registry false positives too, but on sparq it drops SIXTY
+    rows including every one of those genuine run-on-hardware issues — their titles say "bench",
+    "microbench", "re-gather", "canonical host", not "ec2". Trading a false hold for a fleet loop
+    on the larger target is not a repair, so the asymmetry is fixed by making the MATCH precise
+    rather than by making it narrow.
+
+    KNOWN RESIDUAL, stated not hidden: sparq #4328 (an IAM-config audit of the bench role) still
+    fences, because its body free-mentions "the EC2 benchmark role". Over a BODY, `ec2` is a topic
+    word, and no keyword predicate can separate "audits the EC2 role" from "must run on EC2". The
+    durable exit for that class is a machine exit for `needs:ec2` itself, not a wider regex —
+    tracked below in the alert's `machine_gated` census, which makes such rows countable instead
+    of invisible.
+    """
     text = issue_text(issue)
-    folded = text.casefold()
     title = issue.get("title")
     if not isinstance(title, str):
         raise CuratorError("issue title is malformed")
-    return any(keyword in folded for keyword in EC2_KEYWORDS) and not _CODE_ONLY_BENCH.search(title)
+    matched = (any(keyword in text.casefold() for keyword in EC2_PHRASE_KEYWORDS)
+               or bool(_EC2_FREE_WORD.search(text)))
+    return matched and not _CODE_ONLY_BENCH.search(title)
 
 
 def is_well_specified(issue: dict[str, Any], labels: set[str]) -> bool:
@@ -377,6 +479,30 @@ def derive_area(issue: dict[str, Any], labels: set[str], repo_labels: set[str]) 
         return next(iter(crates)), "title crate"
     if len(crates) > 1:
         return None, "multiple crate areas in title"
+
+    # THE TARGET'S OWN AREA TAXONOMY. The crate rule above and the path hints below are both
+    # sparq-shaped: `sparq-*` crate names, and `site/`/`gui/`/`bench/`/`scripts/` trees. Against
+    # the registry — the estate's SECOND enabled target — that left only `area:ci` reachable, so
+    # 8 of its 10 `area:*` labels (dispatch, groom, worker, review-loop, set-up-account, usage,
+    # dashboard, docs) were invisible to the curator and every issue it could classify collapsed
+    # into the SAME package. Since a wave stages at most one issue per package, the whole target's
+    # drain was pinned at 1 per run regardless of the depth budget.
+    #
+    # Same shape as the crate rule, generalised: a repository's `area:<name>` labels ARE its
+    # declared surface vocabulary, so an issue whose TITLE names exactly one of them is
+    # classified by it. Title-only (not the body) for the same precision reason the crate rule is
+    # title-only, and fail-closed on ambiguity exactly like every other branch here: two named
+    # surfaces are an UNRESOLVED area, not a coin flip.
+    declared = {
+        label for label in repo_labels
+        if label.startswith("area:") and len(label) > len("area:")
+        and re.search(rf"(?<![A-Za-z0-9_-]){re.escape(label[len('area:'):])}(?![A-Za-z0-9_-])",
+                      title, re.IGNORECASE)
+    }
+    if len(declared) == 1:
+        return next(iter(declared)), "title names a declared area"
+    if len(declared) > 1:
+        return None, "multiple declared areas named in title"
 
     text = issue_text(issue)
     hints = set()
@@ -455,6 +581,39 @@ def _conflicting_label(labels: set[str], prefix: str, desired: str) -> bool:
     return any(label.startswith(prefix) and label != desired for label in labels)
 
 
+# A fence whose label the target repository does not carry. The line is a LOG entry, not an
+# exception, and main() turns the run red once the whole plan has been printed and applied.
+FENCE_UNAVAILABLE = "FENCE-UNAVAILABLE"
+
+
+def _fence_unavailable(
+    logs: list[str], number: int, fence: str, desired: tuple[str, ...], repo_labels: set[str],
+) -> bool:
+    """True (and logged) when `fence` cannot be applied because the target lacks its label(s).
+
+    This used to `raise CuratorError`, which aborted the ENTIRE target's plan — every other
+    issue's fence and every stage with it — on one unconfigured label. That was invisible while
+    the curator's candidate set was tiny; admitting `status:untriaged` issues (registry #799)
+    makes it reachable on the first tick, and the registry genuinely lacks `needs:ec2` and
+    `status:blocked` today, so the whole-target abort would have replaced a starving lane with a
+    red one and STILL drained nothing.
+
+    Availability and fail-closed are not in tension here, because the two failures are on
+    different axes: the ISSUE is skipped, so it is never admitted (fail-closed, unchanged), while
+    the RUN still curates everything else and then goes red once via main() (loud, unchanged).
+    This is retriage.yml's own "record the per-issue failure, continue the sweep, turn the step
+    red once after the loop" idiom.
+    """
+    missing = sorted(set(desired) - repo_labels)
+    if not missing:
+        return False
+    logs.append(
+        f"{FENCE_UNAVAILABLE} #{number}: {fence} fence needs {','.join(missing)}, which this "
+        f"repository does not have — skipping the issue (never admitted) and failing the run"
+    )
+    return True
+
+
 def plan_repository(
     issues: list[dict[str, Any]],
     repo_labels: set[str],
@@ -478,7 +637,7 @@ def plan_repository(
     for issue in open_issues:
         labels = labels_of(issue)
         number = issue["number"]
-        if has_status(labels) or has_gate(labels):
+        if is_staged(labels) or has_gate(labels):
             continue
         if not trusted_author(issue, automation_logins, allow_actions_bot_issues):
             login = author_login(issue) or "<malformed>"
@@ -493,12 +652,8 @@ def plan_repository(
         if has_conditional_evidence(issue):
             needs_label = "needs:ec2" if "needs:ec2" in repo_labels else "needs:user"
             desired = (needs_label, "status:blocked")
-            missing = sorted(set(desired) - repo_labels)
-            if missing:
-                raise CuratorError(
-                    "target repository is missing conditional-evidence labels: "
-                    + ", ".join(missing)
-                )
+            if _fence_unavailable(logs, number, "CONDITIONAL-EVIDENCE", desired, repo_labels):
+                continue
             gate_actions.append(Mutation(
                 "conditional-evidence", number, issue, desired
             ))
@@ -507,8 +662,9 @@ def plan_repository(
             )
             continue
         if is_steering_question(issue):
-            if "needs:user" not in repo_labels:
-                raise CuratorError("target repository is missing required label needs:user")
+            if _fence_unavailable(logs, number, "QUESTION-SHAPED/steering",
+                                  ("needs:user",), repo_labels):
+                continue
             gate_actions.append(Mutation(
                 "steering-question", number, issue, ("needs:user",)
             ))
@@ -517,8 +673,8 @@ def plan_repository(
             )
             continue
         if is_ec2_measurement(issue):
-            if "needs:ec2" not in repo_labels:
-                raise CuratorError("target repository is missing required label needs:ec2")
+            if _fence_unavailable(logs, number, "EC2-measurement", ("needs:ec2",), repo_labels):
+                continue
             gate_actions.append(Mutation("needs-ec2", number, issue, ("needs:ec2",)))
             logs.append(f"gate #{number}: EC2 measurement work -> needs:ec2")
             continue
@@ -566,6 +722,10 @@ def plan_repository(
     if len(close_options) > close_limit:
         logs.append(f"defer {len(close_options) - close_limit} duplicate close(s): run cap is {close_limit}")
 
+    # `drainable_ready` (PR #799, merged) is the depth MEASUREMENT: what the readiness ENGINE can
+    # enumerate, not the raw `status:ready` attestation. This PR is UPSTREAM of it — it decides
+    # WHICH ISSUES ARE CANDIDATES AT ALL. Both are required; neither subsumes the other, and
+    # neither moves the drain off zero alone (see the PR body's 2x2 matrix).
     current_ready, ready_refusals = drainable_ready(open_issues)
     depth = max(0, target_ready - current_ready)
     # The number `depth` was computed from, ATTRIBUTABLE, and printed on EVERY tick including the
@@ -680,8 +840,13 @@ def plan_repository(
             logs.append(f"skip #{number}: this wave already selected {area}")
             continue
         selected_areas.add(area)
-        stage_actions.append(Mutation("stage", number, issue, desired))
-        logs.append(f"stage #{number}: {','.join(desired)}")
+        # Strip `status:untriaged` in the SAME edit that stages: it is in
+        # ready-issues.BUSY_STATUS, so leaving it behind stages an issue the dispatcher still
+        # cannot enumerate — a repair that changes labels and drains nothing.
+        strip = (UNSTAGED_STATUS,) if UNSTAGED_STATUS in labels_of(issue) else ()
+        stage_actions.append(Mutation("stage", number, issue, desired, remove=strip))
+        logs.append(f"stage #{number}: {','.join(desired)}"
+                    + (f" -{','.join(strip)}" if strip else ""))
 
     # [OPUS-5] ALWAYS emitted, including the zero case — a report that only appears when the
     # number is non-zero cannot be told apart from a report that stopped running.
@@ -834,12 +999,23 @@ def execute_plan(repo: str, mutations: list[Mutation], token: str, apply: bool) 
     closed = 0
     mode = "apply" if apply else "dry-run"
     for mutation in mutations:
+        # THE STRIP BOUND, checked on the PLAN before any I/O and before the dry-run print, so a
+        # malformed plan is refused identically in `--dry-run` and `--apply` and cannot be
+        # discovered only after a live fetch. The curator may remove exactly one label,
+        # `status:untriaged`, and only from a `stage`.
+        for label in mutation.remove:
+            if mutation.kind != "stage" or label != UNSTAGED_STATUS:
+                raise CuratorError(
+                    f"refusing to strip {label!r} from {repo}#{mutation.number}: the curator "
+                    f"may only remove {UNSTAGED_STATUS!r}, and only when staging")
         if mutation.kind == "needs-ec2":
             description = "add needs:ec2"
         elif mutation.kind == "close":
             description = f"close as not planned (duplicate of #{mutation.canonical})"
         else:
             description = "add " + ",".join(mutation.labels)
+            if mutation.remove:
+                description += " / remove " + ",".join(mutation.remove)
         print(f"{mode} {repo}#{mutation.number}: {description}")
         if not apply:
             continue
@@ -879,6 +1055,9 @@ def execute_plan(repo: str, mutations: list[Mutation], token: str, apply: bool) 
             command = ["issue", "edit", str(mutation.number), "--repo", repo]
             for label in mutation.labels:
                 command.extend(["--add-label", label])
+            # Bounded by the plan-shape guard at the top of this loop.
+            for label in mutation.remove:
+                command.extend(["--remove-label", label])
         try:
             subprocess.run(["gh", *command], check=True, env=_gh_env(token))
         except (FileNotFoundError, subprocess.CalledProcessError) as exc:
@@ -1471,15 +1650,27 @@ def _self_test() -> int:
                    and any(m.kind == "stage" and m.number == 74 for m in parked_plan)
                    and not any(m.kind == "stage" and m.number == 74 for m in unparked_plan)))
 
-    # (e) A status:* duplicate and a status:* EC2 issue are protected from every mutation kind.
+    # (e) A STAGED duplicate and a STAGED EC2 issue are protected from every mutation kind.
+    #
+    # registry #799 changed what "staged" means: this fixture previously used `status:untriaged`
+    # for #202 as a stand-in for "the pipeline already owns this", which is precisely the
+    # conflation that starved the board — `status:untriaged` is the assertion that NOTHING owns
+    # it. #202 now carries a real staging status, and the untriaged EC2 case is asserted
+    # positively below: it is FENCED (`needs:ec2`), which is a machine exit, rather than left to
+    # sit forever with no label and no owner.
     status_fixture = [
         issue(200, "Repair frontier collision detector", ("area:alpha",)),
         issue(201, "Repair frontier collision detector", ("status:ready", "area:alpha")),
-        issue(202, "Run quiet-box EC2 gather", ("status:untriaged", "area:bench")),
+        issue(202, "Run quiet-box EC2 gather", ("status:in-progress", "area:bench")),
     ]
     planned, _ = plan_repository(status_fixture, all_labels, automation)
     touched = {m.number for m in planned}
-    checks.append(("already-status issues are never touched", not ({201, 202} & touched)))
+    checks.append(("already-staged issues are never touched", not ({201, 202} & touched)))
+
+    untriaged_ec2 = [issue(203, "Run quiet-box EC2 gather", ("status:untriaged", "area:bench"))]
+    planned, _ = plan_repository(untriaged_ec2, all_labels | {"status:untriaged"}, automation)
+    checks.append(("an untriaged EC2 measurement is FENCED, not staged and not ignored",
+                   [(m.kind, m.labels) for m in planned] == [("needs-ec2", ("needs:ec2",))]))
 
     # (f) A non-collaborator, non-allowlisted author cannot be staged or dedupe-closed.
     untrusted = [issue(210, "Improve gamma parser", ("area:gamma",), author="outsider")]
@@ -1513,6 +1704,89 @@ def _self_test() -> int:
     checks.append(("measurement work is gated while code-only bench work remains stageable",
                    any(m.kind == "needs-ec2" and m.number == 230 for m in planned)
                    and any(m.kind == "stage" and m.number == 231 for m in planned)))
+
+    # ============================================================================================
+    # THE FENCE IS A ONE-WAY HOLD, SO THE PREDICATE THAT WRITES IT MUST BE PRECISE.
+    #
+    # `needs:ec2` has no machine exit and `triage-stock-alert.census()` excludes every `needs:*`
+    # row from `machine_owed`, so a FALSE fence removes the issue from the population the alarm
+    # this PR adds is keyed on. The bare `ec2` keyword therefore matches as a FREE WORD, never as
+    # a substring of a label / path / branch / identifier. Each check below is bound to
+    # `_EC2_FREE_WORD`: reverting it to the old `"ec2" in text.casefold()` reds the first three;
+    # narrowing the scan to the title (the alternative this diff REJECTED on the measurement)
+    # reds the fourth and fifth.
+    # ============================================================================================
+    # (e1) THE MEASURED LIVE FALSE POSITIVES. All three registry rows (#471, #802, #803) match the
+    # old rule only because the literal LABEL `needs:ec2` appears in a body that is discussing
+    # this very fence. Verbatim-shaped bodies, long enough to clear the well-specified bar so the
+    # fixture proves the FENCE is what changed and not some other gate.
+    # Shared filler that clears `is_well_specified` (>=200 chars AND one concrete reference), so
+    # every check below turns on the FENCE and never on a different gate. The reference is
+    # deliberately ec2-free.
+    spec = ("\n\n## Acceptance\nSee `scripts/alpha-writer.py`. "
+            + "Detailed acceptance criteria for the change. " * 12)
+    label_mention = issue(
+        940, "no_change vocabulary has no environment reason", ("area:alpha",),
+        body="Layer 2 asks the worker to auto-gate `needs:ec2` when the model reports an "
+             "environment blocker, and only #3314 correctly carries `needs:ec2` today." + spec)
+    planned, _ = plan_repository([label_mention], all_labels, automation)
+    checks.append((
+        "a body that merely NAMES the needs:ec2 label is not fenced",
+        not is_ec2_measurement(label_mention)
+        and any(m.kind == "stage" and m.number == 940 for m in planned)))
+
+    # (e2) A FILENAME containing `ec2` is not a claim about where the work runs. Live shapes:
+    # `research/ci-ec2-design.md`, `.github/workflows/bench-ec2.yml`, `scripts/ec2-buildfarm.sh`,
+    # the branch `chore/sq-uhqah-formalize-codex-ec2`, and `AWSServiceRoleForEC2Spot`.
+    for number, blurb in (
+        (941, "The `research/ci-ec2-design.md` OIDC pattern is the one to reuse here."),
+        (942, "Wire the HEAVY tiers into `.github/workflows/bench-ec2.yml` and the nightly lane."),
+        (943, "Flip `scripts/ec2-buildfarm.sh` fmt from ADVISORY to gating."),
+        (944, "Stale branch `chore/sq-uhqah-formalize-codex-ec2` is unreachable by review."),
+        (945, "The scoped role cannot create the `AWSServiceRoleForEC2Spot` SLR."),
+    ):
+        path_mention = issue(number, "Repair the alpha snapshot writer", ("area:alpha",),
+                             body=blurb + spec)
+        planned, _ = plan_repository([path_mention], all_labels, automation)
+        checks.append((
+            f"a path/branch/identifier containing ec2 is not fenced (#{number})",
+            not is_ec2_measurement(path_mention)
+            and any(m.kind == "stage" and m.number == number for m in planned)))
+
+    # (e3) ...and the label mention does not become fence-able just by appearing in the TITLE.
+    checks.append((
+        "a TITLE that names the needs:ec2 label is not fenced either",
+        not is_ec2_measurement(issue(946, "Auto-gate bench issues with needs:ec2", ()))))
+
+    # (e4) THE FIX MUST NOT BECOME A FAIL-OPEN. The precision repair narrows WHICH mentions count,
+    # never WHERE they may appear: a body that says the work runs on a box still fences. This is
+    # the check that reds the rejected title-scoping variant, which on the live sparq board would
+    # have dropped SIXTY rows — including #4040/#4056/#4352/#4370, whose titles say "bench",
+    # "microbench" and "canonical host" and never say "ec2" at all.
+    for number, blurb in (
+        (950, "Gathered on the quiet EC2 reference box with CANONICAL=1."),
+        (951, "This needs the DBPSB EC2/nightly tier, not the work box."),
+        (952, "Work-box numbers are non-canonical; run it on EC2."),
+        (953, "Requires the dedicated quiet-box protocol on the perf host."),
+    ):
+        body_run = issue(number, "Measure the alpha loader at 100M triples", ("area:bench",),
+                         body=blurb + spec)
+        planned, _ = plan_repository([body_run], all_labels, automation)
+        checks.append((
+            f"a body that says the work RUNS on the hardware still fences (#{number})",
+            is_ec2_measurement(body_run)
+            and any(m.kind == "needs-ec2" and m.number == number for m in planned)))
+
+    # (e5) The free-word rule is LIVE, not shadowed. If a future edit renames or drops the bare
+    # `ec2` entry, `EC2_PHRASE_KEYWORDS` silently regains a plain-substring `ec2` and every check
+    # above goes green again while the defect is back — the decaying-control shape. Pin the
+    # partition itself rather than trusting the derivation.
+    checks.append((
+        "the bare ec2 keyword is scanned ONLY by the free-word rule",
+        EC2_BARE_KEYWORD in EC2_KEYWORDS
+        and EC2_BARE_KEYWORD not in EC2_PHRASE_KEYWORDS
+        and len(EC2_PHRASE_KEYWORDS) == len(EC2_KEYWORDS) - 1
+        and set(EC2_PHRASE_KEYWORDS) | {EC2_BARE_KEYWORD} == set(EC2_KEYWORDS)))
 
     # Policy controls the ready-depth target. Thirty distinct eligible areas prove the policy
     # value reaches the planner instead of leaving the former hard-coded cap of twelve in place.
@@ -1603,6 +1877,121 @@ def _self_test() -> int:
                    len([m for m in planned if m.kind == "stage"]) == 1
                    and "frontier: area-limited at 1/4 (1 areas busy)" in logs))
 
+    # ============================================================================================
+    # registry #799 — `status:untriaged` IS AN ADMISSIBLE CANDIDATE STATE.
+    #
+    # Every check below is bound to a specific guard, and each was confirmed RED by deleting or
+    # inverting that guard (see the PR body's mutation table).
+    # ============================================================================================
+    untriaged_labels = all_labels | {"status:untriaged", "status:available"}
+
+    # (u1) THE HEADLINE GUARD. An issue carrying only `status:untriaged` is unstaged work, and the
+    # curator is the ONLY lane that mints priority/area/status:ready. Inverting `is_staged` back
+    # to `has_status` turns this stage into zero mutations.
+    stuck = [issue(900, "Improve alpha parser behavior", ("status:untriaged", "area:alpha"))]
+    planned, _ = plan_repository(stuck, untriaged_labels, automation)
+    staged_now = [m for m in planned if m.kind == "stage"]
+    checks.append(("a status:untriaged issue IS a staging candidate", len(staged_now) == 1))
+
+    # (u2) ...and the SAME mutation strips it. `status:untriaged` is in
+    # `ready-issues.BUSY_STATUS`, so an add-only stage leaves the issue unenumerable and the
+    # repair drains nothing. Deleting the `remove=strip` argument makes this red while (u1)
+    # stays green — which is exactly the vacuous-fix shape this guards against.
+    checks.append(("...and the stage mutation strips status:untriaged",
+                   bool(staged_now) and staged_now[0].remove == ("status:untriaged",)
+                   and "status:ready" in staged_now[0].labels))
+
+    # (u3) Only `status:untriaged` is unstaged. Any OTHER status — including untriaged ALONGSIDE
+    # one (the `status:available` acctNN inventory records, and the contradictory
+    # untriaged+ready pair `retriage.py` owns) — is still staged and never touched here.
+    for label in ("status:ready", "status:in-progress", "status:blocked"):
+        other = [issue(901, "Improve beta parser behavior", ("status:untriaged", label,
+                                                            "area:beta"))]
+        planned, _ = plan_repository(other, untriaged_labels, automation)
+        checks.append((f"status:untriaged + {label} is staged, never re-staged",
+                       not any(m.kind == "stage" for m in planned)))
+    inventory = [issue(902, "acct09", ("status:untriaged", "status:available", "area:beta"))]
+    planned, _ = plan_repository(inventory, untriaged_labels, automation)
+    checks.append(("a status:available account record is never staged",
+                   not any(m.kind == "stage" for m in planned)))
+
+    # (u4) THE CLOSE PATH IS NOT WIDENED. `has_status` still guards duplicate closure, so
+    # admitting 274 untriaged issues as staging candidates must not newly expose any of them to
+    # automated closing. Replacing `has_status` with `is_staged` in the close branch makes this
+    # red (the untriaged duplicate becomes closable).
+    dupes = [
+        issue(910, "Improve alpha parser behavior", ("status:untriaged", "area:alpha")),
+        issue(911, "Improve alpha parser behavior", ("status:untriaged", "area:alpha")),
+    ]
+    planned, _ = plan_repository(dupes, untriaged_labels, automation)
+    checks.append(("an untriaged duplicate is never auto-closed",
+                   not any(m.kind == "close" for m in planned)))
+
+    # (u5) THE STRIP IS BOUNDED AT THE MUTATION BOUNDARY, not by convention. execute_plan refuses
+    # any removal that is not `status:untriaged` on a `stage`. Deleting the raise lets a
+    # hand-built mutation strip anything.
+    for bad in (Mutation("stage", 1, issue(1, "x"), ("status:ready",), remove=("needs:user",)),
+                Mutation("needs-ec2", 1, issue(1, "x"), ("needs:ec2",),
+                         remove=("status:untriaged",))):
+        for apply_mode in (False, True):
+            refused = ""
+            try:
+                execute_plan("o/r", [bad], "tok", apply=apply_mode)
+            except CuratorError as exc:
+                refused = str(exc)
+            checks.append((f"execute_plan(apply={apply_mode}) refuses to strip "
+                           f"{bad.remove[0]} on a {bad.kind}", "may only remove" in refused))
+
+    # (u6) THE TARGET'S OWN AREA TAXONOMY. A repository's `area:*` labels are its declared surface
+    # vocabulary; before this rule only sparq-shaped hints (`sparq-*` crates, `site/`, `gui/`,
+    # `bench/`, `scripts/`) resolved, so every registry issue collapsed into `area:ci` and the
+    # one-issue-per-package wave rule pinned the whole target at one stage per run. Deleting the
+    # `declared` block makes this red.
+    declared_area, reason = derive_area(
+        issue(920, "The gamma sweep drops rows", ()), set(), all_labels)
+    checks.append(("an issue whose title names a declared area resolves to it",
+                   (declared_area, reason) == ("area:gamma", "title names a declared area")))
+    # Fail-closed on ambiguity, exactly like every other branch of derive_area.
+    ambiguous, reason = derive_area(
+        issue(921, "Make gamma and delta agree", ()), set(), all_labels)
+    checks.append(("two declared areas in one title is UNRESOLVED, never a coin flip",
+                   ambiguous is None and reason == "multiple declared areas named in title"))
+    # Word-boundary, not substring: `area:alpha` must not match "alphabetically". The body is
+    # neutral on purpose — `long_body` mentions `scripts/`, which the LATER path-hint rule
+    # resolves to `area:ci`, and a fixture that lets a different rule answer proves nothing about
+    # this one.
+    boundary, reason = derive_area(
+        issue(922, "Sort the output alphabetically", (), body="No paths here. " * 20),
+        set(), all_labels)
+    checks.append(("a declared area matches on word boundaries, not substrings",
+                   boundary is None and "declared" not in reason))
+    # An EXISTING area label still wins — the new rule is a last resort, not an override.
+    existing, reason = derive_area(
+        issue(923, "The gamma sweep drops rows", ("area:beta",)), {"area:beta"}, all_labels)
+    checks.append(("an existing area label still wins over the title",
+                   (existing, reason) == ("area:beta", "existing")))
+
+    # (u7) A FENCE WHOSE LABEL THE TARGET LACKS skips the ISSUE (never admits it) and fails the
+    # RUN — it no longer aborts the whole target's plan. Deleting the `continue`/log makes the
+    # first assertion red; deleting main()'s FENCE_UNAVAILABLE scan makes a silent pass possible,
+    # which the second assertion pins by requiring the marker in the log.
+    without_ec2 = all_labels - {"needs:ec2"} | {"status:untriaged"}
+    mixed = [
+        issue(930, "Benchmark the alpha loader on a dedicated EC2 instance and report ns/op",
+              ("status:untriaged",),
+              body="Run the benchmark on EC2 hardware and record the measured numbers. "
+                   + "Detailed acceptance criteria. " * 12),
+        issue(931, "Improve gamma parser behavior", ("status:untriaged", "area:gamma")),
+    ]
+    planned, logs = plan_repository(mixed, without_ec2, automation)
+    fence_lines = [line for line in logs if line.startswith(FENCE_UNAVAILABLE)]
+    checks.append(("an unavailable fence never admits its issue",
+                   not any(m.number == 930 for m in planned)))
+    checks.append(("an unavailable fence is logged for main() to fail the run on",
+                   len(fence_lines) == 1 and "needs:ec2" in fence_lines[0]))
+    checks.append(("...and the REST of the target is still curated",
+                   any(m.kind == "stage" and m.number == 931 for m in planned)))
+
     # [OPUS-5] The unattributable class must be REPORTED, not silently re-skipped forever.
     # "Zebra component" matches no crate, path or area label, so derive_area refuses it.
     # NB: a body with NO path and NO crate token — the shared long_body names scripts/frontier.py,
@@ -1688,6 +2077,7 @@ def main() -> int:
     targets = load_targets(Path(args.policy_file), args.bot_login)
     tokens, ambient = load_tokens()
     remaining_closes = MAX_CLOSES
+    unavailable_fences = 0
     for repo, automation_logins, allow_actions_bot_issues, target_ready in targets:
         owner = repo.split("/", 1)[0]
         token = tokens.get(owner, ambient)
@@ -1702,9 +2092,16 @@ def main() -> int:
         print(frontier_header(repo, issues, target_ready))
         for line in logs:
             print(line)
+            if line.startswith(FENCE_UNAVAILABLE):
+                unavailable_fences += 1
         actual_closes = execute_plan(repo, mutations, token, args.apply)
         used = actual_closes if args.apply else sum(m.kind == "close" for m in mutations)
         remaining_closes -= used
+    if unavailable_fences:
+        print(f"::error::{unavailable_fences} issue(s) matched a fence whose label the target "
+              f"repository does not carry; they were skipped, never admitted — create the "
+              f"missing label(s) named above", file=sys.stderr)
+        return 1
     return 0
 
 
