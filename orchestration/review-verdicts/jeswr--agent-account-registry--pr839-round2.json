@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 839,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "c39f3e79ad8b25d945a47ccfe477573b7ebc852c",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 1's two major findings are resolved. The implementation now explicitly scopes its privacy guarantee to removal of account censuses and per-account rows, acknowledges that live-agent counts remain a fleet-size lower bound, and uses accurate footer wording. The added busy-fleet test is non-vacuous: it exercises one live lease per account at different fleet sizes, verifies the known count-bearing residual actually diverges, and verifies the remaining quota/capacity projection is invariant after excluding that expressly retained residual. The per-account quota and observability rows, account-count fields, and eligible/total capacity census are projected away; headroom remains derived from the existing fail-closed eligibility predicate. The finished-document composition assertion and its positive, poisoning, nested-key, UI, and end-to-end tests provide meaningful regression coverage. No new correctness, soundness, or security issue is supported by the diff.",
+  "verdict": "approve"
+ }
+}
