@@ -209,6 +209,93 @@ jobs:
           # worker-live.sh's stateful contract fixture against this unchanged validator.
           python3 scripts/model-health.py decide --policy-file policy/repos.toml
 
+  # [OPUS-5] WATCH THE WATCHER, half (b): is the metrics snapshot still being DELIVERED?
+  #
+  # metrics.yml's own `metrics-alert` job catches a metrics job that RAN and FAILED. It structurally
+  # cannot catch a metrics job that never ran: a cron that silently under-delivers produces no
+  # failed job to key on, and no workflow can detect its own non-execution. Delivery here is
+  # measurably imperfect — on the live ring at 2026-07-27T15:50Z, 24 snapshots spanned 550.0 min
+  # (23.91 min effective cadence against a */15 schedule, 30.0 min worst gap).
+  #
+  # So the staleness assertion is hosted HERE, in a different workflow on an independent schedule.
+  # That makes the watchers a RING rather than a chain, and a chain of watchers always terminates in
+  # an unwatched one:
+  #   metrics job FAILS     -> metrics.yml   `metrics-alert`
+  #   metrics never RUNS    -> groom.yml     `metrics-stale`      (this job)
+  #   groom never RUNS      -> dashboard.yml `cron-keepalive`     (re-dispatches groom.yml at 1800s)
+  #   dashboard never RUNS  -> metrics.yml   `dashboard-publish`  (staleness fallback)
+  # Deliberately NOT hosted in dashboard.yml: registry #656 (dashboard live-refresh) is in flight
+  # there, and dashboard.yml already hosts the fleet-wide cron keepalive, which would make one
+  # workflow the single point of failure for two independent liveness mechanisms.
+  #
+  # NO `needs:` and NO `if:`, on purpose and asserted by scripts/metrics-alert.py's self-test over
+  # every groom outcome: a watchdog suppressed by the failure of the sweep it happens to share a
+  # workflow file with is not a watchdog. It reads ONE public JSON file's timestamp and holds
+  # contents:read + issues:write — no arming, no merging, no label writes of any kind.
+  metrics-stale:
+    name: WATCHDOG (is the metrics snapshot still being delivered?)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # SECRET-EXFIL GUARD (issue #101): reads ALERT_TOKEN/ALERT_REPO, so it is bound to the
+    # default-branch-only `dispatch-secrets` environment where those secrets live, exactly like the
+    # `groom` and `groom-alert` jobs.
+    environment: dispatch-secrets
+    # Repair authority, never admission authority. Pinned by the self-test.
+    permissions:
+      contents: read  # the two sparse checkouts below (script inputs + the published snapshot)
+      issues: write   # upsert/close the rolling snapshot-staleness ops-alert issue
+    steps:
+      # Same input set as metrics.yml's `metrics-alert` job: the script, plus the three files its
+      # --self-test asserts against (both workflow YAMLs for the `if:`/`needs:`/permissions/call-site
+      # seam, and scripts/metrics.py for the cross-file contract that the path read here is the path
+      # the collector writes). Missing inputs fail LOUD rather than silently skipping the checks.
+      - name: Check out ONLY the watchdog's inputs (pinned, sparse, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: registry
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/metrics-alert.py
+            scripts/metrics.py
+            .github/workflows/metrics.yml
+            .github/workflows/groom.yml
+          sparse-checkout-cone-mode: false
+
+      # The snapshot metrics.py CAS-publishes (scripts/metrics.py PUBLISHED_PATH) lives on the
+      # unprotected `ledger` data-plane branch. Read-only, one file. If this checkout fails the job
+      # goes red and the run is visibly broken; if it succeeds but the file is absent, the script
+      # treats that as STALE (fail-closed) rather than as healthy.
+      - name: Check out ONLY the published metrics snapshot from the ledger branch
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: ledger
+          ref: ledger
+          persist-credentials: false
+          sparse-checkout: data/metrics.json
+          sparse-checkout-cone-mode: false
+
+      - name: Alert maintainer if the published metrics snapshot has gone stale
+        id: metrics-stale
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REGISTRY_REPO: ${{ github.repository }}
+          # The collector's own published file, in the ledger worktree checked out above. The
+          # self-test cross-checks this against scripts/metrics.py's PUBLISHED_PATH, so the two
+          # cannot drift into a permanent false page.
+          SNAPSHOT_PATH: ledger/data/metrics.json
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          MAINTAINER_HANDLE: jeswr
+          # Privacy routing (locked decision 22c, issue #39). The body carries only a timestamp, an
+          # age and two run links — no account handles, no ledger content — so the registry-repo
+          # fallback is safe.
+          ALERT_REPO: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
+          ALERT_TOKEN: ${{ secrets.ALERT_TOKEN || '' }}
+        run: |
+          set -uo pipefail
+          python3 registry/scripts/metrics-alert.py --self-test
+          python3 registry/scripts/metrics-alert.py --stale-check
+
   # FAIL-LOUD alert for a HARD GROOM failure (issue #176). The model-access health decision is the
   # LAST step of the `groom` job under the default success() guard, and every other repair happens
   # inside that same job — so when an EARLIER step fails or is cancelled (ledger data-only invariant
