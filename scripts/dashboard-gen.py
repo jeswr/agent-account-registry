@@ -389,7 +389,29 @@ def _quota_state(account, entry, now):
     return "available", None
 
 
-def _provider_quota(accounts, usage, now):
+def _quota_probe_signal(probe):
+    """The provider-row `signal` for a snapshot the probe verdict DISTRUSTED (issue #628).
+
+    When `_probe_outcome` says the snapshot was not measured, build_dashboard discards the usage
+    map, so every provider row used to fall through to the "no live usage signal (catalog
+    availability only)" wording — the SAME string a provider that genuinely exposes no usage
+    headers emits, and one that still implies catalog availability is the signal (it is
+    deliberately not counted as free any more). The reason word tracks the normalized outcome so
+    "the probe reported a failure", "the last success is too old" and "no usable sidecar exists"
+    stay distinguishable on the row itself. Pure — unit-tested by --self-test."""
+    outcome = probe.get("outcome") if isinstance(probe, dict) else None
+    if outcome == "failed":
+        reason = "usage probe failed"
+    elif outcome == "ok":
+        # `ok` but not measured can only mean the freshness check rejected the stamp.
+        reason = "usage probe is stale"
+    else:
+        reason = "usage probe outcome is unknown"
+    return (f"{reason} — no measurement for this snapshot "
+            "(catalog availability is not counted as free)")
+
+
+def _provider_quota(accounts, usage, now, probe=None):
     """Per-provider CUMULATIVE quota rows (maintainer request 2026-07-18): where a provider has
     several accounts, the AGGREGATE headroom across them; single-account providers still emit a
     row, marked `single_account`. HONEST aggregation of the signals that actually exist — no
@@ -420,10 +442,20 @@ def _provider_quota(accounts, usage, now):
     --self-test; rows carry provider names + counts only (decision 22: no account identifiers,
     salted or otherwise, on this surface).
 
+    `probe` is the normalized probe verdict (`_probe_outcome`) for the snapshot, when the caller
+    has one. It changes NO count — the counts already fail closed on the empty map build_dashboard
+    hands over — only the `signal` label, which must name the broken probe instead of borrowing the
+    "this provider exposes no usage headers" wording (issue #628). A distrusted verdict takes
+    precedence over the probed/exempt derivation below, because both of those are read out of the
+    very snapshot the verdict rejected: the row must never claim a live measurement it cannot back.
+
     These rows are INTERNAL as of issue #374. The counts below are the source of truth for the
     capacity decision and are asserted in both directions by the suite, but they are never
     published: build_dashboard emits `_public_provider_quota(_provider_quota(...))`, which keeps the
     operational answer and drops every field that reads out the fleet's size."""
+    # #628: `probe=None` means "the caller stated nothing about the probe" and leaves the labels
+    # exactly as they were; any verdict that is not an explicit measurement distrusts the snapshot.
+    distrusted = probe is not None and not (isinstance(probe, dict) and probe.get("measured") is True)
     groups = {}
     for account in accounts:
         groups.setdefault(account["provider"], []).append(account)
@@ -506,7 +538,9 @@ def _provider_quota(accounts, usage, now):
                 "soonest_reset": min(window["resets"], default=None),
                 "oldest_reset": max(window["resets"], default=None),
             })
-        if probed and exempt:
+        if distrusted:
+            signal = _quota_probe_signal(probe)
+        elif probed and exempt:
             signal = "mixed: live rate-limit-header probe + probe-exempt accounts"
         elif probed:
             signal = "live rate-limit-header probe (per-window utilization)"
@@ -1431,7 +1465,9 @@ def build_dashboard(issues, leases_document, usage, dispatch_history, model_heal
         # (issue #374). The per-account `accounts` array that used to sit under this key is gone;
         # this section is now the whole quota surface.
         "provider_quota": _public_provider_quota(
-            _provider_quota(accounts, usage_rendered, now)),
+            # The verdict travels WITH the snapshot it licensed (#628): when it distrusted the
+            # snapshot, the row says so instead of reading like a provider with no usage headers.
+            _provider_quota(accounts, usage_rendered, now, probe)),
         "fleet": {
             "active_agents": len(live),
             "capacity": _public_capacity(capacity),
@@ -1844,6 +1880,49 @@ def _self_test():
         "windows": [],  # no usage signal exists -> no remaining-quota number is fabricated
         "soonest_reset": _utc_iso(now + 300), "oldest_reset": _utc_iso(now + 300),
     })
+    # [#628] A DISTRUSTED snapshot must not borrow the future-provider wording. Once the probe
+    # verdict fails closed, build_dashboard hands over an empty usage map, so every row fell into
+    # the "no live usage signal (catalog availability only)" branch — which says the provider
+    # exposes no usage headers (it may well expose them; the probe broke) and still credits catalog
+    # availability as the signal (it is deliberately not counted as free). Each reason word is
+    # pinned separately, so collapsing the outcomes into one label turns a row red.
+    def _distrust_signal(reason):
+        return (f"{reason} — no measurement for this snapshot "
+                "(catalog availability is not counted as free)")
+
+    unmeasured_probes = {
+        "failed": _probe_outcome({"schema": PROBE_SCHEMA, "outcome": "failed",
+                                  "attempted_at": now - 30}, now),
+        "stale ok": _probe_outcome({"schema": PROBE_SCHEMA, "outcome": "ok",
+                                    "attempted_at": now - PROBE_MAX_AGE_SECONDS - 1}, now),
+        "no sidecar": _probe_outcome(None, now),
+    }
+    check("[#628] a distrusted snapshot names the probe, and the reason tracks the outcome",
+          {name: _provider_quota(quota_accounts[3:], {}, now, probe)[0]["signal"]
+           for name, probe in unmeasured_probes.items()},
+          {"failed": _distrust_signal("usage probe failed"),
+           "stale ok": _distrust_signal("usage probe is stale"),
+           "no sidecar": _distrust_signal("usage probe outcome is unknown")})
+    check("[#628] ...and none of them is the no-usage-headers label that provider would emit",
+          [_provider_quota(quota_accounts[3:], {}, now)[0]["signal"],
+           any(_provider_quota(quota_accounts[3:], {}, now, probe)[0]["signal"]
+               == _provider_quota(quota_accounts[3:], {}, now)[0]["signal"]
+               for probe in unmeasured_probes.values())],
+          ["no live usage signal (catalog availability only)", False])
+    # Both directions of the precedence. A distrusted verdict wins over the probed/exempt
+    # derivation (those are read out of the rejected snapshot, so "live rate-limit-header probe"
+    # would be a claim the verdict cannot back) — and a MEASURED verdict changes nothing at all,
+    # so the new branch cannot swallow the honest labels.
+    check("[#628] a distrusted verdict never claims a live measurement, however live the map looks",
+          [row["signal"] for row in _provider_quota(quota_accounts, quota_usage, now,
+                                                    unmeasured_probes["failed"])],
+          [_distrust_signal("usage probe failed")] * 2)
+    check("[#628] a measured verdict leaves the probed/exempt signals exactly as they were",
+          [row["signal"] for row in _provider_quota(
+              quota_accounts, quota_usage, now,
+              _probe_outcome({"schema": PROBE_SCHEMA, "outcome": "ok",
+                              "attempted_at": now - 30}, now))],
+          [quota_rows[0]["signal"], quota_rows[1]["signal"]])
     check("cumulative quota: fail-closed-omitted account is unknown, never free",
           [(row["accounts_available"], row["accounts_unknown"]) for row in _provider_quota(
               [{"handle": "ghost", "provider": "anthropic", "catalog_available": True,
@@ -2087,6 +2166,20 @@ def _self_test():
           {"outcome": "failed", "detail": "secret-materialization-failed",
            "attempted_at": _utc_iso(now - 30), "age_seconds": 30, "stale": False,
            "measured": False})
+    # [#628] The WIRING: the verdict must actually reach the row build_dashboard publishes. Dropping
+    # the `probe` argument at the call site leaves every other assertion in this file green while the
+    # page goes back to blaming the provider for a broken probe, so it is asserted end-to-end here —
+    # once for a failed sidecar and once for none at all, which carry different reason words.
+    check("[#628] the published row blames the probe, not the provider, on a distrusted snapshot",
+          [degraded["provider_quota"][0]["signal"],
+           build_dashboard(issues, leases, usage, history, None, now,
+                           "fixture-salt")["provider_quota"][0]["signal"]],
+          [_distrust_signal("usage probe failed"),
+           _distrust_signal("usage probe outcome is unknown")])
+    check("[#628] ...while a fresh measurement publishes the live-probe signal unchanged",
+          build_dashboard(issues, leases, usage, history, None, now, "fixture-salt",
+                          probe_status=fresh_probe)["provider_quota"][0]["signal"],
+          "live rate-limit-header probe (per-window utilization)")
     check("stale ok probe surfaces its age and stops counting as measured",
           _probe_outcome(stale_probe, now),
           {"outcome": "ok", "detail": "probe-succeeded",
