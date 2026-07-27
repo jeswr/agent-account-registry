@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 867,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "7273d63356275c179eabdf1398a9fc9582c087c0",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly strengthens the provider-label regression from a prose/textual claim into a non-vacuous execution test. The harness obtains LABELS_JSON from the actual meta step env mapping, renders the relevant GitHub Actions expressions, executes the real delimited predicate, and verifies both command-substitution and backtick payloads remain data. Its positive control runs the same payloads through the former inline join form and requires canary creation, so a renderer that merely neutralizes expressions cannot pass. The env reader and expression renderer fail closed on missing, ambiguous, empty, or invalid inputs, and the exact LABELS_JSON expression plus absence of label-context interpolation in consuming run scripts are pinned. The workflow itself only gains explanatory comments and does not weaken permissions, routing, gates, or trust checks.",
+  "verdict": "approve"
+ }
+}
