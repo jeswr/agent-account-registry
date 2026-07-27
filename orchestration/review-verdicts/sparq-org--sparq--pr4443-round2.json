@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4443,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c4d60958df58dbe1a36e25326166bba4d18d8231",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves both prior major findings. The latency harness now makes probe inputs and returned vectors opaque to optimization, retains separate per-arm checksums, asserts equivalence and non-vacuity, performs discarded warmups, and times both arms in opposite orders. The documentation has also been narrowed consistently across Cargo.toml, README.md, compress.rs, and the data-formats skill: it claims only synthetic, host-independent block-skip opportunity, explicitly disclaims latency conclusions, and leaves real-dataset canonical-host validation pending. The model/shipped-filter and feature-off-baseline equivalence tests exercise the real filter and range paths rather than mocks. No correctness, soundness, test-validity, security, or instruction-injection issue remains in the supplied diff.",
+  "verdict": "approve"
+ }
+}
