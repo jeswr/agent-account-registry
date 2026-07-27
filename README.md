@@ -371,10 +371,12 @@ than failing later at claim time:
 Commit + push to `master`. An account that is available + in the catalog but **not** in a repo's
 `account_pool` will never be claimed for that repo.
 
-> **If the handle was enrolled by the broker, this step is a grant WIDENING** — its account issue
-> carries a `grant_targets:` line that must gain the same `<owner>/<repo>`, or the record now
-> disagrees with policy and the next `activate` for that handle refuses. See
-> [`grant_targets:` is the authorization record](#grant_targets-is-the-authorization-record--how-to-read-it-and-how-to-repair-it).
+> **If the handle was enrolled by the broker, do NOT widen its grant here.** An ordinary policy PR
+> takes effect for claims the moment it merges, but it establishes no row-scoped
+> `account-pool/<handle>` provenance for the new row — which the broker requires per granted row —
+> and it leaves the account issue's `grant_targets:` line disagreeing with policy, so that handle's
+> resume and `activate` paths then refuse. Widen through the broker instead: see
+> [`grant_targets:` — the recorded target set, and how to repair it](#grant_targets--the-recorded-target-set-and-how-to-repair-it).
 
 ### Verify
 
@@ -692,7 +694,7 @@ invalid, or under-scoped, the broker exits **without ever surfacing a sign-in UR
 `gh secret set REGISTRY_SECRETS_PAT --repo jeswr/agent-account-registry --env dispatch-secrets`)
 is posted on the issue, so a credential is never captured that cannot be stored.
 
-### `grant_targets:` is the authorization record — how to read it and how to repair it
+### `grant_targets:` — the recorded target set, and how to repair it
 
 One authorization, three artifacts, read at three different times:
 
@@ -700,14 +702,22 @@ One authorization, three artifacts, read at three different times:
 |---|---|---|---|
 | `grant:<owner>/<repo>` labels | the **request** issue | the human opening the request | the broker's `authorize` step — and **re-read live** immediately before the pool write |
 | `account_pool = [...]` rows | `policy/repos.toml` | the checked `account-pool/<handle>` PR | `policy-resolve` / `select-and-claim`, at **claim** time |
-| `grant_targets: <owner>/<repo>[, ...]` | the **account** issue body (title = the handle) | the broker, when it creates the record | the #211 **resume** path and the post-merge **`activate`** job |
+| `grant_targets: <owner>/<repo>[, ...]` | the **account** issue body (title = the handle) | the broker, when it creates the record (and an operator, by hand, in the recoveries below) | the #211 **resume** path and the post-merge **`activate`** job |
 
 The record is not a duplicate of policy. `activate` fires on a `pull_request` event with no access to
-the request issue's labels, so `grant_targets:` is the only statement of *what was authorized* that it
-can re-prove the merged policy against. `grant-account.verify_membership` requires, in the merged
-document: **every** recorded target lists the handle **exactly once**, and **no other row** lists it at
-all. Both legs are refusals — a record that cannot be read, or that disagrees with policy, fails closed
-and leaves the account `status:pending` for a human. Two states an operator has to repair by hand.
+the request issue's labels, so `grant_targets:` is the only *readable-from-there* statement of the
+authorized target set that it can re-prove the merged policy against. `grant-account.verify_membership`
+requires, in the merged document: **every** recorded target lists the handle **exactly once**, and **no
+other row** lists it at all. Both legs are refusals — a record that cannot be read, or that disagrees
+with policy, fails closed and leaves the account `status:pending` for a human.
+
+**What the record is not.** It is an issue body an operator can edit, and nothing re-derives it from
+the `grant:` labels after enrollment, so it is the broker's transcript of an authorization, never the
+authorization itself. Editing it changes what the later proofs are compared *against*; it is not
+evidence that the request ever authorized a target, and it cannot supply the row-scoped
+`account-pool/<handle>` provenance the broker's no-op/resume path separately requires. That is why the
+first recovery below is a reconstruction of a record whose grant was already reviewed, and the second
+one drives the change back through the broker rather than hand-editing the line into agreement.
 
 #### Recovery 1 — a pre-#579 account record has no `grant_targets:` line
 
@@ -736,32 +746,55 @@ Shape rules `parse_record_line` / `verify_membership` enforce: one line, comma-s
 `<owner>/<repo>`, anywhere in the body; entries are order- and duplicate-insensitive (sorted and
 deduped on read), but each must name an `enabled = true` row of `policy/repos.toml`, and the set must
 be **exactly** the rows the grant occupies — an extra target fails the *exactly once* leg, an omitted
-occupied row fails the *no other row* leg. Then merge the pending PR (or re-run `activate` on it; or
-re-apply `set-up-account` to resume).
+occupied row fails the *no other row* leg. Then **merge the pending PR** — `activate` fires on the
+merge and finishes the enrollment. There is nothing to re-run before then: the job is gated on
+`pull_request.merged == true`, so re-triggering it on a still-open PR is skipped and recovers nothing.
+The pre-merge resume option is re-applying `set-up-account` on the bound request issue.
 
 Do **not** instead hand-add the handle to `policy/repos.toml` to make the two agree: that trades a
 documented one-line record edit for an unreviewed write to the credential-authorization boundary, and
 activation would then refuse anyway for want of a merged, row-scoped `account-pool/<handle>` PR
 accounting for the membership.
 
-#### Recovery 2 — widening a pool by hand must widen the record too
+#### Recovery 2 — widening (or narrowing) an enrolled handle's grant
 
-Adding an already-enrolled handle to another repository's `account_pool` in an ordinary policy PR is a
-normal thing to do — but because `verify_membership` refuses when the handle appears in a **non-target**
-row, that widening leaves the account record disagreeing with policy. So a grant widening has **two**
-halves:
+**Do not widen a brokered handle in an ordinary policy PR.** That half takes effect for claims as soon
+as it merges — `policy-resolve` / `select-and-claim` read `account_pool` and never read
+`grant_targets:` — while establishing no `account-pool/<handle>` provenance for the new row, and the
+next resume for that handle then refuses **either way**: with the record widened to match,
+`trace_membership_provenance` finds no merged, row-scoped grant PR that established the new row; with
+the record left alone, `verify_membership` sees the handle in a **non-target** row. Editing the line
+afterwards does not repair that — it changes only what the proofs compare against.
 
-1. the policy PR that adds the handle to the new row, **and**
-2. an edit to that account issue's `grant_targets:` line adding the same `<owner>/<repo>`.
+Widen through the broker instead, so the audited `grant:` labels are re-proved and the addition lands
+on the checked branch:
 
-The lag is what makes half 2 easy to forget: `select-and-claim` reads *policy*, so the widening takes
-effect for claims as soon as it merges, while the record is read only by resume and `activate` — so the
-disagreement surfaces much later, as a refused activation the next time either runs for that handle (a
-re-run of the merged `account-pool/<handle>` PR's workflow, a manual recovery PR on that branch, or a
-resumed request bound to the account). The same applies in reverse: **narrowing** a pool by hand —
-removing the handle from a row the record still lists — fails the *exactly once* leg, so drop the
-repository from `grant_targets:` in the same change window.
+1. Add the `grant:<owner>/<repo>` label for the new repository to the **original request issue** —
+   the authorization act, on the audited surface the broker actually reads.
+2. Add the same `<owner>/<repo>` to that account issue's `grant_targets:` line. Resume treats the
+   recorded set as the request's authorization snapshot and requires the live labels to still equal it
+   (`require_same_targets`), and `activate` reads the record at merge time — so it has to be there
+   before either runs.
+3. Re-apply the `set-up-account` label to that request issue — a closed one is fine, the workflow
+   triggers on `issues: [labeled]` and reconcile keys off the still-open **account** issue. The #211
+   resume path skips login and registration (the credential is already captured, the slot is the same
+   handle), re-runs `authorize` over the live labels against policy, and opens the **row-scoped**
+   `account-pool/<handle>` PR whose only edit is the new row.
+4. Let `gate` review that PR and merge it. `activate` then re-proves all four legs against the merged
+   policy — the recorded set, the row-scoped before/after pair, the PR's file scope, and its own
+   merge-base diff — and no-ops on an account that is already `status:available`.
 
-The record is the authorization record: if it does not name the repository, the enrollment was never
-proven authorized for it, and the fail-closed direction is a refused activation rather than a silent
-grant.
+If the broker cannot be driven (the request issue is gone, or the account issue no longer resolves as
+resumable — it must be open and `status:pending`/`status:available`), the fallback is to open the
+`account-pool/<handle>` PR **by hand on that branch**, record edited first: the human review of that
+PR is then the authorization of record, and it is what later traces as provenance for the row. An
+ordinary policy PR is never a substitute for it.
+
+**Narrowing** is the one hand edit that stands on its own: remove the handle from the row in a policy
+PR and drop that repository from `grant_targets:` in the same change window. A row the grant no longer
+occupies needs no provenance, and leaving it recorded fails the *exactly once* leg the next time
+resume or `activate` runs for that handle.
+
+The fail-closed direction throughout is a refused activation rather than a silent grant: the record
+decides what `activate` and resume compare the merged policy against, but what licenses a grant is the
+reviewed `account-pool/<handle>` PR behind it.
