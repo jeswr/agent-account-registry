@@ -2660,6 +2660,12 @@ def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_logi
         if isinstance(page, list):
             rows.extend(row for row in page if isinstance(row, dict))
     readmitted = migrated = 0
+    # [G5] One census row per admission DECISION, aggregated into a single population line at the
+    # end of the sweep. Per-PR "park stands" lines already exist; what did not exist is any
+    # aggregate that can tell a self-healing park from one no tick will ever clear, so the
+    # 20-hour stall of a HUMAN-APPLIED `review:parked` cohort was expressible only by reading
+    # every line of a 3,400-line run log. A per-run success signal cannot express a missing edge.
+    park_census = []
     for row in sorted(rows, key=lambda row: row.get("number") or 0):
         number = row.get("number")
         if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
@@ -2740,7 +2746,8 @@ def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_logi
                 consumed=worker_pr.park_generation_cutoffs(comments, bot_login),
                 auto_receipts=worker_pr.auto_readmission_records(comments, bot_login),
                 auto_marker_count=worker_pr.auto_readmission_marker_count(comments, bot_login),
-                auto_evidence=evidence_probe, live_holds=holds, log=log)
+                auto_evidence=evidence_probe, live_holds=holds, log=log,
+                census=park_census)
             if action == "auto-mint":
                 # RECEIPT FIRST, then the labels (see the docstring).
                 post_comment(repo, number, worker_pr.auto_readmission_receipt(
@@ -2760,7 +2767,43 @@ def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_logi
         except (DispatchError, worker_pr.WorkerPrError) as exc:
             log(f"::warning::auto-readmit skipped for {repo}#{number}: {exc}; the capacity "
                 "park stands")
+    _log_park_census(repo, park_census, log=log)
     return readmitted
+
+
+def _log_park_census(repo, census, log=print):
+    """[G5] Emit the parked-population census for ONE repository's re-admission sweep.
+
+    Three lines at most, and the split is the point:
+
+    - the always-on aggregate, so "how many parks, in what state" is one grep rather than a
+      reconstruction from per-PR lines;
+    - a ``::warning::`` naming the HUMAN-TERMINAL population, because that is the cohort no
+      later tick can clear — the sweep is declining CORRECTLY and will keep declining forever,
+      which is precisely the state a per-run success signal cannot express. Naming the PR
+      numbers is what makes it actionable instead of merely true;
+    - a ``::warning::`` for any UNCLASSIFIED code, which can only mean a writer added a refusal
+      the taxonomy does not know about. That is taxonomy drift, and the fail direction is to say
+      so loudly rather than to file it as self-healing.
+
+    Emits NOTHING for an empty census: a sweep that considered no parked PR has no population to
+    report, and a zero line every tick would train the reader to skip it."""
+    counts, terminal, unclassified = _park_policy.park_census_summary(census)
+    if not counts:
+        return
+    log(f"park census {repo}: " + ", ".join(f"{code}={count}" for code, count in counts.items()))
+    if terminal:
+        log(f"::warning::park census {repo}: {len(terminal)} parked PR(s) are in a HUMAN-TERMINAL "
+            "state that no automatic re-admission can clear — "
+            + ", ".join(f"#{number}" for number in terminal)
+            + ". These are declining CORRECTLY (a human-owned hold is live, a proven human "
+            "applied the park, or the automatic cap is spent); they need a HUMAN gesture, and "
+            "they will stay parked until one arrives.")
+    if unclassified:
+        log(f"::warning::park census {repo}: refusal code(s) outside the G5 taxonomy on "
+            + ", ".join(f"#{number}" for number in unclassified)
+            + " — a park writer has drifted from park_policy.PARK_REFUSAL_CODES and its "
+            "population is uncounted")
 
 
 # [registry #677] How many partition-starvation parks ONE tick may UN-park, per repository. The
@@ -11450,6 +11493,74 @@ def _starvation_sweep_self_test():
     assert _park_policy.HUMAN_PARK_LABEL not in body.splitlines()[0], body.splitlines()[0]
     print("  ok   #677 starvation park: writes review:parked + ONE receipt and NOTHING else — "
           "never needs:user, review:needs-user or status:parked")
+
+    # ---- [G5] the parked-population census -------------------------------------------------
+    #
+    # The sweep emits one "park stands" line per PR per tick and NO aggregate, so a cohort that
+    # is declining correctly-but-forever is indistinguishable from one about to self-heal.
+    # MEASURED on sparq-org/sparq (dispatch run 30262478746, 2026-07-27T11:53Z): 21 parked PRs,
+    # reported by the only existing aggregate as a single "machine capacity park stands ...=13".
+    census_log = []
+    _log_park_census("o/r", [], log=census_log.append)
+    assert census_log == [], census_log
+    print("  ok   [G5] an EMPTY census emits nothing — no zero line to train the reader to skip")
+
+    census_log.clear()
+    _log_park_census("o/r", [
+        {"repo": "o/r", "number": 4197, "code": _park_policy.PARK_REFUSAL_HUMAN_APPLIED,
+         "exit": "human-terminal", "detail": "x"},
+        {"repo": "o/r", "number": 3577, "code": _park_policy.PARK_REFUSAL_HUMAN_APPLIED,
+         "exit": "human-terminal", "detail": "x"},
+        {"repo": "o/r", "number": 4519, "code": _park_policy.PARK_REFUSAL_NO_EVIDENCE,
+         "exit": "exit-reachable", "detail": "x"},
+    ], log=census_log.append)
+    aggregate = census_log[0]
+    assert aggregate == "park census o/r: human-applied=2, no-evidence=1", aggregate
+    warning = census_log[1]
+    assert warning.startswith("::warning::park census o/r: 2 parked PR(s) are in a "
+                              "HUMAN-TERMINAL state"), warning
+    # The population must be NAMED. A count alone is true and useless — an operator cannot act
+    # on "2 PRs", and the whole defect being fixed is that this cohort was unidentifiable.
+    assert "#3577" in warning and "#4197" in warning, warning
+    # ... and the exit-reachable PR must NOT be swept into the human-terminal warning: conflating
+    # them is the exact bucket this census exists to split.
+    assert "#4519" not in warning, warning
+    assert len(census_log) == 2, census_log
+    print("  ok   [G5] the census splits human-terminal from exit-reachable and NAMES the "
+          "cohort a human must clear")
+
+    census_log.clear()
+    _log_park_census("o/r", [{"repo": "o/r", "number": 99, "code": "some-future-code"}],
+                     log=census_log.append)
+    assert any("outside the G5 taxonomy" in line and "#99" in line for line in census_log), \
+        census_log
+    print("  ok   [G5] a refusal code outside the taxonomy is reported as drift, never filed "
+          "as self-healing")
+
+    # THE WIRING, asserted on the PARSED TREE — not on the source text. A comment mentioning
+    # `census` cannot satisfy an AST query, and neither can a docstring; the keyword argument and
+    # the call have to genuinely be there. (Measured repeatedly on this repo: wiring assertions
+    # that grep source text stay green when the wiring is deleted but the comment survives.)
+    import ast as _ast
+    _sweep_tree = _ast.parse(textwrap.dedent(inspect.getsource(_readmit_capacity_parks)))
+    _admission_census_kw = [
+        call for call in _ast.walk(_sweep_tree)
+        if isinstance(call, _ast.Call)
+        and isinstance(call.func, _ast.Attribute)
+        and call.func.attr == "capacity_park_admission"
+        and any(kw.arg == "census" for kw in call.keywords)]
+    assert len(_admission_census_kw) == 1, \
+        f"_readmit_capacity_parks must pass census= to capacity_park_admission exactly once; " \
+        f"found {len(_admission_census_kw)}"
+    _census_emitters = [
+        call for call in _ast.walk(_sweep_tree)
+        if isinstance(call, _ast.Call) and isinstance(call.func, _ast.Name)
+        and call.func.id == "_log_park_census"]
+    assert len(_census_emitters) == 1, \
+        f"_readmit_capacity_parks must emit the census exactly once; found " \
+        f"{len(_census_emitters)}"
+    print("  ok   [G5] the sweep is WIRED to the census (AST-asserted: census= keyword + one "
+          "emitter, immune to a comment that merely names it)")
 
     # RECEIPT-FIRST: a crash between the two leaves an explained PR with no label, never a
     # mysterious label with no explanation.
