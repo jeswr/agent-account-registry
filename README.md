@@ -371,6 +371,11 @@ than failing later at claim time:
 Commit + push to `master`. An account that is available + in the catalog but **not** in a repo's
 `account_pool` will never be claimed for that repo.
 
+> **If the handle was enrolled by the broker, this step is a grant WIDENING** — its account issue
+> carries a `grant_targets:` line that must gain the same `<owner>/<repo>`, or the record now
+> disagrees with policy and the next `activate` for that handle refuses. See
+> [`grant_targets:` is the authorization record](#grant_targets-is-the-authorization-record--how-to-read-it-and-how-to-repair-it).
+
 ### Verify
 
 ```bash
@@ -686,3 +691,77 @@ invalid, or under-scoped, the broker exits **without ever surfacing a sign-in UR
 (the exact mint grants and the storage command
 `gh secret set REGISTRY_SECRETS_PAT --repo jeswr/agent-account-registry --env dispatch-secrets`)
 is posted on the issue, so a credential is never captured that cannot be stored.
+
+### `grant_targets:` is the authorization record — how to read it and how to repair it
+
+One authorization, three artifacts, read at three different times:
+
+| Artifact | Lives on | Written by | Read by |
+|---|---|---|---|
+| `grant:<owner>/<repo>` labels | the **request** issue | the human opening the request | the broker's `authorize` step — and **re-read live** immediately before the pool write |
+| `account_pool = [...]` rows | `policy/repos.toml` | the checked `account-pool/<handle>` PR | `policy-resolve` / `select-and-claim`, at **claim** time |
+| `grant_targets: <owner>/<repo>[, ...]` | the **account** issue body (title = the handle) | the broker, when it creates the record | the #211 **resume** path and the post-merge **`activate`** job |
+
+The record is not a duplicate of policy. `activate` fires on a `pull_request` event with no access to
+the request issue's labels, so `grant_targets:` is the only statement of *what was authorized* that it
+can re-prove the merged policy against. `grant-account.verify_membership` requires, in the merged
+document: **every** recorded target lists the handle **exactly once**, and **no other row** lists it at
+all. Both legs are refusals — a record that cannot be read, or that disagrees with policy, fails closed
+and leaves the account `status:pending` for a human. Two states an operator has to repair by hand.
+
+#### Recovery 1 — a pre-#579 account record has no `grant_targets:` line
+
+Symptom, from `activate`:
+
+```
+refusing to activate acct07: the account record carries no `grant_targets:` line, so the
+repositories this account was authorized for cannot be read — refusing to prove or activate
+its grant (fail closed)
+```
+
+or, from a re-applied `set-up-account` on the bound request issue: *"…its authorized target
+repositories cannot be read … Add a valid `grant_targets:` line to the issue body, then re-apply
+set-up-account."*
+
+Who is affected: an account issue created **before #579** (no such line) that is still
+`status:pending` with an unmerged `account-pool/<handle>` PR. The recovery is a one-line hand edit of
+the **account issue body** — not a policy edit — naming exactly the repositories whose `account_pool`
+that pending entry occupies:
+
+```
+grant_targets: jeswr/agent-account-registry, sparq-org/sparq
+```
+
+Shape rules `parse_record_line` / `verify_membership` enforce: one line, comma-separated
+`<owner>/<repo>`, anywhere in the body; entries are order- and duplicate-insensitive (sorted and
+deduped on read), but each must name an `enabled = true` row of `policy/repos.toml`, and the set must
+be **exactly** the rows the grant occupies — an extra target fails the *exactly once* leg, an omitted
+occupied row fails the *no other row* leg. Then merge the pending PR (or re-run `activate` on it; or
+re-apply `set-up-account` to resume).
+
+Do **not** instead hand-add the handle to `policy/repos.toml` to make the two agree: that trades a
+documented one-line record edit for an unreviewed write to the credential-authorization boundary, and
+activation would then refuse anyway for want of a merged, row-scoped `account-pool/<handle>` PR
+accounting for the membership.
+
+#### Recovery 2 — widening a pool by hand must widen the record too
+
+Adding an already-enrolled handle to another repository's `account_pool` in an ordinary policy PR is a
+normal thing to do — but because `verify_membership` refuses when the handle appears in a **non-target**
+row, that widening leaves the account record disagreeing with policy. So a grant widening has **two**
+halves:
+
+1. the policy PR that adds the handle to the new row, **and**
+2. an edit to that account issue's `grant_targets:` line adding the same `<owner>/<repo>`.
+
+The lag is what makes half 2 easy to forget: `select-and-claim` reads *policy*, so the widening takes
+effect for claims as soon as it merges, while the record is read only by resume and `activate` — so the
+disagreement surfaces much later, as a refused activation the next time either runs for that handle (a
+re-run of the merged `account-pool/<handle>` PR's workflow, a manual recovery PR on that branch, or a
+resumed request bound to the account). The same applies in reverse: **narrowing** a pool by hand —
+removing the handle from a row the record still lists — fails the *exactly once* leg, so drop the
+repository from `grant_targets:` in the same change window.
+
+The record is the authorization record: if it does not name the repository, the enrollment was never
+proven authorized for it, and the fail-closed direction is a refused activation rather than a silent
+grant.
