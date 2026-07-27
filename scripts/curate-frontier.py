@@ -52,23 +52,6 @@ def _load_gh_retry() -> Any:
 _gh_retry = _load_gh_retry()
 
 
-def _load_ready_issues() -> Any:
-    spec = importlib.util.spec_from_file_location(
-        "registry_ready_issues", Path(__file__).resolve().with_name("ready-issues.py"))
-    if spec is None or spec.loader is None:
-        raise RuntimeError("cannot load the shared readiness engine")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-# THE readiness engine, imported rather than re-derived (retriage.py does the same, for the same
-# stated reason: "what must never happen is a THIRD, divergent copy of either rule"). The curator
-# needs it for exactly one question — how deep is the frontier ACTUALLY, right now — and the only
-# authority on that is the predicate the dispatcher itself enumerates with.
-_ready_issues = _load_ready_issues()
-
-
 TARGET_READY = 12
 MAX_CLOSES = 5
 GATE_LABELS = ("needs:", "trust:untrusted")
@@ -593,23 +576,12 @@ def plan_repository(
     if len(close_options) > close_limit:
         logs.append(f"defer {len(close_options) - close_limit} duplicate close(s): run cap is {close_limit}")
 
-    # THE FRONTIER DEPTH IS WHAT THE DISPATCHER CAN ENUMERATE, not what carries the label.
-    #
-    # A bare `"status:ready" in labels` count includes issues the readiness engine itself refuses:
-    # `status:ready` co-labelled `status:deferred`/`status:blocked`/`status:in-progress` is
-    # `busy:` to ready-issues.exclusion_reason and can never be dispatched from that state. On the
-    # live registry board that was 6 of the 13 counted "ready" issues (#32-#36, #43 — all
-    # `status:deferred`), so the curator read 13 >= target 12, computed depth 0 and staged nothing
-    # — for as long as those six stayed deferred, which is unboundedly. A depth budget that counts
-    # undispatchable work as frontier depth is a starvation latch: the emptier the real frontier
-    # gets (work parks, defers, blocks) the LESS the curator refills it.
-    #
-    # exclusion_reason is the dispatcher's own label-side predicate (open_blockers is deliberately
-    # left at its default here — a blocker count needs the issue payload, and counting a
-    # blocker-held issue as depth is the conservative direction).
+    # NOTE: the depth MEASUREMENT (raw `status:ready` count vs what the readiness engine can
+    # actually enumerate) is a separate, live defect owned by PR #799 — deliberately not touched
+    # here so the two repairs stay reviewable apart. This change is upstream of it: it decides
+    # WHICH ISSUES ARE CANDIDATES AT ALL. Both are required; neither subsumes the other.
     current_ready = sum(
-        1 for issue in open_issues
-        if _ready_issues.exclusion_reason(labels_of(issue)) is None
+        1 for issue in open_issues if "status:ready" in labels_of(issue)
     )
     depth = max(0, target_ready - current_ready)
     in_flight_blockers: dict[str, list[dict[str, Any]]] = {}
@@ -1502,13 +1474,7 @@ def main() -> int:
             target_ready=target_ready,
             allow_actions_bot_issues=allow_actions_bot_issues,
         )
-        # Report the DISPATCHABLE depth (what the readiness engine can enumerate), which is the
-        # number the depth budget actually spends, next to the raw label count it is not.
-        enumerable = sum(
-            _ready_issues.exclusion_reason(labels_of(i)) is None for i in issues)
-        print(f"== {repo}: ready={enumerable} "
-              f"(labelled status:ready={sum('status:ready' in labels_of(i) for i in issues)}) "
-              f"untriaged={sum(UNSTAGED_STATUS in labels_of(i) for i in issues)} "
+        print(f"== {repo}: ready={sum('status:ready' in labels_of(i) for i in issues)} "
               f"target={target_ready} ==")
         for line in logs:
             print(line)
