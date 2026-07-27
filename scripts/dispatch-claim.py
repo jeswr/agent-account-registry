@@ -6356,6 +6356,10 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
         # is only released once the LAST holder is parked, so a per-tick cap of 1 multiplied by
         # #822's 10-minute floor turned a 4-holder board into ~55 minutes of total dispatch
         # outage. The loop is per-holder-resilient — one failed park never costs the others.
+        #
+        # >>> starvation-park-batch — EXECUTED by _starvation_park_batch_seam_self_test against
+        # stubs. The sentinels delimit the exact source it runs, so "one tick parks all N" is
+        # proven on the PRODUCTION statements rather than on a copy of them or on their shape.
         starvation_targets = starvation_park_targets(
             repository["items"], starved, live_occupancy)
         for starvation_target in (starvation_targets
@@ -6385,6 +6389,7 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                 # applied is the difference between a self-healing fleet and a stalled one.
                 print(f"::warning::starvation park FAILED {repo}#{starvation_target}: {exc}; the "
                       f"`{GLOBAL_PACKAGE}` partition is still held")
+        # <<< starvation-park-batch
 
         # [registry #772] The starved lane's MISSING EDGE. The park sweep above declines every
         # holder that is not an un-parked provably-inert draft — correctly, because parking an
@@ -15921,6 +15926,100 @@ def _park_call_site(source):
     return None
 
 
+def _starvation_park_batch_source():
+    """The PRODUCTION park-batch statements, lifted verbatim from `dispatch()` by sentinel."""
+    source = inspect.getsource(dispatch)
+    begin = source.index("# >>> starvation-park-batch")
+    begin = source.index("\n", source.index("proven on the PRODUCTION", begin)) + 1
+    end = source.index("# <<< starvation-park-batch")
+    block = textwrap.dedent(source[begin:end])
+    assert block.startswith("starvation_targets = starvation_park_targets("), block[:80]
+    return block
+
+
+def _run_starvation_park_batch(holders, *, token=True, bot="bot", failing=(), planned=()):
+    """EXECUTE the production park-batch block over `holders` inert `__global__` occupants.
+
+    Returns `(parked, counted)` — the PR numbers whose label write actually happened, and the
+    `defer_reasons` count. Every collaborator is a stub, so what is under test is exclusively the
+    production control flow between `starvation_park_targets` and `park_starved_partition_holder`.
+    `failing` names holders whose label write raises, proving the batch is per-holder resilient.
+    """
+    parked, comments = [], []
+
+    def park_pr(number):
+        if number in failing:
+            raise DispatchError("label write failed")
+        parked.append(number)
+
+    occupancy = [_starvation_row(number, packages={GLOBAL_PACKAGE}) for number in holders]
+    namespace = {
+        "starvation_park_targets": starvation_park_targets,
+        "park_starved_partition_holder": park_starved_partition_holder,
+        "_starvation_row": _starvation_row,
+        "DispatchError": DispatchError,
+        "GLOBAL_PACKAGE": GLOBAL_PACKAGE,
+        "MACHINE_PARK_PR_LABEL": MACHINE_PARK_PR_LABEL,
+        "_park_policy": _park_policy,
+        "_issue_timeline_events": lambda *a, **k: [],
+        "_target_is_human_maintainer": lambda *a, **k: False,
+        "_labels": lambda row: [],
+        "_run_gh_target_comment": lambda repo, number, body: comments.append(number),
+        # the production `park_pr=` lambda closes over _run_gh_target_api; the stub reads the
+        # SAME arguments the real call site passes, so a re-pointed label would be visible here
+        "_run_gh_target_api": lambda repo, method, path, payload=None: park_pr(
+            int(path.rsplit("/", 2)[-2])),
+        "repo": "o/r",
+        "repository": {"items": list(planned)},
+        "starved": 12,
+        "live_occupancy": occupancy,
+        "bot_login": bot,
+        "_target_token": lambda _repo: token,
+        "pull_pages": [[{"number": number, "labels": []} for number in holders]],
+        "defer_reasons": Counter(),
+        "print": lambda *a, **k: None,
+    }
+    with contextlib.redirect_stdout(io.StringIO()):
+        exec(compile(_starvation_park_batch_source(),   # noqa: S102 — this repository's own source
+                     "<dispatch starvation-park-batch>", "exec"), namespace)
+    return parked, namespace["defer_reasons"]["partition-starvation-park"]
+
+
+def _starvation_park_batch_seam_self_test():
+    """[registry #822] THE DEFECT, PINNED ON EXECUTED PRODUCTION SOURCE.
+
+    Every other assertion about the batch calls the pure selector directly, so all of them stay
+    green if the production tick acts on only the first target — which IS the defect. This runs
+    the real statements and counts the real writes.
+    """
+    board = [4360, 4509, 4528, 4571][:MEASURED_STARVED_HOLDER_BOARD]
+    parked, counted = _run_starvation_park_batch(list(reversed(board)))
+    assert parked == board, (
+        f"ONE tick must park ALL {len(board)} inert `{GLOBAL_PACKAGE}` holders — the reservation "
+        f"is a union, so parking a subset frees nothing and #822's 10-minute floor makes each "
+        f"un-parked holder another 10 minutes of TOTAL dispatch outage (parked {parked})")
+    assert counted == len(board), counted
+    print(f"  ok   #822 park batch (EXECUTED production source): {len(board)} inert holders -> "
+          f"{len(parked)} label writes on ONE tick, and {counted} counted defer reason(s)")
+
+    # PER-HOLDER RESILIENT: one failed write must not cost the others their park. Under a cap of 1
+    # this case could not even arise; under a batch it is the difference between a partial drain
+    # and none, and the partition needs the LAST holder parked.
+    parked, counted = _run_starvation_park_batch(board, failing={board[0]})
+    assert parked == board[1:] and counted == len(board) - 1, (parked, counted)
+    print("  ok   #822 park batch: one FAILED label write does not abort the batch — the "
+          "remaining holders are still parked this tick")
+
+    # ...and the token/bot gate still stands the whole batch down, writing nothing.
+    assert _run_starvation_park_batch(board, token=False) == ([], 0)
+    assert _run_starvation_park_batch(board, bot="") == ([], 0)
+    # a HEALTHY plan writes nothing even with a full board of eligible holders — the production
+    # block must read the plan's own items, not a constant
+    assert _run_starvation_park_batch(board, planned=[{"number": 900}]) == ([], 0)
+    print("  ok   #822 park batch: no target token, no bot identity, and a HEALTHY plan each "
+          "stand the WHOLE batch down — writing nothing at all")
+
+
 def _starvation_sweep_self_test():
     item = {"number": 900, "package": "crate-a", "deferred": False}
     holder = _starvation_row(41, packages={GLOBAL_PACKAGE})
@@ -16771,6 +16870,9 @@ def _starvation_sweep_self_test():
         f"— otherwise the 1-holder-per-tick defect is back at 10 min/holder (found {park_seam!r})")
     print("  ok   #822 park call-site seam (AST): the production tick PARKS EVERY selected "
           "holder — a re-scalarised call site, a `[:1]`, or a call-site cap= reds here")
+
+    # ---- [registry #822] THE PARK BATCH, EXECUTED on production source -----------------------
+    _starvation_park_batch_seam_self_test()
 
     # ---- THE YAML SEAM: structural, on PARSED nodes ------------------------------------------
     _starvation_yaml_seam_self_test()
