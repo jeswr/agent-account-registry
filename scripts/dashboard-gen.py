@@ -96,6 +96,14 @@ PROBE_MAX_SKEW_SECONDS = 300
 # because the same count is already public on the `ledger` branch (`data/leases.json`); removing it
 # is a product call for the maintainer, tracked separately, not something to decide inside a
 # minimization pass.
+#
+# So the property this change actually establishes is "the public payload carries no ACCOUNT CENSUS
+# and no per-account row", NOT "no fleet count" — and both halves are load-bearing statements that
+# the suite pins: the clone-invariance test below runs each fleet size WITH one live lease per
+# account, so it asserts the invariance where the residual is live, and asserts the residual itself
+# (the agent counts DO scale) rather than avoiding load and implying it does not. The page footer is
+# worded to the same scope; do not restore an absolute "no fleet counts are published" claim while
+# `active_agents` ships.
 FLEET_COMPOSITION_KEYS = frozenset({
     "accounts", "accounts_total", "accounts_available", "accounts_capped", "accounts_unavailable",
     "accounts_unknown", "accounts_reporting", "single_account", "remaining_account_windows",
@@ -1597,15 +1605,18 @@ def _self_test():
 
     # --- Issue #374: NO FLEET COMPOSITION ON THE PUBLIC PAYLOAD. -------------------------------
     # The sharpest statement of the property, and the one that goes red on any partial revert: two
-    # fleets that differ ONLY in how many accounts they contain must publish the SAME document. The
-    # three-account fixture below is three clones of the one-account fixture — same provider, same
-    # limits, same probe numbers, same resets — so every surviving field is one an observer cannot
-    # count accounts with. Pre-#374 this was red on accounts (1 row vs 3), accounts_total (1 vs 3),
+    # fleets that differ ONLY in how many accounts they contain must publish the same document apart
+    # from the live-agent counts named as the KNOWN RESIDUAL above. The three-account fixture below
+    # is three clones of the one-account fixture — same provider, same limits, same probe numbers,
+    # same resets — so every surviving field is one an observer cannot count accounts with, and it
+    # is run both idle and at full occupancy. Pre-#374 this was red on accounts (1 row vs 3),
+    # accounts_total (1 vs 3),
     # single_account (True vs False), accounts_available (1 vs 3), remaining_account_windows
     # (0.58 vs 1.74), limit_remaining (580 vs 1740), limits_known/accounts_reporting (1 vs 3) and
     # fleet.capacity (eligible/total 1/1 vs 3/3) — i.e. on every field this change touched.
-    def clone_fleet(size):
-        clone_issues, clone_usage = [], {}
+    def clone_fleet(size, busy=0):
+        """`size` identical accounts, the first `busy` of them holding one live lease each."""
+        clone_issues, clone_usage, clone_leases = [], {}, []
         for index in range(size):
             clone_handle = f"acct-clone-{index}"
             clone_issues.append({
@@ -1618,12 +1629,48 @@ def _self_test():
             clone_usage[clone_handle] = {"status": "allowed", "5h_util": "0.42",
                                          "5h_reset": now + 3600, "7d_util": "0.8",
                                          "7d_reset": now + 86400}
-        built = build_dashboard(clone_issues, {"leases": []}, clone_usage, history, None, now,
-                                "fixture-salt", probe_status=measured_sidecar)
-        return {"provider_quota": built["provider_quota"], "fleet": built["fleet"]}
+            if index < busy:
+                clone_leases.append({
+                    "account": hashlib.sha256(
+                        f"{clone_handle}:fixture-salt".encode()).hexdigest()[:16],
+                    "claim_id": f"{index:x}" * 32, "holder": f"owner/repo#{index + 1}@run.1",
+                    "package": "pkg", "role": "impl", "model": "opus",
+                    "issued_at": now - 60, "expires_at": now + 60})
+        built = build_dashboard(clone_issues, {"leases": clone_leases}, clone_usage, history, None,
+                                now, "fixture-salt", probe_status=measured_sidecar)
+        return {"provider_quota": built["provider_quota"], "fleet": built["fleet"],
+                "active_by_repository": built["active_by_repository"]}
 
-    check("[#374] a 1-account and a 3-account fleet in the same state publish the SAME payload",
+    def without_agent_counts(published):
+        """The payload minus the KNOWN RESIDUAL (see the FLEET-COMPOSITION block at the top): the
+        live-lease counts, which are not claimed to be invariant and are not published as if they
+        were."""
+        trimmed = copy.deepcopy(published)
+        trimmed["fleet"].pop("active_agents")
+        trimmed.pop("active_by_repository")
+        return trimmed
+
+    check("[#374] a 1-account and a 3-account IDLE fleet publish a byte-identical payload",
           clone_fleet(1), clone_fleet(3))
+    # #839 review round 1, finding 1: idle fleets exercise the property at ZERO load, where nothing
+    # about the fleet is in play — which is precisely the state the residual cannot be seen from.
+    # Re-run it with one live agent per account, so each fixture is a fleet at full occupancy and
+    # the per-account census fields (accounts_total 1 vs 3, remaining_account_windows 0.58 vs 1.74,
+    # limit_remaining 580 vs 1740, capacity 1/1 vs 3/3) are all live and would diverge on a partial
+    # revert.
+    check("[#374] ...and so do a BUSY 1-account and 3-account fleet, one live agent per account",
+          without_agent_counts(clone_fleet(1, busy=1)),
+          without_agent_counts(clone_fleet(3, busy=3)))
+    # The residual, ASSERTED rather than implied by omission: the counts trimmed above really do
+    # scale with the fleet under load, so the property is "no account census", not "no fleet count".
+    # This row is what keeps the page footer and the block comment honest — a change that removes
+    # `active_agents` (or one that quietly restores an absolute no-fleet-count claim) has to come
+    # through here.
+    check("[#374] KNOWN RESIDUAL: the live-agent counts DO scale with the fleet under load",
+          [(clone_fleet(size, busy=size)["fleet"]["active_agents"],
+            clone_fleet(size, busy=size)["active_by_repository"]["repositories"][0]["counts"])
+           for size in (1, 3)],
+          [(1, {"opus": 1}), (3, {"opus": 3})])
     check("[#374] ...and that payload still reports the headroom honestly (not blanked out)",
           (clone_fleet(3)["provider_quota"][0]["headroom"],
            clone_fleet(3)["provider_quota"][0]["windows"][0]["remaining_fraction"],

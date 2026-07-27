@@ -115,7 +115,12 @@
       </section>
     </main>
 
-    <footer>Public operational view · no account identities or fleet counts are published</footer>
+    <!-- Scope this claim to what the payload actually withholds. `fleet.active_agents` and the
+         per-repository model counts ARE published (they are live-lease counts, already public on
+         the `ledger` branch), and with one worker per account they are a lower bound on the fleet
+         size — so an absolute "no fleet counts" claim would be false. See the KNOWN RESIDUAL block
+         in scripts/dashboard-gen.py. -->
+    <footer>Public operational view · no account identities or per-account rows; live-agent counts are published</footer>
   </div>
   <script src="app.js" defer></script>
 </body>
