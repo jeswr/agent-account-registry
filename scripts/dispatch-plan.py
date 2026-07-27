@@ -629,6 +629,75 @@ def _self_test():
     # the interlock is tested against the real engine it exists to protect rather than a mock of
     # it — `scripts/ready-issues.py` here has no `pull_request` guard at all.
     # ------------------------------------------------------------------------------------------
+    def _refuse_exit_zero_swallow(path, step_id):
+        """Refuse any way the `id: step_id` step can FAIL while its job stays green.
+
+        [#773 adversarial review, BLOCKING] The first cut of this check scanned the raw LINES
+        BEFORE the heredoc-open. `continue-on-error: true` placed AFTER `run:` is equally valid
+        YAML and was not in that range, so the mutant survived with the whole suite green and
+        `rc = 0` — a guard that claimed a ban it did not enforce. That is precisely why the
+        `>>> ... <<<` sentinels were deleted from this same change, so it is fixed the same way
+        rather than excused: walk the PARSED step MAPPING, where key order cannot hide anything.
+
+        Three distinct swallows, because they are independent:
+          1. `continue-on-error` (truthy) or `if:` on the STEP or its JOB — the step's failure,
+             or the step itself, disappears.
+          2. `set -euo pipefail` missing from the step's `run:` — a shell script's exit status is
+             its LAST command, so without `-e` a failing python is masked by anything after it.
+          3. anything after the heredoc terminator — even WITH `-e`, a trailing successful
+             command is the step's exit status if the heredoc is not last.
+        """
+        import yaml  # lazy: same shape as dispatch-secrets-guard's parsed step-level ban
+        with open(path, encoding="utf-8") as handle:
+            document = yaml.safe_load(handle)
+        found = []
+        for job_name, job in (document.get("jobs") or {}).items():
+            for step in (job or {}).get("steps") or []:
+                if isinstance(step, dict) and step.get("id") == step_id:
+                    found.append((job_name, job, step))
+        if len(found) != 1:
+            raise AssertionError(
+                f"expected exactly one step `id: {step_id}` in the parsed workflow, "
+                f"found {len(found)} — refusing")
+        job_name, job, step = found[0]
+        for scope, mapping in (("step", step), (f"job `{job_name}`", job)):
+            if mapping.get("continue-on-error"):
+                raise AssertionError(
+                    f"{scope} owning `id: {step_id}` carries a truthy `continue-on-error` — it "
+                    "could fail while the job stays green, making every assertion over its "
+                    "output vacuous. Refusing.")
+            if "if" in mapping:
+                raise AssertionError(
+                    f"{scope} owning `id: {step_id}` carries an `if:` condition — this block is "
+                    "EXECUTED by this self-test from its source text, so a conditional would "
+                    "pass every assertion while never running. Refusing.")
+        run = step.get("run")
+        if not isinstance(run, str):
+            raise AssertionError(f"step `id: {step_id}` has no `run:` script — refusing")
+        commands = [line for line in run.split("\n")
+                    if line.strip() and not line.lstrip().startswith("#")]
+        if not any(line.strip() == "set -euo pipefail" for line in commands):
+            raise AssertionError(
+                f"step `id: {step_id}`'s `run:` does not `set -euo pipefail` — a shell script "
+                "exits with its LAST command's status, so the planner could raise and the step "
+                "still succeed. Refusing.")
+        # `|| true` anywhere in the script, INCLUDING across a backslash continuation (a sibling
+        # seam check was found to miss exactly that), and any command after the heredoc closes.
+        flattened = run.replace("\\\n", " ")
+        if "|| true" in "\n".join(line for line in flattened.split("\n")
+                                  if not line.lstrip().startswith("#")):
+            raise AssertionError(
+                f"step `id: {step_id}` neutralises a command with `|| true` — refusing")
+        terminators = [i for i, line in enumerate(commands) if line.strip() == "PY"]
+        if not terminators:
+            raise AssertionError(f"step `id: {step_id}`'s heredoc is unterminated — refusing")
+        trailing = commands[terminators[-1] + 1:]
+        if trailing:
+            raise AssertionError(
+                f"step `id: {step_id}` runs {len(trailing)} command(s) AFTER its heredoc "
+                f"({trailing[0].strip()!r}) — that command's exit status becomes the step's, so a "
+                "failing planner would be swallowed. Refusing.")
+
     def _workflow_heredoc(path, step_id):
         """The dedented python heredoc of the ONE workflow step whose `id:` is `step_id`.
 
@@ -661,16 +730,7 @@ def _self_test():
         if not closes:
             raise AssertionError(f"step `id: {step_id}`'s heredoc is unterminated — refusing")
         body = body[:closes[0]]
-        # `|| true` / `continue-on-error` on this step would make every assertion below vacuous:
-        # the step could raise and the job would stay green. Refuse both, including on a
-        # backslash-continuation line, which a sibling seam check was found to miss.
-        joined = "\n".join(block[:opens[0] + 1]).replace("\\\n", " ")
-        seam = "\n".join(line for line in joined.split("\n")
-                         if not line.lstrip().startswith("#"))
-        if "continue-on-error" in seam or "|| true" in seam:
-            raise AssertionError(
-                f"step `id: {step_id}` swallows its own failure (continue-on-error / `|| true`) — "
-                "every assertion over its output would be vacuous; refusing")
+        _refuse_exit_zero_swallow(path, step_id)
         pad = min(len(line) - len(line.lstrip()) for line in body if line.strip())
         source = "\n".join(line[pad:] if line.strip() else "" for line in body)
         compile(source, f"<{step_id}>", "exec")
@@ -912,7 +972,34 @@ def _routing_doc():
          "PLAN occupancy carries" in _out_inert),
         (True, True, False))
 
-    # (7) THE DEFERRED LANE. It used to be handed `deferred_input` ALONE — a list `retry_gated`
+    # (7) THE PROBE'S FAIL-CLOSED PATH. [#773 adversarial review, BLOCKING] The code claims
+    # "a probe that raises is a planner we cannot characterise, so it gets no PR rows", and
+    # flipping that handler's `return False` to `return True` left the ENTIRE suite green — a
+    # fail-OPEN predicate on the one interlock whose whole job is preventing the outage. A
+    # planner whose `compute_ready` raises is exactly the hostile/incompatible target the probe
+    # exists for, and it must be refused, not admitted on the strength of an exception.
+    _RAISING_PLANNER = _PR_AWARE_PLANNER.replace(
+        "def compute_ready(issues, in_progress_packages=None):",
+        "def compute_ready(issues, in_progress_packages=None):\n"
+        "    if any('pull_request' in it for it in issues):\n"
+        "        raise RuntimeError('planner cannot handle PR rows')")
+    # Caught rather than allowed to propagate ON PURPOSE. When the probe fails open, the planner's
+    # exception escapes the readiness step and kills the whole sweep for EVERY target — a real
+    # traceback, but a crash-kill reads as "the harness broke", and the fact under test is that
+    # PLAN must survive this planner and refuse it. Catching turns it into a NAMED red row.
+    try:
+        _plan_raise, _out_raise = _run_readiness(
+            [[_issue(500, ["area:usage"], pr=True), _issue(501, _READY + ["area:usage"])]],
+            [_RAISING_PLANNER])
+        _raise_outcome = (
+            "probe raised RuntimeError" in _out_raise, "NOT pull-request-aware" in _out_raise,
+            "PLAN occupancy carries" in _out_raise, _planned(_plan_raise))
+    except Exception as exc:                                       # noqa: BLE001
+        _raise_outcome = f"the sweep DIED for every target: {type(exc).__name__}: {exc}"
+    chk("[#768] a planner whose compute_ready RAISES is refused — the probe fails CLOSED",
+        _raise_outcome, (True, True, False, [501]))
+
+    # (8) THE DEFERRED LANE. It used to be handed `deferred_input` ALONE — a list `retry_gated`
     # filters to `status:deferred` rows, so it contained no occupant of any kind and reserved
     # ZERO keys (MEASURED on the live snapshot: 0 keys held, against 48 in the ready lane). A
     # deferred retry therefore launched onto a crate an in-flight issue owned, which CLAIM's
