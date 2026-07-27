@@ -149,6 +149,16 @@ def _retry_delay(exc, attempt):
     limit is what turns a throttle into a ban. A malformed, non-positive, or absent header
     falls back to the original ladder; an oversized one is capped (RETRY_AFTER_CAP_SECONDS)
     so the read exhausts its retries and fails CLOSED instead of sleeping out the job.
+
+    MEASURED LIMIT OF THIS FIX (2026-07-27, issue #796): the OTHER 403 this snapshot can hit
+    is App-installation budget exhaustion — body `"API rate limit exceeded for installation"`,
+    `x-ratelimit-remaining: 0`, and **no `Retry-After` at all** (0 of 27 observed failures
+    carried one). GitHub's guidance there is to wait for `x-ratelimit-reset`, which can be
+    most of an hour and is longer than this job may live, so that class deliberately falls
+    through the ladder and fails closed: a dead tick beats a job parked on a sleep. Do not
+    read this helper as having solved budget exhaustion — it solves the case where GitHub
+    says how long to wait. Note also that `GET /rate_limit` reports a DIFFERENT bucket and
+    will happily say thousands remain while every read 403s (#796).
     """
     header = getattr(exc, "headers", None)
     suggested = header.get("Retry-After") if hasattr(header, "get") else None
