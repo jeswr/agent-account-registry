@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4636,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "7411b45d24cc2e60d4be193ecfa0934c450be121",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The new wire branch remains fail-closed for absent, unknown, missing-predicate, and invalid-IRI scopes, and reconstructs a deterministic shape whose labels and triple order match the signed certification preimage. The end-to-end grant test exercises the real HTTP decision path with an independently reconstructed, certifier-signed shape; the companion denial test demonstrates that the scope is neither ignored nor widened. This is consistent with the trust semantics' attenuation-only rule and the public HTTP-surface documentation is updated. I found no correctness, soundness, security, or test-validity defect in the diff. Targeted execution could not be performed because cargo is unavailable in the review environment.",
+  "verdict": "approve"
+ }
+}
