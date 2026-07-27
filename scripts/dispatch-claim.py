@@ -8625,6 +8625,43 @@ def _self_test():
     assert [item["state"] for item in enumerate_review_items(
         repo, [_unreviewed], provenance, [], issue_labels, now,
         pr_status=draft_tier_red)] == ["needs-review"]
+    # THE BLOCKING FINDING, at the ENUMERATION boundary: the SAME red draft-tier row on a
+    # READY (non-draft) PR is NOT a repair trigger. A ready worker PR with no review label
+    # falls straight through both label blocks and the `if draft:` block to GAP-A, and
+    # `needs-ci-fix` is explicitly exempt from CLAIM's ready-PR re-entry defuse — so before
+    # this fix the item reached decide_repair_admission(draft=False) and DEFUSED a valid arm.
+    # Reverting GAP-A to the raw `status["repair_gate"]` reds this.
+    _ready = pull(41, "sparq-agent/issue-7-1-1", sha_a, draft=False,
+                  body=f"x <!-- sparq-reviewed-sha:{sha_a} -->")
+    assert enumerate_review_items(repo, [_ready], provenance, [], issue_labels, now,
+                                  pr_status=draft_tier_red) == []
+    # HONESTY about the telemetry: this exit is currently SILENT for a ready PR. `signalled` is
+    # {review:changes, review:needs, review:parked} and every one of those either emits or is
+    # excluded earlier, so NO ready PR can reach the fall-through as a signalled row — nothing
+    # is counted here, by construction. Pinned so the gap is stated rather than assumed away;
+    # closing it is registry #765's population census, deliberately not duplicated in this PR.
+    _ready_counts = Counter()
+    with contextlib.redirect_stdout(io.StringIO()):
+        assert enumerate_review_items(repo, [_ready], provenance, [], issue_labels, now,
+                                      pr_status=draft_tier_red,
+                                      exclusions=_ready_counts) == []
+    assert _ready_counts == Counter(), _ready_counts
+    # The SNAPSHOT's own (newer) draft bit is the second half of the tri-state: a listing that
+    # still says draft while the detail read says the PR is already READY is the un-draft race,
+    # and it must fall back to the strict reading too.
+    _raced = {41: {**draft_tier_red[41], "draft": False}}
+    assert enumerate_review_items(repo, [starved], provenance, [], issue_labels, now,
+                                  pr_status=_raced) == []
+    # (positive control for both: a genuine draft, corroborated by the detail read, repairs)
+    _agreed = {41: {**draft_tier_red[41], "draft": True}}
+    assert [i["state"] for i in enumerate_review_items(
+        repo, [starved], provenance, [], issue_labels, now, pr_status=_agreed)] \
+        == ["needs-ci-fix"]
+    # A READY PR whose STRICT gate is genuinely red is still repairable — the fix narrows the
+    # draft-tier reading only, it does not stand the ready lane down.
+    assert [i["state"] for i in enumerate_review_items(
+        repo, [_ready], provenance, [], issue_labels, now,
+        pr_status={41: status_of(sha_a, gate="failure", legs=["js"])})] == ["needs-ci-fix"]
 
     # ... while a concluded-GREEN gate on a drafted, unarmed, reviewed head is the STRANDED
     # posture (no other autonomous exit exists) — enumerated so CLAIM can hand it to a human
@@ -8971,6 +9008,75 @@ def _self_test():
             run_items([ci_item])
             assert [(script, args[0], args[-1]) for script, args in helper_calls] == [
                 ("worker-pr.py", "disarm", "always")], helper_calls
+            # ==== THE BLOCKING FINDING, AT THE TITLED LEG ====
+            # A stale, CONCLUDED-RED `gate, draft-tier` row on a READY, ARMED, cleanly-mergeable
+            # PR must NOT defuse it. sparq's ci-summary.yml fail-closes a draft-tier run to
+            # FAILURE the moment the PR stops being a draft ("stale draft-tier run, full run
+            # pending") — that is not a leg failure, so the subset argument does not cover it,
+            # and the merge-required `gate` row does not exist until ready_for_review lands
+            # (measured 5s on the healthy path, UNBOUNDED when that delivery is dropped).
+            # Before the tier-appropriate read this dispatched `disarm --when always`, destroying
+            # a valid arm and launching a fixer with an EMPTY leg list. Widening
+            # repair_gate_checks_for(False) back to the full tier set reds this.
+            draft_tier_red_runs = [{"name": CI_GATE_DRAFT_TIER_CHECK, "status": "completed",
+                                    "conclusion": "failure",
+                                    "started_at": "2026-07-23T01:00:00Z"}]
+            fake.update(pull=live_pull(draft=False, auto_merge={"merge_method": "squash"}),
+                        check_runs=draft_tier_red_runs, issue_labels=["area:crate-a"])
+            launched, reasons = run_items([ci_item])
+            assert helper_calls == [], helper_calls
+            assert launched == 0 and reasons["fix:preclaim-defer"] == 1, reasons
+            # ...and the draft-tier name is not even REQUESTED on a ready head — the containment
+            # is reachability, not a downstream filter.
+            assert _requested_gate_name(
+                f"repos/{repo}/commits/{sha_a}/check-runs"
+                f"?check_name={urllib.parse.quote(CI_GATE_DRAFT_TIER_CHECK, safe='')}"
+                "&per_page=100&page=1") == CI_GATE_DRAFT_TIER_CHECK   # the fixture CAN serve it
+            _seen_names = []
+            _real_fake_gh = fake_gh_json
+
+            def _tracing_gh(args):
+                if "/check-runs" in args[-1]:
+                    _seen_names.append(_requested_gate_name(args[-1]))
+                return _real_fake_gh(args)
+
+            globals()["_gh_json"] = _tracing_gh
+            try:
+                run_items([ci_item])
+                assert _seen_names == [CI_GATE_CHECK], _seen_names
+            finally:
+                globals()["_gh_json"] = _real_fake_gh
+            # POSITIVE CONTROL — the marquee claim of this PR, at the same leg. The SAME
+            # draft-tier-only red head on a DRAFT PR does reach the fixer: the ci-fix run is
+            # dispatched (no defuse needed — it is already a draft). Reverting
+            # _live_repair_gate to the strict single-name read reds this.
+            fake.update(pull=live_pull(draft=True, labels=["review:needs"],
+                                       body=f"x <!-- sparq-reviewed-sha:{sha_a} -->"),
+                        check_runs=draft_tier_red_runs, comments=[])
+
+            class _FixAlloc:
+                def __init__(self):
+                    self.calls = []
+
+                def claim(self, _repo, _package, role, chain, *_args, **_kwargs):
+                    self.calls.append((role, list(chain)))
+                    return None       # no slot: DEFERS on capacity, not on a missing trigger
+
+                def release(self, *_args, **_kwargs):
+                    return True
+
+            _fix_alloc = _FixAlloc()
+            launched, reasons = run_items(
+                [ci_item], allocator=_fix_alloc,
+                routing={"models": {"opus5": {"provider_model": "claude-opus-5",
+                                              "harness": "claude-code"}}})
+            assert _fix_alloc.calls == [("fix", ["opus5"])], _fix_alloc.calls
+            assert reasons["fix:preclaim-defer"] == 0, reasons
+            # ...it got all the way to the account claim (deferring only on CAPACITY), and it
+            # never disarmed anything.
+            assert [args[0] for _script, args in helper_calls] == ["record-marker"], helper_calls
+            fake.update(pull=live_pull(draft=False, auto_merge={"merge_method": "squash"}),
+                        check_runs=gate_red, issue_labels=["area:crate-a"])
             # human-parked source issue: no defuse, no dispatch, even with a live trigger
             fake["issue_labels"] = ["area:crate-a", "needs:user"]
             run_items([ci_item])
