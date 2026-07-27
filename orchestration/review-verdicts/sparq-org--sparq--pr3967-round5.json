@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3967,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "62bc02bf7f61a4510887bca3c451f8f27dfaa322",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "bench_s3_trust_allows_ec2 returns success as soon as it finds a matching Allow statement, without accounting for an overriding Deny or a Condition that excludes the launched instances. When python3 is unavailable, any occurrence of ec2.amazonaws.com passes, including a Deny statement or a statement with the wrong action. cmd_check then states that the policy lets EC2 call sts:AssumeRole and reports READY, contradicting the helper's newly documented partial-drift-detector scope and the README's readiness guarantee. The load-bearing tests still do not exercise the prior round's Deny, Condition, or no-parser counterexamples.",
+    "file": "scripts/bench/bench-s3-results.sh",
+    "fix_hint": "Because provision owns and overwrites this role, fail closed unless the parsed trust document is equivalent to the canonical bench_s3_trust_policy, or implement the relevant IAM Deny and Condition semantics. If a real JSON parser is unavailable, withhold READY instead of using a substring test. Add hermetic cases for Allow plus overriding Deny, Allow with an incompatible Condition, and the no-python path; all must make check return nonzero and omit READY.",
+    "severity": "major",
+    "title": "Trust check still reports READY for policies that can deny EC2 assumption"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 5 leaves the prior major trust-validation defect materially unchanged. bench_s3_trust_allows_ec2 still accepts any matching Allow without evaluating an overriding Deny or an incompatible Condition, and its no-python fallback still accepts any document containing ec2.amazonaws.com. cmd_check nevertheless reports that the trust policy lets EC2 call sts:AssumeRole and emits READY, while the README makes the same actual-assumability claim. The comments now explicitly admit the predicate is only a partial drift detector, but that admission conflicts with the externally visible readiness guarantee rather than fixing it. The tests still omit the requested overriding-Deny, incompatible-Condition, and no-python counterexamples. Progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
