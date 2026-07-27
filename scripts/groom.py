@@ -6436,6 +6436,31 @@ def _self_test() -> int:
             ([], True, [{"e" * 32}]),
         )
 
+        # EVERY failure class defers ITSELF. The guard above closes the one ValueError path that
+        # exists today, so this drives a NON-GroomError out of the per-PR body directly: narrow the
+        # handler back to `except GroomError` and this unhandled exception aborts run_sweep before
+        # _release_claims — #644/#647's head-of-line abort, from one PR.
+        class _ValueErrorPages(dict):
+            def get(self, key, default=None):
+                if key == "/repos/owner/repo/issues/33/comments":
+                    raise ValueError("comment page is a shape park_policy rejects")
+                return super().get(key, default)
+
+        terminal_sweep_env["pages"] = _ValueErrorPages(_bot_park_timeline(33))
+        ve_log, ve_error, ve_releases = _sweep_with_refusals({}, pulls=(recovered_pr,))
+        check(
+            "a NON-GroomError from one PR defers THAT PR and never aborts the sweep — dead-lease "
+            "reclaim still runs and the phase reports the deferral",
+            (
+                ve_releases,
+                "age un-park deferred" in ve_log,
+                "age_unpark_deferred=1" in ve_log,
+                "every age park re-admission failed (1 attempted, 0 completed)" in ve_error,
+            ),
+            ([{"e" * 32}], True, True, True),
+        )
+        terminal_sweep_env["pages"] = {}
+
         # A grant with no readable timestamp cannot be proven newer than the park, so it refuses.
         terminal_sweep_env["pages"] = {
             "/repos/owner/repo/issues/33/comments": [
