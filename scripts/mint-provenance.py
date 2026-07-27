@@ -114,15 +114,25 @@ ACTION_REFUSE = "refuse"                   # fail closed: leave the PR un-enumer
 
 
 # ---- module loading (same idiom as backfill-provenance.py) -------------------------------------
+# MEMOIZED. dispatch-claim.py is ~16k lines and the workflow-seam report loads it once per call;
+# the self-test's mutant table calls that report a dozen times, which turned a 2 s self-test into a
+# 12 s one and the mutation sweep into a coffee break. The modules are loaded for their pure
+# predicates and hold no per-call state, so one exec is enough.
+_MODULE_CACHE = {}
+
+
 def _load_script_module(filename, module_name):
     import importlib.util
 
+    if module_name in _MODULE_CACHE:
+        return _MODULE_CACHE[module_name]
     path = SCRIPTS_DIR / filename
     spec = importlib.util.spec_from_file_location(module_name, path)
     if spec is None or spec.loader is None:
         raise MintError(f"cannot load {filename}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    _MODULE_CACHE[module_name] = module
     return module
 
 
