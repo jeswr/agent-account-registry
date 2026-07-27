@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4159,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "fd6561de3b11d3ce147b63d6db4c0398198c6d99",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`unwritten_integer_lexicals` still proves only that every observed lexical occurred somewhere in the generated sequence; it does not prove that every still-live written RDF term remains in each sparq snapshot. `normalize_term` collapses distinct terms such as `\"0105\"^^xsd:integer` and `\"+105\"^^xsd:integer`. Thus, at identical subject/predicate/graph coordinates, a faulty sparq result that drops one spelling but retains the other can normalize to the same single quad as Oxigraph, while the retained lexical remains in `written`, so both the normalized comparison and lexical oracle pass. The added `noncanonical_integer_lexicals_survive_as_distinct_sparq_terms` test checks current engine behavior directly, but does not mutation-test this failure mode through the full adjudication path.",
+    "file": "crates/sparq-bench/src/update_fuzz.rs",
+    "fix_hint": "Add a live-term oracle that tracks expected lexical term identities with their quad coordinates and update lifetime, or an equivalent per-operation preservation check. Add a non-vacuity test feeding the full adjudication path two same-value spellings at the same coordinates with a simulated sparq snapshot missing one spelling, and assert rejection. The oracle must distinguish legitimate deletion from accidental collapse and recurse through triple terms.",
+    "severity": "major",
+    "title": "Numeric adjudication still permits loss of a distinct written RDF term"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 2 remains blocked by the same soundness hole. The new focused tests establish that sparq currently preserves three spellings and that the one-way unwritten-lexical oracle detects canonicalization, but they do not establish that the full differential rejects loss of one still-live written term. Because normalization maps distinct integer lexical forms to one term and the oracle checks only observed lexicals are a subset of all lexicals generated anywhere in the sequence, a faulty sparq snapshot retaining one written spelling while dropping another can still normalize to Oxigraph's single quad and pass. The requested full-adjudication mutation/non-vacuity case is still absent.",
+  "verdict": "request_changes"
+ }
+}
