@@ -1945,10 +1945,12 @@ def enrolment_enable_error(policy_doc, claim_admits, rf_admits):
 
 # ---- FIRST-TICK VOLUME BOUND -----------------------------------------------------------------
 # Reviving a repair lane that has been dead for ten days releases its whole accumulated backlog at
-# once. Measured on the live fleet the day this landed: 25/78 open sparq worker drafts carry a
-# concluded-RED aggregator that ONLY the tiered read can see, and 7 of them clear every other
-# guard and reach `needs-ci-fix` on the first tick (the rest are held by a human hold, an
-# unreviewed head, a conflicting base or an existing review:changes claim).
+# once. MEASURED on the live fleet (2026-07-27, 119 open PRs paginated, 84 worker PRs, every head
+# read per tier name with the endpoint's total_count cross-checked, 0 unprovable reads): 29 open
+# worker drafts carry a concluded-RED aggregator that ONLY the tiered read can see, on top of 17
+# the strict reading already saw. That 29 is an UPPER BOUND on newly-reachable rows — it is
+# aggregator colour alone, and the enumerator's other guards (human hold, unreviewed head,
+# conflicting base, live lease, registry provenance) can only reduce it.
 #
 # Only the FIX lane pushes commits, and this repo has a documented congestion-collapse mode where
 # over-dispatched pushes saturate the target's runners and manufacture FALSE gate failures — which
