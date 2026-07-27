@@ -61,16 +61,6 @@
    "expires_at": 1785179896
   },
   {
-   "account": "dc2d751954080e13",
-   "claim_id": "8a5b0700fac649f9aa1807cd643151c7",
-   "holder": "review:sparq-org/sparq#3635@dispatch-30288792548.1",
-   "package": "sparq-mpc",
-   "role": "review",
-   "model": "sol",
-   "issued_at": 1785174411,
-   "expires_at": 1785178611
-  },
-  {
    "account": "488920c2efe2b3fb",
    "claim_id": "a634c05f554344918dec07dbdb34b141",
    "holder": "review:sparq-org/sparq#4062@dispatch-30288792548.1",
