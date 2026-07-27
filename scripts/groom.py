@@ -226,16 +226,28 @@ def age_receipts(comments: list[dict[str, Any]], marker: str, bot_login: str
 
 
 def age_park_generation(comments: list[dict[str, Any]], bot_login: str) -> int:
-    """The generation a NEW age-park would occupy: one past every park receipt already on record.
+    """The generation a NEW age-park would occupy: one past every park receipt already on record,
+    CLAMPED at AGE_UNPARK_MAX + 1.
 
     Counts MARKERS, not well-formed records — a malformed receipt still consumed a generation,
-    exactly as park_policy's `auto_marker_count` counts markers rather than parsed records."""
+    exactly as park_policy's `auto_marker_count` counts markers rather than parsed records.
+
+    The clamp is what makes the terminal terminal. Without it every further sweep of an already
+    escalated PR mints a HIGHER generation, whose fingerprint no earlier receipt can match, so the
+    escalation comment is re-posted on every tick — forever, on a PR already handed to a human.
+    Escalated is an ABSORBING state: the generation stops at AGE_UNPARK_MAX + 1, the receipt stops
+    changing, and the dedupe holds. (The head SHA remains in the fingerprint, so genuinely NEW work
+    pushed after an escalation does re-state it once — one comment per head, the same bound
+    park_policy's park fingerprints use.)"""
     if not bot_login:
         return 1
-    return 1 + sum(
-        1 for comment in comments
-        if comment["user"]["login"].casefold() == bot_login.casefold()
-        and AGE_PARK_MARKER in comment["body"]
+    return min(
+        AGE_UNPARK_MAX + 1,
+        1 + sum(
+            1 for comment in comments
+            if comment["user"]["login"].casefold() == bot_login.casefold()
+            and AGE_PARK_MARKER in comment["body"]
+        ),
     )
 
 
@@ -5947,6 +5959,31 @@ def _self_test() -> int:
                     for body in _comment_bodies()),
             ),
             ([{"labels": ["needs:user"]}], True, True),
+        )
+        # The escalation is itself RECEIPTED, and that receipt is what makes it idempotent. Drop it
+        # and `already_commented` can never match the body just written, so every subsequent sweep
+        # posts the same escalation again — comment spam on a PR already handed to a human, and a
+        # generation counter that climbs on its own. Replaying the tick with the escalation on
+        # record must write NOTHING.
+        escalation_receipt = f"{AGE_PARK_MARKER} cause=merge-dirty head={31:040x} gen=3 -->"
+        check(
+            "the over-cap ESCALATION is receipted too — both classes consume a generation, so both "
+            "must be on record",
+            any(escalation_receipt in body for body in _comment_bodies()),
+            True,
+        )
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/31/comments": [
+                _park_receipt_comment(1), _park_receipt_comment(2),
+                {"user": {"login": "app[bot]"},
+                 "body": f"> 🤖 SPARQ agent\n\n{STALE_PR_MARKER}\n{escalation_receipt}"}]}
+        replay_escalation_log, _e, _r = _sweep_with_refusals(
+            {}, pulls=({**_stale_worker_pr(31), "labels": [{"name": "needs:user"}]},))
+        check(
+            "an escalation already on record is IDEMPOTENT — the same tick replayed writes NOTHING "
+            "(a human hold that re-comments every sweep is the spam this replaces)",
+            (terminal_sweep_env["writes"], "stale_prs=0" in replay_escalation_log),
+            ([], True),
         )
         terminal_sweep_env["pages"] = {}
 
