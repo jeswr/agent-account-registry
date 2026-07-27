@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4411,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "2252bf2d5a08ed8545ab631fb85cfb8d2c5f7041",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 2 remains clean. The workflow consistently selects the minted App token, then RELEASE_PLZ_TOKEN, then GITHUB_TOKEN for both Release-PR and tag operations. The failure containment probes with that same selected token and refuses to tolerate a 403 whenever a privileged token was selected, preserving fail-closed behavior. A missing App ID skips minting and falls through; a partially or incorrectly provisioned App fails loudly. The documentation and advisory registry accurately describe the remaining user-controlled provisioning step and the distinct limitation of merely enabling the Actions PR setting: it permits PR creation with GITHUB_TOKEN but does not make GITHUB_TOKEN-created tag events trigger release.yml. No correctness, soundness, test-validity, security, or prompt-injection issue is evident.",
+  "verdict": "approve"
+ }
+}
