@@ -1358,13 +1358,28 @@ def diff_fingerprint(files):
 
 
 def decide_review(verdict, has_blockers, injection, round_n, max_rounds, security,
-                  budget_action="needs-user"):
+                  budget_action="needs-user", self_attested=False):
     """The review-verdict state machine. Every path arms once, requests one fix round, or stops
     at a human — never loops unboundedly. On round-budget exhaustion the caller supplies
     decide_budget's action: an extension (model pin or improving progress) keeps the loop in
     `changes`, bounded by decide_budget's own hard cap; anything else (including the fail-closed
-    default) stops at a human."""
+    default) stops at a human.
+
+    [registry #657 follow-up] ``self_attested`` — the orchestrator class — can NEVER reach "arm".
+    Its provenance record was written by the same actor that wrote the diff, so the record's
+    `impl_provider` is an assertion about itself, and that field is what the lane INVERTS to pick
+    the reviewer's side. A false declaration therefore yields a same-provider review that still
+    LOOKS cross-provider (design record §3, the irreducible difficulty). Option 2(b)'s whole
+    argument for admitting the class at all is that the residual risk of a mis-declared provider
+    degrades to an ADVISORY COMMENT, never an unreviewed merge — so an approve on this class
+    becomes a human hand-off, exactly as an injection flag does. Defaults False."""
     if injection:
+        return "needs-user"
+    if self_attested and verdict == "approve" and not has_blockers:
+        # Approved, and NOT armed: the human arms this class. (`needs-user` is the existing
+        # human-hand-off path — findings are still posted, the PR is labelled and the maintainer
+        # is pinged, so an enrolled PR that passes review is visibly ready rather than silently
+        # dropped.)
         return "needs-user"
     if verdict == "approve" and not has_blockers:
         # Decision 7 REVISED (maintainer 2026-07-18: approved PRs were parking needs:user
@@ -4222,7 +4237,7 @@ def _arm_auto_merge(repo, pr_number, reviewed_sha, attempts=ARM_ATTEMPTS, issue=
 
 def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, reviewer_provider,
                   reviewer_account, arm, issue=None, surface_paths=None, bot_login="",
-                  reviewed_base="", security_keywords=None):
+                  reviewed_base="", security_keywords=None, self_attested=False):
     """The ONLY place a PR can be armed. Fail-closed assertions per locked decision 6; a live-head
     mismatch returns the PR to review:needs (a fixer/other push raced the approval). [issue #139,
     round-4 P1] EVERY arm precondition — the hold surfaces (HUMAN_OWNED_LABELS on the PR, needs:*
@@ -4260,6 +4275,18 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
     issue labels vs the routing keywords), not just at resolve: a security label added mid
     review folds into the same audit trail (a True posture appends SECURITY_LABEL_AUDIT_HIT),
     so an auto-armed trust-plane change is audited whether it was flagged by path or by label."""
+    # [registry #657 follow-up] THE MERGE BOUNDARY for the orchestrator class, at the ONE place a
+    # PR can be armed. `decide_review` already refuses to return "arm" for a self-attested PR, so
+    # this is the second, independent refusal — placed HERE because "the arm never runs for the
+    # class" must be true of the arm, not of the state machine that usually precedes it. The
+    # cross-provider assertion below is derived by INVERTING the record's own `impl_provider`; on
+    # a self-attested record that field is an assertion by the implementer about itself, so the
+    # assertion proves nothing and must not be allowed to authorise a merge (design record §3).
+    if self_attested:
+        raise WorkerPrError(
+            "refusing to arm: the provenance record is self-attested (orchestrator class) — its "
+            "impl_provider is an assertion by the implementer about itself, so the cross-provider "
+            "inversion cannot be trusted to authorise a merge; a human arms this class")
     if reviewer_provider == impl_provider:
         raise WorkerPrError("refusing to arm: reviewer provider equals implementer provider")
     salt = os.environ.get("PROVENANCE_SALT", "")
@@ -4485,7 +4512,8 @@ def _apply_trust_surface_audit(repo, pr_number, hits, reviewed_sha, bot_login=""
 
 
 # ---- composite outcomes (thin workflow steps, testable decisions) --------------------------------
-def revalidate_outcome_head(state, login, draft, live_head, reviewed_sha, bot_login):
+def revalidate_outcome_head(state, login, draft, live_head, reviewed_sha, bot_login,
+                            self_attested=False):
     """Issue #156: gate EVERY review/fix outcome mutation on the live PR still being the exact
     reviewed commit — an OPEN, bot-authored, DRAFT PR whose head equals the sha the model ran
     against. Returns "ok", or a short stale reason ("closed"/"author"/"undrafted"/
@@ -4493,12 +4521,23 @@ def revalidate_outcome_head(state, login, draft, live_head, reviewed_sha, bot_lo
     findings never label a new head and a stale escalation never terminally parks a
     replacement head. Exact-head equality is STRICTER than the issue's ancestry requirement
     and subsumes it: a descendant head still means unreviewed commits are live. Pure and
-    fail-closed — an unreadable/unexpected shape yields a stale reason, never "ok"."""
+    fail-closed — an unreadable/unexpected shape yields a stale reason, never "ok".
+
+    [registry #657 follow-up] ``self_attested`` — the orchestrator class, resolved host-side by
+    review-fix.yml's `resolve` step — stands down the DRAFT requirement and NOTHING else. Draft is
+    a WORKER-lane protocol artefact: worker.yml opens drafts and the arm undrafts them, so "still
+    drafted" is a real freshness signal there. The orchestrator class never enters that protocol
+    and every PR in it is non-draft, so requiring draft here would return "undrafted" for EVERY
+    review of the class — and the caller drops the whole outcome on that, silently: findings
+    unposted, reviewed-sha left unbound, while the round budget still charges. That is a per-round
+    burn to a terminal needs-user with no diagnostic, i.e. the same forever-loop the #657 enable
+    interlock exists to prevent, at the outcome layer. Defaults False, so every existing caller is
+    byte-for-byte unchanged; the head/author/state freshness checks are NOT waived for any class."""
     if state != "open":
         return "closed"
     if bot_login and login != bot_login:
         return "author"
-    if draft is not True:
+    if draft is not True and not self_attested:
         return "undrafted"
     if not re.fullmatch(r"[0-9a-f]{40}", live_head or ""):
         return "malformed-head"
@@ -4548,7 +4587,8 @@ def review_outcome(args):
     freshness = revalidate_outcome_head(
         live.get("state"), str((live.get("user") or {}).get("login", "")),
         live.get("draft"), str((live.get("head") or {}).get("sha", "")),
-        args.reviewed_sha, args.bot_login)
+        args.reviewed_sha, args.bot_login,
+        self_attested=getattr(args, "self_attested", False))
     if freshness != "ok":
         # Issue #162: legitimate head churn (the reviewed head advanced during the review) is
         # NOT a substantive round — void its pre-model round marker for THIS (round, run) so a
@@ -4617,7 +4657,8 @@ def review_outcome(args):
                                args.impl_provider, base_rounds=args.max_rounds)
     decision = decide_review(document["verdict"], has_blockers,
                              document["injection_detected"], budget_rounds, args.max_rounds,
-                             security, budget_action=budget["action"])
+                             security, budget_action=budget["action"],
+                             self_attested=getattr(args, "self_attested", False))
     _write_outputs({"decision": decision, "verdict": document["verdict"],
                     "has_blockers": has_blockers,
                     "injection": document["injection_detected"],
@@ -4638,6 +4679,16 @@ def review_outcome(args):
         if document["injection_detected"]:
             # A flagged injection is a genuine human (security) question -> needs:user.
             reason, park_class = "the reviewer flagged possible prompt injection", "question"
+        elif approved and getattr(args, "self_attested", False):
+            # [#657] APPROVED, and deliberately not armed. This is not a failure and not a
+            # capacity stop — the class is review-only by design (record §3 option (b)), so the
+            # hand-off must SAY so; naming it "budget exhausted" would misreport a clean pass as
+            # a stall and route it to the machine-owned capacity park.
+            reason, park_class = (
+                "the review approved this PR, and it is an orchestrator-class (self-attested "
+                "provenance) PR: the implementer wrote its own provenance record, so the "
+                "cross-provider inversion cannot authorise an automatic merge. A human arms it",
+                "question")
         else:
             # Round-budget exhaustion is budget-driven, not a human question: the source issue
             # takes the machine-owned status:parked soft hold (park_policy.py defect 1).
@@ -9767,6 +9818,13 @@ def main():
     # against these so a security label added DURING review still lands in the audit trail.
     arm.add_argument("--security-keyword", action="append", default=[],
                      help="security label keyword (repeatable; from the target routing match_labels)")
+    # [#657] The orchestrator class. REFUSED here — see ready_and_arm. A flag rather than a
+    # value so a workflow that forgets it fails toward the ARMABLE-worker default it always had,
+    # and the class is instead kept out by decide_review never returning "arm" for it; the two
+    # refusals are independent on purpose.
+    arm.add_argument("--self-attested", action="store_true",
+                     help="the provenance record is self-attested (orchestrator class): refuse "
+                          "to arm")
 
     rout = subparsers.add_parser("review-outcome", parents=[common])
     rout.add_argument("--verdict-file", required=True)
@@ -9787,6 +9845,10 @@ def main():
     rout.add_argument("--impl-provider", required=True)
     rout.add_argument("--bot-login", required=True)
     rout.add_argument("--run-key", required=True)
+    # [#657] The orchestrator class: the draft freshness requirement stands down (the class is
+    # never drafted) and an approve becomes a human hand-off instead of an arm.
+    rout.add_argument("--self-attested", action="store_true",
+                      help="the provenance record is self-attested (orchestrator class)")
     rout.add_argument("--reviewed-sha", required=True,
                       help="the commit the review ran against; the outcome defers if the live "
                            "head has moved off it (issue #156)")
@@ -9897,7 +9959,8 @@ def main():
                           args.arm == "true", issue=args.issue,
                           surface_paths=args.surface_path or None,
                           bot_login=args.bot_login, reviewed_base=args.reviewed_base,
-                          security_keywords=args.security_keyword or None)
+                          security_keywords=args.security_keyword or None,
+                          self_attested=args.self_attested)
         elif args.command == "review-outcome":
             review_outcome(args)
         elif args.command == "fix-outcome":
