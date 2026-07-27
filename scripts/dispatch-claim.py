@@ -5474,6 +5474,35 @@ STARVE_ALERT_MARKER = "<!-- sparq-escalate-starved:v1 -->"
 STARVE_RESET_MARKER = "<!-- sparq-escalate-recovered:v1 -->"
 
 
+def deferred_issue_ladder(cutoff, receipts, already_labeled=False):
+    """[registry #797] The deferred-issue lane's park-escalation ladder call, WITH the window
+    attribution it is entitled to claim — module level so it is EXECUTABLE by the self-test.
+
+    `park_ladder_decision` now requires `window_authority`, and this lane is entitled to
+    `WINDOW_AUTHORITY_HUMAN` for one specific reason: its `cutoff` comes STRAIGHT from
+    `park_policy.readmission_cutoff` over the issue's own label timeline, under the strict
+    maintainer probe, with NO automatic-re-admission stamps folded in (contrast the worker-PR
+    lane, which composes them through `readmission_window` and is where #797's false pages came
+    from). Every window this lane can mint is therefore one a proven human opened — which is
+    exactly the claim its terminal comment ("exhausted AGAIN after a human readmission") makes to
+    the maintainer.
+
+    IT IS A FUNCTION, NOT A LITERAL AT THE CALL SITE, DELIBERATELY. A bare
+    `window_authority=WINDOW_AUTHORITY_HUMAN` argument buried in the middle of the 400-line
+    dispatch loop is unreachable by any executable test — measured: swapping that literal for
+    WINDOW_AUTHORITY_UNKNOWN left the whole registry suite green while silently converting this
+    lane's human escalation into a `machine-terminal` the lane does not handle (it would fall
+    through to the `park` arm and mis-bucket itself). Here the claim has a name, a stated reason,
+    and the tests below.
+
+    The MACHINE terminal is unreachable from this lane BY CONSTRUCTION, and the self-test asserts
+    it: a lane that could reach it would need handling for it, and silently taking the `park` arm
+    instead is precisely the failure mode this extraction exists to make impossible."""
+    return _park_policy.park_ladder_decision(
+        cutoff, receipts, window_authority=_park_policy.WINDOW_AUTHORITY_HUMAN,
+        already_labeled=already_labeled)
+
+
 def absorbing_park_leg(repo, number, action, window_key, comments, bot_login, now,
                        linked_open_pr, worker_pr, attempt_marker, post_comment,
                        needs_user_landed, vetoed, log=print,
@@ -6107,20 +6136,10 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                                   "allocation re-enabled")
                             # fall through: the allocator + the `retry` label flip run again.
                         else:
-                            action, window_key, generation = (
-                                _park_policy.park_ladder_decision(
-                                    cutoff,
-                                    worker_pr.park_generation_cutoffs(comments, bot_login),
-                                    # [registry #797] This lane's `cutoff` comes STRAIGHT from
-                                    # readmission_cutoff — the strict maintainer probe — with no
-                                    # automatic-re-admission stamps folded in, so every window it
-                                    # can mint is one a proven human opened. Stated explicitly
-                                    # because the ladder now refuses to decide without it, and
-                                    # because that is exactly the claim the terminal's comment
-                                    # ("after a human readmission") makes to the maintainer.
-                                    window_authority=(
-                                        _park_policy.WINDOW_AUTHORITY_HUMAN),
-                                    already_labeled="status:parked" in item["labels"]))
+                            action, window_key, generation = deferred_issue_ladder(
+                                cutoff,
+                                worker_pr.park_generation_cutoffs(comments, bot_login),
+                                already_labeled="status:parked" in item["labels"])
                             if action == "freeze":
                                 # Unreadable timeline: the ladder never advances on unproven
                                 # data — no window, no receipt, no label, no comment. NOT an
@@ -14615,6 +14634,7 @@ def _self_test():
 
     _starvation_sweep_self_test()
     _absorbing_park_leg_self_test()
+    _deferred_issue_ladder_self_test()
 
     print("dispatch-claim self-test PASSED")
 
@@ -16075,6 +16095,49 @@ def _starvation_yaml_seam_self_test():
 # The discriminating fixtures are the ones where the leg must do NOTHING it did not earn: a clock
 # inside the grace, a window whose terminal is already receipted, an issue with an open worker PR,
 # and a ladder action that is not absorbing at all.
+def _deferred_issue_ladder_self_test():
+    """[registry #797] The deferred-issue lane's ladder call, EXECUTED.
+
+    Every assertion here died when the window authority was swapped for
+    WINDOW_AUTHORITY_UNKNOWN — the mutant that survived the whole registry suite while the
+    authority was an inline literal at an untestable call site."""
+    policy = _park_policy
+    human = "2026-07-23T09:18:19Z"
+
+    def chk(name, got, want):
+        assert got == want, f"{name}: {got!r} != {want!r}"
+        print(f"  ok   {name}")
+
+    chk("[#797] the deferred-issue lane's window is HUMAN-authorised, so its second consumed "
+        "window still reaches the human terminal — the escalation this lane is entitled to",
+        deferred_issue_ladder(human, {policy.PARK_WINDOW_NONE}),
+        ("terminal", human, policy.PARK_ESCALATION_GENERATIONS))
+    chk("[#797] ...and the first one still parks rather than escalating",
+        deferred_issue_ladder(human, set()), ("park", human, 1))
+    # The MACHINE terminal is unreachable from this lane. The lane has no arm for it, so a
+    # `machine-terminal` here would silently fall through to the `park` arm and mis-bucket
+    # itself — the exact silent-fall-through the extraction exists to make impossible.
+    reachable = {deferred_issue_ladder(cutoff, receipts, already_labeled=labeled)[0]
+                 for cutoff in (None, human, "2026-07-24T00:00:00Z", policy.WINDOW_UNREADABLE)
+                 for receipts in (set(), {policy.PARK_WINDOW_NONE},
+                                  {policy.PARK_WINDOW_NONE, human},
+                                  {policy.PARK_WINDOW_NONE, human, "2026-07-24T00:00:00Z"})
+                 for labeled in (False, True)}
+    chk("[#797] `machine-terminal` is UNREACHABLE from the deferred-issue lane (it has no arm "
+        "for it, so reaching it would fall through to `park` and mis-bucket the exit)",
+        "machine-terminal" in reachable, False)
+    chk("[#797] ...and every action it CAN reach is one the lane actually handles",
+        reachable - {"freeze", "dedupe", "unchanged", "legacy-quiet", "terminal", "park"},
+        set())
+    # Whatever it returns must be a DECLARED census bucket — the closed enum raises otherwise,
+    # so a future action reaching this lane cannot vanish from the tick summary.
+    for action in sorted(reachable):
+        if action in policy.PARK_ABSORBING_ACTIONS:
+            continue
+        policy.budget_exhausted_bucket(action)
+    print("  ok   [#797] every action the lane can reach maps to a declared census bucket")
+
+
 def _absorbing_park_leg_self_test():
     here = Path(__file__).resolve()
     policy = _park_policy

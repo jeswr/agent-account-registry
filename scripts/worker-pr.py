@@ -3253,7 +3253,7 @@ def stranded_recover(repo, pr_number, proven_head, issue=None):
     _write_outputs({"action": action, "marker": "invalidate"})
 
 
-def _retire_worker_pr(repo, pr_number, issue, probe, policy, close_pr=None, patch_issue=None,
+def _retire_worker_pr(repo, pr_number, issue, policy, close_pr=None, patch_issue=None,
                       read_issue=None, set_status=None, log=print):
     """[registry #797] Execute a MACHINE-TERMINAL retirement: close the exhausted draft worker PR
     and hand its WORK back to the source issue. IDEMPOTENT end to end — every step is a no-op
@@ -3425,7 +3425,7 @@ def needs_user(repo, pr_number, reason, issue=None, alert_repo=None, alert_token
             if window_key in park_retirement_windows(comments, bot_login):
                 print(f"machine retirement already receipted for window {window_key}; "
                       "converging its close + source-issue hand-back (idempotent)")
-                _retire_worker_pr(repo, pr_number, issue, probe, policy)
+                _retire_worker_pr(repo, pr_number, issue, policy)
                 return
             print(f"capacity park already receipted for window {window_key}; awaiting a "
                   "fresh human gesture — no label/comment churn")
@@ -3497,7 +3497,7 @@ def needs_user(repo, pr_number, reason, issue=None, alert_repo=None, alert_token
             if not policy.park_vetoed(repo, pr_number, MACHINE_PARK_PR_LABEL,
                                       _issue_timeline, is_human=probe):
                 set_review_state(repo, pr_number, "parked")
-            _retire_worker_pr(repo, pr_number, issue, probe, policy)
+            _retire_worker_pr(repo, pr_number, issue, policy)
             print(f"machine retirement recorded (machine generation {generation}): {reason}")
             return
         if action == "terminal":

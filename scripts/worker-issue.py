@@ -1599,6 +1599,21 @@ def _self_test():
         assert any(path.endswith("labels/status:parked") for path in deletes), deletes
         assert any(path.endswith("labels/status:deferred") for path in deletes), deletes
         assert all("status:ready" not in labels for labels in posts), posts
+        # (x-vi-c) [registry #797] `handback`: the source-issue half of a MACHINE-TERMINAL
+        # retirement. Its worker PR has just been CLOSED, so — unlike `readmitted`, whose PR is
+        # still open — the issue goes back to the IMPLEMENTATION frontier: status:ready, with the
+        # machine park AND every in-flight posture cleared. Each removal is load-bearing: a
+        # handback that left `status:parked` (or `status:deferred`, or the in-progress-review
+        # posture of the PR it just closed) standing would be gated straight back out of the
+        # ready engine, and the work the retirement was supposed to preserve would be lost
+        # silently — which is exactly the absorbing state the retirement exists to escape.
+        posts.clear(); deletes.clear()
+        timeline.clear()
+        set_status("o/r", 9, "handback")
+        assert posts == [["status:ready"]], posts
+        for cleared in ("status:parked", "status:deferred", "status:in-progress",
+                        "status:in-progress-review"):
+            assert any(path.endswith(f"labels/{cleared}") for path in deletes), (cleared, deletes)
         # (x-vii) STRICT human probe (park-policy hygiene finding): an unlabel by an actor the
         # collaborator probe cannot confirm as a maintainer mints NO veto — the park proceeds.
         posts.clear(); deletes.clear()
