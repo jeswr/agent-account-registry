@@ -349,10 +349,14 @@ CI_GATE_DRAFT_TIER_CHECK = "gate, draft-tier"
 #     set would fail too — sufficient evidence that the head is broken, and the only direction any
 #     caller of repair_gate_conclusion() is permitted to act on;
 #   * a GREEN draft-tier gate proves NOTHING about the full set (subset-green does not imply
-#     superset-green), so it never stands in for the merge-required context. `stranded` (whose
-#     precondition is a concluded-GREEN gate) therefore keeps reading CI_GATE_CHECK strictly.
-#     (Registry #765, stacked on this PR, redefines `stranded` over the tier-REACHABLE green and
-#     carries its own vocabulary layer for that; nothing here anticipates it.)
+#     superset-green), so it never stands in for the merge-required context: no ADMISSION
+#     decision — arm, merge, enter the queue — may ever consult it.
+#
+#     That asymmetry is a statement about the ADMISSION authority. Issue #762 is the observation
+#     that it was applied to the REPAIR authority as well, where it does not hold: `stranded`'s
+#     entire consequence is a RE-REVIEW of a PR the loop already owns — work performed ON the PR,
+#     not admission OF it. The green half is widened below, and what keeps the two authorities
+#     apart moves INTO THE VALUE — see EVIDENCE GRADE and `stranded_live`.
 CI_REPAIR_GATE_CHECKS = (CI_GATE_CHECK, CI_GATE_DRAFT_TIER_CHECK)
 # ...and which of those names a head can ACTUALLY PUBLISH is a function of its CURRENT draft
 # state, not of the tier set as a whole. This is the second half of the role split and it is
@@ -380,6 +384,38 @@ def repair_gate_checks_for(draft):
     return CI_REPAIR_GATE_CHECKS if draft is True else (CI_GATE_CHECK,)
 
 
+# ---- EVIDENCE GRADE (issue #762) ------------------------------------------------------------
+# TWO AUTHORITIES read an aggregator conclusion, and they need different things from it:
+#
+#   ADMISSION — arm / merge / enter the queue. Requires "the MERGE-REQUIRED context concluded
+#     green". Subset-green cannot supply that, ever. Reads status["gate"] and nothing else.
+#   REPAIR — decide what the loop should DO NEXT to a PR it already owns (dispatch a fixer,
+#     re-review a stranded head). Requires "what is the newest aggregator this head actually
+#     PUBLISHES saying", in BOTH directions. Reads status["repair_gate"].
+#
+# #761 made the repair authority tier-aware in the RED direction only, which left the GREEN half
+# — `stranded` — definitionally unreachable on every sparq draft (#762). Widening it means a
+# tier-reachable GREEN value now exists, and the whole risk of that is a future edit reading it
+# from an admission path. So the separation is enforced IN THE VALUE rather than in a comment:
+#
+#   NEITHER tier-reachable green is spelled "success".
+#
+# `== "success"` is the only expression in this codebase that proves a green aggregator, and after
+# this change it can be true of status["gate"] alone — the strict merge-required context. An
+# admission path that reaches for the tiered field sees an unrecognised value and fails CLOSED
+# (deferring) instead of silently arming on subset-green. The two greens are also DISTINCT values,
+# so nothing downstream can conflate the tiers by accident, and nothing has to re-parse a name.
+GATE_GREEN_MERGE_REQUIRED = "green:merge-required"
+GATE_GREEN_DRAFT_TIER = "green:draft-tier"
+# The tier-reachable greens, in the ORDER of decreasing evidential strength. Repair consumers test
+# membership; nothing else may.
+TIER_REACHABLE_GREEN = frozenset({GATE_GREEN_MERGE_REQUIRED, GATE_GREEN_DRAFT_TIER})
+# Which green a resolved aggregator run yields, keyed by the EXACT tier name that won. Exact
+# equality against this closed table is the tier discriminator — never a prefix or substring test.
+# `gate` is a strict PREFIX of `gate, draft-tier`, so a prefix test would answer "merge-required"
+# for a draft-tier row and hand the admission authority exactly the subset-green it must never see.
+GATE_GREEN_BY_TIER = {CI_GATE_CHECK: GATE_GREEN_MERGE_REQUIRED,
+                      CI_GATE_DRAFT_TIER_CHECK: GATE_GREEN_DRAFT_TIER}
 # ---- AGGREGATOR-NAME DRIFT DETECTOR ----------------------------------------------------------
 # This outage has now happened TWICE from the same root cause: the target renamed the aggregator
 # check-run and this repo, which matches the name EXACTLY, silently read "missing" and stood every
@@ -962,20 +998,53 @@ def repair_gate_conclusion(check_runs, log=print):
     `gate, draft-tier` run supersedes it, and a re-draft's later draft-tier run supersedes the
     full-tier one. A cancelled twin can therefore never decide a head whose real run is newer.
 
-    ONLY THE `failure` ANSWER IS ADMISSIBLE (see CI_REPAIR_GATE_CHECKS): the draft tier runs a
-    strict subset of the full leg set, so a red draft-tier gate proves the full set is red, while
-    a green one proves nothing about it. Callers must branch on `== "failure"` and treat every
-    other value — including pending, missing and unknown — as FAIL OPEN (proceed as if this
-    predicate did not exist). pending is not merely tolerated but load-bearing: measured over the
-    2026-07-19..26 verdict ledger, 70/277 (25.3%) of round-1 review heads had the aggregator
-    still IN PROGRESS at dispatch, so a pending==red reading would stall a quarter of the lane."""
+    THIS IS THE REPAIR AUTHORITY'S READING AND NOTHING ELSE (see EVIDENCE GRADE above). The
+    failure|pending|missing|unknown answers keep interpret_check_runs' vocabulary verbatim; the
+    GREEN answer is graded by the tier that won — GATE_GREEN_MERGE_REQUIRED or
+    GATE_GREEN_DRAFT_TIER — and is therefore NEVER the string "success". Repair consumers test
+    `== "failure"` (a subset-red proves the full set red) or `in TIER_REACHABLE_GREEN` (see
+    stranded_live for why the subset argument does not bind that consequence). An admission
+    consumer that reaches for this value gets neither, and fails closed.
+
+    Every non-"failure", non-green value — pending, missing, unknown — is FAIL OPEN: proceed as
+    if this predicate did not exist. pending is not merely tolerated but load-bearing: measured
+    over the 2026-07-19..26 verdict ledger, 70/277 (25.3%) of round-1 review heads had the
+    aggregator still IN PROGRESS at dispatch, so a pending==red reading would stall a quarter of
+    the lane."""
     if not isinstance(check_runs, list):
         return "unknown"
     latest = _latest_check_runs_by_name(check_runs, log=log)
-    tiered = [entry for name, entry in latest.items() if name in CI_REPAIR_GATE_CHECKS]
+    tiered = [(name, entry) for name, entry in latest.items() if name in CI_REPAIR_GATE_CHECKS]
     if not tiered:
         return "missing"
-    return _gate_state_of(max(tiered, key=lambda entry: entry[0]))
+    # EXACT tier identity, taken from the resolved run's own name — not re-derived by matching
+    # the name again downstream, and never by a prefix test (`gate` prefixes `gate, draft-tier`).
+    name, entry = max(tiered, key=lambda pair: pair[1][0])
+    state = _gate_state_of(entry)
+    return GATE_GREEN_BY_TIER[name] if state == "success" else state
+
+
+def unknown_aggregator_tiers(check_runs):
+    """PURE cross-repo CONTRACT-DRIFT detector (issue #762): the aggregator-SHAPED check-run names
+    present on a head that are NOT in the closed CI_REPAIR_GATE_CHECKS table.
+
+    Non-empty means the target repo publishes an aggregator tier this repo does not recognise —
+    the exact condition that made the ci-fix lane silently unreachable on sparq for ten days,
+    because an unrecognised tier and an absent aggregator both read as "missing".
+
+    ALARM ONLY. The returned names are counted and logged; no caller may resolve, classify or
+    admit on them. Widening repair_gate_conclusion to consume this would reinstate the defect
+    with a wider blast radius: an unknown tier's leg set is unknown, so neither its red nor its
+    green direction can be argued for. The remedy is a human adding the name to the table after
+    checking what that tier actually runs."""
+    if not isinstance(check_runs, list):
+        return []
+    return sorted({
+        run["name"] for run in check_runs
+        if isinstance(run, dict) and isinstance(run.get("name"), str)
+        and run["name"] not in CI_REPAIR_GATE_CHECKS
+        and AGGREGATOR_TIER_SHAPE.fullmatch(run["name"])
+    })
 
 
 def pr_ci_status(record):
@@ -1030,7 +1099,8 @@ def pr_ci_status(record):
     # to "missing", and every caller fails OPEN on anything that is not "failure".
     status["repair_gate"] = repair_gate_conclusion(usable_runs)
     # Drift alarm (see AGGREGATOR_TIER_SHAPE). Carried on the status so PLAN can log it once per
-    # tick; it is never read by any admission.
+    # tick; it is never read by any admission. ALWAYS present, so no consumer can read a missing
+    # key and silently fall back to "no drift"; a degraded record blanks it like the two gates.
     status["gate_tier_drift"] = unknown_aggregator_tiers(usable_runs)
     return status
 
@@ -1049,12 +1119,20 @@ def repair_gate_of(status, draft):
 
     `draft` is tri-state on both sides and BOTH must agree: the enumerator's listing bit says
     draft AND the snapshot's own (newer) detail read must not contradict it. Anything else falls
-    back to the strict merge-required reading — fail CLOSED toward the narrower name."""
+    back to the strict merge-required reading — fail CLOSED toward the narrower name.
+
+    [#762] The RETURN IS ALWAYS THE REPAIR VOCABULARY, on both branches: the strict fallback's
+    "success" is re-graded to GATE_GREEN_MERGE_REQUIRED. Without that this accessor would emit
+    the ADMISSION spelling on one of its two paths, and the enforcement property below would be
+    true of the field but false of the accessor — which is the one repair decisions actually
+    call. Re-grading loses nothing (the fallback's green IS merge-required, and the grade says
+    so) and it makes `repair_gate_of(...) == "success"` unsatisfiable by construction."""
     if not isinstance(status, dict):
         return "unknown"
     if draft is True and status.get("draft") is not False:
         return status.get("repair_gate", "unknown")
-    return status.get("gate", "unknown")
+    strict = status.get("gate", "unknown")
+    return GATE_GREEN_MERGE_REQUIRED if strict == "success" else strict
 
 
 def snapshot_skip_reasons(snapshot_skips):
@@ -1096,13 +1174,44 @@ def stranded_live(draft, armed, reviewed_match, mergeable, gate):
     """PURE live re-derivation of the stranded posture: a DRAFTED, UNARMED PR whose current head
     equals its reviewed-sha marker on a cleanly-mergeable base with a concluded-GREEN gate. The
     loop has no autonomous exit from that state (re-review is bound to a head advance, ci-fix to
-    a red gate, rebase to a conflict, arm to a review outcome), so it is handed loudly to a
-    human. Anything else — armed, ready, unreviewed, red/pending/unknown gate, conflicting or
-    still-computing base — is some other path's job and must NOT be escalated. [round-5 P2]
-    the arm bit is tri-state (see pr_ci_status): only an EXPLICIT armed=False proves the
-    stranded posture — an unknown/garbage latch shape never acts."""
+    a red gate, rebase to a conflict, arm to a review outcome), so the pipeline recovers it by
+    re-reviewing the head under the bounded round budget (issue #161). Anything else — armed,
+    ready, unreviewed, red/pending/unknown gate, conflicting or still-computing base — is some
+    other path's job and must NOT be recovered here. [round-5 P2] the arm bit is tri-state (see
+    pr_ci_status): only an EXPLICIT armed=False proves the stranded posture — an unknown/garbage
+    latch shape never acts.
+
+    `gate` IS A TIER-REACHABLE CONCLUSION (issue #762) — repair_gate_conclusion at PLAN time,
+    _live_repair_gate at CLAIM time — not the strict merge-required reading, and the bare
+    admission spelling "success" is deliberately REFUSED (it can only arrive here by someone
+    piping status["gate"] in, which would be the two authorities' vocabularies silently
+    interchanging; refusing it fails closed, to a defer).
+
+    WHY THE SUBSET ARGUMENT DOES NOT BIND HERE. CI_REPAIR_GATE_CHECKS argues that subset-green
+    proves nothing about the full leg set, so a draft-tier green must never stand in for the
+    merge-required context. That argument is about ADMITTING code toward the merge queue. This
+    predicate admits nothing: its entire consequence is that CLAIM retracts a reviewed-sha marker
+    the posture has already DISPROVED and dispatches `mode: review` — work performed ON the PR,
+    bounded by the same round budget as any review, ending in a verdict that is itself the thing
+    that could later arm. Three properties make subset-green sufficient for THAT consequence:
+
+      * NON-ADMITTING — nothing downstream of `stranded` arms, merges or queues. The arm decision
+        is taken later, from a verdict, against status["gate"], which this change does not touch.
+      * ALREADY THE LANE'S POLICY — #761 measured the alternative and kept it: an un-reviewed
+        draft on a RED head is still a review item ("the loop's own work comes first"). Reviewing
+        a head whose full tier might be red is not a new risk this predicate introduces; it is
+        the standing, measured behaviour of the review lane. Requiring merge-required green here
+        was therefore STRICTER than the lane it feeds — strict enough to be unsatisfiable.
+      * FAILURE MODE IS BOUNDED AND VISIBLE — if the full tier is red, the re-review either finds
+        real defects or the head's red gate enumerates needs-ci-fix on the next tick. Neither is
+        an absorbing state; the round budget bounds the retries either way.
+
+    Against that: with the merge-required reading, on sparq (the only target with a draft tier)
+    this predicate is UNSATISFIABLE — draft and merge-required-green are mutually exclusive by
+    construction — so the #161 escape from an interrupted defuse/disarm did not exist at all on
+    the main target repo."""
     return (draft is True and armed is False and reviewed_match
-            and mergeable is True and gate == "success")
+            and mergeable is True and gate in TIER_REACHABLE_GREEN)
 
 
 def enumerate_disarm_items(repo, pulls, pr_status, provenance, bot_login=""):
@@ -2182,7 +2291,7 @@ def _cap_draft_tier_backlog(items, log=print):
 
 
 def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, bot_login="",
-                           pr_status=None, exclusions=None, enrolled_authors=()):
+                           pr_status=None, exclusions=None, enrolled_authors=(), census=None):
     """PURE review_items enumerator (called by the dispatch.yml PLAN step against its own data;
     unit-tested by --self-test). Fail-closed trust posture (locked decisions 1/3/11/13/19):
     - only open PRs whose head branch matches the worker pattern,
@@ -2220,8 +2329,22 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
       its own live re-derivation CLAIM RE-REVIEWS the current head (issue #161) under the bounded
       round budget, escalating to a human (needs-user) only once that budget is spent by repeated
       failed recovery. A READY (non-draft) unarmed PR in the same posture is deliberately NOT
-      stranded: that is the valid arm=false-policy terminal (human merges)."""
+      stranded: that is the valid arm=false-policy terminal (human merges). [issue #762] Its green
+      precondition is the TIER-REACHABLE reading, so the state is reachable on a draft head at all;
+      see stranded_live for why a re-review may act on subset-green when an arm may not.
+
+    `census` (optional Counter) receives the DISPOSITION of every PR that reaches the
+    drafted-already-reviewed decision — one disjoint IDLE_CENSUS_BUCKETS entry each, labelled or
+    not, with every bucket pre-seeded at zero. `exclusions` remains the SIGNALLED-only exclusion
+    tally and is unchanged: the two are separate because their denominators differ, and summing an
+    exclusion count over a population census would produce a number that means nothing."""
     live_keys = _live_holder_keys(leases, now)
+    if census is not None:
+        # Pre-seed at zero (issue #762 / the #753 population-census rule): an absent bucket and a
+        # zero bucket must not look the same, or "this never happens" is indistinguishable from
+        # "this stopped being counted" — which is exactly how ten days of unreachable repair read
+        # as a healthy tick.
+        census.update({bucket: 0 for bucket in IDLE_CENSUS_BUCKETS})
     items = []
     for pull in pulls:
         if not isinstance(pull, dict):
@@ -2256,6 +2379,13 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
                 print(f"review-enumeration: exclude {repo}#{identity}: {reason}")
                 if exclusions is not None:
                     exclusions[reason] += 1
+
+        def _bucket(name):
+            """[issue #762] Count this PR into ONE disjoint census bucket, whether or not it
+            carries a review-loop label. Unconditional: the signalled-only tally above is what
+            let an unlabelled worker draft leave no trace at all."""
+            if census is not None:
+                census[name] += 1
 
         if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
             exclude_signalled("invalid PR number in snapshot")
@@ -2474,28 +2604,59 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
         # heads and this admission never fired there. Red-only, per CI_REPAIR_GATE_CHECKS' subset
         # argument, and TIER-APPROPRIATE per repair_gate_of: a READY PR is still judged on the
         # strict name alone, so a stale draft-tier row can never defuse a valid arm.
-        if repair_gate_of(status, draft) == "failure" and lease_free:
+        #
+        # [#762] The SAME accessor answers the GREEN half in the branch below, so it is resolved
+        # ONCE here: the red trigger and the stranded precondition must never disagree about which
+        # tier a head publishes, and two separate reads of two different fields is exactly how
+        # they would.
+        repair = repair_gate_of(status, draft)
+        if repair == "failure" and lease_free:
+            _bucket("repair:needs-ci-fix")
             # NEWLY REACHABLE = the strict merge-required reading would NOT have seen this row,
             # i.e. it is part of the ten-day backlog this PR releases. Only those are bounded.
             emit("needs-ci-fix", context=", ".join(status.get("failing_legs") or []),
                  newly_reachable=status.get("gate") != "failure")
         elif (draft and reviewed_match and lease_free
-                and status.get("gate") == "success"
+                and repair in TIER_REACHABLE_GREEN
                 and status.get("conflicting") is False
                 and status.get("armed") is False):
             # [round-5 P2] armed is tri-state: only an EXPLICIT False admits the stranded
-            # escalation — an unknown/garbage latch shape (None) never acts.
+            # recovery — an unknown/garbage latch shape (None) never acts.
             # Absorbing-state escape (never-silent-stall): a DRAFTED, unarmed PR whose reviewed
             # head has a concluded-GREEN gate has no other autonomous exit (re-review requires a
             # head advance, ci-fix a red gate, rebase a conflict, arm a review outcome). It is
             # the residue of a defused arm whose repair trigger evaporated, or of a crashed
             # disarm — CLAIM re-derives it live and RE-REVIEWS the current head under the bounded
             # round budget (issue #161), escalating to a human only after repeated failed recovery.
-            emit("stranded")
+            #
+            # [issue #762] The green is TIER-REACHABLE, not merge-required: reading the strict
+            # `gate` here made this branch unsatisfiable on every sparq draft (draft and
+            # merge-required-green are mutually exclusive by construction), so the #161 escape did
+            # not exist on the main target repo at all. stranded_live carries the full argument for
+            # why the subset-green objection does not bind a consequence that only RE-REVIEWS. The
+            # grade rides along in `context` so the plan, the log and the census all record WHICH
+            # evidence admitted the recovery — a draft-tier-admitted stranded is a distinguishable
+            # population, not a silently-widened one.
+            _bucket(f"stranded:{repair}")
+            # NEWLY REACHABLE = the strict merge-required reading could not have produced this
+            # green, so the row is part of the accumulated backlog rather than steady-state
+            # arrival, and drains under the same per-lane bound as the fix half (#761's
+            # DRAFT_TIER_BACKLOG_PER_TICK_MAX; the cap is lane-keyed, so the two cannot share a
+            # budget). A stranded whose green IS merge-required was already enumerable and is
+            # deliberately not throttled.
+            emit("stranded", context=f"gate evidence: {repair}",
+                 newly_reachable=repair != GATE_GREEN_MERGE_REQUIRED)
         else:
             # Finding D: the drafted already-reviewed fall-through — a labeled PR whose head is
             # bound but whose gate is not a concluded failure and whose posture is not stranded
             # exits here every tick. Name the residue instead of dropping it silently.
+            #
+            # [issue #762] exclude_signalled is SIGNALLED-ONLY: an unlabelled worker draft left no
+            # trace here at all, which is the second reason ten days of unreachable repair looked
+            # like nothing was wrong. The census below counts EVERY PR that reaches this point,
+            # labelled or not, into exactly one disjoint bucket — a per-stage rate cannot express a
+            # MISSING EDGE (#753), only a population partition can.
+            _bucket(_idle_census_bucket(repair, draft, reviewed_match, lease_free))
             exclude_signalled(
                 "head already reviewed; no live repair trigger (gate not concluded-red, "
                 "posture not stranded)")
@@ -2515,6 +2676,46 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
               "what its LEG SET runs, not just the spelling)")
     items.sort(key=lambda item: (item["repo"], item["pr_number"]))
     return _cap_draft_tier_backlog(items)
+
+
+# The disjoint bucket vocabulary for the drafted-already-reviewed fall-through (issue #762,
+# following the #753/#754 population-census pattern). EVERY bucket is emitted on EVERY plan, at
+# zero when unhit: a bucket that only appears when non-zero cannot distinguish "this never
+# happens" from "this stopped being counted", which is the failure class that hid the unreachable
+# repair lane. `idle:unclassified` is the deliberate residual — a posture with no bucket lands
+# there rather than being folded into a neighbour, so a missing bucket shows up as an unexplained
+# count instead of a plausible-looking one.
+IDLE_CENSUS_BUCKETS = (
+    "repair:needs-ci-fix",
+    f"stranded:{GATE_GREEN_MERGE_REQUIRED}",
+    f"stranded:{GATE_GREEN_DRAFT_TIER}",
+    "idle:gate-pending",
+    "idle:gate-missing",
+    "idle:gate-unknown",
+    "idle:green-but-armed-or-conflicted",
+    "idle:lease-held",
+    "idle:not-drafted-or-unreviewed",
+    "idle:unclassified",
+)
+
+
+def _idle_census_bucket(tiered, draft, reviewed_match, lease_free):
+    """PURE: the ONE disjoint census bucket for a PR that reached the fall-through. Ordered most
+    specific first; every branch is reachable and the residual is explicit."""
+    if not lease_free:
+        return "idle:lease-held"
+    if not (draft and reviewed_match):
+        return "idle:not-drafted-or-unreviewed"
+    if tiered in TIER_REACHABLE_GREEN:
+        # Green and idle, but the stranded posture needs a clean base and a provably-absent latch.
+        return "idle:green-but-armed-or-conflicted"
+    if tiered == "pending":
+        return "idle:gate-pending"
+    if tiered == "missing":
+        return "idle:gate-missing"
+    if tiered == "unknown":
+        return "idle:gate-unknown"
+    return "idle:unclassified"
 
 
 def filter_deferred_items(items, repo, leases, now):
@@ -2624,15 +2825,13 @@ def _live_repair_gate(repo, head_sha, draft, fetch=None):
     return repair_gate_conclusion(rows)
 
 
-def _live_strict_gate(repo, head_sha, fetch=None):
-    """LIVE MERGE-ADMISSION reading (role (a)) for one head: the strict merge-required `gate`
-    context and NOTHING else, over the same paginated/cross-checked walk. This is what `stranded`
-    re-derives — its precondition is a concluded-GREEN gate, and subset-green does not imply
-    superset-green, so the draft-tier name must not be requested here (see CI_GATE_CHECK)."""
-    rows = _live_aggregator_runs(repo, head_sha, (CI_GATE_CHECK,), fetch=fetch)
-    if rows is _UNPROVABLE_READ:
-        return "unknown"
-    return interpret_check_runs(rows)["gate"]
+# (#761 added `_live_strict_gate`, a live role-(a) reading, for `stranded` — its ONLY consumer.
+# #762 moves that site to the repair reading above, which leaves no caller: this repo takes no
+# live CI read on any admission path at all, because nothing here arms on CI (the arm decision is
+# `worker-pr.decide_review`, which accepts no CI argument). An uncalled admission helper is worse
+# than none — it invites a future caller into exactly the confusion the role split exists to stop.
+# The strict live reading itself is not lost: `_live_repair_gate(repo, sha, draft=False)` requests
+# `(CI_GATE_CHECK,)` and nothing else, over the same walk, and is pinned by case (g) below.)
 
 
 def _labels(issue):
@@ -4357,19 +4556,22 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 # Re-derived LIVE first: any drift (armed again, head moved, gate red/pending,
                 # base conflicting) means some other path owns the new posture, so defer with NO
                 # mutation and let that path re-admit it.
-                # ROLE (a), the MERGE-ADMISSION reading: `stranded`'s precondition is a
-                # concluded-GREEN gate, and subset-green does not imply superset-green, so this
-                # site requests the strict merge-required name ONLY — never the repair tier set.
-                # Swapping in _live_repair_gate here would let a draft-tier green satisfy a
-                # green-gate precondition; a named test pins that divergence. (Registry #765,
-                # stacked on this PR, deliberately REDEFINES stranded over the tier-reachable
-                # green with its own argument and its own vocabulary layer, and replaces that
-                # assertion. What must survive both is the strict `gate` reading staying the only
-                # thing an ARM or MERGE decision can ever consult.)
-                # It goes through the same paginated + total_count-cross-checked walk as the
-                # repair read: the old unpaginated page-1 read here could not tell a truncated
-                # listing from an absent aggregator either.
-                live_strict_gate = _live_strict_gate(repo, head_sha)
+                # ROLE (b), the REPAIR reading (issue #762 — this site is what #761 left open).
+                # The live re-derivation reads the SAME tier-reachable predicate the enumerator
+                # did: `_live_repair_gate`, which requests only the names THIS head's draft state
+                # can publish, pages each to exhaustion, cross-checks the endpoint's own
+                # `total_count`, and yields "unknown" (defer) rather than a silent "missing" on a
+                # short or garbage read. The previous read here was a single unpaginated
+                # `check_name=gate` request, so on a sparq draft it returned ZERO rows ->
+                # "missing" -> the posture never re-derived. Leaving it strict would have made the
+                # enumerator change above produce items that CLAIM then deferred every tick
+                # forever: this line is what makes the green half have any effect at all.
+                #
+                # It cannot leak into ADMISSION, and the containment is in the VALUE, not here:
+                # `_live_repair_gate` returns the GRADED vocabulary, so what `stranded_live`
+                # receives is `green:merge-required` or `green:draft-tier` — never the bare
+                # "success" that every arm/merge decision tests for. See EVIDENCE GRADE.
+                live_gate = _live_repair_gate(repo, head_sha, draft)
                 reviewed = REVIEWED_SHA_RE.search(pull.get("body") or "")
                 # [round-5 P2] tri-state live arm bit: garbage auto_merge shapes are UNKNOWN
                 # (None) and stranded_live then refuses to act — never "unarmed".
@@ -4378,9 +4580,9 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                               else False if live_auto is None else None)
                 if not stranded_live(draft, live_armed,
                                      bool(reviewed and reviewed.group(1) == head_sha),
-                                     pull.get("mergeable"), live_strict_gate):
+                                     pull.get("mergeable"), live_gate):
                     print(f"defer review {repo}#{number}: the stranded posture did not "
-                          "re-derive on live data")
+                          f"re-derive on live data (tier-reachable gate={live_gate})")
                     continue
                 print(f"recover review {repo}#{number}: stranded residue of an interrupted "
                       "defuse/disarm — re-reviewing the current head under the round budget")
@@ -7945,10 +8147,13 @@ def _self_test():
         same thing inside the enumerator."""
         base = {"head_sha": sha_a, "conflicting": False, "armed": False, "failing_legs": []}
         # `repair_gate` mirrors `gate` here: these fixtures model heads where the strict
-        # merge-required context IS present, so both readings agree. pr_ci_status always
-        # emits both (asserted structurally below), so a row is never missing the field.
+        # merge-required context IS present, so both readings agree — but the tier-reachable
+        # reading is GRADED (issue #762), so its green is GATE_GREEN_MERGE_REQUIRED and never the
+        # bare "success". pr_ci_status always emits both (asserted structurally below), so a row
+        # is never missing the field.
         return {
-            "green": {41: {**base, "gate": "success", "repair_gate": "success"}},
+            "green": {41: {**base, "gate": "success",
+                           "repair_gate": GATE_GREEN_MERGE_REQUIRED}},
             "red": {41: {**base, "gate": "failure", "repair_gate": "failure",
                          "failing_legs": ["workspace clippy"]}},
             "pending": {41: {**base, "gate": "pending", "repair_gate": "pending"}},
@@ -9459,8 +9664,8 @@ def _self_test():
     # whose real full-tier run is newer and green...
     _twin_then_green = [_agg(CI_GATE_DRAFT_TIER_CHECK, "cancelled", started="2026-07-23T01:00:00Z"),
                         _agg(CI_GATE_CHECK, "success", started="2026-07-23T02:00:00Z")]
-    assert repair_gate_conclusion(_twin_then_green) == "success", _twin_then_green
-    assert repair_gate_conclusion(list(reversed(_twin_then_green))) == "success"
+    assert repair_gate_conclusion(_twin_then_green) == GATE_GREEN_MERGE_REQUIRED, _twin_then_green
+    assert repair_gate_conclusion(list(reversed(_twin_then_green))) == GATE_GREEN_MERGE_REQUIRED
     # ...and symmetrically, a stale GREEN draft-tier run must not mask a newer red full-tier
     # one (the same masking bug in the other direction).
     assert repair_gate_conclusion([
@@ -9485,11 +9690,43 @@ def _self_test():
     assert "repair_gate" in _plain_ci, sorted(_plain_ci)
     assert "repair_gate" in degraded_ci and degraded_ci["repair_gate"] == "missing"
     # QUANTIFIER DIRECTION: the draft tier is a strict SUBSET of the full leg set, so a GREEN
-    # draft-tier result must NEVER stand in for the merge-required context. `stranded`'s
-    # concluded-GREEN precondition reads `gate`, which stays "missing" here.
+    # draft-tier result must NEVER stand in for the merge-required context. The strict `gate`
+    # reading stays "missing" here, and the tier-reachable green is GRADED as draft-tier.
     _draft_green = pr_ci_status({**record, "check_runs": [_agg(CI_GATE_DRAFT_TIER_CHECK,
                                                                "success")]})
-    assert (_draft_green["gate"], _draft_green["repair_gate"]) == ("missing", "success")
+    assert (_draft_green["gate"], _draft_green["repair_gate"]) == (
+        "missing", GATE_GREEN_DRAFT_TIER), _draft_green
+    # ---- [issue #762] THE EVIDENCE-GRADE SEPARATION, asserted rather than commented ----------
+    # THE enforcement property: no tier-reachable reading is EVER the string "success", so
+    # `<tiered> == "success"` — the shape every admission path uses to prove a green aggregator —
+    # is false for both tiers and can only ever be true of the strict merge-required `gate`.
+    # Respelling either green as "success" reds this (and re-opens the exact confusion #762 is
+    # about: an arm decision satisfied by a subset-green draft-tier run).
+    for _tier_green in TIER_REACHABLE_GREEN:
+        assert _tier_green != "success", _tier_green
+    _full_green = pr_ci_status({**record, "check_runs": [_agg(CI_GATE_CHECK, "success")]})
+    assert (_full_green["gate"], _full_green["repair_gate"]) == (
+        "success", GATE_GREEN_MERGE_REQUIRED), _full_green
+    # The two greens are DISTINCT values: a consumer can tell the tiers apart from the value
+    # alone, with no name re-parsing and no prefix test anywhere downstream.
+    assert GATE_GREEN_MERGE_REQUIRED != GATE_GREEN_DRAFT_TIER
+    assert set(GATE_GREEN_BY_TIER) == set(CI_REPAIR_GATE_CHECKS), GATE_GREEN_BY_TIER
+    assert set(GATE_GREEN_BY_TIER.values()) == TIER_REACHABLE_GREEN, GATE_GREEN_BY_TIER
+    # NOT SATISFIED BY PREFIX MATCHING. `gate` is a strict prefix of `gate, draft-tier`; if the
+    # tier discriminator were a prefix/startswith test, a draft-tier row would resolve to the
+    # MERGE-REQUIRED grade — the unsound direction. Assert the grade comes out draft-tier for the
+    # longer name and merge-required for the shorter one, i.e. that the longer name is NOT read
+    # as the shorter one despite sharing its prefix.
+    assert CI_GATE_DRAFT_TIER_CHECK.startswith(CI_GATE_CHECK), "premise of the prefix hazard"
+    assert repair_gate_conclusion([_agg(CI_GATE_DRAFT_TIER_CHECK, "success")]) \
+        == GATE_GREEN_DRAFT_TIER
+    assert repair_gate_conclusion([_agg(CI_GATE_CHECK, "success")]) == GATE_GREEN_MERGE_REQUIRED
+    # A GRADED green is still not a green for the ADMISSION reading: `interpret_check_runs` —
+    # the strict merge-required reading every arm/merge path uses — is untouched by the grading
+    # and keeps its own "success"/"missing" vocabulary on the very same rows.
+    assert interpret_check_runs([_agg(CI_GATE_CHECK, "success")])["gate"] == "success"
+    assert interpret_check_runs([_agg(CI_GATE_DRAFT_TIER_CHECK, "success")])["gate"] == "missing"
+    # (the drift detector and its alarm-only property are #761's — asserted there, not here.)
     # The aggregator is never handed to the fixer as an advisory leg to repair, in EITHER
     # spelling (dropping CI_GATE_DRAFT_TIER_CHECK from the exclusion reds this).
     _legs = pr_ci_status({**record, "check_runs": [
@@ -9589,7 +9826,8 @@ def _self_test():
     _many += [_agg(CI_GATE_DRAFT_TIER_CHECK, "success", started="2026-07-24T00:00:00Z")]
     _many *= 5                     # 120 rows > one page; the newest is a SUCCESS
     _f = _live_fetch({CI_GATE_DRAFT_TIER_CHECK: _many})
-    assert len(_many) > 100 and _live_repair_gate("o/r", "a" * 40, True, fetch=_f) == "success"
+    assert len(_many) > 100 and _live_repair_gate("o/r", "a" * 40, True, fetch=_f) \
+        == GATE_GREEN_DRAFT_TIER
     assert sum(1 for p in _f.seen
                if urllib.parse.quote(CI_GATE_DRAFT_TIER_CHECK, safe="") in p) == 2, _f.seen
     # (c) A SHORT READ IS NOT "NO GATE ROW". The page ends while the endpoint says more exist:
@@ -9620,45 +9858,71 @@ def _self_test():
     assert repair_gate_checks_for(True) == CI_REPAIR_GATE_CHECKS
     for _not_draft in (False, None, "true", 1):
         assert repair_gate_checks_for(_not_draft) == (CI_GATE_CHECK,), _not_draft
-    # (h) THE ROLE SPLIT AT THE LIVE READS. `stranded` re-derives role (a) — merge admission —
-    # so it must request the strict name ONLY. On a DRAFT head carrying a GREEN draft-tier
-    # aggregator the two readings DIVERGE, and only the strict one refuses to recover.
-    # Swapping _live_strict_gate for _live_repair_gate at the stranded call site reds this
-    # (round-2 review finding 1: that site previously had no fixture where the readings
-    # differed, so the mutant survived the whole suite).
-    _f = _live_fetch({CI_GATE_DRAFT_TIER_CHECK: [_agg(CI_GATE_DRAFT_TIER_CHECK, "success")]})
-    assert _live_strict_gate("o/r", "a" * 40, fetch=_f) == "missing"
+    # (h) THE ROLE SPLIT AT THE LIVE READS, GREEN HALF — the leg named in this PR's title
+    # (issue #762). `stranded` re-derives role (b), the REPAIR reading, so on a DRAFT head whose
+    # ONLY aggregator is a GREEN `gate, draft-tier` the posture RECOVERS. That head is what every
+    # live sparq worker draft looks like; under the strict merge-required reading #761 shipped it
+    # reads "missing" and the recovery can never fire, which is the whole defect.
+    _draft_green = {CI_GATE_DRAFT_TIER_CHECK: [_agg(CI_GATE_DRAFT_TIER_CHECK, "success")]}
+    _f = _live_fetch(_draft_green)
+    _tier_green = _live_repair_gate("o/r", "a" * 40, True, fetch=_f)
+    assert _tier_green == GATE_GREEN_DRAFT_TIER, _tier_green
+    assert stranded_live(True, False, True, True, _tier_green) is True
+    # M1 — reverting the stranded call site to the strict merge-required name. The SAME head,
+    # read the pre-#762 way: "missing", and the recovery refuses. This pair is the divergence
+    # fixture, in the direction this PR reverses.
+    _f = _live_fetch(_draft_green)
+    _strict = _live_repair_gate("o/r", "a" * 40, False, fetch=_f)
     assert [_requested_gate_name(p) for p in _f.seen] == [CI_GATE_CHECK], _f.seen
-    assert _live_repair_gate("o/r", "a" * 40, True, fetch=_live_fetch(
-        {CI_GATE_DRAFT_TIER_CHECK: [_agg(CI_GATE_DRAFT_TIER_CHECK, "success")]})) == "success"
-    assert stranded_live(True, False, True, True,
-                         _live_strict_gate("o/r", "a" * 40, fetch=_live_fetch(
-                             {CI_GATE_DRAFT_TIER_CHECK: [
-                                 _agg(CI_GATE_DRAFT_TIER_CHECK, "success")]}))) is False
-    assert stranded_live(True, False, True, True,
-                         _live_strict_gate("o/r", "a" * 40, fetch=_live_fetch(
-                             {CI_GATE_CHECK: [_agg(CI_GATE_CHECK, "success")]}))) is True
-    # (i) ...and the stranded read gets the SAME completeness discipline as the repair read: a
-    # short/unprovable walk is UNKNOWN (stranded_live then refuses), never a bare "missing"
-    # drawn from a truncated page-1 listing.
-    assert _live_strict_gate("o/r", "a" * 40, fetch=_live_fetch(
-        {CI_GATE_CHECK: [_agg(CI_GATE_CHECK, "success")]}, total_override=9)) == "unknown"
-    _f = _live_fetch({CI_GATE_CHECK: [_agg(CI_GATE_CHECK, "failure",
-                                           started="2026-07-23T01:00:00Z")] * 100
-                                     + [_agg(CI_GATE_CHECK, "success",
-                                             started="2026-07-24T01:00:00Z")]})
-    assert _live_strict_gate("o/r", "a" * 40, fetch=_f) == "success"    # page 2 decided it
-    assert sum(1 for p in _f.seen if _requested_gate_name(p) == CI_GATE_CHECK) == 2, _f.seen
+    assert _strict == "missing", _strict
+    assert stranded_live(True, False, True, True, _strict) is False
+    # ...and widening the green half must not NARROW it: a merge-required green still recovers,
+    # at its own grade.
+    assert _live_repair_gate("o/r", "a" * 40, False, fetch=_live_fetch(
+        {CI_GATE_CHECK: [_agg(CI_GATE_CHECK, "success")]})) == GATE_GREEN_MERGE_REQUIRED
+    assert stranded_live(True, False, True, True, GATE_GREEN_MERGE_REQUIRED) is True
+    # M2 — THE VOCABULARY SEPARATION, AT THE PREDICATE. `stranded_live` REFUSES the bare
+    # ADMISSION spelling: the only way "success" reaches it is someone piping status["gate"] (or
+    # a strict live read) in, i.e. the two authorities' vocabularies silently interchanging.
+    # Refusing fails closed, to a defer. Making stranded_live accept "success" reds this.
+    assert stranded_live(True, False, True, True, "success") is False
+    assert interpret_check_runs([_agg(CI_GATE_CHECK, "success")])["gate"] == "success"
+    # (i) ...and the stranded read keeps the SAME completeness discipline the repair read has: a
+    # walk that cannot be PROVEN complete is UNKNOWN (stranded_live then refuses), never a bare
+    # "missing" drawn from a truncated page-1 listing. Live right now, sparq #4369 declares
+    # total_count=486 while an unpaginated read returns 30 rows with ZERO aggregator rows.
+    def _short_on_the_deciding_tier(path):
+        # the strict name answers honestly-empty; the DRAFT-TIER name — the one that decides
+        # this head — claims more rows than it returns.
+        if _requested_gate_name(path) == CI_GATE_DRAFT_TIER_CHECK:
+            return {"check_runs": [_agg(CI_GATE_DRAFT_TIER_CHECK, "success")], "total_count": 9}
+        return {"check_runs": [], "total_count": 0}
+
+    _short = _live_repair_gate("o/r", "a" * 40, True, fetch=_short_on_the_deciding_tier)
+    assert _short == "unknown", _short          # NOT "missing" — a defer, not a silent skip
+    assert stranded_live(True, False, True, True, _short) is False
+    _f = _live_fetch({CI_GATE_DRAFT_TIER_CHECK:
+                      [_agg(CI_GATE_DRAFT_TIER_CHECK, "failure",
+                            started="2026-07-23T01:00:00Z")] * 100
+                      + [_agg(CI_GATE_DRAFT_TIER_CHECK, "success",
+                              started="2026-07-24T01:00:00Z")]})
+    # page 2 decided it: an unpaginated read concludes `failure` off page 1 alone and the
+    # recovery never fires on a head that is in fact green.
+    assert _live_repair_gate("o/r", "a" * 40, True, fetch=_f) == GATE_GREEN_DRAFT_TIER
+    assert sum(1 for p in _f.seen
+               if _requested_gate_name(p) == CI_GATE_DRAFT_TIER_CHECK) == 2, _f.seen
 
     # ---- GAP-A/B enumeration: zero-manual repair states over the same surface ----
     def status_of(status_sha, gate="success", conflicting=False, armed=False, legs=(),
-                  repair_gate=None):
-        # Mirrors pr_ci_status's real shape. `repair_gate` defaults to `gate` (the case where
-        # the strict merge-required context exists on the head and both readings agree); the
-        # DRAFT-tier case — strict `gate` missing, tiered red — is passed explicitly.
+                  repair_gate=None, drift=()):
+        # Mirrors pr_ci_status's real shape. `repair_gate` defaults to the SAME head read at the
+        # tier-reachable grade (the case where the strict merge-required context exists and both
+        # readings agree — so a green becomes GATE_GREEN_MERGE_REQUIRED, issue #762); the
+        # DRAFT-tier cases are passed explicitly.
         return {"head_sha": status_sha, "conflicting": conflicting, "armed": armed,
-                "gate": gate, "failing_legs": sorted(legs),
-                "repair_gate": gate if repair_gate is None else repair_gate}
+                "gate": gate, "failing_legs": sorted(legs), "gate_tier_drift": sorted(drift),
+                "repair_gate": (repair_gate if repair_gate is not None
+                                else GATE_GREEN_MERGE_REQUIRED if gate == "success" else gate)}
 
     starved = pull(41, "sparq-agent/issue-7-1-1", sha_a, labels=["review:needs"],
                    body=f"x <!-- sparq-reviewed-sha:{sha_a} -->")
@@ -9685,6 +9949,75 @@ def _self_test():
         {"head already reviewed; no live repair trigger (gate not concluded-red, "
          "posture not stranded)": 1}), fallthrough_counts
     assert "no live repair trigger" in fallthrough_log.getvalue()
+
+    # ---- [issue #762] THE POPULATION CENSUS: the fall-through is counted for EVERY PR --------
+    # `exclusions` above is SIGNALLED-only — an unlabelled worker draft left no trace at all,
+    # which is the second half of why ten days of unreachable repair looked like a healthy tick.
+    # The census counts every PR reaching the decision into exactly ONE bucket, labelled or not.
+    _unlabelled = pull(41, "sparq-agent/issue-7-1-1", sha_a,
+                       body=f"x <!-- sparq-reviewed-sha:{sha_a} -->")
+    _sink, _census = Counter(), Counter()
+    with contextlib.redirect_stdout(io.StringIO()):
+        assert enumerate_review_items(
+            repo, [_unlabelled], provenance, [], issue_labels, now,
+            pr_status={41: status_of(sha_a, gate="pending")},
+            exclusions=_sink, census=_census) == []
+    # The old telemetry sees NOTHING here (that is the defect, pinned so it cannot be mistaken
+    # for coverage); the census sees the PR.
+    assert _sink == Counter(), _sink
+    assert _census["idle:gate-pending"] == 1, _census
+    # EVERY bucket is present on EVERY plan, at zero when unhit — "this never happens" and "this
+    # stopped being counted" must not look the same. Dropping the pre-seed reds this.
+    assert set(_census) == set(IDLE_CENSUS_BUCKETS), sorted(set(_census) ^ set(IDLE_CENSUS_BUCKETS))
+    assert len(set(IDLE_CENSUS_BUCKETS)) == len(IDLE_CENSUS_BUCKETS), "buckets must be distinct"
+    # DISJOINT AND TOTAL: over one PR the buckets sum to exactly 1, in every gate posture the
+    # decision can meet — including the drift posture, whose alarm bucket is counted IN ADDITION
+    # (it is an observation about the head, not a disposition, so it is asserted separately).
+    for _gate, _want in (("pending", "idle:gate-pending"),
+                         ("missing", "idle:gate-missing"),
+                         ("unknown", "idle:gate-unknown"),
+                         ("failure", "repair:needs-ci-fix"),
+                         ("success", f"stranded:{GATE_GREEN_MERGE_REQUIRED}")):
+        _c = Counter()
+        with contextlib.redirect_stdout(io.StringIO()):
+            enumerate_review_items(repo, [_unlabelled], provenance, [], issue_labels, now,
+                                   pr_status={41: status_of(sha_a, gate=_gate)}, census=_c)
+        assert sum(_c.values()) == 1 and _c[_want] == 1, (_gate, _want, _c)
+    # The draft-tier greens and reds land in their OWN buckets — a draft-tier-admitted stranded
+    # is a countable population, not a silently widened one.
+    for _tiered, _want in ((GATE_GREEN_DRAFT_TIER, f"stranded:{GATE_GREEN_DRAFT_TIER}"),
+                           ("failure", "repair:needs-ci-fix")):
+        _c = Counter()
+        with contextlib.redirect_stdout(io.StringIO()):
+            enumerate_review_items(
+                repo, [_unlabelled], provenance, [], issue_labels, now,
+                pr_status={41: status_of(sha_a, gate="missing", repair_gate=_tiered)}, census=_c)
+        assert _c[_want] == 1 and sum(_c.values()) == 1, (_tiered, _want, _c)
+    # Green but LATCHED / CONFLICTED is its own bucket, not folded into a neighbour...
+    for _extra in ({"armed": True}, {"armed": None}, {"conflicting": None}):
+        _c = Counter()
+        with contextlib.redirect_stdout(io.StringIO()):
+            enumerate_review_items(
+                repo, [_unlabelled], provenance, [], issue_labels, now,
+                pr_status={41: {**status_of(sha_a, gate="success"), **_extra}}, census=_c)
+        assert _c["idle:green-but-armed-or-conflicted"] == 1, (_extra, _c)
+    # ...and a DRIFTED head still lands in an ordinary disposition bucket. The drift ALARM itself
+    # is #761's (one ::warning:: per tick from this enumerator, asserted with the rest of the
+    # detector); the census's job is only that the head is still counted somewhere, so a tick
+    # that discovers a renamed aggregator does not also silently lose the PR from the partition.
+    _c = Counter()
+    with contextlib.redirect_stdout(io.StringIO()):
+        enumerate_review_items(
+            repo, [_unlabelled], provenance, [], issue_labels, now,
+            pr_status={41: status_of(sha_a, gate="missing", repair_gate="missing",
+                                     drift=["gate, some-future-tier"])}, census=_c)
+    assert _c["idle:gate-missing"] == 1 and sum(_c.values()) == 1, _c
+    # A drifted head still DECIDES only on the closed table: the unknown tier never becomes a
+    # repair or a stranded item, in either direction.
+    assert enumerate_review_items(
+        repo, [_unlabelled], provenance, [], issue_labels, now,
+        pr_status={41: status_of(sha_a, gate="missing", repair_gate="missing",
+                                 drift=["gate, some-future-tier"])}) == []
 
     # Finding E: a malformed timeline PAGE containing (or hiding) the newest human unlabel must
     # RAISE — park_policy then keeps the FULL budget count (its documented fail direction)
@@ -9727,12 +10060,34 @@ def _self_test():
     assert enumerate_review_items(
         repo, [starved], provenance, [], issue_labels, now,
         pr_status={41: status_of(sha_a, gate="missing", repair_gate="pending")}) == []
-    # QUANTIFIER DIRECTION at the enumeration boundary: a GREEN draft-tier reading is NOT the
-    # stranded posture, because subset-green does not prove the full leg set green. Only the
-    # strict `gate` may satisfy it (the assertion just below is the positive control).
-    assert enumerate_review_items(
-        repo, [starved], provenance, [], issue_labels, now,
-        pr_status={41: status_of(sha_a, gate="missing", repair_gate="success")}) == []
+    # ---- [issue #762] THE GREEN HALF: A RED DRAFT REACHES REPAIR, A GREEN ONE REACHES REVIEW --
+    # THE HEADLINE. The full sparq draft shape — no merge-required context on the head at all,
+    # only a green DRAFT-TIER aggregator — is the stranded posture, and it enumerates. Reverting
+    # the precondition to `status.get("gate") == "success"` reds this line and restores exactly
+    # the ten-day hole: on sparq the state was definitionally unreachable, so the #161 escape from
+    # an interrupted defuse/disarm did not exist on the main target repo.
+    draft_tier_green = {41: status_of(sha_a, gate="missing",
+                                      repair_gate=GATE_GREEN_DRAFT_TIER)}
+    draft_green_items = enumerate_review_items(repo, [starved], provenance, [], issue_labels,
+                                               now, pr_status=draft_tier_green)
+    assert [(item["state"], item["context"]) for item in draft_green_items] == [
+        ("stranded", f"gate evidence: {GATE_GREEN_DRAFT_TIER}")], draft_green_items
+    # ...AND IT IS NOT THEREBY ADMISSIBLE. The recovered item goes to the REVIEW lane — the lane
+    # that re-reads the head and mints a verdict — never to anything that arms or merges. The
+    # arm decision is taken elsewhere, from a verdict, against the strict merge-required `gate`,
+    # which is still "missing" on this very fixture. Both halves asserted: the lane, and the fact
+    # that the evidence which admitted the recovery cannot prove merge-required green.
+    assert _review_item_lane(draft_green_items[0]["state"]) == "review", draft_green_items
+    assert draft_tier_green[41]["gate"] == "missing", draft_tier_green
+    assert draft_tier_green[41]["repair_gate"] not in ("success",), draft_tier_green
+    assert draft_green_items[0]["state"] not in FIX_KIND_OF_STATE, draft_green_items
+    # The recovery's own live re-derivation agrees, and REFUSES the admission vocabulary: a
+    # caller that pipes the strict `gate` reading in gets a defer, not a recovery. (Accepting
+    # "success" here is the one-character change that would let the two authorities' vocabularies
+    # interchange again; it reds this line.)
+    assert stranded_live(True, False, True, True, GATE_GREEN_DRAFT_TIER) is True
+    assert stranded_live(True, False, True, True, GATE_GREEN_MERGE_REQUIRED) is True
+    assert stranded_live(True, False, True, True, "success") is False
     # POLICY UNCHANGED by this fix (measured, see the PR body): an UN-reviewed draft on a
     # red DRAFT-TIER head is still a REVIEW item — the loop's own work comes first. The
     # review lane's ordering is not a function of the aggregator's tier.
@@ -9859,7 +10214,7 @@ def _self_test():
     stranded_items = enumerate_review_items(repo, [starved], provenance, [], issue_labels, now,
                                             pr_status=green)
     assert [(item["state"], item["context"]) for item in stranded_items] == [
-        ("stranded", "")], stranded_items
+        ("stranded", f"gate evidence: {GATE_GREEN_MERGE_REQUIRED}")], stranded_items
     # [round-5 P2] an UNKNOWN arm bit (garbage auto_merge -> armed=None) never proves the
     # stranded posture: only an EXPLICIT armed=False acts
     assert enumerate_review_items(
@@ -10060,18 +10415,26 @@ def _self_test():
     assert decide_repair_admission("needs-ci-fix", False, "failure", True)[0] == "defer"
     assert decide_repair_admission("needs-review", False, "failure", True)[0] == "defer"
 
-    # ---- stranded_live: the terminal hand-off is re-derived live before needs-user ----
-    assert stranded_live(True, False, True, True, "success") is True
-    assert stranded_live(False, False, True, True, "success") is False  # ready: arm=false valid
-    assert stranded_live(True, True, True, True, "success") is False    # armed again: valid arm
-    assert stranded_live(True, False, False, True, "success") is False  # unreviewed: re-review
-    assert stranded_live(True, False, True, False, "success") is False  # conflicting: rebase
-    assert stranded_live(True, False, True, None, "success") is False   # base still computing
-    # [round-5 P2] tri-state arm bit: unknown (None) never proves stranded — only an
-    # explicit False does
-    assert stranded_live(True, None, True, True, "success") is False
+    # ---- stranded_live: the recovery is re-derived live before any marker retraction ----
+    # [issue #762] the `gate` argument is a TIER-REACHABLE conclusion; BOTH grades prove the
+    # posture, and the whole do-nothing surface holds identically under each.
+    for _green in sorted(TIER_REACHABLE_GREEN):
+        assert stranded_live(True, False, True, True, _green) is True, _green
+        assert stranded_live(False, False, True, True, _green) is False  # ready: arm=false valid
+        assert stranded_live(True, True, True, True, _green) is False    # armed again: valid arm
+        assert stranded_live(True, False, False, True, _green) is False  # unreviewed: re-review
+        assert stranded_live(True, False, True, False, _green) is False  # conflicting: rebase
+        assert stranded_live(True, False, True, None, _green) is False   # base still computing
+        # [round-5 P2] tri-state arm bit: unknown (None) never proves stranded — only an
+        # explicit False does
+        assert stranded_live(True, None, True, True, _green) is False
     for live_gate in ("failure", "pending", "missing", "unknown"):
         assert stranded_live(True, False, True, True, live_gate) is False
+    # [issue #762] THE ADMISSION VOCABULARY IS REFUSED. "success" is the merge-required grade's
+    # spelling and belongs to the OTHER authority; a caller that pipes status["gate"] in here
+    # gets a defer, not a recovery. Accepting it would let the two vocabularies interchange
+    # silently, which is the failure this grading exists to prevent.
+    assert stranded_live(True, False, True, True, "success") is False
 
     # ---- _dispatch_review_items wiring (defect-1/2 regression, monkeypatched I/O): the
     # non-draft defuse is reachable ONLY through a live-confirmed trigger, and a human-parked
@@ -10289,53 +10652,15 @@ def _self_test():
             strand_routing = {"models": {
                 "sol": {"provider_model": "TBD", "harness": "codex"},
                 "luna": {"provider_model": "TBD", "harness": "codex"}}}
-            # ==== THE ROLE SPLIT, AT THE STRANDED LEG ====
-            # `stranded` re-derives MERGE ADMISSION (role (a)): its precondition is a
-            # concluded-GREEN gate, and subset-green does not prove superset-green. On a DRAFT
-            # head whose only aggregator is a GREEN `gate, draft-tier`, the strict read is
-            # "missing" and the recovery must DEFER — no marker retraction, no dispatch.
-            # Swapping _live_strict_gate for _live_repair_gate at that call site reds this; it
-            # is the ONLY fixture in the suite where the two live readings diverge, which is why
-            # the round-2 review found that guard unpinned. (Registry #765 deliberately
-            # redefines stranded over the tier-reachable green and REPLACES this assertion with
-            # its own; what must survive both is that nothing which ARMS or MERGES reads the
-            # repair vocabulary.)
-            _strand_pull = live_pull(draft=True, labels=["review:needs"],
-                                     body=f"x <!-- sparq-reviewed-sha:{sha_a} -->")
-            fake.update(pull=_strand_pull,
-                        check_runs=[{"name": CI_GATE_DRAFT_TIER_CHECK, "status": "completed",
-                                     "conclusion": "success",
-                                     "started_at": "2026-07-23T01:00:00Z"}],
-                        comments=[])
-            class _NullAlloc:
-                def __init__(self):
-                    self.calls = []
-
-                def claim(self, _repo, _package, role, chain, *_args, **_kwargs):
-                    self.calls.append((role, list(chain)))
-                    return None
-
-                def release(self, *_args, **_kwargs):
-                    return True
-
-            _strand_alloc = _NullAlloc()
-            _strand_log = io.StringIO()
-            with contextlib.redirect_stdout(_strand_log):
-                run_items([dict(ci_item, state="stranded", context="")],
-                          allocator=_strand_alloc, routing=strand_routing)
-            # BEHAVIOUR kill, not a crash: the mutant reaches the allocator, so assert it does
-            # not — the item must stand down BEFORE any claim, marker write or dispatch.
-            assert _strand_alloc.calls == [], _strand_alloc.calls
-            assert helper_calls == [], helper_calls
-            assert "the stranded posture did not re-derive on live data" \
-                in _strand_log.getvalue(), _strand_log.getvalue()
-            # positive control: the SAME posture with a strict merge-required green DOES recover
-            # (asserted in full just below, after the fixture is put back).
-            assert fake["pull"]["body"] == _strand_pull["body"], "marker must be untouched"
-            fake.update(pull=live_pull(
-                draft=True, labels=["review:needs"],
-                body=f"x <!-- sparq-reviewed-sha:{sha_a} -->"),
-                check_runs=gate_green, comments=[])
+            # ==== THE ROLE SPLIT, AT THE STRANDED LEG (issue #762) ====
+            # #761 asserted HERE that a draft-tier green DEFERS, and said in code that #765 would
+            # replace that assertion. This is that replacement: the CLAIM leg now re-derives the
+            # REPAIR reading, so the sparq draft shape RECOVERS instead of deferring. The
+            # end-to-end assertion lives with the rest of the stranded fixture below (search
+            # "THE SAME RECOVERY ON THE REAL SPARQ DRAFT SHAPE"), where the allocator and the
+            # helper-call list are already in scope. What survives both PRs — and is asserted in
+            # the live-read block above — is that nothing which ARMS or MERGES reads the repair
+            # vocabulary, because neither tier-reachable green is spelled "success".
 
             class StrandAllocator:
                 def __init__(self):
