@@ -5021,7 +5021,7 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
         for _escalated in starvation_provenance_escalation(
                 repository["items"], starved, live_occupancy):
             defer_reasons["partition-starvation-unprovenanced"] += 1
-            print(f"::warning title=unprovenanced __global__ holder::"
+            print("::warning title=unprovenanced __global__ holder::"
                   + starvation_provenance_escalation_body(repo, _escalated, starved).replace(
                       "\n", " "))
         if starved:
