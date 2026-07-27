@@ -2379,6 +2379,7 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
       stranded: that is the valid arm=false-policy terminal (human merges)."""
     live_keys = _live_holder_keys(leases, now)
     items = []
+    conflicting_seen = 0
     for pull in pulls:
         if not isinstance(pull, dict):
             raise DispatchError("review enumeration met a malformed pull request")
@@ -2402,8 +2403,28 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
             for name in [label.get("name") if isinstance(label, dict) else label]
             if isinstance(name, str) and name
         })
-        signalled = bool({"review:changes", "review:needs", MACHINE_PARK_PR_LABEL}
-                         & set(labels))
+        # Issue #464: a CONFLICTING BASE is an enumeration signal in its OWN RIGHT, on the same
+        # footing as the review:* labels above. The DIRTY backlog that motivated the issue was
+        # invisible twice over: `signalled` was label-only, so a conflicting worker PR rejected
+        # by any gate below logged NOTHING unless it happened to also carry a review-loop label
+        # — and the #256-class limbo (a `review:pass` PR whose base drifted) carries none. ~7
+        # actionable DIRTY PRs could therefore be dropped every tick while PLAN printed a clean
+        # summary. The signal is read STRICTLY, exactly as the admission below reads it: an
+        # explicit `conflicting is True` on a status whose head matches this listing row, so a
+        # stale or malformed snapshot never manufactures a conflict it cannot prove. Telemetry
+        # only — `signalled` is consumed by exclude_signalled and nothing else, so widening it
+        # cannot admit, exclude, or re-state any PR.
+        raw_status = (pr_status.get(number)
+                      if isinstance(pr_status, dict)
+                      and isinstance(number, int) and not isinstance(number, bool)
+                      else None)
+        conflicting_signal = (isinstance(raw_status, dict)
+                              and raw_status.get("conflicting") is True
+                              and raw_status.get("head_sha") == sha)
+        if conflicting_signal:
+            conflicting_seen += 1
+        signalled = conflicting_signal or bool(
+            {"review:changes", "review:needs", MACHINE_PARK_PR_LABEL} & set(labels))
 
         def exclude_signalled(reason):
             if signalled:
@@ -2670,7 +2691,23 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
               "that head's CI (see unknown_aggregator_tiers; adding a name requires inspecting "
               "what its LEG SET runs, not just the spelling)")
     items.sort(key=lambda item: (item["repo"], item["pr_number"]))
-    return _cap_draft_tier_backlog(items)
+    items = _cap_draft_tier_backlog(items)
+    # Issue #464 CONFLICT-LANE CENSUS. Counted AFTER the cap, so the number printed is the
+    # number of rebase runs this tick can actually produce. The per-PR lines above name why
+    # each DIRTY PR was dropped; this line names the SHORTFALL itself, so "the auto-rebase
+    # lane produced nothing while the DIRTY backlog sat there" is an assertion in the log
+    # rather than an absence a human has to notice. Printed only when a conflict was actually
+    # observed: a fleet with no DIRTY PR has nothing to be loud about.
+    if conflicting_seen:
+        rebase_items = sum(1 for item in items if item["state"] == "needs-rebase")
+        print(f"review-enumeration: {repo}: {conflicting_seen} worker PR(s) on a CONFLICTING "
+              f"base -> {rebase_items} needs-rebase repair item(s)")
+        if not rebase_items:
+            print(f"::warning::{repo}: {conflicting_seen} worker PR(s) have a conflicting base "
+                  "but ZERO needs-rebase repair item(s) were enumerated — the auto-rebase lane "
+                  "is not firing (issue #464), so those PRs cannot converge; the "
+                  "review-enumeration exclusion line(s) above name the reason for each one")
+    return items
 
 
 def filter_deferred_items(items, repo, leases, now):
@@ -8032,6 +8069,100 @@ def _self_test():
     assert lease_counts == Counter(
         {"a live per-PR review lease already owns this PR": 1}), lease_counts
 
+    # ---- ISSUE #464: the CONFLICT LANE is loud WITHOUT a review-loop label ----
+    # The DIRTY backlog this issue reports (~7 actionable PRs, some stuck since 07-18) could be
+    # dropped by any gate below with ZERO telemetry, because `signalled` was label-only and the
+    # #256-class limbo — a `review:pass` PR whose base drifted under it — carries no review:*
+    # label at all. A head-matched conflicting base is now a signal in its own right, so the
+    # exclusion is named AND aggregated. MUTATION CHECK: restoring the label-only `signalled`
+    # leaves both the log and the Counter empty here (this PR carries only `review:pass`).
+    dirty_pass_row = {**snapshot_rows[0], "labels": ["review:pass"]}
+    dirty_status = {442: {"head_sha": snapshot_sha, "conflicting": True, "armed": None}}
+    dirty_log = io.StringIO()
+    dirty_counts = Counter()
+    with contextlib.redirect_stdout(dirty_log):
+        assert enumerate_review_items(
+            snapshot_repo, [dirty_pass_row], {}, [],
+            {144: ["area:dispatch", "role:impl"]}, now,
+            pr_status=dirty_status, exclusions=dirty_counts) == []
+    assert dirty_counts == Counter({"provenance record is not a JSON object": 1}), dirty_counts
+    assert ("review-enumeration: exclude jeswr/agent-account-registry#442: "
+            "provenance record is not a JSON object") in dirty_log.getvalue(), \
+        dirty_log.getvalue()
+    # ... and the SHORTFALL itself is asserted, not left as an absence: 1 conflicting PR in,
+    # 0 rebase items out, said out loud as a ::warning:: on the tick it happens.
+    assert ("review-enumeration: jeswr/agent-account-registry: 1 worker PR(s) on a CONFLICTING "
+            "base -> 0 needs-rebase repair item(s)") in dirty_log.getvalue(), dirty_log.getvalue()
+    assert "::warning::" in dirty_log.getvalue() and \
+        "auto-rebase lane is not firing" in dirty_log.getvalue(), dirty_log.getvalue()
+
+    # The ACCEPTANCE shape: the same DIRTY `review:pass` PR WITH its registry provenance is the
+    # needs-rebase repair item (conflict repair is review-state-agnostic and runs first), and
+    # the census reports the lane firing — 1 in, 1 out, no warning.
+    rebase_log = io.StringIO()
+    with contextlib.redirect_stdout(rebase_log):
+        dirty_items = enumerate_review_items(
+            snapshot_repo, [dirty_pass_row], snapshot_provenance, [],
+            {144: ["area:dispatch", "role:impl"]}, now, pr_status=dirty_status)
+    assert [(item["pr_number"], item["state"]) for item in dirty_items] == \
+        [(442, "needs-rebase")], dirty_items
+    assert ("review-enumeration: jeswr/agent-account-registry: 1 worker PR(s) on a CONFLICTING "
+            "base -> 1 needs-rebase repair item(s)") in rebase_log.getvalue(), \
+        rebase_log.getvalue()
+    assert "::warning::" not in rebase_log.getvalue(), rebase_log.getvalue()
+
+    # The trust guards still bound the lane: a human-held DIRTY PR is excluded (no autonomous
+    # rebase on a human-owned PR) — but it is now excluded VISIBLY, and it still counts toward
+    # the conflict census, so the human-owned residue cannot masquerade as an empty backlog.
+    held_dirty_log = io.StringIO()
+    held_dirty_counts = Counter()
+    with contextlib.redirect_stdout(held_dirty_log):
+        assert enumerate_review_items(
+            snapshot_repo, [{**dirty_pass_row, "labels": ["review:pass", "needs:user"]}],
+            snapshot_provenance, [], {144: ["area:dispatch", "role:impl"]}, now,
+            pr_status=dirty_status, exclusions=held_dirty_counts) == []
+    assert held_dirty_counts == Counter({"PR carries a human-owned hold label": 1}), \
+        held_dirty_counts
+    assert "auto-rebase lane is not firing" in held_dirty_log.getvalue()
+
+    # A BUSY tick does not mask the shortfall. The live symptom was a fleet visibly working
+    # review/fix runs while every DIRTY PR rotted, so the census must count the REBASE lane
+    # specifically — not "did this tick emit anything". Here a healthy sibling emits needs-fix
+    # while the DIRTY PR is held: 1 conflicting in, 0 REBASE out, still warned. Counting
+    # `len(items)` instead of the needs-rebase rows silences the warning and reds this.
+    busy_sibling_sha = "4" * 40
+    busy_sibling = {**snapshot_rows[0], "number": 443, "labels": ["review:changes"],
+                    "body": "Fixes #145",
+                    "head": {"ref": "sparq-agent/issue-145-1-1", "sha": busy_sibling_sha,
+                             "repo": {"full_name": snapshot_repo}}}
+    busy_provenance = {**snapshot_provenance,
+                       443: {**snapshot_provenance[442], "pr_number": 443, "issue": 145}}
+    busy_log = io.StringIO()
+    with contextlib.redirect_stdout(busy_log):
+        busy_items = enumerate_review_items(
+            snapshot_repo, [{**dirty_pass_row, "labels": ["review:pass", "needs:user"]},
+                            busy_sibling],
+            busy_provenance, [],
+            {144: ["area:dispatch", "role:impl"], 145: ["area:dispatch", "role:impl"]}, now,
+            pr_status=dirty_status)
+    assert [(item["pr_number"], item["state"]) for item in busy_items] == \
+        [(443, "needs-fix")], busy_items
+    assert ("review-enumeration: jeswr/agent-account-registry: 1 worker PR(s) on a CONFLICTING "
+            "base -> 0 needs-rebase repair item(s)") in busy_log.getvalue(), busy_log.getvalue()
+    assert "auto-rebase lane is not firing" in busy_log.getvalue(), busy_log.getvalue()
+
+    # UNKNOWN NEVER SPEAKS: a conflicting status whose head does NOT match the listing row is
+    # stale evidence, so it raises no signal, no census line and no warning — the same strict
+    # head-match the admission itself applies. (Deriving the signal from the status alone would
+    # make a churned head fake a conflict the enumerator would never act on.)
+    stale_log = io.StringIO()
+    with contextlib.redirect_stdout(stale_log):
+        assert enumerate_review_items(
+            snapshot_repo, [dirty_pass_row], snapshot_provenance, [],
+            {144: ["area:dispatch", "role:impl"]}, now,
+            pr_status={442: {"head_sha": "9" * 40, "conflicting": True}}) == []
+    assert "CONFLICTING" not in stale_log.getvalue(), stale_log.getvalue()
+
     pulls = [
         pull(41, "sparq-agent/issue-7-1-1", sha_a, labels=["review:needs"]),
         # spoofed FORK head with a worker-shaped ref: must NOT be enumerated
@@ -9224,7 +9355,8 @@ def _self_test():
         # to the PR head (needs-fix / needs-ci-fix / needs-rebase) or re-enters the arm path
         # (stranded). A self-attested record must never buy write access to its own branch.
         _conflicting = {"head_sha": sha_a, "conflicting": True, "armed": False}
-        assert _enrol_states([_enrol_pull()], {41: _orch}, status={41: _conflicting}) == []
+        with contextlib.redirect_stdout(io.StringIO()):   # #464 conflict-lane shortfall warning
+            assert _enrol_states([_enrol_pull()], {41: _orch}, status={41: _conflicting}) == []
         _red_gate = {"head_sha": sha_a, "conflicting": False, "armed": False, "gate": "failure",
                      "failing_legs": ["test"]}
         assert _enrol_states([_enrol_pull(labels=())], {41: _orch}, status={41: _red_gate}) == []
@@ -9929,10 +10061,12 @@ def _self_test():
     assert enumerate_review_items(repo, [_ready], provenance, [], issue_labels, now,
                                   pr_status=draft_tier_red) == []
     # HONESTY about the telemetry: this exit is currently SILENT for a ready PR. `signalled` is
-    # {review:changes, review:needs, review:parked} and every one of those either emits or is
-    # excluded earlier, so NO ready PR can reach the fall-through as a signalled row — nothing
-    # is counted here, by construction. Pinned so the gap is stated rather than assumed away;
-    # closing it is registry #765's population census, deliberately not duplicated in this PR.
+    # {review:changes, review:needs, review:parked} plus issue #464's conflicting-base signal,
+    # and every one of those either emits or is excluded earlier — the label states above, and a
+    # conflicting base at the GAP-B block, which always emits or excludes and never falls
+    # through. So NO ready PR can reach the fall-through as a signalled row: nothing is counted
+    # here, by construction. Pinned so the gap is stated rather than assumed away; closing it is
+    # registry #765's population census, deliberately not duplicated in this PR.
     _ready_counts = Counter()
     with contextlib.redirect_stdout(io.StringIO()):
         assert enumerate_review_items(repo, [_ready], provenance, [], issue_labels, now,
@@ -10080,11 +10214,16 @@ def _self_test():
     assert [(item["state"], item["context"]) for item in enumerate_review_items(
         repo, [passed], provenance, [], issue_labels, now,
         pr_status=passed_conflicting)] == [("needs-rebase", "")]
-    # ... and a live review/fix lease suppresses it exactly like any other repair state
+    # ... and a live review/fix lease suppresses it exactly like any other repair state.
+    # (Issue #464's conflict-lane shortfall ::warning:: fires on every fixture below that holds
+    # a DIRTY PR back CORRECTLY — lease, human park, orchestrator class. It is captured here so
+    # the suite never emits a GitHub annotation of its own on `example/repo`, and is asserted
+    # where it belongs: the #464 telemetry block above and plan-snapshot's end-to-end test.)
     for holder in (f"review:{repo}#41@run.1", f"fix:{repo}#41@run.1"):
-        assert enumerate_review_items(
-            repo, [passed], provenance, [{"holder": holder, "expires_at": now + 100}],
-            issue_labels, now, pr_status=passed_conflicting) == []
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert enumerate_review_items(
+                repo, [passed], provenance, [{"holder": holder, "expires_at": now + 100}],
+                issue_labels, now, pr_status=passed_conflicting) == []
     # review:needs-user stays terminal for the repair states too (escalation must halt the loop)
     stopped = pull(41, "sparq-agent/issue-7-1-1", sha_a, labels=["review:needs-user"])
     assert enumerate_review_items(repo, [stopped], provenance, [], issue_labels, now,
@@ -10102,8 +10241,9 @@ def _self_test():
     assert enumerate_review_items(repo, [starved], provenance, [], parked_issue, now,
                                   pr_status=red) == []
     conflicted = {41: status_of(sha_a, gate="failure", conflicting=True)}
-    assert enumerate_review_items(repo, [starved], provenance, [], parked_issue, now,
-                                  pr_status=conflicted) == []
+    with contextlib.redirect_stdout(io.StringIO()):   # #464 shortfall warning — see above
+        assert enumerate_review_items(repo, [starved], provenance, [], parked_issue, now,
+                                      pr_status=conflicted) == []
     assert enumerate_review_items(repo, pulls[:1], provenance, [], parked_issue, now) == []
     # flip side: the SAME PR without the park emits (asserted red above via ci_items)
     # GAP-B beats GAP-A per tick: CI on a conflicted base is noise — rebase repair only
@@ -10120,8 +10260,9 @@ def _self_test():
         live = [{"holder": holder, "expires_at": now + 100}]
         assert enumerate_review_items(repo, [starved], provenance, live, issue_labels, now,
                                       pr_status=red) == []
-        assert enumerate_review_items(repo, [starved], provenance, live, issue_labels, now,
-                                      pr_status=both) == []
+        with contextlib.redirect_stdout(io.StringIO()):   # #464 shortfall warning — see above
+            assert enumerate_review_items(repo, [starved], provenance, live, issue_labels, now,
+                                          pr_status=both) == []
     # a stale snapshot (status head != live head) is ignored — unknown never acts
     assert enumerate_review_items(
         repo, [starved], provenance, [], issue_labels, now,

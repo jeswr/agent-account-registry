@@ -332,6 +332,8 @@ def snapshot_targets(fetch, claim, repos, out_dir):
 
 
 def _self_test():
+    import contextlib
+    import io
     import tempfile
     from unittest.mock import patch
 
@@ -541,22 +543,43 @@ def _self_test():
         "recorded_at_run": "1.1",
     }}
     status19 = {19: claim.pr_ci_status(doc["items"]["19"])}
-    repair_items = claim.enumerate_review_items(
-        repo, [review_changes], provenance19, [], {19: ["role:impl"]}, 1000,
-        pr_status=status19)
+    repair_log = io.StringIO()
+    with contextlib.redirect_stdout(repair_log):
+        repair_items = claim.enumerate_review_items(
+            repo, [review_changes], provenance19, [], {19: ["role:impl"]}, 1000,
+            pr_status=status19)
     assert [(item["state"], claim.FIX_KIND_OF_STATE[item["state"]])
             for item in repair_items] == [("needs-rebase", "rebase")], repair_items
     assert conflict_detail_reads == 2
     sleep.assert_called_once_with(MERGEABLE_POLL_INTERVAL_SECONDS)
+    # Issue #464 conflict-lane census, asserted at the SNAPSHOT boundary rather than on a
+    # hand-built status: the re-polled DIRTY record is counted, the lane is reported firing,
+    # and no shortfall warning is raised.
+    assert (f"review-enumeration: {repo}: 1 worker PR(s) on a CONFLICTING base -> 1 "
+            "needs-rebase repair item(s)") in repair_log.getvalue(), repair_log.getvalue()
+    assert "::warning::" not in repair_log.getvalue(), repair_log.getvalue()
     unresolved19 = {19: claim.pr_ci_status({**doc["items"]["19"], "mergeable": None})}
-    assert [item for item in claim.enumerate_review_items(
-        repo, [review_changes], provenance19, [], {19: ["role:impl"]}, 1000,
-        pr_status=unresolved19) if item["state"] == "needs-rebase"] == []
+    unresolved_log = io.StringIO()
+    with contextlib.redirect_stdout(unresolved_log):
+        assert [item for item in claim.enumerate_review_items(
+            repo, [review_changes], provenance19, [], {19: ["role:impl"]}, 1000,
+            pr_status=unresolved19) if item["state"] == "needs-rebase"] == []
+    # An UNRESOLVED mergeability proves no conflict, so it raises no census either — the census
+    # must never invent a DIRTY PR out of the null the poll failed to resolve.
+    assert "CONFLICTING" not in unresolved_log.getvalue(), unresolved_log.getvalue()
     human_owned = {**review_changes,
                    "labels": [{"name": "review:changes"}, {"name": "needs:user"}]}
-    assert claim.enumerate_review_items(
-        repo, [human_owned], provenance19, [], {19: ["role:impl"]}, 1000,
-        pr_status=status19) == []
+    human_log = io.StringIO()
+    with contextlib.redirect_stdout(human_log):
+        assert claim.enumerate_review_items(
+            repo, [human_owned], provenance19, [], {19: ["role:impl"]}, 1000,
+            pr_status=status19) == []
+    # The human-owned hold still excludes the DIRTY PR from any autonomous rebase — but the
+    # residue is now LOUD: 1 conflicting PR in, 0 rebase items out, warned about on the tick it
+    # happens, so a stalled DIRTY backlog can never read like an empty one (issue #464).
+    assert (f"review-enumeration: {repo}: 1 worker PR(s) on a CONFLICTING base -> 0 "
+            "needs-rebase repair item(s)") in human_log.getvalue(), human_log.getvalue()
+    assert "auto-rebase lane is not firing" in human_log.getvalue(), human_log.getvalue()
 
     # (v) THE round-1 point — the degraded record restores the #42 disarm under overflow:
     # an ARMED worker PR whose churned head advanced past its reviewed-sha marker IS
