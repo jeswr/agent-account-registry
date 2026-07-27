@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4426,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "4b2f29dd7075cf3d3b7acaed78e662c68c9ce525",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "grade_cell builds obs only from sessions containing the probe, then scores a probe once len(obs) >= 2. The cs_decided check only verifies that those observed labels are not UNDECIDABLE; it never verifies len(obs) == len(sessions). This contradicts the documented definition \u201cprobes the cell committed on in every session\u201d and permits partial/malformed sessions to improve or distort cs, dissent, and cs_decided while only emitting a non-fatal note. Since this script is the claimed deterministic grading contract, silently changing denominators is a soundness defect.",
+    "file": "bench/fo-km/stability_analyze.py",
+    "fix_hint": "Require exactly one valid answer for every probe in every session before grading (prefer fail closed), or explicitly define and report a missing-data policy. At minimum, include a probe in cs_decided only when len(obs) == len(sessions) and all labels are decisive; make the cs/dissent denominator policy equally explicit.",
+    "severity": "major",
+    "title": "Missing answers incorrectly qualify for cross-session and decided-probe metrics"
+   },
+   {
+    "body": "Running the analyzer without a sessions argument only loads the probe file and prints descriptions of the metrics. It does not call grade_cell, assert any expected result, test malformed/partial answers, or verify the committed 45-session record. Therefore the README/STABILITY.md command labelled \u201cgrading contract (self-check)\u201d cannot detect regressions in any load-bearing formula, including the missing-answer bug.",
+    "file": "bench/fo-km/stability_analyze.py",
+    "fix_hint": "Add deterministic unit/self-check fixtures with asserted cs, dissent, ws, undecidable, cs_decided, adherence, and stratum results, including missing, duplicate, invalid-label, and UNDECIDABLE cases. Make the no-argument self-check execute those assertions and fail nonzero on mismatch (or add an actual test file and describe the no-argument mode honestly).",
+    "severity": "major",
+    "title": "The advertised self-check is vacuous"
+   }
+  ],
+  "progress": null,
+  "summary": "The committed pilot data reproduces the displayed table, but the grader does not enforce the protocol its documentation claims. In particular, missing answers are excluded before the \u201cevery session committed\u201d check, so cs_decided can classify an incomplete probe as fully decided; the main cross-session rates likewise score any probe with only two observations. The advertised no-argument \u201cself-check\u201d merely prints prose and exercises no grading invariant. These defects do not alter the current complete 45-session fixture, but they make the reusable harness unsound for malformed or partial future runs and leave its core formulas without a real regression test.",
+  "verdict": "request_changes"
+ }
+}
