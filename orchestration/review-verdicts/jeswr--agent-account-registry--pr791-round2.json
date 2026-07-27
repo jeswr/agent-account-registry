@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 791,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "e7708d2a71b03d8f962ca7328a328da2c6e192dc",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The module now explicitly states that it has no caller and changes no orchestration behavior. The diff adds only the pure decision module, its self-test-suite entry, and a park cause; it changes no workflow or existing orchestration caller. Consequently no terminal review-loop park or existing review:needs-user backlog item can collect trusted facts, resolve and assert the opposite-provider judge, invoke adjudication, call decide(), apply an exact-head-bound label/state transition, or write the receipt used for termination. The self-tests validate helpers in isolation but cannot demonstrate the feature operating on a PR.",
+    "file": "scripts/stuck_adjudicator.py",
+    "fix_hint": "Add the actual review-loop and bounded backlog-sweep integration, including fail-closed account/token resolution, exact head/base binding, proof of machine-owned labels and trusted receipts, honest trust-surface/security/gate-weakening classification, guarded transitions, and end-to-end tests of those callers.",
+    "severity": "blocker",
+    "title": "The adjudicator still has no executable orchestration path"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 2 fixes both prior fail-closed decision-plane defects: marker absence is now distinguished from corrupt/unknown markers with counterfactual tests, and every final return-to-loop outcome now requires a concrete fix sketch. However, the prior blocker remains explicitly acknowledged by the new module itself: there is still no workflow or orchestration caller, so this change cannot adjudicate any terminal park or backlog item. The pure helpers and self-tests are substantial and non-vacuous, but the claimed stuck-escalation feature remains incomplete until its authority-bearing collection, cross-provider invocation, SHA-bound transition, and durable receipt path are integrated and tested.",
+  "verdict": "request_changes"
+ }
+}
