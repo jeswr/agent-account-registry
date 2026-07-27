@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4354,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "4f1b826e3404eb05539047de95fe0bf9e9cf1c8d",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2's blocking policy issue is resolved: the research record no longer transcribes work-box byte counts, timings, percentages, exact ratios, noise estimates, or capacity observations as measured results. It retains reproducible commands, qualitative directional findings, and an explicit non-canonical caveat. The feature remains default-off, the default dense path is pinned, the feature-on sparsify and decline branches are exercised, and the cross-arm test compares every dictionary ID against a freshly recomputed dense reference while guarding against a vacuous all-inline corpus. The sparse conversion and lookup paths preserve ID-to-value semantics, and the CI feature-matrix leg covers the opt-in state. Remaining numeric constants describe representation sizes, heuristic thresholds, or benchmark inputs rather than committed benchmark results.",
+  "verdict": "approve"
+ }
+}
