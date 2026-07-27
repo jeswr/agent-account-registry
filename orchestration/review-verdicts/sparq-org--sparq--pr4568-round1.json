@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4568,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "46da113760741be3725c1bec6b478de53ebc5086",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The matrix includes `macos-15` and `macos-15-intel`, but the new unconditional bash step runs `sha256sum -- \"${archives[@]}\"`. macOS ships `shasum` rather than GNU `sha256sum` by default. Both macOS matrix rows will therefore fail in archive mode, preventing their digest artifacts from being uploaded; because the collector needs the entire build matrix, the release and provenance jobs will never run successfully. The structural Python test does not execute this cross-platform command and therefore does not catch the failure.",
+    "file": ".github/workflows/build-matrix.yml",
+    "fix_hint": "Use a portable digest implementation, for example select `shasum -a 256` on macOS and `sha256sum` elsewhere while preserving the exact `<64-hex>  <basename>` subject format, or compute the records with a small Python stdlib script available on all matrix runners. Add a hermetic test that exercises or structurally enforces the portable branch for the macOS matrix rows.",
+    "severity": "major",
+    "title": "Archive digest generation uses unavailable `sha256sum` on macOS runners"
+   }
+  ],
+  "progress": null,
+  "summary": "The isolation contract test passes, but the release workflow is not portable across its own build matrix. The new digest step invokes GNU `sha256sum` on every archive runner, including the macOS tiers, where that command is not provided by the standard runner toolchain. Consequently the `package` reusable workflow will fail before producing the combined subjects, so the trusted-builder lane cannot complete on a real release.",
+  "verdict": "request_changes"
+ }
+}
