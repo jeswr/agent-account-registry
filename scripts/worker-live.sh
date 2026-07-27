@@ -247,7 +247,8 @@ _first_match_line() {
 }
 
 # PURE (self-tested, positive-control included): count `producer | EARLY-EXITING-consumer` pipelines
-# in the files named by "$@" and print the number. [#879] This is the SHAPE guard, not a fix for one call site: a
+# in the files named by "$@" and print the number. [#879] This is the SHAPE guard, not a fix for one
+# call site: a
 # consumer that can exit before draining stdin (grep -q/-m, head, sed …q, awk …exit, read) kills the
 # still-running producer with SIGPIPE, and `set -o pipefail` (line 6) then makes the pipeline report
 # 141 — a status the callers read as "did not match" / "failed". It is scheduling-dependent, so it
@@ -4185,13 +4186,15 @@ PY
   # and the `if` takes the else branch. Two guards, in the order that makes each non-vacuous.
   #
   # Guard 1 — BEHAVIOURAL, on an input sized to FORCE the race rather than merely permit it. The
-  # producer emits the needle first and then ~4 MiB of tail: 64x the 64 KiB pipe buffer, so the
-  # producer MUST block on a write, which means the consumer MUST have been scheduled and MUST have
-  # exited on its match. A small fixture would let the producer finish into the buffer and the whole
-  # test would pass on the BROKEN shape too — the "assertion satisfied by a weaker input" trap. The
+  # fixture's SINGLE-process producer emits the needle then ~4 MiB of tail — 64x the 64 KiB pipe
+  # buffer — so it MUST block on a write, which means the consumer MUST have been scheduled and MUST
+  # have exited on its match. A small fixture lets the producer finish into the buffer and the whole
+  # test then passes on the BROKEN shape too: the "assertion satisfied by a weaker input" trap. The
   # first assertion is what proves the fixture is strong enough; delete it and the second proves
-  # nothing. (Measured on the real republish-trust body, 5000 bytes: 69/200 inversions idle, 86/200
-  # under load. At 4 MiB it is not probabilistic.) ---
+  # nothing. Both properties are measured in the fixture's own header — including the two-writer
+  # draft of it that passed this assertion on 1 KiB and had to be replaced. (On the real
+  # republish-trust body, 5000 bytes: 69/200 inversions idle, 86/200 under load. At 4 MiB it is not
+  # probabilistic — 150/150.) ---
   local sp_needle='NEEDLE-SIGPIPE-879' sp_repro="$SCRIPT_DIR/fixtures/sigpipe-repro-879.bash"
   local sp_rc sp_cap
   sp_rc="$(bash "$sp_repro" probe "$sp_needle")"
