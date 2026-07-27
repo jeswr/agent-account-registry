@@ -37,7 +37,7 @@ import sys
 import tempfile
 import time
 import tomllib
-from typing import Any
+from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
@@ -1734,6 +1734,153 @@ DefuseOutcome = PhaseOutcome
 defuse_exit_failure = phase_exit_failure
 
 
+def age_park_cause_recovered(
+    cause: str,
+    pull: dict[str, Any],
+    live_provenance: Callable[[], tuple[str, dict[str, Any] | None]],
+) -> tuple[bool, str]:
+    """Has THIS park's OWN cause provably recovered? Returns (recovered, why).
+
+    This is the machine exit, and it is gated on the CAUSE, never on elapsed time — the same
+    discipline park_policy invariant 3 applies to a capacity park. Each cause has one predicate:
+
+    - ``orphan-draft`` — an ADMISSIBLE registry provenance record now exists on the LIVE ledger
+      ref. That is exactly the predicate _live_provenance_record already computes to CANCEL a
+      park, reused to CLEAR one, so "the review loop will drive this PR" cannot mean two things.
+    - ``merge-*``      — the live ``mergeable_state`` is no longer one of BAD_MERGE_STATES.
+
+    Every ambiguity fails toward STAYING PARKED: an unreadable/conflicting provenance read, a
+    malformed merge state, and an unrecognised cause token all return False. An unrecognised
+    token in particular must never re-admit — a cause we cannot check is a cause we cannot prove
+    recovered, and guessing here would turn the bounded exit into an unbounded retry."""
+    if cause == "orphan-draft":
+        state, _record = live_provenance()
+        if state == "admits":
+            return True, "an admissible provenance record now exists on the live ledger ref"
+        if state == "indeterminate":
+            return False, "the live provenance read was unavailable or conflicting"
+        return False, "still no admissible provenance record on the live ledger ref"
+    if cause.startswith("merge-"):
+        merge_state = pull.get("mergeable_state")
+        if merge_state is None:
+            merge_state = "unknown"
+        if not isinstance(merge_state, str):
+            return False, "the live merge state is malformed"
+        if merge_state in BAD_MERGE_STATES:
+            return False, f"the merge state is still {merge_state}"
+        return True, f"the merge state recovered to {merge_state}"
+    return False, f"cause {cause!r} has no recovery predicate — never auto-re-admitted"
+
+
+def _execute_age_unpark_actions(
+    pulls: dict[str, dict[int, dict[str, Any]]],
+    apis: dict[str, GitHubAPI],
+    registry_api: "GitHubAPI",
+    registry_repo: str,
+    bot_login: str,
+) -> tuple[PhaseOutcome, int]:
+    """Re-admit MACHINE age-parks whose own cause has provably recovered — the exit that makes the
+    class split honest.
+
+    Relabelling an age park from the human terminal to the machine soft hold WITHOUT this phase
+    would be strictly worse than the defect it replaces: `needs:user` is at least visible in a
+    human census, whereas a `review:parked` nothing can clear is an INVISIBLE permanent hold.
+    park_policy's own automatic path cannot supply this exit — capacity_park_admission is gated on
+    per-account model-health recovery evidence, which no orphan-draft or wedged-merge-state park
+    will ever satisfy — so the sweep that KNOWS the cause owns clearing it.
+
+    Bounded exactly as invariant 3 bounds the capacity path:
+      - CAUSE-GATED. age_park_cause_recovered, never elapsed time.
+      - CONSUMED EXACTLY ONCE. The un-park receipt carries the park receipt's own
+        (cause, head, gen) triple; age_unpark_owed refuses a second grant on the same triple, so
+        one recovery can never be re-earned.
+      - CAPPED. Enforced upstream at park time by age_park_label: generation > AGE_UNPARK_MAX is
+        written in the HUMAN class, so an over-cap park never reaches this phase at all.
+      - NEVER CLEARS A HUMAN PARK. A PR carrying a human-owned hold has no owed receipt to begin
+        with (the hand-off wrote no machine receipt), and a machine label whose LATEST application
+        was made by a proven human is refused here by park_policy.park_applications.
+      - RECEIPT-FIRST. The un-park receipt is posted BEFORE the label is removed, so a crash
+        leaves receipt-no-label (converges: the label is simply gone next tick) rather than
+        label-no-receipt, which would let the same recovery be consumed twice.
+
+    Every failure is PER-PR: one unreadable PR never stops the rest."""
+    attempted = 0
+    completed = 0
+    unparked = 0
+    deferrals: list[str] = []
+    for repo, api in apis.items():
+        for number, listed in sorted(pulls.get(repo, {}).items()):
+            labels = _labels(listed, f"target pull request {repo}#{number}")
+            if park_policy.MACHINE_PARK_PR_LABEL not in labels:
+                continue
+            attempted += 1
+            failed = False
+            try:
+                comments = _comments(api, repo, number)
+                owed = age_unpark_owed(comments, bot_login)
+                if owed is None:
+                    continue  # not an age park of ours, or its recovery is already consumed
+                pull = api.request("GET", f"/repos/{repo}/pulls/{number}", allow_404=True)
+                if not isinstance(pull, dict) or pull.get("state") != "open":
+                    print(f"SKIP PR {repo}#{number}: no longer open")
+                    continue
+                recovered, why = age_park_cause_recovered(
+                    owed["cause"], pull,
+                    lambda: _live_provenance_record(
+                        registry_api, registry_repo, repo, number),
+                )
+                if not recovered:
+                    print(f"age park stands {repo}#{number} (cause={owed['cause']} "
+                          f"gen={owed['gen']}): {why}")
+                    continue
+                _latest, human_park, readable = park_policy.park_applications(
+                    repo, number, None,
+                    lambda r, n: api.paginate(f"/repos/{r}/issues/{n}/timeline"),
+                    is_human=lambda login: _is_human_maintainer(api, repo, login))
+                if not readable:
+                    print(f"age park stands {repo}#{number}: the park application timeline "
+                          "could not be read")
+                    continue
+                if human_park:
+                    print(f"age park stands {repo}#{number}: the latest park application is "
+                          "HUMAN-owned — only a human clears it")
+                    continue
+                receipt = (f"{AGE_UNPARK_MARKER} cause={owed['cause']} head={owed['head']} "
+                           f"gen={owed['gen']} -->")
+                api.request(
+                    "POST", f"/repos/{repo}/issues/{number}/comments",
+                    {"body": ("> 🤖 SPARQ agent\n\n"
+                              f"Automatic re-admission: {why}, so the machine-owned "
+                              f"`{park_policy.MACHINE_PARK_PR_LABEL}` age park is cleared and this "
+                              "PR re-enters the ordinary review loop. This recovery is now "
+                              f"consumed and cannot be re-earned.\n\n{receipt}")},
+                )
+                print(f"WRITE age-unpark receipt repo={repo} pr={number} cause={owed['cause']} "
+                      f"gen={owed['gen']}")
+                api.request(
+                    "DELETE",
+                    f"/repos/{repo}/issues/{number}/labels/"
+                    f"{quote(park_policy.MACHINE_PARK_PR_LABEL, safe='')}",
+                    allow_404=True,
+                )
+                print(f"WRITE remove label repo={repo} issue={number} "
+                      f"label={park_policy.MACHINE_PARK_PR_LABEL}")
+                unparked += 1
+            except GroomError as exc:
+                failed = True
+                print(f"ALERT PR {repo}#{number}: {exc} — age un-park deferred")
+                deferrals.append(f"{repo}#{number}: {exc}")
+                continue
+            finally:
+                if not failed:
+                    completed += 1
+    return (
+        PhaseOutcome(label="age park re-admission", changed=completed, attempted=attempted,
+                     deferred=tuple(deferrals)),
+        unparked,
+    )
+
+
 def _execute_defuse_actions(
     actions: list[PullAction],
     apis: dict[str, GitHubAPI],
@@ -2647,6 +2794,10 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
         pull_actions, groomable, target_tokens, now, defuse_stale_seconds, bot_login
     )
 
+    unpark_outcome, unpark_count = _execute_age_unpark_actions(
+        pulls, groomable, registry_api, registry_repo, bot_login
+    )
+
     stale_count = 0
     # Issue #647, the second surviving instance of #644's shape — and the one whose reclaim
     # exposure is most direct, since _release_claims is the very next statement after this loop.
@@ -2829,6 +2980,8 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
         f"defuse_deferred={len(defuse_outcome.deferred) + len(defuse_outcome.unavailable)} "
         f"repair_deferred={len(repair_outcome.deferred)} "
         f"stale_pr_deferred={len(stale_outcome.deferred)} "
+        f"age_unparked={unpark_count} "
+        f"age_unpark_deferred={len(unpark_outcome.deferred)} "
         f"detect_deferred={len(detect_outcome.deferred)}"
     )
     # Issue #644 precedence rule 4, now covering all three per-object phases (issue #647): the
@@ -2838,7 +2991,7 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
     # (rule 3) and leaves this green; it does not, and must not, buy silence for a whole-phase
     # failure. The exit status is the report, never the control flow.
     systemic_sweep_failure = sweep_exit_failure(
-        (detect_outcome, repair_outcome, defuse_outcome, stale_outcome)
+        (detect_outcome, repair_outcome, defuse_outcome, stale_outcome, unpark_outcome)
     )
     if systemic_sweep_failure is not None:
         raise GroomError(systemic_sweep_failure)
