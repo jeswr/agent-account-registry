@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4643,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "175d75b59a78cdf5bde443ec60d5a0475ff5f71f",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The documentation-only change is consistent with the repository's upstream-contribution policy: AGENTS.md explicitly requires draft status, agent identification, a maintainer-review warning, a Why section, reviewer assignment with an @-mention fallback when assignment is unavailable, and forbids agents from marking an upstream PR ready. The lockfile also corroborates the repository-specific dependency statement (hdt 0.7.3 and qwt 0.4.0). No correctness, soundness, security, or test-validity issue is introduced by this diff.",
+  "verdict": "approve"
+ }
+}
