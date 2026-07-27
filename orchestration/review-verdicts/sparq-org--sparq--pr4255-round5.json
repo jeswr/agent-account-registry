@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4255,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ef757799b02e39e1fd90f5860ee63b8cfb187a37",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "CombinationBudget::new says either zero limit \"simply declines everything.\" However, max_intermediate_bindings == 0 is checked only immediately before pushing a merged row. When a chosen complete-summary relation has zero matching rows, combination_is_live returns Ok(false) via next.is_empty() without observing the zero budget. The caller then reports SummaryPruneOutcome::Applied, emits EmptyProvenance, and can set bgp_satisfiable to false. Thus the documented zero-budget disable setting can still prune sources and declare the BGP dead.",
+    "file": "crates/sparq-fedplan-mpc/src/combination.rs",
+    "fix_hint": "Before building/evaluating relations, return SummaryPruneOutcome::Declined when max_intermediate_bindings is zero (JoinTooWide is sufficient), or explicitly redefine and document zero as allowing emptiness proofs that require no stored binding. Add a regression using max_combinations > 0, max_intermediate_bindings == 0, and a complete summary whose selected pattern relation is empty; assert the chosen contract.",
+    "severity": "major",
+    "title": "Zero intermediate budget still does not always decline"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 4's major budget-contract defect remains unresolved. CombinationBudget::new still documents that either zero limit declines everything, but prune_source_combinations_with_summaries does not reject max_intermediate_bindings == 0 up front. If a selected complete-summary relation is empty, combination_is_live returns Ok(false) before attempting to push a binding, so the pass reports Applied, records EmptyProvenance, and may mark the BGP dead despite the documented zero-budget disable/decline behavior. No hostile reviewer-directed instruction was detected.",
+  "verdict": "request_changes"
+ }
+}
