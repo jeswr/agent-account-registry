@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4504,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "5775db380e74e653de2ac4261c6ba9edaf931138",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The cache refactor is sound: cache hits clone an Arc under a read guard, misses build outside the lock, and entry(...).or_insert(...) ensures every racing caller receives the single cached winner rather than a discarded build. Searches therefore run without holding the cache lock, poisoning recovery remains consistent with the prior behavior, and maps for distinct ef_search values cannot be confused. The tests exercise Send/Sync, cold same-level contention, mixed-level contention, and comparison against the warmed map on the same index, appropriately avoiding cross-build nondeterminism. The unique temporary-file counter also removes an existing parallel-test collision. No hostile review-directed instruction appears in the diff.",
+  "verdict": "approve"
+ }
+}
