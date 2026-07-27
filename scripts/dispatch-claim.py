@@ -78,6 +78,12 @@ REVIEW_ITEM_FIELDS = {
     "repo",
     "package",
     "security",
+    # [OPUS-5 #657] True iff this item was admitted by the orchestrator-class path, i.e. its
+    # provenance record is SELF-attested. REQUIRED, not optional, and validated below: every
+    # consumer that resolves a reviewer side or an arm decision has to see it, and
+    # _require_exact_fields makes a producer that forgets to emit it fail loudly instead of
+    # defaulting the safe-looking way. False for every worker-lane item.
+    "self_attested",
     "context",
 }
 DISARM_ITEM_FIELDS = {"pr_number", "head_sha", "reviewed_sha", "repo"}
@@ -533,6 +539,17 @@ def validate_plan(document):
         _safe_string(item["package"], SAFE_PACKAGE, f"{where} package")
         if not isinstance(item["security"], bool):
             raise DispatchError(f"{where} security must be boolean")
+        if not isinstance(item["self_attested"], bool):
+            raise DispatchError(f"{where} self_attested must be boolean")
+        # The review-only invariant, re-asserted at the SCHEMA boundary (issue #657). The
+        # enumerator already refuses to emit anything else for the class, but PLAN and CLAIM are
+        # different processes reading a serialised artifact: a hand-edited or
+        # future-producer-mangled plan must not be able to hand CLAIM a self-attested item in a
+        # code-writing state. Two independent gates, one invariant.
+        if item["self_attested"] and state != "needs-review":
+            raise DispatchError(
+                f"{where} is self-attested but in state {state!r} — the orchestrator class is "
+                "review-only (research/657-orchestrator-pr-admission.md Option 2(b))")
         context = item["context"]
         if (not isinstance(context, str) or len(context) > CI_CONTEXT_MAX
                 or "\n" in context or "\r" in context):
@@ -1478,11 +1495,17 @@ def _ledger_leases(ledger_root):
 # stamp instead. The property that survives a forged provider declaration is not encoded here; it
 # is "never read the declared provider to pick the reviewer". See
 # research/657-orchestrator-pr-admission.md.
+# The SELF-ATTESTED class: the actor that wrote the diff also wrote the record. Named here so
+# the stamp table, the admission opt-in and the enumerator all spell it ONE way — a rename that
+# reaches only the table would silently make the opt-in below unreachable, i.e. a quiet revert.
+ORCHESTRATOR_CLASS = "orchestrator"
 PROVENANCE_ATTESTATION_STAMPS = (
     ("worker-run", re.compile(r"\d+\.\d+")),
     ("backfill", re.compile(r"backfill:\d+\.\d+")),
-    ("orchestrator", re.compile(r"orchestrator:\d+\.\d+")),
+    (ORCHESTRATOR_CLASS, re.compile(r"orchestrator:\d+\.\d+")),
 )
+# Deliberately EXCLUDES ORCHESTRATOR_CLASS — admitting it is an explicit, per-consumer opt-in
+# (provenance_admission_error(..., admit_orchestrator=True)), never a property of the taxonomy.
 MACHINE_ATTESTED_CLASSES = frozenset({"worker-run", "backfill"})
 # Consumer-facing refusal reasons (CLAIM defer lines, review-fix.yml SystemExit). Named constants
 # because the self-test pins them: collapsing the two into one reason destroys exactly the
@@ -1517,7 +1540,7 @@ def provenance_attestation_class(record):
     return None
 
 
-def provenance_admission_error(record, pr_number):
+def provenance_admission_error(record, pr_number, *, admit_orchestrator=False):
     """Return why a PARSED provenance record for target PR ``pr_number`` is NOT admissible by
     the review loop, or None when it passes EVERY record-shape requirement of EVERY consumer.
 
@@ -1546,7 +1569,24 @@ def provenance_admission_error(record, pr_number):
     draft worker PR is review-loop-owned (exempt from the terminal needs:user park) exactly
     when this returns None. Adding a field constraint HERE updates every consumer in the same
     commit — the partial-replica drift that groom-preserved a review-rejected draft (round-3
-    finding: alias/issue unchecked) is structurally impossible to reintroduce."""
+    finding: alias/issue unchecked) is structurally impossible to reintroduce.
+
+    ``admit_orchestrator`` (issue #657, research/657-orchestrator-pr-admission.md §6) is the
+    ONE opt-in that relaxes the machine-attestation requirement, and only to the recognised
+    ``orchestrator`` class. It DEFAULTS FALSE, so every existing caller keeps refusing that
+    class byte-for-byte — the shared predicate stays fail-closed and a new consumer inherits
+    the strict posture unless it names the relaxation.
+
+    It is a PARAMETER rather than a widening of MACHINE_ATTESTED_CLASSES because the class is
+    NOT safe for every consumer. An orchestrator record is self-attested: the actor that wrote
+    the diff also wrote the record, so its ``impl_provider`` is an assertion about itself and
+    nothing may INVERT that field to pick a reviewer. Consumers that only READ a PR are safe;
+    consumers that PUSH CODE or ARM on the record's authority are not. Passing True is
+    therefore a per-consumer decision that has to be written down and tested:
+      admit_orchestrator=True   enumerate_review_items (review-only states; see its docstring)
+      admit_orchestrator=False  everything else, including groom's draft carve-out and every
+                                fix/rebase path — an orchestrator PR is not a pipeline-owned
+                                draft and the fix lane must never push to one."""
     if not isinstance(record, dict):
         return "provenance record is not a JSON object"
     number = record.get("pr_number")
@@ -1582,7 +1622,8 @@ def provenance_admission_error(record, pr_number):
     attestation = provenance_attestation_class(record)
     if attestation is None:
         return ATTESTATION_UNRECOGNISED_REASON
-    if attestation not in MACHINE_ATTESTED_CLASSES:
+    admitted = MACHINE_ATTESTED_CLASSES | ({ORCHESTRATOR_CLASS} if admit_orchestrator else set())
+    if attestation not in admitted:
         return attestation_not_machine_reason(attestation)
     return None
 
@@ -1590,12 +1631,52 @@ def provenance_admission_error(record, pr_number):
 def is_enumerable_provenance(record, pr_number):
     """True iff the review loop will admit target PR ``pr_number``'s provenance record —
     a thin predicate over provenance_admission_error (the single source of truth; see its
-    docstring for the field set and the consumer list)."""
+    docstring for the field set and the consumer list).
+
+    Deliberately has NO orchestrator opt-in: its callers (groom's draft age-park carve-out) ask
+    "is this a pipeline-owned worker draft?", and an orchestrator PR is not one."""
     return provenance_admission_error(record, pr_number) is None
 
 
+def admits_orchestrator_pr(record, pr_number, login, enrolled_authors):
+    """True iff PR ``pr_number`` qualifies for the #657 orchestrator-class review admission.
+
+    TOTAL and fail-closed — never raises, and returns False for every malformed input, because
+    it runs inside the PLAN walk where an exception aborts the whole tick instead of skipping
+    one PR. It is a PREDICATE ONLY: it decides that the head-ref and author SHAPE gates may be
+    waived for this PR, and nothing else. The fork gate, the provenance FIELD admission, the
+    human holds, the machine parks, the source-issue hold and every lease rule are applied by
+    the caller either side of it and are not waivable.
+
+    Both halves are required, and they are deliberately sourced from branches of DIFFERENT
+    authority (see policy-resolve.review_enrolment_authors):
+    - ``record`` is `orchestrator`-attested. Records live on the unprotected `ledger` branch
+      (issue #96), so this half is a low-authority, per-PR gesture.
+    - ``login`` is in ``enrolled_authors``, the repo's master-protected allowlist, compared
+      CASEFOLDED because GitHub logins are case-insensitive. A `[bot]` login can never appear
+      there (policy-resolve refuses one), so this path cannot be used to widen the author gate
+      to some other App.
+
+    An EMPTY ``enrolled_authors`` — the default, and the shipped state for every repo — makes
+    this constantly False, so the enumerator's behaviour is byte-for-byte unchanged until a
+    reviewed master commit opts a login in."""
+    if not enrolled_authors or not isinstance(login, str) or not login:
+        return False
+    if provenance_attestation_class(record) != ORCHESTRATOR_CLASS:
+        return False
+    # The record must still BE this PR's record. Without this, an orchestrator record minted
+    # for PR #7 would waive the shape gates on PR #9 — the field admission below would then
+    # reject #9, but the waiver decision itself must not depend on a later check to be sound.
+    number = record.get("pr_number") if isinstance(record, dict) else None
+    if not isinstance(number, int) or isinstance(number, bool) or number != pr_number:
+        return False
+    return login.casefold() in {
+        author.casefold() for author in enrolled_authors if isinstance(author, str)
+    }
+
+
 def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, bot_login="",
-                           pr_status=None, exclusions=None):
+                           pr_status=None, exclusions=None, enrolled_authors=()):
     """PURE review_items enumerator (called by the dispatch.yml PLAN step against its own data;
     unit-tested by --self-test). Fail-closed trust posture (locked decisions 1/3/11/13/19):
     - only open PRs whose head branch matches the worker pattern,
@@ -1674,17 +1755,37 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
         if pull.get("state") != "open":
             exclude_signalled(f"snapshot state is {pull.get('state')!r}, not open")
             continue
-        if not HEAD_REF_RE.match(ref):
-            exclude_signalled("head ref is not a worker branch")
-            continue
+        # FORK GATE FIRST, and unconditional (issue #657 admission). It used to sit BETWEEN the
+        # two shape gates, which was safe only because nothing could skip them. Now that the
+        # orchestrator admission below waives the head-ref and author gates, the fork gate has
+        # to be the one no waiver can reach — so it is hoisted above every waivable predicate
+        # rather than left to the accident of ordering. `head_repo != repo` is the single
+        # attacker-facing predicate here: a fork head is attacker-controlled and is NEVER
+        # reviewed, admitted, or enrolled, on any path.
         if head_repo != repo:
             exclude_signalled("head repo is not the target repo")
-            continue                      # fork head — attacker-controlled, never reviewed
-        if not login.endswith("[bot]") or (bot_login and login != bot_login):
-            exclude_signalled("author is not the trusted App bot")
             continue
         record = provenance.get(number)
-        record_error = provenance_admission_error(record, number)
+        # ORCHESTRATOR-PR ADMISSION (issue #657 / research/657-orchestrator-pr-admission.md §6,
+        # Option 2(b)). The two gates below select the population the WORKER lane produces. A PR
+        # the orchestrator authored itself is invisible to every path that can run a model
+        # against a PR — measured on sparq 2026-07-27: 30 of 34 open non-draft PRs, all
+        # `jeswr`-authored, ALL failing BOTH gates, 0 holding any ledger verdict.
+        #
+        # `admits_orchestrator_pr` is a pure conjunction of TWO independently-authored facts:
+        # an `orchestrator`-attested record on the `ledger` branch, and the PR author's login in
+        # the repo's MASTER-protected `review_enrolment_authors`. Neither alone admits anything.
+        # Default is an EMPTY allowlist, i.e. the gates below stand exactly as they do today.
+        orchestrator_admitted = admits_orchestrator_pr(record, number, login, enrolled_authors)
+        if not orchestrator_admitted and not HEAD_REF_RE.match(ref):
+            exclude_signalled("head ref is not a worker branch")
+            continue
+        if not orchestrator_admitted and (
+                not login.endswith("[bot]") or (bot_login and login != bot_login)):
+            exclude_signalled("author is not the trusted App bot")
+            continue
+        record_error = provenance_admission_error(
+            record, number, admit_orchestrator=orchestrator_admitted)
         if record_error:
             exclude_signalled(record_error)
             continue                      # missing/invalid registry provenance record — fail
@@ -1768,6 +1869,18 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
         reviewed_match = bool(reviewed and reviewed.group(1) == sha)
 
         def emit(state, context=""):
+            # REVIEW-ONLY for the #657 orchestrator class (design record Option 2(b)). ONE
+            # choke point on purpose: every state this enumerator can produce passes through
+            # here, so the restriction cannot be defeated by a later branch that learns to
+            # emit a new state. `needs-review` posts a comment; every other state dispatches a
+            # run that PUSHES COMMITS to the PR head (needs-fix / needs-ci-fix / needs-rebase)
+            # or re-enters the arm path (stranded). A self-attested record must never buy write
+            # access to its own branch: the actor that wrote the record wrote the diff.
+            if orchestrator_admitted and state != "needs-review":
+                exclude_signalled(
+                    f"orchestrator-class PR is review-only; {state} would dispatch a "
+                    "code-writing run on a self-attested record")
+                return
             items.append({
                 "pr_number": number,
                 "head_sha": sha,
@@ -1776,6 +1889,11 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
                 "repo": repo,
                 "package": plan_package(areas),
                 "security": _security_flagged(set(labels) | set(source_labels)),
+                # The reviewer side must NOT be resolved by inverting `impl_provider` for a
+                # self-attested record (design record §3): a false declaration would yield a
+                # same-provider review that still looks cross-provider. Consumers key on this
+                # flag to pin a CONSTANT review side and to refuse the auto-arm.
+                "self_attested": orchestrator_admitted,
                 "context": context[:CI_CONTEXT_MAX],
             })
 
@@ -6175,6 +6293,7 @@ def _self_test():
             "repo": "example/repo",
             "package": "crate-a",
             "security": False,
+            "self_attested": False,
             "context": "",
         }, {
             "pr_number": 44,
@@ -6184,6 +6303,7 @@ def _self_test():
             "repo": "example/repo",
             "package": "crate-b",
             "security": False,
+            "self_attested": False,
             "context": "docs-quality, opt-in wasm feature-OFF equality",
         }, {
             "pr_number": 46,
@@ -6193,6 +6313,7 @@ def _self_test():
             "repo": "example/repo",
             "package": "crate-a",
             "security": False,
+            "self_attested": False,
             "context": "",
         }],
         "disarm_items": [{
@@ -8385,7 +8506,7 @@ def _self_test():
 
     ci_item = {"pr_number": 41, "head_sha": sha_a, "state": "needs-ci-fix",
                "impl_provider": "anthropic", "repo": repo, "package": "crate-a",
-               "security": False, "context": "js"}
+               "security": False, "self_attested": False, "context": "js"}
     real_io = (_gh_json, _run_target_helper, _target_token, _target_is_human_maintainer)
     with tempfile.TemporaryDirectory() as tmp:
         wiring_root = str(Path(tmp) / "registry")
@@ -8649,7 +8770,7 @@ def _self_test():
 
             fix_item = {"pr_number": 41, "head_sha": sha_a, "state": "needs-fix",
                         "impl_provider": "anthropic", "repo": repo, "package": "crate-a",
-                        "security": False, "context": ""}
+                        "security": False, "self_attested": False, "context": ""}
             routing_ok = {"models": {
                 "opus5": {"provider_model": "claude-opus-5", "harness": "claude"},
                 "fable": {"provider_model": "claude-fable-5", "harness": "claude"},
@@ -9443,7 +9564,8 @@ def _self_test():
                 fanout_items.append({
                     "pr_number": pr_number, "head_sha": head_sha,
                     "state": "needs-ci-fix", "impl_provider": "openai", "repo": repo,
-                    "package": f"fanout-{offset}", "security": False, "context": "gate",
+                    "package": f"fanout-{offset}", "security": False,
+                    "self_attested": False, "context": "gate",
                 })
                 path = Path(wiring_root) / wiring_worker_pr.provenance_path(repo, pr_number)
                 path.parent.mkdir(parents=True, exist_ok=True)

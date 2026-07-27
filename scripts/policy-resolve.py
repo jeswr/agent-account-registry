@@ -112,9 +112,42 @@ POLICY_FIELDS = {
 # thresholds + the per-target readiness-engine selector). policy-resolve accepts-and-ignores them
 # so the dispatch/groom resolver never rejects a policy augmented for the metrics collector; the
 # collector does its own strict validation of their contents.
+# [OPUS-5] review_enrolment_authors (issue #657, research/657-orchestrator-pr-admission.md §6):
+# the MASTER-PROTECTED half of orchestrator-PR admission.
+#
+# The review lane's shape gates — a `sparq-agent/issue-N-` head ref and a `[bot]` author — select
+# the population the WORKER lane produces. A PR the orchestrator authored itself, on an ordinary
+# branch under the maintainer's token, is therefore structurally unreachable by review however
+# correct it is: not deferred, not parked, invisible. Admission re-admits that class, and needs
+# BOTH halves:
+#   1. a provenance record whose attestation class is `orchestrator` (per-PR, `ledger` branch),
+#      and
+#   2. the PR author's login appearing in THIS list (per-repo, master).
+# Both are required because the two branches carry DIFFERENT authority. Provenance records live
+# on `ledger` precisely because master's required `gate` check rejects direct contents-API PUTs
+# (issue #96), so minting a record is a LOW-authority act available to anything holding the App
+# token. This list sits on master, behind the gate and branch protection, so the SET of logins
+# that can ever be admitted is a reviewed change even when an individual record is not. A record
+# naming a login absent from here admits NOTHING (fail-closed; absent => empty list => the shape
+# gates stand exactly as they do today).
+#
+# Entries are canonical lowercase GitHub USER logins. A `[bot]` login is REFUSED: a bot already
+# satisfies the author gate, so listing one could only widen it to an unrelated App.
+#
+# This list NEVER waives the fork gate (`head.repo == target`), the provenance-record field
+# admission, the human holds, the machine parks, or any lease rule. Nor does it make the class
+# equal to a worker PR: per the design record's Option 2(b) the class is REVIEW-ONLY, and its
+# reviewer side is a CONSTANT, never resolved by inverting the record's self-declared
+# `impl_provider` — for a self-authored PR that field is an assertion by the implementer about
+# itself, and inverting it yields a same-provider review that merely LOOKS cross-provider.
 OPTIONAL_POLICY_FIELDS = {"require_usage", "usage_safety_margin", "max_review_rounds",
                           "review_queue_ttl_minutes", "cross_provider_fallback", "security_paths",
-                          "trusted_bots", "allow_actions_bot_issues", "throughput", "readiness"}
+                          "trusted_bots", "allow_actions_bot_issues", "throughput", "readiness",
+                          "review_enrolment_authors"}
+
+# A canonical GitHub USER login: ASCII alphanumeric with internal single hyphens, <= 39 chars.
+# Deliberately excludes the "[bot]" suffix — see the OPTIONAL_POLICY_FIELDS note above.
+GITHUB_LOGIN_RE = re.compile(r"[a-z0-9](?:-?[a-z0-9]){0,38}")
 
 
 # Slots whose underlying account is dead and which must never appear in an account_pool again.
@@ -234,6 +267,26 @@ def _policy_row(target_repo, policy_doc):
     if ("allow_actions_bot_issues" in row
             and not isinstance(row["allow_actions_bot_issues"], bool)):
         raise PolicyError(f"allow_actions_bot_issues for {target_repo!r} must be boolean")
+    if "review_enrolment_authors" in row:
+        authors = row["review_enrolment_authors"]
+        # CANONICAL FORM IS AN INVARIANT here for the same reason it is for account_pool: the
+        # consumer (dispatch-claim.enrolment_waiver) compares casefolded, so " JesWR" would
+        # match at the comparison site while reading as a different value in review. Rejecting
+        # non-canonical entries at the boundary keeps the reviewed text and the matched value
+        # the same string.
+        if not isinstance(authors, list) or any(not isinstance(a, str) for a in authors):
+            raise PolicyError(
+                f"review_enrolment_authors for {target_repo!r} must be a list of login strings")
+        noncanonical = [a for a in authors if GITHUB_LOGIN_RE.fullmatch(a) is None]
+        if noncanonical:
+            raise PolicyError(
+                f"review_enrolment_authors for {target_repo!r} contains non-canonical "
+                f"login(s) {noncanonical!r} — each entry must match "
+                f"{GITHUB_LOGIN_RE.pattern} exactly (lowercase, no whitespace, no '[bot]' "
+                f"suffix: a bot already satisfies the author gate and needs no enrolment)")
+        if len(set(authors)) != len(authors):
+            raise PolicyError(
+                f"review_enrolment_authors for {target_repo!r} contains duplicates")
     if "security_paths" in row:
         paths = row["security_paths"]
         if (not isinstance(paths, list)
@@ -257,7 +310,22 @@ def _policy_row(target_repo, policy_doc):
     # this shared loader rather than be independently guessed at each call site.
     normalized = dict(row)
     normalized.setdefault("allow_actions_bot_issues", False)
+    normalized.setdefault("review_enrolment_authors", [])
     return normalized
+
+
+def review_enrolment_authors(target_repo, policy_doc):
+    """The master-protected set of logins this repo may enrol into the review lane (casefolded).
+
+    Read by the PLAN assemble step and handed to enumerate_review_items. Deliberately NOT
+    surfaced through resolve(): resolve's output dict is compared field-by-field by
+    dispatch-claim._route_matches against the TARGET-side resolver, so adding a key there
+    would be a cross-repo contract change; this is a separate, registry-only read.
+
+    Absent / empty => empty frozenset, i.e. enrolment is OFF and the shape gates stand exactly
+    as before. _policy_row has already refused a malformed or non-canonical list, so reaching
+    here means every entry is a canonical login."""
+    return frozenset(_policy_row(target_repo, policy_doc)["review_enrolment_authors"])
 
 
 def _normalise_labels(role_or_labels):
