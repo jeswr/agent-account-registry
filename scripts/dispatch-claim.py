@@ -16137,6 +16137,31 @@ def _deferred_issue_ladder_self_test():
         policy.budget_exhausted_bucket(action)
     print("  ok   [#797] every action the lane can reach maps to a declared census bucket")
 
+    # THE CALL-SITE SEAM. Everything above tests the helper; none of it can see the dispatch loop
+    # calling `park_ladder_decision` DIRECTLY with its own (wrong) authority and bypassing the
+    # helper entirely — measured, that mutant survived the whole registry suite. The property is
+    # therefore proved STRUCTURALLY over the parsed tree: this module may reach the ladder in
+    # exactly ONE place, and that place is `deferred_issue_ladder`. Walking the AST (not the
+    # text) means a call cannot hide in a lambda, a nested def, a dead branch or a reflow, and a
+    # matching string in a comment or docstring proves nothing.
+    import ast
+    source = Path(__file__).resolve().read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    owner = next(node for node in ast.walk(tree)
+                 if isinstance(node, ast.FunctionDef) and node.name == "deferred_issue_ladder")
+    inside = {id(node) for node in ast.walk(owner)}
+    strays = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if getattr(node.func, "attr", None) != "park_ladder_decision":
+            continue
+        if id(node) not in inside:
+            strays.append(node.lineno)
+    chk("[#797] dispatch-claim reaches park_ladder_decision through deferred_issue_ladder and "
+        "NOWHERE else — the authority claim cannot be bypassed at the call site",
+        strays, [])
+
 
 def _absorbing_park_leg_self_test():
     here = Path(__file__).resolve()
