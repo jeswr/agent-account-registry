@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4472,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "6fdfbddf78f39ab9e6b80eddf0c7868e4be79cea",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 4 finds no correctness, soundness, test-validity, or security defect. The design remains explicit that v0.1 type erasure requires a closed GraphName representation plus fallible emission-time conversion, while compile-time rejection is limited to syntactic forms that necessarily yield invalid graph names. It preserves the accepted string-literal-to-NamedNode path and requires positive, negative, runtime-error, default-graph, cross-backend, and triple-byte-identity witnesses. The superseding status correction is internally consistent and does not overstate implementation: it clearly records that the upstream quad-emission patch is still future work. Findings are materially unchanged from round 3, so progress is stagnant.",
+  "verdict": "approve"
+ }
+}
