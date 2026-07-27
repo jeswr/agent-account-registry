@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4517,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "2c3092ef7ebed072a08672ddb249ae80a16dbd6b",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 3 resolves the prior major finding. The design record now restores Alt-A to an explicitly undecided, measure-first state; labels the off-tree probes unreviewable; reproduces none of their results; and makes the future verdict contingent on landing reviewable methodology plus a regression-gated `_comment_sq_uii0` snapshot. The remaining discussion is carefully framed as hypotheses and existing in-tree precedent rather than empirical findings. The changed passages are internally consistent and do not make an unsupported ZK soundness, privacy, or performance claim.",
+  "verdict": "approve"
+ }
+}
