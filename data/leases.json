@@ -13,12 +13,12 @@
   {
    "account": "58b7c92faa5b5ca5",
    "claim_id": "74d911c2491446cebf0a21f0571253da",
-   "holder": "sparq-org/sparq#2946@dispatch-30258275504.1",
+   "holder": "sparq-org/sparq#2946@30259305500.1",
    "package": "sparq-zk-compose",
    "role": "soundness",
    "model": "opus5",
-   "issued_at": 1785149131,
-   "expires_at": 1785155431
+   "issued_at": 1785149161,
+   "expires_at": 1785155461
   },
   {
    "account": "58b7c92faa5b5ca5",
