@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 801,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "9f95cb56c2ad4303daf1903ff9ee1dace8955ecb",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "_issue_is_measurement_run classifies one live response, but _gate_issue_as_measurement_run later adds needs:ec2 without re-reading or asserting that the classification inputs still match. The receipt is posted before that mutation, making the race durable: if a human removes the bench label or changes the title/body after classification, the dispatcher can record action=needs-ec2 and gate an issue that no longer qualifies; later reconciliation trusts the receipt and re-adds the label without reclassification. The additive endpoint prevents erasing concurrent labels but does not make the classification decision current. The new relabel tests only mutate before the classifier read, not between classification, receipt, and label mutation.",
+    "file": "scripts/dispatch-claim.py",
+    "fix_hint": "Bind the receipt/action to a final validated live snapshot (labels, title, body, open issue identity) immediately before persistence, and abort with no receipt or mutation when it differs from the classified snapshot. Reconciliation must also avoid enforcing a stale gate receipt onto an issue that no longer qualifies. Add a tripwire that mutates each classification input after classification but before the comment/label write and asserts no receipt and no gate.",
+    "severity": "major",
+    "title": "Gate receipt and label are not bound to the classified issue state"
+   },
+   {
+    "body": "_apply_cli reads current labels with view(), then performs a separate live_text() read and classifies the earlier labels with the later title/body. A bench-label addition between those reads can miss needs:ec2 and allow a measurement run to be readied; a bench-label removal can cause a durable false gate. apply_triage's revision-bound verification checks only the single-role post-condition and never proves that the mixed classification inputs represented one issue state. The self-tests exercise malformed text reads but not either label/text race direction.",
+    "file": "scripts/triage.py",
+    "fix_hint": "Read labels, title, and body as one coherent live document or revalidate all classifier inputs before applying the decision, failing closed on any change. Add end-to-end tests for bench-label addition and removal between the existing reads and assert respectively no admission and no stale gate mutation.",
+    "severity": "major",
+    "title": "Triage combines labels and measurement text from different live snapshots"
+   },
+   {
+    "body": "_apply_cli obtains labels from read_state(), then obtains title/body/state through a separate read_live_body() call. plan therefore classifies a combination that may never have existed. A concurrent live bench-label addition can leave an EC2 measurement run classified as non-bench and promoted; a removal can add needs:ec2 to an issue that has left the bench surface. apply_decision does not bind the measurement decision to the text-and-label snapshot, and the added tests keep those inputs stable.",
+    "file": "scripts/retriage.py",
+    "fix_hint": "Acquire labels, title, body, and state in one validated live read or compare-and-abort if any classifier input changes before mutation. Add mutation tests for both cached/live bench-surface transitions in the interval between the two reads, asserting fail-closed behavior and no false durable gate.",
+    "severity": "major",
+    "title": "Retriage can promote or gate from a mixed live state"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The two round-2 findings are substantively repaired: failed dispatch classification now holds the escalation without mutation/allocation, and the classifier uses live labels, title, and body from one response with non-vacuous tripwires. However, the new gate is still applied from snapshots that are not bound to the mutation. Dispatch can persist a receipt and durable needs:ec2 label after the issue changes following classification, and both live triage paths classify labels and text from separate reads without revalidating the combined decision state. Those races can either durably gate an issue that no longer qualifies or miss the gate and admit an impossible measurement run. These are new major findings, so progress is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
