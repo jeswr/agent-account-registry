@@ -410,9 +410,22 @@ def _self_test():
                         if re.fullmatch(r"  [A-Za-z0-9_-]+:\s*", lines[i])), len(lines))
         job_if = [line for line in lines[jobs[0]:job_end] if line.startswith("    if:")]
         if job_if:
-            raise AssertionError(
-                f"the job owning step `id: {step_id}` carries {job_if[0].strip()!r} — a disabled "
-                "job would leave every executed assertion below green. Refusing.")
+            # ONE modelled exception, and it is an allowlist of a single exact expression, not a
+            # loosening (issue #819). The worry this guard encodes is a PERMANENTLY disabled job
+            # leaving every executed assertion below green. The #819 tick floor is a TEMPORAL rate
+            # gate: it is false only for ticks arriving inside the minimum interval, and the very
+            # next tick past the floor runs the job. Admitting it costs nothing here; admitting
+            # "any `if:`" would give back the whole guard, so anything that is not this exact
+            # string still refuses — including a rewrite of the same gate into a different form,
+            # which must be re-reviewed rather than pattern-matched.
+            floor_gate = "if: ${{ needs.tick-floor.outputs.proceed == 'true' }}"
+            declares_floor_job = any(re.fullmatch(r"  tick-floor:\s*", line) for line in lines)
+            if not (len(job_if) == 1 and job_if[0].strip() == floor_gate and declares_floor_job):
+                raise AssertionError(
+                    f"the job owning step `id: {step_id}` carries {job_if[0].strip()!r} — a "
+                    "disabled job would leave every executed assertion below green. Only the "
+                    f"#819 tick-floor gate ({floor_gate!r}, with a `tick-floor:` job present in "
+                    "the same file) is modelled here. Refusing.")
         opens = [i for i, line in enumerate(block) if line.strip().startswith(f"# >>> {marker}")]
         closes = [i for i, line in enumerate(block) if line.strip() == f"# <<< {marker}"]
         if len(opens) != 1 or len(closes) != 1 or closes[0] <= opens[0]:
@@ -629,6 +642,23 @@ def _self_test():
     # the interlock is tested against the real engine it exists to protect rather than a mock of
     # it — `scripts/ready-issues.py` here has no `pull_request` guard at all.
     # ------------------------------------------------------------------------------------------
+    def _is_modelled_tick_floor_gate(scope, mapping, document):
+        """The ONE `if:` the two guards below admit: the #819 tick floor on the PLAN job.
+
+        This is an allowlist of a single exact expression, not a loosening. What those guards
+        encode is a worry about a PERMANENTLY disabled job leaving every executed assertion green.
+        The tick floor is a TEMPORAL rate gate — false only for a tick arriving inside the minimum
+        interval between EXECUTED ticks, and the next tick past the floor runs the job — so it
+        cannot hide a broken planner for more than one interval. Three conditions, all required:
+        it is the JOB (never a step), the expression is byte-exact, and the job it names actually
+        exists in the same document. A rewrite of the same gate into a different form still
+        refuses, deliberately: that is a re-review, not a pattern match."""
+        if not scope.startswith("job "):
+            return False
+        gate = "${{ needs.tick-floor.outputs.proceed == 'true' }}"
+        return (str(mapping.get("if")).strip() == gate
+                and "tick-floor" in ((document.get("jobs") or {})))
+
     def _refuse_exit_zero_swallow(path, step_id):
         """Refuse any way the `id: step_id` step can FAIL while its job stays green.
 
@@ -666,7 +696,7 @@ def _self_test():
                     f"{scope} owning `id: {step_id}` carries a truthy `continue-on-error` — it "
                     "could fail while the job stays green, making every assertion over its "
                     "output vacuous. Refusing.")
-            if "if" in mapping:
+            if "if" in mapping and not _is_modelled_tick_floor_gate(scope, mapping, document):
                 raise AssertionError(
                     f"{scope} owning `id: {step_id}` carries an `if:` condition — this block is "
                     "EXECUTED by this self-test from its source text, so a conditional would "

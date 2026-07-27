@@ -162,3 +162,67 @@ jobs:
             echo "::error::one or more issues failed their fail-closed retriage post-condition (registry #582)"
             exit 1
           fi
+
+  # ALERT ON THE STOCK, NOT THE RUN.
+  #
+  # The `retriage` job above reported `success` on every one of its ~48 scheduled runs a day while
+  # the population it exists to drain grew for two weeks. Nothing was wrong with any individual
+  # run: each swept its window and each genuinely decided, per issue, to do nothing. MEASURED on
+  # run 30288369320 — 80 issues visited, 80 skips, ZERO writes (65 `classifier-incomplete`).
+  # A per-run success signal STRUCTURALLY CANNOT express a missing state exit.
+  #
+  # A SEPARATE JOB, with `if: always()`, deliberately:
+  #   * `needs: retriage` + `if: always()` runs it whether the sweep passed, failed or was
+  #     cancelled — the sweep's SILENCE is exactly what this is watching, and a watcher hosted as
+  #     an `always()` STEP inside the watched job does not run when that job fails early or is
+  #     killed by its own `timeout-minutes` (plan-alert.py, issue #778).
+  #   * it re-reads the board itself rather than consuming the sweep's snapshot, so a sweep that
+  #     died before producing one still gets censused.
+  # `continue-on-error` is deliberately NOT set: an alert lane that cannot report must be visible.
+  stock-alert:
+    needs: retriage
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REGISTRY_REPO: ${{ github.repository }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      # The watchdog's YAML-seam assertions PARSE this workflow rather than pattern-match it — the
+      # same reason dispatch.yml's secrets guard does, and the same reason PyYAML is a HARD
+      # requirement of `--self-test` there. Probe first, so a runner image that already ships it
+      # keeps the gate at ZERO network dependency; install only when absent, version + sha256
+      # locked to the identical pins pr-gate/dispatch use, because a required fail-closed control
+      # must never depend on a mutable release.
+      - name: Ensure PyYAML for the watchdog's workflow-parse assertions
+        run: |
+          set -euo pipefail
+          if python3 -c 'import yaml' 2>/dev/null; then
+            echo "PyYAML already present; no install needed"
+            exit 0
+          fi
+          cat > "$RUNNER_TEMP/watchdog-requirements.txt" <<'REQ'
+          pyyaml==6.0.2 \
+              --hash=sha256:80bab7bfc629882493af4aa31a4cfa43a4c57c83813253626916b8c7ada83476 \
+              --hash=sha256:1f71ea527786de97d1a0cc0eacd1defc0985dcf6b3f17bb77dcfc8c34bec4dc5
+          REQ
+          python3 -m pip install --disable-pip-version-check --require-hashes \
+            --only-binary=:all: -r "$RUNNER_TEMP/watchdog-requirements.txt"
+          python3 -c 'import yaml; print("PyYAML", yaml.__version__)'
+
+      - name: Verify the stock watchdog
+        run: python3 scripts/triage-stock-alert.py --self-test
+
+      # ONE deduped `ops-alert` issue, upserted on a breached census and auto-closed on a healthy
+      # one. It never touches a work issue's labels (asserted by the self-test above), so it
+      # cannot stampede the installation's hourly request budget.
+      - name: Census the status:untriaged stock and upsert/close the alert
+        # The maintainer handle rides the STEP env, not the job env: the `env` context is not
+        # available in `jobs.<job_id>.env`, so a job-level `${{ env.MAINTAINER_LOGIN }}` would
+        # silently expand to the empty string and the alert would @-mention nobody.
+        env:
+          MAINTAINER_HANDLE: ${{ env.MAINTAINER_LOGIN }}
+        run: python3 scripts/triage-stock-alert.py

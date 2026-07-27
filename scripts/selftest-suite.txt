@@ -9,6 +9,8 @@ deprecated_models.py
 dispatch-claim.py
 dispatch-plan.py
 dispatch-secrets-guard.py
+dispatch-stall-alert.py
+dispatch-tick-floor.py
 gh_retry.py
 grant-account.py
 groom-alert.py
@@ -33,6 +35,7 @@ resolve-conflicts.py
 retriage.py
 route-resolve.py
 select-and-claim.py
+triage-stock-alert.py
 triage.py
 trust-gate.py
 usage-alert.py

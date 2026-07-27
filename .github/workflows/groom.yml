@@ -296,6 +296,95 @@ jobs:
           python3 registry/scripts/metrics-alert.py --self-test
           python3 registry/scripts/metrics-alert.py --stale-check
 
+  # WATCH THE DISPATCHER (issue #819). dispatch.yml already has a per-run failure alert — the
+  # `plan-alert` job — and it fired ZERO times during the 2026-07-27 stall. Measured on run
+  # 30295860510 and repeated on every failing tick from 18:26:17Z: PLAN `failure` (HTTP 403 on an
+  # authenticated read), GUARD `failure` (cannot resolve the repository default branch, over the
+  # SAME exhausted request budget), CLAIM `skipped`, ALERT `skipped`. That alert is gated on
+  # `needs.secrets-guard.result == 'success'` — correctly, since it mounts ALERT_TOKEN and must not
+  # run while the secret-exfil settings are unverified (issue #101) — so the one class of outage
+  # that stops the whole pipeline is exactly the class that also disables its alarm. The gate
+  # cannot be loosened; the alarm has to live outside the workflow it watches.
+  #
+  # Hosted here for the same reason `metrics-stale` is: groom.yml runs on an independent schedule,
+  # is not dispatch, and is itself watched by dashboard.yml's cron keepalive. It costs two API
+  # reads per groom tick.
+  #
+  # NO `needs:` and NO `if:`, on purpose and asserted by scripts/dispatch-stall-alert.py's
+  # self-test: a watchdog suppressed by the failure of the sweep it shares a file with is not a
+  # watchdog — which is the defect above, restated. It reads two listings and holds
+  # contents:read + actions:read + issues:write — no arming, no merging, no label writes.
+  dispatch-stall:
+    name: WATCHDOG (is the dispatcher still completing ticks?)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # SECRET-EXFIL GUARD (issue #101): reads ALERT_TOKEN/ALERT_REPO, so it is bound to the
+    # default-branch-only `dispatch-secrets` environment where those secrets live, exactly like
+    # `groom`, `groom-alert` and `metrics-stale`.
+    environment: dispatch-secrets
+    # Repair authority, never admission authority. Pinned by the self-test.
+    permissions:
+      actions: read   # list dispatch's artifacts + run conclusions (the two signals)
+      contents: read  # the sparse checkout below
+      issues: write   # upsert/close the two rolling ops-alert issues
+    steps:
+      # The script, plus every file its --self-test asserts against: dispatch.yml and groom.yml for
+      # the `if:`/`needs:`/permissions/call-site seam and the two cron cadences, and
+      # dispatch-tick-floor.py for the cross-file threshold contract (the failure-streak threshold
+      # is denominated in TICKS, and how long N ticks take is set entirely by the #819 floor).
+      # Missing inputs fail LOUD rather than silently skipping the checks.
+      # KEEP THIS LIST IN SYNC — REQUIRED_FILES in scripts/dispatch-stall-alert.py is asserted
+      # against this very block.
+      - name: Check out ONLY the watchdog's inputs (pinned, sparse, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: registry
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/dispatch-stall-alert.py
+            scripts/dispatch-tick-floor.py
+            .github/workflows/dispatch.yml
+            .github/workflows/groom.yml
+          sparse-checkout-cone-mode: false
+
+      # PyYAML backs the workflow-parse assertions (regex-over-YAML is how five permissive
+      # misparses got into the secrets guard). Probe first so the runner image's own copy is used
+      # when present; the install path is version + sha256 locked to the identical pins pr-gate
+      # and the secrets guard use.
+      - name: Ensure PyYAML for the watchdog's workflow-parse assertions
+        run: |
+          set -euo pipefail
+          if python3 -c 'import yaml' 2>/dev/null; then
+            echo "PyYAML already present; no install needed"
+            exit 0
+          fi
+          cat > "$RUNNER_TEMP/stall-requirements.txt" <<'REQ'
+          pyyaml==6.0.2 \
+              --hash=sha256:80bab7bfc629882493af4aa31a4cfa43a4c57c83813253626916b8c7ada83476 \
+              --hash=sha256:1f71ea527786de97d1a0cc0eacd1defc0985dcf6b3f17bb77dcfc8c34bec4dc5
+          REQ
+          python3 -m pip install --disable-pip-version-check --require-hashes \
+            --only-binary=:all: -r "$RUNNER_TEMP/stall-requirements.txt"
+          python3 -c 'import yaml; print("PyYAML", yaml.__version__)'
+
+      - name: Alert maintainer if the dispatch pipeline has stalled
+        id: dispatch-stall
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REGISTRY_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          MAINTAINER_HANDLE: jeswr
+          # Privacy routing (locked decision 22c, issue #39). The body carries only counts, an age
+          # and two run links — no account handles, no ledger content, no byte of any target
+          # payload — so the registry-repo fallback is safe.
+          ALERT_REPO: ${{ secrets.ALERT_REPO || vars.ALERT_REPO || '' }}
+          ALERT_TOKEN: ${{ secrets.ALERT_TOKEN || '' }}
+        run: |
+          set -uo pipefail
+          python3 registry/scripts/dispatch-stall-alert.py --self-test
+          python3 registry/scripts/dispatch-stall-alert.py
+
   # FAIL-LOUD alert for a HARD GROOM failure (issue #176). The model-access health decision is the
   # LAST step of the `groom` job under the default success() guard, and every other repair happens
   # inside that same job — so when an EARLIER step fails or is cancelled (ledger data-only invariant
