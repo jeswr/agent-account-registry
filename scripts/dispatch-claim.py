@@ -10464,6 +10464,141 @@ def _self_test():
         assert cross_leg_census["by_held_area"] == {GLOBAL_PACKAGE: 1}, cross_leg_census
     print("  ok   registry-758 (d): the CLAIM leg attributes the same partition the same way")
 
+    # ---- [registry #758] EXHAUSTIVE OVER THE ENUM, ON THE EMITTED LINE, AT BOTH LEGS ----------
+    # Asserting ONE reason class is precisely how the misattribution went uncaught: the only
+    # assertion on an assemble-leg line in this file was a single-occupant `crate-conflict`
+    # fixture. So every member of PARTITION_DEFER_REASONS gets a named case at BOTH legs, the
+    # emitted sentence is compared verbatim, and the coverage map is checked against the DECLARED
+    # enum — a new reason with no case here goes red instead of shipping unprinted and unasserted.
+    enum_labels = {**collapse_labels, 8: ["role:impl"]}
+    enum_row_crate = {"number": 71, "package": "crate-b", "deferred": False}
+    enum_row_global = {"number": 79, "package": GLOBAL_PACKAGE, "deferred": False}
+    # pr#60's source issue 8 carries NO `area:` label, so it reserves `__global__` — the exact
+    # shape of sparq#4360/#4336 on the measured board.
+    enum_global_holder = pull(60, "sparq-agent/issue-8-1-1", sha_a, labels=["review:needs"])
+    enum_crate_holder = pull(76, "sparq-agent/issue-81-1-1", sha_a, labels=["review:needs"])
+    enum_other_holder = pull(77, "sparq-agent/issue-82-1-1", sha_a, labels=["review:needs"])
+    # (rows, pulls, leases, expected assemble line, expected CLAIM line). `leases=None` is an
+    # UNREADABLE ledger, which the partition fails toward exclusion — the sibling-lease branch.
+    assemble_and_claim_cases = {
+        "global-reservation": (
+            [enum_row_crate], [enum_global_holder], [],
+            "assembler defer #71 [global-reservation]: row crate crate-b; "
+            "held area __global__ reserved by pr#60 [not-parked]",
+            "claim-revalidation defer #71 [global-reservation]: row crate crate-b; "
+            "held area __global__ reserved by pr#60"),
+        "cross-cutting-item": (
+            [enum_row_global], [enum_other_holder], [],
+            "assembler defer #79 [cross-cutting-item]: row crate __global__; "
+            "held area __global__ reserved by pr#77 [not-parked]",
+            "claim-revalidation defer #79 [cross-cutting-item]: row crate __global__; "
+            "held area __global__ reserved by pr#77"),
+        "crate-conflict": (
+            [enum_row_crate], [enum_crate_holder], [],
+            "assembler defer #71 [crate-conflict]: row crate crate-b; "
+            "held area crate-b reserved by pr#76 [not-parked]",
+            "claim-revalidation defer #71 [crate-conflict]: row crate crate-b; "
+            "held area crate-b reserved by pr#76"),
+        "sibling-lease": (
+            [enum_row_crate], [], None,
+            "exclude example/repo#71: superseded-until-sibling-resolves — "
+            "a live sibling lease (any lane) holds its package",
+            "claim-revalidation defer #71: crate crate-b busy via sibling lease"),
+    }
+    assert set(assemble_and_claim_cases) == set(PARTITION_DEFER_REASONS), (
+        "PARTITION_DEFER_REASONS gained a member with no printed-line case at either leg — an "
+        "unprinted drop reason is a row that leaves the frontier with nothing on the log or the "
+        "Gate A feed",
+        sorted(set(PARTITION_DEFER_REASONS) ^ set(assemble_and_claim_cases)))
+    for reason, (rows, holders, enum_leases, assemble_line, claim_line) in \
+            assemble_and_claim_cases.items():
+        # ASSEMBLE leg.
+        enum_output = io.StringIO()
+        enum_census = {}
+        with contextlib.redirect_stdout(enum_output):
+            assert filter_busy_area_items(rows, repo, holders, enum_labels, busy_prov,
+                                          leases=enum_leases, now=now, census=enum_census) == []
+        assert enum_output.getvalue().splitlines() == [assemble_line], \
+            (reason, enum_output.getvalue())
+        assert enum_census["by_reason"][reason] == 1, (reason, enum_census)
+        assert sum(enum_census["by_reason"].values()) == 1, (reason, enum_census)
+        assert (enum_census["total"], enum_census["kept"]) == (1, 0), (reason, enum_census)
+        # CLAIM leg, on the SAME board read live. The two legs must classify identically: a stall
+        # that reads `global-reservation` on the plan log and `crate-conflict` on the claim log
+        # sends the operator after two different repairs for one cause.
+        live_holders = [dict(holder, auto_merge=None, draft=False) for holder in holders]
+        claim_output = io.StringIO()
+        claim_census = {}
+        with contextlib.redirect_stdout(claim_output):
+            assert revalidate_items_against_live_pulls(
+                rows, repo, [live_holders], enum_labels, busy_prov, leases=enum_leases,
+                now=now, census=claim_census) == set()
+        assert claim_line in claim_output.getvalue(), (reason, claim_output.getvalue())
+        assert claim_census["by_reason"] == enum_census["by_reason"], (reason, claim_census)
+        assert claim_census["by_held_area"] == enum_census["by_held_area"], (reason, claim_census)
+        assert claim_census["by_holder"] == enum_census["by_holder"], (reason, claim_census)
+    print("  ok   registry-758 (e): every declared defer reason has an asserted printed line at "
+          "BOTH legs, and the two legs classify the same board identically")
+
+    # ---- [registry #758] THE CLAIM CENSUS IS SEALED, AND WIRED AT ITS PRODUCTION CALL SITE ----
+    # It shipped as a parameter with no production caller: `revalidate_items_against_live_pulls`
+    # accepted `census=` and every test above passed one, but `dispatch()` did not — so the CLAIM
+    # half was computed nowhere and read by nobody. Deleting the recorder from the lease branch
+    # left the whole suite green.
+    claim_quiet_census = {}
+    with contextlib.redirect_stdout(io.StringIO()):
+        claim_quiet = revalidate_items_against_live_pulls(
+            frontier, repo, [[]], collapse_labels, busy_prov, leases=[], now=now,
+            census=claim_quiet_census)
+    assert claim_quiet == {70, 71, 72, 73}, claim_quiet
+    assert claim_quiet_census["total"] == 0, claim_quiet_census
+    assert claim_quiet_census["kept"] == len(claim_quiet), claim_quiet_census
+    assert set(claim_quiet_census["by_reason"]) == set(PARTITION_DEFER_REASONS), \
+        claim_quiet_census
+    assert set(claim_quiet_census["by_reason"].values()) == {0}, claim_quiet_census
+    # Passing NO census must not move the CLAIM partition either — telemetry is observation only.
+    with contextlib.redirect_stdout(io.StringIO()):
+        assert revalidate_items_against_live_pulls(
+            frontier, repo, [[]], collapse_labels, busy_prov, leases=[], now=now) == claim_quiet
+    # The emitted line is FLAT and BRACE-FREE: GitHub's secret masker rewrites `{`/`}` to `***`,
+    # so a JSON dump of the census arrives corrupted on the Gate A feed.
+    claim_lease_census = {}
+    with contextlib.redirect_stdout(io.StringIO()):
+        assert revalidate_items_against_live_pulls(
+            [enum_row_crate], repo, [[]], collapse_labels, busy_prov, leases=None, now=now,
+            census=claim_lease_census) == set()
+    assert claim_lease_census["by_reason"]["sibling-lease"] == 1, claim_lease_census
+    assert claim_lease_census["by_holder"] == {"lease-ledger": 1}, claim_lease_census
+    claim_census_line = format_partition_census("claim-census", repo, claim_lease_census)
+    assert claim_census_line == (
+        "claim-census example/repo deferred=1 kept=0 reason.crate-conflict=0 "
+        "reason.cross-cutting-item=0 reason.global-reservation=0 reason.sibling-lease=1 "
+        "area.crate-b=1 holder.prlease-ledger=1"), claim_census_line
+    assert "{" not in claim_census_line and "}" not in claim_census_line, claim_census_line
+    # An unsealed/absent census still emits explicit zeros rather than a bare label.
+    assert format_partition_census("claim-census", repo, None) == \
+        "claim-census example/repo deferred=0 kept=0"
+    # SOURCE-LEVEL call-site seam (main() is not callable from here, so this is labelled as such
+    # rather than dressed up as behavioural coverage — same technique as the #677 pin below).
+    # Without these, every assertion above stays green while production passes no census at all.
+    _claim_src = inspect.getsource(dispatch)
+    for _required, _why in (
+        ("census=claim_census",
+         "dispatch() no longer asks revalidate_items_against_live_pulls for the CLAIM census — "
+         "the CLAIM leg's per-reason breakdown is computed nowhere in production"),
+        ('format_partition_census("claim-census"',
+         "the CLAIM census is computed and then never emitted — a leg whose count nobody can "
+         "read is the same hole as a leg with no count"),
+    ):
+        assert _required in _claim_src, f"{_required!r} missing from dispatch(): {_why}"
+    # ...and the emission must not be guarded behind the census being non-empty, which would
+    # restore the exact "no traffic reads like no instrumentation" ambiguity the sealing removes.
+    assert re.search(r"(?m)^\s*print\(format_partition_census\(\"claim-census\", repo, "
+                     r"claim_census\)\)$", _claim_src), \
+        "the claim-census emission must be an UNCONDITIONAL statement in dispatch()'s loop"
+    print("  ok   registry-758 (f): the CLAIM census is sealed, brace-free, and WIRED at the "
+          "production call site (source-level)")
+
     unparked_output = io.StringIO()
     with contextlib.redirect_stdout(unparked_output):
         unparked_result = revalidate_items_against_live_pulls(
