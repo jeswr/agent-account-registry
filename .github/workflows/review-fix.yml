@@ -652,11 +652,17 @@ jobs:
           # Disjoint top-level lease prefixes: `review:`/`fix:` never share a prefix with the
           # impl `<repo>#`, so neither cap counts the other. The shared per-mode prefix bounds
           # concurrent reviews to the static codex slot count (codex is usage-exempt; the CLI
-          # claim path does not usage-gate, so this static cap IS the bound — by design).
+          # claim path does not usage-gate, so this static cap IS the bound — by design). That is
+          # a DELIBERATE divergence from the dispatcher's `account_slot_bound=True` live-slot
+          # bound, which needs a usage probe this path does not have; issue #581.
           # TTL must outlive this workflow's remaining wall-clock (claim -> run -> release) plus
           # queue slack, or the allocator reclaims this still-live account and two sessions race
           # on one credential (issue #159). Kept in sync with dispatch-claim.py REVIEW_TTL/FIX_TTL
           # (which use the DISPATCHER-claim path's longer bound; adopting that bound here is safe).
+          # BOTH numbers below are cross-asserted: dispatch-claim.py's `_review_fix_workflow_values`
+          # parses these `cap=` / `ttl=` literals and its self-test pins them to
+          # SELF_CLAIM_REVIEW_CAP / SELF_CLAIM_FIX_CAP and REVIEW_TTL / FIX_TTL. Editing one side
+          # only turns that self-test RED — change both, or don't change either.
           if [[ "$MODE" == review ]]; then
             prefix="review:"; cap=10; ttl=4200; role=review
           else
