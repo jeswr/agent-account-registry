@@ -1151,13 +1151,22 @@ def _self_test():
         assert classify_403({"Retry-After": "5", "x-ratelimit-remaining": "0"}, "") == "secondary"
 
     def budget_403_is_not_retried_and_is_sweep_fatal():
-        """The retry count is the whole point: a non-retryable class must cost ONE request."""
+        """Two properties, and BOTH are load-bearing at the call site:
+
+        the retry COUNT — a non-retryable class must cost exactly one request, which is the whole
+        point of classifying at all — and the exception TYPE. Asserting only the count passes a
+        mutant that keeps the request count at one but raises a FetchError instead of a
+        BudgetExhausted, and that mutant is not cosmetic: FetchError is what every per-item
+        handler in this file converts into a per-PR skip, so it would put the sweep straight back
+        into hammering an empty bucket one PR at a time."""
         module = sys.modules[__name__]
-        for label, headers, body, want_attempts in (
-                ("budget", {"x-ratelimit-remaining": "0"}, b"", 1),
+        for label, headers, body, want_attempts, want_type in (
+                ("budget", {"x-ratelimit-remaining": "0"}, b"", 1, BudgetExhausted),
+                ("budget-by-body", {},
+                 b'{"message":"API rate limit exceeded for installation"}', 1, BudgetExhausted),
                 ("permission", {"x-ratelimit-remaining": "4931"},
-                 b"Resource not accessible by integration", 1),
-                ("secondary", {"Retry-After": "1"}, b"secondary rate limit", 3),
+                 b"Resource not accessible by integration", 1, FetchError),
+                ("secondary", {"Retry-After": "1"}, b"secondary rate limit", 3, FetchError),
         ):
             attempts = {"n": 0}
 
@@ -1168,10 +1177,11 @@ def _self_test():
             with patch.object(module, "urlopen", refuse), patch.object(time, "sleep"):
                 try:
                     make_fetch("t")("https://api.github.com/x")
-                except (FetchError, BudgetExhausted):
-                    pass
+                except BaseException as exc:  # noqa: BLE001 - the TYPE is the assertion
+                    got = type(exc)
                 else:
                     raise AssertionError(f"a {label} 403 must raise")
+            assert got is want_type, (label, got, want_type)
             assert attempts["n"] == want_attempts, (label, attempts)
 
     def budget_403_is_never_downgraded_to_a_per_item_skip():
