@@ -634,6 +634,16 @@ jobs:
           # never park a holder on an empty backlog.
           partition_starvation = []
           review_exclusions = Counter()
+          # [registry #762] The PR-side population census. `review_exclusions` is SIGNALLED-only
+          # (it counts a PR that carries a review-loop label), so an UNLABELLED worker draft
+          # sitting in the drafted-already-reviewed fall-through left no trace at all — which is
+          # half of why the ci-fix lane being structurally unreachable on sparq read as ten days
+          # of healthy ticks. This Counter partitions EVERY PR reaching that decision into one
+          # disjoint claim_mod.IDLE_CENSUS_BUCKETS entry, with every bucket emitted at zero, so a
+          # lane going to zero is a VISIBLE number rather than an absence. Kept separate from
+          # review_exclusions on purpose: the two have different denominators and summing them
+          # would produce a total that means nothing.
+          review_census = Counter()
           for index, repository in enumerate(intermediate["repositories"]):
               repo = repository["target_repo"]
               owner, name = repo.split("/", 1)
@@ -722,7 +732,8 @@ jobs:
               enrolled_authors = policy_mod.review_enrolment_authors(repo, policy_doc)
               review_items.extend(claim_mod.enumerate_review_items(
                   repo, pulls, provenance, leases, issue_labels, now, pr_status=pr_status,
-                  exclusions=review_exclusions, enrolled_authors=enrolled_authors))
+                  exclusions=review_exclusions, enrolled_authors=enrolled_authors,
+                  census=review_census))
               # Armed-SHA-mismatch safety invariant (issue #42): CLAIM disarms these FIRST each
               # sweep, re-deriving every precondition live (matching SHAs are never disarmed).
               disarm_items.extend(claim_mod.enumerate_disarm_items(
@@ -849,6 +860,14 @@ jobs:
               f"{reason}={count}" for reason, count in sorted(review_exclusions.items()))
           print(f"review-enumeration excluded {sum(review_exclusions.values())} labeled "
                 f"worker PR(s): {exclusion_detail or 'none'}")
+          # [registry #762] ONE census line on EVERY plan, listing every bucket including the
+          # zeros. A per-stage rate cannot express a MISSING EDGE (#753); only a population
+          # partition can, and only if the empty buckets are printed too — an absent bucket and
+          # a zero bucket must not look the same.
+          census_detail = ", ".join(
+              f"{bucket}={count}" for bucket, count in sorted(review_census.items()))
+          print(f"review-enumeration census over {sum(review_census.values())} drafted "
+                f"already-reviewed worker PR(s): {census_detail or 'none'}")
           PY
 
       - name: Upload immutable plan artifact (pinned)

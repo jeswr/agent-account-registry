@@ -2259,16 +2259,37 @@ def enrolment_enable_error(policy_doc, claim_admits, rf_admits):
 #
 # Scoped to the previously-unreachable rows only: throttling traffic the strict reading already
 # saw would be a new throughput regression dressed up as safety. Once the backlog drains the bound
-# is inert. (Registry #765, stacked on this PR, extends the same bound to the `stranded` lane it
-# revives; the cap is per-lane so the two backlogs cannot share — or steal — one budget.)
+# is inert.
+#
+# [#762] THE GREEN LANE'S OWN NUMBER, and whether the two ramps compose. Same census, same box,
+# same predicates (2026-07-27, 84 worker drafts, 41 393 check-runs paginated, 0 unprovable reads):
+# running THIS branch's full guard set rather than aggregator colour alone, 12 heads reach
+# needs-ci-fix of which the strict reading already saw 5 (so #761 newly reaches 7), and 20 reach
+# `stranded` of which the strict reading already saw 2 (so this half newly reaches 18). The two
+# figures are consistent with #761's 29 upper bound: 29 counts red aggregator colour, 12 is what
+# survives the human-hold / unreviewed-head / conflicting-base / live-lease guards.
+#
+# THEY COMPOSE, and the reason is asymmetric rather than additive: only the FIX lane pushes
+# commits. 5/lane/tick therefore caps CI at +5 pushes per tick no matter what the review lane is
+# doing, which is the quantity the congestion-collapse mode is a function of. The review lane's 18
+# add reviewer ACCOUNT demand, not CI load, and that is bounded independently and earlier by the
+# account allocator (~28 slots across three lanes; 22 review-loop items already compete for them),
+# which returns no-slot and defers without mutating anything. At the ~10-minute cadence the 7
+# clears in 2 ticks and the 18 in 4 — full drain under 40 minutes.
 DRAFT_TIER_BACKLOG_PER_TICK_MAX = 5
 _DRAFT_TIER_NEW = "_draft_tier_newly_reachable"   # private; stripped before the plan row is built
 
 
-def _cap_draft_tier_backlog(items, log=print):
+def _cap_draft_tier_backlog(items, census=None, log=print):
     """PURE-ish (logs only): hold newly-reachable draft-tier rows above
     DRAFT_TIER_BACKLOG_PER_TICK_MAX per LANE per tick, oldest PR first. The private marker is
-    always stripped, so the emitted plan row shape is identical with and without a cap."""
+    always stripped, so the emitted plan row shape is identical with and without a cap.
+
+    [#762] Held rows are also COUNTED into the population census when one is supplied. A row that
+    is deferred invisibly is the same class of defect as the ten silent days this whole change is
+    about: the aggregate log line says how many were held, and the census says it in the same
+    partition as every other disposition, so a lane that is being throttled cannot be mistaken for
+    a lane that is empty."""
     admitted, kept = Counter(), set()
     for item in sorted((i for i in items if i.get(_DRAFT_TIER_NEW)),
                        key=lambda i: (str(i.get("repo") or ""), i.get("pr_number") or 0)):
@@ -2281,6 +2302,8 @@ def _cap_draft_tier_backlog(items, log=print):
         newly = item.pop(_DRAFT_TIER_NEW, False)
         if newly and id(item) not in kept:
             held[_review_item_lane(item["state"])] += 1
+            if census is not None:
+                census[f"deferred:draft-tier-backlog-cap:{_review_item_lane(item['state'])}"] += 1
             continue
         survivors.append(item)
     for lane in sorted(held):
@@ -2675,7 +2698,7 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
               "that head's CI (see unknown_aggregator_tiers; adding a name requires inspecting "
               "what its LEG SET runs, not just the spelling)")
     items.sort(key=lambda item: (item["repo"], item["pr_number"]))
-    return _cap_draft_tier_backlog(items)
+    return _cap_draft_tier_backlog(items, census)
 
 
 # The disjoint bucket vocabulary for the drafted-already-reviewed fall-through (issue #762,
@@ -2696,6 +2719,8 @@ IDLE_CENSUS_BUCKETS = (
     "idle:lease-held",
     "idle:not-drafted-or-unreviewed",
     "idle:unclassified",
+    "deferred:draft-tier-backlog-cap:review",
+    "deferred:draft-tier-backlog-cap:fix",
 )
 
 
@@ -10088,6 +10113,70 @@ def _self_test():
     assert stranded_live(True, False, True, True, GATE_GREEN_DRAFT_TIER) is True
     assert stranded_live(True, False, True, True, GATE_GREEN_MERGE_REQUIRED) is True
     assert stranded_live(True, False, True, True, "success") is False
+    # ---- [issue #762] THE BOUNDED DRAIN: the backlog is released at a rate, not at once -------
+    # Ten days of unreachable repair does not arrive gradually. Build a 12-PR draft-tier backlog
+    # (the MEASURED live sparq ci-fix figure) and assert the first tick admits at most the bound.
+    def _backlog(count, first=100, tiered="failure", strict="missing"):
+        # DISJOINT crates, one per PR: the cross-lane package partition would otherwise let a
+        # single lease hold the whole backlog and mask the cap under a sibling-lease exclusion.
+        pulls_, status_, prov_, labels_ = [], {}, {}, {}
+        for offset in range(count):
+            n = first + offset
+            pulls_.append(pull(n, f"sparq-agent/issue-{n}-1-1", sha_a,
+                               body=f"x <!-- sparq-reviewed-sha:{sha_a} -->"))
+            status_[n] = status_of(sha_a, gate=strict, repair_gate=tiered,
+                                   legs=["workspace clippy"])
+            prov_[n] = {**provenance[41], "pr_number": n, "issue": n}
+            labels_[n] = [f"area:crate-{n}", "role:impl"]
+        return pulls_, status_, prov_, labels_
+
+    _bl_pulls, _bl_status, _bl_prov, _bl_labels = _backlog(12)
+    _c = Counter()
+    with contextlib.redirect_stdout(io.StringIO()):
+        _tick1 = enumerate_review_items(repo, _bl_pulls, _bl_prov, [], _bl_labels, now,
+                                        pr_status=_bl_status, census=_c)
+    assert len(_tick1) == DRAFT_TIER_BACKLOG_PER_TICK_MAX, [i["pr_number"] for i in _tick1]
+    # OLDEST FIRST, deterministically: the lowest PR numbers drain first.
+    assert [i["pr_number"] for i in _tick1] == list(range(100, 105)), _tick1
+    # The deferred remainder is COUNTED, never dropped silently.
+    assert _c["deferred:draft-tier-backlog-cap:fix"] == 12 - DRAFT_TIER_BACKLOG_PER_TICK_MAX, _c
+    # The private backlog marker NEVER escapes into a plan row (the validator rejects unknown
+    # keys, so a leak would hard-fail every tick).
+    for _item in _tick1:
+        assert set(_item) == REVIEW_ITEM_FIELDS, sorted(set(_item) ^ REVIEW_ITEM_FIELDS)
+    # NO STARVATION: the admitted five take per-PR leases, both admissions require lease_free, so
+    # the NEXT tick enumerates the NEXT five. Deleting the lease_free conjunct — or making the cap
+    # park rather than defer — reds this.
+    # A real lease names its package (sibling_lease_conflict fails CLOSED on one that does not,
+    # which would exclude the whole backlog and make this test pass for the wrong reason).
+    _leases = [{"holder": f"fix:{repo}#{n}@run.1", "expires_at": now + 100,
+                "package": f"crate-{n}"} for n in range(100, 105)]
+    with contextlib.redirect_stdout(io.StringIO()):
+        _tick2 = enumerate_review_items(repo, _bl_pulls, _bl_prov, _leases, _bl_labels, now,
+                                        pr_status=_bl_status)
+    assert [i["pr_number"] for i in _tick2] == list(range(105, 110)), _tick2
+    # THE CAP IS SCOPED TO THE PREVIOUSLY-UNREACHABLE ITEMS. A red the STRICT reading could
+    # already see is steady-state traffic and is NOT throttled — capping it would be a new
+    # throughput regression wearing safety's clothes. All 12 come through.
+    _vis_pulls, _vis_status, _vis_prov, _vis_labels = _backlog(
+        12, tiered="failure", strict="failure")
+    with contextlib.redirect_stdout(io.StringIO()):
+        _visible = enumerate_review_items(repo, _vis_pulls, _vis_prov, [], _vis_labels, now,
+                                          pr_status=_vis_status)
+    assert len(_visible) == 12, [i["pr_number"] for i in _visible]
+    # The two lanes are bounded INDEPENDENTLY: 12 draft-tier reds and 12 draft-tier greens in one
+    # tick yield 5 fix items and 5 review items, not 5 in total (the fix lane's cost is CI runs,
+    # the review lane's is reviewer accounts — one budget cannot stand in for the other).
+    _g_pulls, _g_status, _g_prov, _g_labels = _backlog(12, first=200,
+                                                       tiered=GATE_GREEN_DRAFT_TIER)
+    with contextlib.redirect_stdout(io.StringIO()):
+        _mixed = enumerate_review_items(
+            repo, _bl_pulls + _g_pulls, {**_bl_prov, **_g_prov}, [],
+            {**_bl_labels, **_g_labels}, now, pr_status={**_bl_status, **_g_status})
+    assert Counter(_review_item_lane(i["state"]) for i in _mixed) == Counter(
+        {"fix": DRAFT_TIER_BACKLOG_PER_TICK_MAX, "review": DRAFT_TIER_BACKLOG_PER_TICK_MAX}), \
+        [(i["pr_number"], i["state"]) for i in _mixed]
+
     # POLICY UNCHANGED by this fix (measured, see the PR body): an UN-reviewed draft on a
     # red DRAFT-TIER head is still a REVIEW item — the loop's own work comes first. The
     # review lane's ordering is not a function of the aggregator's tier.
@@ -12014,7 +12103,8 @@ def _self_test():
     _seam_ns = {"policy_mod": _SeamPolicy, "claim_mod": _SeamClaim, "review_items": [],
                 "repo": "example/repo", "policy_doc": {"marker": "MASTER-DOC"},
                 "pulls": [], "provenance": {}, "leases": [], "issue_labels": {}, "now": 0,
-                "pr_status": {}, "review_exclusions": Counter()}
+                "pr_status": {}, "review_exclusions": Counter(),
+                "review_census": Counter()}
     exec(textwrap.dedent(_seam.group(1)), _seam_ns)  # noqa: S102 — repository-owned workflow src
     # 1. The allowlist was resolved for THIS repo, from the MASTER policy document.
     assert _seam_seen.get("policy_args") == ("example/repo", {"marker": "MASTER-DOC"}), \
@@ -12023,6 +12113,13 @@ def _self_test():
     #    hard-codes an empty set, or passes the wrong variable, fails here — and that mutant is
     #    invisible to every direct-call assertion in this file.
     assert _seam_seen.get("kwargs", {}).get("enrolled_authors") == frozenset({"sentinel-login"}), \
+        _seam_seen.get("kwargs")
+    # 2b. [#762] ...and so did the population CENSUS counter, through the SAME exec'd call site.
+    #    Identity, not equality: every census assertion in this file drives the enumerator
+    #    directly, so a production caller that never passes `census=` (or passes a throwaway
+    #    Counter that is then never printed) leaves all of them green while the plan's partition
+    #    reads empty forever — the exact vacuity shape this repo keeps measuring at the YAML seam.
+    assert _seam_seen.get("kwargs", {}).get("census") is _seam_ns["review_census"], \
         _seam_seen.get("kwargs")
     # 3. The result is not dropped on the floor.
     assert _seam_ns["review_items"] == ["one-item"], _seam_ns["review_items"]
@@ -14643,6 +14740,7 @@ def _starvation_sweep_self_test():
 
     # ---- THE YAML SEAM: structural, on PARSED nodes ------------------------------------------
     _starvation_yaml_seam_self_test()
+    _census_yaml_seam_self_test()
 
 
 # ==================================================================================================
@@ -15006,6 +15104,157 @@ def _census_code_to_comment(run):
         "the trap left the print statement as CODE — it would not test the stripping"
     assert "starvation=starvation" in mutated, "the trap must not disturb the starvation kwarg"
     return mutated
+
+def _strip_script_comments(script):
+    """PURE: a workflow `run:` script with its `#` comments removed, so a wiring assertion can
+    only be satisfied by CODE.
+
+    The standing measured finding on this repo is that a wiring assertion once stayed green
+    because the STEP'S COMMENT named the thing it searched for. Every fragment check below runs
+    against this stripped text; `_census_seam_violations`' own mutant table includes "the fragment
+    survives only as a comment" precisely so that hazard is a red test rather than a habit.
+
+    Line-scoped and quote-aware (an even number of unescaped quotes before the `#` means the `#`
+    is outside a string). The script is bash + a Python heredoc, so it cannot be tokenized as
+    either language; this is deliberately conservative — it may keep a `#` that sits inside an
+    exotic quoting construct, which can only make a check STRICTER, never weaker."""
+    out = []
+    for line in str(script).splitlines():
+        cut, single, double, index = None, False, False, 0
+        while index < len(line):
+            char = line[index]
+            if char == "\\":
+                index += 2
+                continue
+            if char == "'" and not double:
+                single = not single
+            elif char == '"' and not single:
+                double = not double
+            elif char == "#" and not single and not double:
+                cut = index
+                break
+            index += 1
+        out.append(line if cut is None else line[:cut])
+    return "\n".join(out)
+
+
+# The PARSED dispatch.yml nodes the PR-side population census depends on (issue #762). Same
+# discipline as the starvation seam above — structural on parsed nodes, never grepped over the
+# raw workflow text — plus comment stripping before any fragment check.
+_CENSUS_SEAM_JOB = "plan"
+
+
+def _census_seam_violations(document):
+    """Structural violations of the review-census seam in a PARSED dispatch.yml. Empty == intact."""
+    out = []
+    jobs = (document or {}).get("jobs") or {}
+    plan_steps = (jobs.get(_CENSUS_SEAM_JOB) or {}).get("steps")
+    if not isinstance(plan_steps, list):
+        out.append("dispatch.yml: jobs.plan.steps is not a list — the review census is not "
+                   "produced at all")
+        return sorted(out)
+    assemble = [step for step in plan_steps
+                if isinstance(step, dict) and isinstance(step.get("run"), str)
+                and "review_census" in _strip_script_comments(step["run"])]
+    if len(assemble) != 1:
+        out.append(f"dispatch.yml: expected EXACTLY ONE jobs.plan `run:` step to build "
+                   f"`review_census`; found {len(assemble)} — the census was moved, split or "
+                   "deleted (a comment mentioning it does not count)")
+        return sorted(out)
+    step = assemble[0]
+    if step.get("if") is not None:
+        out.append(f"dispatch.yml: the census step carries an `if:` ({step['if']!r}) — "
+                   "`if: false` (or any condition) would skip the census SILENTLY, which is the "
+                   "exact failure mode the census exists to make impossible")
+    run = _strip_script_comments(step["run"])
+    for fragment, why in (
+        ("review_census = Counter()",
+         "the census counter is never created, so no bucket is ever emitted"),
+        ("census=review_census",
+         "the counter exists but is NEVER PASSED to enumerate_review_items — the census would "
+         "print all-zero buckets on every tick and look healthy while measuring nothing"),
+        ("review_census.items()",
+         "the buckets are counted but never rendered, so nothing reaches the log"),
+        ("review-enumeration census over",
+         "the census summary line is gone — a plan can again report zero review items with no "
+         "population statement anywhere"),
+    ):
+        if fragment not in run:
+            out.append(f"dispatch.yml: the census step lost {fragment!r} — {why}")
+    return sorted(out)
+
+
+def _census_yaml_seam_self_test():
+    import yaml  # self-test-only, same lazy import as _workflow_step_python
+    path = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "dispatch.yml"
+    live = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert _census_seam_violations(live) == [], _census_seam_violations(live)
+
+    # The comment stripper itself, before anything relies on it.
+    assert _strip_script_comments("a = 1  # census=review_census") == "a = 1  "
+    assert _strip_script_comments("  # census=review_census") == "  "
+    assert _strip_script_comments('print("# not a comment")') == 'print("# not a comment")'
+    assert _strip_script_comments("x = '#'  # tail") == "x = '#'  "
+    assert _strip_script_comments("keep = 1") == "keep = 1"
+
+    def census_step(document):
+        return next(step for step in document["jobs"]["plan"]["steps"]
+                    if isinstance(step.get("run"), str)
+                    and "review_census" in _strip_script_comments(step["run"]))
+
+    def mutant(edit):
+        document = yaml.safe_load(path.read_text(encoding="utf-8"))
+        edit(document)
+        return _census_seam_violations(document)
+
+    def drop_fragment(fragment):
+        def edit(document):
+            step = census_step(document)
+            step["run"] = step["run"].replace(fragment, "")
+        return edit
+
+    def comment_out(fragment):
+        """Demote a load-bearing fragment to a COMMENT. The raw workflow text still contains it
+        character-for-character, so an un-stripped grep would still pass — this is the mutant that
+        proves the stripping is load-bearing rather than decorative."""
+        def edit(document):
+            step = census_step(document)
+            step["run"] = step["run"].replace(fragment, f"# {fragment}")
+        return edit
+
+    seam_mutants = {
+        "census step guarded by if: false":
+            lambda d: census_step(d).__setitem__("if", "${{ false }}"),
+        "census step deleted":
+            lambda d: d["jobs"]["plan"].__setitem__(
+                "steps", [s for s in d["jobs"]["plan"]["steps"]
+                          if not (isinstance(s.get("run"), str)
+                                  and "review_census" in _strip_script_comments(s["run"]))]),
+        "plan steps replaced by a scalar":
+            lambda d: d["jobs"]["plan"].__setitem__("steps", "nope"),
+        "the counter is never created":
+            drop_fragment("review_census = Counter()"),
+        "the counter is never PASSED to the enumerator":
+            drop_fragment("census=review_census"),
+        "the buckets are never rendered":
+            drop_fragment("review_census.items()"),
+        "the summary line is deleted":
+            drop_fragment("review-enumeration census over"),
+        "the wiring survives ONLY as a comment":
+            comment_out("census=review_census"),
+        "the summary line survives ONLY as a comment":
+            comment_out('print(f"review-enumeration census over'),
+    }
+    survivors = [name for name, edit in seam_mutants.items() if not mutant(edit)]
+    assert not survivors, f"dispatch.yml census seam mutants NOT caught: {survivors}"
+    # ...and the comment-only mutants are invisible to a RAW-TEXT grep, which is why the stripper
+    # is load-bearing: assert the naive check the stripper replaces would have PASSED them.
+    for _fragment in ("census=review_census", 'print(f"review-enumeration census over'):
+        _doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+        comment_out(_fragment)(_doc)
+        assert _fragment in census_step(_doc)["run"], _fragment
+    print(f"  ok   #762 YAML seam: all {len(seam_mutants)} structural dispatch.yml census "
+          "mutants are caught, including the two that survive a raw-text grep as comments")
 
 
 def _starvation_yaml_seam_self_test():
