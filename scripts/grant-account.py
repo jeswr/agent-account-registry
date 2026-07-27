@@ -899,6 +899,86 @@ def workflow_block(text, step_id, marker):
     return "\n".join(line[pad:] for line in kept)
 
 
+def workflow_step_env(text, step_id):
+    """The `env:` mapping declared by the ONE step whose `id:` is `step_id` (comments stripped).
+
+    #263: the TRANSPORT of untrusted label names is the `env:` block, not the script, so a test
+    that executes a step's fragment must take the fragment's environment FROM THE WORKFLOW rather
+    than supplying it. Deleting or renaming `LABELS_JSON:` then leaves the variable unset and the
+    fragment dies under `set -u`, instead of passing against a value the test kindly provided.
+    A step with no `env:` block, or an unparseable entry, raises — never an empty environment."""
+    lines = workflow_step(text, step_id).split("\n")
+    heads = [index for index, line in enumerate(lines) if line.strip() == "env:"]
+    if len(heads) != 1:
+        raise GrantError(
+            f"expected exactly one `env:` block in step `id: {step_id}`, found {len(heads)} — "
+            "refusing to execute a fragment whose environment cannot be located (fail closed)")
+    indent = len(lines[heads[0]]) - len(lines[heads[0]].lstrip())
+    mapping = {}
+    for line in lines[heads[0] + 1:]:
+        if not line.strip():
+            continue
+        if (len(line) - len(line.lstrip())) <= indent:
+            break
+        key, sep, value = line.strip().partition(":")
+        if not sep or not key.strip():
+            raise GrantError(
+                f"step `id: {step_id}` carries an unparseable `env:` entry {line.strip()!r} — "
+                "refusing to guess its environment (fail closed)")
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        mapping[key.strip()] = value
+    if not mapping:
+        raise GrantError(f"step `id: {step_id}` declares an empty `env:` block — refusing")
+    return mapping
+
+
+_GHA_EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}", re.S)
+# `join(<array>, '<sep>')` — the array argument of interest carries no comma of its own.
+_GHA_JOIN_SEPARATOR = re.compile(r"^join\(\s*[^,]*,\s*(['\"])(.*?)\1\s*\)$", re.S)
+
+
+def render_gha_expressions(text, labels):
+    """`text` with every `${{ ... }}` expression substituted the way the Actions runner substitutes
+    it: TEXTUALLY, before anything — a shell, a YAML value — parses the result.
+
+    #263, THE HAZARD THIS MODELS. `${{ join(github.event.issue.labels.*.name, ' ') }}` written
+    inline in a `run:` block is not an argument the shell receives; it is source code the label
+    name BECOMES. Labels can be applied by anyone with TRIAGE permission while set-up-account's
+    trust gate only vets the triggering actor and the issue author for admin/maintain, so a
+    pre-applied label named `$(...)` was code execution inside a job holding issues:write +
+    contents:write that gates the REGISTRY_SECRETS_PAT steps. Rendering here lets --self-test run
+    the REAL fragment exactly as the runner would, with a hostile label, and observe whether that
+    label is data or code — an assertion that no amount of prose about `env:` can stand in for.
+
+    Only label-reading expressions are modelled (`toJSON` -> the JSON document, `join` -> its
+    separator, a bare `.*.name` array -> space-separated, matching the runner); every other
+    expression renders to an inert placeholder, because this is a label-injection harness and not
+    a general Actions evaluator. Pure; unit-tested by --self-test, including the proof that it
+    DOES inject through the old inline form (a renderer that quietly neutralized everything would
+    make the regression below vacuous)."""
+    if not isinstance(text, str):
+        raise GrantError("cannot render expressions in a non-text fragment — refusing")
+    if not isinstance(labels, list) or any(not isinstance(name, str) for name in labels):
+        raise GrantError("label names must render from a list of strings — refusing")
+
+    def one(match):
+        expr = match.group(1).strip()
+        if "github.event.issue.labels" not in expr:
+            return "<gha>"
+        if expr.startswith("toJSON("):
+            return json.dumps(labels)
+        separator = _GHA_JOIN_SEPARATOR.match(expr)
+        if separator:
+            return separator.group(2).join(labels)
+        if expr.startswith("join("):
+            return ",".join(labels)   # join()'s documented default separator
+        return " ".join(labels)       # a bare `.*.name` array renders space-separated
+
+    return _GHA_EXPRESSION.sub(one, text)
+
+
 def _condition_at(lines, start, end, indent):
     """The single-space-normalized `if:` expression declared at `indent` between `start` and `end`.
 
@@ -1610,18 +1690,28 @@ def _self_test():
     # [#616 review ROUND 2, MAJOR] THE PROVIDER-LABEL PREDICATE IS EXECUTED. It had no test at all,
     # so `run:` -> `true`, restoring last-label-wins, or dropping `unique` all passed. The fragment
     # between its sentinels is extracted and RUN against label fixtures. `${{ }}` expressions are
-    # neutralized (they are not shell) — documented, and the only substitution made.
+    # rendered the way the runner renders them (#263) — label-reading ones carry the fixture's own
+    # label names, every other one becomes an inert placeholder.
+    #
+    # #263: the fragment's environment is READ FROM THE STEP (workflow_step_env) instead of being
+    # supplied by the test. The old form hardcoded `LABELS_JSON=json.dumps(labels)`, so it proved
+    # the predicate's logic while saying nothing about the transport: deleting the `LABELS_JSON:`
+    # env entry — or replacing it with an inline `join(...)` interpolation — left every row below
+    # green. Now the transport IS the fixture, and the hostile-label regression at the end of this
+    # block observes whether a metacharacter label name is data or code.
     # ------------------------------------------------------------------------------------------
-    provider_fragment = re.sub(r"\$\{\{.*?\}\}", "<gha>",
-                               workflow_block(workflow, "meta", "provider-label"))
+    meta_env = workflow_step_env(workflow, "meta")
+    provider_fragment = workflow_block(workflow, "meta", "provider-label")
 
     def provider_of(labels):
-        """(exit code, resolved provider) from the REAL predicate fragment."""
-        script = ("set -euo pipefail\n" + provider_fragment
+        """(exit code, resolved provider) from the REAL predicate fragment, run under the step's
+        OWN `env:` block, both rendered exactly as the Actions runner would render them."""
+        script = ("set -euo pipefail\n" + render_gha_expressions(provider_fragment, labels)
                   + '\nprintf "PROV=%s\\n" "$prov"\n')
+        rendered = {key: render_gha_expressions(value, labels)
+                    for key, value in meta_env.items()}
         done = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
-                              env={**os.environ, "LABELS_JSON": json.dumps(labels)},
-                              timeout=120, check=False)
+                              env={**os.environ, **rendered}, timeout=120, check=False)
         match = re.search(r"^PROV=(.*)$", done.stdout, re.M)
         return done.returncode, (match.group(1) if match else None)
 
@@ -1637,6 +1727,92 @@ def _self_test():
           (provider_of([])[0], provider_of(["area:ci"])[0]), (1, 1))
     check("[#616 r2] a REPEATED single provider label still resolves (unique, not count)",
           provider_of(["provider:openai", "provider:openai"]), (0, "openai"))
+
+    # ------------------------------------------------------------------------------------------
+    # [#263] A LABEL NAME IS DATA, NEVER SHELL — EXECUTED, not asserted in prose.
+    #
+    # The pre-login `meta` step used to expand `${{ join(github.event.issue.labels.*.name, ' ') }}`
+    # straight into a shell `for` loop. Labels can be applied by anyone with TRIAGE permission,
+    # while the trust gate above only vets the triggering actor and the issue author for
+    # admin/maintain — so a triage-level user who pre-applied a label named `$(...)` got code
+    # execution in the broker job, which holds issues:write + contents:write and gates the
+    # REGISTRY_SECRETS_PAT-bearing steps. The transport is now `toJSON(...)` into `LABELS_JSON`,
+    # and these rows are the REGRESSION: the real fragment, the step's real `env:` block, hostile
+    # label names, and a CANARY FILE that only a shell-PARSED label could ever create.
+    #
+    # The renderer is proved non-vacuous in the same breath: the identical hostile labels are put
+    # through the OLD inline form and the canary MUST fire. Without that row, a renderer that
+    # quietly neutralized every expression would make the regression above green forever.
+    # ------------------------------------------------------------------------------------------
+    with tempfile.TemporaryDirectory() as directory:
+        # Each shape gets its OWN canary, and is exercised ALONE: a single `for` list mixing
+        # unbalanced quotes makes bash fail to PARSE, which would hide the injection behind a
+        # syntax error and quietly make the non-vacuity row below unprovable.
+        injections = {"command-substitution": "$(touch {canary})",
+                      "backtick-substitution": "`touch {canary}`"}
+        # The pre-#579 form this issue is about: the label names interpolated into the `run:`
+        # script itself, where the runner substitutes them BEFORE bash parses a single word.
+        inline_form = ("for lbl in ${{ join(github.event.issue.labels.*.name, ' ') }}; do\n"
+                       "  case \"$lbl\" in provider:*) prov=\"${lbl#provider:}\";; esac\n"
+                       "done\n")
+
+        def inject(tag, shape):
+            """(canary path, hostile label name) for one injection shape."""
+            path = os.path.join(directory, tag)
+            return path, shape.format(canary=path)
+
+        executed_by_real = {}
+        executed_by_inline = {}
+        for tag, shape in injections.items():
+            path, label = inject(f"real-{tag}", shape)
+            executed_by_real[tag] = (provider_of(["provider:anthropic", label]),
+                                     os.path.exists(path))
+            path, label = inject(f"inline-{tag}", shape)
+            subprocess.run(["bash", "-c", render_gha_expressions(inline_form, [label])],
+                           capture_output=True, text=True, timeout=120, check=False)
+            executed_by_inline[tag] = os.path.exists(path)
+
+        check("[#263] every injection shape is DATA to the real pre-login fragment",
+              executed_by_real,
+              {tag: ((0, "anthropic"), False) for tag in injections})
+        # NON-VACUITY: the SAME shapes through the pre-#579 inline form MUST execute. Without
+        # this row a renderer (or a harness) that quietly neutralized everything would leave the
+        # row above green forever while proving nothing.
+        check("[#263] NON-VACUOUS: the old inline `join(...)` form DOES execute those shapes",
+              executed_by_inline, {tag: True for tag in injections})
+        # Quoting/whitespace metacharacters stay inert on the REFUSAL path too — the branch that
+        # interpolates issue coordinates into a `gh issue comment` right beside the label data.
+        soup = os.path.join(directory, "quote-soup")
+        check("[#263] quote/whitespace metacharacter labels are data on the REFUSAL path too",
+              (provider_of([f'x"; touch {soup}; #', f"'; touch {soup}; '", f"; touch {soup}",
+                            "a label with spaces", "provider:openai extra"])[0],
+               os.path.exists(soup)),
+              (1, False))
+
+    check("[#263] render_gha_expressions models the runner, and refuses non-text input",
+          (render_gha_expressions("${{ toJSON(github.event.issue.labels.*.name) }}", ["a", "b"]),
+           render_gha_expressions("${{ join(github.event.issue.labels.*.name, ' ') }}", ["a", "b"]),
+           render_gha_expressions("${{ join(github.event.issue.labels.*.name) }}", ["a", "b"]),
+           render_gha_expressions("${{ github.event.issue.labels.*.name }}", ["a", "b"]),
+           render_gha_expressions("${{ github.repository }}", ["a"]),
+           refuses(render_gha_expressions, None, [], needle="non-text fragment"),
+           refuses(render_gha_expressions, "x", "not-a-list", needle="list of strings")),
+          ('["a", "b"]', "a b", "a,b", "a b", "<gha>", True, True))
+    # The `env:` reader must fail LOUDLY rather than hand back an empty environment, or the
+    # transport fixture above degrades into "LABELS_JSON happened to be unset".
+    check("[#263] the step `env:` reader resolves the transport, and refuses what it cannot locate",
+          (meta_env.get("LABELS_JSON"),
+           refuses(workflow_step_env, workflow, "no_such_step", needle="found 0"),
+           refuses(workflow_step_env, workflow, "app-token-pool", needle="found 0")),
+          ("${{ toJSON(github.event.issue.labels.*.name) }}", True, True))
+    # And the label context must reach these steps ONLY through `env:` — never named inside the
+    # script the shell parses. This is the textual half of the #263 regression; the executed half
+    # is above. Comment-stripped, so a prose mention cannot trip it.
+    check("[#263] no label-consuming step names the label context inside its `run:` script",
+          {name: "github.event.issue.labels" in strip_yaml_comments(
+              workflow_step_script(workflow, name)) for name in ("meta", "grant")},
+          {"meta": False, "grant": False})
+
     # ------------------------------------------------------------------------------------------
     # [#616 review ROUND 4, MAJOR 2] THE PRIVILEGED `activate_merged` BODY IS EXECUTED. Round 3
     # asserted it by per-step substring PRESENCE, and presence is not outcome: converting its own
