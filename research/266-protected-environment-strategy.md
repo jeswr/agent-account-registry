@@ -4,8 +4,8 @@
 > **This record changes no behaviour.** It answers the question #266 asks — *shared protected
 > environment, or per-workflow environments?* — before the #101 cutover moves any value, so the
 > migration cannot regress the account fleet. It also re-measures #266's stated premise, which
-> turns out to be **already retired**, and names the one residual the chosen strategy does not
-> cover.
+> turns out to be **already retired**, and states the one gap that keeps the chosen strategy from
+> being a closed trust boundary — together with the check that must land to close it (§6).
 
 ## 1. The ask, and the state it lands in
 
@@ -121,10 +121,16 @@ all-or-nothing fan-out, and the slot union must list every environment holding `
 All four must land together; any subset is a regression. Record that cost here so a future reader
 does not treat B as cheap.
 
-## 5. The repo-wide rule this record establishes
+## 5. The repo-wide rules — four enforced, one not
 
-1. **Every secret lives in `dispatch-secrets` and nowhere else.** Repo scope stays empty — check 1
-   is total, so this binds *all* secrets, not just the migration's 14.
+Rules 1–4 are **enforced**: each names the check that refuses on violation. Rule 5 is **policy
+only** — no check verifies it on this tree (§6), so this record does *not* establish it as an
+invariant, and nothing above or below may be read as relying on it.
+
+1. **Every secret that exists at repo scope or in `dispatch-secrets` lives in `dispatch-secrets`
+   and nowhere else.** Repo scope stays empty — check 1 is total, so this binds *all* secrets at
+   that scope, not just the migration's 14. It says nothing about other environments; that is
+   rule 5's unenforced half.
 2. **Every job that reads a secret carries `environment: dispatch-secrets`** — including a job
    reading only `toJSON(secrets)` or a dynamic `secrets[...]`. Enforced, derived, case-insensitive
    and folded-scalar-aware.
@@ -139,18 +145,46 @@ does not treat B as cheap.
    — and the remediation is direct admin deletion, not a migration rerun (C4 runbook, `:164`).
    The maintainer-settable `ALERT_REPO`/`ALERT_TOKEN` (read by 10 jobs across 5 files, each
    `|| ''`-optional) are the live instance of this rule: if ever set, they go in the environment.
-5. **No second secret-bearing environment.** `github-pages` (`dashboard.yml:419`) is a deployment
-   environment with no secret reads and is unaffected.
+5. **No second secret-bearing environment — POLICY, NOT ENFORCED.** `github-pages`
+   (`dashboard.yml:419`) is a deployment environment with no secret reads and is unaffected. But
+   nothing enumerates the repository's environments, so a violation of this rule is **invisible,
+   not refused**. Stated here only as the intent §6's check must enforce; until that check lands it
+   carries no more weight than a comment, and §6 governs.
 
-## 6. Residual this strategy does not close
+## 6. What keeps this rule set open, and the check that closes it
 
 Checks 1–4 prove the repo scope is empty and that **`dispatch-secrets`** is branch-protected. They
-do **not** enumerate the repository's other environments. A secret placed in some other
-environment is invisible to the guard: the binding-map scan reads the **default-branch** checkout,
-so a consumer job bound to that environment in a modified copy dispatched at an attacker-controlled
-ref is never scanned, and that environment has no verified branch policy. No other environment is
-known to hold secrets today and rule 5 forbids it — but nothing *verifies* it, which is the same
-default-allow shape check 2 exists to eliminate. Closing it is a guard change (enumerate
-`repos/{repo}/environments`, assert every environment other than `dispatch-secrets` holds no
-secrets, fail closed on an unreadable listing); it is filed as a follow-up rather than folded in
-here, because this record changes no behaviour.
+do **not** enumerate the repository's other environments — the guard's only environment reads are
+`environments/dispatch-secrets` and its deployment-branch policies
+(`scripts/dispatch-secrets-guard.py:1410,2115,2120`). A secret placed in some other environment is
+therefore invisible to the guard: the binding-map scan reads the **default-branch** checkout, so a
+consumer job bound to that environment in a modified copy dispatched at an attacker-controlled ref
+is never scanned, and that environment has no verified branch policy. No other environment is known
+to hold secrets today and rule 5 forbids it — but nothing *verifies* it. That is exactly the
+default-allow shape check 2 exists to eliminate, so this record **does not claim the rule set is a
+closed trust boundary**, and rule 5 is marked unenforced rather than asserted.
+
+**Completion precondition.** #266's *decision* — Option A, §§3–4 — stands on its own: it turns on
+`toJSON(secrets)`, rotation fan-out, auto-created environments and the slot union, none of which
+depend on rule 5. What remains **blocked** is the stronger claim rule 5 would license — "every
+secret in this repository is behind a verified default-branch-only policy". Nothing may cite this
+record for that claim, and #266's strategy is complete only when a guard check lands that:
+
+1. paginates `repos/{repo}/environments` to exhaustion, comparing the returned count against
+   `total_count` and **failing closed** on any unreadable, error or short/truncated response —
+   an incomplete listing must never read as "no other environments";
+2. enumerates `environments/{name}/secrets` for **every** environment returned, under the same
+   pagination and fail-closed rules;
+3. **refuses** if any environment other than `dispatch-secrets` holds ≥1 secret, naming it; and
+4. carries non-vacuous `--self-test` coverage of both directions — the accept path, plus a refusal
+   fixture for an alternate environment holding a secret and a refusal fixture for a
+   failed/truncated environment listing.
+
+Only the enumerating read is idempotent, so it is the sole part eligible for `scripts/gh_retry.py`.
+
+**Sequencing.** This check is a precondition on the *claim*, not a gate on the #101 value cutover.
+Today's repo scope is the strictly wider exposure — 14 secrets readable by any job at any ref with
+no binding and no branch policy at all — so deferring the cutover until the check lands would hold
+that wider hole open longer, not shorter. The cutover narrows the surface monotonically; the check
+is what lets anyone say the surface is *bounded*. It is filed as a follow-up issue on this repo
+rather than folded in here, because this record changes no behaviour.
