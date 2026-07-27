@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4133,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "24735e51bb7ee28bef7fe5ad594b800cd9e09374",
+  "round": 6
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 6 is a comment-only change (24735e51) that resolves round 5's sole finding: the top-of-arm comment in recognise_spatial now scopes its \"residual FILTER remains authoritative\" claim, exempting the within-region orientations an installed provider may certify exactly. It matches the two comments that follow it (SpatialKind::within_region doc and the struct-literal comment), so the file no longer asserts an invariant that would make a future sixth orientation with within_region:true look safe. No findings this round.\n\nRe-verified the whole change by running it, not by reading alone.\n\nSoundness: each shape is decided in exactly one place. Block 1 matches only WITHIN/INTERSECTS variable-first; the new match's arm 1 requires the variable SECOND, arm 2 requires CONTAINS variable-first, so the sets are disjoint and no shape is routed twice. sfContains(?g,?h) hits arm 1 and returns None via `?` (arm 2 would also have failed), so no recognition is lost to arm ordering. Both-constant and arity!=2 fall through to None. within_region is true only for sfContains(REGION,?g) == within(?g,REGION); the four converse/intersects orientations get false and keep the residual geof: FILTER. within(REGION,?g) and contains(?g,REGION) imply AABB intersection, so the bbox scan is a valid superset for them.\n\nProvider contract: bbox_candidate_literals uses locate_in_envelope_intersecting (index.rs:711) \u2014 true AABB intersection, not a containment window \u2014 so a geometry strictly containing the region IS returned. lib.rs and SKILL.md now state that obligation explicitly.\n\nTests non-vacuous, proven by two mutations in an isolated copy: (1) relaxing within_region to `iri == GEOF_SF_CONTAINS` (over-certifying the variable-first orientation) turns remaining_constant_region_orientations_are_sound_superset_pushdowns RED on a RESULT differential, not just a call count; (2) swapping the geo index to locate_in_envelope makes converse_containment_orientations_keep_larger_indexed_g\u2026 [truncated 415 chars]",
+  "verdict": "approve"
+ }
+}
