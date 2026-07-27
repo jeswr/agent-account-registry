@@ -10309,19 +10309,29 @@ def _self_test():
         7: [],
     }
 
-    def readmit_sweep(window, rows=None, labels=None, comments=(), holds=None, timeline=None):
-        """Run the sweep with every GitHub seam injected; returns (count, posted, cleared)."""
+    def readmit_sweep(window, rows=None, labels=None, comments=(), holds=None, timeline=None,
+                      provenance=None):
+        """Run the sweep with every GitHub seam injected; returns (count, posted, cleared).
+
+        The sweep's OWN log is captured on `readmit_sweep.log` rather than discarded. It used to
+        go to `lambda _line: None`, which threw away the only output the [G5] census produces —
+        so every census assertion had to call `_log_park_census` directly with hand-built rows,
+        and NOTHING bound the sweep to the emitter except a shape check. See the
+        "[G5] END-TO-END" block below for the two argument-only mutants that survived because of
+        it."""
         posted, cleared = [], []
+        readmit_sweep.log = []
         count = _readmit_capacity_parks(
             "example/repo", rows if rows is not None else [[parked_row]],
             labels if labels is not None else {7: ["status:in-progress-review"]},
-            {41: {"issue": 7}}, readmit_bot, Path("."), worker_pr_mod,
+            provenance if provenance is not None else {41: {"issue": 7}},
+            readmit_bot, Path("."), worker_pr_mod,
             _capacity_recovery_probe(model_health_mod, window, readmit_now),
             comments_fn=lambda _repo, _number: list(comments),
             timeline_fn=lambda _repo, number: list((timeline or park_timeline).get(number, [])),
             post_comment=lambda _repo, number, body: posted.append((number, body)),
             clear_labels=lambda pr, issue: cleared.append((pr, issue)),
-            log=lambda _line: None)
+            log=readmit_sweep.log.append)
         return count, posted, cleared
 
     # A(a): the machine park + a post-park success on the failing account => re-admitted ONCE,
@@ -10385,6 +10395,58 @@ def _self_test():
         count, posted, cleared = readmit_sweep(recovered_window, timeline=human_park)
         assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
         print("  ok   auto-readmit (e): a MAINTAINER-applied park is never auto-re-admitted")
+
+        # ------------------------------------------------------------------------------------
+        # [G5] END-TO-END: the census the REAL sweep emits, from the REAL sweep's own log.
+        #
+        # The AST guard further down proves a `census=` keyword EXISTS and that
+        # `_log_park_census` is called exactly once. It never checks WHAT is passed, and review
+        # of 69535be8 demonstrated the hole by execution: `census=park_census` -> `census=[]`,
+        # and `_log_park_census(repo, park_census, ...)` -> `_log_park_census(repo, [], ...)`,
+        # each a one-argument edit, left the AST guard satisfied and EVERY check in both suites
+        # green while the entire headline deliverable vanished from the output — the same
+        # "a per-run success signal cannot express a missing edge" shape this PR exists to
+        # remove, reintroduced in the fix for it. A third mutant (the emitter moved INSIDE the
+        # per-PR loop) survived for the same reason.
+        #
+        # So this asserts the sweep's OWN log, on a MIXED population, and it is the only place
+        # that does: PR #41 is a MAINTAINER-applied park (human-terminal) and PR #42 is a
+        # machine park whose starvation cause has not recovered (exit-reachable). The `[:2]`
+        # window is still broken, so nothing is re-admitted and both PRs reach a refusal.
+        census_row_42 = dict(parked_row, number=42,
+                             head={**parked_row["head"], "ref": "sparq-agent/issue-8-def"})
+        census_timeline = dict(human_park)
+        census_timeline[42] = [{"event": "labeled",
+                                "label": {"name": MACHINE_PARK_PR_LABEL},
+                                "created_at": park_stamp, "actor": {"login": readmit_bot},
+                                "performed_via_github_app": {"slug": "app"}}]
+        census_timeline[8] = []
+        count, posted, cleared = readmit_sweep(
+            still_broken_window, rows=[[parked_row, census_row_42]],
+            labels={7: ["status:in-progress-review"], 8: ["status:in-progress-review"]},
+            timeline=census_timeline, provenance={41: {"issue": 7}, 42: {"issue": 8}})
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        sweep_log = readmit_sweep.log
+        aggregates = [line for line in sweep_log if line.startswith("park census example/repo: ")]
+        terminal_warnings = [line for line in sweep_log
+                             if line.startswith("::warning::park census ")
+                             and "HUMAN-TERMINAL" in line]
+        # EXACTLY ONE aggregate for the whole sweep: an emitter moved inside the per-PR loop
+        # emits one per PR, which is a different (and useless) artefact.
+        assert len(aggregates) == 1, sweep_log
+        # The aggregate is computed from the rows the ADMISSION wrote — nulling either argument
+        # empties `counts` and `_log_park_census` returns before printing anything at all.
+        assert aggregates[0] == "park census example/repo: human-applied=1, no-evidence=1", \
+            aggregates[0]
+        # ...and the human-terminal cohort is NAMED. #41 is the maintainer-applied park; #42 is
+        # exit-reachable and must NOT be swept into the warning, or the warning stops
+        # distinguishing "no tick will ever clear this" from "a later tick will".
+        assert len(terminal_warnings) == 1, sweep_log
+        assert "1 parked PR(s)" in terminal_warnings[0], terminal_warnings[0]
+        assert "#41" in terminal_warnings[0] and "#42" not in terminal_warnings[0], \
+            terminal_warnings[0]
+        print("  ok   [G5] END-TO-END: the REAL sweep's own log carries the aggregate census "
+              "(human-applied=1, no-evidence=1) and NAMES the human-terminal PR (#41, not #42)")
         # A(g): the per-PR cap terminates — AUTO_READMISSION_MAX markers (well-formed or not)
         # refuse the next re-admission even with fresh evidence.
         capped = [{"user": {"login": readmit_bot},
