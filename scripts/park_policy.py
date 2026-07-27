@@ -578,9 +578,127 @@ def migration_residual_holds(pr_labels, issue_labels, clearing=()):
          | {label for label in issue_labels if isinstance(label, str)}) - dropped)
 
 
+# --- G5: the closed taxonomy of AUTOMATIC-READMISSION REFUSAL codes --------------------------
+#
+# G4 (above) made a PARK's own cause machine-readable, because "a park whose cause no machine can
+# read has no machine exit by construction". capacity_park_admission then reproduced precisely
+# that defect ONE LAYER UP, in this same file: it answers every refusal with a free-prose
+# `detail` string, so no caller can tell apart two structurally different refusal classes:
+#
+#   * EXIT-REACHABLE — the park is machine-owned and a later tick can still clear it unaided:
+#     the recovery evidence has not appeared YET, the probe failed, the timeline was unreadable.
+#     Waiting IS the correct action, and the state is self-healing.
+#   * HUMAN-TERMINAL — nothing this machine will ever do can clear it. A human-owned hold is
+#     live, or a PROVEN HUMAN applied the park themselves, or the automatic cap is spent. The
+#     only exit is a human gesture, and until one arrives the state is frozen.
+#
+# Both print one indistinguishable "park stands" line per tick, forever, and the only aggregate
+# any sweep emits lumps them into a single bucket. MEASURED on sparq-org/sparq at
+# 2026-07-27T11:53Z (dispatch run 30262478746): 21 open PRs carried `review:parked`, and the
+# review-enumeration aggregate reported one undifferentiated
+# "machine capacity park stands (...)=13". Splitting that bucket by the per-PR CLAIM-half lines
+# in the SAME run gives 3 exit-reachable (#4528/#4519/#4133, "no recorded recovery of the park's
+# starvation cause") against 10 human-terminal — of which 4 (#4197/#3620/#3598/#3577) refuse on
+# "the latest park application is HUMAN-owned". Their timelines confirm it: `jeswr` (type=User)
+# hand-applied `review:parked`, the MACHINE-owned soft hold, which park_applications correctly
+# reads as a human-owned park.
+#
+# That last state is the missing edge. It is terminal; it is carried on the one label whose
+# documented contract (invariant 1) is "excludes the surface WITHOUT posing a human question"
+# and promises a machine exit; and it is counted by NOTHING, because every human-question census
+# keys on `needs:user` / `review:needs-user`. A population with no machine exit that no aggregate
+# can express is exactly the shape #753/#754 removed from the conflict lane.
+#
+# THIS TAXONOMY CHANGES NO DECISION. Every branch returns byte-identically what it returned
+# before; the code is recorded ALONGSIDE the answer so the population becomes countable. Nothing
+# here re-admits anything, and no fail-closed exclusion is weakened to raise a re-admission count
+# — the whole point is that the correct refusals become VISIBLE rather than more numerous.
+PARK_REFUSAL_HUMAN_HOLD = "human-hold"              # needs:* / review:needs-user live
+PARK_REFUSAL_HUMAN_APPLIED = "human-applied"        # a proven human applied the park itself
+PARK_REFUSAL_CAP = "cap"                            # AUTO_READMISSION_MAX spent
+PARK_REFUSAL_TIMELINE_UNREADABLE = "timeline-unreadable"
+PARK_REFUSAL_PROBE_FAILED = "probe-failed"
+PARK_REFUSAL_NO_EVIDENCE = "no-evidence"            # cause recovery not recorded (yet)
+PARK_REFUSAL_EVIDENCE_MALFORMED = "evidence-malformed"
+PARK_REFUSAL_EVIDENCE_CONSUMED = "evidence-consumed"
+PARK_REFUSAL_EVIDENCE_STALE = "evidence-stale"      # recovery not strictly after the park
+PARK_REFUSAL_NOT_OFFERED = "not-offered"            # proof-gate call: auto_evidence is None
+
+# Which refusals a later tick can clear WITHOUT a human. The split is the whole point of the
+# taxonomy, so it is data, not a predicate scattered across callers.
+#
+# `cap` is HUMAN-TERMINAL deliberately, and the refusal's own log line already says why: "an
+# account that keeps flapping is a genuine human question; the park stands until a human acts".
+# `evidence-consumed` is EXIT-REACHABLE: it demands a NEW outage-and-recovery pair, which a later
+# tick can genuinely observe. `not-offered` is EXIT-REACHABLE because it is not a refusal about
+# the PR at all — it is the CLAIM proof gate deliberately evaluating without minting.
+PARK_REFUSAL_HUMAN_TERMINAL = frozenset({
+    PARK_REFUSAL_HUMAN_HOLD, PARK_REFUSAL_HUMAN_APPLIED, PARK_REFUSAL_CAP,
+})
+PARK_REFUSAL_CODES = frozenset({
+    PARK_REFUSAL_HUMAN_HOLD, PARK_REFUSAL_HUMAN_APPLIED, PARK_REFUSAL_CAP,
+    PARK_REFUSAL_TIMELINE_UNREADABLE, PARK_REFUSAL_PROBE_FAILED, PARK_REFUSAL_NO_EVIDENCE,
+    PARK_REFUSAL_EVIDENCE_MALFORMED, PARK_REFUSAL_EVIDENCE_CONSUMED,
+    PARK_REFUSAL_EVIDENCE_STALE, PARK_REFUSAL_NOT_OFFERED,
+})
+
+# The two ADMITTING actions and the human-gesture action are not refusals; they are recorded in
+# the census under these codes so one census row exists per decision and the populations sum.
+PARK_ADMIT_CODES = {"auto-mint": "admitted-auto-mint",
+                    "auto-receipt": "admitted-auto-receipt",
+                    "human": "admitted-human-gesture"}
+
+
+def park_refusal_exit_class(code):
+    """"human-terminal" / "exit-reachable" for a refusal `code`, else None for a code outside the
+    closed taxonomy. An UNRECOGNISED code is NOT silently filed as self-healing: None forces the
+    caller to surface it, because a refusal nobody classified is the very thing this exists to
+    stop being invisible."""
+    if code in PARK_REFUSAL_HUMAN_TERMINAL:
+        return "human-terminal"
+    if code in PARK_REFUSAL_CODES:
+        return "exit-reachable"
+    return None
+
+
+def park_census_summary(records):
+    """PURE. Aggregate census `records` (as appended by capacity_park_admission's `census`
+    out-list) into (counts_by_code, human_terminal_numbers, unclassified_numbers).
+
+    `counts_by_code` is an ordered {code: count} over every well-formed record. The two number
+    lists are ascending and de-duplicated: the HUMAN-TERMINAL population is the one an operator
+    has to act on, and the UNCLASSIFIED population is the one that proves this taxonomy has
+    drifted from its writers. Malformed rows are counted under the reserved `"malformed"` code
+    rather than dropped — a census that silently discards what it cannot parse is how a
+    population goes missing in the first place."""
+    counts, terminal, unclassified = {}, set(), set()
+    for record in records if isinstance(records, (list, tuple)) else []:
+        if not isinstance(record, dict):
+            counts["malformed"] = counts.get("malformed", 0) + 1
+            continue
+        code = record.get("code")
+        number = record.get("number")
+        if not isinstance(code, str) or not code:
+            counts["malformed"] = counts.get("malformed", 0) + 1
+            continue
+        counts[code] = counts.get(code, 0) + 1
+        if not isinstance(number, int) or isinstance(number, bool):
+            continue
+        if code in PARK_ADMIT_CODES.values():
+            continue
+        exit_class = park_refusal_exit_class(code)
+        if exit_class == "human-terminal":
+            terminal.add(number)
+        elif exit_class is None:
+            unclassified.add(number)
+    ordered = {code: counts[code] for code in sorted(counts)}
+    return ordered, sorted(terminal), sorted(unclassified)
+
+
 def capacity_park_admission(repo, pr_number, issue_number, fetch_events, is_human=None,
                             log=print, consumed=frozenset(), auto_receipts=(),
-                            auto_marker_count=None, auto_evidence=None, live_holds=()):
+                            auto_marker_count=None, auto_evidence=None, live_holds=(),
+                            census=None):
     """Whether a MACHINE capacity park may be re-admitted now, and on WHOSE authority
     (invariant 3). Returns (action, evidence, detail), where `evidence` is None or
     {"key", "at"} — the recovery event's durable identity plus its canonical recovery stamp, i.e.
@@ -624,20 +742,41 @@ def capacity_park_admission(repo, pr_number, issue_number, fetch_events, is_huma
 
     EVERY ambiguity fails toward staying parked: an unreadable timeline, an unreadable/absent
     health record, a probe that raises, an unsafe evidence key, a recovery that is not STRICTLY
-    after the park (a tie included), a human-owned label, a human-applied park, and the cap."""
+    after the park (a tie included), a human-owned label, a human-applied park, and the cap.
+
+    `census`, when a list is passed, receives EXACTLY ONE row for this decision (the `occupancy`
+    out-list idiom used elsewhere in this pipeline):
+    {"repo", "number", "code", "exit", "detail"} — where `code` is a G5 taxonomy code and `exit`
+    is park_refusal_exit_class(code) (None for the admitting actions). It is a pure OBSERVATION
+    side channel: passing it changes no decision and no returned value, and park_census_summary
+    aggregates the rows so the human-terminal population stops being invisible."""
+    def _answer(action, evidence, code, detail):
+        """Record one census row and return the answer UNCHANGED. The recording is strictly
+        additive — a census list that is absent, or of the wrong type, is simply not written."""
+        if isinstance(census, list):
+            census.append({"repo": repo, "number": pr_number,
+                           "code": PARK_ADMIT_CODES.get(action, code),
+                           "exit": None if action else park_refusal_exit_class(code),
+                           "detail": detail})
+        return (action, evidence, detail)
+
     if capacity_park_readmitted(repo, pr_number, issue_number, fetch_events,
                                 is_human=is_human, log=log, consumed=consumed):
-        return ("human", None, "unconsumed proven-human readmission gesture")
+        return _answer("human", None, None, "unconsumed proven-human readmission gesture")
     held = human_owned_holds(live_holds)
     if held:
-        return (None, None,
-                f"human-owned hold(s) live ({'/'.join(held)}) — never auto-re-admitted")
+        return _answer(
+            None, None, PARK_REFUSAL_HUMAN_HOLD,
+            f"human-owned hold(s) live ({'/'.join(held)}) — never auto-re-admitted")
     latest_park, human_park, readable = park_applications(
         repo, pr_number, issue_number, fetch_events, is_human=is_human, log=log)
     if not readable:
-        return (None, None, "the park application timeline could not be read")
+        return _answer(None, None, PARK_REFUSAL_TIMELINE_UNREADABLE,
+                       "the park application timeline could not be read")
     if human_park:
-        return (None, None, "the latest park application is HUMAN-owned — only a human clears it")
+        return _answer(
+            None, None, PARK_REFUSAL_HUMAN_APPLIED,
+            "the latest park application is HUMAN-owned — only a human clears it")
     parked_at = canonical_ts(latest_park.isoformat()) if latest_park is not None else None
     for receipt in auto_receipts:
         stamp = receipt.get("at") if isinstance(receipt, dict) else None
@@ -645,46 +784,53 @@ def capacity_park_admission(repo, pr_number, issue_number, fetch_events, is_huma
             continue                    # malformed receipts prove nothing (they still count
             # toward the cap below, so they can never buy an extra re-admission)
         if latest_park is None or parse_ts(stamp) > latest_park:
-            return ("auto-receipt", {"key": receipt.get("key"), "at": canonical_ts(stamp)},
-                    f"already automatically re-admitted at {canonical_ts(stamp)} "
-                    f"(receipt evidence {receipt.get('key')!r}); no new evidence consumed")
+            return _answer(
+                "auto-receipt", {"key": receipt.get("key"), "at": canonical_ts(stamp)}, None,
+                f"already automatically re-admitted at {canonical_ts(stamp)} "
+                f"(receipt evidence {receipt.get('key')!r}); no new evidence consumed")
     minted = len(auto_receipts) if auto_marker_count is None else auto_marker_count
     if minted >= AUTO_READMISSION_MAX:
         log(f"::warning::automatic readmission REFUSED for {repo}#{pr_number}: "
             f"{minted} automatic re-admission(s) already granted (cap "
             f"{AUTO_READMISSION_MAX}) and the park fired again — an account that keeps "
             "flapping is a genuine human question; the park stands until a human acts")
-        return (None, None, f"automatic-readmission cap reached ({minted}/"
-                            f"{AUTO_READMISSION_MAX})")
+        return _answer(None, None, PARK_REFUSAL_CAP,
+                       f"automatic-readmission cap reached ({minted}/"
+                       f"{AUTO_READMISSION_MAX})")
     if auto_evidence is None:
-        return (None, None, "no unconsumed human gesture and no recovery evidence offered")
+        return _answer(None, None, PARK_REFUSAL_NOT_OFFERED,
+                       "no unconsumed human gesture and no recovery evidence offered")
     try:
         evidence = auto_evidence(parked_at)
     except Exception as exc:  # noqa: BLE001 — an unreadable cause probe stays parked
         log(f"automatic readmission unknown for {repo}#{pr_number}: the recovery-evidence "
             f"probe failed ({exc}); the capacity park stands")
-        return (None, None, "the recovery-evidence probe failed")
+        return _answer(None, None, PARK_REFUSAL_PROBE_FAILED,
+                       "the recovery-evidence probe failed")
     if not evidence:
-        return (None, None, "no recorded recovery of the park's starvation cause")
+        return _answer(None, None, PARK_REFUSAL_NO_EVIDENCE,
+                       "no recorded recovery of the park's starvation cause")
     key = evidence.get("key") if isinstance(evidence, dict) else None
     recovered_at = evidence.get("recovered_at") if isinstance(evidence, dict) else None
     if not safe_receipt_part(key) or not valid_timestamp(recovered_at):
         log(f"automatic readmission unknown for {repo}#{pr_number}: the recovery evidence is "
             f"malformed (key={key!r}, recovered_at={recovered_at!r}); the capacity park stands")
-        return (None, None, "the recovery evidence is malformed")
+        return _answer(None, None, PARK_REFUSAL_EVIDENCE_MALFORMED,
+                       "the recovery evidence is malformed")
     recovered_canonical = canonical_ts(recovered_at)
     if key in {receipt.get("key") for receipt in auto_receipts if isinstance(receipt, dict)}:
         log(f"automatic readmission declined for {repo}#{pr_number}: the recovery evidence "
             f"{key!r} was already consumed by a receipted automatic re-admission — a NEW "
             "outage-and-recovery pair is required")
-        return (None, None, f"recovery evidence {key!r} already consumed")
+        return _answer(None, None, PARK_REFUSAL_EVIDENCE_CONSUMED,
+                       f"recovery evidence {key!r} already consumed")
     if latest_park is not None and parse_ts(recovered_at) <= latest_park:
-        return (None, None,
-                f"the recovery at {recovered_canonical} is not STRICTLY after the park "
-                f"application at {parked_at}")
-    return ("auto-mint", {"key": key, "at": recovered_canonical},
-            f"recovery evidence {key!r} recorded at {recovered_canonical}, strictly after the "
-            f"park application at {parked_at}")
+        return _answer(None, None, PARK_REFUSAL_EVIDENCE_STALE,
+                       f"the recovery at {recovered_canonical} is not STRICTLY after the park "
+                       f"application at {parked_at}")
+    return _answer("auto-mint", {"key": key, "at": recovered_canonical}, None,
+                   f"recovery evidence {key!r} recorded at {recovered_canonical}, strictly after "
+                   f"the park application at {parked_at}")
 
 
 def effective_readmission_cutoff(human_cutoff, auto_stamps=(), log=print):
