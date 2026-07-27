@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# [OPUS-5] registry #446: the stuck-escalation AUTO-ADJUDICATOR decision plane, as ONE pure module.
+# registry #446: the stuck-escalation AUTO-ADJUDICATOR decision plane, as ONE pure module.
 """stuck_adjudicator.py — decide what happens to a review-loop park that would otherwise be
 terminal, and what an orchestrator-tier adjudication verdict is ALLOWED to do about it.
 
@@ -22,13 +22,18 @@ the opposite provider at orchestrator tier and let exactly three outcomes exist:
                     parked, but with a machine-readable reason marker so the park is finally
                     attributable (park_policy cause `adjudicated-human`).
 
-THIS MODULE IS THE DECISION PLANE ONLY. It performs no I/O, holds no credentials and reads no
-network state: a caller (the review-loop workflow, and the cron sweep over the existing
-`review:needs-user` backlog) collects the facts, runs the cross-provider adjudication, and hands
-the raw verdict document here to be VALIDATED and CLAMPED. Keeping the clamping pure is the
-whole point — the adjudicator is a language model reading a hostile diff, so its output is
-UNTRUSTED DATA, exactly like a reviewer verdict, and the guardrails that bound it must live
-somewhere a model cannot argue with.
+THIS MODULE IS THE DECISION PLANE ONLY, AND IT HAS NO CALLER YET. It performs no I/O, holds no
+credentials and reads no network state: the eventual caller (the review-loop workflow, plus a
+cron sweep over the existing `review:needs-user` backlog) has to collect the facts, resolve an
+opposite-provider account, run the cross-provider adjudication, and hand the raw verdict document
+here to be VALIDATED and CLAMPED — then apply the head-bound label/state transition and write the
+durable receipt. NONE of that wiring exists yet: nothing in `scripts/` or `.github/workflows/`
+imports this module, so ADDING IT CHANGES NO ORCHESTRATION BEHAVIOUR AND DRAINS NO PARK. It lands
+first, and alone, because it is the half that must be settled before any automatic path is
+allowed to touch a park at all: the adjudicator is a language model reading a hostile diff, so
+its output is UNTRUSTED DATA, exactly like a reviewer verdict, and the guardrails that bound it
+must live somewhere a model cannot argue with — reviewable on its own, with a self-test that can
+falsify each guard, rather than buried in the diff that first grants it authority.
 
 THE ONE STRUCTURAL INVARIANT: GUARDRAILS ARE MONOTONE NON-INCREASING. Every guard in this module
 is expressed as a CEILING on `_VERDICT_RANK` (genuinely-human < return-to-loop < override-arm)
@@ -45,12 +50,18 @@ FAIL-CLOSED, in every direction that matters:
     (park_policy.label_application_machine_owned; the machine never overrules a human's hold).
   - A park whose cause is HUMAN-ONLY (`injection`, `human-arm`) or is any other QUESTION-class
     cause is not adjudicable: those parks exist BECAUSE a judgement was already made.
-  - A SILENT park (no readable park-reason marker) IS adjudicable — draining those is half of
+  - A SILENT park (a park-reason marker PROVEN ABSENT) IS adjudicable — draining those is half of
     #446 — but its ceiling is `return-to-loop`. Without a machine-readable cause you cannot
     prove the park was not itself a human judgement, so the adjudicator may push the PR back
     through the FULL cross-provider review (which re-derives the arm decision, the injection
     check and the trust-surface classification from scratch) but may never bypass that gate
     with an arm.
+  - A CORRUPT / UNKNOWN / FUTURE-VERSION marker is NOT a silent park. `parse_park_reason` answers
+    "no marker" and "a marker I rejected" identically (None), and those are opposite states: the
+    second is park_policy's `marker-corrupt` human question, and re-opening it would let a
+    tampered or truncated marker buy an automatic re-review. The marker state is therefore a
+    SEPARATE, explicitly-stated input (MARKER_STATES) and only a POSITIVELY ESTABLISHED absence
+    is adjudicable.
   - NEVER WEAKEN A TEST OR A GATE TO ARM. `gate_weakening` (the caller's evidence that the diff
     under adjudication deletes/relaxes a self-test entry, a gate step or a trust check) caps the
     decision at `return-to-loop` — no confidence grade, no finding class and no verdict can
@@ -61,7 +72,11 @@ FAIL-CLOSED, in every direction that matters:
     cite non-empty evidence. Anything softer stays with the maintainer.
   - RETURN-TO-LOOP MUST BE ABLE TO ACTUALLY RUN. A return-to-loop with no round headroom below
     the absolute hard cap re-parks on the next tick — that is the #446 stall wearing a different
-    label — so no headroom means `genuinely-human`, honestly.
+    label — so no headroom means `genuinely-human`, honestly. The same applies to what the loop
+    would DO with the headroom: EVERY final `return-to-loop` must carry a concrete fix sketch,
+    including one a guardrail CLAMPED down from `override-arm`, because a clamped arm describes
+    why the finding is spurious and not how to close it — sending that back spends one of the
+    two lifetime grants reproducing the identical round.
   - TERMINATION. `return-to-loop` is granted at most `MAX_RETURNS_TO_LOOP` times per PR, counted
     over the bot's OWN durable adjudication receipts (the same trust filter park_policy applies
     to park receipts, so a third party cannot forge a grant). Past the cap the PR is a genuine
@@ -137,6 +152,18 @@ CONFIDENCE_CLEAR = "clear"
 ADJUDICABLE_CAUSES = frozenset({
     "budget", "nochange", "gatefail", "dispatch-missed", "cold-groom", "capacity-unspecified",
 })
+# How the park-reason MARKER ITSELF read — a question the CAUSE cannot answer.
+# park_policy.parse_park_reason returns None for BOTH "this park carries no marker" and "this
+# park's marker was REJECTED" (a cause outside the closed taxonomy, or a `class=` contradicting
+# its cause). Those are opposite states: the first is #446's silent park, the second is exactly
+# park_policy's `marker-corrupt` QUESTION-class park. Collapsing them would let a corrupt,
+# truncated, forged or future-version marker be automatically re-opened as if it had never
+# existed, so the state is a SEPARATE input with a closed vocabulary and a fail-closed default.
+MARKER_ABSENT = "absent"    # the bot's own park receipts were read and carry NO park-reason marker
+MARKER_PRESENT = "present"  # a well-formed marker was read; `park_cause` is the cause off it
+MARKER_CORRUPT = "corrupt"  # a marker exists but would not parse / is not trusted — never silent
+MARKER_STATES = (MARKER_ABSENT, MARKER_PRESENT, MARKER_CORRUPT)
+
 # The park cause a `genuinely-human` adjudication writes, so the surviving park is finally
 # ATTRIBUTABLE — #446's "silent park" is precisely a park nothing can explain. Registered in
 # park_policy's closed taxonomy as QUESTION-class and HUMAN-ONLY: an adjudicated human question
@@ -224,18 +251,28 @@ def assert_cross_provider(impl_provider, judge_provider):
 
 
 def park_eligibility(park_cause, label_machine_owned, prior_returns=0,
-                     max_returns=MAX_RETURNS_TO_LOOP):
+                     max_returns=MAX_RETURNS_TO_LOOP, marker_state=MARKER_CORRUPT):
     """Whether this park may be adjudicated at all, and the CEILING adjudication may reach.
 
     Returns {"eligible", "ceiling", "detail"}. `ceiling` is meaningless when not eligible.
 
     `park_cause` is the cause off the park-reason marker (park_policy.parse_park_reason), or None
-    for a SILENT / unmarked park. `label_machine_owned` is
-    park_policy.label_application_machine_owned for `review:needs-user` on this PR — True ONLY
-    when the newest application of that exact label is provably not a human's; that function
-    already returns False for every ambiguity, and anything other than True is refused here.
-    `prior_returns` is how many `return-to-loop` grants this PR has already consumed
-    (adjudication_records).
+    when that call produced no record. `marker_state` says WHY it produced none, because
+    parse_park_reason cannot: MARKER_ABSENT means the bot's park receipts were read successfully
+    and contain no marker (the SILENT park #446 is half made of), MARKER_PRESENT means a
+    well-formed marker was read and `park_cause` is its cause, and MARKER_CORRUPT means a marker
+    exists but was rejected — a corrupt, truncated, forged or future-version marker, which is
+    park_policy's `marker-corrupt` human question and is NEVER re-opened automatically. The
+    default is MARKER_CORRUPT and an unstated / off-vocabulary state is refused, so a caller that
+    never learned to answer the question cannot accidentally mint a silent park. Evidence that
+    CONTRADICTS itself (a cause beside a claimed-absent marker, or a marker reported present with
+    no readable cause) is refused for the same reason.
+
+    `label_machine_owned` is park_policy.label_application_machine_owned for `review:needs-user`
+    on this PR — True ONLY when the newest application of that exact label is provably not a
+    human's; that function already returns False for every ambiguity, and anything other than True
+    is refused here. `prior_returns` is how many `return-to-loop` grants this PR has already
+    consumed (adjudication_records).
 
     Every branch fails towards leaving the park alone."""
     if label_machine_owned is not True:
@@ -250,6 +287,31 @@ def park_eligibility(park_cause, label_machine_owned, prior_returns=0,
                 "detail": f"adjudication budget spent ({prior_returns}/{max_returns} "
                           "return-to-loop grants consumed) — a standoff this durable is a "
                           "genuine human question"}
+    if marker_state not in MARKER_STATES:
+        return {"eligible": False, "ceiling": VERDICT_HUMAN,
+                "detail": f"the park-reason marker state {marker_state!r} is unstated or outside "
+                          f"{MARKER_STATES}; only a PROVEN-absent marker is a silent park"}
+    if marker_state == MARKER_CORRUPT:
+        return {"eligible": False, "ceiling": VERDICT_HUMAN,
+                "detail": "the park-reason marker is present but was rejected (corrupt, forged "
+                          "or a future version) — that is the marker-corrupt human question, "
+                          "not a silent park"}
+    has_cause = isinstance(park_cause, str) and bool(park_cause)
+    if marker_state == MARKER_ABSENT:
+        if park_cause is not None:
+            return {"eligible": False, "ceiling": VERDICT_HUMAN,
+                    "detail": f"contradictory park evidence: cause {park_cause!r} beside a "
+                              "marker reported ABSENT"}
+        # A POSITIVELY ESTABLISHED absence, and only that: adjudicable — draining these is half
+        # of #446 — but never armable, because nothing here proves the park was not itself a
+        # judgement. Back through the full review gate is the strongest safe move.
+        return {"eligible": True, "ceiling": VERDICT_LOOP,
+                "detail": "silent park (park-reason marker proven absent): re-review only, "
+                          "never arm"}
+    if not has_cause:
+        return {"eligible": False, "ceiling": VERDICT_HUMAN,
+                "detail": f"a park-reason marker was reported present but its cause "
+                          f"{park_cause!r} is unreadable"}
     if park_cause in park_policy.PARK_HUMAN_ONLY_CAUSES:
         return {"eligible": False, "ceiling": VERDICT_HUMAN,
                 "detail": f"cause {park_cause!r} is human-only and is never re-opened"}
@@ -262,11 +324,18 @@ def park_eligibility(park_cause, label_machine_owned, prior_returns=0,
     if park_policy.park_cause_class(park_cause) == park_policy.PARK_CLASS_QUESTION:
         return {"eligible": False, "ceiling": VERDICT_HUMAN,
                 "detail": f"cause {park_cause!r} is a judged human question"}
-    # No readable cause (None) or a cause outside the closed taxonomy: a SILENT park. Adjudicable
-    # — draining these is half of #446 — but never armable, because nothing here proves the
-    # park was not itself a judgement. Back through the review gate is the strongest safe move.
-    return {"eligible": True, "ceiling": VERDICT_LOOP,
-            "detail": "silent park (no readable park-reason cause): re-review only, never arm"}
+    if park_policy.park_cause_class(park_cause) is None:
+        # A well-formed-looking marker naming a cause this taxonomy does not know: a forged or
+        # future-version marker. It says NOTHING about whether the park was a judgement, so it
+        # takes the marker-corrupt direction, never the silent park's re-review ceiling.
+        return {"eligible": False, "ceiling": VERDICT_HUMAN,
+                "detail": f"cause {park_cause!r} is outside park_policy's closed taxonomy "
+                          "(forged or future-version marker) — marker-corrupt, not silent"}
+    # In the taxonomy, capacity-class, and still not adjudicable: today that is `partition`, whose
+    # writer parks the PR directly and never escalates it into the human terminal, so a park this
+    # module sees can never legitimately carry it.
+    return {"eligible": False, "ceiling": VERDICT_HUMAN,
+            "detail": f"cause {park_cause!r} is not an adjudicable park cause"}
 
 
 def parse_verdict(payload, log=print):
@@ -396,9 +465,13 @@ def decide(verdict_payload, eligibility, *, surface_paths_touched=(), security_f
         raise AdjudicationError("guardrails promoted a verdict — refusing to act on it")
 
     if final == VERDICT_LOOP:
-        if proposed == VERDICT_LOOP and not parsed["fix_sketch"]:
-            # "Real but fixable" with nothing to fix is not an adjudication; it is the standoff
-            # restated. Sending it back would burn a raised budget reproducing the same round.
+        if not parsed["fix_sketch"]:
+            # "Back to the loop" with nothing to fix is not an adjudication; it is the standoff
+            # restated, and sending it back burns one of two lifetime grants reproducing the same
+            # round. The requirement is on the FINAL verdict, not on the proposal: an
+            # `override-arm` CLAMPED to the loop by gate_weakening, by a silent park's ceiling or
+            # by any future guard argues that the finding is SPURIOUS — it says nothing about how
+            # to close it — so a clamped arm has, by construction, no sketch to run on.
             return _human(proposed, "return-to-loop carried no concrete fix sketch", parsed,
                           ceilings=ceilings)
         budget = raised_round_budget(base_rounds, rounds_used)
@@ -518,8 +591,10 @@ def returns_consumed(records):
 def sweep_candidates(parked, limit=SWEEP_LIMIT):
     """Order and BOUND one cron sweep over the existing `review:needs-user` backlog.
 
-    `parked` is a list of {"repo", "number", "parked_at", "cause", "label_machine_owned",
-    "records"}. Returns (candidates, skipped): `candidates` is at most `limit` eligible rows,
+    `parked` is a list of {"repo", "number", "parked_at", "cause", "marker_state",
+    "label_machine_owned", "records"} — `marker_state` being one of MARKER_STATES, so a row whose
+    collector never answered "was there a marker at all?" is refused rather than swept in as a
+    silent park. Returns (candidates, skipped): `candidates` is at most `limit` eligible rows,
     OLDEST PARK FIRST (the 36-PR backlog drains in the order it accumulated) with ties broken on
     (repo, number) so two sweeps over the same state pick the same work; `skipped` is EVERY row
     that was dropped, each with the reason. Nothing is dropped silently — a bounded sweep that
@@ -530,7 +605,8 @@ def sweep_candidates(parked, limit=SWEEP_LIMIT):
             skipped.append({"row": row, "detail": "malformed sweep row"})
             continue
         verdict = park_eligibility(row.get("cause"), row.get("label_machine_owned"),
-                                   returns_consumed(row.get("records")))
+                                   returns_consumed(row.get("records")),
+                                   marker_state=row.get("marker_state"))
         if not verdict["eligible"]:
             skipped.append({"repo": row.get("repo"), "number": row.get("number"),
                             "detail": verdict["detail"]})
@@ -593,8 +669,8 @@ def _self_test():
                 "evidence": evidence, "fix_sketch": sketch, "injection_detected": injection,
                 "summary": "s"}
 
-    capacity = park_eligibility("budget", True)
-    silent = park_eligibility(None, True)
+    capacity = park_eligibility("budget", True, marker_state=MARKER_PRESENT)
+    silent = park_eligibility(None, True, marker_state=MARKER_ABSENT)
 
     # ---- the ordering the whole module is expressed in. If this table ever gains an entry
     # without a rank the min() below would raise, so pin both shapes.
@@ -643,27 +719,51 @@ def _self_test():
     # ---- ELIGIBILITY.
     chk("a machine budget park is adjudicable up to ARM",
         (capacity["eligible"], capacity["ceiling"]), (True, VERDICT_ARM))
-    chk("a SILENT park is adjudicable but capped at the loop",
+    chk("a SILENT park (marker PROVEN ABSENT) is adjudicable but capped at the loop",
         (silent["eligible"], silent["ceiling"]), (True, VERDICT_LOOP))
-    chk("an unknown (off-taxonomy) cause is treated exactly like a silent park",
-        park_eligibility("who-knows", True)["ceiling"], VERDICT_LOOP)
     chk("a HUMAN-applied review:needs-user is never adjudicable",
-        park_eligibility("budget", False)["eligible"], False)
+        park_eligibility("budget", False, marker_state=MARKER_PRESENT)["eligible"], False)
     chk("an UNPROVEN label owner is never adjudicable (None is not True)",
-        park_eligibility("budget", None)["eligible"], False)
+        park_eligibility("budget", None, marker_state=MARKER_PRESENT)["eligible"], False)
     for cause in ("injection", "human-arm"):
         chk(f"the human-only cause {cause!r} is never adjudicable",
-            park_eligibility(cause, True)["eligible"], False)
+            park_eligibility(cause, True, marker_state=MARKER_PRESENT)["eligible"], False)
     for cause in ("routing-unresolvable", "marker-corrupt", "history-rewritten"):
         chk(f"the judged question cause {cause!r} is never adjudicable",
-            park_eligibility(cause, True)["eligible"], False)
+            park_eligibility(cause, True, marker_state=MARKER_PRESENT)["eligible"], False)
     chk("an already-adjudicated human park is never re-adjudicated",
-        park_eligibility(ADJUDICATED_HUMAN_CAUSE, True)["eligible"], False)
+        park_eligibility(ADJUDICATED_HUMAN_CAUSE, True, marker_state=MARKER_PRESENT)["eligible"],
+        False)
     chk("TERMINATION: the return-to-loop cap closes eligibility",
-        [park_eligibility("budget", True, n)["eligible"] for n in range(4)],
+        [park_eligibility("budget", True, n, marker_state=MARKER_PRESENT)["eligible"]
+         for n in range(4)],
         [True, True, False, False])
     chk("a non-integer prior-return count is refused, not coerced",
-        park_eligibility("budget", True, "1")["eligible"], False)
+        park_eligibility("budget", True, "1", marker_state=MARKER_PRESENT)["eligible"], False)
+
+    # ---- THE MARKER STATE is a DIFFERENT question from the cause (round-1 finding 2):
+    # parse_park_reason answers "no marker" and "a marker I rejected" identically, and only the
+    # FIRST is a silent park. Each check below is the counterfactual of the `silent` row above.
+    chk("a CORRUPT marker is the marker-corrupt human question, never a silent park",
+        park_eligibility(None, True, marker_state=MARKER_CORRUPT)["eligible"], False)
+    chk("...and corrupt is the DEFAULT, so an unstated marker state cannot mint a silent park",
+        park_eligibility(None, True)["eligible"], False)
+    for bad in (None, "", "maybe", 7, True):
+        chk(f"an off-vocabulary marker state {bad!r} is refused, not guessed",
+            park_eligibility(None, True, marker_state=bad)["eligible"], False)
+    chk("an OFF-TAXONOMY cause off a present marker is marker-corrupt, not silent",
+        (park_eligibility("who-knows", True, marker_state=MARKER_PRESENT)["eligible"],
+         park_eligibility("who-knows", True, marker_state=MARKER_PRESENT)["ceiling"]),
+        (False, VERDICT_HUMAN))
+    chk("a FUTURE-VERSION cause cannot borrow the silent park's re-review ceiling",
+        park_eligibility("v2-something-new", True, marker_state=MARKER_PRESENT)["eligible"],
+        False)
+    chk("contradictory evidence (a cause beside a claimed-ABSENT marker) is refused",
+        park_eligibility("budget", True, marker_state=MARKER_ABSENT)["eligible"], False)
+    chk("...as is a marker reported PRESENT whose cause is unreadable",
+        park_eligibility(None, True, marker_state=MARKER_PRESENT)["eligible"], False)
+    chk("`partition` is a real capacity cause but still not an adjudicable one",
+        park_eligibility("partition", True, marker_state=MARKER_PRESENT)["eligible"], False)
 
     # ---- VERDICT PARSING is closed in every field.
     chk("a well-formed verdict parses",
@@ -702,13 +802,14 @@ def _self_test():
     chk("...and is not marked as clamped", armed["capped"], False)
     chk("...and writes no park cause", armed["park_cause"], None)
 
+    sketched = verdict(sketch="restore the deleted suite entry and assert it fails red")
     chk("NEVER WEAKEN A GATE: the same verdict with gate_weakening cannot arm",
-        decide(verdict(), capacity, gate_weakening=True, log=_quiet)["verdict"], VERDICT_LOOP)
+        decide(sketched, capacity, gate_weakening=True, log=_quiet)["verdict"], VERDICT_LOOP)
     chk("...and the sensitive-surface ESCAPE cannot lift that floor",
-        decide(verdict(), capacity, gate_weakening=True, surface_paths_touched=["scripts/x.py"],
+        decide(sketched, capacity, gate_weakening=True, surface_paths_touched=["scripts/x.py"],
                security_flagged=True, log=_quiet)["verdict"], VERDICT_LOOP)
     chk("...and the floor names itself in the reason",
-        "gate_weakening" in decide(verdict(), capacity, gate_weakening=True,
+        "gate_weakening" in decide(sketched, capacity, gate_weakening=True,
                                    log=_quiet)["reason"], True)
 
     chk("a trust-surface diff defaults to the human on merely-LIKELY confidence",
@@ -726,9 +827,9 @@ def _self_test():
                log=_quiet)["verdict"], VERDICT_HUMAN)
 
     chk("a SILENT park cannot arm however clear the verdict is",
-        decide(verdict(), silent, log=_quiet)["verdict"], VERDICT_LOOP)
+        decide(sketched, silent, log=_quiet)["verdict"], VERDICT_LOOP)
     chk("...and says the eligibility ceiling did it",
-        "eligibility" in decide(verdict(), silent, log=_quiet)["reason"], True)
+        "eligibility" in decide(sketched, silent, log=_quiet)["reason"], True)
 
     chk("injection in the adjudicator's own output is terminal",
         decide(verdict(injection=True), capacity, log=_quiet)["verdict"], VERDICT_HUMAN)
@@ -754,6 +855,23 @@ def _self_test():
     chk("a return-to-loop with NO fix sketch is not an adjudication",
         decide(verdict(v=VERDICT_LOOP, finding="real-fixable"), capacity,
                log=_quiet)["verdict"], VERDICT_HUMAN)
+    # ...and the requirement is on the FINAL verdict, not the proposal (round-1 finding 3): an
+    # arm CLAMPED down to the loop argues the finding is spurious and describes no fix, so
+    # granting it a raised budget would spend a lifetime grant on the identical round. Each pair
+    # below is a counterfactual: the SAME clamp with a sketch does return to the loop (asserted
+    # above), and without one it must reach the maintainer.
+    for label, kwargs in (("gate_weakening", {"gate_weakening": True}),
+                          ("a sensitive surface", {"surface_paths_touched": ["scripts/x.py"],
+                                                   "security_flagged": True,
+                                                   "gate_weakening": True})):
+        chk(f"an arm clamped to the loop by {label} with NO sketch is genuinely-human",
+            decide(verdict(), capacity, log=_quiet, **kwargs)["verdict"], VERDICT_HUMAN)
+    chk("an arm clamped to the loop by a SILENT park with NO sketch is genuinely-human",
+        decide(verdict(), silent, log=_quiet)["verdict"], VERDICT_HUMAN)
+    chk("...and every one of those still names the sketch as what was missing",
+        {decide(verdict(), elig, gate_weakening=weak, log=_quiet)["reason"]
+         for elig, weak in ((capacity, True), (silent, False))},
+        {"return-to-loop carried no concrete fix sketch"})
     chk("NO HEADROOM at the hard cap parks honestly instead of re-parking next tick",
         decide(loop, capacity, base_rounds=3, rounds_used=HARD_CAP_ROUNDS,
                log=_quiet)["verdict"], VERDICT_HUMAN)
@@ -820,15 +938,22 @@ def _self_test():
     # ---- THE SWEEP: bounded, ordered, and never silently truncating.
     backlog = [
         {"repo": "o/r", "number": 3, "parked_at": "2026-07-19T03:00:00Z", "cause": "budget",
-         "label_machine_owned": True, "records": []},
+         "marker_state": MARKER_PRESENT, "label_machine_owned": True, "records": []},
         {"repo": "o/r", "number": 1, "parked_at": "2026-07-18T03:00:00Z", "cause": None,
-         "label_machine_owned": True, "records": []},
+         "marker_state": MARKER_ABSENT, "label_machine_owned": True, "records": []},
         {"repo": "o/r", "number": 2, "parked_at": "2026-07-18T03:00:00Z", "cause": "nochange",
-         "label_machine_owned": True, "records": []},
+         "marker_state": MARKER_PRESENT, "label_machine_owned": True, "records": []},
         {"repo": "o/r", "number": 4, "parked_at": "2026-07-17T03:00:00Z", "cause": "injection",
-         "label_machine_owned": True, "records": []},
+         "marker_state": MARKER_PRESENT, "label_machine_owned": True, "records": []},
         {"repo": "o/r", "number": 5, "parked_at": "2026-07-17T03:00:00Z", "cause": "budget",
-         "label_machine_owned": False, "records": []},
+         "marker_state": MARKER_PRESENT, "label_machine_owned": False, "records": []},
+        # A park whose marker EXISTS but would not parse, and one whose collector never answered
+        # the question at all: neither is a silent park, and both are the oldest rows here — so
+        # if either leaked in it would sort to the FRONT of the sweep, not the tail.
+        {"repo": "o/r", "number": 6, "parked_at": "2026-07-16T03:00:00Z", "cause": None,
+         "marker_state": MARKER_CORRUPT, "label_machine_owned": True, "records": []},
+        {"repo": "o/r", "number": 7, "parked_at": "2026-07-16T03:00:00Z", "cause": None,
+         "label_machine_owned": True, "records": []},
         "not-a-row",
     ]
     chosen, skipped = sweep_candidates(backlog, limit=2)
@@ -836,11 +961,14 @@ def _self_test():
         [(c["repo"], c["number"]) for c in chosen], [("o/r", 1), ("o/r", 2)])
     chk("the sweep honours its bound", len(chosen), 2)
     chk("EVERY dropped row is reported (no silent cap)",
-        sorted(str(s.get("number")) for s in skipped), ["3", "4", "5", "None"])
+        sorted(str(s.get("number")) for s in skipped), ["3", "4", "5", "6", "7", "None"])
     chk("the ineligible rows name their reason",
         all(s.get("detail") for s in skipped), True)
     chk("an unbounded sweep over the same backlog picks up the deferred row",
         [c["number"] for c in sweep_candidates(backlog, limit=SWEEP_LIMIT)[0]], [1, 2, 3])
+    chk("...and NEVER the corrupt-marker or unstated-marker parks, oldest though they are",
+        [c["number"] for c in sweep_candidates(backlog, limit=SWEEP_LIMIT)[0]
+         if c["number"] in (6, 7)], [])
 
     print("stuck_adjudicator self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
