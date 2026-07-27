@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 828,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "6bbcfac55c3b2549ef6dd4c99dfa440bdfd8da7b",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "The prior major finding is resolved. The record now clearly separates the Option A design decision from the stronger repository-wide trust-boundary claim, labels the no-other-secret-bearing-environment rule as policy rather than an enforced invariant, states that the strategy is not complete until an enumerating guard lands, and specifies fail-closed pagination plus non-vacuous refusal fixtures. The cutover sequencing is also supported rather than default-allow: moving the existing repository-scoped values into the already protected and bound environment monotonically reduces current exposure, while the document does not claim that this alone proves all repository secrets are bounded. No actionable correctness, soundness, test-validity, or security issue remains in this documentation-only diff.",
+  "verdict": "approve"
+ }
+}
