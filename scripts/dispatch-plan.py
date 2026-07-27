@@ -614,6 +614,408 @@ def _self_test():
     chk("[#4329] a malformed issue number still kills the sweep, fail-closed",
         _malformed, "target issue fields are malformed")
 
+    # ------------------------------------------------------------------------------------------
+    # [#768] PLAN'S OCCUPANCY MUST CARRY THE PR HALF OF EVERY UNIT OF WORK.
+    #
+    # These run the ENTIRE readiness step, not a sentinel block. The defect this fixes lives at a
+    # CALL SITE (`ready_input = occupancy_input + [...]`, and the deferred lane's argument list),
+    # and a call site is exactly what a block-scoped harness cannot see: deleting six characters
+    # there restores the bug with every block-level assertion still green. So the step's whole
+    # python heredoc is extracted and EXECUTED against a synthetic two-target fixture, and the
+    # assertions are made on the PLAN ROWS it emits — the artifact CLAIM actually consumes.
+    #
+    # Target 0 is a PR-AWARE planner (sparq's occupancy semantics: a PR row reserves its declared
+    # areas and is never a candidate). Target 1 is THIS REPOSITORY'S OWN planner, unmodified, so
+    # the interlock is tested against the real engine it exists to protect rather than a mock of
+    # it — `scripts/ready-issues.py` here has no `pull_request` guard at all.
+    # ------------------------------------------------------------------------------------------
+    def _refuse_exit_zero_swallow(path, step_id):
+        """Refuse any way the `id: step_id` step can FAIL while its job stays green.
+
+        [#773 adversarial review, BLOCKING] The first cut of this check scanned the raw LINES
+        BEFORE the heredoc-open. `continue-on-error: true` placed AFTER `run:` is equally valid
+        YAML and was not in that range, so the mutant survived with the whole suite green and
+        `rc = 0` — a guard that claimed a ban it did not enforce. That is precisely why the
+        `>>> ... <<<` sentinels were deleted from this same change, so it is fixed the same way
+        rather than excused: walk the PARSED step MAPPING, where key order cannot hide anything.
+
+        Three distinct swallows, because they are independent:
+          1. `continue-on-error` (truthy) or `if:` on the STEP or its JOB — the step's failure,
+             or the step itself, disappears.
+          2. `set -euo pipefail` missing from the step's `run:` — a shell script's exit status is
+             its LAST command, so without `-e` a failing python is masked by anything after it.
+          3. anything after the heredoc terminator — even WITH `-e`, a trailing successful
+             command is the step's exit status if the heredoc is not last.
+        """
+        import yaml  # lazy: same shape as dispatch-secrets-guard's parsed step-level ban
+        with open(path, encoding="utf-8") as handle:
+            document = yaml.safe_load(handle)
+        found = []
+        for job_name, job in (document.get("jobs") or {}).items():
+            for step in (job or {}).get("steps") or []:
+                if isinstance(step, dict) and step.get("id") == step_id:
+                    found.append((job_name, job, step))
+        if len(found) != 1:
+            raise AssertionError(
+                f"expected exactly one step `id: {step_id}` in the parsed workflow, "
+                f"found {len(found)} — refusing")
+        job_name, job, step = found[0]
+        for scope, mapping in (("step", step), (f"job `{job_name}`", job)):
+            if mapping.get("continue-on-error"):
+                raise AssertionError(
+                    f"{scope} owning `id: {step_id}` carries a truthy `continue-on-error` — it "
+                    "could fail while the job stays green, making every assertion over its "
+                    "output vacuous. Refusing.")
+            if "if" in mapping:
+                raise AssertionError(
+                    f"{scope} owning `id: {step_id}` carries an `if:` condition — this block is "
+                    "EXECUTED by this self-test from its source text, so a conditional would "
+                    "pass every assertion while never running. Refusing.")
+        run = step.get("run")
+        if not isinstance(run, str):
+            raise AssertionError(f"step `id: {step_id}` has no `run:` script — refusing")
+        commands = [line for line in run.split("\n")
+                    if line.strip() and not line.lstrip().startswith("#")]
+        if not any(line.strip() == "set -euo pipefail" for line in commands):
+            raise AssertionError(
+                f"step `id: {step_id}`'s `run:` does not `set -euo pipefail` — a shell script "
+                "exits with its LAST command's status, so the planner could raise and the step "
+                "still succeed. Refusing.")
+        # `|| true` anywhere in the script, INCLUDING across a backslash continuation (a sibling
+        # seam check was found to miss exactly that), and any command after the heredoc closes.
+        flattened = run.replace("\\\n", " ")
+        if "|| true" in "\n".join(line for line in flattened.split("\n")
+                                  if not line.lstrip().startswith("#")):
+            raise AssertionError(
+                f"step `id: {step_id}` neutralises a command with `|| true` — refusing")
+        terminators = [i for i, line in enumerate(commands) if line.strip() == "PY"]
+        if not terminators:
+            raise AssertionError(f"step `id: {step_id}`'s heredoc is unterminated — refusing")
+        trailing = commands[terminators[-1] + 1:]
+        if trailing:
+            raise AssertionError(
+                f"step `id: {step_id}` runs {len(trailing)} command(s) AFTER its heredoc "
+                f"({trailing[0].strip()!r}) — that command's exit status becomes the step's, so a "
+                "failing planner would be swallowed. Refusing.")
+
+    def _workflow_heredoc(path, step_id):
+        """The dedented python heredoc of the ONE workflow step whose `id:` is `step_id`.
+
+        Fail-closed in the same way `_workflow_block` is: anything it cannot resolve uniquely
+        raises, because an assertion that cannot find its target must never pass vacuously. The
+        `if: false` refusals above already cover a disabled step/job, and they read the same file.
+        """
+        with open(path, encoding="utf-8") as handle:
+            lines = handle.read().split("\n")
+        ids = [i for i, line in enumerate(lines) if line.strip() == f"id: {step_id}"]
+        if len(ids) != 1:
+            raise AssertionError(f"expected one workflow step `id: {step_id}`, found {len(ids)}")
+        starts = [i for i in range(ids[0], -1, -1) if lines[i].lstrip().startswith("- ")]
+        indent = len(lines[starts[0]]) - len(lines[starts[0]].lstrip())
+        end = len(lines)
+        for i in range(starts[0] + 1, len(lines)):
+            if not lines[i].strip():
+                continue
+            here = len(lines[i]) - len(lines[i].lstrip())
+            if here < indent or (here == indent and lines[i].lstrip().startswith("- ")):
+                end = i
+                break
+        block = lines[starts[0]:end]
+        opens = [i for i, line in enumerate(block) if line.rstrip().endswith("<<'PY'")]
+        if len(opens) != 1:
+            raise AssertionError(
+                f"step `id: {step_id}` must run exactly one `<<'PY'` heredoc, found {len(opens)}")
+        body = block[opens[0] + 1:]
+        closes = [i for i, line in enumerate(body) if line.strip() == "PY"]
+        if not closes:
+            raise AssertionError(f"step `id: {step_id}`'s heredoc is unterminated — refusing")
+        body = body[:closes[0]]
+        _refuse_exit_zero_swallow(path, step_id)
+        pad = min(len(line) - len(line.lstrip()) for line in body if line.strip())
+        source = "\n".join(line[pad:] if line.strip() else "" for line in body)
+        compile(source, f"<{step_id}>", "exec")
+        return source
+
+    _readiness_source = _workflow_heredoc(
+        os.path.join(_root, ".github", "workflows", "dispatch.yml"), "readiness")
+
+    # A PR-AWARE planner, written to sparq's contract: an OPEN PR row reserves the `area:` keys it
+    # declares (and NOTHING when it declares none — the occupancy-side rule, see the GLOBAL
+    # decision pinned below) and is never a dispatch candidate; an in-flight issue reserves the
+    # same way. Deliberately a separate implementation rather than an import: it is the CONTRACT
+    # `dispatch.yml` depends on, and a copy of this repo's engine could not express it.
+    _PR_AWARE_PLANNER = '''
+GLOBAL = "__global__"
+IN_FLIGHT = {"status:in-progress", "status:in-progress-review"}
+PARKED = {"needs:user", "review:needs-user", "status:blocked"}
+
+
+def labels_of(issue):
+    return {lb["name"] if isinstance(lb, dict) else lb for lb in issue.get("labels", [])}
+
+
+def declared(labels):
+    return {lb[5:] for lb in labels if lb.startswith("area:")}
+
+
+def packages_of(labels):
+    return declared(labels) or {GLOBAL}
+
+
+def roleless_ready(issues):
+    return sorted(it.get("number") for it in issues
+                  if "pull_request" not in it and "status:ready" in labels_of(it)
+                  and not any(lb.startswith("role:") for lb in labels_of(it)))
+
+
+def compute_ready(issues, in_progress_packages=None):
+    taken = set(in_progress_packages or ())
+    for it in issues:
+        L = labels_of(it)
+        if L & PARKED:
+            continue
+        if "pull_request" in it or (L & IN_FLIGHT):
+            taken |= declared(L)          # OCCUPANCY: declared areas only, no global fallback
+    ready = []
+    cands = [it for it in issues if "pull_request" not in it
+             and "status:ready" in labels_of(it)
+             and not (labels_of(it) & IN_FLIGHT)
+             and not (labels_of(it) & PARKED)
+             and any(lb.startswith("role:") for lb in labels_of(it))
+             and int(it.get("open_blockers", 0)) == 0]
+    for it in sorted(cands, key=lambda i: i.get("number")):
+        pkgs = packages_of(labels_of(it))
+        if GLOBAL in taken or (pkgs & taken) or (GLOBAL in pkgs and taken):
+            continue
+        taken |= pkgs
+        ready.append(it)
+    return ready
+
+
+def plan_dispatch(ready_issues, routing_doc):
+    rows = []
+    for it in ready_issues:
+        pkgs = packages_of(labels_of(it))
+        rows.append({"number": it["number"], "priority": 1,
+                     "package": next(iter(pkgs)) if len(pkgs) == 1 else GLOBAL,
+                     "role": "impl", "agent": "a", "model_chain": ["m"], "escalate": False})
+    return rows
+
+
+def _routing_doc():
+    return {}
+'''
+
+    def _run_readiness(rows_by_target, planners):
+        """EXECUTE the real readiness step over a synthetic snapshot; return (plan, printed).
+
+        `rows_by_target[i]` is the `/issues?state=open` listing for target i (PR rows included,
+        exactly as GitHub returns them). `planners[i]` is either the PR-aware source above or
+        None, meaning "use THIS repository's own scripts/ unmodified".
+        """
+        import json as _json
+        import shutil
+        import tempfile
+        workdir = tempfile.mkdtemp(prefix="readiness-768-")
+        try:
+            root = os.path.join(workdir, "targets")
+            os.makedirs(root)
+            names = []
+            for index, source in enumerate(planners):
+                names.append(f"o/t{index}")
+                target = os.path.join(root, str(index))
+                if source is None:
+                    shutil.copytree(os.path.join(_root, "scripts"),
+                                    os.path.join(target, "scripts"))
+                    shutil.copytree(os.path.join(_root, "orchestration"),
+                                    os.path.join(target, "orchestration"),
+                                    ignore=shutil.ignore_patterns("provenance", "review-verdicts"))
+                else:
+                    os.makedirs(os.path.join(target, "scripts"))
+                    with open(os.path.join(target, "scripts", "dispatch-plan.py"), "w",
+                              encoding="utf-8") as handle:
+                        handle.write(source)
+            # `git rev-parse HEAD` must return a 40-hex sha; a stub on PATH keeps the fixture
+            # free of a real repository (and of any git identity configuration).
+            bindir = os.path.join(workdir, "bin")
+            os.makedirs(bindir)
+            with open(os.path.join(bindir, "git"), "w", encoding="utf-8") as handle:
+                handle.write("#!/bin/sh\necho 00112233445566778899aabbccddeeff00112233\n")
+            os.chmod(os.path.join(bindir, "git"), 0o755)
+            repos_path = os.path.join(root, "repos.txt")
+            with open(repos_path, "w", encoding="utf-8") as handle:
+                handle.write("\n".join(names) + "\n")
+            for index, rows in enumerate(rows_by_target):
+                pulls = [{"number": r["number"], "state": "open", "body": r.get("body", ""),
+                          "author_association": "OWNER",
+                          "head": {"ref": "sparq-agent/x", "sha": "0" * 40,
+                                   "repo": {"full_name": names[index]}},
+                          "user": {"login": "u", "type": "User"},
+                          "labels": r.get("labels", [])}
+                         for r in rows if "pull_request" in r]
+                for kind, items in (("issues", rows), ("pulls", pulls)):
+                    with open(os.path.join(workdir, f"raw-{kind}-{index}.json"), "w",
+                              encoding="utf-8") as handle:
+                        _json.dump({"complete": True, "items": items}, handle)
+            with open(os.path.join(workdir, "trusted-bots.json"), "w", encoding="utf-8") as handle:
+                _json.dump({name: [] for name in names}, handle)
+            saved = (sys.argv[:], os.environ.get("TARGET_ROOT"), os.environ.get("PATH"))
+            os.environ["TARGET_ROOT"] = root
+            os.environ["PATH"] = bindir + os.pathsep + (saved[2] or "")
+            sys.argv = ["-", repos_path, workdir]
+            try:
+                printed = _captured(
+                    lambda: exec(_readiness_source,                     # noqa: S102 — the step
+                                 {"__name__": "__main__"}))
+            finally:
+                sys.argv = saved[0]
+                os.environ["PATH"] = saved[2] or ""
+                if saved[1] is None:
+                    os.environ.pop("TARGET_ROOT", None)
+                else:
+                    os.environ["TARGET_ROOT"] = saved[1]
+            with open(os.path.join(workdir, "issue-plan.json"), encoding="utf-8") as handle:
+                return _json.load(handle), printed
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+    def _issue(number, labels, pr=False, body=""):
+        row = {"number": number, "body": body, "state": "open",
+               "author_association": "OWNER", "user": {"login": "u", "type": "User"},
+               "issue_dependencies_summary": {"blocked_by": 0, "blocking": 0,
+                                              "total_blocked_by": 0, "total_blocking": 0},
+               "labels": [{"name": name} for name in labels]}
+        if pr:
+            row["pull_request"] = {"url": "u"}
+            row.pop("issue_dependencies_summary")
+        return row
+
+    def _planned(plan, index=0):
+        return sorted(item["number"] for item in plan["repositories"][index]["items"])
+
+    _READY = ["status:ready", "role:impl", "priority:P1"]
+
+    # (1) THE REGRESSION. An open PR holds `area:usage`; a ready issue wants it. PLAN must NOT
+    # offer that issue — CLAIM would drop it, AFTER the frontier committed, with no backfill.
+    # The sibling on the free `area:docs` must still be offered, so the assertion cannot be
+    # satisfied by an engine that simply stopped emitting anything.
+    _rows = [_issue(500, ["area:usage"], pr=True),
+             _issue(501, _READY + ["area:usage"]),
+             _issue(502, _READY + ["area:docs"])]
+    _plan, _out = _run_readiness([_rows], [_PR_AWARE_PLANNER])
+    chk("[#768] a row whose area an open PR HOLDS is not offered; its free sibling still is",
+        _planned(_plan), [502])
+    chk("[#768] ...and PLAN says how many PR rows entered its occupancy",
+        ("PLAN occupancy carries 1 open pull-request row(s)" in _out,
+         "NOT pull-request-aware" in _out),
+        (True, False))
+
+    # (2) MONOTONICITY, by execution: the SAME board with the PR removed must offer BOTH rows.
+    # Widening occupancy can only ADD holds, so #502 can never be lost by adding the PR half —
+    # under-serialisation is the corrupting direction and this pins the sign of the change.
+    _plan_free, _ = _run_readiness([[r for r in _rows if "pull_request" not in r]],
+                                   [_PR_AWARE_PLANNER])
+    chk("[#768] monotonicity: removing the PR row can only ADD offers, never remove one",
+        (_planned(_plan_free), set(_planned(_plan)) <= set(_planned(_plan_free))),
+        ([501, 502], True))
+
+    # (3) THE PARKED PR. A parked PR reserves nothing (`occupies_area`), so its area is offered
+    # again. Without this the fix would be a one-way ratchet that never releases a crate.
+    _plan_parked, _ = _run_readiness(
+        [[_issue(500, ["area:usage", "review:needs-user"], pr=True),
+          _issue(501, _READY + ["area:usage"])]], [_PR_AWARE_PLANNER])
+    chk("[#768] a PARKED PR reserves nothing, so its area is offered again",
+        _planned(_plan_parked), [501])
+
+    # (4) THE GLOBAL-FALLBACK DECISION, PINNED. CLAIM does `areas |= issue_areas or
+    # {GLOBAL_PACKAGE}`; this side deliberately does NOT mirror it on the occupancy input.
+    # MEASURED on the live sparq snapshot (2026-07-27, 1473 issues / 119 PRs, list counts ==
+    # search total_count): 14 of 119 open PRs declare no `area:`, and making each seize
+    # `__global__` takes PLAN's frontier from 3 ready + 5 deferred rows to 0 + 0 — the
+    # whole-fleet seizure `_reserving_packages` exists to prevent. An area-less PR must
+    # therefore NOT suppress an unrelated ready issue. If the two sides are ever unified,
+    # CLAIM is the side that moves.
+    _plan_noarea, _ = _run_readiness(
+        [[_issue(500, [], pr=True), _issue(501, _READY + ["area:usage"])]], [_PR_AWARE_PLANNER])
+    chk("[#768] an area-less open PR reserves NOTHING — CLAIM's `or {GLOBAL}` is NOT adopted",
+        _planned(_plan_noarea), [501])
+
+    # (5) THE INTERLOCK, against THIS repository's own planner, unmodified. `ready_candidates`
+    # here has no `pull_request` guard, so a PR row carrying the readiness labels would be
+    # DISPATCHED as though it were an issue — an impl worker launched against a pull-request
+    # number. The probe must refuse it, say why, and leave today's behaviour exactly in place.
+    _own_rows = [_issue(500, _READY + ["area:usage"], pr=True),
+                 _issue(502, _READY + ["area:docs"])]
+    _plan_own, _out_own = _run_readiness([_own_rows], [None])
+    chk("[#768] this repo's OWN planner is refused PR rows — and never plans one as an issue",
+        (500 in _planned(_plan_own), _planned(_plan_own)), (False, [502]))
+    chk("[#768] ...and the refusal is LOUD, naming the reason and the unreserved count",
+        ("::warning::" in _out_own, "NOT pull-request-aware" in _out_own,
+         "DISPATCHES a pull-request row" in _out_own,
+         "1 open PR row(s) were NOT reserved" in _out_own),
+        (True, True, True, True))
+
+    # (6) THE PROBE'S SECOND OBLIGATION, on its own. Mutation found this hole: dropping the
+    # EFFECT check left every other assertion green, because the only non-PR-aware planner in
+    # this suite (this repo's own) fails the SAFETY check FIRST, so EFFECT never decided
+    # anything. A planner that is SAFE — it skips PR rows as candidates — but silently ignores
+    # them as occupants is the case that matters: it makes the whole change an expensive no-op,
+    # and passing it PR rows would let PLAN offer a row an open PR holds while reporting success.
+    _INERT_PLANNER = _PR_AWARE_PLANNER.replace(
+        'if "pull_request" in it or (L & IN_FLIGHT):', "if L & IN_FLIGHT:")
+    _plan_inert, _out_inert = _run_readiness(
+        [[_issue(500, ["area:usage"], pr=True), _issue(501, _READY + ["area:usage"])]],
+        [_INERT_PLANNER])
+    chk("[#768] a planner that IGNORES PR occupancy is refused too, naming that reason",
+        ("does not RESERVE a pull request's declared area" in _out_inert,
+         "NOT pull-request-aware" in _out_inert,
+         "PLAN occupancy carries" in _out_inert),
+        (True, True, False))
+
+    # (7) THE PROBE'S FAIL-CLOSED PATH. [#773 adversarial review, BLOCKING] The code claims
+    # "a probe that raises is a planner we cannot characterise, so it gets no PR rows", and
+    # flipping that handler's `return False` to `return True` left the ENTIRE suite green — a
+    # fail-OPEN predicate on the one interlock whose whole job is preventing the outage. A
+    # planner whose `compute_ready` raises is exactly the hostile/incompatible target the probe
+    # exists for, and it must be refused, not admitted on the strength of an exception.
+    _RAISING_PLANNER = _PR_AWARE_PLANNER.replace(
+        "def compute_ready(issues, in_progress_packages=None):",
+        "def compute_ready(issues, in_progress_packages=None):\n"
+        "    if any('pull_request' in it for it in issues):\n"
+        "        raise RuntimeError('planner cannot handle PR rows')")
+    # Caught rather than allowed to propagate ON PURPOSE. When the probe fails open, the planner's
+    # exception escapes the readiness step and kills the whole sweep for EVERY target — a real
+    # traceback, but a crash-kill reads as "the harness broke", and the fact under test is that
+    # PLAN must survive this planner and refuse it. Catching turns it into a NAMED red row.
+    try:
+        _plan_raise, _out_raise = _run_readiness(
+            [[_issue(500, ["area:usage"], pr=True), _issue(501, _READY + ["area:usage"])]],
+            [_RAISING_PLANNER])
+        _raise_outcome = (
+            "probe raised RuntimeError" in _out_raise, "NOT pull-request-aware" in _out_raise,
+            "PLAN occupancy carries" in _out_raise, _planned(_plan_raise))
+    except Exception as exc:                                       # noqa: BLE001
+        _raise_outcome = f"the sweep DIED for every target: {type(exc).__name__}: {exc}"
+    chk("[#768] a planner whose compute_ready RAISES is refused — the probe fails CLOSED",
+        _raise_outcome, (True, True, False, [501]))
+
+    # (8) THE DEFERRED LANE. It used to be handed `deferred_input` ALONE — a list `retry_gated`
+    # filters to `status:deferred` rows, so it contained no occupant of any kind and reserved
+    # ZERO keys (MEASURED on the live snapshot: 0 keys held, against 48 in the ready lane). A
+    # deferred retry therefore launched onto a crate an in-flight issue owned, which CLAIM's
+    # busy union CANNOT catch — it enumerates `sparq-agent/*` PR heads, not in-progress issues.
+    # MEASURED: 3 such rows on the live board (#2767 `upstream`, #2951 `workspace`, #4423
+    # `sparq-zk-compose`), each with no PR holder at all.
+    _def = ["status:deferred", "role:impl", "priority:P1"]
+    _plan_def, _ = _run_readiness(
+        [[_issue(600, ["area:usage"], pr=True),
+          _issue(601, ["status:in-progress", "role:impl", "priority:P1", "area:docs"]),
+          _issue(602, _def + ["area:usage"]),
+          _issue(603, _def + ["area:docs"]),
+          _issue(604, _def + ["area:free"])]], [_PR_AWARE_PLANNER])
+    chk("[#768] the DEFERRED lane reserves the PR half and the in-flight issue half too",
+        _planned(_plan_def), [604])
+
     # issue #112: a MULTI-area issue reserves the serializing GLOBAL partition, NOT the
     # alphabetically-first area — else a busy secondary area (here 'worker') could not exclude
     # it and it would double-dispatch. A single-area issue still reserves just that area.

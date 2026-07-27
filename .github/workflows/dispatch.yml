@@ -290,10 +290,14 @@ jobs:
               target = root / str(index)
               repo_trusted_bots = set(trusted_bots_map.get(repo, []))
               dispatch = load_dispatch(target / "scripts" / "dispatch-plan.py")
-              raw = [
-                  issue for issue in snapshot("issues", index)
-                  if isinstance(issue, dict) and "pull_request" not in issue
-              ]
+              # `/issues?state=open` returns PR rows too. `raw` stays the ISSUE half — the
+              # blocker-union block below, `details`, `roleless_ready` and the deferred lane are
+              # all issue-shaped and must not change. The PR half is kept separately and folded
+              # into OCCUPANCY only (issue #768).
+              snapshot_rows = [issue for issue in snapshot("issues", index)
+                               if isinstance(issue, dict)]
+              raw = [issue for issue in snapshot_rows if "pull_request" not in issue]
+              pr_rows = [issue for issue in snapshot_rows if "pull_request" in issue]
               # NATIVE GitHub dependency edges, UNIONED with the legacy `Blocked-by: #NN` body
               # markers. Until this landed, THIS LINE was the whole of the dispatcher's notion of
               # "blocked": a regex over the issue BODY. GitHub issue dependencies are generally
@@ -392,6 +396,79 @@ jobs:
 
               pulls = snapshot("pulls", index)
               linked = linked_issue_numbers(pulls, repo)
+              # [#768] EXECUTED end-to-end by scripts/dispatch-plan.py --self-test, which
+              # extracts this STEP'S WHOLE python heredoc and runs it over a synthetic
+              # two-target fixture. No `>>> ... <<<` sentinels here on purpose: nothing
+              # extracts this range on its own, and a marker implying a guard it does not
+              # have is the vacuity class this repo already tracks.
+              # PLAN reserved the ISSUE half of every unit of work and never the PR half: the PR
+              # rows were filtered out of the readiness input above, so `compute_ready` saw an
+              # `area:` free whenever the only thing holding it was an open PR. MEASURED on the
+              # live sparq snapshot: the issue half alone holds 39 partition keys, the union with
+              # the PR half holds 48, and 7 of PLAN's 9 frontier rows landed in one of the 9 keys
+              # only a PR held. CLAIM's busy_packages_of_pulls dropped those 7 afterwards, so they
+              # were never double-dispatched — but it dropped them AFTER compute_ready had
+              # committed the frontier, and a selected row that is removed later frees its package
+              # with NO backfill (issue #113's shape, one layer up). Widening PLAN's occupancy can
+              # only ADD holds, never release one, so it cannot fail open.
+              #
+              # NOT unconditional. `dispatch.yml` plans EVERY target with that target's OWN
+              # readiness engine, and a PR row is only safe input to an engine that understands
+              # one. sparq's `compute_ready` reserves a PR's declared areas and `ready_candidates`
+              # skips any row carrying `pull_request`; the registry's own planner (this repo, the
+              # second target) does NEITHER — handed a PR row it would treat it as a dispatch
+              # CANDIDATE and launch an impl worker against a pull-request number, and reserve
+              # `__global__` for each of the 34 area-less open PRs, taking its own frontier to 0.
+              # So the capability is PROBED BY EXECUTION against the loaded planner, never sniffed
+              # from a version or an attribute, and a planner that fails the probe keeps exactly
+              # today's behaviour and says so loudly. Fail-closed: a probe that raises is a
+              # planner we cannot characterise, so it gets no PR rows.
+              def pr_row_aware(planner):
+                  """Can `planner.compute_ready` be handed PR rows? Two OBLIGATIONS, both run.
+
+                  1. SAFETY — a PR row is never selected as a dispatch candidate. An engine that
+                     returns it would have PLAN emit a plan row whose `number` is a PR.
+                  2. EFFECT — a PR row actually reserves the `area:` keys it declares, so an
+                     otherwise-ready issue on that key is held. An engine that ignores PR rows
+                     would make this whole block an expensive no-op, which must not pass silently.
+                  """
+                  probe = ["status:ready", "priority:P0", "role:impl", "area:__pr_probe__"]
+                  pr = {"number": 999000001, "state": "OPEN", "labels": list(probe),
+                        "open_blockers": 0, "pull_request": {}}
+                  rival = {"number": 999000002, "state": "OPEN", "labels": list(probe),
+                           "open_blockers": 0}
+                  try:
+                      alone = [row.get("number") for row in planner.compute_ready([pr])]
+                      paired = [row.get("number") for row in planner.compute_ready([pr, rival])]
+                  except Exception as exc:                        # noqa: BLE001 — hostile target
+                      return False, f"probe raised {type(exc).__name__}"
+                  if alone or 999000001 in paired:
+                      return False, "planner DISPATCHES a pull-request row as if it were an issue"
+                  if paired:
+                      return False, "planner does not RESERVE a pull request's declared area"
+                  return True, "reserves PR areas and never dispatches a PR row"
+
+              occupancy_input = []
+              pr_aware, pr_aware_why = pr_row_aware(dispatch)
+              if pr_aware:
+                  for pull in pr_rows:
+                      pr_number = pull.get("number")
+                      if not isinstance(pr_number, int) or pr_number <= 0:
+                          raise SystemExit("target pull-request row is malformed")
+                      occupancy_input.append({
+                          "number": pr_number,
+                          "state": "OPEN",
+                          "labels": label_names(pull),
+                          "open_blockers": 0,
+                          "pull_request": {},
+                      })
+                  print(f"{repo}: PLAN occupancy carries {len(occupancy_input)} open pull-request "
+                        f"row(s) — {pr_aware_why}")
+              else:
+                  print(f"::warning::{repo}: target readiness engine is NOT pull-request-aware "
+                        f"({pr_aware_why}) — PLAN reserves the ISSUE half of every unit of work "
+                        f"and never the PR half, so its frontier may offer rows CLAIM will drop "
+                        f"with no backfill. {len(pr_rows)} open PR row(s) were NOT reserved.")
               # Apply the trust + linked-PR exclusions BEFORE the frontier is selected (issue #113:
               # post-frontier filters leave dispatchable holes). compute_ready commits to a
               # conflict-free, priority-ordered frontier, so a candidate removed AFTER selection
@@ -403,7 +480,12 @@ jobs:
               # still RESERVE their package in its taken-seeding, so dropping an in-progress row
               # that is itself linked/untrusted would free a busy crate and fail OPEN into a
               # double-dispatch. PLAN stays advisory — CLAIM re-derives trust + linkage exactly.
-              ready_input = [
+              # `occupancy_input` (the PR half, #768) is prepended for the SAME reason the
+              # in-progress rows are kept: it is pure occupancy the engine reserves and never
+              # selects. It is deliberately NOT subjected to the trust/linked filters — those
+              # decide whether a CANDIDATE may be dispatched, and applying them to an occupant
+              # would free a crate an untrusted author's open PR is really holding.
+              ready_input = occupancy_input + [
                   row for row in readiness_input
                   if "status:in-progress" in row["labels"]
                   or "status:in-progress-review" in row["labels"]
@@ -483,8 +565,30 @@ jobs:
                       "labels": sorted((labels - {"status:deferred"}) | {"status:ready"}),
                   })
               # <<< deferred-retry-filter
+              # [#768] EXECUTED end-to-end by the same whole-heredoc harness.
+              # The deferred lane used to be handed `deferred_input` ALONE. `deferred_input` is
+              # filtered to `status:deferred` rows and `retry_gated` excludes both in-progress
+              # labels, so by construction it contained NO occupant at all — the only occupancy
+              # the lane ever saw was `in_progress_packages=taken`, which is the packages of the
+              # rows the READY lane just selected. Every in-flight issue and every open PR was
+              # therefore FREE in this lane. MEASURED on the live sparq snapshot: 12 of the 17
+              # deferred rows PLAN emitted land in a key an open occupant already holds, and 2 of
+              # them (#2951 on `workspace`, #4423 on `sparq-zk-compose`) are held ONLY by an
+              # in-progress ISSUE — which CLAIM's `busy_packages_of_pulls` cannot see at all,
+              # because it enumerates `sparq-agent/*` PR heads and neither key has one. Those two
+              # are not "burned at CLAIM with no backfill"; they are launched, putting a second
+              # worker on a partition an in-progress issue owns. That is the UNDER-SERIALISED,
+              # silently-corrupting direction, so this lane gets the same occupancy the ready lane
+              # gets: the PR half (when the planner is PR-aware) and the in-flight issue half,
+              # which the engine reserves and never selects.
+              in_flight_input = [
+                  row for row in readiness_input
+                  if "status:in-progress" in row["labels"]
+                  or "status:in-progress-review" in row["labels"]
+              ]
               deferred_ready = dispatch.compute_ready(
-                  deferred_input, in_progress_packages=taken)
+                  occupancy_input + in_flight_input + deferred_input,
+                  in_progress_packages=taken)
 
               routing_doc = dispatch._routing_doc()
               flagged_rows = [(row, False) for row in dispatch.plan_dispatch(ready, routing_doc)]
