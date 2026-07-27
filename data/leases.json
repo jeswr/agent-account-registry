@@ -1,16 +1,6 @@
 {
  "leases": [
   {
-   "account": "51bde6688e140866",
-   "claim_id": "59d0dec56832405cbaae14b957200d13",
-   "holder": "sparq-org/sparq#3048@30231692802.1",
-   "package": "sparq-vectors",
-   "role": "ci",
-   "model": "opus5",
-   "issued_at": 1785118475,
-   "expires_at": 1785124775
-  },
-  {
    "account": "58b7c92faa5b5ca5",
    "claim_id": "9da753c04b8842d7b1f3c8e7c70e269f",
    "holder": "fix:sparq-org/sparq#3865@dispatch-30231311865.1",
