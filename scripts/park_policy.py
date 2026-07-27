@@ -1392,15 +1392,19 @@ def park_reason_records(comments, bot_login, log=print):
 #            worker-pr writes at both injection park sites is "flagged possible prompt injection"
 #            / "flagged possible prompt-injection content". Tier A is also what makes a body
 #            carrying BOTH a negation and an affirmative fail CLOSED.
-#   TIER B — every REMAINING mention denies UNLESS its negation is PROVEN: a recognised negator
-#            must govern that mention from inside the mention's OWN sentence, with nothing between
-#            the two that breaks the negator's reach (a contrast word, a coordination, or a verb
-#            that starts a fresh predicate). "Cannot prove a negation" is NOT "is a negation" — it
-#            denies.
+#   TIER B — every REMAINING mention denies UNLESS the text is PROVEN to assert that injection is
+#            ABSENT. That is a POLARITY question, not a "is there a negator nearby" question, and
+#            conflating the two is what round 1 of this change got wrong: "prompt injection was
+#            not RULED OUT" has a negator governing its predicate and asserts injection is
+#            PRESENT. Tier B therefore computes polarity from three inputs — VOICE, a governing
+#            negator, and the mention's own predicate parsed against CLOSED verb sets — combined
+#            by one explicit table (_INJECTION_POLARITY). See the block above that table.
+#            "Cannot prove absence" is NOT "is absent" — it denies.
 #
 # THE RELEASE CONDITION, in full: no affirmative marker anywhere AND every single mention proven
-# negated. Everything else denies, including anything unclassifiable — a non-string body or a
-# failure inside the classifier itself (see injection_prose_denied's except arm).
+# ABSENT. Everything else denies, including anything unclassifiable — a tail the closed grammar
+# cannot parse, a non-string body, or a failure inside the classifier itself (see
+# injection_prose_denied's except arm).
 #
 # WHAT DID NOT CHANGE. The mention TERM is byte-identical to the pattern this rule has always
 # used (`prompt[- ]injection`, case-insensitive; the old separate `possible prompt injection`
