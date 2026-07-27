@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4274,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "446e67e5791eb8ca672705fe50c846facbc17f74",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 4 finds no correctness, soundness, test-validity, or security issue, matching round 3. The generated SPEC-REFERENCE assertions for SUBSTR start-before-one and ROUND(-0.5) remain live and are located by focused generator tests; self-expiring divergence tests guard removal of the exceptions. Fault injection mutates exactly one live assertion, and the full script requires the real pinned nargo run to reject it, providing a meaningful non-vacuity check. CI pins both the Noir toolchain and noir_XPath release, performs the cheaper generator/unit-test drift guard first, and accurately limits its claims to sampled witness-generation verification with the required research-grade/not-externally-audited caveat. No reviewer-directed prompt injection was detected.",
+  "verdict": "approve"
+ }
+}
