@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# [OPUS-4.8] Registry self-management: static (no-LLM) issue triage for jeswr/agent-account-registry.
+# Registry self-management: static (no-LLM) issue triage for jeswr/agent-account-registry.
 # Modeled on the sparq target's scripts/triage.py, adjusted for the registry's area:* sections and
 # its trust-surface soundness lane. Applied by .github/workflows/triage-issue.yml.
 """triage.py — the deterministic, no-LLM part of issue triage.
@@ -46,6 +46,8 @@ import re
 import subprocess
 import sys
 
+ROLE_LABELS = frozenset({"docs", "impl", "ci", "research", "site"})
+
 # ---------------------------------------------------------------------------------------------------
 # TRUST-PLANE ROLE — INTERIM MAPPING (TODO: registry #582 / #225).
 #
@@ -59,7 +61,7 @@ import sys
 # `match_labels` security rule is evaluated before ANY role route. The security rule's keyword list
 # is IDENTICAL to SEC_KEYWORDS below (asserted by the self-test), so every issue this branch fires
 # on is — by construction — matched by the Phase-1 security override and routed to
-# model_chain ["opus5", "opus"] / agent registry-reviewer / escalate=true, and its eventual PR is
+# model_chain ["opus5"] / agent registry-reviewer / escalate=true, and its eventual PR is
 # HUMAN-armed (worker-pr.py / dispatch-claim.py read the same match_labels keywords). The role
 # label's own chain is NEVER consulted for these issues, so the role label only has to (a) exist
 # and (b) be a configured role route so route-resolve does not raise UnknownRoleError.
@@ -95,7 +97,6 @@ TRUST_PLANE_ROLE = "impl"
 # SEC_KEYWORD as a substring, and the set of ROLE_BY_KIND keys mapped to TRUST_PLANE_ROLE must be
 # EXACTLY this tuple — adding a trust-plane kind without Phase-1 coverage fails the suite.
 TRUST_PLANE_KINDS = ("security",)
-
 ROLE_BY_KIND = {"docs": "docs", "research": "research", "ci": "ci", "site": "site",
                 **{kind: TRUST_PLANE_ROLE for kind in TRUST_PLANE_KINDS}}
 ROLE_BY_TYPE = {"feature": "impl", "bug": "impl", "task": "impl", "chore": "ci",
@@ -655,6 +656,21 @@ def _self_test():
         triage(["priority:P1", "area:worker"], "feature")["role"], TRUST_PLANE_ROLE)
     chk("dispatch -> trust-plane role", triage(["priority:P1", "area:dispatch"], "feature")["role"],
         TRUST_PLANE_ROLE)
+    # The shared catalog pins every role this planner may derive. Every derivation source must
+    # remain representable.
+    derived_roles = set(ROLE_BY_KIND.values()) | set(ROLE_BY_TYPE.values()) | {
+        _role([label], "task") for label in UI_SURFACE_LABELS + INFRA_SURFACE_LABELS
+    } | set(AREA_ROLE_DEFAULT.values())
+    chk("all derived roles have labels", derived_roles <= set(ROLE_LABELS), True)
+    # Exact regression: applying the plan for a trust-surface issue which starts at role:impl
+    # leaves exactly one representable role, never a transiently planned roleless end state.
+    labels = {"role:impl", "area:worker", "priority:P2", "from:agent"}
+    r = triage(labels)
+    final_labels = (labels | r["add"]) - r["remove"]
+    final_roles = {lb for lb in final_labels if lb.startswith("role:")}
+    chk("trust role replacement is exactly-one", final_roles, {f"role:{TRUST_PLANE_ROLE}"})
+    chk("trust role replacement plans no churn when the target is already present",
+        (f"role:{TRUST_PLANE_ROLE}" in r["add"], "role:impl" in r["remove"]), (False, False))
     # [FABLE-5] UI-surface ownership: dashboard work derives role:site (codex-led chain, e4098b9);
     # kind:docs about the dashboard stays docs.
     chk("dashboard -> site", triage(["priority:P2", "area:dashboard"], "feature")["role"], "site")
@@ -819,6 +835,9 @@ def _self_test():
             "area:dispatch", "area:worker", "area:usage", "area:docs", "area:ci",
             "area:workflows", "area:dashboard", "area:review-loop", "area:groom",
             "trust:untrusted"}
+    chk("catalog == the pinned live role labels",
+        {f"role:{role}" for role in ROLE_LABELS},
+        {label for label in REAL if label.startswith("role:")})
     chk("trust-plane role label EXISTS in the registry label set",
         f"role:{TRUST_PLANE_ROLE}" in REAL, True)
     chk("role:soundness is NOT a registry label (the #582 root cause)",
@@ -852,7 +871,7 @@ def _self_test():
         sorted(SEC_KEYWORDS), sorted({k for rule in sec_rules for k in rule["match_labels"]}))
     chk("the security route human-escalates + runs the soundness chain",
         [(rule["model_chain"], rule["agent"], bool(rule.get("escalate"))) for rule in sec_rules],
-        [(["opus5", "opus"], "registry-reviewer", True)])
+        [(["opus5"], "registry-reviewer", True)])
     chk("TRUST_PLANE_ROLE has a configured role route in routing.toml",
         TRUST_PLANE_ROLE in {route.get("role") for route in doc.get("route", [])
                              if "match_labels" not in route}, True)
@@ -880,6 +899,16 @@ def _self_test():
         (1, True, True))
     chk("[#582] missing target label still leaves exactly one role on the issue",
         _roles_of((fixture | r["add"]) - r["remove"]), {"role:docs"})
+    # An explicit role on a NON-trust surface reaches the same live-label check. It is preserved
+    # verbatim and diagnosed when the repository does not have that label; a static catalog must
+    # never silently pre-empt this fail-closed path.
+    fixture = {"priority:P2", "role:soundness", "area:docs"}
+    r = triage(fixture, "task", known_labels=REAL)
+    warning = r["warnings"][0] if r["warnings"] else ""
+    chk("[#582] missing explicit role is preserved and warned on a non-trust surface",
+        (r["role"], _roles_of((fixture | r["add"]) - r["remove"]), len(r["warnings"]),
+         "role:soundness" in warning),
+        ("soundness", {"role:soundness"}, 1, True))
     # missing target AND no existing role -> NOT ready (recoverable untriaged), never ready+roleless.
     r = triage(["priority:P1", "area:dispatch"], "task",
                known_labels=REAL - {f"role:{TRUST_PLANE_ROLE}"})
@@ -1094,7 +1123,7 @@ def _self_test():
     policy_resolve = load_sibling("policy-resolve.py", "registry_policy_resolve")
     policy_doc = tomllib.load(open(os.path.join(root, "policy/repos.toml"), "rb"))
     SELF_REPO = "jeswr/agent-account-registry"
-    SOUNDNESS = (["opus5", "opus"], "registry-reviewer", True)
+    SOUNDNESS = (["opus5"], "registry-reviewer", True)
 
     def resolved(labels):
         """(derived role, route-resolve verdict, policy-resolve verdict) for a POST-TRIAGE label
@@ -1128,9 +1157,18 @@ def _self_test():
             (TRUST_PLANE_ROLE, SOUNDNESS, SOUNDNESS))
     # DISCRIMINATION: the enumeration above is not vacuously true — a NON-trust-plane kind must NOT
     # escalate (otherwise the check would pass even if every issue were force-escalated).
+    # [OPUS-5] `kind:research` was the second sample here and now escalates BY DESIGN: the
+    # 2026-07-26 deprecation collapsed role=research to a single rung (opus5), and a one-rung
+    # chain with no `escalate` has no exit at all — on an opus5 outage it could only defer
+    # forever with no human notified. It is replaced by `kind:site`, which is still a genuine
+    # non-escalating route, so the discrimination remains real rather than being dropped.
     chk("[#595 f1] a non-trust-plane kind is NOT escalated (the enumeration discriminates)",
         [resolved(["priority:P1", "area:usage", "kind:docs"])[1][2],
-         resolved(["priority:P1", "area:usage", "kind:research"])[1][2]], [False, False])
+         resolved(["priority:P1", "area:usage", "kind:site"])[1][2]], [False, False])
+    # ...and research DOES escalate now — asserted so the change above is a pinned decision, not
+    # an unnoticed side effect of the deprecation.
+    chk("[OPUS-5] role:research escalates (single-rung chain must have a human exit)",
+        resolved(["priority:P1", "area:usage", "kind:research"])[1][2], True)
 
     # -----------------------------------------------------------------------------------------------
     # [PR #595 finding 2] THE ARGV ENTRYPOINT IS PINNED TO THE WORKFLOW'S OWN ARGUMENT LIST.

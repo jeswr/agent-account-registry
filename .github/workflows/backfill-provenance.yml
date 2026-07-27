@@ -1,9 +1,16 @@
 # Manual recovery for worker PRs missing their registry provenance record — the #96 outage
 # population (worker succeeded, the provenance job's protected-master write failed) and any
 # pre-migration stragglers. Runs scripts/backfill-provenance.py, which reconstructs the
-# implementer identity ONLY from trusted run-log lines (the historical claim line, or the
-# failed provenance job's own env echo — job-prefix-anchored so model output can never forge
-# it) and writes records to the `ledger` data-plane branch. DRY RUN unless apply=true.
+# implementer identity ONLY from trusted run-log lines — the failed provenance job's own command
+# and env echoes (REQUIRED, and bound to this PR by `--pr` or `HEAD_BRANCH`), corroborated by the
+# claim job's lease line — job-prefix-anchored so model output can never forge it, and writes
+# records to the `ledger` data-plane branch. Both worker.yml invocation shapes are read (#712).
+# A PR it cannot resolve is reported with a SPECIFIC reason (log unreadable / no anchored source /
+# sources disagree / partial evidence / binding mismatch / author mismatch) and left fail-closed
+# invisible — the reasons are distinct because the responses are. Recording provenance and
+# converting a PR to draft are INDEPENDENT actions (#726): a PR already in the merge queue, armed,
+# or `review:pass` is recorded but never drafted, because drafting evicts it from the queue.
+# DRY RUN unless apply=true.
 name: backfill-provenance
 run-name: backfill-provenance ${{ inputs.target_repo }} apply=${{ inputs.apply }}
 
@@ -17,6 +24,13 @@ on:
         type: string
       apply:
         description: Write records + convert to draft (false = dry run)
+        required: false
+        default: false
+        type: boolean
+      no_draft_convert:
+        description: >-
+          Record provenance ONLY, never touch draft state. Belt-and-braces over the review-state
+          predicate, which already refuses to draft a queued/armed/review:pass PR (issue #726).
         required: false
         default: false
         type: boolean
@@ -91,6 +105,7 @@ jobs:
           PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
           TARGET_REPO: ${{ inputs.target_repo }}
           APPLY: ${{ inputs.apply }}
+          NO_DRAFT_CONVERT: ${{ inputs.no_draft_convert }}
           ROUTING_FILE: ${{ steps.policy.outputs.routing_file }}
         run: |
           set -euo pipefail
@@ -98,4 +113,5 @@ jobs:
           args=(--target-repo "$TARGET_REPO" --registry-repo "$GITHUB_REPOSITORY" \
                 --routing-file "$ROUTING_FILE")
           if [[ "$APPLY" == "true" ]]; then args+=(--apply); fi
+          if [[ "$NO_DRAFT_CONVERT" == "true" ]]; then args+=(--no-draft-convert); fi
           python3 scripts/backfill-provenance.py "${args[@]}"

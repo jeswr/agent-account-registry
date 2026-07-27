@@ -41,6 +41,21 @@ if _retry_spec is None or _retry_spec.loader is None:
 ledger_retry = importlib.util.module_from_spec(_retry_spec)
 _retry_spec.loader.exec_module(ledger_retry)
 
+# The fleet-shared bounded-retry layer for IDEMPOTENT READS (registry #563 adoption item 4).
+# worker-pr.py was the LAST registry caller not using it, and that gap is measured: over a 200-run
+# `worker.yml` sample (2026-07-26 02:51Z -> 17:21Z) ~4.8% of publishing runs lost their provenance
+# record to a SINGLE un-retried `repos/<target>/pulls/<N>` read — the live re-verification GET in
+# provenance_record, which runs BEFORE any registry PUT. A PR published without a provenance record
+# fails closed to `__global__` in dispatch-claim.busy_packages_of_pulls and reserves every crate,
+# which starved the worker lane four times on 2026-07-26 (sparq #3641/#4185/#4212/#4222) and needed
+# a human to park the holder each time. See _gh_read_with_retry for the hard scope rule: READS only.
+_gh_retry_spec = importlib.util.spec_from_file_location(
+    "registry_gh_retry", Path(__file__).resolve().parent / "gh_retry.py")
+if _gh_retry_spec is None or _gh_retry_spec.loader is None:
+    raise RuntimeError("cannot load shared gh retry policy")
+gh_retry = importlib.util.module_from_spec(_gh_retry_spec)
+_gh_retry_spec.loader.exec_module(gh_retry)
+
 REVIEW_LABELS = ("review:needs", "review:changes", "review:pass", "review:needs-user",
                  "review:parked")
 LABEL_COLOURS = {
@@ -203,6 +218,21 @@ PARK_GENERATION_MARKER = "<!-- sparq-park-generation:v1"
 # re-admission has to be provable after the labels are gone, exactly like a human's unlabel.
 # Bot-authored + reserved-namespace like every other durable marker.
 AUTO_READMIT_MARKER = "<!-- sparq-auto-readmit:v1"
+# [registry #797] The MACHINE-TERMINAL (retirement) receipt — the FOURTH member of the
+# park-receipt family, and a DISTINCT marker for the same reason the other two are: it records a
+# disposition, not a consumed window, and folding it into the generation receipts would corrupt
+# the counter they ARE. Fields: `window=<ladder window key> generation=<n>`.
+#
+# It records that park_ladder_decision returned `machine-terminal`: the loop re-admitted this PR
+# itself (park_policy invariant 3), the PR exhausted its budget again, and
+# PARK_MACHINE_TERMINAL_GENERATIONS machine-minted windows are now spent. That establishes the
+# approach is not converging — and establishes NOTHING about a human's attention — so the exit is
+# a MACHINE-owned retirement (review:parked stands, the draft PR is CLOSED, the source issue is
+# handed back for architect decomposition) rather than the human-owned review:needs-user terminal
+# this used to page with. It is ALSO the convergence key: the ladder dedupes the window on the
+# next tick, so a retirement whose close/hand-back half died mid-write is re-driven from this
+# receipt instead of being stranded half-done.
+PARK_RETIREMENT_MARKER = "<!-- sparq-park-retired:v1"
 # The window key for the initial no-cutoff window — mirrors park_policy.PARK_WINDOW_NONE
 # (kept literal here so the pure marker parser needs no module load; never valid ISO-8601, so
 # it cannot collide with a real cutoff).
@@ -224,7 +254,30 @@ SAFE_ALIAS_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 # provider ladder is REJECTED (hostile-input surface: a forged marker must never select an
 # arbitrary provider_model — concrete ids are still resolved from protected target routing by
 # alias).
-ESCALATION_LADDERS = {"anthropic": ["opus", "fable", "opus5"], "openai": ["luna", "sol"]}
+def _load_sibling_module(name, filename):
+    """Load a sibling script by path. The scripts/ dir is not a package and several filenames are
+    hyphenated, so a plain `import` is not available."""
+    spec = importlib.util.spec_from_file_location(
+        name, Path(__file__).resolve().with_name(filename))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+ESCALATION_LADDERS = {"anthropic": ["opus5"], "openai": ["luna", "sol"]}
+# [OPUS-5] 2026-07-26: the anthropic ladder lost its `opus` and `fable` rungs to the deprecation,
+# leaving ONE rung. Consequences, both deliberate:
+#   * `pinned_fix_chain("anthropic", "opus5") == ["opus5"]` — still terminates.
+#   * `decide_budget` can no longer mint an `extend-model-pin` on the anthropic side: with no tier
+#     ABOVE opus5, a stagnant opus5 fix goes straight to `needs-user`. That is the correct
+#     fail-closed exit (a human looks at it) rather than a silent extra round on a retired model.
+# The register is IMPORTED, never re-declared — see scripts/deprecated_models.py for why history
+# reads migrate up instead of raising.
+_deprecated = _load_sibling_module("registry_deprecated_models", "deprecated_models.py")
+assert_no_deprecated = _deprecated.assert_no_deprecated
+migrate_tier = _deprecated.migrate_tier
+migrate_tiers = _deprecated.migrate_tiers
+_deprecated.assert_table_clean("ESCALATION_LADDERS", ESCALATION_LADDERS)
 PROGRESS_VALUES = ("improving", "stagnant", "regressing")
 HARD_CAP_ROUNDS = 6  # absolute bound on review rounds across BOTH extension mechanisms
 REVIEWED_SHA_RE = re.compile(r"<!-- sparq-reviewed-sha:([0-9a-f]{40}|none) -->")
@@ -535,6 +588,28 @@ def park_generation_records(comments, bot_login, log=print):
     return records
 
 
+def park_retirement_windows(comments, bot_login, log=print):
+    """[registry #797] The window keys whose MACHINE-TERMINAL retirement is already receipted
+    (PARK_RETIREMENT_MARKER). Bot-authored only, like every marker parser: a forged marker must
+    be able neither to fabricate a retirement nor to suppress a due one.
+
+    A malformed window field is treated as ABSENT with a loud log — the same direction
+    park_generation_records takes, and for the same reason: an unreadable receipt must delay the
+    disposition (which the next tick re-derives) rather than fabricate one that never happened."""
+    pattern = re.escape(PARK_RETIREMENT_MARKER) + r" window=(\S+) generation=([0-9]+) -->"
+    policy = _park_policy()
+    windows = set()
+    for comment in _bot_comments(comments, bot_login):
+        for match in re.finditer(pattern, str(comment.get("body", ""))):
+            window = match.group(1)
+            if window != PARK_WINDOW_NONE and not policy.valid_timestamp(window):
+                log(f"::warning::malformed park-retirement receipt window {window!r} treated as "
+                    "absent — the retirement is re-derived rather than assumed")
+                continue
+            windows.add(window if window == PARK_WINDOW_NONE else policy.canonical_ts(window))
+    return windows
+
+
 def auto_readmission_records(comments, bot_login, log=print):
     """Every WELL-FORMED bot-authored AUTOMATIC-readmission receipt (AUTO_READMIT_MARKER) as
     {"key": evidence key, "at": canonical recovery stamp} — the durable record of each machine
@@ -562,6 +637,125 @@ def auto_readmission_records(comments, bot_login, log=print):
     return records
 
 
+# The ABSORBING-PARK receipt (registry #764) — the THIRD member of the park-receipt family, and
+# again a DISTINCT marker for the same reason AUTO_READMIT_MARKER is: the generation receipts ARE
+# the escalation ladder's counter, so a receipt written on a tick that consumed NO window must not
+# be able to advance it. Fields: `state=<observing|retired> window=<ladder window key> at=<canonical
+# stamp>`.
+#
+# It records that the item landed on an ABSORBING ladder action (park_policy.PARK_ABSORBING_ACTIONS
+# — an outcome with no exit of its own) and starts the bounded clock that
+# park_policy.absorbing_park_disposition ages. Two properties carry the whole bound:
+#   - it is keyed on the ladder WINDOW, and only a human gesture mints a new window key, so a
+#     re-admitted item cannot inherit the aged clock of the park it was admitted out of; and
+#   - the OLDEST live receipt for a window is the streak start, so the grace is consumed exactly
+#     once per window no matter how many ticks observe it.
+ABSORBING_PARK_MARKER = "<!-- sparq-park-absorb:v1"
+# Every `state` an absorbing-park receipt may carry. `observing` starts the bounded clock;
+# `retired` is the durable record that the question-class terminal was reached for that window.
+ABSORBING_PARK_STATES = ("observing", "retired")
+
+
+def absorbing_park_records(comments, bot_login, log=print):
+    """Every WELL-FORMED bot-authored absorbing-park receipt as
+    {"state": str, "window": key, "at": canonical stamp}.
+
+    Bot-authored only, like every marker parser: a forged receipt must be able neither to age a
+    streak toward retirement nor to suppress the observation that starts one.
+
+    Malformed-field direction, matching park_generation_records: a receipt whose `at` will not
+    parse is DROPPED with a loud log. It can prove no elapsed time, so the streak reads as
+    younger (or absent) and the next tick re-observes — retirement is DELAYED, never fabricated.
+    An unrecognised `state` is likewise dropped: a value this code does not understand must not
+    be assumed to mean "still waiting"."""
+    pattern = (re.escape(ABSORBING_PARK_MARKER)
+               + r" state=(\S+) window=(.+?) at=(\S+) -->")
+    policy = _park_policy()
+    records = []
+    for comment in _bot_comments(comments, bot_login):
+        for match in re.finditer(pattern, str(comment.get("body", ""))):
+            state, window, stamp = match.group(1), match.group(2), match.group(3)
+            if state not in ABSORBING_PARK_STATES:
+                log(f"::warning::absorbing-park receipt state {state!r} is unrecognised — "
+                    "treated as absent; the next tick re-observes")
+                continue
+            if not policy.valid_timestamp(stamp):
+                log(f"::warning::malformed absorbing-park receipt stamp {stamp!r} treated as "
+                    "absent — the retirement clock counts only well-formed receipts")
+                continue
+            if window != PARK_WINDOW_NONE:
+                if not policy.valid_timestamp(window):
+                    log(f"::warning::malformed absorbing-park receipt window {window!r} treated "
+                        "as absent — it can key no streak")
+                    continue
+                window = policy.canonical_ts(window)
+            records.append({"state": state, "window": window,
+                            "at": policy.canonical_ts(stamp)})
+    return records
+
+
+def absorbing_park_retired(comments, bot_login, window, log=print):
+    """True when this window's question-class terminal is ALREADY receipted — the durable "this
+    disposition was taken" record that caps retirement at exactly ONE per window.
+
+    Without it the terminal is only capped when the `needs:user` write LANDS: a sticky human
+    unpark vetoes the label, the item stays in the deferred-retry lane, and the next expired
+    clock retires it all over again. The receipt is the cap; the label is best-effort UI on top
+    — the same split the generation ladder already makes."""
+    return any(record["state"] == "retired"
+               for record in absorbing_park_records(comments, bot_login, log)
+               if record["window"] == window)
+
+
+def absorbing_park_streak(comments, bot_login, window, since=None, log=print):
+    """The canonical stamp of the OLDEST live `observing` receipt for `window` — the streak start
+    park_policy.absorbing_park_disposition ages — or "" when the clock is not running.
+
+    `since` (optional) is a canonical stamp BEFORE which receipts are stale: the caller passes the
+    most recent worker ATTEMPT stamp, so a park whose item was actually attempted again begins a
+    FRESH streak instead of inheriting the age of a pre-attempt observation. This is the same
+    "after the last failure" reset idiom escalate_persist_decision uses; without it, capacity that
+    recovered, dispatched, and re-parked would retire on a clock it never earned.
+
+    ALREADY-RETIRED WINDOWS RETURN "": once a window's terminal is receipted, its streak is spent.
+    Re-running the clock on it would let a single window retire twice (two `needs:user` writes,
+    two comments) — the receipt is the record that the disposition was already taken."""
+    policy = _park_policy()
+    records = [record for record in absorbing_park_records(comments, bot_login, log)
+               if record["window"] == window]
+    if any(record["state"] == "retired" for record in records):
+        return ""
+    live = [record["at"] for record in records if record["state"] == "observing"]
+    if since:
+        try:
+            floor = policy.parse_ts(since)
+            live = [stamp for stamp in live if policy.parse_ts(stamp) > floor]
+        except ValueError:
+            log(f"::warning::absorbing-park streak reset stamp {since!r} is unreadable — "
+                "ignoring every receipt for this window (the next tick re-observes)")
+            return ""
+    if not live:
+        return ""
+    return min(live, key=policy.parse_ts)
+
+
+def absorbing_park_receipt(state, window, at):
+    """The receipt BODY marker a caller appends (RECEIPT-FIRST) when an absorbing park is observed
+    or retired. ONE writer, one format — the reader above is keyed on exactly this shape."""
+    policy = _park_policy()
+    if state not in ABSORBING_PARK_STATES:
+        raise WorkerPrError(
+            f"absorbing-park receipt state {state!r} is not one of "
+            f"{', '.join(ABSORBING_PARK_STATES)}")
+    if not policy.valid_timestamp(at):
+        raise WorkerPrError("absorbing-park receipt needs a strict ISO-8601 stamp")
+    if window != PARK_WINDOW_NONE and not policy.valid_timestamp(window):
+        raise WorkerPrError("absorbing-park receipt window must be a cutoff or PARK_WINDOW_NONE")
+    key = window if window == PARK_WINDOW_NONE else policy.canonical_ts(window)
+    return (f"{ABSORBING_PARK_MARKER} state={state} window={key} "
+            f"at={policy.canonical_ts(at)} -->")
+
+
 def auto_readmission_marker_count(comments, bot_login):
     """How many bot-authored AUTO_READMIT_MARKER receipts a PR carries, WELL-FORMED OR NOT — the
     per-PR automatic-readmission cap counter (park_policy.AUTO_READMISSION_MAX). Counting markers
@@ -578,25 +772,54 @@ def auto_readmission_stamps(comments, bot_login, log=print):
     return [record["at"] for record in auto_readmission_records(comments, bot_login, log)]
 
 
+# The evidence-key namespace model-health stamps on its AGED-OUT park exit
+# (model-health.SUSTAINED_HEALTH_KEY_PREFIX, registry #691). The receipt below must not claim the
+# strong gate's finding when the weak one released the park: "the account that was failing when
+# this park landed has since succeeded" is simply FALSE for a park whose own cause aged out of the
+# 48 h window, and a receipt is the durable, public record of why automation acted. Keyed off the
+# namespace rather than a new parameter so no caller can post the wrong sentence by omission.
+AUTO_READMIT_HEURISTIC_PREFIX = "fleet-health/"
+
+
 def auto_readmission_receipt(evidence_key, recovered_at):
     """The receipt BODY a caller posts (RECEIPT-FIRST) before clearing any machine park label.
 
-    One writer, one format, one place the invariant is stated — see AUTO_READMIT_MARKER."""
+    One writer, one format, one place the invariant is stated — see AUTO_READMIT_MARKER. The
+    FINDING sentence follows the evidence namespace: cause-recovery evidence states the proof it
+    actually has, and the #691 aged-out exit states, in as many words, that it is a HEURISTIC
+    about fleet health and not a proof about this park's own cause."""
     policy = _park_policy()
     if not policy.valid_timestamp(recovered_at):
         raise WorkerPrError("automatic-readmission receipt needs a strict ISO-8601 recovery stamp")
     stamp = policy.canonical_ts(recovered_at)
     if not isinstance(evidence_key, str) or not policy.safe_receipt_part(evidence_key):
         raise WorkerPrError("automatic-readmission receipt evidence key is unsafe")
-    return (f"> 🤖 SPARQ agent — automatically re-admitted this MACHINE capacity park: the "
-            f"starvation cause that parked it has demonstrably CLEARED.\n\n"
+    if evidence_key.startswith(AUTO_READMIT_HEURISTIC_PREFIX):
+        finding = (
+            "> 🤖 SPARQ agent — automatically re-admitted this MACHINE capacity park: its own "
+            "starvation cause can no longer be observed, and the fleet is demonstrably "
+            "healthy.\n\n"
+            f"This park is older than the rolling model-health window, so whether the specific "
+            f"condition that parked it has cleared is NOT provable any more — leaving it would "
+            f"make an automatic hold a permanent one. Instead the fleet has recorded sustained "
+            f"successful runs across multiple accounts with no launch failure, the most recent "
+            f"at `{stamp}` (evidence `{evidence_key}` — provider/account-fingerprint/run from "
+            f"the model-health window; no raw handle). **That is a HEURISTIC about fleet health, "
+            f"not proof that this park's own cause cleared.** The machine park label(s) are "
+            f"being removed and the review loop re-admitted with a real budget window.\n\n")
+    else:
+        finding = (
+            "> 🤖 SPARQ agent — automatically re-admitted this MACHINE capacity park: the "
+            "starvation cause that parked it has demonstrably CLEARED.\n\n"
             f"A worker account that was failing when this park landed recorded a SUCCESSFUL run "
             f"at `{stamp}`, strictly after the park application (evidence `{evidence_key}` — "
             f"provider/account-fingerprint/run from the model-health window; no raw handle). The "
-            f"machine park label(s) are being removed and the review loop re-admitted with a real "
-            f"budget window.\n\n"
-            f"This consumes that recovery evidence EXACTLY ONCE: the same evidence can never "
-            f"re-admit this PR again, a later park needs a NEW outage-and-recovery pair, and at "
+            f"machine park label(s) are being removed and the review loop re-admitted with a "
+            f"real budget window.\n\n")
+    return (f"{finding}"
+            f"This consumes that evidence EXACTLY ONCE: the same evidence can never re-admit "
+            f"this PR again, a later park needs FRESH evidence that has not been consumed (for "
+            f"the cause-recovery route, a new outage-and-recovery pair), and at "
             f"most {policy.AUTO_READMISSION_MAX} automatic re-admissions are ever granted to one "
             f"PR — past that the loop stops and asks a human. A human hold "
             f"(`{'` / `'.join(HUMAN_OWNED_LABELS)}`) and a human-applied park are never "
@@ -731,7 +954,13 @@ def pinned_fix_floor(comments, bot_login, provider):
     floor = None
     for comment in _bot_comments(comments, bot_login):
         for match in pattern.finditer(str(comment.get("body", ""))):
-            tier = match.group(2)
+            # [OPUS-5] a marker written BEFORE the 2026-07-26 deprecation names `opus`/`fable`.
+            # Migrate it up to opus5 rather than raising: raising here would permanently stall
+            # every in-flight PR that had escalated, and the floor may only ever rise, so the
+            # migrated tier cannot re-authorize anything the original pin forbade. A marker
+            # naming a genuinely unknown tier still raises (fail closed) — migrate_tier passes
+            # unknown values through unchanged.
+            tier = migrate_tier(match.group(2))
             if tier not in ladder:
                 raise WorkerPrError("recorded model pin is not a ladder member for this provider")
             if floor is None or ladder.index(tier) > ladder.index(floor):
@@ -744,6 +973,7 @@ def pinned_fix_chain(provider, floor):
     first. Tiers below the floor are never offered to the allocator — see the defer-not-fallback
     rationale on decide_budget."""
     ladder = ESCALATION_LADDERS.get(provider)
+    floor = migrate_tier(floor)   # [OPUS-5] accept a pre-deprecation floor; see pinned_fix_floor
     if not ladder or floor not in ladder:
         raise WorkerPrError("model pin must be a ladder member for its provider")
     return ladder[ladder.index(floor):]
@@ -813,16 +1043,26 @@ def decide_budget(rounds_used, per_round_models, latest_progress, provider,
         # declared cap — the existing bug continued at round 6 with base_rounds=8. Reject the
         # misconfiguration fail-closed rather than silently honouring a base the cap forbids.
         raise WorkerPrError("base_rounds must not exceed the absolute hard cap")
-    models = sorted(set(per_round_models))
+    # [OPUS-5] MIGRATE BEFORE VALIDATING. These three inputs are HISTORY read back off the PR
+    # (recorded fix-round models, pending fix markers, the pinned floor). After the 2026-07-26
+    # deprecation an in-flight PR whose earlier rounds ran on `opus` or `fable` carries markers
+    # naming tiers the ladder no longer has — validating those raw would raise here on EVERY tick
+    # and stall a PR that was healthy before the config change. Mapping them UP to opus5 is safe:
+    # the floor may only ever rise, so a migrated rung can never lower a pin or re-authorize a
+    # tier the pin forbade. New CONFIG naming a retired tier is still rejected (assert_table_clean
+    # on ESCALATION_LADDERS above) — only history migrates.
+    models = sorted(set(migrate_tiers(per_round_models)))
     for model in models:
         if model not in ladder:
             raise WorkerPrError("a recorded fix-round model is not a ladder member")
-    pending = sorted(set(pending_fix_models))
+    pending = sorted(set(migrate_tiers(pending_fix_models)))
     for model in pending:
         if model not in ladder:
             raise WorkerPrError("a pending fix-round model is not a ladder member")
-    if pin_floor is not None and pin_floor not in ladder:
-        raise WorkerPrError("pin_floor must be a ladder member for its provider")
+    if pin_floor is not None:
+        pin_floor = migrate_tier(pin_floor)
+        if pin_floor not in ladder:
+            raise WorkerPrError("pin_floor must be a ladder member for its provider")
     if latest_progress is not None and latest_progress not in PROGRESS_VALUES:
         raise WorkerPrError("latest_progress must be improving, stagnant, regressing, or None")
     # The absolute hard cap is evaluated BEFORE the base-budget continuation (issue #163): were
@@ -1118,13 +1358,28 @@ def diff_fingerprint(files):
 
 
 def decide_review(verdict, has_blockers, injection, round_n, max_rounds, security,
-                  budget_action="needs-user"):
+                  budget_action="needs-user", self_attested=False):
     """The review-verdict state machine. Every path arms once, requests one fix round, or stops
     at a human — never loops unboundedly. On round-budget exhaustion the caller supplies
     decide_budget's action: an extension (model pin or improving progress) keeps the loop in
     `changes`, bounded by decide_budget's own hard cap; anything else (including the fail-closed
-    default) stops at a human."""
+    default) stops at a human.
+
+    [registry #657 follow-up] ``self_attested`` — the orchestrator class — can NEVER reach "arm".
+    Its provenance record was written by the same actor that wrote the diff, so the record's
+    `impl_provider` is an assertion about itself, and that field is what the lane INVERTS to pick
+    the reviewer's side. A false declaration therefore yields a same-provider review that still
+    LOOKS cross-provider (design record §3, the irreducible difficulty). Option 2(b)'s whole
+    argument for admitting the class at all is that the residual risk of a mis-declared provider
+    degrades to an ADVISORY COMMENT, never an unreviewed merge — so an approve on this class
+    becomes a human hand-off, exactly as an injection flag does. Defaults False."""
     if injection:
+        return "needs-user"
+    if self_attested and verdict == "approve" and not has_blockers:
+        # Approved, and NOT armed: the human arms this class. (`needs-user` is the existing
+        # human-hand-off path — findings are still posted, the PR is labelled and the maintainer
+        # is pinged, so an enrolled PR that passes review is visibly ready rather than silently
+        # dropped.)
         return "needs-user"
     if verdict == "approve" and not has_blockers:
         # Decision 7 REVISED (maintainer 2026-07-18: approved PRs were parking needs:user
@@ -1154,6 +1409,60 @@ def decide_fix(injection, made_changes, gate_ok, pushed, nochange_runs, gatefail
 
 
 # ---- GitHub I/O ----------------------------------------------------------------------------------
+# gh prints the HTTP status in two shapes: `HTTP 404: Not Found` and `gh: Not Found (HTTP 404)`.
+# Both are matched so a caller (and a human reading a run log) can tell a transient 5xx / secondary
+# rate-limit 403 apart from a genuine 404 / permission refusal.
+_GH_STATUS_RE = re.compile(r"HTTP[ :]*([1-5]\d\d)\b|\(HTTP ([1-5]\d\d)\)")
+_GH_STDERR_EXCERPT_MAX = 200
+
+
+def _gh_error_detail(result):
+    """Observable classification of a FAILED `gh` invocation: the HTTP status, the retry class, the
+    classifier's REASON, and a redacted single-line stderr excerpt.
+
+    Registry #677 comment 5: `_run_gh` discarded `gh`'s stderr entirely, so a transient 5xx, a
+    secondary-rate-limit 403 and a genuine 404/permission refusal all reached the operator as the
+    single opaque line `GitHub API request failed for repos/<o>/<r>/pulls/<N>`. That is why ~4.8% of
+    provenance losses went unnoticed for a month: the log could not distinguish "retry would have
+    worked" from "this PR does not exist". The excerpt crosses a PUBLIC sink (run logs + ops-alert
+    issue bodies), so it is redacted (issue #135) and length-capped.
+
+    Registry #748: the status now comes from `gh_retry` FIRST (`GhResult.gh_http_status`), which
+    recovers it from the `GH_DEBUG=api` response line when gh's own message swallowed it — the exact
+    case that made #729 report `http=unknown class=permanent attempts=1/5` on 4/4 real failures.
+    `class`/`reason` are the READ policy's verdict (`gh_retry.classify_read_failure`), so the log
+    line says what the retry layer actually decided rather than what a narrower table would guess.
+    For a WRITE (`_run_gh`) the class is therefore advisory only: writes are never replayed."""
+    text = (getattr(result, "stderr", "") or getattr(result, "stdout", "") or "").strip()
+    status = getattr(result, "gh_http_status", None)
+    if not status:
+        match = _GH_STATUS_RE.search(text)
+        status = (match.group(1) or match.group(2)) if match else None
+    retryable, reason = gh_retry.classify_read_failure(text, status)
+    excerpt = _redact_public_text(" ".join(text.split()))[:_GH_STDERR_EXCERPT_MAX]
+    return {
+        "status": status,
+        "transient": retryable,
+        "reason": getattr(result, "gh_retry_reason", None) or reason,
+        "excerpt": excerpt,
+        "exit": getattr(result, "returncode", None),
+    }
+
+
+def _gh_error_message(args, result, *, attempts=1):
+    """The fail-LOUD message for a failed `gh` call. Keeps the historical
+    `GitHub API request failed for <endpoint>` prefix (log greps and backfill-provenance.py's
+    operator guidance key on it) and APPENDS the status/class/reason/attempts/stderr that used to be
+    thrown away."""
+    endpoint = args[1] if len(args) > 1 else "request"
+    detail = _gh_error_detail(result)
+    return (f"GitHub API request failed for {endpoint} "
+            f"(exit={detail['exit']} http={detail['status'] or 'unknown'} "
+            f"class={'transient' if detail['transient'] else 'permanent'} "
+            f"reason={detail['reason']} "
+            f"attempts={attempts}): {detail['excerpt'] or 'no stderr'}")
+
+
 def _run_gh(args, *, input_text=None, check=True, env=None):
     merged_env = None
     if env:
@@ -1161,7 +1470,7 @@ def _run_gh(args, *, input_text=None, check=True, env=None):
     result = subprocess.run(["gh", *args], input=input_text, capture_output=True, text=True,
                             check=False, env=merged_env)
     if check and result.returncode != 0:
-        raise WorkerPrError(f"GitHub API request failed for {args[1] if len(args) > 1 else 'request'}")
+        raise WorkerPrError(_gh_error_message(args, result))
     return result
 
 
@@ -1172,6 +1481,122 @@ def _gh_json(args, *, input_doc=None, env=None):
         return json.loads(raw or "null")
     except json.JSONDecodeError as exc:
         raise WorkerPrError("GitHub API returned malformed JSON") from exc
+
+
+def _gh_read_with_retry(args, *, env=None):
+    """Run ONE idempotent `gh` READ through the fleet-shared bounded-retry layer.
+
+    Returns `(CompletedProcess, attempts_used)` — the caller keeps its own returncode handling and
+    fail-loud error type exactly as with `_run_gh(check=False)`; only the loop/sleep mechanics are
+    delegated (gh_retry's contract).
+
+    HARD SCOPE RULE, enforced STRUCTURALLY rather than by convention: `gh_retry.read_cli_reject` is
+    the same predicate the shell entrypoint uses, and it admits only read verbs / `gh api` GETs with
+    no request body. A mutation routed here is REFUSED, never retried — an ambiguous transient
+    failure does not prove GitHub skipped a write, so replaying one could duplicate a comment,
+    repeat a state transition, or write a second provenance record."""
+    listed = list(args)
+    reason = gh_retry.read_cli_reject(listed)
+    if reason:
+        raise WorkerPrError(f"refusing to retry a non-read gh call: {reason}")
+    merged_env = {**os.environ, **env} if env else None
+    attempts = [1]
+
+    def _sleep(attempt, retry_after=None):
+        attempts[0] = attempt + 1
+        gh_retry.sleep_backoff(attempt, retry_after)
+
+    result = gh_retry.run_gh(listed, env=merged_env, sleep=_sleep)
+    # gh_retry counts the attempts it actually spent; the sleep hook can only see the retries it was
+    # asked to perform, so prefer the layer's own count (they agree, and disagreeing would mean the
+    # loop returned without sleeping — exactly the shape registry #748 is about).
+    return result, getattr(result, "gh_attempts", attempts[0])
+
+
+# Stable, greppable marker for a provenance read that never resolved. Emitted with the target repo
+# and PR (or head branch) so the loss is ATTRIBUTABLE from the run log alone — the previous silent
+# shape is what made the ~4.8% rate invisible until it was reconstructed from 200 runs by hand.
+PROVENANCE_READ_FAILURE_MARKER = "PROVENANCE-READ-FAILED"
+# Registry #748. The DEEPER defect behind #729 was not the missing retry: it was that the retry layer
+# could report `attempts=1/5` for an entire error class and nobody could see it until four run logs
+# were read by hand. This marker is the standing detector for that shape — a provenance read that
+# failed WITHOUT a recoverable status and WITHOUT being retried. Under the current classifier it is
+# unreachable (a statusless read failure retries by rule, `gh_retry.classify_read_failure`), so any
+# occurrence means either a newly narrowed classifier or a new gh behaviour, and it is loud on the
+# first instance rather than the fifth.
+PROVENANCE_RETRY_VACUITY_MARKER = "PROVENANCE-RETRY-VACUOUS"
+
+
+def _retry_vacuity_alarm(*, status, attempts, retryable, endpoint):
+    """The `PROVENANCE-RETRY-VACUOUS` line for a read that failed blind AND unretried, or "" when
+    the retry layer behaved. Pure so the guard can assert it directly."""
+    if status or attempts > 1 or retryable:
+        return ""
+    return (f"{PROVENANCE_RETRY_VACUITY_MARKER} endpoint={endpoint} attempts={attempts}"
+            f"/{gh_retry.MAX_ATTEMPTS} — the read failed with NO recoverable HTTP status and was "
+            f"NOT retried, so the bounded-retry budget is vacuous for this error class "
+            f"(registry #748: this is the #729 regression signature, not a transient outage)")
+
+
+def _provenance_read(args, *, target_repo, subject, env=None):
+    """The provenance path's ONE idempotent-read primitive: bounded retry on transient classes, and
+    a COUNTED, ATTRIBUTABLE fail-loud on exhaustion or refusal.
+
+    Registry #677: a worker that cannot record provenance publishes a PR that reserves `__global__`
+    and stalls the whole fleet, so this failure must never be a log line nobody reads. On failure it
+    emits FOUR observable, machine-consumable artifacts before raising:
+
+      1. the stable `PROVENANCE-READ-FAILED` log line naming repo + PR/branch + http status + class
+         + attempts — the same run-log substrate `scripts/backfill-provenance.py` already reads;
+      2. an Actions `::error` annotation, which the checks API counts and attributes to the run;
+      3. a `$GITHUB_STEP_SUMMARY` row, durable on the run itself and needing no extra permission;
+      4. a deduped ops-alert issue when — and ONLY when — an alert route is configured. It is NOT
+         configured on worker.yml's `provenance` job today (no `REGISTRY_REPO`/`ALERT_TOKEN`, and
+         that job deliberately holds no `issues: write` beside `PROVENANCE_SALT`), exactly like
+         `_registry_put_file`'s existing terminal alert. Artifacts 1-3 are the ones that fire there.
+
+    It does NOT weaken the fail-closed rule downstream: a PR whose record is absent still takes
+    `__global__` in dispatch-claim.busy_packages_of_pulls."""
+    result, attempts = _gh_read_with_retry(args, env=env)
+    if result.returncode == 0:
+        try:
+            return json.loads(result.stdout or "null")
+        except json.JSONDecodeError as exc:
+            raise WorkerPrError("GitHub API returned malformed JSON") from exc
+    detail = _gh_error_detail(result)
+    klass = "transient" if detail["transient"] else "permanent"
+    endpoint = args[1] if len(args) > 1 else "request"
+    summary = (f"{PROVENANCE_READ_FAILURE_MARKER} repo={target_repo} {subject} "
+               f"endpoint={endpoint} http={detail['status'] or 'unknown'} class={klass} "
+               f"reason={detail['reason']} attempts={attempts}/{gh_retry.MAX_ATTEMPTS}")
+    print(f"worker-pr: {summary}", flush=True)
+    print(f"::error title=provenance read failed::{summary} — no provenance record will be "
+          f"written for this PR, so it will reserve the __global__ partition until backfilled",
+          flush=True)
+    vacuity = _retry_vacuity_alarm(status=detail["status"], attempts=attempts,
+                                   retryable=detail["transient"], endpoint=endpoint)
+    if vacuity:
+        print(f"worker-pr: {vacuity}", flush=True)
+        print(f"::error title=bounded retry is vacuous for this error class::{vacuity}", flush=True)
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary_path:
+        try:
+            with open(summary_path, "a", encoding="utf-8") as handle:
+                handle.write(f"- `{summary}`\n")
+                if vacuity:
+                    handle.write(f"- `{vacuity}`\n")
+        except OSError as exc:  # best-effort — never mask the operational error below
+            print(f"step-summary write failed (non-fatal): {exc}", file=sys.stderr)
+    _ops_alert(*_alert_route(),
+               f"⚠️ Worker provenance read failing — {target_repo}",
+               f"> 🤖 SPARQ agent — `{summary}`.\n\n"
+               f"The live re-verification read failed, so **no provenance record was written**. "
+               f"That PR is invisible to the review sweep and reserves the `__global__` partition "
+               f"in `dispatch-claim.busy_packages_of_pulls` until `scripts/backfill-provenance.py` "
+               f"recovers it. Last API error: {detail['excerpt'] or 'no stderr'}\n\n"
+               f"`class=transient` means the bounded retry budget was exhausted (availability); "
+               f"`class=permanent` means GitHub refused (404/permission) and retrying cannot help.")
+    raise WorkerPrError(_gh_error_message(args, result, attempts=attempts))
 
 
 def _paginated_comments(repo, pr_number):
@@ -1663,6 +2088,7 @@ def record_model_pin(repo, pr_number, round_n, tier, provider, run_key, bot_logi
     """Durably pin the fix-model floor after a budget extension (idempotent: an existing
     equal-or-higher recorded floor wins — the floor only ever moves UP the ladder)."""
     ladder = ESCALATION_LADDERS.get(provider)
+    tier = migrate_tier(tier)   # [OPUS-5] a caller carrying a pre-deprecation tier converges up
     if not ladder or tier not in ladder:
         raise WorkerPrError("model pin tier must be a ladder member for its provider")
     comments = _paginated_comments(repo, pr_number)
@@ -2088,7 +2514,14 @@ def provenance_record(registry_repo, target_repo, pr_number, head_sha, impl_prov
     if not re.fullmatch(r"[0-9a-f]{16}", impl_account_h or ""):
         raise WorkerPrError("impl_account_h must be a 16-hex salted account hash")
     if verify_bot_login:
-        pull = _gh_json(["api", f"repos/{target_repo}/pulls/{pr_number}"])
+        # Registry #677: THE read that lost ~4.8% of provenance records. It is an idempotent GET
+        # that runs BEFORE any registry PUT, so a bounded retry on transient classes is safe and
+        # changes nothing about what is accepted — every verification below is unchanged, and an
+        # exhausted retry or a genuine refusal still raises rather than recording anything.
+        pull = _provenance_read(["api", f"repos/{target_repo}/pulls/{pr_number}"],
+                                target_repo=target_repo, subject=f"pr={pr_number}")
+        if not isinstance(pull, dict):
+            raise WorkerPrError("GitHub API returned a malformed pull request")
         if pull.get("state") != "open":
             raise WorkerPrError("provenance target PR is not open")
         if str((pull.get("user") or {}).get("login", "")) != verify_bot_login:
@@ -2229,8 +2662,13 @@ def reconcile_provenance(registry_repo, target_repo, head_branch, impl_provider,
     if not re.fullmatch(r"sparq-agent/issue-[1-9][0-9]*-[A-Za-z0-9._-]+", head_branch or ""):
         raise WorkerPrError("reconcile head branch is unsafe")
     owner = target_repo.split("/", 1)[0]
-    pulls = _gh_json([
-        "api", f"repos/{target_repo}/pulls?head={owner}:{head_branch}&state=open&per_page=100"])
+    # Same class, same job, same consequence (registry #677): an un-retried blip on THIS idempotent
+    # listing GET also ends the run with no record and a `__global__`-reserving PR. Routed through
+    # the same primitive so the fix is at the layer that binds — every read on the provenance path
+    # — rather than only at the one line the 8-record audit happened to sample.
+    pulls = _provenance_read(
+        ["api", f"repos/{target_repo}/pulls?head={owner}:{head_branch}&state=open&per_page=100"],
+        target_repo=target_repo, subject=f"branch={head_branch}")
     pr_number = select_reconcilable_pr(pulls, target_repo, verify_bot_login, issue, head_branch)
     if pr_number is None:
         print(f"reconcile: no open bot PR on {head_branch}; nothing to record")
@@ -2738,10 +3176,214 @@ def fix_lane_defer(repo, pr_number, stale_reason, proven_head, issue=None):
                     "applied": applied})
 
 
+# ---- stranded recovery: retract the reviewed-sha assertion the stranded posture disproves --------
+#
+# ISSUE #708 / THE REVIEW LANE'S NO-OP DISPATCH LOOP. `stranded` (dispatch-claim.enumerate_review_
+# items) is the recovery state for {DRAFTED, UNARMED, reviewed-sha == head, concluded-GREEN gate,
+# clean base} — the residue of an interrupted defuse/disarm. Its recovery action is "RE-review the
+# current head despite the matching marker" (issue #161), and dispatch-claim bypasses its own
+# already-reviewed guard for exactly that state.
+#
+# review-fix.yml does NOT have that carve-out. Its resolve step computes
+#     already_done = marker == head_sha
+# unconditionally, so EVERY stranded dispatch resolves, claims (or adopts) an account lease, runs
+# the `Skip an already-reviewed head` step, releases the lease, SKIPS the model job entirely — and
+# reports the whole run `success`. The recovery has therefore never once executed; the item is
+# re-planned and re-dispatched on every dispatch tick, forever, consuming a scarce reviewer lease
+# and its repository/package partition each time.
+#
+# MEASURED on master, 2026-07-26 12:00-17:10 UTC: 160 mode=review dispatches, 117 (73%) never ran a
+# model (the `Run` job's conclusion was `skipped`); 91 of those reported the workflow conclusion
+# `success`; five PRs accounted for 114 of the 117. In the 17:00 tick the review lane planned 12
+# items, "launched" 4, and exactly ONE of those four ran a model.
+#
+# This is the identical spin the #560 fix-lane hand-over closed one lane over, and dispatch-claim's
+# own #560 self-test comment already NAMES it ("green becomes `stranded` (whose review dispatch then
+# exits `already_done` with no work done: the same successful spin one lane over)"). The remedy is
+# the same, for the same reason, and it is NOT a weakening of the idempotence guard:
+#
+#   The marker is an ASSERTION — "a review of this exact head completed end-to-end". review-fix.yml's
+#   outcome job binds it LAST, after the lane label and the arm. A PR that is still a DRAFT, still
+#   UNARMED, and still carrying a matching marker is the registry's own proof that the outcome did
+#   NOT complete end-to-end. The assertion is FALSE, and it is exactly the false part that suppresses
+#   re-review. Writing UNBOUND_REVIEWED_SHA restores the marker's invariant (marker == head IFF a
+#   completed review outcome exists for that head). review-fix.yml's already_done predicate is left
+#   BYTE-IDENTICAL and keeps its full strength.
+#
+# The stand-down surface is the #560 surface, for the #560 reasons: a human hold, the machine
+# capacity park, or `review:pass` owns the PR and this recovery mutates NOTHING for any of them.
+# Two guards are added on top, because the stranded posture is *specifically* about arm state:
+#   * ARMED (a live auto_merge object) or NON-DRAFT — retracting the marker on an armed PR is what
+#     makes enumerate_disarm_items disarm + dequeue + redraft it (#584 follow-up finding 1). The
+#     stranded posture asserts armed is EXPLICITLY False, so an armed re-read means the posture
+#     evaporated between dispatch-claim's live re-derivation and this write: stand down.
+#   * the marker must NAME the head being recovered — a marker naming some other sha is already
+#     stale to the enumerator (re-review is already admitted) or belongs to a newer completed
+#     review this recovery has said nothing about.
+# Every one of those is decided BEFORE the first write, so "mutates nothing" is literally true of
+# each stand-down, and all reads happen AFTER the caller's own live re-derivation so a guard landing
+# in that window still wins.
+STRANDED_RECOVERY_ACTIONS = ("retract", "hold", "pass-hold", "armed-hold", "marker-mismatch")
+STRANDED_RECOVERY_QUIET_ACTIONS = ("hold", "pass-hold", "armed-hold", "marker-mismatch")
+
+
+def stranded_recovery_action(live_review, holds, armed, draft, live_marker, proven_head):
+    """PURE: what the stranded recovery must do, given the LIVE `review:*` label set, the LIVE hold
+    set (human holds + machine parks), the LIVE tri-state arm bit, the LIVE draft bit, the LIVE
+    reviewed-sha marker, and `proven_head` — the head whose stranded posture dispatch-claim
+    re-derived on live data.
+
+    - "hold" — a human hold or the machine capacity park is live: mutate NOTHING. A recovery is not
+      a park adjudication, and a park already excludes the PR from both lanes.
+    - "pass-hold" — `review:pass` is live: mutate NOTHING (#584 follow-up finding 1). The pass IS
+      the verdict; there is nothing for the review lane to produce, and retracting the marker of a
+      passed PR is precisely what disarms and re-drafts it.
+    - "armed-hold" — the PR is ARMED, is NOT a draft, or its arm bit is UNKNOWN: mutate NOTHING.
+      `armed` is tri-state exactly as in dispatch_claim.stranded_live — only an explicit False may
+      act, so a garbage/absent auto_merge shape never authorises the most destructive write in the
+      pipeline.
+    - "marker-mismatch" — the marker does not name `proven_head`: mutate NOTHING. Re-review is
+      either already admitted, or the marker belongs to a newer completed review.
+    - "retract" otherwise: write UNBOUND_REVIEWED_SHA so the review lane can actually run the model
+      this dispatch already paid a lease for.
+    """
+    if set(holds):
+        return "hold"
+    if PASS_LANE_PR_LABEL in set(live_review):
+        return "pass-hold"
+    if armed is not False or draft is not True:
+        return "armed-hold"
+    if live_marker != proven_head:
+        return "marker-mismatch"
+    return "retract"
+
+
+def stranded_recover(repo, pr_number, proven_head, issue=None):
+    """Issue #708: retract the reviewed-sha assertion a re-derived `stranded` posture disproves, so
+    the review lane's own recovery dispatch can run a model instead of exiting `already_done`.
+
+    Called from dispatch-claim.py's CLAIM step immediately after `stranded_live` re-derives the
+    posture and immediately BEFORE the review lease is claimed. The caller does NOT trust this
+    command's report: it re-reads the PR and refuses to spend a reviewer lease unless the marker
+    provably no longer names the head (so every stand-down below converges to a loud, counted,
+    attributed defer rather than to another silent no-op run).
+
+    Fails closed on a malformed `proven_head`, and is idempotent: once the marker is already
+    `none`, `stranded_recovery_action` returns "marker-mismatch" and nothing is written (and
+    set_reviewed_sha itself issues no PATCH for an already-canonical marker)."""
+    if not re.fullmatch(r"[0-9a-f]{40}", proven_head or ""):
+        raise WorkerPrError(
+            "stranded recovery requires the 40-hex --head-sha whose stranded posture was "
+            "re-derived live; without it the retraction cannot be targeted (refusing to touch "
+            "anything)")
+    holds = live_human_holds(repo, pr_number, issue)
+    parks = live_machine_parks(repo, pr_number, issue)
+    live_review = _live_review_labels(repo, pr_number)
+    pull = _gh_json(["api", f"repos/{repo}/pulls/{pr_number}"])
+    live_auto = pull.get("auto_merge")
+    armed = True if isinstance(live_auto, dict) else False if live_auto is None else None
+    draft = pull.get("draft")
+    live_marker = reviewed_sha_of(pull.get("body") or "")
+    action = stranded_recovery_action(
+        live_review, sorted(set(holds) | set(parks)), armed, draft, live_marker, proven_head)
+    if action in STRANDED_RECOVERY_QUIET_ACTIONS:
+        detail = {
+            "hold": f"live hold(s) {sorted(set(holds) | set(parks))} own the PR",
+            "pass-hold": f"{PASS_LANE_PR_LABEL} is live (review namespace "
+                         f"{sorted(live_review)}) — the pass IS the verdict, and retracting a "
+                         "passed PR's marker disarms and re-drafts it",
+            "armed-hold": f"the PR is not a provably UNARMED draft (armed={armed!r}, "
+                          f"draft={draft!r}) — the stranded posture evaporated",
+            "marker-mismatch": f"the reviewed-sha marker {live_marker or 'absent'!r} does not "
+                               f"name the recovered head {proven_head[:12]}",
+        }[action]
+        print(f"stranded recovery: NOTHING written for {repo}#{pr_number} — {detail}")
+        _write_outputs({"action": action, "marker": "keep"})
+        return
+    print(f"stranded recovery: {repo}#{pr_number} is a DRAFTED, UNARMED PR whose reviewed-sha "
+          f"marker still asserts {proven_head[:12]} was reviewed end-to-end, yet no completed "
+          "review outcome exists for it (the outcome job binds the marker LAST, after the lane "
+          f"label and the arm) — retracting the assertion to '{UNBOUND_REVIEWED_SHA}' so the "
+          "recovery re-review actually runs instead of exiting already_done with no work done")
+    set_reviewed_sha(repo, pr_number, UNBOUND_REVIEWED_SHA)
+    _write_outputs({"action": action, "marker": "invalidate"})
+
+
+def _retire_worker_pr(repo, pr_number, issue, policy, close_pr=None, patch_issue=None,
+                      read_issue=None, set_status=None, log=print):
+    """[registry #797] Execute a MACHINE-TERMINAL retirement: close the exhausted draft worker PR
+    and hand its WORK back to the source issue. IDEMPOTENT end to end — every step is a no-op
+    when it has already happened — because the `dedupe` arm re-drives it from the durable
+    receipt after a crash, and because a retirement that could only be applied once would strand
+    half of itself on the first transient.
+
+    THE PR HALF: `PATCH pulls/N state=closed`. A closed draft loses nothing — the branch, the
+    commits and the diff all survive and a human (or a later dispatch) can reopen it — while an
+    open one that will never be worked again keeps appearing in every enumeration, every sweep
+    and every read budget forever. This is the exit the machine class did not have: without it a
+    spent capacity park is ABSORBING (the registry #764 shape, PR-side), and "absorbing" is how
+    the 2026-07-18 mass park stayed live for eight days.
+
+    THE ISSUE HALF (park_policy.retirement_handback — PURE, tested there): a HUMAN-held source
+    issue is not touched at all; an issue still on `role:impl` is swapped to `role:research` for
+    architect decomposition, because two full budgets on the same approach is evidence about the
+    approach; anything already off the impl route is simply requeued (a second reroute would
+    loop). The role swap is a FULL label-set PATCH, never add-then-remove: the planner rejects an
+    issue with two role labels or none, and both interleavings can produce one.
+
+    EVERY step is best-effort and LOGGED. The authoritative record of the disposition is the
+    durable receipt the caller posted BEFORE calling this; a failed close or hand-back must not
+    raise back into the review outcome (the PR is correctly parked either way) and is re-driven
+    on the next tick. Fail direction on an unreadable source issue: hand nothing back — an issue
+    whose labels cannot be read cannot be proven free of a human hold."""
+    close_pr = close_pr or (lambda: _gh_json(
+        ["api", "-X", "PATCH", f"repos/{repo}/pulls/{pr_number}", "--input", "-"],
+        input_doc={"state": "closed"}))
+    read_issue = read_issue or (lambda: _gh_json(["api", f"repos/{repo}/issues/{issue}"]))
+    patch_issue = patch_issue or (lambda labels: _gh_json(
+        ["api", "-X", "PATCH", f"repos/{repo}/issues/{issue}", "--input", "-"],
+        input_doc={"labels": labels}))
+    set_status = set_status or (lambda status: _load_worker_issue().set_status(
+        repo, issue, status))
+    try:
+        close_pr()
+        log(f"machine retirement: closed {repo}#{pr_number} (branch and diff kept)")
+    except Exception as exc:  # noqa: BLE001 — the receipt is the record; a failed close retries
+        log(f"::warning::machine retirement: could not close {repo}#{pr_number} ({exc}); the "
+            "receipt stands and the next tick re-drives the close")
+    if not issue:
+        return
+    try:
+        live = read_issue()
+        labels = [label.get("name") if isinstance(label, dict) else label
+                  for label in (live.get("labels") or [])] if isinstance(live, dict) else None
+        if labels is None or any(not isinstance(name, str) for name in labels):
+            raise WorkerPrError("source issue labels are unreadable")
+    except Exception as exc:  # noqa: BLE001 — an unreadable issue is never handed back
+        log(f"::warning::machine retirement: source issue {repo}#{issue} is unreadable ({exc}) "
+            "— handing nothing back (an unreadable hold cannot be proven absent)")
+        return
+    action, desired, detail = policy.retirement_handback(labels)
+    if action == "hold":
+        log(f"machine retirement: source issue {repo}#{issue} left untouched — {detail}")
+        return
+    try:
+        if desired != sorted(labels):
+            patch_issue(desired)
+        # The issue re-enters the frontier: the machine park is lifted and the in-progress-review
+        # posture (whose PR just closed) is cleared. `set_status` re-checks the sticky human
+        # veto at its own write point, and applies no park label here.
+        set_status("handback")
+        log(f"machine retirement: source issue {repo}#{issue} handed back — {detail}")
+    except Exception as exc:  # noqa: BLE001 — best-effort; re-driven from the receipt next tick
+        log(f"::warning::machine retirement: hand-back of {repo}#{issue} failed ({exc}); the "
+            "retirement receipt stands and the next tick re-drives it")
+
+
 # ---- terminal escalation + arm --------------------------------------------------------------------
 def needs_user(repo, pr_number, reason, issue=None, alert_repo=None, alert_token=None,
                maintainer=None, park_class="question", bot_login="", head_sha="",
-               attempt_key=""):
+               attempt_key="", park_cause=""):
     """Loop stop: park labels on BOTH surfaces, an explanatory comment, and an ops-alert-style
     registry ping. The PR stays DRAFT.
 
@@ -2799,20 +3441,30 @@ def needs_user(repo, pr_number, reason, issue=None, alert_repo=None, alert_token
         # The ladder's window is the LATER of the proven-human readmission gesture and any
         # AUTOMATIC re-admission receipt (registry #614): an automatic re-admission grants the
         # same real budget window a human gesture grants, so a PR that was automatically
-        # re-admitted and then exhausted its budget AGAIN consumes a FRESH generation and still
-        # reaches the PARK_ESCALATION_GENERATIONS question-class terminal — it just gets there
-        # having actually retried. Without this the re-park would dedupe against the
-        # pre-recovery window forever and never escalate to a human. WINDOW_UNREADABLE still wins
-        # outright (the ladder must FREEZE on an unproven timeline).
-        cutoff = policy.effective_readmission_cutoff(
+        # re-admitted and then exhausted its budget AGAIN consumes a FRESH generation. Without
+        # this the re-park would dedupe against the pre-recovery window forever and never
+        # escalate at all. WINDOW_UNREADABLE still wins outright (the ladder must FREEZE on an
+        # unproven timeline).
+        #
+        # [registry #797] BUT WHICH LADDER that fresh generation is charged to depends on WHO
+        # opened the window, and readmission_window is what says so. This exact call site is the
+        # defect: it used to hand the ladder a bare cutoff string, so the loop's OWN automatic
+        # re-admissions were counted as human generations and the terminal below paged the
+        # maintainer with "This PR was human-readmitted" about a re-admission the maintainer
+        # never made. MEASURED on 35 live sparq PRs: 20 of the 21 carrying generation receipts
+        # had escalated on a window whose key is byte-identical to their own auto-readmit stamp;
+        # ZERO had escalated on a human's gesture.
+        window = policy.readmission_window(
             policy.readmission_cutoff(repo, pr_number, issue, _issue_timeline, is_human=probe,
                                       on_unreadable=policy.WINDOW_UNREADABLE),
             auto_readmission_stamps(comments, bot_login))
+        cutoff = window["cutoff"]
         records = park_generation_records(comments, bot_login)
         receipts = {record["window"] for record in records}
         fingerprint = policy.park_fingerprint(head_sha, attempt_key)
         action, window_key, generation = policy.park_ladder_decision(
-            cutoff, receipts, fingerprint=fingerprint,
+            cutoff, receipts, window_authority=window["authority"],
+            machine_windows=window["machine_windows"], fingerprint=fingerprint,
             consumed_fingerprints={record["fingerprint"] for record in records
                                    if record["fingerprint"]})
         if action == "freeze":
@@ -2821,6 +3473,16 @@ def needs_user(repo, pr_number, reason, issue=None, alert_repo=None, alert_token
                   "ladder never advances on unproven data)")
             return
         if action == "dedupe":
+            # [registry #797] CONVERGE A HALF-DONE RETIREMENT FIRST. The retirement is
+            # receipt-first, so a crash (or a transient GitHub failure) between the receipt and
+            # the close/hand-back leaves the PR receipted-but-open — and the ladder dedupes this
+            # window forever after, so without this arm the disposition would be stranded
+            # half-taken with nothing left to re-drive it. Every step is idempotent.
+            if window_key in park_retirement_windows(comments, bot_login):
+                print(f"machine retirement already receipted for window {window_key}; "
+                      "converging its close + source-issue hand-back (idempotent)")
+                _retire_worker_pr(repo, pr_number, issue, policy)
+                return
             print(f"capacity park already receipted for window {window_key}; awaiting a "
                   "fresh human gesture — no label/comment churn")
             return
@@ -2839,11 +3501,72 @@ def needs_user(repo, pr_number, reason, issue=None, alert_repo=None, alert_token
                              f"cutoff={window_key}"
                              f"{f' head={head_sha} attempt={attempt_key}' if fingerprint else ''}"
                              " -->")
+        # EVERY CAPACITY PARK STATES ITS CAUSE (registry #677 review finding). Until this, the
+        # capacity ladder wrote `review:parked` with a generation receipt and NO park-reason
+        # receipt, so nothing on the PR said which mechanism had parked it. A reader looking for
+        # "the newest park-reason receipt" therefore saw a cause from an OLDER, already-released
+        # episode and treated the ladder's park as that mechanism's to release — un-parking a PR
+        # that park_ladder_decision would then refuse to re-park (`dedupe`), leaving it un-parked
+        # AND un-parkable. `park_cause` is the narrow cause when the caller knows it; when it does
+        # not, the receipt still lands under the honest `capacity-unspecified`, because a park
+        # episode with no cause receipt at all is the hole. `park_reason_marker` DERIVES the class
+        # from the taxonomy, so an accidental question-class cause here raises rather than
+        # mislabelling a capacity park.
+        reason_marker = "\n\n" + policy.park_reason_marker(
+            park_cause if policy.park_cause_class(park_cause) == policy.PARK_CLASS_CAPACITY
+            else "capacity-unspecified",
+            generation=generation, head=head_sha or None)
+        if action == "machine-terminal":
+            # [registry #797] THE MACHINE'S OWN GIVE-UP. The loop re-admitted this PR itself
+            # (invariant 3 — proven cause-recovery, or the labelled sustained-fleet-health
+            # heuristic of #691) and it exhausted its budget again;
+            # PARK_MACHINE_TERMINAL_GENERATIONS machine-minted windows are now spent, which is
+            # every automatic chance AUTO_READMISSION_MAX allows. What that establishes is that
+            # the approach is not converging. What it does NOT establish is anything at all
+            # about a human's attention — so this exit is machine-owned end to end and the
+            # maintainer is not paged: the PR keeps the MACHINE `review:parked` class, the draft
+            # is CLOSED (its branch and its whole diff survive; nothing is deleted), and the
+            # WORK goes back to the source issue for architect decomposition rather than a
+            # third identical attempt.
+            #
+            # RECEIPT-FIRST, exactly like every other park write: the durable retirement receipt
+            # lands BEFORE the close and the hand-back, so a crash between them leaves
+            # receipt-no-disposition, which the `dedupe` arm above re-drives. The reverse order
+            # would close the PR with nothing on record saying why.
+            _comment(repo, pr_number,
+                     f"> 🤖 SPARQ agent — the autonomous review loop is RETIRING this pull "
+                     f"request: {reason}\n\n"
+                     f"This is a MACHINE-owned give-up, **not** a human question. The loop "
+                     f"parked this PR for capacity, re-admitted it **itself** on recorded "
+                     f"recovery evidence, and it exhausted its budget again — "
+                     f"{generation} machine-granted budget window(s) consumed (latest "
+                     f"{window_key}), which is every automatic re-admission "
+                     f"`AUTO_READMISSION_MAX` allows. No human re-admitted it and no human "
+                     f"decision is required here, so nobody is being paged.\n\n"
+                     f"What happens now: the PR is **closed** (the branch and the diff are "
+                     f"kept — reopen it at any time), and the source issue is handed back for "
+                     f"architect decomposition instead of a third identical attempt. Two full "
+                     f"review budgets on the same approach is evidence about the APPROACH, not "
+                     f"about the maintainer's inbox."
+                     f"\n\n{PARK_RETIREMENT_MARKER} window={window_key} "
+                     f"generation={generation} -->{generation_marker}{reason_marker}")
+            if not policy.park_vetoed(repo, pr_number, MACHINE_PARK_PR_LABEL,
+                                      _issue_timeline, is_human=probe):
+                set_review_state(repo, pr_number, "parked")
+            _retire_worker_pr(repo, pr_number, issue, policy)
+            print(f"machine retirement recorded (machine generation {generation}): {reason}")
+            return
         if action == "terminal":
             # Bounded escalation: PARK_ESCALATION_GENERATIONS windows consumed — repeated
             # post-readmission failure IS a human question now. The terminal label write is
             # veto-checked like every park write (round-3 finding 1), and the comment never
             # claims a label that did not land.
+            #
+            # [registry #797] Reaching HERE now PROVES a human opened the window this generation
+            # was charged to (park_ladder_decision refuses the human terminal on any other
+            # authority), which is what makes the "human-readmitted" sentence below true. It was
+            # not: 20 of the 21 live sparq escalations carrying receipts had reached this branch
+            # on the loop's OWN automatic re-admission.
             #
             # RECEIPT-FIRST ordering (round-4 finding 2): the veto is PROBED first (so the
             # receipt is honest about a suppressed write), the durable receipt is posted
@@ -2902,7 +3625,7 @@ def needs_user(repo, pr_number, reason, issue=None, alert_repo=None, alert_token
                  f"`{MACHINE_PARK_PR_LABEL}` here and `status:parked` on the source issue "
                  f"(whichever are present; a `needs:user` unlabel on either surface also "
                  f"opens the budget window) — the budget restarts from the latest gesture."
-                 f"{label_note}{generation_marker}")
+                 f"{label_note}{generation_marker}{reason_marker}")
         if parked:
             set_review_state(repo, pr_number, "parked")
         if issue:
@@ -3168,13 +3891,20 @@ def _queue_disarm_mutation(mutation, node_id):
         raise WorkerPrError(f"GraphQL {mutation} failed for the queued pull request")
 
 
-def disarm(repo, pr_number, when, preserve_review_state=False):
+def disarm(repo, pr_number, when, preserve_review_state=False, bot_login=""):
     """Defuse a worker PR's GitHub-side arm/ready state, fail-closed on LIVE data only (the plan
     row that requested this is hostile — every precondition is re-derived from the API here).
 
-    Trust surface mirrors the review enumerator: only an open, same-repo, bot-authored
-    `sparq-agent/*` PR is ever touched. A PR labelled review:needs-user OR needs:user is
-    human-owned, and when=always (the autonomous-fix defuse) stands down on it entirely — as it
+    Trust surface mirrors the review enumerator: only an open, same-repo, `sparq-agent/*` PR
+    authored by the EXACT App identity named in ``bot_login`` is ever touched (issue #570 — the
+    author gate used to accept ANY `[bot]` login, so a forged plan row could redraft, disable
+    auto-merge on, and relabel a same-repo PR belonging to a DIFFERENT GitHub App; the exact-
+    identity standard is the same one the re-post suppression already uses, see
+    ``verify_bot_login``). An EMPTY ``bot_login`` proves nothing and therefore disarms nothing:
+    both ``when=mismatch`` and ``when=always`` stand down rather than fall back to any-`[bot]`.
+
+    A PR labelled review:needs-user OR needs:user is human-owned, and when=always (the
+    autonomous-fix defuse) stands down on it entirely — as it
     does on a `needs:*`-parked head-ref-linked SOURCE issue, which it additionally consults so a
     fix push never rides into that human's territory. But when=mismatch — the issue #42 safety
     invariant, retracting a latch that would merge a never-reviewed tree — must NOT be blocked by
@@ -3222,6 +3952,15 @@ def disarm(repo, pr_number, when, preserve_review_state=False):
     if head_repo != repo or not head_match or not login.endswith("[bot]"):
         _write_outputs({"disarmed": False})
         print("disarm skipped: not a same-repo bot worker PR")
+        return
+    # Issue #570: EXACT App identity, both modes, no any-`[bot]` fallback. The three mutations
+    # below (dequeue/disable-auto, redraft, relabel) are writes to someone's PR; `[bot]` is a
+    # SUFFIX shared by every GitHub App with write access to this repo, so authorising on it let a
+    # forged `disarm_items` row aim the safety net at a foreign App's PR. An unsupplied identity
+    # is unprovable, not permissive — it fails closed here rather than widening the gate.
+    if not bot_login or login != bot_login:
+        _write_outputs({"disarmed": False})
+        print("disarm skipped: the PR author is not the expected App identity")
         return
     if preserve_review_state and not ({"review:needs", "review:changes"} & labels):
         raise WorkerPrError(
@@ -3514,7 +4253,7 @@ def _arm_auto_merge(repo, pr_number, reviewed_sha, attempts=ARM_ATTEMPTS, issue=
 
 def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, reviewer_provider,
                   reviewer_account, arm, issue=None, surface_paths=None, bot_login="",
-                  reviewed_base="", security_keywords=None):
+                  reviewed_base="", security_keywords=None, self_attested=False):
     """The ONLY place a PR can be armed. Fail-closed assertions per locked decision 6; a live-head
     mismatch returns the PR to review:needs (a fixer/other push raced the approval). [issue #139,
     round-4 P1] EVERY arm precondition — the hold surfaces (HUMAN_OWNED_LABELS on the PR, needs:*
@@ -3552,6 +4291,18 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
     issue labels vs the routing keywords), not just at resolve: a security label added mid
     review folds into the same audit trail (a True posture appends SECURITY_LABEL_AUDIT_HIT),
     so an auto-armed trust-plane change is audited whether it was flagged by path or by label."""
+    # [registry #657 follow-up] THE MERGE BOUNDARY for the orchestrator class, at the ONE place a
+    # PR can be armed. `decide_review` already refuses to return "arm" for a self-attested PR, so
+    # this is the second, independent refusal — placed HERE because "the arm never runs for the
+    # class" must be true of the arm, not of the state machine that usually precedes it. The
+    # cross-provider assertion below is derived by INVERTING the record's own `impl_provider`; on
+    # a self-attested record that field is an assertion by the implementer about itself, so the
+    # assertion proves nothing and must not be allowed to authorise a merge (design record §3).
+    if self_attested:
+        raise WorkerPrError(
+            "refusing to arm: the provenance record is self-attested (orchestrator class) — its "
+            "impl_provider is an assertion by the implementer about itself, so the cross-provider "
+            "inversion cannot be trusted to authorise a merge; a human arms this class")
     if reviewer_provider == impl_provider:
         raise WorkerPrError("refusing to arm: reviewer provider equals implementer provider")
     salt = os.environ.get("PROVENANCE_SALT", "")
@@ -3777,7 +4528,8 @@ def _apply_trust_surface_audit(repo, pr_number, hits, reviewed_sha, bot_login=""
 
 
 # ---- composite outcomes (thin workflow steps, testable decisions) --------------------------------
-def revalidate_outcome_head(state, login, draft, live_head, reviewed_sha, bot_login):
+def revalidate_outcome_head(state, login, draft, live_head, reviewed_sha, bot_login,
+                            self_attested=False):
     """Issue #156: gate EVERY review/fix outcome mutation on the live PR still being the exact
     reviewed commit — an OPEN, bot-authored, DRAFT PR whose head equals the sha the model ran
     against. Returns "ok", or a short stale reason ("closed"/"author"/"undrafted"/
@@ -3785,12 +4537,23 @@ def revalidate_outcome_head(state, login, draft, live_head, reviewed_sha, bot_lo
     findings never label a new head and a stale escalation never terminally parks a
     replacement head. Exact-head equality is STRICTER than the issue's ancestry requirement
     and subsumes it: a descendant head still means unreviewed commits are live. Pure and
-    fail-closed — an unreadable/unexpected shape yields a stale reason, never "ok"."""
+    fail-closed — an unreadable/unexpected shape yields a stale reason, never "ok".
+
+    [registry #657 follow-up] ``self_attested`` — the orchestrator class, resolved host-side by
+    review-fix.yml's `resolve` step — stands down the DRAFT requirement and NOTHING else. Draft is
+    a WORKER-lane protocol artefact: worker.yml opens drafts and the arm undrafts them, so "still
+    drafted" is a real freshness signal there. The orchestrator class never enters that protocol
+    and every PR in it is non-draft, so requiring draft here would return "undrafted" for EVERY
+    review of the class — and the caller drops the whole outcome on that, silently: findings
+    unposted, reviewed-sha left unbound, while the round budget still charges. That is a per-round
+    burn to a terminal needs-user with no diagnostic, i.e. the same forever-loop the #657 enable
+    interlock exists to prevent, at the outcome layer. Defaults False, so every existing caller is
+    byte-for-byte unchanged; the head/author/state freshness checks are NOT waived for any class."""
     if state != "open":
         return "closed"
     if bot_login and login != bot_login:
         return "author"
-    if draft is not True:
+    if draft is not True and not self_attested:
         return "undrafted"
     if not re.fullmatch(r"[0-9a-f]{40}", live_head or ""):
         return "malformed-head"
@@ -3840,7 +4603,8 @@ def review_outcome(args):
     freshness = revalidate_outcome_head(
         live.get("state"), str((live.get("user") or {}).get("login", "")),
         live.get("draft"), str((live.get("head") or {}).get("sha", "")),
-        args.reviewed_sha, args.bot_login)
+        args.reviewed_sha, args.bot_login,
+        self_attested=getattr(args, "self_attested", False))
     if freshness != "ok":
         # Issue #162: legitimate head churn (the reviewed head advanced during the review) is
         # NOT a substantive round — void its pre-model round marker for THIS (round, run) so a
@@ -3909,7 +4673,8 @@ def review_outcome(args):
                                args.impl_provider, base_rounds=args.max_rounds)
     decision = decide_review(document["verdict"], has_blockers,
                              document["injection_detected"], budget_rounds, args.max_rounds,
-                             security, budget_action=budget["action"])
+                             security, budget_action=budget["action"],
+                             self_attested=getattr(args, "self_attested", False))
     _write_outputs({"decision": decision, "verdict": document["verdict"],
                     "has_blockers": has_blockers,
                     "injection": document["injection_detected"],
@@ -3930,6 +4695,16 @@ def review_outcome(args):
         if document["injection_detected"]:
             # A flagged injection is a genuine human (security) question -> needs:user.
             reason, park_class = "the reviewer flagged possible prompt injection", "question"
+        elif approved and getattr(args, "self_attested", False):
+            # [#657] APPROVED, and deliberately not armed. This is not a failure and not a
+            # capacity stop — the class is review-only by design (record §3 option (b)), so the
+            # hand-off must SAY so; naming it "budget exhausted" would misreport a clean pass as
+            # a stall and route it to the machine-owned capacity park.
+            reason, park_class = (
+                "the review approved this PR, and it is an orchestrator-class (self-attested "
+                "provenance) PR: the implementer wrote its own provenance record, so the "
+                "cross-provider inversion cannot authorise an automatic merge. A human arms it",
+                "question")
         else:
             # Round-budget exhaustion is budget-driven, not a human question: the source issue
             # takes the machine-owned status:parked soft hold (park_policy.py defect 1).
@@ -3944,7 +4719,9 @@ def review_outcome(args):
         needs_user(args.repo, args.pr, reason, issue=args.issue,
                    alert_repo=alert_repo, alert_token=alert_token, park_class=park_class,
                    bot_login=args.bot_login, head_sha=args.reviewed_sha,
-                   attempt_key=attempt_key)
+                   attempt_key=attempt_key,
+                   # registry #677: state the cause so the park episode is attributable.
+                   park_cause="budget")
     else:
         # decision == "arm": the workflow runs ready-and-arm as a separate step under the
         # narrowly-minted arm token; the post-arm trust-surface audit trail is applied
@@ -4031,12 +4808,103 @@ def fix_outcome(args):
                    alert_repo=alert_repo, alert_token=alert_token, park_class=park_class,
                    bot_login=args.bot_login, head_sha=args.reviewed_sha,
                    attempt_key=(f"nochange{args.round}={nochange_runs}" if not made_changes
-                                else f"gatefail{args.round}={gatefail_runs}"))
+                                else f"gatefail{args.round}={gatefail_runs}"),
+                   # registry #677: the same axis the attempt fingerprint already distinguishes.
+                   park_cause="nochange" if not made_changes else "gatefail")
     else:
         print("fix outcome: staying in review:changes (retried next sweep tick)")
 
 
 # ---- self-test ------------------------------------------------------------------------------------
+# ---- registry #677: the WORKFLOW seam behind the provenance read ---------------------------------
+def _workflow_yaml(name):
+    import yaml
+    path = Path(__file__).resolve().parents[1] / ".github" / "workflows" / name
+    if not path.is_file():
+        raise WorkerPrError(f"{name} not found for the workflow-seam check: {path}")
+    return yaml.safe_load(path.read_text(encoding="utf-8"))
+
+
+def provenance_retry_budget_seconds(reads=2):
+    """Worst-case wall time the provenance path can spend inside the bounded-retry layer plus the
+    registry CAS deadline, derived from gh_retry's and this module's OWN constants — never a
+    hard-coded number. `reads` is the number of idempotent GETs on the path (reconcile's listing +
+    provenance_record's verification). The workflow's `timeout-minutes` MUST admit this: a job
+    cancelled mid-backoff reproduces exactly the missing record the retry exists to prevent, so
+    raising MAX_ATTEMPTS without raising the timeout must go red rather than ship."""
+    per_read = sum(gh_retry.backoff_ceiling(attempt) + gh_retry.JITTER
+                   for attempt in range(1, gh_retry.MAX_ATTEMPTS))
+    return reads * per_read + _REGISTRY_CAS_DEADLINE_S
+
+
+def provenance_workflow_seam_report():
+    """Structural findings about the LIVE worker.yml `provenance` job, each asserted by the
+    self-test. Read off PARSED YAML nodes: a substring or `count(...) == N` assertion over workflow
+    text cannot see `if: false`, `continue-on-error: true`, a deleted step, a re-pointed script
+    path, or a timeout too short for the retry budget — and on this project every uncaught mutant
+    has lived at exactly that seam."""
+    job = _workflow_yaml("worker.yml")["jobs"]["provenance"]
+    step = next((s for s in (job.get("steps") or [])
+                 if "reconcile-provenance" in str(s.get("run") or "")), None)
+    run = str((step or {}).get("run") or "")
+    return {
+        "invokes_reconcile": bool(re.search(r"worker-pr\.py\s+reconcile-provenance", run)),
+        "script_path": next((tok for tok in run.split() if tok.endswith("worker-pr.py")), None),
+        "step_if": (step or {}).get("if"),
+        "step_continue_on_error": (step or {}).get("continue-on-error"),
+        "job_if_always": "always()" in str(job.get("if") or ""),
+        "timeout_minutes": job.get("timeout-minutes"),
+        "retry_budget_seconds": provenance_retry_budget_seconds(),
+        "step_has_gh_token": "GH_TOKEN" in ((step or {}).get("env") or {}),
+        "job_needs_publish": "publish" in (job.get("needs") or []),
+        "job_permissions": job.get("permissions"),
+        # Registry #748: status recovery rides on `GH_DEBUG` containing `api` in gh's child env.
+        # `gh_retry.debug_env` is widen-only so an ambient value cannot DISABLE it, but a
+        # `GH_DEBUG:` pinned at the workflow/job/step level is still the seam where someone would
+        # try, and `scripts/pat-validity.py` already establishes the strip-GH_DEBUG idiom in this
+        # repo — so the absence is asserted structurally instead of trusted.
+        #
+        # The scanned ROOT travels with the sites, from the same call. Review of 6f69e0e0 showed
+        # why: re-pointing this call site at an empty directory satisfied `sites == []` VACUOUSLY,
+        # and the paired "reads the LIVE workflow tree" check could not notice, because it
+        # re-derived `.github/workflows` INDEPENDENTLY of the report. An assertion about a scan
+        # has to read what the scan says it scanned.
+        **dict(zip(("gh_debug_scanned_root", "gh_debug_env_sites"), _workflow_gh_debug_scan())),
+    }
+
+
+def _workflow_gh_debug_scan(root=None):
+    """`(scanned root as a str, sites)` — the pair, from ONE call, so a consumer cannot assert the
+    sites of one directory against the identity of another."""
+    root = Path(root) if root else Path(__file__).resolve().parents[1] / ".github" / "workflows"
+    return str(root), sorted(_workflow_gh_debug_sites(root))
+
+
+def _workflow_gh_debug_sites(root=None):
+    """Every `<workflow>:<scope>` under `root` (default `.github/workflows`) that pins a `GH_DEBUG`
+    env key, read off PARSED YAML at all three levels (workflow / job / step). `root` is injectable
+    so the self-test can prove the scanner FINDS a pin — an always-empty scanner would satisfy the
+    "no pins in the live tree" assertion vacuously."""
+    import yaml
+    sites = set()
+    root = Path(root) if root else Path(__file__).resolve().parents[1] / ".github" / "workflows"
+    for path in sorted(root.glob("*.yml")) + sorted(root.glob("*.yaml")):
+        document = yaml.safe_load(path.read_text(encoding="utf-8"))
+        if not isinstance(document, dict):
+            continue
+        if "GH_DEBUG" in (document.get("env") or {}):
+            sites.add(f"{path.name}:workflow")
+        for job_name, job in (document.get("jobs") or {}).items():
+            if not isinstance(job, dict):
+                continue
+            if "GH_DEBUG" in (job.get("env") or {}):
+                sites.add(f"{path.name}:{job_name}")
+            for index, step in enumerate(job.get("steps") or []):
+                if isinstance(step, dict) and "GH_DEBUG" in (step.get("env") or {}):
+                    sites.add(f"{path.name}:{job_name}:step{index}")
+    return sites
+
+
 def _self_test():
     ok = True
 
@@ -4162,11 +5030,36 @@ def _self_test():
           [{"key": auto_key, "at": "2026-07-25T03:10:00Z"}])
     check("the receipt states the consume-exactly-once invariant and the cap",
           ("EXACTLY ONCE" in auto_receipt_comments[0]["body"]
-           and "NEW outage-and-recovery pair" in auto_receipt_comments[0]["body"]
+           and "new outage-and-recovery pair" in auto_receipt_comments[0]["body"]
            and f"most {_park_policy().AUTO_READMISSION_MAX} automatic"
            in auto_receipt_comments[0]["body"]), True)
     check("the receipt carries the SPARQ agent self-identification",
           auto_receipt_comments[0]["body"].startswith("> 🤖 SPARQ agent"), True)
+    # ---- [registry #691] THE RECEIPT MUST NOT OVERSTATE WHICH GATE RELEASED THE PARK. -------
+    # A receipt is the durable public record of why automation acted. The aged-out exit does NOT
+    # know that this park's own cause cleared — it cannot, the evidence has aged out — so the
+    # cause-recovery finding would be a false statement. The finding follows the evidence-key
+    # namespace, so no caller can post the wrong sentence by omission.
+    heuristic_body = auto_readmission_receipt(
+        "fleet-health/openai/dc2d7519aaaa0001/6041.1", "2026-07-25T03:10:00Z")
+    check("the aged-out receipt says it is a HEURISTIC about fleet health, and never claims the "
+          "cause-recovery finding",
+          ("not proof that this park's own cause cleared" in heuristic_body,
+           "demonstrably CLEARED" in heuristic_body,
+           "A worker account that was failing when this park landed" in heuristic_body),
+          (True, False, False))
+    check("the cause-recovery receipt still states the proof it actually has",
+          ("demonstrably CLEARED" in auto_receipt_comments[0]["body"],
+           "HEURISTIC" in auto_receipt_comments[0]["body"]), (True, False))
+    check("both receipts carry the same marker, cap sentence and self-identification (one "
+          "reader, one family)",
+          (heuristic_body.startswith("> 🤖 SPARQ agent"),
+           AUTO_READMIT_MARKER in heuristic_body,
+           f"most {_park_policy().AUTO_READMISSION_MAX} automatic" in heuristic_body,
+           auto_readmission_records([{"user": {"login": bot}, "body": heuristic_body}], bot)),
+          (True, True, True,
+           [{"key": "fleet-health/openai/dc2d7519aaaa0001/6041.1",
+             "at": "2026-07-25T03:10:00Z"}]))
     check("an automatic receipt NEVER counts as a consumed park-generation window (the ladder "
           "counter is untouched)",
           (park_generation_cutoffs(auto_receipt_comments, bot),
@@ -4862,11 +5755,17 @@ def _self_test():
     # the same issue must RAISE, and the exact branch must still record. Monkeypatched I/O —
     # no network, no registry writes.
     prov_docs = []
-    real_prov = {name: globals()[name] for name in ("_gh_json", "_registry_put_file")}
+    real_prov = {name: globals()[name]
+                 for name in ("_gh_read_with_retry", "_registry_put_file")}
     prov_pull = {"state": "open", "user": {"login": bot},
                  "head": {"ref": branch, "sha": "a" * 40, "repo": {"full_name": repo}}}
+
+    def _ok_read(args, **kwargs):
+        return subprocess.CompletedProcess(["gh", *args], 0,
+                                           stdout=json.dumps(prov_pull), stderr=""), 1
+
     try:
-        globals()["_gh_json"] = lambda a, **k: json.loads(json.dumps(prov_pull))
+        globals()["_gh_read_with_retry"] = _ok_read
         globals()["_registry_put_file"] = (
             lambda _repo, _path, document, _msg, volatile_fields=frozenset():
             prov_docs.append(document) or True)
@@ -4885,6 +5784,521 @@ def _self_test():
     finally:
         for name, real in real_prov.items():
             globals()[name] = real
+
+    # ---- registry #677: the GENERATOR of missing provenance records ------------------------------
+    # Measured: ~4.8% of publishing runs lost their record on the live re-verification READ in
+    # provenance_record, which had NO retry and DISCARDED gh's stderr, so a transient 5xx was
+    # indistinguishable from a genuine 404. Every guard below is exercised through the REAL code
+    # path — `subprocess.run` and `gh_retry.sleep_backoff` are the only stubs, so gh_retry's loop,
+    # the transient classifier, the attempt counter, the marker line and the alert all run for real.
+    prov_state = {}
+
+    def _prov_env(script):
+        """Install a scripted `gh` and capture every observable side effect of the read path."""
+        prov_state.clear()
+        prov_state.update(calls=[], slept=[], printed=[], alerts=[], store={}, script=list(script))
+
+        def fake_run(cmd, **kwargs):
+            prov_state["calls"].append(list(cmd))
+            rc, out, err = prov_state["script"][min(len(prov_state["calls"]) - 1,
+                                                    len(prov_state["script"]) - 1)]
+            return subprocess.CompletedProcess(cmd, rc, stdout=out, stderr=err)
+
+        def fake_put(_registry, path, document, _message, volatile_fields=frozenset()):
+            """The REAL idempotency contract of _registry_put_file, in-memory: it stores the same
+            SERIALIZED bytes and adjudicates a repeat write with the production
+            _registry_record_equivalent — so this stand-in cannot drift from the write path, and a
+            record that differs on an identifying field still fails closed."""
+            body = json.dumps(document, indent=1, sort_keys=True) + "\n"
+            existing = prov_state["store"].get(path)
+            if existing is not None:
+                if _registry_record_equivalent(existing, document, volatile_fields):
+                    return False  # already recorded — idempotent success, no rewrite
+                raise WorkerPrError(f"registry file {path} already exists with different content")
+            prov_state["store"][path] = body
+            return True
+
+        return fake_run, fake_put
+
+    def _stored():
+        """Every provenance record the in-memory registry holds, parsed."""
+        return [json.loads(text) for text in prov_state["store"].values()]
+
+    _PULL_JSON = json.dumps(prov_pull)
+    _T503 = (1, "", "gh: Service Unavailable (HTTP 503)")
+    _T403_RATE = (1, "", "HTTP 403: You have exceeded a secondary rate limit")
+    _P403_PERM = (1, "", "HTTP 403: Resource not accessible by integration")
+    _P404 = (1, "", "gh: Not Found (HTTP 404)")
+    _OK = (0, _PULL_JSON, "")
+
+    real_io = {name: globals()[name] for name in ("_registry_put_file", "_ops_alert")}
+    real_subprocess_run, real_sleep = subprocess.run, gh_retry.sleep_backoff
+
+    def _run_prov(script, *, fn=None):
+        """Run one provenance_record (or `fn`) against the scripted gh, returning the raised
+        WorkerPrError (or None) with every side effect left in `prov_state` — including the
+        captured stdout, which is where the counted/attributable failure evidence lands."""
+        fake_run, fake_put = _prov_env(script)
+        subprocess.run = fake_run
+        globals()["_registry_put_file"] = fake_put
+        captured = io.StringIO()
+        raised = None
+        try:
+            with contextlib.redirect_stdout(captured):
+                (fn or (lambda: provenance_record(
+                    "o/registry", repo, 42, "", "anthropic", "opus", "ab" * 8, 7, "10.1",
+                    verify_bot_login=bot, verify_head_branch=branch)))()
+        except WorkerPrError as exc:
+            raised = exc
+        prov_state["printed"] = captured.getvalue().splitlines()
+        return raised
+
+    try:
+        gh_retry.sleep_backoff = lambda attempt, retry_after=None: prov_state["slept"].append(
+            attempt)
+        globals()["_ops_alert"] = (
+            lambda alert_repo, alert_token, title, body:
+            prov_state["alerts"].append((title, body)))
+
+        # GUARD 1 — a TRANSIENT failure on the verification read is retried, and then succeeds.
+        # This is the whole point of the change: 4 of ~84 publishing runs/hour used to die here.
+        err = _run_prov([_T503, _T503, _OK])
+        check("#677 a TRANSIENT failure on the provenance read is RETRIED and then SUCCEEDS",
+              (err, len(prov_state["calls"]), prov_state["slept"],
+               [d["pr_number"] for d in _stored()]),
+              (None, 3, [1, 2], [42]))
+
+        # GUARD 2 — an EXHAUSTED retry is a COUNTED, ATTRIBUTABLE failure naming the PR, never a
+        # silent skip, and NOTHING is recorded.
+        summary_file = Path(tempfile.mkdtemp()) / "step-summary.md"
+        summary_file.write_text("", encoding="utf-8")
+        os.environ["GITHUB_STEP_SUMMARY"] = str(summary_file)
+        try:
+            err = _run_prov([_T503])
+        finally:
+            os.environ.pop("GITHUB_STEP_SUMMARY", None)
+        step_summary = summary_file.read_text(encoding="utf-8")
+        marker = next((line for line in prov_state["printed"]
+                       if PROVENANCE_READ_FAILURE_MARKER in line and not line.startswith("::")), "")
+        annotation = next((line for line in prov_state["printed"]
+                           if line.startswith("::error ")), "")
+        check("#677 an EXHAUSTED retry fails LOUD, records NOTHING, and burns the whole budget",
+              (isinstance(err, WorkerPrError), len(prov_state["calls"]), prov_state["store"]),
+              (True, gh_retry.MAX_ATTEMPTS, {}))
+        check("#677 the exhausted-retry failure NAMES the PR and is CLASSIFIED and COUNTED",
+              (f"repo={repo}" in marker, "pr=42" in marker, "class=transient" in marker,
+               "http=503" in marker,
+               f"attempts={gh_retry.MAX_ATTEMPTS}/{gh_retry.MAX_ATTEMPTS}" in marker),
+              (True, True, True, True, True))
+        check("#677 the failure is ATTRIBUTABLE in four machine-readable places "
+              "(log marker, ::error annotation, step summary, ops alert)",
+              (PROVENANCE_READ_FAILURE_MARKER in marker,
+               "pr=42" in annotation,
+               PROVENANCE_READ_FAILURE_MARKER in step_summary and "pr=42" in step_summary,
+               [t for t, _b in prov_state["alerts"]] == [f"⚠️ Worker provenance read failing — {repo}"],
+               any("pr=42" in b for _t, b in prov_state["alerts"])),
+              (True, True, True, True, True))
+        check("#677 the raised error carries the status and the stderr gh used to DISCARD",
+              ("http=503" in str(err), "class=transient" in str(err),
+               "Service Unavailable" in str(err),
+               str(err).startswith(f"GitHub API request failed for repos/{repo}/pulls/42")),
+              (True, True, True, True))
+
+        # GUARD 3 — a GENUINE 404 refusal is still refused, is NOT retried, and is DISTINGUISHABLE
+        # from the transient class. Retrying a 404 would burn five slow attempts to reach the same
+        # verdict; conflating it with a 503 is exactly what hid this defect for a month.
+        err = _run_prov([_P404])
+        marker404 = next((line for line in prov_state["printed"]
+                          if PROVENANCE_READ_FAILURE_MARKER in line and not line.startswith("::")),
+                         "")
+        check("#677 a GENUINE 404 refusal is refused, unretried, and class=permanent",
+              (isinstance(err, WorkerPrError), len(prov_state["calls"]), prov_state["slept"],
+               "class=permanent" in marker404, "http=404" in marker404, prov_state["store"]),
+              (True, 1, [], True, True, {}))
+
+        # GUARD 4 — the sharpest discrimination: TWO 403s, same status code, opposite classes.
+        # A substring check on the status alone cannot tell these apart; the class must.
+        err_rate = _run_prov([_T403_RATE, _T403_RATE, _OK])
+        rate_calls = len(prov_state["calls"])
+        err_perm = _run_prov([_P403_PERM])
+        perm_marker = next((line for line in prov_state["printed"]
+                            if PROVENANCE_READ_FAILURE_MARKER in line
+                            and not line.startswith("::")), "")
+        check("#677 a secondary-rate-limit 403 is TRANSIENT but a permission 403 is PERMANENT",
+              (err_rate, rate_calls, isinstance(err_perm, WorkerPrError),
+               len(prov_state["calls"]), "class=permanent" in perm_marker),
+              (None, 3, True, 1, True))
+
+        # A read that SUCCEEDS but returns a non-object payload must fail CLOSED as a WorkerPrError
+        # (which every caller already degrades to its documented conservative result), never crash
+        # mid-decision on `None.get`.
+        try:
+            err = _run_prov([(0, "null", "")])
+        except Exception as exc:  # noqa: BLE001 — a crash here is itself the finding
+            err = exc
+        check("#677 a 200-but-malformed pull payload fails CLOSED, never crashes mid-decision",
+              (type(err).__name__, prov_state["store"]), ("WorkerPrError", {}))
+
+        # GUARD 5 — the WRITE stays idempotent across a retry. The retry is on the READ only; a
+        # rerun of the whole job (including a rerun whose read is retried) must find its own
+        # byte-identical record and treat it as already-recorded, never write a second or
+        # conflicting one.
+        fake_run, fake_put = _prov_env([_T503, _OK])
+        subprocess.run = fake_run
+        globals()["_registry_put_file"] = fake_put
+        shared_store = prov_state["store"]
+        written = []
+        with contextlib.redirect_stdout(io.StringIO()):
+            for attempt_key in ("10.1", "10.1", "10.2"):
+                # Each pass re-arms the SAME transient-then-success read script, i.e. every write
+                # in this loop is preceded by a retried read — the exact sequence the fix creates.
+                prov_state["script"], prov_state["calls"] = [_T503, _OK], []
+                provenance_record("o/registry", repo, 42, "", "anthropic", "opus", "ab" * 8, 7,
+                                  attempt_key, verify_bot_login=bot, verify_head_branch=branch)
+                written.append(len(shared_store))
+        check("#677 the WRITE stays idempotent across a retried read: 3 runs (incl. a rerun whose "
+              "volatile run key differs) leave exactly ONE record, the FIRST one",
+              (written, len(shared_store),
+               [d["recorded_at_run"] for d in _stored()]),
+              ([1, 1, 1], 1, ["10.1"]))
+        # ...and the retry has NOT made the write permissive: a record that differs on an
+        # IDENTIFYING field (the implementer alias) is still refused, never silently rewritten.
+        prov_state["script"], prov_state["calls"] = [_T503, _OK], []
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                provenance_record("o/registry", repo, 42, "", "anthropic", "sol", "ab" * 8, 7,
+                                  "10.1", verify_bot_login=bot, verify_head_branch=branch)
+        except WorkerPrError:
+            check("#677 a DIVERGENT record still fails closed after a retried read",
+                  (len(shared_store),
+                   json.loads(shared_store[provenance_path(repo, 42)])["impl_alias"]),
+                  (1, "opus"))
+        else:
+            check("#677 a DIVERGENT record still fails closed after a retried read",
+                  "written", "refused")
+
+        # GUARD 6 — the reconcile listing read is on the SAME path with the SAME consequence and
+        # goes through the SAME primitive. (Scoping the fix to only the one line the audit sampled
+        # would leave this one generating the identical `__global__` holder.)
+        listing = json.dumps([{**prov_pull, "number": 42}])
+        err = _run_prov([(1, "", "HTTP 502: Bad Gateway"), (0, listing, ""), (0, _PULL_JSON, "")],
+                        fn=lambda: reconcile_provenance(
+                            "o/registry", repo, branch, "anthropic", "opus", "ab" * 8, 7, "10.1",
+                            bot))
+        check("#677 the reconcile LISTING read is retried through the same primitive",
+              (err, len(prov_state["calls"]), prov_state["slept"],
+               [d["pr_number"] for d in _stored()]),
+              (None, 3, [1], [42]))
+
+        # ---- registry #748: the shape that made #729's own retry VACUOUS ------------------------
+        # MEASURED on gh 2.94.0 against a local server: for any >=400 response with a JSON
+        # content-type and an empty/truncated body, gh prints THIS and nothing else — 403/404/429/
+        # 500/502/503 are byte-identical. It is what all four real failures (sparq #4300/#4308/
+        # #4310/#4313) produced, and #729 logged `http=unknown class=permanent attempts=1/5`.
+        _STATUSLESS = (1, "", "unexpected end of JSON input")
+
+        # GUARD 10 — THE discriminating mutant. Narrow the classifier back and this goes red.
+        err = _run_prov([_STATUSLESS, _STATUSLESS, _OK])
+        check("#748 a STATUSLESS 'unexpected end of JSON input' on the idempotent provenance GET "
+              "is RETRIED and then SUCCEEDS (this is the exact shape that shipped broken)",
+              (err, len(prov_state["calls"]), prov_state["slept"],
+               [d["pr_number"] for d in _stored()]),
+              (None, 3, [1, 2], [42]))
+
+        # GUARD 11 — an EXHAUSTED statusless read spends the WHOLE budget, is classified/attributed,
+        # and records nothing. `attempts=1/5` here was #729 reporting its own vacuity.
+        summary_file = Path(tempfile.mkdtemp()) / "step-summary.md"
+        summary_file.write_text("", encoding="utf-8")
+        os.environ["GITHUB_STEP_SUMMARY"] = str(summary_file)
+        try:
+            err = _run_prov([_STATUSLESS])
+        finally:
+            os.environ.pop("GITHUB_STEP_SUMMARY", None)
+        blind_marker = next((line for line in prov_state["printed"]
+                             if PROVENANCE_READ_FAILURE_MARKER in line
+                             and not line.startswith("::")), "")
+        # The `reason=` FIELD is a label, and registry #772 legitimately changed which label this
+        # exact text earns (`transient-text` now, via `_TRANSIENT_TEXT`, rather than the
+        # `statusless` default). The properties that matter — and that #729 got wrong — are the
+        # BUDGET, the CLASS, the unrecoverable status, and that nothing was recorded. Those are
+        # asserted exactly; the reason is asserted to be one of the two labels that mean
+        # "retried a read we could not classify by status", so a future re-labelling does not red
+        # this while a silent revert to `permanent`/one-attempt still does.
+        check("#748 an exhausted statusless read burns the FULL budget and is reported as "
+              "transient and status-unrecoverable, not as a permanent refusal",
+              (isinstance(err, WorkerPrError), len(prov_state["calls"]),
+               f"attempts={gh_retry.MAX_ATTEMPTS}/{gh_retry.MAX_ATTEMPTS}" in blind_marker,
+               "class=transient" in blind_marker,
+               any(f"reason={label}" in blind_marker
+                   for label in ("statusless", "transient-text")),
+               "http=unknown" in blind_marker, prov_state["store"]),
+              (True, gh_retry.MAX_ATTEMPTS, True, True, True, True, {}))
+        check("#748 the vacuity alarm does NOT fire when the retry layer did retry "
+              "(no cry-wolf on a genuine exhausted-budget failure)",
+              [line for line in prov_state["printed"]
+               if PROVENANCE_RETRY_VACUITY_MARKER in line], [])
+
+        # GUARD 12 — the status RECOVERED from the GH_DEBUG channel is what classifies, in BOTH
+        # directions. Same swallowed gh message; only the debug trace differs.
+        def _traced(status_line):
+            return (1, "", f"* Request at t\n> GET /x HTTP/1.1\n> Authorization: token ghs_SENT\n"
+                           f"< HTTP/2.0 {status_line}\n* Request took 1ms\n"
+                           f"unexpected end of JSON input")
+
+        err = _run_prov([_traced("502 Bad Gateway"), _traced("502 Bad Gateway"), _OK])
+        check("#748 a 502 recovered from the DEBUG channel is retried and the marker reports "
+              "http=502 instead of http=unknown",
+              (err, len(prov_state["calls"]), [d["pr_number"] for d in _stored()]),
+              (None, 3, [42]))
+        err = _run_prov([_traced("404 Not Found")])
+        traced_marker = next((line for line in prov_state["printed"]
+                              if PROVENANCE_READ_FAILURE_MARKER in line
+                              and not line.startswith("::")), "")
+        check("#748 a 404 recovered from the DEBUG channel is REFUSED in one attempt and reports "
+              "the real status — the statusless retry does not swallow genuine refusals",
+              (isinstance(err, WorkerPrError), len(prov_state["calls"]), prov_state["slept"],
+               "http=404" in traced_marker, "class=permanent" in traced_marker,
+               "reason=refused-http-404" in traced_marker),
+              (True, 1, [], True, True, True))
+
+        # GUARD 13 — NO CREDENTIAL MATERIAL REACHES A SINK. The debug channel carries request
+        # headers and (on failure) the response body; every sink below is PUBLIC and unrecoverable
+        # once written. The Authorization line in this fixture is deliberately UNREDACTED — gh 2.94.0
+        # redacts it, but this guard must hold even if a gh upgrade stops doing so.
+        sentinel, body_sentinel = "ghs_SENTINELTOKENVALUE0123456789", "secret-response-body"
+        leaky_stream = gh_retry.DEBUG_TRACE_SAMPLE
+        summary_file = Path(tempfile.mkdtemp()) / "step-summary.md"
+        summary_file.write_text("", encoding="utf-8")
+        os.environ["GITHUB_STEP_SUMMARY"] = str(summary_file)
+        try:
+            err = _run_prov([(1, "", leaky_stream)])
+        finally:
+            os.environ.pop("GITHUB_STEP_SUMMARY", None)
+        sinks = {
+            "raised error": str(err),
+            "stdout log + ::error annotation": "\n".join(prov_state["printed"]),
+            "step summary": summary_file.read_text(encoding="utf-8"),
+            "ops-alert body": "\n".join(f"{t}\n{b}" for t, b in prov_state["alerts"]),
+        }
+        check("#748 the fixture really does carry credential + body material "
+              "(a guard over an empty fixture proves nothing)",
+              (sentinel in leaky_stream, body_sentinel in leaky_stream,
+               "Authorization" in leaky_stream), (True, True, True))
+        check("#748 NO credential material, request/response header, or response body reaches ANY "
+              "public sink (raised error, run log, ::error annotation, step summary, ops alert)",
+              sorted(name for name, text in sinks.items()
+                     if sentinel in text or body_sentinel in text or "Authorization" in text
+                     or "X-Github-Request-Id" in text), [])
+        check("#748 and the status is STILL recovered from the trace that was scrubbed away",
+              ("http=502" in sinks["stdout log + ::error annotation"],
+               "class=transient" in sinks["stdout log + ::error annotation"]), (True, True))
+        check("#748 every sink is NON-EMPTY (an all-empty sink set would satisfy the leak guard "
+              "vacuously)",
+              sorted(name for name, text in sinks.items() if not text.strip()), [])
+
+        # GUARD 14 — the VACUITY DETECTOR itself. Re-narrow the classifier to the pre-#748
+        # behaviour (which is exactly what shipped) and the run must now SHOUT
+        # `PROVENANCE-RETRY-VACUOUS`, on the FIRST occurrence, instead of quietly logging
+        # `attempts=1/5` for a whole error class.
+        # The inversion is driven with a statusless shape that is in NEITHER text table. Using the
+        # measured `unexpected end of JSON input` here stopped modelling the pre-#748 world once
+        # registry #772 added that exact string to `_TRANSIENT_TEXT`: `is_transient_stderr` began
+        # returning True for it, so the "conservative" stand-in retried and the control silently
+        # stopped reproducing the 1-attempt vacuity it exists to reproduce. An untabled blind shape
+        # restores the historical semantics faithfully — a classifier that can only match TEXT is
+        # blind to it, which is precisely the pre-#748 failure mode and the one #748 generalises.
+        _UNTABLED_STATUSLESS = (1, "", "error decoding server response: unexpected token at "
+                                       "position 0")
+        real_classify = gh_retry.classify_read_failure
+        try:
+            gh_retry.classify_read_failure = (
+                lambda message, status=None: (gh_retry.is_transient_stderr(message or ""),
+                                              "pre-748-conservative"))
+            err = _run_prov([_UNTABLED_STATUSLESS])
+        finally:
+            gh_retry.classify_read_failure = real_classify
+        vac_line = next((line for line in prov_state["printed"]
+                         if PROVENANCE_RETRY_VACUITY_MARKER in line
+                         and not line.startswith("::")), "")
+        vac_annotation = next((line for line in prov_state["printed"]
+                               if line.startswith("::error") and PROVENANCE_RETRY_VACUITY_MARKER
+                               in line), "")
+        check("#748 INVERTING the classifier back to the shipped behaviour reproduces the 1-attempt "
+              "failure AND trips the vacuity detector (log line + ::error annotation)",
+              (isinstance(err, WorkerPrError), len(prov_state["calls"]),
+               f"attempts=1/{gh_retry.MAX_ATTEMPTS}" in vac_line, bool(vac_annotation)),
+              (True, 1, True, True))
+        check("#748 the vacuity alarm is a pure predicate: blind+unretried fires, and each of the "
+              "three exits (status recovered / retried / classified retryable) silences it",
+              (bool(_retry_vacuity_alarm(status=None, attempts=1, retryable=False,
+                                         endpoint="repos/o/r/pulls/7")),
+               _retry_vacuity_alarm(status="502", attempts=1, retryable=False, endpoint="e"),
+               _retry_vacuity_alarm(status=None, attempts=5, retryable=False, endpoint="e"),
+               _retry_vacuity_alarm(status=None, attempts=1, retryable=True, endpoint="e")),
+              (True, "", "", ""))
+    finally:
+        subprocess.run = real_subprocess_run
+        gh_retry.sleep_backoff = real_sleep
+        for name, real in real_io.items():
+            globals()[name] = real
+
+    # GUARD 7 — the retry layer is READS-ONLY BY CONSTRUCTION. gh_retry's hard scope rule: an
+    # ambiguous transient failure does not prove GitHub skipped a write, so a replayed mutation
+    # could duplicate a comment, repeat a state transition, or write a second provenance record.
+    # The refusal is structural (gh_retry.read_cli_reject), not a convention.
+    reached = []
+    real_subprocess_run = subprocess.run
+    try:
+        subprocess.run = lambda cmd, **kwargs: reached.append(list(cmd)) or (
+            subprocess.CompletedProcess(cmd, 0, stdout="{}", stderr=""))
+        # The ATTACHED forms (`-XPUT`, `--method=POST`, `-X=DELETE`, `-fkey=val`) are registry #731:
+        # gh accepts them as real methods (measured against an echo server — `-fkey=val` with no
+        # `-X` makes gh POST a JSON body), and the pre-#731 scan admitted every one of them as a
+        # "read". They are listed here because this PR's whole retry-direction justification is
+        # "a write can never reach the widened statusless branch".
+        for argv in (["api", "-X", "PUT", "repos/o/r/contents/x"],
+                     ["api", "--method", "PATCH", "repos/o/r/pulls/7"],
+                     ["api", "repos/o/r/issues/7/labels", "-f", "labels[]=x"],
+                     ["api", "-XPUT", "repos/o/r/contents/x"],
+                     ["api", "-X=DELETE", "repos/o/r/issues/7/labels/x"],
+                     ["api", "--method=POST", "repos/o/r/issues/7/comments"],
+                     ["api", "-fbody=x", "repos/o/r/issues/7/comments"],
+                     ["api", "-Fbody=x", "repos/o/r/issues/7/comments"],
+                     ["api", "--input=payload.json", "repos/o/r/issues/7/comments"],
+                     ["pr", "merge", "7"], ["issue", "comment", "7", "-R", "o/r", "--body", "x"],
+                     ["pr", "ready", "7", "-R", "o/r"]):
+            try:
+                _gh_read_with_retry(argv)
+                refused = "retried"
+            except WorkerPrError:
+                refused = "refused"
+            # A POSITIVE named check per shape: the pre-#748 loop only emitted a check when a
+            # mutation slipped THROUGH, so deleting a shape from this list went unnoticed.
+            check(f"#677/#731 retry layer REFUSES the mutation {' '.join(argv[:3])}",
+                  refused, "refused")
+        check("#677 the bounded-retry layer is READS-ONLY by construction "
+              "(no mutation ever reached gh)", reached, [])
+        subprocess.run = lambda cmd, **kwargs: reached.append(list(cmd)) or (
+            subprocess.CompletedProcess(cmd, 0, stdout="{}", stderr=""))
+        result, attempts = _gh_read_with_retry(["api", "repos/o/r/pulls/7"])
+        check("#677 an idempotent GET IS admitted by the retry layer",
+              (result.returncode, attempts, len(reached)), (0, 1, 1))
+        # ...and #731's other direction: a legitimate `-X GET … -f q=` search read (gh sends the
+        # fields as QUERY PARAMETERS under an explicit GET) must NOT be refused as a write.
+        reached.clear()
+        result, attempts = _gh_read_with_retry(
+            ["api", "-X", "GET", "search/issues", "-f", "q=repo:o/r is:pr", "-f", "per_page=1"])
+        check("#731 a `-X GET … -f q=` search read is ADMITTED (fields under an explicit GET are "
+              "query params, not a body)", (result.returncode, attempts, len(reached)), (0, 1, 1))
+    finally:
+        subprocess.run = real_subprocess_run
+
+    # GUARD 8 — `_run_gh`'s message surfaces the exit status, the HTTP status, the class and the
+    # stderr it used to throw away, for EVERY caller (writes included), while keeping the historic
+    # `GitHub API request failed for <endpoint>` prefix that log greps key on.
+    real_subprocess_run = subprocess.run
+    try:
+        subprocess.run = lambda cmd, **kwargs: subprocess.CompletedProcess(
+            cmd, 1, stdout="", stderr="HTTP 503: upstream unavailable")
+        try:
+            _run_gh(["api", "repos/o/r/pulls/7"])
+        except WorkerPrError as exc:
+            raised = str(exc)
+        else:
+            raised = "(did not raise)"
+    finally:
+        subprocess.run = real_subprocess_run
+    check("#677 _run_gh RAISES the CLASSIFIED message, not the opaque pre-#677 one",
+          (raised.startswith("GitHub API request failed for repos/o/r/pulls/7"),
+           "exit=1" in raised, "http=503" in raised, "class=transient" in raised,
+           "upstream unavailable" in raised),
+          (True, True, True, True, True))
+    failed_put = subprocess.CompletedProcess(
+        ["gh"], 1, stdout="", stderr="HTTP 503: upstream unavailable")
+    message = _gh_error_message(["api", "repos/o/r/contents/p"], failed_put, attempts=3)
+    check("#677 _run_gh surfaces exit/http/class/stderr instead of discarding them",
+          (message.startswith("GitHub API request failed for repos/o/r/contents/p"),
+           "exit=1" in message, "http=503" in message, "class=transient" in message,
+           "attempts=3" in message, "upstream unavailable" in message),
+          (True, True, True, True, True, True))
+    check("#677 an unclassifiable failure reports http=unknown, never a fabricated status",
+          "http=unknown" in _gh_error_message(
+              ["api", "x"], subprocess.CompletedProcess(["gh"], 128, stdout="", stderr="boom")),
+          True)
+    # The excerpt crosses a PUBLIC sink (run log + ops-alert issue body): raw account handles and
+    # emails must never ride out on it (issue #135).
+    leaky = subprocess.CompletedProcess(
+        ["gh"], 1, stdout="",
+        stderr="HTTP 403: acct07 (bot@example.com) is not permitted")
+    check("#677 the surfaced stderr excerpt is REDACTED for the public sink",
+          ("acct07" not in _gh_error_message(["api", "x"], leaky),
+           "bot@example.com" not in _gh_error_message(["api", "x"], leaky),
+           "[redacted-account]" in _gh_error_message(["api", "x"], leaky)),
+          (True, True, True))
+    check("#677 the excerpt is single-line and length-capped (a GITHUB_OUTPUT/annotation sink "
+          "must never take a multiline blob)",
+          (("\n" not in _gh_error_detail(subprocess.CompletedProcess(
+              ["gh"], 1, stdout="", stderr="a\nb\nc"))["excerpt"]),
+           len(_gh_error_detail(subprocess.CompletedProcess(
+               ["gh"], 1, stdout="", stderr="x " * 500))["excerpt"]) <= _GH_STDERR_EXCERPT_MAX),
+          (True, True))
+
+    # GUARD 9 — the YAML SEAM, structurally on parsed nodes. A substring or `count(...) == N`
+    # assertion over workflow text does not catch `if: false`, `continue-on-error: true`, a deleted
+    # step, or a timeout too short for the retry budget to complete in — and the measured finding on
+    # this project is that every uncaught mutant lives at exactly that seam.
+    seam = provenance_workflow_seam_report()
+    check("#677 YAML seam: the provenance step INVOKES worker-pr.py reconcile-provenance "
+          "(the call site the retry lives behind)",
+          (seam["invokes_reconcile"], seam["script_path"]),
+          (True, "registry/scripts/worker-pr.py"))
+    check("#677 YAML seam: the provenance step is UNCONDITIONAL and cannot exit-zero-swallow "
+          "a provenance failure",
+          (seam["step_if"], seam["step_continue_on_error"], seam["job_if_always"]),
+          (None, None, True))
+    check("#677 YAML seam: the job's timeout ADMITS the whole bounded-retry budget "
+          "(raising MAX_ATTEMPTS without raising the timeout goes RED here)",
+          (seam["timeout_minutes"] * 60 >= seam["retry_budget_seconds"],
+           seam["retry_budget_seconds"] > 0),
+          (True, True))
+    check("#677 YAML seam: the read is AUTHENTICATED (an unauthenticated read is a permanent "
+          "401 that no retry can clear)", seam["step_has_gh_token"], True)
+    check("#677 YAML seam: the retried read runs in the job that executes NO target code",
+          (seam["job_needs_publish"], seam["job_permissions"]), (True, {"contents": "write"}))
+    check("#748 YAML seam: NO workflow, job or step pins GH_DEBUG — status recovery depends on it "
+          "reaching gh's child env, and this is the seam where a pin would silently restore the "
+          "statusless blindness with nothing going red",
+          seam.get("gh_debug_env_sites", "KEY MISSING"), [])
+    seam_probe = Path(tempfile.mkdtemp())
+    (seam_probe / "probe.yml").write_text(
+        "env:\n  GH_DEBUG: ''\njobs:\n"
+        "  a:\n    env:\n      GH_DEBUG: ''\n    steps:\n      - run: x\n"
+        "      - run: y\n        env:\n          GH_DEBUG: ''\n", encoding="utf-8")
+    check("#748 YAML seam: the GH_DEBUG scanner FINDS a pin at each of the three levels "
+          "(an always-empty scanner would satisfy the emptiness check above vacuously)",
+          sorted(_workflow_gh_debug_sites(seam_probe)),
+          ["probe.yml:a", "probe.yml:a:step1", "probe.yml:workflow"])
+    # The emptiness above is only meaningful if the scan that produced it looked at the live
+    # workflow tree. This reads the root OUT OF THE REPORT — never re-derives it — so a call site
+    # re-pointed at an empty or fabricated directory goes red here instead of satisfying
+    # `gh_debug_env_sites == []` vacuously. The two properties are the identity of the directory
+    # and the fact that it actually holds this repo's workflows.
+    scanned_root = Path(seam.get("gh_debug_scanned_root") or "/nonexistent/unset")
+    check("#748 YAML seam: the emptiness above is about the LIVE workflow tree — asserted from "
+          "the root the SCAN reports, not from a path the test re-derives for itself",
+          (scanned_root,
+           scanned_root.is_dir(),
+           len(list(scanned_root.glob("*.yml"))) >= 5,
+           (scanned_root / "worker.yml").is_file()),
+          (Path(__file__).resolve().parents[1] / ".github" / "workflows", True, True, True))
+    # ...and the pair really does travel together: a scan of the probe tree reports the probe
+    # tree, so `gh_debug_scanned_root` cannot be a constant that ignores its argument.
+    check("#748 YAML seam: the reported root is the one that WAS scanned (it tracks the argument)",
+          _workflow_gh_debug_scan(seam_probe),
+          (str(seam_probe), ["probe.yml:a", "probe.yml:a:step1", "probe.yml:workflow"]))
+    check("#748 and even a pinned GH_DEBUG cannot disable recovery: debug_env is widen-only",
+          (gh_retry.debug_env({"GH_DEBUG": ""})["GH_DEBUG"],
+           gh_retry.debug_env({"GH_DEBUG": "false"})["GH_DEBUG"]), ("api", "false,api"))
 
     verdict = {"verdict": "request_changes", "injection_detected": False, "summary": "s",
                "issues": [{"severity": "major", "file": "src/a.rs", "title": "t", "body": "b",
@@ -5030,22 +6444,26 @@ def _self_test():
     # Mechanism 1 — model escalation, precedence over progress (it resets the quality question).
     # Direction (sol r2 f2): the ladder escalates UPWARD per opus < luna < fable < sol —
     # exhaustion on the WEAK tier pins the STRONG tier, never the reverse.
-    check("exhaustion on opus pins fable (escalates UP)", budget(3, ["opus"], "stagnant"),
-          {"action": "extend-model-pin", "pin": "fable"})
-    check("model pin outranks improving progress", budget(3, ["opus"], "improving"),
-          {"action": "extend-model-pin", "pin": "fable"})
+    # [OPUS-5] 2026-07-26: the anthropic ladder is SINGLE-RUNG (opus/fable retired). There is no
+    # tier above opus5, so mechanism 1 can no longer fire on the anthropic side — a legacy `opus`
+    # history MIGRATES to opus5 (the terminal tier) and therefore falls through to mechanism 2.
+    # This is the behaviour change the deprecation causes; it is asserted, not assumed.
+    check("legacy opus history migrates to the terminal tier -> no model pin, stagnant stops",
+          budget(3, ["opus"], "stagnant"), {"action": "needs-user", "pin": None})
+    check("legacy opus history + improving progress-extends (no tier above to pin)",
+          budget(3, ["opus"], "improving"), {"action": "extend-progress", "pin": None})
+    check("legacy fable history migrates to the terminal tier too",
+          budget(3, ["fable"], "stagnant"), {"action": "needs-user", "pin": None})
+    check("a legacy opus+fable history collapses to ONE terminal rung, not two",
+          budget(3, ["opus", "fable"], "improving"), {"action": "extend-progress", "pin": None})
     check("exhaustion on luna pins sol (escalates UP)",
           budget(3, ["luna"], None, provider="openai"),
           {"action": "extend-model-pin", "pin": "sol"})
-    # opus5 is the top anthropic tier (2026-07-24): fable exhaustion now escalates UP to it.
-    check("exhaustion on fable pins opus5 (escalates UP, 2026-07-24)",
-          budget(3, ["fable"], "stagnant"),
-          {"action": "extend-model-pin", "pin": "opus5"})
     # Mechanism 2 — progress extension once the top tier has run (or nothing is recorded)
     check("opus5 + improving extends on progress (terminal tier)",
           budget(3, ["opus5"], "improving"),
           {"action": "extend-progress", "pin": None})
-    check("opus+fable+opus5 + improving is progress-only",
+    check("a mixed legacy+current history is progress-only",
           budget(4, ["opus", "fable", "opus5"], "improving"),
           {"action": "extend-progress", "pin": None})
     check("no fix record + improving extends", budget(3, [], "improving"),
@@ -5056,11 +6474,20 @@ def _self_test():
     check("pending pinned-floor fix authorizes its re-review",
           budget(3, ["opus", "fable"], "stagnant", pending=["fable"], pin="fable"),
           {"action": "extend-pending-review", "pin": None})
+    # [OPUS-5] the same posture written with CURRENT tiers — proves the re-review authorization
+    # does not depend on the retired aliases surviving.
+    check("pending opus5 fix at an opus5 floor authorizes its re-review",
+          budget(3, ["opus5"], "stagnant", pending=["opus5"], pin="opus5"),
+          {"action": "extend-pending-review", "pin": None})
     check("no pending fix in the same posture stops (flip side)",
           budget(3, ["opus", "fable", "opus5"], "stagnant"),
           {"action": "needs-user", "pin": None})
-    check("pending fix BELOW the pinned floor never extends",
-          budget(3, ["opus", "fable", "opus5"], "stagnant", pending=["opus"], pin="fable"),
+    # [OPUS-5] the below-floor case is no longer expressible on the ANTHROPIC ladder (one rung
+    # means nothing can be below the floor), so it is asserted on the openai ladder, which still
+    # has two tiers. Losing the anthropic form must not lose the invariant.
+    check("pending fix BELOW the pinned floor never extends (openai, two-tier)",
+          budget(3, ["luna", "sol"], "stagnant", pending=["luna"], pin="sol",
+                 provider="openai"),
           {"action": "needs-user", "pin": None})
     check("unpinned pending fix authorizes (floor is the ladder bottom)",
           budget(3, ["opus"], None, pending=["opus"]),
@@ -5093,8 +6520,8 @@ def _self_test():
           {"action": "needs-user", "pin": None})
     check("hard cap stops past 6", budget(7, ["fable"], "improving"),
           {"action": "needs-user", "pin": None})
-    check("round 5 still extends under the cap", budget(5, ["opus"], None)["action"],
-          "extend-model-pin")
+    check("round 5 still extends under the cap (openai still has a tier above luna)",
+          budget(5, ["luna"], None, provider="openai")["action"], "extend-model-pin")
     # openai two-tier ladder: SOL is terminal — mechanism 2 only once sol has run
     check("openai sol + stagnant stops (never pins DOWN to luna)",
           budget(3, ["sol"], "stagnant", provider="openai"),
@@ -5158,13 +6585,23 @@ def _self_test():
         {"user": {"login": "mallory"},
          "body": f"z {MODEL_PIN_MARKER} round=3 tier=fable run=6.6 -->"},
     ]
-    check("pinned floor reads the bot marker (forged higher pin ignored)",
-          pinned_fix_floor(pin_comments, bot, "anthropic"), "opus")
-    check("highest recorded floor wins",
+    # [OPUS-5] a PRE-DEPRECATION marker (tier=opus) migrates UP to opus5 instead of raising.
+    # Without this, every in-flight PR that had ever escalated would raise on every tick.
+    check("a pre-deprecation pin marker migrates up, it does not raise",
+          pinned_fix_floor(pin_comments, bot, "anthropic"), "opus5")
+    check("the forged non-bot pin is STILL ignored after migration",
+          pinned_fix_floor([{"user": {"login": "mallory"},
+                             "body": f"z {MODEL_PIN_MARKER} round=3 tier=opus run=6.6 -->"}],
+                           bot, "anthropic"), None)
+    check("highest recorded floor wins (both legacy tiers collapse onto opus5)",
           pinned_fix_floor(pin_comments + [
               {"user": {"login": bot},
                "body": f"z {MODEL_PIN_MARKER} round=4 tier=fable run=4.1 -->"}], bot,
-              "anthropic"), "fable")
+              "anthropic"), "opus5")
+    check("a CURRENT-tier marker still reads straight through",
+          pinned_fix_floor([{"user": {"login": bot},
+                             "body": f"z {MODEL_PIN_MARKER} round=1 tier=opus5 run=1.1 -->"}],
+                           bot, "anthropic"), "opus5")
     try:
         pinned_fix_floor([{"user": {"login": bot},
                            "body": f"z {MODEL_PIN_MARKER} round=1 tier=gpt-omega run=1.1 -->"}],
@@ -5177,10 +6614,14 @@ def _self_test():
           pinned_fix_chain("openai", "luna"), ["luna", "sol"])
     check("pinned chain at the terminal tier", pinned_fix_chain("anthropic", "opus5"),
           ["opus5"])
-    check("pinned fable floor keeps opus5 above it (2026-07-24)",
-          pinned_fix_chain("anthropic", "fable"), ["fable", "opus5"])
-    check("pinned chain at the bottom is the whole ladder",
-          pinned_fix_chain("anthropic", "opus"), ["opus", "fable", "opus5"])
+    # [OPUS-5] a legacy floor migrates to the terminal tier; the chain still TERMINATES.
+    check("a legacy fable floor migrates to the terminal opus5 chain",
+          pinned_fix_chain("anthropic", "fable"), ["opus5"])
+    check("a legacy opus floor migrates to the terminal opus5 chain",
+          pinned_fix_chain("anthropic", "opus"), ["opus5"])
+    check("every anthropic pinned chain is non-empty (it must still terminate)",
+          [bool(pinned_fix_chain("anthropic", t)) for t in ("opus", "fable", "opus5")],
+          [True, True, True])
     check("openai pinned chain at its terminal tier", pinned_fix_chain("openai", "sol"),
           ["sol"])
     try:
@@ -5338,12 +6779,13 @@ def _self_test():
                           "body": f"x {FIX_MODEL_MARKER} round=1 model=fable run=1.1 -->"}]
             opus5_fix = [{"user": {"login": bot},
                           "body": f"x {FIX_MODEL_MARKER} round=1 model=opus5 run=1.1 -->"}]
-            check("outcome model extension pins + stays changes",
-                  outcome("stagnant", opus_fix),
-                  [("findings", 3), ("pin", "fable"), ("state", "changes")])
-            check("outcome fable exhaustion pins opus5 (2026-07-24)",
-                  outcome("stagnant", fable_fix),
-                  [("findings", 3), ("pin", "opus5"), ("state", "changes")])
+            # [OPUS-5] both legacy fix-model markers migrate onto the terminal tier, so a
+            # stagnant outcome escalates to a HUMAN rather than minting another round on a
+            # retired model. The exit exists — it is just needs-user, not a further pin.
+            check("outcome: a legacy opus fix migrates to terminal -> human escalation",
+                  [e[0] for e in outcome("stagnant", opus_fix)], ["findings", "needs-user"])
+            check("outcome: a legacy fable fix migrates to terminal -> human escalation",
+                  [e[0] for e in outcome("stagnant", fable_fix)], ["findings", "needs-user"])
             check("outcome progress extension stays changes without a pin",
                   outcome("improving", opus5_fix), [("findings", 3), ("state", "changes")])
             terminal = outcome("stagnant", opus5_fix)
@@ -5500,6 +6942,31 @@ def _self_test():
         check("the INITIAL window is receipted (gen=1 cutoff=none)",
               f"{PARK_GENERATION_MARKER} gen=1 cutoff={PARK_WINDOW_NONE} -->"
               in park_route_comments[-1], True)
+        # registry #677: EVERY capacity park states its cause in a park-reason receipt. Before
+        # this the ladder wrote review:parked with a generation receipt only, so nothing on the
+        # PR said which mechanism parked it and a reader looking for "the newest cause" saw one
+        # from an older, already-released episode and released the ladder's park.
+        _pp = _park_policy()
+        check("a capacity park with NO stated cause still emits an attributable reason receipt",
+              (_pp.parse_park_reason(park_route_comments[-1]) or {}).get("cause"),
+              "capacity-unspecified")
+        check("...and it is CAPACITY-class, never the human terminal",
+              (_pp.parse_park_reason(park_route_comments[-1]) or {}).get("class"),
+              _pp.PARK_CLASS_CAPACITY)
+        park_route_calls.clear()
+        needs_user("o/r", 41, "budget spent", issue=7, park_class="capacity", bot_login=bot,
+                   park_cause="budget")
+        check("a STATED capacity cause is recorded verbatim",
+              (_pp.parse_park_reason(park_route_comments[-1]) or {}).get("cause"), "budget")
+        park_route_calls.clear()
+        # A question-class cause can never be smuggled through the capacity path: the taxonomy
+        # decides the class, so the writer falls back rather than emitting class=capacity
+        # cause=injection (which parse_park_reason would reject outright anyway).
+        needs_user("o/r", 41, "budget spent", issue=7, park_class="capacity", bot_login=bot,
+                   park_cause="injection")
+        check("a QUESTION-class cause cannot be laundered through the capacity park path",
+              (_pp.parse_park_reason(park_route_comments[-1]) or {}).get("cause"),
+              "capacity-unspecified")
         # (b) question stop (default) keeps the unconditional human-owned pair.
         park_route_calls.clear()
         needs_user("o/r", 41, "human question", issue=7)
@@ -5704,8 +7171,6 @@ def _self_test():
             unlabel("review:parked", "2026-07-22T16:36:56Z")]
         park_route_calls.clear()
         park_route_comments.clear()
-        import contextlib
-        import io
         bounce_log = io.StringIO()
         with contextlib.redirect_stdout(bounce_log):
             needs_user("o/r", 41, "budget spent", issue=7, park_class="capacity",
@@ -5756,6 +7221,158 @@ def _self_test():
                    head_sha="", attempt_key="rounds=5")
         check("(k) an unknown fingerprint parks exactly as before (no `head=` in the receipt)",
               (bool(park_route_calls), "head=" in park_route_comments[-1]), (True, False))
+
+        # ---- [registry #797] THE MACHINE RE-ADMISSION MUST NOT REACH THE HUMAN CLASS.
+        # This is the CALL SITE, executed end to end — the pure-ladder assertions in
+        # park_policy cannot see whether needs_user actually passes the authority it derives,
+        # and a call site that reverts to the bare `effective_readmission_cutoff` leaves every
+        # one of those pure tests green. Replayed from the live sparq #4422 / #3595 shape:
+        # gen-1 initial window receipted, then the loop's OWN auto-readmit receipt(s), and
+        # ZERO human events on either timeline. ----
+        retire_calls = []
+        real_retire_json = wiring_globals["_gh_json"]
+
+        def _fake_retire_json(args, **kwargs):
+            path = args[-3] if "--input" in args else args[-1]
+            retire_calls.append(("api", args[1] if args[0] == "api" else args[0], path,
+                                 kwargs.get("input_doc")))
+            if path.endswith("/issues/7"):
+                return {"labels": [{"name": "area:engine"}, {"name": "role:impl"},
+                                    {"name": "status:parked"}]}
+            return {}
+
+        def auto_receipt(stamp, key="fleet-health/anthropic/9e13/301.1"):
+            return {"user": {"login": bot}, "created_at": stamp,
+                    "body": f"x {AUTO_READMIT_MARKER} evidence={key} at={stamp} -->"}
+
+        def gen_receipt(generation, window):
+            return {"user": {"login": bot}, "created_at": window,
+                    "body": f"x {PARK_GENERATION_MARKER} gen={generation} cutoff={window} -->"}
+
+        try:
+            wiring_globals["_gh_json"] = _fake_retire_json
+            # (#797-a) #4422 EXACTLY: the initial window receipted, ONE machine re-admission,
+            # no human gesture anywhere. Pre-#797 this emitted review:needs-user + "This PR was
+            # human-readmitted" + an @maintainer page. It must now stay in the MACHINE class.
+            auto_1 = "2026-07-27T08:02:21Z"
+            park_route_state["timelines"] = {
+                41: [labeled("review:parked", "2026-07-27T07:00:00Z")], 7: []}
+            park_route_state["comments"] = [gen_receipt(1, PARK_WINDOW_NONE),
+                                            auto_receipt(auto_1)]
+            park_route_calls.clear()
+            park_route_comments.clear()
+            retire_calls.clear()
+            needs_user("o/r", 41, "budget spent", issue=7, park_class="capacity",
+                       bot_login=bot, head_sha="c" * 40, attempt_key="rounds=4")
+            check("#797-a (#4422): a MACHINE re-admission NEVER writes the human-owned "
+                  "review:needs-user / needs:user pair",
+                  [call for call in park_route_calls
+                   if call[-1] == "needs-user" or "needs-user" in str(call)], [])
+            check("#797-a: ...and never claims the maintainer readmitted it",
+                  ("human-readmitted" in park_route_comments[-1],
+                   "needs a human decision" in park_route_comments[-1]), (False, False))
+            check("#797-a: it consumes the machine window as a MACHINE park (gen 1 of the "
+                  "machine ladder), receipt first",
+                  park_route_calls,
+                  [("receipt",), ("pr-state", "parked"), ("issue-status", 7, "parked")])
+            check("#797-a: the receipt binds the MACHINE-minted window key",
+                  f"cutoff={auto_1}" in park_route_comments[-1], True)
+            check("#797-a: nothing is closed or handed back while the machine still has a "
+                  "chance left", retire_calls, [])
+            # (#797-b) #3595 EXACTLY: a SECOND machine window. AUTO_READMISSION_MAX chances are
+            # spent, so the machine RETIRES — its own terminal — and still does not page.
+            auto_2 = "2026-07-27T14:50:59Z"
+            park_route_state["comments"] = [gen_receipt(1, PARK_WINDOW_NONE),
+                                            gen_receipt(1, auto_1),
+                                            auto_receipt(auto_1), auto_receipt(auto_2, "k2")]
+            park_route_calls.clear()
+            park_route_comments.clear()
+            retire_calls.clear()
+            needs_user("o/r", 41, "budget spent", issue=7, park_class="capacity",
+                       bot_login=bot, head_sha="d" * 40, attempt_key="rounds=5")
+            check("#797-b (#3595): the SECOND machine window RETIRES — machine-owned, "
+                  "receipt first, review:parked kept",
+                  park_route_calls, [("receipt",), ("pr-state", "parked"),
+                                     ("issue-status", 7, "handback")])
+            check("#797-b: the retirement is receipted durably against its window",
+                  f"{PARK_RETIREMENT_MARKER} window={auto_2}" in park_route_comments[-1], True)
+            check("#797-b: the comment says MACHINE give-up, never a human question",
+                  ("MACHINE-owned give-up" in park_route_comments[-1],
+                   "needs a human decision" in park_route_comments[-1],
+                   "human-readmitted" in park_route_comments[-1]), (True, False, False))
+            check("#797-b: the draft PR is CLOSED (the absorbing machine park finally has an "
+                  "exit)",
+                  [doc for _kind, _verb, path, doc in retire_calls
+                   if path.endswith("/pulls/41")], [{"state": "closed"}])
+            check("#797-b: the source issue is handed back on the DECOMPOSITION route "
+                  "(role:impl -> role:research), as one atomic full-label PATCH",
+                  [doc for _kind, _verb, path, doc in retire_calls
+                   if path.endswith("/issues/7") and doc is not None],
+                  [{"labels": ["area:engine", "role:research", "status:parked"]}])
+            # (#797-c) THE MIRROR: the SAME receipt history, but the newest gesture is a PROVEN
+            # human unlabel. The human ladder is intact — this still escalates, and the
+            # "human-readmitted" sentence is finally true when it is written.
+            park_route_state["timelines"] = {
+                41: [labeled("review:parked", "2026-07-27T07:00:00Z"),
+                     unlabel("review:parked", "2026-07-27T18:00:00Z")], 7: []}
+            park_route_state["comments"] = [gen_receipt(1, PARK_WINDOW_NONE),
+                                            gen_receipt(1, auto_1), auto_receipt(auto_1)]
+            park_route_calls.clear()
+            park_route_comments.clear()
+            retire_calls.clear()
+            needs_user("o/r", 41, "budget spent", issue=7, park_class="capacity",
+                       bot_login=bot, head_sha="e" * 40, attempt_key="rounds=6")
+            check("#797-c: a GENUINE human re-admission still reaches the human terminal — "
+                  "the protection is preserved, not removed",
+                  park_route_calls,
+                  [("receipt",), ("pr-state", "needs-user"),
+                   ("issue-status", 7, "needs-user")])
+            check("#797-c: ...and only THEN is 'human-readmitted' a true statement",
+                  "human-readmitted" in park_route_comments[-1], True)
+            check("#797-c: a human escalation closes nothing and hands nothing back",
+                  retire_calls, [])
+            # (#797-d) CONVERGENCE: the retirement receipt exists but the close died. The
+            # ladder dedupes the window, so without the dedupe-arm convergence the disposition
+            # is stranded half-taken forever.
+            park_route_state["timelines"] = {
+                41: [labeled("review:parked", "2026-07-27T07:00:00Z")], 7: []}
+            park_route_state["comments"] = [
+                gen_receipt(1, PARK_WINDOW_NONE), gen_receipt(1, auto_1),
+                auto_receipt(auto_1), auto_receipt(auto_2, "k2"),
+                {"user": {"login": bot}, "created_at": auto_2,
+                 "body": (f"x {PARK_RETIREMENT_MARKER} window={auto_2} generation=2 -->"
+                          f" {PARK_GENERATION_MARKER} gen=2 cutoff={auto_2} -->")}]
+            park_route_calls.clear()
+            park_route_comments.clear()
+            retire_calls.clear()
+            needs_user("o/r", 41, "budget spent", issue=7, park_class="capacity",
+                       bot_login=bot, head_sha="f" * 40, attempt_key="rounds=7")
+            check("#797-d: a receipted-but-unclosed retirement is CONVERGED on the next tick "
+                  "(no new comment, the close re-driven)",
+                  (park_route_comments,
+                   [path for _kind, _verb, path, _doc in retire_calls
+                    if path.endswith("/pulls/41")]), ([], ["repos/o/r/pulls/41"]))
+            # (#797-e) A HUMAN-HELD source issue is never touched by a retirement.
+            park_route_state["comments"] = [gen_receipt(1, PARK_WINDOW_NONE),
+                                            gen_receipt(1, auto_1),
+                                            auto_receipt(auto_1), auto_receipt(auto_2, "k2")]
+            park_route_calls.clear()
+            park_route_comments.clear()
+            retire_calls.clear()
+            wiring_globals["_gh_json"] = lambda args, **kwargs: (
+                {"labels": [{"name": "role:impl"}, {"name": "needs:external-audit"}]}
+                if str(args[-1]).endswith("/issues/7")
+                else _fake_retire_json(args, **kwargs))
+            needs_user("o/r", 41, "budget spent", issue=7, park_class="capacity",
+                       bot_login=bot, head_sha="0" * 40, attempt_key="rounds=8")
+            check("#797-e: a retirement leaves a HUMAN-HELD source issue completely alone "
+                  "(no label PATCH, no status flip)",
+                  ([doc for _kind, _verb, path, doc in retire_calls
+                    if path.endswith("/issues/7") and doc is not None],
+                   [call for call in park_route_calls if call[0].startswith("issue-status")]),
+                  ([], []))
+        finally:
+            wiring_globals["_gh_json"] = real_retire_json
     finally:
         wiring_globals.update(real_park_route)
 
@@ -6385,7 +8002,8 @@ def _self_test():
         return argparse.Namespace(returncode=code, stdout="", stderr="")
 
     def run_disarm(base_ref="main", draft=False, armed=True, labels=(), when="mismatch",
-                   preserve_review_state=False, **overrides):
+                   preserve_review_state=False, bot_login="sparq[bot]",
+                   author="sparq[bot]", **overrides):
         disarm_calls.clear()
         compare_paths.clear()
         fake_outputs.clear()
@@ -6393,7 +8011,7 @@ def _self_test():
         net.update({
             "live": {"state": "open", "draft": draft,
                      "auto_merge": {"merge_method": "squash"} if armed else None,
-                     "user": {"login": "sparq[bot]"},
+                     "user": {"login": author},
                      "labels": [{"name": name} for name in labels],
                      "body": f"pr body\n\n<!-- sparq-reviewed-sha:{rev_sha} -->\n",
                      "head": {"sha": head_69, "ref": "sparq-agent/issue-7-fix",
@@ -6404,7 +8022,8 @@ def _self_test():
                         for key, doc in identical_compares.items()},
             "graphql_auto_merge": armed,
         }, **overrides)
-        disarm("o/r", 41, when, preserve_review_state=preserve_review_state)
+        disarm("o/r", 41, when, preserve_review_state=preserve_review_state,
+               bot_login=bot_login)
 
     try:
         wiring_globals["_gh_json"] = fake_gh_json
@@ -6636,6 +8255,46 @@ def _self_test():
             run_disarm(labels=(hold,), when="always")
             check(f"held always-defuse ({hold}) stands down untouched",
                   (disarm_calls, fake_outputs.get("disarmed")), ([], False))
+
+        # ---- Issue #570: the author gate is the EXACT App identity, never any `[bot]` ----
+        # POSITIVE CONTROL FIRST, so every zero-mutation assertion below is non-vacuous: the
+        # identical live state under the TRUSTED identity really does disarm. If the gate were
+        # inverted (or the fixture stopped producing a mismatch), this goes red first.
+        run_disarm(compare=json.loads(json.dumps(evil)))
+        check("#570 control: the trusted App identity still disarms a real mismatch",
+              ("pr merge 41 -R o/r --disable-auto" in disarm_calls
+               and "pr ready 41 -R o/r --undo" in disarm_calls,
+               fake_outputs.get("disarmed")), (True, True))
+        for mode in ("mismatch", "always"):
+            # A DIFFERENT App's PR (same repo, same worker-shaped head ref, no reviewed-sha
+            # binding it) is the exact #570 attack: pre-fix, `login.endswith("[bot]")` passed and
+            # the forged row redrafted + relabelled a foreign App's pull request.
+            run_disarm(when=mode, compare=json.loads(json.dumps(evil)),
+                       author="mallory[bot]")
+            check(f"#570 ({mode}): a foreign App author mutates nothing",
+                  (disarm_calls, fake_outputs.get("disarmed"),
+                   "disarm_error" in fake_outputs), ([], False, False))
+            # No identity supplied is UNPROVABLE, not permissive — it must not degrade to the old
+            # any-`[bot]` gate. Red the moment `bot_login` is treated as optional again.
+            run_disarm(when=mode, compare=json.loads(json.dumps(evil)), bot_login="")
+            check(f"#570 ({mode}): an empty expected identity fails closed",
+                  (disarm_calls, fake_outputs.get("disarmed"),
+                   "disarm_error" in fake_outputs), ([], False, False))
+            # Near-miss identities (a prefix of the trusted login, and the bare account without
+            # the App suffix) are foreign apps too — the comparison is equality, not membership.
+            for impostor in ("sparq-bot[bot]", "sparq"):
+                run_disarm(when=mode, compare=json.loads(json.dumps(evil)),
+                           bot_login=impostor)
+                check(f"#570 ({mode}): {impostor} is not the trusted App identity",
+                      (disarm_calls, fake_outputs.get("disarmed")), ([], False))
+        # Issue #105 must survive the new gate: a genuinely stale latch on a HUMAN-HELD PR of the
+        # TRUSTED App is still retracted (latch off + redraft), with the hold label preserved.
+        run_disarm(compare=json.loads(json.dumps(evil)), labels=("review:needs-user",))
+        check("#570 does not regress #105: a held trusted-App mismatch is still retracted",
+              ("pr merge 41 -R o/r --disable-auto" in disarm_calls
+               and "pr ready 41 -R o/r --undo" in disarm_calls,
+               "state:needs" in disarm_calls, fake_outputs.get("disarmed")),
+              (True, False, True))
     finally:
         wiring_globals.update(real_disarm_io)
 
@@ -6885,6 +8544,50 @@ def _self_test():
     except WorkerPrError:
         check("#560 f1: an unknown action fails closed in the marker projection",
               "raised", "raised")
+
+    # ---- ISSUE #708: the STRANDED recovery must retract the assertion its posture disproves -----
+    # The stranded posture IS the disproof: review-fix.yml's outcome job binds the reviewed-sha
+    # marker LAST (after the lane label and the arm), so a DRAFTED, UNARMED PR still carrying a
+    # marker equal to its head cannot have had a completed review outcome. Without the retraction
+    # the recovery dispatch resolves, takes a reviewer lease, exits `already_done`, skips the model
+    # and reports `success` — measured 117 of 160 mode=review dispatches on 2026-07-26.
+    _s_head, _s_other = "c" * 40, "d" * 40
+    check("#708: a drafted, unarmed, marker-bound PR is retracted",
+          stranded_recovery_action(set(), [], False, True, _s_head, _s_head), "retract")
+    check("#708: a human hold stands the recovery down",
+          stranded_recovery_action(set(), ["needs:user"], False, True, _s_head, _s_head), "hold")
+    check("#708: the machine capacity park stands the recovery down",
+          stranded_recovery_action({MACHINE_PARK_PR_LABEL}, [MACHINE_PARK_PR_LABEL], False, True,
+                                   _s_head, _s_head), "hold")
+    check("#708: review:pass stands the recovery down (the pass IS the verdict)",
+          stranded_recovery_action({PASS_LANE_PR_LABEL}, [], False, True, _s_head, _s_head),
+          "pass-hold")
+    # The arm bit is TRI-STATE exactly as in dispatch_claim.stranded_live: only an explicit False
+    # authorises the retraction, because a retracted marker on an armed PR is what makes
+    # enumerate_disarm_items disable-auto + dequeue + REDRAFT it (#584 follow-up finding 1).
+    check("#708: an ARMED PR is never retracted",
+          stranded_recovery_action(set(), [], True, True, _s_head, _s_head), "armed-hold")
+    check("#708: an UNKNOWN arm bit is never retracted",
+          stranded_recovery_action(set(), [], None, True, _s_head, _s_head), "armed-hold")
+    check("#708: a NON-DRAFT PR is never retracted",
+          stranded_recovery_action(set(), [], False, False, _s_head, _s_head), "armed-hold")
+    check("#708: an unknown draft bit is never retracted",
+          stranded_recovery_action(set(), [], False, None, _s_head, _s_head), "armed-hold")
+    check("#708: a marker naming ANOTHER head is left alone",
+          stranded_recovery_action(set(), [], False, True, _s_other, _s_head), "marker-mismatch")
+    check("#708: an already-retracted marker writes nothing (idempotent)",
+          stranded_recovery_action(set(), [], False, True, UNBOUND_REVIEWED_SHA, _s_head),
+          "marker-mismatch")
+    check("#708: an absent marker writes nothing",
+          stranded_recovery_action(set(), [], False, True, None, _s_head), "marker-mismatch")
+    # Ordering: a hold/pass wins over EVERY other consideration, and the arm guard wins over the
+    # marker check — so no quiet action can ever be reached via a path that already wrote.
+    check("#708: a hold wins over an armed, marker-mismatched PR",
+          stranded_recovery_action({PASS_LANE_PR_LABEL}, ["needs:user"], True, False, _s_other,
+                                   _s_head), "hold")
+    check("#708: every non-retract action is declared quiet",
+          sorted(set(STRANDED_RECOVERY_ACTIONS) - {"retract"}),
+          sorted(STRANDED_RECOVERY_QUIET_ACTIONS))
 
     # ---- #584 FOLLOW-UP FINDING 1: a review:pass PR IS NOT THE FIX LANE'S TO HAND OVER ----------
     # The fix lane admits on FIVE states and only `needs-fix` keys on review:changes;
@@ -7818,7 +9521,7 @@ def _self_test():
                          "sha": oc_state.get("head", "b" * 40)}}
 
     def run_review_outcome(verdict, labels=(), issue_labels=(), injection=False,
-                           reviewed_sha="b" * 40, **live_over):
+                           reviewed_sha="b" * 40, self_attested=False, **live_over):
         oc_calls.clear(); oc_outputs.clear(); oc_state.clear()
         oc_state.update(labels=labels, issue_labels=issue_labels, **live_over)
         with tempfile.TemporaryDirectory() as tmp:
@@ -7834,7 +9537,8 @@ def _self_test():
                 repo="o/r", pr=41, verdict_file=str(verdict_file),
                 files_file=str(files_file), round=1, max_rounds=3, security=False,
                 surface_path=[], issue=7, impl_provider="anthropic",
-                bot_login="sparq[bot]", run_key="9.1", reviewed_sha=reviewed_sha))
+                bot_login="sparq[bot]", run_key="9.1", reviewed_sha=reviewed_sha,
+                self_attested=self_attested))
 
     def run_fix_outcome(labels=(), issue_labels=(), injection="false",
                         reviewed_sha="b" * 40, **live_over):
@@ -7880,6 +9584,33 @@ def _self_test():
         check("unheld injection outcome still parks needs-user",
               (oc_calls, oc_outputs.get("decision")),
               (["post-findings", "needs-user"], "needs-user"))
+
+        # ---- [registry #657] THE ORCHESTRATOR CLASS, THROUGH THE REAL OUTCOME PATH -------
+        # (a) BASELINE, and the whole reason the outcome leg is part of the #657 enable
+        #     interlock: a NON-DRAFT PR without the class flag is DROPPED as `undrafted`,
+        #     with findings unposted and reviewed-sha left unbound — while the round budget
+        #     still charges. Every enrollable PR is non-draft, so an unwired outcome step
+        #     turns each review into a silent per-round burn ending in a terminal park.
+        run_review_outcome("approve", draft=False)
+        check("a non-draft PR is DROPPED as undrafted without the class flag",
+              (oc_calls, oc_outputs.get("decision"), oc_outputs.get("stale_reason")),
+              ([], "stale", "undrafted"))
+        # (b) ...and WITH it the outcome applies: findings posted, and the approve becomes a
+        #     HUMAN hand-off rather than an arm. Dropping `self_attested` anywhere between
+        #     argv and revalidate_outcome_head restores (a) here.
+        run_review_outcome("approve", draft=False, self_attested=True)
+        check("an orchestrator-class non-draft approve applies, and hands off to a human",
+              (oc_calls, oc_outputs.get("decision")),
+              (["post-findings", "needs-user"], "needs-user"))
+        # (c) the waiver is DRAFT-ONLY: a moved head is still stale for the class.
+        run_review_outcome("approve", draft=False, self_attested=True, head="d" * 40)
+        check("...and the class does not waive head freshness",
+              (oc_calls, oc_outputs.get("decision"), oc_outputs.get("stale_reason")),
+              (["round-void"], "stale", "head-moved"))
+        # (d) a DRAFT worker PR is unaffected by the flag existing at all.
+        run_review_outcome("approve")
+        check("the worker lane still arms on an approve",
+              (oc_calls, oc_outputs.get("decision")), (["post-findings"], "arm"))
 
         # the fix outcome paths drop the same way (re-review + injection->needs-user)
         for injection, park_name in (("false", "re-review"), ("true", "needs-user")):
@@ -7937,6 +9668,36 @@ def _self_test():
               (oc_calls, oc_outputs.get("decision")), ([], "hold"))
     finally:
         globals().update(real_oc)
+
+    # ---- THE DENY-PROSE BINDING (sparq-org/sparq#3809) --------------------------------------
+    # The legacy-park migration classifies a park by matching park_policy.LEGACY_PARK_DENY_PROSE
+    # against the prose THIS FILE writes. Until the v1 reason marker is emitted at the park write
+    # sites, that coupling is a security guard bound to an English sentence with nothing holding
+    # the two together: rewording an injection reason here would silently stop the migration
+    # recognising it, and a security-parked PR would be handed back to the machine.
+    #
+    # This binds them in BOTH directions. The literal must still be present in this file (so a
+    # reword fails here rather than in production), and it must still be matched by a deny
+    # pattern (so loosening the pattern fails too).
+    deny_policy = _park_policy()
+    _wp_source = Path(__file__).resolve().read_text(encoding="utf-8")
+    injection_reasons = [
+        "the reviewer flagged possible prompt injection",
+        "the fixer flagged the seeded findings as possible prompt injection",
+        "The reviewer flagged possible prompt-injection content; escalating to a human.",
+    ]
+    for reason_text in injection_reasons:
+        check(f"the injection reason {reason_text[:38]!r}... is still written by this file",
+              reason_text in _wp_source, True)
+        check(f"...and is still DENIED by park_policy.LEGACY_PARK_DENY_PROSE",
+              any(pattern.search(reason_text)
+                  for pattern, _cause in deny_policy.LEGACY_PARK_DENY_PROSE), True)
+    # And the guard must actually refuse a park carrying each of them, end to end.
+    for reason_text in injection_reasons:
+        check(f"reclassify_legacy_park REFUSES a park whose prose is {reason_text[:30]!r}...",
+              deny_policy.reclassify_legacy_park(
+                  [{"user": {"login": "bot"}, "body": f"> 🤖 SPARQ agent — {reason_text}"}],
+                  "bot")[0], None)
 
     print("worker-pr self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
@@ -8078,12 +9839,31 @@ def main():
                          help="the source issue (its needs:*/status:parked labels are part of the "
                               "hold surface)")
 
+    # Issue #708: the stranded recovery's marker retraction (see stranded_recover). Same required
+    # --head-sha discipline as fix-lane-defer, for the same reason: an untargeted retraction is the
+    # most destructive write in the pipeline, so a missing value fails loudly rather than degrading.
+    srec = subparsers.add_parser("stranded-recover", parents=[common])
+    srec.add_argument("--head-sha", required=True,
+                      help="the 40-hex head whose stranded posture was re-derived live; its "
+                           "disproved reviewed-sha assertion is retracted so the recovery "
+                           "re-review actually runs a model")
+    srec.add_argument("--issue", type=int,
+                      help="the source issue (its needs:*/status:parked labels are part of the "
+                           "hold surface)")
+
     nuser = subparsers.add_parser("needs-user", parents=[common])
     nuser.add_argument("--reason", required=True)
     nuser.add_argument("--issue", type=int)
     # Source-issue park ownership (park_policy.py): "question" -> human-owned needs:user,
     # "capacity" -> machine-owned status:parked (capacity/decline/budget-driven stops).
     nuser.add_argument("--park-class", choices=("question", "capacity"), default="question")
+    # registry #677: the narrow cause of a capacity park, so the park EPISODE is attributable in
+    # its own receipt. Omitted -> the receipt still lands under `capacity-unspecified`; a park with
+    # no cause receipt at all is the hole this closes. Constrained to the CAPACITY half of the
+    # closed taxonomy so a CLI caller cannot mislabel a capacity park as a human question.
+    nuser.add_argument("--park-cause", default="", choices=("",) + tuple(sorted(
+        cause for cause, klass in _park_policy().PARK_CAUSES.items()
+        if klass == _park_policy().PARK_CLASS_CAPACITY)))
     # Required for capacity parks once a readmission window exists (the generation-receipt
     # parser's bot trust filter); the question class never needs it.
     nuser.add_argument("--bot-login", default="")
@@ -8100,6 +9880,11 @@ def main():
     dis.add_argument("--preserve-review-state", action="store_true",
                      help="redraft safely without changing review:needs/review:changes "
                           "(when=always label re-entry only)")
+    # Issue #570: mandatory, so a caller that forgets the trusted identity fails LOUDLY at argv
+    # instead of silently no-opping. An explicitly EMPTY value still fails closed inside disarm().
+    dis.add_argument("--bot-login", required=True,
+                     help="the exact App login that must author the PR (any other author, "
+                          "including another [bot], is skipped)")
 
     # The live reviewer handle arrives via env WORKER_REVIEWER_ACCOUNT (not argv — argv is echoed
     # into public logs) and is compared against the recorded hash under PROVENANCE_SALT.
@@ -8124,6 +9909,13 @@ def main():
     # against these so a security label added DURING review still lands in the audit trail.
     arm.add_argument("--security-keyword", action="append", default=[],
                      help="security label keyword (repeatable; from the target routing match_labels)")
+    # [#657] The orchestrator class. REFUSED here — see ready_and_arm. A flag rather than a
+    # value so a workflow that forgets it fails toward the ARMABLE-worker default it always had,
+    # and the class is instead kept out by decide_review never returning "arm" for it; the two
+    # refusals are independent on purpose.
+    arm.add_argument("--self-attested", action="store_true",
+                     help="the provenance record is self-attested (orchestrator class): refuse "
+                          "to arm")
 
     rout = subparsers.add_parser("review-outcome", parents=[common])
     rout.add_argument("--verdict-file", required=True)
@@ -8144,6 +9936,10 @@ def main():
     rout.add_argument("--impl-provider", required=True)
     rout.add_argument("--bot-login", required=True)
     rout.add_argument("--run-key", required=True)
+    # [#657] The orchestrator class: the draft freshness requirement stands down (the class is
+    # never drafted) and an approve becomes a human hand-off instead of an arm.
+    rout.add_argument("--self-attested", action="store_true",
+                      help="the provenance record is self-attested (orchestrator class)")
     rout.add_argument("--reviewed-sha", required=True,
                       help="the commit the review ran against; the outcome defers if the live "
                            "head has moved off it (issue #156)")
@@ -8235,15 +10031,19 @@ def main():
         elif args.command == "fix-lane-defer":
             fix_lane_defer(args.repo, args.pr, args.stale_reason, args.head_sha,
                            issue=args.issue)
+        elif args.command == "stranded-recover":
+            stranded_recover(args.repo, args.pr, args.head_sha, issue=args.issue)
         elif args.command == "needs-user":
             alert_repo, alert_token = _alert_route()
             needs_user(args.repo, args.pr, args.reason, issue=args.issue,
                        alert_repo=alert_repo, alert_token=alert_token,
                        park_class=args.park_class, bot_login=args.bot_login,
-                       head_sha=args.head_sha, attempt_key=args.attempt_key)
+                       head_sha=args.head_sha, attempt_key=args.attempt_key,
+                       park_cause=args.park_cause)
         elif args.command == "disarm":
             disarm(args.repo, args.pr, args.when,
-                   preserve_review_state=args.preserve_review_state)
+                   preserve_review_state=args.preserve_review_state,
+                   bot_login=args.bot_login)
         elif args.command == "ready-and-arm":
             ready_and_arm(args.repo, args.pr, args.reviewed_sha, args.impl_provider,
                           args.impl_account_h, args.reviewer_provider,
@@ -8251,7 +10051,8 @@ def main():
                           args.arm == "true", issue=args.issue,
                           surface_paths=args.surface_path or None,
                           bot_login=args.bot_login, reviewed_base=args.reviewed_base,
-                          security_keywords=args.security_keyword or None)
+                          security_keywords=args.security_keyword or None,
+                          self_attested=args.self_attested)
         elif args.command == "review-outcome":
             review_outcome(args)
         elif args.command == "fix-outcome":

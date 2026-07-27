@@ -71,6 +71,48 @@ without reaction counting. **Release** and **heartbeat** are keyed by the unique
 (idempotent). The groomer **reclaims** leases past `expires_at` (a dead/cancelled worker frees its
 slot automatically — no receipt-guessing).
 
+### The `package` partition has ONE canonical derivation (and one pinned copy)
+
+A row's `package` is the single conflict partition its lease reserves, reduced from the source
+issue's `area:*` labels: **exactly one** distinct area reserves that area, **zero or multiple**
+reserve the serializing `__global__` partition (fail-closed — over-serialize a multi-area row rather
+than free a busy sibling crate).
+
+That reduction is **`lease_schema.plan_package`**. Precisely:
+
+| deriver | how |
+|---|---|
+| `dispatch-claim.plan_package` (mints the CAS claim) | **delegates** to `lease_schema.plan_package` |
+| `review-fix.yml` `resolve` job | **calls** `dispatch_claim.plan_package` — the minter's own function object |
+| `worker.yml` self-claim shell step | **calls** `lease_schema.py --plan-package` (the CSV CLI) |
+| `worker.yml` adopt validator | **imports** `lease_schema` from the registry checkout |
+| `dispatch-plan.py:_plan_package` | the ONE genuine copy — it ships inside the target repos, which have no `lease_schema.py`, so it is **pinned by an executed agreement assertion** in `dispatch-claim.py --self-test`, not shared |
+
+So there is one canonical definition, four callers, and exactly one pinned copy. Reverting any of the
+**four callers** to a private reduction — even one that agrees today — turns
+`dispatch-claim.py --self-test` red, because every caller carries a **shared-code** leg and not just
+a value-agreement leg (value agreement is exactly what a private-but-agreeing copy also satisfies):
+
+* the three **workflow** callers are *executed* out of the parsed YAML, and must both agree on every
+  area shape **and** still contain the canonical call — re-inlining the rule removes the anchor, so
+  the extraction fails with `found 0` instead of silently testing a copy;
+* the **minter**'s delegation is probed directly: the self-test swaps `lease_schema.plan_package`
+  out for a sentinel and requires `dispatch-claim.plan_package`'s result to follow it, which only
+  shared code can do (`adopt-loop L1b`).
+
+The fifth row, `dispatch-plan.py`, is the exception and is **agreement-pinned, not shared** — it
+ships where `lease_schema.py` does not exist. A private copy *there* is caught only if it disagrees
+on one of the exercised area shapes, which is weaker than the four callers above.
+The routing tables `review-fix.yml` re-derives inline (`review_chain` / `fix_chain` / `ladders`) are
+pinned to `dispatch-claim.REVIEW_CHAIN` / `FIX_CHAIN` / `worker-pr.ESCALATION_LADDERS` the same way.
+
+This matters because these values are derived **twice by design** — once by the dispatcher that
+mints a CAS claim, once by the review/fix (or worker) run that adopts it — and both adopt steps
+compare the two for **equality**. When `resolve` carried its own pre-#112 alphabetically-first
+reduction, every PR whose source issue held two `area:*` labels had its own dispatcher's claim
+rejected on every tick, forever: a deterministic loop that burned an account lease and a runner per
+tick and was the single largest failure class on the review lane that day.
+
 ## Selection logic (`select-and-claim`)
 
 `scripts/select-and-claim.py` (added in Phase 3) takes `(package, role, model-chain)` and returns an
@@ -124,6 +166,36 @@ a rolling `data/cache-affinity.json`), never in the public repos.
   also a trust surface (dispatch/worker/set-up-account/review-loop/groom), the security
   `match_labels` override still wins (opus + trust-surface audit; Decision 7 revised 2026-07-18) — stricter than the frontier floor,
   unchanged.
+
+- **A chain-ORDER preference belongs in the target's routing table, never in one repository's
+  resolver.** Every dispatchable route is derived **twice**: PLAN runs the *target's*
+  `scripts/route-resolve.py`, CLAIM re-derives it with registry-owned `scripts/policy-resolve.py`
+  against the target's routing table read at its **protected** default tip, and
+  `dispatch-claim._route_matches` requires **exact** equality of `model_chain` / `agent` /
+  `escalate`. A rule only one side implements is therefore not a preference that half-applies — it
+  raises `RouteDivergenceError`, the item defers `route-plan-claim-divergence`, and because the
+  comparison is a pure function of the labels and the table it defers **identically on every
+  subsequent tick**. The affected issues stop dispatching entirely. Machine-readable form —
+  `orchestration/routing.toml` in the target:
+
+  ```toml
+  [[chain_preference]]
+  labels   = ["area:gui"]      # EXACT labels; ANY one selects. Never a substring: "gui" in label
+                               # would sweep area:guide / area:guidance into the carve-out.
+  lead     = "sol"             # moved to the FRONT; every other rung keeps its relative order,
+                               # so this is PREFERENCE, NOT EXCLUSION.
+  requires = ["sol", "opus5"]  # fires only when the chain ALREADY contains all of these.
+  ```
+
+  `scripts/chain_preference.py` is the shared **mechanism**, imported by both registry resolvers
+  and hard-coding no selector. `lead` **must** appear in `requires`, which is what makes re-order
+  the only reachable effect — a preference can never inject a model into a chain that deliberately
+  excludes it (e.g. turning the single-provider, escalating `role:research` chain cross-provider).
+  Security `match_labels` routes are exempt on both sides: an implementor preference must never
+  re-order a soundness chain. Verify a target with
+  `python3 scripts/cross-resolver-agreement.py --target-root <checkout>`, which drives **both**
+  resolvers over a 22-row label matrix and reports any row they decide differently.
+  Live instance: the maintainer's 2026-07-26 `area:gui` carve-out (sparq PR #4211).
 
 ## Adding an account — step-by-step runbook (an agent can follow this verbatim)
 
@@ -281,11 +353,30 @@ Edit `policy/repos.toml` for each target repo that should be allowed to use this
 
 ```toml
 [repos."sparq-org/sparq"]
-account_pool = ["acct01", "acct02", "acct03", "acct04", "acct05"]   # add the new handle
-max_concurrent = 5                                                   # optional: allow more parallelism
+account_pool = ["acct01", "acct02", "acct04", "acct05"]   # add the handle from the steps above
+max_concurrent = 5                                                  # optional: allow more parallelism
 ```
+
+Two constraints the resolver enforces, so a pool that violates either is refused outright rather
+than failing later at claim time:
+
+- **Handles must be canonical** — exactly `acct[0-9a-z]{2,}`, no surrounding whitespace and no case
+  variation. `" acct04"` and `"ACCT04"` are both rejected. (A padded handle used to pass validation
+  while evading the retirement check below, and downstream `select-and-claim` strips before
+  matching, so it became claimable and leaked its CAS lease to TTL.)
+- **Retired handles can never reappear.** `acct03` and `acct06` are retired (accounts cancelled /
+  expired 2026-07-25) and are refused by `policy-resolve.RETIRED_ACCOUNTS`. Their slot names stay
+  permanently reserved — `set-up-account` counts `acctNN` issues in ANY state — so a new enrolment
+  always gets a NEW handle, never a recycled one.
 Commit + push to `master`. An account that is available + in the catalog but **not** in a repo's
 `account_pool` will never be claimed for that repo.
+
+> **If the handle was enrolled by the broker, do NOT widen its grant here.** An ordinary policy PR
+> takes effect for claims the moment it merges, but it establishes no row-scoped
+> `account-pool/<handle>` provenance for the new row — which the broker requires per granted row —
+> and it leaves the account issue's `grant_targets:` line disagreeing with policy, so that handle's
+> resume and `activate` paths then refuse. Widen through the broker instead: see
+> [`grant_targets:` — the recorded target set, and how to repair it](#grant_targets--the-recorded-target-set-and-how-to-repair-it).
 
 ### Verify
 
@@ -442,6 +533,52 @@ maintainer action (re-mint the setup-token). It is deliberately a **cooldown, no
 account may be the fleet's only cross-provider review account, and zero reviews is worse than a
 partial success rate.
 
+### A `no_change` never re-dispatches the same tier (issue #701)
+
+Measured 2026-07-26 over 196 completed `worker.yml` runs: **70 success / 126 failure**, dominated by
+the structured exit class `no_change` — the model ran to a clean exit and produced **no diff**. The
+same hard issue was then retried **up to 3x with the same model**, with no record of why the previous
+attempt produced nothing, so one issue could consume three worker slots and three account leases to
+produce nothing. Every sampled target was a substantive, correctly-labelled, genuinely hard task, so
+this is a task-difficulty ↔ execution-mode mismatch, not a stale backlog.
+
+Two halves, both in `scripts/no_change_routing.py` (the single declaration; `worker-live.sh` produces,
+`model-health.py` stores, `dispatch-claim.py` routes):
+
+- **`why_no_diff`.** A worker returning no edits is asked, in the stable prompt prefix, to write
+  `.worker-no-diff.json` naming one of a **closed five-word vocabulary** (`underspecified`,
+  `blocked_on_decision`, `too_large`, `already_done`, `other`). The file is lifted out of the tree
+  **before** the change detection — otherwise writing the explanation would itself be the diff — and
+  the reason rides the existing sanitized `no-change-v1` envelope as its **vocabulary index**, never
+  as text, so nothing model-authored can reach the public ledger or an alert body. Absent, malformed,
+  or out-of-vocabulary ⇒ `unspecified`, which is the value the router treats as *no signal*.
+- **The decision**, taken in `dispatch()` on the deferred-retry path **before `allocator.claim()`**
+  picks a model (the claim is what would otherwise walk the resolved chain from its head again):
+  dispatch on an **untried** tier of the same chain, or — when no untried tier remains, or the
+  declared reason says the task's *shape* is the blocker (`too_large` / `underspecified`) — fire
+  #500's `role:impl` → `role:research` reroute at a threshold of **one**, because a second identical
+  outcome cannot inform a decision the evidence has already made.
+
+Fail-closed and bounded, in the directions that matter:
+
+- An unreadable health window already leaves the issue deferred with **no** escalation, and `unknown`
+  (the fold target for an unattributable exit) is neither `no_change` nor success — so an unreadable
+  exit class can never mark an issue intractable.
+- The narrowing has its **own** machine exit, `TIER_EXCLUSION_SECONDS` (**6 h**), 8x tighter than the
+  48 h health window: a chain narrowed onto a tier with no capacity cannot stall the issue for the
+  full window.
+- Escalation terminates in `min(len(chain), DECLINE_ESCALATION_MIN)` dispatches, each on a distinct
+  tier, and the terminal for an issue already on a non-implementation route is the **machine-owned**
+  `status:parked` soft hold — never `needs:user` (#703).
+
+The evidence path is itself a **YAML seam**: `worker.yml`'s `exit-class` step and the separate
+no-target-code `model_health` job are the only wire carrying a `no_change` (and its `why_no_diff`)
+into the ledger the dispatcher routes on. Cutting it fails **silently** — no job goes red, the
+dispatcher simply sees no evidence and resumes retrying the same tier — so
+`dispatch-claim._no_change_seam_violations` pins it on **parsed** nodes (`if:`, step/job presence,
+the `needs:` edge, both `env:` inputs, and the `--reset-hint` argument), with each mutant applied to
+the parsed document in memory and required to come back named.
+
 ## Security posture
 
 - Tokens: only in GitHub secrets (encrypted at rest, masked in logs), and only in the
@@ -477,6 +614,35 @@ partial success rate.
   writes or mutation-confirmations (their conflict/fail-loud semantics are caller-owned — a replayed
   mutation can double-dispatch a worker, #559/#558).
 - Public codebases request a worker and receive an opaque claim; they never see account internals.
+- Worker publication is re-attested LIVE, twice (issue #568). The pre-model `trust` step runs tens
+  of minutes before push/PR (the job budget is up to 90 minutes, which is why the lane mints two
+  further App tokens across that span), so `worker.yml` repeats the FULL author / body-SHA /
+  status-label / trust-gate revalidation in the fresh publisher immediately before
+  `Commit, push, and open DRAFT target pull request` — a maintainer who closes, rewrites, or
+  human-parks the issue mid-run is never published over. Three properties make it sound: the
+  verifier is a **pre-model snapshot** — the trust-gate program, the `worker-issue.py` driver that
+  runs the live checks and decides whether to invoke it, and the `park_policy.py` sibling the
+  driver loads out of its own directory (the whole closure the path executes, or it dies on every
+  run), since the local gate executes target-controlled cargo build scripts on the runner and
+  could otherwise rewrite any of them — taken
+  from the SHA-pinned checkouts into `RUNNER_TEMP` (outside every model-container mount) and
+  re-bound to their recorded sha256s, with nothing else permitted in the snapshot directory, so the
+  candidate change can never authorize its own publication — `reverify --forbid-gate-root` refuses
+  at runtime if the gate path resolves into the model-mutable tree; the re-check runs in
+  `--mode pre-publish`,
+  which accepts **this run's own** `status:in-progress` claim (dispatch mode's `status:ready`
+  demand would refuse every real run) and nothing else; and ownership is a genuine
+  compare-and-swap — the run-key-bound claim receipt is posted **before** the shared
+  `status:in-progress` label, so a newer run supersedes an older one even in the pre-attempt
+  window, and `holds_live_claim` refuses whenever the newest receipt is not this run's. A step
+  *outcome*, finally, proves only that a shell exited 0 — which those same build scripts can
+  arrange without the verifier ever running, by persisting `BASH_ENV` (bash sources it before the
+  block's first line) or a hijacked `PATH` out of the gate via `$GITHUB_ENV`/`$GITHUB_PATH` — so
+  publication is additionally gated on a positive **attestation** the re-check emits only after the
+  live re-verification returns; the re-check executes on a reset PATH with the interpreter levers
+  cleared and python isolated; and the gate step's own runner command files are redirected to a
+  quarantine path, removing that persistence primitive at its source. Drift ABORTS without
+  mutating human-owned issue state; `final_state` returns the issue to the pool.
 
 ## Registering a new account (web-login broker)
 
@@ -527,3 +693,108 @@ invalid, or under-scoped, the broker exits **without ever surfacing a sign-in UR
 (the exact mint grants and the storage command
 `gh secret set REGISTRY_SECRETS_PAT --repo jeswr/agent-account-registry --env dispatch-secrets`)
 is posted on the issue, so a credential is never captured that cannot be stored.
+
+### `grant_targets:` — the recorded target set, and how to repair it
+
+One authorization, three artifacts, read at three different times:
+
+| Artifact | Lives on | Written by | Read by |
+|---|---|---|---|
+| `grant:<owner>/<repo>` labels | the **request** issue | the human opening the request | the broker's `authorize` step — and **re-read live** immediately before the pool write |
+| `account_pool = [...]` rows | `policy/repos.toml` | the checked `account-pool/<handle>` PR | `policy-resolve` / `select-and-claim`, at **claim** time |
+| `grant_targets: <owner>/<repo>[, ...]` | the **account** issue body (title = the handle) | the broker, when it creates the record (and an operator, by hand, in the recoveries below) | the #211 **resume** path and the post-merge **`activate`** job |
+
+The record is not a duplicate of policy. `activate` fires on a `pull_request` event with no access to
+the request issue's labels, so `grant_targets:` is the only *readable-from-there* statement of the
+authorized target set that it can re-prove the merged policy against. `grant-account.verify_membership`
+requires, in the merged document: **every** recorded target lists the handle **exactly once**, and **no
+other row** lists it at all. Both legs are refusals — a record that cannot be read, or that disagrees
+with policy, fails closed and leaves the account `status:pending` for a human.
+
+**What the record is not.** It is an issue body an operator can edit, and nothing re-derives it from
+the `grant:` labels after enrollment, so it is the broker's transcript of an authorization, never the
+authorization itself. Editing it changes what the later proofs are compared *against*; it is not
+evidence that the request ever authorized a target, and it cannot supply the row-scoped
+`account-pool/<handle>` provenance the broker's no-op/resume path separately requires. That is why the
+first recovery below is a reconstruction of a record whose grant was already reviewed, and the second
+one drives the change back through the broker rather than hand-editing the line into agreement.
+
+#### Recovery 1 — a pre-#579 account record has no `grant_targets:` line
+
+Symptom, from `activate`:
+
+```
+refusing to activate acct07: the account record carries no `grant_targets:` line, so the
+repositories this account was authorized for cannot be read — refusing to prove or activate
+its grant (fail closed)
+```
+
+or, from a re-applied `set-up-account` on the bound request issue: *"…its authorized target
+repositories cannot be read … Add a valid `grant_targets:` line to the issue body, then re-apply
+set-up-account."*
+
+Who is affected: an account issue created **before #579** (no such line) that is still
+`status:pending` with an unmerged `account-pool/<handle>` PR. The recovery is a one-line hand edit of
+the **account issue body** — not a policy edit — naming exactly the repositories whose `account_pool`
+that pending entry occupies:
+
+```
+grant_targets: jeswr/agent-account-registry, sparq-org/sparq
+```
+
+Shape rules `parse_record_line` / `verify_membership` enforce: one line, comma-separated
+`<owner>/<repo>`, anywhere in the body; entries are order- and duplicate-insensitive (sorted and
+deduped on read), but each must name an `enabled = true` row of `policy/repos.toml`, and the set must
+be **exactly** the rows the grant occupies — an extra target fails the *exactly once* leg, an omitted
+occupied row fails the *no other row* leg. Then **merge the pending PR** — `activate` fires on the
+merge and finishes the enrollment. There is nothing to re-run before then: the job is gated on
+`pull_request.merged == true`, so re-triggering it on a still-open PR is skipped and recovers nothing.
+The pre-merge resume option is re-applying `set-up-account` on the bound request issue.
+
+Do **not** instead hand-add the handle to `policy/repos.toml` to make the two agree: that trades a
+documented one-line record edit for an unreviewed write to the credential-authorization boundary, and
+activation would then refuse anyway for want of a merged, row-scoped `account-pool/<handle>` PR
+accounting for the membership.
+
+#### Recovery 2 — widening (or narrowing) an enrolled handle's grant
+
+**Do not widen a brokered handle in an ordinary policy PR.** That half takes effect for claims as soon
+as it merges — `policy-resolve` / `select-and-claim` read `account_pool` and never read
+`grant_targets:` — while establishing no `account-pool/<handle>` provenance for the new row, and the
+next resume for that handle then refuses **either way**: with the record widened to match,
+`trace_membership_provenance` finds no merged, row-scoped grant PR that established the new row; with
+the record left alone, `verify_membership` sees the handle in a **non-target** row. Editing the line
+afterwards does not repair that — it changes only what the proofs compare against.
+
+Widen through the broker instead, so the audited `grant:` labels are re-proved and the addition lands
+on the checked branch:
+
+1. Add the `grant:<owner>/<repo>` label for the new repository to the **original request issue** —
+   the authorization act, on the audited surface the broker actually reads.
+2. Add the same `<owner>/<repo>` to that account issue's `grant_targets:` line. Resume treats the
+   recorded set as the request's authorization snapshot and requires the live labels to still equal it
+   (`require_same_targets`), and `activate` reads the record at merge time — so it has to be there
+   before either runs.
+3. Re-apply the `set-up-account` label to that request issue — a closed one is fine, the workflow
+   triggers on `issues: [labeled]` and reconcile keys off the still-open **account** issue. The #211
+   resume path skips login and registration (the credential is already captured, the slot is the same
+   handle), re-runs `authorize` over the live labels against policy, and opens the **row-scoped**
+   `account-pool/<handle>` PR whose only edit is the new row.
+4. Let `gate` review that PR and merge it. `activate` then re-proves all four legs against the merged
+   policy — the recorded set, the row-scoped before/after pair, the PR's file scope, and its own
+   merge-base diff — and no-ops on an account that is already `status:available`.
+
+If the broker cannot be driven (the request issue is gone, or the account issue no longer resolves as
+resumable — it must be open and `status:pending`/`status:available`), the fallback is to open the
+`account-pool/<handle>` PR **by hand on that branch**, record edited first: the human review of that
+PR is then the authorization of record, and it is what later traces as provenance for the row. An
+ordinary policy PR is never a substitute for it.
+
+**Narrowing** is the one hand edit that stands on its own: remove the handle from the row in a policy
+PR and drop that repository from `grant_targets:` in the same change window. A row the grant no longer
+occupies needs no provenance, and leaving it recorded fails the *exactly once* leg the next time
+resume or `activate` runs for that handle.
+
+The fail-closed direction throughout is a refused activation rather than a silent grant: the record
+decides what `activate` and resume compare the merged policy against, but what licenses a grant is the
+reviewed `account-pool/<handle>` PR behind it.

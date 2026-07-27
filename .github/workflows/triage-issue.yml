@@ -1,4 +1,4 @@
-# [OPUS-4.8] Registry self-management: issue triage + untrusted-input quarantine for
+# Registry self-management: issue triage + untrusted-input quarantine for
 # jeswr/agent-account-registry. Mirrors the sparq target's .github/workflows/triage-issue.yml
 # trust-gate pattern: on a new/edited issue, trust-gate by the AUTHOR's repo permission with an
 # EXACT-MATCH trust for jeswr (the maintainer) and for the registry orchestrator App bot login; a

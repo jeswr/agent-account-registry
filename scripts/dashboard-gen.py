@@ -42,7 +42,9 @@ DEFERRED_RE = re.compile(r"^\S+\s+defer(?:red)?\s", re.MULTILINE)
 # Decision 22: no raw account handles anywhere on the public surface — observability lease rows
 # must already carry the collector's 8-hex salted label (OBS_SALTED_LABEL_RE below); anything else
 # dies loudly, and _assert_private additionally backstops every known raw handle over the finished
-# document. (The dashboard's OWN account labels use the canonical 16-hex hash — see _salted_labels.)
+# document. Issue #374 additionally stops the SALTED per-account rows being published at all — see
+# the fleet-composition block below — but the label validation stays, because a raw handle reaching
+# the collector output is a privacy incident whether or not this build would have published it.
 OBS_SCHEMA = "registry-observability/v1"
 OBS_SALTED_LABEL_RE = re.compile(r"[0-9a-f]{8}")
 OBS_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:+-]{0,63}")
@@ -64,6 +66,49 @@ PROBE_MAX_AGE_SECONDS = 3600
 # Runner/generator clock skew is seconds, not minutes; a stamp further in the future than this is
 # not a clock artifact but a bogus stamp, and bogus == unmeasured.
 PROBE_MAX_SKEW_SECONDS = 300
+
+# FLEET-COMPOSITION MINIMIZATION (issue #374, closing the sol-audit finding #184 deferred).
+#
+# The line this repo had already accepted is model-health.render_body's PUBLIC-registry route
+# (sol-audit #204): when an alert lands on the public registry it carries the provider and the
+# condition and SUPPRESSES the failure/fleet counts, reset hints and diagnostics, because those
+# "would compositionally disclose the worker-account fleet". The dashboard was the loud version of
+# the very same disclosure and had never been held to that line: it published one row per account
+# (salted label, provider, availability, live windows, active-agent count) plus
+# accounts_total/available/capped/unavailable/unknown, single_account, per-window
+# accounts_reporting/remaining_account_windows/limit_remaining/limits_known, and
+# fleet.capacity {eligible, total}. Every one of those is a direct read of the fleet's CARDINALITY,
+# and the salted labels were stable across builds, so the page also tracked individual accounts
+# over time.
+#
+# The counts are NOT deleted — they remain the internal single source of truth for "is there usable
+# headroom" (_provider_quota / the capacity tally in build_dashboard), still unit-tested here, still
+# the one predicate shared with the allocator. They are PROJECTED AWAY at publication time by
+# _public_provider_quota + _public_capacity, which keep the operational answer (has this provider
+# headroom, how full are its windows on average, when does it refill) while being invariant under
+# cloning the fleet. _assert_no_fleet_composition then backstops the FINISHED document fail-closed,
+# so a future field cannot silently re-open the surface this closes.
+#
+# KNOWN RESIDUAL, stated rather than hidden: `fleet.active_agents` (and the per-repository model
+# counts it summarizes) is a count of LIVE LEASES, not of accounts — but because the catalog's
+# `max_concurrent_workers` is 1, N concurrent agents implies at least N accounts, so it is a lower
+# BOUND on the fleet size. It is kept because it is the dashboard's core operational number and
+# because the same count is already public on the `ledger` branch (`data/leases.json`); removing it
+# is a product call for the maintainer, tracked separately, not something to decide inside a
+# minimization pass.
+#
+# So the property this change actually establishes is "the public payload carries no ACCOUNT CENSUS
+# and no per-account row", NOT "no fleet count" — and both halves are load-bearing statements that
+# the suite pins: the clone-invariance test below runs each fleet size WITH one live lease per
+# account, so it asserts the invariance where the residual is live, and asserts the residual itself
+# (the agent counts DO scale) rather than avoiding load and implying it does not. The page footer is
+# worded to the same scope; do not restore an absolute "no fleet counts are published" claim while
+# `active_agents` ships.
+FLEET_COMPOSITION_KEYS = frozenset({
+    "accounts", "accounts_total", "accounts_available", "accounts_capped", "accounts_unavailable",
+    "accounts_unknown", "accounts_reporting", "single_account", "remaining_account_windows",
+    "limit_remaining", "limits_known", "eligible", "total", "label",
+})
 
 
 class DashboardError(RuntimeError):
@@ -224,26 +269,16 @@ def _catalog(issues):
     return accounts, private_values
 
 
-def _salted_labels(handles, salt):
-    """Canonical 16-hex salted account labels (issue #184), reusing the ONE shared hasher
-    model-health.account_hash — sha256(handle + ':' + salt)[:16], identical to the ledger and
-    worker-pr fingerprints (locked decision 22a) — instead of a divergent 8-hex HMAC. A missing
-    PROVENANCE_SALT FAILS CLOSED: account_hash raises on an empty salt, so the whole build dies
-    rather than deploying `salt-missing` rows that would pin a public row to a single account
-    with no salt at all."""
+def _require_salt(salt):
+    """Issue #184's fail-closed salt precondition, RETAINED after #374 removed the last
+    handle-derived label from the payload. It no longer guards a value this build publishes; it
+    guards the ENVIRONMENT. A dashboard that builds happily with PROVENANCE_SALT unset is exactly
+    the environment in which a re-added account label would be published unsalted (the pre-#184 bug
+    deployed literal `salt-missing` rows, pinning a public row to a single account with no salt at
+    all). One string check, and the whole build dies rather than proceeding unsalted."""
     if not isinstance(salt, str) or not salt.strip() or not salt.isprintable():
         raise DashboardError(
-            "dashboard account labels require a non-empty printable PROVENANCE_SALT")
-    account_hash = _model_health_module().account_hash
-    try:
-        labels = {handle: account_hash(handle, salt) for handle in handles}
-    except ValueError as exc:
-        raise DashboardError(
-            "dashboard account labels require PROVENANCE_SALT (issue #184): "
-            f"{exc}") from exc
-    if len(set(labels.values())) != len(labels):
-        raise DashboardError("salted account label collision")
-    return labels
+            "the dashboard build requires a non-empty printable PROVENANCE_SALT (issue #184)")
 
 
 def _percent(value):
@@ -274,26 +309,6 @@ def _availability(account, usage_entry):
     if any(value is not None and value >= 100 for value in known):
         return "capped"
     return "available"
-
-
-def _window_rows(account, usage_entry):
-    usage_entry = usage_entry if isinstance(usage_entry, dict) else {}
-    rows = []
-    for prefix, name in WINDOWS:
-        used = _percent(usage_entry.get(f"{prefix}_util"))
-        reset = _utc_iso(usage_entry.get(f"{prefix}_reset"))
-        limit = usage_entry.get(f"{prefix}_limit")
-        if limit is None:
-            limit = account["limits"].get(f"{prefix}_limit")
-        if prefix == "fable_7d_oi" and used is None and reset is None and limit is None:
-            continue
-        rows.append({
-            "name": name,
-            "used_percent": used,
-            "reset_at": reset,
-            "limit": str(limit) if limit is not None else None,
-        })
-    return rows
 
 
 _SELECT_AND_CLAIM_MODULE = None
@@ -403,7 +418,12 @@ def _provider_quota(accounts, usage, now):
     every known window-reset/backoff stamp for the provider: soonest = the first moment ANY
     quota refills, oldest = when the last known window has refilled. Pure — unit-tested by
     --self-test; rows carry provider names + counts only (decision 22: no account identifiers,
-    salted or otherwise, on this surface)."""
+    salted or otherwise, on this surface).
+
+    These rows are INTERNAL as of issue #374. The counts below are the source of truth for the
+    capacity decision and are asserted in both directions by the suite, but they are never
+    published: build_dashboard emits `_public_provider_quota(_provider_quota(...))`, which keeps the
+    operational answer and drops every field that reads out the fleet's size."""
     groups = {}
     for account in accounts:
         groups.setdefault(account["provider"], []).append(account)
@@ -509,6 +529,91 @@ def _provider_quota(accounts, usage, now):
             "oldest_reset": max(provider_resets, default=None),
         })
     return rows
+
+
+def _provider_headroom(row):
+    """The cardinality-free replacement for a provider row's five-number account census (#374):
+    WHETHER this provider has usable headroom right now and, when it does not, why. A strict
+    function of the same counts `fleet.capacity` and the allocator key off — so the page still
+    cannot advertise capacity dispatch would refuse — but four words instead of a fleet census.
+    Precedence is "can we dispatch?" first, then the most actionable reason: capped refills at
+    `soonest_reset`, unknown means the probe told us nothing, unavailable means the catalog or a
+    dead credential took the provider out."""
+    if row["accounts_available"]:
+        return "available"
+    if row["accounts_capped"]:
+        return "capped"
+    if row["accounts_unknown"]:
+        return "unknown"
+    return "unavailable"
+
+
+def _public_provider_quota(rows):
+    """Project the internal provider rows onto the published payload (#374).
+
+    Dropped outright: accounts_total/available/capped/unavailable/unknown, single_account,
+    accounts_reporting, limit_remaining, limits_known. Every one is either a count of accounts or
+    a sum whose magnitude scales with the number of accounts (`limit_remaining` is Σ limit×remaining
+    over reporting accounts, so a publicly-known plan limit divides straight back out to a fleet
+    size). `remaining_account_windows` was itself Σ of per-account fractions and therefore bounded
+    ABOVE by the fleet size — 2.4 said "at least 3 accounts" out loud — so it is published as the
+    MEAN remaining fraction instead: same headroom reading, invariant under cloning the fleet."""
+    public = []
+    for row in rows:
+        windows = []
+        for window in row["windows"]:
+            reporting = window["accounts_reporting"]
+            if reporting <= 0:
+                continue    # _provider_quota never emits one; never divide by it if it ever does
+            windows.append({
+                "name": window["name"],
+                "remaining_fraction": round(
+                    window["remaining_account_windows"] / reporting, 2),
+                "soonest_reset": window["soonest_reset"],
+                "oldest_reset": window["oldest_reset"],
+            })
+        public.append({
+            "provider": row["provider"],
+            "headroom": _provider_headroom(row),
+            "signal": row["signal"],
+            "windows": windows,
+            "soonest_reset": row["soonest_reset"],
+            "oldest_reset": row["oldest_reset"],
+        })
+    return public
+
+
+def _public_capacity(capacity):
+    """fleet.capacity, cardinality-free (#374): per provider, WHETHER the allocator would find an
+    eligible account right now — not how many eligible out of how many held."""
+    return {provider: values["eligible"] > 0 for provider, values in capacity.items()}
+
+
+def _assert_no_fleet_composition(document):
+    """Fail-closed backstop over the FINISHED public document (#374) — the composition twin of
+    _assert_private. Every name in FLEET_COMPOSITION_KEYS was, until this change, a published read
+    of the fleet's size or of one identified account; `accounts` and `label` additionally catch a
+    re-introduced per-account row array (the shape both the account cards and the observability
+    lease rows used). Refusing the build is the point: the projection above is easy to bypass by
+    adding one key to the document literal, and a public-surface regression that only prose forbids
+    is a regression waiting to happen."""
+    found = set()
+
+    def visit(value):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key in FLEET_COMPOSITION_KEYS:
+                    found.add(key)
+                visit(item)
+        elif isinstance(value, list):
+            for item in value:
+                visit(item)
+
+    visit(document)
+    if found:
+        raise DashboardError(
+            "fleet-composition assertion failed: the public dashboard payload may not disclose "
+            f"{sorted(found)} (issue #374)")
 
 
 # --- WIRING ASSERTIONS: reading the workflow / the page script without letting a comment or a
@@ -1101,9 +1206,10 @@ def _obs_exit_rows(items):
 
 
 def _obs_flow(flow):
-    """Queue depth/age per class, salted lease utilization, review rounds, park rates, arm→merge
-    latency, target-CI congestion. A lease row whose label is not the 8-hex salted shape is a raw
-    account identity reaching the collector output — a decision-22 privacy incident, fatal."""
+    """Queue depth/age per class, fleet-wide lease utilization, review rounds, park rates,
+    arm→merge latency, target-CI congestion. A lease row whose label is not the 8-hex salted shape
+    is a raw account identity reaching the collector output — a decision-22 privacy incident,
+    fatal — and since issue #374 the rows themselves are aggregated away rather than republished."""
     if not isinstance(flow, dict):
         return None
     queue = []
@@ -1119,7 +1225,14 @@ def _obs_flow(flow):
                       "oldest_age_minutes": _obs_minutes(item.get("oldest_age_minutes"))})
     queue.sort(key=lambda row: row["class"])
 
-    leases = []
+    # Issue #374: the per-account lease rows are validated but NOT published. A list of up to 40
+    # {label, provider, utilization} rows is a per-account row array by another name — it reads out
+    # the fleet's size directly and its labels are stable across builds, which is exactly what the
+    # `accounts` array was removed for. The load-balance question the panel answers ("is one account
+    # carrying the fleet?") survives as summary statistics that are invariant under cloning the
+    # fleet. The decision-22 label check still runs on every INPUT row: a raw handle in the
+    # collector's output is a privacy incident regardless of what this build would have published.
+    lease_utilizations = []
     for item in flow.get("leases") if isinstance(flow.get("leases"), list) else []:
         if not isinstance(item, dict):
             continue
@@ -1127,10 +1240,15 @@ def _obs_flow(flow):
         if not isinstance(label, str) or OBS_SALTED_LABEL_RE.fullmatch(label) is None:
             raise DashboardError(
                 "observability lease row does not carry a salted account label (decision 22)")
-        provider = str(item.get("provider") or "").lower()
-        leases.append({"label": label,
-                       "provider": provider if SAFE_PROVIDER_RE.fullmatch(provider) else None,
-                       "utilization_1h": _obs_fraction(item.get("utilization_1h"))})
+        utilization = _obs_fraction(item.get("utilization_1h"))
+        if utilization is not None:
+            lease_utilizations.append(utilization)
+    lease_utilization = None
+    if lease_utilizations:
+        lease_utilization = {
+            "mean": round(sum(lease_utilizations) / len(lease_utilizations), 2),
+            "max": round(max(lease_utilizations), 2),
+        }
 
     rounds = flow.get("review_rounds")
     review_rounds = None
@@ -1170,7 +1288,8 @@ def _obs_flow(flow):
             continue
         ci_queue.append({"repository": repository, "depth": depth})
 
-    return {"queue": queue[:12], "leases": leases[:40], "review_rounds": review_rounds,
+    return {"queue": queue[:12], "lease_utilization_1h": lease_utilization,
+            "review_rounds": review_rounds,
             "parks_1h": parks_1h, "arm_to_merge_minutes_24h": arm_to_merge,
             "target_ci_queue": ci_queue[:12]}
 
@@ -1262,16 +1381,15 @@ def _normalize_observability(document):
 def build_dashboard(issues, leases_document, usage, dispatch_history, model_health, now, salt,
                     observability=None, probe_status=None):
     accounts, private_values = _catalog(issues)
-    handles = [account["handle"] for account in accounts]
-    labels = _salted_labels(handles, salt)
+    _require_salt(salt)
     usage = usage if isinstance(usage, dict) else {}
     try:
         leases = _lease_schema_module().validate_ledger(leases_document)
     except ValueError as exc:
         raise DashboardError(f"lease ledger is malformed: {exc}") from exc
     live = _live_leases(leases, now)
-    # Lease identities are already the canonical public salted labels. Raw handles come only from
-    # the private catalog/usage inputs and remain in the privacy deny-set.
+    # Only the AGGREGATE lease count reaches the payload (#374); lease identities never do. Raw
+    # handles come only from the catalog/usage inputs and remain in the privacy deny-set.
     private_values.update(str(handle) for handle in usage)
 
     # Issue #219: a snapshot the probe did not actually produce is not evidence of anything. When
@@ -1292,42 +1410,31 @@ def build_dashboard(issues, leases_document, usage, dispatch_history, model_heal
     probe = _probe_outcome(probe_status, now)
     usage_rendered = usage if probe["measured"] else {}
 
-    rows = []
+    # The internal capacity tally. ONE predicate for the provider row and eligible capacity: an
+    # account is counted eligible only where the allocator would also admit it. Issue #374: this
+    # stays a count internally — it is what decides "is there headroom" — but only the boolean
+    # projection of it is published.
     capacity = {}
     for account in accounts:
         entry = usage_rendered.get(account["handle"])
-        # ONE predicate for the card badge, the provider row and eligible capacity: an account is
-        # counted eligible only where the allocator would also admit it.
         availability, _backoff_until = _quota_state(account, entry, now)
         provider_capacity = capacity.setdefault(
             account["provider"], {"eligible": 0, "total": 0})
         provider_capacity["total"] += 1
         if availability == "available":
             provider_capacity["eligible"] += 1
-        weekly_reset_at = _utc_iso(entry.get("7d_reset")) if isinstance(entry, dict) else None
-        rows.append({
-            "label": labels[account["handle"]],
-            "provider": account["provider"],
-            "availability": availability,
-            "active_agents": sum(
-                1 for lease in live if lease.get("account") == labels[account["handle"]]),
-            "weekly_reset_at": weekly_reset_at,
-            "windows": _window_rows(account, entry),
-        })
-    rows.sort(key=lambda row: (
-        row["provider"], row["weekly_reset_at"] is None,
-        row["weekly_reset_at"] or "", row["label"]))
     history = dispatch_history if isinstance(dispatch_history, list) else []
     document = {
         "schema": SCHEMA,
         "generated_at": _utc_iso(now),
-        "accounts": rows,
-        # Cumulative per-provider headroom (maintainer request 2026-07-18) — rendered by the
-        # dashboard's "Provider quota (cumulative)" section, above the per-account cards.
-        "provider_quota": _provider_quota(accounts, usage_rendered, now),
+        # Per-provider headroom (maintainer request 2026-07-18), MINIMIZED for the public payload
+        # (issue #374). The per-account `accounts` array that used to sit under this key is gone;
+        # this section is now the whole quota surface.
+        "provider_quota": _public_provider_quota(
+            _provider_quota(accounts, usage_rendered, now)),
         "fleet": {
             "active_agents": len(live),
-            "capacity": capacity,
+            "capacity": _public_capacity(capacity),
             "last_sweep_at": history[0].get("at") if history else None,
             "dispatch_outcomes": history,
         },
@@ -1345,6 +1452,7 @@ def build_dashboard(issues, leases_document, usage, dispatch_history, model_heal
         # document so the raw-identity assertion below covers every observability string too.
         document["observability"] = observability
     _assert_private(document, private_values)
+    _assert_no_fleet_composition(document)
     return document
 
 
@@ -1386,6 +1494,13 @@ def _self_test():
         ok = ok and good
         print(f"  {'ok  ' if good else 'FAIL'} {name}: {got!r} (want {want!r})")
 
+    def _raises_dashboard(thunk):
+        try:
+            thunk()
+        except DashboardError:
+            return True
+        return False
+
     now = 1_750_000_000
     # #612 review finding 1: since a build with NO sidecar publishes nothing as capacity (correct —
     # an unsupplied measurement is the weakest evidence of all), every fixture below that means to
@@ -1423,35 +1538,23 @@ def _self_test():
     expected = {
         "schema": SCHEMA,
         "generated_at": "2025-06-15T15:06:40Z",
-        "accounts": [{
-            "label": "26208fef35e33b14", "provider": "anthropic", "availability": "available",
-            "active_agents": 1,
-            "weekly_reset_at": "2025-06-16T15:06:40Z",
-            "windows": [
-                {"name": "5 hour", "used_percent": 42.0,
-                 "reset_at": "2025-06-15T16:06:40Z", "limit": "1000"},
-                {"name": "7 day", "used_percent": 80.0,
-                 "reset_at": "2025-06-16T15:06:40Z", "limit": "7000"},
-            ],
-        }],
+        # Issue #374: NO `accounts` array, and the provider row carries a headroom WORD plus mean
+        # window fractions instead of the five-number account census + Σ-over-accounts sums.
         "provider_quota": [{
-            "provider": "anthropic", "accounts_total": 1, "accounts_available": 1,
-            "accounts_capped": 0, "accounts_unavailable": 0, "accounts_unknown": 0,
-            "single_account": True,
+            "provider": "anthropic",
+            "headroom": "available",
             "signal": "live rate-limit-header probe (per-window utilization)",
             "windows": [
-                {"name": "5 hour", "accounts_reporting": 1, "remaining_account_windows": 0.58,
-                 "limit_remaining": 580, "limits_known": 1,
+                {"name": "5 hour", "remaining_fraction": 0.58,
                  "soonest_reset": "2025-06-15T16:06:40Z", "oldest_reset": "2025-06-15T16:06:40Z"},
-                {"name": "7 day", "accounts_reporting": 1, "remaining_account_windows": 0.2,
-                 "limit_remaining": 1400, "limits_known": 1,
+                {"name": "7 day", "remaining_fraction": 0.2,
                  "soonest_reset": "2025-06-16T15:06:40Z", "oldest_reset": "2025-06-16T15:06:40Z"},
             ],
             "soonest_reset": "2025-06-15T16:06:40Z", "oldest_reset": "2025-06-16T15:06:40Z",
         }],
         "fleet": {
             "active_agents": 1,
-            "capacity": {"anthropic": {"eligible": 1, "total": 1}},
+            "capacity": {"anthropic": True},
             "last_sweep_at": "2025-06-15T15:05:00Z",
             "dispatch_outcomes": history,
         },
@@ -1472,7 +1575,7 @@ def _self_test():
         "2025-01-01Z dispatcher complete: 1 worker/review/fix run(s) launched\n"), (1, 1))
     check("raw identity absent", handle not in json.dumps(got) and email not in json.dumps(got), True)
     leaky = copy.deepcopy(got)
-    leaky["accounts"][0]["debug"] = handle
+    leaky["provider_quota"][0]["debug"] = handle
     try:
         _assert_private(leaky, {handle})
     except DashboardError:
@@ -1488,21 +1591,112 @@ def _self_test():
         salt_missing_failed = False
     check("missing salt fails closed (no dashboard is built without PROVENANCE_SALT)",
           salt_missing_failed, True)
-    check("canonical label is the shared 16-hex hash, not the old 8-hex HMAC",
-          _salted_labels([handle], "fixture-salt")[handle],
-          _model_health_module().account_hash(handle, "fixture-salt"))
-    check("canonical dashboard label has exactly 16 lowercase hex characters",
-          re.fullmatch(r"[0-9a-f]{16}", _salted_labels([handle], "fixture-salt")[handle])
-          is not None, True)
     invalid_salts_rejected = []
-    for invalid_salt in (None, "   ", "salt\nvalue"):
+    for invalid_salt in (None, "", "   ", "salt\nvalue"):
         try:
-            _salted_labels([handle], invalid_salt)
+            _require_salt(invalid_salt)
         except DashboardError:
             invalid_salts_rejected.append(True)
         else:
             invalid_salts_rejected.append(False)
-    check("invalid salts fail closed", invalid_salts_rejected, [True, True, True])
+    check("invalid salts fail closed", invalid_salts_rejected, [True, True, True, True])
+    check("a real salt is accepted (the precondition is not vacuously fatal)",
+          _require_salt("fixture-salt"), None)
+
+    # --- Issue #374: NO FLEET COMPOSITION ON THE PUBLIC PAYLOAD. -------------------------------
+    # The sharpest statement of the property, and the one that goes red on any partial revert: two
+    # fleets that differ ONLY in how many accounts they contain must publish the same document apart
+    # from the live-agent counts named as the KNOWN RESIDUAL above. The three-account fixture below
+    # is three clones of the one-account fixture — same provider, same limits, same probe numbers,
+    # same resets — so every surviving field is one an observer cannot count accounts with, and it
+    # is run both idle and at full occupancy. Pre-#374 this was red on accounts (1 row vs 3),
+    # accounts_total (1 vs 3),
+    # single_account (True vs False), accounts_available (1 vs 3), remaining_account_windows
+    # (0.58 vs 1.74), limit_remaining (580 vs 1740), limits_known/accounts_reporting (1 vs 3) and
+    # fleet.capacity (eligible/total 1/1 vs 3/3) — i.e. on every field this change touched.
+    def clone_fleet(size, busy=0):
+        """`size` identical accounts, the first `busy` of them holding one live lease each."""
+        clone_issues, clone_usage, clone_leases = [], {}, []
+        for index in range(size):
+            clone_handle = f"acct-clone-{index}"
+            clone_issues.append({
+                "title": clone_handle,
+                "labels": [{"name": "status:available"}],
+                "body": ("provider: anthropic\nmodels: [opus]\n"
+                         f"secret_ref: ACCTCLONE{index}_TOKEN\n"
+                         "limits: 5h_limit=1000 7d_limit=7000\n"),
+            })
+            clone_usage[clone_handle] = {"status": "allowed", "5h_util": "0.42",
+                                         "5h_reset": now + 3600, "7d_util": "0.8",
+                                         "7d_reset": now + 86400}
+            if index < busy:
+                clone_leases.append({
+                    "account": hashlib.sha256(
+                        f"{clone_handle}:fixture-salt".encode()).hexdigest()[:16],
+                    "claim_id": f"{index:x}" * 32, "holder": f"owner/repo#{index + 1}@run.1",
+                    "package": "pkg", "role": "impl", "model": "opus",
+                    "issued_at": now - 60, "expires_at": now + 60})
+        built = build_dashboard(clone_issues, {"leases": clone_leases}, clone_usage, history, None,
+                                now, "fixture-salt", probe_status=measured_sidecar)
+        return {"provider_quota": built["provider_quota"], "fleet": built["fleet"],
+                "active_by_repository": built["active_by_repository"]}
+
+    def without_agent_counts(published):
+        """The payload minus the KNOWN RESIDUAL (see the FLEET-COMPOSITION block at the top): the
+        live-lease counts, which are not claimed to be invariant and are not published as if they
+        were."""
+        trimmed = copy.deepcopy(published)
+        trimmed["fleet"].pop("active_agents")
+        trimmed.pop("active_by_repository")
+        return trimmed
+
+    check("[#374] a 1-account and a 3-account IDLE fleet publish a byte-identical payload",
+          clone_fleet(1), clone_fleet(3))
+    # #839 review round 1, finding 1: idle fleets exercise the property at ZERO load, where nothing
+    # about the fleet is in play — which is precisely the state the residual cannot be seen from.
+    # Re-run it with one live agent per account, so each fixture is a fleet at full occupancy and
+    # the per-account census fields (accounts_total 1 vs 3, remaining_account_windows 0.58 vs 1.74,
+    # limit_remaining 580 vs 1740, capacity 1/1 vs 3/3) are all live and would diverge on a partial
+    # revert.
+    check("[#374] ...and so do a BUSY 1-account and 3-account fleet, one live agent per account",
+          without_agent_counts(clone_fleet(1, busy=1)),
+          without_agent_counts(clone_fleet(3, busy=3)))
+    # The residual, ASSERTED rather than implied by omission: the counts trimmed above really do
+    # scale with the fleet under load, so the property is "no account census", not "no fleet count".
+    # This row is what keeps the page footer and the block comment honest — a change that removes
+    # `active_agents` (or one that quietly restores an absolute no-fleet-count claim) has to come
+    # through here.
+    check("[#374] KNOWN RESIDUAL: the live-agent counts DO scale with the fleet under load",
+          [(clone_fleet(size, busy=size)["fleet"]["active_agents"],
+            clone_fleet(size, busy=size)["active_by_repository"]["repositories"][0]["counts"])
+           for size in (1, 3)],
+          [(1, {"opus": 1}), (3, {"opus": 3})])
+    check("[#374] ...and that payload still reports the headroom honestly (not blanked out)",
+          (clone_fleet(3)["provider_quota"][0]["headroom"],
+           clone_fleet(3)["provider_quota"][0]["windows"][0]["remaining_fraction"],
+           clone_fleet(3)["fleet"]["capacity"]),
+          ("available", 0.58, {"anthropic": True}))
+    check("[#374] the golden document carries none of the composition keys",
+          sorted(FLEET_COMPOSITION_KEYS
+                 & set(re.findall(r'"([^"]+)":', json.dumps(got)))), [])
+    for banned_key, banned_value in (("accounts", []), ("accounts_total", 3),
+                                     ("single_account", True), ("label", "26208fef35e33b14"),
+                                     ("eligible", 1), ("limit_remaining", 580)):
+        poisoned = copy.deepcopy(got)
+        poisoned["fleet"][banned_key] = banned_value
+        try:
+            _assert_no_fleet_composition(poisoned)
+        except DashboardError:
+            composition_rejected = True
+        else:
+            composition_rejected = False
+        check(f"[#374] a re-introduced `{banned_key}` key fails the build closed",
+              composition_rejected, True)
+    check("[#374] ...and the real document passes the same assertion (not vacuously fatal)",
+          _assert_no_fleet_composition(got), None)
+    check("[#374] the assertion reaches keys nested inside lists, not just the top level",
+          _raises_dashboard(lambda: _assert_no_fleet_composition(
+              {"provider_quota": [{"windows": [{"accounts_reporting": 2}]}]})), True)
 
     def issue(account_handle, provider, secret):
         return {
@@ -1578,17 +1772,11 @@ def _self_test():
         ledger_rejected = False
     check("malformed records ledger fails loudly, never a fabricated check",
           ledger_rejected, True)
-    salted = _salted_labels(ordered_handles, "fixture-salt")
-    check("providers grouped + weekly resets soonest first + unknown last", [
-        (row["provider"], row["label"], row["weekly_reset_at"])
-        for row in ordered["accounts"]
-    ], [
-        ("anthropic", salted["anth-soon"], _utc_iso(now + 100)),
-        ("anthropic", salted["anth-late"], _utc_iso(now + 900)),
-        ("anthropic", salted["anth-unknown"], None),
-        ("future-provider", salted["future-one"], _utc_iso(now + 500)),
-        ("openai", salted["openai-one"], None),
-    ])
+    # Issue #374 replaced the per-account rows this used to order with one row per provider; the
+    # surviving public ordering promise is "one alphabetical row per provider, no account rows".
+    check("one alphabetical provider row, and no per-account rows at all",
+          ([row["provider"] for row in ordered["provider_quota"]], "accounts" in ordered),
+          (["anthropic", "future-provider", "openai"], False))
     check("repo/model table parses impl + review + fix and excludes expired", [
         ordered["fleet"]["active_agents"], ordered["active_by_repository"]
     ], [3, {
@@ -1801,10 +1989,35 @@ def _self_test():
           _limit_window(["inf", "nan", "-5"]), (0, None, True))
     check("cumulative quota rows carry no raw account identifier (decision 22)",
           all(h not in json.dumps(quota_rows) for h in quota_handles), True)
-    check("ordered fixture publishes one cumulative row per provider, single-account marked",
-          [(row["provider"], row["accounts_total"], row["single_account"])
-           for row in ordered["provider_quota"]],
-          [("anthropic", 3, False), ("future-provider", 1, True), ("openai", 1, True)])
+    # The INTERNAL rows still carry the census (they are what decides capacity); the PUBLISHED rows
+    # carry the headroom word derived from it. Both halves are asserted so neither can drift.
+    check("ordered fixture: internal census -> published headroom, per provider",
+          [(row["provider"], row["accounts_total"], row["single_account"],
+            _provider_headroom(row))
+           for row in _provider_quota(_catalog(ordered_issues)[0], ordered_usage, now)],
+          # every anthropic/future entry in ordered_usage is a PARTIAL probe row (a reset stamp with
+          # no utilization), which _quota_state files as unknown — so the census is 3/1 accounts,
+          # none of them free, and the headroom word says exactly that without saying how many.
+          [("anthropic", 3, False, "unknown"), ("future-provider", 1, True, "unknown"),
+           ("openai", 1, True, "available")])
+    check("ordered fixture publishes headroom words, never the census behind them",
+          [(row["provider"], row["headroom"]) for row in ordered["provider_quota"]],
+          [("anthropic", "unknown"), ("future-provider", "unknown"),
+           ("openai", "available")])
+    # The headroom precedence, all four branches, both directions: "can we dispatch" wins, then the
+    # most actionable reason. Collapsing any branch into another (or always answering "available")
+    # turns a row red.
+    for census, want_headroom in (
+            ({"accounts_available": 1, "accounts_capped": 9, "accounts_unknown": 9,
+              "accounts_unavailable": 9}, "available"),
+            ({"accounts_available": 0, "accounts_capped": 1, "accounts_unknown": 9,
+              "accounts_unavailable": 9}, "capped"),
+            ({"accounts_available": 0, "accounts_capped": 0, "accounts_unknown": 1,
+              "accounts_unavailable": 9}, "unknown"),
+            ({"accounts_available": 0, "accounts_capped": 0, "accounts_unknown": 0,
+              "accounts_unavailable": 1}, "unavailable")):
+        check(f"headroom precedence resolves to {want_headroom}",
+              _provider_headroom(census), want_headroom)
 
     # --- usage-probe outcome (issue #219): dashboard.yml's secret-materialization + probe steps
     # are continue-on-error and a failed probe was replaced by `{}`, so precisely WHEN measurement
@@ -1832,14 +2045,21 @@ def _self_test():
     def probe_view(status):
         built = build_dashboard(issues, leases, usage, history, None, now, "fixture-salt",
                                 probe_status=status)
-        return (built["accounts"][0]["availability"], built["fleet"]["capacity"],
-                built["provider_quota"][0]["accounts_available"],
-                built["provider_quota"][0]["accounts_unknown"],
+        # #374 moved the observable from the per-account row + the census to the headroom word and
+        # the capacity boolean. It is the SAME predicate underneath, so this block still fails on
+        # any weakening of the #219/#612 gate — an unmeasured probe must read `unknown`/no capacity.
+        return (built["provider_quota"][0]["headroom"], built["fleet"]["capacity"],
+                built["provider_quota"][0]["windows"],
                 (built.get("usage_probe") or {}).get("measured"))
 
     check("fresh ok probe: a real measurement still publishes real capacity",
           probe_view(fresh_probe),
-          ("available", {"anthropic": {"eligible": 1, "total": 1}}, 1, 0, True))
+          ("available", {"anthropic": True},
+           [{"name": "5 hour", "remaining_fraction": 0.58,
+             "soonest_reset": _utc_iso(now + 3600), "oldest_reset": _utc_iso(now + 3600)},
+            {"name": "7 day", "remaining_fraction": 0.2,
+             "soonest_reset": _utc_iso(now + 86400), "oldest_reset": _utc_iso(now + 86400)}],
+           True))
     for probe_name, probe_status in (
             ("failed", failed_probe),
             ("stale ok", stale_probe),
@@ -1855,13 +2075,13 @@ def _self_test():
                                       "attempted_at": now})):
         check(f"{probe_name} probe: the SAME usage input is never published as capacity",
               probe_view(probe_status),
-              ("unknown", {"anthropic": {"eligible": 0, "total": 1}}, 0, 1, False))
+              ("unknown", {"anthropic": False}, [], False))
     degraded = build_dashboard(issues, leases, usage, history, None, now, "fixture-salt",
                                probe_status=failed_probe)
-    check("failed probe publishes no window numbers or weekly reset from the dead snapshot",
-          [(row["weekly_reset_at"], [window["used_percent"] for window in row["windows"]])
-           for row in degraded["accounts"]],
-          [(None, [None, None])])
+    check("failed probe publishes no window numbers or reset stamps from the dead snapshot",
+          [(row["windows"], row["soonest_reset"], row["oldest_reset"])
+           for row in degraded["provider_quota"]],
+          [([], None, None)])
     check("failed probe surfaces its outcome, detail and age on the public document",
           degraded["usage_probe"],
           {"outcome": "failed", "detail": "secret-materialization-failed",
@@ -1914,31 +2134,31 @@ def _self_test():
     # with a legible value rather than take the suite down with a KeyError.
     sidecarless_marker = sidecarless.get("usage_probe") or {}
     check("[#612] NO sidecar: nothing published as capacity, and the marker IS on the document",
-          (sidecarless["accounts"][0]["availability"],
+          (sidecarless["provider_quota"][0]["headroom"],
            sidecarless["fleet"]["capacity"],
-           sidecarless["provider_quota"][0]["accounts_available"],
-           sidecarless["provider_quota"][0]["accounts_unknown"],
            "usage_probe" in sidecarless,
            (sidecarless_marker.get("outcome"), sidecarless_marker.get("measured"),
             sidecarless_marker.get("stale"), sidecarless_marker.get("attempted_at"))),
-          ("unknown", {"anthropic": {"eligible": 0, "total": 1}}, 0, 1, True,
+          ("unknown", {"anthropic": False}, True,
            ("unknown", False, True, None)))
-    check("[#612] and no window numbers or weekly reset leak from the untrusted snapshot",
-          [(row["weekly_reset_at"], [window["used_percent"] for window in row["windows"]])
-           for row in sidecarless["accounts"]],
-          [(None, [None, None])])
+    check("[#612] and no window numbers or reset stamps leak from the untrusted snapshot",
+          [(row["windows"], row["soonest_reset"]) for row in sidecarless["provider_quota"]],
+          [([], None)])
     # The core misreport (issue #219): a catalog-available account the probe never reported on used
     # to render "available" and count toward eligible capacity. It is the allocator's INELIGIBLE
     # shape, so it is "unknown" and eligible 0 — even with a perfectly healthy probe.
     unreported = build_dashboard(issues, leases, {}, history, None, now, "fixture-salt",
                                  probe_status=fresh_probe)
     check("catalog-available account with NO probe entry is unknown and not eligible capacity",
-          (unreported["accounts"][0]["availability"], unreported["fleet"]["capacity"]),
-          ("unknown", {"anthropic": {"eligible": 0, "total": 1}}))
-    check("eligible capacity equals the provider row's free count (one shared predicate)",
-          [(row["provider"], row["accounts_available"]) for row in ordered["provider_quota"]],
-          [(provider, values["eligible"])
-           for provider, values in sorted(ordered["fleet"]["capacity"].items())])
+          (unreported["provider_quota"][0]["headroom"], unreported["fleet"]["capacity"]),
+          ("unknown", {"anthropic": False}))
+    # The one-shared-predicate parity, restated on the minimized surface (#374): published capacity
+    # is true for exactly the providers whose published headroom is "available". Both projections
+    # read the SAME internal count, so the page cannot advertise capacity dispatch would refuse.
+    check("published capacity agrees with the published headroom word (one shared predicate)",
+          [(row["provider"], row["headroom"] == "available")
+           for row in ordered["provider_quota"]],
+          sorted(ordered["fleet"]["capacity"].items()))
     with tempfile.TemporaryDirectory() as directory:
         usage_file = Path(directory, "usage.json")
         usage_file.write_text(json.dumps(usage), encoding="utf-8")
@@ -2227,17 +2447,21 @@ def _self_test():
                     os.environ["PROVENANCE_SALT"] = saved_salt
             published = json.loads(Path(root, "site", "data.json").read_text(encoding="utf-8"))
             return ((published.get("usage_probe") or {}).get("measured"),
-                    published["accounts"][0]["availability"],
-                    published["fleet"]["capacity"])
+                    published["provider_quota"][0]["headroom"],
+                    published["fleet"]["capacity"],
+                    # [#374] the END-TO-END statement: whatever else main() writes, the file that
+                    # actually reaches Pages carries no composition key.
+                    sorted(FLEET_COMPOSITION_KEYS
+                           & set(re.findall(r'"([^"]+)":', json.dumps(published)))))
 
     check("[#612] main() forwards a FRESH sidecar, so a healthy run still publishes capacity",
           main_document({"schema": PROBE_SCHEMA, "outcome": "ok", "detail": "probe-succeeded",
                          "attempted_at": live_now}),
-          (True, "available", {"anthropic": {"eligible": 1, "total": 1}}))
+          (True, "available", {"anthropic": True}, []))
     check("[#612] main() forwards a FAILED sidecar, so the same run publishes none",
           main_document({"schema": PROBE_SCHEMA, "outcome": "failed",
                          "detail": "probe-exited-nonzero", "attempted_at": live_now}),
-          (False, "unknown", {"anthropic": {"eligible": 0, "total": 1}}))
+          (False, "unknown", {"anthropic": False}, []))
 
     # --- #612 review round 2, finding 5 (MINOR), UI half: the page's call sites. Deleting
     # `summary.append(probe)` or the SECOND argument of `updateFreshness(...)` removes the promised
@@ -2334,9 +2558,15 @@ const degraded = (node) =>
   for (const [name, document_] of Object.entries(input.documents)) {
     ids.warning = element("div#warning");
     ids.summary = element("div#summary");
+    ids["provider-quota"] = element("div#provider-quota");
     scope.render(document_);
     warnings[name] = {
       hidden: ids.warning.hidden,
+      // [#374] the rendered quota + summary text, so the assertions below can state what the page
+      // SHOWS rather than what app.js contains: a headroom word and a percentage, never a count of
+      // accounts. `text()` walks children, which is where every one of those strings lives.
+      quota: text(ids["provider-quota"]),
+      capacityLines: text(ids.summary),
       // `text()`, not `.textContent`: updateFreshness renders each independent degradation as its
       // own `.warning-line` child (issue #580), so the banner's own textContent is empty and a
       // direct read would make this row vacuously false for BOTH documents.
@@ -2410,6 +2640,34 @@ const degraded = (node) =>
            page["warnings"]["staleFailed"]["probeNotice"],
            page["warnings"]["staleFailed"]["capacityNote"]),
           (0, False, 1, False, True, False, 2, True, True, True))
+    # --- [#374] the SAME executed page, on what the fleet section now shows. The measured document
+    # is the one-anthropic-account fixture: pre-#374 this section rendered "1 account · 1 free ·
+    # 0 capped", a "single account" badge, "0.9 of 1 account-windows free" and a
+    # "1 / 1" capacity line — four independent counts of the fleet. Every row below is red on the
+    # pre-#374 page and on any partial revert of the renderer.
+    quota_text = page["warnings"]["measured"]["quota"]
+    failed_quota_text = page["warnings"]["failed"]["quota"]
+    check("[#374] the page renders a headroom word and a percentage, not an account census",
+          ("capacity available" in quota_text,
+           "anthropic" in quota_text,
+           "% of this window's quota left" in quota_text,
+           re.search(r"\d+\s+accounts?\b", quota_text) is not None,
+           re.search(r"account-windows?\b", quota_text) is not None,
+           "single account" in quota_text,
+           "limit-units left" in quota_text),
+          (True, True, True, False, False, False, False))
+    check("[#374] an unmeasured probe still degrades the rendered headroom (fail-closed on the UI)",
+          ("no usable measurement" in failed_quota_text,
+           "capacity available" in failed_quota_text),
+          (True, False))
+    check("[#374] the summary capacity card states availability, never eligible/total",
+          ("anthropic available" in " ".join(
+              page["warnings"]["measured"]["capacityLines"].split()),
+           "anthropic none free" in " ".join(
+               page["warnings"]["failed"]["capacityLines"].split()),
+           re.search(r"\d+\s*/\s*\d+",
+                     page["warnings"]["measured"]["capacityLines"]) is not None),
+          (True, True, False))
 
     health = _normalize_model_health({
         "generated_at": now,
@@ -2443,7 +2701,10 @@ const degraded = (node) =>
                            {"class": "4", "depth": 9, "oldest_age_minutes": 3},
                            {"class": "9z", "depth": 1}],
                  "leases": [{"label": "ab12cd34", "provider": "anthropic",
-                             "utilization_1h": 0.8}],
+                             "utilization_1h": 0.8},
+                            {"label": "ef56ab78", "provider": "anthropic",
+                             "utilization_1h": 0.4},
+                            {"label": "cd90ef12", "provider": "openai"}],
                  "review_rounds": {"mean": 1.44444, "max": 3, "budget_exhausted_1h": 0},
                  "parks_1h": {"needs_user": 2, "needs_orchestrator": 1},
                  "arm_to_merge_minutes_24h": {"p50": 18, "p90": 55.5, "samples": 9},
@@ -2474,8 +2735,10 @@ const degraded = (node) =>
                                   {"model": "fable", "exit_class": "success", "count": 3}],
         "flow": {"queue": [{"class": "2a", "depth": 1, "oldest_age_minutes": 12.3},
                            {"class": "4", "depth": 9, "oldest_age_minutes": 3.0}],
-                 "leases": [{"label": "ab12cd34", "provider": "anthropic",
-                             "utilization_1h": 0.8}],
+                 # [#374] three validated lease rows in, ZERO published: only the mean/max of the
+                 # utilizations that parsed (0.8, 0.4 -> 0.6/0.8). The unparseable third row proves
+                 # the aggregate is taken over reporting rows, and the count itself never appears.
+                 "lease_utilization_1h": {"mean": 0.6, "max": 0.8},
                  "review_rounds": {"mean": 1.44, "max": 3, "budget_exhausted_1h": 0},
                  "parks_1h": {"needs_user": 2, "needs_orchestrator": 1},
                  "arm_to_merge_minutes_24h": {"p50": 18.0, "p90": 55.5, "samples": 9},
@@ -2519,6 +2782,23 @@ const degraded = (node) =>
         label_rejected = False
     check("raw (non-salted) lease label is a fatal privacy violation (decision 22)",
           label_rejected, True)
+    # [#374] ...and the salted labels are not published either. Two fleets whose lease rows differ
+    # only in COUNT must normalize identically; pre-#374 the row array itself was the disclosure.
+    def obs_leases(rows):
+        fixture = copy.deepcopy(obs_fixture)
+        fixture["flow"]["leases"] = rows
+        return _normalize_observability(fixture)["flow"]
+
+    one_lease = obs_leases([{"label": "ab12cd34", "provider": "anthropic",
+                             "utilization_1h": 0.5}])
+    four_leases = obs_leases([{"label": f"ab12cd3{index}", "provider": "anthropic",
+                               "utilization_1h": 0.5} for index in range(4)])
+    check("[#374] lease rows of different fleet sizes normalize to the same published flow",
+          (one_lease, one_lease == four_leases,
+           "ab12cd34" in json.dumps(one_lease)),
+          (four_leases, True, False))
+    check("[#374] no reported lease utilization publishes nothing rather than a zero",
+          obs_leases([])["lease_utilization_1h"], None)
     with_observability = build_dashboard(
         issues, leases, usage, history, None, now, "fixture-salt", observability=obs_fixture)
     check("build_dashboard publishes the normalized observability key",
@@ -2537,7 +2817,7 @@ const degraded = (node) =>
     check("raw handle inside observability text is caught by the privacy assertion",
           leak_rejected, True)
     empty = build_dashboard([], {"leases": []}, None, [], None, now, "fixture-salt")
-    check("do-nothing case", (empty["accounts"], empty["fleet"],
+    check("do-nothing case", (empty["provider_quota"], empty["fleet"],
                               empty["active_by_repository"]),
           ([], {"active_agents": 0, "capacity": {}, "last_sweep_at": None,
                 "dispatch_outcomes": []}, {"models": [], "repositories": []}))
