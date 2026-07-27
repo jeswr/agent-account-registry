@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4426,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c8b426f38d481e81e9e4d0edc912442fc77a0181",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves both prior major findings. The grader now states an explicit missing-data policy, restricts cs_decided to probes answered decisively in every session, exposes completeness diagnostics, and offers --strict fail-closed behavior. Its no-argument mode now runs hand-computed fixtures covering missing, duplicate, invalid-label, and UNDECIDABLE inputs and re-derives every published column from the committed 45-session record. I executed both the self-check and strict analysis of the committed record; both passed, and the generated table matches STABILITY.md. No correctness, soundness, test-validity, or security issue remains in the reviewed diff.",
+  "verdict": "approve"
+ }
+}
