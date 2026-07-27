@@ -23,12 +23,12 @@
   {
    "account": "51bde6688e140866",
    "claim_id": "7c46b53814c143e2bf792962a4894df2",
-   "holder": "sparq-org/sparq#4423@dispatch-30242987004.1",
+   "holder": "sparq-org/sparq#4423@30243796247.1",
    "package": "sparq-zk-compose",
    "role": "soundness",
    "model": "opus5",
-   "issued_at": 1785134746,
-   "expires_at": 1785141046
+   "issued_at": 1785134776,
+   "expires_at": 1785141076
   }
  ]
 }
