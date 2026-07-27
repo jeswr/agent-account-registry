@@ -29,7 +29,7 @@ implementer identity rests on, and admission reads it. Only these shapes exist:
 |---|---|---|---|
 | `<run>.<attempt>` | `worker-run` | yes — machine-attested | worker.yml's `provenance` job |
 | `backfill:<run>.<attempt>` | `backfill` | yes — machine-attested | `scripts/backfill-provenance.py` |
-| `orchestrator:<run>.<attempt>` | `orchestrator` | **no** — self-attested | an actor holding a registry credential |
+| `orchestrator:<run>.<attempt>` | `orchestrator` | **only by explicit opt-in** — self-attested | an actor holding a registry credential |
 | anything else / absent | — | **no** — unrecognised | — |
 
 The two machine classes are written **host-side**, by a job that executes no target code. A
@@ -45,6 +45,29 @@ folded into the generic malformed-stamp reason, so an audit can tell "nobody sta
 anti-forgery guarantee — an actor with registry write can simply write a machine-shaped stamp
 instead. The property that survives a forged declaration is *never reading the declared provider
 to pick the reviewer*; see `research/657-orchestrator-pr-admission.md`.
+
+### Admitting the `orchestrator` class (the opt-in)
+
+The class is refused by **default and by every consumer**. One consumer can opt in, per call, via
+`provenance_admission_error(record, pr, admit_orchestrator=True)` — a parameter rather than a
+widening of `MACHINE_ATTESTED_CLASSES`, because the class is not safe for every consumer. A
+consumer that only READS a PR is safe; one that PUSHES CODE or ARMS on the record's authority is
+not. Today exactly one consumer opts in: `enumerate_review_items`, and only to emit
+`needs-review`.
+
+Admission additionally requires the PR's author login to appear in that repo's
+`review_enrolment_authors` in `policy/repos.toml`. **The two halves live on branches of different
+authority on purpose.** Records live on the unprotected `ledger` branch precisely because master's
+required `gate` check rejects direct contents-API PUTs (issue #96), so minting a record is a
+low-authority act available to anything holding the App token. The allowlist lives on master,
+behind branch protection, so the *set* of logins that can ever be admitted is a reviewed change
+even when an individual record is not. Neither half admits anything alone.
+
+Enrolment never waives the fork gate, the record's field admission, the human holds, the machine
+parks, or any lease rule — and it never makes the class equal to a worker PR. See
+`research/657-orchestrator-pr-admission.md` §7, including **§7.3: the class is not yet wired at
+CLAIM or in `review-fix.yml`, so no repo may enable `review_enrolment_authors` yet** — a
+self-test interlock enforces that.
 
 This registry file is the review loop's ROOT OF TRUST for the implementer identity: the target
 model has no registry token, so it cannot forge these records, unlike commit trailers or PR body

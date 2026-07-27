@@ -515,6 +515,15 @@ jobs:
               return module
 
           claim_mod = load("registry_dispatch_claim", registry / "scripts" / "dispatch-claim.py")
+          # [OPUS-5 #657] Registry-owned policy, read from the MASTER checkout. `_policy_row`
+          # inside review_enrolment_authors validates the whole row, so a malformed or
+          # non-canonical review_enrolment_authors list HARD-FAILS this step rather than
+          # silently resolving to "nobody is enrolled" — a fail-closed default that is
+          # indistinguishable from a typo is exactly how an enrolment silently never happens.
+          policy_mod = load("registry_policy_resolve", registry / "scripts" / "policy-resolve.py")
+          import tomllib
+          with open(registry / "policy" / "repos.toml", "rb") as handle:
+              policy_doc = tomllib.load(handle)
 
           intermediate = json.loads(Path(out_dir, "issue-plan.json").read_text(encoding="utf-8"))
           # Lease state comes from the data-plane `ledger` branch checkout (issue #28) — the
@@ -616,9 +625,17 @@ jobs:
               # aggregate line at
               # PLAN completion (park-policy defect 3: "0 review item(s)" can never again
               # coexist silently with labeled worker PRs).
+              # [OPUS-5 #657] The MASTER-protected half of orchestrator-PR admission. Read from
+              # the private `registry` checkout (master), NEVER from the `registry-ledger`
+              # checkout: provenance records live on ledger precisely because master's required
+              # gate rejects direct PUTs, so the record half is a low-authority per-PR gesture
+              # and this list is the reviewed half that bounds which logins it can ever name.
+              # Reading it from ledger would collapse both halves onto one authority and make
+              # the pair pointless. Absent/empty => enrolment OFF => the shape gates stand.
+              enrolled_authors = policy_mod.review_enrolment_authors(repo, policy_doc)
               review_items.extend(claim_mod.enumerate_review_items(
                   repo, pulls, provenance, leases, issue_labels, now, pr_status=pr_status,
-                  exclusions=review_exclusions))
+                  exclusions=review_exclusions, enrolled_authors=enrolled_authors))
               # Armed-SHA-mismatch safety invariant (issue #42): CLAIM disarms these FIRST each
               # sweep, re-deriving every precondition live (matching SHAs are never disarmed).
               disarm_items.extend(claim_mod.enumerate_disarm_items(
@@ -687,8 +704,15 @@ jobs:
               for item in repository["items"]:
                   if set(item) != expected_item_fields:
                       raise SystemExit("plan item fields are invalid")
+          # [OPUS-5 #657] This set is a hand-maintained REPLICA of dispatch-claim.REVIEW_ITEM_FIELDS
+          # and it silently drifted the moment the enumerator gained a field: the producer emitted
+          # `self_attested`, this replica did not list it, and EVERY plan tick would have died here
+          # with "plan review item fields are invalid". The replica stays (this guard deliberately
+          # re-derives nothing from the module it is guarding), but dispatch-claim's self-test now
+          # parses this literal out of the workflow and asserts set equality with
+          # REVIEW_ITEM_FIELDS, so the next field addition fails a unit test instead of a tick.
           expected_review_fields = {"pr_number", "head_sha", "state", "impl_provider", "repo",
-                                    "package", "security", "context"}
+                                    "package", "security", "self_attested", "context"}
           for item in document["review_items"]:
               if set(item) != expected_review_fields:
                   raise SystemExit("plan review item fields are invalid")
