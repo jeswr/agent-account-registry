@@ -94,6 +94,23 @@ EC2_KEYWORDS = (
     "quiet-box", "ec2", "canonical gather", "same-box", "full-scale",
     "nightly gather", "gather run",
 )
+# `ec2` is the ONE entry in EC2_KEYWORDS that is a BARE TOKEN rather than a phrase, so it is the
+# only one a label (`needs:ec2`, `blocked:ec2`), a path (`research/ci-ec2-design.md`,
+# `.github/workflows/bench-ec2.yml`, `scripts/ec2-buildfarm.sh`), a branch name
+# (`chore/sq-uhqah-formalize-codex-ec2`) or an identifier (`AWSServiceRoleForEC2Spot`) can
+# swallow. Every one of those is the issue TALKING ABOUT the fence, not announcing work that has
+# to run on dedicated hardware. See is_ec2_measurement for the measured false-positive census.
+EC2_BARE_KEYWORD = "ec2"
+EC2_PHRASE_KEYWORDS = tuple(k for k in EC2_KEYWORDS if k != EC2_BARE_KEYWORD)
+# Free-word `ec2`: not glued into a label (`:` before), a path segment (`/` before), a compound
+# (`-`/`_` either side), an identifier (alnum either side), or a filename extension (`.yml`).
+# `/` is deliberately NOT excluded AFTER the token, so prose like `EC2/nightly tier` and
+# `CANONICAL/EC2 measurement` still match; and a trailing `.` only blocks when an extension
+# follows, so a sentence ending "…runs on EC2." still matches.
+_EC2_FREE_WORD = re.compile(
+    rf"(?<![A-Za-z0-9_:/-]){re.escape(EC2_BARE_KEYWORD)}(?![A-Za-z0-9_-]|\.[A-Za-z0-9])",
+    re.IGNORECASE,
+)
 WELL_SPECIFIED_LABELS = {"self-improvement", "from:agent", "drift"}
 SAFE_REPO = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*"
@@ -386,12 +403,55 @@ def is_trust_surface(issue: dict[str, Any], labels: set[str]) -> bool:
 
 
 def is_ec2_measurement(issue: dict[str, Any]) -> bool:
+    """Whether the issue announces work that has to RUN on dedicated measurement hardware.
+
+    The bare `ec2` keyword now matches as a FREE WORD, not as a substring. That is the repair,
+    and it is the only behaviour change: the phrase keywords, the title-only `_CODE_ONLY_BENCH`
+    escape, and the fail-loud malformed-payload contract are all untouched.
+
+    WHY THIS IS A BLOCKING DEFECT AND NOT A PRECISION NICETY. `needs:ec2` is a ONE-WAY hold: no
+    lane in this estate removes it, and `triage-stock-alert.census()` — the alarm THIS PR adds —
+    excludes every `needs:*` row from `machine_owed`, because a `needs:` gate normally means a
+    HUMAN owes the issue its next move. So a false fence does not merely delay an issue, it moves
+    the issue OUT of the population the starvation alarm keys on. That is exactly the
+    missing-state-exit defect this PR exists to close, re-created one layer up by the fix for it.
+    Admitting `status:untriaged` as a candidate (`is_staged`) is what made it reachable at scale.
+
+    MEASURED, frozen snapshots of BOTH enabled targets, 2026-07-27 (1501 + 350 open issues).
+    The three live registry false positives are code issues that match ONLY because the literal
+    label `needs:ec2` appears in a body discussing this very fence:
+
+        #803  "…with only #3314 correctly carrying `needs:ec2`…"
+        #802  "…asks the worker to auto-gate `needs:ec2` when…"
+        #471  "…auto-gate EC2-measurement bench issues with needs:ec2…"
+
+    Predicate population, base -> this rule: registry 4 -> 1, sparq 102 -> 84. All 18 sparq drops
+    are the same class — `bench-ec2.yml`, `scripts/ec2-buildfarm.sh`, `research/ci-ec2-design.md`,
+    `chore/sq-uhqah-formalize-codex-ec2`, `blocked:ec2`, `AWSServiceRoleForEC2Spot`,
+    `work-box/EC2 timings are NON-canonical`. NOTHING that says it must run on a box is dropped:
+    #4040/#4056/#4352/#4370/#3314/#2764/#2810/#2822/#3163/#3164 all still fence.
+
+    REJECTED ALTERNATIVE, on the measurement. Title-scoping the keyword scan (so match and escape
+    share a scope) removes all three registry false positives too, but on sparq it drops SIXTY
+    rows including every one of those genuine run-on-hardware issues — their titles say "bench",
+    "microbench", "re-gather", "canonical host", not "ec2". Trading a false hold for a fleet loop
+    on the larger target is not a repair, so the asymmetry is fixed by making the MATCH precise
+    rather than by making it narrow.
+
+    KNOWN RESIDUAL, stated not hidden: sparq #4328 (an IAM-config audit of the bench role) still
+    fences, because its body free-mentions "the EC2 benchmark role". Over a BODY, `ec2` is a topic
+    word, and no keyword predicate can separate "audits the EC2 role" from "must run on EC2". The
+    durable exit for that class is a machine exit for `needs:ec2` itself, not a wider regex —
+    tracked below in the alert's `machine_gated` census, which makes such rows countable instead
+    of invisible.
+    """
     text = issue_text(issue)
-    folded = text.casefold()
     title = issue.get("title")
     if not isinstance(title, str):
         raise CuratorError("issue title is malformed")
-    return any(keyword in folded for keyword in EC2_KEYWORDS) and not _CODE_ONLY_BENCH.search(title)
+    matched = (any(keyword in text.casefold() for keyword in EC2_PHRASE_KEYWORDS)
+               or bool(_EC2_FREE_WORD.search(text)))
+    return matched and not _CODE_ONLY_BENCH.search(title)
 
 
 def is_well_specified(issue: dict[str, Any], labels: set[str]) -> bool:
@@ -1597,6 +1657,89 @@ def _self_test() -> int:
     checks.append(("measurement work is gated while code-only bench work remains stageable",
                    any(m.kind == "needs-ec2" and m.number == 230 for m in planned)
                    and any(m.kind == "stage" and m.number == 231 for m in planned)))
+
+    # ============================================================================================
+    # THE FENCE IS A ONE-WAY HOLD, SO THE PREDICATE THAT WRITES IT MUST BE PRECISE.
+    #
+    # `needs:ec2` has no machine exit and `triage-stock-alert.census()` excludes every `needs:*`
+    # row from `machine_owed`, so a FALSE fence removes the issue from the population the alarm
+    # this PR adds is keyed on. The bare `ec2` keyword therefore matches as a FREE WORD, never as
+    # a substring of a label / path / branch / identifier. Each check below is bound to
+    # `_EC2_FREE_WORD`: reverting it to the old `"ec2" in text.casefold()` reds the first three;
+    # narrowing the scan to the title (the alternative this diff REJECTED on the measurement)
+    # reds the fourth and fifth.
+    # ============================================================================================
+    # (e1) THE MEASURED LIVE FALSE POSITIVES. All three registry rows (#471, #802, #803) match the
+    # old rule only because the literal LABEL `needs:ec2` appears in a body that is discussing
+    # this very fence. Verbatim-shaped bodies, long enough to clear the well-specified bar so the
+    # fixture proves the FENCE is what changed and not some other gate.
+    # Shared filler that clears `is_well_specified` (>=200 chars AND one concrete reference), so
+    # every check below turns on the FENCE and never on a different gate. The reference is
+    # deliberately ec2-free.
+    spec = ("\n\n## Acceptance\nSee `scripts/alpha-writer.py`. "
+            + "Detailed acceptance criteria for the change. " * 12)
+    label_mention = issue(
+        940, "no_change vocabulary has no environment reason", ("area:alpha",),
+        body="Layer 2 asks the worker to auto-gate `needs:ec2` when the model reports an "
+             "environment blocker, and only #3314 correctly carries `needs:ec2` today." + spec)
+    planned, _ = plan_repository([label_mention], all_labels, automation)
+    checks.append((
+        "a body that merely NAMES the needs:ec2 label is not fenced",
+        not is_ec2_measurement(label_mention)
+        and any(m.kind == "stage" and m.number == 940 for m in planned)))
+
+    # (e2) A FILENAME containing `ec2` is not a claim about where the work runs. Live shapes:
+    # `research/ci-ec2-design.md`, `.github/workflows/bench-ec2.yml`, `scripts/ec2-buildfarm.sh`,
+    # the branch `chore/sq-uhqah-formalize-codex-ec2`, and `AWSServiceRoleForEC2Spot`.
+    for number, blurb in (
+        (941, "The `research/ci-ec2-design.md` OIDC pattern is the one to reuse here."),
+        (942, "Wire the HEAVY tiers into `.github/workflows/bench-ec2.yml` and the nightly lane."),
+        (943, "Flip `scripts/ec2-buildfarm.sh` fmt from ADVISORY to gating."),
+        (944, "Stale branch `chore/sq-uhqah-formalize-codex-ec2` is unreachable by review."),
+        (945, "The scoped role cannot create the `AWSServiceRoleForEC2Spot` SLR."),
+    ):
+        path_mention = issue(number, "Repair the alpha snapshot writer", ("area:alpha",),
+                             body=blurb + spec)
+        planned, _ = plan_repository([path_mention], all_labels, automation)
+        checks.append((
+            f"a path/branch/identifier containing ec2 is not fenced (#{number})",
+            not is_ec2_measurement(path_mention)
+            and any(m.kind == "stage" and m.number == number for m in planned)))
+
+    # (e3) ...and the label mention does not become fence-able just by appearing in the TITLE.
+    checks.append((
+        "a TITLE that names the needs:ec2 label is not fenced either",
+        not is_ec2_measurement(issue(946, "Auto-gate bench issues with needs:ec2", ()))))
+
+    # (e4) THE FIX MUST NOT BECOME A FAIL-OPEN. The precision repair narrows WHICH mentions count,
+    # never WHERE they may appear: a body that says the work runs on a box still fences. This is
+    # the check that reds the rejected title-scoping variant, which on the live sparq board would
+    # have dropped SIXTY rows — including #4040/#4056/#4352/#4370, whose titles say "bench",
+    # "microbench" and "canonical host" and never say "ec2" at all.
+    for number, blurb in (
+        (950, "Gathered on the quiet EC2 reference box with CANONICAL=1."),
+        (951, "This needs the DBPSB EC2/nightly tier, not the work box."),
+        (952, "Work-box numbers are non-canonical; run it on EC2."),
+        (953, "Requires the dedicated quiet-box protocol on the perf host."),
+    ):
+        body_run = issue(number, "Measure the alpha loader at 100M triples", ("area:bench",),
+                         body=blurb + spec)
+        planned, _ = plan_repository([body_run], all_labels, automation)
+        checks.append((
+            f"a body that says the work RUNS on the hardware still fences (#{number})",
+            is_ec2_measurement(body_run)
+            and any(m.kind == "needs-ec2" and m.number == number for m in planned)))
+
+    # (e5) The free-word rule is LIVE, not shadowed. If a future edit renames or drops the bare
+    # `ec2` entry, `EC2_PHRASE_KEYWORDS` silently regains a plain-substring `ec2` and every check
+    # above goes green again while the defect is back — the decaying-control shape. Pin the
+    # partition itself rather than trusting the derivation.
+    checks.append((
+        "the bare ec2 keyword is scanned ONLY by the free-word rule",
+        EC2_BARE_KEYWORD in EC2_KEYWORDS
+        and EC2_BARE_KEYWORD not in EC2_PHRASE_KEYWORDS
+        and len(EC2_PHRASE_KEYWORDS) == len(EC2_KEYWORDS) - 1
+        and set(EC2_PHRASE_KEYWORDS) | {EC2_BARE_KEYWORD} == set(EC2_KEYWORDS)))
 
     # Policy controls the ready-depth target. Thirty distinct eligible areas prove the policy
     # value reaches the planner instead of leaving the former hard-coded cap of twelve in place.
