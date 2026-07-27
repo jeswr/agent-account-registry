@@ -208,8 +208,36 @@ interlock exists to prevent, so the mint refuses four specific shapes.
   the point.)
 
 The mint additionally requires the PR to **name** the issue (`#N`, word-bounded, in the title or
-body). Without it an operator typo binds a review to an unrelated partition, and the record's
-assertion stops being checkable from the PR alone.
+body). Scope this honestly: the PR body is author-controlled, so this is a **consistency and typo
+control, not an authorization control** — an enrolled author who wanted a different partition could
+write a different `#N`. Its value is that an operator's mistyped `--issue` cannot silently bind a
+review to an unrelated partition, and that the record's assertion is checkable from the PR alone.
+Against a determined enrolled author it proves nothing, and an enrolled author already holds
+strictly more direct powers than this.
+
+### 4.4 Attacks tried, and where each one stops
+
+Constructed rather than asserted. Every one is blocked by at least two independent barriers.
+
+| attempt | stopped by |
+|---|---|
+| fork PR minted for | fork gate at the mint, again at PLAN/CLAIM/resolve; measured 0/103 fork heads |
+| non-enrolled collaborator's same-repo PR | allowlist check at the mint; `admits_orchestrator_pr` re-checks live at every consumer |
+| add yourself to `policy/repos.toml` on a branch, then dispatch | the job's default-ref guard refuses any non-default ref, and dispatching needs `actions: write` on the registry |
+| socially engineer a mint for someone else's PR | the mint re-reads the LIVE author; the operator's PR number only ever fetches |
+| **mint over an un-recorded WORKER PR** (would permanently strand worker.yml's own create-only write) | `[bot]` author refusal **and** the `sparq-agent/` namespace refusal **and** the allowlist |
+| ask for a machine-attested stamp | no input on the path names a run key or class (asserted structurally); the class refusal names every other class |
+| point the mint at a repo outside the policy | the workflow's enabled-target step; `review_enrolment_authors` raises on an unknown row |
+| mint for a closed/merged PR | open-state check at the mint, and again at enumeration |
+| **push a commit to an enrolled author's PR head after minting** | *not blocked* — see below |
+
+The last one is a genuine, accepted residual and is worth naming. Any collaborator with write on the
+target can push to a same-repo PR branch, so a review dispatched against a minted record may end up
+reviewing a commit the enrolled author did not write. This is **identical to the worker lane's**
+exposure and the consequences are bounded the same way: the class is review-only (`emit` refuses
+every state but `needs-review`), the fix lane can never push to it (`review_fix_pr_admission` waives
+nothing outside `mode == "review"`), and the arm refuses the class outright. The worst outcome is a
+model review comment on someone else's commit.
 
 ## 5. Degrading when minting is unavailable
 
@@ -273,9 +301,13 @@ Every guard below is inverted by a mutant and named by the test that reds. Mutan
 | **YAML**: no `actions: read` | grant it | *the mint job may NOT read run logs* |
 | **YAML**: `--apply` conditional | make it unconditional **or comment it out** | *--apply is conditional on its own input* |
 | **YAML**: dry-run default | flip to true | *dispatch defaults to a dry run* |
-| **YAML**: env↔input bindings | bind `APPLY` to `allow_global_partition` | *every env name is bound to its OWN input expression* |
+| **YAML**: env↔input bindings | bind `APPLY` to `allow_global_partition`; **or add a new secret** | *every env name is bound to its OWN expression, and there are no others* |
 | **YAML**: no run-key input/argument | add either | *no workflow input or env names a run key* |
 | **YAML**: self-test before the mint | **comment it out** | *the self-test runs BEFORE the mint* |
+
+**Sweep result: 47 mutants, 47 killed, 0 survivors, 0 harness errors** (frozen `git archive HEAD`
+snapshot, so no live edit could race it — a backgrounded sweep against a live tree is how a mutant
+was left in a tree here earlier today).
 
 **A measured finding worth keeping.** The first sweep left exactly one survivor: commenting the
 self-test invocation out of the workflow's `run:` block did **not** red
