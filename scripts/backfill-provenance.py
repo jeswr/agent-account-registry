@@ -529,19 +529,26 @@ def existing_record_admission_error(body, pr_number, admission_error):
 # Three dispositions, not two. The middle one — a record that EXISTS but which every consumer
 # REFUSES — used to share the "leave it alone" branch with a healthy record and print NEEDS-HUMAN
 # forever. It is a distinct state with a distinct machine action, so it gets a distinct name.
-def seal_error(accounted, population):
-    """PURE. Why this run's per-PR outcome counters do NOT account for the whole worker-PR
-    population, or None when they do (registry #776).
+def seal_population(accounted, population):
+    """Assert that every worker PR in the population left `backfill()` through exactly one
+    COUNTED exit. Returns None, or RAISES BackfillError (registry #776).
 
     A backfill that silently skips is another state with no exit — the class this estate found
     eight times in one day. Two exits in `backfill()` printed `skip #N` and touched no counter,
     so the completion line's arithmetic had quietly stopped describing the population; both were
-    unreached on live data, which is exactly why they survived review. Prose cannot enforce the
-    property. This can, because it RAISES."""
+    unreached on live data, which is exactly why they survived review.
+
+    IT RAISES RATHER THAN RETURNING A REASON, deliberately. A `reason = check(...)` / `if reason:
+    raise` shape has a seam between deciding and acting, and a mutation run over this very change
+    proved the seam is where the vacuity lives: deleting the two-line `if ... raise` while leaving
+    the computation in place SURVIVED every test, because the tests exercised the predicate and
+    the call site's existence but nothing forced the result to have an effect. There is no seam to
+    delete when the decision and the raise are the same statement."""
     if accounted == population:
         return None
-    return (f"backfill accounting is unsealed: {accounted} counted outcome(s) for a population "
-            f"of {population} worker PR(s) — some PR left the loop through an uncounted exit")
+    raise BackfillError(
+        f"backfill accounting is unsealed: {accounted} counted outcome(s) for a population "
+        f"of {population} worker PR(s) — some PR left the loop through an uncounted exit")
 
 
 RECORD_ABSENT = "absent"                 # nothing anywhere -> MINT from the run log
@@ -960,10 +967,10 @@ def backfill(target_repo, registry_repo, routing_file, apply_changes, no_draft_c
           f"needs-human {needs_human}, blocked {blocked} "
           f"(population {population})")
     # [registry #776] THE SEAL. Every worker PR left this loop through exactly one counted exit,
-    # or this raises.
-    unsealed = seal_error(written + repaired + skipped + needs_human + blocked, population)
-    if unsealed is not None:
-        raise BackfillError(unsealed)
+    # or this raises. Bare statement on purpose — see seal_population's docstring: a
+    # `reason = ...` / `if reason: raise` shape has a deletable seam, and a mutant that deleted
+    # exactly that seam survived the whole suite.
+    seal_population(written + repaired + skipped + needs_human + blocked, population)
 
 
 def identity_from_run_log(log_readable, log_text, target_repo, pr_number, issue, live_author,
@@ -1831,12 +1838,28 @@ def _self_test():
         unsealed = str(exc)
     check("an unreadable registry probe is a COUNTED terminal state, so the run still seals",
           unsealed, None)
+    seal_raised = None
+    try:
+        seal_population(1, 2)
+    except BackfillError as exc:
+        seal_raised = str(exc)
     check("the seal RAISES when a PR left through an uncounted exit",
-          seal_error(1, 2) is not None, True)
-    check("  ...and passes when every PR is accounted for", seal_error(2, 2), None)
-    check("backfill() seals through THAT function — a private copy could not drift",
-          [n.func.id for n in ast.walk(backfill_tree) if isinstance(n, ast.Call)
-           and getattr(n.func, "id", "") == "seal_error"], ["seal_error"])
+          seal_raised is not None and "unsealed" in seal_raised, True)
+    check("  ...and returns quietly when every PR is accounted for", seal_population(2, 2), None)
+    # The seam M8 exploited: `unsealed = seal(...)` computed and then discarded. There is no
+    # seam left to delete only if the call is a BARE STATEMENT of the function that itself
+    # raises — assert BOTH facts, because either one alone is satisfiable by a vacuous shape.
+    seal_calls = [n for n in ast.walk(backfill_tree) if isinstance(n, ast.Call)
+                  and getattr(n.func, "id", "") == "seal_population"]
+    seal_bare = [n.value for n in ast.walk(backfill_tree) if isinstance(n, ast.Expr)
+                 and isinstance(n.value, ast.Call)
+                 and getattr(n.value.func, "id", "") == "seal_population"]
+    check("backfill() seals through THAT function, as a BARE statement whose result cannot be "
+          "discarded by deleting an `if`",
+          (len(seal_calls), len(seal_bare)), (1, 1))
+    check("  ...and the sealing function is the one that RAISES (no reason-returning seam)",
+          any(isinstance(n, ast.Raise) for n in ast.walk(
+              ast.parse(textwrap.dedent(inspect.getsource(seal_population))))), True)
 
     # --- [registry #657 §7.4 step 2b] THE ORCHESTRATOR CLASS, THROUGH THE REAL LOOP -----------
     # Driven twice against the SAME tree with only `review_enrolment_authors` changing, because

@@ -8257,6 +8257,47 @@ def _self_test():
                                   doc, "m"),
                any("-X" in call for call in put_calls)), (False, False))
 
+        # --- [registry #776] supersede_legacy: the OPT-IN escape from a permanent dead end -----
+        # A legacy MASTER record that every consumer refuses cannot be corrected in place —
+        # master permanently rejects protected-path writes — and the divergence check above then
+        # forbids the corrected ledger copy that would shadow it. Measured 2026-07-27: 7 master
+        # provenance records carry the attempt-less `backfill:<run>` stamp an older revision of
+        # backfill-provenance.py wrote, which the post-#657 admission refuses; 2 are open worker
+        # PRs. The opt-in lifts the LEGACY veto only.
+        put_calls.clear()
+        put_state["files"] = {legacy_loc: record_meta({"pr_number": 8})}
+        superseded = _registry_put_file("reg/repo", "orchestration/provenance/o--r--pr7.json",
+                                        doc, "m", supersede_legacy=True)
+        # BEHAVIOURAL, not a return-value shape: the PUT has to actually be ISSUED. Clearing the
+        # divergence check without clearing `legacy` leaves the "identical pre-migration record"
+        # short-circuit in the path, so the write silently becomes a NO-OP that still reports
+        # success — the failure mode that makes a repair worse than the dead end it replaces.
+        check("supersede_legacy over a DIVERGENT legacy master copy actually WRITES",
+              (superseded, sum(1 for call in put_calls if "-X" in call)), (True, 1))
+        check("  ...and the write still pins the ledger branch, never the protected default",
+              [f"branch={LEDGER_REF}" in call for call in put_calls if "-X" in call], [True])
+        put_calls.clear()
+        put_state["files"] = {legacy_loc: record_meta({"pr_number": 8}),
+                              ledger_loc: record_meta({"pr_number": 8})}
+        try:
+            _registry_put_file("reg/repo", "orchestration/provenance/o--r--pr7.json", doc, "m",
+                               supersede_legacy=True)
+            check("supersede_legacy NEVER lifts the LEDGER veto", "no error", "error")
+        except WorkerPrError as exc:
+            check("supersede_legacy NEVER lifts the LEDGER veto",
+                  "different content" in str(exc) and LEDGER_REF in str(exc), True)
+        put_calls.clear()
+        put_state["files"] = {legacy_loc: record_meta({"pr_number": 8})}
+        try:
+            _registry_put_file("reg/repo", "orchestration/provenance/o--r--pr7.json", doc, "m")
+            check("supersede is OPT-IN — the default still fails closed on the same input",
+                  "no error", "error")
+        except WorkerPrError as exc:
+            check("supersede is OPT-IN — the default still fails closed on the same input",
+                  "default branch" in str(exc), True)
+        check("  ...and that default-path refusal issued no PUT",
+              any("-X" in call for call in put_calls), False)
+
         # issue #131: a rerun of a failed provenance job re-derives the record with a bumped
         # GITHUB_RUN_ATTEMPT, so `recorded_at_run` flips `.1` -> `.2` while every IDENTIFYING field
         # is unchanged. Named volatile, the otherwise byte-different record is accepted as
