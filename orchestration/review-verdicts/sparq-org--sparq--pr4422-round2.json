@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4422,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "5ca700b88820980f4d55bfa6f7a05b47c5786a65",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "join_eq_r_check permits every lane to reuse the same genuine pair and does not constrain completeness or distinctness. Therefore a satisfying proof establishes only existence of at least one joined pair, represented R times; it cannot imply that the committed graphs' true join cardinality N is at most R. The documentation's claim that the verifier learns N in [1,R] conflicts with the later acknowledgement that a prover with N > R may drop pairs. This is a material overclaim on a ZK/honesty-critical surface, repeated in the design record, package comments, benchmark role text, and tests.",
+    "file": "zk/compose/compose_core/src/join.nr",
+    "fix_hint": "Define precisely what N denotes. If N is actual graph/query-result cardinality, remove every N in [1,R] claim and say the circuit proves R not-necessarily-distinct witnesses, equivalent with respect to cardinality to proving at least one match; R only fixes the number of public lane commitments/subproof shape. If N instead denotes a prover-selected disclosed subset, name it accordingly and explicitly state it does not bound or hide the true result cardinality. Update the corresponding claims in research/zk-hidden-join-design.md, both main.nr files, Nargo.toml, constraint_pack.py/generated benchmark docs, snapshot comment, and JR2 commentary.",
+    "severity": "major",
+    "title": "The circuit does not prove actual join cardinality lies in [1,R]"
+   }
+  ],
+  "progress": null,
+  "summary": "The new circuit appears to soundly prove R not-necessarily-distinct joined lanes, but the PR repeatedly interprets that statement as bounding the graph's or result's cardinality to N in [1,R]. Because lanes may repeat and completeness/distinctness are unconstrained, the relation proves only that at least one genuine joined pair exists. The committed graphs may have any positive number of matches, including more than R; the PR itself says such pairs may be dropped. This makes the central cardinality-hiding claim incorrect and honesty-sensitive. The implementation can remain, but all descriptions must state the exact existential/multiplicity statement and avoid claiming an upper bound on actual join cardinality.",
+  "verdict": "request_changes"
+ }
+}
