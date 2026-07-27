@@ -332,6 +332,25 @@ GLOBAL_PACKAGE = "__global__"   # mirrors the target ready-engine's serializing 
 CI_CONTEXT_MAX = 1000           # advisory failing-leg context cap (plan field + workflow input)
 MAX_FAILING_LEGS = 20
 
+# [registry #772] WHY a PR reserves the serializing partition. `busy_packages_of_pulls` reaches
+# `__global__` down four DIFFERENT paths that were indistinguishable once the area set was
+# unioned, so the run log could not tell "this PR genuinely spans everything" from "we have no
+# idea what this PR touches" — and only the second has a recovery. The distinction is not
+# cosmetic: it is the difference between a partition working as designed and a lane annihilated
+# by a lost registry write.
+#
+# CLOSED SET, and `record_global_reservation_cause` RAISES on anything outside it. A new
+# `__global__` path added later must name itself here or fail loud at the census, rather than
+# quietly joining the unattributable pile the way this class did for a month.
+GLOBAL_CAUSE_DECLARED = "declared-areas"        # the reservation came from real `area:*` labels
+GLOBAL_CAUSE_NO_PROVENANCE = "missing-provenance"   # no admissible record — areas UNKNOWABLE
+GLOBAL_CAUSE_SOURCE_UNLISTED = "source-unlisted"    # valid record, source issue closed/unlisted
+GLOBAL_CAUSE_SOURCE_NO_AREAS = "source-no-areas"    # valid record, source issue carries no area
+GLOBAL_RESERVATION_CAUSES = (
+    GLOBAL_CAUSE_DECLARED, GLOBAL_CAUSE_NO_PROVENANCE,
+    GLOBAL_CAUSE_SOURCE_UNLISTED, GLOBAL_CAUSE_SOURCE_NO_AREAS,
+)
+
 
 def plan_package(areas):
     """The single conflict partition a plan/lease row reserves for a collection of `area:*`
@@ -1142,6 +1161,11 @@ def busy_packages_of_pulls(repo, pulls, issue_labels, provenance, pr_status=None
                  if isinstance(label, str) and label.startswith("area:")}
         parked = bool(pr_labels & hold_labels)
         record = provenance.get(number) if isinstance(provenance, dict) else None
+        # [registry #772] The reservation CAUSE is decided on the SAME branches that decide the
+        # reservation itself, never re-derived afterwards from the finished area set — by then the
+        # four paths to `__global__` are indistinguishable. Nothing below changes which areas are
+        # reserved; `cause` is pure attribution rolled out to the caller.
+        cause = GLOBAL_CAUSE_DECLARED
         if is_enumerable_provenance(record, number):
             source = (issue_labels.get(record["issue"])
                       if isinstance(issue_labels, dict) else None)
@@ -1152,17 +1176,22 @@ def busy_packages_of_pulls(repo, pulls, issue_labels, provenance, pr_status=None
                 issue_areas = {label[5:] for label in source
                                if isinstance(label, str) and label.startswith("area:")}
                 areas |= issue_areas or {GLOBAL_PACKAGE}
+                if not issue_areas:
+                    cause = GLOBAL_CAUSE_SOURCE_NO_AREAS
             else:
                 areas |= {GLOBAL_PACKAGE}  # closed/unlisted source: the enumerator still
                                            # emits this PR as `__global__` — mirror it
+                cause = GLOBAL_CAUSE_SOURCE_UNLISTED
         else:
             areas |= {GLOBAL_PACKAGE}      # missing/invalid linkage — fail closed
+            cause = GLOBAL_CAUSE_NO_PROVENANCE
         status = (pr_status[number]
                   if isinstance(pr_status, dict) and number in pr_status else _NO_PR_DETAIL)
         inactive, reason = _pull_inactivity_decision(pull, status)
         if parked and inactive:
             if isinstance(occupancy, list):
-                occupancy.append(("parked-free", number, frozenset(areas), reason, inactive))
+                occupancy.append(("parked-free", number, frozenset(areas), reason, inactive,
+                                  cause))
             continue                      # provably inert human-parked PR — frees its crates
         if isinstance(occupancy, list):
             # [registry #677] The 5th element is `inactive` — the SAME _pull_inactivity_decision
@@ -1171,8 +1200,11 @@ def busy_packages_of_pulls(repo, pulls, issue_labels, provenance, pr_status=None
             # copy of "would parking this PR actually free its crates?" is exactly the
             # mint-vs-adopt drift #707 exists to prevent. For an UN-parked PR the `reason` slot
             # says only "not-parked", so without this the answer is unrecoverable downstream.
+            # [registry #772] The 6th element is the reservation CAUSE (GLOBAL_RESERVATION_CAUSES).
+            # Same mint-vs-adopt doctrine as the 5th: decided at the branch that made the
+            # decision, carried out, never recomputed downstream.
             occupancy.append(("busy", number, frozenset(areas),
-                              reason if parked else "not-parked", inactive))
+                              reason if parked else "not-parked", inactive, cause))
         busy |= areas
     return busy
 
@@ -1306,6 +1338,130 @@ def starvation_park_target(planned_items, deferred, occupancy, log=print):
         f"behind the `{GLOBAL_PACKAGE}` partition; {len(candidates)} un-parked inert holder(s) "
         f"{sorted(candidates)} — parking pr#{target} (cap {STARVATION_PARKS_PER_TICK_MAX}/tick)")
     return target
+
+
+def record_global_reservation_cause(census, cause):
+    """Count ONE `__global__` reservation into `census` under a DECLARED cause.
+
+    [registry #772] The closed-enum recorder, same discipline as #758's `record_partition_defer`:
+    an undeclared cause RAISES rather than silently minting a bucket. The class this exists for
+    spent a month invisible precisely because "why is `__global__` held?" had no vocabulary — a
+    lost registry write and a genuinely repo-wide change produced the identical log line. A
+    silently-widening enum would rebuild that hole one new branch at a time."""
+    if cause not in GLOBAL_RESERVATION_CAUSES:
+        raise DispatchError(
+            f"undeclared `{GLOBAL_PACKAGE}` reservation cause {cause!r} — every path that "
+            f"reserves the serializing partition must name itself in GLOBAL_RESERVATION_CAUSES "
+            f"{list(GLOBAL_RESERVATION_CAUSES)}")
+    census[cause] = census.get(cause, 0) + 1
+    return census
+
+
+def global_reservation_census(occupancy):
+    """PURE. `{cause: count}` over every BUSY occupancy row that reserves `__global__`.
+
+    [registry #772] The visibility half. The counts are EXHAUSTIVE over that population — each
+    holder lands in exactly one bucket, so `sum(census.values())` equals the number of
+    `__global__` holders and a miscount cannot hide behind a rounding story. Rows that do not
+    hold the serializing partition are not in the population and are not counted; a `parked-free`
+    row is not counted either, because it has already released its crates and starves nobody.
+
+    A row too short to carry a cause (a pre-#772 5-tuple) RAISES through the recorder rather than
+    being skipped: skipping it would under-count exactly the population this measures."""
+    census = {}
+    for row in occupancy if isinstance(occupancy, list) else []:
+        if not isinstance(row, tuple) or len(row) < 5:
+            continue                      # not an occupancy row at all — nothing to attribute
+        if row[0] != "busy" or GLOBAL_PACKAGE not in row[2]:
+            continue
+        record_global_reservation_cause(census, row[5] if len(row) >= 6 else None)
+    return census
+
+
+# [registry #772] How many unprovenanced `__global__` holders ONE tick may escalate, per target
+# repository. The same pacing doctrine as STARVATION_PARKS_PER_TICK_MAX: an escalation is a loud,
+# operator-facing artifact, and emitting one per holder per tick would bury the signal it exists
+# to raise. One per tick converges — each tick re-measures the live occupancy.
+STARVATION_ESCALATIONS_PER_TICK_MAX = 1
+
+
+def starvation_provenance_escalation(planned_items, deferred, occupancy, log=print,
+                                     cap=STARVATION_ESCALATIONS_PER_TICK_MAX):
+    """PURE. The unprovenanced `__global__` holder(s) to ESCALATE — the starved lane's MISSING EDGE.
+
+    [registry #772] `starvation_park_target` is the only remedy the sweep has, and it declines
+    every holder that is not an un-parked provably-inert draft, because parking an ACTIVE holder
+    writes a label and frees nothing. That refusal is correct. What was missing is what happens
+    NEXT: the sweep logged "parking nobody" and the tick ended, so a lane annihilated by a PR with
+    no registry provenance record simply stayed at zero, invisibly, with no terminal state and no
+    named recovery. MEASURED on jeswr/agent-account-registry: 5 of 84 successful dispatch ticks on
+    2026-07-27 planned 0 items with every ready row deferred behind such a holder, and the three
+    PRs responsible (sparq-org/sparq #4360, #4509, #4528) were still recordless 16h/8h/4h later —
+    because `backfill-provenance.yml` is `workflow_dispatch`-only and nothing triggers it.
+
+    THIS FUNCTION FREES NOTHING. It does not touch the area set, the busy union, or the
+    reservation: an unprovenanced PR's crates are genuinely unknowable and under-serialising them
+    is the corrupting direction (two workers on one crate can produce a semantic conflict that
+    compiles and passes). It converts an invisible permanent hold into a COUNTED, CAPPED, NAMED
+    one that says which PR, why, and which recovery closes it.
+
+    Selection — the holder must be one the PARK sweep cannot help:
+      - the lane must be measurably STARVED (`planned_items` empty, `deferred` positive) — the
+        identical two clauses as the park sweep, so the two halves can never disagree about
+        whether this tick was starved;
+      - the row must be BUSY and hold `__global__` (a `parked-free` row starves nobody);
+      - its cause must be `missing-provenance` SPECIFICALLY. A holder that is `__global__` because
+        its source issue carries no `area:` labels is a partition working as designed and has no
+        provenance recovery — escalating it would be noise;
+      - and the park sweep's remedy must NOT apply. An un-parked, provably-inert holder is
+        exactly what `starvation_park_target` selects, so escalating it too would double-report
+        the one case that already self-heals.
+
+    Returns at most `cap` PR numbers in ascending order — deterministic, like the park half."""
+    if planned_items:
+        return []                         # the plan is HEALTHY — nothing is starved
+    if not isinstance(deferred, int) or isinstance(deferred, bool) or deferred <= 0:
+        return []                         # empty backlog / unreadable count is not starvation
+    stuck = []
+    for row in occupancy if isinstance(occupancy, list) else []:
+        if not isinstance(row, tuple) or len(row) < 6:
+            continue                      # no cause slot — not evidence to escalate on
+        decision, pr_number, packages, reason, inactive, cause = row[:6]
+        if decision != "busy":
+            continue
+        if GLOBAL_PACKAGE not in packages:
+            continue
+        if cause != GLOBAL_CAUSE_NO_PROVENANCE:
+            continue                      # a declared-area global hold has no provenance recovery
+        if reason == "not-parked" and inactive is True:
+            continue                      # the PARK sweep already selects this one — not stuck
+        if not isinstance(pr_number, int) or isinstance(pr_number, bool) or pr_number <= 0:
+            continue
+        stuck.append(pr_number)
+    if not stuck:
+        return []
+    stuck.sort()
+    if len(stuck) > cap:
+        log(f"starvation escalation paced: {len(stuck)} unprovenanced `{GLOBAL_PACKAGE}` "
+            f"holder(s) {stuck} have no park remedy; escalating {cap} this tick")
+        stuck = stuck[:cap]
+    return stuck
+
+
+def starvation_provenance_escalation_body(repo, pr_number, deferred):
+    """The operator-facing receipt for ONE escalated unprovenanced holder. Names the PR, the cost,
+    the cause and the ONE recovery that clears it — a hold whose exit nobody can find is the
+    failure mode this replaces (registry #703)."""
+    return (
+        f"`{repo}#{pr_number}` reserves the serializing `{GLOBAL_PACKAGE}` partition because it "
+        f"has NO admissible registry provenance record, so the crates it touches are unknowable "
+        f"and the reservation fails closed. {deferred} ready row(s) were deferred behind it this "
+        f"tick and the issue lane planned nothing.\n\n"
+        f"It is NOT a candidate for the starvation park sweep (that only helps an un-parked, "
+        f"provably-inert draft), so no automatic remedy applies and the hold does not expire.\n\n"
+        f"**Recovery:** run the `backfill-provenance` workflow for `{repo}` with `apply=true`. It "
+        f"reconstructs the implementer identity from the worker run log and writes the record to "
+        f"the `ledger` branch; the reservation then resolves to the PR's real `area:*` set.")
 
 
 def live_pull_detail_stub(pull):
@@ -12113,10 +12269,12 @@ def _self_test():
 _STARVE_SHA = "c" * 40
 
 
-def _starvation_row(number, *, packages, parked=False, inactive=True, decision="busy"):
-    """One occupancy row in the exact 5-tuple shape busy_packages_of_pulls appends."""
+def _starvation_row(number, *, packages, parked=False, inactive=True, decision="busy",
+                    cause=GLOBAL_CAUSE_DECLARED):
+    """One occupancy row in the exact 6-tuple shape busy_packages_of_pulls appends (#772 added the
+    reservation-cause slot)."""
     return (decision, number, frozenset(packages),
-            "detail" if parked else "not-parked", inactive)
+            "detail" if parked else "not-parked", inactive, cause)
 
 
 def _starvation_sweep_self_test():
@@ -12344,8 +12502,8 @@ def _starvation_sweep_self_test():
     parked_rows = occupancy_of(parked_inert)
     assert len(parked_rows) == 1, parked_rows
     assert parked_rows[0][0] == "parked-free", parked_rows
-    assert len(parked_rows[0]) == 5, (
-        "the parked-free occupancy row must carry the 5-element shape — it is the SOLE producer "
+    assert len(parked_rows[0]) == 6, (
+        "the parked-free occupancy row must carry the 6-element shape — it is the SOLE producer "
         "of starvation_unpark_targets' input, so a 4-tuple silently disables the un-park half")
     assert parked_rows[0][4] is _pull_inactivity_decision(parked_inert)[0] is True, parked_rows
     # its area set is the one the un-park decision reads, and it must be the REAL reservation:
@@ -12357,11 +12515,129 @@ def _starvation_sweep_self_test():
         dict(parked_inert, head={"ref": "sparq-agent/issue-7-1-1", "sha": _STARVE_SHA,
                                  "repo": {"full_name": "o/r"}}),
         labels={7: ["area:crate-a"]}, provenance=prov)
-    assert resolved_rows[0][0] == "parked-free" and len(resolved_rows[0]) == 5, resolved_rows
+    assert resolved_rows[0][0] == "parked-free" and len(resolved_rows[0]) == 6, resolved_rows
     assert resolved_rows[0][2] == frozenset({"crate-a"}), resolved_rows
     assert starvation_unpark_targets(resolved_rows, {41}) == [41]
     print("  ok   #677 parked-free arity: the un-park half's SOLE input row is produced with the "
-          "5-element shape and the REAL area set — park stands on __global__, releases on a crate")
+          "6-element shape and the REAL area set — park stands on __global__, releases on a crate")
+
+    # ---- [registry #772] WHY the partition is held: PRODUCED, closed, counted ------------------
+    # Four different branches reach `__global__`, and once the area set was unioned they were
+    # indistinguishable — so a lane annihilated by a LOST REGISTRY WRITE logged exactly what a
+    # genuinely repo-wide change logs. Every case below runs the REAL producer, never a hand-built
+    # row: hand-built rows would stay green if busy_packages_of_pulls hard-coded one cause.
+    def _prov_for(number):
+        return {number: dict(prov[41], pr_number=number)}
+
+    unprovenanced = busy_pull(51, "sparq-agent/issue-7-1-1", [])
+    cause_cases = (
+        # (pull, issue labels, provenance, expected cause, does it hold __global__?)
+        (unprovenanced, {}, {}, GLOBAL_CAUSE_NO_PROVENANCE, True),
+        (busy_pull(52, "sparq-agent/issue-7-1-1", []), {7: []}, _prov_for(52),
+         GLOBAL_CAUSE_SOURCE_NO_AREAS, True),
+        (busy_pull(53, "sparq-agent/issue-7-1-1", []), {}, _prov_for(53),
+         GLOBAL_CAUSE_SOURCE_UNLISTED, True),
+        (busy_pull(54, "sparq-agent/issue-7-1-1", []), {7: ["area:crate-a"]}, _prov_for(54),
+         GLOBAL_CAUSE_DECLARED, False),
+    )
+    census_rows = []
+    for pull, labels, provenance_map, want_cause, want_global in cause_cases:
+        produced = occupancy_of(pull, labels=labels, provenance=provenance_map)
+        assert len(produced) == 1 and produced[0][0] == "busy", produced
+        assert produced[0][5] == want_cause, (pull["number"], produced)
+        # THE FAIL-CLOSED DIRECTION, asserted per branch: every cause but `declared-areas` still
+        # reserves the whole serializing partition. #772 attributes the hold; it never narrows it.
+        # Under-serialisation is the corrupting direction — two workers on one crate can produce a
+        # semantic conflict that compiles, passes and is wrong — so inverting this is a defect,
+        # not an optimisation, and it reds HERE.
+        assert (GLOBAL_PACKAGE in produced[0][2]) is want_global, produced
+        census_rows.extend(produced)
+    # A genuinely-unknown-area PR reserves EXACTLY the serializing partition while it is in flight.
+    assert occupancy_of(unprovenanced)[0][2] == frozenset({GLOBAL_PACKAGE}), "fail-closed weakened"
+    print("  ok   #772 reservation cause: all four `__global__` branches are PRODUCED distinctly, "
+          "and every unknown-area cause still reserves the whole partition (fail-closed intact)")
+
+    # The census is EXHAUSTIVE over the holder population: one bucket each, summing to the count of
+    # `__global__` holders. A miscount cannot hide — deleting a branch reds the sum, not just a key.
+    census = global_reservation_census(census_rows)
+    holders = [row for row in census_rows if row[0] == "busy" and GLOBAL_PACKAGE in row[2]]
+    assert sum(census.values()) == len(holders) == 3, (census, holders)
+    assert census == {GLOBAL_CAUSE_NO_PROVENANCE: 1, GLOBAL_CAUSE_SOURCE_NO_AREAS: 1,
+                      GLOBAL_CAUSE_SOURCE_UNLISTED: 1}, census
+    # `declared-areas` reserves real crates, so it is NOT in the starving population and is not
+    # counted — the census measures the serializing holders, not every open PR.
+    assert GLOBAL_CAUSE_DECLARED not in census, census
+    # CLOSED enum: a new `__global__` branch must name itself or fail loud at the census.
+    for bad in ("invented-cause", None, "", "MISSING-PROVENANCE", 0):
+        try:
+            record_global_reservation_cause({}, bad)
+        except DispatchError:
+            continue
+        raise AssertionError(f"undeclared reservation cause {bad!r} must RAISE, not mint a bucket")
+    print("  ok   #772 census: bucket counts SUM to the __global__ holder population, and an "
+          "undeclared cause raises instead of silently minting a bucket")
+
+    # ---- [registry #772] THE MISSING EDGE: the holder the park sweep cannot help ---------------
+    # This is the whole defect. `starvation_park_target` correctly declines an ACTIVE holder
+    # (parking it writes a label and frees nothing), and before this change the tick simply ended
+    # there — "parking nobody" — so a lane annihilated by a recordless PR stayed at zero with no
+    # terminal state and no named recovery. MEASURED: 5 of 84 successful dispatch ticks on
+    # 2026-07-27, holders #4360/#4509/#4528 still recordless 16h/8h/4h later.
+    active_unprov = occupancy_of(unprovenanced)
+    assert starvation_park_target([], 12, active_unprov) is None, "park sweep should decline it"
+    assert starvation_provenance_escalation([], 12, active_unprov) == [51], active_unprov
+    # A PARKED-but-active holder is equally stuck: busy_packages_of_pulls frees only
+    # `parked AND inactive`, and the park sweep skips anything already parked.
+    parked_active = occupancy_of(dict(unprovenanced, labels=[{"name": MACHINE_PARK_PR_LABEL}]))
+    assert parked_active[0][0] == "busy", parked_active
+    assert starvation_park_target([], 12, parked_active) is None
+    assert starvation_provenance_escalation([], 12, parked_active) == [51], parked_active
+    # ...but the one holder the PARK sweep DOES remedy is never double-reported: an un-parked,
+    # provably-inert draft is the park half's own candidate and self-heals next tick.
+    inert_unprov = occupancy_of(dict(unprovenanced, draft=True))
+    assert starvation_park_target([], 12, inert_unprov) == 51, inert_unprov
+    assert starvation_provenance_escalation([], 12, inert_unprov) == [], inert_unprov
+    print("  ok   #772 missing edge: an unprovenanced holder with NO park remedy reaches the "
+          "escalation, and the park half's own candidate is never double-reported")
+
+    # The same two starvation clauses as the park half — the halves can never disagree about
+    # whether this tick was starved. Deleting either reds here.
+    assert starvation_provenance_escalation([{"number": 900}], 12, active_unprov) == []
+    assert starvation_provenance_escalation([], 0, active_unprov) == []
+    assert starvation_provenance_escalation([], -1, active_unprov) == []
+    assert starvation_provenance_escalation([], True, active_unprov) == []
+    assert starvation_provenance_escalation([], "12", active_unprov) == []
+    # A holder that is `__global__` for a DECLARED reason has no provenance recovery — escalating
+    # it would be pure noise. Inverting the cause filter reds here.
+    for pull, labels, provenance_map, cause, _global in cause_cases[1:]:
+        rows = occupancy_of(pull, labels=labels, provenance=provenance_map)
+        assert starvation_provenance_escalation([], 12, rows) == [], (cause, rows)
+    # crate-only holders, malformed rows, and pre-#772 5-tuples are not evidence to escalate on
+    assert starvation_provenance_escalation([], 12, [_starvation_row(
+        41, packages={"crate-a"}, cause=GLOBAL_CAUSE_NO_PROVENANCE)]) == []
+    assert starvation_provenance_escalation([], 12, ["junk"]) == []
+    assert starvation_provenance_escalation([], 12, None) == []
+    assert starvation_provenance_escalation(
+        [], 12, [("busy", 41, frozenset({GLOBAL_PACKAGE}), "not-parked", False)]) == []
+    print("  ok   #772 escalation gating: never fires on a healthy plan, an empty backlog, a "
+          "declared-area hold, or a row that cannot carry a cause")
+
+    # PACED like the park half: deterministic, ascending, capped — an escalation is a loud
+    # operator artifact and one per holder per tick would bury the signal it exists to raise.
+    many = [_starvation_row(number, packages={GLOBAL_PACKAGE}, inactive=False,
+                            cause=GLOBAL_CAUSE_NO_PROVENANCE) for number in (73, 51, 62)]
+    paced = []
+    assert starvation_provenance_escalation([], 12, many, log=paced.append) == [51]
+    assert any("escalating 1 this tick" in line for line in paced), paced
+    assert starvation_provenance_escalation([], 12, many, cap=2, log=paced.append) == [51, 62]
+    # the receipt NAMES the one recovery that clears the hold — a hold whose exit nobody can find
+    # is the failure mode this replaces (#703).
+    receipt = starvation_provenance_escalation_body("o/r", 51, 12)
+    assert "o/r#51" in receipt and "backfill-provenance" in receipt and "apply=true" in receipt, \
+        receipt
+    assert "12 ready row(s)" in receipt, receipt
+    print("  ok   #772 escalation pacing + receipt: ascending, capped, and the body names the "
+          "backfill recovery that actually clears the hold")
 
     # ---- THE PLAN SEAM: v5 validation of the evidence field -----------------------------------
     base_plan = {
