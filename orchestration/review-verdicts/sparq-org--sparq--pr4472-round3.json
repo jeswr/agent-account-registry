@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4472,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "892690fde33837e665f2f60f3d4edad9bd79e1de",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 3 resolves the prior major finding. The design now explicitly preserves string-literal graph expressions, ties their acceptance to the existing str-to-NamedNode coercion, and requires a positive generator/runtime witness so the compile-time filter is acceptance-preserving. It retains generation-time rejection only for syntactic forms that necessarily produce out-of-space values, while the closed GraphName representation and fallible emission-time conversion cover erased production calls and bindings. The negative, positive, runtime-error, and default-graph tests exercise the stated invariants rather than merely matching generated text. No new correctness, soundness, test-validity, or security issue is apparent in the diff.",
+  "verdict": "approve"
+ }
+}
