@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4478,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a1356b1f4687c3c8b624e16eeebfd15d460a6920",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The response body is decoded before the parse-error handler, but UnicodeDecodeError is not caught. A malformed or intercepted response containing invalid UTF-8 therefore produces a traceback and exit code 1, while the documented contract says network/parse failures return 2 so wrappers cannot confuse failure states. The official sparse index should provide UTF-8 JSON, making this a robustness issue rather than a blocker.",
+    "file": "scripts/check-spargebra-release.py",
+    "fix_hint": "Decode inside the parsing try block and include UnicodeDecodeError in the caught exceptions, or add it to the preceding request/read exception handler, then add a focused self-test for the exit-code contract if practical.",
+    "severity": "minor",
+    "title": "Non-UTF-8 index responses bypass the documented indeterminate exit path"
+   }
+  ],
+  "progress": null,
+  "summary": "The release watcher is correctly scoped as a non-gating developer tool, distinguishes network/parse indeterminacy from a negative release result, filters yanked and prerelease versions, compares unsorted index entries, and has a meaningful hermetic self-test wired into docs-quality CI. The accompanying documentation consistently preserves the local-patch and conformance/security constraints around eventual unvendoring. One minor robustness gap remains in handling a malformed non-UTF-8 index response, but it does not undermine the normal crates.io sparse-index path or justify blocking this change.",
+  "verdict": "approve"
+ }
+}
