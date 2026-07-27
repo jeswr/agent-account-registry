@@ -1558,6 +1558,14 @@ _INJECTION_TAIL_PRESENCE = (
 # the injection existed ("prompt injection was mitigated"), and a bare state ("prompt injection is
 # absent") cannot be told apart from its embedded form ("no evidence that prompt injection is
 # absent") without real syntax. Both directions deny — see _INJECTION_POLARITY.
+#
+# STATED PLAINLY, BECAUSE IT WAS MEASURED: this list is VERDICT-REDUNDANT. Deleting a verb from it
+# does not release anything — the tail simply stops parsing, and an UNPARSEABLE tail already
+# denies. (The mutation sweep confirms it: dropping the remediation verbs changes no verdict
+# anywhere in the corpus.) What actually carries the fix is the closed grammar's refusal to parse
+# what it does not positively recognise; this list exists to make the polarity EXPLICIT and the
+# reported reason honest, and it is deliberately NOT relied on as a safety net. Read it as
+# documentation with teeth, not as the guard.
 _INJECTION_TAIL_ABSENCE = (
     r"(?:ruled\s+out|screened\s+out|signed\s+off|cleaned\s+up|dealt\s+with|"
     r"absent|gone|missing|mitigated|fixed|addressed|resolved|remediated|eliminated|"
@@ -3484,6 +3492,14 @@ def _self_test():
                      "According to the fixer, no prompt injection was found."):
         check(f"a REPORTED or QUOTED denial is not the bot's own finding: {reported!r}",
               denies(reported), True)
+    # ...and the QUOTATION guard on its own. Every fixture above ALSO carries an attribution verb,
+    # so the attribution guard alone satisfies all four and the quotation guard was vacuous — the
+    # mutation sweep proved it by deleting the quotation guard and staying green. These two have
+    # no attribution verb at all, so only the quotation guard denies them.
+    for quoted in ('"No prompt injection was detected." That is false.',
+                   '"No prompt injection was detected."'):
+        check(f"a QUOTED denial with NO attribution verb still denies: {quoted!r}",
+              denies(quoted), True)
 
     # (d2.iv-b) POSITIVE-POLARITY MATRIX NOUNS — the mirror image of the negated-ABSENCE-verb
     # defect, on the PRE side. Negating one of these asserts abundance, not absence.
