@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4610,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c16675ab9209a78ef3fd7a131c0334dc2c244826",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`is_absolute_iri` now checks a valid scheme and a blacklist of characters, but that is not sufficient to validate an RFC 3987 IRI as required by expansion step 15.4. For example, `http://example.com/%ZZ` and a trailing bare `%` contain none of the blacklisted characters and are therefore accepted as datatype IRIs even though their percent-encoding is malformed. Other RFC 3987 structural/code-point constraints are likewise not represented. This makes the new `datatype_iri_with_a_space_is_rejected` test a narrow witness rather than evidence for the documented general obligation, and can let invalid typed values expand successfully.",
+    "file": "crates/sparq-jsonld/src/context/iri.rs",
+    "fix_hint": "Use a real IRI parser/validator appropriate to RFC 3987, or implement complete validation (including percent-encoding and allowed Unicode ranges) at the datatype check. Add focused negative tests for malformed percent escapes such as `%ZZ` and `%`, plus a positive Unicode IRI case to prevent over-rejection.",
+    "severity": "major",
+    "title": "Datatype IRI validation still accepts malformed IRIs"
+   }
+  ],
+  "progress": null,
+  "summary": "The negative-test runner wiring and non-vacuity guards are well structured, but the datatype-IRI fix is incomplete relative to the JSON-LD requirement and the PR's own claim. It rejects a small character class rather than validating IRI syntax, so malformed absolute-looking datatype IRIs still pass.",
+  "verdict": "request_changes"
+ }
+}
