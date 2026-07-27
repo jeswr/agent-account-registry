@@ -43,13 +43,20 @@ on:
     #
     #   this schedule, steady state: 1 pull-listing request per target per pass and nothing else,
     #     because the existing-record probes now read from the ledger/default-branch CHECKOUTS
-    #     (see the checkout steps below). 2 targets x 3 passes = ~6 requests/h, ~1% of headroom.
-    #     Before that change it was ~93 per pass = ~279/h, i.e. ~46% of the headroom, permanently.
+    #     (see the checkout steps below). 2 targets x 3 passes = 6 requests/h, ~1% of headroom.
+    #     Before that change: sparq-org/sparq 1 listing + 69 ledger hits + 4 falling through to
+    #     master at 2 = 78, the registry 1 + 16 = 17, so 95 per pass (93 of them record probes)
+    #     = ~285/h — ~46% of the headroom, permanently, and never once repairing anything.
     #
-    #   this schedule, worst case (the outage it repairs — every open worker PR recordless): the
-    #     irreducible per-PR cost is the run-log read (3) + the commit listing (1) + the record
-    #     write's own live CAS probes (3). At 73 open worker PRs that is ~512 requests for the
-    #     ONE pass that repairs them; the next two passes are back to ~1. ~518/h, inside headroom.
+    #   this schedule, worst case (the outage it repairs — every open worker PR recordless, so
+    #     every one takes the full identity path): the irreducible per-PR cost is the run-log read
+    #     (3) + the commit listing (1) + the record write's own live CAS probes and PUT (3). At 73
+    #     open worker PRs: 1 + 73*7 = 512 for the ONE pass that repairs them, and the next two
+    #     passes are back to 1 each. ~517/h against ~857/h before, i.e. inside the headroom where
+    #     it was outside it.
+    #
+    # Every per-operation figure above was counted with GH_DEBUG=api on the real endpoints, not
+    # inferred: an X-RateLimit-Used delta is NOT usable on a token other agents are also spending.
     - cron: '9,29,49 * * * *'
   workflow_dispatch:
     inputs:
