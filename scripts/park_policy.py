@@ -110,7 +110,38 @@ READMISSION_LABELS = (HUMAN_PARK_LABEL, MACHINE_PARK_LABEL, MACHINE_PARK_PR_LABE
 # PARK_GENERATION_MARKER whose window key is the cutoff (or PARK_WINDOW_NONE for the initial
 # window). Label writes are best-effort UI on top: a sticky-veto-suppressed label re-apply
 # never stalls the ladder, because the ladder never reads labels.
+#
+# [registry #797] ONLY A HUMAN'S DECISION MAY CHARGE ONE OF THESE GENERATIONS. The counter above
+# says "human-readmitted", and the escalation comment it drives says so out loud — but until this
+# fix the ladder could not tell a human's unlabel from the loop's OWN automatic re-admission
+# (invariant 3 / registry #614), because both arrive as a bare `cutoff` string through
+# effective_readmission_cutoff. MEASURED on the live sparq population 2026-07-27: 35 open draft
+# PRs sat on the human-owned `review:needs-user` terminal, all 73 applications of it made by
+# `sparq-orchestrator[bot]` and NONE by a human; of the 21 carrying generation receipts, 20 had
+# escalated on a window minted by an AUTOMATIC re-admission (the window key is byte-identical to
+# the PR's own `sparq-auto-readmit` stamp — e.g. #4422 gen=2 cutoff=2026-07-27T08:02:21Z, and
+# #3595 whose BOTH windows are auto stamps) and ZERO on a window a human opened. The loop parked
+# its own PRs, re-admitted them itself, counted its own re-admission as a human generation, and
+# then paged the maintainer claiming they had readmitted it.
+#
+# So the generation counter is now attributed: see WINDOW_AUTHORITY_* / readmission_window, and
+# park_ladder_decision's REQUIRED `window_authority`. A window the machine minted charges the
+# MACHINE ladder (PARK_MACHINE_TERMINAL_GENERATIONS) instead, whose terminal is machine-owned.
 PARK_ESCALATION_GENERATIONS = 2
+# WHO opened the readmission window a park-generation is charged to. `readmission_window` derives
+# it; `park_ladder_decision` REQUIRES it (keyword-only, no default) so no call site can reach the
+# human terminal by forgetting to attribute its window — the defect above in one word.
+#   human    a PROVEN-human unlabel of a park label (readmission_cutoff's strict maintainer probe)
+#            is the newest gesture. ONLY this may charge a PARK_ESCALATION_GENERATIONS generation
+#            and so ONLY this can ever reach the human-owned terminal.
+#   machine  the loop's own automatic re-admission receipt is the newest gesture (or ties the
+#            human one — a tie proves nothing about the human's intent and resolves to machine).
+#   unknown  no window at all, an unreadable timeline, or a caller that cannot attribute. Treated
+#            exactly like `machine` for the terminal, and — having no attribution to count with —
+#            it counts EVERY consumed window on the machine ladder so it still terminates.
+WINDOW_AUTHORITY_HUMAN = "human"
+WINDOW_AUTHORITY_MACHINE = "machine"
+WINDOW_AUTHORITY_UNKNOWN = "unknown"
 # The receipt window key for a budget exhaustion with NO readmission cutoff (the initial
 # full-budget window). Never a valid ISO-8601 timestamp, so it can never collide with a real
 # cutoff key.
@@ -146,6 +177,15 @@ MACHINE_PARK_DESCRIPTION = (
 # even though each individual re-admission already needs its own fresh, unconsumed recovery
 # evidence; the two bounds are independent on purpose.
 AUTO_READMISSION_MAX = 2
+# [registry #797] The MACHINE-owned counterpart of PARK_ESCALATION_GENERATIONS: how many
+# MACHINE-minted budget windows may be consumed before the loop gives up on this PR and RETIRES it
+# (park_ladder_decision's `machine-terminal` action). Deliberately equal to AUTO_READMISSION_MAX —
+# machine windows are minted only by automatic re-admissions, which that constant already caps at
+# two per PR, so this fires exactly when the machine has spent its last automatic chance and the
+# item failed anyway. Past that point nothing further is learned by trying again, and — the whole
+# point of #797 — nothing about a HUMAN's attention has been established either, so the exit must
+# be a machine-owned retirement, never a page.
+PARK_MACHINE_TERMINAL_GENERATIONS = AUTO_READMISSION_MAX
 # ---------------------------------------------------------------------------------------------
 # [registry #764] THE ABSORBING-PARK EXIT. `park_ladder_decision` has five outcomes; three of them
 # neither attempt work nor advance the generation counter, so an item that lands on one lands on
@@ -191,6 +231,12 @@ BUDGET_EXHAUSTED_CENSUS = {
     ("freeze", None): "budget-exhausted-frozen",
     ("park", None): "budget-exhausted",
     ("terminal", None): "budget-exhausted-escalated",
+    # [registry #797] The MACHINE terminal. Declared here even though the deferred-issue lane
+    # passes WINDOW_AUTHORITY_HUMAN (its cutoff comes straight from readmission_cutoff, so it can
+    # only ever mint human windows): the enum RAISES on an undeclared pair, so if that lane is
+    # ever wired to an attributed window the exit lands in a counted bucket instead of crashing
+    # the tick — and, more to the point, instead of being silently re-routed to the human one.
+    ("machine-terminal", None): "budget-exhausted-machine-retired",
     ("legacy-quiet", "observe"): "budget-exhausted-absorbing",
     ("legacy-quiet", "wait"): "budget-exhausted-absorbing",
     ("legacy-quiet", "retire"): "budget-exhausted-retired",
@@ -657,6 +703,46 @@ def human_owned_holds(labels):
                    and (label == HUMAN_PR_PARK_LABEL or label.startswith("needs:"))})
 
 
+def retirement_handback(issue_labels):
+    """[registry #797] PURE. What happens to the SOURCE ISSUE when its worker PR is RETIRED by
+    the machine terminal — the half of the machine-owned give-up that keeps the WORK alive after
+    the attempt is abandoned.
+
+    Returns (action, labels, detail) with `labels` the full desired label set (None when nothing
+    is to be written):
+
+    - ("hold", None, ...): a HUMAN-owned hold (`human_owned_holds` — `review:needs-user` or any
+      `needs:*`) is live on the issue. A human is holding this work for a reason of their own;
+      the retirement records itself on the PR and touches the issue not at all. FAIL-CLOSED: the
+      caller passes the labels it could actually read, and an unreadable issue never reaches here.
+    - ("reroute", labels, ...): the issue is still on the IMPLEMENTATION route (`role:impl`).
+      Re-dispatching the same route is what just failed twice, so the role is swapped to
+      `role:research` for architect decomposition — the SAME hand-off the issue-side repeated-
+      decline path already makes (dispatch-claim._replace_issue_role_with_research), for the same
+      reason: the evidence says the item as specified is not implementable in one pass, not that
+      a human must adjudicate it.
+    - ("requeue", labels, ...): the issue is already off the impl route (research/docs/ci/site,
+      or no role at all). Swapping again would loop, so the labels are returned unchanged and
+      only the machine park is lifted by the caller's status transition.
+
+    The role swap is returned as a COMPLETE label set, never an add/remove pair: add-then-remove
+    can strand the issue with two role labels and remove-then-add with none, and the planner
+    rejects both shapes."""
+    labels = {label for label in (issue_labels or []) if isinstance(label, str)}
+    held = human_owned_holds(labels)
+    if held:
+        return ("hold", None,
+                f"human-owned hold(s) live on the source issue ({'/'.join(held)}) — the "
+                "retirement records itself on the PR and leaves the issue to its human")
+    if "role:impl" in labels:
+        return ("reroute", sorted((labels - {"role:impl"}) | {"role:research"}),
+                "the implementation route exhausted two full budgets — handing the issue to "
+                "architect decomposition (role:impl -> role:research)")
+    return ("requeue", sorted(labels),
+            "the issue is already off the implementation route — the park is lifted without a "
+            "second reroute, which would loop")
+
+
 def label_application_machine_owned(repo, number, label, fetch_events, is_human=None, log=print):
     """Whether the newest `labeled` event for THIS EXACT `label` on `repo#number` was applied by
     something other than a proven human — i.e. whether an automated path may clear it.
@@ -830,6 +916,57 @@ def capacity_park_admission(repo, pr_number, issue_number, fetch_events, is_huma
             f"park application at {parked_at}")
 
 
+def readmission_window(human_cutoff, auto_stamps=(), log=print):
+    """[registry #797] The budget readmission window AND WHO OPENED IT.
+
+    Returns {"cutoff", "authority", "machine_windows"}:
+      - "cutoff": exactly what effective_readmission_cutoff returns (the LATEST of the
+        proven-human cutoff and every well-formed automatic re-admission stamp, canonical
+        spelling; WINDOW_UNREADABLE is contagious; None when there is no window).
+      - "authority": WINDOW_AUTHORITY_HUMAN only when the winning window key is the PROVEN-HUMAN
+        gesture and NO automatic stamp shares that key; WINDOW_AUTHORITY_MACHINE when an
+        automatic re-admission receipt won (or tied — see below); WINDOW_AUTHORITY_UNKNOWN when
+        there is no window at all or the timeline was unreadable.
+      - "machine_windows": the canonical keys of every well-formed automatic stamp, so the ladder
+        can tell which of the PR's ALREADY-RECEIPTED windows were the machine's own and exclude
+        them from the human generation count.
+
+    A TIE RESOLVES TO MACHINE. If a human unlabel and an automatic re-admission canonicalise to
+    the same instant, the machine's re-admission is sufficient on its own to explain the window,
+    so the human's gesture is not PROVEN to be what opened it. Everywhere else in this module
+    ambiguity fails toward staying parked; here the equivalent conservative direction is failing
+    toward the MACHINE class, because the harm being fixed is a page nobody asked for.
+
+    THE DEFECT THIS SPLIT EXISTS FOR: the caller used to receive one bare string and had no way
+    to ask where it came from, so `park_ladder_decision` charged the machine's own re-admissions
+    to the human escalation ladder. See PARK_ESCALATION_GENERATIONS for the measured population.
+    """
+    if human_cutoff == WINDOW_UNREADABLE:
+        return {"cutoff": WINDOW_UNREADABLE, "authority": WINDOW_AUTHORITY_UNKNOWN,
+                "machine_windows": frozenset()}
+    machine, human = [], None
+    for source, stamp in ([("human gesture", human_cutoff)] if human_cutoff else []) \
+            + [("automatic re-admission", stamp) for stamp in (auto_stamps or [])]:
+        if not valid_timestamp(stamp):
+            log(f"::warning::readmission window: dropping the malformed {source} stamp "
+                f"{stamp!r} — unprovable time can never mint a budget window")
+            continue
+        entry = (parse_ts(stamp), canonical_ts(stamp))
+        if source == "human gesture":
+            human = entry
+        else:
+            machine.append(entry)
+    candidates = ([human] if human else []) + machine
+    if not candidates:
+        return {"cutoff": None, "authority": WINDOW_AUTHORITY_UNKNOWN,
+                "machine_windows": frozenset()}
+    machine_windows = frozenset(key for _instant, key in machine)
+    key = max(candidates)[1]
+    authority = (WINDOW_AUTHORITY_MACHINE if key in machine_windows
+                 else WINDOW_AUTHORITY_HUMAN)
+    return {"cutoff": key, "authority": authority, "machine_windows": machine_windows}
+
+
 def effective_readmission_cutoff(human_cutoff, auto_stamps=(), log=print):
     """The budget readmission window a re-admitted PR actually gets: the LATEST of the
     proven-human cutoff (readmission_cutoff) and every well-formed AUTOMATIC re-admission
@@ -841,25 +978,23 @@ def effective_readmission_cutoff(human_cutoff, auto_stamps=(), log=print):
     purely from allocator starvation, so an outage pins it) and quietly re-defer forever. The
     automatic re-admission grants EXACTLY the window a human gesture grants, and it is bounded
     by exactly the same two things that bound the re-admission itself: fresh unconsumed
-    evidence and AUTO_READMISSION_MAX. The park-generation ladder is unchanged and still
-    escalates to the QUESTION class after PARK_ESCALATION_GENERATIONS consumed windows, so a PR
-    that is automatically re-admitted and then exhausts its real budget again still reaches a
-    human — it just does so having actually retried.
+    evidence and AUTO_READMISSION_MAX.
+
+    [registry #797] WHAT THIS FUNCTION MUST NOT BE USED FOR. The BUDGET is rightly blind to who
+    opened the window — a re-admitted PR gets a real retry either way, which is the whole point
+    of #614. The ESCALATION LADDER is not: this docstring used to claim that "a PR that is
+    automatically re-admitted and then exhausts its real budget again still reaches a human — it
+    just does so having actually retried", and that was the defect stated as a feature. Reaching
+    a human is only correct when a human decided something; when the MACHINE re-admitted, the
+    re-exhaustion establishes nothing whatsoever about a human's attention. Ladder callers use
+    readmission_window (which returns the same cutoff PLUS its authority) and pass that authority
+    to park_ladder_decision; this function stays as the cutoff-only view the BUDGET consumers
+    want, and delegates so the two can never disagree about the cutoff itself.
 
     WINDOW_UNREADABLE is contagious and wins outright: an automatic stamp must never mask an
     unreadable label timeline (the ladder has to FREEZE on unproven data). A malformed automatic
     stamp is dropped with a loud log — unprovable time can never mint a window."""
-    if human_cutoff == WINDOW_UNREADABLE:
-        return WINDOW_UNREADABLE
-    candidates = []
-    for source, stamp in ([("human gesture", human_cutoff)] if human_cutoff else []) \
-            + [("automatic re-admission", stamp) for stamp in (auto_stamps or [])]:
-        if not valid_timestamp(stamp):
-            log(f"::warning::readmission window: dropping the malformed {source} stamp "
-                f"{stamp!r} — unprovable time can never mint a budget window")
-            continue
-        candidates.append((parse_ts(stamp), stamp))
-    return canonical_ts(max(candidates)[1]) if candidates else None
+    return readmission_window(human_cutoff, auto_stamps, log=log)["cutoff"]
 
 
 def safe_receipt_part(value):
@@ -1153,14 +1288,25 @@ def reclassify_legacy_park(comments, bot_login, stale_marker=None, log=print):
     return (cause, park_class, f"legacy prose classifies this park as {cause!r} ({park_class})")
 
 
-def park_ladder_decision(cutoff, receipts, already_labeled=False, fingerprint=None,
-                         consumed_fingerprints=frozenset()):
+def park_ladder_decision(cutoff, receipts, *, window_authority, already_labeled=False,
+                         fingerprint=None, consumed_fingerprints=frozenset(),
+                         machine_windows=frozenset()):
     """The ONE label-independent capacity-park escalation ladder (round-3 finding 1), shared
     by the deferred-issue lane (dispatch-claim) and the worker-PR lane (worker-pr needs_user).
     `cutoff` is readmission_cutoff(..., on_unreadable=WINDOW_UNREADABLE); `receipts` is the
     durable bot-authored receipt set (worker-pr park_generation_cutoffs); `already_labeled`
     says whether the machine park label is currently live (COMMENT-DEDUPE input only — the
-    generation math never reads it). Returns (action, window_key, generation):
+    generation math never reads it).
+
+    `window_authority` (REQUIRED, keyword-only — WINDOW_AUTHORITY_*) says WHO opened this
+    window, and `machine_windows` says which of the ALREADY-RECEIPTED windows the machine
+    opened. Both come from readmission_window. It is required and keyword-only ON PURPOSE:
+    [registry #797] the live defect was a call site handing over a bare cutoff string with no
+    attribution at all, so the loop's own automatic re-admissions were charged to the HUMAN
+    escalation ladder and 20 of 21 live escalations paged the maintainer for a re-admission the
+    maintainer never made. A default would have let exactly that call site keep compiling.
+
+    Returns (action, window_key, generation):
 
     - ("freeze", None, None): the timeline was unreadable — no window, no receipt, no label,
       no comment; the ladder never advances on unproven data.
@@ -1175,11 +1321,24 @@ def park_ladder_decision(cutoff, receipts, already_labeled=False, fingerprint=No
       generation consumed). See below for why this is what makes readmission mean anything.
     - ("legacy-quiet", None, None): a pre-receipt park (label live, no gesture, no receipts)
       — stay quiet; generation accounting starts with the first receipted window.
-    - ("terminal", window_key, generation): PARK_ESCALATION_GENERATIONS windows consumed —
-      escalate to the question class. The terminal label write must consult the sticky veto
-      and the comment must be HONEST when the write was suppressed (never claim a label that
-      did not land). Requires a REAL cutoff: the initial PARK_WINDOW_NONE window alone can
-      never escalate, and a cutoff that regressed to None cannot prove a fresh window.
+    - ("terminal", window_key, generation): PARK_ESCALATION_GENERATIONS HUMAN-CHARGED windows
+      consumed — escalate to the question class. The terminal label write must consult the
+      sticky veto and the comment must be HONEST when the write was suppressed (never claim a
+      label that did not land). Requires a REAL cutoff: the initial PARK_WINDOW_NONE window
+      alone can never escalate, and a cutoff that regressed to None cannot prove a fresh
+      window. [registry #797] It ALSO requires `window_authority == WINDOW_AUTHORITY_HUMAN`:
+      a human question must mean a human is genuinely required, so ONLY a window a PROVEN
+      human opened may charge one of these generations, and MACHINE-minted windows are
+      excluded from the count of prior ones as well (`machine_windows`) — otherwise the very
+      first human re-admission after two of the loop's own would land straight on the terminal.
+    - ("machine-terminal", window_key, generation): [registry #797] the MACHINE ladder's own
+      exit — PARK_MACHINE_TERMINAL_GENERATIONS machine-minted windows consumed. The machine
+      re-admitted this item and it failed again, which establishes that the approach is not
+      converging and establishes NOTHING about a human's attention; the caller RETIRES it
+      (machine-owned class, worker PR closed, source issue handed back for decomposition)
+      instead of paging. Reached by every non-human authority, WINDOW_AUTHORITY_UNKNOWN
+      included: an unattributable window may never reach the human terminal, and must still
+      terminate.
     - ("park", window_key, generation): consume this window — soft park (veto-gated label,
       best-effort) + the MANDATORY receipt binding window_key.
 
@@ -1230,10 +1389,29 @@ def park_ladder_decision(cutoff, receipts, already_labeled=False, fingerprint=No
         return ("unchanged", window_key, None)
     if not cutoff and already_labeled and not receipts:
         return ("legacy-quiet", None, None)
-    generation = len(receipts) + 1
-    if cutoff and generation >= PARK_ESCALATION_GENERATIONS:
-        return ("terminal", window_key, generation)
-    return ("park", window_key, generation)
+    # [registry #797] TWO LADDERS, ATTRIBUTED. `charged` is the HUMAN ladder's history — the
+    # initial PARK_WINDOW_NONE window (never a machine re-admission) plus every window a proven
+    # human opened; the machine's own re-admission windows are subtracted out, so they can
+    # neither reach the human terminal themselves nor push a later human window onto it.
+    charged = {key for key in receipts if key not in machine_windows}
+    if not cutoff:
+        # The INITIAL full-budget window. No re-admission of any kind happened, so no ladder can
+        # escalate on it alone — unchanged from before, and deliberately not attributed.
+        return ("park", window_key, len(charged) + 1)
+    if window_authority == WINDOW_AUTHORITY_HUMAN and window_key not in machine_windows:
+        generation = len(charged) + 1
+        if generation >= PARK_ESCALATION_GENERATIONS:
+            return ("terminal", window_key, generation)
+        return ("park", window_key, generation)
+    # MACHINE (or unattributable) window: the machine ladder, whose terminal is a retirement.
+    # An UNKNOWN authority has no attribution to count with, so it counts EVERY consumed window
+    # — over-counting only makes it retire SOONER, which is the safe direction; under-counting
+    # would leave it absorbing (the #764 failure) with no exit at all.
+    machine_generation = (len(receipts) + 1 if window_authority == WINDOW_AUTHORITY_UNKNOWN
+                          else len(receipts) - len(charged) + 1)
+    if machine_generation >= PARK_MACHINE_TERMINAL_GENERATIONS:
+        return ("machine-terminal", window_key, machine_generation)
+    return ("park", window_key, machine_generation)
 
 
 def probe_maintainer(repo, login, read_permission, log=print):
@@ -1271,6 +1449,15 @@ def _self_test():
     # The strict maintainer probe every production site supplies (collaborator permission in
     # HUMAN_MAINTAINER_PERMISSIONS): jeswr is the trusted human; everyone else is not.
     trusted = lambda login: login == "jeswr"  # noqa: E731 — trivial trusted-set stub
+
+    # [registry #797] `window_authority` is a REQUIRED keyword on park_ladder_decision. Every
+    # pre-#797 ladder assertion below models a window a PROVEN HUMAN opened — that is what they
+    # always meant, because the old ladder had no other kind — so this shim states it once
+    # instead of 24 times. The #797 block calls park_ladder_decision DIRECTLY with the machine
+    # and unknown authorities, and pins the required-ness itself.
+    def ladder(cutoff, receipts, window_authority=WINDOW_AUTHORITY_HUMAN, **kwargs):
+        return park_ladder_decision(cutoff, receipts, window_authority=window_authority,
+                                    **kwargs)
 
     bot_park = event("labeled", "needs:user", "2026-07-18T10:00:00Z", "sparq-orchestrator[bot]")
     human_unpark = event("unlabeled", "needs:user", "2026-07-18T11:00:00Z", "jeswr")
@@ -1704,7 +1891,7 @@ def _self_test():
     # An overflow cutoff handed straight to the ladder freezes on the defensive rail —
     # it can mint neither a window key nor a receipt.
     check("round-7 f1: an overflow cutoff freezes the ladder",
-          park_ladder_decision("0001-01-01T00:00:00+23:59", set()), ("freeze", None, None))
+          ladder("0001-01-01T00:00:00+23:59", set()), ("freeze", None, None))
 
     # ---- readmission_cutoff on_unreadable: the ladder can DISTINGUISH windowless from
     # unreadable; default callers keep the plain None => full-count path ----
@@ -1719,44 +1906,44 @@ def _self_test():
 
     # ---- park_ladder_decision: the ONE receipts-driven escalation ladder ----
     check("ladder: unreadable timeline freezes",
-          park_ladder_decision(WINDOW_UNREADABLE, set()), ("freeze", None, None))
+          ladder(WINDOW_UNREADABLE, set()), ("freeze", None, None))
     check("ladder: initial park consumes the PARK_WINDOW_NONE window as generation 1",
-          park_ladder_decision(None, set()), ("park", PARK_WINDOW_NONE, 1))
+          ladder(None, set()), ("park", PARK_WINDOW_NONE, 1))
     check("ladder: the initial window re-fires quietly once receipted",
-          park_ladder_decision(None, {PARK_WINDOW_NONE}), ("dedupe", PARK_WINDOW_NONE, None))
+          ladder(None, {PARK_WINDOW_NONE}), ("dedupe", PARK_WINDOW_NONE, None))
     check("ladder: legacy pre-receipt park stays quiet (no receipt minted)",
-          park_ladder_decision(None, set(), already_labeled=True),
+          ladder(None, set(), already_labeled=True),
           ("legacy-quiet", None, None))
     check("ladder: a fresh gesture window after the initial receipt is TERMINAL at gen 2",
-          park_ladder_decision("2026-07-23T09:18:19Z", {PARK_WINDOW_NONE}),
+          ladder("2026-07-23T09:18:19Z", {PARK_WINDOW_NONE}),
           ("terminal", "2026-07-23T09:18:19Z", 2))
     check("ladder: a fresh gesture window with NO prior receipts parks as generation 1",
-          park_ladder_decision("2026-07-23T09:18:19Z", set()),
+          ladder("2026-07-23T09:18:19Z", set()),
           ("park", "2026-07-23T09:18:19Z", 1))
     check("ladder: an already-receipted gesture window dedupes (comments), never advances",
-          park_ladder_decision("2026-07-23T09:18:19Z", {"2026-07-23T09:18:19Z"}),
+          ladder("2026-07-23T09:18:19Z", {"2026-07-23T09:18:19Z"}),
           ("dedupe", "2026-07-23T09:18:19Z", None))
     check("ladder: a cutoff regressed to None can NEVER escalate past prior receipts",
-          park_ladder_decision(None, {"2026-07-21T08:00:00Z"}),
+          ladder(None, {"2026-07-21T08:00:00Z"}),
           ("park", PARK_WINDOW_NONE, 2))
     check("ladder: already_labeled never suppresses a due receipt once a window exists",
-          park_ladder_decision("2026-07-23T09:18:19Z", set(), already_labeled=True),
+          ladder("2026-07-23T09:18:19Z", set(), already_labeled=True),
           ("park", "2026-07-23T09:18:19Z", 1))
     # Round-6 finding 2: the ladder CANONICALIZES the window key it hands to every receipt
     # writer — a space-form cutoff mints the compact Z-form key (writable + round-trippable),
     # dedupes against its canonical receipt, and escalates on the canonical identity.
     check("ladder round-6 f2: a space-form cutoff mints the CANONICAL window key",
-          park_ladder_decision("2026-07-23 10:30:00Z", set()),
+          ladder("2026-07-23 10:30:00Z", set()),
           ("park", "2026-07-23T10:30:00Z", 1))
     check("ladder round-6 f2: a space-form cutoff dedupes against its canonical receipt",
-          park_ladder_decision("2026-07-23 10:30:00Z", {"2026-07-23T10:30:00Z"}),
+          ladder("2026-07-23 10:30:00Z", {"2026-07-23T10:30:00Z"}),
           ("dedupe", "2026-07-23T10:30:00Z", None))
     check("ladder round-6 f2: a space-form cutoff reaches the gen-2 terminal",
-          park_ladder_decision("2026-07-23 10:30:00Z", {PARK_WINDOW_NONE}),
+          ladder("2026-07-23 10:30:00Z", {PARK_WINDOW_NONE}),
           ("terminal", "2026-07-23T10:30:00Z", 2))
     check("ladder round-6 f2: an unparseable cutoff freezes (defensive rail — it can mint "
           "neither a window key nor a receipt)",
-          park_ladder_decision("not-a-timestamp", set()), ("freeze", None, None))
+          ladder("not-a-timestamp", set()), ("freeze", None, None))
 
     # ---- park_fingerprint + the UNCHANGED-HEAD idempotence axis (#555 recurrence gap).
     # THE DEFECT: a human readmission mints a BRAND-NEW window key, so the next tick that
@@ -1779,14 +1966,14 @@ def _self_test():
     # fingerprint is NOT consumed — quiet skip, no generation, no terminal.
     check("(a) ladder: a fresh window + an unchanged fingerprint is skipped QUIETLY (the "
           "#3488 bounce), never consumed",
-          park_ladder_decision("2026-07-23T09:18:19Z", {PARK_WINDOW_NONE},
+          ladder("2026-07-23T09:18:19Z", {PARK_WINDOW_NONE},
                                fingerprint=f"{head}/rounds=5",
                                consumed_fingerprints=consumed),
           ("unchanged", "2026-07-23T09:18:19Z", None))
     # (b) the head ADVANCED => real work was attempted => the window is consumed normally.
     check("(b) ladder: an advanced head consumes the fresh window (gen-2 terminal at the "
           "configured bound)",
-          park_ladder_decision("2026-07-23T09:18:19Z", {PARK_WINDOW_NONE},
+          ladder("2026-07-23T09:18:19Z", {PARK_WINDOW_NONE},
                                fingerprint=f"{'b' * 40}/rounds=5",
                                consumed_fingerprints=consumed),
           ("terminal", "2026-07-23T09:18:19Z", 2))
@@ -1795,33 +1982,33 @@ def _self_test():
     # the window IS consumed — this is what keeps the escalation bound reachable.
     check("(b') ladder: an advanced attempt counter on an UNCHANGED head still consumes the "
           "window (bounded escalation survives)",
-          park_ladder_decision("2026-07-23T09:18:19Z", {PARK_WINDOW_NONE},
+          ladder("2026-07-23T09:18:19Z", {PARK_WINDOW_NONE},
                                fingerprint=f"{head}/rounds=6",
                                consumed_fingerprints=consumed),
           ("terminal", "2026-07-23T09:18:19Z", 2))
     check("ladder: the FIRST park always lands — no receipted fingerprint can match",
-          park_ladder_decision(None, set(), fingerprint=f"{head}/rounds=5",
+          ladder(None, set(), fingerprint=f"{head}/rounds=5",
                                consumed_fingerprints=frozenset()),
           ("park", PARK_WINDOW_NONE, 1))
     check("ladder: a legacy receipt (no fingerprint recorded) claims no idempotence",
-          park_ladder_decision("2026-07-23T09:18:19Z", {PARK_WINDOW_NONE},
+          ladder("2026-07-23T09:18:19Z", {PARK_WINDOW_NONE},
                                fingerprint=f"{head}/rounds=5",
                                consumed_fingerprints=frozenset()),
           ("terminal", "2026-07-23T09:18:19Z", 2))
     check("ladder: an unknown fingerprint (None) can never suppress a due park",
-          park_ladder_decision("2026-07-23T09:18:19Z", {PARK_WINDOW_NONE},
+          ladder("2026-07-23T09:18:19Z", {PARK_WINDOW_NONE},
                                fingerprint=None, consumed_fingerprints=consumed),
           ("terminal", "2026-07-23T09:18:19Z", 2))
     # Precedence: the window dedupe (already receipted) and the freeze (unproven timeline)
     # both outrank the fingerprint check — an unchanged fingerprint must never turn a frozen
     # or already-receipted decision into a different action.
     check("ladder: the same-window dedupe still wins over the fingerprint check",
-          park_ladder_decision("2026-07-23T09:18:19Z", {"2026-07-23T09:18:19Z"},
+          ladder("2026-07-23T09:18:19Z", {"2026-07-23T09:18:19Z"},
                                fingerprint=f"{head}/rounds=5",
                                consumed_fingerprints=consumed),
           ("dedupe", "2026-07-23T09:18:19Z", None))
     check("ladder: an unreadable timeline still FREEZES ahead of the fingerprint check",
-          park_ladder_decision(WINDOW_UNREADABLE, {PARK_WINDOW_NONE},
+          ladder(WINDOW_UNREADABLE, {PARK_WINDOW_NONE},
                                fingerprint=f"{head}/rounds=5",
                                consumed_fingerprints=consumed),
           ("freeze", None, None))
@@ -1836,7 +2023,7 @@ def _self_test():
     for step in range(1, PARK_ESCALATION_GENERATIONS + 2):
         window = f"2026-07-23T{step:02d}:00:00Z"
         fingerprint = f"{head}/r={step}"
-        action, key, _generation = park_ladder_decision(
+        action, key, _generation = ladder(
             window, ladder_receipts, fingerprint=fingerprint,
             consumed_fingerprints=ladder_consumed)
         real_actions.append(action)
@@ -1844,7 +2031,7 @@ def _self_test():
         ladder_consumed.add(fingerprint)
         # ... the very next tick re-derives the SAME exhaustion from the SAME state under a
         # BRAND-NEW readmission window (a human just re-admitted): the #3488 bounce.
-        bounce_actions.append(park_ladder_decision(
+        bounce_actions.append(ladder(
             f"2026-07-24T{step:02d}:00:00Z", ladder_receipts, fingerprint=fingerprint,
             consumed_fingerprints=ladder_consumed)[0])
     check("(d) genuinely consumed windows climb the ladder to the configured TERMINAL and "
@@ -1854,6 +2041,156 @@ def _self_test():
     check("(d) an unchanged-state re-derivation NEVER advances the ladder at any generation "
           "(the bound is spent only on work actually attempted)",
           bounce_actions, ["unchanged"] * (PARK_ESCALATION_GENERATIONS + 1))
+
+    # ---- [registry #797] THE GENERATION COUNTER IS ATTRIBUTED: a MACHINE re-admission may not
+    # charge a HUMAN generation, and may never reach the human-owned terminal.
+    #
+    # THE LIVE DEFECT, verbatim from sparq PR #4422: gen=1 cutoff=none (the initial window), then
+    # an automatic re-admission receipted `at=2026-07-27T08:02:21Z`, then gen=2 with a cutoff
+    # BYTE-IDENTICAL to that auto stamp and a comment reading "This PR was human-readmitted and
+    # exhausted its budget again ... @jeswr this pull request needs a human decision". No human
+    # touched it: all 73 live applications of review:needs-user across the 35 held PRs were made
+    # by sparq-orchestrator[bot], and 20 of the 21 PRs carrying generation receipts had escalated
+    # on a machine-minted window (the other is a genuine injection escalation, #3743). ----
+    auto_stamp = "2026-07-27T08:02:21Z"
+    human_stamp = "2026-07-27T12:00:00Z"
+    machine_only = frozenset({auto_stamp})
+    # (i) THE HEADLINE GUARD. The exact #4422 state — the initial window receipted, and this
+    # window opened by the loop's OWN automatic re-admission. It must NOT be the human terminal.
+    check("#797 (i): the MACHINE's own re-admission window can NEVER reach the human terminal "
+          "(the #4422 false page)",
+          park_ladder_decision(auto_stamp, {PARK_WINDOW_NONE},
+                               window_authority=WINDOW_AUTHORITY_MACHINE,
+                               machine_windows=machine_only)[0] != "terminal", True)
+    check("#797 (i): ...it stays in the MACHINE class as that ladder's generation 1 — the "
+          "machine re-admitted once, so it still owns the outcome",
+          park_ladder_decision(auto_stamp, {PARK_WINDOW_NONE},
+                               window_authority=WINDOW_AUTHORITY_MACHINE,
+                               machine_windows=machine_only),
+          ("park", auto_stamp, 1))
+    # (i') #3595's real history: BOTH receipted windows are the loop's own auto stamps. The
+    # machine has now spent its AUTO_READMISSION_MAX chances, so THIS is where it gives up —
+    # on the machine terminal, still not on the maintainer's desk.
+    second_auto = "2026-07-26T14:50:59Z"
+    check("#797 (i'): a SECOND machine window exhausts the MACHINE ladder and RETIRES (#3595), "
+          "never pages",
+          park_ladder_decision(second_auto, {PARK_WINDOW_NONE, auto_stamp},
+                               window_authority=WINDOW_AUTHORITY_MACHINE,
+                               machine_windows=frozenset({auto_stamp, second_auto})),
+          ("machine-terminal", second_auto, PARK_MACHINE_TERMINAL_GENERATIONS))
+    # (ii) THE MIRROR. The SAME receipt history under a GENUINE human re-admission still reaches
+    # the human terminal — the protection this ladder exists for is preserved, not removed.
+    check("#797 (ii): a GENUINE human re-admission on the same history still escalates to the "
+          "human terminal",
+          park_ladder_decision(human_stamp, {PARK_WINDOW_NONE},
+                               window_authority=WINDOW_AUTHORITY_HUMAN,
+                               machine_windows=machine_only),
+          ("terminal", human_stamp, PARK_ESCALATION_GENERATIONS))
+    # (iii) MACHINE WINDOWS ARE SUBTRACTED FROM THE HUMAN COUNT. #3595's real history: BOTH
+    # receipted windows are auto stamps. The maintainer's FIRST actual re-admission must get a
+    # full human generation-1 window, not inherit two the machine spent on its own behalf.
+    check("#797 (iii): a human's first re-admission after two MACHINE windows gets generation 1, "
+          "not the machine's inherited count (#3595)",
+          park_ladder_decision(human_stamp, {auto_stamp, "2026-07-26T14:50:59Z"},
+                               window_authority=WINDOW_AUTHORITY_HUMAN,
+                               machine_windows=frozenset({auto_stamp,
+                                                          "2026-07-26T14:50:59Z"})),
+          ("park", human_stamp, 1))
+    # (iv) THE MACHINE LADDER STILL TERMINATES, and does so BOUNDED BY THE CONSTANT. Walk it
+    # from nothing with machine-only windows: the first machine window parks, and the
+    # PARK_MACHINE_TERMINAL_GENERATIONS-th retires. Asserted against the constant, never a 2.
+    machine_receipts, machine_actions = {PARK_WINDOW_NONE}, []
+    for step in range(1, PARK_MACHINE_TERMINAL_GENERATIONS + 2):
+        window = f"2026-07-28T{step:02d}:00:00Z"
+        seen = frozenset(key for key in machine_receipts if key != PARK_WINDOW_NONE) | {window}
+        action, key, _generation = park_ladder_decision(
+            window, machine_receipts, window_authority=WINDOW_AUTHORITY_MACHINE,
+            machine_windows=seen)
+        machine_actions.append(action)
+        machine_receipts.add(key)
+    check("#797 (iv): the MACHINE ladder terminates at PARK_MACHINE_TERMINAL_GENERATIONS and "
+          "stays there — a machine park is never absorbing",
+          machine_actions,
+          ["park"] * (PARK_MACHINE_TERMINAL_GENERATIONS - 1)
+          + ["machine-terminal"] * 2)
+    # (v) UNATTRIBUTABLE IS NOT HUMAN — and still terminates. A caller that cannot attribute its
+    # window must not be able to page anyone, and must not land in an absorbing state either.
+    check("#797 (v): an UNATTRIBUTABLE window never reaches the human terminal",
+          park_ladder_decision(human_stamp, {PARK_WINDOW_NONE},
+                               window_authority=WINDOW_AUTHORITY_UNKNOWN)[0],
+          "machine-terminal")
+    # (vi) THE ARGUMENT IS REQUIRED. This is what stops a future call site re-introducing the
+    # defect by simply not attributing its window: there is no default to fall back to.
+    try:
+        park_ladder_decision(human_stamp, {PARK_WINDOW_NONE})
+        required = "NO ERROR"
+    except TypeError as exc:
+        required = "window_authority" in str(exc)
+    check("#797 (vi): park_ladder_decision REFUSES to decide without an attributed window",
+          required, True)
+    # (vii) THE INITIAL WINDOW IS UNCHANGED under every authority: no re-admission of any kind
+    # happened, so it parks as generation 1 and can escalate nowhere.
+    check("#797 (vii): the initial no-cutoff window is authority-independent",
+          {authority: park_ladder_decision(None, set(), window_authority=authority)
+           for authority in (WINDOW_AUTHORITY_HUMAN, WINDOW_AUTHORITY_MACHINE,
+                             WINDOW_AUTHORITY_UNKNOWN)},
+          {WINDOW_AUTHORITY_HUMAN: ("park", PARK_WINDOW_NONE, 1),
+           WINDOW_AUTHORITY_MACHINE: ("park", PARK_WINDOW_NONE, 1),
+           WINDOW_AUTHORITY_UNKNOWN: ("park", PARK_WINDOW_NONE, 1)})
+
+    # ---- [registry #797] readmission_window: the ATTRIBUTION itself ----
+    check("#797 window: a human gesture newer than every auto stamp is HUMAN-authorised",
+          readmission_window(human_stamp, [auto_stamp]),
+          {"cutoff": human_stamp, "authority": WINDOW_AUTHORITY_HUMAN,
+           "machine_windows": machine_only})
+    check("#797 window: an auto stamp newer than the human gesture is MACHINE-authorised",
+          readmission_window("2026-07-26T00:00:00Z", [auto_stamp]),
+          {"cutoff": auto_stamp, "authority": WINDOW_AUTHORITY_MACHINE,
+           "machine_windows": machine_only})
+    check("#797 window: an auto re-admission with NO human gesture at all is MACHINE-authorised "
+          "(the whole live population)",
+          readmission_window(None, [auto_stamp]),
+          {"cutoff": auto_stamp, "authority": WINDOW_AUTHORITY_MACHINE,
+           "machine_windows": machine_only})
+    check("#797 window: a TIE resolves to MACHINE — an auto stamp at the same instant is a "
+          "sufficient explanation, so the human's intent is not PROVEN",
+          readmission_window(auto_stamp, [auto_stamp])["authority"],
+          WINDOW_AUTHORITY_MACHINE)
+    check("#797 window: an EQUIVALENT space-form spelling still ties to MACHINE (canonical "
+          "identity, round-6 finding 2)",
+          readmission_window("2026-07-27 08:02:21Z", [auto_stamp])["authority"],
+          WINDOW_AUTHORITY_MACHINE)
+    check("#797 window: no gesture of any kind is UNKNOWN, never human",
+          readmission_window(None, []),
+          {"cutoff": None, "authority": WINDOW_AUTHORITY_UNKNOWN,
+           "machine_windows": frozenset()})
+    check("#797 window: an unreadable timeline is contagious AND unattributable",
+          readmission_window(WINDOW_UNREADABLE, [auto_stamp]),
+          {"cutoff": WINDOW_UNREADABLE, "authority": WINDOW_AUTHORITY_UNKNOWN,
+           "machine_windows": frozenset()})
+    logs.clear()
+    check("#797 window: a malformed auto stamp is dropped loudly and cannot mint a window",
+          (readmission_window(None, ["zzz"], log=logs.append), len(logs)), (
+              {"cutoff": None, "authority": WINDOW_AUTHORITY_UNKNOWN,
+               "machine_windows": frozenset()}, 1))
+    check("#797 window: effective_readmission_cutoff is the same decision, cutoff-only (the "
+          "budget view and the ladder view can never disagree)",
+          [effective_readmission_cutoff(h, a) == readmission_window(h, a)["cutoff"]
+           for h, a in ((human_stamp, [auto_stamp]), (None, [auto_stamp]), (None, []),
+                        (WINDOW_UNREADABLE, [auto_stamp]), ("2026-07-25 01:00:00Z", []))],
+          [True] * 5)
+
+    # ---- [registry #797] retirement_handback: the SOURCE ISSUE half of a machine retirement ----
+    check("#797 handback: an impl-route issue is handed to architect decomposition",
+          retirement_handback(["area:engine", "role:impl", "status:parked"])[:2],
+          ("reroute", ["area:engine", "role:research", "status:parked"]))
+    check("#797 handback: an issue already off the impl route is requeued, never re-rerouted",
+          retirement_handback(["area:engine", "role:research"])[:2],
+          ("requeue", ["area:engine", "role:research"]))
+    check("#797 handback: a HUMAN-held source issue is not touched at all",
+          [retirement_handback(["role:impl", hold])[:2]
+           for hold in ("needs:user", "needs:external-audit", HUMAN_PR_PARK_LABEL)],
+          [("hold", None)] * 3)
 
     # ---- capacity_park_admission: AUTOMATIC re-admission of a MACHINE park on proven
     # cause-recovery (invariant 3, registry #614). THE DEFECT: a machine-owned park could only
