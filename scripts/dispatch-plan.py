@@ -985,20 +985,82 @@ def _routing_doc():
     chk("[#768] an area-less open PR reserves NOTHING — CLAIM's `or {GLOBAL}` is NOT adopted",
         _planned(_plan_noarea), [501])
 
-    # (5) THE INTERLOCK, against THIS repository's own planner, unmodified. `ready_candidates`
-    # here has no `pull_request` guard, so a PR row carrying the readiness labels would be
-    # DISPATCHED as though it were an issue — an impl worker launched against a pull-request
-    # number. The probe must refuse it, say why, and leave today's behaviour exactly in place.
+    # (5) THE INTERLOCK, against THIS repository's own planner, unmodified. It used to FAIL the
+    # probe — `scripts/ready-issues.py` had no `pull_request` guard anywhere, so a PR row carrying
+    # the readiness labels would have been DISPATCHED as though it were an issue (an impl worker
+    # launched against a pull-request number) and the interlock refused it PR rows, loudly. Since
+    # the engine gained both halves it PASSES, and the assertions below are the acceptance test:
+    # the probe opens, and the PR's area is genuinely HELD.
+    #
+    # The old first assertion was `(500 in _planned, _planned) == (False, [502])`, which the
+    # REFUSED and the ACCEPTED planner both satisfy — #500 is dropped as a PR row in one case and
+    # as an unready row in the other, and #502 sits on a free area either way. It could not
+    # witness this change in either direction, so a THIRD row is added on the PR's own area: it is
+    # planned iff the PR reserved nothing, which is exactly the property under test.
     _own_rows = [_issue(500, _READY + ["area:usage"], pr=True),
+                 _issue(501, _READY + ["area:usage"]),
                  _issue(502, _READY + ["area:docs"])]
     _plan_own, _out_own = _run_readiness([_own_rows], [None])
-    chk("[#768] this repo's OWN planner is refused PR rows — and never plans one as an issue",
+    chk("[#768] this repo's OWN planner PASSES the probe — it holds the PR's area, plans no PR",
         (500 in _planned(_plan_own), _planned(_plan_own)), (False, [502]))
-    chk("[#768] ...and the refusal is LOUD, naming the reason and the unreserved count",
+    chk("[#768] ...and the interlock OPENS for it, naming the capability and the reserved count",
         ("::warning::" in _out_own, "NOT pull-request-aware" in _out_own,
-         "DISPATCHES a pull-request row" in _out_own,
-         "1 open PR row(s) were NOT reserved" in _out_own),
-        (True, True, True, True))
+         "PLAN occupancy carries 1 open pull-request row(s)" in _out_own,
+         "reserves PR areas and never dispatches a PR row" in _out_own),
+        (False, False, True, True))
+
+    # (5b) THE SAFETY REFUSAL, which (5) no longer exercises now that this repo's planner passes.
+    # Without this the `planner DISPATCHES a pull-request row` branch of `pr_row_aware` would have
+    # NO live coverage at all and could be deleted with the suite green — the probe would then
+    # hand PR rows to an engine that plans them as issues, which is the outage it exists to
+    # prevent. A synthetic planner with ONLY the candidate guard removed isolates that one branch
+    # (the inert planner in (6) isolates the other).
+    _UNGUARDED_PLANNER = _PR_AWARE_PLANNER.replace(
+        '    cands = [it for it in issues if "pull_request" not in it\n',
+        "    cands = [it for it in issues if True\n")
+    assert _UNGUARDED_PLANNER != _PR_AWARE_PLANNER, "the unguarded-planner mutation did not apply"
+    _plan_unguarded, _out_unguarded = _run_readiness(
+        [[_issue(500, _READY + ["area:usage"], pr=True)]], [_UNGUARDED_PLANNER])
+    chk("[#768] a planner that would PLAN a PR row is refused, and plans no PR row",
+        ("DISPATCHES a pull-request row" in _out_unguarded,
+         "NOT pull-request-aware" in _out_unguarded,
+         "PLAN occupancy carries" in _out_unguarded,
+         500 in _planned(_plan_unguarded)),
+        (True, True, False, False))
+
+    # (5c) [#786] THE PROBE'S FAIL-OPEN HOLE, pinned by the shape that exposed it. `_UNGUARDED_
+    # PLANNER` above still RESERVES a PR's declared areas, so the area-declaring probe row shields
+    # ITSELF: it reserves `__pr_probe__`, then its own reservation drops it from selection, and
+    # `alone`/`paired` are both empty however broken the candidate guard is. Before the area-LESS
+    # probe row was added, SAFETY therefore admitted that planner (MEASURED against this repo's
+    # own engine with the guard deleted: alone=[], paired=[], verdict ACCEPT) — and it plans an
+    # area-less PR row as an issue, which is the ONLY shape 40 of 40 open PRs here have. This row
+    # asserts the refusal happens on a board with NO area-declaring row to shield the PR.
+    #
+    # It does NOT isolate `bare_alone` from (5b) — an earlier revision of this comment claimed
+    # "deleting `bare_alone` reds it while (5b) stays green", and that is measurably wrong. Delete
+    # `bare_alone` from `pr_row_aware`'s refusal condition in `dispatch.yml` and re-run: BOTH rows
+    # red, (5b) with (False, False, True, False) and this one with `PLAN DIED on the admitted
+    # planner: KeyError: 500`. Both refusals come from the same probe, so both stop printing at
+    # once. What separates them is what the board then DOES: on (5b)'s area-declaring board the
+    # admitted planner is still harmless (`500 in _planned` stays False — the PR self-shields), so
+    # (5b) witnesses only that the refusal text vanished. This row is the one whose board realises
+    # the outage: the admitted planner emits a plan row whose `number` is a PULL REQUEST and the
+    # downstream assembly dies on it. Two rows, one probe, two different consequences.
+    # Caught for the same reason case (7) catches: when SAFETY admits this planner, PLAN goes on
+    # to emit a plan row whose `number` is a PR and the downstream assembly dies on it. A crash
+    # reads as "the harness broke"; the fact under test is that the probe must REFUSE, so the
+    # exception is turned into a NAMED red row instead of an abort that hides every later check.
+    try:
+        _plan_bare, _out_bare = _run_readiness(
+            [[_issue(500, _READY, pr=True), _issue(501, _READY + ["area:usage"])]],
+            [_UNGUARDED_PLANNER])
+        _bare_outcome = ("DISPATCHES a pull-request row" in _out_bare,
+                         "PLAN occupancy carries" in _out_bare, _planned(_plan_bare))
+    except Exception as exc:                                       # noqa: BLE001
+        _bare_outcome = f"PLAN DIED on the admitted planner: {type(exc).__name__}: {exc}"
+    chk("[#786] an AREA-LESS PR row cannot shield itself — SAFETY still refuses, and plans no PR",
+        _bare_outcome, (True, False, [501]))
 
     # (6) THE PROBE'S SECOND OBLIGATION, on its own. Mutation found this hole: dropping the
     # EFFECT check left every other assertion green, because the only non-PR-aware planner in
