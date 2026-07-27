@@ -5131,6 +5131,13 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                                       "ladder frozen (no readmission credit, no generation "
                                       "receipt) until the timeline reads clean")
                                 continue
+                            # >>> absorbing-park-arm — EXTRACTED AND EXECUTED by
+                            # _absorbing_park_leg_self_test. Source-level substring assertions on
+                            # this arm are VACUOUS: `if False and action in ...` and
+                            # `linked_open_pr=False` both leave every searched string intact while
+                            # destroying the fix (measured, mutants C1/C2). The sentinels delimit
+                            # the block the self-test runs against stub writers; removing either
+                            # one makes that extraction FAIL CLOSED.
                             if action in _park_policy.PARK_ABSORBING_ACTIONS:
                                 # [registry #764] THE MACHINE EXIT FOR AN ABSORBING PARK.
                                 # The whole leg is `absorbing_park_leg` (module level, every
@@ -5152,6 +5159,7 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                                         is_human=lambda login: _target_is_human_maintainer(
                                             repo, login)))] += 1
                                 continue
+                            # <<< absorbing-park-arm
                             if action == "terminal":
                                 # Bounded escalation: PARK_ESCALATION_GENERATIONS windows
                                 # consumed — repeated post-readmission failure IS a human
@@ -13018,6 +13026,14 @@ def _absorbing_park_leg_self_test():
         (first.bucket, len(first.comments), first.needs_user),
         ("budget-exhausted-absorbing", 1, 0))
     clock = [observing(t0)]
+    # TWO observations for one window: the streak is the OLDEST, so a later re-observation can
+    # never RESET the clock and postpone the terminal indefinitely (mutant R2: min -> max).
+    chk("[#764] the retirement clock reads the OLDEST observation, never the newest",
+        wp.absorbing_park_streak([observing(t0), observing(t0 + grace - 5)], bot, "none"),
+        stamp(t0))
+    chk("[#764] ...so a re-observation inside the grace cannot postpone the terminal",
+        Run([observing(t0), observing(t0 + grace - 5)], t0 + grace).bucket,
+        "budget-exhausted-retired")
     inside = Run(clock, t0 + grace - 60)
     chk("[#764] ...WAITS silently inside the bounded grace (no comment, no label)",
         (inside.bucket, inside.comments, inside.needs_user),
@@ -13096,6 +13112,27 @@ def _absorbing_park_leg_self_test():
         (blind.bucket, blind.needs_user), ("budget-exhausted-absorbing", 0))
     chk("[#764] `freeze` is not absorbing — an unreadable timeline proves nothing either way",
         policy.absorbing_park_disposition("freeze", "", t0), ("not-absorbing", ""))
+    # The corrupt-receipt fixture above is filtered by the RECEIPT READER, so it never reaches the
+    # decision's own unparseable-clock arm. Exercise that arm directly (mutant P2: flipping its
+    # `return ("wait", "")` to a retire left every leg-level row green).
+    frozen_logs = []
+    chk("[#764] an UNPARSEABLE streak stamp freezes the decision — it can never retire",
+        policy.absorbing_park_disposition("dedupe", "not-a-timestamp", t0 + grace * 9,
+                                          log=frozen_logs.append), ("wait", ""))
+    chk("[#764] ...and says so loudly rather than failing silently",
+        any("clock unreadable" in line and "freezing" in line for line in frozen_logs), True)
+    # A NAIVE (offset-free) stamp is equally unprovable and must take the same arm.
+    chk("[#764] ...as does an offset-free stamp that cannot be ordered against `now`",
+        policy.absorbing_park_disposition("dedupe", "2026-07-27 09:00:00", t0 + grace * 9,
+                                          log=lambda _line: None), ("wait", ""))
+    # --- P1: the GRACE ITSELF. Every behaviour row above is written relative to
+    # PARK_ABSORBING_GRACE_SECONDS, so setting it to 0 moves the fixtures with it and the suite
+    # stays green while the "bounded chance" this exit promises is gone — the item retires on the
+    # very first observation. Pin the constant, and pin the property that makes it meaningful.
+    chk("[#764] the bounded grace is a REAL window, not zero (a 0 grace retires on sight)",
+        (grace >= 3600, grace <= 7 * 24 * 3600), (True, True))
+    chk("[#764] ...and at a FIXED one-hour age nothing retires under that grace",
+        policy.absorbing_park_disposition("dedupe", stamp(t0), t0 + 3600 - 1)[0], "wait")
     forged = Run([dict(observing(t0), user={"login": "attacker"})], t0 + grace * 4)
     chk("[#764] a NON-bot receipt cannot age a streak toward the terminal",
         (forged.bucket, forged.needs_user), ("budget-exhausted-absorbing", 0))
@@ -13148,6 +13185,46 @@ def _absorbing_park_leg_self_test():
     chk("[#764] ...and no arm of that leg counts a raw string instead of the closed enum",
         [line.strip() for line in executable.splitlines()
          if raw_counter in line and "raw_counter" not in line], [])
+
+    # ...but the two substring rows above are, on their own, VACUOUS — measured. `if False and
+    # action in _park_policy.PARK_ABSORBING_ACTIONS:` and `linked_open_pr=False` each leave every
+    # searched string intact while destroying the fix. So the ARM ITSELF is extracted between its
+    # sentinels and EXECUTED against stub writers, in a one-shot loop so its `continue` is legal.
+    arm = _python_sentinel_block(source, "absorbing-park-arm")
+
+    def run_arm(ladder_action, linked=(42,), block_source=arm):
+        seen, counted = {}, Counter()
+
+        def spy(*args, **kwargs):
+            seen["args"], seen["kwargs"] = args, kwargs
+            return "budget-exhausted-absorbing"
+
+        namespace = {
+            "action": ladder_action, "_park_policy": policy, "defer_reasons": counted,
+            "absorbing_park_leg": spy, "repo": repo, "number": 42, "window_key": None,
+            "comments": [], "bot_login": bot, "time": time, "linked_open_prs": set(linked),
+            "worker_pr": wp, "worker_issue": wi, "_run_gh_target_comment": lambda *a: None,
+            "_issue_needs_user_landed": lambda *a: True, "script_dir": here.parent,
+            "_issue_timeline_events": lambda *a, **k: [],
+            "_target_is_human_maintainer": lambda *a: False,
+        }
+        exec("for _seam_once in (0,):\n" +
+             "\n".join("    " + line for line in block_source.split("\n")),
+             namespace)  # noqa: S102 — the production arm, run verbatim
+        return seen, counted
+
+    fired, counted = run_arm("legacy-quiet")
+    chk("[#764] SEAM (executed): the production arm ROUTES an absorbing action into the leg",
+        (bool(fired), counted["budget-exhausted-absorbing"]), (True, 1))
+    chk("[#764] SEAM (executed): ...and passes the LIVE linked-open-PR set, not a constant",
+        (fired["kwargs"]["linked_open_pr"], run_arm("legacy-quiet", linked=())[0]["kwargs"]
+         ["linked_open_pr"]), (True, False))
+    chk("[#764] SEAM (executed): ...and forwards the ladder action and window it was given",
+        (fired["args"][2], fired["args"][3]), ("legacy-quiet", None))
+    for _quiet in ("freeze", "park", "terminal"):
+        _skipped, _none = run_arm(_quiet)
+        chk(f"[#764] SEAM (executed): a NON-absorbing action (`{_quiet}`) never enters the leg",
+            (_skipped, sum(_none.values())), ({}, 0))
 
     # (9) THE YAML SEAM — the half that actually releases the partition. Applying `needs:user` is
     # only a terminal because dispatch.yml's PLAN filter drops `needs:*` from the deferred-retry
@@ -13209,6 +13286,27 @@ def _dispatch_yaml_block(path, step_id, marker):
     source = "\n".join(line[pad:] for line in body)
     compile(source, f"<{marker}>", "exec")
     return source
+
+def _python_sentinel_block(path, marker):
+    """The dedented python between `# >>> <marker>` and `# <<< <marker>` in a PYTHON source file
+    — the same fail-closed contract as the YAML extractor above, for a production block that
+    lives too deep inside a function for any test to reach it otherwise. Raises on anything it
+    cannot resolve uniquely: an assertion that cannot find its target must FAIL, never pass
+    vacuously."""
+    lines = Path(path).read_text(encoding="utf-8").split("\n")
+    opens = [i for i, line in enumerate(lines) if line.strip().startswith(f"# >>> {marker}")]
+    closes = [i for i, line in enumerate(lines) if line.strip() == f"# <<< {marker}"]
+    if len(opens) != 1 or len(closes) != 1 or closes[0] <= opens[0]:
+        raise AssertionError(
+            f"{Path(path).name} must contain exactly one `# >>> {marker}` ... `# <<< {marker}` "
+            f"pair, found {len(opens)}/{len(closes)} — refusing")
+    body = [line for line in lines[opens[0] + 1:closes[0]]
+            if line.strip() and not line.lstrip().startswith("#")]
+    if not body:
+        raise AssertionError(f"the `{marker}` block extracted to nothing — refusing")
+    pad = min(len(line) - len(line.lstrip()) for line in body)
+    return "\n".join(line[pad:] for line in body)
+
 
 def main():
     parser = argparse.ArgumentParser()
