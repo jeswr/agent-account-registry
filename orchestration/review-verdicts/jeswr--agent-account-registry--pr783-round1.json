@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 783,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "138848b25231f9f5477b76103e8aefc1957bfad8",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`conflicting_seen` is incremented before `head_repo != repo`, worker-ref, author, and provenance validation. The status snapshot selects worker-shaped refs but does not require the head repository to equal the target, so an external fork PR with such a ref and a head-matched DIRTY status can be counted as a conflicting \"worker PR\" and can produce the repo-level zero-rebase warning. The PR remains safely excluded and cannot dispatch, but the new fleet telemetry is not restricted to the population its message claims.",
+    "file": "scripts/dispatch-claim.py",
+    "fix_hint": "Keep conflict as a signal for per-PR exclusion visibility, but increment the repo-level worker conflict census only after the unconditional fork gate (and, if \"worker\" is intended to mean admitted worker, after the relevant worker identity/provenance gates). Add a regression fixture for a head-matched conflicting fork row asserting that it is excluded without inflating the worker conflict census.",
+    "severity": "minor",
+    "title": "Conflict census can be inflated by a fork PR"
+   }
+  ],
+  "progress": null,
+  "summary": "The change is sound and non-vacuously tested: conflict telemetry is derived only from an explicit true value bound to the live listing head, does not alter admission or dispatch state, preserves all fail-closed gates, distinguishes the rebase lane from unrelated work, and has end-to-end snapshot coverage for resolved, unresolved, admitted, and held conflicts. One minor telemetry-integrity issue remains: the conflict census is incremented before the existing worker/head-repository admission gates, so an untrusted fork using a worker-shaped ref can contribute to the claimed worker-conflict population and trigger a misleading warning. This does not grant access or suppress a trust check, so it is not approval-blocking.",
+  "verdict": "approve"
+ }
+}
