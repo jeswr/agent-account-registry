@@ -2002,10 +2002,19 @@ def _execute_age_unpark_actions(
                       f"gen={owed['gen']}")
                 _drop_label()
                 unparked += 1
-            except GroomError as exc:
+            except Exception as exc:  # noqa: BLE001 — see below; this PR defers, the sweep runs on
+                # DELIBERATELY BROADER than the GroomError the sibling loops catch (issue #647).
+                # This phase calls into park_policy, whose timestamp primitives raise ValueError on
+                # a shape they reject — and a non-GroomError escaping here aborts the whole sweep
+                # before _release_claims, which is precisely the head-of-line abort #644/#647 exist
+                # to prevent, reachable from one malformed receipt on one PR. "Each PR defers
+                # ITSELF" has to mean every failure, not just the anticipated class. The deferral
+                # is LOUD: it is ALERTed and fed to the shared exit precedence, so a systemic
+                # failure still reds the run.
                 failed = True
-                print(f"ALERT PR {repo}#{number}: {exc} — age un-park deferred")
-                deferrals.append(f"{repo}#{number}: {exc}")
+                detail = _masked_detail(str(exc), "")
+                print(f"ALERT PR {repo}#{number}: {detail} — age un-park deferred")
+                deferrals.append(f"{repo}#{number}: {detail}")
                 continue
             finally:
                 if not failed:
@@ -6387,6 +6396,44 @@ def _self_test() -> int:
             "it runs — the cap governs grants, and convergence can never become one",
             replay_grants,
             [(True, True)] * 3,
+        )
+
+        # A TIE is not "newer". park_policy resolves every instant tie conservatively (its own
+        # comment: "an instant tie resolves toward HUMAN-owned"), and capacity_park_admission's
+        # recency test is STRICT. Relax `<=` to `<` and a park applied in the same second as the
+        # grant is treated as older, re-opening exactly the multi-writer hole above.
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/33/comments": [
+                _park_receipt_comment(1, 33),
+                _grant_comment(unpark_receipt, at="2026-07-26T10:00:00Z")],
+            **_bot_park_timeline(33)}
+        tie_log, _e, _r = _sweep_with_refusals({}, pulls=(recovered_pr,))
+        check(
+            "an instant TIE between the grant and a park application refuses convergence — the "
+            "comparison is STRICTLY newer, as park_policy's is",
+            (terminal_sweep_env["writes"],
+             "is NEWER than the un-park receipt" in tie_log),
+            ([], True),
+        )
+
+        # A malformed grant stamp must DEFER this PR, not abort the sweep: park_policy's timestamp
+        # primitives raise ValueError, which the per-PR handler must absorb like any other failure.
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/33/comments": [
+                _park_receipt_comment(1, 33),
+                _grant_comment(unpark_receipt, at="not-a-timestamp")],
+            **_bot_park_timeline(33)}
+        malformed_log, malformed_error, malformed_releases = _sweep_with_refusals(
+            {}, pulls=(recovered_pr,))
+        check(
+            "a MALFORMED grant stamp refuses convergence and never aborts the sweep — dead-lease "
+            "reclaim still runs (narrow the per-PR except to GroomError and this reds)",
+            (
+                terminal_sweep_env["writes"],
+                "carries no readable timestamp" in malformed_log,
+                malformed_releases,
+            ),
+            ([], True, [{"e" * 32}]),
         )
 
         # A grant with no readable timestamp cannot be proven newer than the park, so it refuses.
