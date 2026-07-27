@@ -10323,6 +10323,25 @@ def _self_test():
     unknown_base = {41: dict(status_of(sha_a, gate="success"), conflicting=None)}
     assert enumerate_review_items(repo, [starved], provenance, [], issue_labels, now,
                                   pr_status=unknown_base) == []
+    # [issue #762] THE LEASE SUPPRESSION, NON-VACUOUSLY. The lease below names the PR's OWN
+    # package, so sibling_lease_conflict SKIPS it (own_keys) and the exclusion can only come from
+    # the `lease_free` conjunct on the stranded emit itself. The package-LESS lease underneath is
+    # kept as the second, DIFFERENT mechanism (unprovable crate -> fail closed). Until this pair
+    # was split, deleting `lease_free` from the stranded emit passed the whole suite (measured:
+    # that mutant survived), because the package-less lease excluded the PR one guard earlier —
+    # the test was green for a reason that had nothing to do with what it claimed to pin.
+    _own_lease = [{"holder": f"review:{repo}#41@run.1", "expires_at": now + 100,
+                   "package": "crate-a"}]
+    assert enumerate_review_items(repo, [starved], provenance, _own_lease, issue_labels, now,
+                                  pr_status=green) == [], "stranded must respect its own lease"
+    _own_fix_lease = [{"holder": f"fix:{repo}#41@run.1", "expires_at": now + 100,
+                       "package": "crate-a"}]
+    assert enumerate_review_items(repo, [starved], provenance, _own_fix_lease, issue_labels, now,
+                                  pr_status=green) == [], "a live FIX lease also suppresses it"
+    # ...and the SAME lease shape with a red gate suppresses the ci-fix admission too.
+    assert enumerate_review_items(
+        repo, [starved], provenance, _own_fix_lease, issue_labels, now,
+        pr_status={41: status_of(sha_a, gate="missing", repair_gate="failure")}) == []
     assert enumerate_review_items(
         repo, [starved], provenance,
         [{"holder": f"review:{repo}#41@run.1", "expires_at": now + 100}],
@@ -10717,6 +10736,20 @@ def _self_test():
             # ...it got all the way to the account claim (deferring only on CAPACITY), and it
             # never disarmed anything.
             assert [args[0] for _script, args in helper_calls] == ["record-marker"], helper_calls
+            # ...and the SAME draft-tier-only head gone GREEN stands the repair DOWN. The
+            # repair trigger stays RED-ONLY: #762 widens the tier-reachable GREEN for `stranded`
+            # and for nothing else, so the graded green must not leak into the ci-fix admission
+            # (making the ci-fix branch accept a tier-reachable green reds this).
+            fake["check_runs"] = [{"name": CI_GATE_DRAFT_TIER_CHECK, "status": "completed",
+                                   "conclusion": "success",
+                                   "started_at": "2026-07-23T01:00:00Z"}]
+            _fix_alloc = _FixAlloc()
+            launched, reasons = run_items(
+                [ci_item], allocator=_fix_alloc,
+                routing={"models": {"opus5": {"provider_model": "claude-opus-5",
+                                              "harness": "claude-code"}}})
+            assert reasons["fix:preclaim-defer"] == 1 and _fix_alloc.calls == [], (
+                reasons, _fix_alloc.calls)
             fake.update(pull=live_pull(draft=False, auto_merge={"merge_method": "squash"}),
                         check_runs=gate_red, issue_labels=["area:crate-a"])
             # human-parked source issue: no defuse, no dispatch, even with a live trigger
