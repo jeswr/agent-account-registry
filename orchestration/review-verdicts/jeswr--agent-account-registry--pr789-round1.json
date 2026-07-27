@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 789,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "ed7bd078d1b9e4ec0dbb4fef966164f3a12fc0c0",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The all-14-at-repo plus none-at-environment state is coherent only at the instant it is checked. `phase_resume` then enables writers whose current rotation write-back targets the `dispatch-secrets` environment. If one runs before migration, it can upsert an absent environment secret to V2 while the repository still holds V1. The next migration treats repository presence as authoritative, overwrites V2 with V1, and deletes the repository copy. The new comment's premise that there is \u201cno env copy for a writer to rotate\u201d is insufficient because `gh secret set --env` creates/upserts the copy. Scenario 30 stops after checking the four enable calls, so it is vacuous with respect to the dangerous next-state transition and cannot catch this regression.",
+    "file": "scripts/migrate-secrets.sh",
+    "fix_hint": "Do not auto-resume the environment-writing workflows while repository originals remain, unless a separate fail-closed mechanism guarantees no environment write can occur before migration completes. Add a composed self-test that starts from the proposed pre-migration accept state, performs a representative writer rotation/write-back, then exercises the next migration and asserts that the newer credential cannot be overwritten. If that invariant cannot be established, retain the empty-repository-only resume precondition and provide a different controlled abort recovery.",
+    "severity": "blocker",
+    "title": "Pre-migration resume recreates the env-newer/repo-stale credential-loss path"
+   }
+  ],
+  "progress": null,
+  "summary": "The new pre-migration resume branch is not sound. Proving that none of the 14 secrets exists in the environment only proves that no copy exists at the instant of R0; it does not make re-enabling the current writers safe. The repository's writer paths are already environment-bound and rotation write-back targets `dispatch-secrets`, so a later writer can create an environment V2 while the repo V1 remains. A subsequent repo-authoritative migration can then overwrite V2 with stale V1, which is the same credential-loss topology R0 is intended to prevent. The added self-tests model only the resume script's immediate calls and therefore do not exercise this post-resume writer transition.",
+  "verdict": "request_changes"
+ }
+}
