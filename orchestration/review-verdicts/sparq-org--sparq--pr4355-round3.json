@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4355,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "4f0025190a083d6f6839e31e1fdc17972998bddd",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new denylist catches literal `json(...)` and `#let j = json`, but a paper can write `#let grab = eval(\"j\" + \"son\", mode: \"code\")`, then `#let d = grab(\"/src/data/paper-\" + \"timing.generated.json\")` and render `d.records.at(key).value`. No contiguous loader name, generated filename, timing internal, or import appears in the source, so every current regex misses it. This directly contradicts the file's claim that runtime-fragment assembly is structurally safe because a loader must still be named somewhere, and the negative tests do not cover construction of the loader binding itself.",
+    "file": "site/scripts/timing-source-gate.mjs",
+    "fix_hint": "Do not claim a capability boundary from source-text denylisting. Use a structural build boundary where paper compilation cannot address the raw timing JSON and receives only provenance-rendering data/content, or conservatively reject dynamic evaluation and every other reflective/code-loading construct in paper sources in addition to loaders. Add a negative fixture using `eval(\"j\" + \"son\", mode: \"code\")` plus a concatenated path and require the real gate to fail.",
+    "severity": "major",
+    "title": "Lexical gate can construct the loader binding through eval"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 3 closes the exact concatenated-path bypass from round 2 by rejecting direct and aliased calls to a fixed list of data loaders, and it adds a real negative fixture for that case. The load-bearing publication invariant is still not established, however: the gate remains lexical, and Typst can construct the loader binding itself with eval from string fragments, then load the generated JSON through a constructed path without matching LOADER_CALL, LOADER_ALIAS, GENERATED_TIMING_FILE, INTERNALS, or the import checks. The new documentation explicitly claims a constructed path cannot slip past and that papers may not load data from disk at all, so this is still a major honesty-boundary defect. Progress is stagnant because the prior major class remains at the same severity despite the specific prior witness being fixed.",
+  "verdict": "request_changes"
+ }
+}
