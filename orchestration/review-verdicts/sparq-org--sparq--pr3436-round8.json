@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3436,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "40a543191d99ec9ca070715d7edd9f7d937a0ea6",
+  "round": 8
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The module header and CI registration state that none of these harnesses has returned a clean CBMC verdict within the 20-minute budget and correctly label the obligation as not yet discharged. However, `assert_same_sequence` says its encoding is \"the difference between this suite fitting the lane's per-harness solver budget and not\", `forget_relation` says it \"brings each harness back inside\" that budget, and the two equivalence harness docs begin `PROVED (bounded)`. These are direct, material contradictions on a formal-verification surface: a mutant counterexample and a concrete witness establish non-vacuity, not that the clean universal obligations completed.",
+    "file": "crates/sparq-substrate/src/join.rs",
+    "fix_hint": "Change both harness headings from `PROVED (bounded)` to language such as `ASSERTS (bounded; not yet discharged)`. Rewrite the `assert_same_sequence` and `forget_relation` documentation to say the techniques reduce solver cost but have not brought the harnesses within budget, consistently with the module-level SOLVER BUDGET section and `pr_gate = false`/`debt = true` registration.",
+    "severity": "major",
+    "title": "Undischarged harnesses are still documented as proved and budget-fitting"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The harness construction and concrete domain self-check remain technically plausible, but the new solver-budget disclosure is internally contradicted by three nearby API-doc claims. The suite is explicitly described as never having returned a verdict within budget, yet the equality helper and buffer-forgetting helper say their encodings bring it inside that budget, and both equivalence harnesses are titled \"PROVED (bounded)\". Those statements overclaim evidence the PR itself says does not exist. Because round 7 recorded no findings, this newly identified honesty defect makes round 8 regressing.",
+  "verdict": "request_changes"
+ }
+}
