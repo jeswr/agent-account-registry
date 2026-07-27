@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 838,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "acf9566c54b536b70f1f3141988fe8624b8cb843",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Recovery 2 says an operator may add an enrolled handle in an ordinary policy PR and then edit the account issue's `grant_targets:` line. But `grant_targets:` is generated from live `grant:` labels; editing it after the fact does not prove that the request ever authorized the new target. An ordinary policy PR also does not establish the row-scoped `account-pool/<handle>` provenance that the broker and no-op activation path explicitly require. Since claim selection reads `account_pool` and does not validate `grant_targets:`, the policy half takes effect immediately, so calling the editable record \"the authorization record\" is materially misleading and the proposed two-step window is not fail-closed.",
+    "file": "README.md",
+    "fix_hint": "Document widening through an authorization flow that reuses/rechecks audited `grant:<owner>/<repo>` labels and lands the addition through the checked `account-pool/<handle>` path, then updates the record from that proven target set. If manual policy changes are intentionally a separate authorization mechanism, state that explicitly and do not characterize a hand-edited issue line as proof of the original broker authorization.",
+    "severity": "major",
+    "title": "Manual grant widening bypasses the documented authorization and provenance controls"
+   },
+   {
+    "body": "Recovery 1 describes an unmerged pending `account-pool/<handle>` PR and then says to \"merge the pending PR (or re-run `activate` on it ...)\". The workflow's `activate` job is gated on `pull_request.merged == true`; re-running it on an unmerged PR remains skipped and cannot recover the account.",
+    "file": "README.md",
+    "fix_hint": "Say to merge the corrected pending PR, or re-run the activation workflow/job only after the PR has merged; retain re-applying `set-up-account` as the pre-merge resume option.",
+    "severity": "minor",
+    "title": "Recovery suggests activation can be re-run before the pending PR merges"
+   }
+  ],
+  "progress": null,
+  "summary": "The new recovery guidance conflates a broker-generated activation proof with the authorization source and recommends a widening procedure that bypasses the broker's live grant-label check and checked grant-PR provenance. That is unsafe guidance for this trust boundary. There is also a smaller inaccurate recovery instruction about re-running activation on an unmerged pending PR.",
+  "verdict": "request_changes"
+ }
+}
