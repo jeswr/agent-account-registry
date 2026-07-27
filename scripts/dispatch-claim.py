@@ -9241,6 +9241,53 @@ def _self_test():
             strand_routing = {"models": {
                 "sol": {"provider_model": "TBD", "harness": "codex"},
                 "luna": {"provider_model": "TBD", "harness": "codex"}}}
+            # ==== THE ROLE SPLIT, AT THE STRANDED LEG ====
+            # `stranded` re-derives MERGE ADMISSION (role (a)): its precondition is a
+            # concluded-GREEN gate, and subset-green does not prove superset-green. On a DRAFT
+            # head whose only aggregator is a GREEN `gate, draft-tier`, the strict read is
+            # "missing" and the recovery must DEFER — no marker retraction, no dispatch.
+            # Swapping _live_strict_gate for _live_repair_gate at that call site reds this; it
+            # is the ONLY fixture in the suite where the two live readings diverge, which is why
+            # the round-2 review found that guard unpinned. (Registry #765 deliberately
+            # redefines stranded over the tier-reachable green and REPLACES this assertion with
+            # its own; what must survive both is that nothing which ARMS or MERGES reads the
+            # repair vocabulary.)
+            _strand_pull = live_pull(draft=True, labels=["review:needs"],
+                                     body=f"x <!-- sparq-reviewed-sha:{sha_a} -->")
+            fake.update(pull=_strand_pull,
+                        check_runs=[{"name": CI_GATE_DRAFT_TIER_CHECK, "status": "completed",
+                                     "conclusion": "success",
+                                     "started_at": "2026-07-23T01:00:00Z"}],
+                        comments=[])
+            class _NullAlloc:
+                def __init__(self):
+                    self.calls = []
+
+                def claim(self, _repo, _package, role, chain, *_args, **_kwargs):
+                    self.calls.append((role, list(chain)))
+                    return None
+
+                def release(self, *_args, **_kwargs):
+                    return True
+
+            _strand_alloc = _NullAlloc()
+            _strand_log = io.StringIO()
+            with contextlib.redirect_stdout(_strand_log):
+                run_items([dict(ci_item, state="stranded", context="")],
+                          allocator=_strand_alloc, routing=strand_routing)
+            # BEHAVIOUR kill, not a crash: the mutant reaches the allocator, so assert it does
+            # not — the item must stand down BEFORE any claim, marker write or dispatch.
+            assert _strand_alloc.calls == [], _strand_alloc.calls
+            assert helper_calls == [], helper_calls
+            assert "the stranded posture did not re-derive on live data" \
+                in _strand_log.getvalue(), _strand_log.getvalue()
+            # positive control: the SAME posture with a strict merge-required green DOES recover
+            # (asserted in full just below, after the fixture is put back).
+            assert fake["pull"]["body"] == _strand_pull["body"], "marker must be untouched"
+            fake.update(pull=live_pull(
+                draft=True, labels=["review:needs"],
+                body=f"x <!-- sparq-reviewed-sha:{sha_a} -->"),
+                check_runs=gate_green, comments=[])
 
             class StrandAllocator:
                 def __init__(self):
