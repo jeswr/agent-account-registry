@@ -5992,6 +5992,41 @@ def _self_test():
                gh_error_class({"reason": "transient-http-502", "transient": True}),
                gh_error_class({"reason": "refused-http-404", "transient": False})),
               ("throttled", "throttled", "transient", "permanent"))
+        # ...AND EVERY CALL SITE, which is the converse hole and was a REAL SURVIVOR. The two
+        # checks above pin `_provenance_read`'s summary line and `gh_error_class` itself, and BOTH
+        # stay green while `_gh_error_message` — the OTHER emitter, and the second of the two lines
+        # the six losses actually printed — is reverted to its old two-way ternary. Measured: that
+        # revert left the whole suite at 889 ok / 0 FAIL / rc=0 while emitting
+        # `GitHub API request failed for … class=transient` for a throttle. So the assertion is
+        # made per-EMITTER, driven off the same measured stderr through a real result object.
+        class _ThrottledResult:
+            returncode, stdout = 1, ""
+            stderr = gh_retry.MEASURED_PRIMARY_RATE_LIMIT_STDERR
+
+        _throttled_msg = _gh_error_message(["api", "repos/o/r/pulls?head=x"], _ThrottledResult(),
+                                           attempts=1)
+        check("#710 `_gh_error_message` — the SECOND emitter, and the `GitHub API request failed "
+              "for …` line the six losses printed — also names the throttle. Reverting just this "
+              "one call site to the old `transient`/`permanent` ternary reds HERE and nowhere else",
+              ("class=throttled" in _throttled_msg, "reason=primary-rate-limit-403" in _throttled_msg,
+               "http=403" in _throttled_msg, "class=transient" in _throttled_msg,
+               "class=permanent" in _throttled_msg),
+              (True, True, True, False, False))
+        # CONTROL: the other two classes still come out of that same emitter unchanged, so the row
+        # above is asserting a three-way mapping and not an unconditional "always throttled".
+        class _RefusedResult:
+            returncode, stdout = 1, ""
+            stderr = "gh: Not Found (HTTP 404)"
+
+        class _WobbleResult:
+            returncode, stdout = 1, ""
+            stderr = "gh: Service Unavailable (HTTP 503)"
+
+        check("#710 CONTROL: the same emitter still says `permanent` for a refusal and `transient` "
+              "for a wobble — the throttle row above is a discrimination, not a constant",
+              ("class=permanent" in _gh_error_message(["api", "x"], _RefusedResult()),
+               "class=transient" in _gh_error_message(["api", "x"], _WobbleResult())),
+              (True, True))
 
         # A read that SUCCEEDS but returns a non-object payload must fail CLOSED as a WorkerPrError
         # (which every caller already degrades to its documented conservative result), never crash

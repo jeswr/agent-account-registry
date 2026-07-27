@@ -124,11 +124,18 @@ _SECONDARY_403 = ("secondary rate limit", "abuse detection", "retry-after", "ret
 # record on master OR ledger had a FAILED `provenance` job, and all 6 logged exactly that line with
 # this body. Every one then reserved `__global__` in dispatch-claim.busy_packages_of_pulls.
 #
-# It is a REGRESSION OF #748, not an original hole: before #748 recovered the status off the debug
-# trace, this body carried no status gh could print, so `classify_read_failure` reached its
-# statusless default and RETRIED it. Recovering the status is right; routing the recovered 403 into
-# the refusal table without re-checking which 403 shapes are throttles is what broke it — and it
-# also silenced `PROVENANCE-RETRY-VACUOUS`, whose trigger is a statusless unretried read.
+# IT PREDATES #748 — an earlier draft of this comment blamed #748 and that attribution is WRONG.
+# The earliest of the six (worker run 30284835194, target PR sparq-org/sparq#4562) failed at
+# 2026-07-27T16:46:02Z; #748 (`20ecfb8c2`) landed at 18:49:39Z, two hours LATER. Its log line
+# carries no `reason=` field — `reason=` is #748's own addition — so it is definitively pre-#748
+# code, and it already reported `http=403 class=permanent attempts=1/5`: the identical one-attempt
+# loss. Replaying the pre-#748 tree over both real wordings reproduces it: `_GH_STATUS_RE` (that
+# tree's only status source, character-identical to today's `_MESSAGE_STATUS_RE`) recovers `403`
+# from gh's own message, and `is_transient_stderr` — which was then the WHOLE read decision —
+# returns False via `_FATAL_HTTP`. The construction was self-contradictory besides:
+# `classify_read_failure` and its `statusless` default are #748's own creation, so they cannot be
+# what this regressed *from*. #748 added the `reason=` field and changed nothing about the verdict
+# for this shape.
 #
 # Deliberately the specific phrase, not a bare "rate limit": GitHub's own docs URL ("...about rate
 # limiting...") appears in unrelated error bodies, and matching that would reclassify real refusals.
@@ -511,33 +518,56 @@ OBSERVED_GH_FAILURES = (
     ("secondary rate limit",
      "HTTP 403: You have exceeded a secondary rate limit (https://api.github.com/x)", "403", True),
     ("permission 403", "HTTP 403: Resource not accessible by integration", "403", False),
-    # [registry #710] The PRIMARY rate limit, in the two forms it reaches this layer. The second is
-    # the one MEASURED in the six 2026-07-27 provenance losses: gh printed NO status, so the 403 was
-    # recovered off the debug trace by #748 — which is precisely how it landed in the refusal table.
-    ("primary rate limit 403 (status in gh's message)",
+    # [registry #710] The PRIMARY rate limit, in the two forms it reaches this layer — the shape
+    # that lost 6/6 provenance records on 2026-07-27. gh's `gh api` failure format is
+    # `gh: <message> (HTTP <status>)`, so the status IS in gh's own message for this shape; see
+    # `MEASURED_PRIMARY_RATE_LIMIT_EXCERPT` for what the run log actually preserved of it.
+    ("primary rate limit 403 (installation token wording)",
      "HTTP 403: API rate limit exceeded for installation", "403", True),
     ("primary rate limit 403 (user token wording)",
      "HTTP 403: API rate limit exceeded for user ID 4783300", "403", True),
     ("usage error", "unknown flag: --jsonn", None, False),
 )
 
-# The VERBATIM stderr of one of the six 2026-07-27 provenance losses (registry #710) — worker run
-# 30297094506, `provenance` job, target PR sparq-org/sparq#4604. gh printed no status line, so this
-# is also the corpus's only shape whose status exists ONLY on the debug trace. Kept whole (trace +
-# body) because the defect lived in the interaction between the two: the trace supplies the 403 and
-# the body supplies the reason it is not a refusal.
+# VERBATIM, and the only part of this shape that is. Copied character-for-character out of worker
+# run 30284835194's `provenance` job log, 2026-07-27T16:46:02Z (registry #710) — the excerpt is
+# what `worker-pr._gh_error_detail` puts on the public sink, capped at `_GH_STDERR_EXCERPT_MAX`
+# (200 chars), so this is gh's message TRUNCATED, not gh's message.
+MEASURED_PRIMARY_RATE_LIMIT_EXCERPT = (
+    "gh: API rate limit exceeded for installation. If you reach out to GitHub Support for help, "
+    "please include the request ID 4483:1E4F58:9630A1:20F5544:6A678B4A and timestamp "
+    "2026-07-27 16:46:02 UTC. For")
+
+# RECONSTRUCTED, and labelled so — an earlier revision called this "VERBATIM … kept whole" and that
+# was FALSE in a load-bearing way: it dropped gh's status token and the check built on it then
+# asserted a property of the TRUNCATION as though it were a property of gh (registry #710).
+#
+# What is measured and what is reconstructed, precisely:
+#   * the message prefix is `MEASURED_PRIMARY_RATE_LIMIT_EXCERPT`, verbatim (199 chars);
+#   * the tail — the docs sentence and gh's `(HTTP 403)` suffix — is RECONSTRUCTED. That gh's own
+#     message carries a status token is not a guess: run 30284835194 predates #748, so
+#     `_gh_error_detail`'s ONLY status source was a message-only regex (`_GH_STATUS_RE`,
+#     character-identical to today's `_MESSAGE_STATUS_RE`) — and it reported `http=403`. The
+#     verbatim 199-char excerpt contains no match for it, and neither does the docs sentence
+#     (`https` is lowercase; the URL is `rate-limits-for-the-rest-api`), so the token must lie past
+#     the excerpt boundary. gh's `gh api` failure format is `gh: <message> (HTTP <status>)` —
+#     live-observed in this very repo as `gh: Not Found (HTTP 404)` — which is the only remaining
+#     candidate.
+#   * the `GH_DEBUG=api` trace is RECONSTRUCTED in shape (the losses ran without `GH_DEBUG`). It is
+#     carried anyway so this fixture drives the trace-recovery path too.
+# Both status sources are therefore present, which is faithful: `failure_status` must reach `403`
+# whichever one it finds first.
 MEASURED_PRIMARY_RATE_LIMIT_STDERR = """\
-* Request at 2026-07-27 19:46:47.100000000 +0000 UTC m=+0.051081984
-* Request to https://api.github.com/repos/sparq-org/sparq/pulls?head=sparq-org:sparq-agent/issue-3358-30297094506-1&state=open&per_page=100
-> GET /repos/sparq-org/sparq/pulls?head=sparq-org:sparq-agent/issue-3358-30297094506-1&state=open&per_page=100 HTTP/1.1
+* Request at 2026-07-27 16:46:02.100000000 +0000 UTC m=+0.051081984
+* Request to https://api.github.com/repos/sparq-org/sparq/pulls?head=sparq-org:sparq-agent/issue-3517-30284835194-1&state=open&per_page=100
+> GET /repos/sparq-org/sparq/pulls?head=sparq-org:sparq-agent/issue-3517-30284835194-1&state=open&per_page=100 HTTP/1.1
 > Host: api.github.com
 < HTTP/2.0 403 Forbidden
 < X-Ratelimit-Remaining: 0
 * Request took 118.2ms
-gh: API rate limit exceeded for installation. If you reach out to GitHub Support for help, please \
-include the request ID 9C32:2AA981:637C0D6:15F2AAE4:6A67B5A7 and timestamp 2026-07-27 19:46:47 UTC. \
-For more information about rate limiting, see \
-https://docs.github.com/rest/overview/rate-limits-for-the-rest-api"""
+""" + MEASURED_PRIMARY_RATE_LIMIT_EXCERPT + (
+    " more information about rate limiting, see "
+    "https://docs.github.com/rest/overview/rate-limits-for-the-rest-api (HTTP 403)")
 
 # The same 502 failure WITH `GH_DEBUG=api` on, verbatim in shape from the local reproduction: this is
 # the stream `scrub_debug_trace` must reduce to gh's one-line diagnostic and `trace_status` must
@@ -776,19 +806,46 @@ def _self_test():
     # ---- [registry #710] the PRIMARY rate-limit 403 ----
     # THE RED TEST FOR THE FIX IN THE TITLE. Driven through the EXACT composition `run_gh` performs
     # on a failure — scrub the trace, recover the status from message-then-trace, classify — against
-    # the VERBATIM stderr of a measured provenance loss. Emptying `_PRIMARY_RATE_LIMIT_403` (or
-    # deleting its branch in `classify_read_failure`) returns (False, 'refused-http-403') here.
+    # the reconstructed stderr of a measured provenance loss (see the constant for exactly which
+    # bytes are measured). Emptying `_PRIMARY_RATE_LIMIT_403` (or deleting its branch in
+    # `classify_read_failure`) returns (False, 'refused-http-403') here.
     _rl_message = scrub_debug_trace(MEASURED_PRIMARY_RATE_LIMIT_STDERR)
     _rl_status = failure_status(_rl_message, MEASURED_PRIMARY_RATE_LIMIT_STDERR)
     check("#710 the MEASURED primary-rate-limit stderr recovers 403 and is RETRIED as a throttle, "
           "not refused (this exact shape lost 6/6 provenance records on 2026-07-27)",
           (_rl_status, classify_read_failure(_rl_message, _rl_status)),
           ("403", (True, "primary-rate-limit-403")))
-    # The status is ONLY on the trace — which is why #748's status recovery is what routed this
-    # class into the refusal table, and why #748's own `statusless` alarm went silent for it.
-    check("#710 gh printed NO status in its message for this shape, so the 403 exists only on the "
-          "debug trace (the #748 interaction that caused the regression)",
-          _MESSAGE_STATUS_RE.search(_rl_message) is None, True)
+    # gh's OWN message carries the status for this shape — it is NOT trace-only. An earlier revision
+    # asserted the opposite and was asserting a property of the 200-char log EXCERPT, not of gh. The
+    # observation is pinned two ways so a weaker fixture cannot satisfy it: the truncated excerpt is
+    # statusless (which is all the run log preserves), while the full message is not.
+    check("#710 gh's own message carries the 403 for this shape — `_MESSAGE_STATUS_RE` alone "
+          "recovers it, exactly as the PRE-#748 tree's character-identical `_GH_STATUS_RE` did "
+          "when it reported `http=403` at 16:46:02Z, two hours before #748 landed",
+          (bool(_MESSAGE_STATUS_RE.search(_rl_message)), failure_status(_rl_message, None)),
+          (True, "403"))
+    check("#710 …but the run log's 200-char EXCERPT of it is statusless, which is why the operator "
+          "cannot see the status the classifier used (this is the truncation, not gh)",
+          (_MESSAGE_STATUS_RE.search(MEASURED_PRIMARY_RATE_LIMIT_EXCERPT) is None,
+           MEASURED_PRIMARY_RATE_LIMIT_EXCERPT in _rl_message),
+          (True, True))
+    # BOTH real wordings, classified from gh's message alone (no trace) — the installation form the
+    # six losses carried, and the user-token form.
+    for _wording in ("for installation", "for user ID 4783300"):
+        _full = MEASURED_PRIMARY_RATE_LIMIT_EXCERPT.replace("for installation", _wording) + \
+            " more information about rate limiting, see " \
+            "https://docs.github.com/rest/overview/rate-limits-for-the-rest-api (HTTP 403)"
+        check(f"#710 the real primary-rate-limit wording ({_wording!r}) is a THROTTLE from gh's "
+              "message alone, with no debug trace available at all",
+              classify_read_failure(_full, failure_status(_full, None)),
+              (True, "primary-rate-limit-403"))
+        # `is_transient_stderr` is today's WRITE classifier, but pre-#748 it WAS the whole read
+        # decision, and its `_FATAL_HTTP`/`_TRANSIENT_HTTP` regexes are character-identical across
+        # `20ecfb8c2` — so this doubles as the pre-#748 replay: False here is the `attempts=1/5`
+        # that run 30284835194 logged two hours BEFORE #748. The defect predates it.
+        check(f"#710 …and the conservative classifier ({_wording!r}) still refuses it — unchanged "
+              "across #748, which is why blaming #748 for this loss was wrong",
+              is_transient_stderr(_full), False)
     # NOT "every 403 now retries": the discrimination is the point. A permission refusal on the same
     # status is still permanent, so widening the marker tuple to something that matches both reds.
     check("#710 a PERMISSION 403 on a read is still a one-attempt refusal",
