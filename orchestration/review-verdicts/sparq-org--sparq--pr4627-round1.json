@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4627,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f0faccadd93930a8ca51ae524afada31c2f9d52f",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The module says constructing a stream performs no work until polling and dropping NodeStream cancels traversal. AsyncStoreBackend simultaneously says every method \"must\" defer I/O but then explicitly allows an eagerly started operation. Such an allowed backend can spawn/start remote work in objects/subjects and return a stream handle whose Drop does not cancel it. NodeStream has no cancellation hook; it merely drops B::Stream. Consequently the public README/SKILL claims are false for a backend permitted by this trait, and the tests only witness a cooperative fake whose work is entirely poll-driven.",
+    "file": "crates/sparq-wrapper/src/proposed/async_store.rs",
+    "fix_hint": "Choose and document one enforceable contract. If laziness and drop-cancellation are requirements, remove the eager-operation allowance, specify that objects/subjects must not start work before polling and that dropping the returned stream must cancel/abandon backend work, and add a test backend with an explicit active/cancelled token observed on Drop. Alternatively weaken all module/README/SKILL claims to say only that the wrapper itself does not poll or drain after drop and that actual I/O cancellation depends on the backend.",
+    "severity": "major",
+    "title": "Cancellation and laziness are promised but not guaranteed by the backend contract"
+   }
+  ],
+  "progress": null,
+  "summary": "The streaming adapter and its focused tests are generally coherent, but the public cancellation/laziness contract is internally contradictory and overclaims what the API guarantees. The backend trait explicitly permits eagerly started operations, while the module and user documentation promise that constructing a stream performs no work and that dropping it cancels traversal. For an allowed backend that starts an I/O task before returning its stream, dropping NodeStream only drops the handle; it need not cancel that task. This is a load-bearing advertised behavior, so the contract or implementation must be made consistent before approval. I could not execute the targeted Rust tests because cargo is unavailable in the review environment.",
+  "verdict": "request_changes"
+ }
+}
