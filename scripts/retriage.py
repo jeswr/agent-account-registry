@@ -1145,6 +1145,20 @@ def _self_test():
     # -------------------------------------------------------------------------------------------
     import tempfile
 
+    def workflow_policy_path(argv):
+        """The policy path retriage.yml ACTUALLY passes — or a legible refusal.
+
+        Raised, not returned-False, and deliberately BEFORE anything indexes the argv: a bare
+        `ValueError: '--policy-file' is not in list` from a later index() is a kill with no name
+        on it. Same idiom as run_snapshot_argv's missing-`--snapshot` refusal below."""
+        if "--policy-file" not in argv:
+            raise SweepError(
+                "retriage.yml no longer passes `--policy-file` to `retriage.py --apply` — the "
+                "registry #487 actions-bot triage opt-in would silently revert to DENY and every "
+                "issue this repo's own workflows open would go back to `untrusted-author` with a "
+                "perfectly green sweep; refusing")
+        return argv[argv.index("--policy-file") + 1]
+
     def apply_argv_for(policy_path, permission="none"):
         """retriage.yml's OWN apply argv with the two values production computes PER RUN: the
         collaborator permission (the shell probes it per issue) and the policy file. The policy
@@ -1155,21 +1169,17 @@ def _self_test():
             {"MAINTAINER_LOGIN": "owner", "APP_BOT_LOGIN": "app[bot]", "permission": permission,
              "known": ",".join(sorted(known)), "REPO": "o/r", "number": "7"})
             if "--apply" in candidate), None)
-        if argv is None or "--policy-file" not in argv:
-            # Fail CLOSED and legibly, like run_snapshot_argv: a workflow that stopped passing the
-            # policy would silently revert every own-workflow issue to `untrusted-author`, and the
-            # sweep would look perfectly healthy while triaging none of them.
-            raise SweepError("retriage.yml no longer passes `--policy-file` to "
-                             "`retriage.py --apply` — the registry #487 actions-bot triage opt-in "
-                             "would silently revert to deny; refusing")
+        if argv is None:
+            raise SweepError("retriage.yml no longer invokes `retriage.py --apply` — refusing")
         argv = list(argv)
+        workflow_policy_path(argv)              # refuse legibly before indexing
         argv[argv.index("--policy-file") + 1] = policy_path
         return argv
 
     # The path retriage.yml ACTUALLY names must exist and be a usable policy. `root` is the repo
     # root; production resolves the same relative path against the step's cwd, which actions/
     # checkout makes that same directory.
-    declared_policy = apply_argv[apply_argv.index("--policy-file") + 1]
+    declared_policy = workflow_policy_path(apply_argv)
     live_policy = (declared_policy if os.path.isabs(declared_policy)
                    else os.path.join(root, declared_policy))
     live_rows = {}
