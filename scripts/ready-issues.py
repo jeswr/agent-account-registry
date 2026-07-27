@@ -272,7 +272,9 @@ def routing_refusal(labels):
 
 def ready_candidates(issues, log=None):
     """Every issue that passes the FAIL-CLOSED readiness LABEL gate (open + status:ready + exactly
-    one priority + a role + no gate/busy label + zero open blockers), priority-then-number ordered.
+    one priority + exactly one role + no gate/busy label + zero open blockers), priority-then-number
+    ordered. THE gate is this function, not `exclusion_reason` alone: it composes that predicate
+    with `routing_refusal` (registry #122), which the planner would otherwise apply too late.
 
     This is the DRAINABLE set — every issue a fleet could work through — BEFORE the conflict-free
     one-per-package concurrency serialization that compute_ready() layers on top. The two answer
