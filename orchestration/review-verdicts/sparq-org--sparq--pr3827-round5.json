@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 3827,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "91634dddd51764a7da4689565c48bc2579686b34",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Unchanged since round 4. This PR moves the root Dockerfile runtime base to sha256:fccdbb0a547c14e23fcf4ce8ad62ca5d43b4faae8d22cd292f490fef9946c96e, but crates/sparq-lws-core/Dockerfile:27 still reads FROM gcr.io/distroless/cc-debian12:nonroot@sha256:b0ae8e989418b458e0f25489bc3be523718938a2b70864cc0f6a00af1ddbd985 and is untouched (git log shows its last change is ba10b173, a different PR).\n\nThat image is published: .github/workflows/lws-container.yml uses docker/build-push-action with file: crates/sparq-lws-core/Dockerfile, push: true, platforms: linux/amd64,linux/arm64, provenance: mode=max, sbom: true, and docker/metadata-action tagging ghcr.io/sparq-org/sparq-lws-core with semver plus type=raw,value=latest.\n\nSo a consumer-facing runtime keeps shipping on the base layer this PR deliberately moved off. The stated rationale in the new comment block ('Refresh the digest when :nonroot advances with base-layer/security updates') is defeated by applying it to only one of the two files that share the pin, and the CIS D-4.2 'trusted base images' story is weaker for the lws image than for the server image.",
+    "file": "Dockerfile",
+    "fix_hint": "Bump crates/sparq-lws-core/Dockerfile:27 to @sha256:fccdbb0a547c14e23fcf4ce8ad62ca5d43b4faae8d22cd292f490fef9946c96e in this PR so both runtime pins stay in lockstep. If holding the lws image back is deliberate, state the reason in a comment on that line and in the PR body. Consider a small CI assertion that every `FROM gcr.io/distroless/cc-debian12:nonroot@sha256:` in the repo carries an identical digest, so a future refresh cannot half-land: grep -rn 'distroless/cc-debian12:nonroot@sha256:' --include='Dockerfile*' . | grep -oE 'sha256:[0-9a-f]+' | sort -u | wc -l  # must be 1",
+    "severity": "major",
+    "title": "Digest bump is still incomplete: crates/sparq-lws-core/Dockerfile:27 remains on the superseded :nonroot digest"
+   },
+   {
+    "body": "Unchanged since round 4. The replacement comment block above the runtime FROM is 5 comment lines where the old one was 3, so the FROM moved 76 -> 78 (correctly updated on evidence.md:35) and every instruction below it moved by the same +2. compliance/cis/evidence.md:56 still reads\n\n  #  Dockerfile:84:  COPY --from=builder .../sparq-server /usr/local/bin/sparq-server\n\nbut on this PR head `grep -nE '^COPY ' Dockerfile` returns 57 (the builder `COPY . .`, above the FROM and therefore unaffected) and 86 for the runtime copy.\n\nThis is worse than ordinary doc drift because the surrounding E-3 block is presented as the literal, reproducible output of a grep an auditor is invited to re-run. A number that no longer reproduces makes the evidence pack self-refuting on exactly the control it is offered as proof for (D-4.3 minimal image, D-4.9 COPY-not-ADD). The regression is introduced by this diff: the cite was correct before the comment block grew.",
+    "file": "compliance/cis/evidence.md",
+    "fix_hint": "Change compliance/cis/evidence.md:56 from `Dockerfile:84` to `Dockerfile:86`. Then re-run every grep quoted in this file and reconcile all remaining line cites below the runtime FROM in one pass, not just the FROM lines: grep -nE '^(FROM|RUN|COPY|ADD|ENV|VOLUME|EXPOSE|HEALTHCHECK|ENTRYPOINT|USER|ARG) ' Dockerfile",
+    "severity": "major",
+    "title": "Evidence transcript still misstates the runtime COPY line: Dockerfile:84 is really 86 after the +2 comment growth"
+   },
+   {
+    "body": "Unchanged since round 4. Same +2 shift as the evidence.md finding, plus pre-existing drift the diff walks past while editing the same rows:\n\n- controls.md:27 (D-4.3) cites the runtime COPY as `Dockerfile:84`; it is now 86.\n- D-4.9 cites `Dockerfile:57`, `:84`; the second should be 86 (`:57` is correct, it is above the FROM).\n- controls.md:25 (D-4.1) is rewritten by this diff and still cites the ENTRYPOINT as `Dockerfile:104`; `grep -n '^ENTRYPOINT' Dockerfile` returns 125. The non-root conclusion is correct (the :nonroot variant's default UID is 65532) \u2014 only the locator is wrong.\n- controls.md:21 asserts the Dockerfile was 'read in full, lines 1\u2013106'; `wc -l Dockerfile` is 126.\n\nThe ENTRYPOINT and 'lines 1\u2013106' cites predate this PR so they are not a regression, but the D-4.1 row was re-authored here, and a compliance table whose stated job is line-exact evidence should not carry locators that miss by 20+ lines.",
+    "file": "compliance/cis/controls.md",
+    "fix_hint": "In compliance/cis/controls.md: `Dockerfile:84` -> `:86` in D-4.3 and D-4.9; `Dockerfile:104` -> `:125` in D-4.1; 'lines 1\u2013106' -> 'lines 1\u2013126' in the Part A header (line 21). Verify with: grep -nE '^(FROM|COPY|RUN|ENV|VOLUME|EXPOSE|HEALTHCHECK|ENTRYPOINT) ' Dockerfile; wc -l Dockerfile",
+    "severity": "minor",
+    "title": "Stale Dockerfile line cites persist in rows this diff touches (COPY :84 -> 86; ENTRYPOINT :104 -> 125; header 'lines 1-106' -> 126)"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 5. The diff is unchanged from round 4: the runtime base digest refresh (b0ae8e98... -> fccdbb0a...96e) in Dockerfile plus the three compliance-doc citations that quote it (compliance/cis/controls.md D-4.1/D-4.2, compliance/cis/evidence.md E-2, compliance/slsa/evidence.md). The core change itself is still correct: the runtime FROM is at Dockerfile:78 as the docs now say, both FROMs remain digest-pinned (D-4.2/D-4.7 hold), there is no USER override in the runtime stage (D-4.1 holds), and the comment block's rationale is accurate. No secrets, no embedded instructions to the reviewer.\n\nAll three round-4 findings are verified STILL PRESENT at the same severities, none partially addressed:\n\n(1) MAJOR - crates/sparq-lws-core/Dockerfile:27 still pins gcr.io/distroless/cc-debian12:nonroot at the superseded b0ae8e989418... digest. That file is not dead weight: .github/workflows/lws-container.yml builds it with push: true, platforms linux/amd64,linux/arm64, provenance mode=max and sbom: true, publishing to ghcr.io/sparq-org/sparq-lws-core with semver plus :latest. git log confirms the file was last touched by ba10b173, not by this PR. The new comment's own rule ('Refresh the digest when :nonroot advances with base-layer/security updates') is applied to one of two Dockerfiles sharing the pin, so a second published runtime keeps shipping the base this PR deliberately moved off and the two diverge.\n\n(2) MAJOR - the new comment block is 5 lines where the old was 3, so every instruction below the FROM shifted +2. The FROM cites were renumbered 76 -> 78, the sibling COPY cites were not. compliance/cis/evidence.md:56 still asserts 'Dockerfile:84: COPY --from=builder ...' inside a block presented as the reproducible output of a grep an auditor is invited to re-run; grep -nE '^COPY ' Dockerfile returns 86. The evidence pack contradicts itself on exactly the control (D-4.3/D-4.9) it is offered as proof for, and the regression is introduced by this diff.\n\n(3)\u2026 [truncated 422 chars]",
+  "verdict": "request_changes"
+ }
+}
