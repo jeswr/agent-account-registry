@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 860,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "8fedffb0d66961e8338f458736d7d32441fa0250",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "The prior round's permission-set defect is corrected. S1 now states the union of the installation grants needed by all five minting jobs, explicitly includes Actions read and write for quiesce/reenable while retaining Secrets and Environments read and write for migration, and accurately distinguishes the installation ceiling from each phase's least-privilege token request. The runbook is internally consistent with the cited phase routing, environment bindings, recovery paths, closed 14-name migration set, and fail-closed preconditions. I found no remaining blocker or major issue in the diff.",
+  "verdict": "approve"
+ }
+}
