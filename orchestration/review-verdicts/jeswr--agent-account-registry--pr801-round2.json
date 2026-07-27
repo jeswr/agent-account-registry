@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 801,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "cb71635a8257db6bef32c6a0a69b3d90ebe429ff",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "_issue_is_measurement_run still catches every live-read, schema, and classifier failure and returns False. dispatch then deliberately selects the ordinary research/park ladder. The diff documents that both ordinary actions self-clear or re-dispatch and are the cause of the unbounded loop, so persisting one of them after an unreadable classification is not fail-closed: the unclassifiable issue can later return to a worker route. The new tripwires cover successful positive, negative, receipt, and threshold cases, but none proves that a failed classification cannot write a research/park receipt or mutation.",
+    "file": "scripts/dispatch-claim.py",
+    "fix_hint": "Make an unreadable or malformed live classification a terminal defer/error for this escalation, with no receipt, label mutation, role mutation, or claim. Add an end-to-end dispatch tripwire for failed/malformed live reads asserting no research/park action and no allocation.",
+    "severity": "major",
+    "title": "Classifier failures still fall back to a re-admitting escalation path"
+   },
+   {
+    "body": "_issue_is_measurement_run fetches the live issue object but passes set(item[\"labels\"]) from the cached plan to is_measurement_run, ignoring the labels already present in the live response. Bench-surface membership is a load-bearing classifier input. A live addition of area:bench/kind:bench/type:bench can be missed and sent down the ordinary ladder; a live removal can incorrectly add a durable needs:ec2 hold. The tests keep cached and live labels identical, so this race remains untested.",
+    "file": "scripts/dispatch-claim.py",
+    "fix_hint": "Validate and use labels from the same live issue response as title and body, failing closed on malformed label data. Add end-to-end mutation tests for cached non-bench/live-bench and cached bench/live-non-bench transitions.",
+    "severity": "major",
+    "title": "Measurement classification still mixes live text with stale plan labels"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Both round-1 major trust-plane defects remain unchanged. The dispatcher still converts any failed live classification into the ordinary research/park ladder even though this diff itself establishes that those actions self-clear and can re-admit the issue. It also still combines live title/body with cached plan labels rather than classifying one coherent live issue state. The added self-tests do not exercise either a classification-read failure or live/cached label divergence, so they cannot establish fail-closed behavior for these paths.",
+  "verdict": "request_changes"
+ }
+}
