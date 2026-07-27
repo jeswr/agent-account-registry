@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3886,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "3b0503a58553c59619a7735155f43e5fbac4c217",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "In `ChangeRelay::pump`, a `SinkError::Permanent` returned by `deliver` is only saved in `failure`; `self.fail(seq, e)` is deferred until after `self.sink.flush()` and `write_cursor(...)`. If flush returns an error, that error returns first and the earlier permanent refusal never reaches `fail`. Likewise, when an accepted prefix exists, a cursor-write failure returns before `fail`. In both cases `self.poisoned` remains unset, so a later `pump` can call the sink again despite the public promise that a permanent refusal poisons the live relay and makes every subsequent pump fail closed.",
+    "file": "crates/sparq-serve/src/change_sink.rs",
+    "fix_hint": "Poison the relay immediately when `deliver` returns `SinkError::Permanent`, before any fallible flush or cursor bookkeeping, while retaining the refusal to return after safely handling any accepted prefix. Add real-path tests for an accepted prefix followed by a permanent refusal where (1) the subsequent flush fails retryably and (2) cursor persistence fails; in both cases assert `is_poisoned()` and assert that the next `pump` returns `RelayError::Poisoned` without another delivery attempt.",
+    "severity": "major",
+    "title": "Permanent delivery refusal can still be masked without poisoning"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 5 is stagnant: the prior major fail-closed finding remains. A permanent delivery refusal is stored in `failure`, but the relay is not poisoned until after the fallible sink flush and cursor persistence steps. Consequently, a later flush or cursor error can mask the permanent refusal and leave the live relay able to deliver again. The tests still cover only the successful post-refusal flush/cursor path, not either masking path required to establish the documented contract.",
+  "verdict": "request_changes"
+ }
+}
