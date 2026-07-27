@@ -1942,9 +1942,22 @@ def global_reservation_census(occupancy):
 
 
 # [registry #772] How many unprovenanced `__global__` holders ONE tick may escalate, per target
-# repository. The same pacing doctrine as STARVATION_PARKS_PER_TICK_MAX: an escalation is a loud,
-# operator-facing artifact, and emitting one per holder per tick would bury the signal it exists
-# to raise. One per tick converges — each tick re-measures the live occupancy.
+# repository. An escalation is a loud, operator-facing artifact, and emitting one per holder per
+# tick would bury the signal it exists to raise, so it is paced.
+#
+# NO LONGER "the same pacing doctrine as STARVATION_PARKS_PER_TICK_MAX" — that cross-reference was
+# true until #822 and is retracted rather than left standing. The two caps bound DIFFERENT harms
+# and are now sized independently:
+#   * a PARK is a throughput action on a lane that is already at zero, so under-acting is the
+#     expensive direction and its bound is the request budget (see STARVATION_PARKS_PER_TICK_MAX);
+#   * an ESCALATION is a WARNING, so OVER-acting is the expensive direction and 1/tick is right on
+#     its own terms — the harm it guards is a buried signal, not a starved lane.
+#
+# The tick cost is stated so nobody has to re-derive it: at #822's 10-minute floor, N stuck
+# holders take N * 10 minutes for ALL of them to be NAMED in a run log. The measured population
+# was 3 (sparq-org/sparq #4360/#4509/#4528) = 30 minutes to enumerate. That is VISIBILITY latency
+# on a condition that is already permanent and already counted every tick under
+# `partition-starvation-unprovenanced`, not dispatch outage — which is why it is left at 1.
 STARVATION_ESCALATIONS_PER_TICK_MAX = 1
 
 
