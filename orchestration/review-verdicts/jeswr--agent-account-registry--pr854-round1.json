@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 854,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "2f9850fa3f2f9836abe0d98400fe2ea57949725c",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change consistently removes the misleading body-backed provider selector, documents the actual label-only contract in both the issue form and README, and preserves fail-closed provider and grant behavior in the broker. The added self-tests are non-vacuous: they require at least one parsed form element, reject any element type capable of carrying broker request values beyond the explicitly permitted acknowledgement/markdown types, and independently require both provider-label literals in non-comment form content. No trust check, workflow permission, routing rule, or executable workflow path is weakened by this diff.",
+  "verdict": "approve"
+ }
+}
