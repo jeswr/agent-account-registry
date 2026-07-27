@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4135,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "187e40095ec1c82575ab32a22ce5526e47e1985e",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior major rustdoc finding: the reference to the private `verifier::bind_entailment` function is now plain code formatting rather than an intra-doc link. The new policy is fail-closed for every non-Simple entailment regime when completeness is required, leaves the existing default unchanged, and checks the completeness refusal before regime acceptance or later derivation validation. The end-to-end test is non-vacuous because it demonstrates a distinct later grounding failure without the completeness demand and the new refusal with it, across both RDFS and OWL. The Simple-path test also pins the documented exception. Claims remain explicitly scoped as research-grade and not externally audited, consistent with the updated audit record and skill documentation. No correctness, soundness, security, or test-validity issue remains in the supplied diff.",
+  "verdict": "approve"
+ }
+}
