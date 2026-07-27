@@ -12,16 +12,6 @@
   },
   {
    "account": "58b7c92faa5b5ca5",
-   "claim_id": "8583f2c3e5e04d6591a0190e1c40cf4b",
-   "holder": "sparq-org/sparq#3135@30227748480.1",
-   "package": "sparq-acbench",
-   "role": "impl",
-   "model": "opus5",
-   "issued_at": 1785112494,
-   "expires_at": 1785118794
-  },
-  {
-   "account": "58b7c92faa5b5ca5",
    "claim_id": "fe15988181ce469cb66b3b4c0a175e0c",
    "holder": "sparq-org/sparq#3315@30227757694.1",
    "package": "sparq-zk-compose",
