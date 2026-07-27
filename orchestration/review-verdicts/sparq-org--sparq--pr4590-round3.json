@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4590,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "025c9afa604ca37459f52a5b89f17ac3da749e18",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new `fromTerm` and `fromQuad` cases assert term type, structural equality, and canonical-key equality only. A broken implementation such as `fromTerm = term => term` / `fromQuad = quad => quad` passes these assertions. In particular, the test named `fromQuad deep-copies a quad whose subject is a quoted triple` never establishes that either the returned outer Quad or its nested Quad subject is a distinct object. Consequently the test does not pin the deep-copy behavior claimed by its name and by the README.",
+    "file": "packages/rdfjs-conformance/src/index.mjs",
+    "fix_hint": "Add identity assertions on the real factory-produced values: require `copy !== original` in both cases, and for the nested `fromQuad` case require `copy.subject !== original.subject` (plus the existing equality assertions). If the RDF/JS contract intentionally permits identity reuse, remove the deep-copy claim from the test name and README instead.",
+    "severity": "major",
+    "title": "Nested-Quad copy tests do not test that a copy is made"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The RDF-star and directional-literal coverage is otherwise coherent, but the new nested-Quad copy tests do not validate the deep-copy behavior they claim to cover. An implementation can return the input Quad unchanged (including reusing its nested subject) and pass every new assertion, because the tests check only structural equality and keys. This leaves a materially vacuous part of the advertised conformance coverage. Round 2 recorded no findings, so this newly identified major test-validity issue makes progress regressing.",
+  "verdict": "request_changes"
+ }
+}
