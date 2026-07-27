@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4462,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "3d687956c678d2249f1f7d1029a98b5d1820f91a",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The documentation correction is accurate and complete. The live unsafe-site listing reports exactly 12 sparq-vectors sites, and all 12 are represented once in the revised register with current file/line locations. The explanation of the shared native mmap site and wasm32 owned aligned backing matches the implementation, while the revised introduction honestly narrows the gate's guarantee to per-crate count ratcheting rather than claiming mechanical row-level coverage.",
+  "verdict": "approve"
+ }
+}
