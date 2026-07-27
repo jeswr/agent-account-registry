@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 801,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "9edac4b27f292ef45f4664d65ae2a7915555a1cc",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "_issue_is_measurement_run catches every read/classification failure and returns False; dispatch then invokes the ordinary research/park escalation. Both ordinary actions are documented in this diff as self-clearing/re-dispatching and as the cause of the unbounded loop. Thus an unavailable or malformed live issue read suppresses the durable needs:ec2 gate and can eventually put an unclassifiable measurement run back on a worker route. Being deferred in the current tick is insufficient: the persisted action is precisely the permissive fallback this change says is unsafe. The self-tests cover positive, negative, receipt, and threshold cases, but contain no assertion that a failed live classification cannot select research/park.",
+    "file": "scripts/dispatch-claim.py",
+    "fix_hint": "Treat an unreadable or malformed classification input as a terminal defer/error with no escalation mutation and no claim, and add an end-to-end tripwire showing that the failure path writes neither a research/park receipt nor labels and cannot fall through to allocation.",
+    "severity": "major",
+    "title": "Classifier read failures fall back to a path that can re-admit the issue"
+   },
+   {
+    "body": "_issue_is_measurement_run fetches the live issue object but passes set(item[\"labels\"]) from the cached plan into is_measurement_run. Bench-surface membership is a load-bearing classifier input. If an area:bench/kind:bench/type:bench label is added after planning, a genuine measurement run is missed and takes the ordinary ladder; if it is removed, the dispatcher can add a durable needs:ec2 hold to an issue that is no longer on the scoped surface. The live API response already contains labels, but they are ignored, and the tests only use identical cached/live labels.",
+    "file": "scripts/dispatch-claim.py",
+    "fix_hint": "Validate and use the labels from the same live issue response as title/body (failing closed on malformed label data), then add mutation tests for a cached non-bench/live-bench transition and the inverse so the decision is proven to use one coherent live state.",
+    "severity": "major",
+    "title": "Measurement classification mixes live text with stale plan labels"
+   }
+  ],
+  "progress": null,
+  "summary": "The shared classifier and its direct tests are substantial, but the dispatcher integration is not fail-closed and does not classify a single live issue state. On an unreadable/malformed live issue it explicitly falls back to the pre-existing self-clearing reroute/park ladder, which can later re-admit the exact measurement-run class this change is meant to durably exclude. In addition, the scoped predicate combines live title/body with cached plan labels, so concurrent surface-label changes can produce either a missed gate or an incorrect durable hold. These are major trust-plane control-flow issues, so approval is not sound.",
+  "verdict": "request_changes"
+ }
+}
