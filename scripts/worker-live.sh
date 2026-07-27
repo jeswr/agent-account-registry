@@ -811,6 +811,32 @@ run_gate() {
 # edit here.
 SELFTEST_MANIFEST="$SCRIPT_DIR/selftest-suite.txt"
 
+# [issue #704] Minimum interpreter the self-test suite is allowed to run under. The floor is set by
+# the enrolled scripts themselves, not by taste: scripts/metrics.py and scripts/dispatch-secrets-guard.py
+# `import tomllib` with no fallback, and tomllib is stdlib only from 3.11. Below the floor the suite
+# does not fail cleanly -- it dies part-way through on the FIRST offending construct and every
+# assertion after that point is never reached, so a truncated run can be mistaken for a narrower
+# pass. Refuse up front instead.
+SELFTEST_PYTHON_FLOOR=3.11
+
+# PURE (self-tested): compare an interpreter's `major.minor` against a `major.minor` floor.
+# Prints `ok` (at or above the floor), `below`, or `unknown` when either side is unparseable.
+# `unknown` is deliberately NOT `ok`: an interpreter whose version we cannot read must fail closed
+# rather than be waved through. Components are compared NUMERICALLY -- string order would rank
+# "3.9" above "3.11" and wave through an interpreter two minors under the floor.
+_python_version_at_least() {
+  local have=$1 floor=$2 hmaj hmin fmaj fmin
+  [[ "$have" =~ ^([0-9]+)\.([0-9]+) ]] || { printf 'unknown\n'; return 0; }
+  hmaj=${BASH_REMATCH[1]} hmin=${BASH_REMATCH[2]}
+  [[ "$floor" =~ ^([0-9]+)\.([0-9]+)$ ]] || { printf 'unknown\n'; return 0; }
+  fmaj=${BASH_REMATCH[1]} fmin=${BASH_REMATCH[2]}
+  if (( hmaj > fmaj || (hmaj == fmaj && hmin >= fmin) )); then
+    printf 'ok\n'
+  else
+    printf 'below\n'
+  fi
+}
+
 _read_selftest_list() {
   local file=$1
   [[ -f "$file" ]] || return 1
@@ -2609,6 +2635,35 @@ self_test() {
       failures=$((failures + 1))
     fi
   }
+
+  # --- [issue #704] interpreter floor, asserted BEFORE any fixture runs. An unsupported python3
+  # must fail LOUDLY and IMMEDIATELY: the suite embeds python fixtures and drives enrolled scripts
+  # that need >= $SELFTEST_PYTHON_FLOOR, and under an older interpreter it used to abort mid-run,
+  # skipping every later assertion (the whole #575 bundle/publish block among them). A gate whose
+  # coverage silently depends on the runner's interpreter minor version is the wrong property for
+  # the repo that IS the trust plane. `die` here, not `chk` -- a partial suite is not a result. ---
+  local _pyver _pyfloor
+  _pyver=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || true)
+  _pyfloor=$(_python_version_at_least "$_pyver" "$SELFTEST_PYTHON_FLOOR")
+  [[ "$_pyfloor" == ok ]] || die "self-test requires python3 >= $SELFTEST_PYTHON_FLOOR (found ${_pyver:-<unreadable>}, verdict $_pyfloor); refusing to run a partial suite"
+
+  chk "python floor: the running interpreter satisfies the suite floor" "$_pyfloor" "ok"
+  chk "python floor: exactly the floor is accepted" \
+    "$(_python_version_at_least 3.11 3.11)" "ok"
+  chk "python floor: a newer minor is accepted" \
+    "$(_python_version_at_least 3.12 3.11)" "ok"
+  chk "python floor: a newer major is accepted" \
+    "$(_python_version_at_least 4.0 3.11)" "ok"
+  chk "python floor: one minor BELOW the floor is refused" \
+    "$(_python_version_at_least 3.10 3.11)" "below"
+  chk "python floor: minor is compared NUMERICALLY, not as a string (3.9 < 3.11)" \
+    "$(_python_version_at_least 3.9 3.11)" "below"
+  chk "python floor: an older MAJOR is refused" \
+    "$(_python_version_at_least 2.7 3.11)" "below"
+  chk "python floor: an unreadable interpreter version is NOT waved through" \
+    "$(_python_version_at_least "" 3.11)" "unknown"
+  chk "python floor: a garbage version string is NOT waved through" \
+    "$(_python_version_at_least 'not.a.version' 3.11)" "unknown"
 
   # --- codex provider-model argv contract (sol/luna, and terra on docs lanes). Claude empty
   # is rejected upstream by the _run_headless_harness normalization, so it never reaches this
@@ -4537,8 +4592,13 @@ import time
 
 offset, refresh_value = int(sys.argv[1]), sys.argv[2]
 enc = lambda raw: base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
-access = (f"{enc(b'{\"alg\":\"RS256\"}')}."
-          "%s.sig" % enc(json.dumps({'exp': int(time.time()) + offset}).encode()))
+# [issue #704] The header is built OUTSIDE the join: a backslash inside an f-string expression
+# is 3.12-only (PEP 701), and on an older interpreter it is a SyntaxError that killed the suite
+# here, silently skipping every assertion below. Plain concatenation is 3.8-compatible and
+# byte-identical. Keep it that way.
+hdr = enc(b'{"alg":"RS256"}')
+payload = enc(json.dumps({'exp': int(time.time()) + offset}).encode())
+access = hdr + "." + payload + ".sig"
 print(json.dumps({"OPENAI_API_KEY": None, "auth_mode": "chatgpt",
                   "tokens": {"id_token": "ID_TOKEN_FIXTURE", "access_token": access,
                              "refresh_token": refresh_value,
@@ -4550,6 +4610,20 @@ PY
   # (a) VALID stored access token: no exchange, and the MOUNTED file carries NO refresh material.
   local pfroot="$tmp/pf-valid" pf_cred pf_rc pf_env="$tmp/pf-valid.env"
   pf_cred=$(_preflight_fixture "$pfroot" 864000 'REFRESH-TOKEN-SENTINEL-VALID')
+  # [issue #704] Pin the shape the hoisted builder above must keep producing: a three-segment JWT
+  # whose header decodes to exactly {"alg":"RS256"} and whose payload carries the requested exp.
+  # Without this, the only thing proving the header survived the hoist is the downstream pre-flight
+  # behaviour, which would still pass on a token that merely LOOKS well formed.
+  chk "(a) the fixture builds a 3-segment token with an exact RS256 header and the requested exp" \
+    "$(python3 -c '
+import base64, json, sys
+seg = json.loads(sys.argv[1])["tokens"]["access_token"].split(".")
+pad = lambda s: s + "=" * (-len(s) % 4)
+dec = lambda s: base64.urlsafe_b64decode(pad(s)).decode()
+delta = json.loads(dec(seg[1]))["exp"] - int(sys.argv[2])
+print(len(seg), dec(seg[0]), seg[2], "in-window" if 863990 <= delta <= 864000 else delta)' \
+      "$pf_cred" "$(date +%s)" 2>&1)" \
+    '3 {"alg":"RS256"} sig in-window'
   : > "$pf_env"
   if (
     export WORKER_ROOT="$pfroot" WORKER_ACCOUNT=acctexample WORKER_PROVIDER=openai \
