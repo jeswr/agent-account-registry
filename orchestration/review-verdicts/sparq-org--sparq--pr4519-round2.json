@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4519,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c91658e7250cd16f07fa11aea60a8781a599a435",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "run_hybrid asks each auxiliary arm for only cfg.candidates(k) results and applies derive_mask afterward. Thus the filter can compact only the returned prefix, not compute the arm's top candidates over the admissible domain as the docs claim. For example, with k=1 and the default over-fetch of 4, an arm ranking five nonmatching IDs before the sole matching ID returns only the first four; masking produces an empty arm and the matching result is permanently lost. The new witness includes exactly four total arm hits, so the matching ID remains inside the requested prefix and does not exercise this boundary.",
+    "file": "crates/sparq-vectors/src/rewrite.rs",
+    "fix_hint": "Pass the admissibility mask (or an equivalent predicate/constraint) into the arm contract so the arm can return the requested number of admissible results. Alternatively, define a paginated/exhaustive arm protocol and keep fetching until enough admissible candidates are collected or the arm is exhausted. Add a filtered-ann query-path test with more than cfg.candidates(k) nonmatching hits ahead of a matching hit and assert that the matching hit is returned with compacted provenance rank.",
+    "severity": "major",
+    "title": "Post-truncation masking can still lose admissible auxiliary hits"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 2 fixes the dictionary-domain failure and applies the BGP mask to auxiliary results before fusion, with non-vacuous query-path tests. However, the mask is applied only after each auxiliary arm has already truncated its unrestricted ranking to cfg.candidates(k). If more than over_fetch*k inadmissible hits precede an admissible hit, that hit is never returned by the closure and therefore cannot be recovered by filtering. The implementation still cannot provide the documented ranking over admissible candidates for a general arm. Progress is improving because two prior defects are fixed and the prior vacuous test has been replaced by meaningful witnesses, but filtered hybrid retrieval remains incomplete.",
+  "verdict": "request_changes"
+ }
+}
