@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4447,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ac367ccf9635c55dba8a7b6dbc8bc03f4ba4b6e5",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "wac_expressible returns true for every Allow/Condition::None row, but compile_wac also returns an empty Unsupported policy for Audience::AllExcept(vec![]). Consequently wac_acl_doc_at considers that row an ACL document. If an ancestor has an applicable subtree grant and a descendant has this empty AllExcept row, wac_effective_acl selects the descendant and evaluate_wac denies, whereas the compiler emitted no descendant policy/document under the model described by this change, so the ancestor should remain effective. The doc comment's claim that compile_wac has only two relevant early returns is therefore false, and the added inexpressible-row test does not cover the audience-based return.",
+    "file": "crates/sparq-acbench/src/oracle.rs",
+    "fix_hint": "Make the materialization predicate match all empty-policy cases from compile_wac, including matches!(intent.audience, Audience::AllExcept(ref excl) if excl.is_empty()), and extend an_inexpressible_row_creates_no_acl_document_and_cannot_shadow with that row. Prefer a shared, explicitly exhaustive classification if possible so compiler/oracle drift cannot recur.",
+    "severity": "major",
+    "title": "Empty AllExcept policy incorrectly creates a shadowing ACL document"
+   }
+  ],
+  "progress": null,
+  "summary": "The nearest-ACL resolution is directionally consistent with the cited WAC design and the new shadowing test exercises the real oracle path. However, the helper that decides whether a row materializes an ACL document does not actually mirror compile_wac: Audience::AllExcept with an empty exclusion list compiles to an empty unsupported policy, yet wac_expressible treats it as a document. Such a row can therefore incorrectly shadow a valid ancestor ACL and turn an inherited Allow into Deny. The new tests cover deny and conditional unsupported rows but omit this third empty-policy path.",
+  "verdict": "request_changes"
+ }
+}
