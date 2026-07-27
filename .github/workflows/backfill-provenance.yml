@@ -28,10 +28,28 @@ run-name: backfill-provenance ${{ github.event_name == 'schedule' && 'ALL enable
 
 on:
   schedule:
-    # Every 20 minutes, offset off the :00/:10 dispatch-tick boundaries so the repair is not
-    # competing with the tick for the very API budget whose exhaustion it is repairing. The
-    # dispatch tick floor is 10 minutes (#822), so a lost record now costs at most ~2 ticks of
-    # `__global__` reservation instead of an unbounded wait for a human.
+    # Every 20 minutes. The dispatch tick floor is 10 minutes (#822), so a lost record now costs
+    # at most ~2 ticks of `__global__` reservation instead of an unbounded wait for a human.
+    #
+    # THE BUDGET, MEASURED — because this workflow spends the same `github.token` installation
+    # budget whose exhaustion loses the records, and an earlier revision of this comment claimed
+    # the :9/:29/:49 offset "is not competing with the tick for the budget", which is FALSE. An
+    # offset changes only WHEN the requests land; it cannot reduce an HOURLY total by one request.
+    # It is kept for burst separation and nothing else. The real answer is the cost:
+    #
+    #   yardstick (scripts/dispatch-tick-floor.py, measured): a dispatch tick costs 613 requests,
+    #     the 10-min floor caps that at 6/h = 3678/h, and OBSERVED_SAFE_REQUESTS_PER_HOUR is 4291
+    #     (OBSERVED_BREAKING is 7969) — so ~613 requests/h of headroom exist for everything else.
+    #
+    #   this schedule, steady state: 1 pull-listing request per target per pass and nothing else,
+    #     because the existing-record probes now read from the ledger/default-branch CHECKOUTS
+    #     (see the checkout steps below). 2 targets x 3 passes = ~6 requests/h, ~1% of headroom.
+    #     Before that change it was ~93 per pass = ~279/h, i.e. ~46% of the headroom, permanently.
+    #
+    #   this schedule, worst case (the outage it repairs — every open worker PR recordless): the
+    #     irreducible per-PR cost is the run-log read (3) + the commit listing (1) + the record
+    #     write's own live CAS probes (3). At 73 open worker PRs that is ~512 requests for the
+    #     ONE pass that repairs them; the next two passes are back to ~1. ~518/h, inside headroom.
     - cron: '9,29,49 * * * *'
   workflow_dispatch:
     inputs:
@@ -140,6 +158,20 @@ jobs:
         with:
           persist-credentials: false
 
+      # [registry #710] The `ledger` data plane, ON DISK. Every open worker PR needs an
+      # "is it already recorded?" read, and each of those used to be a Contents API request
+      # against `github.token` — MEASURED 93 per scheduled pass across the two enabled targets,
+      # spent on the same installation budget whose exhaustion is what loses the records in the
+      # first place. `actions/checkout` fetches over the git protocol and costs that budget
+      # NOTHING, so the whole probe stage becomes free. The default-branch copy (the legacy
+      # pre-ledger record location) is the checkout above, at the workspace root.
+      - name: Checkout the ledger data plane (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ledger
+          path: ledger-data
+          persist-credentials: false
+
       - name: Checkout public target for protected routing data (pinned, no persisted token)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -194,8 +226,14 @@ jobs:
         run: |
           set -euo pipefail
           python3 scripts/backfill-provenance.py --self-test
+          # --ledger-records / --master-records serve the existing-record probes from the two
+          # checkouts above instead of the Contents API: 0 `github.token` requests where there
+          # were 1-2 per open worker PR (registry #710). The script REFUSES a root that is
+          # missing or carries no provenance directory, so a broken checkout fails this pass
+          # loudly instead of reading every record as absent.
           args=(--target-repo "$TARGET_REPO" --registry-repo "$GITHUB_REPOSITORY" \
-                --routing-file "$ROUTING_FILE")
+                --routing-file "$ROUTING_FILE" \
+                --ledger-records ledger-data --master-records .)
           if [[ "$APPLY" == "true" ]]; then args+=(--apply); fi
           if [[ "$NO_DRAFT_CONVERT" == "true" ]]; then args+=(--no-draft-convert); fi
           python3 scripts/backfill-provenance.py "${args[@]}"

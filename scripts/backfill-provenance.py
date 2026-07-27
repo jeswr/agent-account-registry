@@ -40,7 +40,7 @@ import inspect
 import io
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import subprocess
 import sys
@@ -400,6 +400,96 @@ def effective_record_body(probe, ledger_ref):
     return body
 
 
+# --- [registry #710] WHERE THE EXISTING-RECORD READ COMES FROM ---------------------------------
+# This pass asks "is there already a record for this PR?" once per open worker PR, and until now
+# each of those was one Contents API request against `github.token` — the SAME installation budget
+# whose exhaustion is the defect this PR exists to fix. MEASURED 2026-07-27 (GH_DEBUG=api request
+# counting, exact — a shared-token `X-RateLimit-Used` delta is NOT, other agents move it):
+#
+#   sparq-org/sparq          73 open worker PRs -> 69 ledger hits (1 req each)
+#                                                +  4 ledger 404 -> master (2 req each) = 77 reqs
+#   jeswr/agent-account-registry  16 open worker PRs, all ledger hits                   = 16 reqs
+#
+# 93 requests per scheduled pass that exist ONLY to answer a question the job can answer from disk
+# for free: the records live on refs of THIS repository, and the job already checks the repository
+# out. `actions/checkout` fetches over the git protocol, which does not touch the REST budget at
+# all. So when the workflow hands us checkouts of both refs we read the bodies from them.
+#
+# It is a strict reduction in API surface, never a widening of what counts as recorded:
+#   * a record that is present in the checkout is judged by the SAME
+#     `existing_record_admission_error` as before — the body is the blob, byte for byte;
+#   * a MISSING root, or a root with no provenance directory, is a broken checkout, NOT "no
+#     records" — it raises and the whole pass fails loudly rather than concluding that every PR
+#     needs a fresh record;
+#   * a checkout is a snapshot, so a record written by a concurrent worker mid-pass reads as
+#     absent. That is safe in the only direction it can go: `worker_pr.provenance_record` re-probes
+#     BOTH locations LIVE inside its CAS loop and returns idempotent-success on an identical
+#     record or raises on a divergent one. Staleness costs a few requests, never a wrong record.
+def checkout_record_probe(record_path, *, ledger_root, master_root, ledger_ref, error_cls):
+    """A `probe(ref=...)` for `effective_record_body`, served from checked-out trees. [#710]
+
+    Same contract as `worker_pr._probe_registry_file`: returns `(body, sha)`, `(None, None)` when
+    the record is absent, and RAISES on any other failure. `sha` is always None — `effective_
+    record_body` discards it, and the only consumer that needs a real blob sha
+    (`provenance_record`'s CAS) does its own live probe by design."""
+    def probe(ref=None):
+        root = Path(ledger_root if ref == ledger_ref else master_root).resolve()
+        # Traversal guard. `record_path` is built by worker_pr.provenance_path from an already
+        # policy-validated `owner/name` and an int, so this cannot fire today — it is here so
+        # that stays true if the path ever becomes caller-supplied.
+        path = root.joinpath(*PurePosixPath(record_path).parts)
+        try:
+            path.resolve().relative_to(root)
+        except ValueError as exc:
+            raise error_cls(f"record path {record_path!r} escapes the checkout root") from exc
+        if not path.exists():
+            return None, None       # the ONLY absent verdict — the clean 404 equivalent
+        try:
+            # PRESENT BUT UNREADABLE IS NOT ABSENT, and the distinction is the whole fail-closed
+            # posture (sol #217: unknown never counts as recorded). A directory where a record
+            # should be, an undecodable blob and an OS-level read error are all "we do not know",
+            # so they refuse this PR into NEEDS-HUMAN — exactly what a non-404 API probe failure
+            # does — instead of reporting no record and inviting a rewrite.
+            if not path.is_file():
+                raise IsADirectoryError(f"{path} is not a regular file")
+            return path.read_text(encoding="utf-8"), None
+        except (OSError, UnicodeDecodeError) as exc:
+            raise error_cls(f"registry file {record_path} is unreadable in the checkout: {exc}")
+    return probe
+
+
+def record_source_roots(ledger_records, master_records):
+    """True when existing-record reads come from checkouts, False for the Contents API. [#710]
+
+    BOTH or NEITHER. One alone would read one ref off a snapshot and the other off the live API —
+    a mixed view of a ledger-first fallback, which is the shape that makes "already recorded" mean
+    two different things in the same pass."""
+    if bool(ledger_records) != bool(master_records):
+        raise BackfillError(
+            "--ledger-records and --master-records must be given together: reading one ref from a "
+            "checkout and the other from the API is a mixed view of the ledger-first fallback")
+    return bool(ledger_records) and bool(master_records)
+
+
+def validate_record_checkout(root, ref_label, provenance_dir):
+    """Raise unless `root` looks like a real checkout carrying the provenance data. [#710]
+
+    The failure this closes is the quiet one: an empty or wrong-ref checkout makes EVERY record
+    read as absent, which turns a read-only census into a pass that tries to re-record the whole
+    population. A checkout of either ref always carries the provenance directory (34 records on
+    master, 470 on ledger as of 2026-07-27), so its absence is a broken input, not a data fact."""
+    base = Path(root)
+    if not base.is_dir():
+        raise BackfillError(
+            f"{ref_label} record checkout {root!r} is not a directory — refusing to read every "
+            "provenance record as ABSENT off a checkout that is not there")
+    if not (base / provenance_dir).is_dir():
+        raise BackfillError(
+            f"{ref_label} record checkout {root!r} has no {provenance_dir}/ — that is a wrong-ref "
+            "or truncated checkout, not a repository with no provenance records")
+    return True
+
+
 def existing_record_admission_error(body, pr_number, admission_error):
     """Why an existing record body does NOT admit target PR ``pr_number``, or None when it
     passes the review loop's full admission (sol #217: a successful Contents response used to
@@ -697,7 +787,8 @@ def human_remainder(census):
     return census.needs_human
 
 
-def backfill(target_repo, registry_repo, routing_file, apply_changes, no_draft_convert=False):
+def backfill(target_repo, registry_repo, routing_file, apply_changes, no_draft_convert=False,
+             ledger_records=None, master_records=None):
     worker_pr = _load_worker_pr()
     admission_error = _load_dispatch_claim().provenance_admission_error
     import tomllib
@@ -706,6 +797,20 @@ def backfill(target_repo, registry_repo, routing_file, apply_changes, no_draft_c
     salt = os.environ.get("PROVENANCE_SALT", "")
     if not salt:
         raise BackfillError("PROVENANCE_SALT is required (records store only the salted hash)")
+
+    # [registry #710] Existing-record reads come from checked-out refs when the caller supplies
+    # them (see `checkout_record_probe`) — that is 93 fewer `github.token` requests per scheduled
+    # pass across the two enabled targets, against the very budget whose exhaustion loses the
+    # records. BOTH roots or NEITHER: one alone would silently mix a live ref with a snapshot.
+    # Validated up front so a broken checkout fails the PASS, not each PR into NEEDS-HUMAN.
+    from_checkout = record_source_roots(ledger_records, master_records)
+    if from_checkout:
+        validate_record_checkout(ledger_records, worker_pr.LEDGER_REF, worker_pr.PROVENANCE_DIR)
+        validate_record_checkout(master_records, "default-branch", worker_pr.PROVENANCE_DIR)
+        print(f"record source: checkouts ({worker_pr.LEDGER_REF}={ledger_records}, "
+              f"default-branch={master_records}) — 0 API requests for existing-record probes")
+    else:
+        print("record source: Contents API (1-2 requests per open worker PR)")
 
     # --slurp: without it `gh api --paginate` emits each page as a SEPARATE json array and a
     # >100-open-PR target aborts on "malformed JSON" before recovery begins (sol r5).
@@ -747,8 +852,13 @@ def backfill(target_repo, registry_repo, routing_file, apply_changes, no_draft_c
         # non-404 probe failure defers the PR (worker_pr._probe_registry_file raises — unknown
         # never counts as recorded), and a present-but-inadmissible record is NEEDS-HUMAN,
         # never a skip (this script never rewrites an existing record).
-        pr_probe = lambda ref=None: worker_pr._probe_registry_file(  # noqa: E731
-            registry_repo, record_path, ref=ref)
+        if from_checkout:
+            pr_probe = checkout_record_probe(
+                record_path, ledger_root=ledger_records, master_root=master_records,
+                ledger_ref=worker_pr.LEDGER_REF, error_cls=worker_pr.WorkerPrError)
+        else:
+            pr_probe = lambda ref=None: worker_pr._probe_registry_file(  # noqa: E731
+                registry_repo, record_path, ref=ref)
         try:
             body = effective_record_body(pr_probe, worker_pr.LEDGER_REF)
         except worker_pr.WorkerPrError as exc:
@@ -1013,8 +1123,33 @@ def backfill_workflow_seam_report():
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
                 called.add(node.func.attr)
     cron = [str(entry.get("cron")) for entry in ((triggers or {}).get("schedule") or [])]
+    # --- [registry #710] the RECORD-SOURCE seam ------------------------------------------------
+    # This one degrades SILENTLY, which is why it is asserted structurally rather than left to the
+    # script. Drop `--ledger-records`/`--master-records` from the invocation and nothing fails —
+    # the pass just goes back to spending ~93 Contents requests of the installation budget it is
+    # there to protect. Point `ref:` at the default branch instead of `ledger` and it does not even
+    # fail the checkout validation (a default-branch checkout also carries a provenance
+    # directory); it would simply stop seeing the 470 ledger records and try to re-record them.
+    # So: the checkout's `ref`, the checkout's `path`, and the flag VALUES are all pinned, and the
+    # path and the flag are asserted to be the SAME string.
+    ledger_checkout = next((s for s in steps
+                            if str((s.get("with") or {}).get("ref") or "") == "ledger"), None)
+    ledger_with = (ledger_checkout or {}).get("with") or {}
+    # `[^\s)]+` not `\S+`: the flags sit inside a bash `args=( … )`, so a greedy \S+ swallows the
+    # closing paren of the LAST one and the assertion compares `.)` against `.`.
+    flags = dict(re.findall(r"--(ledger-records|master-records)\s+([^\s)]+)", run))
     return {
         "schedule_cron": cron,
+        "ledger_checkout_ref": str(ledger_with.get("ref") or ""),
+        "ledger_checkout_path": str(ledger_with.get("path") or ""),
+        "ledger_checkout_no_creds": ledger_with.get("persist-credentials") is False,
+        "ledger_checkout_pinned": bool(re.fullmatch(
+            r"actions/checkout@[0-9a-f]{40}", str((ledger_checkout or {}).get("uses") or ""))),
+        "record_source_flags": flags,
+        # The flag must name the directory the checkout actually writes to. These drifting apart
+        # is the mutation that reads every ledger record as absent.
+        "record_flag_matches_checkout": (flags.get("ledger-records")
+                                         == str(ledger_with.get("path") or "")),
         # `needs:` is a scalar OR a list in Actions YAML; normalise so the assertion cannot be
         # satisfied by a string that merely happens to contain the right characters.
         "backfill_needs_resolve": ([job["needs"]] if isinstance(job.get("needs"), str)
@@ -1407,6 +1542,19 @@ def _self_test():
           "fleet outage and must red the run",
           seam["no_continue_on_error"], True)
 
+    # ---- [registry #710] the RECORD-SOURCE seam: the schedule must not spend the budget it repairs
+    check("#710 the ledger data plane is CHECKED OUT — pinned, credential-free, at the `ledger` "
+          "ref specifically (a default-branch checkout at this path would still pass the script's "
+          "own validation while silently hiding every ledger record)",
+          (seam["ledger_checkout_ref"], seam["ledger_checkout_pinned"],
+           seam["ledger_checkout_no_creds"]),
+          ("ledger", True, True))
+    check("#710 …and the invocation ACTUALLY READS from it: dropping --ledger-records / "
+          "--master-records fails nothing at runtime, it just silently returns the pass to ~93 "
+          "Contents requests of the very budget whose exhaustion loses the records",
+          (seam["record_source_flags"], seam["record_flag_matches_checkout"]),
+          ({"ledger-records": "ledger-data", "master-records": "."}, True))
+
     # ---- [registry #710] the resolution itself, executed ---------------------------------------
     enabled = ["jeswr/agent-account-registry", "sparq-org/sparq"]
     check("#710 a SCHEDULE event applies to every enabled target — the `inputs` context is empty "
@@ -1422,6 +1570,65 @@ def _self_test():
                                                     enabled)),
            _refuses(lambda: resolve_dispatch_inputs("workflow_dispatch", "  ", "true", enabled)),
            _refuses(lambda: resolve_dispatch_inputs("schedule", "", "", []))),
+          (True, True, True))
+
+    # ---- [registry #710] the checkout-served record probe ---------------------------------------
+    _ck = Path(tempfile.mkdtemp())
+    _led, _mas = _ck / "ledger-data", _ck / "master-data"
+    for _root in (_led, _mas):
+        (_root / "orchestration" / "provenance").mkdir(parents=True)
+    (_led / "orchestration/provenance/o--r--pr7.json").write_text('{"ledger":1}', encoding="utf-8")
+    (_mas / "orchestration/provenance/o--r--pr7.json").write_text('{"master":1}', encoding="utf-8")
+    (_mas / "orchestration/provenance/o--r--pr8.json").write_text('{"master":8}', encoding="utf-8")
+
+    def _ck_probe(path):
+        return checkout_record_probe(path, ledger_root=_led, master_root=_mas,
+                                     ledger_ref="ledger", error_cls=BackfillError)
+
+    check("#710 the checkout probe is LEDGER-FIRST and falls back to the default branch exactly "
+          "like the API probe — same `effective_record_body`, same precedence (issue #96)",
+          (effective_record_body(_ck_probe("orchestration/provenance/o--r--pr7.json"), "ledger"),
+           effective_record_body(_ck_probe("orchestration/provenance/o--r--pr8.json"), "ledger"),
+           effective_record_body(_ck_probe("orchestration/provenance/o--r--pr9.json"), "ledger")),
+          ('{"ledger":1}', '{"master":8}', None))
+    check("#710 the probe returns the API probe's (body, sha) SHAPE on a hit and (None, None) on "
+          "a miss, so it is a drop-in for worker_pr._probe_registry_file",
+          (_ck_probe("orchestration/provenance/o--r--pr7.json")(ref="ledger"),
+           _ck_probe("orchestration/provenance/o--r--pr9.json")(ref="ledger")),
+          (('{"ledger":1}', None), (None, None)))
+    check("#710 a record path that escapes the checkout root is REFUSED, not read",
+          _refuses(lambda: _ck_probe("../../etc/passwd")(ref="ledger")), True)
+    # PRESENT-BUT-UNREADABLE MUST NOT READ AS ABSENT. Reading it as absent is the fail-open shape
+    # this whole probe has to avoid: it would report "no record" for a PR that has one, and invite
+    # a rewrite of a record nobody could decode. Both undecodable-blob and not-a-regular-file are
+    # exercised because they take different branches (UnicodeDecodeError is NOT an OSError).
+    (_led / "orchestration/provenance/o--r--pr10.json").write_bytes(b'{"x": "\xff\xfe"}')
+    (_led / "orchestration/provenance/o--r--pr11.json").mkdir()
+    check("#710 a record that is PRESENT but unreadable REFUSES the PR (NEEDS-HUMAN), it is never "
+          "reported as absent — undecodable blob and not-a-regular-file alike",
+          (_refuses(lambda: _ck_probe("orchestration/provenance/o--r--pr10.json")(ref="ledger")),
+           _refuses(lambda: _ck_probe("orchestration/provenance/o--r--pr11.json")(ref="ledger")),
+           # CONTROL: a genuinely absent record is still the clean (None, None), so the row above
+           # is a discrimination and not "everything refuses".
+           _ck_probe("orchestration/provenance/o--r--pr99.json")(ref="ledger")),
+          (True, True, (None, None)))
+    check("#710 the two record roots are BOTH-or-NEITHER: one alone would read one ref off a "
+          "snapshot and the other off the live API, a mixed view of the ledger-first fallback",
+          (_refuses(lambda: record_source_roots("ledger-data", "")),
+           _refuses(lambda: record_source_roots("", ".")),
+           record_source_roots("ledger-data", "."), record_source_roots(None, None)),
+          (True, True, True, False))
+    # FAIL-CLOSED on the input itself. This is the mutation that matters: an absent or wrong-shaped
+    # checkout makes EVERY record read as missing, which turns a census into a pass that re-records
+    # the whole population. It must kill the PASS, not degrade into per-PR NEEDS-HUMAN.
+    _empty = Path(tempfile.mkdtemp())
+    check("#710 a MISSING record checkout, and one with no provenance directory, both REFUSE the "
+          "whole pass — 'the checkout is not there' must never be read as 'there are no records'",
+          (_refuses(lambda: validate_record_checkout(str(_ck / "nope"), "ledger",
+                                                     "orchestration/provenance")),
+           _refuses(lambda: validate_record_checkout(str(_empty), "ledger",
+                                                     "orchestration/provenance")),
+           validate_record_checkout(str(_led), "ledger", "orchestration/provenance")),
           (True, True, True))
     check("two-page slurped listing flattens (sol r5)",
           flatten_pull_pages([[{"number": 1}], [{"number": 2}, {"number": 3}]]),
@@ -1627,6 +1834,7 @@ def _self_test():
 
     stub_worker_pr = types.SimpleNamespace(
         LEDGER_REF="ledger", WorkerPrError=BackfillError,
+        PROVENANCE_DIR="orchestration/provenance",
         provenance_path=lambda repo, number: f"orchestration/provenance/{number}.json",
         _probe_registry_file=lambda repo, path, ref=None: (None, None),
         account_hash=lambda account, salt: "deadbeefdeadbeef",
@@ -1667,6 +1875,57 @@ def _self_test():
            "DRY-RUN #9002: would convert to draft" in e2e), (True, True))
     check("E2E: BOTH records are counted — draft policy never withholds a record",
           "backfill complete: would record 2, skipped 0, needs-human 0" in e2e, True)
+
+    # ---- [registry #710] THE CALL SITE: does backfill() actually read from the checkout? --------
+    # The unit checks above pin `checkout_record_probe`; the seam check pins the YAML. Neither can
+    # see a `backfill()` that built the checkout probe and then went on using the API one anyway —
+    # the suite would stay green while every pass kept spending the budget. So this run replaces
+    # `_probe_registry_file` with a TRIPWIRE: any Contents probe at all is a failure.
+    ck_ledger, ck_master = Path(tempfile.mkdtemp()), Path(tempfile.mkdtemp())
+    for _root in (ck_ledger, ck_master):
+        (_root / "orchestration" / "provenance").mkdir(parents=True)
+    # 9001 is already recorded ON THE LEDGER; 9002/9003 are on neither ref.
+    (ck_ledger / "orchestration/provenance/9001.json").write_text("{}", encoding="utf-8")
+
+    def _tripwire(repo, path, ref=None):
+        raise AssertionError(
+            f"backfill() hit the Contents API for {path} (ref={ref}) despite being handed "
+            "record checkouts — the probes it was meant to stop spending are still being spent")
+
+    ck_worker_pr = types.SimpleNamespace(**{**vars(stub_worker_pr),
+                                            "_probe_registry_file": _tripwire})
+    ck_buffer = io.StringIO()
+    saved_globals = {name: globals()[name] for name in patched}
+    saved_salt = os.environ.get("PROVENANCE_SALT")
+    try:
+        globals().update(
+            _gh_json=e2e_gh_json, _run_gh=e2e_run_gh,
+            _load_worker_pr=lambda: ck_worker_pr,
+            _load_dispatch_claim=lambda: types.SimpleNamespace(
+                provenance_admission_error=lambda record, pr: None),
+            review_state=lambda repo, number, runner=None: e2e_state[number])
+        os.environ["PROVENANCE_SALT"] = "self-test-only"
+        with contextlib.redirect_stdout(ck_buffer):
+            ck_census = backfill("sparq-org/sparq", "jeswr/agent-account-registry",
+                                 str(routing_toml), False,
+                                 ledger_records=str(ck_ledger), master_records=str(ck_master))
+    finally:
+        globals().update(saved_globals)
+        if saved_salt is None:
+            os.environ.pop("PROVENANCE_SALT", None)
+        else:
+            os.environ["PROVENANCE_SALT"] = saved_salt
+    ck_out = ck_buffer.getvalue()
+    check("#710 E2E: handed record checkouts, backfill() serves EVERY existing-record read off "
+          "disk and issues ZERO Contents requests — the ledger record is still found and skipped, "
+          "and the two absent ones still proceed exactly as before",
+          (ck_census.skipped, ck_census.written, ck_census.unresolved,
+           "skip #9001: provenance already recorded" in ck_out,
+           "0 API requests for existing-record probes" in ck_out),
+          (1, 1, 1, True, True))
+    check("#710 E2E CONTROL: with NO checkouts the same run goes back through the Contents API, "
+          "so the row above is asserting the routing and not a probe nobody ever calls",
+          "record source: Contents API" in e2e, True)
 
     # ---- [registry #710] the census must be COMPLETE, and the exit code must carry it ----------
     check("#710 E2E: the empty-commits PR is COUNTED as unresolved and SAID to be left recordless "
@@ -1803,12 +2062,22 @@ def main():
                         help="record provenance ONLY; never touch draft state. Belt-and-braces "
                              "over the review-state predicate, which already refuses to draft a "
                              "queued/armed/review:pass PR (issue #726)")
+    parser.add_argument("--ledger-records",
+                        help="root of a checkout of the registry's ledger ref. Given WITH "
+                             "--master-records, existing-record probes are served from disk "
+                             "instead of the Contents API — 0 github.token requests instead of "
+                             "1-2 per open worker PR (registry #710)")
+    parser.add_argument("--master-records",
+                        help="root of a checkout of the registry's default branch (the legacy "
+                             "pre-ledger record location). Required with --ledger-records")
     args = parser.parse_args()
     if args.self_test:
         return _self_test()
     try:
         census = backfill(args.target_repo, args.registry_repo, args.routing_file, args.apply,
-                          no_draft_convert=args.no_draft_convert)
+                          no_draft_convert=args.no_draft_convert,
+                          ledger_records=args.ledger_records,
+                          master_records=args.master_records)
     except BackfillError as exc:
         print(f"backfill-provenance: {exc}", file=sys.stderr)
         return EXIT_ERROR
