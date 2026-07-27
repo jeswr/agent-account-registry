@@ -45,6 +45,7 @@ and this script never prints the login it hashed alongside the hash.
 """
 
 import argparse
+import copy
 import json
 import os
 from pathlib import Path
@@ -543,21 +544,29 @@ def _workflow(name):
     return yaml.safe_load(path.read_text(encoding="utf-8"))
 
 
-def mint_workflow_seam_report():
+def mint_workflow_seam_report(workflow=None):
     """Structural findings about the LIVE mint-provenance.yml, each asserted by --self-test.
 
     Every finding is derived from the PARSED document, never a substring of the file: an `if:
     false`, a deleted step, a reordered command or a wrong-input binding (`APPLY: ${{
     inputs.allow_global_partition }}` is valid YAML and lints clean) all survive a grep and none
-    survives this."""
-    workflow = _workflow("mint-provenance.yml")
+    survives this. `workflow` is injectable so the self-test can run a MUTANT TABLE over a copy of
+    the real document instead of asserting the happy path only.
+
+    The `run:` script is COMMENT-STRIPPED (dispatch-claim's audited, quote-aware stripper) before
+    any fragment check. Measured on this file: without it, commenting the self-test invocation out
+    left `self_test_before_mint` True — the token was still in the text. A wiring assertion may
+    only ever be satisfied by CODE."""
+    workflow = _workflow("mint-provenance.yml") if workflow is None else workflow
+    strip = _load_dispatch_claim()._strip_script_comments
     # PyYAML parses a bare `on:` key as the boolean True.
     triggers = workflow.get("on") if "on" in workflow else workflow.get(True)
     inputs = (((triggers or {}).get("workflow_dispatch") or {}).get("inputs") or {})
     job = workflow["jobs"]["mint"]
     steps = job["steps"]
-    step = next((s for s in steps if "mint-provenance.py" in str(s.get("run") or "")), None)
-    run = str((step or {}).get("run") or "")
+    step = next((s for s in steps
+                 if "mint-provenance.py" in strip(str(s.get("run") or ""))), None)
+    run = strip(str((step or {}).get("run") or ""))
     guard = str(job.get("if") or "")
     self_at = run.find("mint-provenance.py --self-test")
     invoke_at = run.find('mint-provenance.py "${args[@]}"')
@@ -902,7 +911,7 @@ def _self_test():                                                       # noqa: 
           [row for row in enrolled_live if row[1]], [])
     # NON-VACUOUS: the same reader, over the same LIVE rows, WOULD surface an enabled list — so
     # the assertion above is a fact about the shipped policy, not about a constantly-empty reader.
-    import copy
+
 
     probe_doc = copy.deepcopy(policy_doc)
     probe_repo = sorted(probe_doc["repos"])[0]
@@ -940,6 +949,80 @@ def _self_test():                                                       # noqa: 
         "APPLY": "${{ inputs.apply }}",
         "ALLOW_GLOBAL": "${{ inputs.allow_global_partition }}",
     })
+
+    # ---- the YAML-seam MUTANT TABLE ----------------------------------------------------------
+    # Asserting the happy path proves the report can read a correct workflow, not that it would
+    # catch a broken one. Every mutant below is a real way this workflow has been (or could be)
+    # neutered; each must flip a NAMED finding. Two of them survive only as a COMMENT — the exact
+    # shape that left this file's first self-test-ordering check vacuous.
+    def mutated(edit):
+        doc = copy.deepcopy(_workflow("mint-provenance.yml"))
+        edit(doc)
+        return mint_workflow_seam_report(doc)
+
+    def mint_step(doc):
+        return next(s for s in doc["jobs"]["mint"]["steps"]
+                    if "mint-provenance.py" in str(s.get("run") or ""))
+
+    def comment_out_line(doc, fragment):
+        step = mint_step(doc)
+        lines = str(step["run"]).splitlines()
+        hits = [i for i, line in enumerate(lines) if fragment in line]
+        assert hits, f"seam mutant fragment not present: {fragment!r}"
+        for i in hits:
+            lines[i] = "# " + lines[i].lstrip()
+        step["run"] = "\n".join(lines) + "\n"
+
+    def wf_inputs(doc):
+        return (doc.get("on") if "on" in doc else doc.get(True))["workflow_dispatch"]["inputs"]
+
+    for name, edit, key, want in (
+            ("the job is neutered with if: false",
+             lambda d: d["jobs"]["mint"].update(**{"if": "false"}), "job_ref_guarded", False),
+            ("the default-ref guard is deleted",
+             lambda d: d["jobs"]["mint"].pop("if"), "job_ref_guarded", False),
+            ("the secret-scoped environment is dropped",
+             lambda d: d["jobs"]["mint"].pop("environment"), "job_environment", None),
+            ("actions: read is granted (backfill's identity source)",
+             lambda d: d["jobs"]["mint"]["permissions"].update(actions="read"),
+             "no_actions_permission", False),
+            ("the mint step is made conditional",
+             lambda d: mint_step(d).update(**{"if": "false"}), "step_unconditional", False),
+            ("an operator-supplied run key input appears",
+             lambda d: wf_inputs(d).update(run_key={"type": "string"}), "no_run_key_input", False),
+            ("an --attestation argument appears",
+             lambda d: mint_step(d).update(run=str(mint_step(d)["run"]) + "  --attestation x\n"),
+             "no_run_key_argument", False),
+            ("the dispatch default flips to apply=true",
+             lambda d: wf_inputs(d)["apply"].update(default=True),
+             "dispatch_default_is_dry_run", True),
+            # COMMENT-ONLY mutants: the token stays in the text, the CODE is gone.
+            ("the self-test invocation survives only as a comment",
+             lambda d: comment_out_line(d, "mint-provenance.py --self-test"),
+             "self_test_before_mint", False),
+            ("the --apply conditional survives only as a comment",
+             lambda d: comment_out_line(d, "args+=(--apply)"), "apply_is_conditional", False),
+            ("the --allow-global-partition conditional survives only as a comment",
+             lambda d: comment_out_line(d, "args+=(--allow-global-partition)"),
+             "global_is_conditional", False),
+            ("set -euo pipefail survives only as a comment",
+             lambda d: comment_out_line(d, "set -euo pipefail"), "errexit", False)):
+        check(f"YAML-seam mutant reds: {name}", mutated(edit)[key], want)
+    # The wrong-input seam needs a value comparison rather than a boolean.
+    check("YAML-seam mutant reds: APPLY is bound to the WRONG input",
+          mutated(lambda d: mint_step(d)["env"].update(
+              APPLY="${{ inputs.allow_global_partition }}"))["step_env_bindings"]["APPLY"],
+          "${{ inputs.allow_global_partition }}")
+    # ...and the control: a RAW-TEXT search would have passed the comment-only mutants, which is
+    # why the stripper is load-bearing rather than tidy.
+    def raw_run(edit):
+        doc = copy.deepcopy(_workflow("mint-provenance.yml"))
+        edit(doc)
+        return str(mint_step(doc)["run"])
+
+    check("...and a raw-text grep WOULD have passed the commented-out self-test",
+          "mint-provenance.py --self-test" in raw_run(
+              lambda d: comment_out_line(d, "mint-provenance.py --self-test")), True)
 
     print("mint-provenance self-test:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
