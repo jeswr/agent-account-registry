@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4519,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c07831986edb771316b51b44ccbb3a1dace26e25",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "run_aux_arms still sets ceiling = candidates.max(graph.dict.len()) and stops once want >= ceiling, but check_arm_ids explicitly accepts inline-integer IDs that are not bounded by dict.len(). derive_mask can contain such IDs when ?node is bound through an object position, and neither ArmFn nor the vec:hybrid subject contract enforces the comment's assumption that an entity-retrieval arm never ranks inline literals. An arm may therefore place more than dict.len() valid inline IDs before an admissible inline ID, causing paging to stop before reaching it and violating the claimed top-candidates-over-the-admissible-domain behavior.",
+    "file": "crates/sparq-vectors/src/rewrite.rs",
+    "fix_hint": "Remove graph.dict.len() as the exhaustion bound while inline IDs remain valid. Use explicit arm exhaustion/cursor semantics, pass admissibility into the arm, or enforce and document a stored-entity-only arm contract and reject inline IDs. Add a filtered-ann end-to-end test where ?node is constrained in object position to an inline integer and that admissible ID appears beyond the former dictionary-length request ceiling.",
+    "severity": "major",
+    "title": "Dictionary-length paging ceiling still loses admissible inline IDs"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 4 does not resolve the round-3 correctness defect. The filtered auxiliary-arm paging loop still caps requests at candidates.max(graph.dict.len()), while check_arm_ids still accepts inline-integer IDs outside the stored dictionary range. The documented entity-only assumption is not enforced by ArmFn or by the vec:hybrid subject contract, and no inline-integer filtered query-path witness was added. Consequently, valid admissible inline IDs can remain beyond the paging ceiling and be silently omitted. The same major finding remains at the same severity, so progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
