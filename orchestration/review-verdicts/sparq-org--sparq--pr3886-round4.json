@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3886,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "3b0503a58553c59619a7735155f43e5fbac4c217",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "In `ChangeRelay::pump`, `SinkError::Permanent` from `deliver` remains stored in `failure`, while `self.fail(seq, e)` is deferred until after `self.sink.flush()` and `write_cursor(...)`. If flush returns a retryable error, `pump` returns that error and never records the earlier permanent refusal in `self.poisoned`. If an accepted prefix exists and cursor persistence fails, the early `RelayError::Cursor` likewise leaves the relay unpoisoned. A subsequent `pump` can therefore call the sink again, contradicting the public contract that a permanent refusal poisons the live relay and makes every later pump fail closed.",
+    "file": "crates/sparq-serve/src/change_sink.rs",
+    "fix_hint": "Poison the relay immediately when `deliver` returns `SinkError::Permanent`, before any fallible flush or cursor bookkeeping, while retaining the original refusal for deterministic error handling. Add real-path tests with an accepted prefix followed by a permanent refusal and then (1) a retryable flush failure and (2) a cursor-write failure; assert `is_poisoned()` and that the next `pump` returns `RelayError::Poisoned` without another delivery attempt.",
+    "severity": "major",
+    "title": "Permanent delivery refusal can still be masked without poisoning"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 4 is stagnant: the round-3 major finding remains. A permanent `deliver` refusal is only recorded in `failure`; the relay does not poison itself until after `flush` and cursor persistence. A retryable flush error or cursor-write error can still return first, masking the permanent refusal and leaving the live relay armed. The added tests still cover only the case where post-refusal flush and cursor persistence succeed, so the documented immediate fail-closed contract is not established.",
+  "verdict": "request_changes"
+ }
+}
