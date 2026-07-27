@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 848,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "421054a4b44fbb47a5c26fa958c7516e41021c96",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly centralizes the actionlint version and digests in a strictly parsed, checked-in data file. Both consumers reject missing, duplicate, malformed, or unknown pins; the workflow continues to verify the downloaded tarball before extraction, while the worker continues to verify both tarball and executable and to reject unsupported production architectures. The workflow drift assertion covers the real gate plus negative fixtures, and the parser/refusal tests are non-vacuous. No trust check, permissions boundary, SHA binding, or audit behavior is weakened.",
+  "verdict": "approve"
+ }
+}
