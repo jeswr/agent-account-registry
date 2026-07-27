@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4530,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d7cdce2506761e38a0383b8e411f89dd0cf0a7d0",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The host admission/commitment mirror and the Noir relation consistently enforce the load-bearing invariants: committed rule shapes, range restriction, grounded join premises, canonical integer operand binding, whitelisted builtins, and terminal-root binding. The negative tests exercise real forgery paths rather than mocks, including uncommitted-rule substitution, an unbound conclusion variable, absent graph leaves, ungrounded premises, false/relabelled builtin operands, invalid rule indices, and root mismatch. The extracted signed-integer helpers preserve the FILTER binding and verdict behavior, and the documentation keeps the feature explicitly research-grade, unmeasured, undispatched, and not externally audited. No hostile reviewer-directed instruction was present in the diff.",
+  "verdict": "approve"
+ }
+}
