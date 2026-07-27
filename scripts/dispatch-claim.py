@@ -2270,26 +2270,28 @@ def enrolment_enable_error(policy_doc, claim_admits, rf_admits):
 #
 # [#762] THE GREEN LANE'S OWN NUMBER, and whether the two ramps compose. MEASURED by running THIS
 # TREE's own enumerate_review_items over live sparq-org/sparq data — the real guard set, not
-# aggregator colour — on 2026-07-27T14:47Z: 119 open PRs paginated, 85 worker-shaped heads, every
-# head's check-run listing walked per tier name and cross-checked against the endpoint's own
-# total_count (456 pages, 26 576 rows, ZERO short/unprovable reads, zero snapshot skips).
+# aggregator colour — on 2026-07-27T15:24Z, re-derived on the master-rebased tree after #761/#771/
+# #758 landed: 118 open PRs paginated, 84 worker-shaped heads, every head's check-run listing
+# walked per tier name and cross-checked against the endpoint's own total_count (447 pages, 25 891
+# rows, 45 walks over one page, ZERO short/unprovable reads, zero snapshot skips).
 #
-# Uncapped first-tick population: 7 needs-ci-fix (#761's half), 17 stranded (this half), plus 2
-# ordinary needs-review. Of those 24 repair rows the STRICT merge-required reading sees exactly
-# ZERO — only 20 of the 85 heads publish a `gate` row at all, and none of those 20 is among the 24.
-# So both halves are 100% newly reachable on the live fleet, and every stranded row's evidence
-# grade is `green:draft-tier`; `stranded:green:merge-required` is 0.
+# Uncapped first-tick population: 5 needs-ci-fix (#761's half), 17 stranded (this half), plus 1
+# needs-fix and 3 ordinary needs-review. Of those 22 REPAIR rows the STRICT merge-required reading
+# sees exactly ZERO — every one reads `gate: missing` — so both halves are 100% newly reachable on
+# the live fleet, and every stranded row's evidence grade is `green:draft-tier`
+# (`stranded:green:merge-required` is 0).
 #
-# With the bound below actually applied, tick 1 emits 5 + 5 + 2 = 12 and holds 2 fix / 12 review
-# for the following ticks. (Six worker PRs carry no provenance record on either branch and are
-# excluded upstream of all of this, so these figures UNDERSTATE the population.)
+# With the bound below actually applied, tick 1 emits 5 + 17->5 + 1 + 3 = 14 and holds 12 review-lane
+# rows for later ticks; the fix lane's 5 fit under the cap, so it holds none. (Six worker PRs carry
+# no provenance record on either branch and are excluded upstream of all of this, so these figures
+# UNDERSTATE the population.)
 #
 # THEY COMPOSE, and the reason is asymmetric rather than additive: only the FIX lane pushes
 # commits. 5/lane/tick caps CI at +5 pushes per tick no matter what the review lane is doing, and
 # that push rate is the quantity the congestion-collapse mode is a function of. The review lane's
 # 17 add reviewer ACCOUNT demand, not CI load, and that is bounded independently and EARLIER by
 # the account allocator, which returns no-slot and defers without mutating anything. At the
-# ~10-minute cadence the 7 clears in 2 ticks and the 17 in 4 — full drain under 40 minutes.
+# ~10-minute cadence the fix half clears in ONE tick and the 17 in 4 — full drain under 40 minutes.
 DRAFT_TIER_BACKLOG_PER_TICK_MAX = 5
 _DRAFT_TIER_NEW = "_draft_tier_newly_reachable"   # private; stripped before the plan row is built
 
