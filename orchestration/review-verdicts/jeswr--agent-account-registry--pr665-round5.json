@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 665,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "8131bcc89d32a0f0df0055942d613afe1f30d550",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_mark_model_launched` appends `launched=true` before the shell starts `docker run`. If cancellation lands after the append but before Docker begins, the harness cannot publish `startup_failed` or an exit class. The workflow nevertheless admits the marker and defaults the missing class to `unknown`, even though no provider CLI ran. Case A kills during image build, case B waits until the Docker stub is already running, and case E is a source-adjacency assertion; none deterministically cancels in this exact boundary. Calling the gap small or irreducible does not make the admission claim sound.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Tie admission to a host-observable handshake establishing that the provider invocation actually began, using a channel outside model-writable state, and add a non-vacuous cancellation test that deterministically pauses after the current pre-Docker append point but before Docker/provider invocation, terminates the harness, and asserts that no provider-health-admissible marker or class remains.",
+    "severity": "major",
+    "title": "Pre-Docker marker still admits cancellation before invocation starts"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round-4 major remains unresolved. `_mark_model_launched` still publishes `launched=true` before the shell invokes `docker run`. Cancellation after that append but before Docker starts leaves no opportunity for the reserved-status retraction or exit-class capture, yet `model_health` admits the marker and records `unknown`; this still fabricates provider-health data when no provider CLI ran. The added text now explicitly accepts this residual window, and case E only proves source adjacency, not that entering the provider invocation is host-observed. Cases A and B still kill during image build and after the Docker stub has begun, respectively, so neither exercises the disputed boundary. Progress is therefore stagnant. No reviewer-directed injection was detected.",
+  "verdict": "request_changes"
+ }
+}
