@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4355,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "4f0025190a083d6f6839e31e1fdc17972998bddd",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The source explicitly concedes that a loader name assembled from fragments at runtime is beyond the lexical gate, then incorrectly asserts that a paper still must name a loader somewhere. A paper can construct both the binding and path, for example `#let grab = eval(\"j\" + \"son\", mode: \"code\")` followed by `#let d = grab(\"/src/data/paper-\" + \"timing.generated.json\")`, and render `d.records.at(key).value`. This matches none of LOADER_CALL, LOADER_ALIAS, GENERATED_TIMING_FILE, INTERNALS, ANY_IMPORT, or TIMING_IMPORT. The negative-fixture test still covers only direct/aliased loaders and computed paths, not construction of the loader binding. Thus the build gate does not establish the README/SKILL claim that papers cannot load data from disk or bypass forced provenance.",
+    "file": "site/scripts/timing-source-gate.mjs",
+    "fix_hint": "Replace the source-text denylist with a structural build boundary in which paper compilation cannot address the raw timing JSON and receives only provenance-rendering content/data. If retaining a lexical gate, conservatively reject reflective/code-evaluation constructs such as `eval` and add a real negative fixture that constructs `json` from string fragments plus a concatenated timing path, requiring `auditTimingSources` to report it.",
+    "severity": "major",
+    "title": "Reflective eval still bypasses the lexical timing-source gate"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 4 leaves the round-3 major finding materially unchanged. The gate now acknowledges that runtime-fragment assembly is beyond a lexical check, but still claims a structural backstop because a loader must be named somewhere. That claim is false: Typst can construct the loader binding itself with eval, and neither the implementation nor the negative fixtures reject reflective evaluation. The README and skill continue to promise that papers cannot load data from disk and that constructed paths cannot bypass the boundary. Because this is the load-bearing provenance boundary, the unresolved bypass remains major and progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
