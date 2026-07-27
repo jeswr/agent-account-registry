@@ -1,60 +1,49 @@
 {
-  "generated_at": "2026-07-26T23:47:04Z",
+  "generated_at": "2026-07-27T00:15:14Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
-      "issues_open": 1409,
+      "issues_open": 1411,
       "issues_ready": 385,
-      "issues_closed_1h": 4,
+      "issues_closed_1h": 0,
       "issues_closed_24h": 116,
       "prs_open": 120,
       "prs_draft": 84,
       "prs_opened_1h": 3,
       "prs_closed_1h": 0,
-      "prs_merged_1h": 4,
+      "prs_merged_1h": 0,
       "prs_merged_24h": 125,
-      "review_changes_backlog": 7,
+      "review_changes_backlog": 6,
       "needs_user_parked": 18,
       "review_lane_health": "ok",
-      "review_lane_runs_1h": 19,
+      "review_lane_runs_1h": 11,
       "worker_attempts_1h": 0,
       "worker_success_rate_1h": null,
       "pr_open_rate": 3.0,
-      "pr_close_rate": 4.0,
-      "net_pr_flow": -1.0
+      "pr_close_rate": 0.0,
+      "net_pr_flow": 3.0
     },
     "jeswr/agent-account-registry": {
-      "issues_open": 323,
+      "issues_open": 322,
       "issues_ready": 76,
-      "issues_closed_1h": 0,
-      "issues_closed_24h": 9,
+      "issues_closed_1h": 2,
+      "issues_closed_24h": 10,
       "prs_open": 30,
       "prs_draft": 18,
       "prs_opened_1h": 1,
       "prs_closed_1h": 0,
-      "prs_merged_1h": 1,
+      "prs_merged_1h": 0,
       "prs_merged_24h": 19,
       "review_changes_backlog": 4,
       "needs_user_parked": 6,
-      "review_lane_health": "ok",
-      "review_lane_runs_1h": 1,
+      "review_lane_health": "idle",
+      "review_lane_runs_1h": 0,
       "worker_attempts_1h": 0,
       "worker_success_rate_1h": null,
       "pr_open_rate": 1.0,
-      "pr_close_rate": 1.0,
-      "net_pr_flow": 0.0
+      "pr_close_rate": 0.0,
+      "net_pr_flow": 1.0
     }
   },
-  "alerts": [
-    {
-      "target": "jeswr/agent-account-registry",
-      "classification": "ready-starved",
-      "fire": true,
-      "summary": "ready frontier 76 > 30 but 0 issues closed over 2 snapshots \u2014 the drain has stalled",
-      "metrics": {
-        "issues_ready": 76,
-        "issues_closed_1h": 0
-      }
-    }
-  ]
+  "alerts": []
 }
