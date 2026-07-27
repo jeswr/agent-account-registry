@@ -623,6 +623,15 @@ PARK_REFUSAL_EVIDENCE_MALFORMED = "evidence-malformed"
 PARK_REFUSAL_EVIDENCE_CONSUMED = "evidence-consumed"
 PARK_REFUSAL_EVIDENCE_STALE = "evidence-stale"      # recovery not strictly after the park
 PARK_REFUSAL_NOT_OFFERED = "not-offered"            # proof-gate call: auto_evidence is None
+# The two exits a SWEEP takes BEFORE it ever reaches capacity_park_admission. Review of the first
+# round of this taxonomy measured 8 parked PRs in, 5 census rows out: both of these `continue`
+# before the admission call, so neither was written, and the rows summed to the ADMISSIONS rather
+# than to the population. `tick-deferred` is benign (it logs per PR and self-heals next tick);
+# `read-failed` is not — a PR whose GitHub read fails on every tick is precisely a stuck-forever
+# population, and it was absent from the only aggregate that could have expressed it. That is the
+# same missing-edge defect this taxonomy exists to remove, one layer down, so both are codes.
+PARK_REFUSAL_READ_FAILED = "read-failed"            # the PR's own GitHub state was unreadable
+PARK_REFUSAL_TICK_DEFERRED = "tick-deferred"        # AUTO_READMISSION_PER_TICK_MAX spent
 
 # Which refusals a later tick can clear WITHOUT a human. The split is the whole point of the
 # taxonomy, so it is data, not a predicate scattered across callers.
@@ -640,6 +649,7 @@ PARK_REFUSAL_CODES = frozenset({
     PARK_REFUSAL_TIMELINE_UNREADABLE, PARK_REFUSAL_PROBE_FAILED, PARK_REFUSAL_NO_EVIDENCE,
     PARK_REFUSAL_EVIDENCE_MALFORMED, PARK_REFUSAL_EVIDENCE_CONSUMED,
     PARK_REFUSAL_EVIDENCE_STALE, PARK_REFUSAL_NOT_OFFERED,
+    PARK_REFUSAL_READ_FAILED, PARK_REFUSAL_TICK_DEFERRED,
 })
 
 # The two ADMITTING actions and the human-gesture action are not refusals; they are recorded in
@@ -659,6 +669,22 @@ def park_refusal_exit_class(code):
     if code in PARK_REFUSAL_CODES:
         return "exit-reachable"
     return None
+
+
+def park_census_record(census, repo, pr_number, code, detail):
+    """Append EXACTLY ONE census row to `census` (a no-op for a non-list, the out-list idiom).
+
+    THE ONLY WRITER of a census row, used both by capacity_park_admission's own `_answer` and by
+    the sweep's pre-admission exits (`read-failed`, `tick-deferred`). One writer is the point: a
+    second hand-built `census.append(...)` elsewhere is how the `exit` class silently drifts from
+    park_refusal_exit_class, and the exit class is what splits "no tick will ever clear this"
+    from "a later tick will"."""
+    if not isinstance(census, list):
+        return
+    census.append({"repo": repo, "number": pr_number, "code": code,
+                   "exit": (None if code in set(PARK_ADMIT_CODES.values())
+                            else park_refusal_exit_class(code)),
+                   "detail": detail})
 
 
 def park_census_summary(records):
@@ -752,12 +778,10 @@ def capacity_park_admission(repo, pr_number, issue_number, fetch_events, is_huma
     aggregates the rows so the human-terminal population stops being invisible."""
     def _answer(action, evidence, code, detail):
         """Record one census row and return the answer UNCHANGED. The recording is strictly
-        additive — a census list that is absent, or of the wrong type, is simply not written."""
-        if isinstance(census, list):
-            census.append({"repo": repo, "number": pr_number,
-                           "code": PARK_ADMIT_CODES.get(action, code),
-                           "exit": None if action else park_refusal_exit_class(code),
-                           "detail": detail})
+        additive — a census list that is absent, or of the wrong type, is simply not written.
+        Delegates to park_census_record so this and the sweep's pre-admission exits cannot
+        disagree about the row shape or the exit class."""
+        park_census_record(census, repo, pr_number, PARK_ADMIT_CODES.get(action, code), detail)
         return (action, evidence, detail)
 
     if capacity_park_readmitted(repo, pr_number, issue_number, fetch_events,
@@ -2154,6 +2178,28 @@ def _self_test():
     check("census: an unreadable timeline is COUNTED, not silent",
           [(row["code"], row["exit"]) for row in unreadable_rows],
           [(PARK_REFUSAL_TIMELINE_UNREADABLE, "exit-reachable")])
+    # THE SWEEP'S OWN EXITS. Two decisions about a parked PR are made BEFORE the admission is
+    # ever called (dispatch-claim._readmit_capacity_parks): the per-tick pacing defer and a
+    # per-PR GitHub read that failed. Review measured 8 parked PRs in and 5 rows out because of
+    # them. They are written through the SAME single writer, so their row shape and exit class
+    # cannot drift from the admission's.
+    sweep_exits = []
+    park_census_record(sweep_exits, "o/r", 10, PARK_REFUSAL_READ_FAILED, "comments unreadable")
+    park_census_record(sweep_exits, "o/r", 70, PARK_REFUSAL_TICK_DEFERRED, "cap 5 spent")
+    check("census: the sweep's PRE-ADMISSION exits are counted, with the admission's row shape",
+          sweep_exits,
+          [{"repo": "o/r", "number": 10, "code": PARK_REFUSAL_READ_FAILED,
+            "exit": "exit-reachable", "detail": "comments unreadable"},
+           {"repo": "o/r", "number": 70, "code": PARK_REFUSAL_TICK_DEFERRED,
+            "exit": "exit-reachable", "detail": "cap 5 spent"}])
+    # ...and NEITHER is human-terminal: a read failure and a paced defer are both things a later
+    # tick can genuinely clear. Filing either as human-terminal would put a transient blip into
+    # the cohort an operator is told needs a HUMAN gesture, which is how that warning stops
+    # meaning anything.
+    check("census: neither sweep exit is filed as human-terminal", park_census_summary(
+        sweep_exits), ({PARK_REFUSAL_READ_FAILED: 1, PARK_REFUSAL_TICK_DEFERRED: 1}, [], []))
+    check("census: the single writer ignores a non-list census (the out-list idiom)",
+          park_census_record(None, "o/r", 1, PARK_REFUSAL_READ_FAILED, "x"), None)
     # An ADMISSION is censused too, so the rows sum to the population rather than to the
     # refusals alone, and it belongs to NEITHER blocked class.
     check("census: an auto-mint is recorded under an admit code with no exit class",

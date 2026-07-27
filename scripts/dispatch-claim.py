@@ -2724,6 +2724,13 @@ def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_logi
                     f"{readmitted} park(s) (cap {AUTO_READMISSION_PER_TICK_MAX}) — the park "
                     "stands until the next tick so the re-entry cannot starve the allocator "
                     "whose starvation parked most of them")
+                # [G5] CENSUSED even though it never reaches the admission: this PR IS in the
+                # parked population, and a census that counts only what the admission decided
+                # sums to the ADMISSIONS, not to the population it claims to describe.
+                _park_policy.park_census_record(
+                    park_census, repo, number, _park_policy.PARK_REFUSAL_TICK_DEFERRED,
+                    f"this tick's automatic re-admission cap "
+                    f"({AUTO_READMISSION_PER_TICK_MAX}) is spent")
                 continue
             # ONE spelling of the hold rule (park_policy.human_owned_holds), shared with
             # capacity_park_admission's own refusal and the migration precondition, so the
@@ -2767,6 +2774,21 @@ def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_logi
         except (DispatchError, worker_pr.WorkerPrError) as exc:
             log(f"::warning::auto-readmit skipped for {repo}#{number}: {exc}; the capacity "
                 "park stands")
+            # [G5] The exit that MOST needed counting. A per-PR read that fails on this tick can
+            # fail on every tick, and such a PR is stuck forever — the exact shape this census
+            # exists to make expressible — yet it left no row at all, because the failure
+            # precedes the admission call. It is counted conservatively: the read failure may
+            # have preceded the machine-park check, so this row can include a PR whose park
+            # status could not be ESTABLISHED. That is the fail-visible direction; unreadable is
+            # unknown, and unknown must be counted rather than silently dropped. It has its own
+            # code, so it pollutes neither the human-terminal cohort nor any other count.
+            _park_policy.park_census_record(
+                park_census, repo, number, _park_policy.PARK_REFUSAL_READ_FAILED,
+                f"the PR's own GitHub state could not be read ({exc})")
+    # The `continue`s ABOVE the try — a non-bot author, a fork head, a closed PR, a PR with no
+    # live machine park — are deliberately NOT censused: those PRs are not in the parked
+    # population, and counting them would make the aggregate describe the board instead of the
+    # parks. Every exit taken by a PR that IS parked now writes exactly one row.
     _log_park_census(repo, park_census, log=log)
     return readmitted
 
@@ -10310,7 +10332,7 @@ def _self_test():
     }
 
     def readmit_sweep(window, rows=None, labels=None, comments=(), holds=None, timeline=None,
-                      provenance=None):
+                      provenance=None, comments_fn=None):
         """Run the sweep with every GitHub seam injected; returns (count, posted, cleared).
 
         The sweep's OWN log is captured on `readmit_sweep.log` rather than discarded. It used to
@@ -10327,7 +10349,8 @@ def _self_test():
             provenance if provenance is not None else {41: {"issue": 7}},
             readmit_bot, Path("."), worker_pr_mod,
             _capacity_recovery_probe(model_health_mod, window, readmit_now),
-            comments_fn=lambda _repo, _number: list(comments),
+            comments_fn=(comments_fn if comments_fn is not None
+                         else lambda _repo, _number: list(comments)),
             timeline_fn=lambda _repo, number: list((timeline or park_timeline).get(number, [])),
             post_comment=lambda _repo, number, body: posted.append((number, body)),
             clear_labels=lambda pr, issue: cleared.append((pr, issue)),
@@ -10447,6 +10470,52 @@ def _self_test():
             terminal_warnings[0]
         print("  ok   [G5] END-TO-END: the REAL sweep's own log carries the aggregate census "
               "(human-applied=1, no-evidence=1) and NAMES the human-terminal PR (#41, not #42)")
+
+        # ------------------------------------------------------------------------------------
+        # [G5] THE ROWS SUM TO THE POPULATION — 8 parked PRs in, 8 rows out.
+        #
+        # Review measured this exact scenario on the first round of the taxonomy and got 8 in
+        # and 5 counted: the per-tick pacing defer and a failed per-PR read both `continue`
+        # BEFORE the admission call, so neither wrote a row and the aggregate summed to the
+        # ADMISSIONS instead of the population. The read-failure case is the one that matters —
+        # a PR whose GitHub read fails on this tick can fail on every tick, which is a
+        # stuck-forever population that the one aggregate built to express it could not see.
+        #
+        # #41's comments read raises (read-failed); #42..#46 re-admit on proven recovery and
+        # spend AUTO_READMISSION_PER_TICK_MAX; #47 and #48 are then paced off (tick-deferred).
+        crowd = [dict(parked_row, number=n,
+                      head={**parked_row["head"], "ref": f"sparq-agent/issue-{n - 34}-abc"})
+                 for n in range(41, 49)]
+        crowd_provenance = {n: {"issue": n - 34} for n in range(41, 49)}
+        crowd_timeline = {n: [{"event": "labeled",
+                               "label": {"name": MACHINE_PARK_PR_LABEL},
+                               "created_at": park_stamp, "actor": {"login": readmit_bot},
+                               "performed_via_github_app": {"slug": "app"}}]
+                          for n in range(41, 49)}
+        crowd_timeline.update({n - 34: [] for n in range(41, 49)})
+
+        def crowd_comments(_repo, number):
+            if number == 41:
+                raise DispatchError("comments page unreadable")
+            return []
+
+        count, posted, cleared = readmit_sweep(
+            recovered_window, rows=[crowd], labels={n - 34: [] for n in range(41, 49)},
+            timeline=crowd_timeline, provenance=crowd_provenance, comments_fn=crowd_comments)
+        assert count == AUTO_READMISSION_PER_TICK_MAX == 5, count
+        crowd_aggregates = [line for line in readmit_sweep.log
+                            if line.startswith("park census example/repo: ")]
+        assert len(crowd_aggregates) == 1, readmit_sweep.log
+        assert crowd_aggregates[0] == (
+            "park census example/repo: admitted-auto-mint=5, read-failed=1, tick-deferred=2"), \
+            crowd_aggregates[0]
+        # 8 PRs entered the parked population; 8 rows came out. Nothing is human-terminal here,
+        # so no operator is paged for a transient read failure or a paced defer.
+        assert not [line for line in readmit_sweep.log if "HUMAN-TERMINAL" in line], \
+            readmit_sweep.log
+        print("  ok   [G5] END-TO-END: the census rows SUM TO THE POPULATION — 8 parked PRs in, "
+              "8 rows out (5 admitted + 1 read-failed + 2 tick-deferred), none paged as "
+              "human-terminal")
         # A(g): the per-PR cap terminates — AUTO_READMISSION_MAX markers (well-formed or not)
         # refuse the next re-admission even with fresh evidence.
         capped = [{"user": {"login": readmit_bot},
