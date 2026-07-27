@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4417,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "4369e61fba04c0335b77500e23bae1bb8df027d7",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The revision is internally consistent with the implementation paths it documents. The new tests exercise the real vec: rewrite/query path: k=0 is accepted and produces an empty result across nearest/search and vector/node seed coverage, while constants in the score position reach the shared bare-variable validation and produce the asserted hard error. The expanded informative format, normalization, assurance-namespace, and container-validation descriptions match the corresponding store, DiskANN, delta, schema, provenance, and bounded-validation code. The text also avoids overclaiming: it explicitly marks primary-container normalization, namespace dereferenceability, provenance, and authenticity gaps as unsatisfied, and describes the bounded model-checking scope as bounded rather than universal over arbitrary-length inputs.",
+  "verdict": "approve"
+ }
+}
