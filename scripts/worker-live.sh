@@ -4212,6 +4212,19 @@ PY
   chk "..._first_match_line too: no consumer process, so nothing can early-exit (#879)" \
     "$(_first_match_line "$sp_needle" <<< "$sp_cap")" "1"
 
+  # _first_match_line replaced eight `grep -n … | head -n1 | cut` sites, so it needs its own direct
+  # tests — every one of its callers happens to use a pattern that matches EXACTLY ONCE, so the
+  # order assertions above cannot tell "first" from "last" and a mutation that returned the LAST
+  # match survived the whole suite. These two pin the contract instead of relying on its callers:
+  chk "_first_match_line returns the FIRST match, not the last (multi-match input)" \
+    "$(_first_match_line 'x' <<< $'a\nx\nb\nx\nc')" "2"
+  # ...and no-match is a NORMAL empty result with status 0, NOT a `set -e` abort. This is what makes
+  # the "after-or-missing" / "attest-first-or-missing" / "label-first-or-missing" arms of the order
+  # assertions reachable at all: under the old `grep -n … | head` shape a zero-match pipeline exited
+  # 1 through `pipefail` and killed the whole suite before the arm could ever be reported.
+  chk "..._first_match_line reports no-match as empty+status-0 (the -or-missing arms are reachable)" \
+    "$(_first_match_line 'zzz-no-such-string' <<< $'a\nb'; printf '|%s' "$?")" "|0"
+
   # Guard 2 — STATIC, and this is the one that keeps the class out. A behavioural test only covers
   # the call sites someone remembered to write a test for; the scanner covers every line of
   # scripts/*.sh. Positive control FIRST so the zero below cannot be a scanner that matches nothing:
