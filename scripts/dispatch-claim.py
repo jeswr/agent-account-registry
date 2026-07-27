@@ -861,7 +861,8 @@ def _gate_state_of(gate_entry):
 def tiered_gate_conclusion(check_runs, log=print):
     """PURE, TIER-AWARE aggregator resolution over CI_TIERED_GATE_CHECKS — the ONE predicate
     every DRAFT-head red-gate decision reads (the review-dispatch precondition in
-    enumerate_review_items and the GAP-A needs-ci-fix admission that receives its reroutes).
+    the GAP-A needs-ci-fix admission in enumerate_review_items and CLAIM's live
+    re-derivation of it).
 
     Same failure|pending|success|missing|unknown vocabulary as interpret_check_runs, resolved
     newest-run-wins ACROSS the tiered names — a full-tier `gate` run started after a
@@ -1671,7 +1672,7 @@ def is_enumerable_provenance(record, pr_number):
 
 
 def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, bot_login="",
-                           pr_status=None, exclusions=None, reroutes=None):
+                           pr_status=None, exclusions=None):
     """PURE review_items enumerator (called by the dispatch.yml PLAN step against its own data;
     unit-tested by --self-test). Fail-closed trust posture (locked decisions 1/3/11/13/19):
     - only open PRs whose head branch matches the worker pattern,
@@ -1698,17 +1699,12 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
     - needs-rebase: a CONFLICTING base (mutually exclusive with, and prioritized over, both the
       review/fix loop and the ci-fix — CI and reviews on a conflicted base are noise),
     - needs-ci-fix: the TIERED aggregator (tiered_gate_conclusion) CONCLUDED failure on the
-      CURRENT head. Two ways in. (a) the merge-queue starver: crate-scoped local gates pass,
-      full-matrix legs are red, reviews approve on substance, nothing fixes CI; (b) the
-      RED-GATE REVIEW-DISPATCH PRECONDITION — a PR that would otherwise have been emitted as
-      needs-review is rerouted here instead, because a review bound to a head whose gate has
-      ALREADY concluded red spends a review round restating what CI reported. Measured over the
-      2026-07-19..26 verdict ledger with dispatch timestamps applied: 38/151 (25.2%) of round-1
-      review FAILURES were bound to such a head, against 15.1% of round-1 approvals — so the
-      red-gate head both predicts a wasted round and is ~1.7x enriched among the wasted ones.
-      A gate still in progress is NOT enumerated and is NOT rerouted (no churn; 25.3% of
-      round-1 heads were pending at dispatch and must still be reviewed). A status whose
-      head_sha disagrees with the live listing is stale and ignored (unknown never acts),
+      CURRENT head while the loop has nothing else to do for the PR (the merge-queue starver:
+      crate-scoped local gates pass, full-matrix legs are red, reviews approve on substance,
+      nothing fixes CI). Reading the TIERED conclusion rather than the strict merge-required
+      `gate` is what makes this admission reachable at all on a DRAFT head — see
+      CI_TIERED_GATE_CHECKS. A gate still in progress is NOT enumerated (no churn). A status
+      whose head_sha disagrees with the live listing is stale and ignored (unknown never acts),
     - stranded: a DRAFTED, unarmed PR whose reviewed head has a concluded-GREEN gate on a clean
       base — the residue of an interrupted defuse/disarm that no other state can re-admit. After
       its own live re-derivation CLAIM RE-REVIEWS the current head (issue #161) under the bounded
@@ -1862,33 +1858,6 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
                 "context": context[:CI_CONTEXT_MAX],
             })
 
-        def emit_review():
-            """RED-GATE REVIEW-DISPATCH PRECONDITION. Every needs-review emit goes through
-            here so the precondition cannot be bypassed by adding a sixth re-entry path.
-
-            A review bound to a head whose TIERED aggregator has already CONCLUDED red does
-            not produce new information — the reviewer reads the diff and restates a failure
-            CI already reported. Reroute it to the fix lane (needs-ci-fix, the SAME state the
-            merge-queue-starver path uses) so the head is repaired first and the review lands
-            on a head worth reviewing. Not a defer, not a park: needs-ci-fix is a live lane
-            with a bounded budget, and its own fix outcome flips the PR back to review:needs
-            on the new head, so there is no absorbing state to fall into.
-
-            FAILS OPEN on every non-`failure` reading — pending, success, missing, unknown,
-            and a degraded check-run snapshot (which drops the field entirely) all keep the
-            ordinary review dispatch. A red gate WITHOUT a free lease also keeps it: the
-            reroute target requires lease_free, so narrowing here instead would drop the
-            item with no lane at all."""
-            if lease_free and status.get("tiered_gate") == "failure":
-                emit("needs-ci-fix", context=", ".join(status.get("failing_legs") or []))
-                reason = ("red gate already concluded on this head — rerouted from "
-                          "needs-review to the needs-ci-fix lane")
-                print(f"review-enumeration: reroute {repo}#{number}: {reason}")
-                if reroutes is not None:
-                    reroutes[reason] += 1
-                return
-            emit("needs-review")
-
         # GAP-B: conflict repair FIRST and alone — CI on a conflicted base is noise. This is
         # REVIEW-STATE-AGNOSTIC by design (issue #351, the #256 limbo): a review:pass PR is
         # armable (decision 7 REVISED) but the arm can NEVER merge a conflicting base, so a
@@ -1930,7 +1899,7 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
             # red CI can fall through to needs-ci-fix. A READY explicit re-entry is different:
             # the external transition itself requests that the PR be brought back into review.
             if not draft or not reviewed_match:
-                emit_review()
+                emit("needs-review")
                 continue
         if draft:
             # A provenance-backfilled pre-migration PR with no review:* label yet, or a
@@ -1942,7 +1911,7 @@ def enumerate_review_items(repo, pulls, provenance, leases, issue_labels, now, b
                 exclude_signalled("a live per-PR review lease already owns this PR")
                 continue
             if not reviewed_match:
-                emit_review()
+                emit("needs-review")
                 continue
             # head already reviewed — fall through to the ci-fix consideration below (this is
             # exactly the starved posture: the loop is done with this head, CI is not).
@@ -7065,10 +7034,14 @@ def _self_test():
         (no snapshot at all — a degraded/absent check-run read); a stale head_sha collapses to the
         same thing inside the enumerator."""
         base = {"head_sha": sha_a, "conflicting": False, "armed": False, "failing_legs": []}
+        # `tiered_gate` mirrors `gate` here: these fixtures model heads where the strict
+        # merge-required context IS present, so both readings agree. pr_ci_status always
+        # emits both (asserted structurally below), so a row is never missing the field.
         return {
-            "green": {41: {**base, "gate": "success"}},
-            "red": {41: {**base, "gate": "failure", "failing_legs": ["workspace clippy"]}},
-            "pending": {41: {**base, "gate": "pending"}},
+            "green": {41: {**base, "gate": "success", "tiered_gate": "success"}},
+            "red": {41: {**base, "gate": "failure", "tiered_gate": "failure",
+                         "failing_legs": ["workspace clippy"]}},
+            "pending": {41: {**base, "gate": "pending", "tiered_gate": "pending"}},
             "unknown": None,
         }
 
@@ -7173,7 +7146,8 @@ def _self_test():
                     body=f"desc\n\n<!-- sparq-reviewed-sha:{reviewed} -->\n")
 
     _armed_status = {41: {"head_sha": sha_a, "conflicting": False, "armed": True,
-                          "gate": "failure", "failing_legs": ["docs-quality quick-gates"]}}
+                          "gate": "failure", "tiered_gate": "failure",
+                          "failing_legs": ["docs-quality quick-gates"]}}
     # THE CONSEQUENCE, through the real projection: the post-hand-over PR must NOT be emitted for
     # disarm. If the hand-over retracts this PR's marker, `_pass_body_sha` becomes `none` and the
     # safety net fires — disable-auto + dequeue + REDRAFT on a passed, armed, ready PR.
@@ -8200,9 +8174,14 @@ def _self_test():
     assert pr_ci_status({**record, "check_runs_degraded": True})["gate"] == "missing"
 
     # ---- GAP-A/B enumeration: zero-manual repair states over the same surface ----
-    def status_of(status_sha, gate="success", conflicting=False, armed=False, legs=()):
+    def status_of(status_sha, gate="success", conflicting=False, armed=False, legs=(),
+                  tiered_gate=None):
+        # Mirrors pr_ci_status's real shape. `tiered_gate` defaults to `gate` (the case where
+        # the strict merge-required context exists on the head and both readings agree); the
+        # DRAFT-tier case — strict `gate` missing, tiered red — is passed explicitly.
         return {"head_sha": status_sha, "conflicting": conflicting, "armed": armed,
-                "gate": gate, "failing_legs": sorted(legs)}
+                "gate": gate, "failing_legs": sorted(legs),
+                "tiered_gate": gate if tiered_gate is None else tiered_gate}
 
     starved = pull(41, "sparq-agent/issue-7-1-1", sha_a, labels=["review:needs"],
                    body=f"x <!-- sparq-reviewed-sha:{sha_a} -->")
@@ -8484,7 +8463,16 @@ def _self_test():
         if "/pulls/41" in path:
             return fake["pull"]
         if "/check-runs" in path:
-            return {"check_runs": fake["check_runs"]}
+            # Serve the tiered read the way GitHub does: one NAME per request, plus the
+            # endpoint's own `total_count` (which _live_tiered_gate cross-checks). The
+            # fixture's rows are keyed by their own `name`, so a head whose only aggregator
+            # is `gate, draft-tier` answers the strict `check_name=gate` request with an
+            # EMPTY page — exactly the live sparq draft shape.
+            wanted = next((name for name in CI_TIERED_GATE_CHECKS
+                           if f"check_name={urllib.parse.quote(name, safe='')}" in path), None)
+            served = [run for run in fake["check_runs"]
+                      if wanted is None or run.get("name") == wanted]
+            return {"check_runs": served, "total_count": len(served)}
         if "/timeline" in path:
             # The readmission-window probe (PR + source-issue label timelines). A missing
             # entry serves an EMPTY timeline (no human unlabel — the full-count behaviour
@@ -9622,7 +9610,9 @@ def _self_test():
                 if match:
                     return fanout_pulls[int(match.group(1))]
                 if "/check-runs" in path:
-                    return {"check_runs": gate_red}
+                    served = [run for run in gate_red
+                              if f"check_name={urllib.parse.quote(run['name'], safe='')}" in path]
+                    return {"check_runs": served, "total_count": len(served)}
                 match = re.search(r"/issues/([0-9]+)/comments(?:\?.*)?$", path)
                 if match:
                     return [[]]
