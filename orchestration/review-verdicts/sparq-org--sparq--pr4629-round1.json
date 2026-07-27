@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4629,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c450814ccafa147c66fdb41948dbf2dc7896959e",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly extends form applicability to SHACL predicate targets. Subject and object membership checks use the appropriate graph direction, the strongest matching rationale is retained independently of target iteration order, and dash:applicableToClass correctly supersedes predicate-based rationales without overriding node/class matches. The public ShapeVia expansion is documented across the crate README, API docs, and matching skill. Tests exercise positive and negative subject/object selection, full cross-shape ordering, multiple rationales on one shape, selected-form behavior, and serialized golden output; these assertions traverse the real ShapesModel and Graph-backed applicability path and are non-vacuous. No security or soundness defects are evident in the diff.",
+  "verdict": "approve"
+ }
+}
