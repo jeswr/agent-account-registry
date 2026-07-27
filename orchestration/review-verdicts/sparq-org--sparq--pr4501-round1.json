@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4501,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "7c17c1760ca4f65f6963af8f5ee0aebb80414c6f",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "hidden_only_salt_disclosure_is_dominated_by_the_clear_commitment never serializes a presentation, invokes the verifier, or calls reconstruct_public_inputs. Its local disclosed_commitments helper merely collects commitments from fields in the fixture, and additionally collects HiddenIssuerAttestation.commitment itself. Thus equality before/after clearing salt follows structurally from changing only salt, and non-emptiness follows from the test inserting c into those fields. The test does not establish that C(G) is exposed on the real presentation path or byte-bound into the bb public inputs, despite comments and docs presenting it as a trip-wire for exactly those properties.",
+    "file": "crates/sparq-zk-compose/src/verifier.rs",
+    "fix_hint": "Replace or supplement this with a real-path test that serializes/deserializes the hidden-only manifest and asserts the exact public-input bytes reconstructed for the scan contain C(G), then verifies that removing salt does not remove C(G) from the externally disclosed representation. Avoid defining disclosure by a test-only helper that directly reads the fields whose presence is the premise.",
+    "severity": "major",
+    "title": "The claimed disclosure trip-wire is synthetic and vacuous"
+   },
+   {
+    "body": "Section 3 claims graph -> salt is fixed at issuance and globally unique per graph, so salt and C(G) induce an identical equivalence relation across presentations. The cited SaltReused logic only rejects one salt mapped to two distinct referenced commitments inside the manifest being verified; it neither enforces global uniqueness across presentations nor proves that repeated presentations or re-issuances of the same graph retain one salt. Consequently, the stronger 'identical partition' claim does not follow from the code evidence. At most, current clear disclosure of the same C(G) can dominate salt linkage under explicitly stated issuance/stability assumptions.",
+    "file": "research/zk-hidden-path-salt-disclosure.md",
+    "fix_hint": "State the precise threat-model assumptions needed for cross-presentation domination and identify where salt stability/global uniqueness across issuances is enforced. If it is not enforceable, narrow the conclusion to the current manifest/issuance model and remove the 'identical partition' and globally enforced language. Add a real test only for properties the verifier actually enforces.",
+    "severity": "major",
+    "title": "Identical cross-presentation partition is not supported by the cited uniqueness check"
+   }
+  ],
+  "progress": null,
+  "summary": "The privacy conclusion may be reasonable for the current format, but the PR overstates both its proof and its regression coverage. The new test does not exercise serialization, verification, or reconstructed public inputs; it computes a synthetic set directly from the same manifest fields it populated, including HiddenIssuerAttestation.commitment. It therefore cannot serve as the claimed trip-wire that C(G) remains publicly disclosed and proof-bound. The accompanying assertion that audit #9 makes graph-to-salt induce an identical cross-presentation partition is also not established by the cited verifier behavior, which checks salt reuse only among distinct referenced commitments within one manifest. These are load-bearing claims in a ZK privacy assessment, so the change needs stronger evidence and narrower wording before approval.",
+  "verdict": "request_changes"
+ }
+}
