@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4537,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "773c0cf0fe8f9c123757882c8b51a1f7ae8d6194",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 4 remains correct and complete on the diff-scoped evidence. Statement provenance is keyed by the asserted triple for both RDF 1.2 and complete RDF 1.1 reification, with unannotated reifiers correctly falling back to the head and multiple annotations combined deterministically by minimum weight. Pooling uses the restricted training graph, shares one trained model between paired arms, preserves the exact uniform/no-statement-provenance no-op, and has non-vacuity and malformed-input coverage. Query-time fusion weights are aligned one-for-one with retained blocks; the per-node path scans only the grounded node's matching predicate edges and fails open for missing mappings or edges, while the persisted header value is accurately documented as graph-global. The focused grounding tests exercise the real vector-store, header, grounding, and weighted-RRF paths, including distinct per-node outcomes. Public API documentation is updated consistently, and no hostile instruction is present in the diff. With no findings in either round 3 or round 4, progress is stagnant under the required comparison scale.",
+  "verdict": "approve"
+ }
+}
