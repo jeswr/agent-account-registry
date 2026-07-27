@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 789,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "4b083d185bc4aebb50a521a32122e4c85c66aed7",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new branch identifies `absent == 0` as `the migrate mutated nothing`. That conclusion is not established by `_repo_names`: a run interrupted after copying one or more values to the environment but before its first repository deletion also leaves all 14 repository names present. The branch still refuses safely, and re-dispatching the migration remains the appropriate recovery while writers are quiesced, so this is a diagnostic accuracy issue rather than a trust-check bypass.",
+    "file": "scripts/migrate-secrets.sh",
+    "fix_hint": "Describe the state as `all 14 remain at repository scope (consistent with a pre-migration abort or an interruption before repository deletion)` and retain the same refusal and recovery. If an exact pre-migration diagnosis is required, establish it from additional fail-closed evidence rather than repository-name presence alone.",
+    "severity": "minor",
+    "title": "All repository names present does not prove the migration mutated nothing"
+   }
+  ],
+  "progress": "improving",
+  "summary": "The round-1 blocker is fixed. The all-14-at-repository pre-migration shape is no longer accepted: `assert_repo_scope_clear_for_resume` dies before any workflow enable, while the existing partial-state and empty-repository branches remain fail-closed and accept-only-after-convergence respectively. Scenario 28b non-vacuously asserts rc=1, the distinct diagnosis, zero enables, and exact call history; scenario 28c pins the 13-of-14 boundary. One minor diagnostic overclaim remains: repository-name presence alone cannot prove that the migration mutated nothing, because an interruption after environment copy but before the first repository deletion has the same repository shape. This does not reopen the credential-loss path or make the prescribed convergence recovery less safe under the quiesced protocol.",
+  "verdict": "approve"
+ }
+}
