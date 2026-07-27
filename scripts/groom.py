@@ -6135,17 +6135,56 @@ def _self_test() -> int:
             "/repos/owner/repo/issues/31/comments": [
                 _park_receipt_comment(1), _park_receipt_comment(2)]}
         capped_log, _e, _r = _sweep_with_refusals({}, pulls=(_stale_worker_pr(31),))
+        # [#769] THE ESCALATION MUST NOT CLAIM GRANTS THAT WERE NEVER MADE. This fixture is the
+        # dominant live shape: two PARK receipts, ZERO un-park receipts. The cap counts park
+        # GENERATIONS, and a generation is consumed by every re-park however the label was
+        # cleared — so generation 3 does NOT imply the machine granted two re-admissions, and the
+        # first version of this comment asserted flatly that it did. A maintainer told the machine
+        # already tried twice goes looking for a flapping cause; the durable record says nobody
+        # tried at all, and what actually wants explaining is what kept clearing the park.
+        # BOTH DIRECTIONS are asserted, here and immediately below, because a wording that is
+        # honest for one grant count and false for the other is the defect itself.
         check(
-            "re-admission is CAPPED: an age park past AGE_UNPARK_MAX escalates to needs:user and "
-            "the comment names the REPEATED FAILURE rather than the timeout",
+            "[#769] re-admission is CAPPED: an age park past AGE_UNPARK_MAX escalates to "
+            "needs:user, and with NO grants on record the comment says the machine granted NONE "
+            "— it never claims re-admissions it did not make",
             (
                 _park_bodies(),
                 any("age-park generation 3" in body for body in _comment_bodies()),
+                any("the machine granted NO automatic re-admission on this PR"
+                    in body for body in _comment_bodies()),
+                any("the machine already granted" in body for body in _comment_bodies()),
+                any("automatic re-admission(s)" in body for body in _comment_bodies()),
+            ),
+            ([{"labels": ["needs:user"]}], True, True, False, False),
+        )
+        # ... and the SAME escalation with two REAL grants on record states the count it can
+        # prove, and names the flap. Swap the two branches and one of these two checks reds.
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/32/comments": [
+                _park_receipt_comment(1, 32), _park_receipt_comment(2, 32),
+                {"user": {"login": "app[bot]"},
+                 "body": f"{AGE_UNPARK_MARKER} cause=merge-dirty head={32:040x} gen=1 -->"},
+                {"user": {"login": "app[bot]"},
+                 "body": f"{AGE_UNPARK_MARKER} cause=merge-dirty head={32:040x} gen=2 -->"}]}
+        granted_log, _e, _r = _sweep_with_refusals({}, pulls=(_stale_worker_pr(32),))
+        check(
+            "[#769] ...and when the machine DID grant re-admissions, the escalation states the "
+            "count the receipts prove and names the flap",
+            (
+                any("the machine granted 2 automatic re-admission(s)" in body
+                    for body in _comment_bodies()),
                 any("a repeated failure — not a timeout" in body
                     for body in _comment_bodies()),
+                any("granted NO automatic re-admission" in body
+                    for body in _comment_bodies()),
             ),
-            ([{"labels": ["needs:user"]}], True, True),
+            (True, True, False),
         )
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/31/comments": [
+                _park_receipt_comment(1), _park_receipt_comment(2)]}
+        capped_log, _e, _r = _sweep_with_refusals({}, pulls=(_stale_worker_pr(31),))
         # The escalation is itself RECEIPTED, and that receipt is what makes it idempotent. Drop it
         # and `already_commented` can never match the body just written, so every subsequent sweep
         # posts the same escalation again — comment spam on a PR already handed to a human, and a
@@ -6292,6 +6331,88 @@ def _self_test() -> int:
             "a receipt on record (park_policy invariant 3, preserved exactly)",
             (terminal_sweep_env["writes"], "age_unparked=0" in human_log),
             ([], True),
+        )
+
+        # [#769] THE ONE RULE, on the PAIR the previous check could not reach. The check above
+        # carries `needs:user` ALONE, so the MACHINE_PARK_PR_LABEL membership test refuses it and
+        # human_owned_holds is never consulted — which is exactly how this went missing. The
+        # defect is the PR wearing BOTH labels: it enters the phase (the machine label IS live),
+        # its cause HAS recovered, and before this guard it was GRANTED — measured on the real
+        # function: `grants=1`, an un-park receipt minted, `review:parked` deleted.
+        #
+        # No human label was cleared, so invariant 3 held literally, and that is what made it easy
+        # to miss. The harm is the BUDGET: the one automatic recovery this park will ever earn was
+        # spent on a PR that provably could not re-enter, because the live `needs:user` keeps
+        # every downstream admission refusing. Consume-once means it can never be re-earned.
+        #
+        # BOTH HOLD SPELLINGS are driven, because human_owned_holds covers `review:needs-user` and
+        # ANY `needs:*` and a guard scoped to one symptom does not generalise. Delete the
+        # `human_owned_holds` call and BOTH of these red.
+        for _hold in ("needs:user", "review:needs-user", "needs:external-audit"):
+            terminal_sweep_env["pages"] = {
+                "/repos/owner/repo/issues/37/comments": [_park_receipt_comment(1, 37)],
+                **_bot_park_timeline(37)}
+            held_log, _e, _r = _sweep_with_refusals(
+                {}, pulls=(_machine_parked_pr(37, "clean", ("review:parked", _hold),
+                                              fresh=True),))
+            check(
+                f"[#769] a PR wearing BOTH review:parked and `{_hold}` spends NO re-admission "
+                "budget: no grant receipt, no unlabel, and the park is NAMED as human-held",
+                (
+                    terminal_sweep_env["writes"],
+                    "age_unparked=0" in held_log,
+                    f"human-owned hold(s) live ({_hold})" in held_log,
+                ),
+                ([], True, True),
+            )
+        # THE OTHER DIRECTION, on the SAME fixture minus the hold — otherwise the three checks
+        # above would pass just as well if the exit had stopped granting anything at all. This is
+        # the same PR, same recovered cause, same receipts: it MUST still be re-admitted.
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/37/comments": [_park_receipt_comment(1, 37)],
+            **_bot_park_timeline(37)}
+        unheld_log, _e, _r = _sweep_with_refusals(
+            {}, pulls=(_machine_parked_pr(37, "clean", ("review:parked",), fresh=True),))
+        check(
+            "[#769] CONTROL: the identical PR WITHOUT the hold is still re-admitted — the hold "
+            "guard refuses the held case only, it does not disable the exit",
+            (
+                ("DELETE", "/repos/owner/repo/issues/37/labels/review%3Aparked")
+                in terminal_sweep_env["writes"],
+                "age_unparked=1" in unheld_log,
+            ),
+            (True, True),
+        )
+
+        # [#769] park_policy INVARIANT 3, pinned STRUCTURALLY rather than by scenario. The
+        # behavioural checks above can only speak about the label paths their fixtures reach; the
+        # claim that has to hold is about EVERY path — "this phase's only label DELETE is on
+        # MACHINE_PARK_PR_LABEL, and no path here auto-clears a human hold". The incident behind
+        # that invariant is a label re-applied 37 times, and the live control is sparq-org/sparq
+        # #3728, a conflict-resolver escalation carrying `needs:user`: nothing in this phase may
+        # ever reach it. Parsed, never regexed — a source regex passes permissively under a
+        # reflow, and the failure mode of a permissive guard here is silent.
+        _unpark_fn = next(
+            node for node in ast.walk(ast.parse(
+                Path(__file__).resolve().read_text(encoding="utf-8")))
+            if isinstance(node, ast.FunctionDef) and node.name == "_execute_age_unpark_actions")
+        _unpark_deletes = [
+            ast.unparse(node) for node in ast.walk(_unpark_fn)
+            if isinstance(node, ast.Call)
+            and any(isinstance(arg, ast.Constant) and arg.value == "DELETE"
+                    for arg in node.args)]
+        check(
+            "[#769] the age exit issues EXACTLY ONE label DELETE and it is on "
+            "MACHINE_PARK_PR_LABEL — invariant 3: no path here auto-clears a human hold "
+            "(#3728, a conflict-resolver needs:user escalation, is the live control)",
+            (
+                len(_unpark_deletes),
+                all("park_policy.MACHINE_PARK_PR_LABEL" in call for call in _unpark_deletes),
+                any(name in call for call in _unpark_deletes
+                    for name in ("HUMAN_PARK_LABEL", "HUMAN_PR_PARK_LABEL", "needs:user",
+                                 "needs-user")),
+            ),
+            (1, True, False),
         )
 
         # A machine label a PROVEN HUMAN applied is likewise never auto-cleared: the actor decides,
