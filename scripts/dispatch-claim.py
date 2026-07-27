@@ -1254,6 +1254,43 @@ def record_partition_defer(census, reason, held_area, holder):
     census["total"] = census.get("total", 0) + 1
 
 
+def seal_partition_census(census, kept):
+    """[registry #758] Close a census so a leg that dropped NOTHING is distinguishable from a leg
+    that was never instrumented — "missing edge" and "edge with no traffic" must not read alike
+    (registry #753/#754). No-op unless `census` is a dict, so a call site may pass its optional
+    sink unconditionally."""
+    if not isinstance(census, dict):
+        return census
+    census.setdefault("by_reason", {reason: 0 for reason in PARTITION_DEFER_REASONS})
+    census.setdefault("by_held_area", {})
+    census.setdefault("by_holder", {})
+    census.setdefault("total", 0)
+    census["kept"] = kept
+    return census
+
+
+def format_partition_census(label, repo, census):
+    """[registry #758] ONE flat `label repo deferred=.. kept=.. reason.X=.. area.Y=.. holder.prZ=..`
+    line for a partition census.
+
+    BRACE-FREE BY CONSTRUCTION, and that is a correctness requirement rather than a style choice:
+    GitHub's secret masker rewrites `{`/`}` in log output, so a JSON dump of this census arrives
+    corrupted on the Gate A feed. The assemble leg emits the same shape inline in dispatch.yml
+    (pinned there by `_starvation_seam_violations`); this is the CLAIM leg's emitter, which runs
+    inside `dispatch()` rather than in the workflow's inline python."""
+    census = census if isinstance(census, dict) else {}
+    return " ".join(
+        [str(label), str(repo),
+         "deferred=" + str(census.get("total", 0)),
+         "kept=" + str(census.get("kept", 0))]
+        + ["reason." + str(reason) + "=" + str(count) for reason, count
+           in sorted((census.get("by_reason") or {}).items())]
+        + ["area." + str(area) + "=" + str(count) for area, count
+           in sorted((census.get("by_held_area") or {}).items())]
+        + ["holder.pr" + str(holder) + "=" + str(count) for holder, count
+           in sorted((census.get("by_holder") or {}).items())])
+
+
 def filter_busy_area_items(items, repo, pulls, issue_labels, provenance, pr_status=None,
                            leases=None, now=0, starvation=None, census=None):
     """Drop plan items whose package has an in-flight worker PR (registry issue #27: the review
@@ -1324,14 +1361,10 @@ def filter_busy_area_items(items, repo, pulls, issue_labels, provenance, pr_stat
     if isinstance(starvation, dict):
         starvation["deferred"] = global_deferred
         starvation["kept"] = len(kept)
-    if isinstance(census, dict):
-        # Always present, at zero if nothing fired: a leg that dropped nothing and a leg that was
-        # never instrumented must not read alike on the Gate A feed (registry #753/#754).
-        census.setdefault("by_reason", {reason: 0 for reason in PARTITION_DEFER_REASONS})
-        census.setdefault("by_held_area", {})
-        census.setdefault("by_holder", {})
-        census.setdefault("total", 0)
-        census["kept"] = len(kept)
+    # Always present, at zero if nothing fired: a leg that dropped nothing and a leg that was
+    # never instrumented must not read alike on the Gate A feed (registry #753/#754). SHARED with
+    # the CLAIM leg so the two legs cannot seal differently.
+    seal_partition_census(census, len(kept))
     return kept
 
 
@@ -1496,6 +1529,10 @@ def revalidate_items_against_live_pulls(items, repo, pull_pages, issue_labels, p
             record_partition_defer(census, "sibling-lease", package, "lease-ledger")
             continue
         dispatchable.add(number)
+    # [registry #758] SAME sealing as the assemble leg. Without it a healthy CLAIM tick leaves the
+    # census `{}`, which is byte-identical to "the census was never wired" — and this leg's census
+    # WAS unwired at the production call site when it shipped.
+    seal_partition_census(census, len(dispatchable))
     return dispatchable
 
 
@@ -4583,12 +4620,20 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
         # [registry #677] The SAME live occupancy the revalidation computes, kept for the
         # starvation sweep below rather than re-derived from a second view.
         live_occupancy = []
+        # [registry #758] The CLAIM leg's per-reason / per-HELD-AREA census. This shipped as a
+        # parameter with NO production caller: `revalidate_items_against_live_pulls` accepted
+        # `census=` and every test passed one, but `dispatch()` did not — so the CLAIM half of the
+        # fix was computed nowhere and read by no one, which is the same hole as not having it.
+        claim_census = {}
         live_dispatchable = revalidate_items_against_live_pulls(
             repository["items"], repo, pull_pages, live_issue_labels, claim_provenance,
             # [round-5 P1] the cross-lane lease partition reads the ledger-branch checkout;
             # an unreadable ledger view yields None and the partition fails toward exclusion.
             leases=_ledger_leases(ledger_root), now=int(time.time()),
-            occupancy=live_occupancy)
+            occupancy=live_occupancy, census=claim_census)
+        # Emitted unconditionally, brace-free (the secret masker eats `{`/`}`), so a CLAIM tick
+        # that dropped nothing publishes explicit zeros rather than silence.
+        print(format_partition_census("claim-census", repo, claim_census))
 
         # Safety invariant FIRST (issue #42): stale arm latches are retracted before any fix or
         # review admission can push onto (or re-review past) an armed, mutated head. The disarm lane
