@@ -10,11 +10,29 @@
 # invisible — the reasons are distinct because the responses are. Recording provenance and
 # converting a PR to draft are INDEPENDENT actions (#726): a PR already in the merge queue, armed,
 # or `review:pass` is recorded but never drafted, because drafting evicts it from the queue.
-# DRY RUN unless apply=true.
+# DRY RUN unless apply=true — EXCEPT on the schedule, which always applies (see below).
+#
+# [registry #710] IT IS NO LONGER MANUAL-ONLY, AND THAT IS THE POINT. A worker PR whose provenance
+# job failed reserves the `__global__` partition in dispatch-claim.busy_packages_of_pulls, which
+# defers EVERY issue-lane row fleet-wide. Until this schedule existed, the only exit from that state
+# was a human noticing and dispatching this workflow by hand — so one failed API read at the end of
+# one worker run bought an open-ended dispatch outage. A hold whose only exit is a human is not an
+# exit. The schedule bounds the damage at one cron period, for every enabled policy target, without
+# weakening the fail-closed reader by a single line: it repairs the DATA, exactly as designed.
+#
+# WHY IT CONVERGES EVEN THOUGH THE CAUSE IS AN EXHAUSTED API BUDGET: a scheduled run that is itself
+# rate-limited fails loudly and the next period retries, in a different budget window. The in-job
+# bounded retry (scripts/gh_retry.py) cannot span a primary rate-limit window; this can.
 name: backfill-provenance
-run-name: backfill-provenance ${{ inputs.target_repo }} apply=${{ inputs.apply }}
+run-name: backfill-provenance ${{ github.event_name == 'schedule' && 'ALL enabled targets apply=true' || format('{0} apply={1}', inputs.target_repo, inputs.apply) }}
 
 on:
+  schedule:
+    # Every 20 minutes, offset off the :00/:10 dispatch-tick boundaries so the repair is not
+    # competing with the tick for the very API budget whose exhaustion it is repairing. The
+    # dispatch tick floor is 10 minutes (#822), so a lost record now costs at most ~2 ticks of
+    # `__global__` reservation instead of an unbounded wait for a human.
+    - cron: '9,29,49 * * * *'
   workflow_dispatch:
     inputs:
       target_repo:
@@ -42,11 +60,71 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # [registry #710] The `inputs` context is EMPTY on a schedule event — `workflow_dispatch`'s
+  # `default:` does NOT apply — so a scheduled run must derive its own target list and apply flag.
+  # That resolution is `backfill-provenance.resolve_dispatch_inputs`, a PURE function with its own
+  # red tests, deliberately NOT a `${{ a && 'x' || y }}` ternary: a ternary can only ever be
+  # asserted structurally, and string-equality on an expression proves the text is there, never
+  # that it evaluates the way the comment claims. This job holds NO secret.
+  resolve:
+    name: Resolve enabled policy targets + the apply flag
+    if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      targets: ${{ steps.resolve.outputs.targets }}
+      apply: ${{ steps.resolve.outputs.apply }}
+    steps:
+      - name: Checkout private registry (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Resolve
+        id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          TARGET_REPO: ${{ inputs.target_repo }}
+          APPLY: ${{ inputs.apply }}
+        run: |
+          set -euo pipefail
+          python3 scripts/backfill-provenance.py --self-test
+          python3 - <<'PY'
+          import importlib.util, json, os, tomllib
+          spec = importlib.util.spec_from_file_location(
+              "backfill", "scripts/backfill-provenance.py")
+          backfill = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(backfill)
+          # The ENABLED policy rows are the only admissible targets, read from the protected
+          # default-branch checkout this job is pinned to. Each matrix leg re-enforces its own row
+          # anyway (defence in depth) — this list only decides WHICH legs exist.
+          rows = tomllib.load(open("policy/repos.toml", "rb")).get("repos", {})
+          enabled = sorted(name for name, row in rows.items()
+                           if isinstance(row, dict) and row.get("enabled") is True)
+          targets, apply_changes = backfill.resolve_dispatch_inputs(
+              os.environ["EVENT_NAME"], os.environ.get("TARGET_REPO", ""),
+              os.environ.get("APPLY", ""), enabled)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"targets={json.dumps(targets)}\n")
+              out.write(f"apply={'true' if apply_changes else 'false'}\n")
+          print(f"resolved targets={targets} apply={apply_changes} "
+                f"event={os.environ['EVENT_NAME']}")
+          PY
+
   backfill:
     name: Backfill missing provenance records (ledger branch)
+    needs: resolve
     # The salt is a secret: refuse to run from any non-default ref (a modified branch copy of
     # this workflow must never see it — the sol-audit arbitrary-ref class).
     if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+    strategy:
+      # One target's failure must never cancel another's repair — the whole point is that every
+      # enabled target gets a machine exit, not that the first one does.
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.resolve.outputs.targets) }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     # SECRET-EXFIL GUARD (issue #101): reads PROVENANCE_SALT, which lives in the `dispatch-secrets`
@@ -65,14 +143,14 @@ jobs:
       - name: Checkout public target for protected routing data (pinned, no persisted token)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          repository: ${{ inputs.target_repo }}
+          repository: ${{ matrix.target }}
           path: target-routing
           persist-credentials: false
 
       - name: Enforce the policy row (enabled target + ITS validated routing pointer)
         id: policy
         env:
-          TARGET_REPO: ${{ inputs.target_repo }}
+          TARGET_REPO: ${{ matrix.target }}
         run: |
           set -euo pipefail
           [[ "$TARGET_REPO" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || { echo '::error::unsafe target repo'; exit 1; }
@@ -103,10 +181,16 @@ jobs:
           # non-draft PR needing conversion is WARNed with the manual command (github.token
           # has no target write; the outage population is already draft).
           PROVENANCE_SALT: ${{ secrets.PROVENANCE_SALT }}
-          TARGET_REPO: ${{ inputs.target_repo }}
-          APPLY: ${{ inputs.apply }}
+          TARGET_REPO: ${{ matrix.target }}
+          # RESOLVED, never `inputs.apply` — which is EMPTY on a schedule event and would make the
+          # cron a dry run, i.e. a machine exit that repairs nothing (registry #710).
+          APPLY: ${{ needs.resolve.outputs.apply }}
           NO_DRAFT_CONVERT: ${{ inputs.no_draft_convert }}
           ROUTING_FILE: ${{ steps.policy.outputs.routing_file }}
+        # NO `continue-on-error`, and the exit code is deliberately NOT swallowed: exit 2 means
+        # open worker PRs are still holding `__global__` after this pass, which is an active
+        # fleet-wide dispatch outage and must red the run. `set -e` propagates it; the script has
+        # already emitted the `::error` annotation naming the population.
         run: |
           set -euo pipefail
           python3 scripts/backfill-provenance.py --self-test

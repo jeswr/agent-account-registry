@@ -599,6 +599,87 @@ def _ensure_draft(target_repo, number, is_draft, apply_changes, *, state,
     return True
 
 
+# [registry #710] EXIT CODES. The recovery used to be exit-zero whatever it left behind, so a run
+# that repaired nothing was indistinguishable from a run that found nothing — the same missing-signal
+# shape as the losses it exists to repair. `2` is deliberately DISTINCT from the hard-failure `1` so
+# the caller can say "the pass ran and left holders" without claiming the pass itself broke.
+EXIT_OK = 0
+EXIT_ERROR = 1
+EXIT_UNREPAIRED = 2
+
+
+SCHEDULE_EVENT = "schedule"
+
+
+def _refuses(thunk):
+    """True iff `thunk` raises BackfillError — the self-test's refusal predicate. [registry #710]"""
+    try:
+        thunk()
+    except BackfillError:
+        return True
+    return False
+
+
+def resolve_dispatch_inputs(event_name, requested_target, apply_input, enabled_targets):
+    """The `schedule` vs `workflow_dispatch` input resolution, as a PURE function. [registry #710]
+
+    Returns `(targets, apply_changes)`.
+
+    This exists as Python rather than as a `${{ a && 'x' || y }}` ternary in the workflow because a
+    ternary can only be asserted STRUCTURALLY — string-equality on the expression proves the text is
+    present, never that it evaluates the way the comment claims. Two properties have to hold and
+    both are executable here:
+
+      * `inputs` is EMPTY on a schedule event, so neither `workflow_dispatch`'s `default:` applies.
+        A scheduled run that inherited an empty `target_repo` would silently back off to nothing,
+        and one that inherited a falsy `apply` would be a cron that repairs nothing — a machine exit
+        that does not exit, which is the failure mode this whole change is about.
+      * a scheduled run covers EVERY enabled policy target, because the population it repairs is
+        per-target and a hard-coded target would leave the others with no machine exit at all.
+
+    A manual dispatch is unchanged: it repairs exactly the target it names, and it stays a DRY RUN
+    unless the operator asked for `apply`."""
+    scheduled = event_name == SCHEDULE_EVENT
+    enabled = [str(name) for name in enabled_targets]
+    if scheduled:
+        if not enabled:
+            raise BackfillError("no enabled policy target to back-fill")
+        return enabled, True
+    requested = str(requested_target or "").strip()
+    if not requested:
+        raise BackfillError("target_repo is required for a manual dispatch")
+    if requested not in enabled:
+        raise BackfillError(f"{requested} is not an enabled policy target")
+    return [requested], str(apply_input).strip().lower() == "true"
+
+
+class BackfillCensus(NamedTuple):
+    """What ONE pass left behind. Population census, not a per-stage success rate: a per-stage rate
+    cannot express "this PR fell out between two stages", which is how the two uncounted `skip`
+    exits below hid from every report."""
+
+    written: int
+    skipped: int
+    needs_human: int
+    unresolved: int
+    applied: bool
+
+
+def unrepaired_after(census):
+    """Open worker PRs still holding `__global__` when this pass ended. PURE, so the exit rule has
+    a red test that does not need a fake GitHub.
+
+    `written` counts toward the remainder on a DRY RUN and only there: a dry run names records it
+    WOULD write, and a PR whose record was never actually written is still recordless, still
+    invisible to the review sweep, and still serialising the whole fleet. Reporting a dry run as
+    clean because it "handled" those PRs is the precise shape of an exit-zero that swallows the
+    finding."""
+    remainder = census.needs_human + census.unresolved
+    if not census.applied:
+        remainder += census.written
+    return remainder
+
+
 def backfill(target_repo, registry_repo, routing_file, apply_changes, no_draft_convert=False):
     worker_pr = _load_worker_pr()
     admission_error = _load_dispatch_claim().provenance_admission_error
@@ -616,7 +697,7 @@ def backfill(target_repo, registry_repo, routing_file, apply_changes, no_draft_c
     pulls = flatten_pull_pages(pages)
     if pulls is None:
         raise BackfillError("pull listing is malformed")
-    written = skipped = needs_human = 0
+    written = skipped = needs_human = unresolved = 0
     for pull in pulls:
         if not isinstance(pull, dict):
             continue
@@ -711,11 +792,17 @@ def backfill(target_repo, registry_repo, routing_file, apply_changes, no_draft_c
             continue
         commits = _gh_json(["api", f"repos/{target_repo}/pulls/{number}/commits?per_page=100"])
         if not isinstance(commits, list) or not commits:
-            print(f"skip #{number}: PR has no commits")
+            # [registry #710] COUNTED. These two exits leave the PR exactly as recordless as a
+            # NEEDS-HUMAN one — it keeps holding `__global__` — but they used to `continue` without
+            # incrementing anything, so the completion line under-reported the population it was
+            # reporting on. A state a census cannot express is a state nobody acts on.
+            unresolved += 1
+            print(f"skip #{number}: PR has no commits — left recordless")
             continue
         opened_sha = str((commits[0] or {}).get("sha", ""))
         if not re.fullmatch(r"[0-9a-f]{40}", opened_sha):
-            print(f"skip #{number}: first commit sha is malformed")
+            unresolved += 1
+            print(f"skip #{number}: first commit sha is malformed — left recordless")
             continue
 
         impl_account_h = worker_pr.account_hash(account, salt)
@@ -735,7 +822,9 @@ def backfill(target_repo, registry_repo, routing_file, apply_changes, no_draft_c
                       no_draft_convert=no_draft_convert)
     mode = "recorded" if apply_changes else "would record"
     print(f"backfill complete: {mode} {written}, skipped {skipped}, "
-          f"needs-human {needs_human}")
+          f"needs-human {needs_human}, unresolved {unresolved}")
+    return BackfillCensus(written=written, skipped=skipped, needs_human=needs_human,
+                          unresolved=unresolved, applied=bool(apply_changes))
 
 
 def identity_from_run_log(log_readable, log_text, target_repo, pr_number, issue, live_author,
@@ -876,7 +965,39 @@ def backfill_workflow_seam_report():
     # silently turns an apply run into a record-only run (or vice versa). Assert the exact
     # expression each env name is bound to, not merely that the name appears.
     step_env = {k: str(v) for k, v in ((step or {}).get("env") or {}).items()}
+    # --- [registry #710] the SCHEDULE seam ---------------------------------------------------
+    # `if: false`, a deleted trigger, a literal matrix and a hardcoded target list are all valid
+    # YAML that lints clean, and none of them can be seen by a substring or a `count(...) == N`
+    # over the workflow text. Every finding here is structural, and the last one is an AST walk of
+    # the resolver step's OWN inline program — because a step that stopped calling
+    # `resolve_dispatch_inputs` and hardcoded a target would leave that function's unit tests
+    # passing while the machine exit silently covered one target, or none.
+    resolve_job = workflow["jobs"].get("resolve") or {}
+    resolve_step = next((s for s in resolve_job.get("steps") or []
+                         if "GITHUB_OUTPUT" in str(s.get("run") or "")), None)
+    resolve_run = str((resolve_step or {}).get("run") or "")
+    inline = resolve_run.partition("<<'PY'\n")[2].partition("\nPY")[0]
+    called = set()
+    if inline:
+        for node in ast.walk(ast.parse(textwrap.dedent(inline))):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                called.add(node.func.attr)
+    cron = [str(entry.get("cron")) for entry in ((triggers or {}).get("schedule") or [])]
     return {
+        "schedule_cron": cron,
+        # `needs:` is a scalar OR a list in Actions YAML; normalise so the assertion cannot be
+        # satisfied by a string that merely happens to contain the right characters.
+        "backfill_needs_resolve": ([job["needs"]] if isinstance(job.get("needs"), str)
+                                   else list(job.get("needs") or [])),
+        "matrix_expression": str(((job.get("strategy") or {}).get("matrix") or {}).get("target")),
+        "matrix_fail_fast": (job.get("strategy") or {}).get("fail-fast"),
+        "resolve_job_ref_guarded": ("github.ref ==" in str(resolve_job.get("if") or "")
+                                    and "default_branch" in str(resolve_job.get("if") or "")),
+        "resolve_holds_no_secret": "environment" not in resolve_job,
+        "resolve_calls_pure_resolver": "resolve_dispatch_inputs" in called,
+        "resolve_outputs": {k: str(v) for k, v in (resolve_job.get("outputs") or {}).items()},
+        "no_continue_on_error": ("continue-on-error" not in job
+                                 and "continue-on-error" not in (step or {})),
         "job_ref_guarded": "github.ref ==" in guard and "default_branch" in guard,
         "job_environment": job.get("environment"),
         "actions_read": (job.get("permissions") or {}).get("actions"),
@@ -1226,10 +1347,52 @@ def _self_test():
           seam["no_draft_convert_default"], False)
     # The wrong-input seam: binding NO_DRAFT_CONVERT to `inputs.apply` lints clean and silently
     # inverts an apply run. Assert the exact expression, not the mere presence of the name.
-    check("each workflow env name is bound to ITS OWN dispatch input (wrong-input seam)",
+    check("each workflow env name is bound to ITS OWN input (wrong-input seam). APPLY is bound to "
+          "the RESOLVED value, never `inputs.apply` — which is EMPTY on a schedule event and would "
+          "make the cron a dry run, i.e. a machine exit that repairs nothing [#710]",
           seam["step_env_bindings"],
-          {"TARGET_REPO": "${{ inputs.target_repo }}", "APPLY": "${{ inputs.apply }}",
+          {"TARGET_REPO": "${{ matrix.target }}",
+           "APPLY": "${{ needs.resolve.outputs.apply }}",
            "NO_DRAFT_CONVERT": "${{ inputs.no_draft_convert }}"})
+
+    # ---- [registry #710] the MACHINE EXIT: this recovery must not need a human ----------------
+    check("#710 the backfill runs ON A SCHEDULE — without it a failed provenance job holds the "
+          "`__global__` partition until a human notices, which is not an exit",
+          seam["schedule_cron"], ["9,29,49 * * * *"])
+    check("#710 the schedule covers EVERY enabled policy target: the matrix comes from the "
+          "resolver's output, never a literal list, and one target's failure cannot cancel another",
+          (seam["backfill_needs_resolve"], seam["matrix_expression"], seam["matrix_fail_fast"]),
+          (["resolve"], "${{ fromJSON(needs.resolve.outputs.targets) }}", False))
+    check("#710 the resolver step actually CALLS resolve_dispatch_inputs (AST of its own inline "
+          "program) — a step that hardcoded the targets would leave that function's unit tests "
+          "green while the machine exit covered one target, or none",
+          seam["resolve_calls_pure_resolver"], True)
+    check("#710 the resolver publishes BOTH resolved values and is itself ref-guarded, while "
+          "holding no secret (it reads only the protected policy file)",
+          (seam["resolve_outputs"], seam["resolve_job_ref_guarded"],
+           seam["resolve_holds_no_secret"]),
+          ({"targets": "${{ steps.resolve.outputs.targets }}",
+            "apply": "${{ steps.resolve.outputs.apply }}"}, True, True))
+    check("#710 nothing swallows the exit code: an unrepaired population (exit 2) is an active "
+          "fleet outage and must red the run",
+          seam["no_continue_on_error"], True)
+
+    # ---- [registry #710] the resolution itself, executed ---------------------------------------
+    enabled = ["jeswr/agent-account-registry", "sparq-org/sparq"]
+    check("#710 a SCHEDULE event applies to every enabled target — the `inputs` context is empty "
+          "there, so inheriting it would give a cron that repairs nothing",
+          resolve_dispatch_inputs("schedule", "", "", enabled), (enabled, True))
+    check("#710 a manual dispatch is UNCHANGED: exactly the named target, dry run by default",
+          (resolve_dispatch_inputs("workflow_dispatch", "sparq-org/sparq", "false", enabled),
+           resolve_dispatch_inputs("workflow_dispatch", "sparq-org/sparq", "true", enabled)),
+          ((["sparq-org/sparq"], False), (["sparq-org/sparq"], True)))
+    check("#710 a manual dispatch naming a DISABLED/unknown target is refused, and an empty "
+          "target is refused rather than silently fanning out to everything",
+          (_refuses(lambda: resolve_dispatch_inputs("workflow_dispatch", "evil/repo", "true",
+                                                    enabled)),
+           _refuses(lambda: resolve_dispatch_inputs("workflow_dispatch", "  ", "true", enabled)),
+           _refuses(lambda: resolve_dispatch_inputs("schedule", "", "", []))),
+          (True, True, True))
     check("two-page slurped listing flattens (sol r5)",
           flatten_pull_pages([[{"number": 1}], [{"number": 2}, {"number": 3}]]),
           [{"number": 1}, {"number": 2}, {"number": 3}])
@@ -1404,8 +1567,14 @@ def _self_test():
     # record still get counted?) is asserted rather than assumed.
     E2E_HEAD_QUEUED = "sparq-agent/issue-3404-16234567890-1"
     E2E_HEAD_FRESH = "sparq-agent/issue-3405-16234567891-1"
+    # [registry #710] A PR whose identity resolves but whose commit listing comes back empty. It
+    # used to `continue` WITHOUT touching any counter, so it left the loop recordless and invisible
+    # to the completion line — a state the census could not express, and therefore one nobody acted
+    # on. It still holds `__global__` exactly like a NEEDS-HUMAN row.
+    E2E_HEAD_NOCOMMITS = "sparq-agent/issue-3406-16234567892-1"
     e2e_logs = {"16234567890": prov_env(issue=3404, head=E2E_HEAD_QUEUED),
-                "16234567891": prov_env(issue=3405, head=E2E_HEAD_FRESH)}
+                "16234567891": prov_env(issue=3405, head=E2E_HEAD_FRESH),
+                "16234567892": prov_env(issue=3406, head=E2E_HEAD_NOCOMMITS)}
 
     def e2e_pull(number, head):
         return {"number": number, "draft": False,
@@ -1414,8 +1583,9 @@ def _self_test():
 
     def e2e_gh_json(args):
         if "--slurp" in args:
-            return [[e2e_pull(9001, E2E_HEAD_QUEUED), e2e_pull(9002, E2E_HEAD_FRESH)]]
-        return [{"sha": "ab" * 20}]
+            return [[e2e_pull(9001, E2E_HEAD_QUEUED), e2e_pull(9002, E2E_HEAD_FRESH),
+                     e2e_pull(9003, E2E_HEAD_NOCOMMITS)]]
+        return [] if "/pulls/9003/commits" in args[-1] else [{"sha": "ab" * 20}]
 
     def e2e_run_gh(args, *, check=True):
         if list(args[:2]) == ["run", "view"]:
@@ -1431,7 +1601,7 @@ def _self_test():
         _probe_registry_file=lambda repo, path, ref=None: (None, None),
         account_hash=lambda account, salt: "deadbeefdeadbeef",
         provenance_record=e2e_no_write)
-    e2e_state = {9001: QUEUED_ONLY, 9002: FRESH}
+    e2e_state = {9001: QUEUED_ONLY, 9002: FRESH, 9003: FRESH}
     routing_toml = Path(tempfile.mkdtemp()) / "routing.toml"
     routing_toml.write_text('[models.fable]\nprovider = "anthropic"\n', encoding="utf-8")
     patched = ("_gh_json", "_run_gh", "_load_worker_pr", "_load_dispatch_claim", "review_state")
@@ -1447,8 +1617,8 @@ def _self_test():
             review_state=lambda repo, number, runner=None: e2e_state[number])
         os.environ["PROVENANCE_SALT"] = "self-test-only"
         with contextlib.redirect_stdout(e2e_buffer):
-            backfill("sparq-org/sparq", "jeswr/agent-account-registry", str(routing_toml),
-                     False)
+            e2e_census = backfill("sparq-org/sparq", "jeswr/agent-account-registry",
+                                  str(routing_toml), False)
     finally:
         globals().update(saved_globals)
         if saved_salt is None:
@@ -1467,6 +1637,39 @@ def _self_test():
            "DRY-RUN #9002: would convert to draft" in e2e), (True, True))
     check("E2E: BOTH records are counted — draft policy never withholds a record",
           "backfill complete: would record 2, skipped 0, needs-human 0" in e2e, True)
+
+    # ---- [registry #710] the census must be COMPLETE, and the exit code must carry it ----------
+    check("#710 E2E: the empty-commits PR is COUNTED as unresolved and SAID to be left recordless "
+          "— it used to `continue` with no counter, so the completion line under-reported the "
+          "population it was reporting on",
+          (e2e_census.unresolved, "skip #9003: PR has no commits — left recordless" in e2e,
+           "unresolved 1" in e2e),
+          (1, True, True))
+    check("#710 E2E: backfill() RETURNS the census it printed (the exit rule reads the return "
+          "value, so a printed-only census could not drive it)",
+          (e2e_census.written, e2e_census.skipped, e2e_census.needs_human, e2e_census.applied),
+          (2, 0, 0, False))
+    e2e_lines = []
+    check("#710 E2E: this pass left 3 open worker PRs with no record, so it exits NON-ZERO with an "
+          "`::error` naming the population — a DRY RUN repairs nothing, and reporting it clean "
+          "because it 'handled' those PRs is exactly the exit-zero that swallows the finding",
+          (report_census(e2e_census, "sparq-org/sparq", emit=e2e_lines.append),
+           len(e2e_lines) == 1 and e2e_lines[0].startswith("::error title=recordless worker PRs"),
+           "3 open worker pull request(s)" in e2e_lines[0],
+           "__global__" in e2e_lines[0]),
+          (EXIT_UNREPAIRED, True, True, True))
+    clean_lines = []
+    check("#710 a pass that left NOTHING behind exits 0 with a `::notice`, so the red state above "
+          "is a real signal and not the permanent condition of the workflow",
+          (report_census(BackfillCensus(written=4, skipped=70, needs_human=0, unresolved=0,
+                                        applied=True), "sparq-org/sparq", emit=clean_lines.append),
+           clean_lines[0].startswith("::notice title=provenance census clean")),
+          (EXIT_OK, True))
+    check("#710 unrepaired_after: an APPLIED pass banks its writes, a DRY RUN does not",
+          (unrepaired_after(BackfillCensus(6, 0, 0, 0, True)),
+           unrepaired_after(BackfillCensus(6, 0, 0, 0, False)),
+           unrepaired_after(BackfillCensus(0, 70, 2, 1, True))),
+          (0, 6, 3))
 
     # --- effective ledger-first record + admission before any skip (sol #217) ------------------
     # The REAL review-loop admission function, imported — not a replica — so these red if the
@@ -1540,12 +1743,36 @@ def main():
     if args.self_test:
         return _self_test()
     try:
-        backfill(args.target_repo, args.registry_repo, args.routing_file, args.apply,
-                 no_draft_convert=args.no_draft_convert)
+        census = backfill(args.target_repo, args.registry_repo, args.routing_file, args.apply,
+                          no_draft_convert=args.no_draft_convert)
     except BackfillError as exc:
         print(f"backfill-provenance: {exc}", file=sys.stderr)
-        return 1
-    return 0
+        return EXIT_ERROR
+    return report_census(census, args.target_repo)
+
+
+def report_census(census, target_repo, *, emit=print):
+    """Emit the terminal census and return the process exit code. [registry #710]
+
+    A recordless open worker PR reserves `__global__` in `dispatch-claim.busy_packages_of_pulls`,
+    which vetoes EVERY row in the repo — so "this pass ended with holders left" is an active fleet
+    outage, not a backlog item, and it gets an `::error` annotation plus a non-zero exit. It is not
+    alarm fatigue: the steady state is zero, and a standing red means real un-repaired holders that
+    only a human can clear."""
+    remainder = unrepaired_after(census)
+    if not remainder:
+        emit(f"::notice title=provenance census clean::{target_repo}: every open worker PR has an "
+             f"admissible provenance record (recorded {census.written}, already had one "
+             f"{census.skipped})")
+        return EXIT_OK
+    emit(f"::error title=recordless worker PRs remain::{target_repo}: {remainder} open worker "
+         f"pull request(s) still have NO admissible provenance record after this pass "
+         f"(needs-human {census.needs_human}, unresolved {census.unresolved}, "
+         f"{'would-record ' + str(census.written) + ' (DRY RUN — nothing was written)'
+            if not census.applied else 'recorded ' + str(census.written)}). Each one reserves the "
+         f"`__global__` partition in dispatch-claim.busy_packages_of_pulls, which defers every "
+         f"issue-lane row fleet-wide until it is cleared (registry #677/#710).")
+    return EXIT_UNREPAIRED
 
 
 if __name__ == "__main__":
