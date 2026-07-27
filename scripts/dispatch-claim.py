@@ -4752,10 +4752,26 @@ def _fix_chain_model_pin(fix_chain, ladder):
     FLOOR it expands back to `ladder[ladder.index(pin):]`. For the workflow's own chain resolution
     and its adopt-time `model not in models` assertion to agree with what the dispatcher claimed
     against, that expansion must not readmit a tier the route excluded. So the pin is the
-    LOWEST-LADDER member of the intersection, returned only when its expansion is exactly the
-    intersection; otherwise "" and the caller fails closed. Returning the floor regardless would
-    hand the worker a WIDER chain than the dispatcher was allowed to claim from — the very
-    re-widening this issue is about, moved one hop downstream.
+    LOWEST-LADDER member of the intersection, returned only when its expansion holds exactly the
+    intersection's MEMBERS; otherwise "" and the caller fails closed. Returning the floor
+    regardless would hand the worker a WIDER chain than the dispatcher was allowed to claim from
+    — the very re-widening this issue is about, moved one hop downstream.
+
+    MEMBERSHIP, NOT ORDER, IS THE CONTRACT — deliberately, and the comparison below is on SETS
+    for that reason. The two sequences are two DIFFERENT documented orders over the same aliases:
+    `FIX_CHAIN` is the allocator PREFERENCE walk (strongest first) and is *by construction* the
+    REVERSE of `ESCALATION_LADDERS` (capability-ASCENDING), while `model_pin` is a FLOOR whose
+    expansion is ladder-ordered by definition — precisely what `pinned_fix_chain` already hands
+    the allocator for a round-budget pin. What a route AUTHORIZES is a set of tiers; an expansion
+    holding a tier the route excluded is the re-widening this helper exists to refuse, and that
+    is exactly what the set comparison catches. Demanding ORDERED equality instead would refuse
+    the widest-open case there is — an openai PR whose route excludes NOTHING, chain
+    `["sol", "luna"]` against the ladder's `["luna", "sol"]` — and hand every such fix to
+    needs-user over a preference order the workflow never claims against: on the dispatcher path
+    `claim_id` is always set, so review-fix.yml ADOPTS the claim and only membership-asserts the
+    expansion (`model not in models`); its own ordered `--models` claim runs solely when
+    `claim_id == ""`, where there is no dispatcher claim to disagree with and floor semantics
+    have always been cheapest-first.
 
     Note the pinned-floor case is subsumed: `fix_chain` is already a subset of
     `pinned_fix_chain(provider, pin_floor)`, so the returned pin can only ever be at or above the
@@ -13702,6 +13718,30 @@ agent = "impl"
                 _route_constrained_fix_chain(
                     wiring_worker_pr.pinned_fix_chain("openai", "sol"), ["opus5", "sol"]),
                 wiring_worker_pr.ESCALATION_LADDERS["openai"]) == "sol"
+            # THE FULL CHAIN, end to end — the case the singleton/empty/unknown/non-suffix rows
+            # above never covered. A route that excludes NOTHING must still be transmissible, and
+            # the chain review-fix.yml derives from the pin must hold exactly the tiers the
+            # dispatcher claimed against. (No LIVE route authorizes `luna` today, so this drives
+            # the helper with an explicit both-tier route; the `luna in FIX_CHAIN` assertion above
+            # keeps the table side of that honest.)
+            _full578 = _route_constrained_fix_chain(FIX_CHAIN["openai"], ["luna", "sol"])
+            _ladder578 = list(wiring_worker_pr.ESCALATION_LADDERS["openai"])
+            assert _full578 == ["sol", "luna"], _full578
+            _pin578 = _fix_chain_model_pin(_full578, _ladder578)
+            assert _pin578 in _ladder578, (
+                "the fully-unconstrained openai fix chain must remain transmissible: an ORDERED "
+                "round-trip check here would refuse a route that excluded nothing and send every "
+                "openai fix to needs-user over FIX_CHAIN/ladder order, which is REVERSED by "
+                "construction — see _fix_chain_model_pin on why membership is the contract",
+                _pin578, _full578, _ladder578)
+            _expanded578 = _ladder578[_ladder578.index(_pin578):]
+            assert set(_expanded578) == set(_full578), (
+                "review-fix.yml's model_pin expansion must readmit no tier outside the chain the "
+                "dispatcher claimed against", _expanded578, _full578)
+            assert _expanded578 == _ladder578, (
+                "an unconstrained route must pin the ladder FLOOR: a higher pin would under-state "
+                "what the route authorized and starve the tiers below it",
+                _expanded578, _ladder578)
             print("  ok   [#578] the fix lane claims FIX_CHAIN ∩ the source issue's LIVE route "
                   "(never a ladder floor), carries that constraint into review-fix.yml on "
                   "model_pin, and fails closed — escalating on `escalate = true`, deferring "
