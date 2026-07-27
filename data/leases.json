@@ -1,14 +1,3 @@
 {
- "leases": [
-  {
-   "account": "488920c2efe2b3fb",
-   "claim_id": "e85064b730eb4bc0acf02debb015b3d4",
-   "holder": "fix:jeswr/agent-account-registry#858@dispatch-30311209703.1",
-   "package": "dispatch",
-   "role": "fix",
-   "model": "opus5",
-   "issued_at": 1785192044,
-   "expires_at": 1785198344
-  }
- ]
+ "leases": []
 }
