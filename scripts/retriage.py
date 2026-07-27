@@ -21,12 +21,16 @@ directions:
 WHO MAY BE RETRIAGED (registry #487). The author trust gate is the FIRST thing `plan()` checks,
 and until now it recognised exactly two automation identities: the maintainer and the orchestrator
 App bot. `github-actions[bot]` — the login every one of THIS repo's own workflows authors issues as
-— is neither, and reads a repo permission of `none`, so every issue our own automation opened
-returned `untrusted-author` and could be neither promoted out of `status:untriaged` nor demoted on
-a label regression. #487 already shipped the per-repo `allow_actions_bot_issues` opt-in and wired
-it into dispatch CLAIM (`dispatch-claim._issue_is_trusted`) and the curator
+— is neither, and reads a repo permission of `none`, so a lane-labelled issue our own automation
+opened would return `untrusted-author` and be neither promotable out of `status:untriaged` nor
+demotable on a label regression. #487 already shipped the per-repo `allow_actions_bot_issues`
+opt-in and wired it into dispatch CLAIM (`dispatch-claim._issue_is_trusted`) and the curator
 (`curate-frontier.trusted_author`); this sweep was the residual consumer. It now reads the SAME
-policy row, so triage trust cannot drift from admission trust. The opt-in admits the EXACT login
+policy row, so triage trust cannot drift from admission trust. This is a LATENT-CONSISTENCY fix
+and is INERT on this repo today: the sweep's board is exactly the `status:untriaged` and
+`status:ready` lane queries, and nothing labels a `github-actions[bot]` issue onto either lane
+(see the "[registry #487] THE ACTIONS-BOT TRIAGE OPT-IN" block in the self-test for the executed
+board-membership assertion and the upstream unit this waits on). The opt-in admits the EXACT login
 `github-actions[bot]` and nothing else — never a `<x>[bot]` suffix match, which is the defect #487
 closed on the dispatch side, since a suffix would admit any unrelated or compromised GitHub App.
 It widens TRIAGE only: it grants no admission, no arming and no merge, and every park below is
@@ -628,12 +632,25 @@ def _self_test():
              known_labels=real).get("role"), "ci")
 
     # -------------------------------------------------------------------------------------------
-    # [registry #487] THE ACTIONS-BOT TRIAGE OPT-IN. `github-actions[bot]` is neither the
-    # maintainer nor the App bot and reads a repo permission of `none`, so before this every issue
-    # one of our OWN workflows opened returned `untrusted-author` — unpromotable out of
-    # status:untriaged and undemotable on a label regression, which is why the alert-responder
-    # class this exists to serve sat in the same trap as the alerts (see #488: 26 closes, 26
-    # reopens, ONE `labeled` event in six days).
+    # [registry #487] THE ACTIONS-BOT TRIAGE OPT-IN — a LATENT-CONSISTENCY fix, not a live one.
+    # `github-actions[bot]` is neither the maintainer nor the App bot and reads a repo permission
+    # of `none`, so this sweep's trust gate returns `untrusted-author` for it while
+    # `dispatch-claim._issue_is_trusted` and `curate-frontier.trusted_author` — reading the SAME
+    # per-repo policy row — admit it. What #487 closes here is that DISAGREEMENT: triage trust can
+    # no longer refuse what admission trust already grants for the same repo.
+    #
+    # It changes no decision on this repo today, and the honest reason is worth writing down
+    # because a green sweep will otherwise be misread as coverage. The sweep's board is EXACTLY
+    # the two lane queries (`labels=status:untriaged` and `labels=status:ready` — asserted by
+    # EXECUTION in the "[#487] the sweep board is EXACTLY the two lane queries" row below), and
+    # nothing puts a `github-actions[bot]` issue on either lane: `triage-issue.yml` is the only
+    # thing that applies a lane label and it fires on `issues: [opened, edited, reopened]`, while
+    # events written with the repository's own `GITHUB_TOKEN` do not start workflow runs — so the
+    # alert issues `metrics.py` opens on `github.token` are never triaged at all. `plan()` is
+    # therefore never called on them and this gate is never reached. Making the alert-responder
+    # class actually triageable needs the UPSTREAM unit (open those issues as the App bot, for
+    # which `triage-issue.yml` does fire, or have `metrics.py` apply the triage labels itself);
+    # this diff is the consumer that will be correct when that lands, and inert until it does.
     # -------------------------------------------------------------------------------------------
     def authored(login, *names, body=""):
         doc = issue(*names, body=body) if names else issue("status:untriaged", body=body)
@@ -1579,16 +1596,22 @@ if rest[:1] == ["label"]:
 if rest[:1] != ["api"]:
     sys.exit(f"stub gh_retry saw an unexpected call: {args}")
 target = rest[1]
+with open(os.environ["STUB_TARGET_LOG"], "a", encoding="utf-8") as handle:
+    handle.write(target + "\\n")
 if "/collaborators/" in target:
     print("write")
     sys.exit(0)
 if os.environ["STUB_PAYLOAD"] == "object":
     print(json.dumps({"message": "Not Found"}))
     sys.exit(0)
-label = target.split("labels=")[1].split("&")[0]
+# A lane-LESS board query is SERVED, not refused: the stub must not be the thing that catches an
+# unfiltered sweep, or the "[#487] the sweep board is EXACTLY the two lane queries" row below would
+# be asserting the stub's strictness instead of the workflow's. It answers with a short page so the
+# page accounting the #605 rows check is undisturbed and that row is the ONLY thing that goes red.
+label = target.split("labels=")[1].split("&")[0] if "labels=" in target else ""
 page = int(target.split("&page=")[1])   # NOT "page=" — `per_page=100` matches that first
-base = 1000000 if label.endswith("ready") else 0
-count = 100 if page <= int(os.environ["STUB_FULL_PAGES"]) else 7
+base = 1000000 if label.endswith("ready") else (2000000 if not label else 0)
+count = 7 if not label else (100 if page <= int(os.environ["STUB_FULL_PAGES"]) else 7)
 print(json.dumps([{"number": base + page * 1000 + index, "user": {"login": "owner"},
                    "body": "", "labels": [{"name": label}],
                    "updated_at": "2026-07-01T00:00:00Z"} for index in range(count)]))
@@ -1603,7 +1626,7 @@ with open(os.environ["STUB_APPLY_LOG"], "a", encoding="utf-8") as handle:
 
     def run_sweep_step(full_pages=2, payload="array", run_number=3):
         """Execute the REAL sweep step body. Returns (exit code, log text, page-file names,
-        window line count, applier invocation count)."""
+        window line count, applier invocation count, API targets the step actually requested)."""
         with tempfile.TemporaryDirectory() as directory:
             root = os.path.join(directory, "repo")
             os.makedirs(os.path.join(root, "scripts"))
@@ -1613,11 +1636,12 @@ with open(os.environ["STUB_APPLY_LOG"], "a", encoding="utf-8") as handle:
             temp = os.path.join(directory, "runner-temp")
             os.makedirs(temp)
             log = os.path.join(directory, "apply.log")
+            targets_path = os.path.join(directory, "targets.log")
             environment = dict(os.environ, RUNNER_TEMP=temp, REPO="o/r",
                                MAINTAINER_LOGIN="owner", APP_BOT_LOGIN="app[bot]",
                                GITHUB_RUN_NUMBER=str(run_number),
                                STUB_FULL_PAGES=str(full_pages), STUB_PAYLOAD=payload,
-                               STUB_APPLY_LOG=log,
+                               STUB_APPLY_LOG=log, STUB_TARGET_LOG=targets_path,
                                STUB_REAL_RETRIAGE=os.path.abspath(__file__))
             completed = subprocess.run(["bash", "-c", sweep_script], cwd=root, env=environment,
                                        capture_output=True, text=True, timeout=600, check=False)
@@ -1634,13 +1658,17 @@ with open(os.environ["STUB_APPLY_LOG"], "a", encoding="utf-8") as handle:
             if os.path.isfile(log):
                 with open(log, encoding="utf-8") as handle:
                     applies = sum(1 for line in handle if line.strip())
+            targets = []
+            if os.path.isfile(targets_path):
+                with open(targets_path, encoding="utf-8") as handle:
+                    targets = [line.strip() for line in handle if line.strip()]
             return (completed.returncode, completed.stdout + completed.stderr, pages, window,
-                    applies)
+                    applies, targets)
 
     # 2 full pages + a short third page per lane = 207 issues per lane, 414 in all, cap 80.
     # `got=0` (the truncation mutation) fetches ONE page per lane and applies a truncated board:
     # the page-file list and the reported board total both change, so this row dies on it.
-    code, log, pages, window, applies = run_sweep_step(full_pages=2)
+    code, log, pages, window, applies, targets = run_sweep_step(full_pages=2)
     checks.append(("[#605 r2 f2] the step reads until a SHORT page arrives, on BOTH lanes",
                    (code, pages) == (0, ["page-ready-1.json", "page-ready-2.json",
                                          "page-ready-3.json", "page-untriaged-1.json",
@@ -1649,16 +1677,31 @@ with open(os.environ["STUB_APPLY_LOG"], "a", encoding="utf-8") as handle:
                    "414 board issue(s)" in log))
     checks.append(("[#605 r2 f2] ...and the capped window is what the applier is actually fed",
                    (window, applies) == (80, 80)))
+    # [registry #487] BOARD MEMBERSHIP — the honest scope of the opt-in, asserted by EXECUTION.
+    # The rows above prove the widening WORKS on a document handed to plan(); this one proves WHICH
+    # documents production can ever hand it. Every board request the real step body issues carries
+    # a `labels=` filter, and the filter values are exactly the two lanes — so an issue carrying
+    # NEITHER lane label is never fetched, never snapshotted, never passed to `--apply`, and
+    # `plan()` (hence the #487 trust gate) is never reached for it. That is why this unit is inert
+    # on this repo today rather than "covering" the alert-responder class, and it is what a reader
+    # must not be allowed to forget. Dies on: dropping `labels=$label` from the board query
+    # (an unfiltered board would sweep every open issue), and on adding/renaming/removing a lane.
+    board = [target for target in targets if "/issues?" in target]
+    lanes = {target.split("labels=")[1].split("&")[0] for target in board if "labels=" in target}
+    checks.append(("[#487] the sweep board is EXACTLY the two lane queries — an issue on no lane "
+                   "is never fetched, so plan() and its trust gate are never reached for it",
+                   (bool(board), all("labels=" in target for target in board), lanes)
+                   == (True, True, {"status:untriaged", "status:ready"})))
     # The REQUEST ceiling: 25 full pages against max_pages=20. Deleting the ceiling's own `exit 1`,
     # or `if false`, or a raised max_pages all let the loop run to the short page and exit 0.
-    code, log, pages, _window, applies = run_sweep_step(full_pages=25)
+    code, log, pages, _window, applies, _targets = run_sweep_step(full_pages=25)
     checks.append(("[#605 r2 f2] a board past the REQUEST ceiling fails the step CLOSED at page 20",
                    (code != 0, "larger than 20 pages" in log,
                     len([name for name in pages if name.startswith("page-untriaged-")]), applies)
                    == (True, True, 20, 0)))
     # The page-SHAPE guard: `jq 'length'` alone returns 2 for {"message": "Not Found"}, which is
     # `-lt 100`, so an error document used to break the loop and be swept as a complete board.
-    code, log, _pages, _window, applies = run_sweep_step(payload="object")
+    code, log, _pages, _window, applies, _targets = run_sweep_step(payload="object")
     checks.append(("[#605 r2 f2] a non-array page payload fails the step CLOSED, never sweeps",
                    (code != 0, "not a JSON array" in log, applies) == (True, True, 0)))
 
