@@ -15307,8 +15307,12 @@ def _self_test():
         count, posted, cleared = readmit_sweep(
             recovered_window, rows=[[orch_row()]], provenance={41: orch_record},
             enrolled_authors=orch_enrolled)
-        assert count == 1 and cleared == [(41, 7)], (count, cleared)
-        assert len(posted) == 1 and worker_pr_mod.AUTO_READMIT_MARKER in posted[0][1], posted
+        assert count == 1 and cleared == [(41, 7)], (
+            "[#835] a capacity-parked ORCHESTRATOR-class PR must be machine-re-admitted; "
+            "reverting either waived gate in the candidate filter reds THIS assertion. "
+            f"got {(count, cleared)!r}")
+        assert len(posted) == 1 and worker_pr_mod.AUTO_READMIT_MARKER in posted[0][1], (
+            f"[#835] the re-admission must be RECEIPTED first: {posted!r}")
         print("  ok   [#835] a capacity-parked ORCHESTRATOR-class PR is MACHINE re-admitted "
               "(receipt-first) — the #614 stall no longer has an unreachable population")
 
@@ -15317,19 +15321,22 @@ def _self_test():
         #     changed between the two calls is the master-protected allowlist.
         assert readmit_sweep(recovered_window, rows=[[orch_row()]],
                              provenance={41: orch_record}) == (0, [], []), \
-            ("an EMPTY review_enrolment_authors must leave the two shape gates standing "
+            ("[#835] an EMPTY review_enrolment_authors must leave the two shape gates standing "
              "byte-for-byte — enrolment is the discriminator, not the head-ref shape")
         print("  ok   [#835] ...and with an EMPTY allowlist the very same PR is still refused")
 
         # (3) WORKER-CLASS REGRESSION CONTROL, FROZEN. The worker row's outcome is pinned by
         #     LITERAL expectation on both sides of the allowlist — not by re-calling the waiver
         #     predicate, which would go quiet the moment that predicate changed.
-        assert readmit_sweep(recovered_window)[0::2] == (1, [(41, 7)]), "worker park regressed"
+        assert readmit_sweep(recovered_window)[0::2] == (1, [(41, 7)]), \
+            "[#835] REGRESSION CONTROL: the worker-class capacity park must still re-admit"
         assert readmit_sweep(recovered_window, enrolled_authors=orch_enrolled)[0::2] \
-            == (1, [(41, 7)]), \
-            "an enabled allowlist must not change ANY worker-class re-admission outcome"
-        assert readmit_sweep(still_broken_window, enrolled_authors=orch_enrolled) == (0, [], []), \
-            "an enabled allowlist must not manufacture a worker re-admission without recovery"
+            == (1, [(41, 7)]), (
+            "[#835] REGRESSION CONTROL: an enabled allowlist must not change ANY "
+            "worker-class re-admission outcome")
+        assert readmit_sweep(still_broken_window, enrolled_authors=orch_enrolled) == (0, [], []), (
+            "[#835] REGRESSION CONTROL: an enabled allowlist must not manufacture a worker "
+            "re-admission without proven recovery")
         print("  ok   [#835] worker-class re-admission is unchanged in BOTH allowlist states "
               "(regression control, frozen literals)")
 
@@ -15351,7 +15358,7 @@ def _self_test():
                                        "recorded_at_run": "6001.1"}}, orch_enrolled),
                 ("no record at all fails closed", [[orch_row()]], {}, orch_enrolled)):
             assert readmit_sweep(recovered_window, rows=_rows, provenance=_prov,
-                                 enrolled_authors=_authors) == (0, [], []), _why
+                                 enrolled_authors=_authors) == (0, [], []), f"[#835] {_why}"
         print("  ok   [#835] no third-party, fork, foreign-record, machine-attested or "
               "recordless PR becomes re-admittable (5 shapes, one differing property each)")
     finally:
