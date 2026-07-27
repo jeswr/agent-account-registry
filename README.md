@@ -105,6 +105,11 @@ ships where `lease_schema.py` does not exist. A private copy *there* is caught o
 on one of the exercised area shapes, which is weaker than the four callers above.
 The routing tables `review-fix.yml` re-derives inline (`review_chain` / `fix_chain` / `ladders`) are
 pinned to `dispatch-claim.REVIEW_CHAIN` / `FIX_CHAIN` / `worker-pr.ESCALATION_LADDERS` the same way.
+`FIX_CHAIN` is the provider-wide walk, **not** the chain the dispatcher claims from: since #578 the
+fix lane claims `FIX_CHAIN[impl_provider] ∩ route.model_chain`, where the route is re-derived live
+from the **source issue's** labels, so a trust-surface PR is never fixed by a tier its route
+excluded. That narrowing reaches the workflow through the existing `model_pin` input — which is what
+keeps the two derivations equal; an intersection the pin cannot express fails the claim closed.
 
 This matters because these values are derived **twice by design** — once by the dispatcher that
 mints a CAS claim, once by the review/fix (or worker) run that adopts it — and both adopt steps

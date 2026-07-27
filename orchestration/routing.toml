@@ -9,12 +9,27 @@
 # (the security surfaces) are listed FIRST and win over the role blocks below them.
 #
 # match_labels SEMANTICS: a rule matches if ANY of the issue's labels CONTAINS any listed keyword
-# as a SUBSTRING. This is ALSO the signal the review-lane arm-side security classifier consults
-# (worker-pr.py security_flagged / dispatch-claim.py _security_flagged read the target routing's
-# match_labels keywords), so the trust-surface areas below are load-bearing for the arm gate, not
-# only for model selection: a review that approves an issue matched here is routed to a HUMAN arm
-# (needs:user), never auto-armed. THIS repo is the orchestration trust plane, so its worker/
-# dispatch/set-up-account/review-loop/groom areas ARE security surfaces.
+# as a SUBSTRING. This is ALSO the signal the review-lane ARM-SIDE security classifier consults, so
+# the trust-surface areas below are load-bearing for the arm gate, not only for model selection: a
+# review that approves an issue matched here is routed to a HUMAN arm (needs:user), never
+# auto-armed. THIS repo is the orchestration trust plane, so its worker/dispatch/set-up-account/
+# review-loop/groom areas ARE security surfaces.
+#
+# WHICH CODE ACTUALLY READS THESE KEYWORDS (#578 AC5 — this note said "dispatch-claim.py
+# _security_flagged" too, and that was never true; the doc and the code now agree):
+#   * THE ARM GATE, and it is the one that matters: review-fix.yml's resolve step calls
+#     policy-resolve.routing_security_keywords(<target>) — a FAIL-CLOSED union of every
+#     match_labels keyword in the target's routing — and threads it into worker-pr.py
+#     security_flagged(..., extra_keywords=...) / live_security_flagged. That is what withholds
+#     the auto-arm from a trust-surface PR.
+#   * dispatch-claim.py `_security_flagged` does NOT read this table. It stamps the PLAN row's
+#     advisory `security` boolean from its OWN built-in SECURITY_KEYWORDS plus the `trust:*` label
+#     prefix, and that boolean is never consulted by any dispatch decision (in particular it plays
+#     no part in fix-chain selection — #578 constrains that from the resolved ROUTE instead).
+#     Threading the target's keywords into it would mean handing a HOSTILE target's routing table
+#     to the pure PLAN enumerator to compute a field nothing reads.
+# Also mirrored, deliberately and by a self-test rather than by this comment: scripts/triage.py's
+# SEC_KEYWORDS must stay IDENTICAL to the match_labels list below.
 
 # ---------------------------------------------------------------------------------------------------
 # [models] — the catalog. Mirrors sparq's catalog so the shared account_pool + cross-provider

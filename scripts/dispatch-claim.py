@@ -836,8 +836,17 @@ def validate_plan(document):
 
 
 def _security_flagged(labels):
-    """Security surfaces never auto-arm (mirrors worker-pr.py security_flagged): substring
-    keywords per routing match_labels semantics plus the trust:* prefix namespace."""
+    """The PLAN row's ADVISORY `security` boolean: substring keywords per routing match_labels
+    SEMANTICS (this module's own SECURITY_KEYWORDS) plus the trust:* prefix namespace.
+
+    [#578 AC5] It does NOT read the TARGET routing's `match_labels`, and the doc now says so —
+    orchestration/routing.toml previously claimed it did. The classifier that DOES union them is
+    the arm-side one (review-fix.yml resolve -> policy-resolve.routing_security_keywords ->
+    worker-pr.security_flagged / live_security_flagged), and that is the gate which withholds the
+    auto-arm. This flag decides nothing: in particular it plays no part in fix-chain selection,
+    which is constrained from the RESOLVED ROUTE (_route_constrained_fix_chain), never from a
+    plan-persisted boolean. Widening it would mean handing a HOSTILE target's routing table to the
+    pure PLAN enumerator to compute a field no consumer reads."""
     return (any(keyword in label for label in labels for keyword in SECURITY_KEYWORDS)
             or any(label.startswith("trust:") for label in labels))
 
@@ -4713,6 +4722,53 @@ def _resolvable_chain(chain, routing):
     return usable
 
 
+def _route_constrained_fix_chain(fix_aliases, route_chain):
+    """[#578] The fix lane's claim chain: the INTERSECTION of the provider-wide fix walk with the
+    PR's OWN trust-tier route, order preserved from `fix_aliases`.
+
+    WHY AN INTERSECTION AND NOT A FLOOR. `FIX_CHAIN[impl_provider]` (or its pinned truncation) is
+    a PROVIDER-wide preference walk; it knows nothing about the route the SOURCE ISSUE resolved
+    to. So a trust-surface PR whose issue routed to a restricted soundness chain could be FIXED by
+    a tier that route deliberately excludes — the fix lane silently re-widened what routing.toml
+    narrowed, and `escalate = true` (defer-not-fallback) was bypassed on the fix leg. A LADDER
+    FLOOR (the shape the closed PR #282 proposed) does not close this: a floor readmits every
+    ladder member ABOVE it, including ones the route omits, so a route naming a single mid-ladder
+    tier still leaks its successors. Only set membership expresses "this route does not authorize
+    that model".
+
+    `route_chain` is whatever the LIVE resolver derived from the source issue's LIVE labels; a
+    non-string entry is ignored so a hostile/garbled chain can only NARROW the result. An empty
+    result means the route authorizes no same-provider fix model at all — the caller FAILS CLOSED
+    (defer, or escalate per `escalate = true`) and never falls through to the provider default."""
+    allowed = {alias for alias in route_chain if isinstance(alias, str)}
+    return [alias for alias in fix_aliases if alias in allowed]
+
+
+def _fix_chain_model_pin(fix_chain, ladder):
+    """[#578] The `model_pin` value that carries `fix_chain` into review-fix.yml, or "" when it
+    cannot be carried faithfully.
+
+    review-fix.yml has exactly ONE input for restricting the fix chain: `model_pin`, a ladder
+    FLOOR it expands back to `ladder[ladder.index(pin):]`. For the workflow's own chain resolution
+    and its adopt-time `model not in models` assertion to agree with what the dispatcher claimed
+    against, that expansion must not readmit a tier the route excluded. So the pin is the
+    LOWEST-LADDER member of the intersection, returned only when its expansion is exactly the
+    intersection; otherwise "" and the caller fails closed. Returning the floor regardless would
+    hand the worker a WIDER chain than the dispatcher was allowed to claim from — the very
+    re-widening this issue is about, moved one hop downstream.
+
+    Note the pinned-floor case is subsumed: `fix_chain` is already a subset of
+    `pinned_fix_chain(provider, pin_floor)`, so the returned pin can only ever be at or above the
+    recorded floor — the defer-not-fallback guarantee is preserved, never relaxed."""
+    ladder = list(ladder)
+    if not fix_chain or any(alias not in ladder for alias in fix_chain):
+        return ""
+    floor = min(fix_chain, key=ladder.index)
+    if set(ladder[ladder.index(floor):]) != set(fix_chain):
+        return ""
+    return floor
+
+
 def _chain_probe_exempt(chain, routing):
     """True iff EVERY alias in `chain` maps to a POSITIVELY probe-exempt provider in the target
     routing catalog (issue #115) — so a wholesale usage-probe outage (usage=None) does NOT gate a
@@ -4776,7 +4832,7 @@ def _missed_fix_budget(worker_pr, comments, bot_login, round_number, cutoff_fn, 
 def _dispatch_review_items(review_items, repo, policy, routing, allocator, worker_pr,
                            registry_repo, registry_root, workflow_ref, bot_login, usage, margin,
                            defer_reasons, lanes=None, ledger_root="", fix_dispatch=None, *,
-                           enrolled_authors):
+                           enrolled_authors, policy_doc, policy_module):
     """Hostile re-validation + claim + launch for the review/fix loop. Every item failure SKIPS
     that item (per-item resilience, like the issue loop). `defer_reasons` is the tick's SHARED
     histogram: allocator lease errors here must fold into the same `lease-error` counter the
@@ -4788,7 +4844,13 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
     (review vs fix via _review_item_lane); a launch folds into that lane's `launched` and a hard
     failure (lease error, revalidation DispatchError, failed workflow launch) into its `error`. This
     keeps a review/fix lane that launched NOTHING visible to the tick-health recorder even when the
-    worker lane launched — the exact masking this loop's bare launched-count return used to allow."""
+    worker lane launched — the exact masking this loop's bare launched-count return used to allow.
+
+    `policy_doc` + `policy_module` are the REGISTRY-owned policy document and the shared
+    `policy-resolve` module (issue #578). The fix lane re-derives the PR's trust-tier route from
+    the SOURCE ISSUE's LIVE labels through them — the same resolver `_route_matches` uses — and
+    intersects the provider fix chain with it. Nothing persisted in the hostile plan is trusted for
+    that decision, so these are REQUIRED: a caller that cannot supply them cannot dispatch a fix."""
     if lanes is None:
         lanes = _new_lane_counts()
     if fix_dispatch is None:
@@ -5226,6 +5288,35 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
             # budget still bounds how long it can defer before a loud needs-user.)
             fix_aliases = (worker_pr.pinned_fix_chain(impl_provider, pin_floor)
                            if pin_floor else FIX_CHAIN[impl_provider])
+            # ---- ISSUE #578: THE FIX LANE HONOURS THE PR's OWN TRUST-TIER ROUTE ----------------
+            # `fix_aliases` above is a PROVIDER-wide walk. On its own it re-widens exactly what
+            # routing.toml narrowed: a trust-surface PR whose source issue routed to a restricted
+            # soundness chain could be fixed by a tier that route excludes, and the route's
+            # `escalate = true` (defer, never degrade) never applied to the fix leg at all.
+            #
+            # The route is re-derived LIVE, from the SOURCE ISSUE's LIVE labels, through the SAME
+            # shared resolver `_route_matches` uses — never from anything the hostile plan
+            # persisted (`item["security"]`, `item["model_chain"]`, the plan's own route fields).
+            # The claim chain is then the INTERSECTION (never a ladder floor — see
+            # _route_constrained_fix_chain), and `fix_model_pin` is how that same constraint rides
+            # into review-fix.yml so the worker's chain resolution and its adopt-time model
+            # assertion agree with what was claimed here.
+            #
+            # A resolver refusal is CAPTURED, not raised: it must fail the FIX lane closed without
+            # taking down a cross-provider REVIEW of the same PR, which does not consume this
+            # route at all (the review chain is the INVERSE of the implementer's provider and is
+            # computed from REVIEW_CHAIN, not from routing.toml's implementor chain).
+            unconstrained_fix_aliases = list(fix_aliases)
+            route_error, route_chain, route_escalate = "", [], False
+            try:
+                route = policy_module.resolve(repo, list(source_labels_live), policy_doc, routing)
+                route_chain = list(route["model_chain"])
+                route_escalate = bool(route["escalate"])
+            except (ValueError, TypeError, KeyError) as exc:
+                route_error = f"{exc.__class__.__name__}: {exc}"
+            fix_aliases = _route_constrained_fix_chain(unconstrained_fix_aliases, route_chain)
+            fix_model_pin = _fix_chain_model_pin(
+                fix_aliases, worker_pr.ESCALATION_LADDERS.get(impl_provider, ()))
             # Privacy (locked decision 22a): provenance stores ONLY the salted account hash; a
             # raw-handle/missing hash already deferred above (provenance_admission_error).
             impl_account_h = record["impl_account_h"]
@@ -5329,6 +5420,42 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 mode, role = "fix", "fix"
                 chain = _resolvable_chain(fix_aliases, routing)
                 holder_namespace, ttl = "fix:", FIX_TTL
+            if mode == "fix" and (route_error or not fix_aliases or not fix_model_pin):
+                # [#578] FAIL CLOSED, and name WHICH of the three failures it is. The one thing
+                # that must never happen here is falling through to the provider-wide FIX_CHAIN:
+                # that is the hole. This guard sits BEFORE the generic `not chain` escalation
+                # because an empty intersection is a ROUTE refusal, not an unresolvable catalog,
+                # and the two want different diagnostics.
+                if route_error:
+                    detail = ("the source issue's route could not be resolved from its LIVE "
+                              f"labels ({route_error})")
+                elif not fix_aliases:
+                    detail = (f"the {impl_provider} fix chain {unconstrained_fix_aliases} and "
+                              f"issue #{issue_number}'s route chain {route_chain} share no "
+                              "model, so the route authorizes no same-provider fixer")
+                else:
+                    detail = (f"the route-constrained fix chain {fix_aliases} cannot be carried "
+                              "into review-fix.yml as a model_pin floor over the "
+                              f"{impl_provider} ladder "
+                              f"{list(worker_pr.ESCALATION_LADDERS.get(impl_provider, ()))} "
+                              "without readmitting a tier the route excluded")
+                if not route_error and not fix_aliases and not route_escalate:
+                    # A non-escalating route with no same-provider fixer DEFERS (the route's own
+                    # contract: only `escalate = true` routes hand chain exhaustion to a human).
+                    defer_reasons["fix-route-chain-empty"] += 1
+                    fix_dispatch["defer:route-chain-empty"] += 1
+                    print(f"defer review {repo}#{number}: {detail}; the fix lane never falls "
+                          "back to the provider-wide chain")
+                else:
+                    # `escalate = true` (the trust surfaces), an unresolvable route, or a
+                    # constraint the workflow input cannot express: all three are standing
+                    # table/code contradictions that repeat every tick, so they go to a human
+                    # rather than deferring forever behind a counter.
+                    _pr_needs_user(script_dir, repo, number, issue_number,
+                                   "the fix lane cannot honour the source issue's trust-tier "
+                                   f"route: {detail}; a human must reconcile the routing table "
+                                   "with the fix chain")
+                continue
             if not chain:
                 # The inverse (or same-provider) chain cannot resolve a concrete model right now
                 # (e.g. sol/luna not yet in the target routing catalog). Never silent-queue:
@@ -5549,9 +5676,15 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
             "-f", f"mode={mode}",
             "-f", f"fix_kind={fix_kind}",
             "-f", f"fix_context={fix_context}",
-            # The pinned fix-model floor rides along so the workflow's own chain resolution
+            # The EFFECTIVE fix-model floor rides along so the workflow's own chain resolution
             # honours it (review mode never carries a pin; the input is ladder-validated there).
-            "-f", f"model_pin={(pin_floor or '') if mode == 'fix' else ''}",
+            # [#578] "Effective" = the round-budget pin AND the source issue's route, folded
+            # together: `fix_model_pin` is derived from the route-constrained chain, which is
+            # already the pinned chain intersected with the route, so it is never below the
+            # recorded floor and never readmits a tier the route excluded. The guard above
+            # refused to dispatch at all when that value is empty, so mode=fix always carries a
+            # real pin here.
+            "-f", f"model_pin={fix_model_pin if mode == 'fix' else ''}",
             "-f", f"review_round={round_number}",
             "-f", f"account={account}",
             "-f", f"claim_id={claim_id}",
@@ -6838,7 +6971,13 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                 # authority is exactly what makes the pair pointless). Absent/empty => enrolment
                 # OFF => CLAIM's shape gates stand. CLAIM re-derives the waiver itself rather than
                 # trusting PLAN's `self_attested`, so a PLAN->CLAIM window edit fails closed.
-                enrolled_authors=policy_module.review_enrolment_authors(repo, policy_doc))
+                enrolled_authors=policy_module.review_enrolment_authors(repo, policy_doc),
+                # [#578] The fix lane re-derives each PR's trust-tier route LIVE through the SAME
+                # registry-owned resolver `_route_matches` uses, from the SAME policy document
+                # validated above. Passing the module + document (rather than a pre-resolved
+                # route) is what keeps the derivation inside CLAIM, on live source-issue labels,
+                # with nothing from the hostile plan in the loop.
+                policy_doc=policy_doc, policy_module=policy_module)
     print(f"dispatcher complete: {dispatched} worker/review/fix run(s) launched")
     print(_fix_dispatch_line(fix_dispatch))
     # Per-lane tick summary (issue #108) — coarse counts only (no issue numbers/handles). A stalled
@@ -10627,6 +10766,38 @@ def _self_test():
          "leg off with nothing red anywhere else — every enrolled PR then defers on the "
          "plan/CLAIM self_attested disagreement, every tick, forever. Found: "
          f"{ast.dump(_enrol_args[0])}")
+    # (c6b) [#578] THE SAME PIN FOR THE ROUTE RE-DERIVATION ARGUMENTS. The fix lane's route
+    #       constraint is only as live as the resolver + document it is handed: passing a stub
+    #       module, a stale snapshot, or `{}` would make every route resolve permissively (or
+    #       fail-closed-forever) with nothing red in the wiring harness, which supplies its own
+    #       fixtures. So the ARGUMENT EXPRESSIONS are asserted to be dispatch()'s OWN validated
+    #       `policy_module` / `policy_doc` names — the very objects `_route_matches` resolves the
+    #       worker lane through.
+    _route_args = {
+        keyword.arg: keyword.value
+        for node in ast.walk(_dispatch_fn) if isinstance(node, ast.Call)
+        and getattr(node.func, "id", "") == "_dispatch_review_items"
+        for keyword in node.keywords if keyword.arg in ("policy_doc", "policy_module")}
+    assert sorted(_route_args) == ["policy_doc", "policy_module"], (
+        "dispatch() must hand CLAIM's review/fix loop the live policy document AND the shared "
+        "policy-resolve module — without both, the fix lane cannot re-derive the PR's trust-tier "
+        f"route and #578's intersection is unenforceable. Found: {sorted(_route_args)}")
+    for _name, _node in sorted(_route_args.items()):
+        assert isinstance(_node, ast.Name) and _node.id == _name, (
+            f"_dispatch_review_items must receive dispatch()'s own validated `{_name}`, not a "
+            f"literal or a substitute. Found: {ast.dump(_node)}")
+    # ...and the parameters are KEYWORD-ONLY and REQUIRED, so a caller that forgets them is a
+    # TypeError rather than a silently unconstrained fix lane.
+    _rf_fn = next(
+        node for node in ast.walk(ast.parse(
+            Path(__file__).resolve().read_text(encoding="utf-8")))
+        if isinstance(node, ast.FunctionDef) and node.name == "_dispatch_review_items")
+    assert ([arg.arg for arg in _rf_fn.args.kwonlyargs]
+            == ["enrolled_authors", "policy_doc", "policy_module"]
+            and _rf_fn.args.kw_defaults == [None, None, None]), (
+        "_dispatch_review_items' trust-plane inputs must stay REQUIRED keyword-only parameters; a "
+        "default would let a call site drop the route constraint silently. Found: "
+        f"{[a.arg for a in _rf_fn.args.kwonlyargs]}")
     # (c7) THE TWO SECURITY PROPERTIES THE WAIVER RESTS ON — asserted at EVERY consumer, because
     #      the waiver decision is now made in three places (PLAN, CLAIM, review-fix.yml resolve)
     #      and a property that holds in two of them is not a property.
@@ -11863,8 +12034,19 @@ def _self_test():
                 "user": {"login": bot, "type": "Bot"},
                 "labels": [{"name": name} for name in labels]}
 
+    # [#578] The route resolver every pre-existing wiring row runs against: it authorizes EVERY
+    # alias, so the intersection is the identity there and those rows keep measuring exactly what
+    # they measured before. The #578 rows below pass the REAL policy-resolve module instead, so
+    # the constraint itself is proved against a real routing table rather than this stub.
+    class _UnconstrainedRoute:
+        model_chain = sorted({alias for table in (REVIEW_CHAIN, FIX_CHAIN)
+                              for aliases in table.values() for alias in aliases})
+
+        def resolve(self, _repo, _labels, _policy_doc, _routing_doc):
+            return {"model_chain": list(self.model_chain), "agent": "x", "escalate": False}
+
     def run_items(items, allocator=None, routing=None, policy=None, usage=None,
-                  enrolled_authors=()):
+                  enrolled_authors=(), policy_doc=None, policy_module=None):
         helper_calls.clear()
         reasons = Counter()
         # Issue #108: a fresh per-lane accumulator each call; run_items.lanes exposes it for the
@@ -11876,7 +12058,9 @@ def _self_test():
             routing or {}, allocator, wiring_worker_pr, "reg/repo",
             wiring_root, "main", bot, usage, 0.10, reasons, lanes=lanes,
             ledger_root=wiring_ledger_root, fix_dispatch=fix_dispatch,
-            enrolled_authors=enrolled_authors)
+            enrolled_authors=enrolled_authors,
+            policy_doc=policy_doc if policy_doc is not None else {},
+            policy_module=policy_module or _UnconstrainedRoute())
         run_items.lanes = lanes
         run_items.fix_dispatch = fix_dispatch
         return launched, reasons
@@ -13235,6 +13419,293 @@ def _self_test():
             finally:
                 globals()["_gh_json"] = fake_gh_json
                 globals()["_run_gh"] = real_run_gh
+
+            # ---- ISSUE #578: THE FIX LANE'S CLAIM CHAIN IS THE PR's OWN ROUTE ∩ FIX_CHAIN ----
+            # The defect: `FIX_CHAIN[impl_provider]` was the ONLY chain input, so a PR whose
+            # source issue routed to a restricted chain could be fixed by a tier that route
+            # deliberately excludes. Everything below is driven through the PRODUCTION
+            # `_dispatch_review_items` claim call with the REAL policy-resolve module — no slice
+            # helper — so a mutation that drops the intersection, or swaps it for the ladder
+            # floor PR #282 proposed, turns these red.
+            _pol578 = _load_module("registry_policy_resolve_578",
+                                   Path(__file__).resolve().parent / "policy-resolve.py")
+            _policy578 = {"repos": {repo: {
+                "enabled": True, "routing": "orchestration/routing.toml",
+                "account_pool": ["acct01"], "max_concurrent": 1, "worker_timeout_minutes": 30,
+                "gate_profile": "lint-only", "arm_auto_merge": False, "max_attempts": 1,
+                "trust": "collaborators"}}}
+            # A routing table with FOUR shapes the fix lane must treat differently. Note `role:ci`
+            # and `role:site` name the SAME anthropic tier but differ in `escalate`, which is what
+            # separates the human hand-off from the plain defer.
+            _routing578 = tomllib.loads("""
+[models.opus5]
+provider = "anthropic"
+harness = "claude"
+provider_model = "claude-opus-5"
+[models.sol]
+provider = "openai"
+harness = "codex"
+provider_model = "TBD"
+[models.luna]
+provider = "openai"
+harness = "codex"
+provider_model = "TBD"
+[defaults]
+model_chain = ["opus5", "sol"]
+agent = "impl"
+[[route]]
+match_labels = ["dispatch"]
+model_chain = ["opus5"]
+agent = "reviewer"
+escalate = true
+[[route]]
+role = "ci"
+model_chain = ["opus5", "sol"]
+agent = "impl"
+[[route]]
+role = "site"
+model_chain = ["opus5"]
+agent = "impl"
+[[route]]
+role = "perf"
+model_chain = ["luna", "opus5"]
+agent = "impl"
+""")
+            _pr578, _issue578 = 91, 910
+            _head578 = f"{_pr578:040x}"
+            _labels578 = ["area:crate-a", "role:ci"]
+
+            def _pull578():
+                return {"number": _pr578, "state": "open", "draft": True, "body": "",
+                        "mergeable": True, "auto_merge": None,
+                        "head": {"ref": f"sparq-agent/issue-{_issue578}-1-1",
+                                 "sha": _head578, "repo": {"full_name": repo}},
+                        "base": {"ref": "main", "repo": {"default_branch": "main"}},
+                        "user": {"login": bot, "type": "Bot"},
+                        "labels": [{"name": "review:changes"}, {"name": "area:crate-a"}]}
+
+            def _gh578(args):
+                path = args[-1]
+                if path.endswith(f"/pulls/{_pr578}"):
+                    return _pull578()
+                if "/check-runs" in path:
+                    return {"check_runs": [], "total_count": 0}
+                if "/timeline" in path:
+                    return [[]]
+                if f"/issues/{_pr578}/comments" in path:
+                    return [[]]
+                if f"/issues/{_issue578}" in path:
+                    return {"labels": [{"name": name} for name in _labels578]}
+                if "/compare/" in path:
+                    return {"status": "ahead", "files": [{"filename": "src/a.rs"}]}
+                raise AssertionError(f"unexpected #578 API read: {path}")
+
+            _rec578 = Path(wiring_root) / wiring_worker_pr.provenance_path(repo, _pr578)
+            _rec578.parent.mkdir(parents=True, exist_ok=True)
+            _rec578.write_text(json.dumps({
+                "head_sha_at_open": _head578, "impl_account_h": "ef" * 8, "impl_alias": "sol",
+                "impl_provider": "openai", "issue": _issue578, "pr_number": _pr578,
+                "recorded_at_run": "578.1"}), encoding="utf-8")
+            _verdict578 = Path(wiring_root) / wiring_worker_pr.verdict_path(repo, _pr578, 1)
+            _verdict578.parent.mkdir(parents=True, exist_ok=True)
+            _verdict578.write_text(json.dumps({
+                "verdict": "request_changes", "injection_detected": False, "summary": "s",
+                "issues": [], "progress": None}), encoding="utf-8")
+            _item578 = {"pr_number": _pr578, "head_sha": _head578, "state": "needs-fix",
+                        "impl_provider": "openai", "repo": repo, "package": "crate-a",
+                        "security": False, "self_attested": False, "context": ""}
+
+            class _Alloc578:
+                def __init__(self):
+                    self.chains = []
+
+                def claim(self, _repo, _package, _role, chain, *_args, **_kwargs):
+                    self.chains.append(list(chain))
+                    return {"account": "acct01", "claim_id": "57" * 16,
+                            "model": chain[0], "provider": "openai"}
+
+                def release(self, *_args, **_kwargs):
+                    return True
+
+            _runs578 = []
+
+            def _run_gh578(args, *, check=True):
+                _runs578.append(list(args))
+                return subprocess.CompletedProcess(args, 0)
+
+            def _argv578(key):
+                return [arg.split("=", 1)[1] for args in _runs578 for arg in args
+                        if arg.startswith(f"{key}=")]
+
+            try:
+                globals()["_gh_json"] = _gh578
+                globals()["_run_gh"] = _run_gh578
+
+                # (1) THE HEADLINE. `role:ci` routes to ["opus5", "sol"]; the openai fix walk is
+                # ["sol", "luna"]. The claim chain must be the INTERSECTION ["sol"] — luna is a
+                # tier this route never authorized, and the unpatched code offered it.
+                _alloc = _Alloc578()
+                _launched, _ = run_items([_item578], allocator=_alloc, routing=_routing578,
+                                         policy_doc=_policy578, policy_module=_pol578)
+                assert _launched == 1, _launched
+                assert _alloc.chains == [["sol"]], (
+                    "the fix lane must claim against FIX_CHAIN ∩ route.model_chain; a chain "
+                    "containing `luna` means the PR's own route was ignored", _alloc.chains)
+                assert FIX_CHAIN["openai"] == ["sol", "luna"], (
+                    "NON-VACUITY: the excluded tier must really be in the provider walk, or the "
+                    "assertion above proves nothing", FIX_CHAIN)
+                # (2) AC4 — the SAME constraint rides into review-fix.yml on `model_pin`, so the
+                # workflow's own chain resolution (`ladder[ladder.index(pin):]`) and its
+                # adopt-time `model not in models` check agree with what was claimed here.
+                assert _argv578("model_pin") == ["sol"], (
+                    "the route-constrained floor must reach review-fix.yml; an empty model_pin "
+                    "leaves the worker resolving the full provider fix chain", _runs578)
+
+                # (3) NON-VACUITY vs REMOVAL: the identical item under a resolver that authorizes
+                # every alias claims the UNCONSTRAINED walk. So (1) is measuring the route, not
+                # some unrelated narrowing.
+                _runs578.clear()
+                _alloc = _Alloc578()
+                run_items([_item578], allocator=_alloc, routing=_routing578)
+                assert _alloc.chains == [["sol", "luna"]], _alloc.chains
+
+                # (4) NON-VACUITY vs the LADDER FLOOR (the closed PR #282's shape). A route that
+                # names a MID-ladder tier and not its successor is where a floor and an
+                # intersection part company: the floor readmits `sol`, the intersection does not.
+                _ladder578 = wiring_worker_pr.ESCALATION_LADDERS["openai"]
+                assert _route_constrained_fix_chain(FIX_CHAIN["openai"], ["luna", "opus5"]) \
+                    == ["luna"], "the intersection must drop every tier the route omits"
+                assert wiring_worker_pr.pinned_fix_chain("openai", "luna") == ["luna", "sol"], (
+                    "NON-VACUITY: a ladder FLOOR at the same tier readmits `sol`, which is why a "
+                    "floor cannot implement this constraint", _ladder578)
+                # ...and that same route is refused end-to-end, because the constraint cannot be
+                # carried into review-fix.yml as a floor without readmitting `sol` (AC4).
+                _labels578 = ["area:crate-a", "role:perf"]
+                _runs578.clear()
+                _alloc = _Alloc578()
+                _launched, _ = run_items([_item578], allocator=_alloc, routing=_routing578,
+                                         policy_doc=_policy578, policy_module=_pol578)
+                assert _launched == 0 and _alloc.chains == [] and _runs578 == [], (
+                    _launched, _alloc.chains, _runs578)
+                assert [(script, args[0]) for script, args in helper_calls] == [
+                    ("worker-pr.py", "round-record"),
+                    ("worker-pr.py", "needs-user")], helper_calls
+
+                # (5) EMPTY INTERSECTION ON AN `escalate = true` ROUTE (the trust surface): the
+                # security override routes to opus5 only, the PR was implemented by openai, so no
+                # same-provider fixer is authorized. It must reach a HUMAN — never the provider
+                # default, never a silent forever-defer.
+                _labels578 = ["area:dispatch", "role:ci"]
+                _runs578.clear()
+                _alloc = _Alloc578()
+                _launched, _reasons = run_items([_item578], allocator=_alloc,
+                                                routing=_routing578, policy_doc=_policy578,
+                                                policy_module=_pol578)
+                assert _launched == 0 and _alloc.chains == [] and _runs578 == [], (
+                    "a trust-surface PR with no route-authorized fixer must never claim",
+                    _launched, _alloc.chains, _runs578)
+                assert [(script, args[0]) for script, args in helper_calls] == [
+                    ("worker-pr.py", "round-record"),
+                    ("worker-pr.py", "needs-user")], helper_calls
+
+                # (6) EMPTY INTERSECTION ON A NON-ESCALATING ROUTE: the route's own contract is
+                # defer-not-escalate, so this DEFERS with an attributed reason and mutates
+                # nothing — but it still never falls back to ["sol", "luna"].
+                _labels578 = ["area:crate-a", "role:site"]
+                _runs578.clear()
+                _alloc = _Alloc578()
+                _launched, _reasons = run_items([_item578], allocator=_alloc,
+                                                routing=_routing578, policy_doc=_policy578,
+                                                policy_module=_pol578)
+                assert _launched == 0 and _alloc.chains == [] and [
+                    args[0] for _script, args in helper_calls] == ["round-record"], (
+                    "a non-escalating route DEFERS: no claim, no launch, and no park mutation",
+                    _launched, _alloc.chains, helper_calls)
+                assert _reasons["fix-route-chain-empty"] == 1, _reasons
+                assert run_items.fix_dispatch["defer:route-chain-empty"] == 1, \
+                    run_items.fix_dispatch
+
+                # (7) A RESOLVER REFUSAL fails the FIX lane closed (never the provider default)...
+                class _RaisingRoute:
+                    def resolve(self, *_args, **_kwargs):
+                        raise ValueError("routing table unreadable")
+
+                _labels578 = ["area:crate-a", "role:ci"]
+                _runs578.clear()
+                _alloc = _Alloc578()
+                _launched, _ = run_items([_item578], allocator=_alloc, routing=_routing578,
+                                         policy_doc=_policy578, policy_module=_RaisingRoute())
+                assert _launched == 0 and _alloc.chains == [] and _runs578 == [], (
+                    _launched, _alloc.chains, _runs578)
+                assert [(script, args[0]) for script, args in helper_calls] == [
+                    ("worker-pr.py", "round-record"),
+                    ("worker-pr.py", "needs-user")], helper_calls
+            finally:
+                globals()["_gh_json"] = fake_gh_json
+                globals()["_run_gh"] = real_run_gh
+
+            # (8) ...and does NOT take down the cross-provider REVIEW of the same PR, which does
+            # not consume this route at all (its chain is the INVERSE of the implementer's
+            # provider, computed from REVIEW_CHAIN). Same raising resolver, review posture: the
+            # reviewer chain is still offered to the allocator.
+            fake.update(pull=live_pull(draft=True, labels=["review:needs"]))
+            fake["comments"] = []
+            alloc = FakeAllocator()
+            run_items([dict(fix_item, state="needs-review")], allocator=alloc,
+                      routing=routing_ok, policy_doc=_policy578,
+                      policy_module=_RaisingRoute())
+            assert alloc.chains == [["sol", "luna"]], (
+                "a fix-lane route failure must not starve the review lane", alloc.chains)
+            assert helper_calls == [], helper_calls
+
+            # (9) THE LIVE TABLES (acceptance criterion 2), resolved through the SAME shared
+            # resolver against THIS repository's own protected routing table. These are the rows
+            # the audit named, re-derived against the catalog as it stands today (`fable`/`opus`
+            # were retired from every chain on 2026-07-26, so the surviving live bite is `luna`).
+            _live578 = tomllib.loads(
+                (Path(__file__).resolve().parents[1] / "orchestration" / "routing.toml")
+                .read_text(encoding="utf-8"))
+            _live_policy578 = {"repos": {"probe/target": dict(_policy578["repos"][repo])}}
+
+            def _live_fix578(labels, provider):
+                _route = _pol578.resolve("probe/target", labels, _live_policy578, _live578)
+                return _route_constrained_fix_chain(FIX_CHAIN[provider], _route["model_chain"])
+
+            # A trust-surface issue routes to the opus5-only soundness chain: an anthropic PR is
+            # fixed there and NOWHERE else; an openai PR has no authorized fixer at all.
+            assert _live_fix578(["area:dispatch", "role:impl"], "anthropic") == ["opus5"]
+            assert _live_fix578(["area:dispatch", "role:impl"], "openai") == []
+            # role:ci is the frontier chain ["opus5", "sol"] — `luna` is in the openai fix walk
+            # and NOT in that route, so the fix lane must not offer it.
+            assert _live_fix578(["area:ci", "role:ci"], "anthropic") == ["opus5"]
+            assert _live_fix578(["area:ci", "role:ci"], "openai") == ["sol"]
+            assert _live_fix578(["area:docs", "role:docs"], "openai") == ["sol"]
+            assert "luna" in FIX_CHAIN["openai"], (
+                "NON-VACUITY: `luna` must be in the live openai fix walk for the three rows "
+                "above to be excluding anything", FIX_CHAIN)
+            # ...and the `model_pin` those live chains transmit is exactly the claimed tier.
+            assert _fix_chain_model_pin(["sol"], wiring_worker_pr.ESCALATION_LADDERS["openai"]) \
+                == "sol"
+            assert _fix_chain_model_pin(["opus5"],
+                                        wiring_worker_pr.ESCALATION_LADDERS["anthropic"]) \
+                == "opus5"
+            assert _fix_chain_model_pin([], wiring_worker_pr.ESCALATION_LADDERS["openai"]) == ""
+            assert _fix_chain_model_pin(["luna"],
+                                        wiring_worker_pr.ESCALATION_LADDERS["openai"]) == "", (
+                "a floor that would readmit `sol` must fail closed, not under-state the "
+                "constraint the dispatcher claimed against")
+            assert _fix_chain_model_pin(["ghost"],
+                                        wiring_worker_pr.ESCALATION_LADDERS["openai"]) == ""
+            # DEFER-NOT-FALLBACK IS PRESERVED, not relaxed: intersecting a PINNED chain can only
+            # ever raise the transmitted floor, never lower it below the recorded pin.
+            assert _fix_chain_model_pin(
+                _route_constrained_fix_chain(
+                    wiring_worker_pr.pinned_fix_chain("openai", "sol"), ["opus5", "sol"]),
+                wiring_worker_pr.ESCALATION_LADDERS["openai"]) == "sol"
+            print("  ok   [#578] the fix lane claims FIX_CHAIN ∩ the source issue's LIVE route "
+                  "(never a ladder floor), carries that constraint into review-fix.yml on "
+                  "model_pin, and fails closed — escalating on `escalate = true`, deferring "
+                  "otherwise — when the route authorizes no same-provider fixer")
 
             # ---- issue #118: an unsafe/out-of-policy claim whose lease release FAILS (a CAS
             # conflict, or the garbage claim_id that was itself the violation) is a COUNTED
