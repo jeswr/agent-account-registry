@@ -2331,7 +2331,7 @@ def claim_review_pr_admission(repo, pr_number, pull, record, bot_login, enrolled
 REVIEW_FIX_HEAD_REF_RE = re.compile(r"sparq-agent/issue-([1-9][0-9]*)-[A-Za-z0-9._-]+")
 
 
-def review_fix_pr_admission(repo, pull, record, enrolled_authors):
+def review_fix_pr_admission(repo, pull, record, enrolled_authors, mode):
     """review-fix.yml `resolve`'s PR-shape + provenance admission, as ONE shared function.
 
     Returns ``(self_attested, error)``; ``error`` is the exact SystemExit reason the resolve step
@@ -2354,7 +2354,15 @@ def review_fix_pr_admission(repo, pull, record, enrolled_authors):
 
     The FORK GATE is applied first and is NOT waivable, exactly as in CLAIM and PLAN. So are the
     base-ref, human-hold, machine-park and source-issue checks the resolve step keeps around this
-    call. The waiver covers the draft / head-ref / author SHAPE gates and nothing else."""
+    call. The waiver covers the draft / head-ref / author SHAPE gates and nothing else.
+
+    ``mode`` is REQUIRED and the waiver applies to ``"review"`` ALONE. This workflow is
+    `workflow_dispatch`, so its mode is an INPUT, not something the dispatcher can guarantee:
+    PLAN's review-only choke point and `validate_plan`'s schema re-assertion both live upstream
+    of a manual dispatch and neither binds one. A `fix` run PUSHES COMMITS to the PR head, and a
+    self-attested record must never buy write access to its own branch (design record §3), so
+    the third choke point is here: in any mode but review the pre-#657 shape gates stand, and an
+    enrolled non-draft PR is refused exactly as it is today."""
     pull = pull if isinstance(pull, dict) else {}
     number = pull.get("number")
     head = pull.get("head") or {}
@@ -2365,7 +2373,8 @@ def review_fix_pr_admission(repo, pull, record, enrolled_authors):
         return False, "pull request number is malformed"
     if head_repo != repo:
         return False, "pull request head is a fork; refusing to run models on it"
-    admitted = admits_orchestrator_pr(record, number, author, enrolled_authors)
+    admitted = (mode == "review"
+                and admits_orchestrator_pr(record, number, author, enrolled_authors))
     if not admitted:
         # The pre-#657 gates, byte-for-byte, in their original order and with their original
         # reasons. An empty allowlist (every repo's default) means this branch always runs.
@@ -7215,6 +7224,10 @@ def review_fix_admits_orchestrator_class(source=None):
          not "wired", it is a hole.
       3. FAIL CLOSED: against a stub that returns a refusal, the block must still raise. Deleting
          the ``raise SystemExit`` must never read as wiring.
+      4. REVIEW-ONLY: the same PR in ``fix`` mode must still raise. This workflow is
+         `workflow_dispatch`, so its mode is an input; a seam that hard-codes ``"review"`` would
+         let a fix run inherit the waiver and PUSH COMMITS to the PR head on a self-attested
+         record. Only driving the seam in BOTH modes can see it.
 
     POSITIVE PROOF ONLY. Any extraction failure, exception, or ambiguity reads False, which keeps
     the interlock ARMED."""
@@ -7225,13 +7238,14 @@ def review_fix_admits_orchestrator_class(source=None):
     except Exception:            # noqa: BLE001 — an unreadable seam is NOT proof of wiring
         return False
 
-    def _run(authors, admission=None):
+    def _run(authors, admission=None, mode="review"):
         """Execute the workflow's own block. Returns the `self_attested` it bound, or None when
         it raised (i.e. refused)."""
         namespace = {"dispatch_claim": types.SimpleNamespace(
             review_fix_pr_admission=admission or review_fix_pr_admission),
             "repo": PROBE_REPO, "record": orchestrator_probe_record(),
-            "pull": orchestrator_probe_pull(), "enrolled_authors": authors}
+            "pull": orchestrator_probe_pull(), "enrolled_authors": authors,
+            "mode": mode}
         try:
             exec(compiled, namespace)   # noqa: S102 — repository-owned workflow source
         except SystemExit:
@@ -7244,7 +7258,9 @@ def review_fix_admits_orchestrator_class(source=None):
     default_off = _run(())
     fails_closed = _run((PROBE_ENROLLED_LOGIN,),
                         admission=lambda *args, **kwargs: (True, "refused by the probe"))
-    return admitted is True and default_off is None and fails_closed is None
+    review_only = _run((PROBE_ENROLLED_LOGIN,), mode="fix")
+    return (admitted is True and default_off is None and fails_closed is None
+            and review_only is None)
 
 
 def _probe_worker_pr():
@@ -10038,44 +10054,58 @@ def _self_test():
                 "user": {"login": login},
                 "head": {"ref": ref, "sha": sha_a, "repo": {"full_name": head_repo}}}
 
-    assert review_fix_pr_admission(repo, _rf_pull(), _orch, _ENROLLED) == (True, None), \
+    assert review_fix_pr_admission(repo, _rf_pull(), _orch, _ENROLLED, "review") \
+        == (True, None), \
         ("THE HEADLINE ROW: a NON-DRAFT, human-authored, ordinary-branch PR is admitted by "
          "review-fix.yml's resolve step. Restoring any of the three shape gates unconditionally "
          "reds exactly this line — and the draft one is the gate EVERY enrollable PR fails.")
     # Each waived gate, one at a time, with the waiver switched off. These are the exact
     # SystemExit reasons the resolve step raised before #657 — unchanged, byte for byte.
-    assert review_fix_pr_admission(repo, _rf_pull(), _orch, ()) \
+    assert review_fix_pr_admission(repo, _rf_pull(), _orch, (), "review") \
         == (False, "pull request is not an open draft")
-    assert review_fix_pr_admission(repo, _rf_pull(draft=True), _orch, ()) \
+    # REVIEW-ONLY, AT THE THIRD CHOKE POINT. review-fix.yml is `workflow_dispatch`, so its
+    # `mode` is an INPUT — PLAN's emit() restriction and validate_plan's schema re-assertion
+    # both live upstream of a manual dispatch and neither binds one. A `fix` run PUSHES COMMITS
+    # to the PR head, so the waiver must not exist in that mode: the identical enrolled PR is
+    # refused by the pre-#657 draft gate. Deleting the `mode == "review"` conjunct reds this,
+    # and the hole it opens is a self-attested record buying write access to its own branch.
+    for _mode in ("fix", "", "REVIEW", "review ", None, True):
+        assert review_fix_pr_admission(repo, _rf_pull(), _orch, _ENROLLED, _mode) \
+            == (False, "pull request is not an open draft"), _mode
+    assert review_fix_pr_admission(repo, _rf_pull(draft=True), _orch, (), "review") \
         == (False, "pull request head is not a worker branch")
     assert review_fix_pr_admission(
-        repo, _rf_pull(draft=True, ref="sparq-agent/issue-7-1-1"), _orch, ()) \
+        repo, _rf_pull(draft=True, ref="sparq-agent/issue-7-1-1"), _orch, (), "review") \
         == (False, "pull request author is not a bot")
     # THE FORK GATE IS NOT WAIVABLE HERE EITHER, and it reports FIRST — an enrolled author with a
     # perfect record on an attacker-controlled head is stopped by the fork gate, by name.
     assert review_fix_pr_admission(
-        repo, _rf_pull(head_repo="attacker/repo"), _orch, _ENROLLED) \
+        repo, _rf_pull(head_repo="attacker/repo"), _orch, _ENROLLED, "review") \
         == (False, "pull request head is a fork; refusing to run models on it"), \
         ("the fork gate is the single attacker-facing predicate in the resolve step and no "
          "waiver may reach it; deleting it, or moving it below the waiver, reds this line")
     assert review_fix_pr_admission(
         repo, _rf_pull(head_repo="attacker/repo", ref="sparq-agent/issue-7-1-1", login=bot,
-                       draft=True), provenance[41], ()) \
+                       draft=True), provenance[41], (), "review") \
         == (False, "pull request head is a fork; refusing to run models on it"), \
         "...on a plain WORKER PR too — the fork gate is unconditional, not class-scoped"
     # A third party is never admitted, and a machine-attested record waives nothing.
-    assert review_fix_pr_admission(repo, _rf_pull(login="mallory"), _orch, _ENROLLED)[0] is False
-    assert review_fix_pr_admission(repo, _rf_pull(), provenance[41], _ENROLLED)[0] is False
+    assert review_fix_pr_admission(
+        repo, _rf_pull(login="mallory"), _orch, _ENROLLED, "review")[0] is False
+    assert review_fix_pr_admission(
+        repo, _rf_pull(), provenance[41], _ENROLLED, "review")[0] is False
     # A record minted for ANOTHER PR waives nothing at the waiver decision.
     assert review_fix_pr_admission(
-        repo, _rf_pull(), dict(_orch, pr_number=40), _ENROLLED)[0] is False
+        repo, _rf_pull(), dict(_orch, pr_number=40), _ENROLLED, "review")[0] is False
     # The pre-#657 worker population is unchanged, allowlist on or off.
     _rf_worker = _rf_pull(draft=True, ref="sparq-agent/issue-7-1-1", login=bot)
-    assert review_fix_pr_admission(repo, _rf_worker, provenance[41], ()) \
-        == review_fix_pr_admission(repo, _rf_worker, provenance[41], _ENROLLED) == (False, None)
+    for _mode in ("review", "fix"):
+        assert review_fix_pr_admission(repo, _rf_worker, provenance[41], (), _mode) \
+            == review_fix_pr_admission(repo, _rf_worker, provenance[41], _ENROLLED, _mode) \
+            == (False, None), _mode
     # TOTAL — it is called from a workflow step where an exception is an unactionable traceback.
     for _junk_pull in (None, "nope", {}, {"number": True}, {"number": 0}, {"head": None}):
-        assert review_fix_pr_admission(repo, _junk_pull, _orch, _ENROLLED)[0] is False
+        assert review_fix_pr_admission(repo, _junk_pull, _orch, _ENROLLED, "review")[0] is False
 
     # (3b) THE FORK GATE'S POSITION, pinned by the REPORTED REASON. The ordering claim attached to
     # (3) was measured untrue in review of #759: for an ADMITTED PR the head-ref gate is waived, so
@@ -10247,9 +10277,9 @@ def _self_test():
     for _mutant, _why in (
         (_rf_live.replace(
             "self_attested, admission_error = dispatch_claim.review_fix_pr_admission(\n"
-            "              repo, pull, record, enrolled_authors)",
+            "              repo, pull, record, enrolled_authors, mode)",
             "self_attested, admission_error = dispatch_claim.review_fix_pr_admission(\n"
-            "              repo, pull, record, ())"),
+            "              repo, pull, record, (), mode)"),
          "hard-coding an EMPTY allowlist at the call site is a refusal, not wiring — this is the "
          "'wired but mis-argued' mutant, and it is invisible to any probe that stubs the "
          "predicate instead of calling it"),
@@ -10339,18 +10369,31 @@ def _self_test():
     #      admits an enrolled PR — every other term in the probe is satisfied. Only the
     #      default-off term sees that an EMPTY allowlist no longer refuses.
     _rf_self_enrol = _rf_live.replace(
-        "              repo, pull, record, enrolled_authors)",
-        "              repo, pull, record, (str((pull.get(\"user\") or {}).get(\"login\", \"\")),))")
+        "              repo, pull, record, enrolled_authors, mode)",
+        "              repo, pull, record, "
+        "(str((pull.get(\"user\") or {}).get(\"login\", \"\")),), mode)")
     assert _rf_self_enrol != _rf_live
     assert review_fix_admits_orchestrator_class(source=_rf_self_enrol) is False, \
         ("a resolve step that enrols the PR's own author must read as UNWIRED: it collapses the "
          "two branches of DIFFERENT authority (the unprotected ledger record, the master-"
          "protected allowlist) onto one, which is the whole point of the pair. This is the row "
          "that makes the probe's default-off term load-bearing.")
+    #      ...and the REVIEW-ONLY conjunct at the seam: a resolve step that hard-codes the mode
+    #      would let a `workflow_dispatch` with mode=fix waive the shape gates and PUSH COMMITS
+    #      to the PR head on a self-attested record. It still admits, still defaults off and
+    #      still fails closed, so only a probe that drives the seam in BOTH modes sees it.
+    _rf_mode_pinned = _rf_live.replace(
+        "              repo, pull, record, enrolled_authors, mode)",
+        "              repo, pull, record, enrolled_authors, \"review\")")
+    assert _rf_mode_pinned != _rf_live
+    assert review_fix_admits_orchestrator_class(source=_rf_mode_pinned) is False, \
+        ("a resolve step that hard-codes mode=\"review\" must read as UNWIRED: the workflow is "
+         "`workflow_dispatch`, so a fix run would then inherit the waiver and push commits to a "
+         "PR whose provenance record its own author wrote")
     #      ...and the cruder form — admitting with no predicate call at all — too.
     _rf_uncond = _rf_live.replace(
         "          self_attested, admission_error = dispatch_claim.review_fix_pr_admission(\n"
-        "              repo, pull, record, enrolled_authors)",
+        "              repo, pull, record, enrolled_authors, mode)",
         "          self_attested, admission_error = True, None")
     assert _rf_uncond != _rf_live
     assert review_fix_admits_orchestrator_class(source=_rf_uncond) is False, \
@@ -10487,7 +10530,7 @@ def _self_test():
                                      (PROBE_ENROLLED_LOGIN,))[0] is False, \
         "...and CLAIM makes the same decision, on its own re-read"
     assert review_fix_pr_admission(PROBE_REPO, _foreign_pull, _foreign,
-                                   (PROBE_ENROLLED_LOGIN,))[0] is False, \
+                                   (PROBE_ENROLLED_LOGIN,), "review")[0] is False, \
         "...and so does review-fix.yml's resolve predicate"
     # Non-vacuity: the SAME record for the SAME PR does waive, at all three.
     assert admits_orchestrator_pr(orchestrator_probe_record(9), 9, PROBE_ENROLLED_LOGIN,
@@ -10497,7 +10540,7 @@ def _self_test():
         (PROBE_ENROLLED_LOGIN,)) == (True, None)
     assert review_fix_pr_admission(
         PROBE_REPO, _foreign_pull, orchestrator_probe_record(9),
-        (PROBE_ENROLLED_LOGIN,)) == (True, None)
+        (PROBE_ENROLLED_LOGIN,), "review") == (True, None)
     print(f"  ok   #657 enable interlock: CLAIM={_claim_admits}, review-fix resolve={_rf_admits}, "
           f"outcome={_outcome_admits}, arm-refuses={_arm_refuses} — ALL FOUR derived by execution "
           f"and fail-closed; policy/repos.toml enables enrolment for NOBODY (the minting path, "

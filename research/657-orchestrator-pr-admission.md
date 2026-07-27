@@ -370,7 +370,13 @@ same defect class survived the rewrite one level out.
 2. **`review-fix.yml`'s resolve step**, completely. All four predicates moved into
    `dispatch_claim.review_fix_pr_admission`, so the `run:` script carries no predicate of its own
    — `call it, and die on its answer`. The fork gate is hoisted above every waivable predicate
-   there too. The step exports `self_attested`.
+   there too. The step exports `self_attested`. **The waiver applies to `mode == "review"`
+   alone**: this workflow is `workflow_dispatch`, so its mode is an *input*, and PLAN's
+   review-only `emit()` choke point and `validate_plan`'s schema re-assertion both live upstream
+   of a manual dispatch and bind neither. Without that conjunct an `actions:write` holder could
+   dispatch `mode=fix` against an enrolled PR and get a run that PUSHES COMMITS to a head whose
+   provenance record its own author wrote — found while writing this PR's own tests, and it is the
+   third choke point the review-only property actually needs.
 3. **The outcome leg.** `revalidate_outcome_head(..., self_attested=)` stands down the DRAFT
    requirement **and nothing else** (state/author/head-freshness are untouched).
 4. **The arm boundary**, refused twice and independently: `decide_review` never returns `"arm"`

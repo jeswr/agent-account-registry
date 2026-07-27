@@ -354,7 +354,7 @@ jobs:
           # dispatch-claim.py, so no predicate lives in this `run:` script that a text probe would
           # have to guess at. Fail closed: any error is a SystemExit.
           self_attested, admission_error = dispatch_claim.review_fix_pr_admission(
-              repo, pull, record, enrolled_authors)
+              repo, pull, record, enrolled_authors, mode)
           if admission_error:
               raise SystemExit(admission_error)
           impl_provider = record["impl_provider"]
