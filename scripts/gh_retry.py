@@ -341,11 +341,19 @@ def run_gh(args, *, env=None, input=None, attempts=MAX_ATTEMPTS,
         if raw.returncode == 0 or not retry:
             return result
         if attempt < attempts:
-            if reason == "statusless":
+            if status is None:
                 # Counted, greppable signal that we retried BLIND. Registry #748's deeper defect was
                 # not the missing retry, it was that a whole error class could report `attempts=1/5`
                 # with nobody able to see it; every caller of this layer now emits a line when the
                 # status could not be recovered, so the class is visible on its first occurrence.
+                #
+                # KEYED ON THE FACT, NOT ON THE LABEL. This was `reason == "statusless"` until
+                # registry #772 landed `"unexpected end of json input"` in `_TRANSIENT_TEXT`:
+                # that entry sits ABOVE the statusless default in `classify_read_failure`, so the
+                # single most common blind shape started returning `transient-text` and the alarm
+                # for it went SILENT — while still being retried, and still being blind. Blindness
+                # is a property of `status`, so ask `status`; any future text-table entry is then
+                # unable to silence this again, which is exactly how it was silenced once.
                 report(f"gh_retry: {BLIND_READ_MARKER} endpoint="
                        f"{listed[1] if len(listed) > 1 else listed[0]} attempt={attempt}"
                        f"/{attempts} — no HTTP status recoverable from gh's message or its debug "
@@ -667,11 +675,37 @@ def _self_test():
     # exact byte-for-byte shape that shipped broken in #729 (`http=unknown class=permanent
     # attempts=1/5` on 4/4 real failures). On an idempotent read it must now be RETRIED.
     _STATUSLESS = "unexpected end of JSON input"
-    check("#748 a STATUSLESS 'unexpected end of JSON input' is RETRYABLE on an idempotent read",
-          classify_read_failure(_STATUSLESS), (True, "statusless"))
+    # MERGE RECONCILIATION with registry #772 (PR #775), which fixed the SAME production defect at
+    # the TEXT-TABLE layer while this fixed it at the STATUS-RECOVERY layer. #772 added
+    # `"unexpected end of json input"` to `_TRANSIENT_TEXT`, which sits ABOVE the statusless
+    # default, so this exact text now classifies `transient-text` rather than `statusless`. The
+    # retry DECISION is unchanged (True either way) and the two fixes compose safely — the
+    # recovered-status branches still run FIRST, so a recovered 404 is refused in one attempt and
+    # #772's table cannot make it retryable. What the composition did break is the BLIND alarm,
+    # which keyed on the reason LABEL; it now keys on `status is None` (see run_gh).
+    #
+    # So the property asserted here is the one that survives either classifier: the read is
+    # RETRIED and it is BLIND.
+    check("#748 the measured 'unexpected end of JSON input' shape is RETRYABLE on an idempotent "
+          "read AND is genuinely blind (no status recoverable from message or trace)",
+          (classify_read_failure(_STATUSLESS)[0], failure_status(_STATUSLESS)), (True, None))
+    # ...and #772's table cannot promote it over a RECOVERED refusal status: the composition is
+    # only safe because status recovery is consulted first. Deleting either recovered-status
+    # branch reds here.
+    check("#748 a recovered REFUSAL status still beats #772's transient text table",
+          (classify_read_failure(_STATUSLESS, "404"), classify_read_failure(_STATUSLESS, "502")),
+          ((False, "refused-http-404"), (True, "transient-http-502")))
+    # THE `statusless` DEFAULT still has its own red test, on a shape that is in NEITHER table —
+    # which is the whole point of it: #772 closed the one MEASURED text, while this closes every
+    # shape nobody has measured yet. Here the two classifiers still disagree, and that disagreement
+    # is the fix.
+    _UNTABLED = "error decoding server response: unexpected token at position 0"
+    check("#748 an UNTABLED statusless read failure still falls through to the `statusless` "
+          "default and is retried",
+          classify_read_failure(_UNTABLED), (True, "statusless"))
     check("#748 the pre-fix conservative classifier still says NO to it "
           "(so the two classifiers are genuinely different and the widening is the fix)",
-          is_transient_stderr(_STATUSLESS), False)
+          is_transient_stderr(_UNTABLED), False)
 
     real_run = subprocess.run
     try:

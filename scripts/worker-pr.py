@@ -5776,11 +5776,20 @@ def _self_test():
         blind_marker = next((line for line in prov_state["printed"]
                              if PROVENANCE_READ_FAILURE_MARKER in line
                              and not line.startswith("::")), "")
+        # The `reason=` FIELD is a label, and registry #772 legitimately changed which label this
+        # exact text earns (`transient-text` now, via `_TRANSIENT_TEXT`, rather than the
+        # `statusless` default). The properties that matter — and that #729 got wrong — are the
+        # BUDGET, the CLASS, the unrecoverable status, and that nothing was recorded. Those are
+        # asserted exactly; the reason is asserted to be one of the two labels that mean
+        # "retried a read we could not classify by status", so a future re-labelling does not red
+        # this while a silent revert to `permanent`/one-attempt still does.
         check("#748 an exhausted statusless read burns the FULL budget and is reported as "
-              "transient/statusless, not as a permanent refusal",
+              "transient and status-unrecoverable, not as a permanent refusal",
               (isinstance(err, WorkerPrError), len(prov_state["calls"]),
                f"attempts={gh_retry.MAX_ATTEMPTS}/{gh_retry.MAX_ATTEMPTS}" in blind_marker,
-               "class=transient" in blind_marker, "reason=statusless" in blind_marker,
+               "class=transient" in blind_marker,
+               any(f"reason={label}" in blind_marker
+                   for label in ("statusless", "transient-text")),
                "http=unknown" in blind_marker, prov_state["store"]),
               (True, gh_retry.MAX_ATTEMPTS, True, True, True, True, {}))
         check("#748 the vacuity alarm does NOT fire when the retry layer did retry "
@@ -5850,12 +5859,21 @@ def _self_test():
         # behaviour (which is exactly what shipped) and the run must now SHOUT
         # `PROVENANCE-RETRY-VACUOUS`, on the FIRST occurrence, instead of quietly logging
         # `attempts=1/5` for a whole error class.
+        # The inversion is driven with a statusless shape that is in NEITHER text table. Using the
+        # measured `unexpected end of JSON input` here stopped modelling the pre-#748 world once
+        # registry #772 added that exact string to `_TRANSIENT_TEXT`: `is_transient_stderr` began
+        # returning True for it, so the "conservative" stand-in retried and the control silently
+        # stopped reproducing the 1-attempt vacuity it exists to reproduce. An untabled blind shape
+        # restores the historical semantics faithfully — a classifier that can only match TEXT is
+        # blind to it, which is precisely the pre-#748 failure mode and the one #748 generalises.
+        _UNTABLED_STATUSLESS = (1, "", "error decoding server response: unexpected token at "
+                                       "position 0")
         real_classify = gh_retry.classify_read_failure
         try:
             gh_retry.classify_read_failure = (
                 lambda message, status=None: (gh_retry.is_transient_stderr(message or ""),
                                               "pre-748-conservative"))
-            err = _run_prov([_STATUSLESS])
+            err = _run_prov([_UNTABLED_STATUSLESS])
         finally:
             gh_retry.classify_read_failure = real_classify
         vac_line = next((line for line in prov_state["printed"]
