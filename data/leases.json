@@ -2,16 +2,6 @@
  "leases": [
   {
    "account": "51bde6688e140866",
-   "claim_id": "10b2bb62fca64c37a393d86d1d1af8b0",
-   "holder": "sparq-org/sparq#3412@30228498099.1",
-   "package": "sparq-geo",
-   "role": "impl",
-   "model": "opus5",
-   "issued_at": 1785113654,
-   "expires_at": 1785119954
-  },
-  {
-   "account": "51bde6688e140866",
    "claim_id": "d3df0504743c45f0a47ea5ab4cc5d9b7",
    "holder": "sparq-org/sparq#2695@30228850993.1",
    "package": "sparq-engine",
