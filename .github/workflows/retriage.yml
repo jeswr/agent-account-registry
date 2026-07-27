@@ -183,6 +183,28 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
+      # The watchdog's YAML-seam assertions PARSE this workflow rather than pattern-match it — the
+      # same reason dispatch.yml's secrets guard does, and the same reason PyYAML is a HARD
+      # requirement of `--self-test` there. Probe first, so a runner image that already ships it
+      # keeps the gate at ZERO network dependency; install only when absent, version + sha256
+      # locked to the identical pins pr-gate/dispatch use, because a required fail-closed control
+      # must never depend on a mutable release.
+      - name: Ensure PyYAML for the watchdog's workflow-parse assertions
+        run: |
+          set -euo pipefail
+          if python3 -c 'import yaml' 2>/dev/null; then
+            echo "PyYAML already present; no install needed"
+            exit 0
+          fi
+          cat > "$RUNNER_TEMP/watchdog-requirements.txt" <<'REQ'
+          pyyaml==6.0.2 \
+              --hash=sha256:80bab7bfc629882493af4aa31a4cfa43a4c57c83813253626916b8c7ada83476 \
+              --hash=sha256:1f71ea527786de97d1a0cc0eacd1defc0985dcf6b3f17bb77dcfc8c34bec4dc5
+          REQ
+          python3 -m pip install --disable-pip-version-check --require-hashes \
+            --only-binary=:all: -r "$RUNNER_TEMP/watchdog-requirements.txt"
+          python3 -c 'import yaml; print("PyYAML", yaml.__version__)'
+
       - name: Verify the stock watchdog
         run: python3 scripts/triage-stock-alert.py --self-test
 
