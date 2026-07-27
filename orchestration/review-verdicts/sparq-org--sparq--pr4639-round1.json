@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4639,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "295fff4a861f351ef1560c7c8fd0c0d367cfd275",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The new validateStore binding directly validates the receiver's Graph with the existing SHACL engine while parsing only the supplied shapes graph. The implementation preserves the opt-in feature boundary, exposes the intended wasm camelCase name, and documents the default-graph-only dataset semantics. The native tests exercise violating and conforming stored data, equivalence with the stateless path modulo blank-node renaming, repeatability, default-versus-named graph behavior, and stateless-path independence; wasm tests cover the actual exported path and parse-error behavior. The public-surface documentation is updated consistently. No correctness, soundness, security, or vacuous-test issue was found. Tests could not be executed in this checkout because cargo is unavailable, so this verdict is based on the supplied diff and read-only source context.",
+  "verdict": "approve"
+ }
+}
