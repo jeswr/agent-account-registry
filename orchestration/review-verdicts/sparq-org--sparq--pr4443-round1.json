@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4443,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c8fdc1d0c44a020237e16eb297d10a0d0c015bd1",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "In `measure_bloom_selective_scan_latency`, `sink` is checked before either timed loop, then updated by both loops and never read afterward. In an optimized benchmark build, the lookup results and potentially substantial surrounding work can therefore be removed or simplified because they have no observable effect. This makes the latency comparison unsuitable as evidence for the conclusions recorded by the PR.",
+    "file": "crates/sparq-core/src/compress.rs",
+    "fix_hint": "Consume each arm's result through `std::hint::black_box` (including the probe key/input as appropriate), retain separate observable checksums/counts for ON and OFF, and assert those counts agree after timing. Add warmup and alternate or repeat arm order to reduce systematic ordering bias.",
+    "severity": "major",
+    "title": "Timed lookup results are not kept observable"
+   },
+   {
+    "body": "The module documentation says measurement \u201cREFUTES\u201d the prior rationale and that a present-id lookup is \u201cneither faster nor slower,\u201d while the same diff states the latency half is non-canonical, uses only a synthetic WatDiv-shaped input, and leaves real Wikidata/canonical-host confirmation pending. Skip-count evidence can show little opportunity to avoid decoding for this synthetic distribution, but it cannot establish latency neutrality or refute the broader workload claim, especially with the current benchmark validity problem.",
+    "file": "crates/sparq-core/src/compress.rs",
+    "fix_hint": "Limit the documentation to the host-independent observation actually established (for the tested synthetic high-NDV distributions, present-key candidate windows and skip opportunity are small). Remove \u201cneither faster nor slower\u201d and definitive \u201cREFUTES\u201d wording until the corrected harness is run on the canonical host with the intended real dataset.",
+    "severity": "major",
+    "title": "Non-canonical synthetic measurement is presented as a definitive performance result"
+   }
+  ],
+  "progress": null,
+  "summary": "The added benchmark does not preserve an observable use of the timed results, so an optimizing build may eliminate or materially simplify the calls being measured. The documentation then draws definitive present-key performance conclusions from that harness even though it labels the latency data non-canonical and says canonical validation is still pending. The model-equivalence and result-equivalence tests are useful, but they do not validate the performance claims.",
+  "verdict": "request_changes"
+ }
+}
