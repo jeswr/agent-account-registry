@@ -13,12 +13,12 @@
   {
    "account": "51bde6688e140866",
    "claim_id": "1db7197759d347fda24442bb54df5898",
-   "holder": "sparq-org/sparq#3088@dispatch-30238098223.1",
+   "holder": "sparq-org/sparq#3088@30238608501.1",
    "package": "sparq-vectors",
    "role": "impl",
    "model": "opus5",
-   "issued_at": 1785128472,
-   "expires_at": 1785134772
+   "issued_at": 1785128498,
+   "expires_at": 1785134798
   },
   {
    "account": "dc2d751954080e13",
