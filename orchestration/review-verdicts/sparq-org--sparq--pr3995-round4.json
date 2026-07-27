@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 3995,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c664aa94e195153d30732169c3ec411e2f270042",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`container` and `boundBy` still give a node's own patterns a single owner, and `scopedNodes` emits those patterns only after that one binder. If `?person OPTIONAL worksAt ?organisation` and `?company OPTIONAL partnerOf ?organisation` independently reach a node typed `ex:Organisation`, the second OPTIONAL can bind a non-Organisation whenever the first leaves the variable unbound. In the OPTIONAL plus FILTER NOT EXISTS case, the exclusion similarly tests any partner when the OPTIONAL did not bind the variable, rather than only partners satisfying the target node's declared constraints. This changes answers and violates the shared canvas node's semantics.",
+    "file": "gui/app/src/lib/query-builder.ts",
+    "fix_hint": "Emit the shared target's class and attribute constraints in every independently scoped incoming group that can bind or test that target, while keeping them out of the top level. Both OPTIONAL blocks should contain `?organisation a <http://example.org/Organisation> .`; the FILTER NOT EXISTS block should contain it too. Preserve the existing nesting behavior for chains and avoid duplicating constraints merely within the same dependent scope.",
+    "severity": "major",
+    "title": "Shared scoped targets still apply constraints to only one incoming group"
+   },
+   {
+    "body": "The tests named for two OPTIONALs and OPTIONAL plus exclusion still expect the target type triple only in the first OPTIONAL and absent from the second independently scoped group. They therefore validate the known single-owner defect. Exact-string serialization coverage is not result-equivalence evidence for the load-bearing scoping invariant.",
+    "file": "gui/app/src/lib/query-builder.test.ts",
+    "fix_hint": "Change the expected queries so each independently scoped incoming group includes the target class and attribute patterns. Add executable result-equivalence fixtures with a matching and a non-matching target for the second edge, covering both two OPTIONALs and OPTIONAL plus FILTER NOT EXISTS, so omitting the repeated constraints makes the tests fail.",
+    "severity": "minor",
+    "title": "Shared-target tests still assert the incorrect single-owner invariant"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 4 is materially unchanged on the prior load-bearing defect. The serializer still assigns each node's class and attributes to one `boundBy` edge, so independently scoped incoming OPTIONAL or FILTER NOT EXISTS groups do not each enforce the shared target's constraints. The two shared-target tests still explicitly expect the type triple only in the first OPTIONAL and omit it from the second OPTIONAL/exclusion, codifying the incorrect semantics rather than checking result equivalence. Because the same major correctness issue and its test-validity consequence remain, progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
