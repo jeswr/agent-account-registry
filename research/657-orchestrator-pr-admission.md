@@ -186,6 +186,11 @@ Two facts sharpen §1's diagnosis:
 
 - **The two gates are perfectly correlated in the live population.** All 30 unreachable PRs fail
   the head-ref gate *and* the author gate; **0 fail only one**. Widening one alone reaches nothing.
+  **As of 2026-07-27T00:00Z.** This one is a snapshot, not an invariant: an independent
+  re-measurement later the same day found two *newer* automation PRs (`#4488` dependabot, `#4460`
+  release-plz) that fail the head-ref gate **only**. The argument is unaffected — those are not
+  orchestrator-authored and enrolment would not reach them — but "0 fail only one" is time-bound
+  and must be re-derived, never quoted, by any later decision.
 - **The fork gate is not what is excluding anything.** `head.repo == sparq-org/sparq` for
   **117/117** open PRs. There is no fork PR in the population at all.
 - Verdict coverage is exactly bimodal: reachable **4/4** hold a ledger verdict, unreachable
@@ -240,7 +245,7 @@ Landed (PLAN half only):
 
 | consumer | file:line | still refuses |
 |---|---|---|
-| CLAIM record re-read | `dispatch-claim.py` `record_error = provenance_admission_error(record, number)` | yes |
+| CLAIM record re-read | `dispatch-claim.py` `claim_review_admission_error(record, number)` | yes |
 | review-fix.yml resolve | `.github/workflows/review-fix.yml` `admission_error = dispatch_claim.provenance_admission_error(...)` | yes |
 | reviewer-side chain | `dispatch-claim.py` `chain = _resolvable_chain(REVIEW_CHAIN[impl_provider], routing)` | still **inverts** the self-declared provider |
 | reviewer≠implementer check | `dispatch-claim.py` `claim_provider == impl_provider` violation | would trip on a constant side |
@@ -248,19 +253,50 @@ Landed (PLAN half only):
 
 Enabling `review_enrolment_authors` now would enumerate a PR at PLAN that CLAIM re-refuses **every
 tick, forever**, with a generic defer counter as the only symptom. So the tree carries a
-**self-removing enable interlock**: while either downstream consumer still refuses the class,
-the self-test asserts that **no repo configures `review_enrolment_authors`**. Turning the feature
-on is impossible until the wiring lands, and the interlock stops constraining policy by itself
-once it does. `policy/repos.toml` is therefore **unchanged** — this PR shrinks the unreachable
-set by **0**, on purpose.
+**self-removing enable interlock**, and it is enforced at three independent depths.
+
+**1. In production, at the decision.** `admits_orchestrator_pr` conjoins the live CLAIM wiring
+fact (`claim_admits_orchestrator_class()`, which *calls* the production admission over a synthetic
+`orchestrator`-attested record). With the allowlist enabled and CLAIM unwired the waiver returns
+False, the two shape gates stand exactly as they do today, the pre-feature refusal reason still
+prints, and the population is simply not enumerated. **Turning the key in `policy/repos.toml`
+cannot turn the feature on** — not "is asserted not to", *cannot*. The clause self-removes when
+step 1 of §7.4 lands.
+
+**2. In the gate, twice.** `dispatch-claim.py --self-test` and `policy-resolve.py --self-test`
+both run `enrolment_enable_error` against the live policy and the two wiring probes, so an
+enabling diff has to defeat two separately enrolled self-tests to reach master.
+
+**3. Both wiring facts are derived BEHAVIOURALLY, and both fail closed.** This is the part that
+was wrong in the first draft and is worth recording, because the failure mode is a general one:
+
+| fact | first draft | how it failed | now |
+|---|---|---|---|
+| CLAIM admits? | regex for an exact call line in this module's own source; **absence** ⇒ "wired" | any reflow / rename / added kwarg stops the match. A two-line reflow with **no behaviour change** disarmed it, nothing red | `claim_admits_orchestrator_class()` **calls** `claim_review_admission_error` |
+| review-fix.yml admits? | `"admit_orchestrator" in <block>` | tests a **token**, not a **value**: an explicit `admit_orchestrator=False` — a *refusal* — read as admitting, as did a comment carrying the token | `review_fix_admits_orchestrator_class()` **execs** the workflow's own block against stubs and requires the opt-in **value** plus fail-closed behaviour |
+
+A guard is only as falsifiable as the facts fed into it. Both probes now return True **only on
+positive proof**; an unreadable seam, an exception or an ambiguous answer reads False and keeps the
+interlock armed. `policy/repos.toml` is **unchanged** — this PR shrinks the unreachable set by
+**0**, on purpose.
 
 ### 7.4 Follow-up, in the order it must land
 
-1. Thread `admit_orchestrator` into the CLAIM re-read and `review-fix.yml`'s resolve step.
+1. Thread `admit_orchestrator` into `claim_review_admission_error` and `review-fix.yml`'s resolve
+   step. Both wiring probes then flip to True by themselves, the production clause in
+   `admits_orchestrator_pr` stops constraining anything, and both self-test interlocks stand down —
+   nothing has to be remembered and deleted.
 2. Pin a **constant** reviewer side for the class. Note this is **five** enforcement points, not
    one: the `REVIEW_CHAIN` subscript, the `claim_provider == impl_provider` violation,
    review-fix.yml's inline chain table and its two re-assertions, and `worker-pr.py`'s
    `ready_and_arm` refusal. A one-sided change deadlocks the lane.
+   **Also in scope at this step**, named here because §6's "five enforcement points" list omits
+   them: three *other* regexes over the same branch shape DO extract the issue number —
+   `groom.py:112 WORKER_BRANCH`, `worker-pr.py:287 WORKER_HEAD_RE`, `backfill-provenance.py:52
+   HEAD_RE`. `worker-pr.py`'s hold lookup falls back to that derivation when no `source_issue` is
+   passed (no match ⇒ *no holds found*), and its disarm path refuses any ref that is not a worker
+   ref. Neither runs on the admitted class while the feature is inert; both must be handled before
+   it is not.
 3. Plumb the attestation class to the arm and refuse it there (§3 option (b): the residual risk
    of an openai-harness orchestrator must be an advisory comment, never a merge).
 4. A minting path. `backfill-provenance.py` + `backfill-provenance.yml` supply the ledger CAS

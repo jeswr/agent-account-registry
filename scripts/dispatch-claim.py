@@ -8503,6 +8503,10 @@ def _self_test():
          "a COMMENT carrying the token is not wiring — the token check read it as wired"),
         (_rf_live.replace("raise SystemExit(admission_error)", "admission_error = None"),
          "a resolve step that no longer fails closed is broken, not wired"),
+        (_rf_wired.replace("raise SystemExit(admission_error)", "admission_error = None"),
+         "WIRED but no longer fail-closed is still not wired — this is the row that makes the "
+         "probe's fail-closed sub-fact load-bearing rather than subsumed by the value check "
+         "(measured: without it, deleting `fails_closed` was an equivalent mutant)"),
     ):
         assert _mutant != _rf_live, f"the mutation fixture no longer matches the workflow: {_why}"
         assert review_fix_admits_orchestrator_class(source=_mutant) is False, _why
