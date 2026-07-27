@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3890,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "0726f0409bc10efcf72c12b835da1568f5456a73",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "JoinIndex::lookup still returns JoinIndex::all whenever child_cols is empty, while build_join_index fills that list with every parent subject when parent_cols is empty. The test r2rml_join_no_conditions_is_cross_product locks in the same incorrect behavior. With no rr:joinCondition, R2RML requires the child and parent triples maps to use the same logical table, and the referencing object must be the parent subject generated from that same current row. For two self-table rows the correct links are row1->row1 and row2->row2, not all four pairs. The implementation also accepts omitted conditions when the logical tables differ.",
+    "file": "crates/sparq-cli/src/tabular.rs",
+    "fix_hint": "Represent the omitted-condition case separately. Require the child and parent triples maps to name the same logical table, then evaluate the parent subject map against the current child row so row correspondence is preserved without a cross-product bucket. Reject omitted rr:joinCondition when the logical tables differ. Replace the cross-product test with a real-path two-row same-table test asserting only row-correlated objects, add a failure test for different logical tables, and correct the module and CLI skill claims.",
+    "severity": "major",
+    "title": "Omitted join conditions still incorrectly produce a cross product"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 5 is stagnant. The round-4 major correctness finding remains unchanged: omitted rr:joinCondition is still documented, implemented, and tested as a cross product. R2RML permits omission only when child and parent triples maps use the same logical table; in that case the referencing object is the parent subject generated from the same current logical row. The current index instead returns every distinct parent subject for every child row and does not reject omission across different logical tables, producing spurious relationships.",
+  "verdict": "request_changes"
+ }
+}
