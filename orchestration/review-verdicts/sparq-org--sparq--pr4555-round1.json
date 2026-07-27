@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 4555,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "7f0ec9a691ead360f497b8d85fc7443cab633e05",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The status and \u00a77 say the transform \u201cnever regresses,\u201d but the evidence is six unit tests, selected differential runs, and a 519-package corpus; the AST fuzzer and several suites were explicitly not run, and no formal proof or external audit exists. For a constraint-removal optimization, \u201cnever\u201d is a universal soundness claim that the stated evidence cannot establish. This conflicts with the otherwise careful caveats and makes the record materially overclaim.",
+    "file": "research/noir-dominated-overflow-elision-7161.md",
+    "fix_hint": "Replace every \u201cnever regresses\u201d formulation with \u201cno regressions were observed in the tested corpus/suites,\u201d and keep the scope of each statement tied to the exact measurements performed.",
+    "severity": "major",
+    "title": "Finite testing does not justify the repeated \u201cnever regresses\u201d claim"
+   },
+   {
+    "body": "The added Markdown embeds opcode totals, percentages, per-package deltas, synthetic-fixture counts, and wall-clock compile timings. AGENTS.md explicitly prohibits hard-coded performance numbers in Markdown and says work-box timings are non-canonical. Labeling them non-canonical does not remove the prohibition. The companion research file does the same extensively.",
+    "file": "research/noir-optimization-program.md",
+    "fix_hint": "Move raw measurements to the repository's approved generated/result artifact mechanism and link to it from the research records. Keep only qualitative conclusions in Markdown, or obtain and document the specific policy-approved representation if this research program has one.",
+    "severity": "major",
+    "title": "Hard-coded benchmark and timing results violate repository policy"
+   },
+   {
+    "body": "The paragraph beginning \u201cUnlike \u00a710.5\u2013\u00a710.7 the issue body was fetched\u201d appears twice consecutively, including the trailing introduction to the findings table. This is an obvious editing error.",
+    "file": "research/noir-optimization-program.md",
+    "fix_hint": "Delete one copy of the duplicated paragraph.",
+    "severity": "minor",
+    "title": "Issue-body paragraph is duplicated verbatim"
+   }
+  ],
+  "progress": null,
+  "summary": "The record is unusually careful about the missing backend gate measurement and the fact that the patch is not shipped, but it still makes claims stronger than its evidence and violates the repository's prohibition on hard-coded performance figures in Markdown. A finite unit/corpus run can support \u201cno regressions observed,\u201d not \u201cnever regresses.\u201d The program record also contains an accidental duplicated paragraph. These are fixable documentation issues; the supplied diff contains no implementation whose soundness can independently be verified.",
+  "verdict": "request_changes"
+ }
+}
