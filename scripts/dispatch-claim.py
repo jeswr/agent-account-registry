@@ -3965,7 +3965,8 @@ def _migrate_legacy_park(repo, number, issue_number, comments, labels, bot_login
 def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_login, script_dir,
                             worker_pr, evidence_probe, comments_fn=None, timeline_fn=None,
                             post_comment=None, clear_labels=None, log=print,
-                            migration_provable=False, convert_labels=None):
+                            migration_provable=False, convert_labels=None, *,
+                            enrolled_authors):
     """AUTOMATIC re-admission of MACHINE capacity parks whose starvation cause has demonstrably
     cleared (registry #614) — the sweep that closes the structural stall: a MACHINE-owned park
     could only ever be cleared by a HUMAN, so a capacity outage stranded every PR it parked even
@@ -3982,6 +3983,16 @@ def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_logi
     leaves receipt-no-label — which the receipt-driven proof gate admits and this sweep converges
     on the next tick — never label-no-receipt, which would erase the re-admission from every proof
     surface and re-strand the PR. Every failure is PER-PR: one unreadable PR never stops the rest.
+
+    [registry #835] `enrolled_authors` is the repo's MASTER-protected `review_enrolment_authors`
+    allowlist — REQUIRED keyword-only, exactly as `_dispatch_review_items` takes it (#821), so a
+    caller that forgets it is a TypeError rather than a silent enrolment-off sweep. Without it this
+    sweep's CANDIDATE FILTER (a worker head ref AND the App-bot author) excluded the #657
+    orchestrator class outright, so a machine-owned capacity park taken by an ENROLLED
+    orchestrator PR had NO machine exit at all: the #614 stall, reproduced on precisely the
+    population the enrolment feature serves, and invisible to every per-run success signal because
+    each individual sweep succeeded. Note #813 does not cover this — it fixed the LADDER's
+    machine-vs-human attribution; the candidate filter is a separate, shape-based gate.
 
     Returns the number of PRs re-admitted this tick."""
     comments_fn = comments_fn or _pr_comments
@@ -4050,19 +4061,41 @@ def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_logi
         if row.get("state") != "open":
             continue
         head = row.get("head") or {}
-        if (head.get("repo") or {}).get("full_name") != repo \
-                or not HEAD_REF_RE.match(str(head.get("ref", ""))):
-            continue                      # not a same-repo worker branch — never ours to re-admit
+        # FORK GATE FIRST, and unconditional — hoisted above every waivable predicate exactly as
+        # enumerate_review_items hoists it (#657), rather than left to the accident of ordering.
+        # `head.repo != repo` is the single attacker-facing predicate in this sweep: a fork head is
+        # attacker-controlled and is NEVER re-admitted, on any path, by any waiver.
+        if (head.get("repo") or {}).get("full_name") != repo:
+            continue
         login = str((row.get("user") or {}).get("login", ""))
-        if not bot_login or login != bot_login:
-            continue                      # only the trusted App bot's own worker PRs
+        if not bot_login:
+            continue                      # no App identity: receipts can be neither read nor minted
+        # [registry #835] ORCHESTRATOR-CLASS RE-ADMISSION. The two gates below are the WORKER
+        # lane's PRODUCER SHAPE (research/657-orchestrator-pr-admission.md §7.2), not a trust
+        # root; an orchestrator-authored PR satisfies NEITHER, which is exactly what #821's
+        # waiver exists to bypass. Reuse that ONE predicate rather than re-deriving the shape
+        # test, so "admitted at PLAN/CLAIM" and "re-admittable here" cannot drift. Both halves
+        # of the waiver still hold: an `orchestrator`-attested record for THIS PR on the
+        # unprotected `ledger` branch AND the author's login in the master-protected allowlist.
+        # An EMPTY allowlist — every repo's default — makes this constantly False and the two
+        # gates below stand byte-for-byte as they did before.
+        record = provenance.get(number) if isinstance(provenance, dict) else None
+        orchestrator_admitted = admits_orchestrator_pr(record, number, login, enrolled_authors)
+        if not orchestrator_admitted:
+            if not HEAD_REF_RE.match(str(head.get("ref", ""))):
+                continue                  # not a same-repo worker branch — never ours to re-admit
+            if login != bot_login:
+                continue                  # only the trusted App bot's own worker PRs
         try:
             # EVERYTHING that can fail on hostile/degraded data lives inside the per-PR try: a
             # malformed label list, an unreadable comments page, or a failed timeline read must
             # skip THIS PR (its park simply stands) and never abort the sweep — the whole tick's
             # claim runs under this call.
             labels = set(_labels(row))
-            record = provenance.get(number)
+            # `record` was read above the candidate filter (#835): the orchestrator waiver is a
+            # function OF the record, so the record has to exist before the gates it can waive
+            # are evaluated. ONE read per PR per tick — a second `provenance.get` here would be a
+            # second view of the same decision and could drift from the one the waiver used.
             issue_number = record.get("issue") if isinstance(record, dict) else None
             if not isinstance(issue_number, int) or isinstance(issue_number, bool) \
                     or issue_number <= 0:
@@ -6209,7 +6242,13 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                     # (registry #691) so this call site and the admission probe above cannot
                     # drift apart.
                     migration_provable=_legacy_migration_provable(
-                        model_health, health_window, _now))
+                        model_health, health_window, _now),
+                    # [registry #835] The MASTER-protected half of orchestrator-PR admission,
+                    # read from the SAME validated policy document CLAIM reads it from below.
+                    # Hard-coding `()` here would leave the class with a machine-owned park and
+                    # no machine exit — the #614 stall on the enrolled population — with nothing
+                    # red anywhere, so the argument EXPRESSION is pinned by the self-test.
+                    enrolled_authors=policy_module.review_enrolment_authors(repo, policy_doc))
 
         # [registry #677] THE MACHINE EXIT FOR A STARVED PLAN. Four times on 2026-07-26 the
         # issue lane went to `PLAN complete: 0 issue item(s)` / `lane worker: planned=0 launched=0`
@@ -7724,6 +7763,13 @@ def _self_test():
             def _policy_row(repo, document):
                 assert repo == "example/repo" and document["repos"][repo]["enabled"] is True
                 return policy
+
+            @staticmethod
+            def review_enrolment_authors(repo, _policy_doc):
+                # [#835] Enrolment OFF, the shipped default for every repo — this fixture is the
+                # no_change decline tripwire and must exercise the pre-#835 worker semantics.
+                assert repo == "example/repo"
+                return frozenset()
 
             @staticmethod
             def resolve(repo, issue_labels, policy_doc, routing_doc):
@@ -14465,7 +14511,7 @@ def _self_test():
     }
 
     def readmit_sweep(window, rows=None, labels=None, comments=(), holds=None, timeline=None,
-                      provenance=None, comments_fn=None):
+                      provenance=None, comments_fn=None, enrolled_authors=()):
         """Run the sweep with every GitHub seam injected; returns (count, posted, cleared).
 
         The sweep's OWN log is captured on `readmit_sweep.log` rather than discarded. It used to
@@ -14487,7 +14533,7 @@ def _self_test():
             timeline_fn=lambda _repo, number: list((timeline or park_timeline).get(number, [])),
             post_comment=lambda _repo, number, body: posted.append((number, body)),
             clear_labels=lambda pr, issue: cleared.append((pr, issue)),
-            log=readmit_sweep.log.append)
+            log=readmit_sweep.log.append, enrolled_authors=enrolled_authors)
         return count, posted, cleared
 
     # A(a): the machine park + a post-park success on the failing account => re-admitted ONCE,
@@ -14679,7 +14725,7 @@ def _self_test():
                                                     readmit_now),
             comments_fn=boom_comments,
             timeline_fn=lambda _repo, number: list(park_timeline.get(number, [])),
-            post_comment=lambda *_a: None, clear_labels=lambda *_a: None, log=lambda _l: None)
+            post_comment=lambda *_a: None, clear_labels=lambda *_a: None, log=lambda _l: None, enrolled_authors=())
         assert skipped == 0, skipped
         print("  ok   auto-readmit: an unreadable PR skips only itself (per-PR resilience)")
 
@@ -14724,7 +14770,7 @@ def _self_test():
                 post_comment=lambda _repo, number, body: posted.append(body),
                 clear_labels=lambda *_a: None, log=lambda _l: None,
                 migration_provable=provable,
-                convert_labels=lambda pr, issue: converted.append((pr, issue)))
+                convert_labels=lambda pr, issue: converted.append((pr, issue)), enrolled_authors=())
             return posted, converted
 
         posted, converted = migrate_sweep([budget_body])
@@ -14812,7 +14858,7 @@ def _self_test():
                 {"user": {"login": readmit_bot}, "body": budget_body}],
             timeline_fn=lambda _repo, number: list(migrate_timeline.get(number, [])),
             post_comment=lambda *_a: None, clear_labels=lambda *_a: None, log=lambda _l: None,
-            migration_provable=True, convert_labels=composed_convert)
+            migration_provable=True, convert_labels=composed_convert, enrolled_authors=())
         assert migrated_count == 0, "the migration must not re-admit in the same breath"
         assert composed_pr_labels == {MACHINE_PARK_PR_LABEL}, composed_pr_labels
         assert "needs:user" not in composed_issue_labels, composed_issue_labels
@@ -14828,7 +14874,7 @@ def _self_test():
             timeline_fn=lambda _repo, number: list(park_timeline.get(number, [])),
             post_comment=lambda *_a: None,
             clear_labels=lambda pr, issue: composed_cleared.append((pr, issue)),
-            log=lambda _l: None, migration_provable=False)
+            log=lambda _l: None, migration_provable=False, enrolled_authors=())
         assert composed_readmitted == 1, (composed_readmitted, sorted(composed_issue_labels))
         assert composed_cleared == [(41, 7)], composed_cleared
         print("  ok   legacy-migration COMPOSED: a migrated PR whose source issue carried "
@@ -14921,7 +14967,7 @@ def _self_test():
                     {"user": {"login": readmit_bot}, "body": budget_body}],
                 timeline_fn=lambda _repo, number: list(migrate_timeline.get(number, [])),
                 post_comment=lambda *_a: None, clear_labels=lambda *_a: None,
-                log=lambda _l: None, migration_provable=True)   # convert_labels=None => REAL
+                log=lambda _l: None, migration_provable=True, enrolled_authors=())   # convert_labels=None => REAL
         finally:
             globals()["_run_gh_target_api"] = prev_api
             globals()["_run_target_helper"] = prev_helper
@@ -14957,7 +15003,7 @@ def _self_test():
             timeline_fn=lambda _repo, number: list(park_timeline.get(number, [])),
             post_comment=lambda *_a: None, clear_labels=lambda *_a: None, log=lambda _l: None,
             migration_provable=True,
-            convert_labels=lambda pr, issue: many_converted.append(pr))
+            convert_labels=lambda pr, issue: many_converted.append(pr), enrolled_authors=())
         assert len(many_converted) == LEGACY_PARK_MIGRATION_MAX, many_converted
         print(f"  ok   legacy-migration: one tick migrates at most "
               f"{LEGACY_PARK_MIGRATION_MAX} parks (bounded re-entry)")
@@ -15127,7 +15173,7 @@ def _self_test():
                 aged_timeline[41] if number != 7 else []),
             post_comment=lambda *_a: None,
             clear_labels=lambda pr, issue: herd_cleared.append(pr),
-            log=lambda _l: None, migration_provable=False)
+            log=lambda _l: None, migration_provable=False, enrolled_authors=())
         assert herd_count == AUTO_READMISSION_PER_TICK_MAX, (herd_count, herd_cleared)
         assert len(herd_cleared) == AUTO_READMISSION_PER_TICK_MAX, herd_cleared
         # ...and the drain is DETERMINISTIC, not starving: ascending PR order, so the parks this
@@ -15241,7 +15287,7 @@ def _self_test():
                 post_comment=lambda *_a: None, clear_labels=lambda *_a: None,
                 log=lambda _l: None,
                 migration_provable=_legacy_migration_provable(
-                    model_health_mod, healthy_window, readmit_now))
+                    model_health_mod, healthy_window, readmit_now), enrolled_authors=())
         finally:
             globals()["_run_gh_target_api"] = prev_api2
             globals()["_run_target_helper"] = prev_helper2
@@ -15286,7 +15332,7 @@ def _self_test():
             post_comment=lambda *_a: None, clear_labels=lambda *_a: None, log=lambda _l: None,
             migration_provable=_legacy_migration_provable(
                 model_health_mod, healthy_window, readmit_now),
-            convert_labels=chain_convert)
+            convert_labels=chain_convert, enrolled_authors=())
         assert chain_migrated == 0, "the migration must not re-admit in the same breath"
         assert chain_pr_labels == {MACHINE_PARK_PR_LABEL}, chain_pr_labels
         assert "needs:user" not in chain_issue_labels, chain_issue_labels
@@ -15313,13 +15359,137 @@ def _self_test():
             timeline_fn=lambda _repo, number: list(chain_timeline.get(number, [])),
             post_comment=lambda *_a: None,
             clear_labels=lambda pr, issue: chain_cleared.append((pr, issue)),
-            log=lambda _l: None, migration_provable=False)
+            log=lambda _l: None, migration_provable=False, enrolled_authors=())
         assert chain_readmitted == 1, (chain_readmitted, sorted(chain_issue_labels))
         assert chain_cleared == [(41, 7)], chain_cleared
         print("  ok   aged-out exit CHAIN: a legacy park that could not migrate before #691 "
               "migrates AND is actually released one span later (both layers, end to end)")
+
+        # ---- [registry #835] THE RE-ADMISSION CANDIDATE FILTER ADMITS THE #657 ORCHESTRATOR
+        # CLASS. The defect: `_readmit_capacity_parks` selected candidates on HEAD_REF_RE *and*
+        # the App-bot login — the WORKER lane's producer shape. An orchestrator-class PR
+        # satisfies NEITHER (that is what #821's waiver exists to bypass), so once such a PR took
+        # a MACHINE-owned capacity park NOTHING could ever re-admit it: the #614 stall, on
+        # precisely the population the feature serves, and invisible to every per-run signal
+        # because each sweep succeeded. Both directions are asserted, plus a FROZEN worker-class
+        # control and the three shapes that must stay out. ----
+        orch_login = "enrolled-orchestrator"
+        orch_enrolled = (orch_login,)
+
+        def orch_row(number=41, login=orch_login, ref="fix/ordinary-branch",
+                     head_repo="example/repo"):
+            """The #657 population's shape: same-repo head on an ORDINARY branch (fails
+            HEAD_REF_RE), HUMAN author (fails the `[bot]` gate), carrying the machine park."""
+            return {"number": number, "state": "open", "draft": False,
+                    "user": {"login": login},
+                    "head": {"sha": "b" * 40, "ref": ref,
+                             "repo": {"full_name": head_repo}},
+                    "labels": [{"name": MACHINE_PARK_PR_LABEL}]}
+
+        orch_record = dict(orchestrator_probe_record(41), issue=7)
+        assert provenance_attestation_class(orch_record) == ORCHESTRATOR_CLASS, orch_record
+
+        # (1) THE HEADLINE, POSITIVE. Reverting either waived gate in the candidate filter (or
+        #     hard-coding `enrolled_authors=()` at the production call site) reds THIS line.
+        count, posted, cleared = readmit_sweep(
+            recovered_window, rows=[[orch_row()]], provenance={41: orch_record},
+            enrolled_authors=orch_enrolled)
+        assert count == 1 and cleared == [(41, 7)], (
+            "[#835] a capacity-parked ORCHESTRATOR-class PR must be machine-re-admitted; "
+            "reverting either waived gate in the candidate filter reds THIS assertion. "
+            f"got {(count, cleared)!r}")
+        assert len(posted) == 1 and worker_pr_mod.AUTO_READMIT_MARKER in posted[0][1], (
+            f"[#835] the re-admission must be RECEIPTED first: {posted!r}")
+        print("  ok   [#835] a capacity-parked ORCHESTRATOR-class PR is MACHINE re-admitted "
+              "(receipt-first) — the #614 stall no longer has an unreachable population")
+
+        # (2) THE SAME ROW, ALLOWLIST EMPTY => still refused. This is what makes (1) a test of
+        #     the ENROLMENT waiver rather than of some incidental widening: the only thing that
+        #     changed between the two calls is the master-protected allowlist.
+        assert readmit_sweep(recovered_window, rows=[[orch_row()]],
+                             provenance={41: orch_record}) == (0, [], []), \
+            ("[#835] an EMPTY review_enrolment_authors must leave the two shape gates standing "
+             "byte-for-byte — enrolment is the discriminator, not the head-ref shape")
+        print("  ok   [#835] ...and with an EMPTY allowlist the very same PR is still refused")
+
+        # (3) WORKER-CLASS REGRESSION CONTROL, FROZEN. The worker row's outcome is pinned by
+        #     LITERAL expectation on both sides of the allowlist — not by re-calling the waiver
+        #     predicate, which would go quiet the moment that predicate changed.
+        assert readmit_sweep(recovered_window)[0::2] == (1, [(41, 7)]), \
+            "[#835] REGRESSION CONTROL: the worker-class capacity park must still re-admit"
+        assert readmit_sweep(recovered_window, enrolled_authors=orch_enrolled)[0::2] \
+            == (1, [(41, 7)]), (
+            "[#835] REGRESSION CONTROL: an enabled allowlist must not change ANY "
+            "worker-class re-admission outcome")
+        assert readmit_sweep(still_broken_window, enrolled_authors=orch_enrolled) == (0, [], []), (
+            "[#835] REGRESSION CONTROL: an enabled allowlist must not manufacture a worker "
+            "re-admission without proven recovery")
+        print("  ok   [#835] worker-class re-admission is unchanged in BOTH allowlist states "
+              "(regression control, frozen literals)")
+
+        # (4) NOTHING ELSE BECOMES RE-ADMITTABLE. Each of these differs from (1) in exactly one
+        #     property, so each pins one predicate the waiver must NOT reach.
+        for _why, _rows, _prov, _authors in (
+                ("a THIRD-PARTY author is not enrolled",
+                 [[orch_row(login="drive-by-contributor")]], {41: orch_record}, orch_enrolled),
+                ("a FORK head is never ours to re-admit, on any path",
+                 [[orch_row(head_repo="attacker/fork")]], {41: orch_record}, orch_enrolled),
+                ("the record must be THIS PR's record",
+                 [[orch_row()]], {41: dict(orchestrator_probe_record(9), issue=7)},
+                 orch_enrolled),
+                ("a MACHINE-attested record is not the orchestrator class",
+                 [[orch_row()]], {41: {"pr_number": 41, "issue": 7,
+                                       "impl_provider": sorted(IMPL_PROVIDERS)[0],
+                                       "impl_alias": "sol", "impl_account_h": "0" * 16,
+                                       "head_sha_at_open": "0" * 40,
+                                       "recorded_at_run": "6001.1"}}, orch_enrolled),
+                ("no record at all fails closed", [[orch_row()]], {}, orch_enrolled)):
+            assert readmit_sweep(recovered_window, rows=_rows, provenance=_prov,
+                                 enrolled_authors=_authors) == (0, [], []), f"[#835] {_why}"
+        print("  ok   [#835] no third-party, fork, foreign-record, machine-attested or "
+              "recordless PR becomes re-admittable (5 shapes, one differing property each)")
     finally:
         globals()["_target_is_human_maintainer"] = prev_target_probe
+
+    # ---- [registry #835] THE CALL SITE, on the PARSED module. A behavioural test of the sweep
+    # cannot see `dispatch()` passing a hard-coded `()` — the sweep would keep passing while the
+    # feature was off in production, which is exactly the vacuity shape #827's review found
+    # (`--self-test || true`, a bare `args+=(--apply)`). The parameter is REQUIRED keyword-only,
+    # so OMITTING it is a TypeError; what a signature cannot catch is the WRONG VALUE, and that
+    # is what is pinned here. Parsed, never regexed: #759 measured a source regex failing
+    # permissive under a two-line reflow with no behaviour change. ----
+    _readmit_fn = next(
+        node for node in ast.walk(ast.parse(
+            Path(__file__).resolve().read_text(encoding="utf-8")))
+        if isinstance(node, ast.FunctionDef) and node.name == "dispatch")
+    _readmit_enrol = [
+        keyword.value for node in ast.walk(_readmit_fn) if isinstance(node, ast.Call)
+        and getattr(node.func, "id", "") == "_readmit_capacity_parks"
+        for keyword in node.keywords if keyword.arg == "enrolled_authors"]
+    assert len(_readmit_enrol) == 1, \
+        (f"expected exactly one enrolled_authors argument to _readmit_capacity_parks in "
+         f"dispatch(), got {len(_readmit_enrol)}")
+    assert (isinstance(_readmit_enrol[0], ast.Call)
+            and getattr(_readmit_enrol[0].func, "attr", "") == "review_enrolment_authors"
+            and [getattr(a, "id", "") for a in _readmit_enrol[0].args] == ["repo", "policy_doc"]), \
+        ("dispatch() must hand the re-admission sweep the repo's MASTER-protected allowlist, "
+         "resolved live from the policy document it already validated — the same expression "
+         "CLAIM gets. Hard-coding `()` here re-opens the #614 stall for the enrolled class with "
+         f"nothing red anywhere else. Found: {ast.dump(_readmit_enrol[0])}")
+    # ...and the sweep's own signature keeps the parameter REQUIRED: a default would let a future
+    # caller (or a reverted call site) silently sweep with enrolment off.
+    _readmit_def = next(
+        node for node in ast.walk(ast.parse(
+            Path(__file__).resolve().read_text(encoding="utf-8")))
+        if isinstance(node, ast.FunctionDef) and node.name == "_readmit_capacity_parks")
+    assert ("enrolled_authors" in [a.arg for a in _readmit_def.args.kwonlyargs]
+            and _readmit_def.args.kw_defaults[
+                [a.arg for a in _readmit_def.args.kwonlyargs].index("enrolled_authors")] is None), \
+        ("_readmit_capacity_parks must take enrolled_authors as a REQUIRED keyword-only "
+         "parameter (as _dispatch_review_items does), so omitting it is a TypeError rather than "
+         "a silently enrolment-off sweep")
+    print("  ok   [#835] the sweep's allowlist is REQUIRED and its production call site resolves "
+          "it through policy-resolve.review_enrolment_authors (parsed call site, not a regex)")
 
     # ---- round-3 Opus finding: a maintainer probe-CALL failure emits the distinct loud
     # ::warning:: diagnostic (and still fails toward not-human); a genuine not-a-maintainer
