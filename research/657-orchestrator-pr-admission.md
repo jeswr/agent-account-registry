@@ -189,8 +189,11 @@ Two facts sharpen §1's diagnosis:
 - **The fork gate is not what is excluding anything.** `head.repo == sparq-org/sparq` for
   **117/117** open PRs. There is no fork PR in the population at all.
 - Verdict coverage is exactly bimodal: reachable **4/4** hold a ledger verdict, unreachable
-  **0/30** do. Notably all 4 reachable PRs already carry `review:pass`, so the lane's *live*
-  unserved queue is currently **zero** — the entire backlog is the invisible set.
+  **0/30** do. All 4 reachable PRs also carry `review:pass` (measured). It is tempting to conclude
+  from that "the lane's live unserved queue is zero", but that does **not** follow from the label
+  alone — `enumerate_review_items` is review-state-agnostic for the repair states, so a
+  `review:pass` PR on a conflicting base or a concluded-red gate still enumerates. The measured
+  claim is the label distribution; the queue depth was not measured.
 
 ### 7.2 What the head-ref gate is actually for — evidence
 
