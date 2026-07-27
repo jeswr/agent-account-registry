@@ -12251,6 +12251,29 @@ def _starvation_seam_violations(document):
     if "registry-dispatch-plan/v4" in run:
         out.append("dispatch.yml: the plan-assembly step still mentions the v4 schema — a "
                    "reverted stamp or a reverted inline check would ship a plan CLAIM refuses")
+    # [registry #758] The assemble-leg census wiring. COMMENTS ARE STRIPPED FIRST, deliberately:
+    # this block is heavily commented and every fragment below also appears in prose above it, so
+    # a substring check over the raw `run:` text would stay green after the CODE was deleted —
+    # the claim-in-a-comment failure mode measured on registry #756's artifact-upload check.
+    code = "\n".join(line.split("#", 1)[0] for line in run.splitlines())
+    for fragment, why in (
+        ("census=partition_census",
+         "filter_busy_area_items is no longer asked for the per-reason breakdown, so the leg "
+         "that eats the frontier goes back to having no counter at all"),
+        ('print("assemble-census "',
+         "the census is computed and then never emitted — a leg whose count nobody can read is "
+         "the same hole as a leg with no count"),
+        ('partition_census.get("total", 0)',
+         "the emitted line stops carrying the deferral TOTAL"),
+        ('"by_held_area"',
+         "the emitted line stops carrying the HELD-AREA attribution — which is the entire fix: "
+         "attributing to the dropped row's own crate is what reported 27 contended crates for a "
+         "stall caused by one `__global__` reservation"),
+        ('"by_reason"',
+         "the emitted line stops carrying the per-reason breakdown"),
+    ):
+        if fragment not in code:
+            out.append(f"dispatch.yml: the plan-assembly step lost {fragment!r} — {why}")
     claim_steps = (jobs.get(_STARVATION_CLAIM_STEP) or {}).get("steps")
     if not isinstance(claim_steps, list):
         out.append("dispatch.yml: jobs.claim.steps is not a list — the sweep has no runner")
@@ -12264,6 +12287,30 @@ def _starvation_seam_violations(document):
         out.append("dispatch.yml: the `claim` step no longer runs dispatch-claim.py, so the "
                    "starved-plan sweep never executes")
     return sorted(out)
+
+
+def _census_code_to_comment(run):
+    """[registry #758] Build the COMMENT-TRAP mutant of the assemble step: every #758 census
+    fragment survives in a COMMENT while none of it survives as code, and `starvation=starvation`
+    — which shares a line with `census=partition_census` — is deliberately left intact so the
+    pre-existing non-stripping starvation check cannot kill this mutant on someone else's behalf.
+    A raw-substring wiring check calls this step wired; the comment-stripped one must not."""
+    assert "starvation=starvation, census=partition_census)" in run, \
+        "the comment-trap mutant no longer knows where the census kwarg lives"
+    mutated = run.replace("starvation=starvation, census=partition_census)",
+                          "starvation=starvation)")
+    # The `run:` scalar arrives DEDENTED from yaml.safe_load, so the anchors must not assume a
+    # column. Cut from the start of the print statement's line to the end of its last line.
+    marker = 'print("assemble-census "'
+    begin = mutated.rindex("\n", 0, mutated.index(marker)) + 1
+    end = mutated.index("\n", mutated.index('.items())]))', begin)) + 1
+    fragments = ('census=partition_census print("assemble-census " '
+                 'partition_census.get("total", 0) "by_held_area" "by_reason"')
+    mutated = mutated[:begin] + f"# {fragments}\n" + mutated[end:]
+    assert marker not in mutated.replace(f"# {fragments}", ""), \
+        "the trap left the print statement as CODE — it would not test the stripping"
+    assert "starvation=starvation" in mutated, "the trap must not disturb the starvation kwarg"
+    return mutated
 
 
 def _starvation_yaml_seam_self_test():
@@ -12321,6 +12368,30 @@ def _starvation_yaml_seam_self_test():
                            if s.get("id") == "claim").__setitem__("run", "echo hi"),
         "claim steps replaced by a scalar":
             lambda d: d["jobs"]["claim"].__setitem__("steps", "nope"),
+        # [registry #758] the assemble-leg census wiring
+        "the filter is no longer asked for the per-reason census":
+            drop_fragment("census=partition_census"),
+        "the census is computed but never emitted":
+            drop_fragment('print("assemble-census "'),
+        "the emitted line drops the deferral total":
+            drop_fragment('partition_census.get("total", 0)'),
+        "the emitted line drops the HELD-AREA attribution":
+            drop_fragment('"by_held_area"'),
+        "the emitted line drops the per-reason breakdown":
+            drop_fragment('"by_reason"'),
+        # THE COMMENT TRAP, as a first-class mutant: delete the CODE and leave prose that still
+        # contains every fragment. A raw-text substring check passes this; the comment-stripped
+        # one must not. Measured on registry #756: an upload-path check stayed green exactly this
+        # way because the step's own comment named the file it searched for.
+        #
+        # SURGICAL ON PURPOSE. A first draft of this mutant deleted whole LINES containing the
+        # census fragments, which collaterally deleted `starvation=starvation` (it shares a line
+        # with `census=partition_census`) — so the pre-existing, NON-stripping starvation check
+        # killed it and the trap proved nothing about the stripping. It survived correctly only
+        # once the collateral damage was removed. The census code, and only the census code, goes.
+        "the census code is replaced by a comment naming every fragment":
+            lambda d: assemble_step(d).__setitem__(
+                "run", _census_code_to_comment(assemble_step(d)["run"])),
     }
     survivors = [name for name, edit in seam_mutants.items() if not mutant(edit)]
     assert not survivors, f"dispatch.yml seam mutants NOT caught: {survivors}"
