@@ -396,7 +396,11 @@ jobs:
 
               pulls = snapshot("pulls", index)
               linked = linked_issue_numbers(pulls, repo)
-              # >>> pr-occupancy — EXECUTED by scripts/dispatch-plan.py --self-test (issue #768).
+              # [#768] EXECUTED end-to-end by scripts/dispatch-plan.py --self-test, which
+              # extracts this STEP'S WHOLE python heredoc and runs it over a synthetic
+              # two-target fixture. No `>>> ... <<<` sentinels here on purpose: nothing
+              # extracts this range on its own, and a marker implying a guard it does not
+              # have is the vacuity class this repo already tracks.
               # PLAN reserved the ISSUE half of every unit of work and never the PR half: the PR
               # rows were filtered out of the readiness input above, so `compute_ready` saw an
               # `area:` free whenever the only thing holding it was an open PR. MEASURED on the
@@ -465,7 +469,6 @@ jobs:
                         f"({pr_aware_why}) — PLAN reserves the ISSUE half of every unit of work "
                         f"and never the PR half, so its frontier may offer rows CLAIM will drop "
                         f"with no backfill. {len(pr_rows)} open PR row(s) were NOT reserved.")
-              # <<< pr-occupancy
               # Apply the trust + linked-PR exclusions BEFORE the frontier is selected (issue #113:
               # post-frontier filters leave dispatchable holes). compute_ready commits to a
               # conflict-free, priority-ordered frontier, so a candidate removed AFTER selection
@@ -562,7 +565,7 @@ jobs:
                       "labels": sorted((labels - {"status:deferred"}) | {"status:ready"}),
                   })
               # <<< deferred-retry-filter
-              # >>> deferred-occupancy — EXECUTED by scripts/dispatch-plan.py --self-test (#768).
+              # [#768] EXECUTED end-to-end by the same whole-heredoc harness.
               # The deferred lane used to be handed `deferred_input` ALONE. `deferred_input` is
               # filtered to `status:deferred` rows and `retry_gated` excludes both in-progress
               # labels, so by construction it contained NO occupant at all — the only occupancy
@@ -586,7 +589,6 @@ jobs:
               deferred_ready = dispatch.compute_ready(
                   occupancy_input + in_flight_input + deferred_input,
                   in_progress_packages=taken)
-              # <<< deferred-occupancy
 
               routing_doc = dispatch._routing_doc()
               flagged_rows = [(row, False) for row in dispatch.plan_dispatch(ready, routing_doc)]

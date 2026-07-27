@@ -895,7 +895,24 @@ def _routing_doc():
          "1 open PR row(s) were NOT reserved" in _out_own),
         (True, True, True, True))
 
-    # (6) THE DEFERRED LANE. It used to be handed `deferred_input` ALONE — a list `retry_gated`
+    # (6) THE PROBE'S SECOND OBLIGATION, on its own. Mutation found this hole: dropping the
+    # EFFECT check left every other assertion green, because the only non-PR-aware planner in
+    # this suite (this repo's own) fails the SAFETY check FIRST, so EFFECT never decided
+    # anything. A planner that is SAFE — it skips PR rows as candidates — but silently ignores
+    # them as occupants is the case that matters: it makes the whole change an expensive no-op,
+    # and passing it PR rows would let PLAN offer a row an open PR holds while reporting success.
+    _INERT_PLANNER = _PR_AWARE_PLANNER.replace(
+        'if "pull_request" in it or (L & IN_FLIGHT):', "if L & IN_FLIGHT:")
+    _plan_inert, _out_inert = _run_readiness(
+        [[_issue(500, ["area:usage"], pr=True), _issue(501, _READY + ["area:usage"])]],
+        [_INERT_PLANNER])
+    chk("[#768] a planner that IGNORES PR occupancy is refused too, naming that reason",
+        ("does not RESERVE a pull request's declared area" in _out_inert,
+         "NOT pull-request-aware" in _out_inert,
+         "PLAN occupancy carries" in _out_inert),
+        (True, True, False))
+
+    # (7) THE DEFERRED LANE. It used to be handed `deferred_input` ALONE — a list `retry_gated`
     # filters to `status:deferred` rows, so it contained no occupant of any kind and reserved
     # ZERO keys (MEASURED on the live snapshot: 0 keys held, against 48 in the ready lane). A
     # deferred retry therefore launched onto a crate an in-flight issue owned, which CLAIM's
