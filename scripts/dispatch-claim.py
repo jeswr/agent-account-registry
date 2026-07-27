@@ -8178,6 +8178,45 @@ def _self_test():
     assert "self_attested" in REVIEW_ITEM_FIELDS, \
         "dropping the field from the schema makes every consumer default the unsafe way"
 
+    # (10) THE ENABLE INTERLOCK — a SELF-REMOVING tripwire, and the most important assertion in
+    # this block. PLAN admission alone is not a feature, it is an OUTAGE: CLAIM re-reads the
+    # record with its own provenance_admission_error call and review-fix.yml's resolve step
+    # raises SystemExit on the same predicate. Neither passes admit_orchestrator today, so an
+    # enumerated orchestrator item would be re-refused every tick, forever — the permanent
+    # per-tick defer, with a generic counter as its only symptom.
+    #
+    # So: while EITHER downstream consumer still refuses the class, no repo may configure
+    # `review_enrolment_authors`. That makes "this PR is inert" a TESTED property rather than a
+    # promise in a PR body, and it makes turning the feature on impossible until the wiring
+    # lands. When the follow-up wires both consumers, this assertion stops constraining policy
+    # on its own — it does not need to be remembered and deleted.
+    _module_source = Path(__file__).resolve().read_text(encoding="utf-8")
+    _claim_reread = re.search(
+        r"(?m)^ *record_error = provenance_admission_error\(record, number\)$", _module_source)
+    _claim_admits = _claim_reread is None
+    _rf_admits = "admit_orchestrator" in _review_fix_step_python(
+        r"(?m)^[ \t]*admission_error = dispatch_claim\.provenance_admission_error\(",
+        r"(?m)^[ \t]*impl_provider = record\[",
+        "provenance admission consumption")
+    _repos_doc = tomllib.loads(
+        (Path(__file__).resolve().parents[1] / "policy" / "repos.toml").read_text("utf-8"))
+    _configured = {name: row.get("review_enrolment_authors")
+                   for name, row in (_repos_doc.get("repos") or {}).items()
+                   if row.get("review_enrolment_authors")}
+    if not (_claim_admits and _rf_admits):
+        assert not _configured, (
+            "policy/repos.toml enables review_enrolment_authors for "
+            f"{sorted(_configured)} while the review lane's DOWNSTREAM consumers still refuse "
+            "the orchestrator class (CLAIM record re-read admits="
+            f"{_claim_admits}, review-fix.yml resolve admits={_rf_admits}). Every enrolled PR "
+            "would be enumerated by PLAN and re-refused at CLAIM on every tick, forever. Wire "
+            "both consumers first — see research/657-orchestrator-pr-admission.md.")
+        print("  ok   #657 enable interlock: admission is wired at PLAN only, and policy "
+              "correctly enables it for NO repo (turning it on now would defer forever)")
+    else:
+        print("  ok   #657 enable interlock: CLAIM and review-fix.yml both admit the class, "
+              f"so policy may enable it ({sorted(_configured) or 'none enabled yet'})")
+
     # YAML SEAM: the attestation checks live in provenance_admission_error, so they are only
     # load-bearing on the path that actually runs a model against a PR if review-fix.yml's
     # resolve step both CALLS that function and DIES on its result. Asserted against the PARSED
@@ -10060,6 +10099,69 @@ def _self_test():
                         re.finditer(r'\*\*\(\{"([a-z_]+)"', projection.group(1))}
     assert snapshot_fields == {"number", "state", "draft", "body", "labels",
                                "head", "user", "auto_merge"}, snapshot_fields
+
+    # ---- [OPUS-5 #657] YAML SEAM: the orchestrator-admission allowlist must actually REACH the
+    # enumerator. Every Python-side assertion above drives enumerate_review_items directly with an
+    # `enrolled_authors` argument the PRODUCTION caller might simply never pass — that is precisely
+    # the shape of vacuity this repo keeps measuring at the workflow boundary. So EXEC the real
+    # call-site block out of dispatch.yml against stubs and assert the value flows end to end. ----
+    _seam = re.search(
+        r"\n( *enrolled_authors = policy_mod\.review_enrolment_authors\(.*?"
+        r"review_items\.extend\(claim_mod\.enumerate_review_items\(.*?\)\))",
+        workflow, re.DOTALL)
+    assert _seam, ("dispatch.yml lost the review-enrolment call site — the allowlist is no "
+                   "longer read or no longer passed to the enumerator")
+    _seam_seen = {}
+
+    class _SeamPolicy:
+        @staticmethod
+        def review_enrolment_authors(repo_arg, doc_arg):
+            _seam_seen["policy_args"] = (repo_arg, doc_arg)
+            return frozenset({"sentinel-login"})
+
+    class _SeamClaim:
+        @staticmethod
+        def enumerate_review_items(*args, **kwargs):
+            _seam_seen["kwargs"] = kwargs
+            return ["one-item"]
+
+    _seam_ns = {"policy_mod": _SeamPolicy, "claim_mod": _SeamClaim, "review_items": [],
+                "repo": "example/repo", "policy_doc": {"marker": "MASTER-DOC"},
+                "pulls": [], "provenance": {}, "leases": [], "issue_labels": {}, "now": 0,
+                "pr_status": {}, "review_exclusions": Counter()}
+    exec(textwrap.dedent(_seam.group(1)), _seam_ns)  # noqa: S102 — repository-owned workflow src
+    # 1. The allowlist was resolved for THIS repo, from the MASTER policy document.
+    assert _seam_seen.get("policy_args") == ("example/repo", {"marker": "MASTER-DOC"}), \
+        _seam_seen.get("policy_args")
+    # 2. ...and it actually ARRIVED at the enumerator. A caller that drops the keyword, or
+    #    hard-codes an empty set, or passes the wrong variable, fails here — and that mutant is
+    #    invisible to every direct-call assertion in this file.
+    assert _seam_seen.get("kwargs", {}).get("enrolled_authors") == frozenset({"sentinel-login"}), \
+        _seam_seen.get("kwargs")
+    # 3. The result is not dropped on the floor.
+    assert _seam_ns["review_items"] == ["one-item"], _seam_ns["review_items"]
+    # 3b. THE REPLICA THAT ACTUALLY BROKE. dispatch.yml re-asserts the plan's review-item field
+    #     set with its own hand-written literal. Adding `self_attested` to REVIEW_ITEM_FIELDS
+    #     without updating that literal does NOT fail any test in this file — it kills every
+    #     PLAN tick at runtime with "plan review item fields are invalid". Pin the two together
+    #     so the NEXT field addition reds a unit test instead of the fleet.
+    _yaml_review_fields = re.search(
+        r"expected_review_fields = \{(.*?)\}", workflow, re.DOTALL)
+    assert _yaml_review_fields, "dispatch.yml lost its review-item field guard"
+    assert set(re.findall(r'"([a-z_]+)"', _yaml_review_fields.group(1))) == REVIEW_ITEM_FIELDS, \
+        ("dispatch.yml's expected_review_fields replica has drifted from REVIEW_ITEM_FIELDS — "
+         "every plan tick would die on 'plan review item fields are invalid'")
+    # 4. The policy document is loaded from the MASTER checkout, never the ledger one. Both are
+    #    present in this job; reading the allowlist from `registry-ledger` would put both halves
+    #    of the admission on the same unprotected branch and make requiring two of them pointless.
+    _policy_load = re.search(
+        r'(?m)^ *with open\((?P<expr>[^)]*"repos\.toml"[^)]*)\, *"rb"\) as handle:',
+        workflow)
+    assert _policy_load, "dispatch.yml lost the policy/repos.toml read"
+    assert "registry /" in _policy_load.group("expr"), _policy_load.group("expr")
+    assert "ledger" not in _policy_load.group("expr"), \
+        ("the enrolment allowlist must come from the master checkout — reading it from the "
+         "unprotected ledger branch collapses the two-authority design into one")
 
     # ---- Issue #109: the tick-health recorder must make a snapshot-skip-only tick VISIBLE.
     # Snapshot skips fold into the defer histogram (snapshot_skip_reasons) but are NOT `planned`

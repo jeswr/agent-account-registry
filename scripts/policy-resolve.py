@@ -270,7 +270,7 @@ def _policy_row(target_repo, policy_doc):
     if "review_enrolment_authors" in row:
         authors = row["review_enrolment_authors"]
         # CANONICAL FORM IS AN INVARIANT here for the same reason it is for account_pool: the
-        # consumer (dispatch-claim.enrolment_waiver) compares casefolded, so " JesWR" would
+        # consumer (dispatch-claim.admits_orchestrator_pr) compares casefolded, so " JesWR" would
         # match at the comparison site while reading as a different value in review. Rejecting
         # non-canonical entries at the boundary keeps the reviewed text and the matched value
         # the same string.
@@ -702,6 +702,50 @@ agent = "docs-agent"
                              'trusted_bots=["dup[bot]", "dup[bot]"]\n')
     rejects("trusted_bots rejects duplicates", "trusted_bots",
             lambda: resolve("o/r", "impl", dup_bots, routing))
+    # ---- [OPUS-5 #657] review_enrolment_authors: the master-protected half of orchestrator-PR
+    # admission. Absent => empty => admission is OFF, which is the shipped state of every repo. ----
+    def _authors(body):
+        return review_enrolment_authors("o/r", tomllib.loads(
+            '[repos."o/r"]\nenabled=true\nrouting="r.toml"\naccount_pool=["acct01"]\n'
+            'max_concurrent=1\nworker_timeout_minutes=30\ngate_profile="lint-only"\n'
+            'arm_auto_merge=false\nmax_attempts=1\ntrust="collaborators"\n' + body))
+
+    check("review_enrolment_authors defaults EMPTY (admission off)", _authors(""), frozenset())
+    check("review_enrolment_authors surfaced",
+          _authors('review_enrolment_authors=["jeswr"]\n'), frozenset({"jeswr"}))
+    check("review_enrolment_authors accepts an explicitly empty list",
+          _authors("review_enrolment_authors=[]\n"), frozenset())
+    # A `[bot]` login is REFUSED. A bot already satisfies the review lane's author gate, so the
+    # only thing listing one could do is widen that gate to some OTHER App — the exact
+    # suffix-matching hole issue #111 closed for trusted_bots. Deleting the pattern check
+    # re-opens it, and this line goes red.
+    rejects("review_enrolment_authors refuses a [bot] login", "non-canonical",
+            lambda: _authors('review_enrolment_authors=["some-app[bot]"]\n'))
+    # CANONICAL FORM IS AN INVARIANT (the account_pool lesson): the consumer compares
+    # casefolded, so a padded or upper-case entry would MATCH at the comparison site while
+    # reading as a different value in review. Reject at the boundary instead.
+    for _bad, _why in (('" jeswr"', "leading space"), ('"JesWR"', "upper case"),
+                       ('"jeswr "', "trailing space"), ('""', "empty"),
+                       ('"-jeswr"', "leading hyphen"), ('"a b"', "space"),
+                       ('"jeswr\\n"', "newline"), ("7", "non-string")):
+        rejects(f"review_enrolment_authors refuses {_why}",
+                "review_enrolment_authors",
+                lambda body=f"review_enrolment_authors=[{_bad}]\n": _authors(body))
+    rejects("review_enrolment_authors refuses duplicates", "duplicates",
+            lambda: _authors('review_enrolment_authors=["jeswr", "jeswr"]\n'))
+    rejects("review_enrolment_authors must be a list", "must be a list",
+            lambda: _authors('review_enrolment_authors="jeswr"\n'))
+    # The field must be a RECOGNISED optional key: an unknown key is a hard refusal here, so a
+    # typo in policy/repos.toml fails the whole tick loudly instead of silently enrolling nobody.
+    check("review_enrolment_authors is a recognised optional field",
+          "review_enrolment_authors" in OPTIONAL_POLICY_FIELDS, True)
+    rejects("a TYPO'd enrolment key is refused, not ignored", "unknown fields",
+            lambda: _authors('review_enrolment_author=["jeswr"]\n'))
+    # It is NOT surfaced through resolve(): that dict is compared field-by-field against the
+    # TARGET-side resolver by dispatch-claim._route_matches, so an extra key there would be a
+    # cross-repo contract change causing permanent per-tick defers.
+    check("resolve() output is unchanged by enrolment", "review_enrolment_authors" in impl, False)
+
     # Issue #487: the exact actions-bot exception is a validated, per-repo opt-in. Missing means
     # false so a newly onboarded repository cannot inherit this author class accidentally.
     check("allow_actions_bot_issues defaults false", impl["allow_actions_bot_issues"], False)
