@@ -10414,6 +10414,90 @@ def _self_test():
          "leg off with nothing red anywhere else — every enrolled PR then defers on the "
          "plan/CLAIM self_attested disagreement, every tick, forever. Found: "
          f"{ast.dump(_enrol_args[0])}")
+    # (c7) THE TWO SECURITY PROPERTIES THE WAIVER RESTS ON — asserted at EVERY consumer, because
+    #      the waiver decision is now made in three places (PLAN, CLAIM, review-fix.yml resolve)
+    #      and a property that holds in two of them is not a property.
+    #
+    #      SECURITY A — A `[bot]` LOGIN CAN NEVER ENTER THE ALLOWLIST. Otherwise this path becomes
+    #      a way to widen the author gate to some OTHER GitHub App: the `[bot]` suffix is the only
+    #      thing distinguishing the trusted orchestration App from any other installed App, and an
+    #      enrolled `other-app[bot]` would be admitted by the casefolded membership test with the
+    #      head-ref gate already waived. The refusal lives in policy-resolve's row validation, so
+    #      it only binds a consumer that reads the allowlist THROUGH that validation. All three do,
+    #      and each is pinned: dispatch.yml and review-fix.yml on the PARSED workflow, CLAIM on the
+    #      parsed module (see (c6)).
+    _pol = _load_module("registry_policy_resolve_657",
+                        Path(__file__).resolve().parent / "policy-resolve.py")
+    try:
+        _pol.review_enrolment_authors("o/r", tomllib.loads(
+            '[repos."o/r"]\nenabled=true\nrouting="r.toml"\naccount_pool=["acct01"]\n'
+            'max_concurrent=1\nworker_timeout_minutes=30\ngate_profile="lint-only"\n'
+            'arm_auto_merge=false\nmax_attempts=1\ntrust="collaborators"\n'
+            'review_enrolment_authors=["some-other-app[bot]"]\n'))
+    except _pol.PolicyError as _exc:
+        assert "non-canonical" in str(_exc), str(_exc)
+    else:
+        raise AssertionError(
+            "a `[bot]` login must never be admissible to review_enrolment_authors — with the "
+            "head-ref gate waived it would let this path widen the trusted-App author gate to "
+            "ANY installed App")
+    # ...and the consumers really route through that validation. Both workflow reads are extracted
+    # from the PARSED `run:` scripts and asserted on the PARSED PYTHON, so neither a YAML reflow
+    # nor a line rewrap can make either vacuous.
+    for _wf, _job, _end in (
+            ("dispatch.yml", "plan", r"(?m)^[ \t]*review_items\.extend\("),
+            ("review-fix.yml", "resolve",
+             r"(?m)^[ \t]*self_attested, admission_error = ")):
+        _enrol_block = _workflow_step_python(
+            _wf, _job, r"(?m)^[ \t]*enrolled_authors = ", _end,
+            f"{_wf} enrolment read")
+        # `_workflow_step_python` dedents by the block's COMMON prefix; the review-fix read sits
+        # inside a `with open(...)` so its first line still carries the nesting indent. Strip it
+        # per-line off the first line's indent — the block is a single statement either way.
+        _pad = len(_enrol_block) - len(_enrol_block.lstrip(" "))
+        _enrol_block = "\n".join(line[_pad:] if line[:_pad].isspace() or not line.strip()
+                                 else line.lstrip() for line in _enrol_block.splitlines())
+        _assigns = [node for node in ast.walk(ast.parse(_enrol_block))
+                    if isinstance(node, ast.Assign)
+                    and any(getattr(t, "id", "") == "enrolled_authors" for t in node.targets)]
+        assert len(_assigns) == 1, f"{_wf}: {len(_assigns)} enrolled_authors assignments"
+        _calls = [n for n in ast.walk(_assigns[0].value) if isinstance(n, ast.Call)
+                  and getattr(n.func, "attr", getattr(n.func, "id", ""))
+                  == "review_enrolment_authors"]
+        assert _calls, (
+            f"{_wf}'s `{_job}` job must resolve enrolled_authors through "
+            "policy-resolve.review_enrolment_authors — that accessor VALIDATES the whole policy "
+            "row, and its validation is the only thing that keeps a `[bot]` login (i.e. another "
+            "GitHub App) out of the allowlist. A hand-rolled read of the TOML key would parse a "
+            f"malformed or `[bot]`-bearing list without complaint. Found: {ast.dump(_assigns[0])}")
+    #
+    #      SECURITY B — THE RECORD MUST BE *THIS* PR'S RECORD, at the WAIVER DECISION. An
+    #      orchestrator record minted for PR #7 must not waive the shape gates on PR #9. The field
+    #      admission would reject #9 a few lines later, but a guard that depends on a LATER check
+    #      is one reordering away from a hole — and the reorder is invisible, because the outcome
+    #      is unchanged until it happens.
+    _foreign = dict(orchestrator_probe_record(7))
+    assert admits_orchestrator_pr(_foreign, 9, PROBE_ENROLLED_LOGIN,
+                                  (PROBE_ENROLLED_LOGIN,)) is False, \
+        ("a record minted for PR #7 must not waive PR #9's shape gates — deleting the pr_number "
+         "re-check inside admits_orchestrator_pr reds this, and the waiver would then be granted "
+         "on a foreign record with only a later field check standing between it and a review")
+    _foreign_pull = dict(orchestrator_probe_pull(9))
+    assert claim_review_pr_admission(PROBE_REPO, 9, _foreign_pull, _foreign, PROBE_BOT_LOGIN,
+                                     (PROBE_ENROLLED_LOGIN,))[0] is False, \
+        "...and CLAIM makes the same decision, on its own re-read"
+    assert review_fix_pr_admission(PROBE_REPO, _foreign_pull, _foreign,
+                                   (PROBE_ENROLLED_LOGIN,))[0] is False, \
+        "...and so does review-fix.yml's resolve predicate"
+    # Non-vacuity: the SAME record for the SAME PR does waive, at all three.
+    assert admits_orchestrator_pr(orchestrator_probe_record(9), 9, PROBE_ENROLLED_LOGIN,
+                                  (PROBE_ENROLLED_LOGIN,)) is True
+    assert claim_review_pr_admission(
+        PROBE_REPO, 9, _foreign_pull, orchestrator_probe_record(9), PROBE_BOT_LOGIN,
+        (PROBE_ENROLLED_LOGIN,)) == (True, None)
+    assert review_fix_pr_admission(
+        PROBE_REPO, _foreign_pull, orchestrator_probe_record(9),
+        (PROBE_ENROLLED_LOGIN,)) == (True, None)
     print(f"  ok   #657 enable interlock: CLAIM={_claim_admits}, review-fix resolve={_rf_admits}, "
           f"outcome={_outcome_admits}, arm-refuses={_arm_refuses} — ALL FOUR derived by execution "
           f"and fail-closed; policy/repos.toml enables enrolment for NOBODY (the minting path, "
