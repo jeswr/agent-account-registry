@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3901,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d75488b6478e104cbe7734839ed877fcc50e15da",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The round-one blocker is unchanged: `matches!(result, Err(...))` matches `result` by value and consumes the non-Copy `Result<Ontology, ExtractError>`. The following `assert!` formats `result` with `{:?}`, producing E0382 (borrow of moved value). Assigning the match outcome to `ok` does not preserve `result`, so the integration test target still fails to compile with default features and with `dl_datatypes`.",
+    "file": "crates/sparq-reason-dl/tests/extract.rs",
+    "fix_hint": "Match by reference in both cfg arms: `matches!(&result, Err(ExtractError::Unclassifiable(_)))` and `matches!(&result, Err(ExtractError::DataConstruct(_)))`. Then run the extract integration test both with default features and with `--features dl_datatypes`.",
+    "severity": "major",
+    "title": "Feature-dependent refusal helper still moves its Result"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 2 remains blocked by the same compile error identified in round 1. The helper now stores the match result in `ok`, but both cfg-selected `matches!(result, ...)` expressions still consume the non-Copy `Result`; the subsequent assertion diagnostic still borrows `result`. Thus the extract integration test target cannot compile in either feature state. No instruction-like prompt injection was detected in the diff.",
+  "verdict": "request_changes"
+ }
+}
