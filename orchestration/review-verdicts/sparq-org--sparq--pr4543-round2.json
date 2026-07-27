@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4543,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "6ee5e02fb891494970795b1f009a655edeae77fe",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior major soundness finding. The record now distinguishes the sound row-3 rewrite from rows 2 and 4, explicitly demonstrates why at-most-one is insufficient for the else-value collapses, withdraws row 4 from the reconstructable proposal, identifies its test as unjustified, and carries the same qualification into the optimization-program summary. The remaining claims are appropriately bounded: this is a parked null-result experiment, the patch is not shipped or proposed upstream, row 2 remains explicitly unvalidated follow-up work, and the empirical evidence is not presented as proof beyond the measured corpus. No correctness, test-validity, security, or honesty blocker remains in the documentation change.",
+  "verdict": "approve"
+ }
+}
