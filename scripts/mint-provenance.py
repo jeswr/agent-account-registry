@@ -504,9 +504,20 @@ def mint(repo, pr_number, issue_number, impl_alias, registry_repo, routing, enro
 
     stamp = mint_stamp(env.get("GITHUB_RUN_ID"), env.get("GITHUB_RUN_ATTEMPT"),
                        dispatch_claim.ORCHESTRATOR_CLASS)
+    # An UNREADABLE existing-record probe is not "nothing is recorded" (backfill's sol #217
+    # finding). effective_record_body deliberately raises on any non-404 failure, so catch it HERE
+    # and turn it into a refusal with the operator's next action, rather than a traceback: a
+    # transient registry failure must never let this run write a SECOND, divergent record.
+    try:
+        existing_body = read_record()
+    except Exception as exc:                            # noqa: BLE001 — any probe failure refuses
+        reason = (f"cannot establish whether a provenance record already exists ({exc}); nothing "
+                  "is recorded — re-run once the registry probe succeeds")
+        log(f"REFUSE {repo}#{pr_number}: {reason}")
+        return MintDecision(ACTION_REFUSE, reason, None)
     decision = mint_decision(
         repo, pr_number, issue_number, impl_alias, enrolled_authors, routing, stamp,
-        env.get("PROVENANCE_SALT", ""), read_pull(), read_issue(), read_record(),
+        env.get("PROVENANCE_SALT", ""), read_pull(), read_issue(), existing_body,
         allow_global_partition=allow_global_partition,
         attestation_class=dispatch_claim.provenance_attestation_class,
         orchestrator_class=dispatch_claim.ORCHESTRATOR_CLASS,
@@ -859,17 +870,20 @@ def _self_test():                                                       # noqa: 
     modules = (worker_pr, dispatch_claim, lease_schema)
 
     def run_mint(*, apply_changes=False, env=None, record=None, allow_global=False,
-                 pull_over=None, issue_over=None):
+                 pull_over=None, issue_over=None, record_reader=None):
         written = []
         decision = mint(repo, 41, 7, "opus5", "reg/istry", routing, enrolled,
                         apply_changes=apply_changes, allow_global_partition=allow_global,
                         env=env if env is not None else good_env,
                         read_pull=lambda: pull(**(pull_over or {})),
                         read_issue=lambda: issue(**(issue_over or {})),
-                        read_record=lambda: record,
+                        read_record=record_reader or (lambda: record),
                         write_record=lambda: written.append("put"),
                         modules=modules, log=lambda *_a, **_k: None)
         return decision, written
+
+    def _exploding_probe():
+        raise RuntimeError("registry file probe failed: HTTP 502")
 
     decision, written = run_mint()
     check("a DRY RUN decides to mint and writes NOTHING", (decision.action, written),
@@ -881,6 +895,12 @@ def _self_test():                                                       # noqa: 
     decision, written = run_mint(apply_changes=True, record=body)
     check("an already-minted PR writes nothing", (decision.action, written),
           (ACTION_ALREADY, []))
+    # An UNREADABLE probe is not "nothing recorded": it must refuse, never write a second record.
+    decision, written = run_mint(apply_changes=True, record_reader=_exploding_probe)
+    check("an unreadable existing-record probe refuses and writes nothing",
+          (decision.action, written), (ACTION_REFUSE, []))
+    check("...with the operator's next action, not a traceback",
+          "re-run once the registry probe succeeds" in decision.reason, True)
     decision, written = run_mint(apply_changes=True, env=_Env({"PROVENANCE_SALT": "s"}))
     check("a run with no runner run identity refuses and writes nothing",
           (decision.action, written), (ACTION_REFUSE, []))

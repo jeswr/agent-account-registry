@@ -305,7 +305,9 @@ Every guard below is inverted by a mutant and named by the test that reds. Mutan
 | **YAML**: no run-key input/argument | add either | *no workflow input or env names a run key* |
 | **YAML**: self-test before the mint | **comment it out** | *the self-test runs BEFORE the mint* |
 
-**Sweep result: 47 mutants, 47 killed, 0 survivors, 0 harness errors** (frozen `git archive HEAD`
+| **call site**: an unreadable existing-record probe | read it as "nothing recorded" | *an unreadable existing-record probe refuses and writes nothing* |
+
+**Sweep result: 48 mutants, 48 killed, 0 survivors, 0 harness errors** (frozen `git archive HEAD`
 snapshot, so no live edit could race it — a backgrounded sweep against a live tree is how a mutant
 was left in a tree here earlier today).
 
