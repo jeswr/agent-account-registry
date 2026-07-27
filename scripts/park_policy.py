@@ -181,7 +181,8 @@ PARK_ABSORBING_ACTIONS = frozenset({"legacy-quiet", "dedupe", "unchanged"})
 PARK_ABSORBING_GRACE_SECONDS = 6 * 3600
 # Every disposition absorbing_park_disposition can return. Closed set: the census map below
 # raises on anything outside it, so a new disposition cannot be added without also being counted.
-PARK_ABSORBING_DISPOSITIONS = ("observe", "wait", "retire", "hold-linked-pr", "not-absorbing")
+PARK_ABSORBING_DISPOSITIONS = ("observe", "wait", "retire", "spent", "hold-linked-pr",
+                               "not-absorbing")
 # The CLOSED census enum for the deferred-issue budget-exhaustion leg. Every population entering
 # the leg leaves through exactly one of these buckets, so the buckets SUM to the population and a
 # future missing edge shows as a growing bucket rather than as silence. Keyed by
@@ -193,14 +194,17 @@ BUDGET_EXHAUSTED_CENSUS = {
     ("legacy-quiet", "observe"): "budget-exhausted-absorbing",
     ("legacy-quiet", "wait"): "budget-exhausted-absorbing",
     ("legacy-quiet", "retire"): "budget-exhausted-retired",
+    ("legacy-quiet", "spent"): "budget-exhausted-retired",
     ("legacy-quiet", "hold-linked-pr"): "budget-exhausted-absorbing-linked-pr",
     ("dedupe", "observe"): "budget-exhausted-absorbing",
     ("dedupe", "wait"): "budget-exhausted-absorbing",
     ("dedupe", "retire"): "budget-exhausted-retired",
+    ("dedupe", "spent"): "budget-exhausted-retired",
     ("dedupe", "hold-linked-pr"): "budget-exhausted-absorbing-linked-pr",
     ("unchanged", "observe"): "budget-exhausted-absorbing",
     ("unchanged", "wait"): "budget-exhausted-absorbing",
     ("unchanged", "retire"): "budget-exhausted-retired",
+    ("unchanged", "spent"): "budget-exhausted-retired",
     ("unchanged", "hold-linked-pr"): "budget-exhausted-absorbing-linked-pr",
 }
 
@@ -223,6 +227,7 @@ def budget_exhausted_bucket(action, disposition=None):
 
 
 def absorbing_park_disposition(action, streak_started_at, now, linked_open_pr=False,
+                               already_retired=False,
                                grace=PARK_ABSORBING_GRACE_SECONDS, log=print):
     """PURE. What to do about a park that has landed on an ABSORBING ladder action — the exit
     `park_ladder_decision` structurally cannot provide for itself.
@@ -244,6 +249,10 @@ def absorbing_park_disposition(action, streak_started_at, now, linked_open_pr=Fa
       durable observation receipt. Nothing else: no label, no escalation.
     - "wait": the clock is running and the grace has NOT elapsed. Write nothing (the receipt is
       already durable); count it and stay quiet.
+    - "spent": this window's terminal is ALREADY receipted. Stay quiet — the disposition was
+      taken once and is durable. This is what caps retirement at one per window even when a
+      sticky human unpark VETOED the `needs:user` write, leaving the item in the lane: without
+      it, every later expired clock would retire it again.
     - "retire": the absorbing state has PERSISTED past `grace`. The caller escalates to the
       question-class terminal — receipt first, then the veto-checked `needs:user` write — which
       both records the disposition on the issue and removes it from the deferred-retry lane
@@ -261,6 +270,8 @@ def absorbing_park_disposition(action, streak_started_at, now, linked_open_pr=Fa
     """
     if action not in PARK_ABSORBING_ACTIONS:
         return ("not-absorbing", "")
+    if already_retired:
+        return ("spent", "")
     if linked_open_pr:
         return ("hold-linked-pr", streak_started_at or "")
     if not streak_started_at:

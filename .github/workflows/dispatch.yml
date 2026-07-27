@@ -455,6 +455,17 @@ jobs:
               # absent here: the deferred-retry lane IS the park's readmission hook — CLAIM
               # re-gates every other label live and its `retry` flip strips status:parked
               # exactly when the allocator proves capacity exists.
+              # >>> deferred-retry-filter — EXECUTED by scripts/dispatch-claim.py --self-test.
+              # [registry #764] The `needs:*` clause below is not merely a hold: it is the LANE
+              # EXIT the absorbing-park retirement uses. `absorbing_park_leg` retires a stuck
+              # item by applying the question-class `needs:user`, and THIS line is what turns
+              # that label into a released `area:` partition — compute_ready serializes one row
+              # per package, so a retired item that stayed in `deferred_input` would keep
+              # starving its siblings exactly as before. Deleting the clause silently restores
+              # the whole defect while every unit test on the leg stays green, so the block is
+              # extracted between these sentinels and RUN against fixtures; removing either
+              # sentinel makes that extraction FAIL CLOSED. Its only inputs are
+              # `readiness_input`, `linked`, `details`, `trusted` and `repo_trusted_bots`.
               retry_gated = {"status:blocked", "status:in-progress",
                              "status:in-progress-review", "status:untriaged", "trust:untrusted"}
               deferred_input = []
@@ -471,6 +482,7 @@ jobs:
                       **row,
                       "labels": sorted((labels - {"status:deferred"}) | {"status:ready"}),
                   })
+              # <<< deferred-retry-filter
               deferred_ready = dispatch.compute_ready(
                   deferred_input, in_progress_packages=taken)
 

@@ -657,6 +657,19 @@ def absorbing_park_records(comments, bot_login, log=print):
     return records
 
 
+def absorbing_park_retired(comments, bot_login, window, log=print):
+    """True when this window's question-class terminal is ALREADY receipted — the durable "this
+    disposition was taken" record that caps retirement at exactly ONE per window.
+
+    Without it the terminal is only capped when the `needs:user` write LANDS: a sticky human
+    unpark vetoes the label, the item stays in the deferred-retry lane, and the next expired
+    clock retires it all over again. The receipt is the cap; the label is best-effort UI on top
+    — the same split the generation ladder already makes."""
+    return any(record["state"] == "retired"
+               for record in absorbing_park_records(comments, bot_login, log)
+               if record["window"] == window)
+
+
 def absorbing_park_streak(comments, bot_login, window, since=None, log=print):
     """The canonical stamp of the OLDEST live `observing` receipt for `window` — the streak start
     park_policy.absorbing_park_disposition ages — or "" when the clock is not running.
