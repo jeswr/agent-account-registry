@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 791,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "1b7d2922c74cd3343c3925540fba1d3f3477e35c",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new file explicitly performs no I/O and says a review-loop workflow and cron sweep will call it, but this diff changes no workflow or existing orchestration caller. The only executable entry points are --self-test and --adjudicator-provider; main() rejects every other use. Consequently neither terminal review-loop parks nor the existing review:needs-user backlog can collect facts, invoke a cross-provider judge, call decide(), apply a SHA-bound transition, or write the durable receipt. Adding the file to selftest-suite proves only the pure helper behavior, not the feature claimed by the change.",
+    "file": "scripts/stuck_adjudicator.py",
+    "fix_hint": "Add the actual review-loop and bounded backlog-sweep integration, including opposite-provider account/token resolution, exact head/base binding, machine-owned-label proof, trusted receipt collection, honest trust-surface/security/gate-weakening classification, guarded label/state transitions, and tests that exercise those callers end to end.",
+    "severity": "blocker",
+    "title": "The adjudicator is not integrated into any executable orchestration path"
+   },
+   {
+    "body": "park_eligibility() deliberately treats every cause outside the closed taxonomy exactly like a missing marker and returns eligible=True with a return-to-loop ceiling. Those states are not equivalent: an unknown cause can result from a corrupt, partially forged, or future-version marker. The module's interface receives only park_cause, so it cannot distinguish an absent marker from a present-but-invalid one. This bypasses the existing marker-corrupt QUESTION-class fail-closed state and permits an ambiguous/tampered park to be automatically re-opened.",
+    "file": "scripts/stuck_adjudicator.py",
+    "fix_hint": "Represent marker absence separately from marker parse failure. Permit re-review only when absence is positively established; map malformed, unknown, or unsupported markers to marker-corrupt/ineligible. Add a counterfactual self-test showing an off-taxonomy or malformed marker stays human-only.",
+    "severity": "major",
+    "title": "Malformed or unknown park causes are automatically re-admitted as silent parks"
+   },
+   {
+    "body": "decide() requires fix_sketch only when final is return-to-loop AND proposed is already return-to-loop. If an override-arm proposal is clamped to return-to-loop by gate_weakening, silent-park eligibility, or another loop ceiling, the default empty fix_sketch is accepted and a raised round budget is granted. That contradicts the stated invariant that returning to the loop must be actionable and can reproduce the same standoff while consuming a limited grant. The self-tests currently assert these empty-sketch clamped loop outcomes, so they enshrine the gap rather than catch it.",
+    "file": "scripts/stuck_adjudicator.py",
+    "fix_hint": "Require a concrete sanitized fix_sketch for every final return-to-loop result, regardless of the proposed verdict, or fail to genuinely-human. Update the gate-weakening and silent-park tests to supply a sketch and add negative assertions that each clamped empty-sketch case becomes genuinely-human.",
+    "severity": "major",
+    "title": "Clamped return-to-loop outcomes do not require an actionable fix sketch"
+   }
+  ],
+  "progress": null,
+  "summary": "The change adds a substantial pure decision module and non-vacuous self-tests, but it does not connect that module to any workflow or caller, so no parked PR can actually be adjudicated. Two fail-closed defects also remain in the decision plane: malformed/off-taxonomy park causes are treated as silent and eligible for automatic re-review, and a verdict clamped from arm to return-to-loop can consume additional rounds without a concrete fix sketch. These are trust-plane and termination failures, so the change is not complete or safe to approve.",
+  "verdict": "request_changes"
+ }
+}
