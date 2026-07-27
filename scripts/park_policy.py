@@ -1628,10 +1628,14 @@ def _injection_tail_polarity(after):
     field = _INJECTION_TAIL_FIELD.match(after)
     if field:
         value = field.group("value").casefold()
-        if value in _INJECTION_FIELD_ABSENT:
-            return "field-absent"
         if value in _INJECTION_FIELD_PRESENT:
             return "field-present"
+        # A field value only proves absence if NOTHING takes it back — "prompt injection: no —
+        # but see round 3" is not a clean bill. The affirmative value needs no such guard: it
+        # denies either way.
+        if value in _INJECTION_FIELD_ABSENT and not _INJECTION_NEGATION_BREAKER.search(
+                after[field.end():]):
+            return "field-absent"
         return None
     parsed = _INJECTION_TAIL.match(after)
     if not parsed:
@@ -3472,7 +3476,14 @@ def _self_test():
     # open. Without this, an unknown verb poses as a second noun and slips a presence claim past.
     for unknown in ("prompt-injection content lurks in the diff",
                     "No correctness defect, or prompt-injection content lurks in the diff",
-                    "No correctness defect, or prompt-injection content: maybe"):
+                    "No correctness defect, or prompt-injection content: maybe",
+                    # a predicate the grammar DOES know, with a trailer that takes it back
+                    "No prompt injection was detected in the diff but the payload is live",
+                    "No prompt-injection issue remains in the diff, and a payload was found.",
+                    # ...and the same for a field value: `: no` is not a clean bill if something
+                    # after it takes it back.
+                    "prompt injection: no — but see round 3",
+                    "prompt injection: none, and the payload is live"):
         check(f"a tail the closed grammar cannot parse is UNKNOWN and DENIES: {unknown!r}",
               denies(unknown), True)
 
