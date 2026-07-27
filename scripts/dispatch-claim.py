@@ -5,6 +5,7 @@
 """Validate an unprivileged dispatch plan, claim leases, and launch live workers fail-closed."""
 
 import argparse
+import ast
 import base64
 from collections import Counter
 import contextlib
@@ -10642,26 +10643,93 @@ def _self_test():
     # An unsealed/absent census still emits explicit zeros rather than a bare label.
     assert format_partition_census("claim-census", repo, None) == \
         "claim-census example/repo deferred=0 kept=0"
-    # SOURCE-LEVEL call-site seam (main() is not callable from here, so this is labelled as such
-    # rather than dressed up as behavioural coverage — same technique as the #677 pin below).
-    # Without these, every assertion above stays green while production passes no census at all.
-    _claim_src = inspect.getsource(dispatch)
-    for _required, _why in (
-        ("census=claim_census",
-         "dispatch() no longer asks revalidate_items_against_live_pulls for the CLAIM census — "
-         "the CLAIM leg's per-reason breakdown is computed nowhere in production"),
-        ('format_partition_census("claim-census"',
-         "the CLAIM census is computed and then never emitted — a leg whose count nobody can "
-         "read is the same hole as a leg with no count"),
-    ):
-        assert _required in _claim_src, f"{_required!r} missing from dispatch(): {_why}"
-    # ...and the emission must not be guarded behind the census being non-empty, which would
-    # restore the exact "no traffic reads like no instrumentation" ambiguity the sealing removes.
-    assert re.search(r"(?m)^\s*print\(format_partition_census\(\"claim-census\", repo, "
-                     r"claim_census\)\)$", _claim_src), \
-        "the claim-census emission must be an UNCONDITIONAL statement in dispatch()'s loop"
+    # STRUCTURAL call-site seam (main() is not callable from here, so this is decided on
+    # `dispatch()`'s own AST rather than dressed up as behavioural coverage). Without it every
+    # assertion above stays green while production passes no census at all.
+    #
+    # ROUND-3 REPAIR — this pin was three assertions over SOURCE TEXT, and all three were weaker
+    # than their own messages claimed:
+    #   * `"census=claim_census" in src` and `'format_partition_census("claim-census"' in src` are
+    #     satisfied by the same text sitting in a COMMENT, and by a call in dead code.
+    #   * `re.search(r'(?m)^\s*print\(...\)$', src)`, whose message read "must be an UNCONDITIONAL
+    #     statement", matches ANY indentation. Wrapping the emission in
+    #     `if claim_census.get("total"):` left the suite at exit 0 with 108 `ok` lines — INCLUDING
+    #     the `registry-758 (f)` line naming this guard. That is the third round of the same defect
+    #     class on this PR, which indicts the KIND of assertion, not the individual regex.
+    # All three are now AST checks, and they are the SAME helpers the dispatch.yml seam applies to
+    # the assemble leg's twin emission — one implementation, so the two legs cannot drift apart.
+    # `.body[0].body` unwraps the `def dispatch(...)` node: the per-repo loop is a statement
+    # of the FUNCTION body, whereas dispatch.yml's inline python has it at module level.
+    _claim_scope = ast.parse(textwrap.dedent(inspect.getsource(dispatch))).body[0].body
+    _wiring = _call_keyword_violations(
+        _claim_scope, "dispatch()", "revalidate_items_against_live_pulls",
+        {"census": "claim_census"})
+    assert _wiring == [], _wiring
+    _emission = _every_pass_emission_violations(
+        _claim_scope, "dispatch(): the claim-census emission",
+        _is_census_print("claim-census"), "plan['repositories']")
+    assert _emission == [], _emission
+    # The AST helpers are themselves mutation-tested HERE, on this leg's real source, so this pin
+    # cannot become another guard that is merely asserted to work. Each edit below is a mutation a
+    # reviewer actually applied to production (or its direct sibling); each must come back with a
+    # named violation. A regex over `^\s*print\(...\)$` passes EVERY one of them.
+    _emission_probes = {
+        "wrapped in `if <census>:`":
+            "if claim_census.get('total'):\n    print(format_partition_census("
+            "'claim-census', repo, claim_census))",
+        "wrapped in `try:`":
+            "try:\n    print(format_partition_census('claim-census', repo, claim_census))\n"
+            "except Exception:\n    pass",
+        "moved into a skippable inner `for` body":
+            "for _bucket in claim_census:\n    print(format_partition_census("
+            "'claim-census', repo, claim_census))",
+        "moved into a skippable `while` body":
+            "while claim_census:\n    print(format_partition_census("
+            "'claim-census', repo, claim_census))\n    break",
+        "stdout redirected away from the log by a `with`":
+            "with contextlib.redirect_stdout(io.StringIO()):\n    print(format_partition_census("
+            "'claim-census', repo, claim_census))",
+        "moved to the loop's `else:` clause":
+            None,  # handled below: needs the loop node, not a body statement
+        "deleted outright, with a comment left naming it":
+            "# print(format_partition_census('claim-census', repo, claim_census))\npass",
+        "preceded by a bare `continue` the emission can never survive":
+            None,  # handled below: inserted BEFORE, not in place of
+    }
+    _probe_loop = next(node for node in _claim_scope
+                       if isinstance(node, ast.For) and ast.unparse(node.iter)
+                       == "plan['repositories']")
+    _probe_index = next(i for i, node in enumerate(_probe_loop.body)
+                        if _is_census_print("claim-census")(node))
+    for _probe, _replacement in _emission_probes.items():
+        _scope = ast.parse(textwrap.dedent(inspect.getsource(dispatch))).body[0].body
+        _loop = next(node for node in _scope if isinstance(node, ast.For)
+                     and ast.unparse(node.iter) == "plan['repositories']")
+        if _replacement is not None:
+            _loop.body[_probe_index:_probe_index + 1] = ast.parse(_replacement).body
+        elif _probe.startswith("moved to the loop"):
+            _loop.orelse = [_loop.body.pop(_probe_index)]
+        else:
+            _loop.body.insert(_probe_index, ast.parse("if True:\n    continue").body[0])
+        _found = _every_pass_emission_violations(
+            _scope, "probe", _is_census_print("claim-census"), "plan['repositories']")
+        assert _found, (
+            f"the claim-census emission guard is VACUOUS against the mutation {_probe!r}: it "
+            "returned no violation, which is exactly how the `^\\s*print\\(...\\)$` regex it "
+            "replaces let `if claim_census.get(\"total\"):` through at 108 green ok lines")
+    # ...and the wiring pin must not be satisfiable by a comment, which is what `in src` was.
+    _commented = ast.parse(textwrap.dedent(inspect.getsource(dispatch))).body[0].body
+    for _node in ast.walk(ast.Module(body=_commented, type_ignores=[])):
+        if isinstance(_node, ast.Call) and _callee_name(_node.func) == \
+                "revalidate_items_against_live_pulls":
+            _node.keywords = [kw for kw in _node.keywords if kw.arg != "census"]
+    assert _call_keyword_violations(
+        _commented, "probe", "revalidate_items_against_live_pulls",
+        {"census": "claim_census"}), \
+        "the CLAIM census wiring pin does not notice the kwarg being dropped"
     print("  ok   registry-758 (f): the CLAIM census is sealed, brace-free, and WIRED at the "
-          "production call site (source-level)")
+          "production call site — emission proven UNCONDITIONAL on dispatch()'s AST, and that "
+          f"proof mutation-tested against {len(_emission_probes)} skip mutations")
 
     unparked_output = io.StringIO()
     with contextlib.redirect_stdout(unparked_output):
@@ -12491,6 +12559,191 @@ def _starvation_sweep_self_test():
     _starvation_yaml_seam_self_test()
 
 
+# ==================================================================================================
+# [registry #758, ROUND 3] "THIS STATEMENT RUNS ON EVERY PASS" — DECIDED ON THE AST, NOT ON TEXT.
+#
+# WHY THIS IS AN AST PREDICATE AND NOT A BETTER REGEX. Three consecutive review rounds on this PR
+# died of the SAME defect class — a claimed guard that an EXECUTED mutant refutes — and two of the
+# three share one cause: **the assertion's language could not express the property its own message
+# named.**
+#
+#   round 1: the assemble leg had no red test at all (a MISSING assertion).
+#   round 2: the `(c)` fixture listed the `__global__` occupant first, so first-match and lowest-PR
+#            coincided and the fixture could not tell the defect from the fix.
+#   round 3: `re.search(r'(?m)^\s*print\(...\)$', source)`, whose assertion message read "the
+#            claim-census emission must be an UNCONDITIONAL statement". `^\s*` matches ANY
+#            indentation. The reviewer applied the exact mutation the guard claims to prevent —
+#            wrapping the emission in `if claim_census.get("total"):` — and got **exit 0, 108 `ok`
+#            lines, including the one naming this guard**.
+#
+# A regex over source text can see WHAT a line says; it can never see WHERE that line sits in the
+# control flow. "Runs once on every pass of the loop" is a statement about ANCESTRY, so it is
+# decided on the ancestry. That is not a stricter regex — it is a different KIND of assertion, and
+# it also makes the whole comment-in-place-of-code failure mode structurally impossible, because a
+# comment is not an `ast.stmt`.
+#
+# THE SAME PREDICATE RUNS ON BOTH LEGS — `dispatch()`'s claim-census emission and dispatch.yml's
+# inline-python assemble-census emission. A guard that holds on one leg and not on its twin is
+# precisely the asymmetry that produced rounds 1 and 2, and the symmetric YAML-side hole was live
+# at round 3: wrapping the assemble emission in a python `if` returned NO violations.
+#
+# HONEST BOUNDARY, stated because the previous version of this guard overclaimed exactly here:
+# this proves the emission is not skippable **by control flow inside the loop body**. It does NOT
+# prove the iteration reaches it — an earlier statement that RAISES still skips it, and both loop
+# bodies legitimately contain calls that can raise. What it forecloses is the silent, green-CI
+# version: `if`, `try/except`, an extra `for`/`while`, a `with` that redirects stdout away from the
+# log, an `else:` branch, and an early `continue`/`return`.
+# ==================================================================================================
+def _binding_jumps(statement):
+    """`continue`/`break`/`return` inside `statement` that would skip the REST of the ENCLOSING
+    loop iteration. A jump inside a NESTED loop binds to that loop and a jump inside a nested
+    function binds to that function, so neither is counted — dispatch.yml's assemble loop really
+    does contain inner `for ...: continue` loops, and calling those a violation would make this
+    guard fire on correct code."""
+    found = []
+
+    def walk(node, loop_depth):
+        if isinstance(node, (ast.For, ast.While, ast.AsyncFor)):
+            loop_depth += 1
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda,
+                                  ast.ClassDef)):
+                continue  # its jumps bind to it, not to our loop
+            if isinstance(child, (ast.Continue, ast.Break)) and loop_depth == 0:
+                found.append(type(child).__name__.lower())
+            elif isinstance(child, ast.Return):
+                found.append("return")
+            walk(child, loop_depth)
+
+    walk(statement, 0)
+    return sorted(set(found))
+
+
+def _callee_name(node):
+    """Dotted source name of a call target, or None for anything not a plain name/attribute."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        prefix = _callee_name(node.value)
+        return f"{prefix}.{node.attr}" if prefix else None
+    return None
+
+
+def _every_pass_emission_violations(scope_body, what, is_emission, loop_iter):
+    """[registry #758] Structural violations of "`what` runs ONCE on EVERY pass of the
+    `for ... in <loop_iter>` loop". Empty list == intact. See the block comment above for why this
+    is an AST predicate and for the boundary of what it does and does not prove."""
+    out = []
+    module = ast.Module(body=list(scope_body), type_ignores=[])
+    loops = [node for node in scope_body
+             if isinstance(node, ast.For) and ast.unparse(node.iter) == loop_iter]
+    if len(loops) != 1:
+        out.append(
+            f"{what}: expected EXACTLY ONE top-level `for ... in {loop_iter}` loop in this scope; "
+            f"found {len(loops)}. The per-repo loop was moved, renamed or nested, so 'emitted for "
+            f"every repo' cannot be decided — re-point the loop_iter constant in dispatch-claim.py "
+            f"if the loop was legitimately rewritten.")
+        return out
+    loop = loops[0]
+    anywhere = [node for node in ast.walk(module)
+                if isinstance(node, ast.stmt) and is_emission(node)]
+    if not anywhere:
+        out.append(
+            f"{what}: the emission statement is GONE from this scope — the census is computed and "
+            f"then read by nobody, which is the same hole as never counting it. (A comment or a "
+            f"docstring naming it does not satisfy this check: it is an AST statement match.)")
+        return out
+    if len(anywhere) > 1:
+        out.append(
+            f"{what}: found {len(anywhere)} emission statements where exactly one is expected — a "
+            f"duplicate emission publishes two different census lines per tick and the Gate A feed "
+            f"cannot tell which is authoritative.")
+    direct = [node for node in loop.body if is_emission(node)]
+    if not direct:
+        parents = {}
+        for node in ast.walk(module):
+            for child in ast.iter_child_nodes(node):
+                parents[child] = node
+        ancestry, cursor = [], anywhere[0]
+        while cursor in parents:
+            cursor = parents[cursor]
+            ancestry.append(type(cursor).__name__)
+            if cursor is loop:
+                break
+        out.append(
+            f"{what}: the emission is NOT a direct statement of the `for ... in {loop_iter}` loop "
+            f"body — it sits under {' -> '.join(reversed(ancestry)) or 'nothing recognisable'}, so "
+            f"it no longer runs on every pass. Guarding the emission behind `if <census>`, a "
+            f"`try:`, an inner `for`/`while`, a `with contextlib.redirect_stdout(...)`, or a loop "
+            f"`else:` restores the exact 'no traffic reads like no instrumentation' ambiguity the "
+            f"sealing removes (registry #753/#754).")
+        return out
+    index = loop.body.index(direct[0])
+    jumps = [jump for statement in loop.body[:index] for jump in _binding_jumps(statement)]
+    if jumps:
+        out.append(
+            f"{what}: a bare {'/'.join(sorted(set(jumps)))} can end the iteration before the "
+            f"emission is reached, so a repo can pass through the loop publishing no census line "
+            f"at all — indistinguishable, on the log, from a repo that was never instrumented.")
+    return out
+
+
+def _call_keyword_violations(scope_body, what, callee, keywords):
+    """[registry #758] Structural violations of "`callee` is called exactly once in this scope and
+    receives these keyword arguments, IN CODE". An `x in source` check is satisfied by the same
+    text sitting in a COMMENT — the measured registry #756 failure mode — and by a call in dead
+    code; an AST keyword match is satisfied by neither."""
+    out = []
+    module = ast.Module(body=list(scope_body), type_ignores=[])
+    calls = [node for node in ast.walk(module)
+             if isinstance(node, ast.Call) and _callee_name(node.func) == callee]
+    if len(calls) != 1:
+        out.append(
+            f"{what}: expected EXACTLY ONE `{callee}(...)` call in this scope; found "
+            f"{len(calls)}. Zero means the production call site is gone and every direct-call test "
+            f"above is vacuous; more than one means this pin cannot say which call it is checking.")
+        return out
+    passed = {kw.arg: ast.unparse(kw.value) for kw in calls[0].keywords if kw.arg is not None}
+    for name, expected in sorted(keywords.items()):
+        if passed.get(name) != expected:
+            out.append(
+                f"{what}: `{callee}(...)` no longer receives `{name}={expected}` (it receives "
+                f"{name}={passed.get(name)!r}) — the value is computed nowhere in production, so "
+                f"every test that passes one by hand proves nothing about the shipped tick.")
+    return out
+
+
+def _heredoc_python(run, marker="PY"):
+    """(tree, violations) for the inline python program a `run:` step feeds to
+    `python3 - <<'PY'`. Parsed, so comments and dead prose cannot satisfy anything downstream."""
+    lines = run.splitlines(keepends=True)
+    starts = [i for i, line in enumerate(lines) if line.rstrip().endswith(f"<<'{marker}'")]
+    if len(starts) != 1:
+        return None, [f"dispatch.yml: expected EXACTLY ONE `<<'{marker}'` heredoc in the "
+                      f"plan-assembly step; found {len(starts)} — the inline python this seam "
+                      f"checks cannot be located, so none of its structural pins can be decided"]
+    begin = starts[0]
+    ends = [i for i in range(begin + 1, len(lines)) if lines[i].strip() == marker]
+    if not ends:
+        return None, [f"dispatch.yml: the plan-assembly step's `<<'{marker}'` heredoc is never "
+                      f"terminated — the step would not run as written"]
+    try:
+        return ast.parse(textwrap.dedent("".join(lines[begin + 1:ends[0]]))), []
+    except SyntaxError as exc:
+        return None, [f"dispatch.yml: the plan-assembly step's inline python does not parse "
+                      f"({exc}) — the assemble leg would hard-fail at runtime"]
+
+
+def _is_census_print(label):
+    """A bare `print(...)` STATEMENT whose call carries the literal `label` somewhere in it."""
+    def predicate(node):
+        return (isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
+                and _callee_name(node.value.func) == "print"
+                and any(isinstance(child, ast.Constant) and child.value == label
+                        for child in ast.walk(node.value)))
+    return predicate
+
+
 # The PARSED dispatch.yml nodes the starved-plan sweep depends on. Compared for equality against
 # the parsed document, never grepped: `if: false`, a deleted step, and a re-pointed `id:` are all
 # invisible to a substring or `count(...) == N` assertion over the workflow text, and each one
@@ -12500,6 +12753,15 @@ _STARVATION_SEAM_JOB = "plan"
 _STARVATION_ASSEMBLE_ANCHOR = r"(?m)^\s*partition_starvation = \[\]$"
 _STARVATION_ASSEMBLE_END = r"(?m)^\s*review_exclusions = Counter\(\)$"
 _STARVATION_CLAIM_STEP = "claim"
+# [registry #758 round 3] The plan-assembly step is pinned to EXACTLY these keys. A whitelist, not
+# a blacklist of the disablers anyone happened to think of: `if:` was enumerated and `shell:` was
+# not, and a non-default `shell:` — which makes the runner feed the step to another interpreter —
+# survived the round-2 seam with ZERO violations. Anything able to skip, redirect or excuse this
+# step (`if:`, `shell:`, `continue-on-error:`, `working-directory:`, `timeout-minutes:`, or a
+# GitHub feature that does not exist yet) is now a violation BY DEFAULT. Widen deliberately.
+_ASSEMBLE_STEP_KEYS = frozenset({"name", "run"})
+# The inline-python loop the assemble-census line must be emitted from, once per repo.
+_ASSEMBLE_REPO_LOOP = "enumerate(intermediate['repositories'])"
 
 
 def _starvation_seam_violations(document):
@@ -12524,7 +12786,27 @@ def _starvation_seam_violations(document):
         out.append(f"dispatch.yml: the plan-assembly step carries an `if:` ({step['if']!r}) — "
                    "`if: false` (or any condition) would skip the starvation evidence SILENTLY "
                    "and the sweep would simply never fire")
+    # [registry #758 round 3] ...and every OTHER key that can skip, redirect or excuse the step.
+    # The `if:` check above enumerated one disabler; a non-default `shell:` is another, and it
+    # passed the round-2 seam silently. A whitelist does not depend on having thought of them all.
+    unexpected = sorted(set(step) - _ASSEMBLE_STEP_KEYS)
+    if unexpected:
+        out.append(f"dispatch.yml: the plan-assembly step gained {unexpected} — it is pinned to "
+                   f"exactly {sorted(_ASSEMBLE_STEP_KEYS)} so that ANY key able to skip it "
+                   "(`if:`), hand it to a different interpreter (`shell:`), or forgive its failure "
+                   "(`continue-on-error:`) is a violation by default rather than one this list "
+                   "happened to enumerate. Widen _ASSEMBLE_STEP_KEYS deliberately, with a reason.")
     run = step["run"]
+    # COMMENTS ARE STRIPPED FIRST, for BOTH fragment loops below. This block is heavily commented
+    # and every fragment also appears in prose above its own code, so a substring check over the
+    # raw `run:` text stays green after the CODE is deleted — the claim-in-a-comment failure mode
+    # measured on registry #756's artifact-upload check.
+    #
+    # [registry #758 round 3] The stripping used to apply to the #758 fragments ONLY, while the
+    # five #677 fragments below were still matched against the raw text. That asymmetry is the
+    # same shape as the round-1 and round-2 defects on this PR — a guard that holds on one half
+    # and not on its twin — so the two halves are now stripped identically.
+    code = "\n".join(line.split("#", 1)[0] for line in run.splitlines())
     for fragment, why in (
         ("starvation=starvation",
          "filter_busy_area_items is no longer asked for the measurement"),
@@ -12539,16 +12821,14 @@ def _starvation_seam_violations(document):
         ('starvation.get("deferred", 0) > 0',
          "the empty-backlog guard is gone from the PLAN half"),
     ):
-        if fragment not in run:
+        if fragment not in code:
             out.append(f"dispatch.yml: the plan-assembly step lost {fragment!r} — {why}")
     if "registry-dispatch-plan/v4" in run:
         out.append("dispatch.yml: the plan-assembly step still mentions the v4 schema — a "
                    "reverted stamp or a reverted inline check would ship a plan CLAIM refuses")
-    # [registry #758] The assemble-leg census wiring. COMMENTS ARE STRIPPED FIRST, deliberately:
-    # this block is heavily commented and every fragment below also appears in prose above it, so
-    # a substring check over the raw `run:` text would stay green after the CODE was deleted —
-    # the claim-in-a-comment failure mode measured on registry #756's artifact-upload check.
-    code = "\n".join(line.split("#", 1)[0] for line in run.splitlines())
+    # [registry #758] The assemble-leg census wiring, as TEXT. Necessary but NOT sufficient: a
+    # substring says the fragment exists somewhere, never that it sits on a path that runs. The
+    # structural half immediately below is what closes that gap.
     for fragment, why in (
         ("census=partition_census",
          "filter_busy_area_items is no longer asked for the per-reason breakdown, so the leg "
@@ -12567,6 +12847,23 @@ def _starvation_seam_violations(document):
     ):
         if fragment not in code:
             out.append(f"dispatch.yml: the plan-assembly step lost {fragment!r} — {why}")
+    # [registry #758 round 3] ...AND THE STRUCTURAL HALF, on the PARSED inline python. Every check
+    # above is a substring, and a substring cannot express conditionality: at round 3 the
+    # assemble-census `print` could be wrapped in `if partition_census.get("total"):`, in a
+    # `try:`, or in a skippable inner `for` and this function returned NO violations, because the
+    # fragments were all still present — just no longer on a path that runs. This is the SAME
+    # predicate `registry-758 (f)` applies to `dispatch()`'s claim-census emission; the two legs
+    # are guarded by one implementation so they cannot drift apart again.
+    tree, parse_violations = _heredoc_python(run)
+    out.extend(parse_violations)
+    if tree is not None:
+        out.extend(_every_pass_emission_violations(
+            tree.body, "dispatch.yml plan-assembly step: the assemble-census emission",
+            _is_census_print("assemble-census "), _ASSEMBLE_REPO_LOOP))
+        out.extend(_call_keyword_violations(
+            tree.body, "dispatch.yml plan-assembly step",
+            "claim_mod.filter_busy_area_items",
+            {"census": "partition_census", "starvation": "starvation"}))
     claim_steps = (jobs.get(_STARVATION_CLAIM_STEP) or {}).get("steps")
     if not isinstance(claim_steps, list):
         out.append("dispatch.yml: jobs.claim.steps is not a list — the sweep has no runner")
@@ -12628,6 +12925,27 @@ def _starvation_yaml_seam_self_test():
             step["run"] = step["run"].replace(fragment, "")
         return edit
 
+    def wrap_census_print(header, tail=()):
+        """[registry #758 round 3] Indent the assemble-census `print` statement under `header`,
+        leaving every substring fragment intact. This is the mutation class the text checks
+        physically cannot see, so it is the one that has to be executed rather than reasoned
+        about."""
+        def edit(document):
+            step = assemble_step(document)
+            lines = step["run"].splitlines(keepends=True)
+            begin = next(i for i, line in enumerate(lines)
+                         if 'print("assemble-census "' in line)
+            end = next(i for i in range(begin, len(lines)) if ".items())]))" in lines[i])
+            column = len(lines[begin]) - len(lines[begin].lstrip())
+            pad = " " * column
+            body = [pad + "    " + line[column:] for line in lines[begin:end + 1]]
+            replacement = [pad + header + "\n"] + body + [pad + line + "\n" for line in tail]
+            step["run"] = "".join(lines[:begin] + replacement + lines[end + 1:])
+            assert 'print("assemble-census "' in step["run"], \
+                "the conditionality mutant must leave the emission's TEXT intact — removing it " \
+                "would let the substring checks kill it and prove nothing about the AST check"
+        return edit
+
     seam_mutants = {
         "assemble step guarded by if: false":
             lambda d: assemble_step(d).__setitem__("if", "${{ false }}"),
@@ -12685,6 +13003,35 @@ def _starvation_yaml_seam_self_test():
         "the census code is replaced by a comment naming every fragment":
             lambda d: assemble_step(d).__setitem__(
                 "run", _census_code_to_comment(assemble_step(d)["run"])),
+        # [registry #758 ROUND 3] THE CONDITIONALITY MUTANTS. Every fragment check above is a
+        # SUBSTRING, and a substring cannot see control flow: at round 3 all four of these left
+        # `_starvation_seam_violations` returning [] — the emission was still present, just no
+        # longer on a path that runs. They are the YAML twins of the mutations a reviewer applied
+        # to `dispatch()`'s claim-census emission, and the symmetry is the point: the round-1 and
+        # round-2 defects on this PR were both "guarded on one leg, unguarded on its twin".
+        "the assemble-census emission is wrapped in an `if`":
+            wrap_census_print("if partition_census.get(\"total\"):"),
+        "the assemble-census emission is wrapped in a `try`":
+            wrap_census_print("try:", tail=["except Exception:", "    pass"]),
+        "the assemble-census emission is moved into a skippable inner `for`":
+            wrap_census_print("for _bucket in partition_census:", tail=["    break"]),
+        "the assemble-census emission is moved into a skippable `while`":
+            wrap_census_print("while partition_census:", tail=["    break"]),
+        # ...and the STEP-LEVEL disabler the round-2 seam enumerated its way past. `if:` was on
+        # the list; `shell:` was not, and a non-default shell hands the step to another
+        # interpreter entirely. The key WHITELIST is what makes the next one a violation too.
+        "the assemble step is handed to a non-default `shell:`":
+            lambda d: assemble_step(d).__setitem__("shell", "bash -e {0}"),
+        "the assemble step's failure is forgiven by `continue-on-error:`":
+            lambda d: assemble_step(d).__setitem__("continue-on-error", True),
+        # The filter's census kwarg, dropped in CODE rather than by deleting its text — an AST
+        # keyword check sees this; `"census=partition_census" in code` also does, but only because
+        # the text vanishes with it. This mutant keeps the text and removes the argument.
+        "the census kwarg is passed positionally into a stale parameter slot":
+            lambda d: assemble_step(d).__setitem__(
+                "run", assemble_step(d)["run"].replace(
+                    "starvation=starvation, census=partition_census)",
+                    "starvation=starvation)  # census=partition_census")),
     }
     survivors = [name for name, edit in seam_mutants.items() if not mutant(edit)]
     assert not survivors, f"dispatch.yml seam mutants NOT caught: {survivors}"
