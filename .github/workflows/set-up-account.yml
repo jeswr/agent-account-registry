@@ -457,15 +457,34 @@ jobs:
             exit 1
           fi
           # <<< provider-label
-          # The models line the allocator requires (read_accounts drops model-less accounts),
-          # derived from the provider (mirrors orchestration/routing.toml's [models] catalog).
-          # openai mints the FULL codex alias set [sol, luna, terra]: select-and-claim's
-          # choose_account requires exact alias membership, so a terra-only record would defer
-          # every sol/luna claim forever (sol r2 finding 1). anthropic mints
-          # [opus5, fable, opus, sonnet, haiku] — opus5 added 2026-07-24 (Opus 5 is the new
-          # primary anthropic tier; an account without the alias could never serve an
-          # opus5-led claim).
-          if [ "$prov" = openai ]; then models='[sol, luna, terra]'; else models='[opus5, fable, opus, sonnet, haiku]'; fi
+          # >>> provider-defaults — EXECUTED by scripts/grant-account.py --self-test. Both routing
+          # values every minted record carries are derived HERE, from `$prov` alone, so the two
+          # per-provider defaults cannot drift apart or be reintroduced as a literal downstream.
+          # These sentinels delimit the fragment the self-test extracts and runs; removing either
+          # makes that extraction FAIL CLOSED. `$prov` is its only input, `$models`/`$workers`
+          # its only outputs.
+          #
+          # models: the line the allocator requires (read_accounts drops model-less accounts),
+          # mirroring orchestration/routing.toml's [models] catalog. openai mints the FULL codex
+          # alias set [sol, luna, terra]: select-and-claim's choose_account requires exact alias
+          # membership, so a terra-only record would defer every sol/luna claim forever (sol r2
+          # finding 1). anthropic mints [opus5, fable, opus, sonnet, haiku] — opus5 added
+          # 2026-07-24 (Opus 5 is the new primary anthropic tier; an account without the alias
+          # could never serve an opus5-led claim).
+          #
+          # workers: the per-provider parallelism the maintainer states for a plan of each kind
+          # (#278: openai 12, anthropic 4). The old hard-coded `max_concurrent_workers: 1` in the
+          # register step below was a fleet-capacity defect, not a safety floor — it capped every
+          # broker-minted account at a single concurrent worker regardless of provider, and
+          # choose_account's cap gate then refused every further claim against an account with
+          # spare capacity. An operator may still narrow a specific account by editing its record;
+          # this is only the mint-time default.
+          if [ "$prov" = openai ]; then
+            models='[sol, luna, terra]'; workers=12
+          else
+            models='[opus5, fable, opus, sonnet, haiku]'; workers=4
+          fi
+          # <<< provider-defaults
           # handle/secret here are only a PRE-LOGIN RESERVATION HINT: the login below can take ~13 min,
           # during which another (non-serialized) writer may claim this number, so the store step
           # derives the real slot from complete live state and atomically claims it (an acct-claims
@@ -478,6 +497,7 @@ jobs:
           {
             printf 'provider=%s\n' "$prov"
             printf 'models=%s\n' "$models"
+            printf 'workers=%s\n' "$workers"
             printf 'handle=acct%02d\n' "$((n+1))"
             printf 'secret=ACCT%02d_TOKEN\n' "$((n+1))"
           } >> "$GITHUB_OUTPUT"
@@ -754,6 +774,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PROVIDER: ${{ steps.meta.outputs.provider }}
           MODELS: ${{ steps.meta.outputs.models }}
+          WORKERS: ${{ steps.meta.outputs.workers }}
           HANDLE: ${{ steps.store.outputs.handle }}
           SECRET_NAME: ${{ steps.store.outputs.secret }}
           ISSUE: ${{ github.event.issue.number }}
@@ -777,7 +798,14 @@ jobs:
           print(grant.format_record_line(json.loads(os.environ["GRANT_TARGETS"])))
           PY
           )
-          body=$(printf 'provider: %s\nharness: %s\nmodels: %s\ncredential_format: %s\nmax_concurrent_workers: 1\nsecret_ref: %s\nrequest_issue: %s\n%s\nnotes: registered via set-up-account broker; pending account_pool PR merge\n' "$PROVIDER" "$harness" "$MODELS" "$fmt" "$SECRET_NAME" "$ISSUE" "$grant_line")
+          # #278: `max_concurrent_workers` is the per-provider default the `meta` step derived, never
+          # a literal here. It must not reach the record EMPTY: select-and-claim._parse_account maps
+          # a non-numeric value to 1 SILENTLY (it is not a schema error), so a missing meta output
+          # would re-mint the cap-1 account this fixed instead of failing — and the credential is
+          # already captured and stored by this point, so a silently degraded record is the worst
+          # outcome available. Fail closed on the empty value.
+          : "${WORKERS:?the meta step derived no max_concurrent_workers for this provider}"
+          body=$(printf 'provider: %s\nharness: %s\nmodels: %s\ncredential_format: %s\nmax_concurrent_workers: %s\nsecret_ref: %s\nrequest_issue: %s\n%s\nnotes: registered via set-up-account broker; pending account_pool PR merge\n' "$PROVIDER" "$harness" "$MODELS" "$fmt" "$WORKERS" "$SECRET_NAME" "$ISSUE" "$grant_line")
           # Validate the exact bytes about to be persisted through the allocator's schema guard.
           # A malformed producer output must fail this step before gh can create a corrupt record.
           printf '%s\n' "$body" | python3 scripts/select-and-claim.py \
