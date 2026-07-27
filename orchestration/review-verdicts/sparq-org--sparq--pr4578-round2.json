@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4578,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "27370cc93ad8a87ee887d521fb2fea9ff0c13d73",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "ValueType::Reference is emitted through into_iri(raw), which accepts every named node without consulting rdf:type, subclass entailment, or a validator. SHACL sh:class requires each value node to be an instance of the declared class, while the generated type and docs describe the reference as an instance of that class. Thus an unrelated resource IRI loads successfully as OrganizationRef. The current acceptance test only rejects a literal reference and therefore does not exercise the load-bearing class-membership invariant.",
+    "file": "crates/sparq-wrapper-shacl/src/emit.rs",
+    "fix_hint": "Extend the generated source adapter with a class-membership operation (with clearly specified entailment semantics), invoke it for ValueType::Reference, and add a real-path test where an IRI lacking the required class is rejected while a correctly classified IRI succeeds. Alternatively, explicitly decline sh:class lowering until membership can be checked; a newtype alone must not be presented as enforcement.",
+    "severity": "major",
+    "title": "sh:class loading checks only IRI term kind, not class membership"
+   },
+   {
+    "body": "ScalarType maps xsd:integer to i64 and xsd:decimal to f64. XSD integer is unbounded, so lexically and semantically valid values outside i64 are rejected. XSD decimal is arbitrary precision, so f64 silently rounds distinct valid values and can parse sufficiently large decimals as infinity, which is not an xsd:decimal value. This contradicts the crate-level claim of faithful object models and the statement that supported datatypes have faithful checked mappings.",
+    "file": "crates/sparq-wrapper-shacl/src/schema.rs",
+    "fix_hint": "Use exact generated representations (for example a std-only validated lexical/newtype representation, or generated arbitrary-precision code if the std-only promise is relaxed) and test integers beyond i64 plus decimals that differ beyond f64 precision and very large decimals. Otherwise remove these datatypes from the supported set or clearly rename/document the operation as a narrowing conversion with an explicit range error rather than faithful SHACL loading.",
+    "severity": "major",
+    "title": "i64 and f64 do not faithfully represent XSD integer and decimal value spaces"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 2 fixes the prior RDF-term/datatype erasure, makes the acceptance harness exercise the real term-level distinction, repairs the listed dateTime boundaries, and sorts property children before anonymous-type naming. However, two semantic gaps remain. The generated sh:class loader only checks that a value is an IRI and never checks class membership, despite presenting the newtype as an instance of the declared class. Also, the XSD scalar mappings are not faithful to the datatype value spaces: xsd:integer is arbitrarily large but is narrowed to i64, and xsd:decimal is arbitrary precision but is narrowed to f64 (including precision loss and possible infinity). These are major correctness issues in a crate advertised as faithful SHACL-driven object generation. Because these are new findings relative to round 1, progress is regressing under the required scale, notwithstanding substantial fixes to all four prior findings.",
+  "verdict": "request_changes"
+ }
+}
