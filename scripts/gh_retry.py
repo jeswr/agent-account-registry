@@ -68,6 +68,17 @@ _TRANSIENT_TEXT = (
     "context deadline exceeded",
     "connection reset", "remote end closed connection", "broken pipe", "unexpected eof",
     "connection closed before",
+    # TRUNCATED / EMPTY RESPONSE BODY (registry #772). Go's encoding/json raises
+    # `unexpected end of JSON input` when it decodes a body that ended early, so `gh` surfaces a
+    # dropped or empty HTTP response as THAT text and NOT as a status line — `_GH_STATUS_RE`
+    # finds nothing, the caller logs `http=unknown`, and the class fell through to PERMANENT.
+    # It is the same availability blip as `unexpected eof` one layer up the stack, and it was the
+    # dominant real cause of lost worker-provenance records: MEASURED 6 of 59 publishing
+    # worker.yml runs (10.2%) after #729 merged, every one reporting `class=permanent
+    # attempts=1/5` — i.e. #729's retry apparatus was inert against the very failure it was
+    # built for. A read is idempotent and the budget is bounded, so re-reading a truncated body
+    # is safe; a 4xx that happens to mention it still short-circuits FATAL above.
+    "unexpected end of json input",
 )
 _SECONDARY_403 = ("secondary rate limit", "abuse detection", "retry-after", "retry later")
 
@@ -193,6 +204,17 @@ def _self_test():
           is_transient_stderr("HTTP 422: upstream 502 bad gateway text"), False)
     check("permission 403 fatal", is_transient_stderr("HTTP 403: Resource not accessible"), False)
     check("empty stderr not transient", is_transient_stderr(""), False)
+    # [registry #772] The truncated-body class, verbatim from the six worker.yml runs that lost a
+    # provenance record. It carries NO HTTP status, so it reaches the text table or nothing at all.
+    check("truncated JSON body transient",
+          is_transient_stderr("unexpected end of JSON input"), True)
+    # ...and the FATAL short-circuit still wins over it. This is the quantifier-direction guard:
+    # "some truncated-body errors are transient" must never widen into "every stderr mentioning it
+    # is", or a 404/422 would burn five slow attempts to reach the same loud refusal (#558).
+    check("404 mentioning a truncated body is still fatal",
+          is_transient_stderr("gh: Not Found (HTTP 404): unexpected end of JSON input"), False)
+    check("422 mentioning a truncated body is still fatal",
+          is_transient_stderr("HTTP 422: unexpected end of JSON input"), False)
 
     # ---- backoff: exponential 2->30 ceiling, monotonic, jitter bounded ----
     ceilings = [backoff_ceiling(i) for i in range(1, 7)]
@@ -249,6 +271,40 @@ def _self_test():
         result = run_gh(["api", "repos/o/r"], sleep=fake_sleep)
         check("attempt bound respected (persistent transient fails loud)",
               (result.returncode, calls["n"], sleeps), (1, MAX_ATTEMPTS, [1, 2, 3, 4]))
+
+        # [registry #772] THE PRODUCTION LEG, end to end. Asserting only
+        # `is_transient_stderr(...) is True` would stay green if the marker were in the table but
+        # the retry never actually re-invoked `gh` — and "the string is in a tuple" is not the
+        # property that lost six provenance records. This drives the REAL loop with the REAL
+        # stderr those runs emitted and counts SUBPROCESS INVOCATIONS: pre-fix this was 1.
+        calls["n"] = 0
+        sleeps.clear()
+
+        def truncated_body(cmd, **kwargs):
+            calls["n"] += 1
+            return subprocess.CompletedProcess(
+                cmd, 1, stdout="", stderr="unexpected end of JSON input")
+
+        subprocess.run = truncated_body
+        result = run_gh(["api", "repos/sparq-org/sparq/pulls/4528"], sleep=fake_sleep)
+        check("truncated-body read is RETRIED to the attempt bound (was 1/5 in production)",
+              (result.returncode, calls["n"], sleeps), (1, MAX_ATTEMPTS, [1, 2, 3, 4]))
+
+        # The same leg must still make exactly ONE attempt when the truncated body comes with a
+        # fatal status — deleting the fatal short-circuit reds here, not just in the table above.
+        calls["n"] = 0
+        sleeps.clear()
+
+        def truncated_but_404(cmd, **kwargs):
+            calls["n"] += 1
+            return subprocess.CompletedProcess(
+                cmd, 1, stdout="",
+                stderr="gh: Not Found (HTTP 404): unexpected end of JSON input")
+
+        subprocess.run = truncated_but_404
+        result = run_gh(["api", "repos/o/r"], sleep=fake_sleep)
+        check("truncated body with a FATAL status is still single-attempt",
+              (result.returncode, calls["n"], sleeps), (1, 1, []))
     finally:
         subprocess.run = real_run
 
