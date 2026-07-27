@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4428,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "57d17f06739cc319409f3f8d5456866fc40fddb7",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Every new `#[cfg(not(feature = \"engine\"))]` branch returns an exact vocabulary-IRI comparison, but the corresponding rows remain `Coverage::Pass` and contribute to `REQUIREMENTS_FLOOR`. In that feature state there is no evaluator, so these checks cannot establish any of R1/R2/R3/R7/R8/R14/R18's graph-pattern behavior. This is the same class of non-conformance-sensitive probe that the new comment correctly criticizes; changing `ends_with` to exact equality only validates constants, not the stated requirements.",
+    "file": "crates/sparq-geo/tests/ogc_geosparql_requirements.rs",
+    "fix_hint": "Do not count these requirements as passing when `engine` is disabled. Gate the graph-pattern requirement rows/test on `engine`, or represent them as gaps/not-applicable outside that feature while ensuring the committed conformance floor is derived from the feature-enabled run. Add a feature-off test that verifies the rows cannot be reported as demonstrated merely from vocabulary constants.",
+    "severity": "major",
+    "title": "Feature-off checks still count vacuous graph-pattern coverage as passing"
+   },
+   {
+    "body": "The R1 statement remains `Support SPARQL Query + Protocol + the geo: ontology vocabulary`, yet `core_sparql_query_over_geo_vocab` calls only `sparq_engine::query`. The new module prose says HTTP transport is requirement-agnostic and explicitly removes the prior server-test evidence, leaving the Protocol portion of the recorded passing requirement untested. An in-process evaluator is not a SPARQL Protocol endpoint.",
+    "file": "crates/sparq-geo/tests/ogc_geosparql_requirements.rs",
+    "fix_hint": "Either retain/add a real protocol-level probe using a GeoSPARQL-vocabulary fixture, or narrow/split the requirement and coverage accounting so this row does not claim Protocol conformance based solely on `sparq_engine::query`.",
+    "severity": "major",
+    "title": "R1 claims Query + Protocol but tests only in-process query evaluation"
+   }
+  ],
+  "progress": null,
+  "summary": "The default-feature probes materially improve the test by exercising real graph-pattern evaluation, but the change is not complete across the supported feature states. With `--no-default-features`, all seven requirements remain recorded as `Coverage::Pass` while their checks only compare vocabulary strings and cannot detect the absence or failure of SPARQL graph-pattern support. This directly preserves the vacuity the PR says it removes. R1 also still states Query + Protocol support while its replacement probe exercises only in-process query evaluation and the new prose dismisses protocol coverage without changing the claimed requirement.",
+  "verdict": "request_changes"
+ }
+}
