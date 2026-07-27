@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3635,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "51ed422026659823cb50b7e5c69b224c12cc2b38",
+  "round": 6
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "axis_exceeds compares spent + charge against total + total * BUDGET_REL_TOL. For every positive total, this deliberately accepts representable cumulative spend strictly greater than total when the excess falls within the relative 1e-12 allowance. That contradicts the documented rule that a charge exceeding either total is refused fail-closed and invalidates the claimed exact basic-composition cap. The small-delta tests exercise a zero total and a charge exactly equal to a tiny total; neither exercises a representable just-over-budget cumulative value inside the allowed tolerance.",
+    "file": "crates/sparq-mpc/src/dp_output.rs",
+    "fix_hint": "Remove positive acceptance slack from the configured totals. Use conservative accounting that cannot authorize cumulative epsilon or delta above the configured total, such as exact/fixed-point accounting after validated conversion or deliberately conservative rounding. Add a regression test constructing a representable spent + charge just above a positive total by less than total * 1e-12, and assert that charge is refused without mutating either spent axis.",
+    "severity": "major",
+    "title": "Relative tolerance still authorizes privacy-budget overspend"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 6 is stagnant. The prior major finding remains unchanged: axis_exceeds permits spent + charge to exceed the configured total by total * 1e-12, despite the public fail-closed and basic sequential-composition claims. The tests still cover zero delta and an exact tiny-total boundary, but not a representable cumulative charge just above a positive total within the accepted relative slack. Because delta is a cryptographic failure-probability axis, deliberately authorizing any positive excess contradicts the documented accounting bound.",
+  "verdict": "request_changes"
+ }
+}
