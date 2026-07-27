@@ -462,6 +462,48 @@ def is_well_specified(issue: dict[str, Any], labels: set[str]) -> bool:
     return concrete or bool(labels & WELL_SPECIFIED_LABELS)
 
 
+# A conventional topic prefix: a leading `[tag]`, or a leading `tag:` short enough to be a tag
+# rather than a sentence that merely contains a colon. The colon form is length-bounded (and its
+# character class excludes `.`, `(` and `)`) so that `sq-3x7dl.4: feat(sparq-wasm): …` — the shape
+# every bead-migrated sparq title has — matches NOTHING and leaves those titles on the scan path
+# exactly as before.
+_TOPIC_PREFIX = re.compile(r"^\s*(?:\[([^\]]{1,40})\]|([A-Za-z][A-Za-z0-9 _/-]{0,30}?)\s*:)")
+
+
+def _title_topic_prefix_area(
+    title: str, repo_labels: set[str]
+) -> tuple[str | None, bool]:
+    """`(area, the title carries a topic prefix at all)` for a title's leading `[tag]` / `tag:`.
+
+    The second element is what makes the ABSENCE of a match usable: a title that carries an
+    explicit prefix naming no declared area is a title whose author already stated the topic, so
+    `derive_area` refuses rather than scanning the rest of the sentence for a stray area word (see
+    the measurement in `derive_area`). A title with NO prefix returns `(None, False)` and reaches
+    the scan unchanged.
+
+    Tokens are split on whitespace/comma/slash/plus AND, additionally, each token contributes its
+    hyphen-separated components — so `dispatch-claim:` resolves to `area:dispatch` while the whole
+    token still matches multi-word area names like `set-up-account` and `review-loop`. Measured on
+    this repository's 94 single-area issues, hyphen splitting took the prefix rule from 19 to 22
+    correct classifications with zero misclassifications.
+
+    Fail-closed on ambiguity like every other branch of `derive_area`: a prefix naming two declared
+    areas (`[dispatch/worker]`) resolves to no area, and — because the prefix IS present — gates
+    the scan too.
+    """
+    match = _TOPIC_PREFIX.match(title)
+    if match is None:
+        return None, False
+    raw = (match.group(1) or match.group(2) or "").strip().casefold()
+    tokens = {token for token in re.split(r"[\s,/+]+", raw) if token}
+    tokens |= {part for token in tuple(tokens) for part in token.split("-") if part}
+    named = {
+        label for label in repo_labels
+        if label.startswith("area:") and label[len("area:"):].casefold() in tokens
+    }
+    return (next(iter(named)) if len(named) == 1 else None), True
+
+
 def derive_area(issue: dict[str, Any], labels: set[str], repo_labels: set[str]) -> tuple[str | None, str]:
     existing = sorted(label for label in labels if label.startswith("area:"))
     if len(existing) == 1:
@@ -493,6 +535,45 @@ def derive_area(issue: dict[str, Any], labels: set[str], repo_labels: set[str]) 
     # classified by it. Title-only (not the body) for the same precision reason the crate rule is
     # title-only, and fail-closed on ambiguity exactly like every other branch here: two named
     # surfaces are an UNRESOLVED area, not a coin flip.
+    #
+    # [OPUS-5 #809] THE AUTHOR'S OWN DECLARATION OUTRANKS A SCAN OF THEIR PROSE, and its absence
+    # is itself a signal. MEASURED against this repository's 94 open single-`area:`-labelled
+    # issues (the held-out 83 that the curator did NOT itself stage give the same shape):
+    #
+    #   rule                                    fires  right  wrong  precision
+    #   title-scan alone (the #808 rule)           29     24      5      82.8%
+    #   topic prefix alone                         22     22      0     100.0%
+    #   topic prefix first, then GATED title-scan  30     27      3      90.0%
+    #
+    # Two independent facts fall out, and BOTH are acted on below.
+    #
+    # (1) A conventional topic prefix — `[dispatch] …` / `dashboard: …` — is an EXPLICIT area
+    #     declaration by the author, not an inference from their sentence, and it did not
+    #     misclassify once. It therefore runs BEFORE the title scan and, in particular, resolves
+    #     the `multiple declared areas named in title` refusals where the prefix names the surface
+    #     and the sentence merely mentions a neighbour ("[dispatch] … no open WORKER PR").
+    #
+    # (2) The #808 title scan is NOT safe on its own: it was wrong on 5 of the 29 issues it
+    #     classified, and a wrong `area:` is worse than none because `area:` is the conflict
+    #     partition key — it silently serialises the frontier against the wrong surface. Two of
+    #     those five (`groom-leases: … long worker`, `curate-frontier: … burned a worker attempt`)
+    #     share one shape: the title DOES carry an explicit topic prefix, that prefix names no
+    #     declared area, and the scan then picked up a stray area word from the rest of the
+    #     sentence. An author who tagged their issue `groom-leases:` has already told us the
+    #     topic, and it is not `worker`. So an explicit prefix that resolves to no declared area
+    #     GATES the scan rather than falling through to it: unresolved, not free to guess.
+    #     Net effect of (1)+(2) together on the ground truth: +1 issue classified, -2 wrong.
+    #
+    # What is deliberately NOT here: widening the scan to the BODY. Measured on the same ground
+    # truth, a body+title unique-token scan is 40.0% precise and a dominance-weighted body scan
+    # 50.0% — both worse than a coin flip on a 10-way choice, because a registry issue's body
+    # routinely names every surface it interacts with. Attribution stops at the title.
+    declared_prefix, has_prefix = _title_topic_prefix_area(title, repo_labels)
+    if declared_prefix is not None:
+        return declared_prefix, "title topic prefix names a declared area"
+    if has_prefix:
+        return None, "title topic prefix names no declared area"
+
     declared = {
         label for label in repo_labels
         if label.startswith("area:") and len(label) > len("area:")
@@ -504,22 +585,40 @@ def derive_area(issue: dict[str, Any], labels: set[str], repo_labels: set[str]) 
     if len(declared) > 1:
         return None, "multiple declared areas named in title"
 
-    text = issue_text(issue)
-    hints = set()
-    path_hints = (
-        (r"(?<![A-Za-z0-9_.-])site/", "area:site"),
-        (r"(?<![A-Za-z0-9_.-])gui/", "area:gui"),
-        (r"(?<![A-Za-z0-9_.-])bench/", "area:bench"),
-        (r"(?<![A-Za-z0-9_.-])(?:\.github(?:/|\b)|scripts/)", "area:ci"),
-    )
-    for pattern, area in path_hints:
-        if area in repo_labels and re.search(pattern, text, re.IGNORECASE):
-            hints.add(area)
-    if len(hints) == 1:
-        return next(iter(hints)), "path hint"
-    if len(hints) > 1:
-        return None, "multiple path-hint areas"
-    return None, "no existing label, crate, or path hint maps to a repository area"
+    # [OPUS-5 #809] THE PATH-HINT FALLBACK IS GONE. It inferred an area from a directory named
+    # ANYWHERE in the issue TEXT — `site/`->`area:site`, `gui/`->`area:gui`, `bench/`->`area:bench`,
+    # `.github`/`scripts/`->`area:ci` — and it was the only branch of this function that read the
+    # BODY rather than the title. MEASURED against every open single-`area:`-labelled issue on both
+    # enabled targets (the labels were assigned by a human or another lane, so a hint disagreeing
+    # with one is a genuine misattribution, not a tautology):
+    #
+    #   target                fires  right  wrong  precision
+    #   jeswr/agent-account-registry  62      8     54      12.9%   (ALL 62 fires were `area:ci`)
+    #   sparq-org/sparq (ready)       83     47     36      56.6%
+    #   combined                     145     55     90      37.9%
+    #
+    # WHY IT COLLAPSES ON THE REGISTRY, and why that is not a registry-specific quirk. The hint
+    # assumes a directory is EVIDENCE OF A SURFACE. That holds only where the directory
+    # discriminates. In this repository every line of code lives under `scripts/` or
+    # `.github/workflows/`, so `scripts/` is a CONSTANT across the whole corpus and carries no area
+    # information at all — yet it out-ranks nothing and fires last, so it answered for 62 issues and
+    # sent 15 `area:dispatch`, 12 `area:worker`, 10 `area:review-loop` and 8 `area:set-up-account`
+    # issues to `area:ci`. Title-scoping it does not rescue it (sparq: 58.8%); mentioning a
+    # directory simply is not the same claim as the work living in it.
+    #
+    # AND THE WRONG ANSWERS COST MORE THAN THE MISSING ONES. `area:` is the conflict-partition key:
+    # `plan_repository` skips any candidate whose area is already reserved by in-flight work, so a
+    # wrongly-attributed issue does not merely get mislabelled — it is STAGED, reserves a partition
+    # its work will never touch, and blocks the next correct candidate for that partition. On the
+    # live board 13 in-flight issues already reserve 7 of the 10 declared areas, which is what the
+    # `area-limited` line reports every run. Under-attribution and over-attribution are therefore
+    # the same defect measured from two sides, and 90 wrong partitions is the more expensive side.
+    #
+    # Nothing replaces it, deliberately. A repository whose title says nothing about its surface is
+    # an UNRESOLVED area (counted by `unattributable_numbers` below and alarmed on by
+    # `triage-stock-alert.census()`), not a coin flip. A future path->area mapping is welcome, but
+    # it has to be a DECLARED, reviewable map calibrated per repository — not a directory mention.
+    return None, "no existing label, crate or declared area is named in the title"
 
 
 def role_for(labels: set[str], area: str) -> str:
@@ -1956,20 +2055,83 @@ def _self_test() -> int:
         issue(921, "Make gamma and delta agree", ()), set(), all_labels)
     checks.append(("two declared areas in one title is UNRESOLVED, never a coin flip",
                    ambiguous is None and reason == "multiple declared areas named in title"))
-    # Word-boundary, not substring: `area:alpha` must not match "alphabetically". The body is
-    # neutral on purpose — `long_body` mentions `scripts/`, which the LATER path-hint rule
-    # resolves to `area:ci`, and a fixture that lets a different rule answer proves nothing about
-    # this one.
+    # Word-boundary, not substring: `area:alpha` must not match "alphabetically". Asserted on the
+    # EXACT terminal reason rather than on `"declared" not in reason`: that substring proxy passed
+    # for two different states (the declared rule declining, and the terminal fall-through) and
+    # would have kept passing had the fall-through started answering — the registry #717 shape,
+    # where a substring seam assertion admitted a bypass.
     boundary, reason = derive_area(
         issue(922, "Sort the output alphabetically", (), body="No paths here. " * 20),
         set(), all_labels)
     checks.append(("a declared area matches on word boundaries, not substrings",
-                   boundary is None and "declared" not in reason))
+                   (boundary, reason)
+                   == (None, "no existing label, crate or declared area is named in the title")))
     # An EXISTING area label still wins — the new rule is a last resort, not an override.
     existing, reason = derive_area(
         issue(923, "The gamma sweep drops rows", ("area:beta",)), {"area:beta"}, all_labels)
     checks.append(("an existing area label still wins over the title",
                    (existing, reason) == ("area:beta", "existing")))
+
+    # (u6b) [#809] THE TOPIC PREFIX, and the two things its ABSENCE of a match is allowed to do.
+    # Each check names the one line whose deletion reds it, because the three sit on one code path
+    # and a fixture that only exercises the happy branch cannot tell them apart.
+    #
+    # 1. The prefix RESOLVES, and outranks the sentence. Deleting the `if declared_prefix is not
+    #    None` return drops this to the scan, which sees BOTH `alpha` and `beta` and refuses.
+    prefixed, reason = derive_area(
+        issue(924, "[alpha] stop double-counting rows the beta lane already emitted", ()),
+        set(), all_labels)
+    checks.append(("a topic prefix naming a declared area outranks the rest of the title",
+                   (prefixed, reason) == ("area:alpha", "title topic prefix names a declared area")))
+    # 2. …in the bare `tag:` form too, and through a HYPHENATED tag (`alpha-runner:` -> `alpha`).
+    #    Deleting the `token.split("-")` component expansion reds this one alone.
+    hyphenated, reason = derive_area(
+        issue(925, "alpha-runner: the beta queue is drained before the run ends", ()),
+        set(), all_labels)
+    checks.append(("a hyphenated topic prefix resolves through its components",
+                   (hyphenated, reason)
+                   == ("area:alpha", "title topic prefix names a declared area")))
+    # 3. THE GATE. A prefix that names NO declared area REFUSES rather than falling through to the
+    #    scan — the measured `groom-leases: … long worker` shape, where the author has already said
+    #    the topic and the scan would answer with a stray area word from the rest of the sentence.
+    #    Deleting the `if has_prefix` return makes this resolve to `area:beta`, which is the
+    #    misattribution the gate exists to prevent, so the check reds on the WRONG ANSWER (not on a
+    #    None/None comparison that a broken function could satisfy by accident).
+    gated, reason = derive_area(
+        issue(926, "epsilon-sweep: the beta queue is drained before the run ends", ()),
+        set(), all_labels)
+    checks.append(("an explicit topic prefix that names no declared area GATES the title scan",
+                   (gated, reason) == (None, "title topic prefix names no declared area")))
+    # 4. Fail-closed inside the prefix itself: two areas in one tag is UNRESOLVED, and still gates.
+    both, reason = derive_area(
+        issue(927, "[alpha/beta] reconcile the two lanes", ()), set(), all_labels)
+    checks.append(("a topic prefix naming TWO declared areas is UNRESOLVED, never a coin flip",
+                   (both, reason) == (None, "title topic prefix names no declared area")))
+    # 5. THE PREFIX RULE MUST NOT SWALLOW A BEAD-ID PREFIX. Every migrated sparq title begins
+    #    `sq-<id>[.<n>]: …`; if such a title gated, the gate would silently switch that whole target
+    #    off. `sq-3ul2n.8:` contains a `.` (outside the prefix character class) so it matches no
+    #    prefix at all and reaches the scan, which resolves it. Widening `_TOPIC_PREFIX` to accept
+    #    `.` reds this.
+    bead, reason = derive_area(
+        issue(928, "sq-3ul2n.8: feat(gamma): rebuild the index dropping masked rows", ()),
+        set(), all_labels)
+    checks.append(("a dotted bead-id prefix is not a topic prefix and still reaches the scan",
+                   (bead, reason) == ("area:gamma", "title names a declared area")))
+
+    # (u6c) [#809] THE PATH-HINT FALLBACK IS GONE, and nothing may quietly reinstate it. Measured
+    # 145 fires / 37.9% precision across both live targets (12.9% on this repository, where every
+    # file lives under `scripts/`), and a wrong `area:` is a wrongly RESERVED conflict partition.
+    # A body that names `scripts/`, `.github/`, `site/`, `gui/` and `bench/` while the title names
+    # nothing must now resolve to NO area — re-adding any path hint reds this, and the assertion is
+    # on the exact terminal reason so a hint answering `area:ci` cannot pass as "unresolved".
+    hint_body = ("Touches scripts/frontier.py and .github/workflows/gate.yml, plus site/index.tsx, "
+                 "gui/main.rs and bench/run.sh. " * 4)
+    hinted, reason = derive_area(
+        issue(929, "Stop the sweep from double-counting", (), body=hint_body),
+        set(), all_labels | {"area:ci", "area:site", "area:gui", "area:bench"})
+    checks.append(("a directory named only in the BODY no longer attributes an area",
+                   (hinted, reason)
+                   == (None, "no existing label, crate or declared area is named in the title")))
 
     # (u7) A FENCE WHOSE LABEL THE TARGET LACKS skips the ISSUE (never admits it) and fails the
     # RUN — it no longer aborts the whole target's plan. Deleting the `continue`/log makes the
