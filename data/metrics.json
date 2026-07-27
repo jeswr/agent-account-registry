@@ -1,60 +1,49 @@
 {
-  "generated_at": "2026-07-27T22:18:19Z",
+  "generated_at": "2026-07-27T22:45:14Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
-      "issues_open": 1532,
-      "issues_ready": 371,
+      "issues_open": 1534,
+      "issues_ready": 370,
       "issues_closed_1h": 3,
       "issues_closed_24h": 51,
       "prs_open": 100,
-      "prs_draft": 75,
+      "prs_draft": 74,
       "prs_opened_1h": 4,
       "prs_closed_1h": 2,
       "prs_merged_1h": 3,
       "prs_merged_24h": 57,
-      "review_changes_backlog": 6,
+      "review_changes_backlog": 5,
       "needs_user_parked": 21,
       "review_lane_health": "ok",
-      "review_lane_runs_1h": 13,
-      "worker_attempts_1h": 7,
-      "worker_success_rate_1h": 0.5714,
+      "review_lane_runs_1h": 10,
+      "worker_attempts_1h": 4,
+      "worker_success_rate_1h": 1.0,
       "pr_open_rate": 4.0,
       "pr_close_rate": 5.0,
       "net_pr_flow": -1.0
     },
     "jeswr/agent-account-registry": {
-      "issues_open": 361,
+      "issues_open": 369,
       "issues_ready": 76,
       "issues_closed_1h": 8,
-      "issues_closed_24h": 22,
+      "issues_closed_24h": 23,
       "prs_open": 35,
-      "prs_draft": 20,
-      "prs_opened_1h": 6,
-      "prs_closed_1h": 0,
-      "prs_merged_1h": 7,
-      "prs_merged_24h": 40,
-      "review_changes_backlog": 4,
-      "needs_user_parked": 14,
+      "prs_draft": 21,
+      "prs_opened_1h": 7,
+      "prs_closed_1h": 3,
+      "prs_merged_1h": 8,
+      "prs_merged_24h": 41,
+      "review_changes_backlog": 5,
+      "needs_user_parked": 13,
       "review_lane_health": "ok",
       "review_lane_runs_1h": 7,
       "worker_attempts_1h": 8,
-      "worker_success_rate_1h": 0.375,
-      "pr_open_rate": 6.0,
-      "pr_close_rate": 7.0,
-      "net_pr_flow": -1.0
+      "worker_success_rate_1h": 0.625,
+      "pr_open_rate": 7.0,
+      "pr_close_rate": 11.0,
+      "net_pr_flow": -4.0
     }
   },
-  "alerts": [
-    {
-      "target": "jeswr/agent-account-registry",
-      "classification": "worker-failing",
-      "fire": true,
-      "summary": "worker success rate 38% < 50% floor over 2 snapshots (8 attempts this hour)",
-      "metrics": {
-        "worker_success_rate_1h": 0.375,
-        "worker_attempts_1h": 8
-      }
-    }
-  ]
+  "alerts": []
 }
