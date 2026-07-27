@@ -142,6 +142,26 @@ jobs:
             bash -n "$f"
           done
 
+      - name: node --check every dashboard renderer script
+        run: |
+          set -euo pipefail
+          # [issue #613] dashboard/app.js is the LAST hop on the public surface — dashboard-gen's
+          # decision-22 privacy assertions and its fail-closed availability semantics are
+          # re-implemented defensively in JS — and NO gate looked at it. `node --check` parses
+          # without executing, so it is safe on untrusted PR head content. Both failure modes are
+          # fail-closed: no node, or no file swept, refuses rather than reporting a vacuous pass.
+          shopt -s nullglob
+          command -v node >/dev/null 2>&1 \
+            || { echo "::error::node is unavailable; refusing to skip the dashboard renderer parse"; exit 1; }
+          n=0
+          for f in dashboard/*.js dashboard/*.mjs dashboard/*.cjs; do
+            echo "== node --check $f =="
+            node --check "$f"
+            ((n += 1))
+          done
+          [[ "$n" -gt 0 ]] || { echo "::error::dashboard renderer parse ran vacuously (no dashboard/*.js found)"; exit 1; }
+          echo "parsed $n dashboard script(s)"
+
       - name: actionlint + yaml-parse every workflow
         run: |
           set -euo pipefail
