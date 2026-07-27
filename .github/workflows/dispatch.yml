@@ -54,8 +54,115 @@ env:
   DISPATCH_TARGET_REPOS: '["sparq-org/sparq", "jeswr/agent-account-registry"]'
 
 jobs:
+  # MINIMUM INTERVAL BETWEEN EXECUTED TICKS (issue #819). PR #787 cut the snapshot step 6.4x and
+  # the tick from 15-28 min to ~7 min, which is right and is NOT being reverted — but tick DURATION
+  # was the only thing bounding how often the doorbell could start one (the concurrency group
+  # serialises ticks, it does not rate-limit them). Executed ticks/hour went 4-7 all day and then
+  # 13 in the 18Z hour; at 18:26:17Z every authenticated read began returning HTTP 403 and the
+  # whole pipeline stalled. This job is the floor that #787 should have shipped behind: an explicit
+  # minimum interval between EXECUTED ticks, independent of how long a tick happens to take.
+  #
+  # Budget arithmetic (measured; the full derivation and the numbers it rests on are in
+  # scripts/dispatch-tick-floor.py's header, and its self-test asserts the multiplication):
+  #   613 requests/executed tick (instrumented, issue #721) x 6 ticks/h = ~3,678 requests/h,
+  #   against 4-7 ticks/h (~2.4k-4.3k/h) that ran clean for thirteen hours and 13 ticks/h
+  #   (~7,969/h) that broke. The floor therefore makes the DOORBELL STRUCTURALLY UNABLE TO EXCEED
+  #   THE SCHEDULE above (`3,13,23,33,43,53` is 6/h).
+  #
+  # A tick that arrives inside the floor exits as a CLEAN NO-OP: `proceed=false`, exit 0, `plan`
+  # and (transitively) `claim` skipped, one API request issued in total. It deliberately does not
+  # SLEEP until the floor expires — a sleeping job occupies a runner and holds the
+  # `registry-dispatcher` concurrency group for the whole wait, which is the waiter-starvation
+  # shape ci-summary.yml documents. Releasing the group in ~30 s means the doorbell ring queued
+  # behind it is served immediately.
+  tick-floor:
+    name: FLOOR (minimum interval between executed ticks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # NO `continue-on-error`, at the job or the step level: it discards exactly the exit status
+    # that would report a broken floor, and a step can never red its own neutering. The absence is
+    # asserted statically by scripts/dispatch-tick-floor.py's self-test, which also asserts the
+    # `if:`/`needs:`/outputs wiring below — the seam where every uncaught mutant in this estate has
+    # lived.
+    permissions:
+      actions: read    # LIST the `dispatch-tick` marker artifacts (the executed-tick anchor)
+      contents: read   # the sparse checkout below
+    outputs:
+      proceed: ${{ steps.floor.outputs.proceed }}
+    steps:
+      - name: Check out ONLY the floor's inputs (pinned, sparse, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: registry
+          persist-credentials: false
+          # KEEP IN SYNC — REQUIRED_FILES in scripts/dispatch-tick-floor.py is asserted against
+          # this very block, so a trimmed checkout goes RED instead of making the YAML-seam
+          # assertions silently unreachable on the live path.
+          sparse-checkout: |
+            scripts/dispatch-tick-floor.py
+            .github/workflows/dispatch.yml
+          sparse-checkout-cone-mode: false
+
+      # The floor's static workflow-shape assertions PARSE the workflow YAML rather than
+      # pattern-match it (regex-over-YAML is how five permissive misparses got into the guard).
+      # Probe first so the runner image's own PyYAML is used when present and this job keeps zero
+      # network dependency on PyPI; the install path is version + sha256 locked to the identical
+      # pins pr-gate and the secrets guard use.
+      - name: Ensure PyYAML for the floor's workflow-parse assertions
+        run: |
+          set -euo pipefail
+          if python3 -c 'import yaml' 2>/dev/null; then
+            echo "PyYAML already present; no install needed"
+            exit 0
+          fi
+          cat > "$RUNNER_TEMP/floor-requirements.txt" <<'REQ'
+          pyyaml==6.0.2 \
+              --hash=sha256:80bab7bfc629882493af4aa31a4cfa43a4c57c83813253626916b8c7ada83476 \
+              --hash=sha256:1f71ea527786de97d1a0cc0eacd1defc0985dcf6b3f17bb77dcfc8c34bec4dc5
+          REQ
+          python3 -m pip install --disable-pip-version-check --require-hashes \
+            --only-binary=:all: -r "$RUNNER_TEMP/floor-requirements.txt"
+          python3 -c 'import yaml; print("PyYAML", yaml.__version__)'
+
+      - name: Decide whether this tick may execute
+        id: floor
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REGISTRY_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          python3 registry/scripts/dispatch-tick-floor.py --self-test
+          python3 registry/scripts/dispatch-tick-floor.py
+
+      # The anchor the NEXT tick's floor reads. Written here, inside the floor job, BEFORE `plan`
+      # can start — so a tick that dies in the snapshot (the #819 outage shape) still counts as
+      # executed and still holds the floor. Deriving the anchor from run conclusions instead cannot
+      # work: a no-op tick concludes `success` exactly like a real one.
+      - name: Record that this tick is EXECUTING
+        if: ${{ steps.floor.outputs.proceed == 'true' }}
+        run: |
+          set -euo pipefail
+          date -u +%Y-%m-%dT%H:%M:%SZ > "$RUNNER_TEMP/dispatch-tick.txt"
+
+      - name: Upload the executed-tick marker (pinned)
+        if: ${{ steps.floor.outputs.proceed == 'true' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dispatch-tick
+          path: ${{ runner.temp }}/dispatch-tick.txt
+          if-no-files-found: error
+          retention-days: 1
+
   plan:
     name: PLAN (unprivileged, secret-free target half)
+    needs: [tick-floor]
+    # The #819 rate floor. BOTH halves are load-bearing and each defeats a different mutation: the
+    # `needs:` edge makes this job WAIT for the anchor to be written, and the `if:` makes it OBEY
+    # the decision. Cutting either one restores the unbounded-doorbell shape that exhausted the
+    # request budget, so scripts/dispatch-tick-floor.py's self-test evaluates this expression in
+    # both directions against a modelled `needs` context — including the empty-string case a
+    # deleted output would produce.
+    if: ${{ needs.tick-floor.outputs.proceed == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # contents:read exists ONLY for (a) the snapshot-helper registry checkout + the authenticated
@@ -290,14 +397,68 @@ jobs:
               target = root / str(index)
               repo_trusted_bots = set(trusted_bots_map.get(repo, []))
               dispatch = load_dispatch(target / "scripts" / "dispatch-plan.py")
-              raw = [
-                  issue for issue in snapshot("issues", index)
-                  if isinstance(issue, dict) and "pull_request" not in issue
-              ]
+              # `/issues?state=open` returns PR rows too. `raw` stays the ISSUE half — the
+              # blocker-union block below, `details`, `roleless_ready` and the deferred lane are
+              # all issue-shaped and must not change. The PR half is kept separately and folded
+              # into OCCUPANCY only (issue #768).
+              snapshot_rows = [issue for issue in snapshot("issues", index)
+                               if isinstance(issue, dict)]
+              raw = [issue for issue in snapshot_rows if "pull_request" not in issue]
+              pr_rows = [issue for issue in snapshot_rows if "pull_request" in issue]
+              # NATIVE GitHub dependency edges, UNIONED with the legacy `Blocked-by: #NN` body
+              # markers. Until this landed, THIS LINE was the whole of the dispatcher's notion of
+              # "blocked": a regex over the issue BODY. GitHub issue dependencies are generally
+              # available and the maintainer uses the native UI, so a dependency added that way
+              # had ZERO effect on dispatch (sparq issue #4329). MEASURED 2026-07-26 over all
+              # 1368 open sparq issues (cursor-paginated, len == GraphQL totalCount): 112 issues
+              # carry a native edge (170 edges), and of the 427 issues created since 2026-07-20,
+              # 0 carry a native edge and 1 carries a marker — the marker channel is effectively
+              # dead for new work while the native channel is the one being written.
+              #
+              # UNION, never replace: 3 open sparq issues (#2833/#2975/#3817) carry a marker with
+              # no native edge. The fail-safe direction is one-way — the readiness engine keys on
+              # `open_blockers > 0`, so MISSING an edge dispatches an issue that is genuinely
+              # blocked, while OVER-counting one only delays it.
+              #
+              # `issue_dependencies_summary` rides along in the REST list payload the snapshot
+              # step already writes, so this costs ZERO extra requests. Its `blocked_by` counts
+              # only OPEN blockers (`total_blocked_by` counts closed ones too) — MEASURED against
+              # GraphQL `blockedBy` filtered to state=OPEN over all 1368 open issues: identical
+              # sets AND identical per-issue counts, with 16 issues showing
+              # total_blocked_by > blocked_by. So a CLOSED blocker never holds its child.
+              #
+              # >>> blocker-union — EXECUTED by scripts/dispatch-plan.py --self-test. The block is
+              # the SCHEDULED path; a pure-python assertion elsewhere cannot see it, and every
+              # uncaught mutant in this repo's history has lived at the YAML seam. Removing either
+              # sentinel makes that extraction FAIL CLOSED. Keep the block self-contained: `raw`,
+              # `repo`, `label_names` and `re` are its only inputs; it produces `open_numbers`,
+              # `readiness_input` and `details`.
               open_numbers = {
                   issue.get("number") for issue in raw
                   if isinstance(issue.get("number"), int)
               }
+
+              def native_open_blockers(issue, repo):
+                  # ABSENT summary -> 0 (this snapshot carries no native-dependency data, so only
+                  # the marker channel can speak). PRESENT-but-malformed -> 1 unknown blocker:
+                  # reading an uninterpretable schema as "zero blockers" is the fail-OPEN
+                  # direction, so the issue is HELD, loudly, until a human looks.
+                  summary = issue.get("issue_dependencies_summary")
+                  if summary is None:
+                      return 0
+                  number = issue.get("number")
+                  if not isinstance(summary, dict):
+                      print(f"::warning::{repo}#{number}: issue_dependencies_summary is not an "
+                            "object — holding the issue (fail-closed)")
+                      return 1
+                  value = summary.get("blocked_by")
+                  if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                      print(f"::warning::{repo}#{number}: issue_dependencies_summary.blocked_by "
+                            f"is {value!r}, not a non-negative int — holding the issue "
+                            "(fail-closed)")
+                      return 1
+                  return value
+
               details = {}
               readiness_input = []
               for issue in raw:
@@ -307,16 +468,114 @@ jobs:
                       raise SystemExit("target issue fields are malformed")
                   labels = label_names(issue)
                   blockers = re.findall(r"[Bb]locked-by:\s*#([0-9]+)", body)
+                  marker_open = sum(int(blocker) in open_numbers for blocker in blockers)
                   readiness_input.append({
                       "number": number,
                       "state": "OPEN",
                       "labels": labels,
-                      "open_blockers": sum(int(blocker) in open_numbers for blocker in blockers),
+                      # `max` IS the union for the only decision made from this number: the engine
+                      # holds the issue iff native > 0 or marker_open > 0, i.e. iff max > 0. It is
+                      # a lower bound on the cardinality of the union of the two blocker SETS (the
+                      # native channel reports a count, not numbers), which can only understate a
+                      # delay — never flip a held issue to ready. MEASURED: 0 of 1368 open issues
+                      # have the two channels disagreeing on the count.
+                      "open_blockers": max(native_open_blockers(issue, repo), marker_open),
                   })
                   details[number] = (issue, labels, body)
+              # The GUARD against the native channel going DARK unnoticed: an absent summary reads
+              # as 0, which is indistinguishable from "GitHub renamed the field" unless somebody
+              # checks. MEASURED: present on 1368/1368 open sparq ISSUES (and 0/104 PR rows, which
+              # `raw` already excludes), so "no row carries it" is a schema regression. Printed on
+              # EVERY tick including the healthy one — a check that is silent when it passes is a
+              # check nobody notices has stopped running.
+              if raw and not any(
+                      isinstance(issue.get("issue_dependencies_summary"), dict) for issue in raw):
+                  print(f"::warning::{repo}: NATIVE BLOCKER CHANNEL IS DARK — none of {len(raw)} "
+                        "open issues carries `issue_dependencies_summary`. Native GitHub "
+                        "dependencies are being IGNORED and only `Blocked-by: #NN` body markers "
+                        "can hold an issue: a maintainer's native dependency edits have no "
+                        "effect on dispatch until this is fixed.")
+              else:
+                  print(f"{repo}: native blocker channel: LIT "
+                        f"({sum(1 for row in readiness_input if row['open_blockers'])} of "
+                        f"{len(readiness_input)} open issue(s) held by a blocker)")
+              # <<< blocker-union
 
               pulls = snapshot("pulls", index)
               linked = linked_issue_numbers(pulls, repo)
+              # [#768] EXECUTED end-to-end by scripts/dispatch-plan.py --self-test, which
+              # extracts this STEP'S WHOLE python heredoc and runs it over a synthetic
+              # two-target fixture. No `>>> ... <<<` sentinels here on purpose: nothing
+              # extracts this range on its own, and a marker implying a guard it does not
+              # have is the vacuity class this repo already tracks.
+              # PLAN reserved the ISSUE half of every unit of work and never the PR half: the PR
+              # rows were filtered out of the readiness input above, so `compute_ready` saw an
+              # `area:` free whenever the only thing holding it was an open PR. MEASURED on the
+              # live sparq snapshot: the issue half alone holds 39 partition keys, the union with
+              # the PR half holds 48, and 7 of PLAN's 9 frontier rows landed in one of the 9 keys
+              # only a PR held. CLAIM's busy_packages_of_pulls dropped those 7 afterwards, so they
+              # were never double-dispatched — but it dropped them AFTER compute_ready had
+              # committed the frontier, and a selected row that is removed later frees its package
+              # with NO backfill (issue #113's shape, one layer up). Widening PLAN's occupancy can
+              # only ADD holds, never release one, so it cannot fail open.
+              #
+              # NOT unconditional. `dispatch.yml` plans EVERY target with that target's OWN
+              # readiness engine, and a PR row is only safe input to an engine that understands
+              # one. sparq's `compute_ready` reserves a PR's declared areas and `ready_candidates`
+              # skips any row carrying `pull_request`; the registry's own planner (this repo, the
+              # second target) does NEITHER — handed a PR row it would treat it as a dispatch
+              # CANDIDATE and launch an impl worker against a pull-request number, and reserve
+              # `__global__` for each of the 34 area-less open PRs, taking its own frontier to 0.
+              # So the capability is PROBED BY EXECUTION against the loaded planner, never sniffed
+              # from a version or an attribute, and a planner that fails the probe keeps exactly
+              # today's behaviour and says so loudly. Fail-closed: a probe that raises is a
+              # planner we cannot characterise, so it gets no PR rows.
+              def pr_row_aware(planner):
+                  """Can `planner.compute_ready` be handed PR rows? Two OBLIGATIONS, both run.
+
+                  1. SAFETY — a PR row is never selected as a dispatch candidate. An engine that
+                     returns it would have PLAN emit a plan row whose `number` is a PR.
+                  2. EFFECT — a PR row actually reserves the `area:` keys it declares, so an
+                     otherwise-ready issue on that key is held. An engine that ignores PR rows
+                     would make this whole block an expensive no-op, which must not pass silently.
+                  """
+                  probe = ["status:ready", "priority:P0", "role:impl", "area:__pr_probe__"]
+                  pr = {"number": 999000001, "state": "OPEN", "labels": list(probe),
+                        "open_blockers": 0, "pull_request": {}}
+                  rival = {"number": 999000002, "state": "OPEN", "labels": list(probe),
+                           "open_blockers": 0}
+                  try:
+                      alone = [row.get("number") for row in planner.compute_ready([pr])]
+                      paired = [row.get("number") for row in planner.compute_ready([pr, rival])]
+                  except Exception as exc:                        # noqa: BLE001 — hostile target
+                      return False, f"probe raised {type(exc).__name__}"
+                  if alone or 999000001 in paired:
+                      return False, "planner DISPATCHES a pull-request row as if it were an issue"
+                  if paired:
+                      return False, "planner does not RESERVE a pull request's declared area"
+                  return True, "reserves PR areas and never dispatches a PR row"
+
+              occupancy_input = []
+              pr_aware, pr_aware_why = pr_row_aware(dispatch)
+              if pr_aware:
+                  for pull in pr_rows:
+                      pr_number = pull.get("number")
+                      if not isinstance(pr_number, int) or pr_number <= 0:
+                          raise SystemExit("target pull-request row is malformed")
+                      occupancy_input.append({
+                          "number": pr_number,
+                          "state": "OPEN",
+                          "labels": label_names(pull),
+                          "open_blockers": 0,
+                          "pull_request": {},
+                      })
+                  print(f"{repo}: PLAN occupancy carries {len(occupancy_input)} open pull-request "
+                        f"row(s) — {pr_aware_why}")
+              else:
+                  print(f"::warning::{repo}: target readiness engine is NOT pull-request-aware "
+                        f"({pr_aware_why}) — PLAN reserves the ISSUE half of every unit of work "
+                        f"and never the PR half, so its frontier may offer rows CLAIM will drop "
+                        f"with no backfill. {len(pr_rows)} open PR row(s) were NOT reserved.")
               # Apply the trust + linked-PR exclusions BEFORE the frontier is selected (issue #113:
               # post-frontier filters leave dispatchable holes). compute_ready commits to a
               # conflict-free, priority-ordered frontier, so a candidate removed AFTER selection
@@ -328,7 +587,12 @@ jobs:
               # still RESERVE their package in its taken-seeding, so dropping an in-progress row
               # that is itself linked/untrusted would free a busy crate and fail OPEN into a
               # double-dispatch. PLAN stays advisory — CLAIM re-derives trust + linkage exactly.
-              ready_input = [
+              # `occupancy_input` (the PR half, #768) is prepended for the SAME reason the
+              # in-progress rows are kept: it is pure occupancy the engine reserves and never
+              # selects. It is deliberately NOT subjected to the trust/linked filters — those
+              # decide whether a CANDIDATE may be dispatched, and applying them to an occupant
+              # would free a crate an untrusted author's open PR is really holding.
+              ready_input = occupancy_input + [
                   row for row in readiness_input
                   if "status:in-progress" in row["labels"]
                   or "status:in-progress-review" in row["labels"]
@@ -380,6 +644,17 @@ jobs:
               # absent here: the deferred-retry lane IS the park's readmission hook — CLAIM
               # re-gates every other label live and its `retry` flip strips status:parked
               # exactly when the allocator proves capacity exists.
+              # >>> deferred-retry-filter — EXECUTED by scripts/dispatch-claim.py --self-test.
+              # [registry #764] The `needs:*` clause below is not merely a hold: it is the LANE
+              # EXIT the absorbing-park retirement uses. `absorbing_park_leg` retires a stuck
+              # item by applying the question-class `needs:user`, and THIS line is what turns
+              # that label into a released `area:` partition — compute_ready serializes one row
+              # per package, so a retired item that stayed in `deferred_input` would keep
+              # starving its siblings exactly as before. Deleting the clause silently restores
+              # the whole defect while every unit test on the leg stays green, so the block is
+              # extracted between these sentinels and RUN against fixtures; removing either
+              # sentinel makes that extraction FAIL CLOSED. Its only inputs are
+              # `readiness_input`, `linked`, `details`, `trusted` and `repo_trusted_bots`.
               retry_gated = {"status:blocked", "status:in-progress",
                              "status:in-progress-review", "status:untriaged", "trust:untrusted"}
               deferred_input = []
@@ -396,8 +671,31 @@ jobs:
                       **row,
                       "labels": sorted((labels - {"status:deferred"}) | {"status:ready"}),
                   })
+              # <<< deferred-retry-filter
+              # [#768] EXECUTED end-to-end by the same whole-heredoc harness.
+              # The deferred lane used to be handed `deferred_input` ALONE. `deferred_input` is
+              # filtered to `status:deferred` rows and `retry_gated` excludes both in-progress
+              # labels, so by construction it contained NO occupant at all — the only occupancy
+              # the lane ever saw was `in_progress_packages=taken`, which is the packages of the
+              # rows the READY lane just selected. Every in-flight issue and every open PR was
+              # therefore FREE in this lane. MEASURED on the live sparq snapshot: 12 of the 17
+              # deferred rows PLAN emitted land in a key an open occupant already holds, and 2 of
+              # them (#2951 on `workspace`, #4423 on `sparq-zk-compose`) are held ONLY by an
+              # in-progress ISSUE — which CLAIM's `busy_packages_of_pulls` cannot see at all,
+              # because it enumerates `sparq-agent/*` PR heads and neither key has one. Those two
+              # are not "burned at CLAIM with no backfill"; they are launched, putting a second
+              # worker on a partition an in-progress issue owns. That is the UNDER-SERIALISED,
+              # silently-corrupting direction, so this lane gets the same occupancy the ready lane
+              # gets: the PR half (when the planner is PR-aware) and the in-flight issue half,
+              # which the engine reserves and never selects.
+              in_flight_input = [
+                  row for row in readiness_input
+                  if "status:in-progress" in row["labels"]
+                  or "status:in-progress-review" in row["labels"]
+              ]
               deferred_ready = dispatch.compute_ready(
-                  deferred_input, in_progress_packages=taken)
+                  occupancy_input + in_flight_input + deferred_input,
+                  in_progress_packages=taken)
 
               routing_doc = dispatch._routing_doc()
               flagged_rows = [(row, False) for row in dispatch.plan_dispatch(ready, routing_doc)]
@@ -515,6 +813,15 @@ jobs:
               return module
 
           claim_mod = load("registry_dispatch_claim", registry / "scripts" / "dispatch-claim.py")
+          # [OPUS-5 #657] Registry-owned policy, read from the MASTER checkout. `_policy_row`
+          # inside review_enrolment_authors validates the whole row, so a malformed or
+          # non-canonical review_enrolment_authors list HARD-FAILS this step rather than
+          # silently resolving to "nobody is enrolled" — a fail-closed default that is
+          # indistinguishable from a typo is exactly how an enrolment silently never happens.
+          policy_mod = load("registry_policy_resolve", registry / "scripts" / "policy-resolve.py")
+          import tomllib
+          with open(registry / "policy" / "repos.toml", "rb") as handle:
+              policy_doc = tomllib.load(handle)
 
           intermediate = json.loads(Path(out_dir, "issue-plan.json").read_text(encoding="utf-8"))
           # Lease state comes from the data-plane `ledger` branch checkout (issue #28) — the
@@ -531,7 +838,23 @@ jobs:
           review_items = []
           disarm_items = []
           snapshot_skips = []
+          # [registry #677] Per-repo starvation evidence for the CLAIM-side self-healing sweep:
+          # how many READY issue rows the busy partition dropped behind a `__global__` occupant.
+          # CLAIM cannot recompute this — the plan carries only the SURVIVORS, so without it
+          # "planned == 0" cannot be told apart from "the backlog is empty", and the sweep must
+          # never park a holder on an empty backlog.
+          partition_starvation = []
           review_exclusions = Counter()
+          # [registry #762] The PR-side population census. `review_exclusions` is SIGNALLED-only
+          # (it counts a PR that carries a review-loop label), so an UNLABELLED worker draft
+          # sitting in the drafted-already-reviewed fall-through left no trace at all — which is
+          # half of why the ci-fix lane being structurally unreachable on sparq read as ten days
+          # of healthy ticks. This Counter partitions EVERY PR reaching that decision into one
+          # disjoint claim_mod.IDLE_CENSUS_BUCKETS entry, with every bucket emitted at zero, so a
+          # lane going to zero is a VISIBLE number rather than an absence. Kept separate from
+          # review_exclusions on purpose: the two have different denominators and summing them
+          # would produce a total that means nothing.
+          review_census = Counter()
           for index, repository in enumerate(intermediate["repositories"]):
               repo = repository["target_repo"]
               owner, name = repo.split("/", 1)
@@ -606,13 +929,23 @@ jobs:
               # excluded here either: CLAIM re-derives the live round count and applies the
               # terminal transition itself, so a PR whose final outcome mutation crashed
               # converges loudly. `review_exclusions` collects every SIGNALLED
-              # (review:changes / review:needs / review:parked) exclusion reason for the one
-              # aggregate line at
+              # (review:changes / review:needs / review:parked, plus issue #464's CONFLICTING
+              # base — a DIRTY PR signals on its own, whatever its labels) exclusion reason for
+              # the one aggregate line at
               # PLAN completion (park-policy defect 3: "0 review item(s)" can never again
-              # coexist silently with labeled worker PRs).
+              # coexist silently with signalled worker PRs).
+              # [OPUS-5 #657] The MASTER-protected half of orchestrator-PR admission. Read from
+              # the private `registry` checkout (master), NEVER from the `registry-ledger`
+              # checkout: provenance records live on ledger precisely because master's required
+              # gate rejects direct PUTs, so the record half is a low-authority per-PR gesture
+              # and this list is the reviewed half that bounds which logins it can ever name.
+              # Reading it from ledger would collapse both halves onto one authority and make
+              # the pair pointless. Absent/empty => enrolment OFF => the shape gates stand.
+              enrolled_authors = policy_mod.review_enrolment_authors(repo, policy_doc)
               review_items.extend(claim_mod.enumerate_review_items(
                   repo, pulls, provenance, leases, issue_labels, now, pr_status=pr_status,
-                  exclusions=review_exclusions))
+                  exclusions=review_exclusions, enrolled_authors=enrolled_authors,
+                  census=review_census))
               # Armed-SHA-mismatch safety invariant (issue #42): CLAIM disarms these FIRST each
               # sweep, re-deriving every precondition live (matching SHAs are never disarmed).
               disarm_items.extend(claim_mod.enumerate_disarm_items(
@@ -636,18 +969,51 @@ jobs:
               # sibling lease (impl `<repo>#<issue>`, `review:`/`fix:`) on an item's package
               # defers it — the lanes share ONE crate-ownership view (the same ledger the
               # enumerator's superseded-until-sibling-resolves exclusion reads).
+              # [registry #677] `starvation` is filled BY the filter, at the branch that makes
+              # each drop decision — never recounted afterwards from a different view.
+              starvation = {}
+              # [registry #758] The assemble leg is where the frontier actually dies, and it had
+              # no counter: `frontier_size` downstream is assigned the POST-filter count, so the
+              # whole loss sat between "the frontier was wide" and "nothing was planned". The
+              # per-reason / per-HELD-AREA census is filled BY the filter, at the branch that makes
+              # each drop decision — never re-derived here from the surviving rows, which cannot
+              # see which reservation ate the others.
+              partition_census = {}
+              rows_before_assemble = len(repository["items"])
               repository["items"] = claim_mod.filter_busy_area_items(
                   claim_mod.filter_deferred_items(repository["items"], repo, leases, now),
-                  repo, pulls, issue_labels, provenance, pr_status, leases, now)
+                  repo, pulls, issue_labels, provenance, pr_status, leases, now,
+                  starvation=starvation, census=partition_census)
+              # BRACE-FREE by construction: GitHub's secret masker rewrites `{`/`}` to `***` in log
+              # output, so a JSON dump of this census would arrive corrupted. Flat key=value only.
+              print("assemble-census " + " ".join(
+                  [repo, "rows_before=" + str(rows_before_assemble),
+                   "deferred=" + str(partition_census.get("total", 0)),
+                   "kept=" + str(partition_census.get("kept", 0))]
+                  + ["reason." + reason + "=" + str(count) for reason, count
+                     in sorted((partition_census.get("by_reason") or {}).items())]
+                  + ["area." + area + "=" + str(count) for area, count
+                     in sorted((partition_census.get("by_held_area") or {}).items())]
+                  + ["holder.pr" + holder + "=" + str(count) for holder, count
+                     in sorted((partition_census.get("by_holder") or {}).items())]))
+              # Recorded ONLY for a genuinely starved lane: nothing survived AND rows were dropped
+              # behind the serializing partition. A healthy or empty lane records nothing, so the
+              # sweep on the CLAIM side has no starvation to act on at all.
+              if starvation.get("kept") == 0 and starvation.get("deferred", 0) > 0:
+                  print(f"PARTITION STARVATION {repo}: 0 issue item(s) planned behind "
+                        f"{starvation['deferred']} row(s) deferred by a __global__ occupant")
+                  partition_starvation.append(
+                      {"repo": repo, "deferred": starvation["deferred"]})
 
           snapshot_skips.sort(key=lambda skip: (skip["repo"], skip["pr_number"]))
           document = {
-              "schema": "registry-dispatch-plan/v4",
+              "schema": "registry-dispatch-plan/v5",
               "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
               "repositories": intermediate["repositories"],
               "review_items": review_items,
               "disarm_items": disarm_items,
               "snapshot_skips": snapshot_skips,
+              "partition_starvation": partition_starvation,
           }
           # GLOBAL (repo, pr_number) order via the SHARED, self-tested helper (sol r2 on
           # #233): per-repo policy-order assembly inverts lexicographically with a second
@@ -656,9 +1022,9 @@ jobs:
           # PLAN-side inline set-equality checks (CLAIM repeats a stricter independent
           # re-validation of the artifact as hostile data before any mutation).
           if set(document) != {"schema", "generated_at", "repositories", "review_items",
-                               "disarm_items", "snapshot_skips"}:
+                               "disarm_items", "snapshot_skips", "partition_starvation"}:
               raise SystemExit("plan schema top-level fields are invalid")
-          if document["schema"] != "registry-dispatch-plan/v4":
+          if document["schema"] != "registry-dispatch-plan/v5":
               raise SystemExit("plan schema version is invalid")
           expected_item_fields = {"number", "priority", "package", "role", "model_chain",
                                   "agent", "escalate", "labels", "author", "body_sha", "deferred"}
@@ -668,8 +1034,15 @@ jobs:
               for item in repository["items"]:
                   if set(item) != expected_item_fields:
                       raise SystemExit("plan item fields are invalid")
+          # [OPUS-5 #657] This set is a hand-maintained REPLICA of dispatch-claim.REVIEW_ITEM_FIELDS
+          # and it silently drifted the moment the enumerator gained a field: the producer emitted
+          # `self_attested`, this replica did not list it, and EVERY plan tick would have died here
+          # with "plan review item fields are invalid". The replica stays (this guard deliberately
+          # re-derives nothing from the module it is guarding), but dispatch-claim's self-test now
+          # parses this literal out of the workflow and asserts set equality with
+          # REVIEW_ITEM_FIELDS, so the next field addition fails a unit test instead of a tick.
           expected_review_fields = {"pr_number", "head_sha", "state", "impl_provider", "repo",
-                                    "package", "security", "context"}
+                                    "package", "security", "self_attested", "context"}
           for item in document["review_items"]:
               if set(item) != expected_review_fields:
                   raise SystemExit("plan review item fields are invalid")
@@ -681,6 +1054,9 @@ jobs:
           for item in document["snapshot_skips"]:
               if set(item) != expected_skip_fields:
                   raise SystemExit("plan snapshot skip fields are invalid")
+          for item in document["partition_starvation"]:
+              if set(item) != {"repo", "deferred"}:
+                  raise SystemExit("plan partition starvation fields are invalid")
           # Full structural validation with the same validator CLAIM uses (strictly stronger
           # than a hand-rolled inline copy, and available here because the registry is local).
           claim_mod.validate_plan(document)
@@ -691,11 +1067,21 @@ jobs:
                 f"{len(review_items)} review item(s), {len(disarm_items)} disarm item(s), "
                 f"{len(snapshot_skips)} snapshot skip(s)")
           # Park-policy defect 3: ONE aggregate exclusion line, printed on EVERY plan, so a
-          # "0 review item(s)" tick can never coexist silently with labeled worker PRs.
+          # "0 review item(s)" tick can never coexist silently with signalled worker PRs.
+          # "signalled", not "labeled", since issue #464: a CONFLICTING base is a signal in its
+          # own right, so the count now covers DIRTY PRs that carry no review:* label at all.
           exclusion_detail = ", ".join(
               f"{reason}={count}" for reason, count in sorted(review_exclusions.items()))
-          print(f"review-enumeration excluded {sum(review_exclusions.values())} labeled "
+          print(f"review-enumeration excluded {sum(review_exclusions.values())} signalled "
                 f"worker PR(s): {exclusion_detail or 'none'}")
+          # [registry #762] ONE census line on EVERY plan, listing every bucket including the
+          # zeros. A per-stage rate cannot express a MISSING EDGE (#753); only a population
+          # partition can, and only if the empty buckets are printed too — an absent bucket and
+          # a zero bucket must not look the same.
+          census_detail = ", ".join(
+              f"{bucket}={count}" for bucket, count in sorted(review_census.items()))
+          print(f"review-enumeration census over {sum(review_census.values())} drafted "
+                f"already-reviewed worker PR(s): {census_detail or 'none'}")
           PY
 
       - name: Upload immutable plan artifact (pinned)
@@ -900,43 +1286,22 @@ jobs:
       # {owner: token} JSON map (_target_token resolves per repo owner). Each mint is
       # continue-on-error: a missing install for one owner only skips THAT owner's mutation paths;
       # the other owner's dispatch + the issue dispatch for both continue.
+      # The scoping itself is groom.py --print-owner-repos --target-repos-env (issue #273): the
+      # same SELF-TESTED resolver groom/curate/conflict-resolver already use, reading the manifest
+      # instead of policy. It collects EVERY manifest repo per owner — not one representative name,
+      # which would scope that owner's token to a single repo and 404 every mutation on the
+      # owner's OTHER manifest repos (a supported manifest shape the exact-owner-set assertion
+      # does not constrain) — and it still fails LOUD unless the manifest owners are exactly
+      # {sparq-org, jeswr}, so adding an owner without a mint step dies here instead of silently
+      # dropping that owner's token. Repo names are not secret; tee keeps the scope in the log.
       - name: Resolve distinct target owners (per-owner token mint)
         id: owners
         env:
           TARGET_REPOS: ${{ env.DISPATCH_TARGET_REPOS }}
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import json
-          import os
-          import re
-
-          targets = json.loads(os.environ["TARGET_REPOS"])
-          safe = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*")
-          owners = {}
-          for repo in targets:
-              if not safe.fullmatch(repo):
-                  raise SystemExit("unsafe target repo in the manifest")
-              owner, name = repo.split("/", 1)
-              # Collect EVERY repository per owner (defect #120): keeping only one representative
-              # name scoped each owner's App token to a single repo, so any additional enabled
-              # repo under that owner passed the owner-set assertion but had all its mutations
-              # 404/unauthorized and deferred forever. The App-token action's `repositories`
-              # input accepts the full comma-separated list.
-              names = owners.setdefault(owner, [])
-              if name not in names:
-                  names.append(name)
-          # The mint steps below are static (two known owners); assert the manifest owners are
-          # exactly {sparq-org, jeswr} so a manifest change fails LOUD here instead of silently
-          # dropping a new owner's token (which would reintroduce the wrong-owner-token bug).
-          if set(owners) != {"sparq-org", "jeswr"}:
-              raise SystemExit(f"unexpected target owners {sorted(owners)}; add a mint step")
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-              # Comma-separated repo list per owner (GITHUB_OUTPUT is line-based; each name is
-              # already `safe`-validated so it can never contain a comma).
-              output.write(f"sparq_name={','.join(owners['sparq-org'])}\n")
-              output.write(f"jeswr_name={','.join(owners['jeswr'])}\n")
-          PY
+          python3 registry/scripts/groom.py --print-owner-repos \
+            --target-repos-env TARGET_REPOS | tee -a "$GITHUB_OUTPUT"
 
       - name: Mint sparq-org target-scoped App token (issue/PR mutations only)
         id: app-token-sparq
@@ -946,7 +1311,7 @@ jobs:
           app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
           private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
           owner: sparq-org
-          repositories: ${{ steps.owners.outputs.sparq_name }}
+          repositories: ${{ steps.owners.outputs.sparq_names }}
           permission-issues: write
           permission-pull-requests: write
 
@@ -958,7 +1323,7 @@ jobs:
           app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
           private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
           owner: jeswr
-          repositories: ${{ steps.owners.outputs.jeswr_name }}
+          repositories: ${{ steps.owners.outputs.jeswr_names }}
           permission-issues: write
           permission-pull-requests: write
 
@@ -1407,16 +1772,33 @@ jobs:
   # ZERO dispatching fleet-wide yet presents only as skipped jobs on a cron nobody watches. This
   # standalone job keys on `needs.plan.result` and, on failure/cancelled, upserts a rolling
   # `ops-alert` issue @-mentioning the maintainer via the SAME ALERT_REPO/ALERT_TOKEN routing the
-  # account-availability alert uses (locked decision 22c). It never runs when plan succeeds, so a
-  # healthy tick auto-closes any prior open plan-alert. No token or snapshot data reaches this job
-  # (it downloads no PLAN artifact); it only reads the plan JOB RESULT.
+  # account-availability alert uses (locked decision 22c). The JOB runs every tick; it is the
+  # SCRIPT that decides, so a healthy tick auto-closes any prior open plan-alert (as of #778 that
+  # needs BOTH stages green, not PLAN alone). No token or snapshot data reaches this job
+  # (it downloads no PLAN artifact); it only reads the plan/claim JOB RESULTS.
+  #
+  # #778 extends the same argument to CLAIM. GitHub does NOT run a job's `if: always()` steps once
+  # the JOB itself is cancelled (its own `timeout-minutes`, or a run-level cancel), and CLAIM hosts
+  # the CAS lease claim, the worker launch AND the `always()` per-tick telemetry recorder (#756).
+  # Measured on run 30245515435: PLAN success, then CLAIM cancelled at exactly 1200 s
+  # (timeout-minutes 15 + GitHub's 5-minute post-cancel grace); the CAS-claim step never finished
+  # and the telemetry step never ran. The run-level conclusion was `cancelled` — identical to the
+  # 116/117 cancellations in that window that were FREE concurrency coalescing with zero started
+  # jobs, so no run-conclusion aggregate can see it. Worse: PLAN had SUCCEEDED, so the PLAN-only
+  # decision CLOSED any open alert on the very tick CLAIM died mid-write. Hence `needs: claim` and
+  # CLAIM_RESULT below — the ONLY way to observe a cancelled job is from outside it.
   plan-alert:
-    name: ALERT (hard PLAN-job failure)
-    needs: [plan, secrets-guard]
-    # Runs every tick regardless of the PLAN result so a healthy PLAN can auto-close a prior
-    # alert; scripts/plan-alert.py keys on needs.plan.result — close happens ONLY on an explicit
-    # success (a skipped PLAN is not a recovery, review r1), and a success tick with no open alert
-    # does only a bare `gh issue list`, so a green tick stays cheap and side-effect-free.
+    name: ALERT (hard PLAN/CLAIM termination)
+    # `claim` is a dependency purely to READ its result. `always()` keeps this job running when
+    # claim fails/cancels/skips. It costs ~6 s serialized after CLAIM (measured ALERT median 6.4 s
+    # over 25 runs) on a ~595 s tick.
+    needs: [plan, secrets-guard, claim]
+    # Runs every tick regardless of the PLAN/CLAIM results so a healthy tick can auto-close a prior
+    # alert; scripts/plan-alert.py keys on needs.plan.result + needs.claim.result — close happens
+    # ONLY when BOTH are an explicit success (a skipped stage is not a recovery, review r1; and a
+    # green PLAN must not close an alert while CLAIM is what died, #778), and a success tick with
+    # no open alert does only a bare `gh issue list`, so a green tick stays cheap and
+    # side-effect-free.
     # secrets-guard gate (issue #101 review round 1): this job mounts ALERT_TOKEN/ALERT_REPO, so
     # it must NOT run while the secret-exfil settings are unverified — a guard failure skips it
     # (fail closed; the guard-red tick is itself the loud signal).
@@ -1450,6 +1832,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REGISTRY_REPO: ${{ github.repository }}
           PLAN_RESULT: ${{ needs.plan.result }}
+          # #778: the CLAIM result is the ONLY in-run signal that the lease/launch half of the
+          # tick died. Its `always()` telemetry step cannot report its own cancellation.
+          CLAIM_RESULT: ${{ needs.claim.result }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           MAINTAINER_HANDLE: jeswr
           # Privacy routing (locked decision 22c): scripts/plan-alert.py routes to a maintainer-set

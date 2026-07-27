@@ -143,13 +143,22 @@ PY
 # the separate no-target-code model_health job. That job expands this envelope into typed ledger
 # fields; the envelope itself is never stored. Missing telemetry stays absent (best effort), while
 # the target issue is always present so same-task repetition cannot masquerade as account capping.
+#
+# [OPUS-5 #701] The envelope also carries `why:<index>` — the model's own declared reason it
+# produced no diff, from the CLOSED vocabulary in scripts/no_change_routing.py. It travels as an
+# INDEX, not a word, so this protocol boundary stays ASCII-decimal: the declaration file is written
+# by the MODEL, and a free-text reason here would be the one field able to carry model-chosen text
+# into the public health ledger and the maintainer-facing escalation comment. An absent, unreadable
+# or out-of-vocabulary declaration is index 0 (`unspecified`) — never a decompose-triggering value.
 _no_change_health_envelope() {
-  local telemetry_file=$1 issue_number=$2
-  python3 - "$telemetry_file" "$issue_number" <<'PY'
+  local telemetry_file=$1 issue_number=$2 declaration_file=${3:-}
+  python3 - "$telemetry_file" "$issue_number" "$declaration_file" \
+           "$SCRIPT_DIR/no_change_routing.py" <<'PY'
+import importlib.util
 import json
 import sys
 
-path, issue_raw = sys.argv[1:]
+path, issue_raw, declaration_path, routing_path = sys.argv[1:]
 if not issue_raw.isascii() or not issue_raw.isdigit() or not 1 <= int(issue_raw) <= 2_147_483_647:
     raise SystemExit(1)
 try:
@@ -158,7 +167,21 @@ try:
 except (OSError, ValueError):
     document = {}
 
-fields = [("issue", int(issue_raw))]
+# The vocabulary is IMPORTED from the module that also decodes it (model-health) and routes on it
+# (dispatch-claim); a second copy here could drift and silently renumber every stored reason.
+_spec = importlib.util.spec_from_file_location("registry_no_change_routing", routing_path)
+_routing = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_routing)
+try:
+    with open(declaration_path, encoding="utf-8") as handle:
+        declaration = handle.read(4096)
+except OSError:
+    declaration = ""
+why = _routing.reason_code(_routing.parse_declaration(declaration))
+
+# Index 0 (`unspecified`) is the ABSENCE of a signal, so it is omitted rather than stored: a
+# present `why_no_diff` in the ledger then means the model actually declared one.
+fields = [("issue", int(issue_raw))] + ([("why", why)] if why else [])
 usage = document.get("usage") if isinstance(document, dict) else None
 if isinstance(usage, dict):
     for source, name in (("input_tokens", "input"), ("output_tokens", "output")):
@@ -471,6 +494,11 @@ Orchestration contract (overrides any interactive/worktree/PR instructions in th
   `.worker-followups.jsonl` in the repo root: {{"title": "concise title", "body": "why / what",
   "labels": ["kind:bug"]}}. The worker files these as deduplicated, back-linked follow-up issues.
   Do NOT implement them here, and do not reference this file anywhere else (it is never committed).
+- IF YOU END UP MAKING NO CHANGE AT ALL: before you finish, write a file named
+  `.worker-no-diff.json` in the repo root: {{"why": "<one of: underspecified, blocked_on_decision,
+  too_large, already_done, other>", "detail": "one sentence"}}. `why` MUST be exactly one of those
+  five words. This is the ONLY record of why the attempt produced nothing; without it the same task
+  is simply retried. Write it only when you are returning no edits — it is never committed.
 
 === TASK-SPECIFIC CONTEXT (everything above this marker is identical across tasks) ===
 
@@ -483,6 +511,27 @@ Target issue #{issue.get('number')}: {title}
 Path(prompt_path).write_text(prompt, encoding="utf-8")
 Path(prompt_path).chmod(0o600)
 PY
+}
+
+# [OPUS-5 #701] Lift the model's declared no-diff reason OUT of the target tree.
+#
+# ORDER IS LOAD-BEARING: run_model calls this BEFORE `git status --porcelain` decides whether the
+# run produced changes. `.worker-no-diff.json` is an untracked file, so leaving it in the tree would
+# make the very act of explaining "I produced no diff" register AS a diff — the run would publish a
+# PR whose entire content is the explanation, and the no_change signal this whole mechanism routes
+# on would never be emitted. Same lift, same reason, and the same "never committed" property as
+# `.worker-followups.jsonl` above it.
+#
+# The stale-file `rm` is not decoration: a re-run inside one job reuses $WORKER_ROOT, and a leftover
+# declaration from a previous attempt would attribute the wrong reason to this one.
+_lift_no_diff_declaration() {
+  rm -f "${WORKER_ROOT:?}/no-diff.json"
+  if [[ -f "${TARGET_DIR:-.}/.worker-no-diff.json" && ! -L "${TARGET_DIR:-.}/.worker-no-diff.json" ]]
+  then
+    mkdir -p "${WORKER_ROOT:?}"
+    mv -f "${TARGET_DIR:-.}/.worker-no-diff.json" "$WORKER_ROOT/no-diff.json"
+    printf 'worker-live: lifted the model-declared no-diff reason out of the tree\n'
+  fi
 }
 
 run_model() {
@@ -520,12 +569,13 @@ run_model() {
     printf 'worker-live: lifted %s model-declared follow-up line(s) out of the tree\n' \
       "$(wc -l < "$WORKER_ROOT/followups.jsonl" 2>/dev/null || echo 0)"
   fi
+  _lift_no_diff_declaration
   [[ "$(git rev-parse HEAD)" == "$base_sha" ]] || die 'model created commits; worker requires edits only'
   [[ -z "$(git status --porcelain=v1 -- .beads 2>/dev/null)" ]] || die 'model modified forbidden .beads state'
   if [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]]; then
     local no_change_envelope
     no_change_envelope=$(_no_change_health_envelope \
-      "$worker_root/usage-telemetry.json" "$issue_number") ||
+      "$worker_root/usage-telemetry.json" "$issue_number" "$worker_root/no-diff.json") ||
       no_change_envelope="no-change-v1 issue:$issue_number"
     if [[ -n ${GITHUB_ENV:-} ]]; then
       {
@@ -963,6 +1013,61 @@ _workflow_step_if() {
   ' "$file"
 }
 
+# PURE (self-tested): print a workflow step's FULL text — its `- name:` line through the line
+# before the next `- name:` — selected by its exact `id:`. The `if:`-only extractor above cannot
+# see a step's `run:` block, but the #568 trust-root property is about WHICH program the
+# pre-publish re-check executes and in WHICH ORDER the claim step writes, and both live in the
+# body. Empty when the step is absent. (Comment lines that sit BETWEEN steps buffer with the
+# PRECEDING step — assertions must match text inside the step, e.g. flags in its run block, not
+# prose in surrounding comments.)
+_workflow_step_body() {
+  local file="$1" id="$2"
+  [[ -f "$file" ]] || { printf 'worker-live: workflow file missing: %s\n' "$file" >&2; return 1; }
+  awk -v id="$id" '
+    /^[[:space:]]*-[[:space:]]+name:/ {
+      if (started && has_id) { printf "%s", buf; found=1; exit }
+      started=1; has_id=0; buf=""
+    }
+    started { buf = buf $0 "\n" }
+    started && $0 ~ ("^[[:space:]]*id:[[:space:]]*" id "[[:space:]]*$") { has_id=1 }
+    END { if (started && has_id && !found) printf "%s", buf }
+  ' "$file"
+}
+
+# PURE (self-tested): print ONLY the shell script inside a step's `run: |` block, dedented to
+# column 0 — i.e. the exact program the runner executes for that step. [#568 review r1] Text
+# assertions can prove which paths a step MENTIONS; the trust-root property is that a driver
+# swapped after the pin never RUNS, which only executing the real block can demonstrate. Empty for
+# an unknown id or a step with no `run:` block (fail-closed: the caller's assertion then finds
+# nothing to prove and goes red rather than silently passing).
+_workflow_step_run() {
+  local file="$1" id="$2"
+  _workflow_step_body "$file" "$id" | awk '
+    !inrun && /^[[:space:]]*run:[[:space:]]*\|[[:space:]]*$/ { inrun=1; next }
+    inrun {
+      if (indent == "" && $0 ~ /[^[:space:]]/) {
+        match($0, /^[[:space:]]*/); indent = substr($0, 1, RLENGTH)
+      }
+      sub("^" indent, ""); print
+    }'
+}
+
+# PURE (self-tested): print the JOB a workflow step belongs to, selected by its exact `id:` — the
+# job key (a two-space-indented mapping key) most recently seen above it. [#568 + #575] Which JOB a
+# trust-sensitive step lives in is now itself a security property: the pre-publish re-check is sound
+# because it runs in the isolated `publish` job, where no target code has ever executed, and would
+# be unsound back in the `worker` job beside the hostile gate. Text assertions on the step's body
+# cannot see that; this can. Empty when the step is absent (fail-closed: the caller's assertion then
+# finds nothing to prove and goes red rather than silently passing).
+_workflow_step_job() {
+  local file="$1" id="$2"
+  [[ -f "$file" ]] || { printf 'worker-live: workflow file missing: %s\n' "$file" >&2; return 1; }
+  awk -v id="$id" '
+    /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { job=$0; sub(/^[[:space:]]*/,"",job); sub(/:.*$/,"",job); next }
+    $0 ~ ("^[[:space:]]*id:[[:space:]]*" id "[[:space:]]*$") { print job; exit }
+  ' "$file"
+}
+
 # PURE (self-tested): print every `GH_TOKEN:` assignment that appears AFTER the hostile gate step
 # and BEFORE the next job begins. Issue #575's whole finding is that gated, target-controlled code
 # ran in the same job as a token-bearing publisher; the invariant this encodes is that the worker
@@ -980,17 +1085,103 @@ _tokens_after_gate() {
 # [issue #140 review r1] The gate below FAILS CLOSED when a workflow changed and actionlint is
 # unavailable — so the worker lane must be able to provision actionlint itself, or every legitimate
 # workflow change dies at `command -v`. Provisioning mirrors .github/workflows/pr-gate.yml: the
-# SAME pinned release version + tarball sha256 (keep the two in sync when bumping). The pins are
-# hard-coded here and never read from the environment, so nothing PR- or env-controlled can swap
-# in a different artifact; a failed download, a checksum mismatch, or an arch with no pinned
-# checksum REFUSES and the gate still dies (the fail-closed behaviour is preserved, not weakened).
+# SAME pinned release version + tarball sha256. A failed download, a checksum mismatch, or an arch
+# with no pinned checksum REFUSES and the gate still dies (the fail-closed behaviour is preserved,
+# not weakened).
 # [#428 review r2] The EXTRACTED binary is pinned too (BIN sha, of the `actionlint` file inside
 # the pinned tarball) — it is what the cache fast path re-verifies on every reuse, so cached bytes
-# sit inside the same checksum boundary as a fresh download. When bumping the version, update BOTH
-# digests: tarball sha from the release checksums, binary sha via sha256sum of the extracted file.
-_ACTIONLINT_VERSION=1.7.7
-_ACTIONLINT_SHA256_LINUX_AMD64=023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757
-_ACTIONLINT_BIN_SHA256_LINUX_AMD64=9f7dedb4e23f89f2922073d1a6720405b7b520d4f5832ebb96f0d55a2958886c
+# sit inside the same checksum boundary as a fresh download.
+# [issue #431] Those pins used to be hard-coded HERE **and** in pr-gate.yml, so a bump could drift
+# the two lint lanes onto different actionlints. They now live in exactly one place —
+# scripts/actionlint.pin — which both lanes PARSE (never source). Still checked-in, still never
+# env-supplied: the path below is derived from SCRIPT_DIR, not from the environment, so nothing
+# PR- or env-controlled can swap in a different artifact.
+_ACTIONLINT_PIN_FILE="$SCRIPT_DIR/actionlint.pin"
+
+# PURE (self-tested): _actionlint_pin <key> [pin-file] — print the single-source pinned value for
+# KEY. REFUSES (rc 1, nothing printed) when the key is not one of the three known pins, the file is
+# missing, the key does not appear EXACTLY once, or its value does not match that key's exact shape
+# (dotted-numeric version / 64 lowercase hex). The file is parsed, NEVER sourced — a value can only
+# ever be a version or a digest, so a poisoned pin file cannot inject shell. Refusing is fail
+# closed: the caller cannot then fetch an artifact it would be unable to verify, and the gate dies
+# exactly as it does when actionlint is simply absent.
+_actionlint_pin() {
+  local key=$1 file=${2:-$_ACTIONLINT_PIN_FILE} pattern line
+  case "$key" in
+    ACTIONLINT_VERSION) pattern='[0-9]+(\.[0-9]+)*' ;;
+    ACTIONLINT_TARBALL_SHA256_LINUX_AMD64|ACTIONLINT_BIN_SHA256_LINUX_AMD64) pattern='[0-9a-f]{64}' ;;
+    *) return 1 ;;
+  esac
+  [[ -f "$file" ]] || return 1
+  local -a keyed=()
+  mapfile -t keyed < <(grep -E "^${key}=" -- "$file" || true)
+  # exactly once: a duplicated key must not let a well-formed line launder a malformed sibling
+  [[ ${#keyed[@]} -eq 1 ]] || return 1
+  line=${keyed[0]}
+  [[ "$line" =~ ^${key}=${pattern}$ ]] || return 1
+  printf '%s\n' "${line#*=}"
+}
+
+# [issue #431] PURE (self-tested): assert a lint lane's workflow takes its actionlint pin from the
+# single-source pin file and keeps NO copy of its own. Fails (rc 1, naming the reason) when the
+# workflow does not parse, when it has no actionlint provisioning step at all, when such a step
+# never reads the pin file, or when it carries a literal 64-hex checksum or a literal x.y.z version
+# — i.e. exactly the drift this check exists to prevent. Fail-closed in both the unparseable and
+# the no-step-found directions: a renamed/restructured provisioning step must be re-verified by a
+# human, not silently pass.
+_assert_actionlint_pin_single_sourced() {
+  local workflow=$1 pin_rel=${2:-scripts/actionlint.pin}
+  python3 - "$workflow" "$pin_rel" <<'PY'
+import re
+import sys
+
+import yaml
+
+workflow, pin_rel = sys.argv[1:3]
+HEX64 = re.compile(r"(?<![0-9a-f])[0-9a-f]{64}(?![0-9a-f])")
+VERSION = re.compile(r"(?<![\w.])[0-9]+\.[0-9]+\.[0-9]+(?![\w.])")
+
+try:
+    with open(workflow, encoding="utf-8") as handle:
+        doc = yaml.safe_load(handle)
+except Exception as exc:  # unparseable == unverifiable == refuse
+    print(f"actionlint pin: {workflow} does not parse: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def run_bodies(node):
+    if isinstance(node, dict):
+        body = node.get("run")
+        if isinstance(body, str):
+            yield body
+        for value in node.values():
+            yield from run_bodies(value)
+    elif isinstance(node, list):
+        for item in node:
+            yield from run_bodies(item)
+
+
+provisioning = [b for b in run_bodies(doc)
+                if "actionlint" in b and ("releases/download" in b or "sha256sum" in b)]
+if not provisioning:
+    print(f"actionlint pin: {workflow} has no actionlint provisioning step to check "
+          "(fail closed)", file=sys.stderr)
+    raise SystemExit(1)
+
+faults = []
+for body in provisioning:
+    if pin_rel not in body:
+        faults.append(f"an actionlint provisioning step does not read {pin_rel}")
+    if HEX64.search(body):
+        faults.append("an actionlint provisioning step carries a hard-coded 64-hex checksum")
+    if VERSION.search(body):
+        faults.append("an actionlint provisioning step carries a hard-coded x.y.z version")
+if faults:
+    for fault in sorted(set(faults)):
+        print(f"actionlint pin: {workflow}: {fault}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
 
 # _fetch_pinned_actionlint <dest_dir> <url> <tar_sha256> <bin_sha256>: download → sha256-verify
 # the tarball → extract into a FRESH temp dir → sha256-verify the extracted binary → atomically
@@ -999,7 +1190,7 @@ _ACTIONLINT_BIN_SHA256_LINUX_AMD64=9f7dedb4e23f89f2922073d1a6720405b7b520d4f5832
 # any pre-existing dest binary, so a failed/partial provisioning can never leave bytes behind for
 # the cache fast path to trust. url/sha params exist only so the self-test can prove the accept
 # AND the refuse directions offline via file:// fixtures; the production caller
-# (_ensure_actionlint) always passes the hard-coded pins above.
+# (_ensure_actionlint) always passes the single-source pins from scripts/actionlint.pin.
 _fetch_pinned_actionlint() {
   local dest=$1 url=$2 tar_sha256=$3 bin_sha256=$4
   local tmpdir
@@ -1044,15 +1235,26 @@ _fetch_pinned_actionlint_unpack() {
 # params exist only so the self-test can exercise the cache-verification and refusal paths offline
 # via fixtures; the sole production call site passes no arguments, so nothing PR- or
 # env-controlled can swap the pins.
+# [issue #431] The defaults are resolved from scripts/actionlint.pin on every call. That resolution
+# is itself fail-closed: an absent/duplicated/malformed pin REFUSES here rather than falling back
+# to some other version — there is no unpinned path to an actionlint binary.
 _ensure_actionlint() {
-  local bin_sha256=${1:-$_ACTIONLINT_BIN_SHA256_LINUX_AMD64}
-  local url=${2:-"https://github.com/rhysd/actionlint/releases/download/v${_ACTIONLINT_VERSION}/actionlint_${_ACTIONLINT_VERSION}_linux_amd64.tar.gz"}
-  local tar_sha256=${3:-$_ACTIONLINT_SHA256_LINUX_AMD64}
   if command -v actionlint >/dev/null 2>&1; then
     command -v actionlint
     return 0
   fi
-  local cache="${WORKER_TOOL_CACHE:-${HOME:-/tmp}/.cache/worker-tools}/actionlint-${_ACTIONLINT_VERSION}"
+  local version tar_pin bin_pin
+  if ! { version=$(_actionlint_pin ACTIONLINT_VERSION) \
+      && tar_pin=$(_actionlint_pin ACTIONLINT_TARBALL_SHA256_LINUX_AMD64) \
+      && bin_pin=$(_actionlint_pin ACTIONLINT_BIN_SHA256_LINUX_AMD64); }; then
+    printf 'worker-live: actionlint pin %s is missing or malformed (refusing)\n' \
+      "$_ACTIONLINT_PIN_FILE" >&2
+    return 1
+  fi
+  local bin_sha256=${1:-$bin_pin}
+  local url=${2:-"https://github.com/rhysd/actionlint/releases/download/v${version}/actionlint_${version}_linux_amd64.tar.gz"}
+  local tar_sha256=${3:-$tar_pin}
+  local cache="${WORKER_TOOL_CACHE:-${HOME:-/tmp}/.cache/worker-tools}/actionlint-${version}"
   if [[ -e "$cache/actionlint" ]]; then
     if [[ -x "$cache/actionlint" ]] \
         && printf '%s  %s\n' "$bin_sha256" "$cache/actionlint" | sha256sum -c - >/dev/null 2>&1; then
@@ -1069,7 +1271,7 @@ _ensure_actionlint() {
     printf 'worker-live: no pinned actionlint checksum for arch %s (refusing)\n' "$(uname -m)" >&2
     return 1
   fi
-  printf 'worker-live: provisioning pinned actionlint v%s (sha256-verified)\n' "$_ACTIONLINT_VERSION" >&2
+  printf 'worker-live: provisioning pinned actionlint v%s (sha256-verified)\n' "$version" >&2
   _fetch_pinned_actionlint "$cache" "$url" "$tar_sha256" "$bin_sha256"
 }
 
@@ -1141,8 +1343,9 @@ registry_selftest_gate() {
   #    linter; a yaml parse only proves the file is well-formed. Silently degrading to yaml-only when
   #    actionlint was absent let a semantically-broken trust-plane workflow pass the gate. The worker
   #    lane does not pre-install actionlint, so the gate provisions the pinned, sha256-verified
-  #    release itself (_ensure_actionlint — the same pin as pr-gate.yml) and FAILS CLOSED only when
-  #    neither a present nor a verifiably provisioned binary can be had.
+  #    release itself (_ensure_actionlint — [#431] from the same single-source scripts/actionlint.pin
+  #    pr-gate.yml reads, so the two lanes cannot lint with different actionlints) and FAILS CLOSED
+  #    only when neither a present nor a verifiably provisioned binary can be had.
   local actionlint_bin=''
   for t in "${targets[@]}"; do
     kind=${t%%:*}; name=${t#*:}
@@ -2324,6 +2527,42 @@ PY
   printf 'worker-live: wrote the full refreshed credential back to the account secret (env dispatch-secrets)\n'
 }
 
+# PURE (self-tested): print the step id of every `worker`-job token mint that does NOT disable
+# the action's token-revocation post phase. Expected output is EMPTY.
+#
+# WHY (PR #310 round 3 blocker, the gap #575 left open). actions/create-github-app-token by
+# default registers a POST-job phase that REVOKES the installation token — authenticating WITH
+# that token. GitHub runs action post phases after ALL normal steps, i.e. AFTER the hostile gate
+# has executed target-controlled build scripts and tests on this runner. So a mint that stays
+# silent about revocation puts a credential-bearing process on the runner strictly later than
+# the gate: exactly the shape `_tokens_after_gate` exists to ban, but invisible to it, because
+# no `GH_TOKEN:` ever appears in the workflow text — the action supplies the token internally.
+# Every worker-job mint must therefore set `skip-token-revoke: true` and rely on the 60-minute
+# installation TTL plus narrow scoping instead. The isolated `publish`/`final_state` jobs keep
+# the default revoker: no target code ever runs there.
+#
+# Job boundary is a two-space-indented key (same convention as `_tokens_after_gate`), so the
+# clean jobs' own legitimate, revoking mints are deliberately not counted.
+_worker_mints_missing_revoke_skip() {
+  awk '
+    /^  [A-Za-z0-9_-]+:[[:space:]]*$/ {
+      if (injob && mint && !skip) print id
+      mint=0; skip=0; id="(unnamed)"
+      injob = ($0 ~ /^  worker:[[:space:]]*$/)
+      next
+    }
+    !injob { next }
+    /^      -[[:space:]]/ {
+      if (mint && !skip) print id
+      mint=0; skip=0; id="(unnamed)"
+    }
+    /^[[:space:]]*id:[[:space:]]/ { ln=$0; sub(/^[[:space:]]*id:[[:space:]]*/,"",ln); id=ln }
+    /^[[:space:]]*uses:[[:space:]]*actions\/create-github-app-token@/ { mint=1 }
+    /^[[:space:]]*skip-token-revoke:[[:space:]]*true[[:space:]]*$/ { skip=1 }
+    END { if (injob && mint && !skip) print id }
+  ' "$1"
+}
+
 # Non-vacuous host-side self-test: provider-model argv selection, telemetry extraction (claude
 # stream-json + codex --json fixtures, privacy: no transcript content crosses), and task-prompt
 # prefix stability (byte-identical static head across two different issues, variance only below
@@ -2609,6 +2848,91 @@ print(d["usage"]["input_tokens"], d["usage"]["cache_read_input_tokens"],
     "$(sed "1,/^$marker/d" "$tmp/prompt-a.txt" | grep -c 'Target issue #101: first task')" "1"
   chk "empty packages fall back to global scope" \
     "$(sed "1,/^$marker/d" "$tmp/prompt-b.txt" | grep -c 'cross-cutting/global')" "1"
+
+  # === [OPUS-5 #701] why_no_diff: the model's declared reason for producing no diff =============
+  # (1) The task prompt must ASK for it — with the exact closed vocabulary the ledger validates
+  #     against, or every declaration decodes to `unspecified` and the routing signal is dead.
+  chk "the task prompt asks for a .worker-no-diff.json declaration" \
+    "$(grep -c '.worker-no-diff.json' "$tmp/prompt-a.txt")" "1"
+  local _nc_vocab
+  _nc_vocab=$(python3 -c 'import importlib.util,sys
+s=importlib.util.spec_from_file_location("m",sys.argv[1]);m=importlib.util.module_from_spec(s)
+s.loader.exec_module(m)
+print(", ".join(v for v in m.NO_CHANGE_REASONS if v != "unspecified"))' "$SCRIPT_DIR/no_change_routing.py")
+  # Whitespace-normalised: the clause wraps across lines in the brief, and what must not drift is
+  # the VOCABULARY, not the line breaks. Adding a reason to the module without offering it here
+  # (or renaming one) turns this red — the model can only declare words this clause names.
+  chk "the prompt offers exactly the module's declarable vocabulary" \
+    "$(tr -s '[:space:]' ' ' < "$tmp/prompt-a.txt" | grep -cF "one of: $_nc_vocab")" "1"
+
+  # (2) THE ORDER PROPERTY. The lift must run BEFORE the change detection, or writing the
+  #     explanation IS a change and the run publishes a PR containing only the explanation.
+  #     Checked on the line positions inside run_model's own body, so MOVING the call below the
+  #     detection (not just deleting it) turns this red.
+  local _rm_body _lift_at _detect_at
+  _rm_body=$(sed -n '/^run_model() {/,/^}/p' "$SCRIPT_DIR/worker-live.sh")
+  # `|| true` on both: a DELETED call must be reported as a named MISORDERED failure, not abort the
+  # whole suite via `set -e` on grep's exit 1 — an abort here would also skip every later check,
+  # which is how one deletion hides a second defect. (Measured: the first draft did exactly that.)
+  _lift_at=$(grep -n '_lift_no_diff_declaration' <<< "$_rm_body" | head -n1 | cut -d: -f1 || true)
+  _detect_at=$(grep -n 'git status --porcelain=v1 --untracked-files=all' <<< "$_rm_body" \
+    | head -n1 | cut -d: -f1 || true)
+  chk "run_model lifts the no-diff declaration BEFORE it detects changes" \
+    "$([[ -n "$_lift_at" && -n "$_detect_at" && "$_lift_at" -lt "$_detect_at" ]] \
+      && echo before || echo "MISORDERED($_lift_at,$_detect_at)")" "before"
+
+  # (3) THE LIFT ITSELF, executed: a declaration alone must leave a clean tree.
+  local _nd_repo="$tmp/nodiff-repo"
+  mkdir -p "$_nd_repo" && (
+    cd "$_nd_repo" && git init -q . && git config user.email t@e && git config user.name t \
+      && printf 'x\n' > tracked && git add tracked && git commit -qm base
+  )
+  printf '{"why": "too_large", "detail": "needs decomposition"}\n' > "$_nd_repo/.worker-no-diff.json"
+  chk "an unlifted declaration WOULD register as a repository change" \
+    "$( (cd "$_nd_repo" && git status --porcelain=v1 --untracked-files=all | wc -l) )" "1"
+  ( TARGET_DIR="$_nd_repo" WORKER_ROOT="$tmp/nodiff-root" _lift_no_diff_declaration >/dev/null )
+  chk "after the lift the tree is clean (the run still classifies as no_change)" \
+    "$( (cd "$_nd_repo" && git status --porcelain=v1 --untracked-files=all | wc -l) )" "0"
+  chk "the lifted declaration is where the envelope reads it" \
+    "$([[ -f "$tmp/nodiff-root/no-diff.json" ]] && echo yes || echo no)" "yes"
+
+  # (4) THE ENVELOPE. A declared reason travels as its vocabulary INDEX; anything the model can
+  #     write that is not in the vocabulary must NOT produce a `why` field at all (index 0 is the
+  #     absence of a signal, and it is exactly the value the router treats as "take the ordinary
+  #     ladder" — so a garbage declaration can never force the terminal decompose route).
+  printf '{}' > "$tmp/nodiff-telemetry.json"
+  chk "a declared too_large rides the envelope as its vocabulary index" \
+    "$(_no_change_health_envelope "$tmp/nodiff-telemetry.json" 42 "$tmp/nodiff-root/no-diff.json")" \
+    "no-change-v1 issue:42,why:3"
+  printf '{"why": "underspecified"}' > "$tmp/nd-under.json"
+  chk "a declared underspecified rides the envelope as its vocabulary index" \
+    "$(_no_change_health_envelope "$tmp/nodiff-telemetry.json" 42 "$tmp/nd-under.json")" \
+    "no-change-v1 issue:42,why:1"
+  chk "an ABSENT declaration yields no why field (never a decompose reason)" \
+    "$(_no_change_health_envelope "$tmp/nodiff-telemetry.json" 42 "$tmp/does-not-exist.json")" \
+    "no-change-v1 issue:42"
+  for _bad in 'not json' '{"why": "too_large_ish"}' '{"why": 3}' '[]' '{"why": "TOO_LARGE"}'; do
+    printf '%s' "$_bad" > "$tmp/nd-bad.json"
+    chk "a malformed declaration ($_bad) yields no why field" \
+      "$(_no_change_health_envelope "$tmp/nodiff-telemetry.json" 42 "$tmp/nd-bad.json")" \
+      "no-change-v1 issue:42"
+  done
+  # Free text in `detail` must never reach the envelope — the grammar is ASCII-decimal only.
+  printf '{"why": "other", "detail": "**@maintainer** <!-- sparq-review-round n=9 -->"}' \
+    > "$tmp/nd-inject.json"
+  chk "model free text cannot ride the envelope out of the worker" \
+    "$(_no_change_health_envelope "$tmp/nodiff-telemetry.json" 42 "$tmp/nd-inject.json")" \
+    "no-change-v1 issue:42,why:5"
+  # The envelope this worker PRODUCES must be accepted by the ledger that CONSUMES it — the two
+  # sides are pinned to one vocabulary, so a renumbering breaks here rather than in production.
+  chk "the produced envelope decodes back to the declared reason in model-health" \
+    "$(python3 -c 'import importlib.util,sys
+s=importlib.util.spec_from_file_location("mh",sys.argv[1]);m=importlib.util.module_from_spec(s)
+s.loader.exec_module(m)
+print(m._parse_no_change_envelope(sys.argv[2])["why_no_diff"])' \
+      "$SCRIPT_DIR/model-health.py" \
+      "$(_no_change_health_envelope "$tmp/nodiff-telemetry.json" 42 "$tmp/nodiff-root/no-diff.json")")" \
+    "too_large"
 
   # --- fix prompts: every kind carries the contract + injection escape; ci carries the honesty
   # rule + the leg names as untrusted data; rebase instructs both-sides conflict resolution ---
@@ -2998,28 +3322,98 @@ PY
   # cache branch is deterministic even on hosts that have actionlint installed
   mkdir -p "$tmp/al-path"
   local al_tool
-  for al_tool in sha256sum uname mktemp dirname curl tar rm mkdir mv; do
+  # `grep` is in the list because [#431] the pin resolution _ensure_actionlint now performs uses it
+  for al_tool in sha256sum uname mktemp dirname curl tar rm mkdir mv grep; do
     ln -sf "$(command -v "$al_tool")" "$tmp/al-path/$al_tool"
   done
-  mkdir -p "$tmp/al-cache/actionlint-${_ACTIONLINT_VERSION}"
-  cp "$tmp/al-src/actionlint" "$tmp/al-cache/actionlint-${_ACTIONLINT_VERSION}/actionlint"
-  chmod +x "$tmp/al-cache/actionlint-${_ACTIONLINT_VERSION}/actionlint"
+  # the cache dir is named for the SINGLE-SOURCE pinned version — resolving it here (rather than
+  # hard-coding it) is itself part of the #431 contract under test
+  local al_ver
+  al_ver=$(_actionlint_pin ACTIONLINT_VERSION)
+  mkdir -p "$tmp/al-cache/actionlint-${al_ver}"
+  cp "$tmp/al-src/actionlint" "$tmp/al-cache/actionlint-${al_ver}/actionlint"
+  chmod +x "$tmp/al-cache/actionlint-${al_ver}/actionlint"
   chk "_ensure_actionlint reuses a cache copy that matches the pinned binary digest" \
     "$(PATH="$tmp/al-path" WORKER_TOOL_CACHE="$tmp/al-cache" \
        _ensure_actionlint "$al_bin_sha" "file://$tmp/no-such-artifact.tar.gz" "$al_tar_sha")" \
-    "$tmp/al-cache/actionlint-${_ACTIONLINT_VERSION}/actionlint"
+    "$tmp/al-cache/actionlint-${al_ver}/actionlint"
   # [r2] the cache fast path is INSIDE the checksum boundary: a tampered/truncated cache copy is
   # never trusted on executability alone — it is discarded, and with no verifiable download the
   # resolution refuses (fail closed) instead of executing it.
   printf '#!/usr/bin/env bash\necho tampered\n' \
-    > "$tmp/al-cache/actionlint-${_ACTIONLINT_VERSION}/actionlint"
+    > "$tmp/al-cache/actionlint-${al_ver}/actionlint"
   chk "_ensure_actionlint REFUSES a cached binary that fails the pinned digest" \
     "$(PATH="$tmp/al-path" WORKER_TOOL_CACHE="$tmp/al-cache" \
        _ensure_actionlint "$al_bin_sha" "file://$tmp/no-such-artifact.tar.gz" "$al_tar_sha" \
        2>/dev/null || echo refused)" "refused"
   chk "the tampered cache copy is discarded, not left for a later run to trust" \
-    "$([[ -e "$tmp/al-cache/actionlint-${_ACTIONLINT_VERSION}/actionlint" ]] && echo present || echo absent)" \
+    "$([[ -e "$tmp/al-cache/actionlint-${al_ver}/actionlint" ]] && echo present || echo absent)" \
     "absent"
+
+  # --- [issue #431] the actionlint pin is SINGLE-SOURCED in scripts/actionlint.pin. Two lanes
+  # provision actionlint — this script's _ensure_actionlint and .github/workflows/pr-gate.yml — and
+  # while each hard-coded its own copy of the version+checksum a bump could land in one and not the
+  # other, silently linting the same workflows with two different actionlints. Both directions are
+  # asserted: the real pin file parses into the three usable values, every malformed/duplicated/
+  # absent/unknown-key shape REFUSES (so a poisoned pin can never yield an unverifiable download),
+  # the REAL pr-gate.yml passes the single-source check, and a drifted fixture that re-inlines its
+  # own version+checksum FAILS it (that failure is what makes the check non-vacuous). ---
+  chk "the real pin file yields a usable pinned version" \
+    "$([[ "$(_actionlint_pin ACTIONLINT_VERSION)" =~ ^[0-9]+(\.[0-9]+)+$ ]] && echo ok || echo bad)" "ok"
+  chk "the real pin file yields a 64-hex tarball digest" \
+    "$([[ "$(_actionlint_pin ACTIONLINT_TARBALL_SHA256_LINUX_AMD64)" =~ ^[0-9a-f]{64}$ ]] \
+      && echo ok || echo bad)" "ok"
+  chk "the real pin file yields a 64-hex binary digest" \
+    "$([[ "$(_actionlint_pin ACTIONLINT_BIN_SHA256_LINUX_AMD64)" =~ ^[0-9a-f]{64}$ ]] \
+      && echo ok || echo bad)" "ok"
+  chk "an unknown pin key is refused (no silent empty value)" \
+    "$(_actionlint_pin ACTIONLINT_TOTALLY_MADE_UP 2>/dev/null || echo refused)" "refused"
+  chk "a missing pin file is refused" \
+    "$(_actionlint_pin ACTIONLINT_VERSION "$tmp/no-such.pin" 2>/dev/null || echo refused)" "refused"
+  printf 'ACTIONLINT_VERSION=1.7.7\n' > "$tmp/pin-ok.pin"
+  chk "a well-formed fixture pin parses (the refusals below are not vacuous)" \
+    "$(_actionlint_pin ACTIONLINT_VERSION "$tmp/pin-ok.pin" 2>/dev/null || echo refused)" "1.7.7"
+  printf 'ACTIONLINT_VERSION=1.7.7 ; rm -rf /\n' > "$tmp/pin-shell.pin"
+  chk "a pin value carrying shell metacharacters is refused, not passed through" \
+    "$(_actionlint_pin ACTIONLINT_VERSION "$tmp/pin-shell.pin" 2>/dev/null || echo refused)" "refused"
+  printf 'ACTIONLINT_VERSION=1.7.7\nACTIONLINT_VERSION=9.9.9\n' > "$tmp/pin-dup.pin"
+  chk "a DUPLICATED pin key is refused (a good line must not launder a second one)" \
+    "$(_actionlint_pin ACTIONLINT_VERSION "$tmp/pin-dup.pin" 2>/dev/null || echo refused)" "refused"
+  printf 'ACTIONLINT_TARBALL_SHA256_LINUX_AMD64=%s\n' "$(printf 'a%.0s' {1..63})" > "$tmp/pin-short.pin"
+  chk "a short (63-hex) digest pin is refused" \
+    "$(_actionlint_pin ACTIONLINT_TARBALL_SHA256_LINUX_AMD64 "$tmp/pin-short.pin" 2>/dev/null \
+      || echo refused)" "refused"
+  printf 'ACTIONLINT_VERSION=1.7.7\n' > "$tmp/pin-nokey.pin"
+  chk "an absent digest key is refused even when the file exists and parses" \
+    "$(_actionlint_pin ACTIONLINT_BIN_SHA256_LINUX_AMD64 "$tmp/pin-nokey.pin" 2>/dev/null \
+      || echo refused)" "refused"
+  # _ensure_actionlint inherits that refusal: with no actionlint on PATH and an unreadable pin there
+  # is NO fallback version to download — it refuses and the gate dies (fail closed), rather than
+  # silently provisioning some other actionlint.
+  chk "_ensure_actionlint REFUSES when the single-source pin cannot be read" \
+    "$( (PATH="$tmp/al-path" _ACTIONLINT_PIN_FILE="$tmp/no-such.pin" WORKER_TOOL_CACHE="$tmp/al-none" \
+        _ensure_actionlint "$al_bin_sha" "file://$tmp/al-good.tar.gz" "$al_tar_sha") 2>/dev/null \
+      || echo refused)" "refused"
+  # the drift guard itself, both directions
+  chk "the REAL pr-gate.yml takes its actionlint pin from scripts/actionlint.pin" \
+    "$(_assert_actionlint_pin_single_sourced "$SCRIPT_DIR/../.github/workflows/pr-gate.yml" \
+      >/dev/null 2>&1 && echo single-sourced || echo drifted)" "single-sourced"
+  { printf 'name: drift\non: push\njobs:\n  j:\n    runs-on: ubuntu-latest\n    steps:\n'
+    printf '      - name: Install actionlint\n        run: |\n'
+    printf '          ver=1.7.6\n'
+    printf '          sha256=%s\n' "$(printf 'b%.0s' {1..64})"
+    printf '          curl -fsSL -o /tmp/a.tgz "https://x/releases/download/v${ver}/actionlint.tgz"\n'
+    printf '          echo "${sha256}  /tmp/a.tgz" | sha256sum -c -\n'
+  } > "$tmp/al-drift.yml"
+  chk "a workflow that re-inlines its OWN actionlint version+checksum FAILS the check" \
+    "$(_assert_actionlint_pin_single_sourced "$tmp/al-drift.yml" >/dev/null 2>&1 \
+      && echo single-sourced || echo drifted)" "drifted"
+  { printf 'name: nostep\non: push\njobs:\n  j:\n    runs-on: ubuntu-latest\n    steps:\n'
+    printf '      - name: lint\n        run: actionlint -color\n'
+  } > "$tmp/al-nostep.yml"
+  chk "a workflow with NO actionlint provisioning step fails closed, not silently passes" \
+    "$(_assert_actionlint_pin_single_sourced "$tmp/al-nostep.yml" >/dev/null 2>&1 \
+      && echo single-sourced || echo drifted)" "drifted"
 
   # --- [issue #145] container base-image pin check (non-vacuous: a mutable-tag base FAILS). Proves
   # the real worker sandbox is digest-pinned, that an unpinned base is rejected, and that a
@@ -3121,6 +3515,29 @@ WFFIX
     "$(_tokens_after_gate "$wf_mutant" | wc -l | tr -d ' ')" "1"
   chk "#575 (LIVE): the pre-gate/post-model write-token mints are gone from the worker job" \
     "$(grep -Ec '^        id: app-token-(publish|post)$' "$wf" || true)" "0"
+
+  # --- [#126 round 3] The gap the scan above CANNOT see. `_tokens_after_gate` reads workflow
+  # TEXT, so it only catches a credential someone wrote down. create-github-app-token's default
+  # token-revocation POST phase writes nothing down and still runs a token-bearing process after
+  # ALL normal steps — i.e. after the hostile gate. Every worker-job mint must opt out of it. ---
+  chk "#126 (LIVE): every worker-job token mint disables the post-gate revocation phase" \
+    "$(_worker_mints_missing_revoke_skip "$wf" | wc -l | tr -d ' ')" "0"
+  # NON-VACUITY, both regression directions: an explicit opt-in (false) and silence (key absent)
+  # are each the shape that reopens the hole, and each must be reported.
+  local wf_revoke_false="$tmp/worker-revoke-false.yml" wf_revoke_absent="$tmp/worker-revoke-absent.yml"
+  sed 's/^          skip-token-revoke: true$/          skip-token-revoke: false/' "$wf" > "$wf_revoke_false"
+  sed '/^          skip-token-revoke: true$/d' "$wf" > "$wf_revoke_absent"
+  chk "#126: a worker-job mint with skip-token-revoke: false is REPORTED (non-vacuous)" \
+    "$(_worker_mints_missing_revoke_skip "$wf_revoke_false" | wc -l | tr -d ' ')" "2"
+  chk "#126: a worker-job mint SILENT about revocation is REPORTED (non-vacuous)" \
+    "$(_worker_mints_missing_revoke_skip "$wf_revoke_absent" | wc -l | tr -d ' ')" "2"
+  # ...and the scan is JOB-SCOPED, not a blanket rule: the isolated publish job's own mint
+  # legitimately keeps the default revoker (no target code runs there) and must NOT be reported.
+  # This is what proves the LIVE assertion above passes on merit rather than by scanning nothing.
+  chk "#126: the clean publish job's revoking mint is NOT flagged (scan is worker-job scoped)" \
+    "$(_worker_mints_missing_revoke_skip "$wf" | grep -c 'app-token-pub' || true)" "0"
+  chk "#126: ...and that publish-job mint really does exist to be skipped (control)" \
+    "$(grep -Ec '^        id: app-token-pub$' "$wf" || true)" "1"
   local verify_ln mint_ln
   verify_ln=$(grep -n 'worker-live\.sh verify-bundle' "$wf" | head -n1 | cut -d: -f1)
   mint_ln=$(grep -n '^        id: app-token-pub$' "$wf" | head -n1 | cut -d: -f1)
@@ -3129,6 +3546,511 @@ WFFIX
         && printf before || printf after-or-missing)" "before"
   chk "#575 (LIVE): the publisher takes its base from the PRE-GATE record, not the worker worktree" \
     "$(grep -Fc 'ref: ${{ needs.worker.outputs.bundle_base_sha }}' "$wf" || true)" "1"
+
+  # --- [issue #568] publish only ever runs from a snapshot re-attested IN THE FRESH PUBLISHER.
+  # The pre-model `trust` step ran before the (tens-of-minutes) model + gate, so the publish/PR
+  # step additionally gates on a `republish-trust` re-check that sits on the SAME gate-success
+  # publish path. Non-vacuous: dropping the extra gate flips the first assertion red; dropping the
+  # re-check step's own gate flips the second. Both use the per-step extractor already proven
+  # above. ---
+  chk "the publish/PR step is ALSO gated on the pre-publish trust re-check (issue #568)" \
+    "$(_workflow_step_if "$wf" pr | grep -Fc "steps.republish-trust.outcome == 'success'" || true)" "1"
+  chk "the pre-publish trust re-check runs on the gate-success publish path (issue #568)" \
+    "$(_workflow_step_if "$wf" republish-trust \
+       | grep -Fc "needs.worker.outputs.gate_outcome == 'success'" || true)" "1"
+  # ...and only on a bundle that VERIFIED, so a refused artifact aborts before the re-check spends
+  # an API round trip on an issue whose work can never be published anyway.
+  chk "the pre-publish trust re-check requires the bundle verification to have passed" \
+    "$(_workflow_step_if "$wf" republish-trust | grep -Fc "steps.verify.outcome == 'success'" || true)" "1"
+
+  # --- [issue #568 + #575] WHICH JOB the re-check runs in is itself the security property. On the
+  # worker runner it had to defend itself against the very host it executed on: the gate's
+  # target-controlled build scripts can rewrite the registry checkout beside it, which is why that
+  # placement needed a digest-pinned verifier SNAPSHOT under RUNNER_TEMP. In the isolated `publish`
+  # job no target code has ever executed, so the fresh checkouts ARE the trust root. Asserting the
+  # placement is what stops a future edit from quietly moving the re-check back next to the hostile
+  # gate — where #575's own `_tokens_after_gate` invariant would also break, since the re-check is
+  # necessarily token-bearing. Prove the extractor both ways on a fixture first, then the live
+  # property, with the gate step as the negative control (it MUST still be in `worker`). ---
+  local wf_jobfix="$tmp/step-job-fixture.yml"
+  cat > "$wf_jobfix" <<'WFJOB'
+jobs:
+  alpha_job:
+    steps:
+      - name: in the first job
+        id: in-alpha
+  beta_job:
+    steps:
+      - name: in the second job
+        id: in-beta
+WFJOB
+  chk "step-job extractor names the job a step belongs to (first job)" \
+    "$(_workflow_step_job "$wf_jobfix" in-alpha)" "alpha_job"
+  chk "step-job extractor tracks the job boundary (second job, non-vacuous)" \
+    "$(_workflow_step_job "$wf_jobfix" in-beta)" "beta_job"
+  chk "step-job extractor yields NOTHING for an unknown id (fail-closed)" \
+    "$(_workflow_step_job "$wf_jobfix" in-nothing | grep -c . || true)" "0"
+  chk "#568+#575 (LIVE): the pre-publish re-check runs in the ISOLATED publisher, not the worker" \
+    "$(_workflow_step_job "$wf" republish-trust)" "publish"
+  chk "#568+#575 (LIVE): ...and the hostile gate is still in the worker job (negative control)" \
+    "$(_workflow_step_job "$wf" gate)" "worker"
+  chk "#568+#575 (LIVE): the PR the re-check gates is in the publisher too (same clean runner)" \
+    "$(_workflow_step_job "$wf" pr)" "publish"
+
+  # --- [issue #568 + #575] the re-check's TRUST ROOT. It no longer executes a RUNNER_TEMP snapshot
+  # (a snapshot cannot cross runners, and in the publisher there is nothing to hide from): it runs
+  # the fresh checkouts, re-bound to the digests `pin-trust-gate` recorded PRE-MODEL in the worker
+  # job and carried across as job outputs. That binding is the load-bearing part — it upgrades "a
+  # fresh checkout is probably the same bytes" into a proof — and it covers BOTH halves plus the
+  # sibling the ownership CAS loads by path. First prove the body extractor on a fixture (per-step
+  # in both directions + fail-closed on an unknown id), then assert the property on the real
+  # workflow. The pre-model `trust` step doubles as the live negative control: it reverifies with
+  # its own checkout path and no digest binding at all (pre-model = nothing hostile has run yet), so
+  # the extractor demonstrably separates the two reverify call sites rather than matching anywhere
+  # in the file. ---
+  cat > "$tmp/wf-body.yml" <<'YAML'
+      - name: one
+        id: alpha
+        run: |
+          echo alpha-marker
+      - name: three
+        id: delta
+        uses: some/action@0000000000000000000000000000000000000000
+      - name: two
+        id: beta
+        run: |
+          echo beta-marker
+YAML
+  chk "step-body extractor returns ONLY the selected step's text (per-step, non-vacuous)" \
+    "$(_workflow_step_body "$tmp/wf-body.yml" alpha | grep -c 'marker' || true)" "1"
+  chk "step-body extractor reaches the file's LAST step too (END path)" \
+    "$(_workflow_step_body "$tmp/wf-body.yml" beta | grep -Fc 'beta-marker' || true)" "1"
+  chk "step-body extractor yields NOTHING for an unknown id (fail-closed)" \
+    "$(_workflow_step_body "$tmp/wf-body.yml" gamma | grep -c . || true)" "0"
+  chk "pre-publish re-check verifies with the PRE-GATE target checkout's own trust gate (#568)" \
+    "$(_workflow_step_body "$wf" republish-trust \
+       | grep -Fc "verifier='\${{ github.workspace }}/target/scripts/trust-gate.py'" || true)" "1"
+  # That path is only sound because the publisher's target checkout is pinned to the PRE-GATE base
+  # (asserted above) and the bundle is not applied until the `pr` step — so the gate program is the
+  # reviewed revision, never the candidate's. The digest re-binding below is what PROVES it rather
+  # than assuming it.
+  chk "pre-publish re-check NEVER takes its verifier from the candidate's bundle (issue #568)" \
+    "$(_workflow_step_body "$wf" republish-trust | grep -c 'publish-bundle/scripts' || true)" "0"
+  chk "pre-publish re-check declares the candidate-controlled root reverify must refuse (runtime)" \
+    "$(_workflow_step_body "$wf" republish-trust | grep -Fc -- '--forbid-gate-root "$forbidden"' || true)" "1"
+  # ...and that root is the ONE candidate-change-controlled tree in the publisher: the bundle. It
+  # comes from a runner-state EXPRESSION, not an env lookup a later step could redirect.
+  chk "the forbidden root is the bundle dir, from the runner.temp expression (not \$RUNNER_TEMP)" \
+    "$(_workflow_step_body "$wf" republish-trust \
+       | grep -Fc "forbidden='\${{ runner.temp }}/publish-bundle'" || true)" "1"
+  chk "pre-publish re-check re-binds the gate to the PRE-MODEL digest (cross-job, issue #568)" \
+    "$(_workflow_step_body "$wf" republish-trust \
+       | grep -Fc "expected='\${{ needs.worker.outputs.verifier_sha256 }}'" || true)" "1"
+  chk "pre-publish re-check enforces that digest with sha256sum --check --strict" \
+    "$(_workflow_step_body "$wf" republish-trust | grep -Fc 'sha256sum --check --strict' || true)" "1"
+  # An ABSENT pre-model digest (pin step skipped or failed) must REFUSE, not compare against
+  # nothing: without the 64-hex assertion an empty expectation would sail through sha256sum's own
+  # "no properly formatted lines" path or, worse, match an equally empty attestation downstream.
+  chk "pre-publish re-check refuses when the pre-model digests are MISSING (fail-closed)" \
+    "$(_workflow_step_run "$wf" republish-trust \
+       | grep -Fc 'pre-model verifier digest missing' || true)" "1"
+  chk "the worker job EXPORTS the pre-model digests the publisher binds to (the binding's far end)" \
+    "$(grep -Ec '^      verifier_(sha256|driver_sha256|policy_sha256): \$\{\{ steps\.pin-trust-gate\.outputs\.[a-z0-9_]+ \}\}$' "$wf" || true)" "3"
+  chk "verifier snapshot copies FROM the SHA-pinned pre-model checkout" \
+    "$(_workflow_step_body "$wf" pin-trust-gate \
+       | grep -Fc 'src="$GITHUB_WORKSPACE/target/scripts/trust-gate.py"' || true)" "1"
+
+  # --- [issue #568 review r1, carried to the publisher] The trust root is BOTH halves. Binding only
+  # the nested gate program would leave the DRIVER — the program that runs the live
+  # author/body/label/claim checks and decides whether to invoke that gate — unbound. On the worker
+  # runner that was exploitable (the gate's build scripts can rewrite `../registry/...` with an
+  # exit-zero impostor, and the re-check would "succeed" having re-attested nothing). In the
+  # publisher the driver comes from a checkout no target code has touched, so it is executed
+  # directly — but it is still digest-bound to the PRE-MODEL registry copy, which additionally
+  # proves the publisher did not check out some OTHER registry revision. The park_policy sibling
+  # `holds_live_claim` loads by path is bound on the same terms: an unbound module beside a
+  # digest-checked driver is the same impostor hole one level down. ---
+  chk "pre-publish re-check EXECUTES the digest-bound reverify driver (review r1)" \
+    "$(_workflow_step_run "$wf" republish-trust | grep -Fc '"$driver" reverify' || true)" "1"
+  chk "...and that driver is the publisher's OWN registry checkout (no target code ran there)" \
+    "$(_workflow_step_body "$wf" republish-trust \
+       | grep -Fc "driver='\${{ github.workspace }}/registry/scripts/worker-issue.py'" || true)" "1"
+  chk "the driver is re-bound to the PRE-MODEL recorded digest (review r1, cross-job)" \
+    "$(_workflow_step_body "$wf" republish-trust \
+       | grep -Fc "driver_expected='\${{ needs.worker.outputs.verifier_driver_sha256 }}'" || true)" "1"
+  chk "the park_policy sibling is bound too — the CAS closure, not just the entry point (r2)" \
+    "$(_workflow_step_body "$wf" republish-trust \
+       | grep -Fc "policy_expected='\${{ needs.worker.outputs.verifier_policy_sha256 }}'" || true)" "1"
+  chk "driver snapshot copies FROM the pre-model registry checkout (review r1)" \
+    "$(_workflow_step_body "$wf" pin-trust-gate \
+       | grep -Fc 'driver_src="$GITHUB_WORKSPACE/registry/scripts/worker-issue.py"' || true)" "1"
+  chk "pre-model trust step still reverifies with the pinned-checkout copy (negative control)" \
+    "$(_workflow_step_body "$wf" trust \
+       | grep -Fc -- '--trust-gate "$GITHUB_WORKSPACE/target/scripts/trust-gate.py"' || true)" "1"
+  chk "...and the pre-model trust step carries NO digest binding (the two sites really differ)" \
+    "$(_workflow_step_body "$wf" trust | grep -c 'sha256' || true)" "0"
+  # Capture ORDER is the immutability argument: the snapshot's content is trustworthy only because
+  # it is taken before any model code can run. Moving the pin step below the model step flips this.
+  local pin_at model_at
+  pin_at=$(awk '/^[[:space:]]*id:[[:space:]]*pin-trust-gate[[:space:]]*$/{print NR; exit}' "$wf")
+  model_at=$(awk '/^[[:space:]]*id:[[:space:]]*model[[:space:]]*$/{print NR; exit}' "$wf")
+  chk "verifier snapshot is captured BEFORE the model step runs" \
+    "$([[ -n "$pin_at" && -n "$model_at" && "$pin_at" -lt "$model_at" ]] \
+       && echo before || echo after-or-missing)" "before"
+
+  # --- [issue #568 review r1, re-aimed at the publisher] BEHAVIOURAL proof of the trust root, not
+  # just its spelling: render the REAL republish-trust run block (expressions substituted with
+  # sandbox values) and EXECUTE it. The threat the block must survive here is a trust root that is
+  # not the reviewed one — the publisher's target checkout pointing at a revision whose trust gate
+  # differs from the pre-model pin, or a registry checkout whose reverify driver does. Matching
+  # digests -> the driver runs and the block attests. ANY mismatch -> non-zero exit, the driver
+  # never executes, and the attestation is absent so the `pr` step stays gated off. Deleting the
+  # digest re-binding from the workflow flips these red. Every scenario asserts the sandbox
+  # $GITHUB_OUTPUT, because publication is gated on the ATTESTATION the block writes there, not on
+  # its exit status alone (review r2, below).
+  # Extractor first (both directions on a fixture), then the property on the real workflow. ---
+  chk "step-run extractor yields the dedented run: block ONLY (non-vacuous)" \
+    "$(_workflow_step_run "$tmp/wf-body.yml" alpha)" "echo alpha-marker"
+  chk "step-run extractor yields NOTHING for a step with no run: block (fail-closed)" \
+    "$(_workflow_step_run "$tmp/wf-body.yml" delta | grep -c . || true)" "0"
+  chk "step-run extractor yields NOTHING for an unknown id (fail-closed)" \
+    "$(_workflow_step_run "$tmp/wf-body.yml" gamma | grep -c . || true)" "0"
+  local rt="$tmp/rp-runner" rws="$tmp/rp-ws" step="$tmp/rp-step.sh" gsha dsha psha rprc rpout
+  local rpo="$tmp/rp-output"          # the sandbox's $GITHUB_OUTPUT — where the attestation lands
+  # The publisher's two fresh checkouts: the target at the PRE-GATE base (its own trust gate) and
+  # the registry (the reverify driver + the park_policy sibling the ownership CAS loads by path).
+  mkdir -p "$rt/publish-bundle" "$rws/registry/scripts" "$rws/target/scripts"
+  printf 'print("trusted")\n' > "$rws/target/scripts/trust-gate.py"
+  printf 'print("DRIVER-RAN")\n' > "$rws/registry/scripts/worker-issue.py"
+  printf '# policy sibling\n' > "$rws/registry/scripts/park_policy.py"
+  gsha=$(sha256sum "$rws/target/scripts/trust-gate.py" | cut -d' ' -f1)
+  dsha=$(sha256sum "$rws/registry/scripts/worker-issue.py" | cut -d' ' -f1)
+  psha=$(sha256sum "$rws/registry/scripts/park_policy.py" | cut -d' ' -f1)
+  # runner.temp / github.workspace come from runner STATE and the three digests cross from the
+  # WORKER job's completed step outputs — the whole point — so all five are substituted from
+  # outside the sandbox here; every remaining expression is inert argument text to the driver stub.
+  _render_prepub_block() {
+    _workflow_step_run "$wf" republish-trust \
+      | sed -e "s#\${{ runner.temp }}#$rt#g" \
+            -e "s#\${{ github.workspace }}#$rws#g" \
+            -e "s#\${{ needs.worker.outputs.verifier_sha256 }}#${1-$gsha}#g" \
+            -e "s#\${{ needs.worker.outputs.verifier_driver_sha256 }}#${2-$dsha}#g" \
+            -e "s#\${{ needs.worker.outputs.verifier_policy_sha256 }}#${3-$psha}#g" \
+            -e "s#\${{[^}]*}}#x#g" > "$step"
+  }
+  _render_prepub_block
+  : > "$rpo"
+  rpout="$( ( cd "$rws" && RUNNER_TEMP="$rt" GITHUB_OUTPUT="$rpo" GITHUB_RUN_ID=77 \
+              GITHUB_RUN_ATTEMPT=1 bash "$step" ) 2>&1 )" && rprc=ran || rprc=blocked
+  chk "rendered pre-publish block runs the driver when every digest matches the pin (control)" \
+    "$rprc:$(grep -Fc 'DRIVER-RAN' <<<"$rpout" || true)" "ran:1"
+  chk "...and only THEN attests, so publish is enabled by a verification that really ran" \
+    "$(grep -Fc "verified=$gsha" "$rpo" || true)" "1"
+  # (1) The TARGET's trust gate is not the pre-model revision — the candidate change (or a
+  # re-pointed checkout) controlling the program that authorizes its own publication.
+  printf 'raise SystemExit(0)\n' > "$rws/target/scripts/trust-gate.py"
+  : > "$rpo"
+  rpout="$( ( cd "$rws" && RUNNER_TEMP="$rt" GITHUB_OUTPUT="$rpo" GITHUB_RUN_ID=77 \
+              GITHUB_RUN_ATTEMPT=1 bash "$step" ) 2>&1 )" && rprc=ran || rprc=blocked
+  chk "a trust GATE that differs from the pre-model pin blocks publish (driver never runs)" \
+    "$rprc:$(grep -Fc 'DRIVER-RAN' <<<"$rpout" || true):$(grep -c . "$rpo" || true)" "blocked:0:0"
+  printf 'print("trusted")\n' > "$rws/target/scripts/trust-gate.py"
+  # (2) The DRIVER is not the pre-model revision — an exit-zero impostor would "verify" nothing.
+  printf 'print("IMPOSTOR-RAN")\n' > "$rws/registry/scripts/worker-issue.py"
+  : > "$rpo"
+  rpout="$( ( cd "$rws" && RUNNER_TEMP="$rt" GITHUB_OUTPUT="$rpo" GITHUB_RUN_ID=77 \
+              GITHUB_RUN_ATTEMPT=1 bash "$step" ) 2>&1 )" && rprc=ran || rprc=blocked
+  chk "a reverify DRIVER that differs from the pre-model pin blocks publish and never executes" \
+    "$rprc:$(grep -Fc 'IMPOSTOR-RAN' <<<"$rpout" || true):$(grep -c . "$rpo" || true)" "blocked:0:0"
+  printf 'print("DRIVER-RAN")\n' > "$rws/registry/scripts/worker-issue.py"
+  # (3) The park_policy SIBLING is not the pre-model revision — the closure one level down.
+  printf '# swapped policy sibling\n' > "$rws/registry/scripts/park_policy.py"
+  : > "$rpo"
+  rpout="$( ( cd "$rws" && RUNNER_TEMP="$rt" GITHUB_OUTPUT="$rpo" GITHUB_RUN_ID=77 \
+              GITHUB_RUN_ATTEMPT=1 bash "$step" ) 2>&1 )" && rprc=ran || rprc=blocked
+  chk "a swapped park_policy sibling blocks publish too (CAS closure is bound, not just entry)" \
+    "$rprc:$(grep -Fc 'DRIVER-RAN' <<<"$rpout" || true):$(grep -c . "$rpo" || true)" "blocked:0:0"
+  printf '# policy sibling\n' > "$rws/registry/scripts/park_policy.py"
+  # (4) A MISSING pre-model digest (the pin step skipped or failed, so the job output is empty) must
+  # refuse rather than verify against nothing. Without the 64-hex guard an empty expectation reaches
+  # sha256sum as an unparseable line — and an empty attestation downstream would compare EQUAL to an
+  # empty pinned digest, which is exactly why the `pr` gate also demands non-emptiness.
+  _render_prepub_block '' '' ''
+  : > "$rpo"
+  rpout="$( ( cd "$rws" && RUNNER_TEMP="$rt" GITHUB_OUTPUT="$rpo" GITHUB_RUN_ID=77 \
+              GITHUB_RUN_ATTEMPT=1 bash "$step" ) 2>&1 )" && rprc=ran || rprc=blocked
+  chk "an EMPTY pre-model digest refuses to publish (fail-closed, attests nothing)" \
+    "$rprc:$(grep -Fc 'DRIVER-RAN' <<<"$rpout" || true):$(grep -c . "$rpo" || true)" "blocked:0:0"
+  # (5) A stdlib-shadowing module beside the driver must NOT hijack it: python normally puts the
+  # executed script's own directory first on sys.path, and the registry checkout holds many
+  # siblings, so isolated mode (-I, which implies -P) is what keeps this inert. Removing -I from the
+  # workflow flips this red — the planted module would run instead of the driver.
+  _render_prepub_block
+  printf 'raise SystemExit(0)\n' > "$rws/registry/scripts/json.py"
+  : > "$rpo"
+  rpout="$( ( cd "$rws" && RUNNER_TEMP="$rt" GITHUB_OUTPUT="$rpo" GITHUB_RUN_ID=77 \
+              GITHUB_RUN_ATTEMPT=1 bash "$step" ) 2>&1 )" && rprc=ran || rprc=blocked
+  chk "a stdlib-shadowing module beside the driver cannot hijack it (isolated mode holds)" \
+    "$rprc:$(grep -Fc 'DRIVER-RAN' <<<"$rpout" || true):$(grep -Fc "verified=$gsha" "$rpo" || true)" \
+    "ran:1:1"
+  rm -f "$rws/registry/scripts/json.py"
+
+  # --- [issue #568 review r2] The host-side gate executes TARGET-CONTROLLED build scripts, which
+  # can PERSIST an execution environment into every later step ($GITHUB_ENV) and PREPEND binaries
+  # to its PATH ($GITHUB_PATH) — neither of which alters a byte of the pinned files, so neither is
+  # visible to the digest check. The scenarios above ran in a clean environment and therefore did
+  # not exercise that class at all. These do, against the same REAL rendered block:
+  #
+  #   (a) BASH_ENV — bash SOURCES it before the block's first line, so a startup file containing
+  #       `exit 0` makes the step exit 0 having verified NOTHING. This is why the workflow gates
+  #       publish on the block's positive ATTESTATION and not on its outcome: the step still
+  #       "succeeds" here, and MUST leave $GITHUB_OUTPUT empty. Deleting the attestation line, or
+  #       moving it above the reverify call, flips this red.
+  #   (b) $GITHUB_PATH — an attacker sha256sum that exits 0 would wave a MISMATCHED trust root
+  #       through the digest check, and an attacker python3 would "verify" without running the
+  #       driver. The block resets PATH to the system allowlist before looking up any command, so
+  #       the REAL tools run: the mismatch is still refused, and on a matching root the real driver
+  #       (not the hijack) executes. Removing the PATH reset flips both.
+  #   (c) PYTHONPATH — a `sitecustomize.py` on it executes inside every non-isolated interpreter
+  #       startup, i.e. inside the digest-bound driver's own process. The block clears the PYTHON*
+  #       levers and runs python isolated, so the marker must NEVER appear.
+  #
+  # [#575] These levers are DEFENCE IN DEPTH here rather than a live threat: the re-check now runs
+  # in the isolated publisher, where no target code executes and so nothing can write the runner's
+  # environment files in the first place. They are retained and tested because the block's
+  # correctness must not silently depend on that remaining true — and because the attestation
+  # property (a) proves is what the `pr` gate rests on either way. The gate step's own quarantine of
+  # those files is asserted as wiring below, since only a real runner can exercise it. ---
+  local evilbin="$tmp/rp-evilbin" bashenv="$tmp/rp-bashenv.sh" pypath="$tmp/rp-pypath"
+  printf 'exit 0\n' > "$bashenv"
+  : > "$rpo"
+  rpout="$( ( cd "$rws" && RUNNER_TEMP="$rt" GITHUB_OUTPUT="$rpo" GITHUB_RUN_ID=77 \
+              GITHUB_RUN_ATTEMPT=1 BASH_ENV="$bashenv" bash "$step" ) 2>&1 )" && rprc=ran || rprc=blocked
+  chk "a BASH_ENV early exit SUCCEEDS but attests NOTHING (outcome alone cannot publish)" \
+    "$rprc:$(grep -c . "$rpo" || true)" "ran:0"
+  mkdir -p "$evilbin"
+  local hijacked
+  for hijacked in sha256sum python3; do
+    printf '#!/bin/sh\necho HIJACKED-TOOL-RAN\nexit 0\n' > "$evilbin/$hijacked"
+    chmod +x "$evilbin/$hijacked"
+  done
+  printf 'print("IMPOSTOR-RAN")\n' > "$rws/registry/scripts/worker-issue.py"
+  : > "$rpo"
+  rpout="$( ( cd "$rws" && RUNNER_TEMP="$rt" GITHUB_OUTPUT="$rpo" GITHUB_RUN_ID=77 \
+              GITHUB_RUN_ATTEMPT=1 PATH="$evilbin:$PATH" bash "$step" ) 2>&1 )" && rprc=ran || rprc=blocked
+  chk "a \$GITHUB_PATH-hijacked sha256sum/python3 cannot wave a MISMATCHED trust root through" \
+    "$rprc:$(grep -Fc 'HIJACKED-TOOL-RAN' <<<"$rpout" || true):$(grep -c . "$rpo" || true)" "blocked:0:0"
+  printf 'print("DRIVER-RAN")\n' > "$rws/registry/scripts/worker-issue.py"
+  mkdir -p "$pypath"
+  printf 'print("PYTHONPATH-HIJACK-RAN")\n' > "$pypath/sitecustomize.py"
+  : > "$rpo"
+  rpout="$( ( cd "$rws" && RUNNER_TEMP="$rt" GITHUB_OUTPUT="$rpo" GITHUB_RUN_ID=77 \
+              GITHUB_RUN_ATTEMPT=1 PATH="$evilbin:$PATH" PYTHONPATH="$pypath" \
+              bash "$step" ) 2>&1 )" && rprc=ran || rprc=blocked
+  chk "a hijacked PATH/PYTHONPATH is neutralised: the REAL bound driver still runs and attests" \
+    "$rprc:$(grep -Fc 'DRIVER-RAN' <<<"$rpout" || true):$(grep -Fc 'HIJACKED-TOOL-RAN' <<<"$rpout" || true):$(grep -Fc 'PYTHONPATH-HIJACK-RAN' <<<"$rpout" || true):$(grep -Fc "verified=$gsha" "$rpo" || true)" \
+    "ran:1:0:0:1"
+
+  # Wiring the sandbox cannot execute: publication is gated on the ATTESTATION (a bare outcome is
+  # what scenario (a) proves insufficient), and the primitive itself is removed at the source by
+  # quarantining the target-controlled gate step's runner command files. Deleting any of these
+  # from the workflow flips the corresponding assertion red.
+  chk "the publish/PR step requires the re-check's positive attestation, not just its outcome" \
+    "$(_workflow_step_if "$wf" pr \
+       | grep -Fc "steps.republish-trust.outputs.verified == needs.worker.outputs.verifier_sha256" || true)" "1"
+  chk "...and requires it to be NON-EMPTY (two skipped steps must not compare equal)" \
+    "$(_workflow_step_if "$wf" pr | grep -Fc "steps.republish-trust.outputs.verified != ''" || true)" "1"
+  # ORDER inside the block is the whole property: an attestation written before the reverify call
+  # would attest to nothing. Moving the printf above it flips this red.
+  local rb="$tmp/rp-block.txt" rev_at att_at
+  _workflow_step_run "$wf" republish-trust > "$rb"
+  rev_at=$(grep -n 'python3 -I "\$driver" reverify' "$rb" | cut -d: -f1 | head -1)
+  att_at=$(grep -n "printf 'verified=%s" "$rb" | cut -d: -f1 | head -1)
+  chk "the pre-publish block writes its attestation only AFTER the reverify call returns" \
+    "$([[ -n "$rev_at" && -n "$att_at" && "$rev_at" -lt "$att_at" ]] \
+       && echo attest-last || echo attest-first-or-missing)" "attest-last"
+  chk "the pre-publish block resets PATH to the system allowlist before running anything" \
+    "$(_workflow_step_run "$wf" republish-trust \
+       | grep -Fc 'export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' || true)" "1"
+  chk "the pre-publish block neutralises BASH_ENV/ENV in its STEP env (bash sources them first)" \
+    "$(_workflow_step_body "$wf" republish-trust | grep -Ec "^ +(BASH_ENV|ENV): ''$" || true)" "2"
+  chk "the pre-publish block runs the pinned driver in python isolated mode" \
+    "$(_workflow_step_run "$wf" republish-trust | grep -Fc 'python3 -I "$driver" reverify' || true)" "1"
+  chk "the target-controlled gate step cannot persist environment into later steps (quarantine)" \
+    "$(_workflow_step_body "$wf" gate \
+       | grep -Ec '^ +GITHUB_(ENV|PATH): \$\{\{ runner.temp \}\}/gate-quarantine/(env|path)$' || true)" "2"
+
+  # --- [issue #568] the re-check must accept the workflow's OWN label lifecycle, and the claim
+  # step must establish ownership BEFORE it takes the shared label. The claim step moves the issue
+  # ready -> in-progress before the model runs, so a dispatch-mode reverify (which demands
+  # status:ready) would deterministically refuse EVERY legitimate publish — the re-check runs in
+  # pre-publish mode, bound to this run's receipts via the SAME run key the claim + attempt steps
+  # post. Wiring first (text of the real workflow: the mode flag, all three ends of the run-key
+  # binding, the receipt-before-label ORDER, and the pre-model trust step as the dispatch-mode
+  # negative control), then behaviour via a driver over the real reverify below. ---
+  chk "pre-publish re-check runs reverify in pre-publish mode (issue #568)" \
+    "$(_workflow_step_body "$wf" republish-trust | grep -Fc -- '--mode pre-publish' || true)" "1"
+  chk "pre-publish re-check binds the claim to this run's key" \
+    "$(_workflow_step_body "$wf" republish-trust \
+       | grep -Fc -- '--current-run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"' || true)" "1"
+  chk "record-attempt posts its receipt under the SAME run key (a binding end)" \
+    "$(_workflow_step_body "$wf" attempt \
+       | grep -Fc -- '--run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"' || true)" "1"
+  chk "the claim receipt is run-key bound too (the CAS's durable half)" \
+    "$(_workflow_step_body "$wf" claim-receipt \
+       | grep -Fc -- '--run-key "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"' || true)" "1"
+  # ORDER inside the claim step is the supersession property: ownership must be durable BEFORE the
+  # shared status:in-progress label is taken, or an older run stays authorized through the whole
+  # pre-attempt interval. Reversing the two commands flips this red.
+  local claim_body claim_at status_at
+  claim_body="$(_workflow_step_body "$wf" claim-receipt)"
+  claim_at=$(printf '%s\n' "$claim_body" | grep -n 'worker-issue.py claim-receipt' | cut -d: -f1 | head -1)
+  status_at=$(printf '%s\n' "$claim_body" | grep -n 'worker-issue.py status' | cut -d: -f1 | head -1)
+  chk "the ownership receipt is posted BEFORE the shared in-progress label is taken" \
+    "$([[ -n "$claim_at" && -n "$status_at" && "$claim_at" -lt "$status_at" ]] \
+       && echo receipt-first || echo label-first-or-missing)" "receipt-first"
+  # ...and it is no longer best-effort: a `|| true` there would let a run take the label with no
+  # ownership binding, which pre-publish would then (correctly) refuse after a full model spend.
+  chk "the ownership receipt is fail-closed (no || true swallowing a failed post)" \
+    "$(printf '%s\n' "$claim_body" | grep -c '|| true' || true)" "0"
+  chk "pre-model trust step stays in dispatch mode (still demands status:ready)" \
+    "$(_workflow_step_body "$wf" trust | grep -c -- '--mode' || true)" "0"
+
+  # Behaviour: a driver runs the REAL reverify pre-publish path over the label state produced by
+  # the module's own STATUS_TRANSITIONS table, with only the GitHub API seams stubbed. Non-vacuous
+  # in both directions: this run's bound claim must be ACCEPTED (an always-reject regression flips
+  # it red), while a superseded claim, an unbound in-progress state, the mid-flight supersession
+  # window (a newer run's ownership receipt with NO attempt receipt yet), a verifier resolving into
+  # the model-mutable tree, and dispatch mode over the same state must all be REFUSED.
+  cat > "$tmp/prepub-driver.py" <<'PY'
+"""[issue #568] Drive the REAL worker-issue reverify pre-publish path over the label state the
+workflow's own ready -> in-progress transition produces (taken from STATUS_TRANSITIONS, not
+hand-written). Only the GitHub API seams are stubbed; the trust-gate subprocess is real.
+argv: <worker-issue.py path> <scenario> <tmpdir>"""
+import contextlib
+import importlib.util
+import io
+import json
+import pathlib
+import sys
+
+path, scenario, tmp = sys.argv[1], sys.argv[2], sys.argv[3]
+spec = importlib.util.spec_from_file_location("worker_issue", path)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+root = pathlib.Path(tmp) / f"prepub-{scenario}"
+(root / "target" / "scripts").mkdir(parents=True, exist_ok=True)
+model_gate = root / "target" / "scripts" / "trust-gate.py"
+model_gate.write_text("print('trusted')\n", encoding="utf-8")
+gate = root / "trust-gate.py"
+gate.write_text("print('trusted')\n", encoding="utf-8")
+
+add, remove = module.STATUS_TRANSITIONS["in-progress"]
+live = ({"status:ready", "role:impl"} | add) - (remove - add)
+item = {"state": "open", "user": {"login": "jeswr"}, "body": "task",
+        "labels": [{"name": name} for name in sorted(live)]}
+
+
+def receipt(key, stamp, marker):
+    return {"user": {"login": "sparq[bot]"}, "created_at": stamp,
+            "body": f"x {marker} run={key} -->"}
+
+
+own_claim = receipt("77.1", "2026-07-19T01:00:00Z", module.CLAIM_MARKER)
+own_attempt = receipt("77.1", "2026-07-19T02:00:00Z", module.ATTEMPT_MARKER)
+# The supersession window this issue's carried-over race describes: a NEWER run has taken the
+# shared label and posted its ownership receipt, but has not yet reached record-attempt.
+new_claim = receipt("88.1", "2026-07-19T03:00:00Z", module.CLAIM_MARKER)
+new_attempt = receipt("88.1", "2026-07-19T04:00:00Z", module.ATTEMPT_MARKER)
+comments = {"own": [own_claim, own_attempt],
+            "dispatch": [own_claim, own_attempt],
+            "modeltree": [own_claim, own_attempt],
+            "midflight": [own_claim, own_attempt, new_claim],
+            "superseded": [own_claim, own_attempt, new_claim, new_attempt],
+            "unbound": [new_claim, new_attempt]}[scenario]
+module._gh_json = lambda args, *, input_doc=None: json.loads(json.dumps(item))
+module._paginated = lambda repo, issue, resource: list(comments)
+try:
+    # reverify prints its own receipt line; the chk contract is the bare verdict word only.
+    with contextlib.redirect_stdout(io.StringIO()):
+        module.reverify("o/r", 1, "jeswr", module.body_sha("task"),
+                        str(model_gate if scenario == "modeltree" else gate), "sparq[bot]",
+                        str(root / "issue.json"), "77.1",
+                        "dispatch" if scenario == "dispatch" else "pre-publish",
+                        str(root / "target"))
+    print("accepted")
+except module.WorkerIssueError:
+    print("refused")
+PY
+  local wisrc="$SCRIPT_DIR/worker-issue.py"
+  chk "pre-publish reverify ACCEPTS this run's own ready->in-progress claim (lifecycle)" \
+    "$(python3 "$tmp/prepub-driver.py" "$wisrc" own "$tmp" 2>/dev/null || true)" "accepted"
+  chk "pre-publish reverify REFUSES a claim superseded by ANOTHER run" \
+    "$(python3 "$tmp/prepub-driver.py" "$wisrc" superseded "$tmp" 2>/dev/null || true)" "refused"
+  chk "pre-publish reverify REFUSES in the newer run's PRE-ATTEMPT window (ownership ordering)" \
+    "$(python3 "$tmp/prepub-driver.py" "$wisrc" midflight "$tmp" 2>/dev/null || true)" "refused"
+  chk "pre-publish reverify REFUSES status:in-progress with NO claim receipt of ours" \
+    "$(python3 "$tmp/prepub-driver.py" "$wisrc" unbound "$tmp" 2>/dev/null || true)" "refused"
+  chk "pre-publish reverify REFUSES a verifier inside the model-mutable tree" \
+    "$(python3 "$tmp/prepub-driver.py" "$wisrc" modeltree "$tmp" 2>/dev/null || true)" "refused"
+  chk "dispatch-mode reverify still REFUSES the in-progress state (mode is load-bearing)" \
+    "$(python3 "$tmp/prepub-driver.py" "$wisrc" dispatch "$tmp" 2>/dev/null || true)" "refused"
+
+  # --- [issue #568 review r2] The snapshot must be the COMPLETE CLOSURE of the pre-publish path.
+  # Every check above ran the driver from the CHECKOUT, where its siblings sit beside it; the
+  # digest checks prove WHICH bytes run and say nothing about whether the pinned SET is sufficient.
+  # It was not: holds_live_claim — the ownership CAS this whole mode rests on — loads park_policy
+  # by `Path(__file__).with_name(...)`, i.e. out of the driver's own directory, so a snapshot
+  # missing it raises FileNotFoundError before the CAS is ever evaluated. Fail-closed, but on EVERY
+  # legitimate run: a lane that can never publish. Build the snapshot the way the pin step does —
+  # the file list is read OUT OF THE WORKFLOW, so a future reverify path that needs an uncopied
+  # module goes red HERE instead of on the runner — then run the REAL pre-publish path from it,
+  # and prove the negative by deleting the sibling again. ---
+  local snapdir="$tmp/prepub-snapshot" snapfile
+  mkdir -p "$snapdir"
+  while read -r snapfile; do
+    [[ -n "$snapfile" ]] || continue
+    cp "$SCRIPT_DIR/$snapfile" "$snapdir/$snapfile"
+  done < <(_workflow_step_run "$wf" pin-trust-gate \
+           | grep -oE '\$GITHUB_WORKSPACE/registry/scripts/[A-Za-z0-9_.-]+' | sed 's#.*/##' | sort -u)
+  chk "the snapshot fixture is really built from the pin step's own file list (non-vacuous)" \
+    "$([[ -s "$snapdir/worker-issue.py" ]] && echo driver-copied || echo list-not-read)" "driver-copied"
+  chk "the REAL pre-publish path COMPLETES when run from the pinned snapshot (closure)" \
+    "$(python3 "$tmp/prepub-driver.py" "$snapdir/worker-issue.py" own "$tmp" 2>/dev/null || true)" \
+    "accepted"
+  rm -f "$snapdir/park_policy.py"
+  chk "...and DIES from a snapshot missing that sibling (why the pin covers the closure)" \
+    "$(python3 "$tmp/prepub-driver.py" "$snapdir/worker-issue.py" own "$tmp" 2>/dev/null || echo died)" \
+    "died"
+  # ...and the CLOSURE and the BINDING must cover the same set. The publisher digest-binds the
+  # registry modules the pre-publish path loads; a module the pin step records but the publisher
+  # never binds would run UNVERIFIED, and a module the path grows without the pin recording it would
+  # be unbound on both ends. Cross-check the two lists against each other so either drift goes red
+  # HERE rather than on a runner. Non-vacuous: the loop demonstrably iterates (the fixture above
+  # proves the list is read), and a fabricated extra module is reported as unbound.
+  local pinned_file unbound=0 bound=0
+  while read -r pinned_file; do
+    [[ -n "$pinned_file" ]] || continue
+    if _workflow_step_body "$wf" republish-trust | grep -Fq "registry/scripts/$pinned_file'"; then
+      bound=$((bound + 1))
+    else
+      unbound=$((unbound + 1))
+    fi
+  done < <(_workflow_step_run "$wf" pin-trust-gate \
+           | grep -oE '\$GITHUB_WORKSPACE/registry/scripts/[A-Za-z0-9_.-]+' | sed 's#.*/##' | sort -u)
+  chk "every registry module the pin step records is digest-bound in the publisher (closure=binding)" \
+    "$unbound" "0"
+  chk "...and that cross-check really covered the whole recorded closure (non-vacuous)" \
+    "$([[ "$bound" -ge 2 ]] && echo covered || echo "only-$bound")" "covered"
+  # The predicate itself, both directions: it must SEE a module the block really binds and MISS one
+  # it does not. Without this the loop above could pass by matching everything (or nothing).
+  _bound_probe() { _workflow_step_body "$wf" republish-trust | grep -Fq "registry/scripts/$1'" \
+    && echo bound || echo unbound; }
+  chk "the closure/binding predicate SEES a really-bound module (mutant, direction 1)" \
+    "$(_bound_probe worker-issue.py)" "bound"
+  chk "the closure/binding predicate MISSES an unbound one (mutant, direction 2)" \
+    "$(_bound_probe definitely-not-bound.py)" "unbound"
 
   # --- crate-scoped gate package validation (defect #2, run 29634738177): the area:<label> →
   # `cargo -p` mapping crashed with exit 101 when the label was not a workspace-member name.
