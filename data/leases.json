@@ -2,16 +2,6 @@
  "leases": [
   {
    "account": "dc2d751954080e13",
-   "claim_id": "80c5092f81c44480a9ceb75b7d97f8b1",
-   "holder": "review:sparq-org/sparq#4632@dispatch-30311209703.1",
-   "package": "upstream",
-   "role": "review",
-   "model": "sol",
-   "issued_at": 1785192014,
-   "expires_at": 1785196214
-  },
-  {
-   "account": "dc2d751954080e13",
    "claim_id": "0fc849aa0b7b484698f77e7a8053dd72",
    "holder": "review:sparq-org/sparq#4636@dispatch-30311209703.1",
    "package": "sparq-trust",
