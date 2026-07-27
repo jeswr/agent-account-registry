@@ -1371,13 +1371,28 @@ def diff_fingerprint(files):
 
 
 def decide_review(verdict, has_blockers, injection, round_n, max_rounds, security,
-                  budget_action="needs-user"):
+                  budget_action="needs-user", self_attested=False):
     """The review-verdict state machine. Every path arms once, requests one fix round, or stops
     at a human — never loops unboundedly. On round-budget exhaustion the caller supplies
     decide_budget's action: an extension (model pin or improving progress) keeps the loop in
     `changes`, bounded by decide_budget's own hard cap; anything else (including the fail-closed
-    default) stops at a human."""
+    default) stops at a human.
+
+    [registry #657 follow-up] ``self_attested`` — the orchestrator class — can NEVER reach "arm".
+    Its provenance record was written by the same actor that wrote the diff, so the record's
+    `impl_provider` is an assertion about itself, and that field is what the lane INVERTS to pick
+    the reviewer's side. A false declaration therefore yields a same-provider review that still
+    LOOKS cross-provider (design record §3, the irreducible difficulty). Option 2(b)'s whole
+    argument for admitting the class at all is that the residual risk of a mis-declared provider
+    degrades to an ADVISORY COMMENT, never an unreviewed merge — so an approve on this class
+    becomes a human hand-off, exactly as an injection flag does. Defaults False."""
     if injection:
+        return "needs-user"
+    if self_attested and verdict == "approve" and not has_blockers:
+        # Approved, and NOT armed: the human arms this class. (`needs-user` is the existing
+        # human-hand-off path — findings are still posted, the PR is labelled and the maintainer
+        # is pinged, so an enrolled PR that passes review is visibly ready rather than silently
+        # dropped.)
         return "needs-user"
     if verdict == "approve" and not has_blockers:
         # Decision 7 REVISED (maintainer 2026-07-18: approved PRs were parking needs:user
@@ -3889,13 +3904,20 @@ def _queue_disarm_mutation(mutation, node_id):
         raise WorkerPrError(f"GraphQL {mutation} failed for the queued pull request")
 
 
-def disarm(repo, pr_number, when, preserve_review_state=False):
+def disarm(repo, pr_number, when, preserve_review_state=False, bot_login=""):
     """Defuse a worker PR's GitHub-side arm/ready state, fail-closed on LIVE data only (the plan
     row that requested this is hostile — every precondition is re-derived from the API here).
 
-    Trust surface mirrors the review enumerator: only an open, same-repo, bot-authored
-    `sparq-agent/*` PR is ever touched. A PR labelled review:needs-user OR needs:user is
-    human-owned, and when=always (the autonomous-fix defuse) stands down on it entirely — as it
+    Trust surface mirrors the review enumerator: only an open, same-repo, `sparq-agent/*` PR
+    authored by the EXACT App identity named in ``bot_login`` is ever touched (issue #570 — the
+    author gate used to accept ANY `[bot]` login, so a forged plan row could redraft, disable
+    auto-merge on, and relabel a same-repo PR belonging to a DIFFERENT GitHub App; the exact-
+    identity standard is the same one the re-post suppression already uses, see
+    ``verify_bot_login``). An EMPTY ``bot_login`` proves nothing and therefore disarms nothing:
+    both ``when=mismatch`` and ``when=always`` stand down rather than fall back to any-`[bot]`.
+
+    A PR labelled review:needs-user OR needs:user is human-owned, and when=always (the
+    autonomous-fix defuse) stands down on it entirely — as it
     does on a `needs:*`-parked head-ref-linked SOURCE issue, which it additionally consults so a
     fix push never rides into that human's territory. But when=mismatch — the issue #42 safety
     invariant, retracting a latch that would merge a never-reviewed tree — must NOT be blocked by
@@ -3943,6 +3965,15 @@ def disarm(repo, pr_number, when, preserve_review_state=False):
     if head_repo != repo or not head_match or not login.endswith("[bot]"):
         _write_outputs({"disarmed": False})
         print("disarm skipped: not a same-repo bot worker PR")
+        return
+    # Issue #570: EXACT App identity, both modes, no any-`[bot]` fallback. The three mutations
+    # below (dequeue/disable-auto, redraft, relabel) are writes to someone's PR; `[bot]` is a
+    # SUFFIX shared by every GitHub App with write access to this repo, so authorising on it let a
+    # forged `disarm_items` row aim the safety net at a foreign App's PR. An unsupplied identity
+    # is unprovable, not permissive — it fails closed here rather than widening the gate.
+    if not bot_login or login != bot_login:
+        _write_outputs({"disarmed": False})
+        print("disarm skipped: the PR author is not the expected App identity")
         return
     if preserve_review_state and not ({"review:needs", "review:changes"} & labels):
         raise WorkerPrError(
@@ -4235,7 +4266,7 @@ def _arm_auto_merge(repo, pr_number, reviewed_sha, attempts=ARM_ATTEMPTS, issue=
 
 def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, reviewer_provider,
                   reviewer_account, arm, issue=None, surface_paths=None, bot_login="",
-                  reviewed_base="", security_keywords=None):
+                  reviewed_base="", security_keywords=None, self_attested=False):
     """The ONLY place a PR can be armed. Fail-closed assertions per locked decision 6; a live-head
     mismatch returns the PR to review:needs (a fixer/other push raced the approval). [issue #139,
     round-4 P1] EVERY arm precondition — the hold surfaces (HUMAN_OWNED_LABELS on the PR, needs:*
@@ -4273,6 +4304,18 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
     issue labels vs the routing keywords), not just at resolve: a security label added mid
     review folds into the same audit trail (a True posture appends SECURITY_LABEL_AUDIT_HIT),
     so an auto-armed trust-plane change is audited whether it was flagged by path or by label."""
+    # [registry #657 follow-up] THE MERGE BOUNDARY for the orchestrator class, at the ONE place a
+    # PR can be armed. `decide_review` already refuses to return "arm" for a self-attested PR, so
+    # this is the second, independent refusal — placed HERE because "the arm never runs for the
+    # class" must be true of the arm, not of the state machine that usually precedes it. The
+    # cross-provider assertion below is derived by INVERTING the record's own `impl_provider`; on
+    # a self-attested record that field is an assertion by the implementer about itself, so the
+    # assertion proves nothing and must not be allowed to authorise a merge (design record §3).
+    if self_attested:
+        raise WorkerPrError(
+            "refusing to arm: the provenance record is self-attested (orchestrator class) — its "
+            "impl_provider is an assertion by the implementer about itself, so the cross-provider "
+            "inversion cannot be trusted to authorise a merge; a human arms this class")
     if reviewer_provider == impl_provider:
         raise WorkerPrError("refusing to arm: reviewer provider equals implementer provider")
     salt = os.environ.get("PROVENANCE_SALT", "")
@@ -4498,7 +4541,8 @@ def _apply_trust_surface_audit(repo, pr_number, hits, reviewed_sha, bot_login=""
 
 
 # ---- composite outcomes (thin workflow steps, testable decisions) --------------------------------
-def revalidate_outcome_head(state, login, draft, live_head, reviewed_sha, bot_login):
+def revalidate_outcome_head(state, login, draft, live_head, reviewed_sha, bot_login,
+                            self_attested=False):
     """Issue #156: gate EVERY review/fix outcome mutation on the live PR still being the exact
     reviewed commit — an OPEN, bot-authored, DRAFT PR whose head equals the sha the model ran
     against. Returns "ok", or a short stale reason ("closed"/"author"/"undrafted"/
@@ -4506,12 +4550,23 @@ def revalidate_outcome_head(state, login, draft, live_head, reviewed_sha, bot_lo
     findings never label a new head and a stale escalation never terminally parks a
     replacement head. Exact-head equality is STRICTER than the issue's ancestry requirement
     and subsumes it: a descendant head still means unreviewed commits are live. Pure and
-    fail-closed — an unreadable/unexpected shape yields a stale reason, never "ok"."""
+    fail-closed — an unreadable/unexpected shape yields a stale reason, never "ok".
+
+    [registry #657 follow-up] ``self_attested`` — the orchestrator class, resolved host-side by
+    review-fix.yml's `resolve` step — stands down the DRAFT requirement and NOTHING else. Draft is
+    a WORKER-lane protocol artefact: worker.yml opens drafts and the arm undrafts them, so "still
+    drafted" is a real freshness signal there. The orchestrator class never enters that protocol
+    and every PR in it is non-draft, so requiring draft here would return "undrafted" for EVERY
+    review of the class — and the caller drops the whole outcome on that, silently: findings
+    unposted, reviewed-sha left unbound, while the round budget still charges. That is a per-round
+    burn to a terminal needs-user with no diagnostic, i.e. the same forever-loop the #657 enable
+    interlock exists to prevent, at the outcome layer. Defaults False, so every existing caller is
+    byte-for-byte unchanged; the head/author/state freshness checks are NOT waived for any class."""
     if state != "open":
         return "closed"
     if bot_login and login != bot_login:
         return "author"
-    if draft is not True:
+    if draft is not True and not self_attested:
         return "undrafted"
     if not re.fullmatch(r"[0-9a-f]{40}", live_head or ""):
         return "malformed-head"
@@ -4561,7 +4616,8 @@ def review_outcome(args):
     freshness = revalidate_outcome_head(
         live.get("state"), str((live.get("user") or {}).get("login", "")),
         live.get("draft"), str((live.get("head") or {}).get("sha", "")),
-        args.reviewed_sha, args.bot_login)
+        args.reviewed_sha, args.bot_login,
+        self_attested=getattr(args, "self_attested", False))
     if freshness != "ok":
         # Issue #162: legitimate head churn (the reviewed head advanced during the review) is
         # NOT a substantive round — void its pre-model round marker for THIS (round, run) so a
@@ -4630,7 +4686,8 @@ def review_outcome(args):
                                args.impl_provider, base_rounds=args.max_rounds)
     decision = decide_review(document["verdict"], has_blockers,
                              document["injection_detected"], budget_rounds, args.max_rounds,
-                             security, budget_action=budget["action"])
+                             security, budget_action=budget["action"],
+                             self_attested=getattr(args, "self_attested", False))
     _write_outputs({"decision": decision, "verdict": document["verdict"],
                     "has_blockers": has_blockers,
                     "injection": document["injection_detected"],
@@ -4651,6 +4708,16 @@ def review_outcome(args):
         if document["injection_detected"]:
             # A flagged injection is a genuine human (security) question -> needs:user.
             reason, park_class = INJECTION_PROSE_REVIEW, "question"
+        elif approved and getattr(args, "self_attested", False):
+            # [#657] APPROVED, and deliberately not armed. This is not a failure and not a
+            # capacity stop — the class is review-only by design (record §3 option (b)), so the
+            # hand-off must SAY so; naming it "budget exhausted" would misreport a clean pass as
+            # a stall and route it to the machine-owned capacity park.
+            reason, park_class = (
+                "the review approved this PR, and it is an orchestrator-class (self-attested "
+                "provenance) PR: the implementer wrote its own provenance record, so the "
+                "cross-provider inversion cannot authorise an automatic merge. A human arms it",
+                "question")
         else:
             # Round-budget exhaustion is budget-driven, not a human question: the source issue
             # takes the machine-owned status:parked soft hold (park_policy.py defect 1).
@@ -7977,7 +8044,8 @@ def _self_test():
         return argparse.Namespace(returncode=code, stdout="", stderr="")
 
     def run_disarm(base_ref="main", draft=False, armed=True, labels=(), when="mismatch",
-                   preserve_review_state=False, **overrides):
+                   preserve_review_state=False, bot_login="sparq[bot]",
+                   author="sparq[bot]", **overrides):
         disarm_calls.clear()
         compare_paths.clear()
         fake_outputs.clear()
@@ -7985,7 +8053,7 @@ def _self_test():
         net.update({
             "live": {"state": "open", "draft": draft,
                      "auto_merge": {"merge_method": "squash"} if armed else None,
-                     "user": {"login": "sparq[bot]"},
+                     "user": {"login": author},
                      "labels": [{"name": name} for name in labels],
                      "body": f"pr body\n\n<!-- sparq-reviewed-sha:{rev_sha} -->\n",
                      "head": {"sha": head_69, "ref": "sparq-agent/issue-7-fix",
@@ -7996,7 +8064,8 @@ def _self_test():
                         for key, doc in identical_compares.items()},
             "graphql_auto_merge": armed,
         }, **overrides)
-        disarm("o/r", 41, when, preserve_review_state=preserve_review_state)
+        disarm("o/r", 41, when, preserve_review_state=preserve_review_state,
+               bot_login=bot_login)
 
     try:
         wiring_globals["_gh_json"] = fake_gh_json
@@ -8228,6 +8297,46 @@ def _self_test():
             run_disarm(labels=(hold,), when="always")
             check(f"held always-defuse ({hold}) stands down untouched",
                   (disarm_calls, fake_outputs.get("disarmed")), ([], False))
+
+        # ---- Issue #570: the author gate is the EXACT App identity, never any `[bot]` ----
+        # POSITIVE CONTROL FIRST, so every zero-mutation assertion below is non-vacuous: the
+        # identical live state under the TRUSTED identity really does disarm. If the gate were
+        # inverted (or the fixture stopped producing a mismatch), this goes red first.
+        run_disarm(compare=json.loads(json.dumps(evil)))
+        check("#570 control: the trusted App identity still disarms a real mismatch",
+              ("pr merge 41 -R o/r --disable-auto" in disarm_calls
+               and "pr ready 41 -R o/r --undo" in disarm_calls,
+               fake_outputs.get("disarmed")), (True, True))
+        for mode in ("mismatch", "always"):
+            # A DIFFERENT App's PR (same repo, same worker-shaped head ref, no reviewed-sha
+            # binding it) is the exact #570 attack: pre-fix, `login.endswith("[bot]")` passed and
+            # the forged row redrafted + relabelled a foreign App's pull request.
+            run_disarm(when=mode, compare=json.loads(json.dumps(evil)),
+                       author="mallory[bot]")
+            check(f"#570 ({mode}): a foreign App author mutates nothing",
+                  (disarm_calls, fake_outputs.get("disarmed"),
+                   "disarm_error" in fake_outputs), ([], False, False))
+            # No identity supplied is UNPROVABLE, not permissive — it must not degrade to the old
+            # any-`[bot]` gate. Red the moment `bot_login` is treated as optional again.
+            run_disarm(when=mode, compare=json.loads(json.dumps(evil)), bot_login="")
+            check(f"#570 ({mode}): an empty expected identity fails closed",
+                  (disarm_calls, fake_outputs.get("disarmed"),
+                   "disarm_error" in fake_outputs), ([], False, False))
+            # Near-miss identities (a prefix of the trusted login, and the bare account without
+            # the App suffix) are foreign apps too — the comparison is equality, not membership.
+            for impostor in ("sparq-bot[bot]", "sparq"):
+                run_disarm(when=mode, compare=json.loads(json.dumps(evil)),
+                           bot_login=impostor)
+                check(f"#570 ({mode}): {impostor} is not the trusted App identity",
+                      (disarm_calls, fake_outputs.get("disarmed")), ([], False))
+        # Issue #105 must survive the new gate: a genuinely stale latch on a HUMAN-HELD PR of the
+        # TRUSTED App is still retracted (latch off + redraft), with the hold label preserved.
+        run_disarm(compare=json.loads(json.dumps(evil)), labels=("review:needs-user",))
+        check("#570 does not regress #105: a held trusted-App mismatch is still retracted",
+              ("pr merge 41 -R o/r --disable-auto" in disarm_calls
+               and "pr ready 41 -R o/r --undo" in disarm_calls,
+               "state:needs" in disarm_calls, fake_outputs.get("disarmed")),
+              (True, False, True))
     finally:
         wiring_globals.update(real_disarm_io)
 
@@ -9454,7 +9563,7 @@ def _self_test():
                          "sha": oc_state.get("head", "b" * 40)}}
 
     def run_review_outcome(verdict, labels=(), issue_labels=(), injection=False,
-                           reviewed_sha="b" * 40, **live_over):
+                           reviewed_sha="b" * 40, self_attested=False, **live_over):
         oc_calls.clear(); oc_outputs.clear(); oc_state.clear()
         oc_state.update(labels=labels, issue_labels=issue_labels, **live_over)
         with tempfile.TemporaryDirectory() as tmp:
@@ -9470,7 +9579,8 @@ def _self_test():
                 repo="o/r", pr=41, verdict_file=str(verdict_file),
                 files_file=str(files_file), round=1, max_rounds=3, security=False,
                 surface_path=[], issue=7, impl_provider="anthropic",
-                bot_login="sparq[bot]", run_key="9.1", reviewed_sha=reviewed_sha))
+                bot_login="sparq[bot]", run_key="9.1", reviewed_sha=reviewed_sha,
+                self_attested=self_attested))
 
     def run_fix_outcome(labels=(), issue_labels=(), injection="false",
                         reviewed_sha="b" * 40, **live_over):
@@ -9516,6 +9626,33 @@ def _self_test():
         check("unheld injection outcome still parks needs-user",
               (oc_calls, oc_outputs.get("decision")),
               (["post-findings", "needs-user"], "needs-user"))
+
+        # ---- [registry #657] THE ORCHESTRATOR CLASS, THROUGH THE REAL OUTCOME PATH -------
+        # (a) BASELINE, and the whole reason the outcome leg is part of the #657 enable
+        #     interlock: a NON-DRAFT PR without the class flag is DROPPED as `undrafted`,
+        #     with findings unposted and reviewed-sha left unbound — while the round budget
+        #     still charges. Every enrollable PR is non-draft, so an unwired outcome step
+        #     turns each review into a silent per-round burn ending in a terminal park.
+        run_review_outcome("approve", draft=False)
+        check("a non-draft PR is DROPPED as undrafted without the class flag",
+              (oc_calls, oc_outputs.get("decision"), oc_outputs.get("stale_reason")),
+              ([], "stale", "undrafted"))
+        # (b) ...and WITH it the outcome applies: findings posted, and the approve becomes a
+        #     HUMAN hand-off rather than an arm. Dropping `self_attested` anywhere between
+        #     argv and revalidate_outcome_head restores (a) here.
+        run_review_outcome("approve", draft=False, self_attested=True)
+        check("an orchestrator-class non-draft approve applies, and hands off to a human",
+              (oc_calls, oc_outputs.get("decision")),
+              (["post-findings", "needs-user"], "needs-user"))
+        # (c) the waiver is DRAFT-ONLY: a moved head is still stale for the class.
+        run_review_outcome("approve", draft=False, self_attested=True, head="d" * 40)
+        check("...and the class does not waive head freshness",
+              (oc_calls, oc_outputs.get("decision"), oc_outputs.get("stale_reason")),
+              (["round-void"], "stale", "head-moved"))
+        # (d) a DRAFT worker PR is unaffected by the flag existing at all.
+        run_review_outcome("approve")
+        check("the worker lane still arms on an approve",
+              (oc_calls, oc_outputs.get("decision")), (["post-findings"], "arm"))
 
         # the fix outcome paths drop the same way (re-review + injection->needs-user)
         for injection, park_name in (("false", "re-review"), ("true", "needs-user")):
@@ -9785,6 +9922,11 @@ def main():
     dis.add_argument("--preserve-review-state", action="store_true",
                      help="redraft safely without changing review:needs/review:changes "
                           "(when=always label re-entry only)")
+    # Issue #570: mandatory, so a caller that forgets the trusted identity fails LOUDLY at argv
+    # instead of silently no-opping. An explicitly EMPTY value still fails closed inside disarm().
+    dis.add_argument("--bot-login", required=True,
+                     help="the exact App login that must author the PR (any other author, "
+                          "including another [bot], is skipped)")
 
     # The live reviewer handle arrives via env WORKER_REVIEWER_ACCOUNT (not argv — argv is echoed
     # into public logs) and is compared against the recorded hash under PROVENANCE_SALT.
@@ -9809,6 +9951,13 @@ def main():
     # against these so a security label added DURING review still lands in the audit trail.
     arm.add_argument("--security-keyword", action="append", default=[],
                      help="security label keyword (repeatable; from the target routing match_labels)")
+    # [#657] The orchestrator class. REFUSED here — see ready_and_arm. A flag rather than a
+    # value so a workflow that forgets it fails toward the ARMABLE-worker default it always had,
+    # and the class is instead kept out by decide_review never returning "arm" for it; the two
+    # refusals are independent on purpose.
+    arm.add_argument("--self-attested", action="store_true",
+                     help="the provenance record is self-attested (orchestrator class): refuse "
+                          "to arm")
 
     rout = subparsers.add_parser("review-outcome", parents=[common])
     rout.add_argument("--verdict-file", required=True)
@@ -9829,6 +9978,10 @@ def main():
     rout.add_argument("--impl-provider", required=True)
     rout.add_argument("--bot-login", required=True)
     rout.add_argument("--run-key", required=True)
+    # [#657] The orchestrator class: the draft freshness requirement stands down (the class is
+    # never drafted) and an approve becomes a human hand-off instead of an arm.
+    rout.add_argument("--self-attested", action="store_true",
+                      help="the provenance record is self-attested (orchestrator class)")
     rout.add_argument("--reviewed-sha", required=True,
                       help="the commit the review ran against; the outcome defers if the live "
                            "head has moved off it (issue #156)")
@@ -9931,7 +10084,8 @@ def main():
                        park_cause=args.park_cause)
         elif args.command == "disarm":
             disarm(args.repo, args.pr, args.when,
-                   preserve_review_state=args.preserve_review_state)
+                   preserve_review_state=args.preserve_review_state,
+                   bot_login=args.bot_login)
         elif args.command == "ready-and-arm":
             ready_and_arm(args.repo, args.pr, args.reviewed_sha, args.impl_provider,
                           args.impl_account_h, args.reviewer_provider,
@@ -9939,7 +10093,8 @@ def main():
                           args.arm == "true", issue=args.issue,
                           surface_paths=args.surface_path or None,
                           bot_login=args.bot_login, reviewed_base=args.reviewed_base,
-                          security_keywords=args.security_keyword or None)
+                          security_keywords=args.security_keyword or None,
+                          self_attested=args.self_attested)
         elif args.command == "review-outcome":
             review_outcome(args)
         elif args.command == "fix-outcome":
