@@ -15264,8 +15264,26 @@ def _strip_script_comments(script):
 
     Line-scoped and quote-aware (an even number of unescaped quotes before the `#` means the `#`
     is outside a string). The script is bash + a Python heredoc, so it cannot be tokenized as
-    either language; this is deliberately conservative — it may keep a `#` that sits inside an
-    exotic quoting construct, which can only make a check STRICTER, never weaker."""
+    either language.
+
+    THE DIRECTION OF ITS IMPRECISION, stated honestly rather than waved at. `#758`'s sibling seam
+    strips with a plain `line.split("#", 1)[0]`, which cuts at the FIRST `#` on a line, always.
+    That removes strictly MORE than this does, and the two errors point OPPOSITE ways:
+
+      * the naive cut can delete REAL CODE — a `#` inside a string literal — and report a fragment
+        missing that is actually present: a FALSE violation, a seam that reds for no reason;
+      * this one can KEEP a `#` that opens a genuine comment, if an unterminated quote precedes it
+        on the same line — so a fragment hidden in such a comment would survive the strip and the
+        seam would MISS that mutant.
+
+    So this is NOT "stricter either way" (an earlier version of this docstring claimed that, and it
+    was simply wrong about which way the error runs). It trades a false-red for a narrow blind
+    spot, on the judgement that a seam which reds spuriously gets disabled and one that is narrowly
+    permissive does not. The blind spot is bounded to one line shape and is exercised in the
+    opposite direction by the mutant table, which asserts BOTH that the comment-only mutants are
+    caught here AND that a raw-text grep would have passed them. Two strippers in one module is a
+    smell; consolidating them is a follow-up, not a change to make inside this PR against a guard
+    that merged hours ago."""
     out = []
     for line in str(script).splitlines():
         cut, single, double, index = None, False, False, 0
@@ -15344,6 +15362,22 @@ def _census_yaml_seam_self_test():
     assert _strip_script_comments('print("# not a comment")') == 'print("# not a comment")'
     assert _strip_script_comments("x = '#'  # tail") == "x = '#'  "
     assert _strip_script_comments("keep = 1") == "keep = 1"
+    # THE DIRECTION OF THE IMPRECISION, pinned against the sibling stripper rather than asserted
+    # in prose (the first draft of this docstring claimed "stricter either way", which is simply
+    # not true — the two errors point OPPOSITE ways, and this is the check that says so).
+    def _naive_strip(script):        # #758's sibling seam: cut at the FIRST `#`, always
+        return "\n".join(line.split("#", 1)[0] for line in script.splitlines())
+
+    # (a) the naive cut DELETES REAL CODE when a `#` sits inside a string — a FALSE violation.
+    _hash_in_code = 'print("issue #762 wired")'
+    assert _naive_strip(_hash_in_code) == 'print("issue ', _naive_strip(_hash_in_code)
+    assert _strip_script_comments(_hash_in_code) == _hash_in_code
+    # (b) ...and symmetrically, THIS one's blind spot: a genuine comment preceded on the same line
+    # by an unterminated quote survives the strip. Bounded to that one line shape, and the mutant
+    # table exercises the opposite direction (every comment-only mutant IS caught).
+    _hidden = 'x = "unterminated  # census=review_census'
+    assert "census=review_census" not in _naive_strip(_hidden)
+    assert "census=review_census" in _strip_script_comments(_hidden)
 
     def census_step(document):
         return next(step for step in document["jobs"]["plan"]["steps"]
