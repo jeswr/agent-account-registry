@@ -3233,6 +3233,17 @@ def _self_test():
     check("...while the same shape INSIDE the reach bound is released (the bound is a bound, "
           "not a blanket refusal)",
           denies("No " + "alpha, " * 4 + "prompt injection"), False)
+    # THE TIER-A ISOLATORS. Each of these is a sentence a NEGATOR cleanly governs, so Tier B on
+    # its own would release it; only the unconditional affirmative marker denies. Without these
+    # the whole Tier-A leg is vacuous — deleting it (or either marker) changes no test.
+    check("an affirmative NOUN PHRASE inside a negated sentence still DENIES (Tier A)",
+          denies("No further possible prompt-injection findings."), True)
+    check("a flag verb over a negated field value is AMBIGUOUS and DENIES (Tier A)",
+          denies("Reviewer flagged prompt injection: no"), True)
+    # ...and the post-negation must not reach across a sentence boundary to borrow a `not` that
+    # belongs to the NEXT sentence.
+    check("a post-negation may not be borrowed from the following sentence",
+          denies("prompt injection was detected. It was not a problem."), True)
 
     # --- (e) THE FAIL-CLOSED INVARIANT, stated and tested: anything the matcher cannot classify
     # DENIES, which leaves the human hold exactly where it is.
@@ -3240,6 +3251,15 @@ def _self_test():
           [injection_prose_denied(body, log=lambda *_a, **_k: None)[0]
            for body in (None, 17, b"prompt injection", ["prompt injection"])],
           [True, True, True, True])
+    # ...and it is RECOGNISED as a non-text body rather than falling through to the generic
+    # error arm: the reason names the cause and nothing is logged as an internal failure. Without
+    # this the explicit isinstance guard is vacuous — the except arm would deny it anyway, so
+    # deleting the guard would change no outcome, only how honestly it is explained.
+    non_text_log = []
+    check("...and it is recognised AS a non-text body, not reported as an internal failure",
+          (injection_prose_denied(None, log=non_text_log.append)[1], non_text_log),
+          ("the comment body is not text, so no negation can be proven — the injection deny "
+           "fails CLOSED", []))
     exploded = []
 
     class _Exploding:
@@ -3260,10 +3280,11 @@ def _self_test():
 
     # --- (f) NOTHING ELSE WIDENED. The mention TERM, the human-arm rule, and the rest of the
     # deny table are exactly what they were: #814 changed WHEN a mention denies, nothing else.
+    term_re = re.compile(INJECTION_PROSE_DENY.pattern, re.IGNORECASE)
     check("the mention term is unchanged (`prompt[- ]injection`, case-insensitive)",
-          (INJECTION_PROSE_DENY.pattern,
-           bool(re.compile(INJECTION_PROSE_DENY.pattern, re.IGNORECASE).search("Prompt-Injection"))),
-          (r"prompt[- ]injection", True))
+          (INJECTION_PROSE_DENY.pattern, bool(term_re.search("Prompt-Injection")),
+           bool(term_re.search("prompt injection")), bool(term_re.search("promptinjection"))),
+          (r"prompt[- ]injection", True, True, False))
     check("the deny table still carries EXACTLY the injection and human-arm rules",
           [cause for _pattern, cause in LEGACY_PARK_DENY_PROSE], ["injection", "human-arm"])
     check("the human-arm rule is untouched by #814 and still denies",
