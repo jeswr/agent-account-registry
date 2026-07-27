@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4543,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "74516d835914fae88d9c808747dcdd62958b46fa",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 2 explicitly says both inner conditions may be false, yet rows 2 and 4 replace a nested `IfElse` with the opposite branch value merely because the outer selected branch implies one inner condition is false. For row 4, let outer `then_condition = false`, outer `else_condition = true`, and both inner conditions be false (with inner `else_condition` equal to the outer then condition). The original nested merge yields the zero/uninitialized value, while the documented rewrite substitutes `inner_then_value`; row 2 has the symmetric problem. Mutual exclusion proves only that the matched inner arm is dead, not that the other arm is live. This also makes the statements that all four collapses share the same soundness argument and that soundness was not an obstacle unsupported.",
+    "file": "research/noir-not-canonicalization-ifelse-merging.md",
+    "fix_hint": "Re-check the actual upstream preconditions for the existing else-value rewrite and document the stronger implication that makes it valid, if one exists. Add a regression test covering an outer selected branch with both nested conditions false and show that the real simplifier preserves the zero/uninitialized result. If no stronger invariant exists, classify rows 2/4 as unsound, do not present the mirrored implementation as reconstructable, and update the summary in `research/noir-optimization-program.md` accordingly.",
+    "severity": "major",
+    "title": "The stated invariant does not justify collapse rows 2 and 4"
+   }
+  ],
+  "progress": null,
+  "summary": "The experiment record contains a load-bearing soundness error. Its stated `IfElse` invariant (conditions are mutually exclusive, but both may be false) is sufficient for the then-value collapses, but not for the mirrored else-value collapses. Consequently the claim that all four rows are sound under the same invariant, and the reconstruction guidance based on it, cannot be approved.",
+  "verdict": "request_changes"
+ }
+}
