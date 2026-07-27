@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 3858,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c66448ae18980e461d4d2c04424125a2c676bb13",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`sparq_gpu_is_still_unpublished` still checks only whether a comment-stripped line starts with `publish` and contains `false`. A valid unrelated key such as `publish-note = false` satisfies that predicate even if `publish = false` is removed or changed to `publish = true`. Cargo would then treat the package as publishable while this deferral trigger remains green, contradicting the enforcement claims in `lib.rs` and `research/threat-model.md`.",
+    "file": "crates/sparq-gpu/tests/prototype_stage_tripwire.rs",
+    "fix_hint": "Reuse Cargo metadata: select the `sparq-gpu` workspace package by package identity and require its `publish` field to be an empty array, Cargo metadata's representation of `publish = false`. Add a focused regression fixture proving that an absent or true `publish` setting plus an unrelated `publish-note = false` key is rejected.",
+    "severity": "major",
+    "title": "Publication tripwire still accepts unrelated manifest keys"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 4's major finding remains unchanged. The dependency detector now uses Cargo metadata, but `sparq_gpu_is_still_unpublished` still scans manifest text with `starts_with(\"publish\") && contains(\"false\")`. An unrelated key such as `publish-note = false` can therefore keep the tripwire green after `publish = false` is removed or changed, despite the documentation claiming publication is enforced. Progress is stagnant because the same major correctness/security-enforcement gap remains at the same severity.",
+  "verdict": "request_changes"
+ }
+}
