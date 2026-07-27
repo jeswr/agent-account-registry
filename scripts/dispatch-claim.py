@@ -305,6 +305,35 @@ def _lease_ttl(mode):
 
 REVIEW_TTL = _lease_ttl("review")   # 10+10+25+10+15 = 70m (was 20m — shorter than the 25m run job)
 FIX_TTL = _lease_ttl("fix")         # 10+10+60+10+15 = 105m (was 60m — exactly the run job, no slack)
+# ---- THE SELF-CLAIM LANE CAPS (issue #581) ---------------------------------------------------
+# review-fix.yml has TWO launch paths for the SAME work, and they are bounded by DIFFERENT rules
+# ON PURPOSE. This pair names the divergence so it is a decision rather than a drifting literal.
+#
+#   * DISPATCHER-launched (`inputs.claim_id != ''`): the lease was already CAS-claimed above with
+#     `account_slot_bound=True` and a live `usage` probe, so the bound is the LIVE sum of
+#     remaining per-account slots, recomputed inside every CAS attempt (issue #448). No static
+#     ceiling — one would strand an idle provider behind a coarse fleet-wide constant.
+#   * SELF-claimed (`inputs.claim_id == ''` — a manual/CLI workflow_dispatch that never went
+#     through the dispatcher): the workflow shells out to `select-and-claim.py --claim`, whose CLI
+#     path passes NO usage map (select-and-claim.main: `usage` defaults to None). Handing that
+#     path `account_slot_bound=True` would compute "remaining slots" with rate-limit headroom
+#     UNKNOWN, i.e. it would count a probe-gated (anthropic) account's slots as free while it is
+#     actually throttled — an ungated bound that over-admits. A static prefix cap is the only
+#     honest ceiling available without a probe, so this path keeps one.
+#
+# The numbers carry review-fix.yml's own stated rationale: the static codex slot count for each
+# lane (codex being usage-exempt is what makes an unprobed static bound sound for it at all). The
+# live account records that back them are in the PRIVATE registry, so this file cannot re-derive
+# them — which is exactly why they need pinning rather than re-computation. They are NOT
+# interchangeable with the dispatcher's model: never reintroduce them as `max_holder_concurrent`
+# on the dispatcher's claim — `_self_test` asserts that stays None, and setting it would revert
+# the #448 fan-out throughput fix.
+#
+# These MIRROR the `cap=` literals in review-fix.yml's `claim` job; `_review_fix_workflow_values`
+# parses them back out and `_self_test` asserts equality, so a one-sided edit on either side turns
+# the self-test red exactly as a one-sided `ttl=` edit already does.
+SELF_CLAIM_REVIEW_CAP = 10
+SELF_CLAIM_FIX_CAP = 3
 MISSED_FIX_LIMIT = 6  # consecutive missed fix dispatches per round before needs-user (decision 13)
 # "not probed yet" sentinel for the per-PR readmission-cutoff memo (#555 recurrence gap): the
 # cutoff's own falsy value (None = no proven human gesture) is a MEANINGFUL result, so it cannot
@@ -6947,6 +6976,17 @@ def _review_fix_workflow_values(source=None):
     ttl_review = re.search(r'prefix="review:";[^\n]*\bttl=(\d+)', claim_span)
     ttl_fix = re.search(r'prefix="fix:";[^\n]*\bttl=(\d+)', claim_span)
     assert ttl_review and ttl_fix, "claim job local review/fix ttl= literals not found"
+    # Issue #581: the `cap=` literals in that same line were the one unpinned pair in a block
+    # whose siblings are all cross-asserted, so a self-claim cap edit was invisible to every
+    # self-test. Parse them too and pin them to SELF_CLAIM_*_CAP below.
+    cap_review = re.search(r'prefix="review:";[^\n]*\bcap=(\d+)', claim_span)
+    cap_fix = re.search(r'prefix="fix:";[^\n]*\bcap=(\d+)', claim_span)
+    assert cap_review and cap_fix, "claim job local review/fix cap= literals not found"
+    # The cap is only a BOUND if it is actually passed to the allocator; a block that computes
+    # `cap=` and then drops it on the floor is unbounded, and an equality assert on the literal
+    # would still read green. Pin the wiring, not just the number.
+    cap_wired = re.search(r'--max-holder-concurrent "\$cap"', claim_span)
+    assert cap_wired, "claim job does not pass $cap to --max-holder-concurrent (#581)"
     # Issue #560 lane-hand-over wiring, pinned to the WORKFLOW (the python halves cannot see it):
     # the `run` job must EXPORT stage-verdict's staged/stale_reason, the `outcome` job must ADMIT
     # the staged-nothing path (its old `if` skipped the whole job, which is why review:changes was
@@ -6969,6 +7009,8 @@ def _review_fix_workflow_values(source=None):
         "run_fix_s": int(run_m.group(2)) * 60,
         "local_review_ttl": int(ttl_review.group(1)),
         "local_fix_ttl": int(ttl_fix.group(1)),
+        "local_review_cap": int(cap_review.group(1)),
+        "local_fix_cap": int(cap_fix.group(1)),
         "run_exports_staged": "verdict_staged: ${{ steps.stage-verdict.outputs.staged }}"
                               in run_span,
         "run_exports_stale_reason":
@@ -7490,6 +7532,51 @@ def _self_test():
     # would hold the same account for different windows.
     assert _wf["local_review_ttl"] == REVIEW_TTL, _wf["local_review_ttl"]
     assert _wf["local_fix_ttl"] == FIX_TTL, _wf["local_fix_ttl"]
+    # ---- ISSUE #581: THE SELF-CLAIM CAPS, PINNED THE SAME WAY THE TTLs ARE ----------------------
+    # The `cap=` literals sat beside the now-pinned `ttl=` literals with nothing asserting them, so
+    # the self-claim path's concurrency bound could drift silently while every sibling number in
+    # the same shell line was cross-checked. They are a DELIBERATE divergence from the
+    # dispatcher's `account_slot_bound=True` (see SELF_CLAIM_*_CAP for why the unprobed CLI path
+    # cannot use the live-slot bound), so pin them to the named constants that document the
+    # reason: a one-sided edit on either side is now red.
+    assert _wf["local_review_cap"] == SELF_CLAIM_REVIEW_CAP, _wf["local_review_cap"]
+    assert _wf["local_fix_cap"] == SELF_CLAIM_FIX_CAP, _wf["local_fix_cap"]
+    # A non-positive cap is not a tighter bound, it is a DEAD LANE: claim() returns None with
+    # reason "lane-cap" before it ever looks at an account, so every self-claim would defer
+    # forever. Fail closed on the degenerate value rather than shipping a silently dark path.
+    assert SELF_CLAIM_REVIEW_CAP > 0 and SELF_CLAIM_FIX_CAP > 0, (
+        SELF_CLAIM_REVIEW_CAP, SELF_CLAIM_FIX_CAP)
+    # The divergence stays ONE-SIDED by construction: the dispatcher's own review/fix claim is
+    # pinned to account_slot_bound=True + max_holder_concurrent=None by the #448 fan-out
+    # self-test below, so wiring either constant back into it is already red there.
+    #
+    # NON-VACUITY. An equality assert against a literal the extractor mis-parses (or stops
+    # finding) would read green forever, and this is exactly the class of check issue #581 was
+    # filed about. Mutate each `cap=` in the REAL workflow text and require the extractor to
+    # report the mutant — i.e. require the asserts above to actually flip.
+    _rf_text_caps = (Path(__file__).resolve().parents[1] / ".github" / "workflows"
+                     / "review-fix.yml").read_text(encoding="utf-8")
+    for _cap_from, _cap_to, _cap_field in (
+            ('prefix="review:"; cap=10;', 'prefix="review:"; cap=99;', "local_review_cap"),
+            ('prefix="fix:"; cap=3;', 'prefix="fix:"; cap=99;', "local_fix_cap")):
+        _cap_mutant = _rf_text_caps.replace(_cap_from, _cap_to)
+        assert _cap_mutant != _rf_text_caps, (
+            f"the #581 cap mutation {_cap_from!r} matched nothing — the anchor drifted, re-point "
+            "it")
+        assert _review_fix_workflow_values(source=_cap_mutant)[_cap_field] == 99, (
+            f"an edited self-claim {_cap_field} must FLIP the #581 assertion red, but the "
+            "extractor did not report the mutated cap")
+    # Dropping the `--max-holder-concurrent "$cap"` wiring leaves the literal intact and the
+    # lane UNBOUNDED; the equality asserts alone would not notice. Require that mutant to raise.
+    _cap_unwired = _rf_text_caps.replace('--max-holder-concurrent "$cap" \\\n', "")
+    assert _cap_unwired != _rf_text_caps, (
+        "the #581 cap-wiring mutation matched nothing — the anchor drifted, re-point it")
+    try:
+        _review_fix_workflow_values(source=_cap_unwired)
+        raise SystemExit("a claim job that stops passing $cap to --max-holder-concurrent must "
+                         "FAIL the #581 extractor, but it parsed cleanly")
+    except AssertionError:
+        pass
     # Issue #560 lane-hand-over wiring (see _review_fix_workflow_values). Without these the fix
     # lane silently re-acquires the SAME deferred PR every dispatch tick: the enumerator's bucket
     # is the review:changes label, and only this wiring clears it.
