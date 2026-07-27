@@ -82,7 +82,24 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
-RETRYABLE = {403, 429, 500, 502, 503, 504}
+RETRYABLE = {429, 500, 502, 503, 504}
+# 403 is deliberately NOT in RETRYABLE (issue #819). It is not one status, it is three different
+# server answers wearing the same number, and only one of them is a blip worth retrying:
+#
+#   secondary   GitHub is throttling a burst. Carries `Retry-After` (or says "secondary rate
+#               limit" / "abuse detection"). RETRYABLE, after the wait it asks for.
+#   budget      The installation's hourly request budget is spent. Body says "API rate limit
+#               exceeded", `x-ratelimit-remaining: 0`, and — measured, 0 of 27 observed failures
+#               on 2026-07-27 — NO `Retry-After` at all. NOT retryable: the reset can be most of
+#               an hour, so each retry is two more requests spent deepening the outage that is
+#               already refusing them.
+#   permission  The token cannot do this. NOT retryable, and never was: retrying it three times
+#               only made a permanent refusal take fifteen seconds to report.
+#
+# Until #819 every 403 took the retry path, so the tick that exhausted the budget answered by
+# issuing 3x the requests for every read, in 8 parallel threads.
+_SECONDARY_403_MARKERS = ("secondary rate limit", "abuse detection", "retry later")
+_BUDGET_403_MARKERS = ("rate limit exceeded", "rate limit for installation")
 LIST_PAGE_LIMIT = 50        # issues/pulls ceiling: 5000 entries, repo-level, sweep-fatal
 # Per-SHA ceiling backstop: 4000 entries (the f37d13f emergency bump — churned sparq heads
 # really do pass 1000, e.g. PR #2540 at 1061), and it now degrades PER ITEM, never per sweep.
@@ -111,9 +128,35 @@ SNAPSHOT_CONCURRENCY = 8
 # park the whole sweep on a sleep.
 RETRY_AFTER_CAP_SECONDS = 30
 
+# THE REQUEST-BUDGET RESERVE (issue #819 / #796). Every REST response carries the authoritative
+# `x-ratelimit-remaining` for the bucket the request was actually charged to. `GET /rate_limit`
+# does NOT — it reports a different bucket and read healthy throughout the 2026-07-27 outage while
+# every snapshot request 403'd, which is why that endpoint is not consulted anywhere here.
+#
+# When the remaining budget falls to this reserve the sweep STOPS, loudly, instead of spending the
+# last of it. The reserve exists because the snapshot is not the only consumer of this bucket:
+# `secrets-guard` needs a handful of reads to resolve the default branch and the environment
+# policy, CLAIM needs its lease/launch writes, and plan-alert needs one `gh issue list` to raise
+# the alarm. A snapshot that drains the bucket to zero takes the GUARD and the ALERT down with it
+# — which is exactly what happened: on every failing tick since 18:26:17Z the guard failed with
+# "cannot resolve the repository default branch" and ALERT was SKIPPED, so the total pipeline
+# stall raised no alarm at all.
+RATE_LIMIT_RESERVE = 100
+
 
 class FetchError(Exception):
     """A GitHub read failed for good (retries exhausted) or returned a malformed page."""
+
+
+class BudgetExhausted(Exception):
+    """The request budget for this token is spent (or down to RATE_LIMIT_RESERVE).
+
+    DELIBERATELY NOT a FetchError. Every per-item handler in this file catches FetchError and
+    converts it into a per-PR skip, so a budget failure raised as a FetchError would be recorded
+    as `check-runs-read-failed` on PR after PR while the sweep kept issuing requests into a
+    bucket that has none left. Sweep-fatal is the only correct scope for this class, and making
+    it a sibling of FetchError rather than a subclass is what enforces that structurally —
+    `budget_403_is_never_downgraded_to_a_per_item_skip` in the self-test pins it."""
 
 
 class SnapshotItemError(Exception):
@@ -150,26 +193,108 @@ def _retry_delay(exc, attempt):
     falls back to the original ladder; an oversized one is capped (RETRY_AFTER_CAP_SECONDS)
     so the read exhausts its retries and fails CLOSED instead of sleeping out the job.
 
-    MEASURED LIMIT OF THIS FIX (2026-07-27, issue #796): the OTHER 403 this snapshot can hit
-    is App-installation budget exhaustion — body `"API rate limit exceeded for installation"`,
-    `x-ratelimit-remaining: 0`, and **no `Retry-After` at all** (0 of 27 observed failures
-    carried one). GitHub's guidance there is to wait for `x-ratelimit-reset`, which can be
-    most of an hour and is longer than this job may live, so that class deliberately falls
-    through the ladder and fails closed: a dead tick beats a job parked on a sleep. Do not
-    read this helper as having solved budget exhaustion — it solves the case where GitHub
-    says how long to wait. Note also that `GET /rate_limit` reports a DIFFERENT bucket and
-    will happily say thousands remain while every read 403s (#796).
+    THIS HELPER ONLY SIZES THE WAIT. Which 403s are waited on at all is `classify_403`'s job
+    (#819): the OTHER 403 this snapshot can hit is installation budget exhaustion — body
+    `"API rate limit exceeded for installation"`, `x-ratelimit-remaining: 0`, and **no
+    `Retry-After` at all** (0 of 27 observed failures on 2026-07-27 carried one). GitHub's
+    guidance there is to wait for `x-ratelimit-reset`, which can be most of an hour and is
+    longer than this job may live, so that class is now raised as BudgetExhausted on the FIRST
+    response instead of being retried into the same empty bucket twice more. Note also that
+    `GET /rate_limit` reports a DIFFERENT bucket and will happily say thousands remain while
+    every read 403s (#796) — which is why every budget number here comes off the RESPONSE.
     """
-    header = getattr(exc, "headers", None)
-    suggested = header.get("Retry-After") if hasattr(header, "get") else None
-    if suggested is not None:
-        try:
-            seconds = int(str(suggested).strip())
-        except ValueError:
-            seconds = 0
-        if seconds > 0:
-            return min(seconds, RETRY_AFTER_CAP_SECONDS)
+    seconds = _retry_after_seconds(getattr(exc, "headers", None))
+    if seconds:
+        return min(seconds, RETRY_AFTER_CAP_SECONDS)
     return 5 * (attempt + 1)
+
+
+def _header(headers, name):
+    """Case-insensitive single header read over anything dict-like (http.client.HTTPMessage,
+    a plain dict, or the dict a test hands an HTTPError). -> str|None."""
+    if headers is None:
+        return None
+    if hasattr(headers, "get"):
+        got = headers.get(name)
+        if got is not None:
+            return str(got)
+    try:
+        items = headers.items()
+    except AttributeError:
+        return None
+    lowered = name.lower()
+    for key, value in items:
+        if str(key).lower() == lowered:
+            return str(value)
+    return None
+
+
+def _retry_after_seconds(headers):
+    """The `Retry-After` header as a positive int, or 0. A date-form or malformed value is 0 —
+    the caller falls back to its own ladder rather than guessing at an HTTP-date."""
+    raw = _header(headers, "Retry-After")
+    if raw is None:
+        return 0
+    try:
+        seconds = int(raw.strip())
+    except ValueError:
+        return 0
+    return seconds if seconds > 0 else 0
+
+
+def _int_header(headers, name):
+    raw = _header(headers, name)
+    if raw is None:
+        return None
+    try:
+        return int(raw.strip())
+    except ValueError:
+        return None
+
+
+def classify_403(headers, body=""):
+    """-> 'secondary' | 'budget' | 'permission'. See the RETRYABLE block for what each means.
+
+    ORDER IS THE CONTRACT. `secondary` is tested first because a secondary-limit 403 can also
+    carry rate-limit headers; treating one as `budget` would stop a sweep that only needed to wait
+    the few seconds GitHub asked for. `budget` is tested before `permission` because a permission
+    refusal is the RESIDUAL class — the one with no positive evidence — and residual classes must
+    never be inferred from the ABSENCE of a header that a truncated response might simply have
+    dropped."""
+    text = (body or "").lower()
+    if _retry_after_seconds(headers) or any(m in text for m in _SECONDARY_403_MARKERS):
+        return "secondary"
+    if _int_header(headers, "x-ratelimit-remaining") == 0:
+        return "budget"
+    if any(m in text for m in _BUDGET_403_MARKERS):
+        return "budget"
+    return "permission"
+
+
+def _budget_detail(headers):
+    """A human-readable `remaining/limit, resets at ...` for the loud failure message."""
+    remaining = _int_header(headers, "x-ratelimit-remaining")
+    limit = _int_header(headers, "x-ratelimit-limit")
+    reset = _int_header(headers, "x-ratelimit-reset")
+    when = (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(reset))
+            if reset is not None else "unknown")
+    return (f"x-ratelimit-remaining={remaining if remaining is not None else 'absent'}"
+            f"/{limit if limit is not None else 'absent'}, resets at {when}")
+
+
+def _check_reserve(headers):
+    """Read the AUTHORITATIVE remaining budget off a response and stop the sweep before it is
+    gone. Raises BudgetExhausted; returns the remaining count otherwise (None when the header is
+    absent, which is NOT treated as exhaustion — an absent header proves nothing, and failing
+    closed on it would take the pipeline down on any proxy that strips it)."""
+    remaining = _int_header(headers, "x-ratelimit-remaining")
+    if remaining is not None and remaining <= RATE_LIMIT_RESERVE:
+        raise BudgetExhausted(
+            "GitHub request budget is down to the reserve — stopping this snapshot before it "
+            f"spends the last of it ({_budget_detail(headers)}, reserve {RATE_LIMIT_RESERVE}). "
+            "The reserve keeps enough budget for secrets-guard, CLAIM and the ops-alert; a "
+            "snapshot that drains the bucket takes the pipeline's own alarm down with it (#819).")
+    return remaining
 
 
 def make_fetch(token):
@@ -186,8 +311,32 @@ def make_fetch(token):
             })
             try:
                 with urlopen(request, timeout=30) as response:
-                    return json.load(response)
+                    payload = json.load(response)
+                    # Read the budget off the SUCCESSFUL response too (issue #796): that is the
+                    # only place the authoritative number for this bucket ever appears, and a
+                    # sweep that only looks after it has already been refused has learned it one
+                    # request too late.
+                    _check_reserve(getattr(response, "headers", None))
+                    return payload
             except HTTPError as exc:
+                if exc.code == 403:
+                    headers = getattr(exc, "headers", None)
+                    kind = classify_403(headers, _error_body(exc))
+                    if kind == "budget":
+                        raise BudgetExhausted(
+                            "authenticated GitHub read refused (HTTP 403, request budget "
+                            f"exhausted) for {url.split('?')[0]} — {_budget_detail(headers)}. "
+                            "This class carries no Retry-After and its reset can be most of an "
+                            "hour, so it is NOT retried: every retry is another request spent on "
+                            "a bucket that has none. If this is sustained, the dispatcher is "
+                            "issuing more requests per hour than the budget allows — see the "
+                            "tick floor in scripts/dispatch-tick-floor.py (#819).") from exc
+                    if kind == "secondary" and attempt < 2:
+                        time.sleep(_retry_delay(exc, attempt))
+                        continue
+                    raise FetchError(
+                        f"authenticated GitHub read failed (HTTP 403, {kind}) for "
+                        + url.split("?")[0]) from exc
                 if exc.code in RETRYABLE and attempt < 2:
                     time.sleep(_retry_delay(exc, attempt))
                     continue
@@ -202,6 +351,16 @@ def make_fetch(token):
                     "authenticated GitHub read failed for " + url.split("?")[0]) from exc
 
     return fetch
+
+
+def _error_body(exc):
+    """The first 4 KiB of an HTTPError's body, for CLASSIFICATION ONLY. Never rendered into a
+    message, never written to the snapshot: it is remote content. Reading it is best-effort — a
+    body that cannot be read leaves classification to the headers alone."""
+    try:
+        return exc.read(4096).decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001 - any read failure degrades to header-only classification
+        return ""
 
 
 def _ordered_map(worker, jobs, concurrency=SNAPSHOT_CONCURRENCY):
@@ -969,6 +1128,136 @@ def _self_test():
         assert [call.args[0] for call in slept.call_args_list] == [7, 7], \
             slept.call_args_list
 
+    def the_three_403s_are_told_apart():
+        """#819. Until this landed every 403 was retried three times, so the read that proved the
+        budget was gone answered by spending three more requests on it — eight threads deep."""
+        assert classify_403({"Retry-After": "7"}, "") == "secondary"
+        assert classify_403({}, "You have exceeded a secondary rate limit") == "secondary"
+        # The MEASURED budget shape (2026-07-27, 27 observed failures): remaining 0, NO Retry-After.
+        assert classify_403({"x-ratelimit-remaining": "0",
+                             "x-ratelimit-reset": "1785182238"}, "") == "budget"
+        assert classify_403({}, '{"message":"API rate limit exceeded for installation"}') \
+            == "budget"
+        # Header case is not the server's contract to keep: GitHub sends lowercase, http.client
+        # normalises, a proxy may not.
+        assert classify_403({"X-RateLimit-Remaining": "0"}, "") == "budget"
+        # The residual class. No rate evidence at all => permission, never "assume throttle".
+        assert classify_403({"x-ratelimit-remaining": "4931"},
+                            "Resource not accessible by integration") == "permission"
+        assert classify_403({}, "") == "permission"
+        # ORDER: a secondary limit that ALSO reports remaining 0 must still be the retryable
+        # class — GitHub told us exactly how long to wait, so waiting is strictly better than
+        # standing the tick down.
+        assert classify_403({"Retry-After": "5", "x-ratelimit-remaining": "0"}, "") == "secondary"
+
+    def budget_403_is_not_retried_and_is_sweep_fatal():
+        """Two properties, and BOTH are load-bearing at the call site:
+
+        the retry COUNT — a non-retryable class must cost exactly one request, which is the whole
+        point of classifying at all — and the exception TYPE. Asserting only the count passes a
+        mutant that keeps the request count at one but raises a FetchError instead of a
+        BudgetExhausted, and that mutant is not cosmetic: FetchError is what every per-item
+        handler in this file converts into a per-PR skip, so it would put the sweep straight back
+        into hammering an empty bucket one PR at a time."""
+        module = sys.modules[__name__]
+        for label, headers, body, want_attempts, want_type in (
+                ("budget", {"x-ratelimit-remaining": "0"}, b"", 1, BudgetExhausted),
+                ("budget-by-body", {},
+                 b'{"message":"API rate limit exceeded for installation"}', 1, BudgetExhausted),
+                ("permission", {"x-ratelimit-remaining": "4931"},
+                 b"Resource not accessible by integration", 1, FetchError),
+                ("secondary", {"Retry-After": "1"}, b"secondary rate limit", 3, FetchError),
+        ):
+            attempts = {"n": 0}
+
+            def refuse(request, timeout=None, _h=headers, _b=body):
+                attempts["n"] += 1
+                raise HTTPError("https://api.github.com/x", 403, "no", _h, io.BytesIO(_b))
+
+            with patch.object(module, "urlopen", refuse), patch.object(time, "sleep"):
+                try:
+                    make_fetch("t")("https://api.github.com/x")
+                except BaseException as exc:  # noqa: BLE001 - the TYPE is the assertion
+                    got = type(exc)
+                else:
+                    raise AssertionError(f"a {label} 403 must raise")
+            assert got is want_type, (label, got, want_type)
+            assert attempts["n"] == want_attempts, (label, attempts)
+
+    def budget_403_is_never_downgraded_to_a_per_item_skip():
+        """THE COMPOSITION TRAP. `_fetch_check_runs` converts every FetchError into a per-PR
+        `check-runs-read-failed` skip, and `snapshot_one` swallows that. A budget failure raised as
+        a FetchError would therefore be recorded as a skip on PR after PR while the sweep kept
+        hammering an empty bucket — the sweep would look degraded-but-alive and would issue
+        hundreds more requests. BudgetExhausted is not a FetchError precisely so it escapes both
+        handlers, and this is the test that would go red if someone 'tidied' it into the
+        hierarchy."""
+        assert not issubclass(BudgetExhausted, FetchError)
+
+        def broke(url):
+            raise BudgetExhausted("budget gone")
+
+        for label, call in (
+                ("the check-runs walk",
+                 lambda: _fetch_check_runs(broke, repo, "a" * 40, check_name=gate)),
+                ("the PR detail read",
+                 lambda: _pr_status_record(broke, claim, repo, 7)),
+                # The full per-PR sweep, over a pull the worker filter actually admits — a
+                # fixture the filter rejects would make this assertion vacuous by never issuing
+                # a read at all.
+                ("the whole per-PR snapshot", lambda: _pr_status_snapshot(
+                    broke, claim, repo,
+                    [worker_pull(7, "b" * 40)], concurrency=1)),
+        ):
+            try:
+                call()
+            except BudgetExhausted:
+                pass
+            except SnapshotItemError as exc:
+                raise AssertionError(
+                    f"{label} downgraded a budget failure to a per-item skip "
+                    f"({exc.reason}) — the sweep would keep issuing requests") from exc
+            else:
+                raise AssertionError(f"{label} swallowed a budget failure entirely")
+
+    def the_reserve_stops_the_sweep_before_the_budget_is_gone():
+        """#796: the authoritative remaining count only ever appears on the RESPONSE. Reading it
+        off successful responses is what makes the back-off happen one request early instead of
+        one request late."""
+        module = sys.modules[__name__]
+
+        class _Response:
+            def __init__(self, headers):
+                self.headers = headers
+                self._body = io.BytesIO(b"[]")
+
+            def read(self, *args):
+                return self._body.read(*args)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        for label, remaining, want in (
+                ("well inside the budget", 4931, "ok"),
+                ("exactly at the reserve", RATE_LIMIT_RESERVE, "stop"),
+                ("one above the reserve", RATE_LIMIT_RESERVE + 1, "ok"),
+                ("header absent (proves nothing — must NOT fail closed)", None, "ok"),
+        ):
+            headers = {} if remaining is None else {"x-ratelimit-remaining": str(remaining),
+                                                    "x-ratelimit-limit": "5000",
+                                                    "x-ratelimit-reset": "1785182238"}
+            with patch.object(module, "urlopen",
+                              lambda request, timeout=None, _h=headers: _Response(_h)):
+                try:
+                    make_fetch("t")("https://api.github.com/x")
+                    got = "ok"
+                except BudgetExhausted:
+                    got = "stop"
+            assert got == want, (label, got, want)
+
     snapshot_parallel_output_is_identical_to_serial()
     per_pr_reads_actually_overlap()
     repo_listings_overlap_across_repos()
@@ -976,6 +1265,10 @@ def _self_test():
     concurrency_stays_inside_the_secondary_rate_limit_budget()
     sweep_fatal_listing_failure_is_still_fatal()
     retry_after_is_honoured_and_capped()
+    the_three_403s_are_told_apart()
+    budget_403_is_not_retried_and_is_sweep_fatal()
+    budget_403_is_never_downgraded_to_a_per_item_skip()
+    the_reserve_stops_the_sweep_before_the_budget_is_gone()
 
     print("plan-snapshot self-test PASSED")
     return 0
@@ -998,6 +1291,12 @@ def main():
              Path(args.repos_file).read_text(encoding="utf-8").splitlines() if line]
     try:
         snapshot_targets(make_fetch(token), _load_claim(), repos, args.out_dir)
+    except BudgetExhausted as exc:
+        # A distinct, annotated exit: this is not "a read failed", it is "the dispatcher is
+        # running hotter than its request budget allows", and it needs a different fix from
+        # every other snapshot failure. The annotation puts it on the run summary rather than
+        # only in the step log.
+        raise SystemExit(f"::error title=dispatch request budget exhausted::{exc}") from exc
     except FetchError as exc:
         raise SystemExit(str(exc)) from exc
     return 0
