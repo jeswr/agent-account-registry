@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 864,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "7ffeb0b5ed824106261988955f9713b3127effce",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly adds fail-closed JavaScript syntax validation in both gate paths. The workflow sweep uses nullglob, explicitly refuses a missing Node runtime and a vacuous match set, and checks all supported dashboard script extensions without executing untrusted code. The worker gate classifies the same extensions, validates each emitted js target with node --check, and increments the direct-validation count only after success, preserving the existing direct-to-target non-vacuity invariant. The selector self-tests cover positive .js/.mjs classification, exclusion from unrelated target kinds, and exclusion of a non-JavaScript dashboard asset. No trust check is weakened, no permissive fallback is introduced, and no injection-like instruction appears in the diff.",
+  "verdict": "approve"
+ }
+}
