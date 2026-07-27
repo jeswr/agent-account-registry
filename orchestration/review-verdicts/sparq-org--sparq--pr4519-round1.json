@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 4519,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "03e890e10e6233de2332096afb6190bf0ce80b35",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "In run_hybrid, the filtered-ann constraint is passed only to run_knn for the built-in dense arm. cfg.run_arms returns unrestricted IDs, which are fused and truncated to the final k before the surrounding BGP join runs. Consequently, high-ranked auxiliary hits that do not satisfy the join constraint can occupy the fused top-k and then disappear at the join, while qualifying lower-ranked candidates are permanently lost; unrestricted hits also distort the RRF ranks of qualifying hits. This violates the filtered retrieval semantics claimed for the query surface.",
+    "file": "crates/sparq-vectors/src/rewrite.rs",
+    "fix_hint": "Apply the derived candidate mask to every arm's ranking before validate/fusion (preserving each arm's relative order), or pass an equivalent admissibility constraint into the arm contract. Add an end-to-end witness test where an auxiliary arm ranks at least k nonmatching nodes above a matching node and assert that the matching node remains in the constrained top-k with the correct provenance/rank.",
+    "severity": "major",
+    "title": "Auxiliary arms bypass the BGP-derived candidate mask before fusion"
+   },
+   {
+    "body": "run_hybrid accepts arbitrary Id values from caller closures and later calls graph.dict.term(hit.id) while constructing VALUES rows. There is no check that an ID belongs to this graph's dictionary. An out-of-process or buggy arm can therefore turn an invalid ID into the dictionary's out-of-range placeholder term and inject a row that does not identify any retrieved graph entity, rather than producing the documented hard query error.",
+    "file": "crates/sparq-vectors/src/rewrite.rs",
+    "fix_hint": "Validate every arm result ID against the graph dictionary/domain before fusion and return an arm-named error for invalid IDs. Add a real query-path test with an out-of-range ID (and ID 0) proving the query fails closed rather than emitting a placeholder binding.",
+    "severity": "major",
+    "title": "Caller arms can emit IDs outside the graph dictionary"
+   },
+   {
+    "body": "a_hybrid_pattern_joins_the_surrounding_bgp uses a fixture where every vector-store entity has the asserted <http://ex/p> triple, so the constraint admits every candidate. It would pass even if auxiliary arms completely ignored the BGP-derived mask, as the implementation currently does.",
+    "file": "crates/sparq-vectors/tests/vec_hybrid.rs",
+    "fix_hint": "Use distinct predicates or omit the constraining triple for selected arm hits, then assert both the exact surviving top-k IDs and their ranks/provenance.",
+    "severity": "minor",
+    "title": "The join test does not exercise filtered hybrid retrieval"
+   }
+  ],
+  "progress": null,
+  "summary": "The fusion and reranking core is generally well structured, but the query integration is not sound for filtered/join-constrained retrieval. Only the dense arm receives the BGP-derived candidate mask; caller arms are fused without applying that constraint, and the ordinary join filters them only after fusion has already truncated to k. This can both change ranks and return fewer than k qualifying results. The end-to-end join test is vacuous for this invariant because every retrieved fixture node satisfies the constraining triple. Caller-arm IDs also need graph-domain validation before they are converted into VALUES terms.",
+  "verdict": "request_changes"
+ }
+}
