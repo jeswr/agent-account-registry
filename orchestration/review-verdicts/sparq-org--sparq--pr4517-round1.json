@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4517,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "4721b1484f6d4a30b93f0ece91f2f4c922ad4b9d",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new section says its figures live in `crates/sparq-zk-compose/tests/gate_count_snapshot.json` under `_comment_sq_uii0`, but this diff changes only the design document and the referenced entry is absent at the PR head. Consequently the load-bearing claims (relation-minus-recommit cost, ABI-only floor, and the resulting deferral decision) cannot be checked against regression-gated evidence in this change. On a ZK design surface, promising that evidence will land with later circuit work is insufficient to support a present measured conclusion.",
+    "file": "research/zk-hidden-join-design.md",
+    "fix_hint": "Land the probe methodology/results and `_comment_sq_uii0` regression-gated snapshot evidence in the same PR, or defer this documentation change until that evidence exists. Keep the design conclusion explicitly provisional if only an independently reviewable artifact can be linked now.",
+    "severity": "major",
+    "title": "Measured conclusion cites a snapshot entry that is absent from the PR"
+   },
+   {
+    "body": "The added prose hard-codes benchmark-derived quantities such as \u201chalf,\u201d \u201ctwo fifths,\u201d \u201c~2\u00d7,\u201d and \u201c~47\u00d7.\u201d Repository policy forbids hard-coded performance numbers in Markdown and treats work-box measurements as non-canonical. Saying the figures are \u201ccited, never restated here\u201d is also internally inconsistent because these ratios are restated throughout the new text.",
+    "file": "research/zk-hidden-join-design.md",
+    "fix_hint": "Move all measured values and derived ratios into the regression-gated machine-readable snapshot/artifact. In the design record, state only the qualitative result and link the snapshot key, e.g. that the fixed input overhead materially limits the benefit and does not justify the re-audit cost.",
+    "severity": "major",
+    "title": "Markdown hard-codes non-canonical performance ratios"
+   }
+  ],
+  "progress": null,
+  "summary": "The design correction may be directionally reasonable, but this PR makes benchmark-based ZK design claims without landing the cited regression-gated evidence and embeds performance ratios directly in Markdown. The checkout's gate-count snapshot has no `_comment_sq_uii0` entry, although the new text says that entry is where the figures live. That leaves the central measured premise unauditable in this change and conflicts with the repository rule against hard-coded performance numbers in Markdown.",
+  "verdict": "request_changes"
+ }
+}
