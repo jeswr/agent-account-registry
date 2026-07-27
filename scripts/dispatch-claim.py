@@ -8010,6 +8010,173 @@ def _self_test():
         {**provenance[41], "recorded_at_run": "30212384278.1"}, 41) is None
     assert MACHINE_ATTESTED_CLASSES == {"worker-run", "backfill"}, \
         "widening the machine-attested set is an admission change and must be reviewed as one"
+    assert ORCHESTRATOR_CLASS not in MACHINE_ATTESTED_CLASSES, \
+        ("the self-attested class must never become machine-attested — admitting it is a "
+         "per-consumer opt-in, not a property of the taxonomy")
+
+    # ---- #657 ORCHESTRATOR-CLASS ADMISSION (design record section 6, Option 2(b)) -------------
+    # THE GAP. Measured on sparq-org/sparq 2026-07-27 (paginated `gh api /pulls?state=open`,
+    # cross-checked against `gh search prs` and GraphQL totalCount — all three said 117 open):
+    # 34 open non-draft PRs, 4 reachable by the review lane, 30 unreachable. All 30 are authored
+    # by `jeswr` on ordinary branches, and ALL 30 fail the head-ref AND author gates TOGETHER —
+    # 0 fail on only one. 4/4 reachable hold a ledger verdict; 0/30 unreachable do.
+    _ENROLLED = frozenset({"jeswr"})
+    _orch = dict(provenance[41], recorded_at_run="orchestrator:30209757201.1")
+
+    def _enrol_pull(number=41, *, ref="fix/readiness-visibility-opus5", login="jeswr",
+                    head_repo=repo, labels=("review:needs",), draft=False, body=""):
+        return pull(number, ref, sha_a, head_repo=head_repo, login=login, draft=draft,
+                    labels=labels, body=body)
+
+    def _enrol_states(pulls_in, prov_in, *, authors=_ENROLLED, status=None, issues=None):
+        return [(item["state"], item["self_attested"]) for item in enumerate_review_items(
+            repo, pulls_in, prov_in, [], issues if issues is not None else issue_labels, now,
+            pr_status=status, enrolled_authors=authors)]
+
+    # (1) THE HEADLINE GUARD: an owner-authored PR on an ordinary branch becomes reviewable.
+    # Deleting either waiver clause in enumerate_review_items reds exactly this line.
+    assert _enrol_states([_enrol_pull()], {41: _orch}) == [("needs-review", True)], \
+        "an enrolled orchestrator PR must reach the review lane"
+    # ...and it is genuinely BOTH gates being waived, not one: the same PR keeps its ordinary
+    # branch AND its non-bot author. Restoring either gate unconditionally reds the line above.
+    assert not HEAD_REF_RE.match("fix/readiness-visibility-opus5")
+    assert not "jeswr".endswith("[bot]")
+
+    # (2) DEFAULT OFF. With no allowlist — the shipped state of every repo — the identical PR
+    # and the identical record are refused, by the ORIGINAL reason. This is the assertion that
+    # makes "this PR changes no live behaviour until a reviewed master commit opts a login in"
+    # a tested claim rather than a promise.
+    assert _enrol_states([_enrol_pull()], {41: _orch}, authors=frozenset()) == []
+    assert _enrol_states([_enrol_pull()], {41: _orch}, authors=()) == []
+    _off_log = io.StringIO()
+    with contextlib.redirect_stdout(_off_log):
+        enumerate_review_items(repo, [_enrol_pull()], {41: _orch}, [], issue_labels, now)
+    assert "head ref is not a worker branch" in _off_log.getvalue()
+
+    # (3) A FORK PR IS NEVER ADMITTED — the one predicate no waiver can reach. The record is
+    # valid, the author is enrolled, the branch would be waived: only the fork gate stands, and
+    # it must stand FIRST. Hoisting it above the waivable gates is what this pins; moving it
+    # back below them reds this because the head-ref reason would win instead.
+    _fork_log = io.StringIO()
+    with contextlib.redirect_stdout(_fork_log):
+        assert enumerate_review_items(
+            repo, [_enrol_pull(head_repo="attacker/repo")], {41: _orch}, [], issue_labels, now,
+            enrolled_authors=_ENROLLED) == []
+    assert "head repo is not the target repo" in _fork_log.getvalue(), _fork_log.getvalue()
+    # ...including a fork whose head ref is SPOOFED into worker shape.
+    assert enumerate_review_items(
+        repo, [_enrol_pull(ref="sparq-agent/issue-7-1-1", head_repo="attacker/repo")],
+        {41: _orch}, [], issue_labels, now, enrolled_authors=_ENROLLED) == []
+
+    # (4) AN ARBITRARY THIRD PARTY IS NEVER ADMITTED. Same PR, same valid orchestrator record,
+    # a login the master-protected allowlist does not name. Dropping the allowlist half of
+    # admits_orchestrator_pr reds this — and it is the difference between "a bounded named set"
+    # and "any same-repo author".
+    assert _enrol_states([_enrol_pull(login="mallory")], {41: _orch}) == []
+    assert _enrol_states([_enrol_pull(login="jeswr-attacker")], {41: _orch}) == []
+    assert _enrol_states([_enrol_pull(login="")], {41: _orch}) == []
+    # GitHub logins are case-insensitive, so the comparison is casefolded — otherwise the SAME
+    # human is admitted or refused depending on how the listing happened to capitalise them.
+    assert _enrol_states([_enrol_pull(login="JesWR")], {41: _orch}) == [("needs-review", True)]
+
+    # (5) THE RECORD HALF IS REQUIRED TOO. An enrolled author with a worker-run/backfill record
+    # is NOT orchestrator-admitted — such a record asserts a host-side writer that this PR does
+    # not have, and admitting it would let the lane invert its `impl_provider` to pick a
+    # reviewer. It falls back to the shape gates and is refused.
+    assert _enrol_states([_enrol_pull()], {41: provenance[41]}) == []
+    assert _enrol_states([_enrol_pull()], {41: dict(
+        provenance[41], recorded_at_run="backfill:29572728300.1")}) == []
+    assert _enrol_states([_enrol_pull()], {41: dict(
+        provenance[41], recorded_at_run="human:30209757201.1")}) == []
+    assert _enrol_states([_enrol_pull()], {}) == []
+    # A record minted for a DIFFERENT PR waives nothing. The field admission would reject it a
+    # few lines later anyway, but the waiver decision must not depend on a LATER check to be
+    # sound — that is how a reordering turns a redundant guard into a hole.
+    assert not admits_orchestrator_pr(dict(_orch, pr_number=40), 41, "jeswr", _ENROLLED)
+    assert _enrol_states([_enrol_pull()], {41: dict(_orch, pr_number=40)}) == []
+    # TOTAL and non-raising on every malformed input — it runs inside the PLAN walk.
+    for _junk in (None, "not-a-dict", [], 7, {}, {"pr_number": 41}):
+        assert admits_orchestrator_pr(_junk, 41, "jeswr", _ENROLLED) is False, repr(_junk)
+    for _bad_login in (None, "", 7, [], {}):
+        assert admits_orchestrator_pr(_orch, 41, _bad_login, _ENROLLED) is False, repr(_bad_login)
+    assert admits_orchestrator_pr(_orch, 41, "jeswr", None) is False
+
+    # (6) REVIEW-ONLY. Every state other than needs-review dispatches a run that PUSHES COMMITS
+    # to the PR head (needs-fix / needs-ci-fix / needs-rebase) or re-enters the arm path
+    # (stranded). A self-attested record must never buy write access to its own branch.
+    _conflicting = {"head_sha": sha_a, "conflicting": True, "armed": False}
+    assert _enrol_states([_enrol_pull()], {41: _orch}, status={41: _conflicting}) == []
+    _red_gate = {"head_sha": sha_a, "conflicting": False, "armed": False, "gate": "failure",
+                 "failing_legs": ["test"]}
+    assert _enrol_states([_enrol_pull(labels=())], {41: _orch}, status={41: _red_gate}) == []
+    assert _enrol_states([_enrol_pull(labels=("review:changes",))], {41: _orch}) == []
+    _green = {"head_sha": sha_a, "conflicting": False, "armed": False, "gate": "success"}
+    assert _enrol_states(
+        [_enrol_pull(draft=True, labels=(), body=f"<!-- sparq-reviewed-sha:{sha_a} -->")],
+        {41: _orch}, status={41: _green}) == []
+    # ...and the refusal is VISIBLE, never a silent drop: an operator who enrols a PR that then
+    # produces nothing must be able to read why.
+    _ro_log = io.StringIO()
+    with contextlib.redirect_stdout(_ro_log):
+        enumerate_review_items(repo, [_enrol_pull(labels=("review:changes",))], {41: _orch}, [],
+                               issue_labels, now, enrolled_authors=_ENROLLED)
+    assert "review-only" in _ro_log.getvalue(), _ro_log.getvalue()
+    # The SAME conflicting/red-gate/stranded postures on a WORKER PR still produce their repair
+    # states — the restriction is scoped to the class, not a global regression.
+    _worker = pull(41, "sparq-agent/issue-7-1-1", sha_a, login=bot, draft=False)
+    assert [item["state"] for item in enumerate_review_items(
+        repo, [_worker], provenance, [], issue_labels, now, pr_status={41: _conflicting},
+        enrolled_authors=_ENROLLED)] == ["needs-rebase"]
+
+    # (7) THE PREVIOUSLY REACHABLE POPULATION IS UNAFFECTED. A worker PR enumerates identically
+    # with the allowlist on and off, and carries self_attested=False.
+    _worker_needs = pull(41, "sparq-agent/issue-7-1-1", sha_a, login=bot, draft=False,
+                         labels=("review:needs",))
+    assert enumerate_review_items(repo, [_worker_needs], provenance, [], issue_labels, now) == \
+        enumerate_review_items(repo, [_worker_needs], provenance, [], issue_labels, now,
+                               enrolled_authors=_ENROLLED)
+    assert enumerate_review_items(
+        repo, [_worker_needs], provenance, [], issue_labels, now)[0]["self_attested"] is False
+
+    # (8) THE ISSUE BINDING SURVIVES, and it was NEVER the head ref. HEAD_REF_RE's capture group
+    # is not consumed anywhere in this repository (`grep -rn HEAD_REF_RE scripts/ .github/` —
+    # 8 sites, all boolean `.match()`); the issue number a review item is bound to comes from
+    # `record["issue"]`, which provenance_admission_error still requires to be a positive int.
+    # So an enrolled PR is bound to a real issue and its needs:* human hold still parks the PR.
+    assert _enrol_states([_enrol_pull()], {41: _orch},
+                         issues={7: ["needs:user"]}) == []
+    assert _enrol_states([_enrol_pull()], {41: dict(_orch, issue=0)}) == []
+    assert _enrol_states([_enrol_pull()], {41: dict(_orch, issue=True)}) == []
+    # ...and the human holds / machine parks are not waived either.
+    for _hold in ("needs:user", "review:needs-user", MACHINE_PARK_PR_LABEL):
+        assert _enrol_states([_enrol_pull(labels=("review:needs", _hold))], {41: _orch}) == [], _hold
+
+    # (9) THE SCHEMA RE-ASSERTS REVIEW-ONLY. PLAN and CLAIM are different processes reading a
+    # serialised artifact, so the enumerator's guard is not sufficient on its own.
+    _plan_item = {"pr_number": 41, "head_sha": sha_a, "state": "needs-fix",
+                  "impl_provider": "anthropic", "repo": repo, "package": "crate-a",
+                  "security": False, "self_attested": True, "context": ""}
+    # Built from the SAME `fixture` every other plan-schema assertion uses, so a future required
+    # field cannot make this test quietly stop exercising the schema.
+    _plan_doc = {**fixture, "review_items": [_plan_item], "disarm_items": []}
+    try:
+        validate_plan(_plan_doc)
+    except DispatchError as _exc:
+        assert "review-only" in str(_exc), str(_exc)
+    else:
+        raise AssertionError("a self-attested item in a code-writing state must be refused")
+    assert validate_plan({**_plan_doc, "review_items": [
+        {**_plan_item, "state": "needs-review"}]}) is not None
+    for _bad in (None, "true", 1, 0, [], {}):
+        try:
+            validate_plan({**_plan_doc, "review_items": [
+                {**_plan_item, "state": "needs-review", "self_attested": _bad}]})
+        except DispatchError:
+            pass
+        else:
+            raise AssertionError(f"self_attested={_bad!r} must be refused")
+    assert "self_attested" in REVIEW_ITEM_FIELDS, \
+        "dropping the field from the schema makes every consumer default the unsafe way"
 
     # YAML SEAM: the attestation checks live in provenance_admission_error, so they are only
     # load-bearing on the path that actually runs a model against a PR if review-fix.yml's
