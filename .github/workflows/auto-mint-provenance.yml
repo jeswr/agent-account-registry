@@ -66,7 +66,20 @@ jobs:
     # The salt is a secret: refuse to run from any non-default ref (a modified branch copy of this
     # workflow must never see it — the sol-audit arbitrary-ref class). It is also what stops a
     # branch that adds itself to policy/repos.toml from being read as the enrolment allowlist.
-    if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+    #
+    # THE `schedule` CARVE-OUT IS LOAD-BEARING, not a loosening. The strict comparison reads
+    # `github.event.repository`, and NO other scheduled workflow in this repository depends on that
+    # object being present in a cron payload. If it ever were not, this job would evaluate FALSE
+    # and skip — silently, with no census, forever: a scheduled minter that never runs is
+    # bit-for-bit the #929 defect this file exists to fix. GitHub only ever schedules a workflow
+    # from the DEFAULT branch, so there is no non-default ref for a cron tick to come from, while
+    # the arbitrary-ref attack the guard exists for is a DISPATCH — which carries a full repository
+    # payload, and is where the strict check is therefore applied. The server-side
+    # deployment-branch policy on the `dispatch-secrets` environment (default branch only) is the
+    # primary control on both paths regardless; this guard complements it.
+    if: >-
+      ${{ github.event_name == 'schedule'
+          || github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # SECRET-EXFIL GUARD (issue #101): reads PROVENANCE_SALT, which lives in the `dispatch-secrets`

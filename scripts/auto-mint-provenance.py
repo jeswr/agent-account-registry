@@ -663,8 +663,15 @@ def sweep_workflow_seam_report(workflow=None):
         # THE #929 FINDING: this workflow is self-starting, or it is mint-provenance.yml again.
         "schedule_crons": [str((entry or {}).get("cron")) for entry in schedule
                            if isinstance(entry, dict)],
-        # The salt is a secret: a modified branch copy of this workflow must never see it.
+        # The salt is a secret: a modified branch copy of this workflow must never see it. The
+        # DISPATCH path carries the strict comparison...
         "job_ref_guarded": "github.ref ==" in guard and "default_branch" in guard,
+        # ...and the `schedule` path is carved out ON PURPOSE, because the strict comparison reads
+        # `github.event.repository` and a cron tick that silently evaluated it away would skip this
+        # job forever with no census — the #929 defect, re-created by its own fix. Asserted so the
+        # carve-out cannot be quietly deleted (which would re-open that risk) and cannot be
+        # quietly widened to another event either: the finding is the exact event name.
+        "job_schedule_carveout": "github.event_name == 'schedule'" in guard,
         "job_environment": job.get("environment"),
         "contents_write": permissions.get("contents"),
         # Requirement 4: a refusal has to be visible ON THE PR. Without this the sweep degrades to
@@ -1151,7 +1158,10 @@ def _self_test():                                                       # noqa: 
           bool(seam["schedule_crons"]), True)
     check("...on the explicit-minute cadence this repo uses", seam["schedule_crons"],
           ["13,43 * * * *"])
-    check("the sweep job refuses to run off the default ref", seam["job_ref_guarded"], True)
+    check("the sweep job refuses to run off the default ref on a DISPATCH",
+          seam["job_ref_guarded"], True)
+    check("...while the cron tick is carved out, so the guard can never silently skip it",
+          seam["job_schedule_carveout"], True)
     check("the sweep job takes the secret-scoped environment", seam["job_environment"],
           "dispatch-secrets")
     check("the sweep job may write ledger contents", seam["contents_write"], "write")
@@ -1212,6 +1222,16 @@ def _self_test():                                                       # noqa: 
              lambda d: d["jobs"]["sweep"].update(**{"if": "false"}), "job_ref_guarded", False),
             ("the default-ref guard is deleted",
              lambda d: d["jobs"]["sweep"].pop("if"), "job_ref_guarded", False),
+            ("the schedule carve-out is deleted (the cron can then silently skip)",
+             lambda d: d["jobs"]["sweep"].update(**{
+                 "if": "${{ github.ref == format('refs/heads/{0}', "
+                       "github.event.repository.default_branch) }}"}),
+             "job_schedule_carveout", False),
+            ("...or widened to another event",
+             lambda d: d["jobs"]["sweep"].update(**{
+                 "if": str(d["jobs"]["sweep"]["if"]).replace("github.event_name == 'schedule'",
+                                                             "github.event_name != ''")}),
+             "job_schedule_carveout", False),
             ("the secret-scoped environment is dropped",
              lambda d: d["jobs"]["sweep"].pop("environment"), "job_environment", None),
             ("pull-requests: write is dropped (refusals go silent again)",
