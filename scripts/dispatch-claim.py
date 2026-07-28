@@ -1278,6 +1278,53 @@ def stranded_live(draft, armed, reviewed_match, mergeable, gate):
             and mergeable is True and gate in TIER_REACHABLE_GREEN)
 
 
+def armed_sha_mismatch(repo, pull, pr_status):
+    """THE #42 armed-SHA-mismatch INVARIANT itself, as ONE pure predicate, with NO class in it.
+
+    Returns the row ``{pr_number, head_sha, reviewed_sha, repo}`` when this PR's live head carries
+    a latch (armed, or READY with an interrupted disarm) that is NOT bound to the head the
+    reviewed-sha marker names — and None otherwise. Everything here is class-independent: the fork
+    gate, the open/number/sha shape checks, the snapshot-coherence check, the unarmed-draft
+    carve-out and the matching-marker carve-out. The CALLER supplies (a) the CANDIDATE FILTER —
+    which PRs it is entitled to look at — and (b), separately and by construction, whether it may
+    ACT on the answer or only REPORT it.
+
+    WHY IT IS SHARED. Two consumers now ask "is #42 violated here?": the write-authorised worker
+    enumerator (`enumerate_disarm_items` -> CLAIM -> `worker-pr.py disarm`) and the DETECTION-ONLY
+    orchestrator-class observer (`enumerate_disarm_observations`). An invariant with two spellings
+    drifts, and the observer's entire value is that it reports the SAME condition the disarm lane
+    would act on — a second copy would let "what the lane disarms" and "what the census calls a
+    violation" diverge silently, which is the failure this detection exists to rule out.
+
+    PURE and TOTAL: every malformed input yields None, never a raise (it runs inside the PLAN
+    walk, where an exception aborts the whole tick instead of skipping one PR)."""
+    if not isinstance(pull, dict):
+        return None
+    number = pull.get("number")
+    head = pull.get("head") or {}
+    sha = str(head.get("sha", ""))
+    if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
+        return None
+    if pull.get("state") != "open":
+        return None
+    # FORK GATE, unconditional and ahead of every caller-supplied predicate: a fork head is
+    # attacker-controlled and is never disarmed, admitted, enrolled — or censused.
+    if (head.get("repo") or {}).get("full_name") != repo:
+        return None
+    if not SAFE_SHA.fullmatch(sha):
+        return None
+    status = pr_status.get(number) if isinstance(pr_status, dict) else None
+    if not isinstance(status, dict) or status.get("head_sha") != sha:
+        return None                       # stale/unknown snapshot — unknown never acts
+    if status.get("armed") is not True and pull.get("draft") is True:
+        return None                       # unarmed draft — nothing latched, nothing interrupted
+    reviewed = REVIEWED_SHA_RE.search(pull.get("body") or "")
+    reviewed_sha = reviewed.group(1) if reviewed else "none"
+    if reviewed_sha == sha:
+        return None                       # the arm is bound to this exact head — valid, keep it
+    return {"pr_number": number, "head_sha": sha, "reviewed_sha": reviewed_sha, "repo": repo}
+
+
 def enumerate_disarm_items(repo, pulls, pr_status, provenance, bot_login=""):
     """PURE armed-SHA-mismatch enumerator (registry issue #42): any ARMED worker PR whose live
     head no longer equals its recorded reviewed-sha marker is a safety violation — the GitHub
@@ -1296,56 +1343,123 @@ def enumerate_disarm_items(repo, pulls, pr_status, provenance, bot_login=""):
     purpose (PR #60 round-1): the disarm reads only head_sha + the armed bit — both detail
     fields — so check-run volume must never stand this net down (that would be fail-OPEN:
     the one admission whose ACT is the safety measure, defeatable by churning a head past
-    the check-run ceiling)."""
+    the check-run ceiling).
+
+    The #42 invariant itself lives in `armed_sha_mismatch` (shared with the detection-only
+    orchestrator-class observer). What remains HERE is exactly this lane's CANDIDATE FILTER — the
+    worker lane's producer shape plus #570's exact-App gate — because this is the lane that gets
+    to ACT, and its authority is bounded by that filter and nothing else. Issue #105: a human hold
+    (review:needs-user / needs:user) parks autonomous PUSHES and reviews, but it must NEVER
+    suppress this safety-only latch retraction — a stale armed head escalated to review:needs-user
+    after a failed disarm would otherwise strand the latch and merge an unreviewed tree on green
+    CI. Held PRs are enumerated here on the same footing as any other armed-SHA mismatch;
+    worker-pr.py disarm --when mismatch retracts the latch while PRESERVING the hold label."""
     items = []
     for pull in pulls:
         if not isinstance(pull, dict):
             raise DispatchError("disarm enumeration met a malformed pull request")
-        number = pull.get("number")
+        row = armed_sha_mismatch(repo, pull, pr_status)
+        if row is None:
+            continue
+        number = row["pr_number"]
         head = pull.get("head") or {}
-        ref = str(head.get("ref", ""))
-        sha = str(head.get("sha", ""))
-        head_repo = (head.get("repo") or {}).get("full_name")
         login = str((pull.get("user") or {}).get("login", ""))
-        if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
-            continue
-        if pull.get("state") != "open":
-            continue
-        if not HEAD_REF_RE.match(ref) or head_repo != repo:
+        if not HEAD_REF_RE.match(str(head.get("ref", ""))):
             continue
         if not login.endswith("[bot]") or (bot_login and login != bot_login):
             continue
-        record = provenance.get(number)
+        record = provenance.get(number) if isinstance(provenance, dict) else None
         record_number = record.get("pr_number") if isinstance(record, dict) else None
         # Strict int identity, bool excluded — same float/bool-equality hazard as
         # provenance_admission_error: 41.0 == 41 and True == 1 under a bare !=.
         if (not isinstance(record_number, int) or isinstance(record_number, bool)
                 or record_number != number):
             continue                      # never loop-armed without provenance — leave to humans
-        if not SAFE_SHA.fullmatch(sha):
-            continue
-        # Issue #105: a human hold (review:needs-user / needs:user) parks autonomous PUSHES and
-        # reviews, but it must NEVER suppress this safety-only latch retraction. A stale armed
-        # head escalated to review:needs-user after a failed disarm — or a human label applied
-        # while auto-merge stays latched — would otherwise strand the latch and merge an
-        # unreviewed tree on green CI. Held PRs are enumerated here on the same footing as any
-        # other armed-SHA mismatch; worker-pr.py disarm --when mismatch retracts the latch
-        # (disable-auto/dequeue + redraft) while PRESERVING the hold label (it drops the relabel
-        # that would strip review:needs-user and re-admit the PR). enumerate_review_items still
-        # skips held PRs, so the hold keeps stopping pushes/reviews.
-        status = pr_status.get(number) if isinstance(pr_status, dict) else None
-        if not isinstance(status, dict) or status.get("head_sha") != sha:
-            continue                      # stale/unknown snapshot — unknown never acts
-        if status.get("armed") is not True and pull.get("draft") is True:
-            continue                      # unarmed draft — nothing latched, nothing interrupted
-        reviewed = REVIEWED_SHA_RE.search(pull.get("body") or "")
-        reviewed_sha = reviewed.group(1) if reviewed else "none"
-        if reviewed_sha == sha:
-            continue                      # the arm is bound to this exact head — valid, keep it
-        items.append({"pr_number": number, "head_sha": sha,
-                      "reviewed_sha": reviewed_sha, "repo": repo})
+        items.append(row)
     items.sort(key=lambda item: (item["repo"], item["pr_number"]))
     return items
+
+
+# The DETECTION-ONLY emission's stable log prefixes. Named so the workflow seam carries no text of
+# its own and the self-test asserts against the same literals production prints.
+DISARM_OBSERVATION_ALERT = "::warning::armed-SHA mismatch on an enrolled orchestrator-class PR"
+DISARM_OBSERVATION_CENSUS = "disarm-observation census"
+
+
+def enumerate_disarm_observations(repo, pulls, pr_status, provenance, enrolled_authors):
+    """DETECTION-ONLY census of the #42 armed-SHA invariant over the ENROLLED ORCHESTRATOR CLASS —
+    the population `enumerate_disarm_items` structurally cannot see (registry #876 review).
+
+    WHY THIS IS EMISSION AND NOT A LANE. `enumerate_disarm_items` selects candidates on the worker
+    lane's producer shape (`HEAD_REF_RE`) AND #570's exact-App author gate, so an orchestrator-class
+    PR is invisible to the whole disarm path. Making it VISIBLE to that path would mean waiving
+    #570's exact-App gate on a dequeue/redraft/relabel WRITE path — an authority escalation, not a
+    shape widening, and one nothing in #657 argued for. So the invariant is OBSERVED instead: this
+    function is read-only, its rows are never merged into `disarm_items`, they are never written to
+    the plan artifact, and no consumer of them can reach `_apply_disarm_items`. The residual risk
+    is unchanged from today (a human retracts the latch); what changes is that today the condition
+    is INVISIBLE and after this it is named on every tick.
+
+    EVERY TICK, not once. An unresolved detection that reports itself once and then goes quiet is
+    indistinguishable from a resolved one. This is a pure function of the tick's own live snapshot,
+    so it re-derives — and PLAN re-prints — for as long as the condition holds; see
+    `format_disarm_observations`, whose census line is emitted even at zero so "no violations" and
+    "this stopped being counted" cannot look the same.
+
+    ``enrolled_authors`` is the repo's MASTER-protected `review_enrolment_authors`. EMPTY — every
+    repo's default — makes `admits_orchestrator_pr` constantly False, so this observer emits
+    nothing at all until a reviewed master commit opts a login in. The class predicate is the SAME
+    `admits_orchestrator_pr` that PLAN, CLAIM, review-fix.yml's resolve step and the re-admission
+    sweep use: "admitted for review over there" and "observed here" cannot drift into two
+    populations.
+
+    PURE. Raises only on a malformed `pulls` element, exactly as `enumerate_disarm_items` does."""
+    observations = []
+    for pull in pulls:
+        if not isinstance(pull, dict):
+            raise DispatchError("disarm observation met a malformed pull request")
+        row = armed_sha_mismatch(repo, pull, pr_status)
+        if row is None:
+            continue
+        number = row["pr_number"]
+        login = str((pull.get("user") or {}).get("login", ""))
+        record = provenance.get(number) if isinstance(provenance, dict) else None
+        if not admits_orchestrator_pr(record, number, login, enrolled_authors):
+            continue
+        observations.append(row)
+    observations.sort(key=lambda item: (item["repo"], item["pr_number"]))
+    return observations
+
+
+def format_disarm_observations(observations):
+    """The detection-only emission, as LINES — one alert per live violation plus ONE census line
+    that is printed unconditionally, including at zero.
+
+    It lives here rather than in the workflow so the YAML seam is "call it, print every line" and
+    the emission's text is unit-testable. The census line is the half that must not be
+    conditional: a per-violation alert can only ever prove that something WAS reported, never that
+    the observer ran and found nothing — and an absent bucket and a zero bucket must not look the
+    same (the #753/#762 population-census rule this repo already applies to the review lane).
+
+    TOTAL: malformed rows are ignored rather than raised on, because this runs at the end of a PLAN
+    that has already done all of its real work."""
+    rows = [row for row in observations
+            if isinstance(row, dict) and isinstance(row.get("pr_number"), int)
+            and not isinstance(row.get("pr_number"), bool)]
+    lines = []
+    for row in sorted(rows, key=lambda item: (str(item.get("repo")), item["pr_number"])):
+        lines.append(
+            f"{DISARM_OBSERVATION_ALERT} {row.get('repo')}#{row['pr_number']}: the live head "
+            f"{row.get('head_sha')} is latched but the reviewed-sha marker names "
+            f"{row.get('reviewed_sha')}. The disarm lane is DETECTION-ONLY for this class — "
+            "acting would require waiving registry #570's exact-App author gate on a write path — "
+            "so a human must retract the latch (worker-pr.py disarm --when mismatch).")
+    detail = ", ".join(f"{row.get('repo')}#{row['pr_number']}"
+                       for row in sorted(rows, key=lambda item: (str(item.get("repo")),
+                                                                 item["pr_number"])))
+    lines.append(f"{DISARM_OBSERVATION_CENSUS}: {len(rows)} enrolled orchestrator-class PR(s) "
+                 f"with an armed-SHA mismatch ({detail or 'none'})")
+    return lines
 
 
 _NO_PR_DETAIL = object()
@@ -10714,6 +10828,79 @@ def _self_test():
     _live_error = enrolment_enable_error(_repos_doc, _claim_admits, _rf_admits,
                                          _outcome_admits, _arm_refuses)
     assert _live_error is None, _live_error
+
+    # ---- [#657 ENABLE] THE SHIPPED POLICY, DRIVEN THROUGH THE ENUMERATOR ----------------------
+    # `enrolment_enable_error(...) is None` checks WIRING, not READINESS — and it reads None just
+    # as happily when NOBODY is enrolled, which is what it meant for every tree before this one. So
+    # the enable itself is asserted where it is observable: the SHIPPED allowlist, resolved by the
+    # SAME accessor PLAN uses, is fed to the SAME enumerator, and the previously-skipped PR is
+    # enumerated. Emptying `review_enrolment_authors` in policy/repos.toml reds the positive leg;
+    # widening it to every repo reds the control.
+    _enable_policy = _load_module(
+        "registry_policy_resolve_enable",
+        Path(__file__).resolve().parents[1] / "scripts" / "policy-resolve.py")
+    _ENABLED_REPO = "jeswr/agent-account-registry"
+    _DEFERRED_REPO = "sparq-org/sparq"
+    _shipped_authors = _enable_policy.review_enrolment_authors(_ENABLED_REPO, _repos_doc)
+    _deferred_authors = _enable_policy.review_enrolment_authors(_DEFERRED_REPO, _repos_doc)
+    assert _shipped_authors, (
+        "policy/repos.toml must ENABLE review_enrolment_authors for "
+        f"{_ENABLED_REPO} — that is what this change is")
+    assert _deferred_authors == frozenset(), (
+        f"{_DEFERRED_REPO} is deliberately DEFERRED to a follow-up; enabling it here would widen "
+        f"the blast radius past one repo. Found: {sorted(_deferred_authors)}")
+
+    def _enable_states(target_repo, authors, *, login, ref="fix/869-question-park-marker",
+                       record=None):
+        return [item["state"] for item in enumerate_review_items(
+            target_repo,
+            [pull(41, ref, sha_a, head_repo=target_repo, login=login, draft=False,
+                  labels=("review:needs",))],
+            {41: record if record is not None else dict(
+                provenance[41], recorded_at_run="orchestrator:30209757201.1")},
+            [], issue_labels, now, enrolled_authors=authors)]
+
+    # (1) THE RED TEST: a PR of the shape the lane measurably SKIPPED — `jeswr`-authored, ordinary
+    #     branch, non-draft, in THIS repo — is now enumerated, under the allowlist the shipped
+    #     policy actually resolves. Not a hand-written `("jeswr",)`: the literal in the TOML is the
+    #     thing under test, and a test that supplies its own allowlist cannot see it disappear.
+    assert _enable_states(_ENABLED_REPO, _shipped_authors,
+                          login=sorted(_shipped_authors)[0]) == ["needs-review"], (
+        "the shipped allowlist must make an orchestrator-class PR in this repo reviewable")
+    # (2) THE CONTROL, without which (1) could pass by admitting everything. Three PRs that are
+    #     genuinely out of scope stay skipped under the SAME shipped policy — one per axis the
+    #     enable must not widen: the un-enrolled repo, an un-enrolled author, and a record that is
+    #     not orchestrator-attested.
+    assert _enable_states(_DEFERRED_REPO, _deferred_authors,
+                          login=sorted(_shipped_authors)[0]) == [], (
+        "sparq is NOT enrolled by this change — an identical PR there must still be skipped")
+    assert _enable_states(_ENABLED_REPO, _shipped_authors, login="drive-by-contributor") == [], \
+        "an author the shipped allowlist does not name is still skipped"
+    assert _enable_states(_ENABLED_REPO, _shipped_authors, login=sorted(_shipped_authors)[0],
+                          record=provenance[41]) == [], \
+        "a machine-attested record is not the orchestrator class — still skipped"
+    # (3) ...and the enabled row is otherwise UNREMARKABLE policy. `review_enrolment_authors`
+    #     resolves through `_policy_row`, which validates the WHOLE row — required fields, types,
+    #     unknown keys — so the two calls above already prove the enable was not smuggled in by
+    #     breaking the row it sits in (a typo'd key raises "unknown fields" rather than resolving
+    #     to nobody). Asserted explicitly so that reasoning is a test rather than a comment.
+    assert "review_enrolment_authors" in _enable_policy.OPTIONAL_POLICY_FIELDS
+    try:
+        _enable_policy.review_enrolment_authors(
+            _ENABLED_REPO,
+            {"repos": {_ENABLED_REPO: {**_repos_doc["repos"][_ENABLED_REPO],
+                                       "review_enrolment_author": ["jeswr"]}}})
+    except Exception as _typo_exc:        # noqa: BLE001 — the message is the assertion
+        assert "unknown fields" in str(_typo_exc), _typo_exc
+    else:
+        raise AssertionError(
+            "a TYPO'd enrolment key must be REFUSED by the row validator, never silently resolve "
+            "to an empty allowlist — a fail-closed default indistinguishable from a typo is "
+            "exactly how an enrolment silently never happens")
+    print(f"  ok   [#657 enable] the SHIPPED policy enrols {sorted(_shipped_authors)} for "
+          f"{_ENABLED_REPO} ONLY: a previously-skipped orchestrator-class PR is ENUMERATED there, "
+          f"and the same PR in {_DEFERRED_REPO} — plus an unlisted author and a machine-attested "
+          "record — are still skipped")
     # (b) ...and (a) alone is UNFALSIFIABLE while no repo enables the key: deleting the interlock
     #     changes no outcome, which a mutation run reports as a surviving mutant. So drive the
     #     same predicate with a policy that DOES enable it. Each row removes exactly ONE fact, so
@@ -11076,8 +11263,8 @@ def _self_test():
         (PROBE_ENROLLED_LOGIN,), "review") == (True, None)
     print(f"  ok   #657 enable interlock: CLAIM={_claim_admits}, review-fix resolve={_rf_admits}, "
           f"outcome={_outcome_admits}, arm-refuses={_arm_refuses} — ALL FOUR derived by execution "
-          f"and fail-closed; policy/repos.toml enables enrolment for NOBODY (the minting path, "
-          f"design record section 7.4 step 4, does not exist yet)")
+          f"and fail-closed, which is the PRECONDITION policy/repos.toml's now-non-empty "
+          f"review_enrolment_authors ships against")
 
     # YAML SEAM: the attestation checks live in provenance_admission_error, so they are only
     # load-bearing on the path that actually runs a model against a PR if review-fix.yml's
@@ -12658,6 +12845,110 @@ def _self_test():
                 #      review-only class by a PLAN->CLAIM window edit.
                 _stale_log = _claim_log(dict(_orch_item, self_attested=False), ("jeswr",))
                 assert "disagrees with CLAIM's live re-derivation" in _stale_log, _stale_log
+
+                # ==== [#657 ENABLE] THE PROPERTY THAT MAKES ENROLMENT SAFE RATHER THAN
+                # ==== SELF-APPROVAL: THE CLASS INHERITS CROSS-PROVIDER REVIEWER SELECTION.
+                # Enrolment lets the lane review PRs an orchestrator-side agent WROTE. That is only
+                # sound because review is cross-provider — an anthropic-implemented diff is reviewed
+                # from the openai side and vice versa — and the enrolled class must inherit BOTH
+                # halves of that: the chain is the INVERSION `REVIEW_CHAIN[impl_provider]`, and the
+                # claim-layer assertion refuses any claim whose provider equals the implementer's.
+                # Neither is keyed off `self_attested`, so the class cannot bypass them; this drives
+                # the production loop to prove that by EXECUTION rather than by reading.
+                class _ProviderAllocator:
+                    """An allocator that returns a claim on a CHOSEN provider, so the refusal is
+                    driven by the production assertion rather than asserted about."""
+
+                    def __init__(self, provider):
+                        self.provider = provider
+                        self.calls = []
+
+                    def claim(self, _repo, _package, role, chain, *_args, **_kwargs):
+                        self.calls.append((role, list(chain)))
+                        return ({"account": "acct09", "claim_id": "cd" * 16, "model": chain[0],
+                                 "provider": self.provider}, "")
+
+                    def release(self, *_args, **_kwargs):
+                        self.released = True
+                        return True
+
+                record_file.write_text(json.dumps(_orch_record), encoding="utf-8")
+
+                def _provider_run(provider):
+                    fake.update(pull=dict(_orch_pull))
+                    launch_runs.clear()
+                    alloc = _ProviderAllocator(provider)
+                    buffer = io.StringIO()
+                    with contextlib.redirect_stdout(buffer):
+                        launched, _reasons = run_items(
+                            [_orch_item], allocator=alloc, routing=strand_routing,
+                            enrolled_authors=("jeswr",))
+                    return launched, alloc, buffer.getvalue()
+
+                # (v) THE CHAIN IS THE CROSS-PROVIDER INVERSION, for the enrolled class, and it is
+                #     the SAME table the worker class gets. `_orch_item` declares
+                #     impl_provider=anthropic, so the reviewer chain offered to the allocator must
+                #     be REVIEW_CHAIN["anthropic"] — the openai side — not the implementer's own.
+                _xp_launched, _xp_alloc, _xp_log = _provider_run("openai")
+                assert [chain for _role, chain in _xp_alloc.calls] == [
+                    _resolvable_chain(REVIEW_CHAIN["anthropic"], strand_routing)], _xp_alloc.calls
+                assert _xp_alloc.calls and _xp_alloc.calls[0][1] != REVIEW_CHAIN["openai"], (
+                    "the enrolled class must be offered the INVERTED chain, never the "
+                    "implementer's own", _xp_alloc.calls)
+                assert _xp_launched == 1, (_xp_launched, _xp_log)
+
+                # (vi) THE RED TEST. Same enrolled PR, same record, a reviewer claim whose provider
+                #      EQUALS the implementer's. It must be REFUSED — for the enrolled class
+                #      exactly as for the worker class — and no review-fix run may launch. Deleting
+                #      the `claim_provider == impl_provider` clause, or conditioning it on
+                #      `self_attested`, reds this line and nothing else in the suite covers the
+                #      enrolled class here.
+                _same_launched, _same_alloc, _same_log = _provider_run("anthropic")
+                assert _same_launched == 0, (_same_launched, _same_log)
+                assert "reviewer provider would equal implementer provider" in _same_log, _same_log
+                assert launch_runs == [], launch_runs
+                assert getattr(_same_alloc, "released", False) is True, (
+                    "an unsafe claim must be RELEASED, not left holding the account until expiry")
+
+                # (vii) THE CONTROL, so (vi) cannot pass by refusing everything: the WORKER class
+                #       reaches the identical refusal on the identical allocator, and both classes
+                #       launch on a cross-provider one. The assertion is shared code, not a
+                #       class-specific guard, and this is what proves it.
+                record_file.write_text(json.dumps(provenance[41]), encoding="utf-8")
+                fake.update(pull=live_pull(draft=True, labels=("review:needs",)))
+                _worker_same = io.StringIO()
+                with contextlib.redirect_stdout(_worker_same):
+                    _wl, _ = run_items([dict(ci_item, state="needs-review", context="")],
+                                       allocator=_ProviderAllocator("anthropic"),
+                                       routing=strand_routing)
+                assert _wl == 0 and "reviewer provider would equal implementer provider" \
+                    in _worker_same.getvalue(), _worker_same.getvalue()
+                record_file.write_text(json.dumps(provenance[41]), encoding="utf-8")
+                print("  ok   [#657 enable] CROSS-PROVIDER INHERITANCE: an enrolled "
+                      "orchestrator-class PR is offered the INVERTED review chain, and a claim "
+                      "whose provider equals the implementer's is REFUSED + released — the same "
+                      "assertion, on the same code path, as the worker class")
+
+                # (viii) ...AND THE CLASS CAN NEVER ARM. The cross-provider inversion is derived
+                #        from a field the implementer asserted about ITSELF, so §3's residual risk
+                #        is only acceptable because it degrades to an advisory comment. Both arm
+                #        boundaries are driven directly, in both directions, so an always-refusing
+                #        state machine cannot pass this.
+                assert _wp.decide_review("approve", False, False, 1, 3, False,
+                                         self_attested=True) != "arm"
+                assert _wp.decide_review("approve", False, False, 1, 3, False) == "arm"
+                try:
+                    _wp.ready_and_arm(repo, 41, sha_a, "anthropic", "0" * 16, "openai",
+                                      "acct01", True, self_attested=True)
+                except _wp.WorkerPrError as _arm_exc:
+                    assert "self-attested" in str(_arm_exc), _arm_exc
+                else:
+                    raise AssertionError(
+                        "ready_and_arm must REFUSE the self-attested class even when the "
+                        "cross-provider assertion would pass — that refusal is the reason "
+                        "enrolling the class is not self-approval")
+                print("  ok   [#657 enable] ...and the enrolled class can never reach an "
+                      "automatic arm: the approve hands off to a human and ready_and_arm raises")
                 record_file.write_text(json.dumps(provenance[41]), encoding="utf-8")
                 print("  ok   #657 CLAIM leg (real dispatch loop): an enrolled orchestrator PR "
                       "passes the shape gates, an unenrolled one is refused by the PRE-FEATURE "

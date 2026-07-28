@@ -854,6 +854,16 @@ jobs:
 
           review_items = []
           disarm_items = []
+          # [#657 enable] DETECTION-ONLY, and deliberately NOT part of `document`. The disarm lane
+          # selects candidates on the worker producer shape plus registry #570's exact-App author
+          # gate, so it cannot see the enrolled orchestrator class at all — and admitting that
+          # class there would waive #570 on a dequeue/redraft/relabel WRITE path, which is an
+          # authority escalation rather than a shape widening. So the #42 invariant is OBSERVED for
+          # that class instead: these rows are printed and never planned, so nothing downstream
+          # (CLAIM's `_apply_disarm_items` above all) can act on them. Keeping them OUT of the plan
+          # artifact is the structural half of "detection only" — a field CLAIM cannot read is a
+          # field CLAIM cannot act on.
+          disarm_observations = []
           snapshot_skips = []
           # [registry #677] Per-repo starvation evidence for the CLAIM-side self-healing sweep:
           # how many READY issue rows the busy partition dropped behind a `__global__` occupant.
@@ -967,6 +977,11 @@ jobs:
               # sweep, re-deriving every precondition live (matching SHAs are never disarmed).
               disarm_items.extend(claim_mod.enumerate_disarm_items(
                   repo, pulls, pr_status, provenance))
+              # ...and the SAME invariant over the class that enumerator cannot see, as an
+              # OBSERVATION. Same `enrolled_authors` the review enumerator just used, so the
+              # observed population is exactly the admitted one.
+              disarm_observations.extend(claim_mod.enumerate_disarm_observations(
+                  repo, pulls, pr_status, provenance, enrolled_authors))
               # Deferred-retry items with a still-live lease are dropped registry-side, then the
               # busy-area union over ALL open worker PRs (issue #27) keeps impl items out of any
               # crate with an in-flight review-loop PR. The busy partition reads the SAME
@@ -1099,6 +1114,13 @@ jobs:
               f"{bucket}={count}" for bucket, count in sorted(review_census.items()))
           print(f"review-enumeration census over {sum(review_census.values())} drafted "
                 f"already-reviewed worker PR(s): {census_detail or 'none'}")
+          # [#657 enable] The detection-only #42 emission for the enrolled orchestrator class, on
+          # EVERY plan — one ::warning:: per live violation plus a census line that prints even at
+          # zero, so an unresolved detection is re-stated every tick instead of being reported once
+          # and going quiet. Emission only: `disarm_observations` never entered `document`, so
+          # CLAIM cannot read it and no write path exists for this class.
+          for observation_line in claim_mod.format_disarm_observations(disarm_observations):
+              print(observation_line)
           PY
 
       - name: Upload immutable plan artifact (pinned)
