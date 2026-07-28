@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4687,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "20146a175024716d2d0e1d8aa2ec817b9e0bf617",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The container provenance lane is correctly isolated as a reusable-workflow job, consumes the repository-only image name and the immutable digest emitted by the actual build-and-push step, and retains the existing BuildKit provenance. Its permissions match the container generator's registry attachment role without granting contents write. The structural contract covers the new lane, its handoff, tag consistency, least-privilege constraints, and preservation of in-band provenance with non-vacuous mutations; the test passes. The compliance text accurately limits the claim to wired-but-unexercised SLSA L3 machinery, preserves the published L2 level, and explicitly records the post-push/non-fail-closed limitation.",
+  "verdict": "approve"
+ }
+}
