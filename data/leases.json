@@ -19,6 +19,16 @@
    "model": "sol",
    "issued_at": 1785209290,
    "expires_at": 1785213490
+  },
+  {
+   "account": "488920c2efe2b3fb",
+   "claim_id": "331b7929ce264d86865438d04971bb7f",
+   "holder": "fix:sparq-org/sparq#4601@dispatch-30325831042.1",
+   "package": "sparq-gpu",
+   "role": "fix",
+   "model": "opus5",
+   "issued_at": 1785209296,
+   "expires_at": 1785215596
   }
  ]
 }
