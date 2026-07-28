@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 965,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "0e6f833327d77c0b73decb44f21357995cb0732b",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The sweep determines `applied_by_human` from one timeline snapshot, then later posts a receipt and unconditionally deletes `review:needs-user`. A maintainer can re-apply that label after the snapshot but before the DELETE; GitHub labels do not preserve separate applications, so the DELETE removes the newly asserted human hold. The same time-of-check/time-of-use problem exists for clearing the source issue's `needs:user`. This directly contradicts the promised invariant that a human re-applied hold is sticky and no automation may override it.",
+    "file": "scripts/adjudicate-stuck.py",
+    "fix_hint": "Add an arm-side-style, immediately-before-write tamper/human-stop that re-fetches authoritative timeline and label state and aborts unless the currently live application is still provably machine-owned. Because the API mutation is not atomic with that check, use a lease/claim or other compare-and-swap protocol that makes a concurrent human application detectable and preserves it; cover the race in a non-vacuous test.",
+    "severity": "blocker",
+    "title": "A concurrent human hold can be deleted without a current ownership check"
+   },
+   {
+    "body": "For `return-to-loop`, the code posts the adjudication/auto-readmission receipt before deleting `review:needs-user`, adding `review:needs`, and optionally clearing the issue hold. If any later API call fails, the broad exception handler skips the PR. On the next run, `already_recorded(..., RETURN_TO_LOOP, head_sha)` returns true from that receipt and the sweep no-ops, even though some or all label mutations never happened. The PR can therefore remain terminally parked forever while also consuming a re-admission slot. Failures after only some label writes can likewise leave an inconsistent state.",
+    "file": "scripts/adjudicate-stuck.py",
+    "fix_hint": "Separate intent from completion. Do not let an intent/receipt marker suppress reconciliation; record a completion marker only after all required state is verified, and on subsequent sweeps reconcile incomplete transactions idempotently from live state. Add tests that inject failure after each write and prove a later sweep reaches the intended complete state without exceeding the cap.",
+    "severity": "major",
+    "title": "Receipt-first partial failure permanently suppresses the unfinished re-admission"
+   }
+  ],
+  "progress": null,
+  "summary": "The adjudicator is not safe under ordinary races or partial failure. It can erase a newly applied human hold because ownership is checked from an earlier timeline snapshot and the later label deletion has no compare-and-swap guard. Its receipt-first sequence also makes a failed transition permanently non-retryable: a comment written before either label mutation causes the next sweep to treat the head as already completed. These violate the stated sticky-human and fail-closed guarantees.",
+  "verdict": "request_changes"
+ }
+}
