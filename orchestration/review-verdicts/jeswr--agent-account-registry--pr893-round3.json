@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 893,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "83570220be285f749cd0bf0c19f36b0b76f91277",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`check_form` continues past ID validation whenever `\"id\" not in element`, and `_self_test` asserts that an ID-less input, textarea, dropdown, and checkboxes element must be accepted. GitHub's issue-form syntax requires `id` on each of those fillable element types. Consequently the new gate remains unsound: a structurally invalid form such as `{type: input, attributes: {label: A}}` can pass locally and merge green even though GitHub rejects it.",
+    "file": "scripts/issue-form-check.py",
+    "fix_hint": "Require an `id` key on every non-markdown element before applying the existing non-empty, character-set, and uniqueness checks. Replace the four positive missing-ID assertions with negative assertions proving that each fillable type is rejected without an ID.",
+    "severity": "major",
+    "title": "Fillable elements still accept a missing required id"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The round-2 major finding remains unresolved. The validator still treats `id` as optional for every fillable issue-form element and the enrolled self-test explicitly requires acceptance of missing IDs. GitHub's issue-form syntax requires `id` for input, textarea, dropdown, and checkboxes elements, so this gate can still approve forms that GitHub rejects. The new prose disputes the requirement but does not change the relevant control flow or test expectation. Because materially the same major finding remains at the same severity, progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
