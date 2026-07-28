@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4839,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "50878409ef50fbb451aa7d27401d788ec3e98478",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 2.3 says there are 24 `solid_oidc_verifier::` references across seven source files at commit `7f0cfbce`, but `git grep -o \"solid_oidc_verifier::\" 7f0cfbce -- crates/sparq-lws-core/src` yields 25 occurrences across seven files. Because the document explicitly presents every count as independently measured, this should be accurate.",
+    "file": "research/lws-3-crate-split.md",
+    "fix_hint": "Change \u201c24\u201d to \u201c25\u201d, or define and document a counting rule that intentionally excludes one occurrence (for example, a rustdoc-only reference).",
+    "severity": "minor",
+    "title": "Solid-OIDC reference count is off by one"
+   }
+  ],
+  "progress": null,
+  "summary": "The design record is structurally sound and appropriately scoped as a non-ratified decision package. Its central coupling claims are supported by the checked-out code: the retained LDP path constructs WacAuthorizer directly, AppState is parameterized by solid-oidc-verifier traits, the identity predicate is called from the LDP target path, and the existing OdrlGate provides a relevant seam precedent. The phased recommendation preserves the security-sensitive WAC path until a separately reviewed seam change. One small measurement error should be corrected, but it does not undermine the recommendation.",
+  "verdict": "approve"
+ }
+}
