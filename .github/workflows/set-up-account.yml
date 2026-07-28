@@ -92,14 +92,19 @@
 # refuse unless EXACTLY ONE exact-title account issue exists, but that is defensive-only — the
 # register step still called `gh issue create` without proving the title was free, and GitHub
 # permits duplicate issue titles. A second `acctNN` record wedges the account permanently (neither
-# path will relabel an arbitrary one, and the slot's claim ref is never released). Registration now
-# PROVES the exact title is unused — through the strongly-consistent issues API, fully paginated,
-# pull requests excluded — immediately before the create, and refuses if any match exists or the
-# listing cannot be read. The claim-ref protocol (#186) already makes slot allocation
-# first-writer-wins between protocol-observing runs, so this closes the residual window against
-# writers OUTSIDE the protocol (anyone can open an issue on a public repo) between the store step's
-# union read and this create. The always() alarm's register branch carries the recovery for the
-# refusal: a re-apply allocates a FRESH slot, because the conflicting title is now in that union.
+# path will relabel an arbitrary one, and the slot's claim ref is never released). GitHub offers NO
+# atomic create-if-title-absent, and the claim ref (#186) only serializes writers INSIDE the
+# protocol — so a read-then-create sequence cannot by itself exclude an outside writer (anyone can
+# open an issue on a public repo). Registration therefore does not rely on the pre-create read: it
+# reads first only to refuse cheaply on an already-taken title, and then RE-PROVES uniqueness AFTER
+# `gh issue create`, through the strongly-consistent issues API, fully paginated, pull requests
+# excluded. A record is trusted only if that post-create read shows the created issue as the SOLE
+# exact-title match; on any other outcome (a concurrent duplicate, or a listing that cannot be read)
+# the run RETRACTS ITS OWN record — renamed out of the `acctNN` namespace, `account` label removed,
+# closed — and fails. Retraction is deterministic because the retracting run is the only writer that
+# knows which issue it created, so the ambiguous pair is resolved, never merely detected later. The
+# always() alarm's register branch carries the recovery: a re-apply allocates a FRESH slot, because
+# the conflicting title is in the slot union.
 #
 # GRANT-SCOPING fix (#579, re-filed from #190; the closed PR #260 preserves six prior review
 # rounds): enrollment used to append the new handle to EVERY `account_pool` row in
@@ -824,35 +829,42 @@ jobs:
           printf '%s\n' "$body" | python3 scripts/select-and-claim.py \
             --validate-account-record --account-handle "$HANDLE"
           # >>> register-uniqueness — EXECUTED by scripts/grant-account.py --self-test (#394).
-          # REGISTRATION IS CREATE-ONCE: it must PROVE no account issue with this exact title exists
-          # before it creates one. GitHub permits duplicate issue titles, and both activation paths
-          # (the inline one below and the post-merge `activate` job) require EXACTLY ONE exact-title
-          # match — so a second `acctNN` record wedges the account permanently: neither path will
-          # relabel an arbitrary one, and no automated recovery can tell them apart. The store step
-          # proved this slot free from the COMPLETE union (claim refs + acctNN titles in any state +
-          # ACCTNN_TOKEN secrets at both scopes) and then took the claim ref, which defeats every
-          # protocol-observing writer — but that union was read before the claim, and any writer
-          # OUTSIDE the protocol (a hand-filed issue; anyone can open an issue on a public repo) can
-          # still land an `acctNN` title in the window between it and this create. So the ambiguous
-          # state is prevented HERE rather than only refused later: zero matches -> create; ANY match,
-          # or a listing that cannot be read, -> refuse (fail closed). Refusing leaves the captured
-          # credential + burned claim recorded by the always() alarm, whose recovery guidance covers
-          # this case explicitly — and a re-apply then allocates a FRESH slot (the conflicting title
-          # is in the union), so recovery is forward, never a second record for the same handle.
+          # REGISTRATION IS CREATE-ONCE. Both activation paths (the inline one below and the
+          # post-merge `activate` job) require EXACTLY ONE exact-title account issue, so a second
+          # `acctNN` record wedges the account permanently: neither path will relabel an arbitrary
+          # one, and no automated recovery can tell them apart. The store step proved this slot free
+          # from the COMPLETE union (claim refs + acctNN titles in any state + ACCTNN_TOKEN secrets
+          # at both scopes) and then took the claim ref, which defeats every protocol-observing
+          # writer — but any writer OUTSIDE the protocol (a hand-filed issue; anyone can open an
+          # issue on a public repo) can still land an `acctNN` title afterwards.
+          #
+          # A check-then-create sequence CANNOT close that window: GitHub has no atomic
+          # create-if-title-absent, and the claim ref does not serialize writers outside the
+          # protocol, so any read before the create is only a cheap early refusal — never a proof.
+          # The invariant is therefore established AFTER the create, where the outcome is finally
+          # observable: the record counts as registered only if a re-read shows the issue we just
+          # created as the SOLE exact-title match. Anything else — a concurrent duplicate, or a
+          # listing that cannot be read — RETRACTS OUR OWN record (the only issue whose number this
+          # run knows) out of the `acctNN` namespace and fails closed, so the ambiguous pair is
+          # RESOLVED here rather than left for an activation path to refuse forever. The retraction
+          # is deterministic and terminates: an outside writer runs no protocol and retracts
+          # nothing, and no second protocol run can hold this slot's claim ref.
           #
           # Read through the ISSUES API, not `gh issue list --search`: the search index is eventually
           # consistent, and a title created seconds ago — exactly the window this guards — may not be
           # in it yet. Fully paginated (a capped page silently proves nothing), pull requests
           # excluded (they share the issues namespace), and the exact-title comparison is done over
           # the projected `<number> <title>` lines with the handle crossing into awk as DATA.
-          if ! listed=$(gh api --paginate "repos/${{ github.repository }}/issues?state=all&per_page=100" \
-                 --jq '.[] | select(has("pull_request") | not) | "\(.number) \(.title)"'); then
+          exact_title_issues() {
+            gh api --paginate "repos/${{ github.repository }}/issues?state=all&per_page=100" \
+              --jq '.[] | select(has("pull_request") | not) | "\(.number) \(.title)"' \
+              | awk -v handle="$HANDLE" 'NF == 2 && $2 == handle { print $1 }'
+          }
+          if ! prior=$(exact_title_issues); then
             echo "::error::could not enumerate this repository's issues, so it cannot be proven that no account issue titled '$HANDLE' already exists — refusing to register (fail closed)"; exit 1
           fi
-          prior=$(printf '%s\n' "$listed" | awk -v handle="$HANDLE" 'NF == 2 && $2 == handle { print $1 }')
-          count=$(printf '%s' "$prior" | grep -c '^[0-9]' || true)
-          if [ "$count" -ne 0 ]; then
-            echo "::error::$count account issue(s) titled '$HANDLE' already exist ($(printf '%s' "$prior" | tr '\n' ' ')) — a second record for one slot is ambiguous identity that no activation path can resolve, so refusing to register a duplicate (fail closed)"; exit 1
+          if [ -n "$prior" ]; then
+            echo "::error::account issue(s) titled '$HANDLE' already exist ($(printf '%s' "$prior" | tr '\n' ' ')) — a second record for one slot is ambiguous identity that no activation path can resolve, so refusing to register a duplicate (fail closed)"; exit 1
           fi
           # gh issue create needs the label to pre-exist; ensure it idempotently.
           # PR #595 finding 5 audit — `|| true` JUSTIFIED here: `gh label create` fails when the
@@ -865,10 +877,38 @@ jobs:
           gh label create account -R "${{ github.repository }}" \
             -c 1D76DB -d "model-account catalog record" 2>/dev/null || true
           # registry issue + comment use the workflow's own github.token (same-owner)
-          gh issue create -R "${{ github.repository }}" \
+          created=$(gh issue create -R "${{ github.repository }}" \
             --title "$HANDLE" \
             --label account --label "provider:$PROVIDER" --label status:pending \
-            --body "$body"
+            --body "$body")
+          number=${created##*/}
+          case "$number" in
+            ''|*[!0-9]*)
+              echo "::error::gh issue create returned no issue number (got '$created'), so the record it created cannot be re-proven unique and cannot be retracted — refusing to treat '$HANDLE' as registered (fail closed). MANUAL recovery: confirm at most one issue titled '$HANDLE' exists before any re-apply"; exit 1 ;;
+          esac
+          # Retract THIS run's own record and fail. Renaming is what actually resolves the
+          # ambiguity: both activation paths match on the EXACT title, so a merely closed or
+          # unlabelled duplicate would still wedge them. Dropping `account` removes the catalog
+          # marker select_account_issues keys on, and closing takes it out of read_accounts (which
+          # lists open issues only) — together the retracted issue can never be read as an account.
+          retract() {
+            if gh issue edit "$number" -R "${{ github.repository }}" \
+                 --title "$HANDLE (retracted duplicate registration, #394)" \
+                 --remove-label account --remove-label status:pending \
+               && gh issue close "$number" -R "${{ github.repository }}" \
+                 --comment "Retracted by set-up-account: $1"; then
+              echo "::error::$1 — this run RETRACTED its own record (issue #$number: renamed out of the '$HANDLE' namespace, \`account\` label removed, closed), so no ambiguous pair of trusted records remains. Re-apply set-up-account to enroll on a FRESH slot (this slot's claim ref stays burned by design)"
+            else
+              echo "::error::$1 — AND retracting this run's own record DID NOT COMPLETE. Issue #$number may still be titled '$HANDLE' and carry the \`account\` label, which is the ambiguous identity every activation path refuses. MANUAL recovery required: rename #$number out of the '$HANDLE' namespace, drop its \`account\` label and close it, so at most one '$HANDLE' record remains, then re-apply set-up-account"
+            fi
+            exit 1
+          }
+          if ! after=$(exact_title_issues); then
+            retract "the record just created could not be re-proven unique: this repository's issues could not be enumerated after \`gh issue create\`, so create-once is unproven"
+          fi
+          if [ "$after" != "$number" ]; then
+            retract "an account issue titled '$HANDLE' was registered concurrently by a writer outside this protocol (exact-title matches after create: $(printf '%s' "$after" | tr '\n' ' '); expected only #$number)"
+          fi
           # <<< register-uniqueness
 
       - name: Validate the registration through the real allocator parser
@@ -1262,7 +1302,7 @@ jobs:
           if [ "$RESUME" != true ] && [ "$STORE" != success ]; then
             comment "🚨 Enrollment aborted while claiming/storing the credential (store: \`$STORE\`). No usable account was registered; a slot claim ref may have been burned (claims are never released, by design). **Recovery:** re-apply \`set-up-account\` to retry on a fresh slot."
           elif [ "$RESUME" != true ] && [ "$REGISTER" != success ]; then
-            comment "🚨 Credential for **$HANDLE** was STORED (secret \`$SECRET\`) but the \`status:pending\` account issue was not created (register: \`$REGISTER\`). The credential is captured with no account record. **Recovery — check the step log first.** If registration was REFUSED because an account issue titled \`$HANDLE\` ALREADY exists (#394: registration proves the exact title is unused before it creates one, so the duplicate that would wedge BOTH activation paths never forms), do **not** hand-create a second \`$HANDLE\` issue — that is precisely the ambiguous identity both paths refuse to resolve. Instead delete the orphaned \`dispatch-secrets\` secret \`$SECRET\` FIRST (so the pre-existing record cannot be resumed against a credential that is not its own), leave the conflicting issue alone, and re-apply \`set-up-account\`: the existing title is in the slot union, so enrollment allocates a FRESH slot and registers there (this slot's claim ref stays burned by design — claims are never released). Otherwise the register step failed for another reason and no \`$HANDLE\` record exists: create the \`$HANDLE\` issue (status:pending, \`secret_ref: $SECRET\`, and the \`grant_targets:\`/\`models:\` lines) or delete the orphaned secret \`$SECRET\`, then re-apply \`set-up-account\`."
+            comment "🚨 Credential for **$HANDLE** was STORED (secret \`$SECRET\`) but the \`status:pending\` account issue was not created (register: \`$REGISTER\`). The credential is captured with no account record. **Recovery — check the step log first.** If registration was REFUSED because an account issue titled \`$HANDLE\` ALREADY exists — or was created and then RETRACTED because a duplicate landed concurrently (#394: a record counts as registered only if it is re-proven the sole exact-title issue AFTER creation, so the duplicate that would wedge BOTH activation paths is resolved instead of left behind) — do **not** hand-create a second \`$HANDLE\` issue — that is precisely the ambiguous identity both paths refuse to resolve. Instead delete the orphaned \`dispatch-secrets\` secret \`$SECRET\` FIRST (so the pre-existing record cannot be resumed against a credential that is not its own), leave the conflicting issue alone, and re-apply \`set-up-account\`: the existing title is in the slot union, so enrollment allocates a FRESH slot and registers there (this slot's claim ref stays burned by design — claims are never released). Otherwise the register step failed for another reason and no \`$HANDLE\` record exists: create the \`$HANDLE\` issue (status:pending, \`secret_ref: $SECRET\`, and the \`grant_targets:\`/\`models:\` lines) or delete the orphaned secret \`$SECRET\`, then re-apply \`set-up-account\`."
           elif [ "$VALIDATE" != success ]; then
             comment "🚨 **$HANDLE** was stored and the pending issue created, but read_accounts validation failed (\`$VALIDATE\`) — the account body may be malformed, so no policy PR was opened. **Recovery:** fix the \`$HANDLE\` issue body (models / secret_ref), then re-apply \`set-up-account\` — enrollment resumes \`$HANDLE\` (#211) and opens the account_pool PR."
           elif [ "$POLICY_PR" != success ]; then
@@ -1335,9 +1375,10 @@ jobs:
           # `[...][0]` first-match pick would silently relabel an arbitrary duplicate, so zero OR
           # two+ matches fail closed on ambiguous identity rather than mutating the wrong account
           # (round 2 of #383). This stays DEFENCE IN DEPTH after #394 made registration create-once
-          # (it now proves the exact title is unused before creating): this job runs the base-ref
-          # copy of the file on a different event, and an acctNN title can also be hand-filed by
-          # anyone, so activation never assumes registration was the only writer.
+          # (a record is registered only once re-proven the sole exact-title issue after creation,
+          # and otherwise retracts itself): this job runs the base-ref copy of the file on a
+          # different event, and an acctNN title can be hand-filed by anyone at any later moment, so
+          # activation never assumes registration was the only writer.
           mapfile -t nums < <(gh issue list -R "$REPO" --state all --search "\"$handle\" in:title" \
                   --json number,title --jq ".[]|select(.title==\"$handle\")|.number")
           if [ "${#nums[@]}" -ne 1 ]; then
