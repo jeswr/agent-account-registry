@@ -52,6 +52,54 @@ import sys
 ROLE_LABELS = frozenset({"docs", "impl", "ci", "research", "site"})
 
 # ---------------------------------------------------------------------------------------------------
+# STATUSES TRIAGE DOES NOT OWN — the `status:ready` promotion is WITHHELD while one is live.
+#
+# `status:ready` carries TWO meanings that this repository never separated:
+#   (a) triage's CLASSIFICATION attestation — "this issue has a role, a priority and an area";
+#   (b) the dispatcher's ORCHESTRATION posture — "no lane is holding this issue".
+# triage() is the sole author of (a) and has no business asserting (b): `status:deferred` belongs
+# to dispatch-claim's bounded retry lane, the in-progress pair to a live claim/lease, and
+# `status:parked` to park_policy. While any of them is live, (b) is FALSE, so writing the label
+# does not attest anything — it manufactures a contradictory pair.
+#
+# MEASURED (registry #1054, 2026-07-28, live board, 460 open issues): 30 of the 32 open
+# `status:ready` issues ALSO carried `status:deferred`, and the census of the LAST `status:ready`
+# addition on each of those 30 says 30/30 were created by adding `status:ready` to an issue that
+# ALREADY carried `status:deferred` — 24 of them by `github-actions[bot]` (this workflow) on that
+# one day, 6 by the maintainer on 2026-07-18. Not one arose the other way round.
+#
+# The trigger is `triage-issue.yml`'s `[labeled, unlabeled]` types (#607). The dispatcher defers an
+# issue as three App-token writes (+status:deferred, -status:in-progress, -status:ready); the App's
+# token is NOT the repository GITHUB_TOKEN, so those events DO start a run, and 18-21s later this
+# classifier — which reads only role/priority/area/needs/kind — re-stamps `status:ready` over the
+# defer that just happened. Verbatim from #1037's timeline:
+#     16:27:04 labeled   status:deferred    by sparq-orchestrator[bot]
+#     16:27:06 unlabeled status:ready       by sparq-orchestrator[bot]
+#     16:27:27 labeled   status:ready       by github-actions[bot]      <- here
+#
+# The resulting pair is invisible to BOTH lanes — `status:deferred` is in `ready-issues.BUSY_STATUS`
+# so the ready lane refuses it, and dispatch.yml's deferred-retry candidate filter skipped any row
+# already carrying `status:ready` on the (false) premise that the ready lane owned it. Each lane
+# excluded it believing the other had it, so the board's dispatchable frontier was EMPTY.
+#
+# WITHHOLD, never STRIP. This branch declines to ADD the label; it never removes one that is
+# already there. Removing it would silently revert a deliberate human gesture (the 6 rows above are
+# exactly that: the maintainer re-attesting readiness on a stuck deferred issue), and a classifier
+# firing on an unrelated `labeled` event is the wrong actor to retract someone else's attestation.
+# The pair that a human writes is instead HANDLED, by the deferred-retry lane in dispatch.yml.
+#
+# `status:untriaged` is deliberately ABSENT: it is triage's OWN label, the assertion that nothing
+# has classified this issue yet, and clearing it is in scope precisely because triage wrote it.
+# The `else` (not-classification-complete) branch is untouched — it was implicated in 0 of the 30.
+DISPATCHER_OWNED_STATUS = frozenset({
+    "status:deferred",            # dispatch-claim bounded retry lane (locked decision 20)
+    "status:in-progress",         # a live claim/lease
+    "status:in-progress-review",  # a published worker PR cycling through review
+    "status:parked",              # park_policy.py machine capacity park
+    "status:blocked",             # groom/curator hold
+})
+
+# ---------------------------------------------------------------------------------------------------
 # TRUST-PLANE ROLE — INTERIM MAPPING (TODO: registry #582 / #225).
 #
 # The maintainer has an OPEN decision (#582): either `role:soundness` becomes a real label in this
@@ -420,7 +468,21 @@ def triage(labels, issue_type="task", trusted=True, known_labels=None):
         add.add(derived)
     remove |= retract
     if ready:
-        add.add("status:ready")
+        # [registry #1054] `ready` stays the CLASSIFICATION verdict — retriage.py and
+        # triage-stock-alert.py both read it as exactly that ("is the classifier done with this
+        # issue"), and flipping it here would make them call a fully-classified issue incomplete.
+        # What is withheld is only the LABEL WRITE, because the label additionally asserts an
+        # orchestration posture that a live dispatcher status contradicts. See
+        # DISPATCHER_OWNED_STATUS for the measured census.
+        held = sorted(labels & DISPATCHER_OWNED_STATUS)
+        if held:
+            warnings.append(
+                f"withholding status:ready: {', '.join(held)} is live and is owned by the "
+                f"dispatcher/worker/park lane, not by triage (registry #1054) — adding the "
+                f"readiness attestation here would strand the issue in a ready+busy pair that "
+                f"NEITHER the ready lane nor the deferred-retry lane can select")
+        else:
+            add.add("status:ready")
         remove.add("status:untriaged")
         remove.add("needs:area")
     else:
@@ -1609,6 +1671,121 @@ def _self_test():
             "its own post-state plans nothing",
             (bool(first["add"] or first["remove"]), sorted(replay["add"]), sorted(replay["remove"])),
             (True, [], []))
+
+    # -----------------------------------------------------------------------------------------------
+    # [registry #1054] THE READY+BUSY PAIR — triage must not re-mint `status:ready` over a live
+    # defer. The fixture below is the VERBATIM label set registry #1037 held at 2026-07-28T16:27:06Z,
+    # the instant `sparq-orchestrator[bot]` finished deferring it; 21 seconds later this classifier
+    # stamped `status:ready` back on, and the issue has been undispatchable ever since.
+    deferred_1037 = ["area:dispatch", "priority:P1", "role:impl", "self-improvement",
+                     "status:deferred"]
+    r = triage(deferred_1037, "task")
+    post = (set(deferred_1037) | r["add"]) - r["remove"]
+    chk("[#1054] a freshly-DEFERRED, classification-complete issue is NOT re-promoted to ready",
+        ("status:ready" in r["add"], "status:ready" in post,
+         {"status:ready", "status:deferred"} <= post),
+        (False, False, False))
+    # `ready` is the CLASSIFICATION verdict and MUST stay true — retriage.py (`classifier-incomplete`)
+    # and triage-stock-alert.py (`machine_owed`) both read it as "has the classifier finished with
+    # this issue", and a withheld LABEL is not an unfinished classification. Flipping the field
+    # instead of the write would silently re-open registry #799's untriaged deadlock.
+    chk("[#1054] ...but the classification VERDICT retriage/stock-alert consume is unchanged",
+        (r["ready"], r["role"], len(r["warnings"])), (True, "impl", 1))
+    # `any(...)` over the list, never `warnings[0]`: a mutant that suppresses the warning entirely
+    # must be killed by THIS NAMED ROW, not by an IndexError that aborts every row after it.
+    chk("[#1054] ...and the withholding is NAMED in a warning, not silent",
+        any("withholding status:ready" in w and "status:deferred" in w for w in r["warnings"]),
+        True)
+    # The CONTROL, and the half that kills an inverted guard: with no dispatcher-owned status live,
+    # the promotion is unchanged. Without this row, `if not held` passes every assertion above.
+    chk("[#1054] CONTROL: with no dispatcher status live the promotion still fires",
+        sorted(triage(["area:dispatch", "priority:P1", "role:impl", "status:untriaged"],
+                      "task")["add"]), ["status:ready"])
+    # Every member of the set, individually — a guard that keeps the CONSTANT but drops one member
+    # is the mutation a whole-set assertion cannot see (`status:deferred` is 30/30 of the measured
+    # population, but the in-progress pair was re-minted on the same timelines).
+    for held_label in sorted(DISPATCHER_OWNED_STATUS):
+        seed = ["area:dispatch", "priority:P1", "role:impl", held_label]
+        chk(f"[#1054] ...for each dispatcher-owned status individually: {held_label}",
+            "status:ready" in triage(seed, "task")["add"], False)
+    # Still a FIXED POINT under the new branch: the withheld plan must be EMPTY, not oscillating.
+    chk("[#1054] the withheld plan is a fixed point (no add, no remove, no churn)",
+        (sorted(r["add"]), sorted(r["remove"])), ([], []))
+    # [#1054 round 2] THE SECOND ROUTE OUT OF THE FRONTIER. The `status:untriaged` strip is
+    # DELIBERATELY outside the withhold: `status:untriaged` is triage's OWN label, and clearing it
+    # is exactly what leaves a clean lone-`status:deferred` row the retry lane can select. Move the
+    # strip inside the guard and the issue lands `status:untriaged` + `status:deferred` instead —
+    # which `dispatch.yml`'s `retry_gated` refuses — re-stranding it by a DIFFERENT route while
+    # every row above stays green. Found by review; it survived the first round of mutants.
+    _du = ["area:dispatch", "priority:P1", "role:impl", "status:deferred", "status:untriaged"]
+    _rdu = triage(_du, "task")
+    _post_du = (set(_du) | _rdu["add"]) - _rdu["remove"]
+    chk("[#1054] a DEFERRED+UNTRIAGED complete issue is left as a CLEAN lone-deferred row "
+        "(untriaged stripped, ready still withheld) — the retry lane's only admissible shape",
+        (sorted(_post_du), "status:untriaged" in _rdu["remove"]),
+        (["area:dispatch", "priority:P1", "role:impl", "status:deferred"], True))
+
+    # MUTATION. Every row above passes against a guard that is present but INERT, so the guard is
+    # re-derived from this file's own source with the behaviour broken and the STRUCTURE those rows
+    # inspect left intact — the constant still exists, `held` is still computed, the branch is still
+    # there. Each mutant must be killed by a NAMED assertion below, never by an exception.
+    import os as _os  # noqa: PLC0415 — this suite imports os function-locally throughout
+    _self_path = _os.path.abspath(__file__)
+    with open(_self_path, encoding="utf-8") as _fh:
+        _src = _fh.read()
+
+    def _mutant(old, new, label):
+        mutated = _src.replace(old, new)
+        assert mutated != _src, f"[#1054] mutation target moved ({label}) — refusing to pass"
+        namespace = {"__name__": "triage_mutant", "__file__": _self_path}
+        exec(compile(mutated, f"<mutant:{label}>", "exec"), namespace)  # noqa: S102
+        return namespace["triage"]
+
+    # (m1) the constant survives by NAME but is emptied — the "name inside a zero-valued counter"
+    # shape: every structural check for DISPATCHER_OWNED_STATUS still finds it.
+    _m1 = _mutant('DISPATCHER_OWNED_STATUS = frozenset({\n    "status:deferred",',
+                  'DISPATCHER_OWNED_STATUS = frozenset({\n    ' + '"__never__",', "emptied-set")
+    chk("[#1054] MUTANT emptied-set (constant present, membership gone) RE-MINTS the pair",
+        "status:ready" in _m1(deferred_1037, "task")["add"], True)
+    # (m2) the guard is computed and the warning still raised — but the write happens anyway. This
+    # is the mutant a warnings-only or `ready`-only assertion cannot distinguish.
+    _m2 = _mutant("        if held:\n", "        if False:\n", "guard-never-fires")
+    chk("[#1054] MUTANT guard-never-fires RE-MINTS the pair",
+        "status:ready" in _m2(deferred_1037, "task")["add"], True)
+    # (m3) inverted: withholds on the CLEAN issue and promotes on the deferred one. Killed only by
+    # the CONTROL row's mirror below, which is why the control exists.
+    _m3 = _mutant("        if held:\n", "        if not held:\n", "inverted-guard")
+    chk("[#1054] MUTANT inverted-guard RE-MINTS the pair",
+        "status:ready" in _m3(deferred_1037, "task")["add"], True)
+    chk("[#1054] MUTANT inverted-guard ALSO breaks the clean promotion (the control's mirror)",
+        "status:ready" in _m3(["area:dispatch", "priority:P1", "role:impl"], "task")["add"], False)
+    # (m4) the set keeps four of its five members and loses only `status:deferred` — structurally
+    # identical, non-empty, and the exact 30/30 measured population walks straight through it.
+    _m4 = _mutant('    "status:deferred",            # dispatch-claim bounded retry lane',
+                  '    # (removed by mutation)       # dispatch-claim bounded retry lane',
+                  "one-member-dropped")
+    chk("[#1054] MUTANT one-member-dropped (4 of 5 members intact) RE-MINTS the measured pair",
+        "status:ready" in _m4(deferred_1037, "task")["add"], True)
+    chk("[#1054] ...while its surviving members still withhold — so only the per-member rows kill it",
+        "status:ready" in _m4(["area:dispatch", "priority:P1", "role:impl",
+                               "status:in-progress"], "task")["add"], False)
+    # (m5) THE REVIEW-FOUND SURVIVOR: the guard fires, `status:ready` is correctly withheld, and the
+    # issue is STILL stranded — because the `status:untriaged` strip moved inside the guard, so a
+    # deferred+untriaged row keeps a label `retry_gated` refuses. Withholding the promotion is not
+    # sufficient; the row also has to be left in a shape the retry lane can take.
+    _m5 = _mutant("            add.add(\"status:ready\")\n        remove.add(\"status:untriaged\")\n"
+                  "        remove.add(\"needs:area\")\n",
+                  "            add.add(\"status:ready\")\n            remove.add(\"status:untriaged\")\n"
+                  "            remove.add(\"needs:area\")\n", "strip-inside-guard")
+    _r5 = _m5(_du, "task")
+    chk("[#1054] MUTANT strip-inside-guard withholds ready CORRECTLY but re-strands the row as "
+        "untriaged+deferred, which retry_gated refuses",
+        sorted((set(_du) | _r5["add"]) - _r5["remove"]),
+        ["area:dispatch", "priority:P1", "role:impl", "status:deferred", "status:untriaged"])
+    chk("[#1054] ...and it leaves the CLEAN promotion untouched — so only the deferred+untriaged "
+        "row above can kill it",
+        sorted(_m5(["area:dispatch", "priority:P1", "role:impl", "status:untriaged"],
+                   "task")["add"]), ["status:ready"])
 
     # -----------------------------------------------------------------------------------------------
     # THE LIVE `gh` ARGV live_gh builds (shared by triage --apply and retriage --apply): an EMPTY

@@ -914,13 +914,34 @@ jobs:
               # extracted between these sentinels and RUN against fixtures; removing either
               # sentinel makes that extraction FAIL CLOSED. Its only inputs are
               # `readiness_input`, `linked`, `details`, `trusted` and `repo_trusted_bots`.
+              #
+              # [registry #1054] THE OWNERSHIP GAP. This filter used to read
+              #     if "status:deferred" not in labels or "status:ready" in labels: continue
+              # — skipping any deferred row that also carried `status:ready`, on the premise that
+              # the ORDINARY ready lane owned it. That premise is false, and provably so in the
+              # ONE state where the clause can fire: reaching it requires `status:deferred`, and
+              # `status:deferred` is in `ready-issues.BUSY_STATUS`, so `compute_ready` refuses the
+              # very same row (`readiness defer #N: busy: status:deferred`). The clause therefore
+              # never once prevented a double-selection — by construction no row can be in both
+              # `ready` and this candidate set — and its only reachable effect was to make the
+              # ready+deferred pair invisible to BOTH lanes at once, each excluding it in the
+              # belief that the other held it. MEASURED on the live registry board 2026-07-28:
+              # 30 of 32 `status:ready` issues carried the pair, clean ready frontier = 0.
+              # The pair's WRITER is closed separately in scripts/triage.py (the classifier was
+              # re-stamping `status:ready` onto issues the dispatcher had just deferred); this
+              # half makes the deadlock non-recurrent for any pair a HUMAN writes — the maintainer
+              # did exactly that to 6 of the 30, and today that gesture achieves nothing at all.
+              # The swap below is idempotent when `status:ready` is already present (set union),
+              # so an admitted pair is handed to the engine in the same shape as a lone deferred
+              # row. This does NOT relax the busy set: `status:deferred` still means busy to the
+              # ready lane, and every other gate on this row is re-derived live by CLAIM.
               retry_gated = {"status:blocked", "status:in-progress",
                              "status:in-progress-review", "status:untriaged", "trust:untrusted"}
               deferred_input = []
               for row in readiness_input:
                   labels = set(row["labels"])
                   number = row["number"]
-                  if "status:deferred" not in labels or "status:ready" in labels:
+                  if "status:deferred" not in labels:
                       continue
                   if labels & retry_gated or any(l.startswith("needs:") for l in labels):
                       continue
