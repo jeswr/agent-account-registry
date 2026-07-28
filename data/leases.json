@@ -122,16 +122,6 @@
   },
   {
    "account": "9e13ea21abf27e68",
-   "claim_id": "ad43c950826d45e4bdf6b5aaf92d4c44",
-   "holder": "jeswr/agent-account-registry#834@30346358368.1",
-   "package": "ci",
-   "role": "ci",
-   "model": "opus5",
-   "issued_at": 1785230610,
-   "expires_at": 1785233310
-  },
-  {
-   "account": "9e13ea21abf27e68",
    "claim_id": "a24de6ab16c046f79653b81a4c4c00b0",
    "holder": "jeswr/agent-account-registry#636@30346368976.1",
    "package": "dashboard",
