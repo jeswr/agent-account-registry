@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4780,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "da8b49f77a57d3c053a98c68e30ff2ba6d50e6ab",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "At lines 431-440, explain_edge passes `anchors` as both the current-hop frontier and the whole known closure. The documented hop-k input is `derive_effective_rules(..., k - 1)`, which contains direct rules and every earlier round, while derive_effective_rules evaluates hop k with only `frontier` (exactly round k-1) and uses `effective` only for the cycle gate. Therefore a hop-2 explanation can select a certification-capable direct rule (or at later hops any older derived rule) as a candidate anchor even though the real closure cannot use it at that hop. The claim that the explained and fast paths cannot disagree is false, and none of the added tests covers an edge whose certifier exists in an older round but not the current frontier.",
+    "file": "crates/sparq-trust/src/graph.rs",
+    "fix_hint": "Make the API carry the two distinct inputs required by the shared gate, e.g. `explain_edge(frontier, known, cert, now, hop)`, and update the skill/docs and callers accordingly; alternatively provide a closure-level explanation function that reconstructs the exact frontier and known set from direct rules and certifications. Add a regression test where a registrar from an older round attempts an edge at a later hop and assert that both derive_effective_rules and explain_edge reject it identically.",
+    "severity": "major",
+    "title": "explain_edge does not mirror the closure at hops after the first"
+   },
+   {
+    "body": "The recipe at lines 234-239 tells callers to pass the entire output of derive_effective_rules at k-1 as `anchors`. That output is cumulative, not the previous round's frontier, so it does not represent the anchor set used by the closure at hop k and can produce a different verdict.",
+    "file": "skills/trust-graph/SKILL.md",
+    "fix_hint": "Revise the recipe together with the API fix so callers supply or reconstruct both the exact previous-round frontier and the cumulative known-rule set.",
+    "severity": "minor",
+    "title": "Documented explain_edge recipe supplies the wrong anchor set"
+   }
+  ],
+  "progress": null,
+  "summary": "The depth-N closure itself is well covered by non-vacuous multi-hop, attenuation, cycle, depth-bound, and meta-scope tests, but the public explained path is not equivalent to the real closure path as claimed. At hop k>1 the closure uses only the previous round's frontier as candidate anchors and the whole closure-so-far for cycle checks; explain_edge instead uses its single anchors argument for both roles. The documented call pattern supplies direct plus all derived rules, so explain_edge can admit an edge from an older registrar that the actual hop cannot use. This correctness defect in a public diagnostic API and its documentation requires changes.",
+  "verdict": "request_changes"
+ }
+}
