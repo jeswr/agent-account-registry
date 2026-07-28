@@ -11,7 +11,10 @@
 # the row's presence, so an expired-but-present row would suppress nothing. Reading the holder
 # run's status is what `actions: read` below is for; a dead/absent run, a run outside the
 # lease-holding workflows, a holder with no run id, and any lease past its renewal ceiling are all
-# still reclaimed exactly as before.
+# still reclaimed exactly as before. When the probe itself fails (403/5xx) the decision waits for
+# the next tick, and the row is HELD on a short grace expiry meanwhile — for the same reason: a
+# deferral that left the row expired would defer nothing and would re-open the double-dispatch on
+# any transient API blip. The renewal ceiling still bounds it.
 name: groom-leases
 on:
   schedule:

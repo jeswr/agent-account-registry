@@ -95,9 +95,21 @@ RENEWAL_SECONDS = 45 * 60
 # than the lead by design — a renewal must leave the row outside its own lead window at the moment
 # it lands, or the row would be due again immediately.
 RENEWAL_LEAD_SECONDS = 30 * 60
+# UNPROVEN liveness gets a HOLD, not a pass. When the Actions API does not answer (403/5xx/garbage
+# body) the ownership decision has to wait for the next tick — but "wait" cannot mean leaving an
+# EXPIRED row byte-identical, because by the paragraph above such a row suppresses NOTHING: its
+# account slot and its holder key go free to the next dispatcher while the original run may still
+# be writing. That is exactly the double-dispatch this change exists to close, reopened by any
+# transient API blip. So a due row whose liveness is unproven has its expiry pushed to this SHORT
+# grace deadline instead — the row keeps suppressing on the one field every consumer reads, and the
+# DECISION is what gets deferred. Long enough to outlast a skipped cron fire (>= two periods), and
+# never longer than `RENEWAL_LEAD_SECONDS`, so a held row stays inside its lead window and is
+# re-probed EVERY tick rather than quietly sitting on a slot; `RENEWAL_CEILING_SECONDS` still cuts
+# off a probe that never recovers.
+RENEWAL_GRACE_SECONDS = 30 * 60
 # Absolute backstop. A renewal never pushes a lease past `issued_at + RENEWAL_CEILING_SECONDS`,
 # and past that point the lease is reclaimed REGARDLESS of liveness. Without it a run wedged in
-# `in_progress` — or a `gh` probe that keeps failing (which reads as "unproven", below) — would pin
+# `in_progress` — or a `gh` probe that keeps failing (which reads as "unproven", above) — would pin
 # a scarce account slot forever, trading the double-dispatch for a permanent capacity leak. Six
 # hours is GitHub's own hard per-job ceiling, so no honest lease-holding job can outlive it.
 RENEWAL_CEILING_SECONDS = 6 * 3600
@@ -137,7 +149,8 @@ def classify_run(run):
     workflow's run is not evidence its lease is still held, and admitting it would let any
     long-lived run id pin a slot. ``unknown`` is reserved for "the API did not answer" — an
     unreadable document or an unrecognised status — and defers the decision one cron tick rather
-    than guessing in either direction; `RENEWAL_CEILING_SECONDS` bounds how long that can last."""
+    than guessing in either direction, holding the row's exclusivity meanwhile on
+    `RENEWAL_GRACE_SECONDS`; `RENEWAL_CEILING_SECONDS` bounds how long that can last."""
     if not isinstance(run, dict):
         return "unknown"
     if str(run.get("path", "")).split("@", 1)[0] not in LEASE_HOLDING_WORKFLOWS:
@@ -156,7 +169,8 @@ def _lease_epoch(lease, field):
 
 
 def plan_renewal(leases, now, liveness, renewal=RENEWAL_SECONDS,
-                 ceiling=RENEWAL_CEILING_SECONDS, lead=RENEWAL_LEAD_SECONDS):
+                 ceiling=RENEWAL_CEILING_SECONDS, lead=RENEWAL_LEAD_SECONDS,
+                 grace=RENEWAL_GRACE_SECONDS):
     """THE groom-leases decision, pure: what the ledger should hold after this tick.
 
     Returns ``(next_leases, renewed, reclaimed, deferred)``. A row is DUE for a decision once it
@@ -170,8 +184,14 @@ def plan_renewal(leases, now, liveness, renewal=RENEWAL_SECONDS,
         is dead/absent/not a lease-holding workflow, when its timestamps are unreadable, or when
         `issued_at + ceiling` has passed (the backstop: a blind reclaim, but a bounded one, and
         the only path that can still drop a lease whose run reads as live).
-      * DEFERRED — left byte-identical, decided again next tick — when liveness is unproven, and
-        whenever a not-yet-expired row has nothing to renew (there is nothing to reclaim yet).
+      * DEFERRED — the OWNERSHIP DECISION is re-taken next tick, but the row's EXCLUSIVITY is held
+        meanwhile on `min(now + grace, issued_at + ceiling)` — when liveness is unproven. Leaving
+        such a row byte-identical would not defer anything: an expired row suppresses nothing (see
+        the module header), so a single 403/5xx would hand the slot and the holder key straight to
+        the next dispatcher. Post-condition: an unproven row always leaves this function with
+        `expires_at > now`, so every consumer still reads it as live. `ceiling` still bounds it.
+      * left ALONE when it is not yet expired and its run is not live — there is nothing to renew
+        and nothing to reclaim yet, and the row is still suppressing on its own expiry.
 
     `liveness` maps a run id to ``live``/``dead``/``unknown``. It is consulted ONLY for a due row
     inside its ceiling that actually names a lease-owning run, so an idle ledger — and the
@@ -191,19 +211,22 @@ def plan_renewal(leases, now, liveness, renewal=RENEWAL_SECONDS,
         provable = (expires is not None and issued is not None and run_id is not None
                     and now < issued + ceiling)
         state = liveness(run_id) if provable else "dead"
-        if state == "live":
-            extended = min(now + renewal, issued + ceiling)
-            if extended > expires:
-                next_leases.append({**lease, "expires_at": extended})
+        if state in ("live", "unknown"):
+            # A proven-live run earns the full renewal; an unproven one earns only the short grace
+            # hold. Both are clamped to the ceiling, and both are pre-emptive for the same reason —
+            # waiting for the row to actually expire leaves a window in which it suppresses nothing.
+            extended = min(now + (renewal if state == "live" else grace), issued + ceiling)
+            moved = extended > expires
+            next_leases.append({**lease, "expires_at": extended} if moved else lease)
+            # An unproven row is DEFERRED either way: `not moved` means its existing expiry already
+            # sits past the grace deadline, so the post-condition holds with no write. A renewal is
+            # only COUNTED when it moved, so an untouched row never inflates the commit message.
+            if state == "unknown":
+                deferred += 1
+            elif moved:
                 renewed += 1
-            else:
-                next_leases.append(lease)   # already sits past what a renewal could give it
         elif not expired:
             next_leases.append(lease)     # nothing to reclaim yet; re-decided next tick
-            deferred += 1
-        elif state == "unknown":
-            next_leases.append(lease)
-            deferred += 1
         else:
             reclaimed += 1
     return next_leases, renewed, reclaimed, deferred
@@ -890,7 +913,8 @@ def reclaim(repo, now, retries=6, probe=_probe_run):
     """CAS-groom the ledger so crashed/cancelled workers free their slot while LIVE ones keep it.
 
     Expired leases are reclaimed as before EXCEPT where the holder's Actions run is provably still
-    active, which instead RENEWS the expiry (issue #35 — see `plan_renewal`). Returns a
+    active, which instead RENEWS the expiry, or unprovable, which HOLDS it on a short grace deadline
+    (issue #35 — see `plan_renewal`). Returns a
     `ReclaimOutcome(reclaimed, renewed, deferred)`, with `reclaimed == -1` if the CAS kept
     CONFLICTING. A permanent non-conflict PUT error (auth/validation/branch) raises LeaseIOError
     rather than masquerading as -1; a throttle/availability rejection is retried under its own
@@ -903,13 +927,18 @@ def reclaim(repo, now, retries=6, probe=_probe_run):
             _sleep_backoff(attempt)
         leases, sha = _read_ledger(repo)
         live, renewed, n, deferred = plan_renewal(leases, now, liveness)
-        if n == 0 and renewed == 0:
+        # WRITE ON ANY CHANGE, not just on `n or renewed`: a deferred row's grace hold moves
+        # `expires_at` too, and it is only that written field — never the row's presence — that any
+        # duplicate-suppression consumer reads. Skipping the PUT here would leave the unproven row
+        # expired in the ledger and re-open the double-dispatch on the first flaky probe.
+        if live == leases:
             return ReclaimOutcome(0, 0, deferred)
         # The historical subject is preserved verbatim in the reclaim-only case, so the ledger
         # branch's commit log stays greppable across this change.
         message = "; ".join(
             part for part in (f"reclaim {n} expired lease(s)" if n else "",
-                              f"renew {renewed} live lease(s)" if renewed else "") if part)
+                              f"renew {renewed} live lease(s)" if renewed else "",
+                              f"hold {deferred} unproven lease(s)" if deferred else "") if part)
         if _write_ledger(repo, live, sha, message, budget):
             return ReclaimOutcome(n, renewed, deferred)
     return ReclaimOutcome(-1, 0, 0)
@@ -2483,6 +2512,18 @@ def _self_test():
     def _fixed(state):
         return lambda _run_id: state
 
+    # Every assertion below reads a planned row through these, NEVER through `rows[0][...]`. A
+    # mutant that drops the row would otherwise raise IndexError/TypeError out of the ASSERTION and
+    # abort the suite — which records as a kill while every check underneath it silently never runs
+    # (AGENTS.md: crash-after-partial-run). `"GONE"` is a value no fixture uses, so a dropped row
+    # reds its own named check and the rest of the suite still executes.
+    def _expiry(rows, index=0):
+        return rows[index]["expires_at"] if index < len(rows) else "GONE"
+
+    def _row_but_expiry(rows, index=0):
+        return ({k: v for k, v in rows[index].items() if k != "expires_at"}
+                if index < len(rows) else "GONE")
+
     live_worker = _lease35("o/r#7@4242.1", T35 - 6000, T35 - 10)     # expired 10s ago, run alive
     dead_worker = _lease35("o/r#8@4243.1", T35 - 6000, T35 - 10, "d" * 32)
     renewed_rows, n_renew, n_reclaim, n_defer = plan_renewal(
@@ -2495,12 +2536,11 @@ def _self_test():
     # `_live_holder_keys` all decide on `expires_at > now`. If the renewal did not MOVE that field
     # the duplicate suppression stays off and the double-dispatch is untouched.
     check("[RED #35] ...and its expiry is PUSHED FORWARD, so the suppression consumers see it live",
-          (renewed_rows[0]["expires_at"], renewed_rows[0]["expires_at"] > T35,
-           len(reclaim_expired(renewed_rows, T35))),
-          (T35 + RENEWAL_SECONDS, True, 1))
+          (_expiry(renewed_rows), len(reclaim_expired(renewed_rows, T35))),
+          (T35 + RENEWAL_SECONDS, 1))
     check("[RED #35] renewal rewrites expires_at and NOTHING else — issued_at is groom's "
           "policy-timeout anchor and the renewal ceiling's origin",
-          {k: v for k, v in renewed_rows[0].items() if k != "expires_at"},
+          _row_but_expiry(renewed_rows),
           {k: v for k, v in live_worker.items() if k != "expires_at"})
     # [CONTROL] the behaviour that must NOT regress: a crashed/finished worker still frees its slot.
     check("[CONTROL] an expired lease whose run is DEAD is reclaimed exactly as before",
@@ -2521,22 +2561,69 @@ def _self_test():
     soon = _lease35("o/r#7@4242.1", T35 - 3000, T35 + 60)   # 60s from expiry: inside the lead
     soon_rows, soon_renew, soon_reclaim, _d = plan_renewal([soon], T35, _fixed("live"))
     check("[RED #35] a live lease is renewed BEFORE it expires, so it is never SEEN expired",
-          (soon_rows[0]["expires_at"], soon_renew, soon_reclaim, soon_rows[0]["expires_at"] > T35),
-          (T35 + RENEWAL_SECONDS, 1, 0, True))
-    check("[CONTROL] a not-yet-expired lease is NEVER reclaimed, whatever the probe says",
-          [plan_renewal([soon], T35, _fixed(state))[0::2] for state in
-           ("dead", "unknown")], [([soon], 0)] * 2)
+          (_expiry(soon_rows), soon_renew, soon_reclaim, len(reclaim_expired(soon_rows, T35))),
+          (T35 + RENEWAL_SECONDS, 1, 0, 1))
+    check("[CONTROL] a not-yet-expired lease is NEVER reclaimed and is still READ as live, "
+          "whatever the probe says",
+          [(lambda p: (p[2], len(reclaim_expired(p[0], T35))))(
+              plan_renewal([soon], T35, _fixed(state))) for state in ("dead", "unknown")],
+          [(0, 1)] * 2)
+    check("[CONTROL] a not-yet-expired lease whose run is DEAD is left byte-identical "
+          "(no ledger churn while it is still suppressing on its own expiry)",
+          plan_renewal([soon], T35, _fixed("dead"))[0], [soon])
     # The lead has to outlast the cron it rides on, and a renewal has to leave the row OUTSIDE its
     # own lead window at the moment it lands — otherwise the row is due again immediately, or a
     # single skipped cron fire lets a live lease expire unseen.
     check("the renewal window and lead bracket the 15-minute groom-leases cron",
           (RENEWAL_LEAD_SECONDS >= 2 * 15 * 60, RENEWAL_SECONDS > RENEWAL_LEAD_SECONDS,
            RENEWAL_CEILING_SECONDS > RENEWAL_SECONDS), (True, True, True))
-    # UNPROVEN liveness defers rather than guessing: the row is left byte-identical and decided
-    # again next tick. Reclaiming on a failed probe would reinstate the exact bug.
-    deferred_rows, _r, d_reclaim, d_defer = plan_renewal([live_worker], T35, _fixed("unknown"))
-    check("an UNPROVEN probe defers the row unchanged instead of reclaiming it",
-          (deferred_rows, d_reclaim, d_defer), ([live_worker], 0, 1))
+    # UNPROVEN liveness defers the DECISION rather than guessing — but a deferral has to HOLD the
+    # slot, not hand it away. Leaving the expired row byte-identical defers nothing: by the module
+    # header every duplicate-suppression consumer keys on `expires_at > now` and not on the row's
+    # presence, so one 403/5xx/garbage body would free the account and the holder key to the next
+    # dispatcher while the original run may still be writing — the very double-dispatch this change
+    # closes, re-opened by a flaky API. So the row is held on a short, ceiling-clamped grace
+    # deadline and re-probed next tick.
+    deferred_rows, d_renew, d_reclaim, d_defer = plan_renewal([live_worker], T35, _fixed("unknown"))
+    check("[RED #35] an UNPROVEN probe HOLDS the row on grace instead of reclaiming it",
+          (_expiry(deferred_rows), d_renew, d_reclaim, d_defer),
+          (T35 + RENEWAL_GRACE_SECONDS, 0, 0, 1))
+    # ...and the claim that actually matters, measured through the REAL suppression consumers
+    # instead of by asserting the row is present. `live_worker` IS the un-held row that a
+    # byte-identical defer emits, so the second half of this tuple is the counterfactual measured on
+    # the same consumers: every one of them hands the slot straight to a competing dispatcher.
+    # `partition_available` is fed the RECLAIMED list by its one production caller (`claim()`), and
+    # `choose_account` runs `reclaim_expired` itself — so both are driven here exactly as claim()
+    # drives them, not on the raw ledger where an expired row would still look present.
+    check("[RED #35] a grace-HELD unproven row still suppresses a competing claim, where the "
+          "un-held row a byte-identical defer emits does NOT",
+          (len(reclaim_expired(deferred_rows, T35)),
+           partition_available(reclaim_expired(deferred_rows, T35), "o/r#7", "p"),
+           choose_account(A, deferred_rows, ["terra"], "p", "impl", T35),
+           len(reclaim_expired([live_worker], T35)),
+           partition_available(reclaim_expired([live_worker], T35), "o/r#7", "p"),
+           choose_account(A, [live_worker], ["terra"], "p", "impl", T35)),
+          (1, False, None, 0, True, "acct01"))
+    check("[RED #35] the grace hold rewrites expires_at and NOTHING else",
+          _row_but_expiry(deferred_rows),
+          {k: v for k, v in live_worker.items() if k != "expires_at"})
+    check("the grace deadline comes from `grace` — not from the lead, and not from the full "
+          "renewal a PROVEN-live run earns",
+          (_expiry(plan_renewal([live_worker], T35, _fixed("unknown"), grace=123)[0]),
+           _expiry(plan_renewal([live_worker], T35, _fixed("live"), grace=123)[0])),
+          (T35 + 123, T35 + RENEWAL_SECONDS))
+    # The grace is bounded on BOTH sides: long enough that a single skipped cron fire cannot let a
+    # held row lapse unseen, and no longer than the lead, so a held row stays DUE and is re-probed
+    # every tick instead of quietly sitting on a scarce slot.
+    check("the grace hold brackets the 15-minute cron without out-staying its welcome",
+          (RENEWAL_GRACE_SECONDS >= 2 * 15 * 60, RENEWAL_GRACE_SECONDS <= RENEWAL_LEAD_SECONDS,
+           RENEWAL_GRACE_SECONDS < RENEWAL_SECONDS), (True, True, True))
+    held_rows, _hr, h_reclaim, h_defer = plan_renewal(
+        deferred_rows, T35 + 15 * 60, _fixed("unknown"))
+    check("a still-unproven row is re-decided on the NEXT cron tick and held again, never "
+          "silently coasting on the first hold",
+          (h_reclaim, h_defer, _expiry(held_rows)),
+          (0, 1, T35 + 15 * 60 + RENEWAL_GRACE_SECONDS))
     # THE CAPACITY BACKSTOP. Without the ceiling, a run wedged in `in_progress` — or a probe that
     # keeps failing — pins a scarce account slot forever, trading the double-dispatch for a
     # permanent capacity leak. Past the ceiling the reclaim happens REGARDLESS of liveness.
@@ -2547,10 +2634,16 @@ def _self_test():
           plan_renewal([wedged], T35, _fixed("unknown"))[0::2], ([], 1))
     near = _lease35("o/r#7@4242.1", T35 - RENEWAL_CEILING_SECONDS + 60, T35 - 10)
     check("[BACKSTOP] a renewal CLAMPS to the ceiling rather than stepping over it",
-          plan_renewal([near], T35, _fixed("live"))[0][0]["expires_at"],
+          _expiry(plan_renewal([near], T35, _fixed("live"))[0]),
           near["issued_at"] + RENEWAL_CEILING_SECONDS)
-    check("a renewal never lands at or before now (the ledger's expires_at > issued_at invariant)",
-          plan_renewal([near], T35, _fixed("live"))[0][0]["expires_at"] > T35, True)
+    check("[BACKSTOP] a grace HOLD clamps to the same ceiling — an unanswered probe cannot buy "
+          "more slot-time than a proven-live run",
+          _expiry(plan_renewal([near], T35, _fixed("unknown"))[0]),
+          near["issued_at"] + RENEWAL_CEILING_SECONDS)
+    check("neither a renewal nor a grace hold lands at or before now (every deferred row leaves "
+          "plan_renewal still readable as live)",
+          [len(reclaim_expired(plan_renewal([near], T35, _fixed(state))[0], T35))
+           for state in ("live", "unknown")], [1, 1])
     check("a lease with an unreadable expiry/issuance is reclaimed, never renewed",
           (plan_renewal([{**live_worker, "expires_at": "soon"}], T35, _fixed("live"))[0::2],
            plan_renewal([{**live_worker, "issued_at": None}], T35, _fixed("live"))[0::2]),
@@ -3465,11 +3558,12 @@ def _self_test():
     # above pin the decision; this one pins that reclaim() consults a probe at all and that what it
     # PUTs carries the pushed-forward expiry. Deleting the wiring while keeping `plan_renewal`
     # turns exactly this check red.
-    def _drive_reclaim_liveness(state, holder="o/r#1@4242.1"):
+    def _drive_reclaim_liveness(state, holder="o/r#1@4242.1", issued=T35 - 6000, ttl=5900):
         """Drive reclaim() over a fake gh with an injected liveness verdict. Returns
-        (outcome, probed run ids, the leases document the PUT carried)."""
+        (outcome, probed run ids, the lease rows the PUT carried — the `"NO PUT"` sentinel when the
+        writer issued none). The default row expired 100s before `T35`."""
         calls, probed = [], []
-        expired = make_lease("a1", holder, "p", "impl", "m", T35 - 6000, 5900)  # expired 100s ago
+        expired = make_lease("a1", holder, "p", "impl", "m", issued, ttl)
         expired["claim_id"] = "e" * 32
 
         def fake_gh(args, **_kwargs):
@@ -3494,24 +3588,43 @@ def _self_test():
         written = json.loads(base64.b64decode(
             next(a for a in put if a.startswith("content=")).split("=", 1)[1]).decode()) if put \
             else None
-        return result, probed, written
+        # `"NO PUT"` rather than a bare None: a mutant that stops writing must red a NAMED check,
+        # not raise TypeError out of the assertion and abort every check below it.
+        return result, probed, (written or {}).get("leases", "NO PUT")
+
+    def _put_summary(rows):
+        """(claim ids, expiry offsets from T35, how many the suppression consumers read as LIVE) of
+        the ledger a PUT carried — or the `"NO PUT"` sentinel when the writer issued none."""
+        if not isinstance(rows, list):
+            return rows
+        return ([row["claim_id"] for row in rows], [row["expires_at"] - T35 for row in rows],
+                len(reclaim_expired(rows, T35)))
 
     live_outcome, live_probed, live_written = _drive_reclaim_liveness("live")
     check("[RED #35 e2e] reclaim() probes the holder's run and RENEWS instead of dropping it",
           (live_outcome, live_probed), (ReclaimOutcome(0, 1, 0), [4242]))
     check("[RED #35 e2e] ...and the ledger it PUTs carries the row with a FUTURE expiry",
-          ([row["claim_id"] for row in live_written["leases"]],
-           [row["expires_at"] > T35 for row in live_written["leases"]]),
-          (["e" * 32], [True]))
+          _put_summary(live_written), (["e" * 32], [RENEWAL_SECONDS], 1))
     dead_outcome, dead_probed, dead_written = _drive_reclaim_liveness("dead")
     check("[CONTROL e2e] a dead run's lease is still reclaimed, and the PUT drops the row",
-          (dead_outcome, dead_probed, dead_written), (ReclaimOutcome(1, 0, 0), [4242],
-                                                      {"leases": []}))
-    # An unproven probe writes NOTHING at all: the row is left exactly as the previous tick left
-    # it, so a flapping Actions API cannot churn the ledger branch.
+          (dead_outcome, dead_probed, dead_written), (ReclaimOutcome(1, 0, 0), [4242], []))
+    # An unproven probe must still WRITE the grace hold. `reclaim()` used to skip the PUT whenever
+    # nothing was reclaimed or renewed, which left the expired row in the ledger exactly as read —
+    # and an expired row suppresses nothing, so a flapping Actions API re-opened the double-dispatch
+    # on the very tick the deferral was supposed to protect. Measure the ledger the CRON ACTUALLY
+    # WRITES: the row must come back with an expiry in the future.
     unknown_outcome, _p, unknown_written = _drive_reclaim_liveness("unknown")
-    check("[CONTROL e2e] an unproven probe issues no PUT and defers the row",
-          (unknown_outcome, unknown_written), (ReclaimOutcome(0, 0, 1), None))
+    check("[RED #35 e2e] an unproven probe PUTs the row back with a FUTURE expiry rather than "
+          "leaving it expired in the ledger",
+          (unknown_outcome, _put_summary(unknown_written)),
+          (ReclaimOutcome(0, 0, 1), (["e" * 32], [RENEWAL_GRACE_SECONDS], 1)))
+    # ...and the other side of that write rule: a tick with nothing to decide must still write
+    # NOTHING, or the 15-minute cron would rewrite the ledger branch forever. A row far outside its
+    # lead window is not even probed.
+    idle_outcome, idle_probed, idle_written = _drive_reclaim_liveness(
+        "unknown", issued=T35, ttl=RENEWAL_LEAD_SECONDS + 600)
+    check("[CONTROL e2e] a tick with nothing due issues no PUT and no probe",
+          (idle_outcome, idle_probed, idle_written), (ReclaimOutcome(0, 0, 0), [], "NO PUT"))
     # A holder with no run suffix must not cost an Actions API call — the repair leases the
     # groom-leases header calls out are TTL-managed and reclaimed with no probe.
     norun_outcome, norun_probed, _w = _drive_reclaim_liveness("live", holder="review:o/r#1")
@@ -3542,6 +3655,35 @@ def _self_test():
     check("groom-leases.yml's permissions BLOCK grants the actions:read the probe needs, "
           "alongside the ledger write — and nothing else",
           sorted(granted), ["actions: read", "contents: write"])
+
+    # (7) `_probe_run` is where a REAL gh outcome becomes the verdict every branch above keys on,
+    # and it is the only part of this path the injected fakes never execute. The mapping is the
+    # safety argument: a 403/5xx/garbage body MUST read `unknown` (grace hold, decide next tick) and
+    # only a 404 may read `dead`. If a transient failure mapped to `dead` instead, the grace hold
+    # would never fire and the blind reclaim of a live worker would be back, untouched.
+    def _probe_with(returncode, stdout="", stderr=""):
+        saved_run = subprocess.run
+        subprocess.run = lambda args, **_kw: (
+            probe_argv.append(list(args)), _Res(returncode, stdout, stderr))[1]
+        try:
+            return _probe_run("o/r", 4242)
+        finally:
+            subprocess.run = saved_run
+
+    probe_argv = []
+    live_body = json.dumps({"path": ".github/workflows/worker.yml", "status": "in_progress"})
+    check("_probe_run maps a transient gh failure to UNPROVEN and only a 404 to dead",
+          [_probe_with(1, stderr=err) for err in
+           ("gh: ... (HTTP 403)", "gh: ... (HTTP 500)", "gh: ... (HTTP 502)",
+            "dial tcp: connection refused", "gh: ... (HTTP 404)")],
+          ["unknown", "unknown", "unknown", "unknown", "dead"])
+    check("_probe_run maps a readable live run to live, and an unparseable body to UNPROVEN",
+          [_probe_with(0, stdout=live_body), _probe_with(0, stdout="<html>not json</html>"),
+           _probe_with(0, stdout="")], ["live", "unknown", "unknown"])
+    check("_probe_run reads the RUN it was asked about, from the registry repo",
+          probe_argv[-1], ["gh", "api", "repos/o/r/actions/runs/4242"])
+    check("_probe_run never probes at all when the holder named no run",
+          _probe_run("o/r", None), "dead")
 
     # ---- the SAME end-to-end drive for the OTHER THREE writers: release / adopt / claim ----------
     # #558's budget is PER CAS TRANSACTION: each of the four ledger writers builds its own
@@ -3752,7 +3894,7 @@ def main():
             return 1
         print(f"reclaimed {outcome.reclaimed} expired lease(s); "
               f"renewed {outcome.renewed} live lease(s); "
-              f"deferred {outcome.deferred} unproven lease(s)")
+              f"held {outcome.deferred} unproven lease(s) on grace")
         return 0
     if args.claim:
         chain = [m.strip() for m in args.models.split(",") if m.strip()]

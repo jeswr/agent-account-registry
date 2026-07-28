@@ -83,9 +83,17 @@ a second worker mid-run. It has to move `expires_at` rather than merely keep the
 duplicate-suppression consumer (`reclaim_expired`, `partition_available`, dispatch's
 `_live_holder_keys` / `sibling_lease_conflict`) reads *that field*, not the row's presence. A
 dead/absent run, a run outside the two lease-holding workflows, a holder with no run id (the
-TTL-managed `review:`/`fix:` repair leases), an unprovable probe past its ceiling, and any lease
-older than the **6-hour renewal ceiling** are all still reclaimed — the ceiling is what stops a run
-wedged in `in_progress` from trading the double-dispatch for a permanent capacity leak.
+TTL-managed `review:`/`fix:` repair leases), and any lease older than the **6-hour renewal ceiling**
+are all still reclaimed — the ceiling is what stops a run wedged in `in_progress` from trading the
+double-dispatch for a permanent capacity leak.
+
+When the Actions API does not answer at all (403/5xx/garbage body), the ownership decision is
+**deferred to the next tick — and the row is held on a short 30-minute grace deadline** while it
+waits. Deferring by leaving the expired row untouched would defer *nothing*: by the paragraph above
+an expired row suppresses nothing, so one transient probe failure would hand the account and the
+holder key straight to the next dispatcher while the original run may still be writing. The grace
+is shorter than a proven-live renewal, keeps the row inside its lead window so every tick re-probes
+it, and never outruns the same 6-hour ceiling — a probe that never recovers still cannot pin a slot.
 
 ### The `package` partition has ONE canonical derivation (and one pinned copy)
 
