@@ -568,7 +568,23 @@ def read_job_log(repo, job_id, runner=None):
     return out
 
 
-def already_swept(repo, number, repair, runner=None):
+def marker_author_admitted(comment, bot_login):
+    """Is this comment's marker one THIS sweeper wrote? PURE.
+
+    Markers are only counted when SELF-AUTHORED (the pattern resolve-conflicts.py established): an
+    unrestricted marker scan is a DENIAL OF RECOVERY — anyone able to comment could pin a PR out of
+    the class permanently by pasting the marker.
+
+    With no known bot login the polarity flips to trusting every marker, and that is deliberate: a
+    marker this function cannot attribute is at worst a MISSED move (safe, retried next tick once
+    the identity is known), whereas ignoring it is a REPEATED move against a head already updated.
+    Fail-closed here means declining to act, not acting on unverified provenance."""
+    if not bot_login:
+        return True
+    return str(((comment or {}).get("user") or {}).get("login") or "") == bot_login
+
+
+def already_swept(repo, number, repair, bot_login="", runner=None):
     """Has THIS repair already moved THIS PR? -> True/False/None(unreadable).
 
     The durable idempotence key is a self-authored HTML marker on the PR, not a state file. Three
@@ -580,6 +596,8 @@ def already_swept(repo, number, repair, runner=None):
     if not isinstance(payload, list):
         return None
     for comment in payload:
+        if not marker_author_admitted(comment, bot_login):
+            continue
         for match in MARKER_RE.finditer(str((comment or {}).get("body") or "")):
             if int(match.group(1)) == repair:
                 return True
@@ -669,7 +687,7 @@ class Sweeper:
 
     def __init__(self, repo, repairs, runner=None, apply=False, cap=MAX_MOVES_PER_TICK,
                  lookback_hours=REPAIR_LOOKBACK_HOURS, clock=None, sleeper=time.sleep,
-                 summary_path=None):
+                 summary_path=None, bot_login=""):
         self.repo = repo
         self.repairs = repairs
         self.runner = runner
@@ -679,6 +697,7 @@ class Sweeper:
         self.clock = clock or (lambda: int(datetime.now(tz=timezone.utc).timestamp()))
         self.sleeper = sleeper
         self.summary_path = summary_path
+        self.bot_login = bot_login
         self.errors = 0
         self.rows = []
         self.budget_used = 0
@@ -769,7 +788,8 @@ class Sweeper:
         bucket = attribute(pr, self.repo, gate, merged_epoch, contains, ledger, repair)
         if bucket != "attributable":
             return bucket, ledger, gate
-        swept = already_swept(self.repo, pr["number"], repair["repair_pr"], self.runner)
+        swept = already_swept(self.repo, pr["number"], repair["repair_pr"], self.bot_login,
+                              self.runner)
         if swept is None:
             return "read-failed", ledger, gate
         return ("already-swept" if swept else "attributable"), ledger, gate
@@ -841,6 +861,9 @@ def main(argv=None):
                         help="cap on branch moves per tick")
     parser.add_argument("--lookback-hours", type=float, default=REPAIR_LOOKBACK_HOURS,
                         help="how long a declared repair stays live")
+    parser.add_argument("--bot-slug", default=os.environ.get("APP_SLUG", ""),
+                        help="GitHub App slug this sweeper posts as; markers by any other author "
+                             "are ignored so a spoofed marker cannot pin a PR out of the class")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--apply", action="store_true", help="issue writes (default: dry-run)")
     mode.add_argument("--dry-run", action="store_true", help="classify and census only")
@@ -853,8 +876,11 @@ def main(argv=None):
         parser.error("--max-moves must not be negative")
     with open(args.repairs_file, encoding="utf-8") as handle:
         repairs = load_repairs(handle.read())
+    if args.bot_slug and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", args.bot_slug):
+        parser.error("--bot-slug must be a safe GitHub App slug")
     sweeper = Sweeper(args.repo, repairs, apply=args.apply, cap=args.max_moves,
                       lookback_hours=args.lookback_hours,
+                      bot_login=f"{args.bot_slug}[bot]" if args.bot_slug else "",
                       summary_path=os.environ.get("GITHUB_STEP_SUMMARY") or None)
     return sweeper.run()
 
@@ -1189,7 +1215,9 @@ class FakeGh:
             if self.refuse_comment_reads:
                 return 1, ""
             number = int(tail.split("/")[2])
-            return 0, json.dumps([{"body": b} for b in self.comments.get(number, [])])
+            return 0, json.dumps([b if isinstance(b, dict) else
+                                  {"body": b, "user": {"login": BOT_LOGIN}}
+                                  for b in self.comments.get(number, [])])
         if tail.startswith("/git/ref/heads/"):
             branch = tail[len("/git/ref/heads/"):]
             moved = "z" * 40 if self.ref_moves else None
@@ -1214,8 +1242,12 @@ REPAIR_DETAIL = {"merged_at": "2026-07-28T02:26:49Z", "merge_commit_sha": "f" * 
 NOW = parse_rfc3339("2026-07-28T02:30:00Z")
 
 
+BOT_SLUG = "registry-admin"
+BOT_LOGIN = f"{BOT_SLUG}[bot]"
+
+
 def _fixture(*, labels=(), comments=None, refuse_update=(), cap=MAX_MOVES_PER_TICK, apply=True,
-             ref_moves=True, refuse_comment_reads=False):
+             ref_moves=True, refuse_comment_reads=False, bot_login=BOT_LOGIN):
     """Tonight's board, reduced to its two load-bearing members: #903 (attributable) and #92 (red
     on its own merits, identical in every other respect)."""
     pulls = [_pr(903, head="a" * 40, ref="fix/903", labels=labels),
@@ -1232,7 +1264,7 @@ def _fixture(*, labels=(), comments=None, refuse_update=(), cap=MAX_MOVES_PER_TI
                                  "details_url": ".../actions/runs/1/job/555"}]
     gh.logs[555] = _worker_live_log(f"{OWN}: 0 (want 1)")
     sweeper = Sweeper("jeswr/agent-account-registry", [dict(REPAIR)], runner=gh, apply=apply,
-                      cap=cap, clock=lambda: NOW, sleeper=lambda _s: None)
+                      cap=cap, clock=lambda: NOW, sleeper=lambda _s: None, bot_login=bot_login)
     return gh, sweeper
 
 
@@ -1265,6 +1297,18 @@ def _test_live_sweep(chk):
         gh2.updated(), [])
     chk("idempotence: it is censused as already-swept, not silently dropped",
         "already-swept=1" in sweeper2.rows[0], True)
+    spoof = {"body": MARKER.format(repair=917, head="a" * 40), "user": {"login": "someone-else"}}
+    gh2b, sweeper2b = _fixture(comments={903: [spoof]})
+    sweeper2b.run()
+    chk("idempotence: a marker posted by ANYONE ELSE does not suppress the sweep — an "
+        "unrestricted marker scan is a denial of recovery, not an idempotence key",
+        gh2b.updated(), [903])
+    gh2c, sweeper2c = _fixture(comments={903: [spoof]}, bot_login="")
+    sweeper2c.run()
+    chk("idempotence: with NO known bot login the polarity flips to trusting every marker — a "
+        "missed move is safe and retried, a repeated move is not",
+        gh2c.updated(), [])
+
     gh3, sweeper3 = _fixture(comments={903: [MARKER.format(repair=999, head="a" * 40)]})
     sweeper3.run()
     chk("idempotence: a marker for a DIFFERENT repair does not suppress this one",
@@ -1454,10 +1498,12 @@ def _test_workflow_seam(chk):
     chk("seam: the live call bounds the tick with --max-moves",
         live[live.index("--max-moves") + 1] if "--max-moves" in live else None,
         str(MAX_MOVES_PER_TICK))
+    chk("seam: the live call passes --bot-slug, so the marker scan is restricted to markers this "
+        "sweeper itself wrote", "--bot-slug" in live, True)
     chk("seam: every flag the workflow passes is declared by this script's parser",
         sorted(f for f in live if f.startswith("--")
                if f not in ("--apply", "--dry-run", "--repo", "--repairs-file", "--max-moves",
-                            "--lookback-hours", "--self-test")),
+                            "--lookback-hours", "--bot-slug", "--self-test")),
         [])
 
     # --- the TOKEN. A push made with `github.token` does not trigger `pull_request` workflows,

@@ -82,12 +82,17 @@ jobs:
         id: sweep
         env:
           GH_TOKEN: ${{ steps.registry-token.outputs.token }}
+          APP_SLUG: ${{ steps.registry-token.outputs.app-slug }}
         run: |
           set -euo pipefail
+          # The marker scan only counts comments THIS App wrote. Without the slug an unrestricted
+          # scan would let anyone able to comment pin a PR out of the class permanently.
+          [[ -n "${APP_SLUG:-}" ]] || { echo '::error::the App mint delivered no slug'; exit 1; }
           python3 registry/scripts/regate-sweep.py --self-test
           python3 registry/scripts/regate-sweep.py \
             --repo "$GITHUB_REPOSITORY" \
             --repairs-file registry/orchestration/gate-repairs.json \
             --max-moves 5 \
             --lookback-hours 24 \
+            --bot-slug "$APP_SLUG" \
             --apply
