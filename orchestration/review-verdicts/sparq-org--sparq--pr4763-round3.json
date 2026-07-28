@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4763,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "747d9162a4cd5e3582f1927dc22a1fb45f219b15",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "sort_key_is_total only checks whether every projected variable is named in ORDER BY, then claims rows sharing the sort key are the same solution. That is false under SPARQL ordering equality: distinct projected RDF terms can tie after numeric promotion. For example, SELECT ?k ... ORDER BY ?k LIMIT 1 over `1`^^xsd:integer and `1.0`^^xsd:decimal may legally return either term. Both answers pass sort_key_is_total, but order_by_compare first sees different bags and returns Differs, producing a false differential failure. The same boundary problem applies to lossy double ties and NaN. The added truncated-sort test uses only distinct integer keys and does not exercise a tie at the LIMIT boundary.",
+    "file": "crates/sparq-bench/src/fuzz.rs",
+    "fix_hint": "For LIMIT/OFFSET, require a genuinely strict total order over distinguishable projected rows, not merely variable-name coverage. Fail closed with a counted skip whenever the truncation boundary can intersect an ORDER BY tie containing RDF-distinct solutions, including cross-datatype numeric promotion ties, lossy f64 ties, and NaN. Add a live or hand-authored boundary test where integer 1 and decimal 1.0 are permuted and LIMIT 1 selects different legal rows; it must skip, while a strictly ordered boundary must still be compared.",
+    "severity": "major",
+    "title": "LIMIT oracle treats value-tied distinct RDF terms as a total sort key"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 3 fixes the prior lossy-promotion false failure for untruncated sequences by returning a counted TieUnmodelled skip, and its focused test exercises that case. However, the new LIMIT/OFFSET eligibility rule is unsound: covering every projected variable by sort variables does not make the selected RDF solution deterministic, because SPARQL ORDER BY can tie distinct RDF terms after numeric promotion. With ORDER BY ?k LIMIT 1 over integer 1 and decimal 1.0, two conforming engines may select different rows. sort_key_is_total accepts this shape, then order_by_compare checks bag equality first and reports Differs rather than recognizing the legal boundary tie. This is a new major false-positive path, so progress is regressing.",
+  "verdict": "request_changes"
+ }
+}
