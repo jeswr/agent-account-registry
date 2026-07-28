@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4731,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c2351af0ecf42e4b4e43d2e8630ba92e24b485bb",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change is coherent and complete as scoped. Blank-node-bearing SELECT results are encoded as one RDF structure with distinct row nodes, preserving bag multiplicity, unbound rows, variable identity, and cross-row blank-node sharing before independent RDFC-1.0 canonicalization. Graph results correctly use set semantics, unsupported RDF-star/generalized-RDF inputs fail closed, and the explicit HNDQ limit converts pathological canonicalization into triage. The focused tests exercise relabeling, non-isomorphic rewiring, wrong values, sharing mismatches, duplicate rows, all-unbound rows, ground-table parity, invalid inputs, and the bench harness's distinct counted bnode-triage route. Documentation honestly states that end-to-end harness wiring remains deferred, so it does not overclaim coverage.",
+  "verdict": "approve"
+ }
+}
