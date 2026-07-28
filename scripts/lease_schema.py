@@ -9,6 +9,10 @@ from typing import Any
 
 
 GLOBAL_PACKAGE = "__global__"   # the serializing partition (excludes against every area)
+# A partition key names a SET of areas. One area is its own name; two or more are joined with this
+# separator in sorted order, so the key is a canonical function of the set (registry #692 line of
+# work). `__global__` is the UNIVERSAL set and is the only key that intersects every other.
+PARTITION_SEPARATOR = ","
 
 ACCOUNT = re.compile(r"[0-9a-f]{16}")
 CLAIM = re.compile(r"[0-9a-f]{32}")
@@ -26,12 +30,27 @@ def is_repair_holder(value: Any) -> bool:
 
 
 def plan_package(areas: Any) -> str:
-    """THE canonical reduction from a row's `area:*` sections to the ONE `package` partition its
-    lease reserves (registry issue #112). EXACTLY ONE distinct area -> that area; ZERO OR MULTIPLE
-    -> the serializing global partition, so a multi-area row can never co-run with in-flight work
-    in ANY of its areas. Fail-closed: over-serialize a multi-area row rather than free a busy
-    sibling crate. Takes BARE area names (no `area:` prefix); non-string / empty entries are
-    ignored.
+    """THE canonical reduction from a row's `area:*` sections to the `package` partition key its
+    lease reserves (registry issue #112). A key names a SET of areas: EXACTLY ONE distinct area ->
+    that area; TWO OR MORE -> the canonical sorted, `,`-joined composite naming EXACTLY those
+    areas; ZERO -> the serializing global partition. Takes BARE area names (no `area:` prefix);
+    non-string / empty entries are ignored.
+
+    WHY MULTI-AREA IS NO LONGER `__global__`. It used to be, and that made "touches A and B" mean
+    "touches EVERYTHING": `packages_conflict` then excluded such a row against every partition on
+    the board, so it could not co-run with anything and nothing could co-run with it. MEASURED on
+    the live board: 65 of 468 ready issues (13.9%) reduced that way and self-blocked, and an
+    earlier sample found 37 of those 65 (57%) carry genuinely distinct crates — the LABELS were
+    right, the reduction was wrong. `{A,B}` now reserves `{A,B}`, and two rows conflict iff their
+    area sets INTERSECT (`packages_conflict`). This narrows only where the labels PROVE the
+    footprint.
+
+    ZERO AREAS STAYS `__global__`, and that asymmetry is the whole safety argument. An unlabelled
+    row's true footprint is UNKNOWN, so it must keep reserving everything; narrowing it to
+    "nothing" would make an item whose blast radius nobody can name concurrent with all work at
+    once. Registry #75 (4 no-area issues froze the sparq frontier) and #772 (one unprovenanced PR
+    reserved `__global__` and zeroed the impl lane) are the two directions of that trade: an
+    over-wide CANDIDATE costs one dispatch, an under-wide OCCUPANT costs correctness.
 
     Canonical HERE — beside `validate_ledger`, which owns the `package` field's other invariant —
     because this value is derived INDEPENDENTLY by the dispatcher that MINTS a claim and by the
@@ -51,7 +70,57 @@ def plan_package(areas: Any) -> str:
     import it does (`plan_package_csv` below is the entry point for shell callers, so even a
     `run:` script has no reason to re-implement it)."""
     unique = {area for area in (areas or ()) if isinstance(area, str) and area}
-    return next(iter(unique)) if len(unique) == 1 else GLOBAL_PACKAGE
+    if not unique:
+        return GLOBAL_PACKAGE
+    return PARTITION_SEPARATOR.join(sorted(unique))
+
+
+def package_areas(package: Any) -> frozenset | None:
+    """The SET of areas a partition key reserves, or `None` meaning EVERY area.
+
+    `None` (the universal set) for `__global__` and for anything unreadable — a non-string, an
+    empty string, a key with an empty atom. FAIL-CLOSED BY CONSTRUCTION: the one thing this must
+    never do is return an EMPTY set for a key it cannot parse, because an empty set intersects
+    nothing and would make an unparseable key concurrent with all work at once. There is no input
+    for which this returns `frozenset()`."""
+    if not isinstance(package, str) or not package or package == GLOBAL_PACKAGE:
+        return None
+    atoms = package.split(PARTITION_SEPARATOR)
+    if any(not atom for atom in atoms):
+        return None                       # a malformed key is unknown footprint, i.e. everything
+    return frozenset(atoms)
+
+
+def packages_conflict(left: Any, right: Any) -> bool:
+    """Whether two partition keys exclude each other: TRUE iff their area sets INTERSECT.
+
+    THE one conflict predicate. Every enforcement site — the allocator's `partition_available`,
+    the cross-lane `sibling_lease_conflict`, the PLAN assemble filter and the CLAIM-time live
+    re-check — decides with this function rather than with `==`/`in` over the key STRING, because
+    a widening applied at one site and not at another admits work the other half then refuses,
+    which is worse than either. The universal key intersects everything, so `__global__` on either
+    side still serializes in both directions exactly as before."""
+    left_areas, right_areas = package_areas(left), package_areas(right)
+    if left_areas is None or right_areas is None:
+        return True
+    return bool(left_areas & right_areas)
+
+
+def package_conflicts_with_areas(package: Any, areas: Any) -> bool:
+    """`packages_conflict` against an already-expanded set of AREA ATOMS (the busy union).
+
+    The busy union is a union over occupants of the atoms each holds, so it is a plain set of area
+    names that may additionally contain `__global__`. An EMPTY union conflicts with nothing — that
+    is "nobody holds anything", not "unknown footprint" — so it is the one case here that is not
+    fail-closed, and it is exactly the case every caller already special-cases (`if not busy`)."""
+    if not isinstance(areas, (set, frozenset)):
+        areas = frozenset(areas or ())
+    if GLOBAL_PACKAGE in areas:
+        return True
+    own = package_areas(package)
+    if own is None:
+        return bool(areas)                # universal key: any live reservation excludes it
+    return bool(own & areas)
 
 
 def plan_package_csv(csv: Any) -> str:
@@ -143,9 +212,10 @@ def _self_test() -> int:
     # `sorted(areas)[0] if areas else GLOBAL_PACKAGE` REVERSES exactly the multi-area row.
     check("one area reserves that area", plan_package(["site"]) == "site")
     check("no area reserves the global partition", plan_package([]) == GLOBAL_PACKAGE)
-    check("MULTI-area reserves the global partition (not the alphabetically-first area)",
-          plan_package(["ci", "site"]) == GLOBAL_PACKAGE
-          and plan_package(["site", "ci"]) == GLOBAL_PACKAGE)
+    check("MULTI-area reserves EXACTLY its own areas, canonically ordered — never the "
+          "alphabetically-first area, and never the global partition",
+          plan_package(["ci", "site"]) == "ci,site"
+          and plan_package(["site", "ci"]) == "ci,site")
     check("a duplicate area collapses to one area", plan_package(["ci", "ci"]) == "ci")
     check("order does not change a single-area reduction",
           plan_package(["site"]) == plan_package(("site",)))
@@ -163,9 +233,57 @@ def _self_test() -> int:
     check("the CSV entry point agrees with plan_package on every shape",
           plan_package_csv("") == GLOBAL_PACKAGE
           and plan_package_csv("site") == "site"
-          and plan_package_csv("ci,site") == GLOBAL_PACKAGE
+          and plan_package_csv("ci,site") == "ci,site"
           and plan_package_csv("ci,ci") == "ci"
           and plan_package_csv(None) == GLOBAL_PACKAGE)   # type: ignore[arg-type]
+    # A composite key round-trips through the CSV entry point unchanged, so the shell caller that
+    # reduces `$PACKAGES` and the python caller that re-derives from labels cannot disagree.
+    check("a composite key is a fixed point of the CSV entry point",
+          plan_package_csv("ci,site") == plan_package_csv("site,ci") == "ci,site")
+
+    # ---- packages_conflict: THE exclusion predicate. An item labelled {A,B} must reserve {A,B},
+    # not the whole world. THIS IS THE RED TEST for that change: under the pre-fix reduction
+    # `{A,B}` was `__global__`, so the first line below was FALSE (it excluded against `c`) and the
+    # first control was vacuous (everything conflicted with everything).
+    check("[RED] {A,B} and {C} are CONCURRENT — a multi-area row no longer reserves the world",
+          not packages_conflict(plan_package(["a", "b"]), plan_package(["c"])))
+    check("[RED] {A,B} and {B,C} EXCLUDE — the sets intersect on B",
+          packages_conflict(plan_package(["a", "b"]), plan_package(["b", "c"])))
+    check("[CONTROL] two {A} items still exclude",
+          packages_conflict(plan_package(["a"]), plan_package(["a"])))
+    check("[CONTROL] a ZERO-area item still reserves EVERYTHING (fail-closed, both directions)",
+          plan_package([]) == GLOBAL_PACKAGE
+          and packages_conflict(plan_package([]), plan_package(["a"]))
+          and packages_conflict(plan_package(["a"]), plan_package([]))
+          and packages_conflict(plan_package([]), plan_package(["a", "b"]))
+          and packages_conflict(plan_package([]), plan_package([])))
+    check("[CONTROL] {A,B} and {C,D} are concurrent; {A,B} and {A,B} are not",
+          not packages_conflict("a,b", "c,d") and packages_conflict("a,b", "a,b"))
+    check("conflict is symmetric on every pair tried",
+          all(packages_conflict(x, y) == packages_conflict(y, x)
+              for x in ("a", "a,b", "b,c", GLOBAL_PACKAGE, "", None)      # type: ignore[arg-type]
+              for y in ("a", "a,b", "b,c", GLOBAL_PACKAGE, "", None)))    # type: ignore[arg-type]
+    # An UNPARSEABLE key must read as the universal set, never as the empty one: an empty set
+    # intersects nothing and would make a key we cannot read concurrent with all live work.
+    check("an unreadable key is the UNIVERSAL set, never the empty set",
+          package_areas(None) is None and package_areas("") is None      # type: ignore[arg-type]
+          and package_areas(GLOBAL_PACKAGE) is None and package_areas("a,") is None
+          and package_areas(",a") is None and package_areas(0) is None   # type: ignore[arg-type]
+          and all(packages_conflict(bad, "a")
+                  for bad in (None, "", "a,", ",a", 0, [], GLOBAL_PACKAGE)))
+    check("a readable key names EXACTLY its atoms",
+          package_areas("a") == frozenset({"a"})
+          and package_areas("a,b") == frozenset({"a", "b"}))
+    # `package_conflicts_with_areas` is the same predicate against the busy UNION (a set of atoms
+    # that may carry `__global__`). The two must agree wherever both are defined, or the assemble
+    # leg and the allocator disagree about the same board.
+    check("the busy-union form agrees with the pairwise form",
+          package_conflicts_with_areas("a,b", {"c"}) is False
+          and package_conflicts_with_areas("a,b", {"b"}) is True
+          and package_conflicts_with_areas("a,b", {GLOBAL_PACKAGE}) is True
+          and package_conflicts_with_areas(GLOBAL_PACKAGE, {"c"}) is True
+          and package_conflicts_with_areas(GLOBAL_PACKAGE, set()) is False
+          and package_conflicts_with_areas("a", set()) is False)
     return 0 if ok else 1
 
 
