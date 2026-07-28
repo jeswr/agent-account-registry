@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4907,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "18de88ede968f6887c0fb8d3cb930e6be8ea8cba",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The new antijoin category is wired consistently into the category registry and both CI differential lanes. Its three firing shapes satisfy the documented conservative rewrite preconditions, while the theta and disjoint-variable shapes exercise distinct decline conditions. The plan-level test prevents the differential shard from silently exercising only the unrevised path and separately proves all trigger/decline classes are generated, so it is not vacuous. No correctness, soundness, security, or test-validity defect was found. Targeted execution could not be performed because cargo is unavailable in this review environment.",
+  "verdict": "approve"
+ }
+}
