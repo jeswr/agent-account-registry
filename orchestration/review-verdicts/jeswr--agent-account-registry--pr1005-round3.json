@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1005,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "95e22184acedda521ff7f94105aca65490f22249",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The round-2 approval remains supported. This is a documentation-only design record that grants no new authority and changes no behavior, workflow, policy, test, or trust-plane control. Its recommendation is fail-closed: the stuck-escalation adjudicator may re-admit a PR to the existing cross-provider review gate but may not arm, write `review:pass`, merge, or override human-owned stops. The record explicitly preserves SHA binding, trust-surface classification and audit receipts, injection/tamper stops, self-attested provenance restrictions, the `needs:design` gate, and the bounded automatic re-admission policy. It also states the operational cost and the design obligations that would apply if a maintainer later chose to introduce override authority. No reviewer-directed instruction or other prompt-injection text appears in the diff.",
+  "verdict": "approve"
+ }
+}
