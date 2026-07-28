@@ -96,6 +96,17 @@ POLICY_FIELDS = {
 # UNIONED onto the mandatory worker-pr.py DEFAULT_TRUST_SURFACE_PATHS (resolve_trust_surface_paths)
 # — it EXTENDS the built-in floor, it never replaces it, so a non-empty list only ADDS per-target
 # surfaces and an empty/absent one leaves the defaults in force (the guard is never silently off).
+# [issue #459] security_paths_denied: the SUBTRACTIVE counterpart, and the ONLY way a mandatory
+# built-in default ever comes back off. #166 made removal-by-omission impossible on purpose; this
+# field is the explicit, separately-reviewed replacement for it, so a narrowing is written down as
+# a narrowing (a named path in its own field) instead of appearing as a shorter security_paths.
+# Validated here for shape and for the security_paths CONTRADICTION (a path may not be both added
+# and denied — that is a policy the reader cannot resolve, so it is refused at the boundary rather
+# than silently decided at the consumer). The path is deliberately narrow at the CONSUMER too:
+# worker-pr.resolve_trust_surface_paths honours an entry only as an EXACT match of a mandatory
+# default, never as a prefix (so a deny can drop a whole declared surface but can never carve a
+# silent exception inside one), and refuses the whole deny set if it would leave NO surface at all.
+# Absent => empty => the #166 union stands unchanged.
 # trusted_bots (registry issue #111): the EXACT, policy-controlled allowlist of trusted App bot
 # logins (or App-derived login strings) that the dispatcher admits as issue authors ALONGSIDE the
 # `trust = "collaborators"` associations (OWNER/MEMBER/COLLABORATOR). It exists to give the declared
@@ -142,6 +153,7 @@ POLICY_FIELDS = {
 # itself, and inverting it yields a same-provider review that merely LOOKS cross-provider.
 OPTIONAL_POLICY_FIELDS = {"require_usage", "usage_safety_margin", "max_review_rounds",
                           "review_queue_ttl_minutes", "cross_provider_fallback", "security_paths",
+                          "security_paths_denied",
                           "trusted_bots", "allow_actions_bot_issues", "throughput", "readiness",
                           "review_enrolment_authors"}
 
@@ -296,6 +308,25 @@ def _policy_row(target_repo, policy_doc):
                 f"security_paths for {target_repo!r} must be a list of non-empty strings")
         if len(set(paths)) != len(paths):
             raise PolicyError(f"security_paths for {target_repo!r} contains duplicates")
+    # [issue #459] The subtractive half. Validated AFTER security_paths so the contradiction check
+    # below reads an already-shape-validated list (an absent one is the empty set).
+    if "security_paths_denied" in row:
+        denied = row["security_paths_denied"]
+        if (not isinstance(denied, list)
+                or any(not isinstance(p, str) or not p.strip() or "\n" in p or "\r" in p
+                       for p in denied)):
+            raise PolicyError(
+                f"security_paths_denied for {target_repo!r} must be a list of non-empty strings")
+        if len(set(denied)) != len(denied):
+            raise PolicyError(f"security_paths_denied for {target_repo!r} contains duplicates")
+        contradictory = sorted(set(denied) & set(row.get("security_paths") or []))
+        if contradictory:
+            raise PolicyError(
+                f"security_paths_denied for {target_repo!r} also names {contradictory!r} in "
+                "security_paths — a path cannot be both an added surface and a denied one. "
+                "Drop it from one list: the consumer resolves the contradiction fail-closed (the "
+                "ADD wins and the deny is ignored), which is not something a policy row should be "
+                "silently deciding")
     if "trusted_bots" in row:
         bots = row["trusted_bots"]
         if (not isinstance(bots, list)
@@ -481,6 +512,7 @@ def resolve(target_repo, role_or_labels, policy_doc, routing_doc):
         "review_queue_ttl_minutes": int(policy.get("review_queue_ttl_minutes", 30)),
         "cross_provider_fallback": bool(policy.get("cross_provider_fallback", False)),
         "security_paths": list(policy.get("security_paths", [])),
+        "security_paths_denied": list(policy.get("security_paths_denied", [])),
         "trusted_bots": list(policy.get("trusted_bots", [])),
         "allow_actions_bot_issues": policy["allow_actions_bot_issues"],
         "worker_timeout_minutes": policy["worker_timeout_minutes"],
@@ -618,6 +650,41 @@ agent = "docs-agent"
                               'max_concurrent=1\nworker_timeout_minutes=30\ngate_profile="lint-only"\n'
                               'arm_auto_merge=false\nmax_attempts=1\ntrust="collaborators"\n'
                               'security_paths=["ok", ""]\n')
+    # [issue #459] security_paths_denied: the subtractive counterpart. Validated + surfaced here;
+    # the exact-match / add-wins / never-empty semantics live in (and are asserted by)
+    # worker-pr.resolve_trust_surface_paths. `_row` builds an otherwise-identical row so each
+    # rejection below is attributable to the field under test and nothing else.
+    def _row(extra):
+        return tomllib.loads(
+            '[repos."o/r"]\nenabled=true\nrouting="r.toml"\naccount_pool=["acct01"]\n'
+            'max_concurrent=1\nworker_timeout_minutes=30\ngate_profile="lint-only"\n'
+            'arm_auto_merge=false\nmax_attempts=1\ntrust="collaborators"\n' + extra)
+
+    check("security_paths_denied default empty", impl["security_paths_denied"], [])
+    check("security_paths_denied surfaced",
+          resolve("o/r", "impl", _row('security_paths_denied=["containers/"]\n'),
+                  routing)["security_paths_denied"],
+          ["containers/"])
+    # The non-vacuity anchor for the three rejections below: the SAME row shape, with a legal
+    # deny alongside a disjoint security_paths, is ACCEPTED. Without it every rejection would
+    # also pass if resolve() had simply started refusing the field outright.
+    check("a legal deny alongside a DISJOINT security_paths is accepted",
+          resolve("o/r", "impl",
+                  _row('security_paths=["extra/"]\nsecurity_paths_denied=["containers/"]\n'),
+                  routing)["security_paths_denied"],
+          ["containers/"])
+    rejects("security_paths_denied rejects empty entry", "security_paths_denied",
+            lambda: resolve("o/r", "impl", _row('security_paths_denied=["ok", ""]\n'), routing))
+    rejects("security_paths_denied rejects duplicates", "duplicates",
+            lambda: resolve("o/r", "impl",
+                            _row('security_paths_denied=["a/", "a/"]\n'), routing))
+    # The CONTRADICTION: a path both added and denied is refused at the boundary rather than
+    # left for the consumer to resolve silently.
+    rejects("a path in BOTH security_paths and security_paths_denied is refused",
+            "cannot be both",
+            lambda: resolve("o/r", "impl",
+                            _row('security_paths=["containers/", "extra/"]\n'
+                                 'security_paths_denied=["containers/"]\n'), routing))
     # A RETIRED slot reappearing in a pool must be a HARD refusal (#660 review finding 1: the
     # retirement was enforced by nothing, so re-adding acct06 would have gone unnoticed). Both
     # halves are asserted: the retired name is refused, AND the otherwise-identical live pool is

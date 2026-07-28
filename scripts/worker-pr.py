@@ -364,7 +364,9 @@ SECURITY_KEYWORDS = ("zk", "mpc", "crypto", "auth", "e2ee")
 # from the target policy row; this constant is the MANDATORY fail-closed floor. [issue #166] A
 # policy `security_paths` list is UNIONED with this floor by resolve_trust_surface_paths (it
 # EXTENDS these defaults, it does not replace them), so the guard is never silently absent and a
-# narrow custom list can never disable a built-in surface.
+# narrow custom list can never disable a built-in surface. [issue #459] Dropping one of these
+# defaults is possible ONLY through the separate, separately-reviewed `security_paths_denied`
+# field, which names the surface explicitly and can never carve into a subtree or empty the set.
 #
 # [issue #145 — sol-audit worker] The manifest is DIRECTORY PREFIXES, not an enumerated file list.
 # The prior per-script enumeration was a standing blind spot: it omitted credential materialization
@@ -1204,7 +1206,7 @@ def trust_surface_paths_touched(diff_files, surface_paths=DEFAULT_TRUST_SURFACE_
     return sorted(touched)
 
 
-def resolve_trust_surface_paths(supplied):
+def resolve_trust_surface_paths(supplied, denied=None):
     """[issue #166] The single choke point that turns a target's policy `security_paths`
     into the ENFORCED trust-surface set: the mandatory built-in DEFAULT_TRUST_SURFACE_PATHS
     UNIONED with the supplied list — a policy list EXTENDS the defaults, it never REPLACES
@@ -1213,23 +1215,60 @@ def resolve_trust_surface_paths(supplied):
     that already specified its own list) and let a narrow custom list SILENTLY disable the
     built-in workflow/policy/orchestration protections. Unioning here keeps the defaults as
     a fail-closed floor: adding a mandatory default protects every target at once, and a
-    custom list can only ADD surfaces, never subtract one. Removal of a built-in default is
-    therefore possible ONLY through an explicit, separately-reviewed deny/override mechanism
-    (not by omission from a policy row). Every entry is normalized (`_norm_path`, so a
-    trailing `/` subtree marker is preserved) and de-duplicated with the defaults FIRST in a
-    stable order; hostile/empty/non-string supplied entries are dropped (they could only add
-    a surface anyway, never demote the guard). Both wired call sites — the ready-and-arm live
-    re-derivation and the review-outcome diff check — resolve through here, so worker-pr.py
-    enforces the union regardless of what review-fix.yml passes."""
-    resolved = []
-    seen = set()
-    for path in list(DEFAULT_TRUST_SURFACE_PATHS) + list(supplied or ()):
+    custom list can only ADD surfaces, never subtract one. Every entry is normalized
+    (`_norm_path`, so a trailing `/` subtree marker is preserved) and de-duplicated with the
+    defaults FIRST in a stable order; hostile/empty/non-string supplied entries are dropped
+    (they could only add a surface anyway, never demote the guard). Both wired call sites —
+    the ready-and-arm live re-derivation and the review-outcome diff check — resolve through
+    here, so worker-pr.py enforces the union regardless of what review-fix.yml passes.
+
+    [issue #459] `denied` is the SUBTRACTIVE half — the explicit, separately-reviewed
+    deny/override the #166 union deliberately left as the ONLY way to remove a mandatory
+    default. It carries the target policy row's `security_paths_denied` (validated by
+    policy-resolve.py, wired through review-fix.yml as `--deny-surface-path`). Removal by
+    OMISSION from `security_paths` remains impossible; a target that legitimately has no
+    such surface (no `containers/` tree, say) names it here, in its own reviewed field,
+    where the subtraction is visible as a subtraction rather than as a shorter list.
+
+    Three rules keep the subtraction fail-closed, and worker-pr.py applies them itself so
+    the guarantee does not depend on what the workflow passes:
+      1. EXACT MATCH ONLY, and only against a MANDATORY DEFAULT. A deny is not a prefix
+         rule: denying `scripts/worker-pr.py` does NOT punch a hole inside the `scripts/`
+         subtree, and denying a path that is not a built-in default is inert. A deny can
+         therefore only ever drop a whole declared surface — a coarse, visible act — never
+         carve a silent exception into one.
+      2. AN EXPLICIT ADD WINS OVER A DENY. A path named in BOTH `security_paths` and
+         `security_paths_denied` stays. (policy-resolve.py rejects that contradiction at the
+         boundary; this is the independent runtime half.)
+      3. THE RESULT IS NEVER EMPTY. Denying every surface would disable the arm-side
+         trust-surface audit outright, so a deny set that would resolve to nothing is
+         refused WHOLESALE and the full union stands.
+    """
+    supplied_norm = []
+    for path in list(supplied or ()):
         if not isinstance(path, str) or not path.strip():
             continue
         norm = _norm_path(path)
-        if norm and norm not in seen:
-            seen.add(norm)
-            resolved.append(norm)
+        if norm:
+            supplied_norm.append(norm)
+    defaults_norm = [_norm_path(path) for path in DEFAULT_TRUST_SURFACE_PATHS]
+    # Rules 1 + 2: a deny is honoured only as an exact match of a mandatory default that the
+    # target's own security_paths does not re-assert. Everything else is dropped silently —
+    # dropping a deny can only ever leave MORE surface guarded.
+    removable = {norm for norm in (_norm_path(path) for path in list(denied or ())
+                                   if isinstance(path, str) and path.strip())
+                 if norm and norm in defaults_norm and norm not in supplied_norm}
+    resolved = []
+    seen = set()
+    for norm in defaults_norm + supplied_norm:
+        if not norm or norm in seen or norm in removable:
+            continue
+        seen.add(norm)
+        resolved.append(norm)
+    if not resolved:
+        # Rule 3: every surface denied == no arm-side trust-surface audit at all. Refuse the
+        # whole deny set (order-independently) rather than hand the arm an empty guard.
+        return tuple(dict.fromkeys(norm for norm in defaults_norm + supplied_norm if norm))
     return tuple(resolved)
 
 
@@ -5119,7 +5158,8 @@ def _arm_auto_merge(repo, pr_number, reviewed_sha, attempts=ARM_ATTEMPTS, issue=
 
 def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, reviewer_provider,
                   reviewer_account, arm, issue=None, surface_paths=None, bot_login="",
-                  reviewed_base="", security_keywords=None, self_attested=False):
+                  reviewed_base="", security_keywords=None, self_attested=False,
+                  deny_surface_paths=None):
     """The ONLY place a PR can be armed. Fail-closed assertions per locked decision 6; a live-head
     mismatch returns the PR to review:needs (a fixer/other push raced the approval). [issue #139,
     round-4 P1] EVERY arm precondition — the hold surfaces (HUMAN_OWNED_LABELS on the PR, needs:*
@@ -5192,7 +5232,9 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
         # with checked failures — sol r1 on #257).
         # [issue #166] policy `security_paths` EXTEND the mandatory defaults (union), never
         # replace them — a narrow custom list can no longer silently disable a built-in surface.
-        surfaces = resolve_trust_surface_paths(surface_paths)
+        # [issue #459] `deny_surface_paths` is the ONLY way a default comes back off, and only
+        # by exact name; see resolve_trust_surface_paths for the three fail-closed rules.
+        surfaces = resolve_trust_surface_paths(surface_paths, deny_surface_paths)
         # SHA-BOUND snapshot (sol r3): the mutable PR files endpoint is ABA-racable
         # (A -> benign B -> A force-push between the head check and this read would hide
         # the hits while the CAS still accepts A). The compare at the immutable
@@ -5627,7 +5669,10 @@ def review_outcome(args):
     # it does not replace them: an empty supplied list falls back to the defaults alone, and a
     # non-empty one adds to — never subtracts from — the fail-closed floor, so the guard is never
     # silently absent and a narrow custom list cannot disable a built-in surface.
-    surface_paths = resolve_trust_surface_paths(args.surface_path)
+    # [issue #459] `--deny-surface-path` (policy `security_paths_denied`) is the one subtractive
+    # input; it can drop a mandatory default only by exact name, never carve into a subtree, and
+    # never empty the set — see resolve_trust_surface_paths.
+    surface_paths = resolve_trust_surface_paths(args.surface_path, args.deny_surface_path)
     surface_hits = trust_surface_paths_touched(diff_files, surface_paths)
     trust_surface = bool(surface_hits)
     security = args.security or trust_surface
@@ -6635,6 +6680,73 @@ def _self_test():
     check("resolve: de-dups a default and drops malformed entries",
           resolve_trust_surface_paths(["scripts/", "", None, 123, "  ", "extra/"]),
           tuple(DEFAULT_TRUST_SURFACE_PATHS) + ("extra/",))
+
+    # [issue #459] The SUBTRACTIVE half: `security_paths_denied` is the ONLY removal path for a
+    # mandatory default, and it is bounded by three rules. Every assertion below flips red on the
+    # obvious wrong implementation (a plain set-difference, or prefix-matched subtraction).
+    # The deny target is pinned to a real default so the checks cannot go vacuous if the floor is
+    # re-ordered; `containers/` is the concrete case the field exists for (a target with no
+    # container tree). Assert the premise first — if `containers/` ever leaves the floor, these
+    # checks must fail loudly rather than quietly assert nothing.
+    check("resolve/deny: the pinned deny target is a real mandatory default",
+          "containers/" in DEFAULT_TRUST_SURFACE_PATHS, True)
+    # (1) an honoured deny removes EXACTLY that default and nothing else...
+    check("resolve/deny: an exact deny of a default drops exactly that surface",
+          resolve_trust_surface_paths([], ["containers/"]),
+          tuple(p for p in DEFAULT_TRUST_SURFACE_PATHS if p != "containers/"))
+    # ...and the removal is REAL at the matcher, not cosmetic in the list: the denied surface stops
+    # forcing the audit while a sibling default still forces it.
+    check("resolve/deny: the dropped surface no longer flags, its siblings still do",
+          trust_surface_paths_touched(
+              ["containers/worker-model.Dockerfile", "scripts/groom.py"],
+              resolve_trust_surface_paths([], ["containers/"])),
+          ["scripts/groom.py"])
+    # (2) EXACT MATCH ONLY — a deny is not a prefix rule in EITHER direction. Denying a file
+    #     inside a covered subtree must not carve a hole in it (the silent-exception failure a
+    #     naive prefix subtraction would introduce), and denying a parent of a default is inert.
+    check("resolve/deny: a file inside a covered subtree does NOT punch a hole",
+          resolve_trust_surface_paths([], ["scripts/worker-pr.py"]),
+          tuple(DEFAULT_TRUST_SURFACE_PATHS))
+    check("resolve/deny: the subtree still flags the file its deny named",
+          trust_surface_paths_touched(["scripts/worker-pr.py"],
+                                      resolve_trust_surface_paths([], ["scripts/worker-pr.py"])),
+          ["scripts/worker-pr.py"])
+    check("resolve/deny: a deny naming no default at all is inert",
+          resolve_trust_surface_paths([], ["not-a-default/", "containers", "scripts"]),
+          tuple(DEFAULT_TRUST_SURFACE_PATHS))
+    #     ...and the restriction is to the MANDATORY DEFAULTS specifically, not merely to
+    #     "something in the resolved list": a deny naming a per-target ADDITION is inert too.
+    #     The deny field exists to reopen a built-in floor entry; a target that no longer wants
+    #     one of its own extra surfaces just stops listing it in security_paths.
+    check("resolve/deny: a deny naming a per-target ADDITION (not a default) is inert",
+          resolve_trust_surface_paths(["extra/"], ["extra/"]),
+          tuple(DEFAULT_TRUST_SURFACE_PATHS) + ("extra/",))
+    # (3) AN EXPLICIT ADD WINS: a path in BOTH lists stays (policy-resolve rejects the
+    #     contradiction, and this is the independent runtime half that does not trust it).
+    check("resolve/deny: an add re-asserting the same path beats the deny",
+          resolve_trust_surface_paths(["containers/"], ["containers/"]),
+          tuple(DEFAULT_TRUST_SURFACE_PATHS))
+    # (4) NEVER EMPTY: denying every default would disable the arm-side audit outright, so the
+    #     deny set is refused WHOLESALE and the full floor stands.
+    check("resolve/deny: denying every default is refused wholesale, not obeyed",
+          resolve_trust_surface_paths([], list(DEFAULT_TRUST_SURFACE_PATHS)),
+          tuple(DEFAULT_TRUST_SURFACE_PATHS))
+    check("resolve/deny: the refusal is wholesale — a partial deny inside a total one is not "
+          "half-applied",
+          trust_surface_paths_touched(["containers/x", "scripts/y"],
+                                      resolve_trust_surface_paths(
+                                          [], list(DEFAULT_TRUST_SURFACE_PATHS))),
+          ["containers/x", "scripts/y"])
+    # (5) hostile/malformed deny entries are dropped, and no deny at all is byte-identical to the
+    #     pre-#459 union (the additive path is untouched).
+    check("resolve/deny: malformed deny entries are dropped",
+          resolve_trust_surface_paths(["extra/"], ["", None, 123, "  "]),
+          tuple(DEFAULT_TRUST_SURFACE_PATHS) + ("extra/",))
+    check("resolve/deny: an absent deny set is exactly the #166 union",
+          (resolve_trust_surface_paths(["extra/"], None),
+           resolve_trust_surface_paths(["extra/"], [])),
+          (tuple(DEFAULT_TRUST_SURFACE_PATHS) + ("extra/",),
+           tuple(DEFAULT_TRUST_SURFACE_PATHS) + ("extra/",)))
 
     # human_owned: EITHER the loop's own escalation label or groom's parked-PR marker parks the
     # autonomous surface; plain loop states do not.
@@ -12330,6 +12442,13 @@ def main():
     # (resolve_trust_surface_paths) — it extends the defaults; empty -> defaults alone (fail closed).
     arm.add_argument("--surface-path", action="append", default=[],
                      help="trust-surface path/prefix (repeatable; from policy security_paths)")
+    # [issue #459] The SUBTRACTIVE half (repeatable; from policy security_paths_denied). Honoured
+    # only as an EXACT match of a mandatory default the row does not also re-assert, and never to
+    # the point of an empty surface set — resolve_trust_surface_paths applies those rules itself,
+    # so a workflow that passes garbage here can only leave MORE surface guarded.
+    arm.add_argument("--deny-surface-path", action="append", default=[],
+                     help="mandatory trust-surface default to drop, by exact name (repeatable; "
+                          "from policy security_paths_denied)")
     arm.add_argument("--bot-login", default="",
                      help="the App bot login (exact audit-marker suppression identity)")
     arm.add_argument("--reviewed-base", default="",
@@ -12359,6 +12478,11 @@ def main():
     # DEFAULT_TRUST_SURFACE_PATHS floor (it extends the defaults); empty -> the defaults alone.
     rout.add_argument("--surface-path", action="append", default=[],
                       help="trust-surface path/prefix (repeatable; from policy security_paths)")
+    # [issue #459] The SUBTRACTIVE half (repeatable; from policy security_paths_denied) — same
+    # exact-match / add-wins / never-empty rules as the arm side, applied in the resolver.
+    rout.add_argument("--deny-surface-path", action="append", default=[],
+                      help="mandatory trust-surface default to drop, by exact name (repeatable; "
+                           "from policy security_paths_denied)")
     rout.add_argument("--issue", type=int)
     # Budget-extension inputs (maintainer directive 2026-07-17): the implementer provider picks
     # the escalation ladder, the bot login trust-filters the durable fix-model markers, and the
@@ -12493,7 +12617,8 @@ def main():
                           surface_paths=args.surface_path or None,
                           bot_login=args.bot_login, reviewed_base=args.reviewed_base,
                           security_keywords=args.security_keyword or None,
-                          self_attested=args.self_attested)
+                          self_attested=args.self_attested,
+                          deny_surface_paths=args.deny_surface_path or None)
         elif args.command == "review-outcome":
             review_outcome(args)
         elif args.command == "fix-outcome":
