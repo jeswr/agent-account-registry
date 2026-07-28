@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4711,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "9c24d897ca2dd2313d96724d83bc47cb05b5edae",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "This file exports a new public module containing `trust_admit_verdict`, `union_trust_grants`, `TrustGrantSet`, and re-exported credential/session/rule types. The repository contract requires every public API change to update the matching `skills/<surface>/SKILL.md` in the same change. The README's two-line feature listing is not a substitute for the usage skill, especially for this security-sensitive API where callers must understand authentication, Control-gated policy provenance, clear-path/unaudited scope, and the fact that the seam is not handler-wired.",
+    "file": "crates/sparq-lws-core/src/authz/trust_admit.rs",
+    "fix_hint": "Update the matching Solid/access-control usage skill (most likely `skills/access-control/SKILL.md`, or the repository's dedicated LWS/server skill if one exists) in this PR. Document enabling `trust-graph`, constructing only Control-gated rules, calling `trust_admit_verdict`, combining the result with WAC via `union_trust_grants`, the unauthenticated behavior, the lack of handler wiring, and the research-grade externally unaudited `sq-qhy4` boundary. Include a minimal compiling example or link to a focused reference if the skill is already near its size limit.",
+    "severity": "major",
+    "title": "New public authorization API is not documented in the matching skill"
+   }
+  ],
+  "progress": null,
+  "summary": "The admission adapter is carefully fail-closed and the feature-gated integration tests exercise real signatures and important negative paths. However, this change adds a substantial new public API surface (`authz::trust_admit`, its public types, accessors, and functions) without updating the repository's matching user-facing skill. That violates the repository's same-change public-API maintenance contract and leaves users without authoritative integration guidance for a security-sensitive seam.",
+  "verdict": "request_changes"
+ }
+}
