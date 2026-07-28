@@ -526,6 +526,25 @@ GLOBAL_RESERVATION_CAUSES = (
     GLOBAL_CAUSE_SOURCE_UNLISTED, GLOBAL_CAUSE_SOURCE_NO_AREAS,
 )
 
+# [sparq#4821] The fifth cause, and DELIBERATELY NOT A MEMBER OF THE TUPLE ABOVE: it names a
+# reservation that is NARROWED instead of global, so a bucket for it inside
+# GLOBAL_RESERVATION_CAUSES would be structurally unreachable — `global_reservation_census` only
+# ever counts rows that hold `__global__`. A permanently-zero bucket in a closed enum is a counter
+# that looks like coverage and has none, which is the class this file already tracks.
+#
+# It exists because NARROWING THE RESERVATION MUST NOT UNCOUNT THE POPULATION. The
+# `missing-provenance` holder was loud only by accident: it annihilated the lane, and the lane
+# going to zero is what made anyone look. Once its reservation is narrowed the PR stops starving
+# anything — but its provenance record is STILL missing, so it is still invisible to
+# `enumerate_review_items` and its review loop still does not advance. That harm survives this
+# change intact, and an alarm whose population has quietly moved out from under it is the
+# `early-return-hides-the-population` failure. So the narrowed rows get their own always-printed
+# census (`unprovenanced_narrowed_holders`) at the same leg.
+CAUSE_NO_PROVENANCE_NARROWED = "missing-provenance-narrowed"   # no record, but the PR's OWN
+                                                               # `area:*` labels bound its blast
+                                                               # radius — reserve THOSE, not global
+RESERVATION_CAUSES = GLOBAL_RESERVATION_CAUSES + (CAUSE_NO_PROVENANCE_NARROWED,)
+
 
 def plan_package(areas):
     """The single conflict partition a plan/lease row reserves for a collection of `area:*`
@@ -1668,10 +1687,49 @@ def busy_packages_of_pulls(repo, pulls, issue_labels, provenance, pr_status=None
     branch-live/provenance-parked kept reserving a crate the enumerator had already handed
     to a human (frontier collapse preserved). A PR with MISSING/invalid provenance is
     invisible to the enumerator but can still carry a latched arm, and its true crate is
-    unknowable — it reserves the GLOBAL partition (fail closed; the old "stray branch
-    reserves nothing" rule freed exactly the crate an armed stray could merge into). A valid
-    record whose source issue is absent from the open-issue map mirrors the enumerator,
-    which still emits that PR as `__global__`.
+    unknowable UNLESS THE PR ITSELF DECLARES IT — see the next paragraph — so it reserves the
+    GLOBAL partition (fail closed; the old "stray branch reserves nothing" rule freed exactly
+    the crate an armed stray could merge into). A valid record whose source issue is absent
+    from the open-issue map mirrors the enumerator, which still emits that PR as `__global__`.
+
+    [sparq#4821] MISSING PROVENANCE + THE PR'S OWN `area:*` LABELS => THOSE AREAS, NOT
+    `__global__`. This is a NARROWING, never a release: a PR with neither a record nor a
+    declared area still reserves the serializing partition, so the fail-closed default stands
+    for every PR whose blast radius is actually unknown.
+
+    The premise the old rule rested on — "its true crate is unknowable" — was TRUE when it was
+    written and is no longer true for every PR. `scripts/pr-area-labels.py` (sparq's
+    `pr-area-label.yml`) now derives `area:*` from the PR's CHANGED PATHS, and it is fail-closed
+    in the SAME direction as this function: it emits NO label at all — leaving the PR on
+    `__global__` — when the file list is missing, PARTIALLY read (the `files(first: 100)`
+    truncation it cross-checks against `changedFiles`), unattributable, or wider than
+    `max_areas`. So on a target that runs it, `area:` on a PR is a machine-derived attestation of
+    blast radius that is STRICTLY BETTER evidence than the source issue's hand-applied labels
+    this function trusts on the provenanced path. Refusing to read it while trusting the weaker
+    signal was the inversion.
+
+    IT IS A NO-OP WHERE THAT EVIDENCE DOES NOT EXIST, without a per-target flag: a target with no
+    deriver produces no PR `area:` labels (MEASURED on this repository: 40 of 40 open PRs declare
+    none, ready-issues._pr_reserving_packages), so every unprovenanced PR there still takes
+    `__global__` exactly as before. The rule reads the target's own attestation instead of a
+    config switch that could drift from it.
+
+    WHY THIS BRANCH AND NOT THE OTHER THREE. Only this one invents a reservation the PLAN leg
+    never made. PLAN runs the TARGET's readiness engine, whose PR rule is `_reserving_packages` —
+    declared areas, NO global fallback, and its docstring refuses CLAIM's fallback BY NAME after
+    measuring that adopting it drives the sparq frontier to 0. PLAN cannot see provenance at all,
+    so an unprovenanced PR reserves only its declared areas THERE, PLAN commits a frontier on
+    that basis, and CLAIM then deferred every row of it. `source-no-areas` and `source-unlisted`
+    are different: their source ISSUE is known, and an area-less in-progress issue already
+    reserves `__global__` on the PLAN side under the unchanged CANDIDATE-side `packages_of` rule
+    — so narrowing them here alone would buy nothing and is deliberately NOT done.
+
+    THE ASSUMPTION, STATED. A target whose PR `area:` labels are NOT derived fail-closed could
+    under-reserve here. On the provenanced path PR labels only ever WIDEN a union, so this is the
+    one branch where they become load-bearing. Both directions of drift are safe by construction
+    on sparq (the deriver only ADDS labels and has no removal path at all, and removing every
+    `area:` label re-arms `__global__`); a partial hand-removal narrows, and that requires repo
+    write — the same trust boundary as the ledger this function already believes.
 
     HELD != INACTIVE (round-2 P1 on the 2026-07-18 frontier collapse, DRAFTS-ONLY since
     round 3, listing-or-newer-detail coherent since #519): a human-parked PR —
@@ -1731,8 +1789,16 @@ def busy_packages_of_pulls(repo, pulls, issue_labels, provenance, pr_status=None
                 areas |= {GLOBAL_PACKAGE}  # closed/unlisted source: the enumerator still
                                            # emits this PR as `__global__` — mirror it
                 cause = GLOBAL_CAUSE_SOURCE_UNLISTED
+        elif areas:
+            # [sparq#4821] missing/invalid linkage, but the PR's OWN path-derived `area:*` labels
+            # bound its blast radius — reserve exactly those. Still fail-closed (it reserves
+            # SOMETHING, so no crate is left unguarded); the blast radius is just no longer the
+            # whole workspace. `areas` is already the PR's declared set from above; nothing is
+            # unioned in.
+            cause = CAUSE_NO_PROVENANCE_NARROWED
         else:
-            areas |= {GLOBAL_PACKAGE}      # missing/invalid linkage — fail closed
+            areas |= {GLOBAL_PACKAGE}      # missing/invalid linkage AND nothing declared — the
+                                           # blast radius is genuinely unknown: fail closed
             cause = GLOBAL_CAUSE_NO_PROVENANCE
         status = (pr_status[number]
                   if isinstance(pr_status, dict) and number in pr_status else _NO_PR_DETAIL)
@@ -2132,6 +2198,10 @@ def filter_busy_area_items(items, repo, pulls, issue_labels, provenance, pr_stat
     # be a second copy of a fold that must agree with the CLAIM leg's. Always printed, including
     # on a tick where every bucket is zero.
     print(format_partition_reservation_census("assemble-reservations", repo, census))
+    # [sparq#4821] Printed from HERE, unconditionally and at zero, for the same reason the line
+    # above is: this is the leg that holds the occupancy rows, and the population it names only
+    # exists because the narrowing removed it from `global_reservation_census`'s population.
+    print(format_unprovenanced_narrowed_census(repo, occupancy))
     return kept
 
 
@@ -2347,6 +2417,50 @@ def global_reservation_census(occupancy):
     return census
 
 
+def unprovenanced_narrowed_holders(occupancy):
+    """PURE. Ascending PR numbers whose reservation was NARROWED because their provenance record
+    is missing but their own `area:*` labels bound them (`CAUSE_NO_PROVENANCE_NARROWED`).
+
+    [sparq#4821] THE POPULATION THAT WOULD OTHERWISE GO DARK. Before the narrowing, a PR with no
+    registry provenance record announced itself by taking the whole dispatch lane to zero, and
+    `global_reservation_census` counted it under `missing-provenance`. After the narrowing it
+    starves nobody and drops straight out of that census's population — but ITS RECORD IS STILL
+    MISSING, so `enumerate_review_items` still cannot see it and its review loop still does not
+    advance. The throughput symptom is fixed; the underlying lost write is not, and it must not
+    become unobservable as a side effect of fixing the symptom.
+
+    Deliberately a SEPARATE counter rather than a fifth bucket in `global_reservation_census`:
+    that function's population is "rows holding `__global__`", and these rows do not, so a bucket
+    there could never be non-zero. Same recorder discipline, different population.
+
+    Rows too short to carry a cause are skipped: a pre-cause 5-tuple predates this branch entirely
+    and cannot have been narrowed by it."""
+    out = []
+    for row in occupancy if isinstance(occupancy, list) else []:
+        if not isinstance(row, tuple) or len(row) < 6:
+            continue
+        if row[0] != "busy" or row[5] != CAUSE_NO_PROVENANCE_NARROWED:
+            continue
+        number = row[1]
+        if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
+            continue
+        out.append(number)
+    return sorted(out)
+
+
+def format_unprovenanced_narrowed_census(repo, occupancy):
+    """The always-printed one-liner for the narrowed population. ALWAYS, including at zero: a
+    counter that is absent when nothing fired is indistinguishable from one that was never wired,
+    and this repository has paid for that twice (#753/#762)."""
+    holders = unprovenanced_narrowed_holders(occupancy)
+    detail = ", ".join(f"pr#{number}" for number in holders) or "none"
+    return (f"unprovenanced-narrowed census {repo}: {len(holders)} open worker PR(s) have NO "
+            f"registry provenance record but declare their own `area:*` labels, so they reserve "
+            f"those areas instead of `{GLOBAL_PACKAGE}` — {detail}. Their records are still "
+            f"missing and `enumerate_review_items` still cannot see them; recovery is the "
+            f"`backfill-provenance` workflow with apply=true.")
+
+
 # [registry #772] How many unprovenanced `__global__` holders ONE tick may escalate, per target
 # repository. An escalation is a loud, operator-facing artifact, and emitting one per holder per
 # tick would bury the signal it exists to raise, so it is paced.
@@ -2436,14 +2550,18 @@ def starvation_provenance_escalation_body(repo, pr_number, deferred):
     failure mode this replaces (registry #703)."""
     return (
         f"`{repo}#{pr_number}` reserves the serializing `{GLOBAL_PACKAGE}` partition because it "
-        f"has NO admissible registry provenance record, so the crates it touches are unknowable "
-        f"and the reservation fails closed. {deferred} ready row(s) were deferred behind it this "
-        f"tick and the issue lane planned nothing.\n\n"
+        f"has NO admissible registry provenance record AND declares no `area:*` label of its own, "
+        f"so the crates it touches are unknowable and the reservation fails closed. {deferred} "
+        f"ready row(s) were deferred behind it this tick and the issue lane planned nothing.\n\n"
         f"It is NOT a candidate for the starvation park sweep (that only helps an un-parked, "
         f"provably-inert draft), so no automatic remedy applies and the hold does not expire.\n\n"
         f"**Recovery:** run the `backfill-provenance` workflow for `{repo}` with `apply=true`. It "
         f"reconstructs the implementer identity from the worker run log and writes the record to "
-        f"the `ledger` branch; the reservation then resolves to the PR's real `area:*` set.")
+        f"the `ledger` branch; the reservation then resolves to the PR's real `area:*` set.\n\n"
+        f"**Faster partial recovery (sparq#4821):** labelling the PR with the `area:*` sections it "
+        f"actually touches narrows the reservation to those on the very next tick, with or without "
+        f"the record. It does NOT fix the missing record — the PR stays invisible to the review "
+        f"enumerator until the backfill runs — but it stops the lane being starved meanwhile.")
 
 
 def live_pull_detail_stub(pull):
@@ -5300,7 +5418,8 @@ def starvation_unpark_body(packages):
         "while the issue lane was fully starved behind it. Re-derived against the live pull "
         f"listing on this tick, it now reserves {reserved} and **not** `{GLOBAL_PACKAGE}` — "
         "usually because its registry provenance record has since been recorded, so its area "
-        "linkage resolves.\n\n"
+        "linkage resolves, or because it acquired `area:*` labels of its own, which bound its "
+        "blast radius on their own (sparq#4821).\n\n"
         f"The `{MACHINE_PARK_PR_LABEL}` label is removed and the PR re-enters the ordinary review "
         "lane unchanged. No review judgement was made when it was parked, and none is made now. "
         "Human-owned holds are never touched by this sweep — if one is live, the park stands.\n\n"
@@ -5466,10 +5585,18 @@ def starvation_park_body(repo, pr_number, deferred, issue_url):
         "it excludes against **every** crate in the workspace at once. On this dispatch tick the "
         f"issue lane planned **0** items while **{deferred}** ready issue row(s) were deferred "
         "behind that reservation — the worker lane was fully starved.\n\n"
-        "The usual cause is a **missing or unreadable registry provenance record** for this PR: "
-        "`busy_packages_of_pulls` fails closed on unresolvable linkage and adds "
-        f"`{GLOBAL_PACKAGE}` to the reservation. Adding `area:*` labels to the PR cannot remove "
-        "it — the fail-closed default is unioned in on top of them.\n\n"
+        "The usual cause is a **missing or unreadable registry provenance record** for this PR "
+        "together with **no `area:*` label of its own**: `busy_packages_of_pulls` fails closed on "
+        f"a blast radius it cannot bound and reserves `{GLOBAL_PACKAGE}`.\n\n"
+        # [sparq#4821] This paragraph used to say the opposite — "adding `area:*` labels to the PR "
+        # cannot remove it, the fail-closed default is unioned in on top of them" — which was true
+        # of the code as it then stood and told the one reader who could act that no action existed.
+        # The union is now a NARROWING for this cause, so the sentence is not merely stale, it
+        # points away from the working remedy.
+        "**A human remedy now exists and takes effect on the next tick:** add the `area:*` "
+        "label(s) this PR actually touches. A PR that declares its own areas reserves *those* and "
+        f"not `{GLOBAL_PACKAGE}`, even with its provenance record still missing — and the un-park "
+        "half below then releases this park by itself.\n\n"
         "## Why this PR\n\n"
         "It is an open worker PR that (a) holds that partition, (b) is not already parked, and "
         "(c) is a provably inert draft with no arm latch — so parking it **contributes to freeing "
@@ -15895,16 +16022,78 @@ agent = "impl"
     stray_items = enumerate_review_items(repo, [stray_closed], busy_prov, [],
                                          issue_labels, now)
     assert [item["package"] for item in stray_items] == [GLOBAL_PACKAGE], stray_items
-    # [round-2 P2] MISSING/invalid provenance: invisible to the enumerator but still able to
-    # carry a latched arm, and its true crate is unknowable — global reservation (fail
-    # closed), even when the PR wears area labels of its own
+    # [round-2 P2] MISSING/invalid provenance and NOTHING DECLARED: invisible to the enumerator
+    # but still able to carry a latched arm, and its blast radius is genuinely unknown — global
+    # reservation (fail closed). THIS HALF IS UNCHANGED BY sparq#4821 and is the half that keeps
+    # the rule fail-closed; deleting it would turn the narrowing into a release.
     assert busy_packages_of_pulls(repo, [stray_closed], issue_labels, {}) == {GLOBAL_PACKAGE}
-    assert GLOBAL_PACKAGE in busy_packages_of_pulls(
-        repo, [pull(61, "sparq-agent/issue-999-1-1", sha_a, labels=["area:crate-a"])],
-        issue_labels, {})
     assert busy_packages_of_pulls(
         repo, [stray_closed], issue_labels,
         {61: {**busy_record(61, 999), "issue": True}}) == {GLOBAL_PACKAGE}
+    # ---- [sparq#4821] ...but a PR that DECLARES its own areas reserves THOSE, not `__global__`.
+    # MEASURED live: sparq-org/sparq#4799 declared area:deps + area:sparq-wrapper +
+    # area:sparq-wrapper-shacl and reserved every crate in the workspace anyway, taking 26 plan
+    # items to 0 kept. This assertion is the DIRECT REVERSAL of a decision this file previously
+    # pinned ("global reservation ... even when the PR wears area labels of its own"), and the
+    # reversal is not a change of taste: the premise "its true crate is unknowable" stopped being
+    # true for labelled PRs when sparq's fail-closed path deriver (scripts/pr-area-labels.py)
+    # shipped. The reservation is NARROWED, never removed. ----
+    _stray_labelled = pull(61, "sparq-agent/issue-999-1-1", sha_a,
+                           labels=["area:crate-a", "area:crate-z"])
+    assert busy_packages_of_pulls(repo, [_stray_labelled], issue_labels, {}) == {
+        "crate-a", "crate-z"}, "an unprovenanced PR's OWN areas must bound its reservation"
+    # ...and the narrowing is EXACTLY the declared set — not a superset that quietly still
+    # contains the serializing partition, which would leave the lane at zero while the assertion
+    # above passed if it had been written as a membership test.
+    assert GLOBAL_PACKAGE not in busy_packages_of_pulls(repo, [_stray_labelled], issue_labels, {})
+    # THE WHOLE-LANE CONSEQUENCE, at the leg where the frontier actually dies: the sibling rows
+    # in OTHER crates survive. `plan_items` names crate-a and crate-b; the holder declares
+    # crate-a and crate-z, so crate-b must be kept. Pre-fix this returned [].
+    assert [item["number"] for item in filter_busy_area_items(
+        plan_items, repo, [_stray_labelled], issue_labels, {},
+        leases=[], now=now)] == [9], "one unprovenanced holder must no longer drop every item"
+    # ...and its OWN crate is still genuinely reserved — the narrowing must not become a release.
+    assert filter_busy_area_items(
+        [plan_items[0]], repo, [_stray_labelled], issue_labels, {}, leases=[], now=now) == []
+    # THE CAUSE IS ATTRIBUTED TO THE NARROWED BUCKET, and NOT to any `__global__` bucket — the
+    # population must stay counted after it stops starving the lane (the alarm-loses-its-
+    # population class). Both directions, because `global_reservation_census` counting it would
+    # be as wrong as nothing counting it.
+    _narrow_occ = []
+    busy_packages_of_pulls(repo, [_stray_labelled], issue_labels, {}, occupancy=_narrow_occ)
+    assert [row[5] for row in _narrow_occ] == [CAUSE_NO_PROVENANCE_NARROWED], _narrow_occ
+    assert unprovenanced_narrowed_holders(_narrow_occ) == [61], _narrow_occ
+    assert global_reservation_census(_narrow_occ) == {}, _narrow_occ
+    assert CAUSE_NO_PROVENANCE_NARROWED not in GLOBAL_RESERVATION_CAUSES, (
+        "a narrowed row never holds `__global__`, so a bucket for it in the global census would "
+        "be structurally unreachable")
+    assert CAUSE_NO_PROVENANCE_NARROWED in RESERVATION_CAUSES
+    # ...and the un-narrowed holder still lands in `missing-provenance`, so the two causes cannot
+    # be collapsed into one another.
+    _global_occ = []
+    busy_packages_of_pulls(repo, [stray_closed], issue_labels, {}, occupancy=_global_occ)
+    assert global_reservation_census(_global_occ) == {GLOBAL_CAUSE_NO_PROVENANCE: 1}, _global_occ
+    assert unprovenanced_narrowed_holders(_global_occ) == [], _global_occ
+    # THE CENSUS LINE IS PRINTED AT ZERO TOO. A counter that appears only when it fires cannot be
+    # distinguished from one that was never wired (#753/#762) — and this line is the ONLY thing
+    # that still names the missing-record population once it stops starving the lane.
+    assert "0 open worker PR(s) have NO registry provenance record" in (
+        format_unprovenanced_narrowed_census(repo, []))
+    assert "pr#61" in format_unprovenanced_narrowed_census(repo, _narrow_occ)
+    assert "none" in format_unprovenanced_narrowed_census(repo, _global_occ)
+    # A PROVENANCED PR is untouched by any of this: its source issue's areas still union in, so a
+    # PR declaring one crate whose source issue names another reserves BOTH. Kills a "tidy-up"
+    # that routes every PR through the declared-only branch.
+    assert busy_packages_of_pulls(
+        repo, [pull(60, "sparq-agent/issue-8-1-1", sha_a, labels=["area:crate-z"])],
+        {8: ["role:impl", "area:crate-a"]}, busy_prov) == {"crate-a", "crate-z"}
+    # ...and a provenanced PR whose source issue has NO areas STILL takes `__global__` even though
+    # it declares its own. That branch is deliberately NOT narrowed (its source issue is known and
+    # already reserves `__global__` on the PLAN side), so a mutant that moves the `elif areas:`
+    # test above the provenance check turns this red.
+    assert GLOBAL_PACKAGE in busy_packages_of_pulls(
+        repo, [pull(60, "sparq-agent/issue-8-1-1", sha_a, labels=["area:crate-z"])],
+        {8: ["role:impl"]}, busy_prov)
     # a global plan item never co-runs with ANY in-flight worker PR
     assert filter_busy_area_items([{"number": 3, "package": "__global__", "deferred": False}],
                                   repo, [in_review], issue_labels, busy_prov,
@@ -16339,9 +16528,20 @@ agent = "impl"
         "reserving.single-area=1 reserving.single-area.kept=0 reserving.single-area.deferred=1 "
         "reserving.multi-area=0 reserving.multi-area.kept=0 reserving.multi-area.deferred=0 "
         "reserving.global=0 reserving.global.kept=0 reserving.global.deferred=0")
+    # [sparq#4821] ...and the narrowed-population line, on the SAME unconditional footing. Asserted
+    # here rather than only in isolation because this is the tripwire that pins the leg's WHOLE
+    # stdout: wrapping the emission in `if holders:` — the natural "tidy-up" that would make the
+    # missing-record population invisible on every healthy tick — reds exactly this line.
+    expected_narrowed_log = (
+        "unprovenanced-narrowed census example/repo: 0 open worker PR(s) have NO registry "
+        "provenance record but declare their own `area:*` labels, so they reserve those areas "
+        "instead of `__global__` — none. Their records are still missing and "
+        "`enumerate_review_items` still cannot see them; recovery is the `backfill-provenance` "
+        "workflow with apply=true.")
     assert assembler_kept == [], assembler_kept
     assert assembler_output.getvalue().splitlines() == [expected_assembler_log,
-                                                        expected_reservation_log], \
+                                                        expected_reservation_log,
+                                                        expected_narrowed_log], \
         assembler_output.getvalue()
     assert assembler_census["by_reason"]["crate-conflict"] == 1, assembler_census
     assert assembler_census["by_held_area"] == {"crate-b": 1}, assembler_census
@@ -16499,6 +16699,16 @@ agent = "impl"
         "reserving.single-area=3 reserving.single-area.kept=0 reserving.single-area.deferred=3 "
         "reserving.multi-area=0 reserving.multi-area.kept=0 reserving.multi-area.deferred=0 "
         "reserving.global=0 reserving.global.kept=0 reserving.global.deferred=0",
+        # [sparq#4821] pr#60 holds `__global__` for cause `source-no-areas` — a KNOWN source issue
+        # with no `area:` label — which this change deliberately does NOT narrow. So this fixture
+        # also pins the negative: the narrowed census reads ZERO on a board whose whole-lane stall
+        # is real, and a mutant that routes every `__global__` cause through the narrowing would
+        # both empty `expected_stall_log`'s defer lines and put pr#60 on this one.
+        "unprovenanced-narrowed census example/repo: 0 open worker PR(s) have NO registry "
+        "provenance record but declare their own `area:*` labels, so they reserve those areas "
+        "instead of `__global__` — none. Their records are still missing and "
+        "`enumerate_review_items` still cannot see them; recovery is the `backfill-provenance` "
+        "workflow with apply=true.",
     ]
     stall_census = {}
     for stall_order in (stall_pulls, list(reversed(stall_pulls))):
@@ -16526,7 +16736,14 @@ agent = "impl"
         # able to disagree about which area is held or which PR holds it.
         from_log = {}
         reservation_lines = 0
+        narrowed_lines = 0
         for line in stall_output.getvalue().splitlines():
+            if line.startswith("unprovenanced-narrowed census "):
+                # [sparq#4821] Counted, not merely tolerated — same discipline as the line below.
+                # A laxer `continue` on an unrecognised prefix would let the emission be deleted
+                # with every assertion in this loop still green.
+                narrowed_lines += 1
+                continue
             if line.startswith("assemble-reservations "):
                 # [OPUS-5] The reservation-shape line is the leg's OTHER emission and is
                 # re-derived below against the census it was folded from; it carries no
@@ -16540,6 +16757,7 @@ agent = "impl"
             assert parsed, line
             record_partition_defer(from_log, parsed.group(1), parsed.group(3), parsed.group(4))
         assert reservation_lines == 1, stall_output.getvalue()
+        assert narrowed_lines == 1, stall_output.getvalue()
         # ...and the emitted reservation line must be re-derivable from the census the same leg
         # filled, so the operator's log and Gate A's numbers cannot disagree about the shapes.
         assert format_partition_reservation_census(
@@ -16752,9 +16970,13 @@ agent = "impl"
         with contextlib.redirect_stdout(enum_output):
             assert filter_busy_area_items(rows, repo, holders, enum_labels, busy_prov,
                                           leases=enum_leases, now=now, census=enum_census) == []
+        # [sparq#4821] The narrowed-population line is part of the leg's EXACT output for every
+        # declared reason, re-derived from the formatter rather than pasted — so it cannot drift
+        # from the emission, and dropping the emission reds all four reason cases at once.
         assert enum_output.getvalue().splitlines() == [
             assemble_line,
-            format_partition_reservation_census("assemble-reservations", repo, enum_census)], \
+            format_partition_reservation_census("assemble-reservations", repo, enum_census),
+            format_unprovenanced_narrowed_census(repo, [])], \
             (reason, enum_output.getvalue())
         assert enum_census["by_reason"][reason] == 1, (reason, enum_census)
         assert sum(enum_census["by_reason"].values()) == 1, (reason, enum_census)
@@ -17015,7 +17237,10 @@ agent = "impl"
         "assemble-reservations example/repo rows=0 deferred=0 deferred_global=0 "
         "reserving.single-area=0 reserving.single-area.kept=0 reserving.single-area.deferred=0 "
         "reserving.multi-area=0 reserving.multi-area.kept=0 reserving.multi-area.deferred=0 "
-        "reserving.global=0 reserving.global.kept=0 reserving.global.deferred=0"], \
+        "reserving.global=0 reserving.global.kept=0 reserving.global.deferred=0",
+        # [sparq#4821] THE QUIETEST POSSIBLE TICK — no rows, no pulls — still names the narrowed
+        # population at zero. This is the row that kills `if holders: print(...)`.
+        format_unprovenanced_narrowed_census(area_repo, [])], \
         empty_out.getvalue()
     assert empty_census["by_reservation"] == {
         "single-area": {"kept": 0, "deferred": 0},
