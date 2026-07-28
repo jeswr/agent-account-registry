@@ -20,6 +20,16 @@ SIGNIN="$OUTDIR/signin.txt"; TOKEN="$OUTDIR/token"; FMT="$OUTDIR/credential_form
 : > "$SIGNIN"; rm -f "$TOKEN" "$FMT" "$RAW"
 
 strip() { sed -e 's/\x1b\[[0-9;]*m//g'; }
+# [#879] first ERE match of $1 in the de-ANSI'd $RAW, or empty. NEVER `… | grep -oE … | head -1`:
+# `head` exits on its first line, the still-running grep (and the sed feeding it) take SIGPIPE, and
+# under `pipefail` (line 8) the pipeline reports 141 — which `set -e` turns into an abort of the
+# login broker BEFORE $SIGNIN is written, i.e. an enrolment that dies without ever showing the
+# maintainer the sign-in URL. `grep -oE` on a CLI transcript emits one line per URL, so a second
+# match is the normal case, not the exotic one. Here both stages drain their input and the "first"
+# is taken by a bash parameter expansion — no process exists that could exit early or be signalled.
+# The `|| true` is the no-match case, which must reach the `${URL:-…}` fallbacks below rather than
+# abort (before this change a missing URL aborted, making those fallbacks unreachable).
+first_match() { local hits; hits="$(strip < "$RAW" | grep -oE "$1" || true)"; printf '%s' "${hits%%$'\n'*}"; }
 shred_raw() { [ -f "$RAW" ] && { : > "$RAW"; rm -f "$RAW"; }; return 0; }
 trap 'shred_raw' EXIT INT TERM
 
@@ -37,8 +47,8 @@ case "$PROVIDER" in
     # holds only URL/code diagnostics. We still shred it on exit.
     nohup codex login --device-auth > "$RAW" 2>&1 & LP=$!
     for _ in $(seq 1 30); do grep -qiE 'auth.openai.com/codex/device' "$RAW" && break; sleep 1; done
-    URL=$(strip < "$RAW" | grep -oE 'https://auth\.openai\.com/codex/device' | head -1)
-    CODE=$(strip < "$RAW" | grep -oE '[A-Z0-9]{4}-[A-Z0-9]{5}' | head -1)
+    URL=$(first_match 'https://auth\.openai\.com/codex/device')
+    CODE=$(first_match '[A-Z0-9]{4}-[A-Z0-9]{5}')
     { echo "Provider: OpenAI (codex)"; echo "1. Open: ${URL:-https://auth.openai.com/codex/device}";
       echo "2. Enter code: ${CODE:-<see run>}"; echo "   Sign in with the OpenAI account to register."; } > "$SIGNIN"
     poll_exit "$LP"
@@ -51,7 +61,7 @@ case "$PROVIDER" in
     # immediately so the token is never left in a persistent log. Run under the isolated HOME.
     nohup claude setup-token > "$RAW" 2>&1 & LP=$!
     for _ in $(seq 1 30); do grep -qiE 'https?://' "$RAW" && break; sleep 1; done
-    URL=$(strip < "$RAW" | grep -oE 'https?://[^ ]+' | head -1)
+    URL=$(first_match 'https?://[^ ]+')
     { echo "Provider: Anthropic (claude)"; echo "1. Open: ${URL:-<see run>}";
       echo "   Sign in with the Anthropic account to register."; } > "$SIGNIN"
     poll_exit "$LP"

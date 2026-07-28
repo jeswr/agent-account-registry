@@ -1,0 +1,23 @@
+# POSITIVE CONTROL for _sigpipe_shape_hits (registry issue #879). DATA, never executed.
+#
+# One line per early-exiting-consumer shape the scanner claims to detect, plus the two decoys it
+# must NOT count. worker-live.sh's self-test asserts the scanner finds exactly 7 here BEFORE it
+# asserts it finds 0 in scripts/*.sh — without that ordering, a scanner whose regexes had rotted
+# would report a reassuring zero for the wrong reason.
+#
+# This file deliberately carries the broken shape, which is exactly why it must never be named
+# `*.sh`: the scanner globs scripts/*.sh, and a guard that has to exempt its own evidence is a
+# guard with a bypass. Keeping the evidence outside the scanned set needs no exemption at all.
+#
+# --- decoys: MUST NOT count ---
+# a commented `cat x | grep -q y` is not code
+[[ -n "$x" ]] || printf '%s\n' "$x" | grep -c y
+# --- the 7 shapes: MUST count ---
+gen | grep -q needle
+gen | grep -Fq needle && echo hit
+gen | head -n1
+gen | grep -m1 needle
+gen | sed -n '/x/ q'
+gen | awk '/x/ { exit }'
+gen \
+  | read -r first
