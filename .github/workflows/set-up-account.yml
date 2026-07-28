@@ -1127,6 +1127,10 @@ jobs:
           RESUME_FMT: ${{ steps.reconcile.outputs.fmt }}
           PR: ${{ steps.policy_pr.outputs.pr }}
           ISSUE: ${{ github.event.issue.number }}
+          # #896: the repository crosses as env DATA (as the `activate` job already does) so the
+          # account-issue resolution below is a fragment --self-test can EXECUTE verbatim — a
+          # `${{ }}` expression inside it would be workflow source the test cannot run.
+          REPO: ${{ github.repository }}
           # #579: the authorized target set, for the audit trail in the notices below. It is a
           # validated owner/repo list (never raw label text) and is used only as report data — the
           # binding proof happened in the policy-write step.
@@ -1145,20 +1149,54 @@ jobs:
             # label flip WITHOUT suppressing failure, and RE-READ status:available before commenting
             # success or closing the request. Any failure exits non-zero and is surfaced by the
             # always() alarm via this step's `activate_inline` outcome, not swallowed as success.
-            mapfile -t nums < <(gh issue list -R "${{ github.repository }}" --state all --search "\"$HANDLE\" in:title" \
-                    --json number,title --jq ".[]|select(.title==\"$HANDLE\")|.number")
+            #
+            # >>> resolve-account-issue — EXECUTED by scripts/grant-account.py --self-test. #896:
+            # this resolution used to read GitHub's eventually-consistent SEARCH index
+            # (`gh issue list --search "\"$HANDLE\" in:title"`, and uncapped, so also limited to
+            # gh's default 30 results — the #238 lesson). An index-backed read can miss a record
+            # that exists (a fail-closed refusal of a correct activation) and — the one direction
+            # that fails OPEN — can have indexed only ONE copy of a DUPLICATE pair, so the count
+            # reads 1 and an arbitrary record is activated. The authoritative, strongly-consistent,
+            # fully paginated issues API (the carrier #394 moved registration onto) proves the
+            # uniqueness invariant against real state instead; PRs share the endpoint, so they are
+            # filtered out, and `$HANDLE` crosses into jq as `--arg` DATA. These sentinels delimit
+            # the fragment the self-test extracts and runs against a fake GitHub; removing either
+            # makes that extraction FAIL CLOSED. `$HANDLE`/`$REPO` are its only inputs, `$num` its
+            # only output.
+            if ! raw=$(gh api --paginate "repos/$REPO/issues?state=all&per_page=100"); then
+              echo "::error::could not enumerate the account issues of $REPO, so it cannot be proven that '$HANDLE' resolves to exactly one record — refusing to activate (fail closed)"; exit 1
+            fi
+            # Review round 1 of #896: jq's status is CAPTURED, not read through `mapfile < <(...)`.
+            # A `gh` that exits 0 only proves the transfer; the filter still has to process every
+            # record, and bash cannot observe the exit status of a process substitution (`pipefail`
+            # does not reach inside one). So jq could emit the match from an early page, die on a
+            # later unparseable one, and leave `mapfile` succeeding with one element — the count
+            # reads 1 and an arbitrary record is activated off a TRUNCATED enumeration. Assigning
+            # through `if !` puts the filter's failure back on a status bash acts on.
+            if ! matched=$(printf '%s' "$raw" \
+                    | jq -r --arg handle "$HANDLE" '
+                        .[] | select(has("pull_request") | not)
+                            | select(.title == $handle)
+                            | .number'); then
+              echo "::error::could not parse the account issues of $REPO to the end, so it cannot be proven that '$HANDLE' resolves to exactly one record — refusing to activate (fail closed)"; exit 1
+            fi
+            # An empty result must stay ZERO matches: a here-string always carries one line, so it
+            # is only reached when there is something to split.
+            nums=()
+            if [ -n "$matched" ]; then mapfile -t nums <<< "$matched"; fi
             if [ "${#nums[@]}" -ne 1 ]; then
               echo "::error::expected exactly one account issue titled '$HANDLE' in any state, found ${#nums[@]} — refusing to activate (fail closed)"; exit 1
             fi
             num=${nums[0]}
-            labels=$(gh issue view "$num" -R "${{ github.repository }}" --json labels --jq '[.labels[].name]|join(" ")')
+            # <<< resolve-account-issue
+            labels=$(gh issue view "$num" -R "$REPO" --json labels --jq '[.labels[].name]|join(" ")')
             case " $labels " in
               *" status:available "*)
                 echo "$HANDLE (issue #$num) already status:available — idempotent re-run, nothing to flip" ;;
               *" status:pending "*)
-                gh issue edit "$num" -R "${{ github.repository }}" \
+                gh issue edit "$num" -R "$REPO" \
                   --remove-label status:pending --add-label status:available
-                after=$(gh issue view "$num" -R "${{ github.repository }}" --json labels --jq '[.labels[].name]|join(" ")')
+                after=$(gh issue view "$num" -R "$REPO" --json labels --jq '[.labels[].name]|join(" ")')
                 case " $after " in
                   *" status:available "*) : ;;
                   *) echo "::error::label flip for $HANDLE (issue #$num) did not land (labels now: $after) — refusing to claim activation (fail closed)"; exit 1 ;;
@@ -1171,13 +1209,13 @@ jobs:
             # courtesy close of the REQUEST issue: a failure leaves it OPEN, which is the safe
             # direction (visible, hand-closable, and it never un-quarantines or un-labels anything),
             # so it stays non-fatal — but it now emits a ::warning instead of vanishing silently.
-            gh issue comment "$ISSUE" -R "${{ github.repository }}" \
+            gh issue comment "$ISSUE" -R "$REPO" \
               --body "✅ Account **$HANDLE** registered and activated: secret \`$SECRET\` (format \`$fmt\`), \`models: $MODELS\`, already present in the \`policy/repos.toml\` account_pool of its authorized targets \`$TARGETS\` (and no other row), with that membership traced to a merged, checked \`account-pool/$HANDLE\` PR — flipped to \`status:available\`. Closing." \
               || echo "::warning title=set-up-account::activation notice comment failed to post on #$ISSUE"
-            gh issue close "$ISSUE" -R "${{ github.repository }}" \
+            gh issue close "$ISSUE" -R "$REPO" \
               || echo "::warning title=set-up-account::could not close request issue #$ISSUE (it stays open — close it by hand)"
           else
-            gh issue comment "$ISSUE" -R "${{ github.repository }}" \
+            gh issue comment "$ISSUE" -R "$REPO" \
               --body "⏳ Account **$HANDLE** captured (secret \`$SECRET\` stored, format \`$fmt\`, \`models: $MODELS\`) and registered **status:pending** — NOT yet allocatable. Policy PR #$PR adds \`$HANDLE\` to the \`policy/repos.toml\` account_pool of its authorized targets \`$TARGETS\` only; **merge #$PR to activate** — the \`activate\` job then flips it to \`status:available\` and closes this request. This stays open until then." || echo "::warning title=set-up-account::the pending-activation notice failed to post — the refusal/outcome above is the authoritative record"
           fi
 
@@ -1290,8 +1328,37 @@ jobs:
           # acctNN issues are possible after a retried/partial enrollment, since registration
           # creates the issue without proving title uniqueness), so zero OR two+ matches fail
           # closed on ambiguous identity rather than mutating the wrong account (round 2 of #383).
-          mapfile -t nums < <(gh issue list -R "$REPO" --state all --search "\"$handle\" in:title" \
-                  --json number,title --jq ".[]|select(.title==\"$handle\")|.number")
+          #
+          # #896: that uniqueness invariant is proved against AUTHORITATIVE state, never the SEARCH
+          # index. `gh issue list --search "... in:title"` reads GitHub's eventually-consistent
+          # index, which can miss a record that exists (a fail-closed refusal of a correct
+          # activation) and — the one direction that fails OPEN — can have indexed only ONE copy of
+          # a DUPLICATE pair, so the count reads 1 and an arbitrary record is activated. The
+          # strongly-consistent issues API is the carrier #394 moved registration onto for exactly
+          # that reason, fully paginated so it is never silently capped at gh's default 30 results
+          # (#238). The endpoint returns pull requests as well as issues, so PRs are filtered out;
+          # the handle crosses into jq as `--arg` DATA, never interpolated into the filter program.
+          if ! raw=$(gh api --paginate "repos/$REPO/issues?state=all&per_page=100"); then
+            echo "::error::could not enumerate the account issues of $REPO, so it cannot be proven that '$handle' resolves to exactly one record — refusing to activate (fail closed)"; exit 1
+          fi
+          # `--paginate` emits one JSON array per page; jq iterates each top-level array, so no
+          # slurp is needed and no page is silently dropped (the reconcile step reads the same shape).
+          # Review round 1 of #896: jq's status is CAPTURED rather than read through
+          # `mapfile < <(...)`, which discards the status of the process substitution (`pipefail`
+          # does not reach inside one) — jq could emit the match from an early page, die on a later
+          # unparseable one, and leave the count reading 1 on a TRUNCATED enumeration. The `gh` exit
+          # code above proves only the transfer; this proves every record was actually processed.
+          if ! matched=$(printf '%s' "$raw" \
+                  | jq -r --arg handle "$handle" '
+                      .[] | select(has("pull_request") | not)
+                          | select(.title == $handle)
+                          | .number'); then
+            echo "::error::could not parse the account issues of $REPO to the end, so it cannot be proven that '$handle' resolves to exactly one record — refusing to activate (fail closed)"; exit 1
+          fi
+          # An empty result must stay ZERO matches: a here-string always carries one line, so it is
+          # only reached when there is something to split.
+          nums=()
+          if [ -n "$matched" ]; then mapfile -t nums <<< "$matched"; fi
           if [ "${#nums[@]}" -ne 1 ]; then
             echo "::error::expected exactly one account issue titled '$handle' in any state, found ${#nums[@]} — refusing to activate (fail closed)"; exit 1
           fi
