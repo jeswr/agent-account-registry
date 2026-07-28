@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4785,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "9bd7d02a27334709829175292eeb52e552d845bf",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 4 defines the target generically as a checked unsigned `op`, while C2 constrains only the steps after its result. Section 8 excludes `mul` chains but never explicitly limits the elided operation to `add`. The proof models the escaped result as a non-negative integer that remains ordered below its descendant, and the suggested C5 formula starts from `bit_size`; neither handles unchecked unsigned subtraction, whose underflow is represented near the field modulus. A later monotone add can then wrap in the field before its range check, invalidating `r <= d` and potentially losing the original failure. Calling out a later `sub` as a masking step does not address `sub` as the operation whose check is removed.",
+    "file": "research/noir-dominated-overflow-elision-7161.md",
+    "fix_hint": "Define v1 explicitly over checked unsigned `add` targets only (and use that restriction consistently in C1, the proof, candidate counter, and step 3), or provide a separate conservative magnitude argument that rejects every subtraction-underflow case. Also disambiguate whether \u201cmul chains excluded\u201d excludes multiplication as the elided target, as a propagation step, or both.",
+    "severity": "major",
+    "title": "The v1 rule does not exclude subtraction as the elided operation"
+   },
+   {
+    "body": "The companion record says the 501 count did not evaluate C5, did not fully establish C3, and did not establish survival of the covering operation, so it is explicitly an upper bound. This summary nevertheless calls them \u201c501 elidable checks\u201d and derives the approximately 20% figure as though all soundness conditions had passed. The full record also uses the same wording before qualifying it later.",
+    "file": "research/noir-optimization-program.md",
+    "fix_hint": "Call these \u201c501 structural chain candidates (upper bound)\u201d everywhere, and reserve \u201celidable\u201d for candidates that pass all C1\u2013C6 checks in a future implementation or measurement.",
+    "severity": "minor",
+    "title": "The summary overstates upper-bound candidates as elidable checks"
+   }
+  ],
+  "progress": null,
+  "summary": "The record is careful about ACIR versus Brillig, predicate regions, masking operations, and the lack of gate measurements, but its proposed v1 scope does not actually exclude an unchecked subtraction as the elided operation. The stated proof and suggested C5 bound assume an overflowing value grows above the unsigned range; an underflowing subtraction instead becomes a field element near the modulus and can wrap through the field before the downstream range check. The frequency result is also repeatedly presented as 501 elidable checks even though the record later concedes that the counter did not evaluate all soundness conditions. Clarify the supported operation set and consistently label the count as an upper-bound candidate count before using this as an implementation design.",
+  "verdict": "request_changes"
+ }
+}
