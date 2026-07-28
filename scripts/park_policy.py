@@ -72,6 +72,21 @@
 #      possible recovery evidence — see park_application_view. The sticky human-unpark veto
 #      (invariant 2) is untouched either way: the automatic path only ever CLEARS a park, it never
 #      applies one, so it cannot interact with the veto at all.
+#      [sparq-org/sparq#4911] AND THE ACTOR CAN BE THE MACHINE WEARING THE MAINTAINER'S FACE.
+#      Orchestration scripts hold the maintainer's PAT, so their label writes arrive signed by a
+#      proven human: the loop escalates to a human, signs the escalation AS that human, and then
+#      refuses to clear it because a human signed it. MEASURED on the live population 2026-07-28
+#      (31 open `review:parked` PRs, LIST API `--paginate`, driven through this module with the
+#      strongest possible recovery evidence): 14 refuse on a live human-owned hold, 8 admit, and 9
+#      refuse on the actor axis. So (ii)'s receipt gains a SECOND role — machine_receipted_park
+#      binds the App's own capacity receipt to THIS park application (window
+#      PARK_RECEIPT_BINDING_SECONDS, five conjuncts, all ambiguity refusing toward human) and a
+#      park it binds is machine-WRITTEN regardless of whose credential signed the label. HONEST
+#      REACH: exactly 1 of those 9 (#3620) carries a bot receipt at all; the other 8 carry NO
+#      machine-readable receipt on either surface, so no receipt-based predicate can reach them and
+#      they stay parked. That residue is the credential half's to fix, not this one's — a park
+#      written under a human credential cannot receipt ITSELF, because a receipt's trust root is
+#      the App identity.
 #    - Evidence-gated on the CAUSE, never on elapsed time: the caller supplies positive
 #      per-account model-health evidence (model-health.capacity_recovery_evidence — the SAME
 #      records #604's auth_cooldowns / account-auth-cooldown read, never a parallel health store)
