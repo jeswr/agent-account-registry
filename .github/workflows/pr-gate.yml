@@ -50,6 +50,33 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: callsite-coverage census (#939, ADVISORY — never fails this gate)
+        run: |
+          set -euo pipefail
+          # [issue #939] Five measured instances in one night of the same defect: N call sites
+          # share a mechanism and the suite asserts the property ONCE, so removing it from
+          # exactly one site leaves the suite green. This step enumerates the call sites of every
+          # symbol whose CALL SHAPE the PR changed and prints the sites no DISTINCT named check
+          # can be pointed at.
+          #
+          # ADVISORY BY CONSTRUCTION, and in two independent ways, because the false-positive
+          # rate on a real tree is not yet known well enough to enforce: the script returns 0 on
+          # findings, AND this step swallows any non-zero exit into a warning. Enforcement is a
+          # FOLLOW-UP decision once the rate is measured — a lint that gets disabled is worth
+          # less than no lint. What is NOT advisory is the analyser itself:
+          # `callsite-coverage.py --self-test` is enrolled in the required suite above, so a
+          # broken walk reds this gate even though a finding does not.
+          #
+          # No `if:` guards this step and it precedes every step that can fail, so the census
+          # line reaches the log on EVERY run. A silent lint is worthless.
+          base='${{ github.event.pull_request.base.sha }}'
+          if git cat-file -e "$base^{commit}" 2>/dev/null; then
+            python3 scripts/callsite-coverage.py --advisory --base "$base" \
+              || echo "::warning::callsite-coverage (advisory) could not run"
+          else
+            echo "::warning::callsite-coverage (advisory) could not run: base $base is unresolvable"
+          fi
+
       - name: Install PyYAML for the workflow-yaml lint (version + hash locked)
         run: |
           set -euo pipefail
