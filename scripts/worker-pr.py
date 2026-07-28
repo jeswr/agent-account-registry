@@ -795,6 +795,15 @@ def auto_readmission_stamps(comments, bot_login, log=print):
 # namespace rather than a new parameter so no caller can post the wrong sentence by omission.
 AUTO_READMIT_HEURISTIC_PREFIX = "fleet-health/"
 
+# [registry #446] The evidence namespace the STUCK-ESCALATION ADJUDICATOR stamps
+# (scripts/adjudicate-stuck.py). It re-admits a PR that is sitting in the HUMAN terminal
+# (`review:needs-user`) for a MACHINE reason — a spent round budget, or a park that left no cause
+# marker at all. It is a THIRD finding for the same reason the #691 aged-out exit is a second one:
+# neither of the existing sentences is TRUE here. The adjudicator has no model-health evidence and
+# makes no claim about a starvation cause; what it proves is that nothing human owns this hold.
+# Reusing either existing finding would post a false statement of proof on a public PR.
+AUTO_READMIT_ADJUDICATION_PREFIX = "adjudication/"
+
 
 def auto_readmission_receipt(evidence_key, recovered_at):
     """The receipt BODY a caller posts (RECEIPT-FIRST) before clearing any machine park label.
@@ -822,6 +831,19 @@ def auto_readmission_receipt(evidence_key, recovered_at):
             f"the model-health window; no raw handle). **That is a HEURISTIC about fleet health, "
             f"not proof that this park's own cause cleared.** The machine park label(s) are "
             f"being removed and the review loop re-admitted with a real budget window.\n\n")
+    elif evidence_key.startswith(AUTO_READMIT_ADJUDICATION_PREFIX):
+        finding = (
+            "> 🤖 SPARQ agent — the stuck-escalation adjudicator re-admitted this pull request: "
+            "it was held in the HUMAN terminal for a MACHINE reason.\n\n"
+            f"`review:needs-user` is human-owned, but nothing on this PR shows a human ever "
+            f"applied it, and its park carries no question-class cause — it is a spent round "
+            f"budget or a park that recorded no cause at all, and neither is a maintainer "
+            f"question. **No claim is made here that this PR is correct or ready.** The "
+            f"adjudication IS the cross-provider re-review this re-admission buys: that review's "
+            f"own verdict, and the existing arm gate behind it, decide the outcome — this path "
+            f"never arms anything and never relaxes a gate. The budget window is granted at "
+            f"`{stamp}` (evidence `{evidence_key}` — the adjudicated head and episode) so the "
+            f"re-review is not immediately re-parked by the budget that is already spent.\n\n")
     else:
         finding = (
             "> 🤖 SPARQ agent — automatically re-admitted this MACHINE capacity park: the "
@@ -5579,6 +5601,27 @@ def _self_test():
     check("the cause-recovery receipt still states the proof it actually has",
           ("demonstrably CLEARED" in auto_receipt_comments[0]["body"],
            "HEURISTIC" in auto_receipt_comments[0]["body"]), (True, False))
+    # ---- [registry #446] THE ADJUDICATION RE-ADMISSION IS A THIRD FINDING, for the same reason.
+    # It has neither cause-recovery evidence nor a fleet-health observation; claiming either would
+    # be a false statement of proof. It must also never read as an endorsement of the diff.
+    adjudication_body = auto_readmission_receipt(
+        f"{AUTO_READMIT_ADJUDICATION_PREFIX}deadbeefcafe/1", "2026-07-28T09:00:00Z")
+    check("the adjudication receipt states its OWN finding and borrows neither other one",
+          ("held in the HUMAN terminal for a MACHINE reason" in adjudication_body,
+           "demonstrably CLEARED" in adjudication_body,
+           "HEURISTIC about fleet health" in adjudication_body),
+          (True, False, False))
+    check("the adjudication receipt disclaims any judgement on the diff and any arm authority",
+          ("No claim is made here that this PR is correct" in adjudication_body,
+           "never arms anything and never relaxes a gate" in adjudication_body), (True, True))
+    check("the adjudication receipt joins the SAME family: one marker, one reader, one cap",
+          (adjudication_body.startswith("> 🤖 SPARQ agent"),
+           AUTO_READMIT_MARKER in adjudication_body,
+           f"most {_park_policy().AUTO_READMISSION_MAX} automatic" in adjudication_body,
+           auto_readmission_records([{"user": {"login": bot}, "body": adjudication_body}], bot)),
+          (True, True, True,
+           [{"key": f"{AUTO_READMIT_ADJUDICATION_PREFIX}deadbeefcafe/1",
+             "at": "2026-07-28T09:00:00Z"}]))
     check("both receipts carry the same marker, cap sentence and self-identification (one "
           "reader, one family)",
           (heuristic_body.startswith("> 🤖 SPARQ agent"),
