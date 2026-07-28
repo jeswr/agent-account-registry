@@ -22,16 +22,6 @@
   },
   {
    "account": "efb4eb2781de6958",
-   "claim_id": "30a75717d09d4310bc87c2b4b3bd630a",
-   "holder": "sparq-org/sparq#3140@30387160985.1",
-   "package": "zk",
-   "role": "soundness",
-   "model": "opus5",
-   "issued_at": 1785263010,
-   "expires_at": 1785269310
-  },
-  {
-   "account": "efb4eb2781de6958",
    "claim_id": "d60e201a994547f8abe3e95ae7d44f40",
    "holder": "jeswr/agent-account-registry#320@30387273699.1",
    "package": "dispatch",
