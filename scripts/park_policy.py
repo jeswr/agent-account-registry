@@ -3760,6 +3760,25 @@ def _self_test():
     check("(e5) a receipt at or before the PREVIOUS park application belongs to a CLOSED episode",
           admit(reason_records=(park_receipt("partition", "2026-07-19T17:32:35Z"),),
                 attestations=(), bot_login=app_bot, auto_evidence=alias_evidence)[0], None)
+    # ...and that row alone does NOT test rule 4: its receipt is also 8.6 DAYS from the park, so
+    # rule 3 refuses it first and deleting rule 4 leaves the suite green (measured — the mutant
+    # SURVIVED until these rows existed). Rule 4 only ever fires INSIDE the window, and inside the
+    # window a MACHINE previous park is rule 5's job — so the case rule 4 uniquely owns is a
+    # previous park by a DIFFERENT HUMAN, which cannot appear in `machine_park_instants` at all.
+    # Asserted on the predicate directly, where the two bounds can be varied one at a time.
+    rule4_park = parse_ts(alias_park_at)
+    rule4_receipt = (park_receipt("partition", "2026-07-28T08:54:00Z"),)   # 39s before the park
+    check("(e5) RULE 4 IN ISOLATION: inside the window, but at/before a previous HUMAN park "
+          "(which rule 5 can never see), the receipt belongs to the closed episode",
+          [attempt(lambda: machine_receipted_park(
+              rule4_park, parse_ts(bound), rule4_receipt, app_bot)[0])
+           for bound in ("2026-07-28T08:54:00Z",    # AT the receipt      => closed (<=, not <)
+                         "2026-07-28T08:54:01Z",    # AFTER the receipt   => closed
+                         "2026-07-28T08:53:59Z")],  # BEFORE the receipt  => this episode
+          [False, False, True])
+    check("(e5) ...and with no previous park at all there is no lower bound, so it binds",
+          attempt(lambda: machine_receipted_park(rule4_park, None, rule4_receipt, app_bot)[0]),
+          True)
     # THE HUMAN TERMINAL IS UNTOUCHED. `needs:user` means what it always meant, whoever wrote it,
     # and a receipt bound to it changes nothing: the label-ownership gate refuses first.
     timelines[41] = [event("labeled", "needs:user", alias_park_at, "jeswr")]

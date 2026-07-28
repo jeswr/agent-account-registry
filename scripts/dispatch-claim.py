@@ -5323,7 +5323,14 @@ def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_logi
                 # applies the sound filter (written by the actor that applied THIS park), because
                 # reconcile-park-misescalation.py is hand-run under a maintainer token and its
                 # markers are authored by that maintainer, not by the App.
-                attestations=_park_policy.reconcile_attestations(comments))
+                attestations=_park_policy.reconcile_attestations(comments),
+                # [sparq-org/sparq#4911] The App identity, which is the TRUST ROOT of the second
+                # instance binding (machine_receipted_park): a park written under the maintainer's
+                # PAT is machine-owned when the App's own capacity receipt binds to it. This sweep
+                # already refuses to run at all without `bot_login` (the candidate filter above),
+                # so passing it here can never widen the population — it only lets the binding
+                # this PR exists for be evaluated at all. Omit it and the binding is inert.
+                bot_login=bot_login)
             if action == "auto-mint":
                 # RECEIPT FIRST, then the labels (see the docstring).
                 post_comment(repo, number, worker_pr.auto_readmission_receipt(
@@ -6250,7 +6257,13 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                         # comments this gate already read — the read-only proof gate and the
                         # minting sweep must never disagree about whether a park is admissible.
                         reason_records=_park_policy.park_reason_records(comments, bot_login),
-                        attestations=_park_policy.reconcile_attestations(comments))
+                        attestations=_park_policy.reconcile_attestations(comments),
+                        # [sparq-org/sparq#4911] The SAME trust root the minting sweep passes.
+                        # Withholding it here would make the read-only proof gate STRICTER than the
+                        # sweep, so a PR the sweep had already re-admitted would defer forever at
+                        # CLAIM — the exact shape of deadlock the "auto-receipt" branch exists to
+                        # remove. The two must reach the same verdict on the same evidence.
+                        bot_login=bot_login)
                 if not park_action:
                     print(f"defer review {repo}#{number}: machine capacity park stands "
                           f"(durable receipts/label; {park_detail})")
@@ -17862,6 +17875,49 @@ agent = "impl"
         assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
         print("  ok   auto-readmit (e): an instance attestation WITHOUT a class receipt is "
               "refused too — the two conjuncts are independent")
+        # ---- [sparq-org/sparq#4911] THE PARK THE MACHINE WROTE UNDER THE MAINTAINER'S PAT ----
+        #
+        # END TO END THROUGH THIS SWEEP, because the predicate is only half the fix: the binding's
+        # trust root is `bot_login`, and park_policy defaults it to "" so that a caller which does
+        # not wire it gets the OLD refusal. That default makes the whole feature deletable at THIS
+        # call site with no park_policy test noticing — the YAML/call-site seam where the surviving
+        # mutants in this tree live. Both rows below go through the real sweep, the real timeline
+        # parser, the real comment reader and the real label writes; delete `bot_login=bot_login`
+        # from the admission call and the first one goes red.
+        #
+        # The two fixtures differ in ONE field — WHEN the App posted its receipt. Live shape
+        # (sparq #3620): the alias applied `review:parked` at 08:54:39Z and the App posted
+        # `class=capacity cause=partition` at 08:56:05Z, 86 s later, under a DIFFERENT credential
+        # in one logical operation.
+        alias_receipt_stamp = model_health_mod._iso_z(park_epoch + 86)
+        alias_receipt_comment = [
+            {"user": {"login": readmit_bot}, "created_at": alias_receipt_stamp,
+             "body": "parking to unblock the fleet\n\n"
+                     + _park_policy.park_reason_marker("partition")}]
+        count, posted, cleared = readmit_sweep(
+            recovered_window, timeline=maintainer_park(MACHINE_PARK_PR_LABEL),
+            comments=alias_receipt_comment)
+        assert (count, cleared) == (1, [(41, 7)]), (count, posted, cleared)
+        assert len(posted) == 1 and worker_pr_mod.AUTO_READMIT_MARKER in posted[0][1], posted
+        assert any("the instance binding is: the bot's own class=capacity cause=partition park "
+                   "receipt at " in line and "is claimed by no machine label write" in line
+                   for line in readmit_sweep.log), readmit_sweep.log
+        print("  ok   auto-readmit (e) [#4911]: an alias-applied park the APP receipted 86s later "
+              "is MACHINE-written and IS re-admitted — with NO reconcile attestation")
+        # ...and the receipt's PROXIMITY is what binds it, not its mere existence: move the same
+        # receipt one second past the window and the identical PR stays parked. Without this row
+        # the admission above is equally explained by "any bot capacity receipt admits", which is
+        # the entity-scoped rule the instance binding exists to replace.
+        distant_receipt_comment = [
+            {**alias_receipt_comment[0],
+             "created_at": model_health_mod._iso_z(
+                 park_epoch + _park_policy.PARK_RECEIPT_BINDING_SECONDS + 1)}]
+        count, posted, cleared = readmit_sweep(
+            recovered_window, timeline=maintainer_park(MACHINE_PARK_PR_LABEL),
+            comments=distant_receipt_comment)
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        print("  ok   auto-readmit (e) [#4911]: the SAME receipt one second outside the binding "
+              "window leaves the park standing — proximity binds, existence does not")
         count, posted, cleared = readmit_sweep(
             recovered_window, timeline=maintainer_park(MACHINE_PARK_PR_LABEL),
             comments=[capacity_receipt_comment[0],
