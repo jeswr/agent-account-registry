@@ -12619,7 +12619,17 @@ def _self_test():
             ("hostile pull_requests shape",
              gate_freshness(_752_TIP, _752_TIP_AT,
                             {"name": CI_GATE_CHECK, "started_at": "2026-07-27T20:49:47+01:00",
-                             "pull_requests": "nope"}, 752))):
+                             "pull_requests": "nope"}, 752)),
+            # `True == 1` in Python, so a boolean leaking into the PR-number slot would MATCH a
+            # check-run entry for pull request #1 and read that PR's base as this one's — a
+            # freshness verdict about someone else's comparison. The bool guard is the only
+            # thing between those two, and this is the fixture that proves it is live (a
+            # surviving mutant in the first sweep: dropping the guard passed everything else).
+            ("a BOOLEAN pr number must not match entry number 1",
+             gate_freshness(_752_TIP, _752_TIP_AT,
+                            _gate_row(_752_TIP, "2026-07-27T20:49:47+01:00", 1), True)),
+            ("a STRING pr number matches nothing",
+             gate_freshness(_752_TIP, _752_TIP_AT, _row, "752"))):
         assert _v["state"] == GATE_FRESHNESS_UNPROVABLE, (_label, _v)
         assert _v["reason"], _label
     # (f) `deciding_gate_run` and `repair_gate_conclusion` answer about the SAME run — the
