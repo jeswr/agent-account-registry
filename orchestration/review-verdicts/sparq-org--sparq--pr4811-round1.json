@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4811,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "152d45f2f51b5b859b4bca46c12493d6ec3888c3",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The benchmark registry says the invocation measures feature legs `mimalloc / rdf-12 / count-alloc`, README.md says to run both allocator and feature configurations, and the research record describes ten builds. However, `ab.sh` builds each leg only with default features and with `count-alloc`; it never invokes `--features mimalloc`, `--features rdf-12`, or `--features rdf-12,count-alloc`. Thus the documented one-command reproduction cannot produce the production-relevant mimalloc/rdf-12 rows or validate the claim that rdf-12 allocation counts match default.",
+    "file": "bench/parse/oxttl-prefix-alloc/ab.sh",
+    "fix_hint": "Extend `ab.sh` to build and run the documented mimalloc and rdf-12 combinations using distinct target directories (including rdf-12+count-alloc), or narrow the benchmark metadata/README/research reproducibility claims and provide the exact commands that generated every recorded row.",
+    "severity": "major",
+    "title": "Registered A/B command omits the mimalloc and rdf-12 legs it claims to reproduce"
+   },
+   {
+    "body": "The record states that allocation counts are deterministic for the same corpus on \u201cany box\u201d and therefore quotable without a box caveat. The shim counts every allocation made by the complete binary during measured passes, including parser/dependency and harness behavior compiled for the target. Counts can change with Rust/toolchain versions, dependency resolution, target/platform cfg, standard-library implementation, and enabled features; the uncommitted lockfiles make dependency resolution another source of drift. Relaxed atomics make counting safe here, but do not establish cross-build portability. This overclaim is especially material because the allocation deltas are the primary evidence and hard-coded numbers are presented as universally reproducible.",
+    "file": "research/oxttl-prefixed-name-alloc-2026-07.md",
+    "fix_hint": "Scope determinism to repeated runs of the same pinned binary/build configuration and corpus. Record the target, toolchain, dependency revisions/lock resolution, and features alongside counts, and label the reported counts as measurements from that configuration rather than box-independent facts.",
+    "severity": "major",
+    "title": "Allocation counts are incorrectly claimed to be portable across any box"
+   }
+  ],
+  "progress": null,
+  "summary": "The harness is thoughtfully structured, but its registered one-command invocation does not reproduce all of the feature/allocator legs that the benchmark metadata and documentation say it measures. In addition, the research record overstates allocation-count portability: counts from this whole-process global-allocator shim can be deterministic for a fixed binary and input, but not across arbitrary boxes/toolchains/dependency builds. These claims are load-bearing evidence for the benchmark and should be corrected before approval.",
+  "verdict": "request_changes"
+ }
+}
