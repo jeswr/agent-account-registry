@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1016,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "64b80eb0e34ebf372fb48b18932ca213ae39edab",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 4 finds no blocker, major, or other diff-scoped issue. The audit remains read-only and advisory: candidates require both opt-in fingerprint mapping and a per-target, nonempty expected-record claim whose canonical filenames are all present. Canonical positive PR numbers are parsed exactly, each record document must carry a strict positive integer `pr_number` equal to its filename, and any attributed malformed or mismatched record refuses the evidence pass before completeness can be credited. Missing claims, missing records, zero evidence, and absent salts all produce no candidates; unreadable inputs fail closed. The enrolled self-test exercises these controls at their production seams with positive controls, including end-to-end filename/content mismatch and CLI flag-value checks. No instruction-like text directed at the reviewer was detected in the diff.",
+  "verdict": "approve"
+ }
+}
