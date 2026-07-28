@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4836,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ba9d07d1940af5afb1652bc8ab7b2782ee510395",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "G4 says `peerDependencies` plus `peerDependenciesMeta.optional` both preserves the runtime tree and causes npm 7+ to auto-install `@rdfjs/types`, then recommends that option to ensure consumers installing only `@jeswr/sparq` can resolve the emitted declarations. Optional peer dependencies are specifically not auto-installed by npm. Consequently the recommendation and phase 1 do not meet definition-of-done item (iii). The related statement that `skipLibCheck` silently degrades the missing imported types is also not established; missing-module resolution can still be reported independently of declaration-file type checking.",
+    "file": "research/rdfjs-conformance-remaining-work.md",
+    "fix_hint": "Correct the npm behavior and make the tradeoff explicit. If installing only `@jeswr/sparq` must always resolve its declarations, use a regular dependency (types-only packages still appear in the installed dependency tree), bundle/vendor the required declarations, or weaken the acceptance criterion to require consumers to install an optional peer. Do not recommend an optional peer as an auto-installed solution. Either verify the `skipLibCheck` behavior with a fresh-consumer fixture or remove that claim.",
+    "severity": "major",
+    "title": "Optional peer dependency cannot satisfy standalone type resolution"
+   }
+  ],
+  "progress": null,
+  "summary": "The research record is well scoped and most tree-derived observations are supported, but its recommended packaging decision contradicts its own acceptance criterion. An optional peer dependency is not automatically installed by npm, so it does not make the exported RDF/JS types resolve for a consumer that installs only @jeswr/sparq. Because phase 1 and the proposed definition of done rely on that behavior, the design would direct follow-up implementation toward a solution that cannot satisfy the stated goal.",
+  "verdict": "request_changes"
+ }
+}
