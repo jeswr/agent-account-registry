@@ -1152,6 +1152,123 @@ def _self_test():
            lane.labels_removed),
           ([(10, "residual-hold", True)], []))
 
+    # --- (h3) THE REAL WRITE PATH, executed ---------------------------------------------------
+    # `GhClient.post_comment` and `GhClient.remove_label` are the ONLY two writes this program can
+    # perform, and neither had ever executed — not in the self-test, not in a live dry run (a dry
+    # run by definition skips them). A write path proven only by the fake that stands in for it is
+    # not proven at all, so the real methods run here against a recorded `_gh`.
+    global _gh
+    real_gh = _gh
+    issued = []
+
+    def recording_gh(args, token=None, check=True):      # noqa: ARG001 — signature must match
+        issued.append((tuple(args), token))
+
+        class _Result:
+            stdout = "null"
+            returncode = 0
+        return _Result()
+
+    try:
+        _gh = recording_gh
+        client = GhClient("tok-123")
+        client.post_comment("o/r", 7, "body-text")
+        client.remove_label("o/r", 7, "needs:user")
+        client.remove_label("o/r", 7, "needs:external audit/x")
+    finally:
+        _gh = real_gh
+    check("[WRITE PATH] the real GhClient issues exactly one comment POST and one label DELETE, "
+          "on the right endpoints, carrying the token",
+          (len(issued), issued[0][0][:4], issued[0][1],
+           issued[1][0], issued[1][1]),
+          (3,
+           ("api", "-X", "POST", "repos/o/r/issues/7/comments"), "tok-123",
+           ("api", "-X", "DELETE", "repos/o/r/issues/7/labels/needs%3Auser"), "tok-123"))
+    check("[WRITE PATH] the label name is URL-quoted with NO safe characters, so a label "
+          "containing `/` or a space cannot traverse to another endpoint",
+          issued[2][0][3], "repos/o/r/issues/7/labels/needs%3Aexternal%20audit%2Fx")
+    check("[WRITE PATH] this program's whole write surface is two methods — it cannot add a "
+          "label, push, arm, merge or close",
+          sorted(name for name in vars(GhClient)
+                 if not name.startswith("_") and name not in
+                 ("parked_pulls", "comments", "timeline", "pull", "issue_labels")),
+          ["post_comment", "remove_label"])
+
+    # The read-error paths, which the reviewer confirmed correct but untested.
+    def failing_gh(args, token=None, check=True):         # noqa: ARG001
+        class _Result:
+            stdout = ""
+            returncode = 1
+            stderr = "boom"
+        if check:
+            raise RuntimeError("gh api failed: boom")
+        return _Result()
+
+    try:
+        _gh = failing_gh
+        raised = []
+        try:
+            GhClient(None).pull("o/r", 1)
+        except RuntimeError as exc:
+            raised.append(str(exc)[:20])
+
+        def shaped_gh(payload):
+            def inner(args, token=None, check=True):      # noqa: ARG001
+                class _Result:
+                    stdout = json.dumps(payload)
+                    returncode = 0
+                return _Result()
+            return inner
+
+        malformed = []
+        for payload in (None, {"not": "a list"}, ["page-is-not-a-list"]):
+            _gh = shaped_gh(payload)
+            try:
+                GhClient(None).comments("o/r", 1)
+            except RuntimeError as exc:
+                malformed.append("malformed" in str(exc))
+    finally:
+        _gh = real_gh
+    check("[READ PATH] a failing `gh` raises rather than returning an empty read, and a malformed "
+          "or non-list page raises instead of silently reading as 'no comments'",
+          (raised, malformed), (["gh api failed: boom"], [True, True, True]))
+    check("[READ PATH] an unwritable step summary WARNS and never changes the verdict",
+          publish([], 0, [], False, "/proc/self/nonexistent-dir/summary.md"), 0)
+    parser_errors = []
+    with contextlib.redirect_stderr(io.StringIO()):
+        try:
+            main(["--repos", ""])
+        except SystemExit as exc:
+            parser_errors.append(exc.code)
+    check("[CLI] a run with no target repo or no bot login EXITS rather than sweeping nothing "
+          "quietly",
+          parser_errors, [2])
+
+    class ExplodingGh(FakeGh):
+        def parked_pulls(self, repo, label):
+            raise RuntimeError("repo unreadable")
+
+    buffer, errbuf = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(errbuf):
+        repo_errors = []
+        try:
+            considered_bad = reconcile_repo(ExplodingGh({}), "o/r", "bot", "jeswr", True, 5,
+                                           RECONCILE_MAX, [])
+        except RuntimeError as exc:
+            repo_errors.append(str(exc))
+            considered_bad = None
+    check("[SWEEP] an unreadable REPOSITORY propagates to main's per-repo handler rather than "
+          "being swallowed as an empty population",
+          (repo_errors, considered_bad), (["repo unreadable"], None))
+    check("machine_applied resolves an EXACT-INSTANT human/bot tie toward HUMAN ownership, across "
+          "both `Z` and `+00:00` spellings of the same instant",
+          [machine_applied([event("labeled", "needs:user", bot_when, "sparq-orchestrator[bot]"),
+                            event("labeled", "needs:user", human_when, "jeswr")], "needs:user")
+           for bot_when, human_when in (("2026-07-28T01:00:00Z", "2026-07-28T01:00:00Z"),
+                                        ("2026-07-28T01:00:00Z", "2026-07-28T01:00:00+00:00"),
+                                        ("2026-07-28T01:00:00+00:00", "2026-07-28T01:00:00Z"))],
+          [False, False, False])
+
     # --- (i) THE YAML SEAM. Pin the CALL SITE, not only the Python ----------------------------
     # Every uncaught mutant in this repo's measured mutation runs lived at a workflow `if:`, a
     # step, or a call site. Deleting the invocation, dropping --apply or either cap, adding
