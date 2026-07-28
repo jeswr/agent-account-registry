@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4154,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f452b5152b5722c8a1b868cb21f06f71d757e3b5",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Sections 2.1\u20132.4 still embed absolute compute/apply timings, nanoseconds-per-operation estimates, fixed speedups, phase fractions, and a derived Amdahl ceiling from a shared 4-vCPU work box. The NON-CANONICAL caveats avoid presenting the measurements as canonical, but they do not cure the repository-contract violation: hard-coded performance numbers are prohibited in Markdown, and work-box timings cannot serve as canonical evidence. Because the measurements remain the principal support for the B \u2192 C \u2192 D recommendation, the prior round's major finding is materially unchanged.",
+    "file": "research/el-e4-concurrent-saturation.md",
+    "fix_hint": "Remove the absolute timing tables and fixed timing-derived figures from this Markdown record. Retain reproduction commands, deterministic counters, structural complexity evidence, and qualitative conclusions. If raw measurements must be preserved, put them in an appropriate generated or machine-readable benchmark artifact outside outward Markdown, and have the design record reference methodology and non-timing invariants without embedding fixed performance results.",
+    "severity": "major",
+    "title": "Work-box performance numbers remain hard-coded in Markdown"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 3 is stagnant. The sole prior major finding remains unresolved: research/el-e4-concurrent-saturation.md still hard-codes extensive shared-work-box performance results in Markdown, including absolute timings, nanoseconds-per-operation estimates, fixed speedups, phase fractions, and an Amdahl ceiling. Labeling them NON-CANONICAL does not satisfy the repository contract's explicit prohibition on hard-coded performance numbers in Markdown. These figures remain central evidence for the proposed B \u2192 C \u2192 D sequencing, so this is still a substantive evidence-handling violation.",
+  "verdict": "request_changes"
+ }
+}
