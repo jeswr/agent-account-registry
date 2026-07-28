@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4519,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "3782171725db3b3d0ee3452c179637b00e373435",
+  "round": 6
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "run_aux_arms now uses dict.len() + INLINE_DOMAIN as its exhaustion ceiling and repeatedly doubles want until that ceiling. INLINE_DOMAIN is 2^30, and ArmFn must return a materialized Vec for each request. A valid, prefix-consistent arm whose admissible hit is absent or late can therefore be asked for hundreds of millions to over a billion results by a small filtered vec:hybrid query. This can exhaust memory, transport, or the backing service; the domain cardinality is a correctness bound but not a safe paging protocol.",
+    "file": "crates/sparq-vectors/src/rewrite.rs",
+    "fix_hint": "Replace the ever-growing top-n/materialized-Vec protocol with bounded cursor/page iteration or pass admissibility to the arm so each call has a fixed maximum response size and explicit exhaustion. Preserve the inline-ID correctness witness, and add a test with a non-exhausted arm/no admissible hit that asserts every requested page remains under a documented finite cap.",
+    "severity": "major",
+    "title": "Inline-domain ceiling enables billion-result paging requests"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 6 fixes the prior correctness hole: paging now covers the admitted stored-plus-inline ID domain, and the new end-to-end test exercises an inline integer beyond dict.len(). However, the replacement backstop makes an ordinary filtered query capable of driving an auxiliary arm through geometrically growing requests up to roughly 2^30 results. Because ArmFn returns a fully materialized Vec, a sparse valid arm with no admissible early hit can be forced to allocate/transfer enormous pages before termination. This is a new major resource-exhaustion problem, so progress is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
