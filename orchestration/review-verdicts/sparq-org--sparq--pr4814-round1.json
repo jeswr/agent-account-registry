@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4814,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e5411973f094af328bb81a6841bf17bea83ff141",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The added commands use `--features native-ttl`, so they validate only the default feature set plus `native-ttl`. The published bundle in `js/package.json` enables `shacl,jsonld,serialize-rdf,scs,canon,explain-json,native-ttl,bytes-ingest,forms` together. Feature interactions in that actual bundle remain unchecked, contrary to the adjacent claim that this leg covers the shipped feature combination. The nightly comment accurately lists that combination, which makes the mismatch explicit.",
+    "file": ".github/workflows/ci.yml",
+    "fix_hint": "Add a wasm32 build and clippy leg using the complete published feature list (ideally sourced from or kept mechanically consistent with `js/package.json`), or narrow the PR's claim and comment to say it checks only `native-ttl`'s standalone wasm compatibility. If the purpose is to protect the published bundle, the former is required.",
+    "severity": "major",
+    "title": "The shipped wasm feature combination is still not compiled"
+   }
+  ],
+  "progress": null,
+  "summary": "The new wasm32 leg does not actually validate the shipped feature combination that its comment says is now covered. It compiles `native-ttl` only, while the published `build:wasm` command enables nine interacting features. This leaves the stated CI gap open and makes the change incomplete as scoped.",
+  "verdict": "request_changes"
+ }
+}
