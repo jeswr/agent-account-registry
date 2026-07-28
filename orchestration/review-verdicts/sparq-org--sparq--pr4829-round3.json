@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4829,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "8182f6df1221cbaa6aed2144ecb82c38f30d833e",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 3 remains correct and complete on the diff-scoped evidence. The generator derives the per-function fault-site list from emitted tests, requires one unique live assertion site per emitted test, rejects unknown names, and produces isolated single-fault variants. The driver cross-checks that list against the clean Noir file and requires each variant's nargo run to fail, while the focused Rust tests pin complete coverage, live placement, and per-function isolation. No new correctness, soundness, test-validity, or security issue is apparent. The targeted Rust test could not be rerun in this checkout because cargo is unavailable, but the reviewed change is unchanged in substance from the approved prior round.",
+  "verdict": "approve"
+ }
+}
