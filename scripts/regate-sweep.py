@@ -505,7 +505,8 @@ def seal_population(accounted, population):
         f"{population} open pull request(s) — some PR left the sweep through an uncounted exit")
 
 
-def census_line(repair, scanned, counts, confirmed=None, latched_arms=0):
+def census_line(repair, scanned, counts, confirmed=None, latched_arms=0,
+                latched_unknown=0):
     """The one line this emits every tick it holds. A silent sweeper turns a visible 58-minute
     outage into an invisible one, so the class size is reported even when nothing was moved."""
     attributable = sum(counts.get(name, 0) for name in ATTRIBUTABLE_BUCKETS)
@@ -527,6 +528,8 @@ def census_line(repair, scanned, counts, confirmed=None, latched_arms=0):
     # set: how many carried an auto-merge that the head move did not retract and will therefore
     # merge on the fresh green. Silence here would make that merge look unattended.
     fields.append(f"latched-arm={latched_arms}")
+    if latched_unknown:
+        fields.append(f"latched-arm-unknown={latched_unknown}")
     fields.append("refusals=" + (",".join(f"{k}:{v}" for k, v in sorted(refused.items())) or "-"))
     return "CENSUS " + " ".join(fields)
 
@@ -728,6 +731,18 @@ def drop_review_pass(repo, number, labels, runner=None):
     return True
 
 
+def latched_arm_state(pr):
+    """Is auto-merge already latched on this PR? -> True / False / None(unknown). PURE.
+
+    `pr.get("auto_merge")` alone conflates "the API says not armed" with "the field is not in this
+    payload at all", and consuming that default would make the whole latched-arm visibility control
+    quietly vacuous — the field would just stop being reported and nothing would say so. So absence
+    is a THIRD state, and it is censused as such."""
+    if not isinstance(pr, dict) or "auto_merge" not in pr:
+        return None
+    return bool(pr["auto_merge"])
+
+
 def label_names(pr):
     return [str((label or {}).get("name") or "") for label in (pr.get("labels") or [])]
 
@@ -750,6 +765,7 @@ class Sweeper:
         self.bot_login = bot_login
         self.errors = 0
         self.latched_arms = 0
+        self.latched_unknown = 0
         self.rows = []
         self.budget_used = 0
 
@@ -815,7 +831,8 @@ class Sweeper:
         seal_population(sum(counts.values()), len(pulls))
         self.rows.append(census_line(number, len(pulls), counts,
                                      confirmed if self.apply else None,
-                                     latched_arms=self.latched_arms))
+                                     latched_arms=self.latched_arms,
+                                     latched_unknown=self.latched_unknown))
         print(self.rows[-1])
 
     def _classify(self, pr, repair, merged_epoch, merge_sha):
@@ -863,7 +880,12 @@ class Sweeper:
         if not move_branch(self.repo, number, head, self.runner):
             self.errors += 1
             return "move-failed", False
-        latched = bool(pr.get("auto_merge"))
+        latched = latched_arm_state(pr)
+        if latched is None:
+            self.latched_unknown += 1
+            print(f"::warning::regate-sweep: #{number} carries no `auto_merge` field, so whether "
+                  "this move leaves a latched arm in place CANNOT be determined — censused as "
+                  "latched-arm-unknown rather than counted as unarmed")
         if latched:
             self.latched_arms += 1
             print(f"::warning::regate-sweep: #{number} had auto-merge ALREADY latched — removing "
@@ -1528,6 +1550,20 @@ def _test_live_sweep(chk):
                                       for w in ("auto_merge", "disable-auto", "DisableAuto"))], [])
     chk("latched-arm: an UNARMED moved PR reports zero, so the field cannot read as decoration",
         "latched-arm=0" in sweeper7.rows[0], True)
+    # A MISSING `auto_merge` field is a third state. Reading it as "not armed" would let the control
+    # stop reporting without anything saying so — the silent-default shape.
+    chk("latched-arm: an ABSENT auto_merge field is unknown, not False",
+        (latched_arm_state({}), latched_arm_state({"auto_merge": None}),
+         latched_arm_state({"auto_merge": {"x": 1}})), (None, False, True))
+    gh7c, sweeper7c = _fixture()
+    for pull in gh7c.pulls:
+        pull.pop("auto_merge")
+    sweeper7c.run()
+    chk("latched-arm: a payload with no auto_merge field censuses latched-arm-unknown instead of "
+        "silently reporting zero armed PRs",
+        ("latched-arm-unknown=1" in sweeper7c.rows[0], gh7c.updated()), (True, [903]))
+    chk("latched-arm: and the unknown field is ABSENT when every payload carried auto_merge, so it "
+        "cannot become permanent noise", "latched-arm-unknown" in sweeper7.rows[0], False)
     chk("latched-arm: the PR comment names the latched arm explicitly",
         LATCHED_ARM_NOTE[:40] in sweep_comment(917, "t", "t", "a" * 40, ("x",), latched_arm=True),
         True)
@@ -1582,46 +1618,99 @@ def _test_live_sweep(chk):
         "cannot name", isinstance(_raises(sweeper13.run), RegateSweepError), True)
 
 
+class _pinned_env:
+    """Run a block with the ambient CI variables PINNED to known values.
+
+    ⚠️ This exists because the first version of `_test_entry_point` was ENVIRONMENT-DEPENDENT and
+    that made it green locally and RED in CI. `--repo` defaults to `$GITHUB_REPOSITORY`, which is
+    unset on a workstation and SET inside Actions, so "no --repo exits 2" was only ever true off-CI —
+    it passed locally for the reason it could not hold in the one environment that matters. The same
+    trap applies to `$APP_SLUG` (the `--bot-slug` default) and `$GITHUB_STEP_SUMMARY`, which would
+    have made these tests APPEND to the real job summary as a side effect. Assertions about defaults
+    must state the environment they assume rather than inherit it."""
+
+    VARS = ("GITHUB_REPOSITORY", "APP_SLUG", "GITHUB_STEP_SUMMARY")
+
+    def __init__(self, **values):
+        self.values = values
+        self.saved = {}
+
+    def __enter__(self):
+        self.saved = {k: os.environ.get(k) for k in self.VARS}
+        for key in self.VARS:
+            want = self.values.get(key)
+            if want is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = want
+        return self
+
+    def __exit__(self, *exc):
+        for key, value in self.saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        return False
+
+
 def _test_entry_point(chk):
     """`main()` was at 0% line coverage. The CLI-flag gate proves flags are DECLARED; nothing
     proved they were WIRED — including the `--bot-slug` -> `<slug>[bot]` construction the whole
-    marker-authorship control rests on."""
+    marker-authorship control rests on. Every assertion here runs with the ambient CI variables
+    PINNED, because the defaults under test are read from them."""
     import tempfile
     repairs = json.dumps({"schema": 1, "repairs": [dict(REPAIR)]})
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
         handle.write(repairs)
         path = handle.name
+    repo = "jeswr/agent-account-registry"
     try:
-        # A marker written by SOMEONE ELSE. If `main` mis-wires the slug into the login the marker
-        # scan compares against, this PR is wrongly skipped and the sweep silently does nothing.
-        spoof = {"body": MARKER.format(repair=917, head="a" * 40), "user": {"login": "nobody"}}
-        gh, _ = _fixture(comments={903: [spoof]})
-        code = main(["--repo", "jeswr/agent-account-registry", "--repairs-file", path,
-                     "--bot-slug", BOT_SLUG, "--max-moves", "5", "--apply"], runner=gh)
-        chk("entry point: main() runs the sweep end to end and exits 0", code, 0)
-        chk("entry point: main() wires --bot-slug through as `<slug>[bot]`, so a foreign marker is "
-            "ignored and the attributable PR is still moved", gh.updated(), [903])
+        with _pinned_env():        # no GITHUB_REPOSITORY, no APP_SLUG, no step summary
+            # A marker written by SOMEONE ELSE. If `main` mis-wires the slug into the login the
+            # marker scan compares against, this PR is wrongly skipped and the sweep does nothing.
+            spoof = {"body": MARKER.format(repair=917, head="a" * 40), "user": {"login": "nobody"}}
+            gh, _ = _fixture(comments={903: [spoof]})
+            code = main(["--repo", repo, "--repairs-file", path, "--bot-slug", BOT_SLUG,
+                         "--max-moves", "5", "--apply"], runner=gh)
+            chk("entry point: main() runs the sweep end to end and exits 0", code, 0)
+            chk("entry point: main() wires --bot-slug through as `<slug>[bot]`, so a foreign marker "
+                "is ignored and the attributable PR is still moved", gh.updated(), [903])
 
-        gh2, _ = _fixture(comments={903: [{"body": MARKER.format(repair=917, head="a" * 40),
-                                          "user": {"login": BOT_LOGIN}}]})
-        main(["--repo", "jeswr/agent-account-registry", "--repairs-file", path,
-              "--bot-slug", BOT_SLUG, "--apply"], runner=gh2)
-        chk("entry point: and OUR OWN marker read through main() does suppress the move",
-            gh2.updated(), [])
+            gh2, _ = _fixture(comments={903: [{"body": MARKER.format(repair=917, head="a" * 40),
+                                              "user": {"login": BOT_LOGIN}}]})
+            main(["--repo", repo, "--repairs-file", path, "--bot-slug", BOT_SLUG, "--apply"],
+                 runner=gh2)
+            chk("entry point: and OUR OWN marker read through main() does suppress the move",
+                gh2.updated(), [])
 
-        gh3, _ = _fixture()
-        main(["--repo", "jeswr/agent-account-registry", "--repairs-file", path], runner=gh3)
-        chk("entry point: main() DEFAULTS to dry-run — --apply is opt-in, so a mis-wired workflow "
-            "cannot write", [c for c in gh3.calls if "--method" in c], [])
+            gh3, _ = _fixture()
+            main(["--repo", repo, "--repairs-file", path], runner=gh3)
+            chk("entry point: main() DEFAULTS to dry-run — --apply is opt-in, so a mis-wired "
+                "workflow cannot write", [c for c in gh3.calls if "--method" in c], [])
 
-        for label, argv in (
-                ("a malformed --bot-slug", ["--repo", "o/r", "--repairs-file", path,
-                                            "--bot-slug", "bad slug; rm -rf /"]),
-                ("a negative --max-moves", ["--repo", "o/r", "--repairs-file", path,
-                                            "--max-moves", "-1"]),
-                ("no --repo at all", ["--repairs-file", path])):
-            chk(f"entry point: {label} exits 2 rather than sweeping",
-                _exit_code(lambda a=argv: main(a, runner=_fixture()[0])), 2)
+            for label, argv in (
+                    ("a malformed --bot-slug", ["--repo", "o/r", "--repairs-file", path,
+                                                "--bot-slug", "bad slug; rm -rf /"]),
+                    ("a negative --max-moves", ["--repo", "o/r", "--repairs-file", path,
+                                                "--max-moves", "-1"]),
+                    ("neither --repo NOR $GITHUB_REPOSITORY", ["--repairs-file", path])):
+                chk(f"entry point: {label} exits 2 rather than sweeping",
+                    _exit_code(lambda a=argv: main(a, runner=_fixture()[0])), 2)
+
+        # BOTH DIRECTIONS OF THE DEFAULT, each stating its environment instead of inheriting it.
+        with _pinned_env(GITHUB_REPOSITORY=repo, APP_SLUG=BOT_SLUG):
+            gh4, _ = _fixture(comments={903: [{"body": MARKER.format(repair=917, head="a" * 40),
+                                              "user": {"login": BOT_LOGIN}}]})
+            code = main(["--repairs-file", path, "--apply"], runner=gh4)
+            chk("entry point: with $GITHUB_REPOSITORY set, --repo may be omitted and the sweep runs",
+                code, 0)
+            chk("entry point: and $APP_SLUG supplies --bot-slug, so OUR marker still suppresses — "
+                "the env default is wired to the same login the flag builds",
+                gh4.updated(), [])
+        with _pinned_env(APP_SLUG="bad slug; rm -rf /", GITHUB_REPOSITORY=repo):
+            chk("entry point: a malformed $APP_SLUG is rejected exactly like a malformed flag",
+                _exit_code(lambda: main(["--repairs-file", path], runner=_fixture()[0])), 2)
     finally:
         os.unlink(path)
 
