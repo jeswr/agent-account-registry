@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4757,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "699255c653e5592cbfb3e1f6322cf93a0b29f3b5",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`run_nl_query` parses the completion, checks forbidden constructs, and returns it without running the default-enabled dictionary check that the real `Nlq::ask` loop performs. Consequently, a hallucinated predicate or class IRI absent from `graph` is accepted here even though `ask` would repair or reject it. This remains material because `crates/sparq-mcp/src/lib.rs` and `skills/agent-tools/SKILL.md` still describe `nl_query` as using the same grounded generation and validation as `ask`; the new syntax-only wording elsewhere does not make those public parity claims true. The added tests do not exercise an unknown graph term.",
+    "file": "crates/sparq-mcp/src/nlq.rs",
+    "fix_hint": "Apply the same `config.check_dictionary` and `sparq_nlq::constrain::unknown_terms(graph, &parsed)` branch as `Nlq::ask`, use the dictionary repair message in the repair prompt, and add a test proving that an unknown predicate or class IRI is repaired or rejected. Alternatively, consistently remove the same-validation parity claim from every public doc and explicitly specify parse-plus-forbidden-construct validation only.",
+    "severity": "major",
+    "title": "Translate-only path still omits ask's dictionary validation"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 2 is stagnant: the same major dictionary-grounding mismatch remains. `run_nl_query` still returns immediately after parse and forbidden-construct validation and never applies the default-enabled `config.check_dictionary` / `constrain::unknown_terms` validation used by `Nlq::ask`. Some prose now accurately calls validation syntactic, but the public crate docs and agent-tools skill still promise the same grounded generation and validation as `ask`, so an unknown predicate or class IRI can be returned despite that advertised parity. No test covers the missing dictionary-validation invariant.",
+  "verdict": "request_changes"
+ }
+}
