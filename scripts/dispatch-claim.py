@@ -1174,15 +1174,39 @@ def repair_gate_conclusion(check_runs, log=print):
     the lane."""
     if not isinstance(check_runs, list):
         return "unknown"
-    latest = _latest_check_runs_by_name(check_runs, log=log)
-    tiered = [(name, entry) for name, entry in latest.items() if name in CI_REPAIR_GATE_CHECKS]
-    if not tiered:
+    deciding = _deciding_aggregator(check_runs, log=log)
+    if deciding is None:
         return "missing"
     # EXACT tier identity, taken from the resolved run's own name — not re-derived by matching
     # the name again downstream, and never by a prefix test (`gate` prefixes `gate, draft-tier`).
-    name, entry = max(tiered, key=lambda pair: pair[1][0])
+    name, entry = deciding
     state = _gate_state_of(entry)
     return GATE_GREEN_BY_TIER[name] if state == "success" else state
+
+
+def _deciding_aggregator(check_runs, log=print):
+    """PURE: the (name, ranked-entry) pair `repair_gate_conclusion` draws its answer from, or
+    None when the listing is malformed or carries no aggregator row at all.
+
+    Factored out so `deciding_gate_run` and `repair_gate_conclusion` cannot drift about WHICH
+    run decided a head — the freshness reading (registry #940) grades the recency of the exact
+    run whose conclusion the grade reports, and two separate newest-run resolutions is precisely
+    how those two statements would come to describe different runs."""
+    if not isinstance(check_runs, list):
+        return None
+    latest = _latest_check_runs_by_name(check_runs, log=log)
+    tiered = [(name, entry) for name, entry in latest.items() if name in CI_REPAIR_GATE_CHECKS]
+    if not tiered:
+        return None
+    return max(tiered, key=lambda pair: pair[1][0])
+
+
+def deciding_gate_run(check_runs, log=print):
+    """PURE: the ONE aggregator check-run row `repair_gate_conclusion` resolved as newest across
+    the tiered names, or None. The raw row (not the grade) — the freshness reading needs its
+    `started_at` and its own recorded base sha."""
+    deciding = _deciding_aggregator(check_runs, log=log)
+    return None if deciding is None else deciding[1][1]
 
 
 def pr_ci_status(record):
@@ -3729,6 +3753,193 @@ def _live_repair_gate(repo, head_sha, draft, fetch=None):
     if rows is _UNPROVABLE_READ:
         return "unknown"
     return repair_gate_conclusion(rows)
+
+
+# ---- registry #940: A GREEN GATE IS EVIDENCE ABOUT A TREE, NOT ABOUT A PR -----------------------
+# MEASURED HAZARD (issue #940). Two registry PRs read `MERGEABLE` / `mergeStateStatus: CLEAN` with
+# a GREEN `gate`, and both would have reddened `gate` for every subsequent PR:
+#
+#   #752  gate ran 2026-07-26 22:25  ->  #799/#687 landed 07-27 19:08/19:49
+#   #784  gate ran 2026-07-27 16:00  ->  #876      landed 07-28 00:42
+#
+# #752's own check asserts a substring over EVERY log line and master added two more; #784's
+# `seal_population` raises because master's #876 added an orchestrator-class `skipped += 1` above
+# its `population += 1` — a SEMANTIC disagreement, not a text collision, so no diff-overlap
+# heuristic finds it. The mechanism: `pr-gate.yml` fires only on `pull_request` events, so a base
+# move never re-runs it; the registry has NO merge queue (sparq does, which is why this hazard is
+# registry-specific); and the ruleset requires only `gate`. Nothing forces re-derivation when the
+# tree a green was computed against stops existing.
+#
+# THE COMPARISON, AND WHY THIS ONE. A gate run is FRESH for a base tip iff BOTH hold:
+#
+#   (1) STRUCTURAL, CLOCK-FREE — the deciding run's OWN recorded base sha equals the live base
+#       tip sha. GitHub stamps every check-run with the `pull_requests[].base.sha` it was created
+#       against, and a `pull_request` run checks out `refs/pull/N/merge` — head composed with THAT
+#       base. So this is not a proxy for the question, it IS the question, and no clock enters it.
+#       MEASURED on this repo (run 30328130663, PR #937, created 2026-07-28T04:13:11Z): the field
+#       read `769d51e4`, a base 2m33s STALE relative to master's then-tip `cf654f3`. It therefore
+#       LAGS rather than leads — it errs toward calling a fresh gate stale (refuse: safe), not
+#       toward calling a stale gate fresh.
+#
+#   (2) TEMPORAL, WITH A MARGIN — the deciding run STARTED at least
+#       GATE_FRESHNESS_MARGIN_SECONDS after the base tip's commit date. This is the backstop for
+#       the one way (1) could go quiet: if GitHub ever recomputed that field live, (1) would
+#       become vacuously true and stop refusing anything. `started_at` — never `completed_at`:
+#       a run that started BEFORE the tip landed cannot have composed it, whereas `completed_at`
+#       admits exactly the #752 shape (a ~100s gate that starts before a merge and finishes
+#       after it).
+#
+# THE MARGIN IS 300s, AND IT IS A BOUND, NOT A PROOF. It has to exceed GitHub's base-attribution
+# lag, measured once here at 153s; 300s is ~2x that with headroom, and small against the observed
+# master cadence (~14 merges in a night). It cannot be proven sufficient in general — a DIRECT
+# push to master (which this repo's ruleset still permits) carries the pusher's local commit
+# date, which may precede the landing instant without bound. That is exactly why (1) is the
+# BINDING test and (2) only a backstop, and why they are conjunctive: FRESH requires both, so the
+# verdict is never weaker than the stronger of the two.
+#
+# EVERY UNRESOLVABLE OPERAND REFUSES. No base tip sha, no parseable base tip date, no aggregator
+# row, no parseable `started_at`, no recorded base sha for THIS pull request — each yields
+# `unprovable`, and every caller treats `unprovable` exactly as `stale`. "If you cannot establish
+# the base tip's date, refuse" is the whole point: a guard that assumed freshness on an
+# unreadable operand would be silent precisely when GitHub is degraded.
+#
+# WHAT THE REFUSAL MUST NOT DO. `gh run rerun` CANNOT refresh this — it re-tests the same tree
+# (measured on #916: `behind_by=1, status=diverged` against the fix's merge commit). Only a NEW
+# `pull_request` event produces a run whose merge ref composes the newer base tip. So the caller's
+# refusal has to keep that producer reachable rather than suppressing it; see worker-pr.py's
+# ARM_DECLINE_GATE_STALE for the bounded re-admission that guarantees it.
+GATE_FRESH = "fresh"
+GATE_STALE = "stale"
+GATE_FRESHNESS_UNPROVABLE = "unprovable"
+GATE_FRESHNESS_STATES = (GATE_FRESH, GATE_STALE, GATE_FRESHNESS_UNPROVABLE)
+GATE_FRESHNESS_MARGIN_SECONDS = 300
+
+
+def gate_freshness(base_tip_sha, base_tip_at, gate_run, pr_number,
+                   margin_seconds=GATE_FRESHNESS_MARGIN_SECONDS):
+    """PURE: is `gate_run` evidence about a tree that CONTAINED `base_tip_sha`?
+
+    Returns {"state", "reason", "gap_seconds", "run_base_sha", "base_tip_sha", "started_at"}
+    where state is one of GATE_FRESHNESS_STATES. `gap_seconds` is SIGNED — the run's start
+    minus the base tip's commit date — so a negative value reads literally as "this gate
+    predates the base tip by N seconds" and is the census's age gap. It is reported whenever
+    both stamps parse, INCLUDING on a refusal, because a refusal with no number is a hazard a
+    human cannot size.
+
+    Hostile-tolerant in one direction only: anything malformed is `unprovable`, never `fresh`."""
+    verdict = {"state": GATE_FRESHNESS_UNPROVABLE, "reason": "", "gap_seconds": None,
+               "run_base_sha": "", "base_tip_sha": "", "started_at": ""}
+    if not isinstance(base_tip_sha, str) or not SAFE_SHA.fullmatch(base_tip_sha):
+        verdict["reason"] = "the base branch tip sha is unresolvable"
+        return verdict
+    verdict["base_tip_sha"] = base_tip_sha
+    try:
+        tip_at = _park_policy.parse_ts(base_tip_at)
+    except ValueError:
+        verdict["reason"] = f"the base tip's commit date is unparseable ({str(base_tip_at)[:64]!r})"
+        return verdict
+    if not isinstance(gate_run, dict):
+        verdict["reason"] = "no aggregator run resolved on this head"
+        return verdict
+    started_raw = gate_run.get("started_at")
+    try:
+        started = _park_policy.parse_ts(started_raw)
+    except ValueError:
+        verdict["reason"] = ("the deciding gate run's started_at is unparseable "
+                             f"({str(started_raw)[:64]!r})")
+        return verdict
+    verdict["started_at"] = started_raw
+    verdict["gap_seconds"] = int((started - tip_at).total_seconds())
+    run_base = _run_recorded_base_sha(gate_run, pr_number)
+    if not run_base:
+        verdict["reason"] = ("the deciding gate run records no base sha for this pull request, "
+                             "so which tree it graded cannot be established")
+        return verdict
+    verdict["run_base_sha"] = run_base
+    # (1) STRUCTURAL — the binding test. Clock-free: the run's own base sha versus the live tip.
+    if run_base != base_tip_sha:
+        verdict["state"] = GATE_STALE
+        verdict["reason"] = (f"the gate graded a tree based on {run_base[:12]}, but the base "
+                             f"branch tip is now {base_tip_sha[:12]}")
+        return verdict
+    # (2) TEMPORAL — the backstop, in case (1) ever stops discriminating. A run that STARTED
+    # before the tip landed (plus the lag margin) cannot have composed it.
+    if verdict["gap_seconds"] < margin_seconds:
+        verdict["state"] = GATE_STALE
+        verdict["reason"] = (f"the gate started {verdict['gap_seconds']}s after the base tip's "
+                             f"commit date, inside the {margin_seconds}s base-attribution "
+                             "margin — it cannot be proven to have composed that tip")
+        return verdict
+    verdict["state"] = GATE_FRESH
+    verdict["reason"] = (f"the gate graded the current base tip {base_tip_sha[:12]} and started "
+                         f"{verdict['gap_seconds']}s after it landed")
+    return verdict
+
+
+def _run_recorded_base_sha(gate_run, pr_number):
+    """PURE: the base sha GitHub stamped on this check-run FOR THIS pull request, or "".
+
+    The pull-request NUMBER is matched, never "the first entry": a check-run can carry several
+    pull_requests entries (the same head opened against two bases), and reading a sibling PR's
+    base would grade the wrong comparison. An absent number, a malformed entry, or no matching
+    entry all yield "" — which the caller turns into `unprovable`, i.e. a refusal."""
+    entries = gate_run.get("pull_requests")
+    if not isinstance(entries, list) or not isinstance(pr_number, int) \
+            or isinstance(pr_number, bool):
+        return ""
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("number") != pr_number:
+            continue
+        base = entry.get("base")
+        sha = base.get("sha") if isinstance(base, dict) else None
+        if isinstance(sha, str) and SAFE_SHA.fullmatch(sha):
+            return sha
+    return ""
+
+
+def _live_base_tip(repo, base_ref, fetch=None):
+    """LIVE (sha, commit date) of the base branch tip, or ("", "") when it cannot be proven.
+
+    The commit date is `commit.committer.date`. For this repo master moves by GitHub-authored
+    merge commits, whose committer date IS the merge instant on GitHub's own clock (verified:
+    master@93f74358 carries committer "GitHub"), so it is the closest thing to a landing time
+    the REST API exposes — there is no server-received timestamp on a commit. A DIRECT push
+    would carry the pusher's clock instead, which is the unbounded skew the structural test in
+    `gate_freshness` exists to not depend on.
+
+    Fail closed on every degradation: an unreadable ref, a malformed document, a missing sha or
+    a missing date all return ("", ""), which `gate_freshness` reports as `unprovable`."""
+    if not isinstance(base_ref, str) or not base_ref or not isinstance(repo, str) or not repo:
+        return "", ""
+    fetch = fetch or (lambda path: _gh_json(["api", path]))
+    try:
+        doc = fetch(f"repos/{repo}/commits/{urllib.parse.quote(base_ref, safe='')}")
+    except DispatchError:
+        return "", ""
+    if not isinstance(doc, dict):
+        return "", ""
+    sha = doc.get("sha")
+    commit = doc.get("commit")
+    committer = commit.get("committer") if isinstance(commit, dict) else None
+    date = committer.get("date") if isinstance(committer, dict) else None
+    if not isinstance(sha, str) or not SAFE_SHA.fullmatch(sha) or not isinstance(date, str):
+        return "", ""
+    return sha, date
+
+
+def live_gate_freshness(repo, head_sha, base_ref, draft, pr_number, fetch=None, base_fetch=None):
+    """LIVE freshness verdict for one PR head, over the SAME paginated, total_count-cross-checked,
+    newest-run-wins walk `_live_repair_gate` uses — never a second spelling of it.
+
+    An unprovable check-run walk is `unprovable`, exactly as it is `unknown` for the grade: a
+    partial listing must never be read as "no newer run exists"."""
+    rows = _live_aggregator_runs(repo, head_sha, repair_gate_checks_for(draft), fetch=fetch)
+    if rows is _UNPROVABLE_READ:
+        return {"state": GATE_FRESHNESS_UNPROVABLE, "gap_seconds": None, "run_base_sha": "",
+                "base_tip_sha": "", "started_at": "",
+                "reason": "the head's aggregator check-run walk could not be proven complete"}
+    tip_sha, tip_at = _live_base_tip(repo, base_ref, fetch=base_fetch)
+    return gate_freshness(tip_sha, tip_at, deciding_gate_run(rows), pr_number)
 
 
 # (#761 added `_live_strict_gate`, a live role-(a) reading, for `stranded` — its ONLY consumer.
@@ -12308,6 +12519,161 @@ def _self_test():
     assert _live_repair_gate("o/r", "a" * 40, True, fetch=_f) == GATE_GREEN_DRAFT_TIER
     assert sum(1 for p in _f.seen
                if _requested_gate_name(p) == CI_GATE_DRAFT_TIER_CHECK) == 2, _f.seen
+
+    # ---- registry #940: gate freshness — a green is evidence about a TREE ------------------------
+    # THE REPLAY FIXTURES ARE THE REAL COMMITS FROM ISSUE #940, with their real committer dates
+    # read out of this repository's own history. A fixture invented from round numbers could not
+    # show that the two live PRs would have been refused; these are those two PRs.
+    _752_RUN_BASE = "b1050ae9f67ac037fb21696d2891101d4b75e24a"   # master tip when #752's gate ran
+    _752_TIP = "7aeafaaeb7d61613fdbd5715275ec25ce4571160"        # #687, landed after it
+    _752_TIP_AT = "2026-07-27T19:49:47+01:00"
+    _784_RUN_BASE = "c4f087af236215aed6901557aff867bb026af18a"   # master tip when #784's gate ran
+    _784_TIP = "eb30f3de4fea4ea22332fc35cceed957be0cfc5b"        # #876, landed after it
+    _784_TIP_AT = "2026-07-28T00:42:12+01:00"
+
+    def _gate_row(base_sha, started, number=752, name=CI_GATE_CHECK, conclusion="success"):
+        return {"name": name, "status": "completed", "conclusion": conclusion,
+                "started_at": started,
+                "pull_requests": [{"number": number,
+                                   "base": {"ref": "master", "sha": base_sha}}]}
+
+    # (a) THE #752 REPLAY. Green gate, CLEAN PR — and the base moved twice underneath it.
+    _752 = gate_freshness(_752_TIP, _752_TIP_AT,
+                          _gate_row(_752_RUN_BASE, "2026-07-26T22:25:00+01:00", 752), 752)
+    assert _752["state"] == GATE_STALE, _752
+    assert _752["run_base_sha"] == _752_RUN_BASE and _752["base_tip_sha"] == _752_TIP, _752
+    # The census age gap is REPORTED on the refusal, and it is the real one (~21.4h).
+    assert _752["gap_seconds"] == -77087, _752["gap_seconds"]     # 21h24m47s stale
+    # (b) THE #784 REPLAY — the SEMANTIC collision (master's #876 `skipped += 1` above this PR's
+    # `population += 1`). No diff-overlap heuristic finds it; the base-move test does.
+    _784 = gate_freshness(_784_TIP, _784_TIP_AT,
+                          _gate_row(_784_RUN_BASE, "2026-07-27T16:00:00+01:00", 784), 784)
+    assert _784["state"] == GATE_STALE, _784
+    assert _784["gap_seconds"] < 0, _784
+    # (c) THE CONTROL — WITHOUT IT (a) AND (b) WOULD PASS BY REFUSING EVERYTHING. Same shapes,
+    # same predicate: a gate that graded the CURRENT tip, comfortably outside the margin, is
+    # FRESH and arms. If this ever goes red the guard has become a blanket refusal.
+    _fresh = gate_freshness(_752_TIP, _752_TIP_AT,
+                            _gate_row(_752_TIP, "2026-07-27T20:49:47+01:00", 752), 752)
+    assert _fresh["state"] == GATE_FRESH, _fresh
+    assert _fresh["gap_seconds"] == 3600, _fresh
+    # (d) THE TWO CONDITIONS ARE CONJUNCTIVE, and each is INDEPENDENTLY load-bearing:
+    #   (d1) structural alone refuses a run whose CLOCK says fresh — 10h after the tip landed,
+    #        but it graded a different base. Deleting the sha compare passes this fixture.
+    _clock_says_fresh = gate_freshness(_752_TIP, _752_TIP_AT,
+                                       _gate_row(_752_RUN_BASE, "2026-07-28T05:49:47+01:00", 752),
+                                       752)
+    assert _clock_says_fresh["state"] == GATE_STALE, _clock_says_fresh
+    assert _clock_says_fresh["gap_seconds"] == 36000, _clock_says_fresh
+    #   (d2) temporal alone refuses a run whose recorded base MATCHES but which started inside
+    #        the measured base-attribution lag. Deleting the margin compare passes this fixture.
+    _inside_margin = gate_freshness(_752_TIP, _752_TIP_AT,
+                                    _gate_row(_752_TIP, "2026-07-27T19:51:47+01:00", 752), 752)
+    assert _inside_margin["state"] == GATE_STALE, _inside_margin
+    assert _inside_margin["gap_seconds"] == 120 < GATE_FRESHNESS_MARGIN_SECONDS, _inside_margin
+    #   (d3) THE `completed_at` TRAP, which is why this predicate reads `started_at`. A gate that
+    #        STARTED 107s before the tip landed and FINISHED 313s after it — the #752 shape, a
+    #        ~100s gate straddling a merge. Its recorded base already matches, so only the
+    #        timestamp choice decides: on `started_at` it is STALE (it cannot have composed a tip
+    #        that landed mid-run), on `completed_at` it would read FRESH and merge.
+    _straddle = dict(_gate_row(_752_TIP, "2026-07-27T19:48:00+01:00", 752),
+                     completed_at="2026-07-27T19:55:00+01:00")
+    _straddled = gate_freshness(_752_TIP, _752_TIP_AT, _straddle, 752)
+    assert _straddled["state"] == GATE_STALE, _straddled
+    assert _straddled["gap_seconds"] == -107, _straddled
+    # ...and the control that proves the fixture is a genuine near-miss and not stale by miles:
+    # the same run judged on its completion stamp clears the margin comfortably.
+    assert gate_freshness(_752_TIP, _752_TIP_AT,
+                          _gate_row(_752_TIP, _straddle["completed_at"], 752),
+                          752)["state"] == GATE_FRESH
+    # ...and the margin boundary itself is INCLUSIVE at exactly 300s (pins the constant, so a
+    # silent widening to 0 or a narrowing to an hour both show up here).
+    assert gate_freshness(_752_TIP, _752_TIP_AT,
+                          _gate_row(_752_TIP, "2026-07-27T19:54:47+01:00", 752),
+                          752)["state"] == GATE_FRESH
+    assert GATE_FRESHNESS_MARGIN_SECONDS == 300
+    # (e) EVERY UNRESOLVABLE OPERAND REFUSES — and refuses as `unprovable`, distinguishably from
+    # a proven-stale gate, because "GitHub is degraded" and "the base moved" want different
+    # operator responses. Never `fresh`: assuming freshness on an unreadable operand is silence
+    # exactly when the API is unhealthy.
+    _row = _gate_row(_752_TIP, "2026-07-27T20:49:47+01:00", 752)
+    for _label, _v in (
+            ("no base tip sha", gate_freshness("", _752_TIP_AT, _row, 752)),
+            ("malformed base tip sha", gate_freshness("nope", _752_TIP_AT, _row, 752)),
+            ("unparseable tip date", gate_freshness(_752_TIP, "yesterday", _row, 752)),
+            ("naive tip date", gate_freshness(_752_TIP, "2026-07-27T19:49:47", _row, 752)),
+            ("no aggregator row", gate_freshness(_752_TIP, _752_TIP_AT, None, 752)),
+            ("unparseable started_at",
+             gate_freshness(_752_TIP, _752_TIP_AT,
+                            _gate_row(_752_TIP, "not-a-time", 752), 752)),
+            ("no pull_requests entry",
+             gate_freshness(_752_TIP, _752_TIP_AT,
+                            {"name": CI_GATE_CHECK, "status": "completed",
+                             "conclusion": "success",
+                             "started_at": "2026-07-27T20:49:47+01:00"}, 752)),
+            ("a SIBLING pr's base entry only",
+             gate_freshness(_752_TIP, _752_TIP_AT, _row, 999)),
+            ("malformed run base sha",
+             gate_freshness(_752_TIP, _752_TIP_AT,
+                            _gate_row("zz", "2026-07-27T20:49:47+01:00", 752), 752)),
+            ("hostile pull_requests shape",
+             gate_freshness(_752_TIP, _752_TIP_AT,
+                            {"name": CI_GATE_CHECK, "started_at": "2026-07-27T20:49:47+01:00",
+                             "pull_requests": "nope"}, 752))):
+        assert _v["state"] == GATE_FRESHNESS_UNPROVABLE, (_label, _v)
+        assert _v["reason"], _label
+    # (f) `deciding_gate_run` and `repair_gate_conclusion` answer about the SAME run — the
+    # freshness verdict grades the recency of the exact run whose conclusion the grade reports.
+    # A second, independently-written newest-run resolution is how those two would drift.
+    _twins = [_gate_row(_752_RUN_BASE, "2026-07-26T22:25:00+01:00", 752,
+                        name=CI_GATE_DRAFT_TIER_CHECK, conclusion="failure"),
+              _gate_row(_752_TIP, "2026-07-27T20:49:47+01:00", 752)]
+    assert repair_gate_conclusion(_twins) == GATE_GREEN_MERGE_REQUIRED
+    assert deciding_gate_run(_twins)["started_at"] == "2026-07-27T20:49:47+01:00"
+    assert gate_freshness(_752_TIP, _752_TIP_AT, deciding_gate_run(_twins), 752)["state"] \
+        == GATE_FRESH
+    # ...and the older twin, had it decided, would have refused — so the newest-run resolution is
+    # doing real work here and is not incidentally agreeing.
+    assert gate_freshness(_752_TIP, _752_TIP_AT, _twins[0], 752)["state"] == GATE_STALE
+    assert deciding_gate_run("nonsense") is None and deciding_gate_run([]) is None
+    # (g) `_live_base_tip` fails CLOSED on every degradation, and reads committer.date.
+    assert _live_base_tip("o/r", "master", fetch=lambda p: {
+        "sha": _752_TIP, "commit": {"committer": {"date": _752_TIP_AT}}}) \
+        == (_752_TIP, _752_TIP_AT)
+    for _bad in (None, [], {}, {"sha": _752_TIP}, {"sha": "nope", "commit": {
+            "committer": {"date": _752_TIP_AT}}}, {"sha": _752_TIP, "commit": {"committer": 7}},
+            {"sha": _752_TIP, "commit": {"committer": {"date": 17}}}):
+        assert _live_base_tip("o/r", "master", fetch=lambda _p, d=_bad: d) == ("", ""), _bad
+    assert _live_base_tip("o/r", "", fetch=lambda _p: {}) == ("", "")
+
+    def _raise_dispatch(_p):
+        raise DispatchError("base ref unreadable")
+
+    assert _live_base_tip("o/r", "master", fetch=_raise_dispatch) == ("", "")
+    # (h) THE LIVE READING reuses the paginated, total_count-cross-checked walk: an UNPROVABLE
+    # check-run listing is `unprovable`, never a freshness claim drawn from a partial page.
+    _live_row = _gate_row(_752_TIP, "2026-07-27T20:49:47+01:00", 752)
+    _tip_fetch = (lambda _p: {"sha": _752_TIP, "commit": {"committer": {"date": _752_TIP_AT}}})
+    assert live_gate_freshness("o/r", "a" * 40, "master", False, 752,
+                               fetch=_live_fetch({CI_GATE_CHECK: [_live_row]}),
+                               base_fetch=_tip_fetch)["state"] == GATE_FRESH
+    assert live_gate_freshness("o/r", "a" * 40, "master", False, 752,
+                               fetch=_live_fetch({CI_GATE_CHECK: [_live_row]}, total_override=9),
+                               base_fetch=_tip_fetch)["state"] == GATE_FRESHNESS_UNPROVABLE
+    # A gateless head is `unprovable` too — "no gate ran here" is not evidence of freshness.
+    assert live_gate_freshness("o/r", "a" * 40, "master", False, 752,
+                               fetch=_live_fetch({}),
+                               base_fetch=_tip_fetch)["state"] == GATE_FRESHNESS_UNPROVABLE
+    # ...and the DRAFT tier is in scope for the freshness read exactly as it is for the grade,
+    # or every draft head would read "no aggregator run" and refuse forever.
+    _draft_row = _gate_row(_752_TIP, "2026-07-27T20:49:47+01:00", 752,
+                           name=CI_GATE_DRAFT_TIER_CHECK)
+    assert live_gate_freshness("o/r", "a" * 40, "master", True, 752,
+                               fetch=_live_fetch({CI_GATE_DRAFT_TIER_CHECK: [_draft_row]}),
+                               base_fetch=_tip_fetch)["state"] == GATE_FRESH
+    assert live_gate_freshness("o/r", "a" * 40, "master", False, 752,
+                               fetch=_live_fetch({CI_GATE_DRAFT_TIER_CHECK: [_draft_row]}),
+                               base_fetch=_tip_fetch)["state"] == GATE_FRESHNESS_UNPROVABLE
 
     # ---- GAP-A/B enumeration: zero-manual repair states over the same surface ----
     def status_of(status_sha, gate="success", conflicting=False, armed=False, legs=(),
