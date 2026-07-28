@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4847,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e21d28bfb6fbac2203db12175400a731fa628800",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "After seeing `prefix:`, the scanner consumes only ASCII alphanumeric, `_`, `-`, and `.`. SPARQL PN_LOCAL also permits Unicode name characters, percent escapes, and backslash-escaped PN_LOCAL_ESC characters. For an input containing a valid term such as `ex:\u00e9FLTR` or an escaped local-name character followed by `FLTR`, scanning stops inside the prefixed name; subsequent ASCII text is then treated as a bare word and may yield `FLTR -> FILTER` when some unrelated syntax error causes the canary to fail. This contradicts the public guarantee that prefixed-name local parts are data and never keyword candidates, and makes the principal precision invariant inadequately enforced.",
+    "file": "crates/sparq-terse/src/suggest.rs",
+    "fix_hint": "Skip a complete SPARQL prefixed-name/blank-node token using the grammar's PN_LOCAL character and escape rules (or reuse an existing lexer) rather than the current ASCII approximation. Add integration regressions that trigger an unrelated parse failure while valid Unicode, percent-escaped, and backslash-escaped prefixed names contain typo-shaped ASCII suffixes, asserting that no suggestion is emitted.",
+    "severity": "major",
+    "title": "Valid prefixed-name suffixes can be misclassified as keyword typos"
+   }
+  ],
+  "progress": null,
+  "summary": "The diagnostic is fail-closed and does not rewrite the query, but its scanner does not actually exclude every prefixed-name local part as claimed. Valid SPARQL prefixed names can contain characters outside the small ASCII set consumed after `:`, so an ASCII suffix inside the same RDF term can be rescanned as a bare word and produce a misleading keyword suggestion. The tests cover only simple local names and do not exercise the load-bearing lexical-boundary claim.",
+  "verdict": "request_changes"
+ }
+}
