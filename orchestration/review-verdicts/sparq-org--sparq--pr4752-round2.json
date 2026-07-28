@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4752,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "666d7aae3331b901cdbdb4f9d94f2b5e07fd0590",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 1's major fail-closed parsing defect is fixed. parse_request now distinguishes an absent source key from every present non-string value, defaults only the absent case to the body lane, and returns BAD_REQUEST for null, boolean, numeric, array, and object values. The focused regression test supplies otherwise-valid datasets, so it would exercise the former type-confusion path rather than pass vacuously. The stateful server-store path remains generation-keyed, refuses ambiguous body/server selection and unsupported ODRL/trust combinations, and its integration tests exercise the real HTTP and store-update paths. No remaining correctness, soundness, test-validity, or security issue is evident in the supplied diff.",
+  "verdict": "approve"
+ }
+}
