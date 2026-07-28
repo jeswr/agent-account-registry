@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1074,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "3e03e16b3434cc3e215b72d579e298b573b85340",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe new per-workflow pin check faithfully mirrors the existing PR-gate policy for local actions, ordinary action/reusable-workflow references, and Docker digests. It fails closed for missing, malformed, and unpinned workflows, is wired into the touched-workflow path before actionlint provisioning, and the self-tests exercise positive, negative, boundary, parser-failure, real-tree parity, and production-wiring cases. I found no correctness, soundness, test-vacuity, or security defect in the diff.",
+  "verdict": "approve"
+ }
+}
