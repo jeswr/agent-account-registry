@@ -243,7 +243,36 @@ a rolling `data/cache-affinity.json`), never in the public repos.
 `refs/acct-claims/` ref namespace — the canonical allocation record that EVERY account writer
 (the `set-up-account` broker and this manual runbook alike) must claim in before touching a
 secret or an issue. Ref creation is first-writer-wins on the server, so exactly one writer can
-ever own a number:
+ever own a number. That ref IS the mutual exclusion (#237): the secrets API is an upsert with no
+conditional create, so without it two writers running at the same moment — a manual enrolment
+racing the broker — both read the same maximum, both pick `max+1`, and the second silently
+overwrites the first's live credential.
+
+**Deriving `NN`: a successful claim does NOT prove the slot is free.** The namespace was
+introduced after the first accounts existed and is never backfilled, so every legacy slot — and
+anything written out-of-band, skipping this protocol — occupies a number with no claim ref
+behind it. Pick `NN` the way the broker's store step does, as one past the maximum of the
+COMPLETE union of all four allocation records: claim refs, `acctNN` issue titles in ANY state
+(closed and retired numbers stay permanently reserved — never recycle one), and `ACCTNN_TOKEN`
+secret names at BOTH the repository scope and the `dispatch-secrets` environment (post-#101 the
+environment is the canonical home, so a repo-scope-only look is blind to every live token).
+Every listing is `--paginate`, because a capped page silently reports an occupied slot as free;
+if any of the four fails, freeness cannot be proven — STOP rather than guess:
+
+```bash
+REPO=jeswr/agent-account-registry
+{ gh api --paginate "repos/$REPO/git/matching-refs/acct-claims/" \
+    --jq '.[].ref | select(test("^refs/acct-claims/acct[0-9]+$")) | ltrimstr("refs/acct-claims/acct")'
+  gh api --paginate "repos/$REPO/issues?state=all&per_page=100" \
+    --jq '.[] | select(has("pull_request") | not) | .title | select(test("^acct[0-9]+$")) | ltrimstr("acct")'
+  gh api --paginate "repos/$REPO/actions/secrets?per_page=100" \
+    --jq '.secrets[].name | select(test("^ACCT[0-9]+_TOKEN$")) | ltrimstr("ACCT") | rtrimstr("_TOKEN")'
+  gh api --paginate "repos/$REPO/environments/dispatch-secrets/secrets?per_page=100" \
+    --jq '.secrets[].name | select(test("^ACCT[0-9]+_TOKEN$")) | ltrimstr("ACCT") | rtrimstr("_TOKEN")'
+} | sort -n | tail -1   # NN = this number + 1 (zero-padded to two digits)
+```
+
+Then claim it — and only then write anything:
 
 ```bash
 gh api repos/jeswr/agent-account-registry/git/refs \
@@ -251,10 +280,11 @@ gh api repos/jeswr/agent-account-registry/git/refs \
   -f sha="$(gh api repos/jeswr/agent-account-registry/commits/master --jq .sha)"
 ```
 
-If this fails with `Reference already exists`, the number is taken — bump `NN` and retry. Never
-delete a claim ref: a claimed-but-unused slot is merely burned (safe), while reusing a number can
-silently overwrite a live credential (`gh secret set` is an upsert) or mint a duplicate issue
-title (GitHub does not enforce unique titles).
+If this fails with `Reference already exists`, the number is taken — bump `NN` and retry. Any
+other failure leaves the claim state unknown: STOP. Never delete a claim ref: a claimed-but-unused
+slot is merely burned (safe), while reusing a number can silently overwrite a live credential
+(`gh secret set` is an upsert) or mint a duplicate issue title (GitHub does not enforce unique
+titles).
 
 ### Step 0 — obtain a DURABLE, NON-ROTATING token (do NOT use a subscription blob)
 
@@ -326,6 +356,17 @@ accidentally write one at repo scope, recover by **deleting the stray directly**
 command below — **never** by re-running the migration workflow: post-cleanup it cannot mint
 (the bootstrap repo copies are gone by design) and there is nothing left to migrate (see the
 header of `.github/workflows/migrate-secrets-to-env.yml`).
+
+**Prove the secret is absent immediately before this write.** The claim ref excludes every
+protocol-observing writer, but not one that skipped the protocol, and `gh secret set` is an
+upsert that would overwrite a live credential leaving no trace. Only an explicit `HTTP 404` at
+BOTH scopes proves absence — if either says the secret exists, or errors so absence is unproven,
+STOP and re-derive `NN` (the broker's store step refuses on exactly this check):
+
+```bash
+gh api repos/jeswr/agent-account-registry/actions/secrets/ACCT05_TOKEN                        # must be HTTP 404
+gh api repos/jeswr/agent-account-registry/environments/dispatch-secrets/secrets/ACCT05_TOKEN  # must be HTTP 404
+```
 
 ```bash
 tr -d '[:space:]' < ~/.claude-acct5-token | gh secret set ACCT05_TOKEN -R jeswr/agent-account-registry --env dispatch-secrets
