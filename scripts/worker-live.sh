@@ -308,6 +308,19 @@ _sigpipe_shape_hits() {
 # say) cannot splice onto the next body and score a shape present in neither — defence in depth,
 # and the only property here the control fixture's count does NOT pin, because a well-formed body
 # cannot end mid-continuation in the first place.
+#
+# The exemption is SCOPE-AWARE, and asymmetrically so, because a flat "any line starting with `set`"
+# state machine is bypassable (review r1 of #924): a `set +o pipefail` sitting in a heredoc, an
+# uncalled function, a `false` branch or a subshell does NOT disable pipefail in the outer shell,
+# yet it would blank every following line and report zero for pipelines that really are vulnerable —
+# fail-OPEN, the one direction this guard must never fail in. So a DISABLE is honoured only where it
+# is provably in the body's own outermost execution scope: never inside a heredoc, and never after
+# the body has entered any nested construct (`(`/`{`/`$(…)`/if/while/for/case/function — detected
+# over-eagerly on purpose, since the cost of a missed exemption is a spurious hit someone must look
+# at, and the cost of a missed nesting is a real shape silently dropped). An ENABLE is honoured
+# WHEREVER it appears: turning the scanner back on can only ever add hits. The consequence for
+# authors is a rule, not a trap — put `set +o pipefail` at the top of the `run:` body, exactly where
+# fingerprint-accounts.yml already has it, and the region is exempt as before.
 _workflow_run_shell() {
   python3 - "$@" <<'PY'
 import re
@@ -332,6 +345,18 @@ def run_bodies(node):
 
 SET_LINE = re.compile(r"^\s*set\s+(.*)$")
 
+# A heredoc opener: `<<WORD`, `<<-'WORD'`, `<<"WORD"`. The lookarounds keep a here-STRING (`<<<`)
+# out — matching one would invent a heredoc region and (harmlessly, but noisily) stop later
+# `set +o pipefail` lines being honoured.
+HEREDOC_OPEN = re.compile(r"(?<!<)<<-?\s*(?:'([^']*)'|\"([^\"]*)\"|\\?([A-Za-z_]\w*))(?!<)")
+# Evidence that the body has entered SOME nested construct: a subshell/group/function body/`$(…)`
+# (`(`/`{`), or a compound command. Deliberately over-eager — see the scope note above the function.
+NESTED = re.compile(
+    r"[({]|(?:^|[;&|]|\s)"
+    r"(?:if|elif|else|then|fi|while|until|for|do|done|case|esac|select|function)"
+    r"(?=\s|;|$)"
+)
+
 
 def pipefail_delta(line):
     """True if this line enables pipefail, False if it disables it, None if it says nothing.
@@ -349,6 +374,17 @@ def pipefail_delta(line):
     return state
 
 
+def heredoc_delimiters(line):
+    """The delimiter word of every heredoc opened on this line, in order (`<<EOF`, `<<'EOF'` and
+    `<<"EOF"` all reduce to EOF; the quoting only decides expansion, which is not our concern)."""
+    words = []
+    for match in HEREDOC_OPEN.finditer(line):
+        word = next((group for group in match.groups() if group), "")
+        if word:
+            words.append(word)
+    return words
+
+
 out = []
 for path in sys.argv[1:]:
     try:
@@ -360,11 +396,23 @@ for path in sys.argv[1:]:
     for body in run_bodies(doc):
         out.append("#")
         pipefail = True
+        outer = True    # still provably in the body's own outermost execution scope
+        pending = []    # heredoc delimiters still open
         for line in body.splitlines():
+            in_heredoc = bool(pending)
+            if in_heredoc:
+                if line.strip() == pending[0]:
+                    pending.pop(0)
+            else:
+                pending.extend(heredoc_delimiters(line))
             delta = pipefail_delta(line)
             out.append(line if pipefail else "#")
-            if delta is not None:
-                pipefail = delta
+            if delta is True:
+                pipefail = True                                  # re-enable: honoured anywhere
+            elif delta is False and outer and not in_heredoc:
+                pipefail = False                                 # disable: only when provable
+            if in_heredoc or NESTED.search(line):
+                outer = False
 print("\n".join(out))
 PY
 }
@@ -4568,8 +4616,15 @@ PY
   # which is where enrolment decides what gets a credential. Extraction is PyYAML, so the count below
   # is over SHELL, not over YAML that happens to look like shell. The control comes first and its
   # number pins the whole chain at once — mutation-checked, each of these lands somewhere other than
-  # 4: losing the `run:` walk gives 0, dropping the pipefail state machine 6, making the exemption a
-  # whole-body skip 3, and defaulting pipefail to OFF (the fail-OPEN direction) 3.
+  # 9: losing the `run:` walk gives 0, dropping the pipefail state machine 11, making the exemption a
+  # whole-body skip 3, defaulting pipefail to OFF (the fail-OPEN direction) 8, and honouring a
+  # `set +o pipefail` in ANY scope — the flat state machine review r1 of #924 found bypassable, where
+  # a disable buried in a heredoc / an uncalled function / a `false` branch / a subshell blanks the
+  # rest of the body — gives 4, one lost hit per bypass construct. Each HALF of the scope rule is
+  # pinned on its own too: keeping the nesting latch but dropping the heredoc check gives 7, the
+  # reverse gives 6, and narrowing the heredoc delimiter regex to quoted words only gives 8. Those
+  # five bypass steps are the only rows that separate a scope-aware exemption from a scanner that
+  # any nested `set` line can switch off, which is why they are carried as data rather than trusted.
   # Each row captures the extractor's own failure into a SENTINEL rather than letting `set -e` abort
   # here: an absent PyYAML (the unprivileged model container has no pip — #824) must turn these two
   # rows red, not silently take every later row of the suite down with it. Red is the fail-closed
@@ -4578,7 +4633,7 @@ PY
   if _workflow_run_shell "$SCRIPT_DIR/fixtures/sigpipe-workflow-889.yml" > "$tmp/wf-control.txt" 2>/dev/null
   then wf_control=$(_sigpipe_shape_hits "$tmp/wf-control.txt"); else wf_control=extractor-unavailable; fi
   chk "the workflow \`run:\` extractor finds the shapes in pipefail-ON shell and exempts only the rest (control)" \
-    "$wf_control" "4"
+    "$wf_control" "9"
   # ...and an unparseable workflow REFUSES rather than contributing a comfortable zero: a file the
   # scanner cannot read is unverified, which is exactly the state this guard exists to reject.
   # An unterminated flow mapping — invalid at EOF under any conforming YAML parser, so this row

@@ -3,10 +3,12 @@
 # it AND the "zero hits across .github/workflows/*.yml" assertion needs no exemption for its own
 # evidence — the same rule sigpipe-shapes-879.txt / sigpipe-repro-879.bash follow for scripts/*.sh.
 #
-# It carries FOUR countable `producer | early-exiting consumer` shapes in pipefail-ON shell and TWO
-# that must NOT be counted because pipefail is off where they sit. worker-live.sh asserts the exact
-# total, which pins BOTH directions at once: an extractor that returned nothing (or that lost the
-# `run:` walk entirely) undercounts, and one that dropped the pipefail state machine overcounts.
+# It carries NINE countable `producer | early-exiting consumer` shapes in pipefail-ON shell — four
+# in plainly-scoped bodies and five behind a `set +o pipefail` that does not actually apply to them
+# — and TWO that must NOT be counted because pipefail really is off where they sit. worker-live.sh
+# asserts the exact total, which pins BOTH directions at once: an extractor that returned nothing
+# (or that lost the `run:` walk entirely) undercounts, and one that dropped the pipefail state
+# machine overcounts.
 name: sigpipe shape control (not a real workflow)
 on: workflow_dispatch
 jobs:
@@ -42,4 +44,59 @@ jobs:
           set +o pipefail
           tolerated=$(printf 'a\nb\n' | head -1)
           set -o pipefail
+          counted=$(printf 'a\nb\n' | head -1)
+
+      # --- BYPASS CONTROLS (review r1 of #924). Each of the five steps below contains a
+      # `set +o pipefail` that does NOT disable pipefail for the outer shell — it is text in a
+      # heredoc, or it is scoped to a construct that never runs / never leaks its options out — and
+      # then an outer pipeline that IS vulnerable. Every one of those outer pipelines must be
+      # counted (5). Under a flat "any line starting with `set`" state machine all five scored 0,
+      # which is the fail-OPEN direction: real 141-class shapes reported as clean. ---
+
+      # (a) heredoc: the `set` line is DATA being written to another file. QUOTED and UNQUOTED
+      # delimiters are separate steps, not two heredocs in one, because each body resets the scope
+      # state — sharing a step would leave the second form scored by the first one's latch and its
+      # branch of the delimiter regex would then be free to be wrong.
+      - name: disable buried in a quoted-delimiter heredoc
+        run: |
+          set -euo pipefail
+          cat <<'INNER' > /tmp/inner.sh
+          set +o pipefail
+          INNER
+          counted=$(printf 'a\nb\n' | head -1)
+
+      - name: disable buried in an unquoted-delimiter heredoc
+        run: |
+          set -euo pipefail
+          cat <<INNER > /tmp/inner.sh
+          set +o pipefail
+          INNER
+          counted=$(printf 'a\nb\n' | head -1)
+
+      # (b) function body that is never called (and would not leak its options if it were, until
+      # called — the point is that the definition alone changes nothing).
+      - name: disable inside an uncalled function
+        run: |
+          set -euo pipefail
+          never_called() {
+            set +o pipefail
+          }
+          counted=$(printf 'a\nb\n' | head -1)
+
+      # (c) a branch that does not execute.
+      - name: disable inside a false conditional
+        run: |
+          set -euo pipefail
+          if false; then
+            set +o pipefail
+          fi
+          counted=$(printf 'a\nb\n' | head -1)
+
+      # (d) a subshell: `set` in a subshell is local to it and never reaches the parent.
+      - name: disable inside a subshell
+        run: |
+          set -euo pipefail
+          (
+            set +o pipefail
+          )
           counted=$(printf 'a\nb\n' | head -1)
