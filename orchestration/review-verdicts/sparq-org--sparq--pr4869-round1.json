@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4869,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "96bf7e66bf6b8721a14e43d7706e1242d1ef19dc",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The pretest guard correctly checks for the built distribution, discovers static package imports across JavaScript test files, resolves them from the same package hierarchy used by the tests, and distinguishes missing manifest dependencies from workspace-provided test dependencies. The package script and README instructions are consistent with the guard's behavior. No correctness, soundness, test-validity, or security issue is evident in the diff.",
+  "verdict": "approve"
+ }
+}
