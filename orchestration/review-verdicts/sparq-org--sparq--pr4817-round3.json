@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4817,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "0aa059daace6fb2b4dd15b52df099c2b04a606e4",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "The documentation-only change is accurate and appropriately scoped. Commit f85d0180 exists on origin/sq-p6p6-adaptive-replan-local and is not an ancestor of main; it contains the default-off adaptive-replan-local feature, the non-vacuous replan_result_equals_static oracle, and the in-process benchmark. The text now correctly states that sparq-replan-policy was consumed only by the local evaluator while the federated planner retained its richer latency-aware policy, so convergence and drift prevention remain outstanding. research/adaptive-replan-local-evaluator.md \u00a72.2 supports the narrower performance conclusion: the headline fixture had no pruning arm, while collapse_graph had one but only printed rather than asserted its switch count. No correctness, soundness, security, test-validity, or injection issue is present. Round 2 also had no findings, so progress is stagnant under the required comparison scale.",
+  "verdict": "approve"
+ }
+}
