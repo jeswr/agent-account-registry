@@ -3811,21 +3811,32 @@ def _live_repair_gate(repo, head_sha, draft, fetch=None):
 #       LAGS rather than leads — it errs toward calling a fresh gate stale (refuse: safe), not
 #       toward calling a stale gate fresh.
 #
-#   (2) TEMPORAL, WITH A MARGIN — the deciding run STARTED at least
-#       GATE_FRESHNESS_MARGIN_SECONDS after the base tip's commit date. This is the backstop for
-#       the one way (1) could go quiet: if GitHub ever recomputed that field live, (1) would
-#       become vacuously true and stop refusing anything. `started_at` — never `completed_at`:
-#       a run that started BEFORE the tip landed cannot have composed it, whereas `completed_at`
-#       admits exactly the #752 shape (a ~100s gate that starts before a merge and finishes
-#       after it).
+#   (2) TEMPORAL — a CONTRADICTION DETECTOR, not a lag bound. The deciding run must have STARTED
+#       strictly AFTER the base tip's commit date. This is the backstop for the one way (1) could
+#       go quiet: if GitHub ever recomputed that field live, (1) would become vacuously true and
+#       stop refusing anything — but a run that started before the tip existed still could not
+#       have composed it, so the blatant form of that lie is caught here. `started_at` — never
+#       `completed_at`: `completed_at` admits exactly the #752 shape (a ~100s gate that starts
+#       before a merge and finishes after it).
 #
-# THE MARGIN IS 300s, AND IT IS A BOUND, NOT A PROOF. It has to exceed GitHub's base-attribution
-# lag, measured once here at 153s; 300s is ~2x that with headroom, and small against the observed
-# master cadence (~14 merges in a night). It cannot be proven sufficient in general — a DIRECT
-# push to master (which this repo's ruleset still permits) carries the pusher's local commit
-# date, which may precede the landing instant without bound. That is exactly why (1) is the
-# BINDING test and (2) only a backstop, and why they are conjunctive: FRESH requires both, so the
-# verdict is never weaker than the stronger of the two.
+# THE MARGIN IS 1s — ONE SECOND, THE API'S TIMESTAMP RESOLUTION — AND THAT NUMBER IS A RETRACTION.
+# It was first written as 300s, chosen to exceed the 153s base-attribution lag measured above. The
+# very first live application of the finished guard refused ITS OWN PR (registry #950, gap +281s):
+# the run's recorded base was EXACTLY the tip, so by (1) it provably composed that tip, and only
+# the margin refused it. That refusal is not self-clearing — both operands are frozen — and it
+# would have told an operator to move a head that did not need moving. A margin sized to the lag
+# is insurance against the field lying FORWARD; the field was measured lagging (153s) twice and
+# never leading, so the insurance was priced against an unmeasured hazard and paid for with
+# measured false refusals. Reduced to the smallest value that still expresses "strictly after".
+#
+# THE RESIDUAL, NAMED. If GitHub ever starts live-recomputing `pull_requests[].base.sha`, a run
+# that started after the tip landed but composed an older base reads FRESH here. That is the one
+# hole this pair does not close; it is contrary to both measurements, and the same-head axis below
+# plus the latch's own wait on the required `gate` are what remain behind it. A DIRECT push to
+# master (which this repo's ruleset still permits) is the other unbounded case — it carries the
+# pusher's local commit date, which may precede the landing instant without bound. Both are why
+# (1) is the BINDING test and (2) only a backstop, and why they are conjunctive: FRESH requires
+# both, so the verdict is never weaker than the stronger of the two.
 #
 # EVERY UNRESOLVABLE OPERAND REFUSES. No base tip sha, no parseable base tip date, no aggregator
 # row, no parseable `started_at`, no recorded base sha for THIS pull request — each yields
@@ -3948,7 +3959,7 @@ GATE_FRESH = "fresh"
 GATE_STALE = "stale"
 GATE_FRESHNESS_UNPROVABLE = "unprovable"
 GATE_FRESHNESS_STATES = (GATE_FRESH, GATE_STALE, GATE_FRESHNESS_UNPROVABLE)
-GATE_FRESHNESS_MARGIN_SECONDS = 300
+GATE_FRESHNESS_MARGIN_SECONDS = 1
 
 
 def gate_freshness(base_tip_sha, base_tip_at, gate_run, pr_number,
@@ -4002,9 +4013,9 @@ def gate_freshness(base_tip_sha, base_tip_at, gate_run, pr_number,
     # before the tip landed (plus the lag margin) cannot have composed it.
     if verdict["gap_seconds"] < margin_seconds:
         verdict["state"] = GATE_STALE
-        verdict["reason"] = (f"the gate started {verdict['gap_seconds']}s after the base tip's "
-                             f"commit date, inside the {margin_seconds}s base-attribution "
-                             "margin — it cannot be proven to have composed that tip")
+        verdict["reason"] = (f"the gate started {verdict['gap_seconds']}s relative to the base "
+                             "tip's commit date — it did not start strictly after that tip "
+                             f"landed (margin {margin_seconds}s), so it cannot have composed it")
         return verdict
     verdict["state"] = GATE_FRESH
     verdict["reason"] = (f"the gate graded the current base tip {base_tip_sha[:12]} and started "
@@ -12732,12 +12743,24 @@ def _self_test():
                                        752)
     assert _clock_says_fresh["state"] == GATE_STALE, _clock_says_fresh
     assert _clock_says_fresh["gap_seconds"] == 36000, _clock_says_fresh
-    #   (d2) temporal alone refuses a run whose recorded base MATCHES but which started inside
-    #        the measured base-attribution lag. Deleting the margin compare passes this fixture.
-    _inside_margin = gate_freshness(_752_TIP, _752_TIP_AT,
-                                    _gate_row(_752_TIP, "2026-07-27T19:51:47+01:00", 752), 752)
-    assert _inside_margin["state"] == GATE_STALE, _inside_margin
-    assert _inside_margin["gap_seconds"] == 120 < GATE_FRESHNESS_MARGIN_SECONDS, _inside_margin
+    #   (d2) temporal alone refuses a CONTRADICTION: a run whose recorded base matches the tip
+    #        but which STARTED BEFORE that tip existed. That is what a structural field lying
+    #        FORWARD would look like, and it is the only thing this conjunct is for. Deleting the
+    #        temporal compare passes this fixture.
+    #        NOTE the fixture 118s BELOW is the retraction's evidence: a 300s margin refused this
+    #        exact shape with the sign the other way (recorded base == tip, run started AFTER it),
+    #        which is a provably-fresh gate. See the margin block for why that cost was rejected.
+    _contradiction = gate_freshness(_752_TIP, _752_TIP_AT,
+                                    _gate_row(_752_TIP, "2026-07-27T19:47:47+01:00", 752), 752)
+    assert _contradiction["state"] == GATE_STALE, _contradiction
+    assert _contradiction["gap_seconds"] == -120, _contradiction
+    #        ...and the retracted-margin case: recorded base == tip, run started 118s AFTER it.
+    #        A 300s margin called this STALE (it is what refused registry #950 at +281s); by (1)
+    #        the run provably composed that tip, so FRESH is the correct answer.
+    _just_after = gate_freshness(_752_TIP, _752_TIP_AT,
+                                 _gate_row(_752_TIP, "2026-07-27T19:51:45+01:00", 752), 752)
+    assert _just_after["state"] == GATE_FRESH, _just_after
+    assert _just_after["gap_seconds"] == 118, _just_after
     #   (d3) THE `completed_at` TRAP, which is why this predicate reads `started_at`. A gate that
     #        STARTED 107s before the tip landed and FINISHED 313s after it — the #752 shape, a
     #        ~100s gate straddling a merge. Its recorded base already matches, so only the
@@ -12753,12 +12776,15 @@ def _self_test():
     assert gate_freshness(_752_TIP, _752_TIP_AT,
                           _gate_row(_752_TIP, _straddle["completed_at"], 752),
                           752)["state"] == GATE_FRESH
-    # ...and the margin boundary itself is INCLUSIVE at exactly 300s (pins the constant, so a
-    # silent widening to 0 or a narrowing to an hour both show up here).
+    # ...and the boundary itself: exactly ONE second after the tip is FRESH, exactly ZERO
+    # (the same instant) is not. This pins the constant, so a silent re-widening to a lag-sized
+    # margin — the thing that was retracted — shows up here rather than as quiet extra refusals.
     assert gate_freshness(_752_TIP, _752_TIP_AT,
-                          _gate_row(_752_TIP, "2026-07-27T19:54:47+01:00", 752),
+                          _gate_row(_752_TIP, "2026-07-27T19:49:48+01:00", 752),
                           752)["state"] == GATE_FRESH
-    assert GATE_FRESHNESS_MARGIN_SECONDS == 300
+    assert gate_freshness(_752_TIP, _752_TIP_AT,
+                          _gate_row(_752_TIP, _752_TIP_AT, 752), 752)["state"] == GATE_STALE
+    assert GATE_FRESHNESS_MARGIN_SECONDS == 1
     # (e) EVERY UNRESOLVABLE OPERAND REFUSES — and refuses as `unprovable`, distinguishably from
     # a proven-stale gate, because "GitHub is degraded" and "the base moved" want different
     # operator responses. Never `fresh`: assuming freshness on an unreadable operand is silence
