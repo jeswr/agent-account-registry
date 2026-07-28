@@ -6,47 +6,49 @@
 issues for which `curate-frontier.derive_area` returns no area. `area:` is the one label neither
 the curator nor `triage.triage()` can manufacture, so the alert asks whether it could be derived.
 
-**Answer: it already is, at 92.5% precision on held-out data, and no additional signal clears that
+**Answer: it already is, at 92.6% precision on held-out data, and no additional signal clears that
 bar — though the margin over the best rival is not statistically separated.** The residual is not a
 missing rule; it is the class of issues that genuinely span several surfaces.
 
 ## What was measured
 
-Ground truth is this repository's issues carrying **exactly one** `area:*` label (n=576, open and
-closed, at the 2026-07-28T13:07:14Z snapshot). The shipped deriver was evaluated with the area
-labels **stripped from its input**, otherwise it answers `"existing"` and measures nothing.
+Ground truth is this repository's issues carrying **exactly one** `area:*` label, measured at the
+instant `2026-07-28T13:07:14Z`: **n=556**, open and closed. The shipped deriver was evaluated with
+the area labels **stripped from its input**, otherwise it answers `"existing"` and measures nothing.
 
-An earlier draft of this record put the corpus at **n=556**. That count could not be reproduced
-against the snapshot above and is corrected here; every *rate* in this record (186 fires, 173
-correct, 93.0%) re-derives unchanged, because the discrepancy is entirely in rows on which the
-deriver declines. Counts in this record are reproducible by re-running the shipped `derive_area`
-over the issue list and the `LabeledEvent` timeline — do that rather than carrying a figure
-forward, which is how the 556 survived.
+> **Every count in this record is `measured-at 2026-07-28T13:07:14Z`.** A snapshot-pinned count is a
+> function of *(data, instant)*, so re-running the derivation reproduces it only if the label
+> timeline is **rewound to that instant** — replay `labeled`/`unlabeled` events backwards from the
+> current state. Re-running against *live* labels answers a different question and will not match:
+> a 28-second burst at `13:24:06Z–13:24:34Z` added 20 rows, all of which the deriver declines, so a
+> live re-run silently returns `n=576` with **every rate identical** — which reads exactly like
+> corroboration and is not. If you restate the instant, restate every dependent figure with it.
 
 **The corpus is partly self-graded, and the headline figure must be read on the hold-out.**
 `curate-frontier` writes its own derived area back when it stages an issue (`desired = (…, area)`
 → `gh issue edit --add-label`), so some ground-truth labels were authored by the rule being
 graded. Measured, not assumed: exactly two identities have ever applied an `area:*` label here —
-`jeswr` (529 events) and the curator App bot `sparq-orchestrator` (50 events) — and `derive_area`
-has exactly one mutating caller, so bot-authored ⇔ curator-authored. **38 of the 186 firing rows
+`jeswr` and the curator App bot `sparq-orchestrator[bot]` — and `derive_area` has exactly one
+mutating caller, so bot-authored ⇔ curator-authored. Of the 556 corpus rows, **506 carry a
+`jeswr`-applied area label and 50 a curator-applied one; none is unattributed**. **38 of the 186 firing rows
 (20.4%) are self-graded.** The contamination behaves exactly as circularity predicts: of the
 curator-authored rows written *after* the current rule landed (`6bea6cc2b`), 27 of 28 fire and
 **27/27 are "correct"** — the rule agreeing with itself.
 
 | signal | fires | precision | source |
 |---|---|---|---|
-| **shipped `derive_area`, HELD OUT** (curator-authored rows removed; n=523) | **147** | **92.5%** (136/147) | this record |
-| shipped `derive_area`, full corpus (self-graded rows included; n=576) | 186 | 93.0% (173/186) | this record |
+| **shipped `derive_area`, HELD OUT** (curator-authored rows removed; n=506) | **148** | **92.6%** (137/148) | this record |
+| shipped `derive_area`, full corpus (self-graded rows included; n=556) | 186 | 93.0% (173/186) | this record |
 | — of which, self-graded subset only (n=50) | 38 | 94.7% (36/38) | this record |
 | parent-issue inheritance via the `sparq-followup` provenance link | 239 | **56.1%** | this record |
 | declared file→area map, as a marginal fallback on the 370 declines | 38 (10.3% of declines) | **86.8%** (33/38) | this record |
 | body+title token scan | — | 40.0–50.0% | #809, recorded in `derive_area` |
 | directory path hints | 145 | 37.9% combined, **12.9% on this repository** | #809, removed |
 
-Removing every self-graded row costs 0.5pp, so the **decline conclusion survives** — but the
-comparison it rests on was never statistically separated: 136/147 vs 33/38 is Fisher two-sided
-**p = 0.33**, and the held-out 95% Wilson interval (87.1–95.8%) clears the file map's 86.8% by
-0.3pp. "No rival clears the bar" is accurate; "the shipped rule is measurably better" is not.
+Removing every self-graded row costs 0.4pp, so the **decline conclusion survives** — but the
+comparison it rests on was never statistically separated: 137/148 vs 33/38 is Fisher two-sided
+**p = 0.33**, and the held-out 95% Wilson interval (87.2–95.8%) clears the file map's 86.8% by
+0.4pp. "No rival clears the bar" is accurate; "the shipped rule is measurably better" is not.
 
 ### The hold-out is the control this record originally had
 
@@ -54,17 +56,16 @@ The `derive_area` comment block records the #809 measurement against *"the held-
 curator did NOT itself stage"*. An earlier draft of this record dropped that control and asserted
 non-circularity instead. That sentence was wrong, and the number it defended was inflated.
 
-### Two provenance caveats on the ground truth itself
+### One provenance caveat on the ground truth itself
 
-1. **It is dominated by one recent bulk pass.** 315 of the 523 `jeswr`-authored area labels (60%)
-   were applied in scripted bursts on 2026-07-28 — 291 inside a single 45-minute window, ~2.5h
-   before this snapshot — and the corpus more than doubled (261 → 576) in it. That backfill is
-   legitimately held out (`derive_area` was byte-identical throughout and its firing rows there
-   disagree 9 times, which self-graded rows cannot), but it is a bulk labelling pass of unstated
-   provenance, not accumulated independent judgment. The era split is visible: rows written before
-   the rule landed agree at 97.4% (76/78); the backfill agrees at 87.0% (60/69).
-2. **3 issues carry an area label with no `labeled` event at all** (#571, #588, #589 — labels
-   applied at creation emit none). They are reported as UNKNOWN, never folded into either side.
+**It is dominated by one recent bulk pass.** 298 of the 506 held-out rows (59%) had their area
+label applied on 2026-07-28, in scripted bursts — 300 `jeswr` area-label events across 297 distinct
+issues inside a single 45-minute window (`10:05:15Z–10:42:59Z`), ~2.5h before this snapshot — and
+the corpus more than doubled (261 → 556) in it. That backfill is legitimately held out
+(`derive_area` was byte-identical throughout and its firing rows there disagree 9 times, which
+self-graded rows cannot), but it is a bulk labelling pass of unstated provenance, not accumulated
+independent judgment. The era split is visible: rows labelled before the rule landed agree at
+97.4% (76/78); the backfill agrees at 87.1% (61/70).
 
 ### The aggregate hides a branch that fails the record's own test
 
@@ -72,10 +73,10 @@ Split per rule on held-out rows only:
 
 | branch | held-out | self-graded |
 |---|---|---|
-| title topic prefix names a declared area | **104/106 = 98.1%** | 21/21 = 100.0% |
+| title topic prefix names a declared area | **105/107 = 98.1%** | 21/21 = 100.0% |
 | gated title scan | **32/41 = 78.0%** | 15/17 = 88.2% |
 
-The 92.5% aggregate is carried entirely by the topic-prefix branch. The gated title-scan branch
+The 92.6% aggregate is carried entirely by the topic-prefix branch. The gated title-scan branch
 sits at **78.0%** — *below* the 86.8% file→area map this record rejects for being "below the rule
 it would extend". Applied per-branch, that argument rejects the title-scan branch too. (n=41,
 p=0.38 vs the map, so this is a direction to investigate, not a settled result; 9 of the 11
@@ -99,7 +100,7 @@ dispatch work". Inheriting would have mislabelled both.
 ### The declared file map does not pay for itself
 
 Built only from the `area:*` labels' own descriptions (an independent source from the issue
-corpus), it reaches 86.8% (33/38) — **below** the 92.5% held-out rule it would extend, though as
+corpus), it reaches 86.8% (33/38) — **below** the 92.6% held-out rule it would extend, though as
 noted above that gap is not statistically separated (p = 0.33) — while covering just 10.3% of
 declines. 3 of its 5 errors share one shape: the title names a file (`worker-live.sh`) but the work
 is toolchain (`area:ci`). Naming a file is not the same claim as the work living in that surface,
