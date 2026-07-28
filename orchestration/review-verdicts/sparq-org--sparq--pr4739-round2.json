@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4739,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b174f5fa5d6055ef2eefec27c6c15252336f2958",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The document still records a provably terminating huge ACIR loop that can hang without a diagnostic, two ACIR bailout paths that discard source locations, a stale mem2reg ordering comment, and a changelog overclaim. Section 6 explains why unmeasured optimization hypotheses were not promoted to beads, but these four findings are independent correctness, diagnostics, and documentation work and remain without durable task-graph references. This is materially the same major issue reported in round 1.",
+    "file": "research/noir-optimization-new-opportunities.md",
+    "fix_hint": "Create appropriately scoped bead(s) for these four independent follow-ups and cite their IDs at the relevant findings, or explicitly establish that each is non-actionable and remove its future-work framing. Keep the eight optimization candidate specs gated on measurement as currently documented.",
+    "severity": "major",
+    "title": "Independent actionable findings remain untracked"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 2 is stagnant. The prior major finding remains: the new research record still identifies actionable independent follow-ups (the runaway-unroll hang, two lost source locations, the stale mem2reg ordering comment, and the changelog overclaim) without citing durable bead IDs or removing them as non-actionable. The explicit decision not to create beads is justified only for the eight unmeasured optimization candidates whose promotion gate was not met; it does not cover these separate correctness, diagnostics, and documentation findings. Under the repository's task-tracking contract, leaving those findings solely in Markdown is incomplete.",
+  "verdict": "request_changes"
+ }
+}
