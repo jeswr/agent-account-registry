@@ -13,6 +13,7 @@ dispatch-stall-alert.py
 dispatch-tick-floor.py
 gh_retry.py
 grant-account.py
+grant-scope-audit.py
 groom-alert.py
 groom.py
 lease_schema.py
