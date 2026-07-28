@@ -38,9 +38,25 @@ move, a trust surface with a live blocking finding. Re-admissions are counted wi
 counter that bounds automatic re-admission everywhere else
 (worker-pr.auto_readmission_marker_count against park_policy.AUTO_READMISSION_MAX), so the two can
 never drift and this can never become a treadmill: past the cap the PR stays human, permanently.
+The ONE exception is an unfinished transaction OF THIS SWEEP'S OWN (`incomplete_readmission`): a
+receipt whose writes never reached the commit has ALREADY spent its slot, so refusing to finish it
+leaves the PR stranded one write short of done while the cap counts the very receipt that stranded
+it. Finishing grants no budget and posts no second receipt, and it is allowed only on proof that
+the still-live hold PREDATES the receipt — a hold applied after it is a NEW park and the cap
+stands, so the exception cannot become the treadmill the cap exists to prevent.
 Because the granted window is a MACHINE window, registry #797's window-authority attribution
 charges it to the MACHINE ladder — a PR that fails its adjudicated round lands on the machine
 terminal (retire, hand the issue back for decomposition), never back in the maintainer's inbox.
+
+WHO COUNTS AS HUMAN IS THE SHARED DEFINITION, NOT A LOGIN. Every ownership decision runs the
+strict collaborator-permission probe (`MaintainerProbe` -> park_policy.probe_maintainer:
+permission in {admin, maintain, write}) that worker-pr / dispatch-claim / groom / curate-frontier
+already run. An equality test against one configured handle would call every OTHER authorized
+maintainer a machine — and this sweep DELETES holds it believes a machine applied, so that is a
+licence to erase a second maintainer's gesture. And because label_application_machine_owned reads
+"unverifiable actor" as MACHINE, a probe call that cannot COMPLETE is remembered and refuses here
+(`hold_machine_owned`): everywhere else that direction only suppresses a veto, but here it would
+authorise a delete.
 
 DRY-RUN IS THE DEFAULT. `--apply` is required to write anything.
 
@@ -172,7 +188,7 @@ def _quiet(*_args, **_kwargs):
 
 def admission(*, pr_labels, issue_labels, park_records, park_marker_present, bot_bodies,
               hold_applied_by_human, hold_restored, issue_hold_machine_owned, rounds_recorded,
-              readmissions_spent, trust_surface, blocking_findings):
+              readmissions_spent, readmission_in_flight, trust_surface, blocking_findings):
     """PURE. (disposition, reason, detail) — may this PR re-enter the review loop?
 
     `disposition` is a member of DISPOSITIONS and `reason` is a key of ADJUDICATION_REASONS whose
@@ -182,8 +198,11 @@ def admission(*, pr_labels, issue_labels, park_records, park_marker_present, bot
     Every refusal is a REFUSAL CONDITION: anything unproven leaves the PR exactly where it is.
     The caller MUST fail closed on each probe it cannot complete — `hold_applied_by_human=True`
     when the timeline is unreadable, `issue_hold_machine_owned=False` when the issue's label
-    ownership is unprovable, `trust_surface=True` when the keyword union cannot be loaded, and
-    `blocking_findings=None` when the last verdict record cannot be read.
+    ownership is unprovable, `trust_surface=True` when the keyword union cannot be loaded,
+    `blocking_findings=None` when the last verdict record cannot be read, and
+    `readmission_in_flight=False` on every unknown, because that one flag is the only input here
+    that can WIDEN an outcome rather than narrow it (`incomplete_readmission` owns that proof and
+    returns False for every ambiguity).
 
     `park_records` is park_policy.park_reason_records output (oldest first, bot-authored only);
     `park_marker_present` is whether the BOT's history contains a raw PARK_REASON_MARKER at all,
@@ -254,8 +273,16 @@ def admission(*, pr_labels, issue_labels, park_records, park_marker_present, bot
         return out("machine-park-live", f" ({'/'.join(sorted(machine_parks))})")
     if park_policy.HUMAN_PARK_LABEL in set(issue_labels or []) and not issue_hold_machine_owned:
         return out("issue-hold-human")
+    # THE CAP, and its ONE exception. A corrupt counter always refuses. A counter AT the cap
+    # refuses too — UNLESS this sweep's own previous transaction for this head provably never
+    # reached its commit (`readmission_in_flight`, from `incomplete_readmission`). That receipt
+    # already spent the slot it is being charged for, and FINISHING it posts no second receipt and
+    # grants no second window (`readmission_writes` plans no comment once the marker exists), so
+    # refusing here does not conserve budget — it just strands the PR one write short of done,
+    # forever, on the strength of the receipt that stranded it.
     if not isinstance(readmissions_spent, int) or isinstance(readmissions_spent, bool) \
-            or readmissions_spent >= park_policy.AUTO_READMISSION_MAX:
+            or (readmissions_spent >= park_policy.AUTO_READMISSION_MAX
+                and not readmission_in_flight):
         return out("readmissions-spent",
                    f" ({readmissions_spent} of {park_policy.AUTO_READMISSION_MAX} spent)")
     if not isinstance(rounds_recorded, int) or isinstance(rounds_recorded, bool) \
@@ -373,6 +400,66 @@ def readmission_writes(*, pr_labels, issue_labels, recorded, issue_hold_machine_
         writes.append("clear-issue-hold")
     writes.append("delete-hold")
     return tuple(writes)
+
+
+def newest_label_application(events, label):
+    """PURE. The newest `labeled` instant for EXACTLY `label` in a timeline, or None.
+
+    None means UNKNOWN — an unreadable timeline, a malformed event, a stamp that will not parse,
+    or simply no application at all — and every consumer must read it as a refusal rather than as
+    "the hold is old". `unlabeled` events are ignored on purpose: this answers "when was the hold
+    that is live NOW put there", which is the question a re-application after a receipt changes."""
+    newest = None
+    try:
+        for event in events if isinstance(events, list) else []:
+            if not isinstance(event, dict) or event.get("event") != "labeled":
+                continue
+            if (event.get("label") or {}).get("name") != label:
+                continue
+            instant = park_policy.parse_ts(event.get("created_at"))
+            if newest is None or instant > newest:
+                newest = instant
+    except Exception:  # noqa: BLE001 — a malformed timeline proves nothing
+        return None
+    return newest
+
+
+def incomplete_readmission(*, recorded, receipt_stamps, hold_applied_at):
+    """PURE. True when THIS head carries a re-admission of this sweep's own whose transaction
+    provably NEVER COMMITTED, and which must therefore be finished rather than charged again
+    against AUTO_READMISSION_MAX. This is the ONLY input to `admission` that can widen an
+    outcome, so every unknown returns False and leaves the cap in force.
+
+    THE PROOF is an ordering, because the labels cannot tell the two states apart. A transaction
+    that died before its commit and a COMPLETED transaction whose PR the review lane later
+    re-parked look identical live: the hold is on, `review:needs` is off. What separates them is
+    WHICH APPLICATION of the hold is live. The commit is the DELETE of the hold, so:
+
+      - receipt written AFTER the live application  -> that application is the one the receipt was
+        written against, it is still there, so the delete never happened: IN FLIGHT.
+      - live application written AFTER the receipt   -> the delete DID happen and something parked
+        the PR again. That is a NEW park, the cap owns it, and re-admitting on the strength of an
+        old receipt would be an unbounded treadmill at a fixed head.
+
+    A same-instant tie refuses: GitHub stamps are second-resolution and cannot order that race.
+
+    `recorded` is whether the head also carries this sweep's own RETURN_TO_LOOP adjudication
+    marker. Both halves live in ONE comment (`readmission_body`), so requiring both is not
+    belt-and-braces: it is what makes "reconciling spends nothing" STRUCTURAL, since the marker is
+    exactly what makes `readmission_writes` plan no second `comment`."""
+    if not recorded or hold_applied_at is None:
+        return False
+    newest = None
+    for stamp in receipt_stamps or []:
+        try:
+            instant = park_policy.parse_ts(stamp)
+        except Exception:  # noqa: BLE001 — an unreadable receipt time proves nothing
+            return False
+        if newest is None or instant > newest:
+            newest = instant
+    if newest is None:
+        return False
+    return newest > hold_applied_at
 
 
 def clear_hold_with_repair(*, machine_owned_now, delete, restore):
@@ -522,6 +609,77 @@ def restored_hold_body(surface, head, episode):
         f"{adjudication_marker(GENUINELY_HUMAN, 'hold-restored', head, episode)}")
 
 
+class MaintainerProbe:
+    """The SHARED strict human test, bound to this sweep's target token — plus the one extra
+    fail-closed direction this call site needs.
+
+    WHO IS HUMAN. A repo COLLABORATOR whose permission is in
+    park_policy.HUMAN_MAINTAINER_PERMISSIONS ({admin, maintain, write}), decided by the shared
+    park_policy.probe_maintainer wrapper exactly as worker-pr._is_human_maintainer,
+    dispatch-claim._target_is_human_maintainer, groom, curate-frontier and resolve-conflicts all
+    decide it. It is deliberately NOT an equality test against a configured handle: this sweep
+    DELETES holds it believes a machine applied, so a human set narrower than the policy's is a
+    licence to erase any OTHER authorized maintainer's hold on both the PR and its source issue.
+
+    WHY THE `unverified` FLAG. Everywhere else the shared probe is consulted, "unverifiable actor
+    -> not human" is the SAFE direction: it suppresses a veto or a budget window. Here it is the
+    DANGEROUS one, because park_policy.label_application_machine_owned returns `not newest_human`
+    — so a probe outage would silently promote every human-applied hold to "machine-applied" and
+    authorise its DELETE. A probe call that could not complete is therefore remembered here, and
+    `hold_machine_owned` refuses on it.
+
+    A FAILURE IS NEVER CACHED. Caching it would answer the NEXT decision from the cache without
+    re-raising, and `unverified` would read clean for a login that is still unverifiable — the
+    fail-closed flag would hold for one decision and silently lapse for every later one."""
+
+    def __init__(self, repo, read_permission, log=print):
+        self.repo = repo
+        self.unverified = False
+        self._read = read_permission
+        self._log = log
+        self._cache = {}
+
+    def reset(self):
+        """Begin a new ownership decision: `unverified` describes THAT decision only, so one
+        PR's probe outage never freezes the rest of the sweep."""
+        self.unverified = False
+
+    def __call__(self, login):
+        if login in self._cache:
+            return self._cache[login]
+        failures = []
+
+        def read_permission(probe_login):
+            try:
+                return self._read(probe_login)
+            except Exception:
+                failures.append(probe_login)  # remembered here, then re-raised so the shared
+                raise                         # wrapper still logs it and still yields not-human
+
+        human = park_policy.probe_maintainer(self.repo, login, read_permission, log=self._log)
+        if failures:
+            self.unverified = True
+            return False
+        self._cache[login] = human
+        return human
+
+
+def hold_machine_owned(repo, number, label, fetch_events, probe, log=_quiet):
+    """park_policy.label_application_machine_owned for a hold this sweep may DELETE, with the one
+    extra refusal that authority demands: ownership is proven only when the shared helper says
+    MACHINE **and** every collaborator-permission probe it consulted actually COMPLETED (see
+    MaintainerProbe). Any exception at all is False — an unreadable answer proves nothing, and
+    only a PROOF of machine ownership may authorise removing a human-owned label."""
+    probe.reset()
+    try:
+        owned = park_policy.label_application_machine_owned(
+            repo, number, label, fetch_events, is_human=probe, log=log)
+    except Exception as exc:  # noqa: BLE001 — an unreadable answer proves nothing
+        log(f"hold ownership unknown for {repo}#{number} {label!r} ({exc}); not clearable")
+        return False
+    return bool(owned) and not probe.unverified
+
+
 def _gh(args, token=None, check=True):
     env = dict(os.environ)
     if token:
@@ -554,21 +712,39 @@ def _label_names(container):
             if isinstance(label, dict) and isinstance(label.get("name"), str)]
 
 
-def _hold_machine_owned_now(repo, number, label, is_human, token):
+def _collaborator_permission(repo, login, token):
+    """The TARGET repo's collaborator permission for `login`, read under the per-repo App token
+    (the same read dispatch-claim._target_is_human_maintainer takes), or None for a clean 404 —
+    "not a collaborator" is an ANSWER, not an outage. Every other failure RAISES, because
+    park_policy.probe_maintainer must be able to tell an unverifiable actor apart from a verified
+    non-maintainer: the first refuses this sweep, the second does not."""
+    result = _gh(["api", f"repos/{repo}/collaborators/"
+                  f"{urllib.parse.quote(str(login), safe='')}/permission"],
+                 token=token, check=False)
+    if result.returncode != 0:
+        if "HTTP 404" in (result.stderr or ""):
+            return None
+        raise RuntimeError(f"collaborator permission probe exited {result.returncode}: "
+                           f"{(result.stderr or '')[:200]}")
+    payload = json.loads(result.stdout or "null")
+    if not isinstance(payload, dict):
+        raise RuntimeError("collaborator permission payload is malformed")
+    return payload.get("permission")
+
+
+def _hold_machine_owned_now(repo, number, label, probe, token):
     """Whether the LIVE newest application of `label` on `repo#number` is provably the machine's,
     from a timeline read taken RIGHT NOW. FAIL-CLOSED in the only direction that matters: an
-    unreadable answer is a NEGATIVE answer, so it can never authorise a delete and always triggers
-    a restore."""
-    try:
-        timeline = _paginated(repo, number, "timeline", token=token)
-        return park_policy.label_application_machine_owned(
-            repo, number, label, lambda _repo, _num: timeline, is_human=is_human, log=_quiet)
-    except Exception as exc:  # noqa: BLE001
-        print(f"  {repo}#{number}: live hold-ownership probe failed ({exc}) — treated as human")
-        return False
+    unreadable answer — an unreachable timeline OR a collaborator-permission probe that could not
+    complete — is a NEGATIVE answer, so it can never authorise a delete and always triggers a
+    restore."""
+    return hold_machine_owned(
+        repo, number, label,
+        lambda _repo, _num: _paginated(repo, number, "timeline", token=token),
+        probe, log=lambda message: print(f"  {message}"))
 
 
-def _live_hold(repo, number, label, is_human, token):
+def _live_hold(repo, number, label, probe, token):
     """The MUTATION-BOUNDARY snapshot of `repo#number`: (live label names, hold machine-owned).
     Ownership is True when the label is not live at all — there is nothing to own — and otherwise
     the fail-closed live probe."""
@@ -576,7 +752,7 @@ def _live_hold(repo, number, label, is_human, token):
     labels = _label_names(issue if isinstance(issue, dict) else {})
     if label not in set(labels):
         return labels, True
-    return labels, _hold_machine_owned_now(repo, number, label, is_human, token)
+    return labels, _hold_machine_owned_now(repo, number, label, probe, token)
 
 
 def _sweep(args, worker_pr, policy_resolve):
@@ -599,6 +775,11 @@ def _sweep(args, worker_pr, policy_resolve):
     rows = [row for page in (held if isinstance(held, list) else []) if isinstance(page, list)
             for row in page if isinstance(row, dict) and row.get("pull_request")]
     print(f"{len(rows)} open PR(s) on {park_policy.HUMAN_PR_PARK_LABEL} in {args.repo}")
+    # ONE probe for the whole sweep: the same maintainers recur across PRs, so a completed
+    # collaborator read is answered from its cache instead of re-billed per PR. Failures are not
+    # cached, and `hold_machine_owned` resets the flag per decision (MaintainerProbe).
+    is_human = MaintainerProbe(
+        args.repo, lambda login: _collaborator_permission(args.repo, login, args.token))
     readmitted, explained, skipped = [], [], []
     for row in sorted(rows, key=lambda row: row.get("number") or 0):
         number = row["number"]
@@ -609,15 +790,13 @@ def _sweep(args, worker_pr, policy_resolve):
                           for comment in comments if isinstance(comment, dict)
                           and str((comment.get("user") or {}).get("login", "")).casefold()
                           == args.bot_login.casefold()]
-            is_human = (lambda login: login.casefold() == args.maintainer.casefold())
-            # FAIL CLOSED: anything we cannot read counts as "a human applied it".
-            applied_by_human = True
-            try:
-                applied_by_human = not park_policy.label_application_machine_owned(
-                    args.repo, number, park_policy.HUMAN_PR_PARK_LABEL,
-                    lambda _repo, _num: timeline, is_human=is_human, log=_quiet)
-            except Exception as exc:  # noqa: BLE001
-                print(f"  #{number}: hold-ownership probe failed ({exc}) — treated as human")
+            # FAIL CLOSED: anything we cannot read — an unreadable timeline, or a
+            # collaborator-permission probe that could not complete — counts as "a human applied
+            # it" (hold_machine_owned owns both directions).
+            applied_by_human = not hold_machine_owned(
+                args.repo, number, park_policy.HUMAN_PR_PARK_LABEL,
+                lambda _repo, _num: timeline, is_human,
+                log=lambda message: print(f"  #{number}: {message}"))
 
             pull = _gh_json(["api", f"repos/{args.repo}/pulls/{number}"], token=args.token)
             head_sha = str(((pull or {}).get("head") or {}).get("sha", ""))
@@ -630,15 +809,14 @@ def _sweep(args, worker_pr, policy_resolve):
                                  token=args.token)
                 issue_labels = _label_names(issue if isinstance(issue, dict) else {})
                 if park_policy.HUMAN_PARK_LABEL in set(issue_labels):
-                    issue_hold_machine_owned = False   # fail closed until proven otherwise
-                    try:
-                        issue_timeline = _paginated(args.repo, issue_number, "timeline",
-                                                    token=args.token)
-                        issue_hold_machine_owned = park_policy.label_application_machine_owned(
-                            args.repo, issue_number, park_policy.HUMAN_PARK_LABEL,
-                            lambda _repo, _num: issue_timeline, is_human=is_human, log=_quiet)
-                    except Exception as exc:  # noqa: BLE001
-                        print(f"  #{number}: source-issue hold probe failed ({exc})")
+                    # Fail-closed on BOTH halves, exactly like the PR's own hold above: an
+                    # unreadable issue timeline and an incomplete permission probe are each a
+                    # negative answer, and a negative answer keeps the issue's hold human.
+                    issue_hold_machine_owned = hold_machine_owned(
+                        args.repo, issue_number, park_policy.HUMAN_PARK_LABEL,
+                        lambda _repo, num: _paginated(args.repo, num, "timeline",
+                                                      token=args.token),
+                        is_human, log=lambda message: print(f"  #{number}: {message}"))
 
             pr_labels = _label_names(row)
             trust_surface = True
@@ -648,6 +826,25 @@ def _sweep(args, worker_pr, policy_resolve):
             round_n, verdict_record = latest_verdict(args.verdict_root, args.repo, number)
             blocking = blocking_finding_count(verdict_record)
             readmissions_spent = worker_pr.auto_readmission_marker_count(comments, args.bot_login)
+
+            # A RETURN_TO_LOOP receipt records INTENT, never completion, so it suppresses only the
+            # comment (see readmission_writes). A GENUINELY_HUMAN receipt IS the whole transaction,
+            # so it still short-circuits the PR entirely.
+            recorded_loop = already_recorded(comments, args.bot_login, RETURN_TO_LOOP, head_sha)
+            recorded_human = already_recorded(comments, args.bot_login, GENUINELY_HUMAN, head_sha)
+            # ...and an intent that never reached its commit is an UNFINISHED transaction, not a
+            # spent budget. The evidence key ties the receipt to THIS head, and the ordering
+            # against the live hold application is what separates "died mid-write" from
+            # "finished, then re-parked" (incomplete_readmission).
+            evidence_prefix = f"{worker_pr.AUTO_READMIT_ADJUDICATION_PREFIX}{head_sha[:12]}/"
+            in_flight = incomplete_readmission(
+                recorded=recorded_loop,
+                receipt_stamps=[record["at"] for record
+                                in worker_pr.auto_readmission_records(comments, args.bot_login,
+                                                                      log=_quiet)
+                                if str(record.get("key", "")).startswith(evidence_prefix)],
+                hold_applied_at=newest_label_application(timeline,
+                                                         park_policy.HUMAN_PR_PARK_LABEL))
 
             # Everything `admission` reads that is NOT label/ownership state: it is re-run
             # verbatim at the mutation boundary below over freshly-read labels and ownership, so
@@ -662,6 +859,7 @@ def _sweep(args, worker_pr, policy_resolve):
                                   for record in adjudication_records(comments, args.bot_login)),
                 rounds_recorded=worker_pr.count_rounds(comments, args.bot_login),
                 readmissions_spent=readmissions_spent,
+                readmission_in_flight=in_flight,
                 trust_surface=trust_surface,
                 blocking_findings=blocking)
             disposition, reason, detail = admission(
@@ -695,11 +893,6 @@ def _sweep(args, worker_pr, policy_resolve):
                 print(f"  #{number}: SKIP — the hold was cleared while this sweep was running")
                 skipped.append((number, "hold cleared mid-sweep"))
                 continue
-            # A RETURN_TO_LOOP receipt records INTENT, never completion, so it suppresses only the
-            # comment (see readmission_writes). A GENUINELY_HUMAN receipt IS the whole transaction,
-            # so it still short-circuits the PR entirely.
-            recorded_loop = already_recorded(comments, args.bot_login, RETURN_TO_LOOP, head_sha)
-            recorded_human = already_recorded(comments, args.bot_login, GENUINELY_HUMAN, head_sha)
             if disposition == GENUINELY_HUMAN and recorded_human:
                 print(f"  #{number}: already recorded for head {head_sha[:12]} — no-op")
                 continue
@@ -757,9 +950,10 @@ def _sweep(args, worker_pr, policy_resolve):
                     # RECEIPT FIRST. The comment carries the budget window (the auto-readmission
                     # receipt) AND the decision, so a crash before the label writes leaves a PR
                     # that is explained and window-bearing rather than one quietly moved.
-                    receipt = worker_pr.auto_readmission_receipt(
-                        f"{worker_pr.AUTO_READMIT_ADJUDICATION_PREFIX}{head_sha[:12]}/{episode}",
-                        now)
+                    # ONE definition of the evidence key, shared with the reader above, so a
+                    # reconciliation can never fail to recognise the receipt it wrote itself.
+                    receipt = worker_pr.auto_readmission_receipt(f"{evidence_prefix}{episode}",
+                                                                 now)
                     _gh(["api", "-X", "POST", f"repos/{args.repo}/issues/{number}/comments",
                          "-f", "body=" + readmission_body(receipt, live_reason, live_detail,
                                                           head_sha, episode)],
@@ -817,7 +1011,9 @@ def main(argv=None):
                         help="print the GITHUB_OUTPUT matrix line over enabled policy targets")
     parser.add_argument("--repo")
     parser.add_argument("--bot-login")
-    parser.add_argument("--maintainer", default=os.environ.get("MAINTAINER_HANDLE", "jeswr"))
+    # There is deliberately NO --maintainer/handle option: "human" is the shared
+    # collaborator-permission set (MaintainerProbe), and a configurable login would be a way to
+    # narrow it — which on this sweep means authorising the deletion of somebody else's hold.
     parser.add_argument("--token", default=None)
     parser.add_argument("--policy-file", default="policy/repos.toml")
     parser.add_argument("--target-root", default=".",
@@ -871,7 +1067,7 @@ def _self_test():
                       bot_bodies=["the review round budget is exhausted at 6 round(s)"],
                       hold_applied_by_human=False, hold_restored=False,
                       issue_hold_machine_owned=True,
-                      rounds_recorded=6, readmissions_spent=0,
+                      rounds_recorded=6, readmissions_spent=0, readmission_in_flight=False,
                       trust_surface=False, blocking_findings=2)
         kwargs.update(over)
         return kwargs
@@ -939,6 +1135,17 @@ def _self_test():
     check("a corrupt readmission counter never buys a retry (non-int fails to the cap side)",
           [verdict(readmissions_spent=value)[1] for value in (None, "1", True)],
           ["readmissions-spent"] * 3)
+    check("...and an in-flight claim never rescues a CORRUPT counter either: the widening is "
+          "bounded to a countable budget that is merely SPENT, never to an unreadable one",
+          [verdict(readmissions_spent=value, readmission_in_flight=True)[1]
+           for value in (None, "1", True)],
+          ["readmissions-spent"] * 3)
+    check("AT the cap, an unfinished transaction of this sweep's own is FINISHED rather than "
+          "refused — its slot is already spent and finishing posts no second receipt; without "
+          "that proof the cap stands, so the exception cannot become a treadmill",
+          [verdict(readmissions_spent=park_policy.AUTO_READMISSION_MAX,
+                   readmission_in_flight=value)[:2] for value in (True, False)],
+          [(RETURN_TO_LOOP, "budget-park"), (GENUINELY_HUMAN, "readmissions-spent")])
     check("the taxonomy is CLOSED and every branch reachable above is registered in it",
           sorted({ADJUDICATION_REASONS[reason][0] for reason in ADJUDICATION_REASONS}),
           sorted(set(DISPOSITIONS)))
@@ -995,6 +1202,88 @@ def _self_test():
            already_recorded([{"user": {"login": bot}, "body": marker}], bot,
                             RETURN_TO_LOOP, "f" * 40)),
           (True, False, False))
+
+    # ---- WHO IS HUMAN: collaborator PERMISSION, not one configured login --------------------
+    # Both holds this sweep can DELETE are deleted on the strength of this answer, so the human
+    # set must be the SHARED policy set (park_policy.HUMAN_MAINTAINER_PERMISSIONS). A login
+    # equality test admits exactly one maintainer and calls every other one a machine.
+    permissions = {"jeswr": "admin", "second-maintainer": "write", "third-maintainer": "maintain",
+                   "triager": "triage", "drive-by": "read"}
+
+    def applied(login, label, ts="2026-07-28T10:00:00Z"):
+        return [{"event": "labeled", "label": {"name": label}, "created_at": ts,
+                 "actor": {"login": login}, "performed_via_github_app": None}]
+
+    def owned_by_machine(login, label, reader=None):
+        prober = MaintainerProbe("o/r", reader or (lambda who: permissions.get(who)), log=_quiet)
+        return hold_machine_owned("o/r", 41, label,
+                                  lambda _repo, _num: applied(login, label), prober)
+
+    for label in (park_policy.HUMAN_PR_PARK_LABEL, park_policy.HUMAN_PARK_LABEL):
+        check(f"a WRITE and a MAINTAIN collaborator who are NOT the default handle each own their "
+              f"{label} hold — a second maintainer's gesture is not the machine's to delete",
+              [owned_by_machine(login, label)
+               for login in ("second-maintainer", "third-maintainer")], [False, False])
+        check(f"...the default handle still owns theirs, and the BOT's own application is still "
+              f"drainable — the widened human set refuses more, never fewer ({label})",
+              (owned_by_machine("jeswr", label),
+               owned_by_machine("sparq-orchestrator[bot]", label)), (False, True))
+        check(f"a permission BELOW the shared maintainer set is not a human hold ({label}) — the "
+              "set is park_policy's, not a looser local one",
+              [owned_by_machine(login, label) for login in ("triager", "drive-by")], [True, True])
+
+    def boom(_login):
+        raise RuntimeError("collaborator API unavailable")
+
+    check("a permission probe that cannot COMPLETE fails CLOSED here — the shared helper alone "
+          "reads an unverifiable actor as MACHINE and would authorise the delete, so an outage "
+          "must not be allowed to answer this question at all",
+          (park_policy.label_application_machine_owned(
+              "o/r", 41, park_policy.HUMAN_PR_PARK_LABEL,
+              lambda _repo, _num: applied("second-maintainer", park_policy.HUMAN_PR_PARK_LABEL),
+              is_human=MaintainerProbe("o/r", boom, log=_quiet), log=_quiet),
+           owned_by_machine("second-maintainer", park_policy.HUMAN_PR_PARK_LABEL, boom)),
+          (True, False))
+    flaky = MaintainerProbe("o/r", boom, log=_quiet)
+    flaky("second-maintainer")
+    flaky.reset()
+    flaky("second-maintainer")
+    check("a FAILED probe is NEVER cached: the next decision re-probes and is unverifiable again "
+          "instead of inheriting a clean-looking cached answer that lapses the refusal",
+          flaky.unverified, True)
+    reads = []
+    cached = MaintainerProbe("o/r", lambda who: (reads.append(who), permissions.get(who))[1],
+                             log=_quiet)
+    check("a COMPLETED probe IS cached per login — one collaborator read per actor per sweep",
+          (cached("jeswr"), cached("jeswr"), reads, cached.unverified), (True, True, ["jeswr"],
+                                                                        False))
+    def unreadable(_repo, _number):
+        raise RuntimeError("timeline read failed")
+
+    check("an unreadable TIMELINE is refused by the same wrapper, with no probe involved at all",
+          hold_machine_owned("o/r", 41, park_policy.HUMAN_PR_PARK_LABEL, unreadable,
+                             MaintainerProbe("o/r", lambda who: permissions.get(who), log=_quiet),
+                             log=_quiet),
+          False)
+    # ...and the END-TO-END consequence, which is the whole point: that one answer must stop the
+    # DELETE on BOTH surfaces this sweep can write to.
+    check("a second maintainer's hold parks the PR with its human on either surface — the PR's "
+          "own hold routes into `hold_applied_by_human`, the source issue's into "
+          "`issue_hold_machine_owned`, and each alone refuses the whole transaction",
+          [verdict(hold_applied_by_human=not owned_by_machine(
+              "second-maintainer", park_policy.HUMAN_PR_PARK_LABEL))[:2],
+           verdict(issue_hold_machine_owned=owned_by_machine(
+               "second-maintainer", park_policy.HUMAN_PARK_LABEL))[:2]],
+          [(GENUINELY_HUMAN, "human-applied"), (GENUINELY_HUMAN, "issue-hold-human")])
+    attempted = []
+    check("...and at the MUTATION BOUNDARY the same answer stands the DELETE down having written "
+          "nothing at all — no delete, and therefore no restore to repair",
+          (clear_hold_with_repair(
+              machine_owned_now=lambda: owned_by_machine("second-maintainer",
+                                                         park_policy.HUMAN_PR_PARK_LABEL),
+              delete=lambda: attempted.append("delete"),
+              restore=lambda: attempted.append("restore")), attempted),
+          ("stood-down", []))
 
     # ---- THE UN-CLOSEABLE WRITE WINDOW: detected after the write, and REPAIRED --------------
     # A label carries no per-application identity, so a human re-asserting the hold between the
@@ -1064,20 +1353,70 @@ def _self_test():
     check("every planned write is a member of the closed write set",
           sorted(set(plan(held_pr, held_issue)) - set(READMISSION_WRITES)), [])
 
-    def replay(fail_after):
+    # WHICH APPLICATION OF THE HOLD IS LIVE is the only thing that separates an unfinished
+    # transaction from a finished one whose PR was re-parked afterwards — the labels are
+    # identical in both. Every unknown reads as "not in flight", which leaves the cap in force.
+    hold_at = park_policy.parse_ts("2026-07-28T10:00:00Z")
+
+    def in_flight(stamps, applied_at=hold_at, recorded=True):
+        return incomplete_readmission(recorded=recorded, receipt_stamps=stamps,
+                                      hold_applied_at=applied_at)
+
+    check("a receipt written AFTER the application that is STILL live proves the DELETE never "
+          "happened: the transaction is in flight and must be finished, not re-charged",
+          in_flight(["2026-07-28T10:05:00Z"]), True)
+    check("an application written AFTER the receipt is a NEW park — the delete DID happen and "
+          "something parked the PR again, so the cap owns it and no treadmill is possible",
+          in_flight(["2026-07-28T10:05:00Z"], park_policy.parse_ts("2026-07-28T11:00:00Z")),
+          False)
+    check("every unknown leaves the cap in force: no receipt for this head, no adjudication "
+          "marker beside it (so finishing WOULD post a second receipt), an unreadable receipt "
+          "stamp, an unreadable hold application, and a same-second tie that cannot be ordered",
+          [in_flight([]), in_flight(["2026-07-28T10:05:00Z"], recorded=False),
+           in_flight(["not-a-timestamp"]), in_flight(["2026-07-28T10:05:00Z"], None),
+           in_flight(["2026-07-28T10:00:00Z"])],
+          [False, False, False, False, False])
+    check("the live application is the NEWEST `labeled` for EXACTLY that label — an `unlabeled`, "
+          "another label, a malformed stamp and an unreadable timeline are UNKNOWN, never 'old'",
+          [newest_label_application(
+              applied("jeswr", park_policy.HUMAN_PR_PARK_LABEL, "2026-07-28T09:00:00Z")
+              + applied("jeswr", park_policy.HUMAN_PR_PARK_LABEL, "2026-07-28T10:00:00Z")
+              + [{"event": "unlabeled", "label": {"name": park_policy.HUMAN_PR_PARK_LABEL},
+                  "created_at": "2026-07-28T23:00:00Z", "actor": {"login": "jeswr"}}]
+              + applied("jeswr", REENTRY_LABEL, "2026-07-28T22:00:00Z"),
+              park_policy.HUMAN_PR_PARK_LABEL),
+           newest_label_application(applied("jeswr", REENTRY_LABEL),
+                                    park_policy.HUMAN_PR_PARK_LABEL),
+           newest_label_application(applied("jeswr", park_policy.HUMAN_PR_PARK_LABEL, "nope"),
+                                    park_policy.HUMAN_PR_PARK_LABEL),
+           newest_label_application("not-a-timeline", park_policy.HUMAN_PR_PARK_LABEL)],
+          [hold_at, None, None, None])
+
+    def replay(fail_after, spent=0):
         """Sweep the PR until its transaction completes, with the API call for write index
         `fail_after` raising on the FIRST sweep. The `while` condition IS the sweep's listing
         query — a PR is re-swept if and ONLY if it still carries the human hold — so a plan that
-        commits before it is complete simply falls out of the loop half-finished."""
+        commits before it is complete simply falls out of the loop half-finished. Each pass first
+        runs the REAL `admission`, because the receipt this transaction posts also RAISES the live
+        re-admission count: a sweep that refuses its own unfinished transaction strands the PR
+        here exactly as it did in production. `spent` is what the PR had already spent before this
+        transaction, so `AUTO_READMISSION_MAX - 1` is the LAST-SLOT case."""
         pr, issue = set(held_pr), set(held_issue)
-        recorded, receipts, sweeps = False, 0, 0
+        recorded, receipts, sweeps, stamps = False, 0, 0, []
         while park_policy.HUMAN_PR_PARK_LABEL in pr and sweeps < 6:
             sweeps += 1
+            if admission(**base(pr_labels=sorted(pr), issue_labels=sorted(issue),
+                                readmissions_spent=spent + receipts,
+                                readmission_in_flight=in_flight(stamps,
+                                                                recorded=recorded)))[0] \
+                    != RETURN_TO_LOOP:
+                break                   # the sweep leaves the park with a human: STRANDED
             for index, write in enumerate(plan(sorted(pr), sorted(issue), recorded=recorded)):
                 if sweeps == 1 and index == fail_after:
                     break               # the API call raised; the sweep's handler skips the PR
                 if write == "comment":
                     recorded, receipts = True, receipts + 1
+                    stamps.append("2026-07-28T10:30:00Z")
                 elif write == "add-reentry":
                     pr.add(REENTRY_LABEL)
                 elif write == "clear-issue-hold":
@@ -1086,12 +1425,23 @@ def _self_test():
                     pr.discard(park_policy.HUMAN_PR_PARK_LABEL)
         return (sorted(pr), sorted(issue), receipts, sweeps)
 
+    completed = ([([REENTRY_LABEL], [], 1, 2)] * len(READMISSION_WRITES)
+                 + [([REENTRY_LABEL], [], 1, 1)])
     check("a failure after ANY write is RECONCILED to the same complete state by the next sweep, "
           "and the receipt is posted EXACTLY ONCE however many sweeps it takes — so reconciling "
           "can never spend a second automatic re-admission against the cap",
-          [replay(fail_after) for fail_after in range(len(READMISSION_WRITES) + 1)],
-          [([REENTRY_LABEL], [], 1, 2)] * len(READMISSION_WRITES)
-          + [([REENTRY_LABEL], [], 1, 1)])
+          [replay(fail_after) for fail_after in range(len(READMISSION_WRITES) + 1)], completed)
+    check("...and that holds from the LAST SLOT too, which is where it used to fail: the receipt "
+          "this transaction posts takes the live count TO AUTO_READMISSION_MAX, so the next sweep "
+          "must FINISH it rather than refuse it as a spent budget — refusing there stranded the "
+          "PR permanently, one write short of done, on the strength of its own receipt",
+          [replay(fail_after, park_policy.AUTO_READMISSION_MAX - 1)
+           for fail_after in range(len(READMISSION_WRITES) + 1)], completed)
+    check("...but a PR that is AT the cap with no unfinished transaction of its own is still "
+          "refused, mutation-free: the exception is bounded to finishing a receipt this sweep "
+          "provably left in flight, and buys no new re-admission for anyone",
+          replay(len(READMISSION_WRITES), park_policy.AUTO_READMISSION_MAX),
+          ([park_policy.HUMAN_PR_PARK_LABEL], [park_policy.HUMAN_PARK_LABEL], 0, 1))
 
     # ---- the recorded-verdict reader: UNKNOWN is never zero ---------------------------------
     check("blocking findings are counted by severity, and an unreadable record is None (never 0)",
