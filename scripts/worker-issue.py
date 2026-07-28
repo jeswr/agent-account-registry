@@ -2030,7 +2030,15 @@ def _followup_create_behaviour_self_test():
     def _title_of(argv):
         return argv[argv.index("--title") + 1]
 
-    def drive(rows=None, *, vocabulary_readable=True, create_raises_on=None):
+    def drive(rows=None, *, vocabulary_readable=True, create_raises_on=None,
+              issue_list_raises=False):
+        """Returns `(creates, landed, log, raised)`.
+
+        `raised` is the exception that ESCAPED `create_followups`, or None. It is returned rather
+        than propagated so every scenario can assert on it BY NAME: a mutant that re-breaks the
+        batch guarantee otherwise kills the suite by crashing it, and a crash names no property —
+        it reads identically whether the guarantee broke or the stub did.
+        """
         argvs = []
 
         def fake_run_gh(args, *, input_text=None, check=True):
@@ -2044,6 +2052,8 @@ def _followup_create_behaviour_self_test():
 
         def fake_gh_json(args, *, input_doc=None):
             if args[:2] == ["issue", "list"]:
+                if issue_list_raises:
+                    raise WorkerIssueError("GitHub API request failed for issue")
                 return []
             if args[:2] == ["label", "list"]:
                 if not vocabulary_readable:
@@ -2054,7 +2064,7 @@ def _followup_create_behaviour_self_test():
 
         saved = {"_run_gh": globals()["_run_gh"], "_gh_json": globals()["_gh_json"]}
         globals().update({"_run_gh": fake_run_gh, "_gh_json": fake_gh_json})
-        log = io.StringIO()
+        log, raised = io.StringIO(), None
         try:
             with tempfile.TemporaryDirectory() as tmp:
                 spec_file = Path(tmp) / "followups.jsonl"
@@ -2062,18 +2072,22 @@ def _followup_create_behaviour_self_test():
                     "\n".join(json.dumps(row) for row in (spec_rows if rows is None else rows)),
                     encoding="utf-8")
                 with contextlib.redirect_stdout(log):
-                    create_followups("o/r", 42, str(spec_file))
+                    try:
+                        create_followups("o/r", 42, str(spec_file))
+                    except (WorkerIssueError, OSError) as exc:
+                        raised = exc
         finally:
             globals().update(saved)
         creates = [argv for argv in argvs if argv[:2] == ["issue", "create"]]
         # What the stub ACCEPTED is what exists on the target afterwards.
         landed = {_title_of(argv): _labels_of(argv)
                   for argv in creates if not _labels_of(argv) - vocab}
-        return creates, landed, log.getvalue()
+        return creates, landed, log.getvalue(), raised
 
     # (A) SUCCESS PATH — the vocabulary is readable. All three follow-ups are created, and the one
     # carrying a typo keeps its `area:` instead of being minted bare.
-    creates, landed, log = drive()
+    creates, landed, log, raised = drive()
+    assert raised is None, ("BATCH_COMPLETE_READABLE: create_followups raised", repr(raised))
     t1 = [argv for argv in creates if _title_of(argv) == "T1 typo"]
     assert len(t1) == 2, ("expected exactly one retry for the typo'd follow-up", t1)
     assert "area:dispatch" in _labels_of(t1[1]), (
@@ -2092,7 +2106,10 @@ def _followup_create_behaviour_self_test():
     # already-failing create looks like (the read happens seconds later, against the same API).
     # This is the regression under review: the raise escaped `create_followups` and destroyed the
     # two follow-ups whose labels were entirely valid, while both call sites `|| true` the exit.
-    creates, landed, log = drive(vocabulary_readable=False)
+    creates, landed, log, raised = drive(vocabulary_readable=False)
+    assert raised is None, (
+        "BATCH_COMPLETE_UNREADABLE: the unreadable-vocabulary read escaped create_followups — "
+        "this is the exact regression under review", repr(raised))
     assert set(landed) == {"T1 typo", "T2 valid", "T3 valid"}, (
         "BATCH_COMPLETE_UNREADABLE: one follow-up's failure removed the others from the batch — "
         "the population-shrink shape this function exists to prevent", sorted(landed))
@@ -2112,7 +2129,10 @@ def _followup_create_behaviour_self_test():
     # `_known_labels` no longer raises, so without the per-entry guard this property would rest on
     # a single `except` in a single helper — one more raising call added to this loop later and the
     # batch shrinks again, silently, exactly as it did here.
-    creates, landed, log = drive(create_raises_on="T1 typo")
+    creates, landed, log, raised = drive(create_raises_on="T1 typo")
+    assert raised is None, (
+        "BATCH_ISOLATION: a failure creating ONE follow-up escaped create_followups and aborted "
+        "the whole batch", repr(raised))
     assert set(landed) == {"T2 valid", "T3 valid"}, (
         "BATCH_ISOLATION: a raise while creating ONE follow-up prevented the others from being "
         "created", sorted(landed))
@@ -2122,15 +2142,30 @@ def _followup_create_behaviour_self_test():
     # area itself (`area:dsipatch`) declares a label starting `area:`, so a declared-set test says
     # "area present" and stays silent — on the ONE path where the created issue really is born
     # unattributable, because the retry drops that very label.
-    creates, landed, log = drive(
+    creates, landed, log, _ = drive(
         [{"title": "T4 typo'd area", "body": "b4", "labels": ["area:dsipatch"]}])
     assert landed["T4 typo'd area"] == auto, landed["T4 typo'd area"]
     assert "carries no `area:` label" in log, (
         "AREA_WARNING_READS_APPLIED: the follow-up landed with no `area:` and said nothing", log)
     # ...and it stays quiet when an area really did land, so the signal is not a constant.
-    _, landed, log = drive([{"title": "T5 ok", "body": "b5", "labels": ["area:review"]}])
+    _, landed, log, _ = drive([{"title": "T5 ok", "body": "b5", "labels": ["area:review"]}])
     assert landed["T5 ok"] == {"area:review"} | auto, landed["T5 ok"]
     assert "carries no `area:` label" not in log, log
+
+    # (E) THE ONE FAILURE THAT IS *NOT* CONTAINED, pinned so the docstring cannot drift from the
+    # code. Without the existing-title set there is no de-duplication, and re-minting issues the
+    # model already filed is worse than deferring the batch — so this one aborts. Both call sites
+    # `|| true` the exit code, which makes the ANNOTATION the only surviving evidence that a batch
+    # of discovered work was dropped; assert the annotation, not just the abort.
+    creates, landed, log, raised = drive(issue_list_raises=True)
+    assert isinstance(raised, WorkerIssueError), (
+        "DEDUP_UNREADABLE_ABORTS: an unreadable open-issue list must abort the batch rather than "
+        "create follow-ups it cannot de-duplicate", repr(raised))
+    assert creates == [], ("DEDUP_UNREADABLE_ABORTS: created issues without de-duplication",
+                           creates)
+    assert "::error::follow-up capture skipped" in log, (
+        "DEDUP_ABORT_IS_ANNOTATED: the batch was dropped silently — `|| true` at worker.yml and "
+        "review-fix.yml swallows the exit code, so a bare raise leaves NO signal at all", log)
 
 
 
