@@ -96,6 +96,51 @@ class TelemetryConflict(TelemetryError):
     """A retryable contents-API compare-and-swap conflict."""
 
 
+class TelemetryRetryable(TelemetryError):
+    """A THROTTLE/AVAILABILITY rejection this writer may safely re-attempt (registry #594).
+
+    Distinct from `TelemetryConflict`, which is a CAS race: the two need different backoff
+    schedules (sub-second full jitter for contention, 2s→30s for GitHub's secondary limiter), and
+    conflating them re-trips the limiter and burns the budget without ever landing the write.
+
+    WHY THIS WRITER NEEDS IT AT ALL. `ledger_retry.is_transient` exists (registry #594) precisely
+    because the secondary-rate-limit rejection a burst of concurrent contents-API PUTs to ONE
+    branch provokes is 403-shaped, i.e. indistinguishable by status code from a credential verdict.
+    This module opens a NEW ledger-branch writer inside the CLAIM job, on the same branch and the
+    same tick cadence as `model-health.py`'s — so it is exactly the burst that trips it, and
+    without this class one throttled PUT silently costs the tick's Gate A record.
+    """
+
+    def __init__(self, message, retry_after=None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+def _http_error_text(exc):
+    """The text `ledger_retry.is_transient` classifies, assembled from one urllib HTTPError.
+
+    Status alone is not enough and 403 is exactly why: a secondary rate limit and a bad credential
+    are both 403, and only the reason/body/`Retry-After` distinguishes them. A body that cannot be
+    read simply contributes nothing — it must never turn a fatal 403 into a retried one.
+    """
+    parts = [f"HTTP {getattr(exc, 'code', '?')}", str(getattr(exc, "reason", "") or "")]
+    headers = getattr(exc, "headers", None)
+    if headers is not None:
+        for key in ("Retry-After", "retry-after"):
+            try:
+                value = headers.get(key)
+            except (AttributeError, TypeError):
+                value = None
+            if value is not None:
+                parts.append(f"Retry-After: {value}")
+                break
+    try:
+        parts.append(exc.read().decode("utf-8", "replace")[:400])
+    except Exception:                     # noqa: BLE001 — an unreadable body adds nothing
+        pass
+    return " ".join(part for part in parts if part)
+
+
 # =================================================================================================
 # PURE: census bucketing
 # =================================================================================================
@@ -466,9 +511,17 @@ class GitHubAPI:
             if retry_conflict and ledger_retry.is_cas_conflict(
                     f"HTTP {exc.code}", create=body is not None and "sha" not in (body or {})):
                 raise TelemetryConflict("dispatch-telemetry ledger CAS conflict") from exc
+            # registry #594, adopted here: 401/404/422 and permission/credential 403s stay FATAL;
+            # a secondary-rate-limit or availability rejection is RETRYABLE and is handed to the
+            # CAS loop, which already owns this writer's whole request budget.
+            detail = _http_error_text(exc)
+            if ledger_retry.is_transient(detail):
+                raise TelemetryRetryable(
+                    f"GitHub API {method} was throttled or unavailable (HTTP {exc.code})",
+                    ledger_retry.retry_after_seconds(detail)) from exc
             raise TelemetryError(f"GitHub API {method} failed with HTTP {exc.code}") from exc
         except (URLError, TimeoutError) as exc:
-            raise TelemetryError("GitHub API request failed") from exc
+            raise TelemetryRetryable("GitHub API request failed (network)") from exc
         try:
             return json.loads(raw or b"null")
         except json.JSONDecodeError as exc:
@@ -506,16 +559,40 @@ def _sleep_backoff(attempt):
     ledger_retry.sleep_backoff(attempt)
 
 
+def _sleep_throttled(attempt, retry_after):
+    ledger_retry.sleep_transient(attempt, retry_after)
+
+
 def append_records(api, registry_repo, new_records, now, retries=CAS_RETRIES):
     """CAS-append records for one tick, IDEMPOTENTLY on (run_id, repo).
 
     A replayed emission is a confirmed no-op — a duplicate would inflate every bucket it touches
     (registry #737). Returns the ring size after the write.
+
+    REQUEST BUDGET, DECLARED. `read_ledger` sits INSIDE this loop, so the honest ceiling is
+    `retries` GETs + `retries` PUTs (8 + 8 at the default) in a single tick, not the 1 + 1 of the
+    uncontended common case — plus one extra GET per round in the sole case where the telemetry
+    FILE 404s and the branch-existence probe fires. That worst case is within the tick's ~102
+    request headroom, and it is NOT to be "fixed" by dropping retries: a dropped record is a hole
+    in the very series Gate A is evaluated from.
+
+    A THROTTLE is retried through this SAME budget rather than a nested one (registry #594), so
+    adopting `ledger_retry.is_transient` costs no additional request ceiling at all — only a
+    different, longer sleep on the rounds whose cause was the limiter rather than a CAS race.
     """
+    throttled = None
     for attempt in range(retries):
         if attempt:
-            _sleep_backoff(attempt)
-        records, sha = read_ledger(api, registry_repo)
+            if throttled is None:
+                _sleep_backoff(attempt)
+            else:
+                _sleep_throttled(attempt, throttled.retry_after)
+        throttled = None
+        try:
+            records, sha = read_ledger(api, registry_repo)
+        except TelemetryRetryable as exc:
+            throttled = exc
+            continue
         known = {record_identity(r) for r in records}
         fresh = [r for r in new_records
                  if record_identity(r) is not None and record_identity(r) not in known]
@@ -539,8 +616,14 @@ def append_records(api, registry_repo, new_records, now, retries=CAS_RETRIES):
                 "PUT", f"/repos/{registry_repo}/contents/{LEDGER_PATH}", body, retry_conflict=True)
         except TelemetryConflict:
             continue
+        except TelemetryRetryable as exc:
+            throttled = exc
+            continue
         if isinstance(result, dict) and isinstance(result.get("content"), dict):
             return len(records)
+    if throttled is not None:
+        raise TelemetryError(
+            f"dispatch-telemetry ledger write stayed throttled/unavailable ({throttled})")
     raise TelemetryError("dispatch-telemetry ledger CAS conflicts did not settle")
 
 
@@ -673,6 +756,68 @@ def _workflow_step_text(path, step_id, strip_comments=False):
             end = i
             break
     return "\n".join(lines[starts[0]:end])
+
+
+def _workflow_step_node(path, step_id):
+    """The PARSED step mapping whose `id:` is `step_id` — EXACT scalar values, not substrings.
+
+    A substring check cannot see a guard being WIDENED. `if: always()` is a substring of
+    `if: always() && false`, and the second form never runs the step at all: no telemetry record is
+    ever written and `realised_dispatches` reads a fabricated 0 forever, with every
+    `"if: always()" in step_text` assertion still green. That mutant survived until this existed.
+
+    Self-test only, and PyYAML is already a hard dependency of this repo's self-test suite
+    (resolve-conflicts.py, metrics.py) and of `pr-gate.yml`, which installs it hash-locked.
+    """
+    import yaml  # noqa: PLC0415 — lazy, self-test only: same shape as dispatch-plan.py's parse
+    document = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    found = [step
+             for job in ((document or {}).get("jobs") or {}).values()
+             for step in ((job or {}).get("steps") or [])
+             if isinstance(step, dict) and step.get("id") == step_id]
+    if len(found) != 1:
+        raise AssertionError(f"expected one workflow step `id: {step_id}`, found {len(found)}")
+    return found[0]
+
+
+def _norm_runner_temp(value):
+    """`${{ runner.temp }}` and `$RUNNER_TEMP` name the SAME directory in two syntaxes.
+
+    The recorder is pointed at the summary through the shell variable; the CLAIM step declares the
+    writer's path through the expression. Comparing them requires one spelling.
+    """
+    text = str(value if value is not None else "").strip()
+    for token in ("${{ runner.temp }}", "${{runner.temp}}", "${RUNNER_TEMP}", "$RUNNER_TEMP"):
+        text = text.replace(token, "<runner-temp>")
+    return text
+
+
+def _cli_args(script, marker):
+    """`{flag: value}` for the ONE invocation in a step's `run:` whose text contains `marker`.
+
+    VALUES, not presence. `"--summary" in step_text` is satisfied by `--summary /dev/null`: the
+    recorder then reads an empty summary, every per-target `launched` count is absent, and
+    `realised_dispatches` is FABRICATED as 0 for every target — the exact number Gate A is
+    evaluated on — with the suite green. A flag whose value is unpinned is not wired.
+    """
+    import shlex  # noqa: PLC0415 — lazy, self-test only
+    joined = str(script or "").replace("\\\n", " ")
+    calls = [line for line in joined.split("\n") if marker in line]
+    if len(calls) != 1:
+        raise AssertionError(f"expected exactly one `{marker}` invocation, found {len(calls)}")
+    tokens = shlex.split(calls[0], comments=True)
+    args, index = {}, 0
+    while index < len(tokens):
+        token = tokens[index]
+        if not token.startswith("--"):
+            index += 1
+            continue
+        following = tokens[index + 1] if index + 1 < len(tokens) else ""
+        if following and not following.startswith("--"):
+            args[token], index = following, index + 2
+        else:
+            args[token], index = "", index + 1
+    return args
 
 
 def _self_test():   # noqa: C901 — one flat assertion table, deliberately
@@ -861,6 +1006,85 @@ def _self_test():   # noqa: C901 — one flat assertion table, deliberately
     chk("the ring is bounded", len(prune([dict(rec, run_id=f"{i}.1", ts=i)
                                           for i in range(MAX_RECORDS + 50)], 0)), MAX_RECORDS)
 
+    # ---- ledger: THROTTLES ARE RETRIED, credential verdicts are not (registry #594) -------------
+    # This module opens a NEW `ledger`-branch writer inside the CLAIM job, on the same branch and
+    # cadence as model-health's — i.e. exactly the concurrent-PUT burst that trips GitHub's
+    # secondary limiter, whose rejection is 403-SHAPED and so indistinguishable by status from a
+    # credential verdict. `is_transient` is the classifier that already knows the difference;
+    # before this it was imported for CAS conflicts only, and one throttled PUT cost the tick's
+    # whole Gate A record.
+    class _FakeHTTPError:
+        def __init__(self, code, reason, body, retry_after=None):
+            self.code, self.reason, self._body = code, reason, body
+            self.headers = {"Retry-After": retry_after} if retry_after else {}
+
+        def read(self):
+            return self._body.encode()
+
+    chk("[#594] a secondary-rate-limit 403 is classified TRANSIENT from its body, not its status",
+        (ledger_retry.is_transient(_http_error_text(
+            _FakeHTTPError(403, "Forbidden", "You have exceeded a secondary rate limit", "20"))),
+         ledger_retry.retry_after_seconds(_http_error_text(
+             _FakeHTTPError(403, "Forbidden", "secondary rate limit", "20")))),
+        (True, 20))
+    chk("[#594] ...and a CREDENTIAL 403 stays FATAL — the classifier is not a blanket 403 retry",
+        (ledger_retry.is_transient(_http_error_text(
+            _FakeHTTPError(403, "Forbidden", "Resource not accessible by integration"))),
+         ledger_retry.is_transient(_http_error_text(
+             _FakeHTTPError(422, "Unprocessable Entity", "Validation Failed")))),
+        (False, False))
+    class _UnreadableHTTPError(_FakeHTTPError):
+        def read(self):
+            raise OSError("connection closed before the body was read")
+
+    chk("[#594] an unreadable error body contributes nothing and cannot make a 403 retryable",
+        ledger_retry.is_transient(_http_error_text(
+            _UnreadableHTTPError(403, "Forbidden", ""))), False)
+
+    class _ThrottlingAPI(_StubAPI):
+        """PUTs are throttled `throttle` times before one lands; GETs are always served."""
+
+        def __init__(self, throttle):
+            super().__init__()
+            self.left = throttle
+            self.gets = 0
+
+        def request(self, method, path, body=None, allow_404=False, retry_conflict=False):
+            if method == "GET":
+                self.gets += 1
+            if method == "PUT" and self.left:
+                self.left -= 1
+                raise TelemetryRetryable("throttled", 1)
+            return super().request(method, path, body, allow_404, retry_conflict)
+
+    slept = []
+    saved_sleepers = (_sleep_backoff, _sleep_throttled)
+    globals()["_sleep_backoff"] = lambda attempt: slept.append(("contention", attempt))
+    globals()["_sleep_throttled"] = lambda attempt, after: slept.append(("throttle", attempt, after))
+    try:
+        throttling = _ThrottlingAPI(2)
+        landed = append_records(throttling, "o/r", [dict(rec, run_id="77.1")], 100)
+        chk("[#594] a THROTTLED ledger PUT is retried and the tick's record still lands",
+            (landed, throttling.puts, len(throttling.doc["records"])), (1, 1, 1))
+        chk("[#594] ...on the THROTTLE schedule (2s-30s), never the sub-second CAS-contention one "
+            "that just re-trips the limiter",
+            slept, [("throttle", 1, 1), ("throttle", 2, 1)])
+        # The budget claim in append_records' docstring, asserted rather than described: a
+        # throttle is retried through the SAME CAS budget, so adopting #594 adds no request
+        # ceiling. A permanently throttled writer therefore costs `retries` GET + `retries` PUT
+        # attempts and then fails LOUD naming the throttle — it never returns a silent success.
+        slept.clear()
+        dead = _ThrottlingAPI(99)
+        try:
+            append_records(dead, "o/r", [dict(rec, run_id="78.1")], 100, retries=4)
+            throttle_outcome = "returned"
+        except TelemetryError as exc:
+            throttle_outcome = "throttled" if "throttled" in str(exc) else f"other: {exc}"
+        chk("[#594] a permanently throttled write fails LOUD inside the SAME bounded budget",
+            (throttle_outcome, dead.gets, dead.left), ("throttled", 4, 95))
+    finally:
+        globals()["_sleep_backoff"], globals()["_sleep_throttled"] = saved_sleepers
+
     # ---- Gate A evaluation -----------------------------------------------------------------------
     passing = [dict(rec, run_id=f"{i}.1", ts=i, frontier_width=10, realised_dispatches=9)
                for i in range(GATE_A_SUSTAIN_TICKS)]
@@ -982,6 +1206,29 @@ def _self_test():   # noqa: C901 — one flat assertion table, deliberately
     everything = _run_census(_StubPlanner(), ready=ready_input)
     chk("[YAML seam] a fully-free board records zero conflict deferrals",
         (everything["frontier_width"], everything["conflict_deferrals"]), (8, 0))
+
+    # POSTURE, EXECUTED. The census block lives inside a `set -euo pipefail` PLAN step, and a
+    # failed PLAN step SKIPS THE WHOLE CLAIM JOB — so an exception raised by the INSTRUMENTATION
+    # would cost a full tick of dispatching in order to measure dispatching. Delete the guard and
+    # the exception escapes `exec` into this test: a named row, not a crash-kill.
+    class _ExplodingPlanner(_StubPlanner):
+        def _candidates(self, issues, log=None):
+            raise RuntimeError("planner blew up mid-census")
+
+    exploded, exploded_error = None, None
+    try:
+        exploded = _run_census(_ExplodingPlanner())
+    except Exception as exc:            # noqa: BLE001 — this is the mutant being pinned
+        exploded_error = f"{type(exc).__name__}: {exc}"
+    chk("[YAML seam] a census that RAISES cannot take PLAN down with it — telemetry never stops "
+        "the fleet dispatching",
+        (exploded_error, exploded), (None, {}))
+    # ...and the failure is a VISIBLE GAP, not a fabricated zero census. The repo is left OUT of
+    # `frontier_censuses`, so PLAN's `missing_census` warning names it, no record is appended, and
+    # the published panel reads no-record/stale rather than an all-zero row that reads as a
+    # healthy idle tick.
+    chk("[YAML seam] ...and it publishes NOTHING rather than an all-zero census that would read "
+        "as a healthy idle tick", list(published), [])
 
     # The ASSEMBLE leg — the one the measured run actually died at — is likewise EXECUTED, and
     # against the REAL `dispatch-claim` partition, never a stub.
@@ -1125,6 +1372,44 @@ def _self_test():   # noqa: C901 — one flat assertion table, deliberately
          "continue-on-error: true" in claim_step,
          "--frontier" in claim_step, "--summary" in claim_step, "--run-id" in claim_step),
         (True, True, True, True, True, True))
+    # ...AND BY VALUE, which the substring row above structurally cannot do. `always()` is a
+    # SUBSTRING of `always() && false`; the second form never runs the recorder, so no record is
+    # ever appended and Gate A is evaluated on a `realised_dispatches` that was never measured —
+    # with the whole suite green. Comparing the PARSED scalar forbids every widening of the guard,
+    # not just the one spelling a reviewer happened to think of.
+    recorder = _workflow_step_node(workflow, "dispatch-telemetry")
+    chk("[YAML seam] the recorder's `if:` is EXACTLY always() — a widened guard cannot disable it "
+        "behind a substring match",
+        (str(recorder.get("if")), recorder.get("continue-on-error")), ("always()", True))
+    # `set -e`, asserted. Without it a FAILING `--self-test` does not stop the step: `record` runs
+    # anyway and the step's exit status is the recorder's, so the in-workflow self-test gates
+    # nothing at all. `continue-on-error` keeps a red self-test from failing the tick; `-e` is what
+    # makes it red in the first place.
+    recorder_run = str(recorder.get("run", ""))
+    chk("[YAML seam] the recorder step aborts on a FAILING --self-test (`set -e`), instead of "
+        "recording anyway and reporting the recorder's status",
+        ([line.strip() for line in recorder_run.split("\n") if line.strip().startswith("set ")],
+         "dispatch-telemetry.py --self-test" in recorder_run),
+        (["set -euo pipefail"], True))
+    # EVERY ARGUMENT PINNED TO ITS VALUE. `"--summary" in step_text` is satisfied by
+    # `--summary /dev/null`, which makes the summary read as empty, every per-target `launched`
+    # count absent, and `realised_dispatches` fabricated as 0 for every target. The value is
+    # additionally pinned AGAINST THE WRITER below rather than only against a literal, so the
+    # reader and the writer cannot drift apart in a single edit either.
+    recorder_args = _cli_args(recorder_run, "dispatch-telemetry.py record")
+    chk("[YAML seam] every recorder argument is pinned to a VALUE, not merely present",
+        (recorder_args.get("--frontier"),
+         _norm_runner_temp(recorder_args.get("--summary")),
+         recorder_args.get("--registry-repo"),
+         recorder_args.get("--run-id")),
+        ("plan/frontier-census.json", "<runner-temp>/dispatch-summary.json",
+         "$GITHUB_REPOSITORY", "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"))
+    claim_summary = _norm_runner_temp(
+        (_workflow_step_node(workflow, "claim").get("env") or {}).get("DISPATCH_SUMMARY_FILE"))
+    chk("[YAML seam] ...and `--summary` is the SAME file the CLAIM step writes — a reader pointed "
+        "at a path nothing writes fabricates every realised count as zero",
+        (_norm_runner_temp(recorder_args.get("--summary")) == claim_summary, claim_summary),
+        (True, "<runner-temp>/dispatch-summary.json"))
     # SCOPED to the upload step, not the whole file: the filename appears in several places, so a
     # whole-file search survives deleting it from the artifact path — which silently starves CLAIM.
     upload_step = _workflow_step_text(workflow, "upload-plan", strip_comments=True)

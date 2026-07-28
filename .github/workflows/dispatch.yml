@@ -788,63 +788,81 @@ jobs:
               # `readiness_input`, `ready_input`, `ready`, `deferred_ready`; output: one entry in
               # `frontier_censuses` (the PUBLICATION is inside the block on purpose — a block that
               # computed a perfect census and then failed to hand it on would be invisible).
-              conflict_lines = []
-              attribution = "unavailable"
+              # THE WHOLE CENSUS IS GUARDED, and that is a POSTURE decision, not defensiveness.
+              # This block runs inside a `set -euo pipefail` PLAN step, and a failed PLAN step
+              # SKIPS THE ENTIRE CLAIM JOB — so an unguarded exception here would cost a whole
+              # tick's dispatching in order to record a number ABOUT dispatching. The recorder step
+              # in CLAIM already carries `continue-on-error: true` for exactly this reason; this is
+              # the same rule applied at the leg that has no step boundary to hide behind.
+              # The failure mode is a VISIBLE GAP, never a fabricated zero: the repo is simply left
+              # OUT of `frontier_censuses`, so the `missing_census` warning below names it, no
+              # record is appended for this tick, and the published panel reads `stale`/`no-record`
+              # rather than an all-zero census that would look like a healthy idle tick.
               try:
-                  dispatch.compute_ready(ready_input, conflict_log=conflict_lines.append)
-                  attribution = "exact"
-              except TypeError:
-                  print(f"::warning::{repo}: this target's compute_ready() takes no conflict_log — "
-                        "conflict deferrals are counted but NOT attributed to a held area")
-              engine = getattr(dispatch, "_ready", None)
-              candidates_fn = getattr(dispatch, "ready_candidates",
-                                      getattr(engine, "ready_candidates", None))
-              reason_fn = getattr(dispatch, "exclusion_reason",
-                                  getattr(engine, "exclusion_reason", None))
-              frontier_numbers = {issue.get("number") for issue in ready}
-              if candidates_fn is None or reason_fn is None:
-                  # Degrade to a VISIBLE GAP. With no engine verdict we refuse to invent buckets:
-                  # everything unaccounted for lands in `unclassified`, so missing instrumentation
-                  # is loud instead of masquerading as a healthy census.
-                  print(f"::warning::{repo}: target planner exposes no ready_candidates()/"
-                        "exclusion_reason() — the dispatch census degrades to a visible gap")
-                  candidate_numbers, reasons_by_number, conflict_total = (
-                      set(frontier_numbers), {}, 0)
-              else:
-                  candidate_numbers = {
-                      row[1] for row in candidates_fn(ready_input, log=lambda _line: None)}
-                  reasons_by_number = {
-                      row["number"]: reason_fn(set(row["labels"]), row.get("open_blockers", 0))
-                      for row in ready_input}
-                  conflict_total = max(0, len(candidate_numbers) - len(frontier_numbers))
-              conflict_by_area, _attributed = telemetry.parse_conflict_areas(
-                  conflict_lines, conflict_total)
-              frontier_census = {
-                  "open_issues": len(readiness_input),
-                  "candidates": len(candidate_numbers),
-                  "frontier_width": len(frontier_numbers),
-                  "deferred_retry_width": len(deferred_ready),
-                  "conflict_deferrals": conflict_total,
-                  "conflict_by_area": conflict_by_area,
-                  "attribution": attribution,
-                  "census": telemetry.census(
-                      {row["number"] for row in readiness_input},
-                      {row["number"] for row in ready_input},
-                      reasons_by_number, candidate_numbers, frontier_numbers, conflict_by_area),
-              }
-              # BRACE-FREE by construction: GitHub's secret masker rewrites `{`/`}` to `***` in log
-              # output, so the log carries flat key=value text and the ledger carries the record.
-              print("frontier-census " + " ".join([
-                  repo,
-                  "open_issues=" + str(frontier_census["open_issues"]),
-                  "candidates=" + str(frontier_census["candidates"]),
-                  "frontier_width=" + str(frontier_census["frontier_width"]),
-                  "conflict_deferrals=" + str(conflict_total),
-                  "census_total=" + str(frontier_census["census"]["total"]),
-                  "unclassified=" + str(frontier_census["census"]["unclassified"]),
-                  "attribution=" + attribution,
-              ]))
-              frontier_censuses[repo] = frontier_census
+                  conflict_lines = []
+                  attribution = "unavailable"
+                  try:
+                      dispatch.compute_ready(ready_input, conflict_log=conflict_lines.append)
+                      attribution = "exact"
+                  except TypeError:
+                      print(f"::warning::{repo}: this target's compute_ready() takes no "
+                            "conflict_log — conflict deferrals are counted but NOT attributed "
+                            "to a held area")
+                  engine = getattr(dispatch, "_ready", None)
+                  candidates_fn = getattr(dispatch, "ready_candidates",
+                                          getattr(engine, "ready_candidates", None))
+                  reason_fn = getattr(dispatch, "exclusion_reason",
+                                      getattr(engine, "exclusion_reason", None))
+                  frontier_numbers = {issue.get("number") for issue in ready}
+                  if candidates_fn is None or reason_fn is None:
+                      # Degrade to a VISIBLE GAP. With no engine verdict we refuse to invent
+                      # buckets: everything unaccounted for lands in `unclassified`, so missing
+                      # instrumentation is loud instead of masquerading as a healthy census.
+                      print(f"::warning::{repo}: target planner exposes no ready_candidates()/"
+                            "exclusion_reason() — the dispatch census degrades to a visible gap")
+                      candidate_numbers, reasons_by_number, conflict_total = (
+                          set(frontier_numbers), {}, 0)
+                  else:
+                      candidate_numbers = {
+                          row[1] for row in candidates_fn(ready_input, log=lambda _line: None)}
+                      reasons_by_number = {
+                          row["number"]: reason_fn(set(row["labels"]), row.get("open_blockers", 0))
+                          for row in ready_input}
+                      conflict_total = max(0, len(candidate_numbers) - len(frontier_numbers))
+                  conflict_by_area, _attributed = telemetry.parse_conflict_areas(
+                      conflict_lines, conflict_total)
+                  frontier_census = {
+                      "open_issues": len(readiness_input),
+                      "candidates": len(candidate_numbers),
+                      "frontier_width": len(frontier_numbers),
+                      "deferred_retry_width": len(deferred_ready),
+                      "conflict_deferrals": conflict_total,
+                      "conflict_by_area": conflict_by_area,
+                      "attribution": attribution,
+                      "census": telemetry.census(
+                          {row["number"] for row in readiness_input},
+                          {row["number"] for row in ready_input},
+                          reasons_by_number, candidate_numbers, frontier_numbers,
+                          conflict_by_area),
+                  }
+                  # BRACE-FREE by construction: GitHub's secret masker rewrites `{`/`}` to `***`
+                  # in log output, so the log carries flat key=value text and the ledger carries
+                  # the record.
+                  print("frontier-census " + " ".join([
+                      repo,
+                      "open_issues=" + str(frontier_census["open_issues"]),
+                      "candidates=" + str(frontier_census["candidates"]),
+                      "frontier_width=" + str(frontier_census["frontier_width"]),
+                      "conflict_deferrals=" + str(conflict_total),
+                      "census_total=" + str(frontier_census["census"]["total"]),
+                      "unclassified=" + str(frontier_census["census"]["unclassified"]),
+                      "attribution=" + attribution,
+                  ]))
+                  frontier_censuses[repo] = frontier_census
+              except Exception as census_error:   # noqa: BLE001 — see the posture note above
+                  print(f"::warning::{repo}: the dispatch census FAILED "
+                        f"({type(census_error).__name__}: {census_error}) — this tick is recorded "
+                        "as a GAP and dispatch CONTINUES; telemetry never stops the fleet")
               # <<< frontier-census
 
               routing_doc = dispatch._routing_doc()
@@ -2018,13 +2036,28 @@ jobs:
       # zero-realised record is what a growing unrealised bucket is made of. `continue-on-error`
       # — telemetry must never be able to stop the fleet dispatching.
       #
-      # `id:` so `scripts/dispatch-telemetry.py --self-test` can assert THIS step's wiring: the
-      # recorder has exactly one call site, and deleting it, dropping `--frontier`, or inverting the
-      # `if:` restores the un-instrumented state with every script-level test still green.
+      # `if:` IS ASSERTED BY VALUE, not by substring. `always()` is a substring of
+      # `always() && false`, which disables the recorder outright while every `"if: always()" in
+      # step` assertion stays green — no record is ever written and Gate A reads a fabricated zero
+      # forever. --self-test compares the PARSED scalar, so widening the guard reds a named check.
       #
-      # ADDED API COST: one contents GET + one contents PUT per tick (the same CAS shape the
-      # model-health recorder already uses). Everything else is derived from data PLAN and CLAIM
-      # already fetched — no per-PR detail fetch, and no new listing.
+      # `id:` so `scripts/dispatch-telemetry.py --self-test` can assert THIS step's wiring: the
+      # recorder has exactly one call site, and deleting it, dropping `--frontier`, repointing
+      # `--summary` at a path nothing writes, or inverting the `if:` restores the un-instrumented
+      # state with every script-level test still green.
+      #
+      # `set -euo pipefail`, WITH the `-e`: without it a FAILING `--self-test` below does not stop
+      # the step, the `record` call runs anyway, and the step's exit status is the recorder's — so
+      # the in-workflow self-test gated precisely nothing. `continue-on-error: true` is what keeps
+      # a red self-test from failing the tick; `-e` is what makes it red at all.
+      #
+      # ADDED API COST: one contents GET + one contents PUT per tick in the common case (the same
+      # CAS shape the model-health recorder already uses). WORST CASE, DECLARED: `read_ledger` sits
+      # INSIDE the CAS loop, so `CAS_RETRIES = 8` fully contended ticks cost 8 GET + 8 PUT in one
+      # tick. That is the honest ceiling and it is within the ~102 req/tick headroom; it is not
+      # "fixed" by removing retries, because a dropped record is a hole in the very series the gate
+      # is evaluated from. Everything else is derived from data PLAN and CLAIM already fetched —
+      # no per-PR detail fetch, and no new listing.
       - name: Record the per-tick dispatch telemetry (Gate A) on the ledger branch
         if: always()
         continue-on-error: true
@@ -2032,7 +2065,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          set -uo pipefail
+          set -euo pipefail
           python3 registry/scripts/dispatch-telemetry.py --self-test
           python3 registry/scripts/dispatch-telemetry.py record \
             --frontier plan/frontier-census.json \

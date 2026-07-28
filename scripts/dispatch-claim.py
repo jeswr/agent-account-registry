@@ -6682,10 +6682,6 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
     # onto the PLAN-side census. Coarse counts only — no issue numbers, no account handles.
     worker_by_repo = {}
 
-    def _count_repo(repo_name, key):
-        row = worker_by_repo.setdefault(repo_name, {"planned": 0, "launched": 0})
-        row[key] += 1
-
     # Zero-dispatch visibility (registry #28/#32): count the ready items the PLAN carried and, per
     # tick, WHY each was NOT launched. A tick that PLANNED work but launched NOTHING is a health
     # signal (capacity/access/lease contention, not an empty backlog); the CLAIM step records it +
@@ -6948,7 +6944,7 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
         for item in repository["items"]:
             number = item["number"]
             lanes["worker"]["planned"] += 1
-            _count_repo(repo, "planned")
+            _bump_repo_count(worker_by_repo, repo, "planned")
             if number in linked_open_prs:
                 defer_reasons["existing-pr"] += 1
                 print(f"defer {repo}#{number}: an open worker/closing PR already exists")
@@ -7439,7 +7435,7 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                 continue
             dispatched += 1
             lanes["worker"]["launched"] += 1
-            _count_repo(repo, "launched")
+            _bump_repo_count(worker_by_repo, repo, "launched")
             kind = "deferred-retry" if item["deferred"] else "worker"
             # Privacy (locked decision 22b): public workflow logs never carry account handles.
             print(f"dispatched {kind} {repo}#{number}: model={model}, claim={claim_id[:8]}")
@@ -7536,6 +7532,21 @@ def _lane_summary(lanes):
         summary[name] = {"planned": planned, "launched": launched,
                          "deferred": max(0, planned - launched - error), "error": error}
     return summary
+
+
+def _bump_repo_count(by_repo, repo_name, key):
+    """[Gate A telemetry] Increment ONE per-target worker-lane counter, in place.
+
+    MODULE-LEVEL, and that is the point. This was a closure inside `dispatch()` that no test ever
+    CALLED: `_by_repo_summary` below is pure and stays green without it, and the call-site
+    assertions in --self-test read `inspect.getsource(dispatch)`, so they stay green too. Gutting
+    the counter's BODY to `pass` therefore survived the entire suite while making
+    `realised_dispatches` read 0 forever — Gate A permanently closed on a fabricated number, which
+    is the marquee guard of this change. Out here it has a direct, behavioural test.
+    """
+    row = by_repo.setdefault(repo_name, {"planned": 0, "launched": 0})
+    row[key] += 1
+    return by_repo
 
 
 def _by_repo_summary(by_repo):
@@ -9013,15 +9024,31 @@ def _self_test():
         "o/t": {"planned": 0, "launched": 0}}
     assert _by_repo_summary({7: {"planned": 1}, "o/t": "junk"}) == {}
     assert _by_repo_summary(None) == {}
+    # THE COUNTER'S OWN BODY, executed. The two assertions on either side of this one are a PURE
+    # normalizer and a SOURCE-level call-site pairing; neither runs the increment, so gutting the
+    # counter to `pass` kept the whole suite green while `realised_dispatches` read 0 forever —
+    # Gate A permanently closed on a number nothing measured, which is the marquee guard of this
+    # change. That is only testable because the counter is module-level now (it was a closure
+    # inside dispatch()); this is the test that runs it.
+    _bumped = {}
+    _bump_repo_count(_bumped, "o/t", "planned")
+    _bump_repo_count(_bumped, "o/t", "planned")
+    _bump_repo_count(_bumped, "o/t", "launched")
+    _bump_repo_count(_bumped, "o/u", "launched")
+    assert _bumped == {"o/t": {"planned": 2, "launched": 1},
+                       "o/u": {"planned": 0, "launched": 1}}, _bumped
+    # ...and each target gets its OWN row: a shared default dict would make one target's launches
+    # read as every target's, which passes any single-target fixture.
+    assert _bumped["o/t"] is not _bumped["o/u"], _bumped
     # CALL-SITE SEAM (source-level). The normalizer above is pure and stays green even if the
-    # dispatch loop never CALLS it — and a missing `_count_repo(repo, "launched")` would make
-    # `realised_dispatches` permanently 0, i.e. Gate A permanently closed on a fabricated number.
-    # That is the marquee guard of this change, so pin the pairing: every fleet-lane worker
-    # increment is immediately mirrored into the per-target map.
+    # dispatch loop never CALLS it — and a missing `_bump_repo_count(worker_by_repo, repo,
+    # "launched")` would make `realised_dispatches` permanently 0, i.e. Gate A permanently closed
+    # on a fabricated number. That is the marquee guard of this change, so pin the pairing: every
+    # fleet-lane worker increment is immediately mirrored into the per-target map.
     _dispatch_src = inspect.getsource(dispatch)
     for _lane_key in ("planned", "launched"):
         _paired = (f'lanes["worker"]["{_lane_key}"] += 1\n'
-                   f'            _count_repo(repo, "{_lane_key}")')
+                   f'            _bump_repo_count(worker_by_repo, repo, "{_lane_key}")')
         assert _dispatch_src.count(f'lanes["worker"]["{_lane_key}"] += 1') == 1, _lane_key
         assert _paired in _dispatch_src, (
             f'the worker-lane {_lane_key} increment is not mirrored into the per-target Gate A '
