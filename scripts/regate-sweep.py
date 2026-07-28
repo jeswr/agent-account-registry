@@ -117,7 +117,8 @@
 # the trade is ever rejected the change is small and local — one auto-merge-off call in `_act` plus
 # a census field — not a redesign.
 #
-# HOW THIS COMPOSES WITH #940. #940 is the DEFENSIVE half: at arm time, refuse a green `gate` that
+# HOW THIS COMPOSES WITH #940 (landed as #950, commit c37705ff9). #940 is the DEFENSIVE half: at
+# arm time, refuse a green `gate` that
 # was computed against a tree that no longer exists. This is the RECOVERY half: regenerate the
 # evidence for the tree that does exist. They are the two directions of one property — a gate
 # result is evidence about a TREE, not about a PR. #940 refuses stale evidence; this manufactures
