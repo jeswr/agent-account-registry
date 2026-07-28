@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 895,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "765aed46f86e455c5b7b3fab1ef3b02db4c7dbeb",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The exact-title enumeration and `gh issue create` are not atomic. A public-repo user can create an issue titled `$HANDLE` after `gh api --paginate` completes but before `gh issue create` executes; the workflow then creates a second record and wedges both activation paths. Moving the read immediately before the create only narrows the race and does not close it. The claim ref cannot serialize the explicitly in-scope writers outside the protocol. Thus the implementation does not establish the stated create-once invariant and can still fail open into ambiguous identity.",
+    "file": ".github/workflows/set-up-account.yml",
+    "fix_hint": "Use a serialization or atomic ownership mechanism that all relevant title creation must pass through, or redesign identity so duplicate human-created titles cannot collide with registry records (for example, bind activation to a unique issue number recorded under an atomic claimed key and reject/untrusted-label arbitrary issues). If GitHub cannot atomically create-if-title-absent, do not claim this read-then-create sequence closes the outside-writer window; add a compensating protocol that deterministically prevents or safely resolves the concurrent duplicate before either record can be trusted.",
+    "severity": "blocker",
+    "title": "Check-then-create race does not enforce create-once registration"
+   },
+   {
+    "body": "The fake `gh` returns a fixed listing and then records the create, so every test is sequential. None models an issue appearing after the listing but before `issue create`. Consequently the suite remains green for the implementation's central unsound check-then-create behavior and does not prove create-once semantics against the outside writer named in the threat model.",
+    "file": "scripts/grant-account.py",
+    "fix_hint": "Add an executed adversarial scenario in which the fake inserts the same-title issue between the API response and the create attempt, and assert that the protocol cannot produce two trusted account records. This will require testing a redesigned synchronization or identity mechanism; a second pre-create list alone merely moves the same race.",
+    "severity": "major",
+    "title": "Self-test omits the critical concurrent interleaving"
+   }
+  ],
+  "progress": null,
+  "summary": "The proposed pre-create uniqueness check is fail-closed for listing errors and existing duplicates, and its executed tests cover those sequential cases. However, it does not provide create-once semantics: the issues API read and `gh issue create` are separate operations with an unavoidable race. An outside writer can create the same title after the check returns zero and before this workflow creates its issue, producing the exact duplicate state the change claims to prevent. Because public issue creation is explicitly in the threat model, this is a blocker rather than a theoretical concern. The self-test does not exercise that interleaving and therefore cannot validate the central concurrency guarantee.",
+  "verdict": "request_changes"
+ }
+}
