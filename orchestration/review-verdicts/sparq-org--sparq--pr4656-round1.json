@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4656,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "7d8317d048de772cf58d260c43b07df0d81eb19c",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`write_offset` uses `fs::rename(&tmp, path)` while `path` normally already exists after the first successful pump. Rust's rename-over-existing-file behavior is platform-specific; on Windows this fails instead of atomically replacing the destination. The broker messages have already been delivered and flushed at that point, so each subsequent pump returns an I/O error without updating `delivered_through`, and retries publish the same records indefinitely. The existing tests exercise repeated updates only on the current platform and do not establish the advertised platform-neutral durable-resume behavior.",
+    "file": "crates/sparq-serve/src/change_sink.rs",
+    "fix_hint": "Implement a portable atomic-replace abstraction for the offset file (with the necessary platform-specific replacement operation), preserving the old valid offset on failure. Add a test that advances an already-existing offset file and verifies the second persisted value is observed after reopening; run that test on Windows as well as Unix. If Windows support is intentionally excluded, state and enforce that platform restriction rather than exposing a silently broken public API.",
+    "severity": "major",
+    "title": "Offset replacement fails after the first watermark update on Windows"
+   }
+  ],
+  "progress": null,
+  "summary": "The relay and protocol tests cover the principal sequencing and fail-closed paths, but the durable watermark update is not portable: the implementation relies on renaming a temporary file over an existing offset file. That replacement works on Unix but fails on Windows, so after the first successful pump every later pump that advances the same consumer can publish and flush records yet fail to persist the new watermark, causing repeated delivery without durable progress. This is a major correctness defect in a public, otherwise platform-neutral Rust API.",
+  "verdict": "request_changes"
+ }
+}
