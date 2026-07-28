@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1066,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "aa4d80e8f22b2b1349cfc6d26a4876d01653c3a7",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`derives_labels()` accepts any assignment to `labels` whose RHS contains a `pull` name and a string constant `\"labels\"` anywhere in its AST; it does not establish that `pull.get(\"labels\")` supplies the resulting collection. For example, the live assignment can validly become a conditional expression that builds the set from `head.get(\"labels\")` when `pull.get(\"labels\") is not None`, with `[]` otherwise. On normal payloads this binds `labels` from `head` (normally empty), making all three stand-down guards inert, yet the RHS still contains both syntactic tokens required by `derives_labels()`. There is no intervening statement to stop the scan, so all three expected literals are collected and the seam check stays green. KP7 removes the only `pull` occurrence and KP8 moves the PR-derived expression to another assignment, so neither exercises this decoy-within-the-same-RHS case.",
+    "file": "scripts/park_policy.py",
+    "fix_hint": "Recognize the concrete PR-label data-flow shape rather than unrelated token occurrence: prove that the iterable feeding the assigned `labels` collection is the `pull` payload's `labels` field (with only explicitly allowed normalization around it), or behaviorally execute the extracted admission step with controlled payloads. Add a valid non-crashing mutant in which the same RHS mentions `pull.get(\"labels\")` only in a condition/decoy but builds `labels` from `head`, and require a normal FAIL with the pristine total check count.",
+    "severity": "major",
+    "title": "Derivation anchor still does not prove PR labels supply the guarded value"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 3 catches a plain `labels = []` rebind and several simple derivation repoints, but the provenance predicate is still an existential syntax check rather than a binding of the value consumed by the guards to `pull.get(\"labels\")`. A valid, non-crashing derivation can read the PR-label expression only as a decoy while actually producing `labels` from another object; the scanner then reports all three guards unchanged while the workflow admits parked PRs. The prior provenance finding therefore remains at major severity, so progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
