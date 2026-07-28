@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4674,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "7c2c6775a08fa792f2346fa69e18857fb0492c68",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`char_sets_complete_for` uses `saturating_add` and then compares the saturated result with `distinct_subjects`. If the characteristic-set counts overflow and the partition reports `u64::MAX`, the equality succeeds even though the sets are not a valid partition/accounting. Rule C2 may then treat an absent co-occurrence set as proof and suppress a combination. This contradicts the stated recall-safe/fail-closed behavior for public, hand-buildable descriptors.",
+    "file": "crates/sparq-fedplan-mpc/src/combination.rs",
+    "fix_hint": "Accumulate with `checked_add`; on overflow return `false` so Rule C2 declines. Add a negative test with overflowing characteristic-set subject counts and `distinct_subjects == u64::MAX` that verifies no dead pairing is emitted.",
+    "severity": "major",
+    "title": "Saturating subject-count overflow can falsely prove summary completeness"
+   },
+   {
+    "body": "The new validation accepts any in-range candidate index, while `dead_star_pairings` applies `sources[cand.source]` and records `cand.source_id`. A `SelectedPrivateSources` produced from a different/reordered descriptor slice, or a hand-built candidate whose `source_id` disagrees with that indexed descriptor, can therefore use another source's characteristic sets to prove a dead pairing and prune a potentially live combination. The API documentation says the slice must be the same one, but the implementation's advertised fail-closed validation does not enforce that invariant.",
+    "file": "crates/sparq-fedplan-mpc/src/combination.rs",
+    "fix_hint": "Before Rule C2, require every candidate's `source_id` to equal the ID of `sources[candidate.source]`; return `SeamError::DescriptorMismatch` on disagreement. Add a test using an in-range index with a mismatched ID/reordered source slice.",
+    "severity": "major",
+    "title": "Candidate indices are bounds-checked but not matched to descriptor identities"
+   }
+  ],
+  "progress": null,
+  "summary": "Rule C2 has two fail-closed gaps that can turn inconsistent or misaligned descriptor inputs into wrong-answer pruning. The tests cover truncation and out-of-range indices, but neither descriptor-identity mismatch nor overflow in the completeness accounting. Because this pass changes which source combinations execute, both conditions must decline or error rather than be interpreted as proof.",
+  "verdict": "request_changes"
+ }
+}
