@@ -1,49 +1,60 @@
 {
-  "generated_at": "2026-07-28T00:14:19Z",
+  "generated_at": "2026-07-28T00:40:18Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
-      "issues_open": 1534,
-      "issues_ready": 369,
-      "issues_closed_1h": 1,
-      "issues_closed_24h": 50,
-      "prs_open": 96,
+      "issues_open": 1541,
+      "issues_ready": 368,
+      "issues_closed_1h": 2,
+      "issues_closed_24h": 48,
+      "prs_open": 95,
       "prs_draft": 72,
-      "prs_opened_1h": 3,
-      "prs_closed_1h": 4,
-      "prs_merged_1h": 1,
-      "prs_merged_24h": 56,
-      "review_changes_backlog": 8,
+      "prs_opened_1h": 7,
+      "prs_closed_1h": 7,
+      "prs_merged_1h": 3,
+      "prs_merged_24h": 54,
+      "review_changes_backlog": 9,
       "needs_user_parked": 21,
       "review_lane_health": "ok",
-      "review_lane_runs_1h": 7,
-      "worker_attempts_1h": 4,
-      "worker_success_rate_1h": 0.75,
-      "pr_open_rate": 3.0,
-      "pr_close_rate": 5.0,
-      "net_pr_flow": -2.0
+      "review_lane_runs_1h": 17,
+      "worker_attempts_1h": 7,
+      "worker_success_rate_1h": 1.0,
+      "pr_open_rate": 7.0,
+      "pr_close_rate": 10.0,
+      "net_pr_flow": -3.0
     },
     "jeswr/agent-account-registry": {
-      "issues_open": 375,
+      "issues_open": 382,
       "issues_ready": 75,
-      "issues_closed_1h": 2,
+      "issues_closed_1h": 1,
       "issues_closed_24h": 31,
-      "prs_open": 34,
-      "prs_draft": 20,
-      "prs_opened_1h": 5,
+      "prs_open": 37,
+      "prs_draft": 22,
+      "prs_opened_1h": 7,
       "prs_closed_1h": 0,
       "prs_merged_1h": 5,
-      "prs_merged_24h": 50,
-      "review_changes_backlog": 5,
+      "prs_merged_24h": 51,
+      "review_changes_backlog": 6,
       "needs_user_parked": 13,
       "review_lane_health": "ok",
-      "review_lane_runs_1h": 3,
+      "review_lane_runs_1h": 5,
       "worker_attempts_1h": 7,
-      "worker_success_rate_1h": 0.4286,
-      "pr_open_rate": 5.0,
+      "worker_success_rate_1h": 0.5714,
+      "pr_open_rate": 7.0,
       "pr_close_rate": 5.0,
-      "net_pr_flow": 0.0
+      "net_pr_flow": 2.0
     }
   },
-  "alerts": []
+  "alerts": [
+    {
+      "target": "jeswr/agent-account-registry",
+      "classification": "worker-failing",
+      "fire": true,
+      "summary": "worker success rate 57% < 50% floor over 2 snapshots (7 attempts this hour)",
+      "metrics": {
+        "worker_success_rate_1h": 0.5714,
+        "worker_attempts_1h": 7
+      }
+    }
+  ]
 }
