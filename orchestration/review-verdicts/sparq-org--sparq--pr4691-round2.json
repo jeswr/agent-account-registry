@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4691,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "661da3c9f90f54f5799a64a18f01ba28e9e95a50",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "contexts_from_pairs reads indices 0 and 1 but does not check pair.length() == 2. Thus [url, documentText, extra] is accepted even though the function and public API documentation say malformed entries that are not two-string arrays are rejected. The wasm malformed-input test covers a non-array and a short pair, but still does not cover an overlong pair. This is materially the same minor finding as round 1.",
+    "file": "crates/sparq-wasm/src/jsonld_context.rs",
+    "fix_hint": "Reject pairs unless pair.length() == 2 and add a wasm test asserting that an overlong pair is rejected, or explicitly document that only the first two elements are consumed and extras are ignored.",
+    "severity": "minor",
+    "title": "Context entries still are not validated to contain exactly two elements"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The feature remains opt-in, fail-closed, and covered on both the native parsing path and the real wasm boundary. However, the sole round-1 validation mismatch remains unchanged: contexts_from_pairs still reads only elements 0 and 1 without requiring pair.length() == 2, so an overlong entry is accepted despite the documented exact two-element shape. Because this is the same minor contract/documentation issue and no blocker or major correctness, soundness, test-validity, or security defect is evident, approval remains appropriate.",
+  "verdict": "approve"
+ }
+}
