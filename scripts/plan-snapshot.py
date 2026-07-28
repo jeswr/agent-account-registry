@@ -70,6 +70,8 @@ Nothing about WHICH pages are fetched, how a walk terminates, the per-walk ceili
 """
 
 import argparse
+import contextlib
+import io
 from concurrent.futures import ThreadPoolExecutor
 import importlib.util
 import json
@@ -78,6 +80,7 @@ from pathlib import Path
 import re
 import sys
 import time
+import traceback
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
@@ -686,6 +689,34 @@ def snapshot_targets(fetch, claim, repos, out_dir, concurrency=SNAPSHOT_CONCURRE
               f"{len(inert['items'])} open PR(s) provably inert "
               f"({_reason_histogram(inert['reasons'])})")
     print(f"SNAPSHOT complete for {len(repos)} target repo(s)")
+
+
+def _run_checks(checks):
+    """Run `checks` in order, fail-fast, returning (ok, rows) where each row NAMES its check.
+
+    [sparq#4819 round 3] Separated from `_self_test` so the reporting itself is testable against
+    fakes — a reporter asserted only by the suite it reports on cannot witness its own regression.
+
+    An `AssertionError` is a KILL: the guard fired, which is the outcome a mutation battery is
+    entitled to count. ANY other exception is a CRASH: the harness or the product raised, which is
+    NOT a kill and is labelled differently so a mutation run cannot bank it as one. Both are
+    non-ok, so the exit code is identical either way and no failure can be reported as a pass.
+    The traceback is still printed on a crash, because that is the case someone has to debug.
+    """
+    rows = []
+    for check in checks:
+        try:
+            check()
+        except AssertionError as exc:
+            rows.append(f"  FAIL {check.__name__}: {exc}")
+            return False, rows
+        except BaseException as exc:                # noqa: BLE001 — classified, then re-reported
+            traceback.print_exc()
+            rows.append(f"  CRASH {check.__name__}: {type(exc).__name__}: {exc} — NOT a kill, "
+                        "the harness or the product raised")
+            return False, rows
+        rows.append(f"  ok   {check.__name__}")
+    return True, rows
 
 
 def _self_test():
@@ -1398,18 +1429,77 @@ def _self_test():
         assert inertness_attestation(claim, [row13], {13: detail})["items"]["13"] is False
         assert inertness_attestation(claim, [row13], {"13": detail})["items"]["13"] is False
 
-    the_inertness_attestation_adopts_the_claim_predicate_and_fails_closed()
-    snapshot_parallel_output_is_identical_to_serial()
-    per_pr_reads_actually_overlap()
-    repo_listings_overlap_across_repos()
-    in_flight_reads_never_exceed_the_requested_bound()
-    concurrency_stays_inside_the_secondary_rate_limit_budget()
-    sweep_fatal_listing_failure_is_still_fatal()
-    retry_after_is_honoured_and_capped()
-    the_three_403s_are_told_apart()
-    budget_403_is_not_retried_and_is_sweep_fatal()
-    budget_403_is_never_downgraded_to_a_per_item_skip()
-    the_reserve_stops_the_sweep_before_the_budget_is_gone()
+    # [sparq#4819 round 3] A GUARD THAT FIRES MUST SAY WHICH GUARD FIRED. This suite used to be a
+    # flat call sequence, so any failure escaped as a bare traceback with NO verdict line at all —
+    # `--self-test | grep -cE "self-test (PASSED|FAILED)"` returned 0. MEASURED on this file's
+    # marquee guard: mutating `inertness_attestation` to fail open (attest every PR inert) was
+    # detected, but reported as an unlabelled `AssertionError` indistinguishable from the harness
+    # itself breaking. That distinction is the point — a crash is not a kill — and the sibling
+    # data-shape guards in dispatch-plan.py already report named rows, so this file's HEADLINE
+    # guard was the one with the weakest reporting.
+    #
+    # FAIL-FAST IS PRESERVED. `_run_checks` stops at the first failure exactly as the flat
+    # sequence did (several checks share module-level fixture state, so continuing past a failure
+    # would report cascades, not findings). What changed is only the reporting, and the exit code
+    # is unchanged in both directions.
+    # THE REPORTER IS PINNED FIRST, and with plain `if`/`print` rather than `assert` or
+    # `_run_checks` itself. Both of those would route the announcement of a broken reporter
+    # THROUGH the thing under test: measured, an `assert` here escaped as a bare traceback with
+    # zero verdict lines under three separate reporter mutations — reproducing, inside the fix,
+    # the exact defect the fix exists to remove. Fakes only, so no real check is disturbed.
+    def _fake_pass():
+        return None
+
+    def _fake_kill():
+        raise AssertionError("the guard fired")
+
+    def _fake_crash():
+        raise TypeError("the harness broke")
+
+    # The crash branch prints a traceback by design; silence it for the PROBE only so a passing
+    # run stays readable. Real crashes still print, because that is the case someone must debug.
+    with contextlib.redirect_stderr(io.StringIO()):
+        _probe = {
+            "pass": _run_checks((_fake_pass,)),
+            "kill": _run_checks((_fake_pass, _fake_kill, _fake_pass)),
+            "crash": _run_checks((_fake_crash,)),
+        }
+    _want = {
+        "pass": (True, ["  ok   _fake_pass"]),
+        # A KILL (AssertionError = the guard fired) and a CRASH (anything else = the harness or
+        # the product raised) must be LABELLED DIFFERENTLY. Collapsing them is how a crash gets
+        # banked as a kill by a mutation run.
+        "kill": (False, ["  ok   _fake_pass", "  FAIL _fake_kill: the guard fired"]),
+        "crash": (False, ["  CRASH _fake_crash: TypeError: the harness broke — NOT a kill, "
+                          "the harness or the product raised"]),
+    }
+    _bad = [f"{name}: got {_probe[name]!r}, want {_want[name]!r}"
+            for name in _want if _probe[name] != _want[name]]
+    if _bad:
+        for _row in _bad:
+            print(f"  FAIL _run_checks reporter self-check — {_row}")
+        print("plan-snapshot self-test FAILED")
+        return 1
+
+    ok, rows = _run_checks((
+        the_inertness_attestation_adopts_the_claim_predicate_and_fails_closed,
+        snapshot_parallel_output_is_identical_to_serial,
+        per_pr_reads_actually_overlap,
+        repo_listings_overlap_across_repos,
+        in_flight_reads_never_exceed_the_requested_bound,
+        concurrency_stays_inside_the_secondary_rate_limit_budget,
+        sweep_fatal_listing_failure_is_still_fatal,
+        retry_after_is_honoured_and_capped,
+        the_three_403s_are_told_apart,
+        budget_403_is_not_retried_and_is_sweep_fatal,
+        budget_403_is_never_downgraded_to_a_per_item_skip,
+        the_reserve_stops_the_sweep_before_the_budget_is_gone,
+    ))
+    for row in rows:
+        print(row)
+    if not ok:
+        print("plan-snapshot self-test FAILED")
+        return 1
 
     print("plan-snapshot self-test PASSED")
     return 0
