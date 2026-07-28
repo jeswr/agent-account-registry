@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4785,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "08bfe026d64a291814ace035ecebbacc53008c24",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 3 remains correct and complete as a research-only design record. The document consistently limits v1 to ACIR checked unsigned add, excludes subtraction with a field-modulus underflow argument, excludes multiplication and u128 from the initial pass, and makes the existing max-bits defect a hard prerequisite. It distinguishes measured interpreter behavior and structural candidate counts from analytic arguments and unmeasured gate impact, labels the 501 candidates as an upper bound, and states the untested C0, C3, C5, and cover-survival conditions. The proposed sequencing is fail-closed: prerequisite repair, focused gate measurement, then an ACIR-only implementation, with a null-result stop condition. No hostile instruction is embedded in the diff; shell commands appear only as ordinary reproduction documentation. No correctness, soundness, test-validity, or security defect is present.",
+  "verdict": "approve"
+ }
+}
