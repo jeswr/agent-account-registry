@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4601,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "7aa7bcbd19d6384fd81d3ea3cc26869471d01e46",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 7 says each row is \"filed as its own tracked follow-up item\" under sq-vrye, but the table supplies no bead IDs and the task database still shows sq-vrye with no dependent child items and only the broad description \"publish=false measure-first prototype.\" Searches for the distinctive P1-P6 work descriptions find no matching beads. This is materially the same unresolved round-1 finding: the document claims independently checkable tracking that does not exist, so the planned isolation gates and correctness/availability hardening can still be lost.",
+    "file": "research/gpu-threat-model.md",
+    "fix_hint": "Create actual beads for the independently actionable P1-P6 work (combining tightly coupled rows is acceptable), link them to sq-vrye, and put their IDs in the table. If the beads exist only in an unexported database, export the task state so the committed repository makes the claim verifiable.",
+    "severity": "major",
+    "title": "P1-P6 are still asserted as tracked without identifiable beads"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 2 is improving: the native-artifact half of exit condition 3 is now explicitly assigned to P2, and T-GPU-INT is correctly categorized as Tampering. However, the remaining task-tracking defect is still material. Section 7 now asserts that every P1-P6 row is filed as its own tracked follow-up item, but it gives no bead IDs, and the repository task database still contains only the broad sq-vrye bead with no child dependencies or descriptions matching P1-P6. The design record therefore makes a false checkability claim and leaves its concrete deferred security work untracked.",
+  "verdict": "request_changes"
+ }
+}
