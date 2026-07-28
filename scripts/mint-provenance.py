@@ -310,11 +310,18 @@ def issue_mint_refusal(issue_number, issue, pull, plan_package, global_package,
         return (f"source issue #{issue_number} carries an unsafe area:* label ({unsafe[0]!r}); "
                 "review-fix.yml's resolve step refuses it on every dispatch")
     package = plan_package(areas)
+    # [OPUS-5] The refusal is on the SERIALIZING partition specifically, and since the reduction
+    # became a SET that is exactly the ZERO-area case: a multi-area issue now reduces to a key
+    # naming its own areas and excludes only against those, so there is no cross-lane cost to
+    # refuse. The refusal text says "give the issue AT LEAST one area:* label" for the same
+    # reason — two labels is a correct answer now, and telling an operator to delete one would
+    # ask them to make the record LESS accurate to satisfy an encoding limit that no longer
+    # exists. `--allow-global-partition` is unchanged and still the only way to accept the cost.
     if package == global_package and not allow_global_partition:
         return (f"source issue #{issue_number} reduces to the serializing {global_package} "
                 f"partition ({len(areas)} area:* label(s)); a review lease on it excludes every "
                 "other lane. Re-run with --allow-global-partition to accept that cost, or give "
-                "the issue exactly one area:* label")
+                "the issue at least one area:* label")
     if not references_issue(pull, issue_number):
         return (f"the pull request does not reference #{issue_number} in its title or body; the "
                 "record must bind a PR to the issue it actually names")
@@ -738,9 +745,17 @@ def _self_test():                                                       # noqa: 
             lambda: issue_mint_refusal(7, issue(labels=[{"name": "area:a b"}]), pull(), *args))
     rejects("ZERO area labels reduce to the serializing partition and are refused", "__global__",
             lambda: issue_mint_refusal(7, issue(labels=[]), pull(), *args))
-    rejects("TWO area labels reduce to it too", "__global__",
-            lambda: issue_mint_refusal(
-                7, issue(labels=[{"name": "area:ci"}, {"name": "area:docs"}]), pull(), *args))
+    # [OPUS-5][RED] TWO area labels used to reduce to `__global__` too, so a genuinely two-crate
+    # source issue could not be recorded at all without an operator override. The reduction is a
+    # SET now: the record's partition is `ci,docs`, which excludes only against `ci` and `docs`,
+    # so there is nothing to refuse. The ZERO-area row above is the paired CONTROL and is still
+    # refused — that is the only shape whose footprint is genuinely unknown.
+    check("[RED] TWO area labels are BOUND — they reserve exactly those two areas, not the world",
+          issue_mint_refusal(
+              7, issue(labels=[{"name": "area:ci"}, {"name": "area:docs"}]), pull(), *args),
+          None)
+    check("...and the partition such a record reserves names exactly those two areas",
+          lease_schema.plan_package(["docs", "ci"]), "ci,docs")
     check("...and --allow-global-partition is the explicit acceptance of that cost",
           issue_mint_refusal(7, issue(labels=[]), pull(), *args, allow_global_partition=True),
           None)
