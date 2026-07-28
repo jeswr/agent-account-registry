@@ -22649,6 +22649,21 @@ def _absorbing_park_leg_self_test():
         exec(block_source, namespace)  # noqa: S102 — the workflow's own block
         return [row["number"] for row in namespace["deferred_input"]]
 
+    def run_filter_rows(labels, block_source=block):
+        """`run_filter` but returning the EMITTED ROWS, so the deferred->ready swap the block
+        performs on its way out is assertable and not just its selection."""
+        rows = [{"number": 1, "state": "OPEN", "labels": sorted(labels), "open_blockers": 0}]
+        namespace = {"readiness_input": rows, "linked": set(),
+                     "details": {1: ({"author_association": "OWNER"}, sorted(labels), "")},
+                     "trusted": lambda _issue, _bots: True, "repo_trusted_bots": set()}
+        exec(block_source, namespace)  # noqa: S102 — the workflow's own block
+        return namespace["deferred_input"]
+
+    def _dispatch_plan():
+        """The READY lane's engine, loaded the same way the `#112` reduction rows above load it."""
+        return _load_module("registry_dispatch_plan",
+                            Path(__file__).resolve().with_name("dispatch-plan.py"))
+
     parked = ["status:deferred", "status:parked", "priority:P2", "role:impl", "area:x"]
     chk("[#764] the PLAN filter ADMITS a parked+deferred item (the park is a readmission hook)",
         run_filter(parked), [1])
@@ -22658,6 +22673,46 @@ def _absorbing_park_leg_self_test():
     assert mutated != block, "the needs:* clause moved — this mutation must stay live"
     chk("[#764] YAML seam: deleting the needs:* clause RESTORES the defect (retired item planned)",
         run_filter(parked + ["needs:user"], mutated), [1])
+
+    # (10) [registry #1054] THE OWNERSHIP GAP, at the same YAML seam. The filter used to skip a
+    # deferred row that also carried `status:ready` because "the ready lane owns it". It does not:
+    # `status:deferred` is in `ready-issues.BUSY_STATUS`, so the ready lane refuses the identical
+    # row. Both lanes excluded it, each believing the other held it, and on the live registry board
+    # 2026-07-28 that was 30 of 32 `status:ready` issues — a dispatchable frontier of ZERO. The
+    # WRITER is closed in triage.py; this seam is what stops the state being a DEADLOCK when any
+    # other actor (the maintainer did it to 6 of the 30) writes the pair by hand.
+    pair = ["status:deferred", "status:ready", "priority:P2", "role:impl", "area:x"]
+    rows = run_filter_rows(pair)
+    chk("[#1054] the PLAN filter ADMITS a ready+deferred pair instead of stranding it",
+        [row["number"] for row in rows], [1])
+    # The swap at the foot of the block is a set union, so an already-`status:ready` row must be
+    # handed to the engine in the SAME shape as a lone deferred row — not double-labelled, not
+    # left carrying `status:deferred` into a readiness computation that would refuse it again.
+    chk("[#1054] ...and the deferred->ready swap is IDEMPOTENT when status:ready is already there",
+        (rows[0]["labels"] if rows else None,
+         (run_filter_rows([lb for lb in pair if lb != "status:ready"]) or [{}])[0].get("labels")),
+        (sorted(set(pair) - {"status:deferred"}), sorted(set(pair) - {"status:deferred"})))
+    # THE COMPOSITION that made this a deadlock rather than a delay: the OTHER lane must genuinely
+    # refuse the same row. Asserting only this lane's admission would leave "both lanes take it"
+    # (a double-dispatch) indistinguishable from the fix.
+    _ready_rows = [{"number": 1, "state": "OPEN", "labels": sorted(pair), "open_blockers": 0}]
+    chk("[#1054] ...while the READY lane still refuses it — status:deferred stays BUSY, unrelaxed",
+        [row["number"] for row in _dispatch_plan().compute_ready(list(_ready_rows))], [])
+    # Every other gate on the pair must still hold, or this admission is a hole rather than a fix.
+    for gate in ("needs:user", "status:in-progress", "status:blocked", "trust:untrusted",
+                 "status:untriaged"):
+        chk(f"[#1054] ...and the pair is STILL gated by {gate}", run_filter(pair + [gate]), [])
+    # MUTATION at the YAML seam. Restoring the one clause that was deleted must restore the
+    # deadlock — and it must do so while `deferred_input`, the loop and the swap are all still
+    # structurally present, which is exactly what the assertions above inspect.
+    regressed = block.replace('if "status:deferred" not in labels:',
+                              'if "status:deferred" not in labels or "status:ready" in labels:')
+    assert regressed != block, "the #1054 candidate clause moved — this mutation must stay live"
+    chk("[#1054] YAML seam: restoring the `status:ready` clause RESTORES the deadlock",
+        run_filter(pair, regressed), [])
+    chk("[#1054] ...and the restored clause leaves a LONE deferred row admitted — so only the "
+        "pair row above can kill it",
+        run_filter([lb for lb in pair if lb != "status:ready"], regressed), [1])
 
 
 def _dispatch_yaml_block(path, step_id, marker):

@@ -1556,8 +1556,10 @@ def _self_test():
     # instead of the write would silently re-open registry #799's untriaged deadlock.
     chk("[#1054] ...but the classification VERDICT retriage/stock-alert consume is unchanged",
         (r["ready"], r["role"], len(r["warnings"])), (True, "impl", 1))
+    # `any(...)` over the list, never `warnings[0]`: a mutant that suppresses the warning entirely
+    # must be killed by THIS NAMED ROW, not by an IndexError that aborts every row after it.
     chk("[#1054] ...and the withholding is NAMED in a warning, not silent",
-        ("status:deferred" in r["warnings"][0] and "withholding status:ready" in r["warnings"][0]),
+        any("withholding status:ready" in w and "status:deferred" in w for w in r["warnings"]),
         True)
     # The CONTROL, and the half that kills an inverted guard: with no dispatcher-owned status live,
     # the promotion is unchanged. Without this row, `if not held` passes every assertion above.
