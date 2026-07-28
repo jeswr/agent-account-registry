@@ -1597,7 +1597,16 @@ jobs:
         # [issue #156] decision == 'stale' is the head-moved DROP (the live head advanced off
         # the reviewed sha during the run): the outcome applied NOTHING, so reviewed-sha must
         # stay unbound — the sweep re-reviews the current head.
-        if: ${{ inputs.mode == 'review' && steps.outcome.outcome == 'success' && steps.outcome.outputs.decision != 'hold' && steps.outcome.outputs.decision != 'stale' && (steps.outcome.outputs.decision != 'arm' || (steps.arm.outcome == 'success' && steps.arm.outputs.arm_complete == 'true')) }}
+        # [registry #892] `bind_reviewed_sha` is the DECLINED-ARM leg, and it is the routing half
+        # of that decline, not a convenience. ready_and_arm refuses the latch when the aggregator
+        # at the reviewed head has already CONCLUDED red (arm_complete stays false — nothing was
+        # armed), but the review itself completed end to end on this head, so the marker must
+        # bind: a bound marker on a drafted review:needs PR is what makes enumerate_review_items
+        # fall through to GAP-A and emit needs-ci-fix. Leaving it unbound would re-emit
+        # needs-review and spend another cross-provider round on an untouched tree. Deleting this
+        # disjunct therefore does not merely skip a marker write — it converts every declined arm
+        # into a repeat review round, which is what the paired self-test asserts.
+        if: ${{ inputs.mode == 'review' && steps.outcome.outcome == 'success' && steps.outcome.outputs.decision != 'hold' && steps.outcome.outputs.decision != 'stale' && (steps.outcome.outputs.decision != 'arm' || (steps.arm.outcome == 'success' && (steps.arm.outputs.arm_complete == 'true' || steps.arm.outputs.bind_reviewed_sha == 'true'))) }}
         env:
           GH_TOKEN: ${{ steps.app-token-outcome.outputs.token }}
         run: |
