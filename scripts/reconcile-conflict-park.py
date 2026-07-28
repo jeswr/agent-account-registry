@@ -1452,11 +1452,30 @@ def _self_test():
 
     boom = FakeApi({102: stack_row(102)}, fail_repo="o/r")
     boom_code, boom_census, _ = drive(boom, ["--repos", "o/r", "--bot-login", "bot", "--apply"])
+    # Indexing `errors[0]` here would make the swallow-the-error mutant die by IndexError instead
+    # of by name, which shows the code crashed rather than that the handler was load-bearing.
     check("[STACK] an unreadable REPOSITORY reds the run through main's own handler and is named "
           "in the census — never swallowed into a clean exit zero",
-          (boom_code, len(boom_census["errors"]), "o/r" in boom_census["errors"][0],
+          (boom_code, len(boom_census["errors"]),
+           any("o/r" in message for message in boom_census["errors"]),
            boom_census["considered"]),
           (1, 1, True, 0))
+
+    # A non-zero `gh` exit whose payload nevertheless PARSES. Without the returncode check in
+    # `_gh`, every read looks like a success and the sweep releases on data it never really got —
+    # the shape a secondary rate-limit or a revoked token produces.
+    class RcFailApi(FakeApi):
+        def run(self, argv, **kwargs):
+            result = super().run(argv, **kwargs)
+            return types.SimpleNamespace(stdout=result.stdout, returncode=1,
+                                         stderr="You have exceeded a secondary rate limit")
+
+    rc_fail = RcFailApi({102: stack_row(102)})
+    rc_code, rc_census, _ = drive(rc_fail, ["--repos", "o/r", "--bot-login", "bot", "--apply"])
+    check("[STACK] a NON-ZERO `gh` exit is a failure even when its payload parses — the sweep "
+          "reds and writes nothing, rather than acting on data it never really received",
+          (rc_code, rc_fail.writes, rc_census["released"], len(rc_census["errors"])),
+          (1, [], [], 1))
 
     # --- (i) THE YAML SEAM. Pin the CALL SITE, not only the Python ----------------------------
     # Every uncaught mutant in this repo's measured mutation runs lived at a workflow `if:`, a
