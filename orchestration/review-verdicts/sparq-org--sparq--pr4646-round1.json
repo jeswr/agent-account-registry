@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4646,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ef166e2ef412972e9a3d6c0914ff2639bb533361",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "malformed_lexical_forms_fail_instead_of_reading_back_a_substituted_value includes \" 7\" among malformed xsd:integer lexical forms. XML Schema fixes the whiteSpace facet for integer to collapse, so leading/trailing whitespace is normalized before lexical-to-value mapping; this literal should decode as 7 rather than be rejected. The test would lock in non-conformant behavior in decode_i128.",
+    "file": "crates/sparq-wrapper/tests/codecs.rs",
+    "fix_hint": "Remove \" 7\" from the rejection cases and add a positive witness that whitespace-padded/tab/newline-separated boundary whitespace is collapsed and decoded correctly. Update decode_i128 to apply XML Schema whitespace collapse before parsing while still rejecting internal whitespace such as \"+ 1\".",
+    "severity": "major",
+    "title": "Test incorrectly requires rejection of a valid whitespace-collapsed xsd:integer"
+   }
+  ],
+  "progress": null,
+  "summary": "The new integration tests exercise the real Store readback path and cover useful boundary, datatype, error, and fixed-point behavior. However, one test encodes an incorrect XML Schema integer lexical-space assumption: xsd:integer has a fixed whiteSpace facet of collapse, so a whitespace-padded form such as \" 7\" denotes a valid integer after whitespace normalization. Requiring decode_i128 to reject it makes the public codec less conformant and turns that behavior into a regression constraint.",
+  "verdict": "request_changes"
+ }
+}
