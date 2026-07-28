@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4919,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "dc22a6825507218084540e0c11964449abe7b8bf",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The dependency preflight correctly derives the package's runtime dependencies plus the TypeScript test-loader dependency, resolves them before the lazy codec paths run, and fails with actionable install guidance. The package script wiring ensures npm test invokes it. The tightened extension test no longer accepts a missing-module rejection, and the new bzip2 fixture independently decodes to the asserted 250,000-byte alphabet cycle, so the multi-block regression test is non-vacuous and checks byte order/content rather than length alone. The README's CI-lane description matches the workflow context. No correctness, soundness, test-validity, or security issue was found.",
+  "verdict": "approve"
+ }
+}
