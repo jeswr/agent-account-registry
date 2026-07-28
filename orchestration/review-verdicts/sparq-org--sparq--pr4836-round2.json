@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4836,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ecb00295e0a776b3993405be99370d982bded175",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 1's packaging defect is resolved. G4 now correctly distinguishes non-optional peers from optional peers, explicitly states that optional peers are not auto-installed, removes the unsupported skipLibCheck conclusion, and makes the standalone type-resolution/SBOM tradeoff explicit. The phased plan no longer prescribes an optional peer as satisfying standalone installation: phase 1 conditions the manifest choice on whether definition-of-done item (iii) remains unconditional and requires a fresh-consumer fixture in both skipLibCheck states. The record remains appropriately scoped as research rather than implementation, labels unexecuted claims and evidence limitations, and does not introduce a correctness, security, or vacuous-test issue.",
+  "verdict": "approve"
+ }
+}
