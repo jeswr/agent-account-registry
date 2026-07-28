@@ -837,8 +837,12 @@ def auto_readmission_receipt(evidence_key, recovered_at):
             f"the cause-recovery route, a new outage-and-recovery pair), and at "
             f"most {policy.AUTO_READMISSION_MAX} automatic re-admissions are ever granted to one "
             f"PR — past that the loop stops and asks a human. A human hold "
-            f"(`{'` / `'.join(HUMAN_OWNED_LABELS)}`) and a human-applied park are never "
-            f"touched by this path.\n\n"
+            f"(`{'` / `'.join(HUMAN_OWNED_LABELS)}`) is never touched by this path, and neither "
+            f"is a park a human applied by stamping one of those human-owned labels. A park a "
+            f"human applied by stamping the MACHINE-owned soft hold is re-admitted here ONLY when "
+            f"this bot's OWN park-reason receipt already classified the episode `class=capacity` "
+            f"— the machine never clears a park it never classified. To place a hold no machine "
+            f"may lift, use `{'` / `'.join(HUMAN_OWNED_LABELS)}`.\n\n"
             f"{AUTO_READMIT_MARKER} evidence={evidence_key} at={stamp} -->")
 
 
@@ -1732,13 +1736,69 @@ def _write_outputs(values):
             output.write(f"{key}={text}\n")
 
 
+def label_description(label):
+    """The description THIS module owns for `label`, or None when it owns none.
+
+    Only the MACHINE-owned park labels have an owned description, and that is the whole point:
+    their text is a LOAD-BEARING PROMISE about a machine exit, not decoration. Every other label —
+    including the HUMAN terminal `review:needs-user` — keeps the generic string and is never
+    reconciled, so a human-curated description is never overwritten by this writer.
+
+    SCOPED BY park_policy.MACHINE_OWNED_PARK_LABELS, the SAME set capacity_park_admission reads,
+    NOT by a private `== MACHINE_PARK_PR_LABEL` test. The private test was a SURVIVING MUTANT
+    (review round 2): widening it to include `review:needs-user` — a label this module really does
+    call _ensure_label on — left all 1036 checks green while PATCHing the HUMAN terminal's
+    description to the machine-exit promise. That is the inverse of the defect this whole change
+    exists to fix, and groom's twin already had the shared-set spelling, so the two writers were
+    one edit apart from disagreeing about which labels promise a machine exit."""
+    if label in _park_policy().MACHINE_OWNED_PARK_LABELS:
+        return _park_policy().MACHINE_PARK_DESCRIPTION
+    return None
+
+
 def _ensure_label(repo, label):
-    if _run_gh(["api", f"repos/{repo}/labels/{label}"], check=False).returncode == 0:
+    """Create `label`, and RECONCILE the description of a label whose text this module owns.
+
+    THE DEFECT THIS CLOSES (review of the human-applied-park change). This function used to
+    early-return the instant the label existed, and it hard-coded the generic
+    "Registry cross-provider review-loop state" for EVERY label it created — including
+    `review:parked`, whose description is supposed to state the machine exit a reader is entitled
+    to rely on. Descriptions were therefore written once, at creation, and never updated: measured
+    live on sparq-org/sparq, `review:parked` read "Registry cross-provider review-loop state" and
+    `status:parked` still read the superseded #614 wording ("cleared on readmission") that this
+    module's own comments describe as a mechanism which never existed. Code that justifies an
+    automatic exit by what a label PROMISES must make that promise true where a human reads it.
+
+    The reconcile is a PATCH only when the live description DIFFERS from the owned one, so a
+    steady state costs one GET per tick exactly as before, and it is LOUD when it fires."""
+    existing = _run_gh(["api", f"repos/{repo}/labels/{label}"], check=False)
+    owned = label_description(label)
+    if existing.returncode == 0:
+        if owned is None:
+            return
+        try:
+            payload = json.loads(existing.stdout)
+        except (ValueError, TypeError):
+            return                        # an unreadable payload proves no drift; never guess
+        if not isinstance(payload, dict):
+            # `null` PARSES but is not a label. Coercing it to {} would read as "the description
+            # is empty" and PATCH — writing on the strength of a payload we could not read, which
+            # is the opposite of the fail direction every other read here takes.
+            return
+        live = str(payload.get("description") or "")
+        if live == owned:
+            return
+        print(f"WRITE reconcile label description repo={repo} label={label}: "
+              f"{live!r} -> {owned!r}")
+        _gh_json(
+            ["api", "-X", "PATCH", f"repos/{repo}/labels/{label}", "--input", "-"],
+            input_doc={"description": owned},
+        )
         return
     _gh_json(
         ["api", "-X", "POST", f"repos/{repo}/labels", "--input", "-"],
         input_doc={"name": label, "color": LABEL_COLOURS[label],
-                   "description": "Registry cross-provider review-loop state"},
+                   "description": owned or "Registry cross-provider review-loop state"},
     )
 
 
@@ -9375,6 +9435,94 @@ def _self_test():
     check("verdict path", verdict_path("sparq-org/sparq", 12, 2),
           "orchestration/review-verdicts/sparq-org--sparq--pr12-round2.json")
     check("label colours cover review namespace", set(LABEL_COLOURS), set(REVIEW_LABELS))
+
+    # ---- _ensure_label: the label DESCRIPTION is a promise, so it must be RECONCILED -----------
+    #
+    # Review of the human-applied-park change found the justification "the actor chose the label
+    # whose own published description promises this exit" TRUE OF THE CODE and FALSE OF THE WORLD:
+    # this function early-returned the moment the label existed and hard-coded a generic string at
+    # creation, so live `review:parked` on sparq-org/sparq read "Registry cross-provider
+    # review-loop state" and had never been updated. Every branch is asserted here; before this
+    # block the function was STUBBED OUT (`lambda repo, label: None`) in every existing fixture,
+    # so nothing tested it at all.
+    el_real = {name: globals()[name] for name in ("_run_gh", "_gh_json")}
+    try:
+        owned = _park_policy().MACHINE_PARK_DESCRIPTION
+
+        def run_ensure(live_description, label=MACHINE_PARK_PR_LABEL, exists=True, body=None):
+            """Drive the REAL _ensure_label; return the writes it issued."""
+            writes = []
+
+            class _Result:
+                returncode = 0 if exists else 1
+                stdout = (body if body is not None
+                          else json.dumps({"name": label, "description": live_description}))
+                stderr = ""
+
+            globals()["_run_gh"] = lambda args, **kw: _Result()
+            globals()["_gh_json"] = lambda args, **kw: writes.append(
+                (args[2] if len(args) > 2 else "", args[3] if len(args) > 3 else "",
+                 kw.get("input_doc"))) or {}
+            try:
+                _ensure_label("o/r", label)
+            except Exception as exc:  # noqa: BLE001
+                # TOTAL, for the reason the park-policy suite already learned twice: a mutant that
+                # deletes the `isinstance(payload, dict)` guard makes the PRODUCTION call raise on
+                # a non-dict body, and an un-total driver would abort the whole 1036-check suite
+                # (MEASURED: 395 checks lost). Reporting the raise as a value keeps the kill and
+                # keeps the suite running, so "killed" means something.
+                return [("raised", type(exc).__name__, None)]
+            return writes
+
+        check("_ensure_label: a DRIFTED park description is PATCHED to the owned text",
+              run_ensure("Registry cross-provider review-loop state"),
+              [("PATCH", f"repos/o/r/labels/{MACHINE_PARK_PR_LABEL}", {"description": owned})])
+        check("_ensure_label: the SUPERSEDED #614 wording is drifted too (the live status:parked "
+              "text)",
+              len(run_ensure("Machine-owned capacity park (soft hold; cleared on readmission)")),
+              1)
+        check("_ensure_label: an ALREADY-CORRECT description writes NOTHING (steady state is a "
+              "single GET, exactly as before)",
+              run_ensure(owned), [])
+        check("_ensure_label: a MISSING label is CREATED with the owned text, not the generic one",
+              run_ensure(None, exists=False),
+              [("POST", "repos/o/r/labels",
+                {"name": MACHINE_PARK_PR_LABEL, "color": LABEL_COLOURS[MACHINE_PARK_PR_LABEL],
+                 "description": owned})])
+        check("_ensure_label: a NON-park label is never reconciled, however far it has drifted "
+              "(a human-curated description is never stomped)",
+              run_ensure("something a human wrote", label="review:needs"), [])
+        check("_ensure_label: a non-park label is still CREATED with the generic text",
+              run_ensure(None, label="review:needs", exists=False),
+              [("POST", "repos/o/r/labels",
+                {"name": "review:needs", "color": LABEL_COLOURS["review:needs"],
+                 "description": "Registry cross-provider review-loop state"})])
+        check("_ensure_label: an UNREADABLE payload proves no drift and writes nothing",
+              [run_ensure(None, body="not json"), run_ensure(None, body="null")], [[], []])
+        check("_ensure_label: the owned text is park_policy's constant, not a copy",
+              label_description(MACHINE_PARK_PR_LABEL) == owned
+              and label_description("review:needs") is None, True)
+        # THE SURVIVING MUTANT review round 2 found: `label_description` was scoped by a PRIVATE
+        # `== MACHINE_PARK_PR_LABEL`, and widening it to `review:needs-user` left all 1036 checks
+        # green while PATCHing the HUMAN terminal's description to the machine-exit promise — the
+        # inverse of the defect this change fixes. Pinned two ways: the label-by-label answer, and
+        # the SET it must equal, so a widening cannot pass by naming one more label.
+        check("_ensure_label: the HUMAN terminal is NEVER given the machine-exit promise",
+              [label_description(_park_policy().HUMAN_PR_PARK_LABEL),
+               run_ensure("anything at all",
+                          label=_park_policy().HUMAN_PR_PARK_LABEL)], [None, []])
+        check("_ensure_label: EVERY review label except the machine park owns no description",
+              sorted(name for name in REVIEW_LABELS if label_description(name) is not None),
+              sorted(set(REVIEW_LABELS) & _park_policy().MACHINE_OWNED_PARK_LABELS))
+        check("_ensure_label: the owned-description scope IS park_policy's machine-owned set "
+              "(the same set the admission rule reads), not a private list",
+              {name for name in list(REVIEW_LABELS) + ["status:parked", "needs:user", "area:x"]
+               if label_description(name) is not None},
+              set(_park_policy().MACHINE_OWNED_PARK_LABELS)
+              & set(list(REVIEW_LABELS) + ["status:parked", "needs:user", "area:x"]))
+    finally:
+        globals().update(el_real)
+
 
     # ---- issue #156: the host envelope binds the verdict to the reviewed sha, and readers
     # unwrap it (legacy bare documents stay readable) ----

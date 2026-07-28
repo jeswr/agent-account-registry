@@ -1293,7 +1293,9 @@ def sustained_fleet_health_evidence(records, parked_at, now):
     the IDENTICAL path: same strictly-after-the-park ordering check, same receipt, same
     consumed-exactly-once rule (the key is the anchoring success's durable identity, so it can
     never be re-earned), same AUTO_READMISSION_MAX cap, and the same unconditional refusal on any
-    human-owned hold or human-applied park. This adds an evidence SOURCE; it widens no gate.
+    human-owned hold, on a park a human applied by stamping a HUMAN-owned terminal, and on a
+    human-applied machine park that no bot park-reason receipt ever classified `class=capacity`
+    (park_policy.human_park_capacity_proof). This adds an evidence SOURCE; it widens no gate.
 
     The predicate, exactly (ALL must hold):
       0. the window is readable and every record passes _validate_record, and `parked_at` is
