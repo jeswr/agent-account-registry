@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4763,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "fd0fbd3019c1b88eb65fc9a339eb821019a900a6",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "sort_key_is_total only checks whether every projected variable is named in ORDER BY. That does not make the surviving RDF solution deterministic: SELECT ?k ... ORDER BY ?k LIMIT 1 over `1`^^xsd:integer and `1.0`^^xsd:decimal may legally retain either distinct term. Both one-row answers pass sort_key_is_total, but their bags differ, so order_by_compare returns Differs immediately. The new complete-sequence promotion-tie tests do not cover truncation, and a_truncated_non_total_sort_key_stays_cardinality_only uses strictly ordered integer ages rather than a tie crossing the boundary.",
+    "file": "crates/sparq-bench/src/fuzz.rs",
+    "fix_hint": "Fail closed for LIMIT/OFFSET whenever the truncation boundary may intersect an ORDER BY tie containing RDF-distinct solutions, even if every projected variable is listed in the sort key. Add a live or hand-authored boundary test that gives the two sides `1`^^xsd:integer versus `1.0`^^xsd:decimal under ORDER BY ?k LIMIT 1 and requires SkippedRowChoice (or a dedicated counted boundary-tie skip), plus a strictly ordered boundary case that remains Compared. Cover OFFSET and lossy f64/NaN boundary ties by the same rule.",
+    "severity": "major",
+    "title": "Truncated ORDER BY still rejects legal choices from a value-tied boundary"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 5 leaves the prior major LIMIT/OFFSET boundary defect materially unchanged. The new ORDER BY key and TieUnmodelled handling improve complete-sequence comparisons, but check_ordered still treats projected-variable coverage as proof that a truncated answer is deterministic. For SELECT ?k ... ORDER BY ?k LIMIT 1 over RDF-distinct numeric terms that tie by promoted value, each returned one-row solution passes sort_key_is_total; if the engines choose different tied boundary members, order_by_compare sees different bags and returns Differs before tie latitude is considered. The added tests still do not exercise a promoted-value tie crossing a LIMIT or OFFSET boundary. Progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
