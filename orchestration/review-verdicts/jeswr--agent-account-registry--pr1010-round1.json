@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1010,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "0e28d7505ae826f96ad608f10770bcd4ad8f25ca",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_escalation_call_site` accepts any `defer_reasons[STARVATION_STUCK_BUCKETS[...]] += ...` anywhere beneath the loop. It never checks that the inner key is the cause variable unpacked from the `starvation_stuck_holders` result. For example, changing the production counter to `defer_reasons[STARVATION_STUCK_BUCKETS[GLOBAL_CAUSE_NO_PROVENANCE]] += 1` leaves this structural assertion green while filing all three causes into the legacy bucket. The pure selector and distinct-mapping assertions also remain green, so the exact per-cause production guarantee and marquee claim are untested. The AST walk additionally accepts a matching increment beneath `if False`, despite the docstring's claim that dead branches cannot satisfy it.",
+    "file": "scripts/dispatch-claim.py",
+    "fix_hint": "Make the structural check bind the loop target and require the inner `STARVATION_STUCK_BUCKETS` subscript to reference that exact cause binding; also reject statically dead ancestry (at minimum constant-false guards). Add source-mutant assertions showing that a hard-coded cause key and a dead counter both make `_escalation_call_site` return `None`.",
+    "severity": "major",
+    "title": "Call-site self-test does not prove the returned cause selects the bucket"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe per-cause selector, recovery mapping, and pure-function coverage are coherent, but the production call-site proof is materially weaker than the property it claims to enforce. It can remain green when production stops counting by the returned cause, recreating the measurement hole this change is intended to close.",
+  "verdict": "request_changes"
+ }
+}
