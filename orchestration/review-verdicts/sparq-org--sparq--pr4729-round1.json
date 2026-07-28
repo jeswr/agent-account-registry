@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4729,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a9a4da415063c559aa627e9439ca6b6829cd299b",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The shared batch-framing implementation correctly distinguishes top-level arrays, rejects an empty batch with a single invalid-request response, dispatches valid and malformed elements independently and in order, suppresses notification responses, and preserves the existing single-request path. Both server variants use the same core, and the tests exercise mixed batches, all-notification silence, malformed elements, stateful ordering, protocol negotiation, Solid authorization, and stdio framing. The public protocol-version claim and skill documentation are updated consistently. No correctness, soundness, security, or vacuous-test issue was found in the diff.",
+  "verdict": "approve"
+ }
+}
