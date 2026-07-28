@@ -1,0 +1,156 @@
+# Issue #86 / #940 (comment 5102313507): a DEAD AUTO-MERGE LATCH is a PR that is armed, CLEAN and
+# green but that GitHub never enqueues. `autoMergeRequest` and `isInMergeQueue` are mutually
+# exclusive, so an armed-but-unqueued PR reads as healthy to every armed-census in this estate --
+# sparq-org/sparq#4617 sat that way for ELEVEN HOURS while the merge queue was empty.
+#
+# This cron detects the SYMPTOM (armed + CLEAN + required check green + NOT in the queue, sustained
+# past a MEASURED grace period) and remediates it with the one operation proven verdict-safe on
+# #4617: `--disable-auto` then re-arm. It never issues `dequeuePullRequest`, which is what strips a
+# review verdict, and it never writes a human-terminal label.
+name: latch-watchdog
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Every 10 minutes on minutes no other cron here uses: dispatch :03/:13/:23/:33/:43/:53,
+    # groom :07/:22/:37/:52, metrics :11/:26/:41/:56, retriage :07/:37, curate :17/:47,
+    # conflict-resolver :01/:21/:41, groom-leases + dashboard :00/:15/:30/:45. A 10-minute tick
+    # against a 900 s grace bounds worst-case detection at ~25 min, against stalls measured at
+    # 20 min and 11.35 h.
+    - cron: '9,19,29,39,49,59 * * * *'
+
+permissions: {}
+
+concurrency:
+  group: registry-latch-watchdog
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    name: Rescue dead auto-merge latches
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # REGISTRY_ADMIN_APP_ID/KEY live in the default-branch-restricted environment used by the
+    # existing dispatch/groom/conflict-resolver privileged crons.
+    environment: dispatch-secrets
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout private registry (pinned, no persisted token)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Python (pinned)
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: '3.12'
+
+      - name: Install the syntax-only YAML parser
+        run: python3 -m pip install --disable-pip-version-check pyyaml
+
+      # Same authoritative policy-derived per-owner target scopes as groom.yml / conflict-resolver.
+      - name: Resolve enabled target repos per owner from policy
+        id: owners
+        run: |
+          set -euo pipefail
+          python3 scripts/groom.py --print-owner-repos --policy-file policy/repos.toml \
+            | tee -a "$GITHUB_OUTPUT"
+
+      # A missing installation for one owner skips that owner's repositories without starving the
+      # other. The watchdog censuses every such skip as `no-token-for-owner`.
+      - name: Mint sparq-org latch-watchdog App token (pinned)
+        id: target-token-sparq
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
+          private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
+          owner: sparq-org
+          repositories: ${{ steps.owners.outputs.sparq_names }}
+          permission-contents: read
+          permission-issues: write
+          permission-pull-requests: write
+
+      - name: Mint jeswr latch-watchdog App token (pinned)
+        id: target-token-jeswr
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.REGISTRY_ADMIN_APP_ID }}
+          private-key: ${{ secrets.REGISTRY_ADMIN_APP_KEY }}
+          owner: jeswr
+          repositories: ${{ steps.owners.outputs.jeswr_names }}
+          permission-contents: read
+          permission-issues: write
+          permission-pull-requests: write
+
+      - name: Self-test, then detect and rescue dead auto-merge latches
+        env:
+          SPARQ_TOKEN: ${{ steps.target-token-sparq.outputs.token }}
+          JESWR_TOKEN: ${{ steps.target-token-jeswr.outputs.token }}
+          SPARQ_MINT_OUTCOME: ${{ steps.target-token-sparq.outcome }}
+          JESWR_MINT_OUTCOME: ${{ steps.target-token-jeswr.outcome }}
+          SPARQ_NAMES: ${{ steps.owners.outputs.sparq_names }}
+          JESWR_NAMES: ${{ steps.owners.outputs.jeswr_names }}
+          APP_SLUG: ${{ steps.target-token-sparq.outputs.app-slug || steps.target-token-jeswr.outputs.app-slug }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          [[ -z "${SPARQ_TOKEN:-}" ]] || printf '::add-mask::%s\n' "$SPARQ_TOKEN"
+          [[ -z "${JESWR_TOKEN:-}" ]] || printf '::add-mask::%s\n' "$JESWR_TOKEN"
+          if [[ "${SPARQ_MINT_OUTCOME:-}" == "success" && -z "${SPARQ_TOKEN:-}" ]]; then
+            echo "::error::sparq-org token mint succeeded but no token reached this step"
+            exit 1
+          fi
+          if [[ "${JESWR_MINT_OUTCOME:-}" == "success" && -z "${JESWR_TOKEN:-}" ]]; then
+            echo "::error::jeswr token mint succeeded but no token reached this step"
+            exit 1
+          fi
+          [[ -n "${APP_SLUG:-}" ]] || { echo '::error::no target App token was minted'; exit 1; }
+          TARGET_GH_TOKENS="$(python3 - <<'PY'
+          import json
+          import os
+
+          tokens = {}
+          if os.environ.get("SPARQ_TOKEN"):
+              tokens["sparq-org"] = os.environ["SPARQ_TOKEN"]
+          if os.environ.get("JESWR_TOKEN"):
+              tokens["jeswr"] = os.environ["JESWR_TOKEN"]
+          print(json.dumps(tokens, separators=(",", ":")))
+          PY
+          )"
+          export TARGET_GH_TOKENS
+          WATCH_REPOS="$(python3 - <<'PY'
+          import os
+
+          slugs = []
+          for owner, key in (("sparq-org", "SPARQ_NAMES"), ("jeswr", "JESWR_NAMES")):
+              for name in (os.environ.get(key) or "").split(","):
+                  name = name.strip()
+                  if name:
+                      slugs.append(owner + "/" + name)
+          print(",".join(slugs))
+          PY
+          )"
+          [[ -n "$WATCH_REPOS" ]] || { echo '::error::policy resolved no target repos'; exit 1; }
+          python3 scripts/latch-watchdog.py --self-test
+          # --grace-seconds 900 is 52.9x the MEASURED maximum eligible->enqueue latency (17 s over
+          # N=188 healthy sparq merges) and 3x the ruleset's own
+          # merge_queue.min_entries_to_merge_wait_minutes, so ordinary queue batching can never
+          # read as a dead latch. --max-actions-per-head 2 makes the remedy consumed-once-per-head
+          # (one rescue plus one orphan completion) and --max-actions-per-run 5 bounds blast
+          # radius. --budget-threshold 0 reds the run the moment a PR exhausts its per-head budget
+          # and is STILL armed, eligible and outside the queue -- the population alarm a per-run
+          # exit code cannot otherwise express, and the only escalation this tool has. All of
+          # these are asserted at this call site by `latch-watchdog.py --self-test` block (o), so
+          # unwiring any one of them fails the gate.
+          python3 scripts/latch-watchdog.py \
+            --apply \
+            --repos "$WATCH_REPOS" \
+            --marker-actor "${APP_SLUG}[bot]" \
+            --grace-seconds 900 \
+            --required-check gate \
+            --max-actions-per-head 2 \
+            --max-actions-per-run 5 \
+            --budget-threshold 0

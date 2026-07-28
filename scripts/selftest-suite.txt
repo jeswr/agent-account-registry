@@ -17,6 +17,7 @@ grant-account.py
 grant-scope-audit.py
 groom-alert.py
 groom.py
+latch-watchdog.py
 lease_schema.py
 ledger-invariant.py
 ledger_retry.py
