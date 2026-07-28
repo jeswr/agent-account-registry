@@ -21,21 +21,34 @@ them lived only in the reviewer's brief, so every PR paid a whole review round t
 defect its author could have found pre-flight. Run them yourself. Each cites the PR that earned
 it; all of them run **offline**, inside the worker container, with no GitHub token.
 
-1. **Line coverage FIRST — a 0 %-coverage entry point is blocking.** Run the module's own
-   `--self-test` under `python3 -m trace --count` (stdlib; nothing to install) and read the
-   **per-function** misses before you mutate anything. Four for four as a predictor of where
-   mutants survive: **#756** (`cmd_record` + `_read_json` never executed → a dropped call-site
-   argument printed `planned_rows=0` in both trees), **#956** (the module's **only two write
+⚠️ **This list exists in FULL in two repos with no shared owner** — here and in `sparq-org/sparq`'s
+`AGENTS.md`, which is the **canonical** copy. This one cannot be a pointer: this repo has no
+`CLAUDE.md` to auto-load anything, and the worker container is offline, so the text has to be here.
+Change a rule in one and mirror it in the other in the same wave, or say why not. The two have
+already diverged on lane-specific detail. That is the **#958** shape applied to prose, and **#945**
+measured the cost of duplication directly — two copies of one guard make each individually
+unkillable.
+
+1. **Line coverage FIRST — and read it LINE-granular, not function-granular.** Run the module's own
+   `--self-test` under `python3 -m trace --count` (stdlib; nothing to install) and list the
+   **never-executed LINES** before you mutate anything. Four for four as a predictor of where
+   mutants survive: **#756** (`cmd_record` + `_read_json` never executed → the shipped tree
+   printed `planned_rows=4` where the mutant printed `0`), **#956** (the module's **only two write
    methods** had never executed anywhere), **#937** (`main` + `_gh_readers` at 0 % → **13 of 13**
    one-line edits there survived a **248**-check suite, including an `apply=false` "census-only
    preview" that writes real ledger records), **sparq #4743** (**17 of 29** functions at 0 %;
    `main()` at 55 % with its whole `sweep` branch unexecuted, so `return 1 if …sweep() else 0`
    → `return 0` survived all **111** tests). Helpers get tested because they are easy to call;
    **entry points get skipped because the test has to construct the real world — which is exactly
-   where a *fabricating* bug survives.** ⚠️ **Validate the coverage instrument against a function
-   you know is never called**: #756's first one counted docstring lines as covered, scored a
-   never-called function at 6.2 %, and printed *"no code unit is entirely unexecuted"* — it hid
-   the very finding it was built to surface.
+   where a *fabricating* bug survives.** ⚠️ **"Nothing at 0 %" does NOT clear you.** The
+   function-granular headline is the weak form and it misses the worst regions: **#956**'s `main`
+   is at **8/18**, not 0 %, and a fresh sweep of exactly that region found **10 survivors out of
+   10**; **#941**'s `_escalate_two_head` had **1 of 3 call sites covered at 3/3 confidence**, which
+   **#945** re-derived as **3 of 4 site lines never executed while the enclosing functions read
+   75 %**. ⚠️ **Validate the coverage instrument against a function you know is never called**:
+   #756's counted docstring lines as covered, scored a never-called function at 6.2 %, and printed
+   *"no code unit is entirely unexecuted"*; #956's reported zero uncovered lines from a mode that
+   **cannot emit one**. An instrument that cannot fail has told you nothing.
 2. **Ask FOUR independent questions of every assertion** — none subsumes another, and each found
    holes the others swept past (#941). (a) Does the **call site** recompute or re-wire this
    value? (#937 `Z6`: dropping one argument at the single production call site bound the wrong
@@ -49,13 +62,22 @@ it; all of them run **offline**, inside the worker container, with no GitHub tok
 3. **Two mutants per guard: DELETE it, and separately make it conditionally inert** — in a
    **non-crashing** form. They are different experiments. #938: deleting a census emission was
    caught; wrapping it in `if census.get("total")` was **not**, so it would have vanished on
-   exactly the quiet tick an operator interrogates.
-4. **Three false mutation outcomes — say which one you have.** *False kill*: an exception raised
+   exactly the quiet tick an operator interrogates. ⚠️ **One-at-a-time is structurally blind to a
+   DUPLICATED guard** — see item 4's fourth outcome; that experiment needs both copies gone at once.
+4. **FIVE false mutation outcomes — say which one you have.** *False kill*: an exception raised
    **by the mutated line itself** is malformedness, not detection (#956: two mutants "died" to an
    `IndexError` that aborted the suite before any row printed). *Equivalent survivor*: declare it
    and show it unreachable (#937 `D1-default`). *Value-identical survivor*: the substituted value
    collides with one the fixture already uses (#941 pins a fixture head as `'b'*40`) — **choose
-   mutant values that appear nowhere in the harness.**
+   mutant values that appear nowhere in the harness.** *Mutually-masking duplicates*: two copies of
+   one guard make **each copy individually unkillable** — three of **#945**'s four survivors were a
+   single `MIN_ARG_TOKEN` floor written at both the producer (`_arg_literals`) and the consumer
+   (`site_fingerprints`), where *"removing either copy alone left the suite green."* Item 3's
+   one-at-a-time protocol **cannot see this**: find it by asking whether the value is written twice,
+   and by deleting **both** copies as one mutant. *Crash-after-partial-run*: a mutant that reds some
+   rows and then **aborts** the suite records as KILLED while every check below it never ran (#945:
+   an emission block raising `IndexError` after three named `FAIL` rows). Require the mutant run's
+   **total check count** to equal the pristine run's before you call it a kill.
 5. **Ask of every control: WHO can write the thing this reads?** Three arm-capable holes in one
    night, all from evidence read out of **author-controlled** text with no author filter: **#681**
    (per-provider review markers parsed from `pull["body"]` → the required-review count goes
