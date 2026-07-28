@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4901,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "3f4a3b4e44db1c116fe02dd4b821ce098be77ec7",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The server binds `0.0.0.0:3000` on the host, then the script unconditionally runs an `alpine/socat` container with `--network host` and asks it to listen on port 3000. On native Linux, host networking is the literal host network namespace, so socat cannot bind that already-occupied address. Because the `docker run -d` is under `set -e`, the run aborts before the CTH starts. This contradicts the adjacent claim that the sidecar is a harmless passthrough and is especially relevant because the workflow directs the harness to a self-hosted runner.",
+    "file": "crates/sparq-lws-core/conformance/run.sh",
+    "fix_hint": "Detect Docker Desktop versus native-Linux host networking and start the socat forwarder only where the VM-to-host hop is needed. On native Linux, omit the forwarder and let the host-network CTH connect directly to the host server. Add a shell-level test or preflight check covering both networking branches.",
+    "severity": "major",
+    "title": "Host-network forwarder conflicts with the server on native Linux"
+   }
+  ],
+  "progress": null,
+  "summary": "The new harness is not portable to the self-hosted Linux runner configuration it documents: it unconditionally starts a host-network socat listener on the same host port already occupied by the server. This prevents the harness from reaching its actual test execution on native Linux.",
+  "verdict": "request_changes"
+ }
+}
