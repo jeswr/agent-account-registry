@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1016,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "64b80eb0e34ebf372fb48b18932ca213ae39edab",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 3 resolves the prior blocker. Record filenames are now parsed exactly for a positive, non-zero-padded PR number, the document's `pr_number` is required to be a strict positive integer, and filename/content disagreement refuses the entire evidence pass before the filename can satisfy a completeness claim. The enrolled self-test includes direct and end-to-end mismatch cases plus a coherent candidate-producing corpus whose filenames, document PR numbers, and manifest entries agree. The manifest remains an explicit maintainer completeness assertion, while missing claims or missing records continue to produce no candidates. No blocker, major, or other diff-scoped issue remains.",
+  "verdict": "approve"
+ }
+}
