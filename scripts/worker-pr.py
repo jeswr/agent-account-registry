@@ -248,6 +248,42 @@ AUTO_READMIT_MARKER = "<!-- sparq-auto-readmit:v1"
 # next tick, so a retirement whose close/hand-back half died mid-write is re-driven from this
 # receipt instead of being stranded half-done.
 PARK_RETIREMENT_MARKER = "<!-- sparq-park-retired:v1"
+# [registry #972] THE TARGET-IDENTITY REFUSAL RECEIPT — a REFUSAL THAT RECORDS ITSELF.
+#
+# review-fix.yml's `Verify target App identity and default branch` step refuses the `run` job at
+# four predicates. Until #972 every one of them killed that job with the `outcome` job's `if:`
+# unsatisfied, so NOTHING durable was written: no verdict, no round marker, no `review:*`
+# transition. The lane's re-entry condition was therefore byte-identical on the next tick, and the
+# PR was re-dispatched every ~10 minutes FOREVER — a claim, a runner and an account lease burned
+# per tick with no outcome and no exit. MEASURED on jeswr/agent-account-registry#961: PLAN run
+# 30339511626 enumerated it, CLAIM run 30340312044 dispatched round 1, review run 30340804869 died
+# on `pull request author is not the registry App bot`, and `Apply outcome` was SKIPPED. #961
+# escaped only because a human armed and merged it.
+#
+# The receipt carries `reason=<code>` from the CLOSED IDENTITY_REFUSAL_REASONS table below, and it
+# is doing THREE jobs at once, which is why it is a durable marker and not a log line:
+#   - it is the CENSUS ROW: the refusal is countable per reason instead of invisible;
+#   - it is the IDEMPOTENCE key: a re-run of the outcome job re-derives the same receipt and
+#     writes nothing; and
+#   - it is the CAP. One refusal per (PR, reason), ever — see identity_refusal() for why the cap
+#     is one and not N.
+# Bot-authored + reserved-namespace like every other durable marker.
+IDENTITY_REFUSAL_MARKER = "<!-- sparq-identity-refusal:v1"
+# The CLOSED taxonomy of reasons review-fix.yml's target-identity step can refuse a run for — one
+# code per `raise SystemExit` in that step, and nothing else. `identity_refusal_reason_prose`
+# RAISES on a code outside this table rather than inventing an uncounted bucket (the
+# `park_policy.budget_exhausted_bucket` idiom): a fifth refusal added to that step without a code
+# here fails LOUDLY at the writer instead of silently reproducing the very loop this closes.
+#
+# EVERY one of them is deterministic in the sense that decides the park class: the step's inputs
+# are the target repo's own `full_name`/`default_branch`, the App's own login, and the PR's author.
+# A re-dispatch changes NONE of them, so a retry is identical BY CONSTRUCTION.
+IDENTITY_REFUSAL_REASONS = {
+    "wrong-target": "the target App token read a repository other than the dispatched target",
+    "unsafe-default-branch": "the target repository's default branch is not a safe ref name",
+    "not-an-app-bot": "the target App token did not identify a GitHub App bot",
+    "author-not-app-bot": "the pull request author is not the registry App bot",
+}
 # The window key for the initial no-cutoff window — mirrors park_policy.PARK_WINDOW_NONE
 # (kept literal here so the pure marker parser needs no module load; never valid ISO-8601, so
 # it cannot collide with a real cutoff).
@@ -3423,6 +3459,114 @@ def _retire_worker_pr(repo, pr_number, issue, policy, close_pr=None, patch_issue
     except Exception as exc:  # noqa: BLE001 — best-effort; re-driven from the receipt next tick
         log(f"::warning::machine retirement: hand-back of {repo}#{issue} failed ({exc}); the "
             "retirement receipt stands and the next tick re-drives it")
+
+
+# ---- [registry #972] the target-identity refusal: the run job's MISSING EXIT -------------------
+def identity_refusal_reason_prose(reason):
+    """The declared prose for one target-identity refusal code, RAISING on an undeclared code.
+
+    The closed-enum boundary (park_policy.budget_exhausted_bucket's idiom). It is what makes the
+    census SUM: every refusal review-fix.yml's identity step can emit leaves through exactly one
+    declared code, so a fifth `raise SystemExit` added to that step without a code here fails
+    LOUDLY at this writer instead of parking the PR under a bucket nobody counts — or, worse,
+    falling back through to the pre-#972 behaviour of recording nothing at all."""
+    if reason not in IDENTITY_REFUSAL_REASONS:
+        raise WorkerPrError(
+            f"undeclared target-identity refusal reason {reason!r}: every refusal in "
+            "review-fix.yml's `Verify target App identity and default branch` step must map to "
+            "exactly one code in worker-pr.IDENTITY_REFUSAL_REASONS (declare it there) — "
+            "refusing to record it as nothing, which is the #972 loop")
+    return IDENTITY_REFUSAL_REASONS[reason]
+
+
+def identity_refusal_records(comments, bot_login):
+    """PURE. The set of target-identity refusal CODES already receipted on this PR by the bot.
+
+    The cap counter and the idempotence key. Only the bot's own comments are read (the same trust
+    filter every other durable marker uses), so a third party cannot mint or suppress a refusal
+    receipt by quoting one."""
+    found = set()
+    pattern = re.compile(re.escape(IDENTITY_REFUSAL_MARKER) + r" reason=([a-z0-9-]+) -->")
+    for comment in _bot_comments(comments, bot_login):
+        found.update(pattern.findall(str(comment.get("body", ""))))
+    return found
+
+
+def identity_refusal(repo, pr_number, reason, issue=None, bot_login="",
+                     alert_repo=None, alert_token=None, head_sha=""):
+    """Record review-fix.yml's target-identity refusal as a DURABLE, COUNTED, TERMINAL outcome.
+
+    THE DEFECT (#972). The refusal itself is correct and is NOT changed here: the step still
+    refuses, the model still never runs, and no token ever reaches it. What was missing is that
+    the refusal wrote NOTHING — the `run` job died with the `outcome` job's `if:` unsatisfied, so
+    the next tick re-derived a byte-identical world and re-dispatched. A hold with no
+    machine-visible outcome is an infinite retry, which is this repo's own standing rule.
+
+    THE ROUND IS NOT CONSUMED, and the argument is from the code, not from taste:
+
+    - `round-record` runs at review-fix.yml's `Record the review round before the model runs`
+      step, STRICTLY AFTER the identity step. So today zero rounds are charged on this path and
+      nothing here has to un-charge one; the choice is only whether to START charging.
+    - The round budget is the REVIEWER's budget. `decide_budget` grades PROGRESS between rounds
+      and extends on improving progress or a model-tier bump; a round in which no reviewer ran
+      records `progress=null` and no fix-model marker, i.e. it is indistinguishable from a
+      stagnant review and would count AGAINST the PR for work nobody did.
+    - registry #596 already settled this exact shape one step down the same job: a credential
+      outage must not consume a round, because "a pure credential outage walked the PR through the
+      bounded round budget into a capacity park as if the reviewer had declined". A target-identity
+      refusal is strictly earlier — the reviewer was never even launched.
+    - And the decisive one: charging rounds would deliver the PR into the `budget` park, which is
+      CAPACITY class and therefore HAS a machine re-admission. Re-admission would hand it straight
+      back to the identical refusal. An exit that re-admits into the state it exited produces
+      nothing, so consuming the round buys a strictly WORSE exit than not consuming it.
+
+    THE CAP IS ONE, for the same reason `target-identity` is a QUESTION cause: this gate reads the
+    target repo's `full_name`/`default_branch`, the App's own login and the PR's author, and a
+    re-dispatch changes none of them. A cap of N>1 would buy N-1 provably identical runs. Every
+    capped CAPACITY cause in the taxonomy (`budget`, `dispatch-missed`, `nochange`, `gatefail`)
+    caps something that CAN come out differently next attempt; this cannot.
+
+    THE MACHINE EXIT is therefore not a timer but the CAUSE itself: the refusal names its reason
+    in a durable receipt, so when the cause is removed — the gate's decision changes, or the PR's
+    author does — a human clears the park with the reason in front of them, and the park's own
+    `readmission_cutoff` window re-opens the budget exactly as it does for any other question-class
+    park. Minting an automatic re-admission for a cause the machine cannot prove has recovered is
+    the park-readmit cycle this repo has already measured.
+
+    Idempotent: a re-run whose reason is already receipted writes NOTHING (no second comment, no
+    second park, no second ops alert)."""
+    prose = identity_refusal_reason_prose(reason)      # closed enum, BEFORE any write
+    try:
+        already = identity_refusal_records(_paginated_comments(repo, pr_number), bot_login) \
+            if bot_login else set()
+    except WorkerPrError as exc:
+        # An unreadable comment page must never SUPPRESS the exit — that is the #972 failure
+        # direction. Fail toward writing: a duplicate receipt is noise, a missing one is a loop.
+        print(f"::warning::could not read {repo}#{pr_number} comments for the identity-refusal "
+              f"receipt ({exc}); recording the refusal anyway (a missing exit is the defect)")
+        already = set()
+    if reason in already:
+        print(f"identity-refusal census: repo={repo} pr={pr_number} reason={reason} "
+              "cause=target-identity outcome=already-recorded")
+        return
+    # RECEIPT FIRST, exactly like every other park write: a crash between the two leaves
+    # receipt-no-park (which this function re-drives, and which the reader can still count), never
+    # park-no-receipt, where the census row that names the cause would be the thing that vanished.
+    _comment(repo, pr_number,
+             f"> 🤖 **SPARQ agent** — the review run was refused before the reviewer launched: "
+             f"{prose}.\n\nNo review round was charged (no reviewer ran). This refusal cannot "
+             f"come out differently on a retry — the identity gate reads the target repository, "
+             f"this App's own login and the pull request's author, none of which a re-dispatch "
+             f"changes — so the pull request is handed to a human rather than re-dispatched.\n\n"
+             f"{IDENTITY_REFUSAL_MARKER} reason={reason} -->")
+    print(f"identity-refusal census: repo={repo} pr={pr_number} reason={reason} "
+          "cause=target-identity outcome=recorded")
+    needs_user(repo, pr_number,
+               f"the review run was refused by the target-App identity gate: {prose}. No review "
+               "round was charged, and a re-dispatch would be identical",
+               issue=issue, alert_repo=alert_repo, alert_token=alert_token,
+               park_class="question", park_cause="target-identity",
+               bot_login=bot_login, head_sha=head_sha)
 
 
 # ---- terminal escalation + arm --------------------------------------------------------------------
@@ -11626,6 +11770,18 @@ def main():
                       help="the source issue (its needs:*/status:parked labels are part of the "
                            "hold surface)")
 
+    # [registry #972] The target-identity refusal's EXIT. A dedicated subcommand and not a raw
+    # `needs-user --park-cause target-identity` call from the workflow, deliberately: the closed
+    # reason enum, the census row and the idempotence/cap check are the whole substance of this
+    # exit, and putting them in the YAML would leave every one of them in the seam — which is
+    # exactly where this repo keeps measuring its vacuous guards.
+    iref = subparsers.add_parser("identity-refusal", parents=[common])
+    iref.add_argument("--reason", required=True,
+                      choices=tuple(sorted(IDENTITY_REFUSAL_REASONS)))
+    iref.add_argument("--issue", type=int)
+    iref.add_argument("--bot-login", default="")
+    iref.add_argument("--head-sha", default="")
+
     nuser = subparsers.add_parser("needs-user", parents=[common])
     nuser.add_argument("--reason", required=True)
     nuser.add_argument("--issue", type=int)
@@ -11822,6 +11978,11 @@ def main():
                            issue=args.issue)
         elif args.command == "stranded-recover":
             stranded_recover(args.repo, args.pr, args.head_sha, issue=args.issue)
+        elif args.command == "identity-refusal":
+            alert_repo, alert_token = _alert_route()
+            identity_refusal(args.repo, args.pr, args.reason, issue=args.issue,
+                             bot_login=args.bot_login, alert_repo=alert_repo,
+                             alert_token=alert_token, head_sha=args.head_sha)
         elif args.command == "needs-user":
             # [registry #869] the CLI seam's class-agreement check (see validate_park_cause):
             # refuses a cause that contradicts the class it would be receipted under, in BOTH
