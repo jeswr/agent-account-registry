@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1066,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "49810900a57662597b898590cb721e0f393b7ef8",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`guarded()` accepts any top-level guard whose comparator is merely an `ast.Name` spelled `labels`; it does not establish where that name's current value came from. For example, inserting the valid top-level statement `labels = []` immediately before the three stand-down guards leaves `_review_fix_standdown_labels()` returning all three expected literals and leaves every new known-positive check green, while all three guards become inert and the workflow runs models on parked PRs. Thus the implementation's claim that it recognizes what the admission path executes, and specifically that the test reads the PR's own labels, is not established.",
+    "file": "scripts/park_policy.py",
+    "fix_hint": "Bind the seam check to the PR-label derivation and ensure no intervening assignment or mutation can replace/empty `labels` before the guards, or test the extracted admission code behaviorally with parked-label inputs and controlled stubs. Add a valid non-crashing mutant that rebinds `labels` before the guards, assert the mutant differs from pristine source, and require it to produce a normal FAIL while the full pristine check count still completes.",
+    "severity": "major",
+    "title": "AST pin does not prove that `labels` still contains the PR labels"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-1 `if False:` nesting escape now has a valid positive mutation and is rejected. However, the checker still establishes only the guard's top-level AST position, not that its `labels` operand remains the PR-label value. A non-crashing, conditionally inert mutation of that trust check therefore remains green. This is materially the same soundness gap at the same severity, so progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
