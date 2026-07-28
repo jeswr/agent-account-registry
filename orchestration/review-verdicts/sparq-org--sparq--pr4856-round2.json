@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4856,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "3cfb17f4cd353d05aa274dca4737718372d68fc2",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 2 remains correct and complete for the documented compiled-rules subset. The lowering orders each Pattern before its deferred UnpackTriple steps, tracks variables shared with plain positions, earlier atoms, repeated components, and multiple/nested quotations as checks after first binding, and preserves Pattern indices for semi-naive delta evaluation. Evaluation fails closed for unbound, inline, and non-triple IDs before reading dictionary records, then structurally binds or checks all three component IDs without changing bag/set behavior. Ground quotations use the same validated Dict interning path for rules and facts, while unsupported variable-bearing conclusions, negation bodies, and structurally impossible triple-term shapes fail loudly. The focused tests exercise real compile, bind, dictionary, fixpoint, and equivalence paths, including constants, correlation, repetition, opacity, nesting, derived rounds, builtin operands, and rejection cases; none are vacuous. README and inference skill accurately describe the envelope. No correctness, soundness, security, or hostile-instruction issue was found. The targeted test could not be executed because cargo is unavailable in this checkout environment.",
+  "verdict": "approve"
+ }
+}
