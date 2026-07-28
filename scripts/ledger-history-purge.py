@@ -15,8 +15,9 @@ maintenance window. This module is the part that can be automated safely, and it
 INERT with respect to the remote:
 
   * it needs no GitHub token and never invokes `gh` — every subcommand is local git plumbing;
-  * `rewrite` writes ONE local ref (and git's own `refs/original/` backup) and refuses a
-    remote-tracking ref outright, so it cannot be pointed at anything it could publish;
+  * `rewrite` writes ONE local ref (and git's own `refs/original/` backup) and refuses any ref
+    that does not RESOLVE to a `refs/heads/` branch, so it cannot be pointed at anything it
+    could publish;
   * pushing the rewritten ref stays a human step. See README § "Purging raw handles from
     published ledger history" for the ordered runbook (quiesce writers → rewrite → verify →
     force-with-lease → resume writers).
@@ -59,10 +60,9 @@ ACCOUNT_FINGERPRINT_RE = re.compile(r"[0-9a-f]{16}")
 LEGACY_CLAIM_SUBJECT_RE = re.compile(
     r"^claim (?P<claim>[0-9a-f]{8}) (?P<handle>[^ /]+) (?P<target>[^ ]+/[^ ]+)$")
 
-# Record/field separators for the bulk `git log` read. \x01 cannot appear in a commit message that
-# git will hand back through --format, and neither can \x02.
-_RECORD_SEP = "\x01"
-_FIELD_SEP = "\x02"
+# A commit SHA as `git log --format=%H` prints it: 40 hex (SHA-1) or 64 (SHA-256). The bulk read
+# below validates every record against this rather than trusting its own framing.
+COMMIT_SHA_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 
 
 class PurgeError(Exception):
@@ -145,14 +145,27 @@ def _git(args, repo=None, stdin=None, check=True):
 
 
 def _commit_messages(repo, ref):
-    """Return ``[(commit_sha, message), ...]`` for every commit reachable from `ref`."""
-    raw = _git(["log", f"--format={_RECORD_SEP}%H{_FIELD_SEP}%B", ref], repo=repo)
+    """Return ``[(commit_sha, message), ...]`` for every commit reachable from `ref`.
+
+    Framed with NUL (`git log -z`), which is the ONE byte a commit message cannot contain. Control
+    characters are ordinary DATA in a message: framing records on, say, \\x01 lets a crafted
+    message split itself into a second pseudo-record whose text lands in the `sha` field — and
+    neither the legacy-subject walk nor the literal handle count ever reads that field, so the ref
+    reports clean while the handle is still published. Inside a record the SHA is newline-
+    terminated, and a SHA contains no newline. Every record is validated against
+    `COMMIT_SHA_RE`, so a framing surprise REFUSES instead of being parsed into a false clean.
+    """
+    raw = _git(["log", "-z", "--format=%H%n%B", ref], repo=repo)
     records = []
-    for chunk in raw.decode("utf-8", "replace").split(_RECORD_SEP):
+    for chunk in raw.split(b"\x00"):
         if not chunk:
             continue
-        sha, _, message = chunk.partition(_FIELD_SEP)
-        records.append((sha.strip(), message))
+        sha, newline, message = chunk.partition(b"\n")
+        sha = sha.decode("utf-8", "replace")
+        if not newline or COMMIT_SHA_RE.fullmatch(sha) is None:
+            raise PurgeError(f"`git log` record does not begin with a commit SHA ({sha[:16]!r}) — "
+                             "refusing to parse it")
+        records.append((sha, message.decode("utf-8", "replace")))
     if not records:
         raise PurgeError(f"ref {ref!r} resolves to no commits — refusing to report it clean")
     return records
@@ -319,21 +332,43 @@ def cmd_msg_filter():
 # ---- rewrite (LOCAL refs only) ---------------------------------------------------------------
 
 
+def resolve_local_branch(repo, ref):
+    """Resolve `ref` to the ONE full ref name, and refuse anything outside `refs/heads/`.
+
+    Resolution comes FIRST because `git filter-branch` acts on the RESOLVED ref, not on the
+    spelling the operator typed: `origin/ledger` — the very spelling the README uses for scans —
+    resolves to `refs/remotes/origin/ledger`, and filter-branch rewrites it happily. A guard that
+    only pattern-matched the argument would therefore wave through exactly the ref it promises to
+    refuse. An argument that names no ref at all (a bare SHA, `HEAD@{1}`) resolves to nothing and
+    is refused too; an unknown revision makes `rev-parse` exit non-zero, which `_git` raises.
+    """
+    names = _git(["rev-parse", "--symbolic-full-name", ref], repo=repo).decode(
+        "utf-8", "replace").split()
+    if len(names) != 1 or not names[0].startswith("refs/"):
+        raise PurgeError(f"{ref!r} does not name exactly one ref (git resolved {len(names)}) — "
+                         "rewrite needs an unambiguous local branch")
+    if not names[0].startswith("refs/heads/"):
+        raise PurgeError(f"refusing to rewrite {ref!r}: it resolves to {names[0]}, which is "
+                         "not a local branch under refs/heads/ — rewrite a local branch and let "
+                         "a human force-update the remote")
+    return names[0]
+
+
 def rewrite(repo, ref, stream=None, verify=None):
     """Rewrite `ref` in place with git filter-branch, then VERIFY the result.
 
     `verify` is the post-rewrite scanner and is injectable for the self-test ONLY; production
     callers leave it None and get `scan`.
 
-    Local only, and fail-closed at three points: a remote-tracking ref is refused before anything
-    runs (this tool must never be aimable at a ref that could be pushed by rewriting it); an
-    existing `refs/original/` is refused rather than silently clobbering the one backup of the
-    pre-purge history; and the post-rewrite scan must come back with zero exposures.
+    Local only, and fail-closed at three points: the ref is resolved and refused unless it is a
+    local branch, before anything runs (this tool must never be aimable at a ref that could be
+    pushed by rewriting it); an existing `refs/original/` is refused rather than silently
+    clobbering the one backup of the pre-purge history; and the post-rewrite scan must come back
+    with zero exposures.
     """
     stream = sys.stdout if stream is None else stream
-    if ref.startswith("refs/remotes/") or ref.startswith("remotes/"):
-        raise PurgeError(f"refusing to rewrite the remote-tracking ref {ref!r} — "
-                         "rewrite a local branch and let a human force-update the remote")
+    # Every operation below uses the RESOLVED name, so what was guarded is what git acts on.
+    ref = resolve_local_branch(repo, ref)
     existing = _git(["for-each-ref", "--format=%(refname)", "refs/original/"], repo=repo)
     if existing.strip():
         raise PurgeError("refs/original/ already exists — a previous rewrite's backup is still "
@@ -446,12 +481,12 @@ def _self_test():
 
     DECLARED UNEXECUTED LINES (measured with `python3 -m trace --count --missing`, whose marker
     was validated against a function known not to run — the default `--count` output marks nothing
-    and would have reported a clean sheet). Four lines are contract assertions on git's own output
+    and would have reported a clean sheet). Five lines are contract assertions on git's own output
     and cannot be reached while git honours it: the empty-`git log` refusal (a bad ref exits
-    non-zero first), the malformed `cat-file --batch` header, the truncated `--batch-check`
-    answer, and the ls-files entry naming a path other than the pathspec it was given. Plus the
-    `__main__` non-self-test dispatch, unreachable from inside a self-test by construction. Every
-    other line executes here.
+    non-zero first), the `git log -z` record that does not begin with a SHA, the malformed
+    `cat-file --batch` header, the truncated `--batch-check` answer, and the ls-files entry naming
+    a path other than the pathspec it was given. Plus the `__main__` non-self-test dispatch,
+    unreachable from inside a self-test by construction. Every other line executes here.
     """
     import io
     import contextlib
@@ -607,6 +642,26 @@ def _self_test():
         check("the literal-check report still names no handle",
               "acct01" in residual_out.getvalue(), False)
 
+        # CONTROL BYTES ARE DATA. A commit message may contain any byte but NUL, so a bulk read
+        # framed on \x01/\x02 lets ONE message split itself into pseudo-records whose text lands
+        # in the parsed `sha` field — which neither the subject walk nor the literal count reads.
+        # Handles sit AFTER each control byte, so a framing regression reports this ref clean.
+        control = _fixture_repo(root / "control-bytes", [
+            ("release 47f4b2e0\n\nrestored \x01 for acct01 and \x02 for acct2css\n", None)])
+        control_records = _commit_messages(control, "ledger")
+        # Expected SHA read from git, not from the parser under test.
+        check("a control-byte message parses as ONE record, keyed by the real commit SHA",
+              [len(control_records), control_records[0][0]],
+              [1, _git(["rev-parse", "refs/heads/ledger"], repo=control).decode().strip()])
+        check("both control bytes survive INSIDE the message rather than framing it",
+              ["\x01" in control_records[0][1], "\x02" in control_records[0][1]], [True, True])
+        control_report = scan(control, "ledger", ["acct01", "acct2css"])
+        check("the control-byte ref is still counted as one commit",
+              control_report["commits"], 1)
+        check("the handles after \\x01 and \\x02 are counted and reach the exposure total",
+              [control_report["handle_hits"], report_exposures(control_report)], [2, 2])
+        check("the control-byte report still names no handle", _rendered(control_report), False)
+
         # `main` is the entry point the operator actually runs; drive it (report rendering
         # included) rather than only its helpers, with stdout captured so the suite's own rows
         # stay the only thing on stdout.
@@ -661,16 +716,55 @@ def _self_test():
               (_refusal(lambda: rewrite(repo, "ledger", stream=io.StringIO())) or ""), True)
         # A REAL remote-tracking ref, so the refusal cannot be an unknown-ref error standing in
         # for the guard. Rewriting one would rewrite what the next `git push` compares against.
+        # `repo` already carries a refs/original/, so this also pins the ORDER: the ref guard runs
+        # before the backup guard, and the message says which one fired.
         remote_head = _git(["rev-parse", "refs/original/refs/heads/ledger"],
                            repo=repo).decode().strip()
         _git(["update-ref", "refs/remotes/origin/ledger", remote_head], repo=repo)
-        check("rewrite refuses a remote-tracking ref by name",
-              "remote-tracking ref" in
+        check("rewrite refuses a remote-tracking ref before the backup guard is reached",
+              "not a local branch under refs/heads/" in
               (_refusal(lambda: rewrite(repo, "refs/remotes/origin/ledger",
                                         stream=io.StringIO())) or ""), True)
         check("the refused remote-tracking ref was not moved",
               _git(["rev-parse", "refs/remotes/origin/ledger"], repo=repo).decode().strip(),
               remote_head)
+
+        # SHORTHAND. `git filter-branch` acts on the RESOLVED ref, so `origin/ledger` — the exact
+        # spelling the README uses for scans — rewrites `refs/remotes/origin/ledger`. A guard that
+        # matched the typed spelling let this through. Fixture has NO refs/original/, so the
+        # backup guard cannot stand in for the one under test, and the accept case below is in the
+        # SAME repo: a guard that simply refused everything would red it.
+        shorthand = _fixture_repo(root / "shorthand", [
+            ("claim 0123abcd acct01 bench/impl", dirty_a)])
+        shorthand_head = _git(["rev-parse", "refs/heads/ledger"], repo=shorthand).decode().strip()
+        _git(["update-ref", "refs/remotes/origin/ledger", shorthand_head], repo=shorthand)
+        for spelling in ("origin/ledger", "remotes/origin/ledger", "refs/remotes/origin/ledger"):
+            check(f"rewrite refuses {spelling!r}, which RESOLVES outside refs/heads/",
+                  "not a local branch under refs/heads/" in
+                  (_refusal(lambda: rewrite(shorthand, spelling, stream=io.StringIO())) or ""),
+                  True)
+        # A bare SHA names no ref; filter-branch would rewrite whatever ref happened to point at
+        # it. Different branch of the guard, different message.
+        check("rewrite refuses a bare commit SHA, which names no ref at all",
+              "does not name exactly one ref" in
+              (_refusal(lambda: rewrite(shorthand, shorthand_head, stream=io.StringIO())) or ""),
+              True)
+        check("no refused spelling moved the remote-tracking ref",
+              _git(["rev-parse", "refs/remotes/origin/ledger"], repo=shorthand).decode().strip(),
+              shorthand_head)
+        check("no refused spelling created a backup namespace at all",
+              _git(["for-each-ref", "--format=%(refname)", "refs/original/"],
+                   repo=shorthand).decode().strip(), "")
+        # ACCEPT side, same repo: the local branch's own shorthand still rewrites, and the backup
+        # git then writes is the LOCAL one — proving resolution routed to refs/heads/, not to the
+        # remote-tracking ref that shares the name.
+        check("the same repo's LOCAL branch shorthand is still accepted",
+              _refusal(lambda: rewrite(shorthand, "ledger", stream=io.StringIO())), None)
+        check("the accepted rewrite backed up the LOCAL branch, and left the remote-tracking ref",
+              [_git(["for-each-ref", "--format=%(refname)", "refs/original/"],
+                    repo=shorthand).decode().strip(),
+               _git(["rev-parse", "refs/remotes/origin/ledger"], repo=shorthand).decode().strip()],
+              ["refs/original/refs/heads/ledger", shorthand_head])
         check("scan of an unknown ref fails closed",
               _raises(lambda: scan(repo, "refs/heads/does-not-exist")), True)
         check("scan of an unknown ref EXITS NON-ZERO",
