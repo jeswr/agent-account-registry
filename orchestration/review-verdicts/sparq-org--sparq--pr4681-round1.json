@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4681,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "022d78d2537153edde1acd7c5eae864376ff7c2d",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "When BUCKET is unset, only PRINT_POLICY_ONLY avoids account discovery; ordinary --dry-run executes `aws sts get-caller-identity` before reaching the dry-run command wrapper. This contradicts both the script/README promise that `bootstrap-bench-iam.sh --dry-run` makes no AWS call and the safety purpose of previewing exact commands before using credentials. The test is vacuous for the documented invocation because it always adds `--bucket`, bypassing this branch.",
+    "file": "scripts/bench/bootstrap-bench-iam.sh",
+    "fix_hint": "Make ordinary dry-run use a clearly marked placeholder account/bucket (as --print-policy does), or print the STS lookup as a prospective command without executing it. Add a hermetic test invoking --dry-run with no --bucket and assert the AWS stub log remains empty.",
+    "severity": "major",
+    "title": "--dry-run performs an AWS STS call unless --bucket is supplied"
+   },
+   {
+    "body": "The script claims the whole bootstrap is idempotent, but `add-role-to-instance-profile` is wrapped only by a generic error-string allowlist. AWS reports an already occupied one-role instance profile as a limit/quota error rather than one of the accepted AlreadyExists strings, so a normal second run can terminate under `set -e`. The hermetic test only checks that the command is printed and does not exercise rerun behavior.",
+    "file": "scripts/bench/bootstrap-bench-iam.sh",
+    "fix_hint": "Before attaching, query `get-instance-profile` and skip when ROLE_NAME is already present; fail explicitly if a different role occupies the profile. Add stubbed first-run and rerun cases that verify the same role is a no-op and a conflicting role fails clearly.",
+    "severity": "major",
+    "title": "Re-running bootstrap can fail when the role is already attached"
+   }
+  ],
+  "progress": null,
+  "summary": "The durable-egress integration is generally careful, but the bootstrap's advertised no-call dry-run behavior is not true for the documented default invocation. The hermetic test supplies --bucket and therefore misses the real path. The bootstrap also appears not to be idempotent at the role/profile attachment step, contrary to its contract.",
+  "verdict": "request_changes"
+ }
+}
