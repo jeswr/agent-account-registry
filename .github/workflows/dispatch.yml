@@ -610,11 +610,22 @@ jobs:
               #
               # MEASURED by replaying this step verbatim (2026-07-28, live sparq snapshot: 1721
               # issue rows / 91 open PRs / 33 `review:parked`, sparq's own engine, this repo's
-              # `inertness_attestation` as producer): 33 of 33 parked PRs attested inert; PR-held
-              # `area:` keys 40 -> 25, 15 fully released with NO key losing a holder that is not
-              # itself an attested machine park; ready-lane frontier 0 -> 2 and plan rows 2 -> 4,
-              # candidates unchanged at 385. `docs` 34 -> 25 and `ci` 30 -> 27 stay held, as the
-              # union rule requires.
+              # `inertness_attestation` as producer). What is RELEASED is structural and
+              # reproduced on every board it was run against: 33 of 33 parked PRs attested inert;
+              # PR-held `area:` keys 40 -> 25, 15 fully released with NO key losing a holder that
+              # is not itself an attested machine park; `docs` 34 -> 25 and `ci` 30 -> 27 stay
+              # held, as the union rule requires; candidates unchanged.
+              #
+              # NO FRONTIER DELTA IS PINNED HERE, and the omission is deliberate. An earlier
+              # revision of this comment hard-coded one; three verbatim replays of this step over
+              # the same week returned +7, +2 and +3 while agreeing on the release semantics every
+              # time. The spread IS the finding — a released key moves the frontier only if some
+              # candidate happened to be waiting on exactly that key — so any single figure here
+              # is stale by the next tick and misleads the next reader. For a CURRENT number read
+              # the censuses this step already prints every tick:
+              #   `parked-release census <repo>: stamped|NOT STAMPED (...); N of M attested inert;
+              #    K machine-parked row(s) release their areas: ...`
+              #   `partition census <repo>: candidates= frontier= partition-deferred= ...`
               #
               # NOT a second predicate — an ANSWER. `raw-inertness-<i>.json` is written by the
               # AUTHENTICATED registry-inline snapshot step (plan-snapshot.py), which runs before
