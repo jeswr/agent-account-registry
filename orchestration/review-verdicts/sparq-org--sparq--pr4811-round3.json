@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4811,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f1bb95be0a7337349e01d39f9e61eda9e4f9df60",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Each binary verifies only that its own repeated parses match its own warm-up. `ab.sh` streams the released and upstream outputs independently and never compares their triple counts or digests. Therefore a parser revision that consistently produces different triples still leaves the one-command A/B run with exit status 0, despite README.md and the research record describing equal digest plus count as the load-bearing differential invariant. The recorded manual comparison does not make future reruns fail closed.",
+    "file": "bench/parse/oxttl-prefix-alloc/ab.sh",
+    "fix_hint": "Capture a machine-readable result from every compared leg and make `ab.sh` compare both `triples` and `digest` against the released reference, exiting nonzero with both values on mismatch. Exercise that comparison with a small automated test or script-level mutation check that proves a deliberately changed digest makes the A/B command fail.",
+    "severity": "major",
+    "title": "The A/B command does not enforce its byte/count-identical invariant"
+   },
+   {
+    "body": "The `--attribute` manifest rewrite replaces the dependency rev and package/bin name, but it does not replace `description = \"0.3.0-dev (oxigraph git 9af7d59)\"`. `main.rs` reports that description verbatim as the measured oxttl identity, so every attribution binary claims it linked 9af7d59 even when it actually links the requested parent or intermediate SHA. This undermines the provenance of the attribution table and makes captured output misleading.",
+    "file": "bench/parse/oxttl-prefix-alloc/ab.sh",
+    "fix_hint": "Rewrite the description's revision when generating each attribution manifest (or inject the requested revision through an explicit build-time value), then add a check that `--attribute <sha>` output contains that exact SHA and not the upstream baseline SHA.",
+    "severity": "major",
+    "title": "Attribution builds falsely label arbitrary revisions as 9af7d59"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The two round-2 findings are fixed: count runs retain explicit feature identity and the harness Vec is allocated before the counting snapshot. However, round 3 exposes two new reproducibility/correctness problems. The A/B script never checks that the two legs' count/digest results agree, so the documented byte/count-identical invariant is observational only and a divergent parser can still produce a successful run. In addition, attribution wrappers change the dependency revision and package name but retain the upstream manifest's 9af7d59 description, causing arbitrary-commit results to misidentify the revision measured. Because these are new major findings, progress is regressing.",
+  "verdict": "request_changes"
+ }
+}
