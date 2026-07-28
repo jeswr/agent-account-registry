@@ -1424,6 +1424,62 @@ _assert_dockerfile_pinned() {
   return 0
 }
 
+# PURE (self-tested): [issue #524] every non-local `uses:` in a workflow must pin a FULL 40-hex
+# commit sha (docker refs: a 64-hex sha256 digest). This MIRRORS the assertion pr-gate.yml enforces
+# on the whole workflow tree (sol audit #221) — actionlint does not check pinning, so before this
+# the host gate lint (yaml parse + actionlint) accepted an unpinned `actions/checkout@v4` an agent
+# had just written and the mutable tag was first rejected at PR-gate time, a full round later.
+# Keeping the two lanes on ONE policy is the point: a ref this rejects must be one pr-gate rejects.
+#
+# Fail-closed shape, and where it deliberately differs from pr-gate: pr-gate scans EVERY workflow at
+# once and treats a zero-reference scan as a parser regression (vacuous assertion). This runs on ONE
+# touched file, where zero non-local references is legitimate — a `run:`-only workflow has none — so
+# zero is a pass here and the non-vacuity backstop is the self-test instead (a tag-pinned fixture
+# must go RED). A file that does not exist or does not PARSE is still a refusal: an unreadable
+# workflow must never read as "nothing unpinned found".
+_assert_workflow_actions_pinned() {
+  local file="$1"
+  [[ -f "$file" ]] || { printf 'worker-live: workflow file missing: %s\n' "$file" >&2; return 1; }
+  python3 - "$file" <<'PY'
+import re, sys, yaml
+
+def walk(node):
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "uses" and isinstance(value, str):
+                yield value
+            else:
+                yield from walk(value)
+    elif isinstance(node, list):
+        for item in node:
+            yield from walk(item)
+
+path = sys.argv[1]
+try:
+    with open(path, encoding="utf-8") as fh:
+        doc = yaml.safe_load(fh)
+except Exception as exc:  # unparseable -> refuse, never "no unpinned refs found"
+    print(f"worker-live: workflow does not parse: {path}: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+bad = []
+for ref in walk(doc):
+    if ref.startswith("./"):
+        continue  # local action: already pinned by this PR's own commit
+    if ref.startswith("docker://"):
+        ok = re.search(r"@sha256:[0-9a-f]{64}$", ref)
+    else:
+        ok = re.fullmatch(r"[^@\s]+@[0-9a-f]{40}", ref)
+    if not ok:
+        bad.append(ref)
+
+for ref in bad:
+    print(f"worker-live: action reference is not commit-pinned "
+          f"(need @<40-hex sha>) in {path}: uses: {ref}", file=sys.stderr)
+sys.exit(1 if bad else 0)
+PY
+}
+
 # PURE (self-tested): print a workflow step's `if:` EXPRESSION selected by its `id:`. A GitHub
 # Actions `if` with no status function is implicitly wrapped in success(), so a post-gate step
 # written `if: ${{ !inputs.dry_run && steps.model.outcome == 'success' }}` is SILENTLY skipped when
@@ -1794,6 +1850,12 @@ registry_selftest_gate() {
   #    release itself (_ensure_actionlint — [#431] from the same single-source scripts/actionlint.pin
   #    pr-gate.yml reads, so the two lanes cannot lint with different actionlints) and FAILS CLOSED
   #    only when neither a present nor a verifiably provisioned binary can be had.
+  #
+  #    [issue #524] The 40-hex `uses:` pin assertion pr-gate.yml enforces tree-wide (#221) runs here
+  #    too, and BEFORE the actionlint hop: actionlint does not check commit-pinning, so an unpinned
+  #    action an agent just wrote used to survive this gate and die a full round later at PR-gate
+  #    time. It is the cheap check, so it runs before actionlint provisioning — fail fast, and the
+  #    two lanes stay on one policy.
   local actionlint_bin=''
   for t in "${targets[@]}"; do
     kind=${t%%:*}; name=${t#*:}
@@ -1801,6 +1863,8 @@ registry_selftest_gate() {
       printf 'worker-live: lint workflow %s\n' "$name"
       python3 -c 'import sys,yaml; yaml.safe_load(open(sys.argv[1]))' "$name" \
         || die "yaml parse failed: $name"
+      _assert_workflow_actions_pinned "$name" \
+        || die "workflow action reference is not 40-hex commit-pinned: $name (fail closed — pr-gate.yml #221 rejects it too)"
       [[ -n "$actionlint_bin" ]] || actionlint_bin=$(_ensure_actionlint) \
         || die "actionlint unavailable and pinned provisioning failed: $name (fail closed — a workflow change cannot be under-validated)"
       "$actionlint_bin" "$name" || die "actionlint failed: $name"
@@ -4071,6 +4135,113 @@ PY
   chk "empty digest is REJECTED" \
     "$( _assert_dockerfile_pinned "$tmp/empty.Dockerfile" >/dev/null 2>&1 && echo pinned || echo unpinned)" \
     "unpinned"
+
+  # --- [issue #524] the 40-hex `uses:` pin assertion, mirrored from pr-gate.yml (#221) into the
+  # host-side touched-workflow lint. NON-VACUOUS in BOTH directions, and both directions matter for
+  # a different reason: the REJECT fixtures are the exact regression #221 exists to stop (actionlint
+  # passes a mutable tag, so before this the gate did too), while the ACCEPT fixtures — and the real
+  # tree, which pr-gate accepts today — guard against the opposite failure, an over-strict mirror
+  # that would block every legitimate workflow change at implement time. If `walk()` ever stopped
+  # finding `uses:` at all, every REJECT chk below flips red. ---
+  local pin40 pin39 pin_nonhex pin_docker
+  pin40=$(printf 'a%.0s' {1..40})
+  pin39=$(printf 'b%.0s' {1..39})
+  pin_nonhex=$(printf 'z%.0s' {1..40})
+  pin_docker=$(printf 'c%.0s' {1..64})
+  printf 'on: push\njobs:\n  j:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@%s\n' \
+    "$pin40" > "$tmp/wf-pinned.yml"
+  chk "a 40-hex commit-pinned uses: passes (legitimate workflow maintenance stays passable)" \
+    "$( _assert_workflow_actions_pinned "$tmp/wf-pinned.yml" >/dev/null 2>&1 && echo pinned || echo unpinned)" \
+    "pinned"
+  printf 'on: push\njobs:\n  j:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n' \
+    > "$tmp/wf-tag.yml"
+  chk "a mutable TAG ref is REJECTED (the exact #221 regression actionlint waves through)" \
+    "$( _assert_workflow_actions_pinned "$tmp/wf-tag.yml" >/dev/null 2>&1 && echo pinned || echo unpinned)" \
+    "unpinned"
+  printf 'on: push\njobs:\n  j:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout\n' \
+    > "$tmp/wf-noref.yml"
+  chk "a ref-less uses: is REJECTED" \
+    "$( _assert_workflow_actions_pinned "$tmp/wf-noref.yml" >/dev/null 2>&1 && echo pinned || echo unpinned)" \
+    "unpinned"
+  # A near-miss sha is the regression a substring/length-blind check would wave through: 39 hex and
+  # 40 NON-hex must both fail, exactly as pr-gate's `re.fullmatch` makes them fail.
+  printf 'on: push\njobs:\n  j:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@%s\n' \
+    "$pin39" > "$tmp/wf-short.yml"
+  chk "a 39-hex (short) sha is REJECTED" \
+    "$( _assert_workflow_actions_pinned "$tmp/wf-short.yml" >/dev/null 2>&1 && echo pinned || echo unpinned)" \
+    "unpinned"
+  printf 'on: push\njobs:\n  j:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@%s\n' \
+    "$pin_nonhex" > "$tmp/wf-nonhex.yml"
+  chk "a 40-char NON-hex ref is REJECTED" \
+    "$( _assert_workflow_actions_pinned "$tmp/wf-nonhex.yml" >/dev/null 2>&1 && echo pinned || echo unpinned)" \
+    "unpinned"
+  # The three shapes pr-gate deliberately treats differently: a `./` local action needs no pin, a
+  # docker ref pins a 64-hex sha256 digest (a tagged one does not), and a reusable-workflow `uses:`
+  # is pinned like any other action. A mirror that got any of these wrong would diverge from #221.
+  printf 'on: push\njobs:\n  j:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: ./.github/actions/local\n' \
+    > "$tmp/wf-local.yml"
+  chk "a ./ LOCAL action needs no pin (pinned by the PR's own commit)" \
+    "$( _assert_workflow_actions_pinned "$tmp/wf-local.yml" >/dev/null 2>&1 && echo pinned || echo unpinned)" \
+    "pinned"
+  printf 'on: push\njobs:\n  j:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: docker://alpine@sha256:%s\n' \
+    "$pin_docker" > "$tmp/wf-docker-ok.yml"
+  chk "a docker:// ref digest-pinned to 64-hex sha256 passes" \
+    "$( _assert_workflow_actions_pinned "$tmp/wf-docker-ok.yml" >/dev/null 2>&1 && echo pinned || echo unpinned)" \
+    "pinned"
+  printf 'on: push\njobs:\n  j:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: docker://alpine:3.19\n' \
+    > "$tmp/wf-docker-tag.yml"
+  chk "a TAGGED docker:// ref is REJECTED" \
+    "$( _assert_workflow_actions_pinned "$tmp/wf-docker-tag.yml" >/dev/null 2>&1 && echo pinned || echo unpinned)" \
+    "unpinned"
+  printf 'on: push\njobs:\n  j:\n    uses: jeswr/agent-account-registry/.github/workflows/x.yml@%s\n' \
+    "$pin40" > "$tmp/wf-reusable.yml"
+  chk "a JOB-level reusable-workflow uses: is checked too, and a 40-hex pin passes" \
+    "$( _assert_workflow_actions_pinned "$tmp/wf-reusable.yml" >/dev/null 2>&1 && echo pinned || echo unpinned)" \
+    "pinned"
+  printf 'on: push\njobs:\n  j:\n    uses: jeswr/agent-account-registry/.github/workflows/x.yml@main\n' \
+    > "$tmp/wf-reusable-tag.yml"
+  chk "a branch-ref reusable workflow is REJECTED (job-level uses: is not a blind spot)" \
+    "$( _assert_workflow_actions_pinned "$tmp/wf-reusable-tag.yml" >/dev/null 2>&1 && echo pinned || echo unpinned)" \
+    "unpinned"
+  # Per-file zero references is a PASS here and only here: pr-gate scans the whole tree at once, so
+  # zero there means the parser regressed (it fails closed on that); one `run:`-only workflow having
+  # no action reference at all is ordinary. The unparseable/missing cases still REFUSE — an
+  # unreadable workflow must never read as "no unpinned references found".
+  printf 'on: push\njobs:\n  j:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n' \
+    > "$tmp/wf-runonly.yml"
+  chk "a run-only workflow with ZERO action references passes (per-file zero is legitimate)" \
+    "$( _assert_workflow_actions_pinned "$tmp/wf-runonly.yml" >/dev/null 2>&1 && echo pinned || echo unpinned)" \
+    "pinned"
+  printf 'on: push\njobs:\n  j:\n   - bad\n  : : :\n' > "$tmp/wf-broken.yml"
+  chk "an UNPARSEABLE workflow is refused, not read as having no unpinned refs" \
+    "$( _assert_workflow_actions_pinned "$tmp/wf-broken.yml" >/dev/null 2>&1 && echo pinned || echo unpinned)" \
+    "unpinned"
+  chk "a MISSING workflow file is refused (fail closed)" \
+    "$( _assert_workflow_actions_pinned "$tmp/wf-no-such.yml" >/dev/null 2>&1 && echo pinned || echo unpinned)" \
+    "unpinned"
+  # Parity with the lane this mirrors, asserted on the REAL tree: every workflow in the repo passes
+  # pr-gate's tree-wide pin check today, so every one of them must pass this per-file mirror. A
+  # divergence would make the host gate reject what the required gate accepts. The scanned count is
+  # asserted too, so an empty glob cannot make this parity claim vacuous.
+  # Both extensions, because both the classifier above and pr-gate's scan cover `.yml` AND `.yaml`;
+  # an unmatched glob stays a literal string, which the `-f` guard skips.
+  local wf_real wf_scanned=0 wf_rejected=0
+  for wf_real in "$SCRIPT_DIR"/../.github/workflows/*.yml "$SCRIPT_DIR"/../.github/workflows/*.yaml; do
+    [[ -f "$wf_real" ]] || continue
+    wf_scanned=$((wf_scanned + 1))
+    _assert_workflow_actions_pinned "$wf_real" >/dev/null 2>&1 || wf_rejected=$((wf_rejected + 1))
+  done
+  chk "the parity sweep actually scanned the real workflow tree (non-vacuous)" \
+    "$([[ "$wf_scanned" -gt 0 ]] && echo scanned || echo none)" "scanned"
+  chk "every REAL workflow passes the mirror (no divergence from pr-gate.yml #221)" \
+    "$wf_rejected" "0"
+  # WIRING, on the PARSED gate body: without these the assertion above could be perfectly correct
+  # and simply never reached from the touched-workflow lint — and it must DIE, not warn.
+  gate_body=$(declare -f registry_selftest_gate)
+  chk "#524 wiring: the touched-workflow lint calls the pin assertion" \
+    "$(printf '%s\n' "$gate_body" | grep -c '_assert_workflow_actions_pinned')" "1"
+  chk "#524 wiring: an unpinned action REFUSES the gate, it does not warn and continue" \
+    "$(printf '%s\n' "$gate_body" | grep -c 'die "workflow action reference is not 40-hex commit-pinned')" "1"
 
   # --- [issue #40 -> #575] The post-gate token-TTL problem app-token-post/app-token-publish existed
   # to solve is now solved STRUCTURALLY: the publisher is a separate job on a fresh runner, so it
