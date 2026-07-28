@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 890,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "8a76931028aaa710daf79aaf5fb0bb9b90a36579",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "The round-1 precedence defect is corrected soundly: legacy behavior now depends on presence of the `leases` key, so any supplied legacy source remains authoritative even when it yields no usable utilization values, while only a genuinely row-free input consults the collector aggregate. The added tests directly exercise missing, malformed, and empty legacy rows alongside a valid competing aggregate, so they would fail under the prior implementation and are non-vacuous. Aggregate validation rejects incomplete, incoherent, out-of-range, and non-numeric inputs, and the unconditional fatal salted-label check remains in force whenever legacy rows are present. The documentation matches the implemented migration contract.",
+  "verdict": "approve"
+ }
+}
