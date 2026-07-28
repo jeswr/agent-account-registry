@@ -1,59 +1,61 @@
 {
-  "generated_at": "2026-07-28T00:40:18Z",
+  "generated_at": "2026-07-28T00:55:29Z",
   "schema_version": 1,
   "targets": {
     "sparq-org/sparq": {
-      "issues_open": 1541,
+      "issues_open": 1542,
       "issues_ready": 368,
       "issues_closed_1h": 2,
       "issues_closed_24h": 48,
       "prs_open": 95,
-      "prs_draft": 72,
-      "prs_opened_1h": 7,
-      "prs_closed_1h": 7,
+      "prs_draft": 69,
+      "prs_opened_1h": 6,
+      "prs_closed_1h": 4,
       "prs_merged_1h": 3,
       "prs_merged_24h": 54,
-      "review_changes_backlog": 9,
+      "review_changes_backlog": 11,
       "needs_user_parked": 21,
       "review_lane_health": "ok",
-      "review_lane_runs_1h": 17,
-      "worker_attempts_1h": 7,
+      "review_lane_runs_1h": 18,
+      "worker_attempts_1h": 6,
       "worker_success_rate_1h": 1.0,
-      "pr_open_rate": 7.0,
-      "pr_close_rate": 10.0,
-      "net_pr_flow": -3.0
+      "pr_open_rate": 6.0,
+      "pr_close_rate": 7.0,
+      "net_pr_flow": -1.0
     },
     "jeswr/agent-account-registry": {
-      "issues_open": 382,
+      "issues_open": 383,
       "issues_ready": 75,
-      "issues_closed_1h": 1,
-      "issues_closed_24h": 31,
-      "prs_open": 37,
-      "prs_draft": 22,
-      "prs_opened_1h": 7,
+      "issues_closed_1h": 2,
+      "issues_closed_24h": 32,
+      "prs_open": 35,
+      "prs_draft": 20,
+      "prs_opened_1h": 6,
       "prs_closed_1h": 0,
-      "prs_merged_1h": 5,
-      "prs_merged_24h": 51,
-      "review_changes_backlog": 6,
+      "prs_merged_1h": 4,
+      "prs_merged_24h": 53,
+      "review_changes_backlog": 5,
       "needs_user_parked": 13,
       "review_lane_health": "ok",
-      "review_lane_runs_1h": 5,
+      "review_lane_runs_1h": 10,
       "worker_attempts_1h": 7,
       "worker_success_rate_1h": 0.5714,
-      "pr_open_rate": 7.0,
-      "pr_close_rate": 5.0,
+      "pr_open_rate": 6.0,
+      "pr_close_rate": 4.0,
       "net_pr_flow": 2.0
     }
   },
   "alerts": [
     {
       "target": "jeswr/agent-account-registry",
-      "classification": "worker-failing",
+      "classification": "backlog-growing",
       "fire": true,
-      "summary": "worker success rate 57% < 50% floor over 2 snapshots (7 attempts this hour)",
+      "summary": "open PRs 35 > 12 and net PR flow +2.0/hr (open 6.0 > close 4.0) sustained over 2 snapshots",
       "metrics": {
-        "worker_success_rate_1h": 0.5714,
-        "worker_attempts_1h": 7
+        "prs_open": 35,
+        "net_pr_flow": 2.0,
+        "pr_open_rate": 6.0,
+        "pr_close_rate": 4.0
       }
     }
   ]
