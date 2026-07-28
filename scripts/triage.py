@@ -1213,10 +1213,21 @@ def _self_test():
     # invisible to retriage (which only revisits status:untriaged). Pinned statically so it cannot
     # regress: the label mutation carries no `|| true`, the step runs under `set -e`, and a post-read
     # proves both labels landed. (Only the courtesy comment may be best-effort.)
-    quarantine = re.search(r"\n {6}- name: Quarantine.*?(?=\n {6}- name: |\Z)",
-                           "\n".join(line for line in open(triage_wf, encoding="utf-8").read()
-                                     .splitlines() if not line.strip().startswith("#")), re.S)
-    quarantine_body = quarantine.group(0) if quarantine else ""
+    wf_body = "\n".join(line for line in open(triage_wf, encoding="utf-8").read().splitlines()
+                        if not line.strip().startswith("#"))
+
+    def wf_step(step_name):
+        """The EXECUTABLE body of one workflow step, comment lines already dropped."""
+        found = re.search(r"\n {6}- name: " + re.escape(step_name) + r".*?(?=\n {6}- name: |\Z)",
+                          wf_body, re.S)
+        return found.group(0) if found else ""
+
+    def step_if(body):
+        """The step's `if:` expression VERBATIM (empty string when the step has none)."""
+        return next((line.split("if:", 1)[1].strip() for line in body.splitlines()
+                     if line.strip().startswith("if:")), "")
+
+    quarantine_body = wf_step("Quarantine + notify (untrusted author)")
     chk("[#595 f5] the quarantine step exists and runs under set -e",
         bool(quarantine_body) and "set -euo pipefail" in quarantine_body, True)
     chk("[#595 f5] no `|| true` on the quarantine LABEL mutation",
@@ -1225,6 +1236,70 @@ def _self_test():
     chk("[#595 f5] the quarantine labels are verified by a post-read before success",
         all(token in quarantine_body for token in ("--json labels", "trust:untrusted",
                                                    "refusing to report success")), True)
+
+    # -----------------------------------------------------------------------------------------------
+    # [#607] THE TRIGGER LIST IS THE PREVENTION MECHANISM, so it is pinned by EXACT SET, never by
+    # containment. `labeled`/`unlabeled` are distinct issue event types: without them, stripping a
+    # `priority:*` / `role:*` / `area:*` label off a `status:ready` issue re-ran no classifier at all
+    # (the original #178 mechanism) and left it stranded until retriage's sweep (#586). A dropped
+    # token here is exactly the regression #607 fixed and a substring check would not see it.
+    # The parse is deliberately FAIL-CLOSED, not tolerant: a trigger list this regex cannot read
+    # (e.g. reformatted to block style) yields the empty set and reds this row rather than passing
+    # on evidence it never found — keep the flow-style list, or teach the regex the new shape.
+    trigger = re.search(r"\non:\n  issues:\n    types: \[([^\]]*)\]", wf_body)
+    trigger_types = sorted(t.strip() for t in (trigger.group(1) if trigger else "").split(",")
+                           if t.strip())
+    chk("[#607] triage-issue.yml fires on the LABEL events too — exact trigger set",
+        trigger_types, ["edited", "labeled", "opened", "reopened", "unlabeled"])
+    # THE MARQUEE CLAIM, checked at the step that actually delivers it (AGENTS.md pre-flight 9/11):
+    # a trigger that reaches a classifier step gated on the event type would be inert. The
+    # classifier's ONLY condition is trust — exact match, so `&& false` or a re-added event-type
+    # exclusion goes red here.
+    chk("[#607] the classifier step is gated by TRUST ALONE (no event-type condition), so it DOES "
+        "run on labeled/unlabeled",
+        step_if(wf_step("Static triage (trusted author)")), "steps.trust.outputs.trusted == '1'")
+    # ...while the quarantine MUTATION is scoped to the CONTENT events by an ALLOWLIST: a
+    # `labeled`/`unlabeled` event carries no new author content (only an actor with triage/write
+    # permission can emit one), and re-applying it on `unlabeled` would revert the maintainer's own
+    # `trust:untrusted` removal — the sole approval affordance — within seconds. Pinned as the WHOLE
+    # expression: a substring check survives `&& false` and survives a widened allowlist.
+    quarantine_if = step_if(quarantine_body)
+    chk("[#607] the quarantine step's `if:` is EXACTLY the trust gate AND the content-event "
+        "allowlist",
+        quarantine_if,
+        "steps.trust.outputs.trusted != '1' && "
+        "contains(fromJSON('[\"opened\",\"edited\",\"reopened\"]'), github.event.action)")
+    allowlist = re.search(r"fromJSON\('(\[[^']*\])'\)", quarantine_if)
+    quarantined_on = sorted(json.loads(allowlist.group(1))) if allowlist else []
+    chk("[#607] the allowlist PARTITIONS the trigger set — content events quarantine, label events "
+        "never do, and no trigger type is left unjudged",
+        (quarantined_on, sorted(set(trigger_types) - set(quarantined_on))),
+        (["edited", "opened", "reopened"], ["labeled", "unlabeled"]))
+
+    # NO SELF-TRIGGER LOOP. The primary reason is GitHub's own rule — a write made with the
+    # repository's GITHUB_TOKEN starts no workflow run (the rule dispatch.yml's dead `workflow_run`
+    # doorbell measured on 2026-07-17), and this workflow's `gh` calls all run on `github.token`.
+    # These rows are the INDEPENDENT second reason, and the one this module owns: `triage()` is a
+    # FIXED POINT, so replaying it over its own post-state plans NOTHING — and an empty plan issues
+    # no `gh` call at all (asserted below) — so a triage-emitted label event terminates the cascade
+    # after one step even if that suppression rule ever changed. The first-pass plan is asserted
+    # NON-EMPTY in the same row: over a settled label set the fixed-point claim is vacuously true.
+    for case, seed in (("promotes to ready", ["priority:P1", "area:docs", "kind:docs"]),
+                       # the only seed whose FIRST pass plans a real REMOVAL (role swap + the
+                       # untriaged->ready demotion); without it every planned `remove` is filtered
+                       # away by the seed itself and the remove half of the fixed point is untested.
+                       ("role swap", ["priority:P1", "area:docs", "kind:docs", "role:impl",
+                                      "status:untriaged"]),
+                       ("gated by needs:user", ["priority:P1", "area:docs", "needs:user"]),
+                       ("lost-role repair", ["priority:P1", "area:worker", "status:ready"]),
+                       ("no area -> needs:area", ["priority:P1", "kind:docs"])):
+        first = triage(seed, "task")
+        settled = sorted((set(seed) | first["add"]) - first["remove"])
+        replay = triage(settled, "task")
+        chk(f"[#607] triage() is a FIXED POINT ({case}): the first pass mutates, the replay over "
+            "its own post-state plans nothing",
+            (bool(first["add"] or first["remove"]), sorted(replay["add"]), sorted(replay["remove"])),
+            (True, [], []))
 
     # -----------------------------------------------------------------------------------------------
     # THE LIVE `gh` ARGV live_gh builds (shared by triage --apply and retriage --apply): an EMPTY

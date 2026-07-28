@@ -237,8 +237,9 @@ def is_staged(labels: set[str]) -> bool:
 
     NOT the same question as has_status(), and the difference is the whole of registry #799.
 
-    MEASURED DEADLOCK. `triage-issue.yml` fires on `issues: [opened, edited, reopened]` and stamps
-    `status:untriaged` within seconds of creation — `triage.triage()` always adds either
+    MEASURED DEADLOCK. `triage-issue.yml` fires on every `issues` event that can change a label set
+    (`[opened, edited, reopened, labeled, unlabeled]` since #607) and stamps `status:untriaged`
+    within seconds of creation — `triage.triage()` always adds either
     `status:ready` or `status:untriaged`, never neither. The candidate filter used has_status(),
     so from that moment the curator — the ONLY lane in the estate that mints `priority:*`,
     `area:*` and `status:ready` — could never look at the issue again. And `retriage.py` cannot

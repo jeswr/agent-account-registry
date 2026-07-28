@@ -5,7 +5,7 @@ TWO DIRECTIONS, ONE CLASSIFIER (issue #586). The sweep that shipped for #415 was
 — it only promoted `status:untriaged` — so an issue that LOST a required triage label while
 KEEPING its `status:ready` attestation was recoverable by nothing on master: retriage never listed
 it, curate-frontier skips anything already carrying a `status:` label, groom only repairs
-claim-backed state, and triage-issue.yml does not fire on label events. It simply left the
+claim-backed state, and triage-issue.yml did not fire on label events. It simply left the
 readiness frontier forever. `plan()` therefore recomputes `triage.triage()` drift in BOTH
 directions:
 
@@ -644,9 +644,10 @@ def _self_test():
     # the two lane queries (`labels=status:untriaged` and `labels=status:ready` — asserted by
     # EXECUTION in the "[#487] the sweep board is EXACTLY the two lane queries" row below), and
     # nothing puts a `github-actions[bot]` issue on either lane: `triage-issue.yml` is the only
-    # thing that applies a lane label and it fires on `issues: [opened, edited, reopened]`, while
-    # events written with the repository's own `GITHUB_TOKEN` do not start workflow runs — so the
-    # alert issues `metrics.py` opens on `github.token` are never triaged at all. `plan()` is
+    # thing that applies a lane label and it fires on `issues: [opened, edited, reopened, labeled,
+    # unlabeled]` (#607), while events written with the repository's own `GITHUB_TOKEN` do not start
+    # workflow runs — so the alert issues `metrics.py` opens on `github.token`, and every label our
+    # own workflows then write on them, are never triaged at all. `plan()` is
     # therefore never called on them and this gate is never reached. Making the alert-responder
     # class actually triageable needs the UPSTREAM unit (open those issues as the App bot, for
     # which `triage-issue.yml` does fire, or have `metrics.py` apply the triage labels itself);

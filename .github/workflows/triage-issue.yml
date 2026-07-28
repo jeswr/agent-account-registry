@@ -1,7 +1,7 @@
 # Registry self-management: issue triage + untrusted-input quarantine for
 # jeswr/agent-account-registry. Mirrors the sparq target's .github/workflows/triage-issue.yml
-# trust-gate pattern: on a new/edited issue, trust-gate by the AUTHOR's repo permission with an
-# EXACT-MATCH trust for jeswr (the maintainer) and for the registry orchestrator App bot login; a
+# trust-gate pattern: on a new/edited/re-labelled issue, trust-gate by the AUTHOR's repo permission
+# with an EXACT-MATCH trust for jeswr (the maintainer) and for the registry orchestrator App bot; a
 # third-party author is quarantined (trust:untrusted) and its content is NEVER inspected. A trusted
 # author's issue is statically triaged (role/priority/status) by scripts/triage.py — no model call.
 #
@@ -11,7 +11,22 @@ name: triage-issue
 
 on:
   issues:
-    types: [opened, edited, reopened]
+    # PREVENTION, not only recovery (#607). `labeled`/`unlabeled` are DISTINCT issue event types;
+    # without them, stripping a `priority:*` / `role:*` / `area:*` label off a `status:ready` issue
+    # re-ran no classifier at all (the original #178 mechanism) and the issue stayed stranded until
+    # retriage's 30-minute sweep (#586) picked it up. With them the classifier recomputes AT the
+    # moment of the regression. The sweep REMAINS the fail-closed backstop — a run can be cancelled
+    # by the concurrency group below, or never fire at all for a write made with the repository's
+    # own token (see next paragraph) — this trigger just stops the issue being stranded meanwhile.
+    #
+    # NO SELF-TRIGGER LOOP, for two INDEPENDENT reasons. (1) This job writes labels with
+    # `github.token`, and GitHub does not start workflow runs from events the repository
+    # GITHUB_TOKEN emitted — the same documented rule dispatch.yml's dead `workflow_run` doorbell
+    # measured on 2026-07-17 (zero deliveries). (2) Even if that rule ever changed, `triage()` is a
+    # FIXED POINT (`add - labels` / `remove & labels`), so a replay over its own post-state plans
+    # NOTHING and `live_gh`'s editor issues no `gh` call at all for an empty mutation: the cascade
+    # terminates after one step. Both properties are pinned by `scripts/triage.py --self-test`.
+    types: [opened, edited, reopened, labeled, unlabeled]
 
 permissions:
   issues: write
@@ -65,8 +80,19 @@ jobs:
       # green. Only the courtesy NOTIFICATION stays best-effort — it is not a state transition, and
       # it emits a ::warning rather than vanishing. scripts/triage.py --self-test statically
       # asserts this shape so the `|| true` cannot come back on the label write.
+      #
+      # CONTENT EVENTS ONLY (#607). The trust GATE above still runs on every event type — an
+      # untrusted author's issue still never reaches the classifier below and its content is still
+      # never inspected. What is scoped here is the quarantine MUTATION, because a
+      # `labeled`/`unlabeled` event carries no new author content (GitHub only lets an actor with
+      # triage/write permission label an issue, so a third party cannot emit one), and re-running
+      # this on `unlabeled` would REVERT the maintainer's own approval: removing `trust:untrusted`
+      # is the affordance this step's own comment advertises, and it would be re-added within
+      # seconds, leaving every third-party issue permanently unapprovable — plus one more notice
+      # comment per label touch. This is an ALLOWLIST, not an exclusion, so a future event type has
+      # to be judged explicitly instead of silently inheriting the quarantine write.
       - name: Quarantine + notify (untrusted author)
-        if: steps.trust.outputs.trusted != '1'
+        if: steps.trust.outputs.trusted != '1' && contains(fromJSON('["opened","edited","reopened"]'), github.event.action)
         run: |
           set -euo pipefail
           gh issue edit "$NUM" -R "$REPO" --add-label trust:untrusted --add-label status:untriaged
