@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1001,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "83e0dd63c2b8aab7217f03d488bb684827afa8dc",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe documentation-only change is correct and internally consistent with the README header and existing registry design: the repository is public, handles/limits/selection logic are intentionally public, token values remain confined to GitHub secrets, and account emails/PII remain excluded or redacted. The added warnings remove misleading references to a private registry without weakening any trust check, workflow gate, audit trail, test, or security control.",
+  "verdict": "approve"
+ }
+}
