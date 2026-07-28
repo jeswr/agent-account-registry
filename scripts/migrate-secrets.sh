@@ -923,8 +923,24 @@ assert_repo_scope_clear_for_resume() {
 # Re-enable the four quiesced writer workflows (the workflow's reenable-writers job — round 8:
 # it runs as the self-resume after a COMPLETED migrate, or standalone via phase: resume; a
 # FAILED migrate deliberately leaves the writers disabled so a rerun stays raceless).
-# Tries ALL four before failing so one failure never leaves the rest disabled; idempotent
-# (enabling an enabled workflow succeeds).
+# Tries ALL four before failing so one failure never leaves the rest disabled.
+#
+# IDEMPOTENCE IS ASSERTED, NOT ASSUMED (issue #816 — the symmetric counterpart of #328, which
+# fixed the same bug in the quiesce phase's Q1): `gh workflow enable` resolves its selector
+# against DISABLED workflows ONLY, exactly as `gh workflow disable` resolves against ACTIVE
+# ones, so it EXITS NONZERO ("could not find any workflows named ...") on an ALREADY-ENABLED
+# workflow — the operator re-enabled one by hand, or a previous resume died after enabling 2 of
+# 4. The loop being failure-TOLERANT bounds the blast radius (it still attempts all four), but
+# the phase then dies with '::error:: ... re-enable it manually' naming writers that are in fact
+# already fine: a FALSE ALARM, and a run that can never go green until every writer happens to
+# be disabled — i.e. the documented recovery ('re-dispatch phase: resume') is non-convergent.
+# A nonzero enable is therefore INCONCLUSIVE, not fatal: read the workflow's state and accept
+# ONLY the exact postcondition this phase owes — `active`. Anything else — disabled_manually (a
+# genuine failure: a 403 from a mint without Actions: write, or a transient), the 60-day
+# disabled_inactivity, or a state that cannot be read at all — stays a failure, so the
+# idempotence rule never degrades into a blanket swallow of enable failures. The state read
+# sits under Actions: READ, which the reenable mint's Actions: WRITE grant includes, so this
+# needs no new permission (pinned by the self-test's production-grant scenarios).
 phase_resume() {
   echo '== attempt gate (round 11): this must be attempt 1 — re-runs are prohibited =='
   assert_first_attempt
@@ -932,17 +948,27 @@ phase_resume() {
   echo '== phase R0 (round 14): resume precondition — repo scope must hold NONE of the 14 (writers only resume from a clean cutover state) =='
   assert_repo_scope_clear_for_resume
   echo '== phase R: re-enable the 4 quiesced secret-writer workflows (always path) =='
-  local wf failures=0
+  local wf wf_state failures=0
   for wf in "${WRITER_WORKFLOWS[@]}"; do
     if gh workflow enable "$wf" -R "$REPO"; then
       printf 're-enabled: %s\n' "$wf"
-    else
-      printf '::error::migrate-secrets: gh workflow enable %s failed — re-enable it manually: gh workflow enable %s -R %s (NOTE: workflow enable needs the App token'"'"'s Actions: write grant)\n' "$wf" "$wf" "$REPO" >&2
-      failures=1
+      continue
     fi
+    # #816: a nonzero enable is inconclusive — the state read decides, and accepts `active` ONLY.
+    if ! wf_state=$(gh api "repos/${REPO}/actions/workflows/${wf}" --jq .state); then
+      printf '::error::migrate-secrets: gh workflow enable %s failed and its state could not be read — cannot prove %s is enabled, re-enable it manually: gh workflow enable %s -R %s (NOTE: the enable needs the App token'"'"'s Actions: write grant, which includes the Actions: read this state check uses)\n' "$wf" "$wf" "$wf" "$REPO" >&2
+      failures=1
+      continue
+    fi
+    if [[ "$wf_state" != "active" ]]; then
+      printf '::error::migrate-secrets: gh workflow enable %s failed and the workflow is '"'"'%s'"'"', not active — re-enable it manually: gh workflow enable %s -R %s (NOTE: workflow enable needs the App token'"'"'s Actions: write grant)\n' "$wf" "$wf_state" "$wf" "$REPO" >&2
+      failures=1
+      continue
+    fi
+    printf 're-enabled (already active — the enable was a selector miss on a workflow a previous resume attempt enabled): %s\n' "$wf"
   done
   [[ "$failures" -eq 0 ]] \
-    || die 'one or more writer workflows are still DISABLED — re-enable them manually (gh workflow enable <file> -R <owner>/<repo>), then verify with gh workflow list'
+    || die 'one or more writer workflows are still DISABLED (or, per the errors above, could not be PROVEN active — treated the same way) — re-enable them manually (gh workflow enable <file> -R <owner>/<repo>), then verify with gh workflow list'
   printf 'all %d writer workflows re-enabled\n' "${#WRITER_WORKFLOWS[@]}"
 }
 
@@ -1286,8 +1312,8 @@ _grant() {
 }
 # The modeled state of workflow $1: an explicit `state_<wf>` override (used to model
 # disabled_inactivity), else disabled_manually once a `workflow disable` has touched it, else
-# active. Shared by `workflow disable`'s selector resolution and the workflow-state endpoint so
-# the two can never disagree.
+# active. Shared by `workflow disable`'s ACTIVE-only and `workflow enable`'s DISABLED-only
+# selector resolution and by the workflow-state endpoint, so the three can never disagree.
 _wf_state() {
   if [[ -f "$state/state_$1" ]]; then cat "$state/state_$1"
   elif [[ -f "$state/disabled_$1" ]]; then echo disabled_manually
@@ -1309,8 +1335,18 @@ case "$*" in
   "workflow enable "*" -R o/r")
     _grant actions:write \
       || { echo "HTTP 403: Resource not accessible by integration (workflow enable needs Actions: write)" >&2; exit 1; }
-    [[ -f "$state/fail_enable_$3" ]] && exit 1
-    rm -f "$state/disabled_$3"
+    # #816, the MIRROR IMAGE of #328's disable rule: gh resolves `workflow enable` against
+    # DISABLED workflows ONLY, so enabling an already-ACTIVE one is a selector MISS, not a
+    # no-op. Modeling it is what makes the R-loop idempotence path testable at all — with the
+    # old unconditional-success model every enable trivially succeeded and any fix was vacuous.
+    [[ "$(_wf_state "$3")" != active ]] \
+      || { echo "could not find any workflows named $3" >&2; exit 1; }
+    # A modeled transient/denied enable of a still-DISABLED workflow (state unchanged) — the
+    # reject direction of the #816 idempotence rule.
+    [[ -f "$state/fail_enable_$3" ]] && { echo "HTTP 502: Bad Gateway" >&2; exit 1; }
+    # model gh state: the workflow is now ACTIVE (an inactivity-disabled one included — the
+    # explicit override has to go too, else _wf_state would keep reporting the stale state).
+    rm -f "$state/disabled_$3" "$state/state_$3"
     exit 0 ;;
   "api repos/o/r/actions/workflows/"*" --jq .state")
     # Round-8 quiesce gate: the migrate/cleanup phases READ each writer workflow's state and
@@ -1557,6 +1593,19 @@ FAKE
   for wf in worker.yml review-fix.yml set-up-account.yml pat-validity.yml; do
     printf 'run list --all -R o/r --workflow %s --limit 1000 --json status,databaseId --jq %s\n' \
       "$wf" "$NONTERMINAL_FILTER" >> "$expected_quiesce"
+  done
+  # ISSUE #816 — the RETRY shape of the RESUME phase (the mirror image of the #328 quiesce
+  # retry below): every writer is ALREADY enabled, so each `gh workflow enable` is a selector
+  # MISS (nonzero) and is followed by the workflow-state read that proves the postcondition.
+  # Pinning this sequence keeps the idempotence path from degrading into a blanket swallow of
+  # enable failures (no state check) or into an unconditional pre-read on the happy path
+  # (which would break the scenario-19 pin).
+  local expected_resume_retry="$tmp/expected-resume-retry.log"
+  : > "$expected_resume_retry"
+  printf 'api repos/o/r/actions/secrets --paginate --jq .secrets[].name\n' >> "$expected_resume_retry"
+  for wf in worker.yml review-fix.yml set-up-account.yml pat-validity.yml; do
+    printf 'workflow enable %s -R o/r\n' "$wf" >> "$expected_resume_retry"
+    printf 'api repos/o/r/actions/workflows/%s --jq .state\n' "$wf" >> "$expected_resume_retry"
   done
   # ISSUE #328 — the RETRY shape of the same phase: every writer is ALREADY disabled, so each
   # `gh workflow disable` is a selector MISS (nonzero) and is followed by the workflow-state
@@ -2061,6 +2110,29 @@ FAKE
     "$(grep -c 'could not find any workflows named worker.yml' "$tmp/s12c-dis2.out")" 1
   chk "fake-gh model: the failed repeat disable leaves the workflow disabled_manually (the state Q1's postcondition check reads)" \
     "$(FAKE_GH_STATE="$s12c" "$tmp/bin/gh" api repos/o/r/actions/workflows/worker.yml --jq .state)" disabled_manually
+  # ISSUE #816 non-vacuity: the MIRROR-IMAGE selector resolution on `workflow enable` — it
+  # resolves against DISABLED workflows only, so the first enable of the disabled workflow above
+  # succeeds and a REPEAT enable of the now-ACTIVE one ERRORS. Without this modeled failure the
+  # resume retry scenarios (19b/20/20b/21/21c) would be vacuous: every enable would trivially
+  # succeed, which is exactly what the pre-#816 fake did.
+  local en1_rc=0 en2_rc=0
+  FAKE_GH_STATE="$s12c" "$tmp/bin/gh" workflow enable worker.yml -R o/r > "$tmp/s12c-en1.out" 2>&1 || en1_rc=$?
+  chk "fake-gh model: enabling the DISABLED workflow succeeds and leaves it active" \
+    "$en1_rc-$(FAKE_GH_STATE="$s12c" "$tmp/bin/gh" api repos/o/r/actions/workflows/worker.yml --jq .state)" 0-active
+  FAKE_GH_STATE="$s12c" "$tmp/bin/gh" workflow enable worker.yml -R o/r > "$tmp/s12c-en2.out" 2>&1 || en2_rc=$?
+  chk "fake-gh model: a REPEAT workflow enable on the already-ACTIVE workflow ERRORS (#816: gh resolves the selector against DISABLED workflows only)" \
+    "$en2_rc" 1
+  chk "fake-gh model: the repeat-enable failure names the selector miss" \
+    "$(grep -c 'could not find any workflows named worker.yml' "$tmp/s12c-en2.out")" 1
+  chk "fake-gh model: the failed repeat enable leaves the workflow ACTIVE (the state the R loop's postcondition check reads)" \
+    "$(FAKE_GH_STATE="$s12c" "$tmp/bin/gh" api repos/o/r/actions/workflows/worker.yml --jq .state)" active
+  # An inactivity-disabled workflow is enable-RESOLVABLE (it is disabled), and the enable clears
+  # the auto-disable — so the fake cannot report a stale state after a successful enable.
+  printf 'disabled_inactivity\n' > "$s12c/state_review-fix.yml"
+  local eninact_rc=0
+  FAKE_GH_STATE="$s12c" "$tmp/bin/gh" workflow enable review-fix.yml -R o/r >/dev/null 2>&1 || eninact_rc=$?
+  chk "fake-gh model: enabling a disabled_inactivity workflow resolves and clears the auto-disable" \
+    "$eninact_rc-$(FAKE_GH_STATE="$s12c" "$tmp/bin/gh" api repos/o/r/actions/workflows/review-fix.yml --jq .state)" 0-active
 
   # --- scenario 12d: TRANSITIONING RUN (round-8 finding 2 — the non-atomic drain check): a
   # writer run moves between nonterminal statuses (requested -> queued, the real forward
@@ -2358,36 +2430,105 @@ FAKE
   # empty (the state a successful cleanup's C4 proved — the full 14 absent), so the R0
   # precondition passes and the phase proceeds: the R0 listing, then exactly the 4 enables in
   # the canonical writer order, and nothing else.
+  # The writers are DISABLED here (the state a quiesce run left behind — the only state a
+  # resume legitimately starts from), so every enable RESOLVES and succeeds: no state read.
   local s19="$tmp/s19"
   mkdir -p "$s19"
+  seed_quiesced "$s19"
   : > "$s19/repo_secrets"
   rc=$(run_case "$s19" "$tmp/s19.out" resume-writers none)
   chk "resume-writers over an empty repo scope (full 14 absent — post-cleanup state) succeeds" "$rc" 0
   chk "resume-writers: EXACT gh argv sequence (R0 repo listing FIRST, then 4 enables, nothing else)" \
     "$(diff -q "$expected_resume" "$s19/calls.log" >/dev/null 2>&1 && echo same || echo diff)" same
+  chk "resume-writers: leaves all 4 writer workflows ENABLED" \
+    "$(find "$s19" -name 'disabled_*' | wc -l)" 0
+
+  # --- scenario 19b: ISSUE #816 — the RESUME RETRY, the symmetric counterpart of the #328
+  # quiesce retry (scenario 0e). The writers are ALREADY ENABLED — the operator re-enabled them
+  # by hand, or a previous resume died after enabling some of them — so gh, which resolves
+  # `workflow enable` against DISABLED workflows ONLY, misses the selector on every one. The old
+  # loop reported four false '::error:: ... re-enable it manually' alarms and died, making the
+  # documented recovery (re-dispatch phase: resume) non-convergent. It must now converge on the
+  # already-active state. Grants are the PRODUCTION reenable mint verbatim (Actions: write +
+  # Secrets: read), so this also proves the postcondition read needs no grant that mint lacks.
+  local s19b="$tmp/s19b"
+  mkdir -p "$s19b"
+  : > "$s19b/repo_secrets"
+  printf 'actions:write\nsecrets:read\n' > "$s19b/grants"
+  rc=$(run_case "$s19b" "$tmp/s19b.out" resume-writers none)
+  chk "#816 resume RETRY over already-ENABLED writers CONVERGES (was: 4 false alarms + rc 1)" "$rc" 0
+  chk "#816 resume retry: EXACT gh argv (R0 listing, then 4 missed enables each PROVEN by a state read)" \
+    "$(diff -q "$expected_resume_retry" "$s19b/calls.log" >/dev/null 2>&1 && echo same || echo diff)" same
+  chk "#816 resume retry: all 4 writers accepted as already active" \
+    "$(grep -c 'already active' "$tmp/s19b.out")" 4
+  chk "#816 resume retry: ZERO false 're-enable it manually' alarms" \
+    "$(grep -c 're-enable it manually' "$tmp/s19b.out" || true)" 0
+  chk "#816 resume retry: all 4 writers still ENABLED afterwards" \
+    "$(find "$s19b" -name 'disabled_*' | wc -l)" 0
 
   # --- scenario 20: RESUME-WRITERS with ONE enable failing — still ATTEMPTS all 4 (one failure
   # must never leave the remaining writers disabled), then fails loud with the manual runbook.
+  # #816 REJECT DIRECTION: the failing writer is still DISABLED (a transient 5xx), so the state
+  # read returns disabled_manually and the idempotence rule must NOT swallow it — the writer is
+  # genuinely not re-enabled. (Reject directions 2-4: 20b disabled_inactivity, 21 the 403'd
+  # enable, 21c the UNREADABLE state.)
   local s20="$tmp/s20"
   mkdir -p "$s20"
+  seed_quiesced "$s20"
   touch "$s20/fail_enable_review-fix.yml"
   rc=$(run_case "$s20" "$tmp/s20.out" resume-writers none)
   chk "resume-writers with one enable failing -> hard fail" "$rc" 1
   chk "resume-writers with one enable failing: still attempts ALL 4 enables" \
     "$(grep -cE '^workflow enable ' "$s20/calls.log")" 4
-  chk "resume-writers with one enable failing: names the manual remediation" \
-    "$(grep -c 'gh workflow enable review-fix.yml failed — re-enable it manually' "$tmp/s20.out")" 1
+  chk "#816 enable failing on a still-DISABLED writer: names the state and the manual remediation" \
+    "$(grep -c "gh workflow enable review-fix.yml failed and the workflow is 'disabled_manually', not active — re-enable it manually" "$tmp/s20.out")" 1
+  chk "#816 enable failing on a still-DISABLED writer: ONE state read per missed enable, and the other 3 DID enable" \
+    "$(grep -cE '^api repos/o/r/actions/workflows/.* --jq .state$' "$s20/calls.log")-$(find "$s20" -name 'disabled_*' | wc -l)" 1-1
+
+  # --- scenario 20b: #816 REJECT DIRECTION 3 — the 60-day disabled_inactivity state is NOT the
+  # postcondition this phase owes either: a writer GitHub auto-disabled stays disabled after a
+  # failed enable, so accepting anything non-active would report a resume that did not happen.
+  local s20b="$tmp/s20b"
+  mkdir -p "$s20b"
+  seed_quiesced "$s20b"
+  printf 'disabled_inactivity\n' > "$s20b/state_pat-validity.yml"
+  touch "$s20b/fail_enable_pat-validity.yml"
+  rc=$(run_case "$s20b" "$tmp/s20b.out" resume-writers none)
+  chk "#816 disabled_inactivity is NOT accepted as re-enabled -> hard fail" "$rc" 1
+  chk "#816 disabled_inactivity: message names the state and the required active" \
+    "$(grep -c "pat-validity.yml failed and the workflow is 'disabled_inactivity', not active" "$tmp/s20b.out")" 1
 
   # --- scenario 21: PERMISSION MODEL — resume-writers without actions:write fails loud (the
   # writers would silently stay disabled otherwise). secrets:read IS granted so the round-14
-  # R0 precondition passes and the failure exercised is the ENABLE stage, as before.
+  # R0 precondition passes and the failure exercised is the ENABLE stage, as before. The
+  # writers are seeded DISABLED: a 403'd enable over an already-ACTIVE writer would be
+  # correctly (and unhelpfully) accepted by the #816 rule, so only the disabled seed makes this
+  # a real test of the missing grant.
   local s21="$tmp/s21"
   mkdir -p "$s21"
+  seed_quiesced "$s21"
   printf 'actions:read\nsecrets:read\n' > "$s21/grants"
   rc=$(run_case "$s21" "$tmp/s21.out" resume-writers none)
   chk "resume-writers without actions:write -> hard fail" "$rc" 1
   chk "resume-writers without actions:write: still attempts ALL 4 enables" \
     "$(grep -cE '^workflow enable ' "$s21/calls.log")" 4
+  chk "#816 403'd enables: every writer proven still disabled_manually, all 4 stay DISABLED" \
+    "$(grep -c "not active — re-enable it manually" "$tmp/s21.out")-$(find "$s21" -name 'disabled_*' | wc -l)" 4-4
+
+  # --- scenario 21c: #816 REJECT DIRECTION 4 — the state read itself fails (here: a token
+  # granted neither Actions write NOR Actions read, so the enable 403s and the postcondition
+  # cannot be read at all). An UNPROVABLE postcondition is treated exactly like a failed one:
+  # the phase fails closed rather than assuming the writer came back.
+  local s21c="$tmp/s21c"
+  mkdir -p "$s21c"
+  seed_quiesced "$s21c"
+  printf 'secrets:read\n' > "$s21c/grants"
+  rc=$(run_case "$s21c" "$tmp/s21c.out" resume-writers none)
+  chk "#816 unreadable workflow state after a failed enable -> hard fail" "$rc" 1
+  chk "#816 unreadable state: names the unprovable postcondition for all 4 writers" \
+    "$(grep -c 'failed and its state could not be read' "$tmp/s21c.out")" 4
+  chk "#816 unreadable state: all 4 writers stay DISABLED" \
+    "$(find "$s21c" -name 'disabled_*' | wc -l)" 4
 
   # --- scenario 21b: PERMISSION MODEL (round 14) — resume-writers without secrets:READ cannot
   # take the R0 repo-scope listing, so it cannot PROVE the clean cutover state: fail closed at

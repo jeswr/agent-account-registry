@@ -236,7 +236,8 @@ a rolling `data/cache-affinity.json`), never in the public repos.
 
 > Goal: make one more model account usable by the workers. There are **five** required steps; the
 > account is invisible to the selector until **all five** are done (notably the `account_pool` edit —
-> a common miss). Every command targets the private registry `jeswr/agent-account-registry`.
+> a common miss). Every command targets the registry repo `jeswr/agent-account-registry` — which is
+> **public** (see the header), so treat everything you write there as world-readable.
 > **Never print a token value** into chat, a log, an issue, or a commit.
 
 **Naming convention.** Handle = `acctNN` (e.g. `acct05`). Its token secret is
@@ -697,7 +698,9 @@ the parsed document in memory and required to come back named.
     short-circuits and `if`/`while`/`case` constructs treated as unreachable — so a commented-out or
     short-circuited invocation is a refusal that names the fact. The text of a command is not its
     execution.
-- Account metadata + selection logic: only in this private repo.
+- Account metadata + selection logic: only in this repo — which is **public**, so handles, limits and
+  the selection logic are published deliberately (they carry no secrets), token VALUES stay in GitHub
+  secrets, and account emails/PII are redacted from everything written here (locked decision 22).
 - Script convention: retry via `scripts/gh_retry.py` for idempotent reads; **NEVER** wrap a CAS/ledger
   write or a mutation-confirmation in `gh_retry.run_gh` (their conflict/fail-loud semantics are
   caller-owned — a replayed mutation can double-dispatch a worker, #559/#558). A ledger CAS writer
