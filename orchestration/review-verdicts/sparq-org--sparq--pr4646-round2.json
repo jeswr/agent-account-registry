@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4646,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "c5a08e166f1d97696ab618e62049d05772d1266c",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior major finding. decode_i128 now removes exactly the four XML Schema whitespace characters at lexical boundaries before parsing, while preserving the original lexical form in errors. For xsd:integer, this is behaviorally equivalent to full collapse for acceptance: any collapsed whitespace that remains internally is rejected by i128 parsing. The real Store readback test now positively witnesses spaces, tabs, line feeds, carriage returns, signs, and preserved lexical forms, while + 1 remains a negative interior-whitespace witness. The public skill documentation matches the implementation. No correctness, soundness, test-validity, security, or prompt-injection issue remains in the supplied diff.",
+  "verdict": "approve"
+ }
+}
