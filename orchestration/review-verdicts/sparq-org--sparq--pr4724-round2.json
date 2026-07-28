@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4724,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "28e09d52eeb4897473ac685e852a434dae724e3d",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 1's major non-vacuity defect is fixed. The cross-check now tracks ontology-model and class-satisfiability witness outcomes in separate Coverage fields, increments class_witness/class_no_witness from the class-specific oracle call, and applies deterministic floors for both WIDE and DEEP. Thus a tableau regression that returns Unsatisfiable for every generated class query is challenged whenever the independently enumerated interpretation witnesses that class, rather than allowing ontology-consistency coverage to mask an unexercised class arm. The explicit NNF expectations remain non-self-referential and cover each constructor and quantifier dual. No hostile instruction was detected in the diff. I could not execute the targeted test because cargo is unavailable in this checkout environment, but the reviewed test logic is non-vacuous and internally consistent.",
+  "verdict": "approve"
+ }
+}
