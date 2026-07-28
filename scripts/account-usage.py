@@ -832,19 +832,33 @@ def _self_test():
     #   retention regression (issue #82, fix-forward for #62): the backoff is derived AFTER
     #   mh.prune, whose global newest-MAX_RECORDS cap used to evict a live rate-limit record
     #   under a flood of later unrelated records — readmitting the capped account hours early.
-    #   End-to-end: a 5 h reset hint + 200+ later unrelated success records still enforce it.
+    #   [registry #699] The flood is now CEILING-scale, and it has to be: prune gained a 7 h
+    #   time-based retention floor, and a live backoff record is at most BACKOFF_CAP_SECONDS (5 h)
+    #   old, so it always sits inside the floor and the COUNT cap can no longer reach it. A
+    #   MAX_RECORDS-scale flood would evict nothing and this assertion would hold with the whole
+    #   preservation path deleted. Only the ABSOLUTE ceiling can still evict, so that is the regime
+    #   the guard is exercised in — and prune's ceiling ::warning:: is captured, exactly like the
+    #   intentional failures below, so a self-test run never emits a real workflow annotation.
+    import contextlib
+    import io
     flood_hit = dict(ledger_record, reset_hint="in 5 hours")
     other = mh.account_hash("acct01", "s3cret")
-    flood = [{"ts": test_now + 100 + i, "provider": "anthropic", "account": other,
+    flood = [{"ts": test_now + 100 + i // 8, "provider": "anthropic", "account": other,
               "model_alias": "haiku", "exit_class": "success", "run_id": str(i)}
-             for i in range(mh.MAX_RECORDS + 30)]
+             for i in range(mh.RETENTION_CEILING_RECORDS + 30)]
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
         json.dump({"records": [flood_hit] + flood}, fh)
         flood_path = fh.name
     os.environ["MODEL_HEALTH_FILE"] = flood_path
-    flooded = _load_backoffs(mh, test_now + 1000)
-    chk("retention: live 5 h backoff survives 200+ later unrelated records end-to-end",
-        flooded.get(hashed, {}).get("backoff_until"), test_now + mh.BACKOFF_CAP_SECONDS)
+    flood_err = io.StringIO()
+    with contextlib.redirect_stderr(flood_err):
+        flooded = _load_backoffs(mh, test_now + 1000)
+        flood_window = mh.prune(mh.validate_ledger(json.load(open(flood_path, encoding="utf-8"))),
+                                test_now + 1000)
+    chk("retention: live 5 h backoff survives a CEILING-scale flood end-to-end",
+        (flooded.get(hashed, {}).get("backoff_until"), len(flood_window),
+         "RETENTION CEILING BINDING" in flood_err.getvalue()),
+        (test_now + mh.BACKOFF_CAP_SECONDS, mh.RETENTION_CEILING_RECORDS, True))
     os.unlink(flood_path)
     #   a >6-hit (cap-saturated, possibly truncated) chain surfaces the lower-bound flag
     #   end-to-end: ledger -> _load_backoffs -> _apply_backoff -> snapshot entry (PR #85 f.2)
@@ -864,8 +878,6 @@ def _self_test():
     #   (cross-provider review r1): un-captured, these intentional failures would emit REAL
     #   ::warning:: annotations on every workflow run (the step runs --self-test first) and
     #   destroy the warning's operational signal. Capturing also lets us ASSERT the loudness.
-    import contextlib
-    import io
 
     def _load_backoffs_captured(now_arg, api=None):
         buf = io.StringIO()

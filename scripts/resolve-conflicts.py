@@ -362,13 +362,40 @@ def prior_conflicting_files(comments, bot_login):
 
 
 def owned_by_review_rebase_lane(pr, repo, claim):
-    """Conservatively identify worker PRs dispatch owns as needs-rebase/rebase repairs."""
+    """Conservatively identify worker PRs dispatch owns as needs-rebase/rebase repairs.
+
+    True here means this resolver CEDES the PR — it posts nothing, rebases nothing, and lets the
+    review/fix lane repair it. So the predicate is only sound while it selects PRs that lane will
+    actually TAKE; ceding one it refuses is not conservatism, it is a silent no-exit for a
+    CONFLICTING PR, and a conflicting PR is exactly the population that gets no `pr-gate` run at
+    all.
+
+    [registry #657, design record §7.4 step 2b] THE ORCHESTRATOR CLASS IS NEVER CEDED, and the
+    reason is a property of the review lane, not of this shape test. `review_fix_pr_admission`
+    waives the head-ref/author/draft shape gates for ``mode == "review"`` ALONE: a `fix` run
+    PUSHES COMMITS to the PR head, and a self-attested record must never buy write access to its
+    own branch (design record §3). A rebase repair IS a fix dispatch, so the class is refused
+    there at the same four predicates it always was — and handing it over would strand it.
+
+    Today the two populations are DISJOINT BY CONSTRUCTION rather than by any test written here:
+    `admits_orchestrator_pr` requires the author's login in `review_enrolment_authors`, and
+    policy-resolve refuses a `[bot]` login in that list (GITHUB_LOGIN_RE has no brackets), while
+    this predicate requires a `[bot]` author. Adding `and not admits_orchestrator_pr(...)` would
+    therefore be a conjunct that can never fire — a dead guard dressed as a control. What is
+    asserted instead, executably, is the JUSTIFICATION: --self-test runs the LIVE
+    `review_fix_pr_admission` in fix mode over a fully-admissible enrolled orchestrator PR and
+    requires it to REFUSE. Widen that waiver to fix mode and the control reds, pointing here.
+
+    FORK GATE FIRST. It is hoisted out of the middle of the `and` chain — order inside a boolean
+    chain is irrelevant, so the point is not sequencing but that the one predicate no waiver may
+    ever reach is not fused with the two that #657 waives elsewhere."""
     head = pr.get("head") or {}
+    if (head.get("repo") or {}).get("full_name") != repo:
+        return False
     login = str((pr.get("user") or {}).get("login", ""))
     return bool(
         claim.FIX_KIND_OF_STATE.get("needs-rebase") == "rebase"
         and claim.HEAD_REF_RE.match(str(head.get("ref", "")))
-        and (head.get("repo") or {}).get("full_name") == repo
         and login.endswith("[bot]")
     )
 
@@ -1131,6 +1158,62 @@ def _self_test():
         api_worker, snapshot, claim, [repo], bot_login, True, 5, worker_rebaser
     ).run()
     check("needs-rebase worker lane is never double-owned", worker_rebaser.calls, [])
+
+    # --- [registry #657 §7.4 step 2b] THE CEDE PREDICATE AND THE ORCHESTRATOR CLASS -----------
+    # `owned_by_review_rebase_lane` is a HAND-OVER: True means this resolver walks away. That is
+    # only sound while the lane it hands to will TAKE the PR. The #657 orchestrator class is
+    # admitted for `mode == "review"` ALONE — a rebase repair is a FIX dispatch, which pushes
+    # commits to the PR head — so ceding one would strand a CONFLICTING PR in a lane that
+    # structurally refuses it, and a conflicting PR gets no `pr-gate` run at all.
+    ORCH_LOGIN = "jeswr"
+    orch_conflict_pull = {
+        "number": 41, "state": "open", "draft": False,
+        "user": {"login": ORCH_LOGIN},
+        "head": {"ref": "fix/readiness-visibility-opus5", "sha": "e" * 40,
+                 "repo": {"full_name": repo}},
+        "base": {"ref": "main", "repo": {"full_name": repo}},
+    }
+    check("[#657] an orchestrator-class PR is NOT ceded to the review-rebase lane",
+          owned_by_review_rebase_lane(orch_conflict_pull, repo, claim), False)
+    # THE JUSTIFICATION, executable rather than asserted in prose. A record and an allowlist that
+    # make this PR fully admissible in REVIEW mode must still be REFUSED in fix mode; the day
+    # that stops being true, the cede decision above has to be revisited and this reds first.
+    orch_record = claim.orchestrator_probe_record(41)
+    check("[#657] ...the same PR IS admitted by the review lane in review mode (so the fixture "
+          "is not vacuously inadmissible)",
+          claim.review_fix_pr_admission(repo, orch_conflict_pull, orch_record,
+                                        (ORCH_LOGIN,), "review"), (True, None))
+    fix_admitted, fix_error = claim.review_fix_pr_admission(
+        repo, orch_conflict_pull, orch_record, (ORCH_LOGIN,), "fix")
+    check("[#657] ...and REFUSED in fix mode — which is why ceding it would strand it",
+          (fix_admitted, bool(fix_error)), (False, True))
+    # The FORK GATE, hoisted out of the `and` chain: a fork head is never ceded either, whatever
+    # else it satisfies. (A ceded fork PR would be skipped by this resolver AND refused by the
+    # review lane's own unconditional fork gate — invisible to both.)
+    check("[#657] a fork head is never ceded, even with the worker producer shape",
+          owned_by_review_rebase_lane(
+              {"user": {"login": bot_login},
+               "head": {"ref": "sparq-agent/issue-7-1-1",
+                        "repo": {"full_name": "mallory/repo"}}}, repo, claim), False)
+    check("[#657] control: the same-repo worker shape IS still ceded (the gate above is not "
+          "refusing everything)",
+          owned_by_review_rebase_lane(
+              {"user": {"login": bot_login},
+               "head": {"ref": "sparq-agent/issue-7-1-1",
+                        "repo": {"full_name": repo}}}, repo, claim), True)
+    # Each remaining conjunct gets a case that reaches IT alone — measured: without these two,
+    # deleting the author gate, and neutering the head-ref gate, both survived the whole suite
+    # because the other conjunct still refused the orchestrator fixture.
+    check("[#657] the AUTHOR gate: a HUMAN author on a worker-shaped branch is not ceded",
+          owned_by_review_rebase_lane(
+              {"user": {"login": ORCH_LOGIN},
+               "head": {"ref": "sparq-agent/issue-7-1-1",
+                        "repo": {"full_name": repo}}}, repo, claim), False)
+    check("[#657] the HEAD-REF gate: the App bot on an ORDINARY branch is not ceded",
+          owned_by_review_rebase_lane(
+              {"user": {"login": bot_login},
+               "head": {"ref": "fix/readiness-visibility-opus5",
+                        "repo": {"full_name": repo}}}, repo, claim), False)
 
     # (b) Conflict attempts count distinct heads. The second head escalates once;
     # the resulting hard label makes every later sweep inert.

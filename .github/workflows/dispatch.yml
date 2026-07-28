@@ -534,22 +534,39 @@ jobs:
                   """Can `planner.compute_ready` be handed PR rows? Two OBLIGATIONS, both run.
 
                   1. SAFETY — a PR row is never selected as a dispatch candidate. An engine that
-                     returns it would have PLAN emit a plan row whose `number` is a PR.
+                     returns it would have PLAN emit a plan row whose `number` is a PR. Checked
+                     with an area-DECLARING and an area-LESS PR row, for the reason below.
                   2. EFFECT — a PR row actually reserves the `area:` keys it declares, so an
                      otherwise-ready issue on that key is held. An engine that ignores PR rows
                      would make this whole block an expensive no-op, which must not pass silently.
+
+                  [#786] SAFETY was FAIL-OPEN with only the area-declaring row. Once an engine
+                  reserves a PR's declared areas (obligation 2), the probe PR SHIELDS ITSELF: it
+                  reserves `__pr_probe__` in the occupancy pass and is then dropped by its own
+                  reservation in the selection pass, so `alone` is empty whether or not the engine
+                  has a `pull_request` candidate guard at all. MEASURED against this repository's
+                  own engine with the guard deleted and nothing else changed: `alone == []`,
+                  `paired == []`, probe verdict ACCEPT — and the same engine plans an AREA-LESS PR
+                  row as an issue (`compute_ready([bare]) == [999000003]`). That is not a corner:
+                  40 of 40 open PRs on this repository declare no `area:` at all, so the shielded
+                  row is the one shape the population never has. The area-less row reserves
+                  nothing, so nothing can shield it, and it isolates the candidate guard alone.
                   """
                   probe = ["status:ready", "priority:P0", "role:impl", "area:__pr_probe__"]
                   pr = {"number": 999000001, "state": "OPEN", "labels": list(probe),
                         "open_blockers": 0, "pull_request": {}}
                   rival = {"number": 999000002, "state": "OPEN", "labels": list(probe),
                            "open_blockers": 0}
+                  bare = {"number": 999000003, "state": "OPEN", "open_blockers": 0,
+                          "labels": ["status:ready", "priority:P0", "role:impl"],
+                          "pull_request": {}}
                   try:
                       alone = [row.get("number") for row in planner.compute_ready([pr])]
+                      bare_alone = [row.get("number") for row in planner.compute_ready([bare])]
                       paired = [row.get("number") for row in planner.compute_ready([pr, rival])]
                   except Exception as exc:                        # noqa: BLE001 — hostile target
                       return False, f"probe raised {type(exc).__name__}"
-                  if alone or 999000001 in paired:
+                  if alone or bare_alone or 999000001 in paired:
                       return False, "planner DISPATCHES a pull-request row as if it were an issue"
                   if paired:
                       return False, "planner does not RESERVE a pull request's declared area"

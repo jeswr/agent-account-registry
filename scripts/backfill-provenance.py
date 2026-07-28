@@ -35,6 +35,7 @@ prints a handle either.
 import argparse
 import ast
 import contextlib
+import functools
 import importlib.util
 import inspect
 import io
@@ -50,6 +51,12 @@ import types
 from typing import NamedTuple
 
 HEAD_RE = re.compile(r"^sparq-agent/issue-([1-9][0-9]*)-([0-9]+)-([0-9]+)$")
+
+# The master-protected policy this script reads `review_enrolment_authors` out of (#657). A path,
+# so the self-test can point the same code at a repo that actually enables enrolment — asserting
+# only against the live policy, which enables it for nobody, would make every guard below
+# unfalsifiable.
+DEFAULT_POLICY_FILE = "policy/repos.toml"
 
 
 class BackfillError(RuntimeError):
@@ -385,6 +392,82 @@ def _load_dispatch_claim():
     return _load_script_module("dispatch-claim.py", "registry_dispatch_claim")
 
 
+def _load_policy_resolve():
+    """The accessor that VALIDATES the policy row before yielding `review_enrolment_authors`.
+
+    Same posture as PLAN, CLAIM, groom and mint-provenance: a hand-rolled read of the TOML key
+    would happily parse a malformed or `[bot]`-bearing list, and a `[bot]` entry is precisely
+    what must never reach an author gate."""
+    return _load_script_module("policy-resolve.py", "registry_policy_resolve")
+
+
+def enrolled_review_authors(target_repo, policy_file):
+    """The repo's MASTER-protected `review_enrolment_authors`, or an empty frozenset.
+
+    An unreadable / unlisted policy resolves to "nobody", which is the shipped state of every
+    repo and makes every orchestrator-class branch below inert — backfill then behaves
+    byte-for-byte as it did before #657."""
+    try:
+        with open(policy_file, "rb") as handle:
+            import tomllib
+            document = tomllib.load(handle)
+        return frozenset(_load_policy_resolve().review_enrolment_authors(target_repo, document))
+    except Exception:            # noqa: BLE001 — enrolment OFF is the fail-closed answer here
+        return frozenset()
+
+
+def orchestrator_class_admission(claim, pull, target_repo, enrolled_authors, read_record):
+    """[registry #657, design record §7.4 step 2b] Is this open PR an ADMITTED member of the
+    orchestrator class? Returns the admitted record, or None.
+
+    WHY BACKFILL NEEDS TO KNOW AT ALL. Backfill's candidate filter is the WORKER PRODUCER SHAPE
+    (a `sparq-agent/issue-<N>-<run>-<attempt>` head ref plus a `[bot]` author), and #821's waiver
+    exists precisely because an orchestrator PR satisfies NEITHER. Left as a bare shape test the
+    class is invisible here — which is the RIGHT outcome, but for the wrong reason, and the wrong
+    reason is what drifts: widen `HEAD_RE` or relax the author gate and backfill would start
+    treating orchestrator PRs as un-recorded worker PRs. It would then (a) hunt a worker RUN LOG
+    that does not exist for the class — `HEAD_RE`'s run id IS backfill's only identity source, and
+    a self-authored PR has no worker run — reporting every one of them NEEDS-HUMAN, and (b)
+    DRAFT-CONVERT them, which for a class the review lane admits *because* it stands the draft
+    requirement down is a pure regression. Minting for the class is `mint-provenance.py`'s job
+    (#827) and always was.
+
+    So the class is recognised EXPLICITLY, through the SAME predicate every other consumer
+    admits by (`admits_orchestrator_pr` + the shared field admission under its orchestrator
+    opt-in), and skipped with an honest reason.
+
+    ORDER IS LOAD-BEARING. The FORK GATE is first and is not waivable by anything below it —
+    hoisted rather than fused into an `or`/`and` with the waivable shape tests, because inside
+    a boolean list the order is irrelevant and the real hazard is CO-WAIVER.
+
+    The allowlist half is asked with dispatch-claim's OWN probe record rather than a second
+    casefold comparison written here: a valid `orchestrator`-attested record for THIS PR number
+    satisfies the record half by construction, so the answer is exactly "is this login enrolled?"
+    — computed by the live predicate, so it cannot drift from it, and cheap enough to gate the
+    network record read behind. An EMPTY allowlist (every repo's default) answers False for every
+    PR and no record is read at all.
+
+    ``read_record`` is a ``() -> record | None`` callable; a raise propagates to the caller."""
+    head = pull.get("head") or {}
+    if (head.get("repo") or {}).get("full_name") != target_repo:
+        return None                       # FORK GATE FIRST — never waivable, by anything
+    number = pull.get("number")
+    login = (pull.get("user") or {}).get("login", "")
+    if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
+        return None
+    if not isinstance(login, str) or not login:
+        return None
+    if not claim.admits_orchestrator_pr(claim.orchestrator_probe_record(number), number,
+                                        login, enrolled_authors):
+        return None                       # not enrolled => not a candidate => no record read
+    record = read_record()
+    if not claim.admits_orchestrator_pr(record, number, login, enrolled_authors):
+        return None
+    if claim.provenance_admission_error(record, number, admit_orchestrator=True) is not None:
+        return None
+    return record
+
+
 def effective_record_body(probe, ledger_ref):
     """The EFFECTIVE existing-record body for a PR — ledger-first — or None when neither copy
     exists. Readers consume the ledger copy FIRST (issue #96), so a present ledger record is
@@ -398,6 +481,36 @@ def effective_record_body(probe, ledger_ref):
         return body
     body, _sha = probe(ref=None)
     return body
+
+
+def _decoded_record(body):
+    """The parsed record for a probe body, or None when it is absent or not valid JSON.
+
+    Never raises: "unreadable" and "absent" both mean NOT an admitted orchestrator record, which
+    is the fail-closed answer for every branch that consumes this. The WORKER path deliberately
+    keeps its own decode (existing_record_admission_error) — there a malformed record is
+    NEEDS-HUMAN, not a silent skip, and collapsing the two would lose that distinction."""
+    if body is None:
+        return None
+    try:
+        return json.loads(body)
+    except ValueError:
+        return None
+
+
+def _ledger_record(worker_pr, registry_repo, target_repo, number):
+    """The PARSED ledger-first provenance record for `target_repo#number`, or None.
+
+    A named function rather than a nested lambda: ``effective_record_body`` calls its probe with
+    the KEYWORD ``ref=``, so the probe's parameter name is part of the contract — and the head ref
+    is called `ref` in the caller's scope too, which is exactly the shadowing a lambda invites.
+    Raises ``WorkerPrError`` on a non-404 probe failure, as ``effective_record_body`` does."""
+    record_path = worker_pr.provenance_path(target_repo, number)
+
+    def probe(ref=None):
+        return worker_pr._probe_registry_file(registry_repo, record_path, ref=ref)
+
+    return _decoded_record(effective_record_body(probe, worker_pr.LEDGER_REF))
 
 
 def existing_record_admission_error(body, pr_number, admission_error):
@@ -599,9 +712,14 @@ def _ensure_draft(target_repo, number, is_draft, apply_changes, *, state,
     return True
 
 
-def backfill(target_repo, registry_repo, routing_file, apply_changes, no_draft_convert=False):
+def backfill(target_repo, registry_repo, routing_file, apply_changes, no_draft_convert=False,
+             policy_file=DEFAULT_POLICY_FILE):
     worker_pr = _load_worker_pr()
-    admission_error = _load_dispatch_claim().provenance_admission_error
+    claim = _load_dispatch_claim()
+    admission_error = claim.provenance_admission_error
+    # [registry #657] The MASTER-protected half of orchestrator-class admission. Empty for every
+    # repo today, which makes every branch keyed on it inert.
+    enrolled_authors = enrolled_review_authors(target_repo, policy_file)
     import tomllib
     with open(routing_file, "rb") as handle:
         routing = tomllib.load(handle)
@@ -624,12 +742,35 @@ def backfill(target_repo, registry_repo, routing_file, apply_changes, no_draft_c
         head = pull.get("head") or {}
         ref = str(head.get("ref", ""))
         login = str((pull.get("user") or {}).get("login", ""))
-        parsed = parse_head_ref(ref)
-        if not isinstance(number, int) or parsed is None:
+        if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
             continue
+        # FORK GATE FIRST, and alone (#657). It used to sit BETWEEN the head-ref parse and the
+        # author gate, which was safe only because nothing could skip either of them. Hoisted, it
+        # is the one predicate here that no waiver — present or future — can be fused with.
         if (head.get("repo") or {}).get("full_name") != target_repo:
             continue                      # fork heads never get provenance
-        if not login.endswith("[bot]"):
+        parsed = parse_head_ref(ref)
+        if parsed is None or not login.endswith("[bot]"):
+            # NOT the worker producer shape. Before this reads as "nothing to do", ask the ONE
+            # shared #657 predicate whether it is an ADMITTED orchestrator PR, because the two
+            # populations need opposite handling and only one of them is safe to treat as
+            # un-recorded. See orchestrator_class_admission for why admitting the class into the
+            # loop below would be a defect rather than the fix.
+            try:
+                orchestrator_record = orchestrator_class_admission(
+                    claim, pull, target_repo, enrolled_authors,
+                    functools.partial(_ledger_record, worker_pr, registry_repo,
+                                      target_repo, number))
+            except worker_pr.WorkerPrError:
+                # An unreadable registry probe on a PR that was invisible to this script anyway
+                # is not news: it stays invisible. Nothing is written, nothing is claimed.
+                continue
+            if orchestrator_record is not None:
+                skipped += 1
+                print(f"skip #{number}: #657 orchestrator class — provenance is minted by "
+                      "scripts/mint-provenance.py, never backfilled (there is no worker run to "
+                      "source an identity from), and the class is NON-DRAFT by design so draft "
+                      "conversion must not touch it")
             continue
         is_draft = pull.get("draft") is True
         # Probe the LIVE review state only for an actual draft-conversion candidate (an
@@ -1467,6 +1608,185 @@ def _self_test():
            "DRY-RUN #9002: would convert to draft" in e2e), (True, True))
     check("E2E: BOTH records are counted — draft policy never withholds a record",
           "backfill complete: would record 2, skipped 0, needs-human 0" in e2e, True)
+
+    # --- [registry #657 §7.4 step 2b] THE ORCHESTRATOR CLASS, THROUGH THE REAL LOOP -----------
+    # Driven twice against the SAME tree with only `review_enrolment_authors` changing, because
+    # a guard asserted only against the live policy (which enrols nobody) is unfalsifiable:
+    # deleting it changes no outcome and a mutation run says so.
+    real_claim = _load_dispatch_claim()
+    ORCH_LOGIN = "jeswr"
+    ORCH_HEAD = "fix/readiness-visibility-opus5"          # an ORDINARY branch: HEAD_RE cannot match
+    POLICY_ROW = ('[repos."sparq-org/sparq"]\nenabled=true\nrouting="r.toml"\n'
+                  'account_pool=["acct01"]\nmax_concurrent=1\nworker_timeout_minutes=30\n'
+                  'gate_profile="lint-only"\narm_auto_merge=false\nmax_attempts=3\n'
+                  'trust="collaborators"\n')
+
+    # (0) THE PREDICATE ITSELF, called DIRECTLY. The loop below carries its own fork gate, so a
+    #     loop-level fork test cannot see whether THIS function has one — and a gate whose
+    #     deletion reds nothing is not a gate. Measured: deleting the fork gate inside
+    #     orchestrator_class_admission survived a loop-only fork test.
+    def unit_admits(pull, records, enrolled=(ORCH_LOGIN,), reads=None):
+        def read():
+            (reads if reads is not None else []).append(pull.get("number"))
+            return records.get(pull.get("number"))
+        return orchestrator_class_admission(real_claim, pull, "sparq-org/sparq", enrolled, read)
+
+    unit_pull = {"number": 41, "draft": False, "user": {"login": ORCH_LOGIN},
+                 "head": {"ref": ORCH_HEAD, "repo": {"full_name": "sparq-org/sparq"}}}
+    unit_record = real_claim.orchestrator_probe_record(41)
+    check("[#657] unit: an enrolled, orchestrator-attested, same-repo PR IS the class",
+          unit_admits(unit_pull, {41: unit_record}), unit_record)
+    check("[#657] unit: THE FORK GATE — a fork head is refused BEFORE the record is even read",
+          (unit_admits({**unit_pull,
+                        "head": {"ref": ORCH_HEAD, "repo": {"full_name": "mallory/sparq"}}},
+                       {41: unit_record}, (ORCH_LOGIN,), reads := []), reads), (None, []))
+    check("[#657] unit: an EMPTY allowlist refuses, and reads nothing",
+          (unit_admits(unit_pull, {41: unit_record}, (), reads := []), reads),
+          (None, []))
+    check("[#657] unit: a non-enrolled author refuses, and reads nothing",
+          (unit_admits({**unit_pull, "user": {"login": "mallory"}}, {41: unit_record},
+                       (ORCH_LOGIN,), reads := []), reads), (None, []))
+    check("[#657] unit: an ABSENT record refuses (admission requires one to exist)",
+          unit_admits(unit_pull, {}), None)
+    check("[#657] unit: a record bound to a DIFFERENT PR never waives this one's shape gates",
+          unit_admits(unit_pull, {41: real_claim.orchestrator_probe_record(42)}), None)
+    # WHERE THE `[bot]` REFUSAL ACTUALLY LIVES. `admits_orchestrator_pr` is a plain casefolded
+    # membership test: hand it an allowlist containing a `[bot]` login and it WOULD admit that
+    # login, widening the App-author gate to any installed App. Nothing in this file stops that
+    # — the refusal is in policy-resolve's row validation, which is why enrolled_review_authors
+    # goes through that accessor instead of reading the TOML key directly. Asserted where it
+    # lives, honestly, rather than claimed here where it does not.
+    check("[#657] unit: the waiver predicate itself does NOT refuse a `[bot]` allowlist entry",
+          unit_admits({**unit_pull, "user": {"login": "mallory[bot]"}}, {41: unit_record},
+                      ("mallory[bot]",)) is not None, True)
+    with tempfile.TemporaryDirectory() as bot_tmp:
+        bot_policy = Path(bot_tmp) / "repos.toml"
+        bot_policy.write_text(POLICY_ROW + 'review_enrolment_authors=["mallory[bot]"]\n',
+                              encoding="utf-8")
+        check("[#657] ...and enrolled_review_authors REFUSES that policy through "
+              "policy-resolve, so the widened gate can never be assembled",
+              enrolled_review_authors("sparq-org/sparq", str(bot_policy)), frozenset())
+        bot_policy.write_text(POLICY_ROW + f'review_enrolment_authors=["{ORCH_LOGIN}"]\n',
+                              encoding="utf-8")
+        check("[#657] ...while a canonical login resolves (the refusal above is not blanket)",
+              enrolled_review_authors("sparq-org/sparq", str(bot_policy)),
+              frozenset({ORCH_LOGIN}))
+
+    def orch_backfill(enrolled, pull_rows, records):
+        """The REAL backfill loop over `pull_rows`, with the registry/gh boundary stubbed and a
+        policy that does or does not enrol ORCH_LOGIN. Returns everything it printed."""
+        policy_dir = Path(tempfile.mkdtemp())
+        (policy_dir / "repos.toml").write_text(
+            POLICY_ROW + (f'review_enrolment_authors=["{ORCH_LOGIN}"]\n' if enrolled else ""),
+            encoding="utf-8")
+        probe_calls = []
+
+        def orch_probe(_repo, path, ref=None):
+            probe_calls.append((path, ref))
+            body = records.get(path)
+            return (json.dumps(body) if body is not None else None,
+                    "ab" * 20 if body is not None else None)
+
+        orch_worker_pr = types.SimpleNamespace(
+            LEDGER_REF="ledger", WorkerPrError=BackfillError,
+            provenance_path=lambda repo, number: f"orchestration/provenance/{number}.json",
+            _probe_registry_file=orch_probe,
+            account_hash=lambda account, salt: "deadbeefdeadbeef",
+            provenance_record=e2e_no_write)
+        state_calls = []
+
+        def orch_review_state(_repo, number, runner=None):
+            state_calls.append(number)
+            return FRESH
+
+        saved = {name: globals()[name] for name in patched}
+        buffer = io.StringIO()
+        try:
+            globals().update(
+                _gh_json=lambda args: ([pull_rows] if "--slurp" in args
+                                       else [{"sha": "ab" * 20}]),
+                _run_gh=e2e_run_gh, _load_worker_pr=lambda: orch_worker_pr,
+                _load_dispatch_claim=lambda: real_claim,
+                review_state=orch_review_state)
+            os.environ["PROVENANCE_SALT"] = "self-test-only"
+            with contextlib.redirect_stdout(buffer):
+                backfill("sparq-org/sparq", "jeswr/agent-account-registry", str(routing_toml),
+                         False, policy_file=str(policy_dir / "repos.toml"))
+        finally:
+            globals().update(saved)
+            os.environ.pop("PROVENANCE_SALT", None)
+        return buffer.getvalue(), probe_calls, state_calls
+
+    orch_pull_row = {"number": 9003, "draft": False,
+                     "head": {"ref": ORCH_HEAD, "repo": {"full_name": "sparq-org/sparq"}},
+                     "user": {"login": ORCH_LOGIN}}
+    worker_pull_row = e2e_pull(9002, E2E_HEAD_FRESH)
+    orch_records = {"orchestration/provenance/9003.json":
+                    real_claim.orchestrator_probe_record(9003)}
+
+    on_out, on_probes, on_states = orch_backfill(
+        True, [orch_pull_row, worker_pull_row], orch_records)
+    off_out, off_probes, off_states = orch_backfill(
+        False, [orch_pull_row, worker_pull_row], orch_records)
+
+    # (1) ENROLLED: the class is RECOGNISED and explicitly skipped — never minted (backfill's
+    #     only identity source is a worker run log the class has no analogue for) and never
+    #     draft-converted (the review lane admits the class BECAUSE it stands the draft
+    #     requirement down; drafting it would be a pure regression).
+    check("[#657] an enrolled orchestrator PR is recognised and skipped with an honest reason",
+          "skip #9003: #657 orchestrator class" in on_out, True)
+    check("[#657] ...it is never recorded",
+          ("#9003: would record" in on_out, "NEEDS-HUMAN #9003" in on_out), (False, False))
+    check("[#657] ...and its live review state is never even probed, so no draft conversion "
+          "path can reach it", 9003 in on_states, False)
+    # (2) NOT ENROLLED (every repo's shipped state): the same PR is invisible, exactly as before
+    #     #657 — no skip line, no counted outcome, and NO registry read at all.
+    check("[#657] with an EMPTY allowlist the same PR is invisible and costs no registry read",
+          ("#9003" in off_out,
+           [path for path, _ref in off_probes if "9003" in path]), (False, []))
+    # (3) THE FROZEN WORKER-CLASS CONTROL. Literals on BOTH sides, in BOTH allowlist states —
+    #     never a re-call of the live predicate, which is how a control goes quiet the moment
+    #     the predicate it re-derives from changes. Enrolment must not move the worker lane by
+    #     one character.
+    WORKER_LINES = ["DRY-RUN #9002: would record impl=anthropic/fable "
+                    "account_h=deadbeefdeadbeef issue=#3405 opened=abababab "
+                    "(backfill:16234567891.1)",
+                    "DRY-RUN #9002: would convert to draft (review gates require draft)"]
+    for state, out in (("allowlist ON", on_out), ("allowlist OFF", off_out)):
+        check(f"[#657] FROZEN worker-class control ({state}): the worker PR's outcome is "
+              "byte-for-byte the pre-#657 one",
+              [line for line in out.splitlines() if "#9002" in line], WORKER_LINES)
+    check("[#657] FROZEN worker-class control: the two runs agree on the count line",
+          ("backfill complete: would record 1, skipped 1, needs-human 0" in on_out,
+           "backfill complete: would record 1, skipped 0, needs-human 0" in off_out),
+          (True, True))
+    # (4) THE FORK GATE, hoisted above every waivable predicate: a fork head is never admitted
+    #     to the class however enrolled its author is, and is never read for.
+    fork_out, fork_probes, _fork_states = orch_backfill(
+        True, [{**orch_pull_row, "head": {"ref": ORCH_HEAD,
+                                          "repo": {"full_name": "mallory/sparq"}}}],
+        orch_records)
+    check("[#657] a FORK head is never admitted to the class, enrolled author or not",
+          ("#9003" in fork_out, fork_probes), (False, []))
+    #     ...and the LOOP's own fork gate — the one this PR hoisted above the head-ref parse —
+    #     independently refuses a fork PR that DOES have the worker producer shape. Measured:
+    #     without this case, deleting that gate survived the whole suite, because the class
+    #     helper's gate masked the only fork test there was.
+    wfork_out, wfork_probes, wfork_states = orch_backfill(
+        True, [{**e2e_pull(9004, E2E_HEAD_FRESH),
+                "head": {"ref": E2E_HEAD_FRESH, "repo": {"full_name": "mallory/sparq"}}}], {})
+    check("[#657] a FORK head with the WORKER producer shape gets no record, no draft "
+          "conversion, and no registry read",
+          ("#9004" in wfork_out, wfork_probes, wfork_states), (False, [], []))
+    # (5) THE OTHER HALF OF THE CONJUNCTION: an enrolled author whose record is NOT
+    #     orchestrator-attested (a machine `backfill:`-stamped record) is not the class either —
+    #     the waiver needs BOTH independently-authored facts, never one.
+    worker_attested = {**real_claim.orchestrator_probe_record(9003),
+                       "recorded_at_run": "backfill:16234567891.1"}
+    other_out, _p, _s = orch_backfill(
+        True, [orch_pull_row], {"orchestration/provenance/9003.json": worker_attested})
+    check("[#657] an enrolled author with a NON-orchestrator record is not the class",
+          "#9003" in other_out, False)
 
     # --- effective ledger-first record + admission before any skip (sol #217) ------------------
     # The REAL review-loop admission function, imported — not a replica — so these red if the

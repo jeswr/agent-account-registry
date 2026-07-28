@@ -45,6 +45,9 @@ DEFERRED_RE = re.compile(r"^\S+\s+defer(?:red)?\s", re.MULTILINE)
 # document. Issue #374 additionally stops the SALTED per-account rows being published at all — see
 # the fleet-composition block below — but the label validation stays, because a raw handle reaching
 # the collector output is a privacy incident whether or not this build would have published it.
+# Issue #841: the snapshot itself is readable on the PUBLIC `ledger` branch, so this contract no
+# longer REQUIRES the per-account rows either — `flow.lease_utilization_1h` may be sent already
+# aggregated, and a collector that does so writes no per-account row array to a public branch.
 OBS_SCHEMA = "registry-observability/v1"
 OBS_SALTED_LABEL_RE = re.compile(r"[0-9a-f]{8}")
 OBS_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:+-]{0,63}")
@@ -389,7 +392,29 @@ def _quota_state(account, entry, now):
     return "available", None
 
 
-def _provider_quota(accounts, usage, now):
+def _quota_probe_signal(probe):
+    """The provider-row `signal` for a snapshot the probe verdict DISTRUSTED (issue #628).
+
+    When `_probe_outcome` says the snapshot was not measured, build_dashboard discards the usage
+    map, so every provider row used to fall through to the "no live usage signal (catalog
+    availability only)" wording — the SAME string a provider that genuinely exposes no usage
+    headers emits, and one that still implies catalog availability is the signal (it is
+    deliberately not counted as free any more). The reason word tracks the normalized outcome so
+    "the probe reported a failure", "the last success is too old" and "no usable sidecar exists"
+    stay distinguishable on the row itself. Pure — unit-tested by --self-test."""
+    outcome = probe.get("outcome") if isinstance(probe, dict) else None
+    if outcome == "failed":
+        reason = "usage probe failed"
+    elif outcome == "ok":
+        # `ok` but not measured can only mean the freshness check rejected the stamp.
+        reason = "usage probe is stale"
+    else:
+        reason = "usage probe outcome is unknown"
+    return (f"{reason} — no measurement for this snapshot "
+            "(catalog availability is not counted as free)")
+
+
+def _provider_quota(accounts, usage, now, probe=None):
     """Per-provider CUMULATIVE quota rows (maintainer request 2026-07-18): where a provider has
     several accounts, the AGGREGATE headroom across them; single-account providers still emit a
     row, marked `single_account`. HONEST aggregation of the signals that actually exist — no
@@ -420,10 +445,20 @@ def _provider_quota(accounts, usage, now):
     --self-test; rows carry provider names + counts only (decision 22: no account identifiers,
     salted or otherwise, on this surface).
 
+    `probe` is the normalized probe verdict (`_probe_outcome`) for the snapshot, when the caller
+    has one. It changes NO count — the counts already fail closed on the empty map build_dashboard
+    hands over — only the `signal` label, which must name the broken probe instead of borrowing the
+    "this provider exposes no usage headers" wording (issue #628). A distrusted verdict takes
+    precedence over the probed/exempt derivation below, because both of those are read out of the
+    very snapshot the verdict rejected: the row must never claim a live measurement it cannot back.
+
     These rows are INTERNAL as of issue #374. The counts below are the source of truth for the
     capacity decision and are asserted in both directions by the suite, but they are never
     published: build_dashboard emits `_public_provider_quota(_provider_quota(...))`, which keeps the
     operational answer and drops every field that reads out the fleet's size."""
+    # #628: `probe=None` means "the caller stated nothing about the probe" and leaves the labels
+    # exactly as they were; any verdict that is not an explicit measurement distrusts the snapshot.
+    distrusted = probe is not None and not (isinstance(probe, dict) and probe.get("measured") is True)
     groups = {}
     for account in accounts:
         groups.setdefault(account["provider"], []).append(account)
@@ -506,7 +541,9 @@ def _provider_quota(accounts, usage, now):
                 "soonest_reset": min(window["resets"], default=None),
                 "oldest_reset": max(window["resets"], default=None),
             })
-        if probed and exempt:
+        if distrusted:
+            signal = _quota_probe_signal(probe)
+        elif probed and exempt:
             signal = "mixed: live rate-limit-header probe + probe-exempt accounts"
         elif probed:
             signal = "live rate-limit-header probe (per-window utilization)"
@@ -1205,11 +1242,30 @@ def _obs_exit_rows(items):
     return rows[:16]
 
 
+def _obs_lease_aggregate(value):
+    """A lease-utilization aggregate the COLLECTOR computed, i.e. the row-free form of the input
+    (issue #841). Same published shape as the rows-derived one: ``{"mean", "max"}``.
+
+    Fail-closed to None — the panel stat hides — rather than to a plausible-looking number: both
+    fields must be real fractions and ``max >= mean``, which no aggregate over real samples can
+    violate. DROPPING rather than raising is the tolerance this document already declares: inside
+    a well-formed snapshot a malformed row is dropped and only a privacy violation is fatal, and
+    this value carries no identity to violate."""
+    if not isinstance(value, dict):
+        return None
+    mean = _obs_fraction(value.get("mean"))
+    maximum = _obs_fraction(value.get("max"))
+    if mean is None or maximum is None or maximum < mean:
+        return None
+    return {"mean": round(mean, 2), "max": round(maximum, 2)}
+
+
 def _obs_flow(flow):
     """Queue depth/age per class, fleet-wide lease utilization, review rounds, park rates,
     arm→merge latency, target-CI congestion. A lease row whose label is not the 8-hex salted shape
     is a raw account identity reaching the collector output — a decision-22 privacy incident,
-    fatal — and since issue #374 the rows themselves are aggregated away rather than republished."""
+    fatal — and since issue #374 the rows themselves are aggregated away rather than republished
+    (issue #841: and since the rows sit on a PUBLIC branch, they need not be sent at all)."""
     if not isinstance(flow, dict):
         return None
     queue = []
@@ -1232,6 +1288,22 @@ def _obs_flow(flow):
     # carrying the fleet?") survives as summary statistics that are invariant under cloning the
     # fleet. The decision-22 label check still runs on every INPUT row: a raw handle in the
     # collector's output is a privacy incident regardless of what this build would have published.
+    #
+    # Issue #841: #374 fixed what this build PUBLISHES; it did not stop the rows EXISTING. The
+    # collector's snapshot lives at data/observability.json on the `ledger` branch of this PUBLIC
+    # repo, so a consumer contract that says "keep sending one row per account and we will drop
+    # them" still parks a per-account row array — fleet size, stable salted labels — one branch
+    # over from the page #374 cleaned. So the aggregate is now accepted DIRECTLY as
+    # `flow.lease_utilization_1h`, and a collector can satisfy this panel while writing no rows to
+    # the public branch at all. Two properties this must NOT trade away, both self-tested:
+    #   * rows-first precedence, keyed on the PRESENCE of the legacy `leases` key rather than on
+    #     whether a row happened to parse. A collector mid-migration that sends both keeps exactly
+    #     today's published value — including the null it publishes when the rows it sent carry no
+    #     usable `utilization_1h` — so the new key can never override a legacy result. Only the
+    #     genuinely row-free form (no `leases` key at all) consults the collector's aggregate.
+    #   * the decision-22 label check is unconditional over the rows that ARE present. Supplying
+    #     the aggregate is not a way to smuggle an unvalidated row past it, and a collector that
+    #     regresses to writing rows is still caught the moment a raw handle appears in one.
     lease_utilizations = []
     for item in flow.get("leases") if isinstance(flow.get("leases"), list) else []:
         if not isinstance(item, dict):
@@ -1243,12 +1315,13 @@ def _obs_flow(flow):
         utilization = _obs_fraction(item.get("utilization_1h"))
         if utilization is not None:
             lease_utilizations.append(utilization)
-    lease_utilization = None
-    if lease_utilizations:
+    if "leases" in flow:
         lease_utilization = {
             "mean": round(sum(lease_utilizations) / len(lease_utilizations), 2),
             "max": round(max(lease_utilizations), 2),
-        }
+        } if lease_utilizations else None
+    else:
+        lease_utilization = _obs_lease_aggregate(flow.get("lease_utilization_1h"))
 
     rounds = flow.get("review_rounds")
     review_rounds = None
@@ -1431,7 +1504,9 @@ def build_dashboard(issues, leases_document, usage, dispatch_history, model_heal
         # (issue #374). The per-account `accounts` array that used to sit under this key is gone;
         # this section is now the whole quota surface.
         "provider_quota": _public_provider_quota(
-            _provider_quota(accounts, usage_rendered, now)),
+            # The verdict travels WITH the snapshot it licensed (#628): when it distrusted the
+            # snapshot, the row says so instead of reading like a provider with no usage headers.
+            _provider_quota(accounts, usage_rendered, now, probe)),
         "fleet": {
             "active_agents": len(live),
             "capacity": _public_capacity(capacity),
@@ -1844,6 +1919,49 @@ def _self_test():
         "windows": [],  # no usage signal exists -> no remaining-quota number is fabricated
         "soonest_reset": _utc_iso(now + 300), "oldest_reset": _utc_iso(now + 300),
     })
+    # [#628] A DISTRUSTED snapshot must not borrow the future-provider wording. Once the probe
+    # verdict fails closed, build_dashboard hands over an empty usage map, so every row fell into
+    # the "no live usage signal (catalog availability only)" branch — which says the provider
+    # exposes no usage headers (it may well expose them; the probe broke) and still credits catalog
+    # availability as the signal (it is deliberately not counted as free). Each reason word is
+    # pinned separately, so collapsing the outcomes into one label turns a row red.
+    def _distrust_signal(reason):
+        return (f"{reason} — no measurement for this snapshot "
+                "(catalog availability is not counted as free)")
+
+    unmeasured_probes = {
+        "failed": _probe_outcome({"schema": PROBE_SCHEMA, "outcome": "failed",
+                                  "attempted_at": now - 30}, now),
+        "stale ok": _probe_outcome({"schema": PROBE_SCHEMA, "outcome": "ok",
+                                    "attempted_at": now - PROBE_MAX_AGE_SECONDS - 1}, now),
+        "no sidecar": _probe_outcome(None, now),
+    }
+    check("[#628] a distrusted snapshot names the probe, and the reason tracks the outcome",
+          {name: _provider_quota(quota_accounts[3:], {}, now, probe)[0]["signal"]
+           for name, probe in unmeasured_probes.items()},
+          {"failed": _distrust_signal("usage probe failed"),
+           "stale ok": _distrust_signal("usage probe is stale"),
+           "no sidecar": _distrust_signal("usage probe outcome is unknown")})
+    check("[#628] ...and none of them is the no-usage-headers label that provider would emit",
+          [_provider_quota(quota_accounts[3:], {}, now)[0]["signal"],
+           any(_provider_quota(quota_accounts[3:], {}, now, probe)[0]["signal"]
+               == _provider_quota(quota_accounts[3:], {}, now)[0]["signal"]
+               for probe in unmeasured_probes.values())],
+          ["no live usage signal (catalog availability only)", False])
+    # Both directions of the precedence. A distrusted verdict wins over the probed/exempt
+    # derivation (those are read out of the rejected snapshot, so "live rate-limit-header probe"
+    # would be a claim the verdict cannot back) — and a MEASURED verdict changes nothing at all,
+    # so the new branch cannot swallow the honest labels.
+    check("[#628] a distrusted verdict never claims a live measurement, however live the map looks",
+          [row["signal"] for row in _provider_quota(quota_accounts, quota_usage, now,
+                                                    unmeasured_probes["failed"])],
+          [_distrust_signal("usage probe failed")] * 2)
+    check("[#628] a measured verdict leaves the probed/exempt signals exactly as they were",
+          [row["signal"] for row in _provider_quota(
+              quota_accounts, quota_usage, now,
+              _probe_outcome({"schema": PROBE_SCHEMA, "outcome": "ok",
+                              "attempted_at": now - 30}, now))],
+          [quota_rows[0]["signal"], quota_rows[1]["signal"]])
     check("cumulative quota: fail-closed-omitted account is unknown, never free",
           [(row["accounts_available"], row["accounts_unknown"]) for row in _provider_quota(
               [{"handle": "ghost", "provider": "anthropic", "catalog_available": True,
@@ -2087,6 +2205,20 @@ def _self_test():
           {"outcome": "failed", "detail": "secret-materialization-failed",
            "attempted_at": _utc_iso(now - 30), "age_seconds": 30, "stale": False,
            "measured": False})
+    # [#628] The WIRING: the verdict must actually reach the row build_dashboard publishes. Dropping
+    # the `probe` argument at the call site leaves every other assertion in this file green while the
+    # page goes back to blaming the provider for a broken probe, so it is asserted end-to-end here —
+    # once for a failed sidecar and once for none at all, which carry different reason words.
+    check("[#628] the published row blames the probe, not the provider, on a distrusted snapshot",
+          [degraded["provider_quota"][0]["signal"],
+           build_dashboard(issues, leases, usage, history, None, now,
+                           "fixture-salt")["provider_quota"][0]["signal"]],
+          [_distrust_signal("usage probe failed"),
+           _distrust_signal("usage probe outcome is unknown")])
+    check("[#628] ...while a fresh measurement publishes the live-probe signal unchanged",
+          build_dashboard(issues, leases, usage, history, None, now, "fixture-salt",
+                          probe_status=fresh_probe)["provider_quota"][0]["signal"],
+          "live rate-limit-header probe (per-window utilization)")
     check("stale ok probe surfaces its age and stops counting as measured",
           _probe_outcome(stale_probe, now),
           {"outcome": "ok", "detail": "probe-succeeded",
@@ -2799,6 +2931,60 @@ const degraded = (node) =>
           (four_leases, True, False))
     check("[#374] no reported lease utilization publishes nothing rather than a zero",
           obs_leases([])["lease_utilization_1h"], None)
+    # ---- [#841] the ROW-FREE collector contract. #374 stopped this build PUBLISHING the rows; it
+    # did not stop them EXISTING at data/observability.json on the public `ledger` branch. So the
+    # aggregate is accepted directly and a collector need write no per-account rows anywhere.
+    def obs_flow_without_rows(aggregate):
+        fixture = copy.deepcopy(obs_fixture)
+        fixture["flow"].pop("leases", None)          # the collector sends NO per-account rows
+        fixture["flow"]["lease_utilization_1h"] = aggregate
+        return _normalize_observability(fixture)["flow"]["lease_utilization_1h"]
+
+    check("[#841] a collector that sends NO lease rows still publishes the aggregate it computed",
+          obs_flow_without_rows({"mean": 0.31, "max": 0.77}), {"mean": 0.31, "max": 0.77})
+    # Precedence is ROWS-FIRST and total, so a collector mid-migration that sends both publishes
+    # exactly its pre-#841 value — the new key can never silently override real measurements.
+    # Flipping the precedence turns this into {0.99, 0.99}.
+    both = copy.deepcopy(obs_fixture)
+    both["flow"]["lease_utilization_1h"] = {"mean": 0.99, "max": 0.99}
+    check("[#841] lease ROWS outrank a collector-supplied aggregate (no silent override)",
+          _normalize_observability(both)["flow"]["lease_utilization_1h"],
+          {"mean": 0.6, "max": 0.8})
+    # ...and precedence keys on the legacy KEY, not on a row happening to parse. Rows that are
+    # present but report no usable utilization published null pre-#841 and must still publish null:
+    # make the fallback conditional on `lease_utilizations` instead and these become {0.99, 0.99},
+    # i.e. the new key overriding a legacy source that was sent.
+    for case, rows in (
+        ("no utilization field", [{"label": "ab12cd34", "provider": "anthropic"}]),
+        ("malformed utilization", [{"label": "ab12cd34", "provider": "anthropic",
+                                    "utilization_1h": "busy"}]),
+        ("zero rows", []),
+    ):
+        unparseable = copy.deepcopy(both)
+        unparseable["flow"]["leases"] = rows
+        check(f"[#841] legacy rows with {case} keep their pre-#841 null, aggregate or not",
+              _normalize_observability(unparseable)["flow"]["lease_utilization_1h"], None)
+    # ...and sending the aggregate is NOT a way around the decision-22 check on the rows that ARE
+    # present. Make the label check conditional on the rows being used and this normalizes happily.
+    both_raw = copy.deepcopy(both)
+    both_raw["flow"]["leases"][0]["label"] = handle    # a raw account handle alongside a valid mean
+    try:
+        _normalize_observability(both_raw)
+    except DashboardError:
+        aggregate_is_no_bypass = True
+    else:
+        aggregate_is_no_bypass = False
+    check("[#841] a raw lease label stays fatal even when an aggregate is also supplied",
+          aggregate_is_no_bypass, True)
+    for case, aggregate in (
+        ("incoherent (max < mean)", {"mean": 0.8, "max": 0.4}),
+        ("out-of-range fraction", {"mean": 0.2, "max": 1.4}),
+        ("half-supplied (no max)", {"mean": 0.2}),
+        ("non-numeric", {"mean": "busy", "max": "busy"}),
+        ("non-object", [0.2, 0.4]),
+    ):
+        check(f"[#841] {case} collector aggregate is dropped, never published",
+              obs_flow_without_rows(aggregate), None)
     with_observability = build_dashboard(
         issues, leases, usage, history, None, now, "fixture-salt", observability=obs_fixture)
     check("build_dashboard publishes the normalized observability key",
