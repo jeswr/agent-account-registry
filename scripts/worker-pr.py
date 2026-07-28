@@ -248,6 +248,42 @@ AUTO_READMIT_MARKER = "<!-- sparq-auto-readmit:v1"
 # next tick, so a retirement whose close/hand-back half died mid-write is re-driven from this
 # receipt instead of being stranded half-done.
 PARK_RETIREMENT_MARKER = "<!-- sparq-park-retired:v1"
+# [registry #972] THE TARGET-IDENTITY REFUSAL RECEIPT — a REFUSAL THAT RECORDS ITSELF.
+#
+# review-fix.yml's `Verify target App identity and default branch` step refuses the `run` job at
+# four predicates. Until #972 every one of them killed that job with the `outcome` job's `if:`
+# unsatisfied, so NOTHING durable was written: no verdict, no round marker, no `review:*`
+# transition. The lane's re-entry condition was therefore byte-identical on the next tick, and the
+# PR was re-dispatched every ~10 minutes FOREVER — a claim, a runner and an account lease burned
+# per tick with no outcome and no exit. MEASURED on jeswr/agent-account-registry#961: PLAN run
+# 30339511626 enumerated it, CLAIM run 30340312044 dispatched round 1, review run 30340804869 died
+# on `pull request author is not the registry App bot`, and `Apply outcome` was SKIPPED. #961
+# escaped only because a human armed and merged it.
+#
+# The receipt carries `reason=<code>` from the CLOSED IDENTITY_REFUSAL_REASONS table below, and it
+# is doing THREE jobs at once, which is why it is a durable marker and not a log line:
+#   - it is the CENSUS ROW: the refusal is countable per reason instead of invisible;
+#   - it is the IDEMPOTENCE key: a re-run of the outcome job re-derives the same receipt and
+#     writes nothing; and
+#   - it is the CAP. One refusal per (PR, reason), ever — see identity_refusal() for why the cap
+#     is one and not N.
+# Bot-authored + reserved-namespace like every other durable marker.
+IDENTITY_REFUSAL_MARKER = "<!-- sparq-identity-refusal:v1"
+# The CLOSED taxonomy of reasons review-fix.yml's target-identity step can refuse a run for — one
+# code per `raise SystemExit` in that step, and nothing else. `identity_refusal_reason_prose`
+# RAISES on a code outside this table rather than inventing an uncounted bucket (the
+# `park_policy.budget_exhausted_bucket` idiom): a fifth refusal added to that step without a code
+# here fails LOUDLY at the writer instead of silently reproducing the very loop this closes.
+#
+# EVERY one of them is deterministic in the sense that decides the park class: the step's inputs
+# are the target repo's own `full_name`/`default_branch`, the App's own login, and the PR's author.
+# A re-dispatch changes NONE of them, so a retry is identical BY CONSTRUCTION.
+IDENTITY_REFUSAL_REASONS = {
+    "wrong-target": "the target App token read a repository other than the dispatched target",
+    "unsafe-default-branch": "the target repository's default branch is not a safe ref name",
+    "not-an-app-bot": "the target App token did not identify a GitHub App bot",
+    "author-not-app-bot": "the pull request author is not the registry App bot",
+}
 # The window key for the initial no-cutoff window — mirrors park_policy.PARK_WINDOW_NONE
 # (kept literal here so the pure marker parser needs no module load; never valid ISO-8601, so
 # it cannot collide with a real cutoff).
@@ -3483,6 +3519,193 @@ def _retire_worker_pr(repo, pr_number, issue, policy, close_pr=None, patch_issue
     except Exception as exc:  # noqa: BLE001 — best-effort; re-driven from the receipt next tick
         log(f"::warning::machine retirement: hand-back of {repo}#{issue} failed ({exc}); the "
             "retirement receipt stands and the next tick re-drives it")
+
+
+# ---- [registry #972] the target-identity refusal: the run job's MISSING EXIT -------------------
+def identity_refusal_reason_prose(reason):
+    """The declared prose for one target-identity refusal code, RAISING on an undeclared code.
+
+    The closed-enum boundary (park_policy.budget_exhausted_bucket's idiom). It is what makes the
+    census SUM: every refusal review-fix.yml's identity step can emit leaves through exactly one
+    declared code, so a fifth `raise SystemExit` added to that step without a code here fails
+    LOUDLY at this writer instead of parking the PR under a bucket nobody counts — or, worse,
+    falling back through to the pre-#972 behaviour of recording nothing at all."""
+    if reason not in IDENTITY_REFUSAL_REASONS:
+        raise WorkerPrError(
+            f"undeclared target-identity refusal reason {reason!r}: every refusal in "
+            "review-fix.yml's `Verify target App identity and default branch` step must map to "
+            "exactly one code in worker-pr.IDENTITY_REFUSAL_REASONS (declare it there) — "
+            "refusing to record it as nothing, which is the #972 loop")
+    return IDENTITY_REFUSAL_REASONS[reason]
+
+
+def identity_refusal_issue(value, log=print):
+    """PURE. Coerce review-fix.yml's `--issue` into an issue number, or None.
+
+    This is the loop's EXIT, so its inputs must never be able to ABORT it — an aborted exit is
+    #972 returning. `needs.resolve.outputs.issue` crosses a workflow output, and every sibling
+    subcommand declares `--issue type=int`, where an empty or malformed value is an argparse
+    exit 2 BEFORE any park can land. Here it degrades instead: the PR-side park alone already
+    removes the PR from the review frontier (enumerate_review_items excludes
+    HUMAN_HOLD_PR_LABELS), so a missing source issue costs the issue-side label and nothing more."""
+    text = str(value).strip() if value is not None else ""
+    if not text:
+        return None
+    try:
+        number = int(text)
+    except ValueError:
+        log(f"::warning::identity-refusal: issue {value!r} is not an issue number; parking the "
+            "PR only (an unparseable issue must never abort the review loop's exit)")
+        return None
+    return number if number > 0 else None
+
+
+def identity_refusal_records(comments, bot_login):
+    """PURE. The set of target-identity refusal CODES already receipted on this PR by the bot.
+
+    The cap counter and the idempotence key. Only the bot's own comments are read (the same trust
+    filter every other durable marker uses), so a third party cannot mint or suppress a refusal
+    receipt by quoting one."""
+    found = set()
+    pattern = re.compile(re.escape(IDENTITY_REFUSAL_MARKER) + r" reason=([a-z0-9-]+) -->")
+    for comment in _bot_comments(comments, bot_login):
+        found.update(pattern.findall(str(comment.get("body", ""))))
+    return found
+
+
+def identity_refusal_parked(repo, pr_number, read_review_labels=None):
+    """Is the #972 terminal park actually LIVE on this PR — i.e. did the EXIT land, not merely its
+    receipt?
+
+    [registry #979 round-2 finding 3] The receipt and the park are two writes with one API call
+    between them, and the receipt is deliberately written FIRST. So `receipt-written /
+    park-NOT-written` is a reachable state (a `set_review_state` failure, a secondary rate limit,
+    a runner death), and it is the one state in which the receipt must NOT silence the next tick:
+    the PR is still on the review frontier, the refusal is deterministic, and nothing else can
+    re-drive it — `groom` backstops worker-branch PRs, and every PR on the #657 orchestrator class
+    this exit exists for is human-authored on an arbitrary branch.
+
+    FAIL DIRECTION, and it is the OPPOSITE of every other label read in this file, deliberately:
+    an unreadable label surface answers FALSE, i.e. re-drive the park. Everywhere else the hazard
+    is writing a hold that was not earned, so the read fails closed. Here the hazard is #972's
+    infinite re-dispatch, and the write being re-driven is an idempotent label the PR has already
+    earned — a duplicate is a no-op, a missing one is the loop."""
+    reader = read_review_labels or _live_review_labels
+    try:
+        return "review:needs-user" in reader(repo, pr_number)
+    except Exception as exc:      # noqa: BLE001 — see FAIL DIRECTION above
+        print(f"::warning::identity-refusal: could not read the live review labels on "
+              f"{repo}#{pr_number} ({exc}); treating the terminal park as NOT landed and "
+              "re-driving it (a duplicate park write is a no-op; a missing one is #972)")
+        return False
+
+
+def identity_refusal(repo, pr_number, reason, issue=None, bot_login="",
+                     alert_repo=None, alert_token=None, head_sha=""):
+    """Record review-fix.yml's target-identity refusal as a DURABLE, COUNTED, TERMINAL outcome.
+
+    THE DEFECT (#972). The refusal itself is correct and is NOT changed here: the step still
+    refuses, the model still never runs, and no token ever reaches it. What was missing is that
+    the refusal wrote NOTHING — the `run` job died with the `outcome` job's `if:` unsatisfied, so
+    the next tick re-derived a byte-identical world and re-dispatched. A hold with no
+    machine-visible outcome is an infinite retry, which is this repo's own standing rule.
+
+    THE ROUND IS NOT CONSUMED, and the argument is from the code, not from taste:
+
+    - `round-record` runs at review-fix.yml's `Record the review round before the model runs`
+      step, STRICTLY AFTER the identity step. So today zero rounds are charged on this path and
+      nothing here has to un-charge one; the choice is only whether to START charging.
+    - The round budget is the REVIEWER's budget. `decide_budget` grades PROGRESS between rounds
+      and extends on improving progress or a model-tier bump; a round in which no reviewer ran
+      records `progress=null` and no fix-model marker, i.e. it is indistinguishable from a
+      stagnant review and would count AGAINST the PR for work nobody did.
+    - registry #596 already settled this exact shape one step down the same job: a credential
+      outage must not consume a round, because "a pure credential outage walked the PR through the
+      bounded round budget into a capacity park as if the reviewer had declined". A target-identity
+      refusal is strictly earlier — the reviewer was never even launched.
+    - And the decisive one: charging rounds would deliver the PR into the `budget` park, which is
+      CAPACITY class and therefore HAS a machine re-admission. Re-admission would hand it straight
+      back to the identical refusal. An exit that re-admits into the state it exited produces
+      nothing, so consuming the round buys a strictly WORSE exit than not consuming it.
+
+    THE CAP IS ONE, for the same reason `target-identity` is a QUESTION cause: this gate reads the
+    target repo's `full_name`/`default_branch`, the App's own login and the PR's author, and a
+    re-dispatch changes none of them. A cap of N>1 would buy N-1 provably identical runs. Every
+    capped CAPACITY cause in the taxonomy (`budget`, `dispatch-missed`, `nochange`, `gatefail`)
+    caps something that CAN come out differently next attempt; this cannot.
+
+    THE MACHINE EXIT is therefore not a timer but the CAUSE itself: the refusal names its reason
+    in a durable receipt, so when the cause is removed — the gate's decision changes, or the PR's
+    author does — a human clears the park with the reason in front of them, and the park's own
+    `readmission_cutoff` window re-opens the budget exactly as it does for any other question-class
+    park. Minting an automatic re-admission for a cause the machine cannot prove has recovered is
+    the park-readmit cycle this repo has already measured.
+
+    IDEMPOTENT, ON TWO SEPARATE KEYS ([registry #979] round-2 finding 3). The RECEIPT caps the
+    census row and the comment: a re-run whose reason is already receipted writes no second
+    comment, ever. The PARK is keyed on the park itself, re-read live — because the receipt is
+    written FIRST and a failure in the one-API-call window between them leaves receipt-no-park,
+    the one state in which honouring the receipt as an idempotence key would silence the exit and
+    strand the PR on the review frontier forever. A re-run that finds the park already live writes
+    NOTHING (no comment, no park, no ops alert); a re-run that finds it MISSING re-drives the park
+    ALONE."""
+    prose = identity_refusal_reason_prose(reason)      # closed enum, BEFORE any write
+    issue = identity_refusal_issue(issue)
+    try:
+        already = identity_refusal_records(_paginated_comments(repo, pr_number), bot_login) \
+            if bot_login else set()
+    except WorkerPrError as exc:
+        # An unreadable comment page must never SUPPRESS the exit — that is the #972 failure
+        # direction. Fail toward writing: a duplicate receipt is noise, a missing one is a loop.
+        print(f"::warning::could not read {repo}#{pr_number} comments for the identity-refusal "
+              f"receipt ({exc}); recording the refusal anyway (a missing exit is the defect)")
+        already = set()
+
+    def _park():
+        needs_user(repo, pr_number,
+                   f"the review run was refused by the target-App identity gate: {prose}. No "
+                   "review round was charged, and a re-dispatch would be identical",
+                   issue=issue, alert_repo=alert_repo, alert_token=alert_token,
+                   park_class="question", park_cause="target-identity",
+                   bot_login=bot_login, head_sha=head_sha)
+
+    if reason in already:
+        # [registry #979 round-2 finding 3] THE CAP AND THE IDEMPOTENCE KEY ARE NOT THE SAME
+        # OBJECT, and conflating them removed the exit this whole function is. The receipt caps
+        # the CENSUS ROW and the COMMENT — one per (PR, reason), ever, unchanged. It does NOT
+        # stand in for the PARK, because the park is a SEPARATE write that happens AFTER it: this
+        # `return` used to fire on a PR that carried a receipt and no park, so a tick-1 failure in
+        # the one-API-call window between them (the ~25-minute secondary content-creation limit
+        # this repo measured on 2026-07-28 is exactly wide enough) left the PR on the review
+        # frontier with a receipt that silenced every later tick — #972 restored THROUGH its own
+        # exit, and the docstring above claimed this function "re-drives" a state it could not
+        # reach. So the park's idempotence key is the PARK ITSELF, re-read here.
+        if identity_refusal_parked(repo, pr_number):
+            print(f"identity-refusal census: repo={repo} pr={pr_number} reason={reason} "
+                  "cause=target-identity outcome=already-recorded")
+            return
+        # Re-drive the park ALONE: no second receipt, no second census row, no duplicated cap.
+        # This also covers the human who un-parks without removing the cause — the gate refuses
+        # identically, and re-parking with the reason in front of them is the honest answer;
+        # writing nothing would resume the infinite re-dispatch.
+        print(f"identity-refusal census: repo={repo} pr={pr_number} reason={reason} "
+              "cause=target-identity outcome=receipt-without-park re-driving the terminal park")
+        _park()
+        return
+    # RECEIPT FIRST, exactly like every other park write: a crash between the two leaves
+    # receipt-no-park (which the `reason in already` arm above re-drives on the next tick, and
+    # which the reader can still count), never park-no-receipt, where the census row that names
+    # the cause would be the thing that vanished.
+    _comment(repo, pr_number,
+             f"> 🤖 **SPARQ agent** — the review run was refused before the reviewer launched: "
+             f"{prose}.\n\nNo review round was charged (no reviewer ran). This refusal cannot "
+             f"come out differently on a retry — the identity gate reads the target repository, "
+             f"this App's own login and the pull request's author, none of which a re-dispatch "
+             f"changes — so the pull request is handed to a human rather than re-dispatched.\n\n"
+             f"{IDENTITY_REFUSAL_MARKER} reason={reason} -->")
+    print(f"identity-refusal census: repo={repo} pr={pr_number} reason={reason} "
+          "cause=target-identity outcome=recorded")
+    _park()
 
 
 # ---- terminal escalation + arm --------------------------------------------------------------------
@@ -7845,8 +8068,11 @@ def _self_test():
                                  if klass == _pp.PARK_CLASS_QUESTION)
         check("[#869] the question half of the taxonomy is the set this covers",
               question_causes,
+              # [registry #972] `target-identity` joins the question half: review-fix.yml's
+              # target-App identity gate refused the run, and the gate's inputs cannot change
+              # on a re-dispatch, so there is nothing for a machine re-admission to recover.
               ["history-rewritten", "human-arm", "injection", "marker-corrupt",
-               "routing-unresolvable"])
+               "routing-unresolvable", "target-identity"])
         question_bodies = {}
         for cause in question_causes:
             park_route_calls.clear()
@@ -11622,6 +11848,256 @@ def _self_test():
           (_bad_class.returncode, "invalid choice" in _bad_class.stderr,
            "not 'capacity'" in _bad_class.stderr), (1, False, True))
 
+    # ---- [registry #972] THE TARGET-IDENTITY REFUSAL'S EXIT ----------------------------------
+    # The defect was that a refused review wrote NOTHING, so the next tick re-derived a
+    # byte-identical world. These rows are therefore about what the refusal DELIVERS: a census
+    # row naming the reason, a terminal question-class park, and NO round charged.
+    _ir_bot = "registry-admin[bot]"
+
+    class _IdentityWrites:
+        """Captures every write `identity_refusal` performs, in order."""
+
+        def __init__(self, existing=(), live=(), labels_unreadable=False):
+            self.comments, self.states, self.issue_status, self.alerts = [], [], [], []
+            self.existing = list(existing)
+            self.live = set(live)
+            self.labels_unreadable = labels_unreadable
+
+        def install(self):
+            self.saved = {name: globals()[name] for name in (
+                "_comment", "_paginated_comments", "set_review_state", "_ops_alert",
+                "_load_worker_issue", "_live_review_labels")}
+            globals()["_comment"] = lambda repo, pr, body: self.comments.append(body)
+            globals()["_paginated_comments"] = lambda repo, pr: self.existing
+            globals()["set_review_state"] = (
+                lambda repo, pr, state, **kw: (self.states.append(state),
+                                               self.live.add(f"review:{state}"))[0])
+            # [registry #979 round-2 finding 3] The LIVE park surface, which is now a distinct
+            # idempotence key from the receipt. `set_review_state` above adds to it, so a driver
+            # that lets tick 1 park sees the park on tick 2 exactly as production would.
+            globals()["_live_review_labels"] = lambda repo, pr: (
+                (_ for _ in ()).throw(WorkerPrError("live PR label payload is malformed"))
+                if self.labels_unreadable else set(self.live))
+            globals()["_ops_alert"] = lambda *a, **kw: self.alerts.append(a)
+            globals()["_load_worker_issue"] = lambda: types.SimpleNamespace(
+                set_status=lambda repo, issue, status: self.issue_status.append(
+                    (issue, status)))
+            return self
+
+        def restore(self):
+            globals().update(self.saved)
+
+    def _drive_identity_refusal(reason, existing=(), issue=77, live=(),
+                                labels_unreadable=False):
+        writes = _IdentityWrites(existing, live, labels_unreadable).install()
+        raised = None
+        try:
+            identity_refusal("o/r", 41, reason, issue=issue, bot_login=_ir_bot,
+                             head_sha="c" * 40)
+        except WorkerPrError as exc:      # the closed-enum refusal
+            raised = str(exc)
+        finally:
+            writes.restore()
+        return writes, raised
+
+    # (1) THE RED TEST, by execution: a refusal produces a CENSUS ROW naming the reason, a
+    #     TERMINAL question-class park on both surfaces, and NO round marker.
+    _ir_writes, _ir_raised = _drive_identity_refusal("author-not-app-bot")
+    check("[#972] a target-identity refusal is RECORDED (census receipt + park comment), "
+          "not silently dropped",
+          (_ir_raised, len(_ir_writes.comments)), (None, 2))
+    check("[#972] the census row NAMES the refusal reason (countable, not invisible)",
+          f"{IDENTITY_REFUSAL_MARKER} reason=author-not-app-bot -->" in _ir_writes.comments[0],
+          True)
+    check("[#972] the refusal's declared prose reaches the receipt (writer bound to the "
+          "closed table, not to a re-typed sentence)",
+          IDENTITY_REFUSAL_REASONS["author-not-app-bot"] in _ir_writes.comments[0], True)
+    check("[#972] the exit is TERMINAL on both surfaces (review:needs-user + needs:user)",
+          (_ir_writes.states, _ir_writes.issue_status),
+          (["needs-user"], [(77, "needs-user")]))
+    check("[#972] the park receipt is QUESTION-class and names cause=target-identity",
+          f"class={_park_policy().PARK_CLASS_QUESTION} cause=target-identity"
+          in _ir_writes.comments[1], True)
+    # (2) THE ROUND IS NOT CONSUMED. Asserted over EVERY body this path writes, so a future
+    #     edit that starts charging a round here reds this row rather than silently walking the
+    #     PR into the CAPACITY `budget` park (whose automatic re-admission would hand it back
+    #     to the identical refusal).
+    check("[#972] NO review round is charged by a refusal (no reviewer ran)",
+          any(ROUND_MARKER in body for body in _ir_writes.comments), False)
+    # (3) THE CAP IS ONE. Feed BOTH of tick 1's writes back — the receipt as the PR's comment
+    #     history AND the park it landed as the PR's live review label. The second tick must then
+    #     write NOTHING AT ALL: no comment, no park, no ops alert.
+    _ir_receipt = [{"user": {"login": _ir_bot}, "body": _ir_writes.comments[0]}]
+    _ir_second, _ = _drive_identity_refusal(
+        "author-not-app-bot", existing=_ir_receipt, live=("review:needs-user",))
+    check("[#972] a SECOND tick on a refusal that is already receipted AND parked writes nothing "
+          "(cap = 1)",
+          (_ir_second.comments, _ir_second.states, _ir_second.issue_status,
+           _ir_second.alerts), ([], [], [], []))
+    # ...and the cap is per REASON, not a blanket "any receipt silences everything".
+    _ir_other, _ = _drive_identity_refusal(
+        "wrong-target", existing=_ir_receipt, live=("review:needs-user",))
+    check("[#972] a DIFFERENT refusal reason is still recorded (the cap is per-reason)",
+          len(_ir_other.comments), 2)
+    # (3b) [registry #979 round-2 finding 3] THE STATE THE RECEIPT-FIRST ORDER CREATES:
+    #      receipt-written, park-NOT-written. The receipt caps the CENSUS ROW; it must not cap the
+    #      EXIT. Before this fix `if reason in already: return` fired first, so this tick wrote
+    #      nothing at all, the PR stayed on the review frontier with the refusal invisible, and
+    #      #972's infinite re-dispatch was restored THROUGH the exit built to close it — with no
+    #      backstop, because `groom` only covers worker-branch PRs and the whole #657 class this
+    #      gate refuses is human-authored on an arbitrary branch.
+    _ir_half, _ = _drive_identity_refusal("author-not-app-bot", existing=_ir_receipt, live=())
+    check("[#979] a receipted-but-UNPARKED refusal RE-DRIVES the terminal park on the next tick "
+          "(the receipt caps the census row, not the exit)",
+          (_ir_half.states, _ir_half.issue_status), (["needs-user"], [(77, "needs-user")]))
+    check("[#979] ...and it re-drives the PARK ALONE — no second census receipt, no second "
+          "census row (the cap is still one per (PR, reason))",
+          [body for body in _ir_half.comments if IDENTITY_REFUSAL_MARKER in body], [])
+    # ...and the whole two-tick sequence, driven end to end through the PRODUCTION function with
+    # tick 1's park write FAILING — the exact one-API-call window (a secondary content-creation
+    # limit, a runner death) the receipt-first order opens.
+    _ir_t1 = _IdentityWrites().install()
+    _ir_saved_set = globals()["set_review_state"]
+    globals()["set_review_state"] = lambda repo, pr, state, **kw: (_ for _ in ()).throw(
+        WorkerPrError("secondary rate limit on the label write"))
+    _ir_t1_raised = None
+    try:
+        identity_refusal("o/r", 41, "author-not-app-bot", issue=77, bot_login=_ir_bot,
+                         head_sha="c" * 40)
+    except WorkerPrError as exc:
+        _ir_t1_raised = str(exc)
+    finally:
+        globals()["set_review_state"] = _ir_saved_set
+        _ir_t1.restore()
+    check("[#979] tick 1 crashing between the receipt and the park leaves receipt-written, "
+          "park-NOT-written (the window this fix exists for is REAL, not hypothetical)",
+          (bool(_ir_t1_raised), len(_ir_t1.comments), _ir_t1.states),
+          (True, 1, []))
+    _ir_t2, _ = _drive_identity_refusal(
+        "author-not-app-bot",
+        existing=[{"user": {"login": _ir_bot}, "body": _ir_t1.comments[0]}], live=())
+    check("[#979] ...and tick 2 reading tick 1's own receipt COMPLETES the exit instead of "
+          "returning silently (the loop terminates on the second tick)",
+          (_ir_t2.states, _ir_t2.issue_status, len(_ir_t2.alerts)),
+          (["needs-user"], [(77, "needs-user")], 1))
+    # (3c) THE FAIL DIRECTION of the park re-read, which is the OPPOSITE of every other label
+    #      read in this file: unreadable labels must re-drive the park, never suppress it.
+    _ir_blind_labels, _ = _drive_identity_refusal(
+        "author-not-app-bot", existing=_ir_receipt, live=(), labels_unreadable=True)
+    check("[#979] an UNREADABLE live-label surface re-drives the park (fail toward the exit; a "
+          "duplicate label write is a no-op, a missing one is #972)",
+          _ir_blind_labels.states, ["needs-user"])
+    check("[#979] identity_refusal_parked answers on the LIVE label, and answers FALSE when the "
+          "read raises",
+          (identity_refusal_parked("o/r", 41, lambda r, p: {"review:needs-user"}),
+           identity_refusal_parked("o/r", 41, lambda r, p: {"review:needs"}),
+           identity_refusal_parked("o/r", 41, lambda r, p: set()),
+           identity_refusal_parked("o/r", 41, lambda r, p: (_ for _ in ()).throw(
+               WorkerPrError("boom")))),
+          (True, False, False, False))
+    # (4) THE READER'S TRUST FILTER. A receipt authored by anyone but the bot must not be able
+    #     to SUPPRESS the exit — that would be a remote off-switch for the loop's only exit.
+    _ir_forged, _ = _drive_identity_refusal(
+        "author-not-app-bot",
+        existing=[{"user": {"login": "mallory"}, "body": _ir_writes.comments[0]}])
+    check("[#972] a FORGED (non-bot) receipt cannot suppress the exit",
+          len(_ir_forged.comments), 2)
+    check("[#972] identity_refusal_records reads bot receipts only",
+          (identity_refusal_records(
+              [{"user": {"login": _ir_bot}, "body": _ir_writes.comments[0]}], _ir_bot),
+           identity_refusal_records(
+               [{"user": {"login": "mallory"}, "body": _ir_writes.comments[0]}], _ir_bot)),
+          ({"author-not-app-bot"}, set()))
+    # (5) THE CLOSED ENUM, in both directions and BEFORE any write. An undeclared code must
+    #     raise rather than park the PR under a bucket nothing counts.
+    _ir_undeclared, _ir_undeclared_msg = _drive_identity_refusal("brand-new-refusal")
+    check("[#972] an UNDECLARED refusal code raises and writes NOTHING",
+          (_ir_undeclared.comments, _ir_undeclared.states,
+           bool(_ir_undeclared_msg and "undeclared target-identity refusal reason"
+                in _ir_undeclared_msg)), ([], [], True))
+    # (6) The CLI seam accepts every declared code and refuses an undeclared one, answered by
+    #     the PRODUCTION argparse (subprocess), on the REFUSING path only — no GitHub call.
+    _ir_cli = subprocess.run(
+        [sys.executable, "-B", str(Path(__file__).resolve()), "identity-refusal",
+         "--repo", "o/r", "--pr", "41", "--reason", "brand-new-refusal"],
+        capture_output=True, text=True, check=False)
+    check("[#972] the CLI rejects a reason outside the closed enum (argparse choices)",
+          (_ir_cli.returncode, "invalid choice" in _ir_cli.stderr), (2, True))
+    _ir_cli_help = subprocess.run(
+        [sys.executable, "-B", str(Path(__file__).resolve()), "identity-refusal", "--help"],
+        capture_output=True, text=True, check=False)
+    check("[#972] the CLI's declared choices ARE the closed table (no second hand-written list)",
+          all(code in _ir_cli_help.stdout for code in IDENTITY_REFUSAL_REASONS)
+          and _ir_cli_help.returncode == 0, True)
+    # (7) THE EXIT MUST SURVIVE ITS OWN INPUTS. review-fix.yml passes
+    #     `--issue ${{ needs.resolve.outputs.issue }}`, and every sibling subcommand declares that
+    #     option `type=int` — where an empty or malformed value is an argparse exit 2 BEFORE any
+    #     park can land, i.e. the #972 loop resumes. Here it degrades to a PR-only park.
+    _ir_logs = []
+    check("[#972] a malformed/empty/absent source issue degrades instead of aborting the exit",
+          [identity_refusal_issue(v, log=_ir_logs.append)
+           for v in ("77", 77, "", "  ", None, "not-a-number", "0", "-3")],
+          [77, 77, None, None, None, None, None, None])
+    check("[#972] ...and an unparseable issue says so loudly",
+          any("is not an issue number" in line for line in _ir_logs), True)
+    _ir_no_issue, _ = _drive_identity_refusal("author-not-app-bot", issue="")
+    check("[#972] the PR-side terminal park still lands with NO usable source issue "
+          "(the frontier exclusion only needs the PR label)",
+          (_ir_no_issue.states, _ir_no_issue.issue_status, len(_ir_no_issue.comments)),
+          (["needs-user"], [], 2))
+    # ...and the CLI seam declares NO `type=int`, so nothing upstream of the coercion can reject
+    # the value first. Asserted through the PRODUCTION parser, on a path that makes NO GitHub call.
+    #
+    # [registry #979 round-2 finding 2] ARGUMENT ORDER IS THE WHOLE PROOF, and round 1 had it
+    # backwards. argparse converts and validates each option AS IT REACHES IT and exits on the
+    # FIRST error, so with `--reason` first the parser died on the reason and never converted
+    # `--issue` at all: "invalid int value" was absent whether or not `--issue` declared
+    # `type=int`, and the row was vacuous — MEASURED, it was the sole survivor of round 1's
+    # eleven production mutants. `--issue` now comes FIRST, so the parser must get PAST it to
+    # reach the reason, and the assertion is POSITIVE rather than an absence: stderr must name
+    # the REASON error (proving the empty `--issue` was accepted and parsing continued) and must
+    # NOT name an int-conversion error. Adding `type=int` inverts both halves.
+    _ir_issue_cli = subprocess.run(
+        [sys.executable, "-B", str(Path(__file__).resolve()), "identity-refusal",
+         "--repo", "o/r", "--pr", "41", "--issue", "", "--reason", "not-a-declared-code"],
+        capture_output=True, text=True, check=False)
+    check("[#972] the CLI's --issue is not `type=int`: parsing gets PAST an empty --issue and "
+          "fails on the LATER argument instead (an empty value is never an argparse error)",
+          (_ir_issue_cli.returncode,
+           "invalid choice: 'not-a-declared-code'" in _ir_issue_cli.stderr,
+           "invalid int value" in _ir_issue_cli.stderr), (2, True, False))
+    # (8) THE FAIL DIRECTION of the idempotence read. An unreadable comment page must never
+    #     SUPPRESS the exit — a duplicate receipt is noise, a missing one is the #972 loop.
+    _ir_blind = _IdentityWrites().install()
+    _ir_blind_raise = globals()["_paginated_comments"]
+    globals()["_paginated_comments"] = _ir_raiser = (
+        lambda repo, pr: (_ for _ in ()).throw(WorkerPrError("comments page is malformed")))
+    try:
+        identity_refusal("o/r", 41, "author-not-app-bot", issue=7, bot_login=_ir_bot)
+    finally:
+        globals()["_paginated_comments"] = _ir_blind_raise
+        _ir_blind.restore()
+    check("[#972] an UNREADABLE comment page still records the refusal (fail toward writing)",
+          (len(_ir_blind.comments), _ir_blind.states), (2, ["needs-user"]))
+    # (9) THE CALL SITE. Everything above drives `identity_refusal` directly; this drives the
+    #     PRODUCTION `main()` dispatcher with the workflow's own argv shape, so a subcommand
+    #     wired to the wrong function — or not wired at all — reds here. Writes are stubbed, so
+    #     no GitHub call is made.
+    _ir_main = _IdentityWrites().install()
+    _ir_saved_argv, _ir_saved_route = sys.argv, globals()["_alert_route"]
+    globals()["_alert_route"] = lambda: (None, None)
+    sys.argv = ["worker-pr.py", "identity-refusal", "--repo", "o/r", "--pr", "41",
+                "--reason", "author-not-app-bot", "--issue", "7",
+                "--bot-login", _ir_bot, "--head-sha", "d" * 40]
+    try:
+        _ir_main_rc = main()
+    finally:
+        sys.argv, globals()["_alert_route"] = _ir_saved_argv, _ir_saved_route
+        _ir_main.restore()
+    check("[#972] the `identity-refusal` subcommand is WIRED in main() and reaches the writer",
+          (_ir_main_rc, len(_ir_main.comments), _ir_main.states, _ir_main.issue_status),
+          (0, 2, ["needs-user"], [(7, "needs-user")]))
+
     print("worker-pr self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 
@@ -11773,6 +12249,23 @@ def main():
     srec.add_argument("--issue", type=int,
                       help="the source issue (its needs:*/status:parked labels are part of the "
                            "hold surface)")
+
+    # [registry #972] The target-identity refusal's EXIT. A dedicated subcommand and not a raw
+    # `needs-user --park-cause target-identity` call from the workflow, deliberately: the closed
+    # reason enum, the census row and the idempotence/cap check are the whole substance of this
+    # exit, and putting them in the YAML would leave every one of them in the seam — which is
+    # exactly where this repo keeps measuring its vacuous guards.
+    iref = subparsers.add_parser("identity-refusal", parents=[common])
+    iref.add_argument("--reason", required=True,
+                      choices=tuple(sorted(IDENTITY_REFUSAL_REASONS)))
+    # DELIBERATELY NOT `type=int`, unlike every sibling subcommand. This is the loop's EXIT: an
+    # empty or malformed `--issue` must never be able to abort it, because an aborted exit is the
+    # #972 defect returning. The PR-side park alone already removes the PR from the review
+    # frontier (enumerate_review_items excludes HUMAN_HOLD_PR_LABELS), so a missing source issue
+    # degrades to "park the PR, skip the issue" with a loud warning rather than an argparse exit 2.
+    iref.add_argument("--issue", default="")
+    iref.add_argument("--bot-login", default="")
+    iref.add_argument("--head-sha", default="")
 
     nuser = subparsers.add_parser("needs-user", parents=[common])
     nuser.add_argument("--reason", required=True)
@@ -11970,6 +12463,11 @@ def main():
                            issue=args.issue)
         elif args.command == "stranded-recover":
             stranded_recover(args.repo, args.pr, args.head_sha, issue=args.issue)
+        elif args.command == "identity-refusal":
+            alert_repo, alert_token = _alert_route()
+            identity_refusal(args.repo, args.pr, args.reason, issue=args.issue,
+                             bot_login=args.bot_login, alert_repo=alert_repo,
+                             alert_token=alert_token, head_sha=args.head_sha)
         elif args.command == "needs-user":
             # [registry #869] the CLI seam's class-agreement check (see validate_park_cause):
             # refuses a cause that contradicts the class it would be receipted under, in BOTH

@@ -1799,6 +1799,17 @@ PARK_CAUSES = {
     "history-rewritten": PARK_CLASS_QUESTION,  # head no longer descends from the opened commit
     "marker-corrupt": PARK_CLASS_QUESTION,    # durable round/model/pin markers failed validation
     "routing-unresolvable": PARK_CLASS_QUESTION,  # no concrete provider model in the catalog
+    # [registry #972] review-fix.yml's `Verify target App identity and default branch` step
+    # refused the run. QUESTION and not CAPACITY, decided by the ONE property that separates the
+    # two halves of this table: every capacity cause caps something that CAN come out differently
+    # on the next attempt (a different model tier, a re-run gate, a freed lease), which is what
+    # makes a machine re-admission worth minting. This gate's inputs are the target repo's own
+    # `full_name`/`default_branch`, the App's own login, and the PR's author — a re-dispatch
+    # changes NONE of them, so a retry is identical BY CONSTRUCTION and a capacity park's
+    # auto-readmission would deliver the PR straight back into the same refusal. Terminal on the
+    # first observation, exactly like `history-rewritten` and `routing-unresolvable`, which are
+    # terminal for the same reason.
+    "target-identity": PARK_CLASS_QUESTION,   # target-App identity gate refused the review run
 }
 
 # Causes NO machine path may ever re-classify, re-admit, or convert out of the human terminal —
