@@ -874,9 +874,28 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
     chk("route: unconfigured uses the registry",
         _alert_route(None, None, "reg/reg") == ("reg/reg", None))
 
-    # --- exit codes ---
+    # --- exit codes + the empty-scan-set fail-loud ---
+    import tempfile
+
+    def _rc(lanes, live=()):
+        state = {"repo": "o/r",
+                 "lanes": [dict(x, schedule_run_times=[
+                     t.strftime("%Y-%m-%dT%H:%M:%SZ") for t in x["schedule_run_times"]])
+                     for x in lanes],
+                 "live_runs": list(live), "baselines": {}}
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+            json.dump(state, fh)
+            path = fh.name
+        return main(["--state-file", path, "--now", "2026-07-28T12:00:00Z", "--dry-run"])
+
     chk("a bad repo slug is fail-loud exit 2",
         main(["--repo", "not-a-slug", "--dry-run"]) == 2)
+    # 100% question: if NO workflow carried a `schedule:`, M1's population would be empty
+    # and a `return 0` would report health over zero lanes. Both empty shapes are loud.
+    chk("an empty workflow set is fail-loud exit 2", _rc([]) == 2)
+    chk("a scan set with nothing in scope is fail-loud exit 2",
+        _rc([_lane(in_scope=False, now=NOW)]) == 2)
+    chk("a populated, healthy scan set is exit 0", _rc([_lane(fires=CAP, now=NOW)]) == 0)
 
     # --- YAML SEAM. Neither `bash -n` nor actionlint can see which inputs a watchdog
     # keys on, so the hosting job is asserted structurally, by EXACT match. ---
@@ -922,9 +941,17 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
                 with_ = step.get("with", {})
                 chk("seam: checkout does not persist credentials",
                     with_.get("persist-credentials") is False)
-                sparse = str(with_.get("sparse-checkout", ""))
-                for required in REQUIRED_FILES:
-                    chk(f"seam: sparse-checkout names {required}", required in sparse)
+                # EXACT LINE match, never containment: `.github/workflows` is a
+                # SUBSTRING of `.github/workflows/groom.yml`, so a containment check
+                # passes even when the directory entry — which is what M1 actually reads
+                # every lane's cron from — has been dropped. That mutant SURVIVED a
+                # containment check.
+                sparse_lines = [ln.strip() for ln in
+                                str(with_.get("sparse-checkout", "")).splitlines()
+                                if ln.strip()]
+                for required in (*REQUIRED_FILES, WORKFLOWS_DIR):
+                    chk(f"seam: sparse-checkout names {required} on its own line",
+                        required in sparse_lines)
         # This script is enrolled in the suite the `gate` job actually runs, so it cannot
         # silently leave CI.
         suite = (root / "scripts" / "selftest-suite.txt").read_text().split()
