@@ -93,9 +93,17 @@ PROBE_MAX_SKEW_SECONDS = 300
 # so a future field cannot silently re-open the surface this closes.
 #
 # KNOWN RESIDUAL, stated rather than hidden: `fleet.active_agents` (and the per-repository model
-# counts it summarizes) is a count of LIVE LEASES, not of accounts — but because the catalog's
-# `max_concurrent_workers` is 1, N concurrent agents implies at least N accounts, so it is a lower
-# BOUND on the fleet size. It is kept because it is the dashboard's core operational number and
+# counts it summarizes) is a count of LIVE LEASES, not of accounts. It used to be documented here as
+# a lower BOUND on the fleet size — "the catalog's `max_concurrent_workers` is 1, so N concurrent
+# agents implies at least N accounts" — and that premise is false (#882): accounts carry their own
+# cap, acct01 was hand-set to 12 long ago, and since #278 set-up-account MINTS at the per-provider
+# default (openai 12, anthropic 4). One account can therefore hold many of these leases at once, so
+# N live leases implies only ceil(N / the largest cap in the catalog) accounts — a far weaker
+# inference, and one whose divisor is not even published. The residual is thus WEAKER than it was
+# stated to be, never stronger; nothing that was safe becomes unsafe. Do not restore the cap-1
+# reasoning: a future minimization pass that trusts it would be reading a false invariant, and the
+# suite pins the counter-example (one account, three concurrent leases, `active_agents` 3).
+# It is kept because it is the dashboard's core operational number and
 # because the same count is already public on the `ledger` branch (`data/leases.json`); removing it
 # is a product call for the maintainer, tracked separately, not something to decide inside a
 # minimization pass.
@@ -1689,8 +1697,10 @@ def _self_test():
     # single_account (True vs False), accounts_available (1 vs 3), remaining_account_windows
     # (0.58 vs 1.74), limit_remaining (580 vs 1740), limits_known/accounts_reporting (1 vs 3) and
     # fleet.capacity (eligible/total 1/1 vs 3/3) — i.e. on every field this change touched.
-    def clone_fleet(size, busy=0):
-        """`size` identical accounts, the first `busy` of them holding one live lease each."""
+    def clone_fleet(size, busy=0, leases_per_account=1):
+        """`size` identical accounts, the first `busy` of them holding `leases_per_account` live
+        leases each (accounts really do run several at once — see the #882 note in the
+        FLEET-COMPOSITION block: mint-time `max_concurrent_workers` is 12/4, not 1)."""
         clone_issues, clone_usage, clone_leases = [], {}, []
         for index in range(size):
             clone_handle = f"acct-clone-{index}"
@@ -1705,12 +1715,14 @@ def _self_test():
                                          "5h_reset": now + 3600, "7d_util": "0.8",
                                          "7d_reset": now + 86400}
             if index < busy:
-                clone_leases.append({
-                    "account": hashlib.sha256(
-                        f"{clone_handle}:fixture-salt".encode()).hexdigest()[:16],
-                    "claim_id": f"{index:x}" * 32, "holder": f"owner/repo#{index + 1}@run.1",
-                    "package": "pkg", "role": "impl", "model": "opus",
-                    "issued_at": now - 60, "expires_at": now + 60})
+                for slot in range(leases_per_account):
+                    clone_leases.append({
+                        "account": hashlib.sha256(
+                            f"{clone_handle}:fixture-salt".encode()).hexdigest()[:16],
+                        "claim_id": f"{len(clone_leases):032x}",
+                        "holder": f"owner/repo#{index + 1}@run.{slot + 1}",
+                        "package": "pkg", "role": "impl", "model": "opus",
+                        "issued_at": now - 60, "expires_at": now + 60})
         built = build_dashboard(clone_issues, {"leases": clone_leases}, clone_usage, history, None,
                                 now, "fixture-salt", probe_status=measured_sidecar)
         return {"provider_quota": built["provider_quota"], "fleet": built["fleet"],
@@ -1746,6 +1758,20 @@ def _self_test():
             clone_fleet(size, busy=size)["active_by_repository"]["repositories"][0]["counts"])
            for size in (1, 3)],
           [(1, {"opus": 1}), (3, {"opus": 3})])
+    # #882: and the residual is exactly that — a LEASE count, which bounds the account count only
+    # by ceil(N / the largest `max_concurrent_workers` in the catalog). ONE account holding three
+    # concurrent leases publishes the same `active_agents` as three accounts holding one each, so
+    # the retired "cap is 1, therefore ≥N accounts" reading is refuted here rather than in prose
+    # alone. This goes red if `active_agents` is ever redefined as a count of BUSY ACCOUNTS (the
+    # shape a pass that believed the old invariant would think equivalent): the first tuple would
+    # read 1, not 3.
+    check("[#882] active_agents counts LEASES: 1 account x3 leases == 3 accounts x1 lease",
+          [(clone_fleet(1, busy=1, leases_per_account=3)["fleet"]["active_agents"],
+            clone_fleet(1, busy=1,
+                        leases_per_account=3)["active_by_repository"]["repositories"][0]["counts"]),
+           (clone_fleet(3, busy=3)["fleet"]["active_agents"],
+            clone_fleet(3, busy=3)["active_by_repository"]["repositories"][0]["counts"])],
+          [(3, {"opus": 3}), (3, {"opus": 3})])
     check("[#374] ...and that payload still reports the headroom honestly (not blanked out)",
           (clone_fleet(3)["provider_quota"][0]["headroom"],
            clone_fleet(3)["provider_quota"][0]["windows"][0]["remaining_fraction"],
