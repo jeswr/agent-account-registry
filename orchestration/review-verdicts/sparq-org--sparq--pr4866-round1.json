@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4866,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e664d12bb627cc90f3721187a9626f119c359ba2",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "open_validated checks the header, total size, and medoid, but never validates each record's neighbour entries. node_neighbours returns arbitrary u32 values from the file, and search_slots/search_slots_pq/search_slots_filtered immediately index in_working[nbr as usize] and expanded using them. A crafted .spqg with count=1, degree=1, and neighbour slot u32::MAX therefore opens successfully and panics on nearest(), contradicting the documented guarantee that validation makes later searches bounds-safe. This affects both open_from_bytes and mmap-backed open.",
+    "file": "crates/sparq-vamana/src/graph.rs",
+    "fix_hint": "During open validation, scan each record's declared degree entries and reject every neighbour >= count (also reject a stored degree greater than the header degree rather than silently clamping it). Add a focused malformed-file test that constructs an otherwise valid file with an out-of-range neighbour, asserts open/open_from_bytes returns Err, and therefore exercises the real search-safety invariant.",
+    "severity": "major",
+    "title": "Validated files may contain out-of-range neighbour slots and panic during search"
+   },
+   {
+    "body": "ProductQuantizer::from_bytes computes `want = k * sub_len`, `need = off + want * 4`, and later advances offsets without checked arithmetic. dim and m come directly from persisted bytes; on 32-bit targets these operations can overflow readily, and even on 64-bit a sufficiently large declared dimension can overflow `want * 4`. Debug builds panic; release builds may wrap and make subsequent slicing behavior depend on the wrapped offset. The surrounding graph parser advertises clean rejection of malformed PQ tails, so this is a parser correctness and denial-of-service flaw.",
+    "file": "crates/sparq-vamana/src/quant.rs",
+    "fix_hint": "Use checked_mul/checked_add for centroid counts, byte lengths, and offsets, returning a descriptive Err on overflow before any slice. Add a small test using a forged PQ header with extreme dim/m/k values and assert ProductQuantizer::from_bytes (and ideally a forged PQ section through VamanaIndex::open_from_bytes) returns Err without panicking.",
+    "severity": "major",
+    "title": "PQ codebook parsing uses unchecked attacker-controlled size arithmetic"
+   }
+  ],
+  "progress": null,
+  "summary": "The extraction preserves the main API shape, but the newly public file parser does not uphold its stated hostile-input/fail-cleanly contract. A structurally valid header can contain out-of-range neighbour slots that are accepted by open() and later cause indexing panics during search. The PQ decoder also performs unchecked size arithmetic on attacker-controlled dimensions, allowing overflow/panic rather than a descriptive rejection. These are major correctness/security issues for open_from_bytes and mmap-opened untrusted artifacts, and the current malformed-file test does not exercise either load-bearing path.",
+  "verdict": "request_changes"
+ }
+}
