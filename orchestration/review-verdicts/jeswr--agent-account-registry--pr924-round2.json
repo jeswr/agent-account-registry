@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 924,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "d2bec8823b42915e56063261be252281ca553618",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "For each line, `_workflow_run_shell` first appends either the line or `#` using the previous `pipefail` value, and only afterward applies `delta`. Therefore a body such as `set +o pipefail` followed by `set -o pipefail && producer | head -1` comments out the entire second line even though the shell enables pipefail before executing that pipeline. `_sigpipe_shape_hits` consequently reports no hit. This is a fail-open false negative. The fixture's re-enable control puts the vulnerable pipeline on the next line, so its exact-count assertion still passes with this defect.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Model state changes at command granularity, or at minimum scan the applicable remainder of a line after a proven `set -o pipefail` rather than commenting out that whole line. Add a positive control that disables pipefail, then re-enables it and runs `producer | head -1` on the same line (including normal separators such as `&&` or `;`), and require that shape to be counted.",
+    "severity": "major",
+    "title": "Same-line pipefail re-enable can hide a vulnerable pipeline"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The prior round's heredoc/function/branch/subshell bypasses are now covered conservatively, but the workflow guard remains unsound in a different state-transition case. A command that re-enables pipefail and then runs a vulnerable pipeline on the same shell line is emitted as a comment because output is decided from the old disabled state before the enable is applied. The positive control only places the pipeline on the following line, so it does not catch this fail-open omission. Because this is a new major bypass of the trust-sensitive guard, progress is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
