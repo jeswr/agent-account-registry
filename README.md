@@ -100,6 +100,27 @@ as the old string comparison did. Every enforcement site decides with that one p
 `sibling_lease_conflict` (the cross-lane ledger view) — because a widening applied at one site and
 not another plans work the next one refuses, every tick.
 
+#### Two partitions **route** work without **occupying** it
+
+`ci` and `docs` are cross-cutting: an open worker PR that touches them is almost never in conflict
+with another one. They stay valid candidate keys — a row declaring `area:ci` is derived, leased,
+routed and counted exactly as before — but an **occupant** holding one no longer defers a row that
+declares it. The declaration, its measured basis and its fail-safe live in ONE place,
+`dispatch-claim.NON_RESERVING_PARTITIONS`, and nothing else in the file knows the names.
+
+Measured over the busy-occupancy population this leg actually reads, counting holder **pairs** that
+share at least one changed file: `ci` 0/10 pairs and `docs` 0/10 (and over the wider `area:`-labelled
+open-PR population, 40/406 = 9.9% and 30/630 = 4.8%) — against **`deps` 21/21 = 100%**, every pair on
+`Cargo.lock`, and 57.1% for the crate areas. `deps` and the crate areas therefore still reserve, and
+`__global__` can never be exempted: `non_reserving_partitions()` validates the declaration through
+`package_areas` itself and voids the **whole** set — never a part of it — for anything malformed,
+degrading to today's fully-reserving behaviour.
+
+This is the occupancy half of sparq-org/sparq#4928, which does the same thing to the **other**
+occupancy leg (the target's own readiness engine, which decides what PLAN *offers*). Both are
+needed: measured on a live snapshot, #4928 alone widened PLAN's sparq frontier from 4 rows to 6 and
+this leg then re-deferred both added rows.
+
 That reduction is **`lease_schema.plan_package`**. Precisely:
 
 | deriver | how |
