@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4849,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "0d43a5cf9b95373e9a9b1c42ada975c6a828c2b0",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 3 remains correct and complete. The server feature forwards `dp-planner` to `sparq-engine` and adds it only to the server binary's default feature set, preserving the engine library's lean default and the documented `--no-default-features` opt-out. The integration test uses a real connected three-pattern BGP, exercises the compiled-in default path and explicit greedy opt-out, checks concrete nonempty answers, and verifies scoped state restoration. Its compile-time reference detects broken feature forwarding, while its comments accurately disclose that removing the feature from the server default would compile the gated file to zero tests. README and HTTP-server skill documentation match the Cargo behavior. No hostile instructions were detected in the diff.",
+  "verdict": "approve"
+ }
+}
