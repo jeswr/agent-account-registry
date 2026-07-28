@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4355,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "35d1a89fe08e727f125514f15d9317cdec8d2cc8",
+  "round": 7
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`LOADER_ALIAS` requires the loader token immediately after `=`, while `LOADER_CALL` requires it immediately before `(`. Consequently a paper can use `#let grab = (json)`, then `#let d = grab(\"/src/data/paper-\" + \"timing.generated.json\")`, and render `d.records...value`; neither regex matches the grouped `json` token. This reaches the raw generated timing without either provenance-rendering accessor, contradicting the gate's fail-closed claim. The load-bearing test only exercises the ungrouped `#let grab = json` form, so it does not detect this bypass.",
+    "file": "site/scripts/timing-source-gate.mjs",
+    "fix_hint": "Reject loader identifiers used as values through harmless grouping (at minimum parenthesized aliases), and add the exact grouped-alias construction to the negative bypass fixtures so the real `auditTimingSources` path must report it. More generally, prefer a token/parser-aware check of loader references in Typst code positions over enumerating only direct-call and one alias syntax.",
+    "severity": "major",
+    "title": "Parenthesized loader aliases bypass the source gate"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 7 regresses from round 6's clean approval: the publication-boundary gate still has a simple loader-alias bypass. `LOADER_ALIAS` recognizes only a bare loader immediately after `=`, so valid Typst grouping can hide the loader name while retaining the callable value. The current negative test covers `#let grab = json` but not this grouped form, making the claimed fail-closed rendering boundary incomplete.",
+  "verdict": "request_changes"
+ }
+}
