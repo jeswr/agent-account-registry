@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4739,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "4d2effa9a6b573d216dbdf919fff11b9da05b2e4",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Sections 3.1 and 9 now say the runaway-unroll hang and two source-location losses are captured in a follow-up issue filed with this PR, but neither location identifies that issue. Without an issue number or link, the claimed durable tracking is not auditable from the research record and the actionable correctness/diagnostics work can still be lost. This is narrower than round 2 because the two documentation findings are now explicitly and plausibly dispositioned.",
+    "file": "research/noir-optimization-new-opportunities.md",
+    "fix_hint": "Add the filed follow-up issue's durable identifier or link at the Section 3.1 disposition and/or Section 9 status entry. If no issue was actually filed, file the scoped self-improvement issue first and then cite it.",
+    "severity": "major",
+    "title": "Actionable ACIR defects cite no durable follow-up identifier"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 3 is improving: the changelog and mem2reg-comment findings are now explicitly dispositioned as non-actionable, and the three ACIR findings are said to have been filed for upstream reporting. However, the record gives no issue number or link for that follow-up, so the durable tracking claim cannot be verified and a future reader cannot find the work item. The prior major concern is therefore narrowed but not fully resolved.",
+  "verdict": "request_changes"
+ }
+}
