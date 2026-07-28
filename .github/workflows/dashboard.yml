@@ -430,8 +430,10 @@ jobs:
   # KEEP-ALIVE for the newest scheduled workflows: GitHub's cron registration/delivery for
   # recently-added workflows is unreliable (observed 2026-07-21: metrics missed 3 consecutive
   # 15-min slots; curate/conflict-resolver intermittent). This job piggybacks on dashboard's
-  # PROVEN */15 schedule and re-dispatches a listed workflow ONLY when its last run is older
-  # than its own cadence + slack (no-op when the native schedule works — self-retiring).
+  # PROVEN */15 schedule and re-dispatches a listed workflow ONLY when its liveness anchor is
+  # older than its own cadence + slack (no-op when the native schedule works — self-retiring).
+  # That anchor is the newest RUN for most legs and, for dispatch.yml, the newest EXECUTED TICK
+  # (#922 — see the step body: a run there no longer implies a tick).
   # No secrets, no environment; actions:write scoped to this job for the dispatch POST only.
   cron-keepalive:
     name: Re-dispatch stale scheduled workflows (cron-delivery fallback)
@@ -444,14 +446,41 @@ jobs:
       actions: write
     steps:
       - name: Dispatch any listed workflow whose last run is stale
+        # `id:` so dashboard-gen.py's self-test can EXTRACT and EXECUTE this exact body against
+        # hermetic gh/jq stubs (the #533 / #612 pattern): neither `bash -n` nor actionlint can see
+        # WHICH event a liveness check keys on, so #922 — a leg that reads a stream of pure no-op
+        # runs as a live dispatcher — is invisible to every static check in this repo.
+        id: registry-keepalive
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           now=$(date -u +%s)
-          # workflow-file:stale-threshold-seconds (cadence + slack)
-          for spec in metrics.yml:1200 conflict-resolver.yml:1500 curate.yml:2400 dispatch.yml:1200 groom.yml:1800 retriage.yml:3600; do
-            wf="${spec%%:*}"; limit="${spec##*:}"
+          # workflow-file:stale-threshold-seconds[:executed-marker-artifact] (cadence + slack)
+          #
+          # THE ANCHOR (#922). With no third field the liveness signal is the newest RUN's
+          # created_at. That is a valid proxy only where a run IMPLIES the workflow did its work,
+          # and dispatch.yml is the one listed workflow where it does not: since the #819 tick
+          # floor, a within-floor ring concludes `success` in ~30s having executed NOTHING, and
+          # #79's registry-internal ring sources make those no-op runs the NORMAL case (dispatch is
+          # rung roughly every <=7 min). Anchored on runs, this leg therefore reads a dispatcher
+          # that never executes a tick as permanently live — it looks like coverage and is not.
+          #
+          # A third field names the artifact whose existence IS the "it really executed" record.
+          # `dispatch-tick` is uploaded by dispatch.yml's floor job at the moment it decides to
+          # PROCEED (scripts/dispatch-tick-floor.py TICK_MARKER_ARTIFACT), before the snapshot
+          # runs — so a tick that later FAILS still counts as executed, and a no-op tick has no
+          # marker at all. It is the same executed-tick anchor scripts/dispatch-stall-alert.py
+          # keys on, and it is what makes the kick CURATIVE here: a >1200s gap can only mean the
+          # 600s floor is not the thing holding ticks back, so the run this kick starts finds a
+          # stale anchor, proceeds, and executes the tick that was missing.
+          #
+          # This leg is NOT retired in favour of that watchdog: dispatch-stall-alert PAGES A HUMAN,
+          # the keepalive RE-DISPATCHES. Losing it would turn every cron-delivery gap on the
+          # busiest workflow in the fleet into a manual recovery.
+          for spec in metrics.yml:1200 conflict-resolver.yml:1500 curate.yml:2400 dispatch.yml:1200:dispatch-tick groom.yml:1800 retriage.yml:3600; do
+            wf="${spec%%:*}"; rest="${spec#*:}"; limit="${rest%%:*}"
+            if [ "$rest" != "$limit" ]; then marker="${rest#*:}"; else marker=""; fi
             # LIVE-RUN GUARD (#559): a QUEUED or IN_PROGRESS run of the target counts as FRESH —
             # kicking a live workflow queues a duplicate behind it that its singleton group then
             # runs back-to-back, which is exactly the #559 dup-dispatch storm (a long run's
@@ -465,17 +494,31 @@ jobs:
               echo "keepalive: ${wf} has ${live} queued/in-progress run(s) — live, skipping kick"
               continue
             fi
-            last=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${wf}/runs?per_page=1" \
-                   --jq '.workflow_runs[0].created_at // empty' || true)
+            if [ -n "$marker" ]; then
+              anchor="executed (${marker})"
+              # EQUALITY on the name, never a prefix — `dispatch-plan-<run>-<attempt>` is also a
+              # dispatch artifact and reading it as a tick marker would anchor this on the wrong
+              # event (the same rule dispatch-tick-floor.py's newest_marker_epoch states). Expired
+              # entries are dropped: an expired marker's created_at is real but its retention
+              # window has closed, so it is no longer evidence of anything recent.
+              last=$(ANCHOR="$marker" gh api \
+                     "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${marker}&per_page=100" \
+                     --jq '[.artifacts[] | select(.name == env.ANCHOR and .expired != true)
+                            | .created_at] | max // empty' || true)
+            else
+              anchor="ran"
+              last=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${wf}/runs?per_page=1" \
+                     --jq '.workflow_runs[0].created_at // empty' || true)
+            fi
             prev=0
             [ -n "$last" ] && prev=$(date -u -d "$last" +%s)
             age=$(( now - prev ))
             if [ "$age" -gt "$limit" ]; then
-              echo "keepalive: ${wf} last ran ${age}s ago (limit ${limit}s) — dispatching"
+              echo "keepalive: ${wf} last ${anchor} ${age}s ago (limit ${limit}s) — dispatching"
               gh api -X POST \
                 "repos/${GITHUB_REPOSITORY}/actions/workflows/${wf}/dispatches" -f ref=master
             else
-              echo "keepalive: ${wf} fresh (${age}s <= ${limit}s)"
+              echo "keepalive: ${wf} fresh (${anchor} ${age}s <= ${limit}s)"
             fi
           done
 
