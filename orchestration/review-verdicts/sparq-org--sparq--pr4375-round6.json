@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4375,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "3c87546fa2b8831daf76f345578f36e06afb7247",
+  "round": 6
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 6 resolves the prior major inconsistency. SV-ND-2 now qualifies solution indistinguishability for an unreadable or absent bound index to requesters whose eligible entry set is empty, while explicitly permitting only the SV-ND-4 exception for requesters holding eligible entries. The nearby explanation and the Unreadable descriptor conformance scenario use the same boundary. The resulting requirements are internally consistent, and no new correctness, soundness, test-validity, or security issue is evident in the diff.",
+  "verdict": "approve"
+ }
+}
