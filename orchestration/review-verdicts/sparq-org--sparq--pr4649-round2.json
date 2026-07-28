@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4649,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "41b2a83b60384f46140d30c1b67580233944033d",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`preceded_by_name` delegates ordinary ASCII continuation bytes to `transpile::is_ident_char`, which omits legal PN_LOCAL punctuation such as `-` and internal `.`. Thus valid terms such as `ex:a-selct` or `ex:a.selct` expose `selct` as a candidate after the punctuation and can incorrectly suggest `SELECT`. The new parser-backed test covers Unicode and backslash escapes, but not these standard PN_LOCAL continuations, so the round-one correctness issue is only partially fixed.",
+    "file": "crates/sparq-terse/src/diagnose.rs",
+    "fix_hint": "Make both candidate boundaries follow the complete vendored PN_LOCAL lexical rules, including `-`, internal `.`, percent escapes, PN_LOCAL_ESC, and Unicode, rather than treating only non-ASCII and backslash as additions to `is_ident_char`. Add real-parser-backed regressions for valid prefixed names such as `ex:a-selct` and `ex:a.selct`, asserting parsing succeeds and `keyword_hints` is empty; retain a bare-typo positive control.",
+    "severity": "major",
+    "title": "Valid prefixed names containing hyphens or dots can still produce keyword hints"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 2 fixes the reported Unicode and PN_LOCAL_ESC examples with real-parser-backed tests, but the same major false-positive class remains for ordinary legal PN_LOCAL punctuation. `is_name_byte` claims the only missing name-byte classes are non-ASCII and backslash, yet `PN_CHARS`/`PN_LOCAL` also allow `-` and internal `.`, neither of which `transpile::is_ident_char` accepts. Consequently an ASCII keyword-like suffix after either punctuation is still scanned as a standalone typo inside a valid prefixed name. The public guarantee that every valid query produces no hints is therefore still unmet.",
+  "verdict": "request_changes"
+ }
+}
