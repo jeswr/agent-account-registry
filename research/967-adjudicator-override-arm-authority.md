@@ -1,6 +1,6 @@
 # Should the stuck-escalation adjudicator ever get an explicit `override-arm` authority? (#967)
 
-> 🤖 **SPARQ agent** — design record by Claude Opus 5, 2026-07-28. Maintainer-review document.
+> 🤖 **SPARQ agent** — design record, 2026-07-28. Maintainer-review document.
 > **This record changes no behaviour.** It answers a design question raised as a follow-up while
 > implementing #446 and records the answer, its evidence, and its cost, so the two-disposition
 > shape is a *decided* thing rather than an undocumented omission the next author "fixes".
