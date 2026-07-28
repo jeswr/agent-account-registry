@@ -1032,7 +1032,10 @@ def create_followups(repo, source_issue, spec_file):
                           f"{', '.join(keep)}; creating it WITHOUT labels so the discovered work "
                           "is not lost. It is born unattributable — the intended labels are "
                           "recorded in its body.")
-                    bare = body + f"\n<!-- sparq-followup-labels: {','.join(labels)} -->"
+                    # NOT prefixed `sparq-followup`: the body already carries
+                    # `<!-- sparq-followup:v1 -->`, and a second marker sharing that prefix makes
+                    # any substring probe for the provenance link ambiguous.
+                    bare = body + f"\n<!-- sparq-intended-labels: {','.join(labels)} -->"
                     applied = []
                     result = _run_gh(["issue", "create", "-R", repo, "--title", title,
                                       "--body", bare], check=False)
@@ -2122,8 +2125,12 @@ def _followup_create_behaviour_self_test():
         "invalid, so the retry must re-send the declared set unchanged", _labels_of(t1[1]))
     assert landed["T1 typo"] == set(), landed["T1 typo"]
     assert "creating it WITHOUT labels" in log, log
-    assert "sparq-followup-labels: aera:worker,area:dispatch,from:agent,self-improvement" in (
-        t1[2][t1[2].index("--body") + 1]), t1[2]
+    assert "sparq-intended-labels: aera:worker,area:dispatch,from:agent,self-improvement" in (
+        t1[2][t1[2].index("--body") + 1]), (
+        "BARE_RUNG_RECORDS_INTENDED_LABELS: the last rung minted an unattributable issue without "
+        "recording what it should have carried, so the attribution is unrecoverable", t1[2])
+    # The provenance marker must stay UNAMBIGUOUS: exactly one `sparq-followup` comment in the body.
+    assert t1[2][t1[2].index("--body") + 1].count("sparq-followup") == 1, t1[2]
 
     # (C) ISOLATION, on a raise that is NOT the one just fixed: any per-entry failure is contained.
     # `_known_labels` no longer raises, so without the per-entry guard this property would rest on
