@@ -45,11 +45,14 @@
 """Row-scoped account_pool grants + their exact, per-target postconditions (one shared helper)."""
 
 import argparse
+import atexit
 import importlib.util
 import json
 import os
 import pathlib
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1703,6 +1706,19 @@ def _self_test():
     meta_env = workflow_step_env(workflow, "meta")
     provider_fragment = workflow_block(workflow, "meta", "provider-label")
 
+    # The fragment's REFUSAL arm posts `gh issue comment "$ISSUE" -R "$REPO" --body …`, and running
+    # the real fragment therefore ran the REAL `gh` — MEASURED at five live invocations per
+    # self-test run before the enrolled-suite sandbox existed. A recording fixture `gh`, first on
+    # PATH, keeps the refusal arm executing exactly as written while turning its side effect into
+    # data. `_gh_calls` is asserted on below, so this fake cannot silently stop being reached.
+    _gh_bin = tempfile.mkdtemp()
+    atexit.register(shutil.rmtree, _gh_bin, True)
+    _gh_calls = os.path.join(_gh_bin, "calls")
+    with open(os.path.join(_gh_bin, "gh"), "w", encoding="utf-8") as _fh:
+        _fh.write('#!/bin/sh\nprintf "%s\\n" "$*" >> ' + shlex.quote(_gh_calls) + '\nexit 0\n')
+    os.chmod(os.path.join(_gh_bin, "gh"), 0o755)
+    _gh_path = _gh_bin + os.pathsep + os.environ.get("PATH", "")
+
     def provider_of(labels):
         """(exit code, resolved provider) from the REAL predicate fragment, run under the step's
         OWN `env:` block, both rendered exactly as the Actions runner would render them."""
@@ -1711,7 +1727,8 @@ def _self_test():
         rendered = {key: render_gha_expressions(value, labels)
                     for key, value in meta_env.items()}
         done = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
-                              env={**os.environ, **rendered}, timeout=120, check=False)
+                              env={**os.environ, **rendered, "PATH": _gh_path},
+                              timeout=120, check=False)
         match = re.search(r"^PROV=(.*)$", done.stdout, re.M)
         return done.returncode, (match.group(1) if match else None)
 
@@ -1727,6 +1744,15 @@ def _self_test():
           (provider_of([])[0], provider_of(["area:ci"])[0]), (1, 1))
     check("[#616 r2] a REPEATED single provider label still resolves (unique, not count)",
           provider_of(["provider:openai", "provider:openai"]), (0, "openai"))
+    # NON-VACUITY of the fixture `gh` installed above: the refusal rows must actually have driven
+    # the fragment's `gh issue comment` arm THROUGH it. If this goes False the fake stopped being
+    # reached — either the refusal arm no longer posts, or something bypassed PATH and the real
+    # binary is live again, which is exactly the regression the fixture exists to prevent.
+    check("[#616 r2] the REFUSAL arm posts through the fixture gh (never the real binary)",
+          [line.split()[:2] for line in
+           (open(_gh_calls, encoding="utf-8").read().splitlines()
+            if os.path.exists(_gh_calls) else [])][:1],
+          [["issue", "comment"]])
 
     # ------------------------------------------------------------------------------------------
     # [#278] THE PER-PROVIDER MINT DEFAULTS ARE EXECUTED, AND THE RECORD STEP CONSUMES THEM.

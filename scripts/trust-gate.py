@@ -62,9 +62,28 @@ def _cli_exit_tests():
     me = os.path.abspath(__file__)
     ok = True
 
-    def run_cli(*args):
+    def run_cli(*args, env=None):
         return subprocess.run([sys.executable, me, *args],
-                              capture_output=True, text=True).returncode
+                              capture_output=True, text=True, env=env).returncode
+
+    def fetch_failure_exit():
+        """Exit code of the --fetch path when the permission lookup FAILS.
+
+        This used to be driven by naming a repo that does not exist, which made the row a REAL,
+        ambient-credentialed `gh api repos/<...>/collaborators/x/permission` call to github.com on
+        every self-test run — an escape the enrolled suite could not see, and a network dependency
+        inside a row that reads as hermetic. A failing fixture `gh` on PATH proves the same
+        property offline, and proves it for ANY lookup failure rather than only for HTTP 404.
+        """
+        import tempfile
+        with tempfile.TemporaryDirectory() as fail_bin:
+            fail_gh = os.path.join(fail_bin, "gh")
+            with open(fail_gh, "w", encoding="utf-8") as fh:
+                fh.write('#!/bin/sh\necho "could not resolve to a Repository" >&2\nexit 1\n')
+            os.chmod(fail_gh, 0o755)
+            return run_cli("--author", "x", "--repo", "o/r", "--fetch",
+                           env=dict(os.environ,
+                                    PATH=fail_bin + os.pathsep + os.environ.get("PATH", "")))
 
     checks = [
         ("trusted author exits 0",
@@ -75,10 +94,9 @@ def _cli_exit_tests():
          run_cli("--author", "x", "--permission", "read"), 3),
         ("promoted third-party exits 0",
          run_cli("--author", "x", "--permission", "read", "--maintainer-approved"), 0),
-        # --fetch against an unreachable repo: fetch_permission degrades to "none" ->
-        # untrusted -> exit 3 (fail closed, NEVER a crash exit).
-        ("fetch failure fails closed to 3",
-         run_cli("--author", "x", "--repo", "invalid/definitely-not-a-repo-000", "--fetch"), 3),
+        # A FAILING permission lookup: fetch_permission degrades to "none" -> untrusted ->
+        # exit 3 (fail closed, NEVER a crash exit). Driven offline — see fetch_failure_exit.
+        ("fetch failure fails closed to 3", fetch_failure_exit(), 3),
         # Malformed invocations are hard errors (exit 2), never actionable verdicts.
         ("missing author is a hard error",
          run_cli("--permission", "write"), 2),
