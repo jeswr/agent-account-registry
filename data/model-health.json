@@ -1,14 +1,6 @@
 {
  "records": [
   {
-   "ts": 1785250327,
-   "provider": "openai",
-   "account": "dc2d751954080e13",
-   "model_alias": "sol",
-   "exit_class": "success",
-   "run_id": "30370336522.1"
-  },
-  {
    "ts": 1785250331,
    "provider": "anthropic",
    "account": "9e13ea21abf27e68",
@@ -1644,6 +1636,19 @@
    "model_alias": "",
    "exit_class": "success",
    "run_id": "30403544268.1"
+  },
+  {
+   "ts": 1785276995,
+   "provider": "openai",
+   "account": "dc2d751954080e13",
+   "model_alias": "sol",
+   "exit_class": "no_change",
+   "run_id": "30403819022.1",
+   "input_tokens": 126754,
+   "output_tokens": 815,
+   "wall_seconds": 27,
+   "issue": 2706,
+   "why_no_diff": "too_large"
   }
  ]
 }
