@@ -1793,6 +1793,14 @@
    "model_alias": "opus5",
    "exit_class": "success",
    "run_id": "30320300769.1"
+  },
+  {
+   "ts": 1785203616,
+   "provider": "fleet",
+   "account": "5f5b2dc3fb8e231b",
+   "model_alias": "",
+   "exit_class": "success",
+   "run_id": "30321278494.1"
   }
  ]
 }
