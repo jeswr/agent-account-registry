@@ -56,6 +56,7 @@ because nobody notices when it stops.
 """
 
 import argparse
+import io
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -1011,6 +1012,7 @@ def sweep_workflow_seam_report(workflow=None):
 
 # ---- self-test ---------------------------------------------------------------------------------
 def _self_test():                                                       # noqa: C901 - flat asserts
+    import base64
     import copy
 
     ok = True
@@ -1539,7 +1541,7 @@ def _self_test():                                                       # noqa: 
         def run(self, *, apply_changes=True, max_mints=DEFAULT_MAX_MINTS,
                 max_comments=DEFAULT_MAX_COMMENTS, annotate_repo="o/r",
                 targets=(("o/r", ("jeswr",)),), record_boom=False, pulls_boom=False,
-                mint_boom=False):
+                mint_boom=False, routing_boom=False, comments_boom=False):
             def mint_pr(repo, number, issue_number, routing, authors, pl, iss):
                 self.handed.append({"repo": repo, "number": number, "issue_number": issue_number,
                                     "routing": routing, "authors": authors, "issue": iss})
@@ -1561,14 +1563,23 @@ def _self_test():                                                       # noqa: 
                     raise RuntimeError("pull listing failed: HTTP 502")
                 return self.pulls
 
+            def read_routing(repo):
+                if routing_boom:
+                    raise SweepError("the routing pointer is not a relative repository path")
+                return {"models": {AUTO_IMPL_ALIAS: {"provider": "anthropic"}}}
+
+            def read_comments(repo, number):
+                if comments_boom:
+                    raise RuntimeError("comment listing failed: HTTP 502")
+                return self.comments.get(number, [])
+
             return sweep(
                 list(targets), annotate_repo=annotate_repo,
-                read_routing=lambda repo: {"models": {AUTO_IMPL_ALIAS:
-                                                      {"provider": "anthropic"}}},
+                read_routing=read_routing,
                 read_pulls=read_pulls, read_issue=lambda repo, n:
                     self.issues.get(n, issue(number=n)),
                 read_record=read_record, mint_pr=mint_pr,
-                read_comments=lambda repo, n: self.comments.get(n, []),
+                read_comments=read_comments,
                 post_comment=lambda repo, n, b: self.posted.append((n, b)),
                 apply_changes=apply_changes, max_mints=max_mints, max_comments=max_comments,
                 log=lambda *_a, **_k: None)
@@ -1788,6 +1799,259 @@ def _self_test():                                                       # noqa: 
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+
+    # ---- main(): THE PRODUCTION CALL SITE, argument by argument ---------------------------------
+    # WHY THIS BLOCK EXISTS. Round 2 blocked on "a value pinned through a pure helper while the call
+    # site independently re-wires it"; the repair swept `sweep()`'s call sites and STOPPED THERE.
+    # `main()` is the call site above those, and it was at 0% line coverage — 26 body lines that no
+    # check reached. MEASURED: 13 one-line edits inside it survived the whole suite. The worst is not
+    # subtle: passing `True` instead of `args.apply` makes a manual dispatch advertised as a
+    # census-only preview WRITE REAL LEDGER RECORDS, and `--apply` is the entire safety story of an
+    # unattended writer.
+    #
+    # So `main()` is driven here with a patched argv and recorders in place of the six readers, the
+    # writer factory and `sweep` itself, and every argument it forwards is read back off the
+    # recorded call. Coverage is the instrument that found this, and it is cheaper than mutation
+    # testing: run it, list every function at 0%, and drive those first.
+    def main_call(argv, policy=None, targets_authors=("jeswr",)):
+        """Run the real `main()` with recorders installed. Returns what it forwarded."""
+        seen = {}
+
+        def fake_sweep(targets, **kwargs):
+            seen["targets"] = targets
+            seen.update(kwargs)
+            return census_row(new_counters(mint_cap=kwargs["max_mints"],
+                                          comment_cap=kwargs["max_comments"],
+                                          apply_changes=kwargs["apply_changes"]))
+
+        def fake_mint_caller(mp, registry_repo, apply_changes, log, write_record=None):
+            seen["mint_caller_args"] = (registry_repo, apply_changes)
+            return lambda *a, **k: None
+
+        def fake_gh_readers(mp, registry_repo):
+            seen["gh_readers_repo"] = registry_repo
+            return tuple(f"reader-{name}" for name in
+                         ("routing", "pulls", "issue", "record", "comments", "post"))
+
+        doc = policy if policy is not None else {
+            "repos": {"o/r": {"enabled": True, "review_enrolment_authors": list(targets_authors)}}}
+        patches = {
+            "sweep": fake_sweep, "_mint_caller": fake_mint_caller,
+            "_gh_readers": fake_gh_readers, "_read_policy": lambda: doc,
+            "_load_mint_provenance": lambda: mint_provenance,
+            "_load_policy_resolve": lambda: type("P", (), {
+                "review_enrolment_authors": staticmethod(
+                    lambda name, d: (d["repos"][name].get("review_enrolment_authors") or []))})(),
+        }
+        saved_globals = {name: globals()[name] for name in patches}
+        saved_argv, saved_stderr = sys.argv[:], sys.stderr
+        globals().update(patches)
+        sys.argv = ["auto-mint-provenance.py", *argv]
+        # argparse prints usage to stderr on a refusal; swallow it so a PASSING run's log stays
+        # readable, and assert the exit code instead of scraping the text.
+        sys.stderr = io.StringIO()
+        try:
+            seen["returned"] = main()
+        except SystemExit as exc:                     # argparse refusals are a legitimate outcome
+            seen["exit"] = exc.code
+        finally:
+            globals().update(saved_globals)
+            sys.argv, sys.stderr = saved_argv, saved_stderr
+        return seen
+
+    ran = main_call(["--registry-repo", "o/r", "--annotate-repo", "o/r"])
+    check("main() forwards the DRY RUN by default — apply_changes is args.apply, not True",
+          ran["apply_changes"], False)
+    check("...and the WRITER is built dry too, which is the whole meaning of --apply",
+          ran["mint_caller_args"], ("o/r", False))
+    check("...and the caps it forwards are the parsed arguments' defaults",
+          (ran["max_mints"], ran["max_comments"]), (DEFAULT_MAX_MINTS, DEFAULT_MAX_COMMENTS))
+    check("...and --annotate-repo reaches the sweep as given", ran["annotate_repo"], "o/r")
+    check("...and the readers are the ones _gh_readers built for THIS registry",
+          (ran["gh_readers_repo"], ran["read_routing"], ran["post_comment"]),
+          ("o/r", "reader-routing", "reader-post"))
+    check("...and the population comes from the master-protected enrolment authority",
+          ran["targets"], [("o/r", ("jeswr",))])
+    check("...and a clean run returns 0", ran["returned"], 0)
+
+    applied = main_call(["--registry-repo", "o/r", "--annotate-repo", "o/r", "--apply"])
+    check("--apply reaches BOTH the writer factory and the comment switch, together",
+          (applied["mint_caller_args"], applied["apply_changes"]), (("o/r", True), True))
+
+    capped = main_call(["--registry-repo", "o/r", "--annotate-repo", "o/r",
+                        "--max-mints", "1", "--max-comments", "2"])
+    check("the per-tick caps main() forwards are the OPERATOR's, not constants",
+          (capped["max_mints"], capped["max_comments"]), (1, 2))
+
+    other = main_call(["--registry-repo", "reg/istry", "--annotate-repo", "other/repo"])
+    check("...and --registry-repo and --annotate-repo are DISTINCT arguments, not one value",
+          (other["gh_readers_repo"], other["mint_caller_args"][0], other["annotate_repo"]),
+          ("reg/istry", "reg/istry", "other/repo"))
+
+    check("a run enrolling NOBODY sweeps nothing rather than defaulting to an author",
+          main_call(["--registry-repo", "o/r", "--annotate-repo", "o/r"],
+                    policy={"repos": {"o/r": {"enabled": True}}})["targets"], [])
+    for missing in (["--registry-repo", "o/r"], ["--annotate-repo", "o/r"], []):
+        check(f"main() REFUSES rather than guessing when {missing or 'everything'} is all it has",
+              main_call(missing).get("exit"), 2)
+    check("...and a negative cap is refused rather than silently clamped",
+          main_call(["--registry-repo", "o/r", "--annotate-repo", "o/r",
+                     "--max-mints", "-1"]).get("exit"), 2)
+
+    # THE OPERATOR-VISIBLE OUTPUT. The census reaches the job summary, which is where a human
+    # actually reads whether the tick did anything; a run that decides correctly and reports nowhere
+    # is the silent-minter failure mode in another costume.
+    summary_path = SCRIPTS_DIR.parent / ".git" / f"auto-mint-summary-probe-{os.getpid()}"
+    saved_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    os.environ["GITHUB_STEP_SUMMARY"] = str(summary_path)
+    try:
+        main_call(["--registry-repo", "o/r", "--annotate-repo", "o/r"])
+        written_summary = summary_path.read_text(encoding="utf-8") if summary_path.exists() else ""
+    finally:
+        if saved_summary is None:
+            os.environ.pop("GITHUB_STEP_SUMMARY", None)
+        else:
+            os.environ["GITHUB_STEP_SUMMARY"] = saved_summary
+        summary_path.unlink(missing_ok=True)
+    check("main() writes the census into the job summary an operator actually reads",
+          ("### auto-mint" in written_summary, "enrolled_pulls=0" in written_summary), (True, True))
+
+    # ---- _gh_readers: the live endpoints, the pagination, the pointer guard ---------------------
+    # Also 0% covered, and the survivors there are severe: reading `pulls/{n}` instead of
+    # `issues/{n}` makes every reference resolve as a pull request; reading a FIXED comment thread
+    # makes the dedupe miss forever, so a refusal comment is re-posted on every tick; and NOT
+    # flattening the paginated list is a TOTAL OUTAGE that censuses as `enrolled_pulls=0` — a
+    # fabricated healthy zero, which is the worst failure shape available to this file.
+    class _FakeGH:
+        """Just enough of mint-provenance to drive `_gh_readers` and record every call."""
+
+        LEDGER_REF = "ledger"
+
+        def __init__(self, payloads=None):
+            self.calls, self.posted = [], []
+            self.payloads = payloads or {}
+
+        def _gh_json(self, argv):
+            self.calls.append(list(argv))
+            for needle, value in self.payloads.items():
+                if any(needle in part for part in argv):
+                    return value
+            return None
+
+        def _run_gh(self, argv):
+            self.posted.append(list(argv))
+
+        def _load_worker_pr(self):
+            gh = self
+
+            class _WorkerPR:
+                LEDGER_REF = "ledger"
+
+                @staticmethod
+                def provenance_path(repo, number):
+                    return f"provenance/{repo}/{number}.json"
+
+                @staticmethod
+                def _probe_registry_file(registry_repo, path, ref=None):
+                    gh.calls.append(["probe", registry_repo, path, str(ref)])
+                    return None
+
+            return _WorkerPR()
+
+        @staticmethod
+        def effective_record_body(probe, ledger_ref):
+            return probe(ledger_ref)
+
+    def readers_for(payloads=None, policy=None, call=None):
+        """Build the real readers over a fake gh, and run `call(readers)` WHILE the policy patch is
+        still installed.
+
+        The patch has to outlive the build, and that is not a detail: `read_routing` calls
+        `_read_policy()` at CALL time, so an earlier version of this helper that restored the global
+        in a `finally` around the build alone left every pointer fixture refusing for the wrong
+        reason — "the policy row carries no routing pointer" from the LIVE policy, which has no
+        `o/r` row at all. Those checks passed, and would have passed with the traversal guard
+        deleted. Asserting the guard's own reason is what makes them mean anything."""
+        fake = _FakeGH(payloads)
+        saved_policy = globals()["_read_policy"]
+        globals()["_read_policy"] = lambda: (
+            policy if policy is not None
+            else {"repos": {"o/r": {"routing": "orchestration/routing.toml"}}})
+        try:
+            readers = _gh_readers(fake, "reg/istry")
+            return fake, readers, (None if call is None else total(lambda: call(readers)))
+        finally:
+            globals()["_read_policy"] = saved_policy
+
+    fake, (r_routing, r_pulls, r_issue, r_record, r_comments, r_post), _ = readers_for(
+        payloads={"pulls?state=open": [[{"number": 41}, {"number": 42}], [{"number": 43}]],
+                  "/comments": [[{"body": "a"}], [{"body": "b"}]]})
+    check("read_pulls FLATTENS the paginated slurp — an unflattened page list would make the "
+          "population silently EMPTY while the census reported enrolled_pulls=0",
+          [row["number"] for row in r_pulls("o/r")], [41, 42, 43])
+    check("...and it asks for OPEN pulls, paginated, from the target",
+          any("--paginate" in c and any("repos/o/r/pulls?state=open&per_page=100" in p
+                                       for p in c) for c in fake.calls), True)
+    check("read_comments flattens its pages too", [row["body"] for row in r_comments("o/r", 41)],
+          ["a", "b"])
+    check("...and reads the comments of THE PR IT WAS ASKED ABOUT, not a fixed thread",
+          any(any("repos/o/r/issues/41/comments" in p for p in c) for c in fake.calls), True)
+    fake.calls.clear()
+    r_issue("o/r", 7)
+    check("read_issue reads the ISSUES endpoint — `pulls/{n}` would make every reference resolve "
+          "as a pull request",
+          fake.calls, [["api", "repos/o/r/issues/7"]])
+    fake.calls.clear()
+    r_record("o/r", 41)
+    check("read_record probes the REGISTRY's own provenance path on the ledger ref",
+          fake.calls, [["probe", "reg/istry", "provenance/o/r/41.json", "ledger"]])
+    r_post("o/r", 41, "the refusal body")
+    check("post_comment posts the body it was GIVEN, to that PR",
+          (fake.posted[0][:5], "-f" in fake.posted[0],
+           "body=the refusal body" in fake.posted[0]),
+          (["api", "-X", "POST", "repos/o/r/issues/41/comments", "-f"], True, True))
+
+    # THE PATH-TRAVERSAL GUARD, at its ONLY call site. The predicate has an exhaustive fixture table
+    # above; nothing observed that `read_routing` actually consults it.
+    # Each pointer asserts the guard's OWN reason text, so a fixture that refuses for some unrelated
+    # reason (a missing policy row, say) cannot stand in for the guard having fired.
+    for pointer, because in (("../secrets.toml", "escapes the repository root"),
+                             ("a/../../b", "escapes the repository root"),
+                             ("/etc/passwd", "not a relative repository path"),
+                             ("C:\\x", "not a relative repository path"),
+                             (None, "carries no routing pointer"),
+                             ("", "carries no routing pointer")):
+        fake, _readers, outcome = readers_for(policy={"repos": {"o/r": {"routing": pointer}}},
+                                             call=lambda rs: rs[0]("o/r"))
+        check(f"read_routing REFUSES the routing pointer {pointer!r} instead of fetching it, "
+              f"and says why: {because!r}",
+              (outcome, fake.calls, because in str(routing_pointer_error(pointer))),
+              (("RAISED", "SweepError"), [], True))
+    _fake, _readers, parsed = readers_for(
+        payloads={"contents/": {"encoding": "base64",
+                                "content": base64.b64encode(b'[models.opus5]\nprovider="anthropic"\n'
+                                                            ).decode()}},
+        call=lambda rs: rs[0]("o/r"))
+    check("...while the SHIPPED pointer is fetched and parsed",
+          parsed, {"models": {"opus5": {"provider": "anthropic"}}})
+    _fake, _readers, refused = readers_for(
+        payloads={"contents/": {"encoding": "utf-8", "content": "x"}},
+        call=lambda rs: rs[0]("o/r"))
+    check("...and a payload that is not a base64 file refuses rather than being trusted",
+          refused, ("RAISED", "SweepError"))
+
+    # ---- sweep()'s two remaining uncovered branches ---------------------------------------------
+    routing_boom = _Recorder(clean)
+    check("an UNREADABLE routing catalog SKIPS the target with a named reason and still "
+          "emits a census — it must never raise out of the tick",
+          census_fields(lambda: routing_boom.run(routing_boom=True),
+                        "targets", "enrolled_pulls", "skipped_targets") + (routing_boom.written,),
+          (0, 0, {"o/r": REASON_TARGET_ROUTING_UNREADABLE}, []))
+    annotate_boom = _Recorder([pull(number=41, body="no reference")])
+    row = annotate_boom.run(comments_boom=True)
+    check("a refusal whose ANNOTATION fails is still censused, and the tick continues",
+          (row["refused"], row["refusals"], annotate_boom.written),
+          (1, {REASON_NO_REFERENCE: 1}, []))
 
     # ---- the workflow seam ----------------------------------------------------------------------
     seam = sweep_workflow_seam_report()
