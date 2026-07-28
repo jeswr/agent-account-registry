@@ -1422,6 +1422,59 @@ def _test_dispatch_panel(chk):
         (0, "unknown"))
     chk("[gate-a feed] a target that has never reported says so",
         dispatch_panel(fresh, "other/repo", now), {"status": "no-record"})
+
+    # ---- THE READER ITSELF, driven (same class as dispatch-telemetry's L11) --------------------
+    # `read_dispatch_telemetry` was 0% covered under this file's own `--self-test`: every row above
+    # hands `dispatch_panel` a records LIST built in the test, so the function that PRODUCES that
+    # list from the ledger was never called. `return None` unconditionally, and repointing the GET
+    # at `data/metrics-history.json?ref=master`, both survived — the panel then reads `unavailable`
+    # forever, which is an honest status but a permanent blind spot on the Gate A feed.
+    telemetry_mod = _dispatch_telemetry_module()
+    ring = {"records": [rec(now, 10, 9)]}
+
+    class _RingAPI:
+        """Serves ONE contents GET and remembers the exact path it was asked for."""
+
+        def __init__(self, payload, raise_on_get=False):
+            self.payload, self.raise_on_get, self.paths = payload, raise_on_get, []
+
+        def request(self, method, path, body=None, allow_404=False, retry_conflict=False):
+            del method, body, retry_conflict
+            self.paths.append(path)
+            if self.raise_on_get:
+                raise MetricsError("HTTP 500")
+            if self.payload is None:
+                return None if allow_404 else {}
+            return {"content": base64.b64encode(json.dumps(self.payload).encode()).decode()}
+
+    good = _RingAPI(ring)
+    got = read_dispatch_telemetry(good, "o/r")
+    # THE PATH IS PINNED AGAINST THE WRITER'S OWN CONSTANT, not against a literal — the reader
+    # reading a different file than the recorder writes is the failure, and that is a relation
+    # between two modules, not a string. `LEDGER_PATH` is asserted separately so repointing the
+    # constant itself is also visible.
+    chk("[gate-a reader] read_dispatch_telemetry GETs the ring the recorder WRITES, and returns "
+        "its records",
+        (good.paths, [(r["repo"], r["frontier_width"]) for r in (got or [])],
+         telemetry_mod.LEDGER_PATH),
+        ([f"/repos/o/r/contents/{telemetry_mod.LEDGER_PATH}?ref={LEDGER_REF}"],
+         [("sparq-org/sparq", 10)], "data/dispatch-telemetry.json"))
+    chk("[gate-a reader] ...an absent ring is None (panel `no-record`), never an empty list that "
+        "would read as a dispatcher reporting nothing",
+        read_dispatch_telemetry(_RingAPI(None), "o/r"), None)
+    chk("[gate-a reader] ...a MALFORMED ring is None + a warning, never partially trusted",
+        (read_dispatch_telemetry(_RingAPI({"records": [{"ts": "nope"}]}), "o/r"),
+         read_dispatch_telemetry(_RingAPI({"not-a-ring": True}), "o/r")), (None, None))
+    chk("[gate-a reader] ...and an unreadable GET is None + a warning, never a crash that would "
+        "stop the whole metrics run publishing throughput",
+        read_dispatch_telemetry(_RingAPI(None, raise_on_get=True), "o/r"), None)
+    # END TO END: the reader's output feeds the panel. Driven together, so a reader that returns
+    # the right thing into a panel that ignores it (or vice versa) cannot pass.
+    chk("[gate-a reader] the ring the reader returns is the ring the PANEL publishes",
+        (lambda p: (p["status"], p["frontier_width"], p["realised_dispatches"]))(
+            dispatch_panel(read_dispatch_telemetry(_RingAPI(ring), "o/r"),
+                           "sparq-org/sparq", now)),
+        ("ok", 10, 9))
     # "could not read the ring" and "the dispatcher never reported" are DIFFERENT failures.
     unreadable = attach_dispatch_panels(
         {"targets": {"sparq-org/sparq": {}, "jeswr/agent-account-registry": {}}}, None, now)
