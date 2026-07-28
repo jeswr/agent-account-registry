@@ -933,6 +933,12 @@ jobs:
           # file, so the strictly set-validated plan schema is untouched). A target that planned but
           # produced no census is a telemetry hole, not a silent zero — say so out loud. This is
           # NOT fatal: telemetry must never be able to stop the fleet dispatching.
+          # >>> census-write — EXTRACTED AND EXECUTED by `scripts/dispatch-telemetry.py
+          # --self-test`. This is the PRODUCING end of the PLAN -> CLAIM hand-off: the filename and
+          # the directory written here have to agree with the artifact member `upload-plan`
+          # carries, and neither agreement is visible in either step on its own. Executed, so the
+          # basename is READ OFF the file this block actually creates and compared with the parsed
+          # upload path. Inputs: `Path`, `json`, `out_dir`, `repos`, `frontier_censuses`.
           missing_census = [repo for repo in repos if repo not in frontier_censuses]
           if missing_census:
               print("::warning::dispatch telemetry: no frontier census for "
@@ -940,6 +946,7 @@ jobs:
           Path(out_dir, "frontier-census.json").write_text(
               json.dumps({"repositories": frontier_censuses}, indent=2, sort_keys=True) + "\n",
               encoding="utf-8")
+          # <<< census-write
           print(f"PLAN rows: {sum(len(repo['items']) for repo in repositories)} issue item(s)")
           PY
 
@@ -1336,7 +1343,15 @@ jobs:
           # step wrote, so CLAIM receives ONE document describing the whole
           # frontier -> plan-rows -> realised chain. Best-effort: a telemetry merge failure must
           # never fail PLAN, and a census the merge could not reach simply carries no assemble leg
-          # (which the record then shows as a null leg, not as a zero).
+          # (which the record then shows as a NULL leg, not as a zero — build_record._maybe, and
+          # the `a MISSING assemble leg records null, never a coerced 0` self-test row).
+          # >>> assemble-merge — EXTRACTED AND EXECUTED by
+          # `scripts/dispatch-telemetry.py --self-test` against a real census file on disk. It used
+          # to be checked by searching the RAW workflow text for two substrings, which the step's
+          # own comments satisfy: replacing this whole block with `pass` left the suite green while
+          # the assemble leg — the leg where the frontier was MEASURED to die — silently stopped
+          # reaching CLAIM. A block that is code is tested by RUNNING it.
+          # Inputs: `Path`, `json`, `out_dir`, `assembler_census`.
           census_path = Path(out_dir, "frontier-census.json")
           try:
               census_doc = json.loads(census_path.read_text(encoding="utf-8"))
@@ -1347,6 +1362,7 @@ jobs:
                   json.dumps(census_doc, indent=2, sort_keys=True) + "\n", encoding="utf-8")
           except (OSError, ValueError) as exc:
               print(f"::warning::dispatch telemetry: assemble-leg merge failed ({exc})")
+          # <<< assemble-merge
           # [registry #762] ONE census line on EVERY plan, listing every bucket including the
           # zeros. A per-stage rate cannot express a MISSING EDGE (#753); only a population
           # partition can, and only if the empty buckets are printed too — an absent bucket and

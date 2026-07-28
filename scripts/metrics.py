@@ -688,7 +688,18 @@ def dispatch_panel(records, repo, now, stale_after=DISPATCH_STALE_SECONDS):
         # (registry #758). `__global__` means ONE workspace-wide reservation ate those rows, which
         # argues AGAINST widening crate parallelism; a crate name means genuine contention on that
         # crate. `__deferred-retry__` / `__uncensused__` are non-crate buckets — see dispatch.yml.
-        "assembler_deferrals": int(latest.get("assembler_deferrals", 0) or 0),
+        # NULL-PRESERVING, deliberately. `int(x or 0)` publishes 0 for a leg that never reported,
+        # which is the one number that must never be fabricated here: `assembler_deferrals=0` on
+        # the feed reads as "the assemble leg is healthy", and the assemble leg is exactly where
+        # the frontier was measured to die. `assemble_leg` states which of the two it is.
+        "assemble_leg": (latest.get("assemble_leg")
+                         if latest.get("assemble_leg") in {"reported", "missing"}
+                         else ("reported" if isinstance(latest.get("assembler_deferrals"), int)
+                               else "missing")),
+        "assembler_deferrals": (latest["assembler_deferrals"]
+                                if isinstance(latest.get("assembler_deferrals"), int)
+                                and not isinstance(latest.get("assembler_deferrals"), bool)
+                                else None),
         "assembler_by_area": dict(latest.get("assembler_by_area") or {}),
         "chain": dict(latest.get("chain") or {}),
         "candidates": int(latest.get("candidates", 0) or 0),
@@ -1376,8 +1387,22 @@ def _test_dispatch_panel(chk):
         "sparq-org/sparq", now)
     chk("[gate-a feed] the feed says WHERE the frontier was lost, not just that it was",
         (chained["assembler_deferrals"], chained["assembler_by_area"],
-         chained["chain"]["unaccounted"], chained["realisation_rate"]),
-        (30, {"__global__": 30}, 0, 0.0))
+         chained["chain"]["unaccounted"], chained["realisation_rate"],
+         chained["assemble_leg"]),
+        (30, {"__global__": 30}, 0, 0.0, "reported"))
+    # ABSENT IS NOT ZERO, all the way to the PUBLISHED feed. `int(x or 0)` here would republish a
+    # LOST assemble leg as `assembler_deferrals: 0`, which on this panel reads as "the assemble leg
+    # is healthy" — and the assemble leg is precisely where the frontier was measured to die. The
+    # record already distinguishes the two states (dispatch-telemetry's `_maybe` / `assemble_leg`);
+    # this row is what stops the last hop from collapsing them again.
+    lost = dispatch_panel([rec(now, 32, 0)], "sparq-org/sparq", now)
+    chk("[gate-a feed] a LOST assemble leg is published as null + `missing`, never as a healthy 0",
+        (lost["assembler_deferrals"], lost["assemble_leg"]), (None, "missing"))
+    chk("[gate-a feed] ...and a leg that reported 0 is published as 0 + `reported`",
+        (lambda p: (p["assembler_deferrals"], p["assemble_leg"]))(
+            dispatch_panel([rec(now, 32, 0, assembler_deferrals=0,
+                                assemble_leg="reported")], "sparq-org/sparq", now)),
+        (0, "reported"))
     chk("[gate-a feed] a target that has never reported says so",
         dispatch_panel(fresh, "other/repo", now), {"status": "no-record"})
     # "could not read the ring" and "the dispatcher never reported" are DIFFERENT failures.

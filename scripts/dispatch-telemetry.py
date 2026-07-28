@@ -288,6 +288,18 @@ def build_record(repo, run_id, frontier, dispatch, now):
         value = source.get(key, 0)
         return int(value) if isinstance(value, int) and value >= 0 else 0
 
+    def _maybe(source, key):
+        """The non-negative int at `key`, or None when it is ABSENT or unusable.
+
+        The nullable counterpart of `_n`. Used ONLY for the assemble leg, where "the leg reported
+        zero" and "the leg never reported" are different facts and collapsing them publishes a
+        healthy-looking zero for the leg that is actually missing.
+        """
+        value = source.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return None
+        return value
+
     def _areas(key):
         value = frontier.get(key)
         return ({str(k): int(v) for k, v in value.items() if isinstance(v, int) and v > 0}
@@ -305,19 +317,29 @@ def build_record(repo, run_id, frontier, dispatch, now):
     # anywhere on it), so each leg is named and the residual is carried explicitly rather than
     # absorbed. `route_rejections` is the frontier rows plan_dispatch refused (ambiguous/unknown
     # role) — derived, never assumed zero.
-    before_assemble = _n(frontier, "plan_rows_before_assemble")
-    assembler_deferrals = _n(frontier, "assembler_deferrals")
+    # ABSENT IS NOT ZERO, and this distinction is the whole point of the leg. `assembler_deferrals:
+    # 0` means the assemble leg RAN and deferred nothing. A MISSING key means the leg never
+    # reported at all — the PLAN-side merge could not reach the census, or the census never
+    # travelled. `_n` coerced both to 0, so a LOST assemble leg published `assembler_deferrals=0`:
+    # the leg where the frontier was MEASURED to die would have read healthy forever, on the very
+    # feed this record exists to make honest. That is a fabricated number of exactly the kind the
+    # rest of this module refuses, so the leg is nullable and its absence is stated.
+    before_assemble = _maybe(frontier, "plan_rows_before_assemble")
+    assembler_deferrals = _maybe(frontier, "assembler_deferrals")
+    leg_reported = before_assemble is not None and assembler_deferrals is not None
     entering = frontier_width + _n(frontier, "deferred_retry_width")
     chain = {
         "frontier_and_retry_rows": entering,
         "route_rejections": max(0, entering - before_assemble) if before_assemble else 0,
         "assembler_deferrals": assembler_deferrals,
-        "claim_deferrals": max(0, before_assemble - assembler_deferrals - planned_rows)
-                           if before_assemble else 0,
+        "claim_deferrals": (max(0, before_assemble - assembler_deferrals - planned_rows)
+                            if leg_reported and before_assemble else 0),
         "realised_dispatches": realised,
         "unrealised_planned_rows": planned_rows - realised,
     }
-    chain["unaccounted"] = entering - (
+    # ...and the RESIDUAL is not computable without the leg. Attributing the whole gap to the legs
+    # that did report would be the same fabrication one level up, so it is null too.
+    chain["unaccounted"] = None if not leg_reported else entering - (
         chain["route_rejections"] + chain["assembler_deferrals"] + chain["claim_deferrals"]
         + chain["realised_dispatches"] + chain["unrealised_planned_rows"])
     return {
@@ -333,9 +355,12 @@ def build_record(repo, run_id, frontier, dispatch, now):
         "unrealised_rows": planned_rows - realised,
         "conflict_deferrals": _n(frontier, "conflict_deferrals"),
         "conflict_by_area": areas,
+        # NULLABLE, deliberately — see the `_maybe` note above. `assemble_leg` states the fact
+        # directly so no consumer has to infer "missing" from a null it might coerce.
         "plan_rows_before_assemble": before_assemble,
         "assembler_deferrals": assembler_deferrals,
         "assembler_by_area": _areas("assembler_by_area"),
+        "assemble_leg": "reported" if leg_reported else "missing",
         "chain": chain,
         "census": {str(k): int(v) for k, v in (census_doc.get("buckets") or {}).items()
                    if isinstance(v, int)},
@@ -352,6 +377,12 @@ def render_log_line(record):
     lines, runtime stdout included). Emitting the record as JSON to the log would destroy it, so the
     log carries a flat key=value summary and the ledger carries the record.
     """
+    def _flat(value):
+        """`null` for a missing leg. Rendering it as `0` in the ONE line a human reads would
+        undo, at the display layer, exactly the absent-is-not-zero distinction build_record makes.
+        """
+        return "null" if value is None else str(value)
+
     line = (
         "dispatch-telemetry "
         f"repo={record.get('repo', '?')} "
@@ -360,8 +391,9 @@ def render_log_line(record):
         f"realised_dispatches={record.get('realised_dispatches', 0)} "
         f"unrealised_rows={record.get('unrealised_rows', 0)} "
         f"conflict_deferrals={record.get('conflict_deferrals', 0)} "
-        f"assembler_deferrals={record.get('assembler_deferrals', 0)} "
-        f"chain_unaccounted={(record.get('chain') or {}).get('unaccounted', 0)} "
+        f"assemble_leg={record.get('assemble_leg', 'missing')} "
+        f"assembler_deferrals={_flat(record.get('assembler_deferrals'))} "
+        f"chain_unaccounted={_flat((record.get('chain') or {}).get('unaccounted'))} "
         f"census_total={record.get('census_total', 0)} "
         f"census_unclassified={record.get('census_unclassified', 0)} "
         f"attribution={record.get('attribution', 'unavailable')}"
@@ -431,6 +463,14 @@ def _valid_record(record):
         return False
     for field in _REQUIRED_FIELDS[3:]:
         if not isinstance(record.get(field), int) or record[field] < 0:
+            return False
+    # The assemble leg is NULLABLE — `None` means the leg never reported, which is a fact the ring
+    # must be able to carry. It must NOT be able to carry anything else: a string or a negative
+    # there would flow to the published panel unchecked.
+    for field in ("plan_rows_before_assemble", "assembler_deferrals"):
+        value = record.get(field)
+        if value is not None and (isinstance(value, bool)
+                                  or not isinstance(value, int) or value < 0):
             return False
     for field in ("conflict_by_area", "census"):
         value = record.get(field, {})
@@ -792,6 +832,38 @@ def _norm_runner_temp(value):
     return text
 
 
+def _artifact_paths(step):
+    """The `path:` members of an upload/download-artifact step, as EXACT path strings.
+
+    Substring checks over the step text cannot see a member being RENAMED: `frontier-census.json`
+    is a substring of `frontier-census.json.disabled`, and `if-no-files-found: error` does not fire
+    while the OTHER member still resolves — so the census silently stops travelling and CLAIM
+    records nothing, with every link individually looking plausible.
+    """
+    raw = str(((step or {}).get("with") or {}).get("path", ""))
+    return [line.strip() for line in raw.split("\n") if line.strip()]
+
+
+def _landed_artifact_paths(upload, download):
+    """Where each uploaded member ACTUALLY LANDS in the consuming job, computed not asserted.
+
+    `actions/download-artifact` extracts each member to `<with.path>/<basename>`. Deriving that set
+    from the three links — upload `path:`, download `path:`, and the artifact `name:` on both —
+    is the only check a per-link assertion cannot replace: every link can be individually
+    well-formed while the composition points the reader at a file that is never written. `path:
+    plan` -> `path: plan-x` is exactly that shape, and it is a SUBSTRING of itself.
+    """
+    up_name = str(((upload or {}).get("with") or {}).get("name", "")).strip()
+    down_name = str(((download or {}).get("with") or {}).get("name", "")).strip()
+    if not up_name or up_name != down_name:
+        return set()          # a name mismatch downloads nothing at all
+    directory = str(((download or {}).get("with") or {}).get("path", "")).strip().rstrip("/")
+    if not directory:
+        return set()
+    return {f"{directory}/{_norm_runner_temp(member).rsplit('/', 1)[-1]}"
+            for member in _artifact_paths(upload)}
+
+
 def _cli_args(script, marker):
     """`{flag: value}` for the ONE invocation in a step's `run:` whose text contains `marker`.
 
@@ -921,15 +993,49 @@ def _self_test():   # noqa: C901 — one flat assertion table, deliberately
          mixed["chain"]["unaccounted"], sum(
              v for k, v in mixed["chain"].items() if k != "frontier_and_retry_rows")),
         (2, 1, 0, 12))
-    chk("[chain-sum] a target with no assemble leg reported leaves a VISIBLE residual",
-        (lambda c: (c["assembler_deferrals"], c["unaccounted"]))(
-            build_record("o/t", "99.1", dict(frontier_doc, frontier_width=10,
-                                             deferred_retry_width=0),
-                         {"planned": 0, "launched": 0}, 100)["chain"]), (0, 10))
+    # ---- ABSENT IS NOT ZERO: a LOST assemble leg records NULL, never a coerced 0 ----------------
+    # THE PROMISE IN THE WORKFLOW COMMENT, MADE TRUE. `dispatch.yml` says a census the merge could
+    # not reach "carries no assemble leg (which the record then shows as a null leg, not as a
+    # zero)". It did not: `_n` coerced the missing key to 0, so a lost leg published
+    # `assembler_deferrals=0` — and 0 on that field means "the assemble leg ran and deferred
+    # nothing", i.e. the leg where the frontier was MEASURED to die would have read HEALTHY
+    # forever. Delete the PLAN-side merge and this is the row that goes red.
+    lost_leg = build_record("o/t", "99.1",
+                            dict(frontier_doc, frontier_width=10, deferred_retry_width=0),
+                            {"planned": 0, "launched": 0}, 100)
+    chk("[null-leg] a census that reached CLAIM with NO assemble leg records null, never 0",
+        (lost_leg["assemble_leg"], lost_leg["assembler_deferrals"],
+         lost_leg["plan_rows_before_assemble"], lost_leg["chain"]["assembler_deferrals"],
+         lost_leg["chain"]["unaccounted"]),
+        ("missing", None, None, None, None))
+    # ...and a leg that DID report zero is a different record. Both rows are needed: either one
+    # alone is satisfied by hard-coding the other answer.
+    reported_zero = build_record(
+        "o/t", "99.1",
+        dict(frontier_doc, frontier_width=10, deferred_retry_width=0,
+             plan_rows_before_assemble=10, assembler_deferrals=0),
+        {"planned": 10, "launched": 10}, 100)
+    chk("[null-leg] ...while a leg that RAN and deferred nothing records a real 0 and a real "
+        "residual — the two states are distinguishable, which is the whole point",
+        (reported_zero["assemble_leg"], reported_zero["assembler_deferrals"],
+         reported_zero["chain"]["assembler_deferrals"], reported_zero["chain"]["unaccounted"]),
+        ("reported", 0, 0, 0))
+    chk("[null-leg] the ledger ACCEPTS a null leg (it must be able to carry the fact) but "
+        "refuses a malformed one",
+        (_valid_record(lost_leg),
+         _valid_record(dict(lost_leg, assembler_deferrals="none")),
+         _valid_record(dict(lost_leg, plan_rows_before_assemble=-1))),
+        (True, False, False))
     chk("[chain-sum] the brace-free log line carries the assemble leg and the residual",
         ("assembler_deferrals=30" in render_log_line(measured),
          "chain_unaccounted=0" in render_log_line(measured),
          "{" in render_log_line(measured)), (True, True, False))
+    chk("[null-leg] ...and the ONE line a human reads says `null`, not `0`",
+        ("assembler_deferrals=null" in render_log_line(lost_leg),
+         "chain_unaccounted=null" in render_log_line(lost_leg),
+         "assemble_leg=missing" in render_log_line(lost_leg),
+         "assemble_leg=reported" in render_log_line(reported_zero)),
+        (True, True, True, True))
     # tick_records keeps a census-only repo (the exact silent-improvement failure).
     ticks = tick_records({"repositories": {"a/b": frontier_doc, "c/d": frontier_doc}},
                          {"by_repo": {"a/b": {"planned": 4, "launched": 4}}}, "99.1", 100)
@@ -1413,10 +1519,104 @@ def _self_test():   # noqa: C901 — one flat assertion table, deliberately
         (blind_record["assembler_by_area"], blind_record["assembler_deferrals"],
          blind_kept, _sums(blind_record)),
         ({"__uncensused__": 3}, 3, [1], 0))
-    assemble_yaml = Path(workflow).read_text(encoding="utf-8")
-    chk("[YAML seam] PLAN merges the assemble leg into the census CLAIM will read",
-        ('census_doc.setdefault("repositories", {}).setdefault(' in assemble_yaml,
-         "assembler_census.items()" in assemble_yaml), (True, True))
+    # ---- THE PLAN -> CLAIM ARTIFACT HAND-OFF, link by link, BY PARSED STRUCTURE ----------------
+    # WHY THIS BLOCK EXISTS IN THIS SHAPE. Every link below used to be checked by searching step
+    # TEXT for a substring, and a substring cannot see a value being WIDENED or a name being
+    # EXTENDED — `frontier-census.json` is a substring of `frontier-census.json.disabled`,
+    # `path: plan` of `path: plan-x`, and the raw-file merge check was satisfied by the step's own
+    # COMMENTS. Three of the five links survived deletion that way. So the whole hand-off is
+    # asserted from the PARSED workflow, and the end-to-end property is COMPUTED from the links
+    # rather than asserted on each of them separately.
+    #
+    # THE LINKS: (L1) the census block computes+publishes [executed, above]; (L2) PLAN writes
+    # `frontier-census.json` into `out_dir`; (L3) the assemble block computes `assembler_census`
+    # [executed, above]; (L4) PLAN merges L3 into L2's file [executed, below]; (L5) `upload-plan`
+    # carries it; (L6) `download-plan` extracts it; (L7) the recorder is pointed at where it lands;
+    # (L8) CLAIM writes the dispatch summary; (L9) the recorder reads THAT file; (L10)
+    # dispatch-claim mirrors each launch into the per-target map [tested in dispatch-claim.py].
+
+    import tempfile   # noqa: PLC0415 — self-test only
+    # L4 — EXECUTED, against a real census file on disk. Replacing the merge with `pass` reds this
+    # row; no comment can satisfy it, because nothing is being searched for.
+    merge_block = _workflow_block(workflow, "assemble", "assemble-merge")
+    with tempfile.TemporaryDirectory() as merge_dir:
+        Path(merge_dir, "frontier-census.json").write_text(
+            json.dumps({"repositories": {"o/t": {"frontier_width": 3}}}), encoding="utf-8")
+        exec(merge_block,   # noqa: S102 — the workflow block, executed on purpose
+             {"Path": Path, "json": json, "out_dir": merge_dir, "print": lambda *_a, **_k: None,
+              "assembler_census": {"o/t": {"plan_rows_before_assemble": 7,
+                                           "assembler_deferrals": 4,
+                                           "assembler_by_area": {"ci": 4}}}})
+        merged = json.loads(
+            Path(merge_dir, "frontier-census.json").read_text(encoding="utf-8"))["repositories"]
+    chk("[hand-off L4] the assemble leg is MERGED INTO the census file CLAIM reads, and the "
+        "readiness-side fields survive the merge",
+        (merged["o/t"].get("frontier_width"), merged["o/t"].get("plan_rows_before_assemble"),
+         merged["o/t"].get("assembler_deferrals"), merged["o/t"].get("assembler_by_area")),
+        (3, 7, 4, {"ci": 4}))
+    # ...and a census file it cannot read is a WARNING, never a failed PLAN (telemetry must not be
+    # able to stop the fleet) — executed on a directory with no census in it.
+    with tempfile.TemporaryDirectory() as empty_dir:
+        merge_error = None
+        try:
+            exec(merge_block,   # noqa: S102
+                 {"Path": Path, "json": json, "out_dir": empty_dir,
+                  "print": lambda *_a, **_k: None,
+                  "assembler_census": {"o/t": {"assembler_deferrals": 4}}})
+        except Exception as exc:            # noqa: BLE001 — the mutant being pinned
+            merge_error = f"{type(exc).__name__}: {exc}"
+    chk("[hand-off L4] ...and an unreadable census file degrades to a warning, never a failed PLAN",
+        merge_error, None)
+
+    upload = _workflow_step_node(workflow, "upload-plan")
+    download = _workflow_step_node(workflow, "download-plan")
+    recorder = _workflow_step_node(workflow, "dispatch-telemetry")
+    recorder_args = _cli_args(str(recorder.get("run", "")), "dispatch-telemetry.py record")
+    # L2 — EXECUTED. The producing end: the basename is READ OFF the file the block actually
+    # creates, never searched for, and compared with the parsed upload member. PLAN writing
+    # `census.json` while the artifact carries `frontier-census.json` is invisible in either step.
+    write_block = _workflow_block(workflow, "readiness", "census-write")
+    with tempfile.TemporaryDirectory() as write_dir:
+        exec(write_block,   # noqa: S102 — the workflow block, executed on purpose
+             {"Path": Path, "json": json, "out_dir": write_dir, "repos": ["o/t", "o/u"],
+              "print": lambda *_a, **_k: None,
+              "frontier_censuses": {"o/t": {"frontier_width": 3}}})
+        written = sorted(p.name for p in Path(write_dir).iterdir())
+        written_doc = json.loads(
+            Path(write_dir, written[0]).read_text(encoding="utf-8")) if written else {}
+    chk("[hand-off L2] PLAN WRITES the census, and the file it creates is the artifact member "
+        "`upload-plan` carries",
+        (written,
+         sorted(written_doc.get("repositories", {})),
+         [_norm_runner_temp(m).rsplit("/", 1)[-1] for m in _artifact_paths(upload)
+          if m.endswith(tuple(written))]),
+        (["frontier-census.json"], ["o/t"], ["frontier-census.json"]))
+    # L5 — EXACT path members, not a substring. Renaming a member (`…json` -> `…json.disabled`)
+    # leaves `if-no-files-found: error` silent, because the OTHER member still resolves.
+    chk("[hand-off L5] the upload step carries BOTH artifact members as EXACT paths, and refuses "
+        "to upload an empty artifact",
+        (sorted(_norm_runner_temp(member) for member in _artifact_paths(upload)),
+         ((upload.get("with") or {}).get("if-no-files-found"))),
+        (["<runner-temp>/frontier-census.json", "<runner-temp>/plan.json"], "error"))
+    # L5/L6 — the two ends must name the SAME artifact. A name drift downloads nothing at all, and
+    # nothing in either step's own text reveals it.
+    chk("[hand-off L5+L6] upload and download name the SAME artifact",
+        ((upload.get("with") or {}).get("name") == (download.get("with") or {}).get("name"),
+         str((download.get("with") or {}).get("path", ""))),
+        (True, "plan"))
+    # L7 — THE COMPOSITION, computed from L5+L6 rather than asserted per link. This is the row that
+    # `path: plan` -> `path: plan-x` cannot pass: each link stays individually well-formed, and the
+    # recorder ends up pointed at a file that is never written.
+    landed = _landed_artifact_paths(upload, download)
+    claim_plan_args = _cli_args(
+        str(_workflow_step_node(workflow, "claim").get("run", "")), "dispatch-claim.py")
+    chk("[hand-off L7] every consumer path RESOLVES to a member that actually lands — upload "
+        "path + artifact name + download path + the reader's flag, COMPOSED",
+        (sorted(landed),
+         _cli_args(str(recorder.get("run", "")),
+                   "dispatch-telemetry.py record").get("--frontier") in landed,
+         claim_plan_args.get("--plan") in landed),
+        (["plan/frontier-census.json", "plan/plan.json"], True, True))
 
     claim_step = _workflow_step_text(workflow, "dispatch-telemetry")
     chk("[YAML seam] the CLAIM call site runs the recorder, always(), and cannot fail the tick",
@@ -1430,7 +1630,6 @@ def _self_test():   # noqa: C901 — one flat assertion table, deliberately
     # ever appended and Gate A is evaluated on a `realised_dispatches` that was never measured —
     # with the whole suite green. Comparing the PARSED scalar forbids every widening of the guard,
     # not just the one spelling a reviewer happened to think of.
-    recorder = _workflow_step_node(workflow, "dispatch-telemetry")
     chk("[YAML seam] the recorder's `if:` is EXACTLY always() — a widened guard cannot disable it "
         "behind a substring match",
         (str(recorder.get("if")), recorder.get("continue-on-error")), ("always()", True))
@@ -1449,7 +1648,6 @@ def _self_test():   # noqa: C901 — one flat assertion table, deliberately
     # count absent, and `realised_dispatches` fabricated as 0 for every target. The value is
     # additionally pinned AGAINST THE WRITER below rather than only against a literal, so the
     # reader and the writer cannot drift apart in a single edit either.
-    recorder_args = _cli_args(recorder_run, "dispatch-telemetry.py record")
     chk("[YAML seam] every recorder argument is pinned to a VALUE, not merely present",
         (recorder_args.get("--frontier"),
          _norm_runner_temp(recorder_args.get("--summary")),
