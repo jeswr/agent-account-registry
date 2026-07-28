@@ -107,6 +107,11 @@
 # still inherits its ORIGINAL authorization (#579) rather than whatever the labels say at retry
 # time. It is deliberately NOT a fifth member of the pre-claim slot-freeness union: a binding can
 # only exist where a claim ref already exists, so it would be provably redundant.
+# The binding is written AFTER the two secret-absence proofs and immediately BEFORE `gh secret set`
+# (review round 2). Reconcile can prove the bound slot's secret EXISTS but never WHO wrote it, so a
+# binding left behind by an absence-probe REFUSAL would be read by the retry as this enrollment's
+# own completed capture — adopting an out-of-band credential and registering an account around it.
+# No resumable evidence is published until both scopes have been proven empty.
 #
 # GRANT-SCOPING fix (#579, re-filed from #190; the closed PR #260 preserves six prior review
 # rounds): enrollment used to append the new handle to EVERY `account_pool` row in
@@ -850,8 +855,9 @@ jobs:
           # dispatch-secrets environment — the post-#101 canonical home; an env-only stray must be
           # visible BEFORE the irreversible claim, not first at the absence probe) — each fully
           # paginated, because any capped listing silently treats every unseen slot as free — plus a
-          # secret-absence probe right before the upsert. If any listing fails, freeness cannot be
-          # proven -> fail closed. The pre-login hint is reused when still free so a retry converges
+          # secret-absence probe at BOTH scopes before anything durable (binding or credential) is
+          # written for the claimed slot. If any listing fails, freeness cannot be proven -> fail
+          # closed. The pre-login hint is reused when still free so a retry converges
           # on the same slot.
           reserved=${RESERVED_HANDLE#acct}; reserved=$((10#$reserved))
           claimed=""
@@ -901,8 +907,35 @@ jobs:
           fi
           HANDLE=$(printf 'acct%02d' "$claimed")
           SECRET_NAME=$(printf 'ACCT%02d_TOKEN' "$claimed")
-          # [#534] BIND THE REQUEST TO THE SLOT, BEFORE THE IRREVERSIBLE CAPTURE. The register step's
-          # `request_issue:` line is the #211 reconcile key, but it is written AFTER `gh secret set`
+          # ABSENCE PROOF AT BOTH SCOPES, BEFORE ANY RESUMABLE EVIDENCE EXISTS (review round 2 of
+          # #534). The claim defeats every protocol-observing writer; these probes narrow the
+          # residual out-of-protocol (manual) window — a write racing the union enumeration above —
+          # to probe->set. Only an explicit 404 proves absence; any other outcome (exists, network
+          # error) refuses. They run BEFORE the request binding below, and that order is load-bearing:
+          # the binding is precisely what a retry reads as "this enrollment captured a credential for
+          # this slot", and reconcile can prove the named secret EXISTS but never WHO wrote it. A
+          # binding left behind by a probe refusal would therefore let the retry adopt the very
+          # out-of-band secret that caused the refusal as its own capture, and build an account record
+          # around a credential this enrollment never stored. Nothing durable is written until both
+          # scopes are PROVEN empty, so a refusal here costs only the burned claim.
+          if probe=$(GH_TOKEN="$REGISTRY_PAT" gh api "repos/${{ github.repository }}/actions/secrets/$SECRET_NAME" 2>&1); then
+            echo "::error::secret $SECRET_NAME already exists despite an owned claim (out-of-band write) — refusing to overwrite (fail closed)"; exit 1
+          fi
+          if ! printf '%s' "$probe" | grep -q 'HTTP 404'; then
+            echo "::error::could not prove $SECRET_NAME is absent — refusing to store (fail closed)"; exit 1
+          fi
+          # Post-#101 the canonical home is the `dispatch-secrets` environment: probe it too
+          # (BOTH scopes must 404 — a repo-scope stray would trip the secrets-guard, an env
+          # stray means the claim protocol was bypassed).
+          if envprobe=$(GH_TOKEN="$REGISTRY_PAT" gh api "repos/${{ github.repository }}/environments/dispatch-secrets/secrets/$SECRET_NAME" 2>&1); then
+            echo "::error::secret $SECRET_NAME already exists in the dispatch-secrets environment despite an owned claim — refusing to overwrite (fail closed)"; exit 1
+          fi
+          if ! printf '%s' "$envprobe" | grep -q 'HTTP 404'; then
+            echo "::error::could not prove $SECRET_NAME is absent from the dispatch-secrets environment — refusing to store (fail closed)"; exit 1
+          fi
+          # [#534] BIND THE REQUEST TO THE SLOT — after both absence proofs above, and immediately
+          # before the irreversible capture below; that sandwich is the whole ordering. The register
+          # step's `request_issue:` line is the #211 reconcile key, but it is written AFTER `gh secret set`
           # — so a run that dies in that gap leaves a stored credential with no durable binding at
           # all, and the retry mints a fresh slot instead of completing this transaction. The binding
           # is taken HERE, while nothing irreversible has happened: if it fails, the cost is exactly
@@ -951,24 +984,6 @@ jobs:
             echo "::error::could not bind request #$ISSUE to slot $HANDLE ($BINDING_REF) — refusing to store (fail closed). Nothing irreversible happened: no credential was captured, the claim on $HANDLE is burned (claims are never released, #186), and re-applying set-up-account enrolls cleanly on a fresh slot."; exit 1
           fi
           echo "request #$ISSUE is bound to slot $HANDLE ($BINDING_REF) — a run that dies before the account issue exists is now resumable (#534)"
-          # Last probe before the irreversible upsert: the claim defeats every protocol-observing
-          # writer; this narrows the residual out-of-protocol (manual) window to probe->set. Only an
-          # explicit 404 proves absence — any other outcome (exists, network error) refuses.
-          if probe=$(GH_TOKEN="$REGISTRY_PAT" gh api "repos/${{ github.repository }}/actions/secrets/$SECRET_NAME" 2>&1); then
-            echo "::error::secret $SECRET_NAME already exists despite an owned claim (out-of-band write) — refusing to overwrite (fail closed)"; exit 1
-          fi
-          if ! printf '%s' "$probe" | grep -q 'HTTP 404'; then
-            echo "::error::could not prove $SECRET_NAME is absent — refusing to store (fail closed)"; exit 1
-          fi
-          # Post-#101 the canonical home is the `dispatch-secrets` environment: probe it too
-          # (BOTH scopes must 404 — a repo-scope stray would trip the secrets-guard, an env
-          # stray means the claim protocol was bypassed).
-          if envprobe=$(GH_TOKEN="$REGISTRY_PAT" gh api "repos/${{ github.repository }}/environments/dispatch-secrets/secrets/$SECRET_NAME" 2>&1); then
-            echo "::error::secret $SECRET_NAME already exists in the dispatch-secrets environment despite an owned claim — refusing to overwrite (fail closed)"; exit 1
-          fi
-          if ! printf '%s' "$envprobe" | grep -q 'HTTP 404'; then
-            echo "::error::could not prove $SECRET_NAME is absent from the dispatch-secrets environment — refusing to store (fail closed)"; exit 1
-          fi
           # The secret lives on THIS registry repo, in the `dispatch-secrets` ENVIRONMENT
           # (post-#101): worker.yml/review-fix.yml resolve secrets[secret_ref] from env-bound
           # jobs, and the rotation write-back targets the same environment. A repo-scope write

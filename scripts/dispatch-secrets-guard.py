@@ -1516,6 +1516,26 @@ SETUP_ACCOUNT_BINDING_GUARDS = (
     ('"$PROVIDER"', "^(openai|anthropic)$"),
     ('"$BIND_FMT"', "^[a-z0-9]+(-[a-z0-9]+)*$"),
 )
+# The two single-secret absence proofs that must COMPLETE before the binding is published (review
+# round 2 of #534). They exist to catch an out-of-protocol write that raced the pre-claim union, and
+# each one REFUSES. The binding is what a retry reads as "this enrollment captured a credential for
+# this slot" — and reconcile can prove the named secret EXISTS, never WHO wrote it. So a binding
+# created ahead of these probes and left behind by one of their refusals makes the very out-of-band
+# secret that caused the refusal indistinguishable from this enrollment's own capture: the retry
+# emits `resume=true`/`stage=register` and mints an account record around a credential that was
+# never stored here. Each pattern is the GET of ONE named secret (`.../$SECRET_NAME`), which the
+# union's `?per_page=100` listings at the same two paths can never satisfy.
+SETUP_ACCOUNT_ABSENCE_PROBES = (
+    ("repository-scope", re.compile(
+        r'gh api "repos/\$\{\{ github\.repository \}\}/actions/secrets/\$\{?SECRET_NAME')),
+    (f"{ENVIRONMENT}-environment", re.compile(
+        r'gh api "repos/\$\{\{ github\.repository \}\}/environments/'
+        + re.escape(ENVIRONMENT) + r'/secrets/\$\{?SECRET_NAME')),
+)
+# A probe that runs and then ignores its own answer publishes exactly the evidence a proven-absent
+# slot would, so each probe must also REFUSE within its own region (its line through the next probe,
+# or the binding creation).
+SETUP_ACCOUNT_PROBE_REFUSAL_RE = re.compile(r"\bexit 1\b")
 
 
 def strip_shell_comments(text):
@@ -1758,7 +1778,12 @@ def setup_account_binding_verdict(step_lines):
         to cover, which is precisely the defect #534 reported;
     (d) VALIDATION — every operator- or CLI-supplied component of the name is shape-validated
         earlier in the step, because an unvalidated capture flowing into a git API path is an
-        injection sink (research/914 §4.2's first obligation).
+        injection sink (research/914 §4.2's first obligation);
+    (e) ABSENCE-FIRST (review round 2) — BOTH single-secret absence probes are issued, and each
+        REFUSES, before the binding is created. The binding is resumable capture evidence and
+        reconcile cannot tell WHO wrote the secret it later finds, so a binding published ahead of
+        the probes and left behind by a probe refusal is read on the retry as this enrollment's own
+        completed capture — adopting an out-of-band credential and registering an account around it.
 
     A missing store step, or any missing property, is a refusal that NAMES what is missing (fail
     closed). Comments are stripped before matching, as everywhere else in this guard, so commented
@@ -1816,6 +1841,56 @@ def setup_account_binding_verdict(step_lines):
         return False, ("the request binding is not created AFTER the `refs/acct-claims/` claim and "
                        "BEFORE the irreversible `gh secret set` capture — a binding written after "
                        "the capture cannot cover the store->register gap it exists to cover (#534)")
+    def refuses_in_block(start):
+        """True when the `if ...; then ... fi` construct beginning at `start` reaches an `exit 1`.
+        Single-line (`if ...; then exit 1; fi`) and multi-line forms alike; the store step's probe
+        blocks are flat, and the scan is bounded by the binding creation, so a refusal written
+        AFTER the binding — or one belonging to a different construct entirely — can never stand in
+        for this branch's."""
+        for index in range(start, create_index):
+            if SETUP_ACCOUNT_PROBE_REFUSAL_RE.search(step_lines[index]):
+                return True
+            text = step_lines[index].strip()
+            if text == "fi" or text.endswith("; fi"):
+                break
+        return False
+
+    for label, pattern in SETUP_ACCOUNT_ABSENCE_PROBES:
+        probe_index = next((index for index, line in enumerate(step_lines)
+                            if pattern.search(line)), None)
+        if probe_index is None:
+            return False, (f"the {label} secret-absence probe (the GET of `$SECRET_NAME` itself, "
+                           "not the paginated listing) is not in the store step — the binding would "
+                           "publish resumable capture evidence for a slot whose secret was never "
+                           "proven absent (fail closed)")
+        if probe_index >= create_index:
+            return False, (f"the {label} secret-absence probe runs AFTER the request binding is "
+                           "created — a binding left behind when that probe refuses is read by the "
+                           "retry as this enrollment's own capture, so the out-of-band secret that "
+                           "caused the refusal is adopted and an account is registered around a "
+                           "credential this enrollment never stored (#534 review round 2)")
+        captured = re.search(r"\bif\s+(?:!\s+)?([A-Za-z_][A-Za-z0-9_]*)=\$\(",
+                             step_lines[probe_index])
+        if captured is None:
+            return False, (f"the {label} secret-absence probe does not capture its own outcome "
+                           "(`if VAR=$(gh api ...)`) — an outcome that is never read cannot prove "
+                           "the slot empty before the binding is published")
+        variable = captured.group(1)
+        if not refuses_in_block(probe_index):
+            return False, (f"the {label} secret-absence probe does not REFUSE (`exit 1`) when the "
+                           "secret already EXISTS — the binding would then publish resumable "
+                           "capture evidence for an out-of-band credential")
+        proof_index = next((index for index in range(probe_index, create_index)
+                            if f'"${variable}"' in step_lines[index]
+                            and "HTTP 404" in step_lines[index]), None)
+        if proof_index is None:
+            return False, (f"the {label} secret-absence probe never tests ${variable} for an "
+                           "explicit `HTTP 404` before the binding — only a 404 proves absence, so "
+                           "a throttled or unreachable probe would otherwise pass for empty")
+        if not refuses_in_block(proof_index):
+            return False, (f"the {label} secret-absence probe's non-404 outcome does not REFUSE "
+                           "(`exit 1`) before the binding — an unprovable absence would publish "
+                           "the same resumable evidence a proven-empty slot does")
     for variable, pattern in SETUP_ACCOUNT_BINDING_GUARDS:
         if not any("grep -qE" in joined(index) and variable in joined(index)
                    and pattern in joined(index)
@@ -2572,6 +2647,20 @@ def _self_test():
     # without a binding taken BEFORE `gh secret set` a run that dies in that gap strands an
     # irreversibly captured credential AND burns a second slot on the retry. Every mutation below is
     # a way of reopening that gap while leaving the union contract green.
+    repo_probe_lines = [
+        '          if probe=$(GH_TOKEN="$REGISTRY_PAT" gh api "repos/${{ github.repository }}/actions/secrets/$SECRET_NAME" 2>&1); then exit 1; fi',
+        "          if ! printf '%s' \"$probe\" | grep -q 'HTTP 404'; then exit 1; fi",
+    ]
+    env_probe_lines = [
+        '          if envprobe=$(GH_TOKEN="$REGISTRY_PAT" gh api "repos/${{ github.repository }}/environments/dispatch-secrets/secrets/$SECRET_NAME" 2>&1); then exit 1; fi',
+        "          if ! printf '%s' \"$envprobe\" | grep -q 'HTTP 404'; then exit 1; fi",
+    ]
+    binding_create_lines = [
+        '          if ! gh api "repos/${{ github.repository }}/git/refs" \\',
+        '                 -f ref="$BINDING_REF" -f sha="$GITHUB_SHA"; then exit 1; fi',
+    ]
+    capture_line = ('          GH_TOKEN="$REGISTRY_PAT" gh secret set "$SECRET_NAME" '
+                    '--env dispatch-secrets < "$LOGIN_DIR/token"')
     binding_sample = [
         "      - name: Claim slot atomically",
         "        id: store",
@@ -2579,14 +2668,16 @@ def _self_test():
         '          out=$(gh api "repos/${{ github.repository }}/git/refs" \\',
         '                  -f ref="refs/acct-claims/$cand" -f sha="$GITHUB_SHA")',
         "          HANDLE=$(printf 'acct%02d' \"$claimed\")",
+        "          SECRET_NAME=$(printf 'ACCT%02d_TOKEN' \"$claimed\")",
+        *repo_probe_lines,
+        *env_probe_lines,
         "          if ! printf '%s' \"$ISSUE\" | grep -qE '^[0-9]+$'; then exit 1; fi",
         "          if ! printf '%s' \"$PROVIDER\" | grep -qE '^(openai|anthropic)$'; then exit 1; fi",
         '          BIND_FMT=$(cat "$LOGIN_DIR/credential_format")',
         "          if ! printf '%s' \"$BIND_FMT\" | grep -qE '^[a-z0-9]+(-[a-z0-9]+)*$'; then exit 1; fi",
         '          BINDING_REF="refs/acct-requests/$ISSUE/$HANDLE/$PROVIDER/$BIND_FMT/$BIND_DIGEST"',
-        '          if ! gh api "repos/${{ github.repository }}/git/refs" \\',
-        '                 -f ref="$BINDING_REF" -f sha="$GITHUB_SHA"; then exit 1; fi',
-        '          GH_TOKEN="$REGISTRY_PAT" gh secret set "$SECRET_NAME" --env dispatch-secrets < "$LOGIN_DIR/token"',
+        *binding_create_lines,
+        capture_line,
         "      - name: Register the account issue",
     ]
     chk("[#534] binding: claim -> validated name -> git/refs create -> capture -> ok",
@@ -2616,14 +2707,89 @@ def _self_test():
     chk("[#534] binding: name severed from the REQUEST -> refuse (reconcile could never find it)",
         (verdict_unbound_request[0], "request issue" in verdict_unbound_request[1]),
         (False, True))
-    late = list(binding_sample)
-    late_create = [late.pop(11), late.pop(11)]   # the two git/refs creation lines
-    late[12:12] = late_create                    # ...re-inserted AFTER `gh secret set`
+    def _binding_sample_moved(moved_lines, after):
+        """binding_sample with `moved_lines` lifted out and re-inserted after the `after` line —
+        content-keyed, so an edit to the sample can never silently relocate the WRONG lines."""
+        remaining = [line for line in binding_sample if line not in moved_lines]
+        at = remaining.index(after) + 1
+        return "\n".join(remaining[:at] + list(moved_lines) + remaining[at:])
+
     verdict_late = setup_account_binding_verdict(
-        setup_account_store_step_lines("\n".join(late)))
+        setup_account_store_step_lines(
+            _binding_sample_moved(binding_create_lines, capture_line)))
     chk("[#534] binding: created AFTER the irreversible capture -> refuse, ordering NAMED (this is "
         "exactly the gap the issue reported, so it must never read as satisfied)",
         (verdict_late[0], "BEFORE the irreversible" in verdict_late[1]), (False, True))
+    # [#534 review round 2] THE TRANSITION THE ROUND-1 ROWS OMITTED: binding created -> a final
+    # absence probe reports the secret EXISTS -> the step refuses, leaving the binding behind ->
+    # retry. Reconcile can prove `${handle^^}_TOKEN` exists but never WHO wrote it, so that leftover
+    # binding is indistinguishable from a completed capture and the retry emits
+    # `resume=true`/`stage=register` around a credential this enrollment never stored. The ordering
+    # is therefore the fix, and each probe is pinned ahead of the binding SEPARATELY — the two probe
+    # different scopes and moving either one alone reopens the adoption on that scope.
+    # Each scope is mutated INDEPENDENTLY: the two probes cover different stores, so reopening
+    # either one alone re-admits the adoption on that store, and item 4's mutually-masking-duplicate
+    # trap is exactly what a single "some probe refuses somewhere" check would walk into — the
+    # OTHER probe's `exit 1`s (and the three shape-validation `exit 1`s that sit between the env
+    # probe and the binding) are still present in every mutant below.
+    for scope, probe_lines, probe_var in (
+            ("repository-scope", repo_probe_lines, "probe"),
+            ("dispatch-secrets-environment", env_probe_lines, "envprobe")):
+        verdict_probe_late = setup_account_binding_verdict(
+            setup_account_store_step_lines(
+                _binding_sample_moved(probe_lines, binding_create_lines[-1])))
+        chk(f"[#534 r2] binding: the {scope} absence probe moved AFTER the binding creation -> "
+            "refuse, adoption of the out-of-band credential NAMED (this IS the reported transition: "
+            "binding created -> probe reports exists -> refusal leaves the binding -> retry adopts)",
+            (verdict_probe_late[0], scope in verdict_probe_late[1],
+             "is adopted" in verdict_probe_late[1]),
+            (False, True, True))
+        verdict_gone = setup_account_binding_verdict(
+            setup_account_store_step_lines(
+                "\n".join(line for line in binding_sample if line not in probe_lines)))
+        chk(f"[#534 r2] binding: the {scope} absence probe DELETED -> refuse (the binding may not "
+            "publish resumable evidence for a slot never proven empty)",
+            (verdict_gone[0], scope in verdict_gone[1], "never proven absent" in verdict_gone[1]),
+            (False, True, True))
+        # Item 3 of the author pre-flight: the CONDITIONALLY-INERT mutant, not only the deleted one.
+        # The probe still runs and still precedes the binding — it simply stops refusing.
+        exists_inert = "\n".join(
+            line.replace("then exit 1; fi", "then :; fi") if line == probe_lines[0] else line
+            for line in binding_sample)
+        verdict_exists_inert = setup_account_binding_verdict(
+            setup_account_store_step_lines(exists_inert))
+        chk(f"[#534 r2] binding: the {scope} probe runs but does NOT refuse when the secret already "
+            "exists -> refuse (an inert probe publishes the same evidence a proven-empty slot does)",
+            (verdict_exists_inert[0], scope in verdict_exists_inert[1],
+             "already EXISTS" in verdict_exists_inert[1]),
+            (False, True, True))
+        uncaptured = "\n".join(
+            line.replace(f"if {probe_var}=$(", "if $(") if line == probe_lines[0] else line
+            for line in binding_sample)
+        verdict_uncaptured = setup_account_binding_verdict(
+            setup_account_store_step_lines(uncaptured))
+        chk(f"[#534 r2] binding: the {scope} probe's outcome is DISCARDED (not captured) -> refuse "
+            "(an unread outcome cannot prove the slot empty before the binding is published)",
+            (verdict_uncaptured[0], scope in verdict_uncaptured[1],
+             "does not capture its own outcome" in verdict_uncaptured[1]),
+            (False, True, True))
+        no_404 = "\n".join(line for line in binding_sample if line != probe_lines[1])
+        verdict_no_404 = setup_account_binding_verdict(
+            setup_account_store_step_lines(no_404))
+        chk(f"[#534 r2] binding: the {scope} probe's explicit `HTTP 404` test DELETED -> refuse "
+            "(a throttled/unreachable probe would otherwise pass for absent and bind anyway)",
+            (verdict_no_404[0], scope in verdict_no_404[1], "HTTP 404" in verdict_no_404[1]),
+            (False, True, True))
+        unproven_inert = "\n".join(
+            line.replace("then exit 1; fi", "then :; fi") if line == probe_lines[1] else line
+            for line in binding_sample)
+        verdict_unproven_inert = setup_account_binding_verdict(
+            setup_account_store_step_lines(unproven_inert))
+        chk(f"[#534 r2] binding: the {scope} probe's NON-404 outcome stops refusing -> refuse "
+            "(unprovable absence must never publish resumable capture evidence)",
+            (verdict_unproven_inert[0], scope in verdict_unproven_inert[1],
+             "non-404 outcome does not REFUSE" in verdict_unproven_inert[1]),
+            (False, True, True))
     no_fmt_guard = [line for line in binding_sample
                     if "^[a-z0-9]+(-[a-z0-9]+)*$" not in line]
     verdict_no_fmt_guard = setup_account_binding_verdict(
@@ -2649,7 +2815,8 @@ def _self_test():
     except OSError:
         live_binding_verdict = (False, "set-up-account.yml unreadable (fail closed)")
     chk("workflow: set-up-account binds the request to the claimed slot, with every name component "
-        "shape-validated, AFTER the claim and BEFORE the irreversible capture (#534)",
+        "shape-validated, AFTER the claim, AFTER both refusing secret-absence proofs, and BEFORE "
+        "the irreversible capture (#534)",
         live_binding_verdict, (True, "ok"))
 
     # BINDING-MAP CONTRACT (sol round 17 on the #275 PR): synthetic accept + every reject
