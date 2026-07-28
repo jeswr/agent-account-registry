@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4901,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "7c383a9ab3f02599357ecdf5a36580a0aaf73905",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 3 finds no correctness, soundness, test-validity, or security defect. The load-bearing native-Linux/VM-backed networking split remains guarded by a real host-network reachability probe, with a post-forwarder re-probe and fail-closed behavior. The hermetic validator's self-test passes and its C7 mutations exercise removal of both the probe definition and the guard. The workflow remains manual-only and advisory, generated credentials and reports are excluded, report freshness and harness status are checked, and the score ratchet rejects regressions. This is materially the same clean result as round 2, so progress is stagnant by the required scale.",
+  "verdict": "approve"
+ }
+}
