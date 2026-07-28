@@ -617,6 +617,44 @@ jobs:
                       and trusted(details[row["number"]][0], repo_trusted_bots))
               ]
               ready = dispatch.compute_ready(ready_input)
+              # >>> partition-census — EXECUTED by scripts/dispatch-plan.py --self-test.
+              # THE LARGEST REFUSAL IN THIS DISPATCHER HAD NO CENSUS ROW. `compute_ready` admits
+              # ONE unit per `area:` package, so it silently discards most of the drainable
+              # backlog every tick. MEASURED 2026-07-28 against live sparq-org/sparq (473
+              # status:ready issues, 94 open PRs, sparq's own planner + real workspace roots):
+              # 452 candidates -> frontier 7. That is 445 refusals per tick, and NOTHING named
+              # them: the per-lane summary (#108) starts at `planned`, which is already the
+              # post-frontier number, and CLAIM's histogram only ever sees rows that survived.
+              # So the fleet-capacity question kept being answered with account arithmetic while
+              # the real limiter was invisible — the same missing-edge class as #700/#708, one
+              # stage further upstream. Every other cap here names itself every tick; this one
+              # now does too, ZERO INCLUDED, so a quiet tick is distinguishable from an
+              # uninstrumented one. Derived from the planner's OWN candidate set so the
+              # denominator can never drift from the frontier it explains. `log` is stubbed
+              # because the candidate walk already printed its per-issue attributions when
+              # `compute_ready` ran — re-printing them would double the readiness noise. Costs
+              # ZERO additional GitHub API requests: it re-walks the in-memory snapshot only.
+              # Its only inputs are `dispatch`, `ready_input`, `ready` and `repo`.
+              candidates_fn = getattr(dispatch, "ready_candidates", None)
+              if candidates_fn is None:
+                  print(f"::warning::{repo}: target planner has no ready_candidates() — "
+                        "partition attrition is UNMEASURABLE on this target")
+              else:
+                  _cands = candidates_fn(ready_input, log=lambda *a, **k: None)
+                  _selected = {row.get("number") for row in ready}
+                  _contended = {}
+                  for _entry in _cands:
+                      if _entry[2].get("number") in _selected:
+                          continue
+                      for _pkg in _entry[3]:
+                          _contended[_pkg] = _contended.get(_pkg, 0) + 1
+                  _ranked = sorted(_contended.items(), key=lambda kv: (-kv[1], kv[0]))[:8]
+                  _top = ", ".join(f"{_k}={_v}" for _k, _v in _ranked) or "none"
+                  print(f"partition census {repo}: candidates={len(_cands)} "
+                        f"frontier={len(ready)} "
+                        f"partition-deferred={max(0, len(_cands) - len(ready))} "
+                        f"top-contended: {_top}")
+              # <<< partition-census
               # Issue #225: a `status:ready` issue carrying NO role:* label is dropped by the
               # readiness engine (has_role) BEFORE any plan row exists — it shows up in no plan,
               # no diagnostic, and never drains. 117 accumulated before a human noticed. Report

@@ -33,6 +33,12 @@ _ready = _load("ready_issues", "ready-issues.py")
 _route = _load("route_resolve", "route-resolve.py")
 
 compute_ready = _ready.compute_ready
+# [OPUS-5] The partition census in dispatch.yml's readiness step reads the planner's OWN candidate
+# set as the frontier's denominator. sparq's copy of this file already re-exports it (its line 51);
+# this copy had drifted, so the shared step would have reported the registry target as
+# UNMEASURABLE while measuring sparq — the "kept behaviourally identical" promise in this file's
+# header is exactly what stops one target silently losing an instrument the other has.
+ready_candidates = _ready.ready_candidates
 packages_of = _ready.packages_of
 labels_of = _ready.labels_of
 valid_priority = _ready.valid_priority
@@ -487,6 +493,79 @@ def _self_test():
         ("30 status:ready issue(s)" in _truncated,
          "#19, #20 (+10 more)" in _truncated, "#21" in _truncated),
         (True, True, False))
+
+    # ------------------------------------------------------------------------------------------
+    # [OPUS-5] PARTITION CENSUS. The conflict partition is the dispatcher's LARGEST refusal and it
+    # emitted no census row at all: MEASURED 2026-07-28 on live sparq, 452 drainable candidates
+    # collapsed to a frontier of 7, and the per-lane summary's `planned` is already the
+    # POST-frontier number, so 445 refusals/tick were invisible and the capacity question kept
+    # being answered with account arithmetic. Like every other block in that step this one lives
+    # in workflow python — the seam where every uncaught mutant in this repo has lived — so it is
+    # EXTRACTED and EXECUTED here, not pattern-matched. Each row below dies on a one-token flip:
+    # dropping the selected-row skip, inverting the `is None` compatibility branch, guarding the
+    # print behind a truthy `_contended`, reversing the rank order, removing the `[:8]` bound, or
+    # dropping the `log=` stub.
+    # ------------------------------------------------------------------------------------------
+    partition_block = _workflow_block(
+        os.path.join(_root, ".github", "workflows", "dispatch.yml"), "readiness",
+        "partition-census")
+
+    class _StubCandidatePlanner:
+        """Stands in for the target's `dispatch` module. `enumerate_candidates=False` models a
+        planner that PREDATES ready_candidates (the compatibility branch)."""
+
+        def __init__(self, cands, enumerate_candidates=True):
+            self.seen = []
+            self.log_supplied = None
+            self._cands = list(cands)
+            if enumerate_candidates:
+                self.ready_candidates = self._enumerate
+
+        def _enumerate(self, issues, log=None):
+            self.seen.append(list(issues))
+            self.log_supplied = log is not None
+            return list(self._cands)
+
+    def _cand(number, pkgs):
+        """One `ready_candidates` row in the engine's shape: (priority, number, item, packages)."""
+        return (1, number, {"number": number}, set(pkgs))
+
+    def _run_partition_block(cands, ready_rows, enumerate_candidates=True):
+        planner = _StubCandidatePlanner(cands, enumerate_candidates)
+        namespace = {"dispatch": planner, "ready_input": [{"number": 1}],
+                     "ready": [{"number": n} for n in ready_rows], "repo": "o/t"}
+        text = _captured(lambda: exec(partition_block, namespace))  # noqa: S102 — workflow block
+        return text.strip(), planner
+
+    # #1/#4 were SELECTED, so only #2/#3 (package a) and #5 (package b) are still contending.
+    # Counting the selected rows too would print `a=3, b=2`; that is the mutant this row kills.
+    _five = [_cand(1, "a"), _cand(2, "a"), _cand(3, "a"), _cand(4, "b"), _cand(5, "b")]
+    _busy, _planner = _run_partition_block(_five, [1, 4])
+    chk("[OPUS-5] the EXECUTED workflow block names the frontier's denominators and contention",
+        _busy,
+        "partition census o/t: candidates=5 frontier=2 partition-deferred=3 "
+        "top-contended: a=2, b=1")
+    chk("[OPUS-5] ...and stubs `log` so the re-walk does not double the readiness attributions",
+        (_planner.log_supplied, _planner.seen), (True, [[{"number": 1}]]))
+    # The brief's standing rule: a cap must name itself EVERY tick it holds, including a tick on
+    # which it refused nothing. Guarding the print behind `if _contended:` is the mutant here.
+    _quiet, _ = _run_partition_block([_cand(1, "a"), _cand(2, "b")], [1, 2])
+    chk("[OPUS-5] ...and still prints on a tick that deferred NOTHING (zero included)",
+        _quiet,
+        "partition census o/t: candidates=2 frontier=2 partition-deferred=0 "
+        "top-contended: none")
+    _degraded, _planner = _run_partition_block([_cand(1, "a")], [], False)
+    chk("[OPUS-5] a planner without ready_candidates() says so and fabricates no census",
+        ("partition attrition is UNMEASURABLE" in _degraded,
+         "partition census" in _degraded, _planner.seen), (True, False, []))
+    # Rank by COUNT descending, then key — and cap at 8. An ascending sort or a dropped bound
+    # both change this line; `z` (the single smallest) is the row that must fall off the end.
+    _many = [_cand(100 + i, chr(ord("a") + i)) for i in range(8) for _ in range(8 - i)]
+    _many += [_cand(999, "z")]
+    _ranked_text, _ = _run_partition_block(_many, [])
+    chk("[OPUS-5] contention is ranked by count (desc) and bounded to the top 8",
+        (_ranked_text.split("top-contended: ")[1], "z=1" in _ranked_text),
+        ("a=8, b=7, c=6, d=5, e=4, f=3, g=2, h=1", False))
 
     # ------------------------------------------------------------------------------------------
     # [sparq #4329] NATIVE GitHub dependency edges. The dispatcher derived `open_blockers` ONLY
