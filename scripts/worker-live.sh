@@ -1207,6 +1207,31 @@ for b in blocks:
 '
 }
 
+# PURE (self-tested): pr-gate.yml's INDEPENDENT escape channel -- the report file it initialises
+# and the assertion that reds on any `::error::gh-escape` row -- normalised, as one comparable value.
+#
+# It is pinned separately from the suite loop because it is a SEPARATE signal: the loop trusts
+# run-selftest's EXIT STATUS, this trusts its OUTPUT, and the point is that one being silenced does
+# not silence the other. Measured before this pin existed: deleting the channel outright, and making
+# it conditionally inert, BOTH survived the whole suite at 434/434 with zero FAIL rows -- a guard
+# added in the same round as its own mutation sweep, with no mutant covering it.
+#
+# The `tee` line is deliberately NOT matched here: it already belongs to the suite-loop block, and
+# pinning it twice would let two assertions mask each other's mutants.
+_pr_gate_escape_channel() {
+  local file=$1
+  [[ -f "$file" ]] || return 0
+  awk '
+    { line = $0; sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line) }
+    line ~ /^#/ || line == "" { next }
+    line ~ /^escapes=/ { print line; next }
+    line == ": > \"$escapes\"" { print line; next }
+    line ~ /^if grep -q .\^::error::gh-escape / { on = 1; print line; next }
+    on { print line }
+    on && line == "fi" { exit }
+  ' "$file"
+}
+
 # PURE (self-tested): print pr-gate.yml's self-test loop -- `for s in $suite; do` through its
 # `done` -- normalised to stripped, comment-free lines, so the gate's ACTUAL suite invocation can be
 # pinned by exact whole-block match. Prints nothing when the file or the loop is absent, which fails
@@ -5885,6 +5910,34 @@ DISPATCH
        && printf missed || printf caught)" "caught"
   chk "pr-gate loop check is NON-VACUOUS: a conditionally-inert 'if false' no longer matches" \
     "$([[ "$(_pr_gate_suite_loop "$loopfix/if-false.yml" | paste -sd'|' -)" == "$expected_loop" ]] \
+       && printf missed || printf caught)" "caught"
+  # THE INDEPENDENT CHANNEL. R4/R5 measured: deleting this block, and making it conditionally inert,
+  # both SURVIVED the whole suite at 434/434 with zero FAIL rows before this pin existed.
+  local expected_channel
+  expected_channel=$(cat <<'CHANNEL'
+escapes="$RUNNER_TEMP/gh-escape-report.txt"
+: > "$escapes"
+if grep -q '^::error::gh-escape ' "$escapes"; then
+echo "::error::a self-test reached the real gh — see the gh-escape rows above"
+exit 1
+fi
+CHANNEL
+)
+  chk "pr-gate.yml keeps the INDEPENDENT ::error:: escape channel (exact block)" \
+    "$(_pr_gate_escape_channel "$SCRIPT_DIR/../.github/workflows/pr-gate.yml")" "$expected_channel"
+  printf '%s\n' '          escapes="$RUNNER_TEMP/gh-escape-report.txt"' '          : > "$escapes"' \
+    "          if false && grep -q '^::error::gh-escape ' \"\$escapes\"; then" \
+    '            exit 1' '          fi' > "$loopfix/chan-inert.yml"
+  printf '%s\n' '          escapes="$RUNNER_TEMP/gh-escape-report.txt"' '          : > "$escapes"' \
+    > "$loopfix/chan-deleted.yml"
+  chk "channel check is NON-VACUOUS: a conditionally-inert channel no longer matches" \
+    "$([[ "$(_pr_gate_escape_channel "$loopfix/chan-inert.yml")" == "$expected_channel" ]] \
+       && printf missed || printf caught)" "caught"
+  chk "channel check is NON-VACUOUS: a DELETED channel no longer matches" \
+    "$([[ "$(_pr_gate_escape_channel "$loopfix/chan-deleted.yml")" == "$expected_channel" ]] \
+       && printf missed || printf caught)" "caught"
+  chk "channel check fails CLOSED on an unreadable workflow" \
+    "$([[ "$(_pr_gate_escape_channel "$loopfix/absent.yml" 2>/dev/null)" == "$expected_channel" ]] \
        && printf missed || printf caught)" "caught"
   chk "pr-gate loop check fails CLOSED on an unreadable workflow" \
     "$([[ "$(_pr_gate_suite_loop "$loopfix/absent.yml" 2>/dev/null | paste -sd'|' -)" == "$expected_loop" ]] \
