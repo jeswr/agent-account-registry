@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 895,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "c9ecc923ce88a1f4503027cf81441ea824cf4006",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": true,
+  "issues": [
+   {
+    "body": "The activation alarm says to identify the broker-created issue because \"the register step logged its number,\" then retract the other issue. But `created=$(gh issue create ...)` captures the command's URL, `number=${created##*/}` parses it, and the successful path never prints either value. Only failure/retraction messages include `#$number`; the residual late-writer scenario deliberately exits registration successfully, so those messages do not run. When activation later finds two exact-title issues, the cited step log contains no authoritative provenance for which record owns the stored credential. The prescribed manual action is therefore unsafe: choosing the wrong issue as the intruder can retain the forged record and discard the broker's credential-bound record. The self-test checks only that the alarm contains the recovery phrases, not that the successful registration path actually emits the required number.",
+    "file": ".github/workflows/set-up-account.yml",
+    "fix_hint": "Immediately after validating `number`, emit a non-secret audit line that unambiguously binds `$HANDLE` to the created issue number, and extend the executed harness to assert that this provenance is present on the successful `outsider_late` path and matches the broker-created record. Update the alarm wording only if it points to evidence that is actually durable and available to the operator.",
+    "severity": "major",
+    "title": "Late-duplicate recovery relies on an issue number that is never logged"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The prior round's race and test-validity findings are addressed honestly: the new executed late-writer scenario pins the unavoidable post-read window, and the coupled activation assertion demonstrates fail-closed refusal rather than mis-activation. However, the newly added recovery procedure depends on provenance that the workflow does not record. On the successful path, `gh issue create` stdout is captured into `created` and its parsed issue number is never emitted, yet the alarm tells an operator that the register-step log contains that number. After a late duplicate, the operator therefore cannot safely distinguish the credential-bound broker record from the intruder using the stated evidence; retracting the wrong record can destroy the trusted binding. The diff also contains reviewer-directed prose (for example, commands to read a stated scope before trusting a claim), so injection detection is set.",
+  "verdict": "request_changes"
+ }
+}
