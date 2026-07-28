@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1010,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "0395008212b87ca541b95da12bc9cbc6e2776d8a",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_live_nodes` recursively yields every AST child and does not stop at execution-scope boundaries. Consequently, if the production `defer_reasons[...] += 1` is moved into a nested `def`, `async def`, class body method, or lambda beneath the `for`, `_escalation_call_site` still finds the `AugAssign` and returns `dispatch`, although the loop only defines that object and never performs the count. None of the seven source mutants covers this shape. This violates the helper's stated proof that the production loop counts every result and permits the escalation histogram to go silent with the self-test green.",
+    "file": "scripts/dispatch-claim.py",
+    "fix_hint": "Make the live-node traversal used for a loop body stop before nested execution scopes (`FunctionDef`, `AsyncFunctionDef`, `Lambda`, and method bodies reached through `ClassDef`; handle class-body execution deliberately rather than treating all descendants alike). Add a parseable production-source mutant that wraps or moves the counter into an uncalled nested function inside the loop and assert `_escalation_call_site` returns `None`.",
+    "severity": "major",
+    "title": "Call-site proof accepts counters inside uncalled nested code"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 1's cause-binding and constant-false cases are now addressed, and the added mutants genuinely exercise those fixes. However, the structural proof still crosses Python execution boundaries: `_live_nodes(loop)` recursively descends into nested function, class, and lambda bodies. A counter moved into a nested callable defined inside the escalation loop is therefore accepted even though defining that callable does not execute the counter. The production escalation can again become silent while the self-test remains green, so the call-site guarantee is still not non-vacuous.",
+  "verdict": "request_changes"
+ }
+}
