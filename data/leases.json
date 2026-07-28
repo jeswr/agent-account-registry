@@ -62,16 +62,6 @@
   },
   {
    "account": "dc2d751954080e13",
-   "claim_id": "80604702c54a437a954700dd6c5b966b",
-   "holder": "review:sparq-org/sparq#4768@dispatch-30340312044.1",
-   "package": "sparq-lws-core",
-   "role": "review",
-   "model": "sol",
-   "issued_at": 1785225719,
-   "expires_at": 1785229919
-  },
-  {
-   "account": "dc2d751954080e13",
    "claim_id": "35eaf789d72844c38b6ce5094552a984",
    "holder": "review:jeswr/agent-account-registry#893@dispatch-30340312044.1",
    "package": "workflows",
