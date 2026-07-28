@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4841,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "036d1ef5097b3126ce72b1022ccd1110658b189a",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 4 remains clean. The soft-branch lowering preserves per-path scope, including converging OPTIONAL/NOT EXISTS targets, nested required components, cycles, and projection exclusion for variables bound only inside negation. The focused tests exercise those load-bearing cases on emitted SPARQL rather than mocks. The query handoff state machine also preserves the intended mount-race and later workspace-switch behavior with non-vacuous transition tests. I found no new correctness, soundness, security, or test-validity issue in the changed files.",
+  "verdict": "approve"
+ }
+}
