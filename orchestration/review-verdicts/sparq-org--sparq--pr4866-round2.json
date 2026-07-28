@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4866,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "e1fe122fd1f5af0f401ecf7e160aba098d540f2a",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "parse_pq_section validates the code array length but not its contents. ProductQuantizer permits K below 256, while each persisted code remains an arbitrary u8. search_slots_pq passes such a code to DistanceTable::distance, which indexes tables[s * k + c as usize] without checking c < k. Thus a crafted .spqg with a valid K=1 codebook and a code byte of 255 opens successfully but can panic in nearest(), violating the documented malformed-input fail-cleanly contract.",
+    "file": "crates/sparq-vamana/src/graph.rs",
+    "fix_hint": "While parsing the PQ section, validate every code byte against pq.k() (ideally report the slot/subspace and offending value) before constructing PqCache. Add a focused real-path test that mutates a valid persisted PQ file to use a code >= K, asserts both open and open_from_bytes return Err, and confirms no search-time panic is deferred.",
+    "severity": "major",
+    "title": "PQ sections accept out-of-range centroid codes that panic during search"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 2 fixes both prior findings: adjacency is now bounds-filtered on the real search path with mmap and owned-byte coverage, and PQ codebook size arithmetic is checked before allocation/slicing. However, the newly hardened PQ parser still accepts attacker-controlled code bytes without checking that each code is below the decoded codebook's K. Search uses those bytes directly as DistanceTable column indices, so a malformed but otherwise structurally valid PQ section can open successfully and then panic in nearest(). Because this is a new major hostile-input issue after a round with two different major findings, progress is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
