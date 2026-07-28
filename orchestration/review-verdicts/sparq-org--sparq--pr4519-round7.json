@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4519,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "b3318cd9209a6031bc71fadc552a2d8031ab3544",
+  "round": 7
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 7 resolves the prior major resource-exhaustion finding. The filtered auxiliary-arm paging loop now caps its own escalation at MAX_ARM_PAGE (65,536), fails closed with an arm-named error when the admissible ranking cannot be established within that bound, and preserves a caller's explicitly requested candidates page without geometrically escalating beyond the documented cap. The new end-to-end test uses a non-exhausting arm with distinct valid inline IDs, proves that the real query path reaches but never exceeds the cap, and verifies fail-closed behavior. The earlier inline-ID correctness witness remains present, so the safety fix does not restore the round-5 premature dictionary-length cutoff. No new correctness, soundness, test-validity, security, or hostile-instruction issue is evident in the supplied diff.",
+  "verdict": "approve"
+ }
+}
