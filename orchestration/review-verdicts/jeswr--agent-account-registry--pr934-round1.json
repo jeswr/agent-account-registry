@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 934,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "8dd1aa2d13ffbb5ad42bec392e01786b38415c13",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The keepalive now keys dispatch.yml liveness on the exact, non-expired executed-tick artifact while preserving run-age anchoring for every other workflow and the existing live-run guard. The threshold is tied to the floor module and leaves a full tick of slack. The added self-tests execute the extracted production shell body with strict hermetic stubs and assert both disagreement directions between run and marker age, exact-name and expiry handling, live-run precedence, read-failure behavior, unchanged run-anchored legs, and a fresh-fleet control. These tests are non-vacuous and would fail for the pre-change run anchor or the identified weakening mutations. No trust check, permission boundary, or injection-sensitive expansion is weakened.",
+  "verdict": "approve"
+ }
+}
