@@ -1894,17 +1894,108 @@ def filter_busy_area_items(items, repo, pulls, issue_labels, provenance, pr_stat
     return kept
 
 
-# [registry #677] How many `__global__` holders ONE tick may park, per target repository. One.
-# The recurrence in #677 is that parking a holder by hand simply PROMOTES the next one, so a
-# sweep that drained the whole holder set in a single tick would be exactly that mistake
-# automated — it would park PRs whose reservation was never the binding one, and each park costs
-# real review progress. One per tick converges over ticks (each park frees the partition and the
-# NEXT tick re-measures whether the lane is still starved) and never over-shoots.
-STARVATION_PARKS_PER_TICK_MAX = 1
+# [registry #677 + #822] How many `__global__` holders ONE tick may park, per target repository.
+#
+# THIS CONSTANT WAS 1, AND THE 1 WAS WRONG IN TWO INDEPENDENT WAYS.
+#
+# (a) IT NEVER CONVERGED THE WAY ITS COMMENT CLAIMED. The old rationale was "each park frees the
+#     partition and the NEXT tick re-measures". It does not. `filter_busy_area_items` reads
+#     `global_reserved = GLOBAL_PACKAGE in busy`, and `busy` is a UNION over every occupant — so
+#     `__global__` stays reserved while ANY holder holds it. With N inert holders, parking one
+#     frees exactly nothing: the lane is still fully starved on the next tick, and the next, until
+#     the LAST holder is parked. Every intermediate park spent real review progress and bought
+#     zero throughput. Parking all N is therefore not "the hand-parking mistake automated" — it is
+#     the only batch size at which the action does anything at all.
+#
+# (b) THE TICK FLOOR MULTIPLIED ITS COST. #822 imposes a 10-minute minimum between EXECUTED ticks
+#     (scripts/dispatch-tick-floor.MIN_TICK_INTERVAL_SECONDS). A cap denominated in TICKS is
+#     denominated in 10-minute units now. MEASURED on sparq-org/sparq 2026-07-27: `assemble-census`
+#     read `kept=0` on four consecutive executed ticks (20:12:40Z -> 20:47:36Z), every row deferred
+#     by `reason.global-reservation`, zero impl workers launched; it cleared at 21:07:30Z. Four
+#     holders at one park per 10-minute tick is ~55 minutes of TOTAL dispatch outage. Before #822
+#     ticks ran every ~7 minutes (briefly ~4), so the same cap was cheap. THE FLOOR IS CORRECT AND
+#     STAYS — it exists because exceeding ~6 ticks/h exhausted the request budget and took the
+#     fleet down twice. The cap is what changes.
+#
+# WHY BATCHING IS SAFE, from the sweep's OWN predicate. `starvation_park_targets` fires only when
+# `planned_items` is empty AND `deferred > 0` — nothing whatsoever is dispatchable and something is
+# queued behind the partition. Under that condition there is no lane left to starve by parking too
+# many: the lane is already at zero. The eligibility predicate (BUSY + holds `__global__` +
+# un-parked + provably inert) is UNCHANGED — this constant governs how many of the holders that
+# predicate already admits may be acted on in one tick, and nothing else.
+#
+# THE BOUND, and its arithmetic. A bound still exists so a pathological board cannot turn one tick
+# into an unbounded mutation burst, but it is derived from the measured board and the measured
+# request budget rather than from the number 1:
+#
+#   cost of ONE park            <= 5 authenticated requests
+#       ITEMISED in STARVATION_PARK_REQUEST_ITEMS below, because prose cannot be mutation-tested
+#       and this derivation was WRONG on its face in round 1: the sticky-unpark veto's timeline
+#       read was written as "(1)", which is a count of `gh api --paginate` INVOCATIONS, not of
+#       HTTP requests. At `per_page=100` that read costs ceil(events/100) requests.
+#       RE-MEASURED on the live target (sparq-org/sparq), as `len(timeline?per_page=100)`. THE
+#       POPULATION IS THE FOUR PRs THE SWEEP ACTUALLY PARKED, and it identifies itself: their
+#       `review:parked` labels landed 20:15:53Z, 20:28:37Z, 20:41:20Z and 20:50:16Z — FOUR
+#       CONSECUTIVE TICKS, ONE PARK EACH, which is this defect visible in the label timeline.
+#           #4599 = 8, #4601 = 5, #4604 = 7, #4607 = 4 events
+#       and the three OLDEST open PRs (#1487/#1509/#1607) — the widest timelines the fleet
+#       actually holds — carry 19 / 32 / 25. ONE page each, so the itemised 1 is right.
+#       (An EARLIER round of this comment named #4360/#4509/#4528/#4571 as the board. That was
+#       wrong and is corrected rather than quietly dropped: #4571 is an ISSUE, #4360 is a CLOSED
+#       PR, and #4509/#4528 carry `needs:user` — a human-owned hold that
+#       park_starved_partition_holder REFUSES. They are the UNPROVENANCED population this file
+#       names elsewhere, which is a different set from the PARKED board.)
+#       These counts DRIFT — they moved within hours of being taken, and two read methods
+#       disagreed by one — so the exact numbers are not what the bound rests on. What it rests on
+#       is the margin to the 100/page boundary: at a cap of 12 the spare affords FOUR pages per
+#       holder (12 * (4 + 4) = 96 <= 102) before the budget binds, i.e. ~400 timeline events on
+#       every holder at once.
+#   spare requests per tick     ~= 102
+#       the floor sizes a clean tick at MEASURED_REQUESTS_PER_TICK=613 and 6 ticks/h = 3,678/h,
+#       against OBSERVED_SAFE_REQUESTS_PER_HOUR = 7*613 = 4,291/h that ran clean for thirteen
+#       hours. Spare = 4,291 - 3,678 = 613/h = ~102 per tick at 6 ticks/h.
+#   12 parks * 5 requests       =  60  <=  102     (59% of the spare, 9.8% of a tick)
+#
+# and 12 is 3x the largest starved board actually measured (4 holders, the window above), so the
+# measured case drains in ONE tick (10 min) rather than FOUR (40 min); the observed outage ran ~55
+# min because that window also spans the tick that first measured it and the one that cleared it. A
+# board wider than the bound is paced onto later ticks exactly as before, loudly. _starvation_sweep_self_test asserts BOTH halves
+# of this arithmetic against dispatch-tick-floor.py's own constants, so neither the floor nor this
+# bound can drift away from the reasoning that produced it.
+#
+# EVERY MEASURED INPUT THAT ARITHMETIC CONSUMES IS PINNED BY EQUALITY, not merely by the inequality
+# that reads it (registry #871). An inequality pins exactly ONE direction, and for the inputs below
+# the direction it leaves open is the UNSAFE one: `_batch_cost <= _spare_per_tick` reads the park
+# cost only on the LEFT, so understating it makes the assertion strictly EASIER. MEASURED on this
+# file before the pins existed: `STARVATION_PARK_REQUESTS_EACH = 1` SURVIVED the entire self-test,
+# and `= 1` with the cap widened to 100 survived it too — a green suite sanctioning ~500 real
+# requests per tick (6 x 1,113 = 6,678/h) against an OBSERVED-SAFE 4,291/h. Only the OVER-stating
+# mutant (`= 50`) ever died. That is exactly the shape of the MEASURED_STARVED_HOLDER_BOARD hole,
+# one constant over.
+#
+# The per-park request cost, ITEMISED so the total cannot drift away from its own derivation: a
+# mutant that rewrites the total is caught by the equality pin on the total, and one that rewrites
+# a line item is caught by the equality pin on the itemisation.
+STARVATION_PARK_REQUEST_ITEMS = (
+    # the sticky-unpark veto's timeline read: ONE `--paginate` invocation, ceil(events/100)
+    # requests at per_page=100; MEASURED one page for every holder on the live board
+    ("unpark-veto timeline read", 1),
+    ("collaborator-permission probes behind the veto", 2),
+    ("the park receipt comment", 1),
+    ("the machine-park label write", 1),
+)
+STARVATION_PARK_REQUESTS_EACH = sum(_n for _what, _n in STARVATION_PARK_REQUEST_ITEMS)   # == 5
+STARVATION_PARKS_PER_TICK_MAX = 12
+
+# The widest starved `__global__` holder board MEASURED on a live target (sparq-org/sparq,
+# 2026-07-27 20:12:40Z-20:47:36Z). The bound must drain it in ONE tick or the floor multiplies the
+# outage again; the self-test asserts exactly that.
+MEASURED_STARVED_HOLDER_BOARD = 4
 
 
-def starvation_park_target(planned_items, deferred, occupancy, log=print):
-    """PURE. The ONE `__global__` occupant to park because the issue lane is STARVED, or None.
+def starvation_park_targets(planned_items, deferred, occupancy, log=print,
+                            cap=STARVATION_PARKS_PER_TICK_MAX):
+    """PURE. EVERY `__global__` occupant to park because the issue lane is STARVED (ascending).
 
     This is the trigger for the self-healing sweep in registry #677. It fires on the MEASURED
     condition, never on a timer, and every clause below is load-bearing:
@@ -1926,13 +2017,19 @@ def starvation_park_target(planned_items, deferred, occupancy, log=print):
       free one single crate. Registry #677 measured exactly that outcome by hand. A holder whose
       park would not demonstrably free the partition is not a candidate.
 
-    Deterministic and bounded: candidates are considered in ascending PR number and exactly one is
-    returned, so at most STARVATION_PARKS_PER_TICK_MAX == 1 holder is parked per repository per
-    tick, and two runs over the same input pick the same PR."""
+    ALL of them, not one (registry #822 composition defect — see STARVATION_PARKS_PER_TICK_MAX).
+    `busy` is a UNION, so the partition stays reserved while any holder holds it: parking one of N
+    frees nothing and the next tick — now 10 minutes away, not 7 — re-measures the identical
+    starvation. Under this function's own predicate (`planned_items` empty AND `deferred > 0`)
+    there is no dispatch left to protect, so the batch cannot starve anything.
+
+    Deterministic and bounded: candidates are returned in ascending PR number, at most `cap` of
+    them, so two runs over the same input pick the same PRs and a pathological board is paced onto
+    later ticks instead of becoming an unbounded mutation burst."""
     if planned_items:
-        return None                       # the plan is HEALTHY — never park a holder
+        return []                         # the plan is HEALTHY — never park a holder
     if not isinstance(deferred, int) or isinstance(deferred, bool) or deferred <= 0:
-        return None                       # nothing was starved (empty backlog / unreadable count)
+        return []                         # nothing was starved (empty backlog / unreadable count)
     candidates = []
     for row in occupancy if isinstance(occupancy, list) else []:
         if not isinstance(row, tuple) or len(row) < 5:
@@ -1954,12 +2051,21 @@ def starvation_park_target(planned_items, deferred, occupancy, log=print):
         log("starvation sweep: the issue lane planned 0 item(s) behind "
             f"{deferred} partition-deferred row(s), but no UN-PARKED, provably-inert "
             f"`{GLOBAL_PACKAGE}` holder was found — parking nobody")
-        return None
-    target = min(candidates)
+        return []
+    candidates.sort()
+    targets = candidates[:cap] if isinstance(cap, int) and not isinstance(cap, bool) else []
     log(f"starvation sweep: issue lane planned 0 item(s) while {deferred} ready row(s) deferred "
         f"behind the `{GLOBAL_PACKAGE}` partition; {len(candidates)} un-parked inert holder(s) "
-        f"{sorted(candidates)} — parking pr#{target} (cap {STARVATION_PARKS_PER_TICK_MAX}/tick)")
-    return target
+        f"{candidates} — parking {targets} (cap {cap}/tick)")
+    if len(candidates) > len(targets):
+        # LOUD, because this is the ONLY residue of the old defect: the partition is a union, so a
+        # board wider than the bound still frees nothing this tick and the remainder waits a full
+        # floor interval. It has never been observed (widest measured board:
+        # MEASURED_STARVED_HOLDER_BOARD), and if it is, the bound is what needs re-deriving.
+        log(f"::warning::starvation park paced: {len(candidates)} inert `{GLOBAL_PACKAGE}` "
+            f"holder(s) exceed the {cap}/tick bound; {candidates[len(targets):]} wait for the "
+            "next tick, and the partition stays reserved until the LAST holder is parked")
+    return targets
 
 
 def record_global_reservation_cause(census, cause):
@@ -2001,9 +2107,22 @@ def global_reservation_census(occupancy):
 
 
 # [registry #772] How many unprovenanced `__global__` holders ONE tick may escalate, per target
-# repository. The same pacing doctrine as STARVATION_PARKS_PER_TICK_MAX: an escalation is a loud,
-# operator-facing artifact, and emitting one per holder per tick would bury the signal it exists
-# to raise. One per tick converges — each tick re-measures the live occupancy.
+# repository. An escalation is a loud, operator-facing artifact, and emitting one per holder per
+# tick would bury the signal it exists to raise, so it is paced.
+#
+# NO LONGER "the same pacing doctrine as STARVATION_PARKS_PER_TICK_MAX" — that cross-reference was
+# true until #822 and is retracted rather than left standing. The two caps bound DIFFERENT harms
+# and are now sized independently:
+#   * a PARK is a throughput action on a lane that is already at zero, so under-acting is the
+#     expensive direction and its bound is the request budget (see STARVATION_PARKS_PER_TICK_MAX);
+#   * an ESCALATION is a WARNING, so OVER-acting is the expensive direction and 1/tick is right on
+#     its own terms — the harm it guards is a buried signal, not a starved lane.
+#
+# The tick cost is stated so nobody has to re-derive it: at #822's 10-minute floor, N stuck
+# holders take N * 10 minutes for ALL of them to be NAMED in a run log. The measured population
+# was 3 (sparq-org/sparq #4360/#4509/#4528) = 30 minutes to enumerate. That is VISIBILITY latency
+# on a condition that is already permanent and already counted every tick under
+# `partition-starvation-unprovenanced`, not dispatch outage — which is why it is left at 1.
 STARVATION_ESCALATIONS_PER_TICK_MAX = 1
 
 
@@ -2011,7 +2130,7 @@ def starvation_provenance_escalation(planned_items, deferred, occupancy, log=pri
                                      cap=STARVATION_ESCALATIONS_PER_TICK_MAX):
     """PURE. The unprovenanced `__global__` holder(s) to ESCALATE — the starved lane's MISSING EDGE.
 
-    [registry #772] `starvation_park_target` is the only remedy the sweep has, and it declines
+    [registry #772] `starvation_park_targets` is the only remedy the sweep has, and it declines
     every holder that is not an un-parked provably-inert draft, because parking an ACTIVE holder
     writes a label and frees nothing. That refusal is correct. What was missing is what happens
     NEXT: the sweep logged "parking nobody" and the tick ended, so a lane annihilated by a PR with
@@ -2036,7 +2155,7 @@ def starvation_provenance_escalation(planned_items, deferred, occupancy, log=pri
         its source issue carries no `area:` labels is a partition working as designed and has no
         provenance recovery — escalating it would be noise;
       - and the park sweep's remedy must NOT apply. An un-parked, provably-inert holder is
-        exactly what `starvation_park_target` selects, so escalating it too would double-report
+        exactly what `starvation_park_targets` selects, so escalating it too would double-report
         the one case that already self-heals.
 
     Returns at most `cap` PR numbers in ascending order — deterministic, like the park half."""
@@ -4478,11 +4597,21 @@ def _log_park_census(repo, census, log=print):
             "population is uncounted")
 
 
-# [registry #677] How many partition-starvation parks ONE tick may UN-park, per repository. The
-# park side is capped at 1 because each park changes the measured condition; the un-park side is
-# capped at the same value the ordinary capacity re-admission uses, for the same stated reason —
-# a whole cohort re-entering the review lane in one tick starves the allocator that parked most of
-# them. An un-park deferred by this ceiling writes nothing and is simply retried next tick.
+# [registry #677] How many partition-starvation parks ONE tick may UN-park, per repository.
+#
+# DELIBERATELY ASYMMETRIC with STARVATION_PARKS_PER_TICK_MAX, and the asymmetry is the point. The
+# two directions have opposite failure modes: a park batch acts on a lane that is ALREADY at zero
+# (the sweep's predicate is `planned=0 and deferred>0`), so it cannot starve anything and is
+# bounded only by the request budget; an un-park batch puts a whole cohort BACK into a live review
+# lane, which is exactly what starves the allocator that parked most of them. So the release side
+# stays pinned to the ordinary capacity re-admission ceiling, for that reason and no other.
+#
+# The residual coupling, stated rather than hidden: a wide park batch can now be released more
+# slowly than it was applied. That is the benign direction (a release is throughput coming back,
+# not an outage), and releases are driven by each PR's provenance record landing, which does not
+# arrive in a batch. An un-park deferred by this ceiling writes nothing and is retried next tick —
+# which is now a 10-minute unit (#822), so the drain of a full cohort is
+# ceil(N / AUTO_READMISSION_PER_TICK_MAX) * 10 minutes. Re-derive this if that ever binds.
 STARVATION_UNPARKS_PER_TICK_MAX = AUTO_READMISSION_PER_TICK_MAX
 
 # The park cause this sweep owns. It is written into the park receipt and re-read before any
@@ -4711,10 +4840,13 @@ def starvation_park_body(repo, pr_number, deferred, issue_url):
         f"`{GLOBAL_PACKAGE}` to the reservation. Adding `area:*` labels to the PR cannot remove "
         "it — the fail-closed default is unioned in on top of them.\n\n"
         "## Why this PR\n\n"
-        "It is the lowest-numbered open worker PR that (a) holds that partition, (b) is not "
-        "already parked, and (c) is a provably inert draft with no arm latch — so parking it "
-        "**demonstrably frees the partition**. A holder whose park would not free anything is "
-        "never selected. At most one holder is parked per tick.\n\n"
+        "It is an open worker PR that (a) holds that partition, (b) is not already parked, and "
+        "(c) is a provably inert draft with no arm latch — so parking it **contributes to freeing "
+        "the partition**. A holder whose park would not free anything is never selected.\n\n"
+        "The reservation is a **union**, so the partition is only released once the **last** such "
+        "holder is parked. Every eligible holder is therefore parked on the same tick (up to a "
+        f"bound of {STARVATION_PARKS_PER_TICK_MAX}); parking them one per tick would leave the "
+        "lane fully starved for the whole drain and buy nothing until the final one.\n\n"
         "## What the label means\n\n"
         f"`{MACHINE_PARK_PR_LABEL}` is the **machine-recoverable capacity** class. A parked, "
         "inactive PR releases its crate reservation — that release is the entire purpose of this "
@@ -4747,7 +4879,7 @@ def park_starved_partition_holder(repo, pr_number, deferred, labels, park_pr, po
     The three refusals, all failing toward DOING NOTHING:
 
     - `labels` already carries the machine park -> nothing to do (idempotence, defence in depth;
-      starvation_park_target already declines an already-parked holder).
+      starvation_park_targets already declines an already-parked holder).
     - `labels` carries a HUMAN-owned hold -> a human is already holding this PR and the machine
       has no business writing a second hold on top of it.
     - `vetoed(pr_number)` -> park_policy's sticky human-unpark veto. A human who un-parked this PR
@@ -6694,9 +6826,18 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
 
         starved = next((entry["deferred"] for entry in plan["partition_starvation"]
                         if entry["repo"] == repo), 0)
-        starvation_target = starvation_park_target(
+        # EVERY inert holder, not the lowest one (registry #822). `busy` is a union: the partition
+        # is only released once the LAST holder is parked, so a per-tick cap of 1 multiplied by
+        # #822's 10-minute floor turned a 4-holder board into ~55 minutes of total dispatch
+        # outage. The loop is per-holder-resilient — one failed park never costs the others.
+        #
+        # >>> starvation-park-batch — EXECUTED by _starvation_park_batch_seam_self_test against
+        # stubs. The sentinels delimit the exact source it runs, so "one tick parks all N" is
+        # proven on the PRODUCTION statements rather than on a copy of them or on their shape.
+        starvation_targets = starvation_park_targets(
             repository["items"], starved, live_occupancy)
-        if starvation_target is not None and bot_login and _target_token(repo):
+        for starvation_target in (starvation_targets
+                                  if bot_login and _target_token(repo) else []):
             try:
                 _live_row = next(
                     (row for page in pull_pages if isinstance(page, list)
@@ -6716,11 +6857,13 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                             is_human=lambda probe: _target_is_human_maintainer(repo, probe))):
                     defer_reasons["partition-starvation-park"] += 1
             except DispatchError as exc:
-                # One failed park never stops the tick: the lane is already starved, and the next
-                # tick re-measures and retries. Loud, because a park that cannot be applied is the
-                # difference between a self-healing fleet and a stalled one.
+                # One failed park never stops the tick — nor the OTHER parks in this batch: the
+                # lane is already starved, the remaining holders each still hold the partition,
+                # and the next tick re-measures and retries. Loud, because a park that cannot be
+                # applied is the difference between a self-healing fleet and a stalled one.
                 print(f"::warning::starvation park FAILED {repo}#{starvation_target}: {exc}; the "
                       f"`{GLOBAL_PACKAGE}` partition is still held")
+        # <<< starvation-park-batch
 
         # [registry #772] The starved lane's MISSING EDGE. The park sweep above declines every
         # holder that is not an un-parked provably-inert draft — correctly, because parking an
@@ -17464,82 +17607,368 @@ def _escalation_call_site(source):
     return None
 
 
+def _park_call_site(source):
+    """[registry #822] STRUCTURAL proof that some PRODUCTION function iterates EVERY target
+    `starvation_park_targets(...)` returned and parks EACH one. Returns that function's name,
+    or None.
+
+    This is the seam for the leg named in the title, and it is the one a plausible regression
+    actually lands on. The pure-function tests above all stay green if the call site quietly
+    re-scalarises the batch — `park(targets[0])`, `for t in targets[:1]`, `cap=1` at the call
+    site — which restores the exact 1-per-tick defect while every assertion in this file passes.
+    So the check is on ANCESTRY, and it refuses:
+
+      - no `for` over the assigned result           -> the batch is not iterated at all;
+      - `park_starved_partition_holder` outside it  -> at most one holder is ever written;
+      - any SLICE in the loop's iterable            -> `[:1]` is the defect wearing a loop;
+      - a `cap=` keyword at the call site           -> the bound must be the DERIVED constant,
+                                                       not a number retyped at the call site.
+    """
+    import ast
+    tree = ast.parse(source)
+    for func in ast.walk(tree):
+        if not isinstance(func, ast.FunctionDef) or func.name.endswith("_self_test"):
+            continue
+        bound = set()
+        for node in ast.walk(func):
+            if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
+                continue
+            if getattr(node.value.func, "id", None) != "starvation_park_targets":
+                continue
+            if any(keyword.arg == "cap" for keyword in node.value.keywords):
+                continue                  # a call-site cap can silently restore the 1/tick defect
+            bound.update(target.id for target in node.targets
+                         if isinstance(target, ast.Name))
+        if not bound:
+            continue
+        for loop in ast.walk(func):
+            if not isinstance(loop, ast.For):
+                continue
+            iter_names = {node.id for node in ast.walk(loop.iter)
+                          if isinstance(node, ast.Name)}
+            if not (iter_names & bound):
+                continue
+            if any(isinstance(node, ast.Slice) for node in ast.walk(loop.iter)):
+                continue                  # `targets[:1]` is the per-tick cap of 1, re-typed
+            for stmt in ast.walk(loop):
+                if (isinstance(stmt, ast.Call)
+                        and getattr(stmt.func, "id", None)
+                        == "park_starved_partition_holder"):
+                    return func.name
+    return None
+
+
+def _starvation_park_batch_source():
+    """The PRODUCTION park-batch statements, lifted verbatim from `dispatch()` by sentinel."""
+    source = inspect.getsource(dispatch)
+    begin = source.index("# >>> starvation-park-batch")
+    begin = source.index("\n", source.index("proven on the PRODUCTION", begin)) + 1
+    end = source.index("# <<< starvation-park-batch")
+    block = textwrap.dedent(source[begin:end])
+    assert block.startswith("starvation_targets = starvation_park_targets("), block[:80]
+    return block
+
+
+def _run_starvation_park_batch(holders, *, token=True, bot="bot", failing=(), planned=()):
+    """EXECUTE the production park-batch block over `holders` inert `__global__` occupants.
+
+    Returns `(parked, counted)` — the PR numbers whose label write actually happened, and the
+    `defer_reasons` count. Every collaborator is a stub, so what is under test is exclusively the
+    production control flow between `starvation_park_targets` and `park_starved_partition_holder`.
+    `failing` names holders whose label write raises, proving the batch is per-holder resilient.
+    """
+    parked, comments = [], []
+
+    def park_pr(number):
+        if number in failing:
+            raise DispatchError("label write failed")
+        parked.append(number)
+
+    occupancy = [_starvation_row(number, packages={GLOBAL_PACKAGE}) for number in holders]
+    namespace = {
+        "starvation_park_targets": starvation_park_targets,
+        "park_starved_partition_holder": park_starved_partition_holder,
+        "_starvation_row": _starvation_row,
+        "DispatchError": DispatchError,
+        "GLOBAL_PACKAGE": GLOBAL_PACKAGE,
+        "MACHINE_PARK_PR_LABEL": MACHINE_PARK_PR_LABEL,
+        "_park_policy": _park_policy,
+        "_issue_timeline_events": lambda *a, **k: [],
+        "_target_is_human_maintainer": lambda *a, **k: False,
+        "_labels": lambda row: [],
+        "_run_gh_target_comment": lambda repo, number, body: comments.append(number),
+        # the production `park_pr=` lambda closes over _run_gh_target_api; the stub reads the
+        # SAME arguments the real call site passes, so a re-pointed label would be visible here
+        "_run_gh_target_api": lambda repo, method, path, payload=None: park_pr(
+            int(path.rsplit("/", 2)[-2])),
+        "repo": "o/r",
+        "repository": {"items": list(planned)},
+        "starved": 12,
+        "live_occupancy": occupancy,
+        "bot_login": bot,
+        "_target_token": lambda _repo: token,
+        "pull_pages": [[{"number": number, "labels": []} for number in holders]],
+        "defer_reasons": Counter(),
+        "print": lambda *a, **k: None,
+    }
+    with contextlib.redirect_stdout(io.StringIO()):
+        exec(compile(_starvation_park_batch_source(),   # noqa: S102 — this repository's own source
+                     "<dispatch starvation-park-batch>", "exec"), namespace)
+    return parked, namespace["defer_reasons"]["partition-starvation-park"]
+
+
+def _starvation_park_batch_seam_self_test():
+    """[registry #822] THE DEFECT, PINNED ON EXECUTED PRODUCTION SOURCE.
+
+    Every other assertion about the batch calls the pure selector directly, so all of them stay
+    green if the production tick acts on only the first target — which IS the defect. This runs
+    the real statements and counts the real writes.
+    """
+    # the real PR numbers of the board the sweep parked one-per-tick on the measured window
+    board = [4599, 4601, 4604, 4607][:MEASURED_STARVED_HOLDER_BOARD]
+    parked, counted = _run_starvation_park_batch(list(reversed(board)))
+    assert parked == board, (
+        f"ONE tick must park ALL {len(board)} inert `{GLOBAL_PACKAGE}` holders — the reservation "
+        f"is a union, so parking a subset frees nothing and #822's 10-minute floor makes each "
+        f"un-parked holder another 10 minutes of TOTAL dispatch outage (parked {parked})")
+    assert counted == len(board), counted
+    print(f"  ok   #822 park batch (EXECUTED production source): {len(board)} inert holders -> "
+          f"{len(parked)} label writes on ONE tick, and {counted} counted defer reason(s)")
+
+    # PER-HOLDER RESILIENT: one failed write must not cost the others their park. Under a cap of 1
+    # this case could not even arise; under a batch it is the difference between a partial drain
+    # and none, and the partition needs the LAST holder parked.
+    parked, counted = _run_starvation_park_batch(board, failing={board[0]})
+    assert parked == board[1:] and counted == len(board) - 1, (parked, counted)
+    print("  ok   #822 park batch: one FAILED label write does not abort the batch — the "
+          "remaining holders are still parked this tick")
+
+    # ...and the token/bot gate still stands the whole batch down, writing nothing.
+    assert _run_starvation_park_batch(board, token=False) == ([], 0)
+    assert _run_starvation_park_batch(board, bot="") == ([], 0)
+    # a HEALTHY plan writes nothing even with a full board of eligible holders — the production
+    # block must read the plan's own items, not a constant
+    assert _run_starvation_park_batch(board, planned=[{"number": 900}]) == ([], 0)
+    print("  ok   #822 park batch: no target token, no bot identity, and a HEALTHY plan each "
+          "stand the WHOLE batch down — writing nothing at all")
+
+
 def _starvation_sweep_self_test():
     item = {"number": 900, "package": "crate-a", "deferred": False}
     holder = _starvation_row(41, packages={GLOBAL_PACKAGE})
 
     # ---- TRIGGER: fires only on the measured starvation --------------------------------------
     logs = []
-    assert starvation_park_target([], 12, [holder], log=logs.append) == 41
-    assert any("planned 0 item(s)" in line and "parking pr#41" in line for line in logs), logs
+    assert starvation_park_targets([], 12, [holder], log=logs.append) == [41]
+    assert any("planned 0 item(s)" in line and "parking [41]" in line for line in logs), logs
     print("  ok   #677 starvation sweep: a starved lane behind an inert __global__ holder "
           "selects exactly that holder")
 
     # A HEALTHY plan is the guard the brief calls out by name: over-parking costs real review
     # progress, so ANY planned item must stand the sweep down. Deleting the `if planned_items`
     # clause reds HERE.
-    assert starvation_park_target([item], 12, [holder]) is None
-    assert starvation_park_target([item], 0, [holder]) is None
+    assert starvation_park_targets([item], 12, [holder]) == []
+    assert starvation_park_targets([item], 0, [holder]) == []
     print("  ok   #677 starvation sweep: NEVER fires while the plan is healthy (>=1 planned item)")
 
     # An EMPTY backlog is not starvation. Deleting the `deferred <= 0` clause reds HERE — and
     # this is the case that would otherwise park a holder for no throughput at all.
-    assert starvation_park_target([], 0, [holder]) is None
-    assert starvation_park_target([], -1, [holder]) is None
-    assert starvation_park_target([], True, [holder]) is None      # bool is not a count
-    assert starvation_park_target([], "12", [holder]) is None      # unreadable count
+    assert starvation_park_targets([], 0, [holder]) == []
+    assert starvation_park_targets([], -1, [holder]) == []
+    assert starvation_park_targets([], True, [holder]) == []      # bool is not a count
+    assert starvation_park_targets([], "12", [holder]) == []      # unreadable count
     print("  ok   #677 starvation sweep: an EMPTY backlog (0 deferred rows) parks nobody")
 
     # ---- CANDIDATE SELECTION: each declining clause, one at a time ----------------------------
     # already parked -> idempotence. Re-running the sweep against its own output selects nobody.
-    assert starvation_park_target(
-        [], 12, [_starvation_row(41, packages={GLOBAL_PACKAGE}, parked=True)]) is None
+    assert starvation_park_targets(
+        [], 12, [_starvation_row(41, packages={GLOBAL_PACKAGE}, parked=True)]) == []
     # parked AND inert -> busy_packages_of_pulls already freed it (decision `parked-free`)
-    assert starvation_park_target(
+    assert starvation_park_targets(
         [], 12, [_starvation_row(41, packages={GLOBAL_PACKAGE}, parked=True,
-                                 decision="parked-free")]) is None
+                                 decision="parked-free")]) == []
     # ...and the decision filter is checked INDEPENDENTLY of the reason slot. Today a
     # `parked-free` row always carries a park reason, so the two guards overlap and deleting
     # either alone still declines. This fixture is the row that separates them: a NON-`busy`
     # decision whose reason slot reads "not-parked". It cannot arise from the current
     # busy_packages_of_pulls, and that is exactly why it is here — a new decision kind added
     # later must not silently become a park candidate.
-    assert starvation_park_target(
-        [], 12, [("parked-free", 41, frozenset({GLOBAL_PACKAGE}), "not-parked", True)]) is None
-    assert starvation_park_target(
+    assert starvation_park_targets(
+        [], 12, [("parked-free", 41, frozenset({GLOBAL_PACKAGE}), "not-parked", True)]) == []
+    assert starvation_park_targets(
         [], 12, [("some-future-decision", 41, frozenset({GLOBAL_PACKAGE}),
-                  "not-parked", True)]) is None
+                  "not-parked", True)]) == []
     print("  ok   #677 starvation sweep: an ALREADY-PARKED holder is never re-parked "
           "(idempotent), and only a `busy` decision is ever a candidate")
 
     # ACTIVE holder -> parking it would write a label and free NOTHING (busy_packages_of_pulls
     # frees only `parked AND inactive`). Deleting the `inactive is not True` clause reds HERE.
-    assert starvation_park_target(
-        [], 12, [_starvation_row(41, packages={GLOBAL_PACKAGE}, inactive=False)]) is None
-    assert starvation_park_target(
-        [], 12, [_starvation_row(41, packages={GLOBAL_PACKAGE}, inactive=None)]) is None
+    assert starvation_park_targets(
+        [], 12, [_starvation_row(41, packages={GLOBAL_PACKAGE}, inactive=False)]) == []
+    assert starvation_park_targets(
+        [], 12, [_starvation_row(41, packages={GLOBAL_PACKAGE}, inactive=None)]) == []
     print("  ok   #677 starvation sweep: an ACTIVE holder — whose park would free NOTHING — "
           "is never parked")
 
     # a holder of REAL crates is not a __global__ holder: parking it does not unstarve the lane.
-    assert starvation_park_target(
-        [], 12, [_starvation_row(41, packages={"crate-a", "crate-b"})]) is None
+    assert starvation_park_targets(
+        [], 12, [_starvation_row(41, packages={"crate-a", "crate-b"})]) == []
     # a malformed occupancy row is not evidence to act on
-    assert starvation_park_target([], 12, [("busy", 41, frozenset({GLOBAL_PACKAGE}))]) is None
-    assert starvation_park_target([], 12, ["junk"]) is None
-    assert starvation_park_target([], 12, None) is None
-    assert starvation_park_target(
-        [], 12, [_starvation_row(0, packages={GLOBAL_PACKAGE})]) is None
+    assert starvation_park_targets([], 12, [("busy", 41, frozenset({GLOBAL_PACKAGE}))]) == []
+    assert starvation_park_targets([], 12, ["junk"]) == []
+    assert starvation_park_targets([], 12, None) == []
+    assert starvation_park_targets(
+        [], 12, [_starvation_row(0, packages={GLOBAL_PACKAGE})]) == []
     print("  ok   #677 starvation sweep: crate-only holders and malformed occupancy rows are "
           "not candidates")
 
-    # ---- BOUND: at most ONE per tick, deterministically -------------------------------------
+    # ---- [registry #822] THE DEFECT THIS CHANGE FIXES: ONE tick parks EVERY inert holder ------
+    #
+    # `busy` is a UNION over occupants, so `__global__` stays reserved while ANY holder holds it:
+    # parking 1 of N frees NOTHING and the lane is identically starved next tick — which #822's
+    # 10-minute floor makes a 10-minute unit. MEASURED on sparq-org/sparq 2026-07-27: kept=0 on
+    # four consecutive executed ticks 20:12:40Z->20:47:36Z, zero impl workers launched, ~55 min of
+    # total dispatch outage. THIS IS THE ASSERTION THE PRE-FIX CODE REDS ON — it returned
+    # `min(candidates)`, i.e. `41`, for every fixture below.
     many = [_starvation_row(n, packages={GLOBAL_PACKAGE}) for n in (77, 41, 63)]
-    assert STARVATION_PARKS_PER_TICK_MAX == 1
-    assert starvation_park_target([], 12, many) == 41
-    assert starvation_park_target([], 12, list(reversed(many))) == 41
-    print("  ok   #677 starvation sweep: THREE eligible holders yield exactly ONE target, the "
-          "lowest-numbered, order-independently")
+    assert starvation_park_targets([], 12, many) == [41, 63, 77]
+    assert starvation_park_targets([], 12, list(reversed(many))) == [41, 63, 77]
+    print("  ok   #822 starvation sweep: THREE eligible holders are ALL parked on ONE tick, "
+          "ascending and order-independently — parking one of three frees nothing")
+
+    # The measured board itself, at its real PR numbers: one tick, one floor interval, drained.
+    # These are the four PRs the sweep ACTUALLY parked, one per tick, on the window this change is
+    # justified by — `review:parked` applied at 20:15:53Z / 20:28:37Z / 20:41:20Z / 20:50:16Z.
+    board_numbers = [4599, 4601, 4604, 4607][:MEASURED_STARVED_HOLDER_BOARD]
+    board = [_starvation_row(n, packages={GLOBAL_PACKAGE}) for n in reversed(board_numbers)]
+    assert starvation_park_targets([], 30, board) == board_numbers, board_numbers
+    _floor = _load_module("registry_tick_floor_pin",
+                          Path(__file__).resolve().parent / "dispatch-tick-floor.py")
+    _drain_ticks = -(-MEASURED_STARVED_HOLDER_BOARD // STARVATION_PARKS_PER_TICK_MAX)
+    _drain_minutes = _drain_ticks * _floor.MIN_TICK_INTERVAL_SECONDS // 60
+    assert _drain_ticks == 1 and _drain_minutes == 10, (
+        f"the widest MEASURED starved board ({MEASURED_STARVED_HOLDER_BOARD} holders) must drain "
+        f"in ONE executed tick; at a cap of {STARVATION_PARKS_PER_TICK_MAX} it takes "
+        f"{_drain_ticks} tick(s) = {_drain_minutes} min of TOTAL dispatch outage, because the "
+        "union keeps the partition reserved until the LAST holder is parked")
+    # THE OBSERVATION ITSELF IS PINNED. Everything above is satisfied by a SMALLER board, so a
+    # mutant that quietly understates the measurement leaves the whole battery green while the
+    # bound it justifies stops being justified — measured: `MEASURED_STARVED_HOLDER_BOARD = 1`
+    # survived this file until this assertion existed. A recorded observation can only be
+    # defended by pinning it; it is re-derived from a NEW measurement, never from code.
+    assert MEASURED_STARVED_HOLDER_BOARD == 4, (
+        "MEASURED_STARVED_HOLDER_BOARD is an OBSERVATION — sparq-org/sparq, four consecutive "
+        "executed dispatch ticks 2026-07-27 20:12:40Z-20:47:36Z, assemble-census kept=0 with "
+        "every row deferred by reason.global-reservation. Change it only with a new measurement, "
+        "and re-derive STARVATION_PARKS_PER_TICK_MAX when you do")
+    assert (MEASURED_STARVED_HOLDER_BOARD * _floor.MIN_TICK_INTERVAL_SECONDS // 60) == 40, \
+        "the PRE-FIX drain of the measured board is the number this change is justified by " \
+        "(4 holders x a 10-minute floor); if either input moved, the justification moved with it"
+    print(f"  ok   #822 drain time: the measured {MEASURED_STARVED_HOLDER_BOARD}-holder board "
+          f"drains in {_drain_ticks} tick ({_drain_minutes} min), not "
+          f"{MEASURED_STARVED_HOLDER_BOARD} ticks "
+          f"({MEASURED_STARVED_HOLDER_BOARD * _floor.MIN_TICK_INTERVAL_SECONDS // 60} min)")
+
+    # ---- THE BOUND IS STILL A BOUND, and its arithmetic is pinned to the FLOOR's own numbers --
+    # A bound exists so a pathological board cannot become an unbounded mutation burst. It is
+    # derived, not chosen: park cost * bound must fit the request headroom the floor left behind.
+    _ticks_per_hour = 3600 / _floor.MIN_TICK_INTERVAL_SECONDS
+    _spare_per_tick = (_floor.OBSERVED_SAFE_REQUESTS_PER_HOUR
+                       - _ticks_per_hour * _floor.MEASURED_REQUESTS_PER_TICK) / _ticks_per_hour
+    _batch_cost = STARVATION_PARKS_PER_TICK_MAX * STARVATION_PARK_REQUESTS_EACH
+    assert _batch_cost <= _spare_per_tick, (
+        f"a full park batch costs {_batch_cost} requests but the floor's own budget leaves only "
+        f"{_spare_per_tick:.0f} spare per tick — re-derive STARVATION_PARKS_PER_TICK_MAX, or the "
+        "sweep becomes the next rate-limit outage (#819)")
+    assert STARVATION_PARKS_PER_TICK_MAX >= MEASURED_STARVED_HOLDER_BOARD
+    print(f"  ok   #822 bound arithmetic: {STARVATION_PARKS_PER_TICK_MAX} parks x "
+          f"{STARVATION_PARK_REQUESTS_EACH} requests = {_batch_cost} <= "
+          f"{_spare_per_tick:.0f} spare/tick — asserted against dispatch-tick-floor's OWN "
+          "constants, so neither can drift alone")
+
+    # ---- ...AND EVERY MEASURED INPUT THAT ARITHMETIC READS IS PINNED BY EQUALITY [#871] -------
+    #
+    # The inequality above can only ever pin ONE direction per input, and for three of the four it
+    # is the SAFE direction that is pinned — the unsafe one runs free:
+    #
+    #   input                             read on   an inequality alone leaves open
+    #   STARVATION_PARK_REQUESTS_EACH     LEFT      UNDERSTATING the per-park cost
+    #   OBSERVED_SAFE_REQUESTS_PER_HOUR   RIGHT     OVERSTATING the ceiling the budget is judged by
+    #   MEASURED_REQUESTS_PER_TICK        RIGHT     OVERSTATING tick cost (spare = M/6 grows with M)
+    #   MIN_TICK_INTERVAL_SECONDS         both      only [600, 614] — the drain asserts floor-divide
+    #                                               by 60, and MEASURED: `= 601` survived them
+    #
+    # MEASURED, on this file before these four assertions existed: `STARVATION_PARK_REQUESTS_EACH
+    # = 1` SURVIVED the whole self-test; so did `= 1` together with `STARVATION_PARKS_PER_TICK_MAX
+    # = 100`, which sanctions ~500 real requests per tick (6 x 1,113 = 6,678/h) against an
+    # OBSERVED-SAFE 4,291/h — the exact outage class #819 is. Only the OVER-stating `= 50` died.
+    # Same shape as MEASURED_STARVED_HOLDER_BOARD, one constant over: if a constant records a
+    # measurement, assert the measurement.
+    assert STARVATION_PARK_REQUEST_ITEMS == (
+        ("unpark-veto timeline read", 1),
+        ("collaborator-permission probes behind the veto", 2),
+        ("the park receipt comment", 1),
+        ("the machine-park label write", 1),
+    ), ("the per-park cost is an ITEMISED MEASUREMENT of the requests park_starved_partition_"
+        "holder issues. THE POPULATION TO RE-MEASURE IS THE PRs THE SWEEP ACTUALLY PARKED — on "
+        "sparq-org/sparq that is #4599/#4601/#4604/#4607, identifiable without trusting this "
+        "sentence because their `review:parked` labels landed 20:15:53Z/20:28:37Z/20:41:20Z/"
+        "20:50:16Z, one per tick, which is the defect itself. It is NOT the unprovenanced "
+        "population (#4360/#4509/#4528) this file names elsewhere: those are a different set, one "
+        "is closed and two carry a `needs:user` hold this writer refuses. Their `--paginate` "
+        "timeline reads measured 8/5/7/4 events, and the three OLDEST open PRs 19/32/25 — one "
+        "page each, and the counts DRIFT, so re-measure rather than trust them. Then up to 2 "
+        "collaborator-permission probes, the receipt comment and the label write. Change a line "
+        "item only with a new measurement of that call path, and re-derive "
+        "STARVATION_PARKS_PER_TICK_MAX when you do")
+    assert STARVATION_PARK_REQUESTS_EACH == 5, (
+        "STARVATION_PARK_REQUESTS_EACH is a MEASUREMENT, and it is read only on the LEFT of "
+        "`_batch_cost <= _spare_per_tick`, so an inequality cannot defend it downward: at `= 1` "
+        "the batch is costed at a fifth of what it issues and the bound stops bounding anything")
+    assert _floor.MEASURED_REQUESTS_PER_TICK == 613, (
+        "MEASURED_REQUESTS_PER_TICK is dispatch-tick-floor's instrumented per-tick request count "
+        "(#721). This file's spare is (7M - 6M)/6 = M/6, so it GROWS with M — an overstated tick "
+        "cost silently buys this batch headroom that does not exist")
+    assert _floor.OBSERVED_SAFE_REQUESTS_PER_HOUR == 7 * 613, (
+        "OBSERVED_SAFE_REQUESTS_PER_HOUR is an OBSERVATION — 7 executed ticks in the 10Z hour, "
+        "ran clean; 13 (OBSERVED_BREAKING) did not. It sits only on the RIGHT of every `<=` that "
+        "reads it, in BOTH files, so overstating it is invisible to all of them. This PR is what "
+        "made a second file's bound lean on it, so it is pinned from the consumer")
+    assert _floor.MIN_TICK_INTERVAL_SECONDS == 10 * 60, (
+        "the #822 floor is what turns a per-TICK cap into a per-10-MINUTE cap; if it moves, every "
+        "drain time in this block and the bound they justify must be re-derived")
+
+    # ...and the itemised timeline read is the one line item that is not a constant of the API: a
+    # holder with >100 timeline events costs a page more, so the margin to that boundary is worth
+    # having in the run log. It is COMPUTED AND REPORTED, NOT ASSERTED, and deliberately so:
+    # `_pages_afforded >= 1` is algebraically the same statement as `_batch_cost <= _spare_per_tick`
+    # above, so it could never fire on its own. An assertion that cannot fail is the vacuity this
+    # very block exists to eliminate, and writing one here would have been the same mistake in a
+    # new costume. Strengthening it to `>= 2` WOULD bite — but it would narrow the bound's honest
+    # interval from [4, 20] to [4, 16] as a side effect of a comment, which is a different change.
+    _pages_afforded = (int(_spare_per_tick) // STARVATION_PARKS_PER_TICK_MAX
+                       - (STARVATION_PARK_REQUESTS_EACH - 1))
+    print(f"  ok   #871 measured inputs PINNED BY EQUALITY: park cost "
+          f"{STARVATION_PARK_REQUESTS_EACH} (itemised), floor {_floor.MIN_TICK_INTERVAL_SECONDS}s, "
+          f"tick {_floor.MEASURED_REQUESTS_PER_TICK} req, safe "
+          f"{_floor.OBSERVED_SAFE_REQUESTS_PER_HOUR}/h — and the batch affords "
+          f"{_pages_afforded} timeline page(s) per holder (reported, not asserted: it restates "
+          f"the batch-cost bound) against a MEASURED 1")
+
+    # ...and a board WIDER than the bound is paced, ascending, loudly — never silently truncated.
+    paced_logs = []
+    wide = [_starvation_row(n, packages={GLOBAL_PACKAGE})
+            for n in range(100, 100 + STARVATION_PARKS_PER_TICK_MAX + 3)]
+    taken = starvation_park_targets([], 40, list(reversed(wide)), log=paced_logs.append)
+    assert taken == list(range(100, 100 + STARVATION_PARKS_PER_TICK_MAX)), taken
+    assert any(line.startswith("::warning::starvation park paced:") for line in paced_logs), \
+        paced_logs
+    # the explicit `cap=` override is the same code path, so the bound is testable without
+    # rewriting the constant
+    assert starvation_park_targets([], 40, wide, cap=2, log=lambda _m: None) == [100, 101]
+    assert starvation_park_targets([], 40, wide, cap=0, log=lambda _m: None) == []
+    print("  ok   #822 pacing: a board wider than the bound takes the LOWEST `cap` holders and "
+          "WARNS that the partition stays reserved until the remainder is parked")
 
     # ---- THE WRITE: the exact mutation set, and what it must never contain --------------------
     def run_park(labels, *, vetoed=None):
@@ -17736,14 +18165,14 @@ def _starvation_sweep_self_test():
                                           "repo": {"full_name": "o/r"}}}
     active_ready = dict(inert_draft, draft=False)
     latched_draft = dict(inert_draft, auto_merge={"enabled_by": {"login": "x"}})
-    for row, want_inactive, want_target in ((inert_draft, True, 41),
-                                            (active_ready, False, None),
-                                            (latched_draft, False, None)):
+    for row, want_inactive, want_target in ((inert_draft, True, [41]),
+                                            (active_ready, False, []),
+                                            (latched_draft, False, [])):
         produced = occupancy_of(row)
         assert len(produced) == 1 and produced[0][0] == "busy", produced
         # the bit the sweep reads IS _pull_inactivity_decision's own answer, not a constant
         assert produced[0][4] is _pull_inactivity_decision(row)[0] is want_inactive, produced
-        assert starvation_park_target([], 12, produced) == want_target, (row, produced)
+        assert starvation_park_targets([], 12, produced) == want_target, (row, produced)
     print("  ok   #677 starvation end-to-end: the inertness bit is PRODUCED by "
           "busy_packages_of_pulls — a live non-draft or latched holder is never selected")
 
@@ -17833,24 +18262,24 @@ def _starvation_sweep_self_test():
           "undeclared cause raises instead of silently minting a bucket")
 
     # ---- [registry #772] THE MISSING EDGE: the holder the park sweep cannot help ---------------
-    # This is the whole defect. `starvation_park_target` correctly declines an ACTIVE holder
+    # This is the whole defect. `starvation_park_targets` correctly declines an ACTIVE holder
     # (parking it writes a label and frees nothing), and before this change the tick simply ended
     # there — "parking nobody" — so a lane annihilated by a recordless PR stayed at zero with no
     # terminal state and no named recovery. MEASURED: 5 of 84 successful dispatch ticks on
     # 2026-07-27, holders #4360/#4509/#4528 still recordless 16h/8h/4h later.
     active_unprov = occupancy_of(unprovenanced)
-    assert starvation_park_target([], 12, active_unprov) is None, "park sweep should decline it"
+    assert starvation_park_targets([], 12, active_unprov) == [], "park sweep should decline it"
     assert starvation_provenance_escalation([], 12, active_unprov) == [51], active_unprov
     # A PARKED-but-active holder is equally stuck: busy_packages_of_pulls frees only
     # `parked AND inactive`, and the park sweep skips anything already parked.
     parked_active = occupancy_of(dict(unprovenanced, labels=[{"name": MACHINE_PARK_PR_LABEL}]))
     assert parked_active[0][0] == "busy", parked_active
-    assert starvation_park_target([], 12, parked_active) is None
+    assert starvation_park_targets([], 12, parked_active) == []
     assert starvation_provenance_escalation([], 12, parked_active) == [51], parked_active
     # ...but the one holder the PARK sweep DOES remedy is never double-reported: an un-parked,
     # provably-inert draft is the park half's own candidate and self-heals next tick.
     inert_unprov = occupancy_of(dict(unprovenanced, draft=True))
-    assert starvation_park_target([], 12, inert_unprov) == 51, inert_unprov
+    assert starvation_park_targets([], 12, inert_unprov) == [51], inert_unprov
     assert starvation_provenance_escalation([], 12, inert_unprov) == [], inert_unprov
     print("  ok   #772 missing edge: an unprovenanced holder with NO park remedy reaches the "
           "escalation, and the park half's own candidate is never double-reported")
@@ -18175,8 +18604,8 @@ def _starvation_sweep_self_test():
     # labelled as such rather than dressed up as behavioural coverage. Same technique the
     # `migration_provable=` call-site pin above uses.
     _dispatch_src = inspect.getsource(dispatch)
-    assert "starvation_park_target(" in _dispatch_src, \
-        "main()'s dispatch loop no longer CALLS starvation_park_target — the starved-plan sweep " \
+    assert "starvation_park_targets(" in _dispatch_src, \
+        "main()'s dispatch loop no longer CALLS starvation_park_targets — the starved-plan sweep " \
         "is unreachable and every test above is vacuous"
     assert "park_starved_partition_holder(" in _dispatch_src, \
         "main()'s dispatch loop no longer CALLS park_starved_partition_holder — the sweep " \
@@ -18208,7 +18637,7 @@ def _starvation_sweep_self_test():
         f"(found {_unpark_write.group(1) if _unpark_write else None!r}) — this sweep must never "
         "be able to remove a human-owned hold")
     assert _dispatch_src.index("starvation_unpark_targets(") \
-        < _dispatch_src.index("starvation_park_target("), \
+        < _dispatch_src.index("starvation_park_targets("), \
         "the un-park half must run BEFORE the park half in the tick, so a tick that releases a " \
         "holder re-measures the lane before deciding whether to park another"
     # The label the production call site actually writes. The injected `park_pr` in the tests
@@ -18222,7 +18651,7 @@ def _starvation_sweep_self_test():
         f"(found {_park_write.group(1) if _park_write else None!r}) — registry #703: this action "
         "must never become a conveyor into the human terminal")
     # ...and it must not route through the escalating capacity-park ladder either.
-    _sweep_block = _dispatch_src[_dispatch_src.index("starvation_park_target("):]
+    _sweep_block = _dispatch_src[_dispatch_src.index("starvation_park_targets("):]
     _sweep_block = _sweep_block[:_sweep_block.index("for item in repository[\"items\"]")]
     for forbidden in ("_pr_needs_user", "_park_source_issue", "_issue_needs_user_landed"):
         assert forbidden not in _sweep_block, (
@@ -18244,6 +18673,23 @@ def _starvation_sweep_self_test():
         f"both, an unprovenanced __global__ holder is silent again (found {seam!r})")
     print("  ok   #772 call-site seam (AST): the production tick ITERATES the escalation and "
           "COUNTS every escalated holder — a deleted call site or a dropped counter reds here")
+
+    # ---- [registry #822] THE PARK CALL SITE, on the PARSED tree -------------------------------
+    # The pure-function tests prove `starvation_park_targets` returns the whole batch. NONE of them
+    # can see whether the production tick acts on the whole batch. `park(targets[0])`, `[:1]`, or a
+    # `cap=1` at the call site each restore the exact defect this PR removes while leaving every
+    # other assertion in this file green — which is the vacuity class this repo keeps measuring, on
+    # the leg named in the title. Decided on ancestry, so a comment cannot satisfy it.
+    park_seam = _park_call_site(Path(__file__).resolve().read_text(encoding="utf-8"))
+    assert park_seam == "dispatch", (
+        "the production tick must ITERATE starvation_park_targets(...) and call "
+        "park_starved_partition_holder for EACH target, un-sliced and without a call-site `cap=` "
+        f"— otherwise the 1-holder-per-tick defect is back at 10 min/holder (found {park_seam!r})")
+    print("  ok   #822 park call-site seam (AST): the production tick PARKS EVERY selected "
+          "holder — a re-scalarised call site, a `[:1]`, or a call-site cap= reds here")
+
+    # ---- [registry #822] THE PARK BATCH, EXECUTED on production source -----------------------
+    _starvation_park_batch_seam_self_test()
 
     # ---- THE YAML SEAM: structural, on PARSED nodes ------------------------------------------
     _starvation_yaml_seam_self_test()
