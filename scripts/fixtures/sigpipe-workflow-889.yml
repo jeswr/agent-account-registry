@@ -1,0 +1,45 @@
+# POSITIVE CONTROL for _workflow_run_shell (registry issue #889). DATA, never executed and never
+# dispatched: it lives under scripts/fixtures/ rather than .github/workflows/, so GitHub never sees
+# it AND the "zero hits across .github/workflows/*.yml" assertion needs no exemption for its own
+# evidence — the same rule sigpipe-shapes-879.txt / sigpipe-repro-879.bash follow for scripts/*.sh.
+#
+# It carries FOUR countable `producer | early-exiting consumer` shapes in pipefail-ON shell and TWO
+# that must NOT be counted because pipefail is off where they sit. worker-live.sh asserts the exact
+# total, which pins BOTH directions at once: an extractor that returned nothing (or that lost the
+# `run:` walk entirely) undercounts, and one that dropped the pipefail state machine overcounts.
+name: sigpipe shape control (not a real workflow)
+on: workflow_dispatch
+jobs:
+  control:
+    runs-on: ubuntu-latest
+    steps:
+      # pipefail ON, stated. Both shapes below are counted (2).
+      - name: pipefail on
+        run: |
+          set -euo pipefail
+          first=$(printf '%s\n' "$body" | head -1)
+          if printf '%s' "$probe" | grep -q 'HTTP 404'; then echo found; fi
+
+      # pipefail UNSTATED. Assumed ON, because `shell: bash` (and every explicit `shell: bash` step)
+      # runs with -o pipefail: a body that never says otherwise must fail closed into the guard, not
+      # out of it. Counted (1) — awk scores a segment once, so the `sed`+`head` line is one hit.
+      - name: pipefail unstated
+        run: |
+          n=$(gh api "repos/o/r/issues" | sed -n 's/^x:[[:space:]]*//p' | head -1)
+
+      # Deliberately DISABLED, exactly like fingerprint-accounts.yml's `rl()` helper. NOT counted:
+      # with pipefail off a SIGPIPEd producer cannot set the pipeline's status, so the shape is out
+      # of the class rather than merely tolerated.
+      - name: pipefail off
+        run: |
+          set +e +o pipefail   # tolerate 401/no-header responses
+          rl() { grep -i "^x-ratelimit-$1:" /tmp/h.txt | head -1; }
+
+      # Disabled and then RE-ENABLED. The shape before the re-enable is exempt, the one after it is
+      # counted (1) — so the exemption can never be implemented as a whole-body skip.
+      - name: pipefail off then on again
+        run: |
+          set +o pipefail
+          tolerated=$(printf 'a\nb\n' | head -1)
+          set -o pipefail
+          counted=$(printf 'a\nb\n' | head -1)

@@ -234,12 +234,22 @@ jobs:
             echo "no prior enrollment bound to request #$ISSUE — proceeding with a fresh enrollment"
             exit 0
           fi
-          num=$(printf '%s' "$bound" | head -1)
+          # [#889] CAPTURE, then take the first line with a parameter expansion — never
+          # `producer | head`. `head` exits on its first line, SIGPIPEs the still-running producer,
+          # and the `set -euo pipefail` opening this step then reports 141 for a pipeline that did what
+          # it was asked to: under `set -e` that aborts the step. `$( )` runs the producer to
+          # completion and yields ITS status, and `${x%%$'\n'*}` is a builtin with no second process
+          # that could exit early or be signalled. `sed -n …p` (no `q`) drains its input by
+          # construction, so it stays a pipe safely. See #879/#888 for the measured class.
+          num=${bound%%$'\n'*}
           handle=$(gh issue view "$num" -R "$REPO" --json title --jq .title)
           body=$(gh issue view "$num" -R "$REPO" --json body --jq .body)
-          secret=$(printf '%s\n' "$body" | sed -n 's/^secret_ref:[[:space:]]*\([A-Za-z0-9_]*\).*/\1/p' | head -1)
-          models=$(printf '%s\n' "$body" | sed -n 's/^models:[[:space:]]*\(.*\)$/\1/p' | head -1 | tr -d '\r')
-          fmt=$(printf '%s\n' "$body" | sed -n 's/^credential_format:[[:space:]]*\([A-Za-z0-9._-]*\).*/\1/p' | head -1)
+          secret=$(printf '%s\n' "$body" | sed -n 's/^secret_ref:[[:space:]]*\([A-Za-z0-9_]*\).*/\1/p')
+          secret=${secret%%$'\n'*}
+          models=$(printf '%s\n' "$body" | sed -n 's/^models:[[:space:]]*\(.*\)$/\1/p' | tr -d '\r')
+          models=${models%%$'\n'*}
+          fmt=$(printf '%s\n' "$body" | sed -n 's/^credential_format:[[:space:]]*\([A-Za-z0-9._-]*\).*/\1/p')
+          fmt=${fmt%%$'\n'*}
           # #579: the authorized target set recorded on the bound account issue. It is the RESUMED
           # request's authorization snapshot — the grant step below requires it to still equal the
           # live `grant:` labels — so a record without a readable `grant_targets:` line cannot be
@@ -284,7 +294,7 @@ jobs:
           fi
           if probe=$(GH_TOKEN="$REGISTRY_PAT" gh api "repos/$REPO/environments/dispatch-secrets/secrets/$secret" 2>&1); then
             echo "resume preflight: secret $secret exists in the dispatch-secrets environment"
-          elif printf '%s' "$probe" | grep -q 'HTTP 404'; then
+          elif [[ "$probe" == *'HTTP 404'* ]]; then
             echo "::error::account issue #$num ($handle) references secret $secret, which does NOT exist in the dispatch-secrets environment — resuming would activate an account with no usable credential (fail closed). Either restore the secret and re-apply set-up-account to resume, or close account issue #$num (its slot stays burned by design; claims are never released) and re-apply for a fresh enrollment."; exit 1
           else
             echo "::error::could not prove secret $secret exists in the dispatch-secrets environment (the probe failed for a non-404 reason) — refusing to resume (fail closed). Re-apply set-up-account to retry."; exit 1
@@ -717,7 +727,11 @@ jobs:
               claimed=$n
               break
             fi
-            if ! printf '%s' "$out" | grep -qi 'already exists'; then
+            # [#889] `${out,,}` + a fixed-string match replaces `| grep -qi`: `grep -q` exits on its
+            # first match, so under `pipefail` a pipeline that DID match can report 141 and send this
+            # `if !` down the refusing branch. Here the whole test is bash builtins — no pipe, no
+            # consumer that can be signalled — so a collision is still read as a collision.
+            if [[ "${out,,}" != *'already exists'* ]]; then
               echo "::error::claim-ref creation for $cand failed for a non-collision reason — refusing to store (fail closed)"; exit 1
             fi
             echo "slot $cand was claimed concurrently; re-deriving (attempt $attempt)"
@@ -733,7 +747,7 @@ jobs:
           if probe=$(GH_TOKEN="$REGISTRY_PAT" gh api "repos/${{ github.repository }}/actions/secrets/$SECRET_NAME" 2>&1); then
             echo "::error::secret $SECRET_NAME already exists despite an owned claim (out-of-band write) — refusing to overwrite (fail closed)"; exit 1
           fi
-          if ! printf '%s' "$probe" | grep -q 'HTTP 404'; then
+          if [[ "$probe" != *'HTTP 404'* ]]; then
             echo "::error::could not prove $SECRET_NAME is absent — refusing to store (fail closed)"; exit 1
           fi
           # Post-#101 the canonical home is the `dispatch-secrets` environment: probe it too
@@ -742,7 +756,7 @@ jobs:
           if envprobe=$(GH_TOKEN="$REGISTRY_PAT" gh api "repos/${{ github.repository }}/environments/dispatch-secrets/secrets/$SECRET_NAME" 2>&1); then
             echo "::error::secret $SECRET_NAME already exists in the dispatch-secrets environment despite an owned claim — refusing to overwrite (fail closed)"; exit 1
           fi
-          if ! printf '%s' "$envprobe" | grep -q 'HTTP 404'; then
+          if [[ "$envprobe" != *'HTTP 404'* ]]; then
             echo "::error::could not prove $SECRET_NAME is absent from the dispatch-secrets environment — refusing to store (fail closed)"; exit 1
           fi
           # The secret lives on THIS registry repo, in the `dispatch-secrets` ENVIRONMENT
@@ -1277,7 +1291,11 @@ jobs:
         run: |
           set -euo pipefail
           handle="${HEAD_REF#account-pool/}"
-          if ! printf '%s' "$handle" | grep -qE '^acct[0-9a-z]{2,}$'; then
+          # [#889] bash's own ERE match, not `| grep -qE`: `grep -q` exits on its first match and
+          # under `pipefail` the SIGPIPEd producer can turn a VALID handle into a refusal. It is also
+          # the stricter check — `[[ =~ ]]` anchors against the WHOLE string, where grep is
+          # line-oriented and would have accepted an embedded newline followed by anything.
+          if ! [[ "$handle" =~ ^acct[0-9a-z]{2,}$ ]]; then
             echo "::error::head ref '$HEAD_REF' does not encode a valid account handle — refusing"; exit 1
           fi
           # Resolve the account issue by EXACT title FIRST (#579): its `grant_targets:` line records
@@ -1319,7 +1337,7 @@ jobs:
           # parent, an unreadable blob, a diff reaching beyond the granted rows — refuses, leaving
           # the account status:pending for a human.
           if ! parent=$(gh api "repos/$REPO/commits/$MERGE_SHA" --jq '.parents[0].sha') \
-             || ! printf '%s' "$parent" | grep -qE '^[0-9a-f]{40}$'; then
+             || ! [[ "$parent" =~ ^[0-9a-f]{40}$ ]]; then
             echo "::error::could not resolve the first parent of merge commit $MERGE_SHA, so the pre-merge policy cannot be read and the grant's scope cannot be re-proved — refusing to activate $handle (fail closed)"; exit 1
           fi
           # Raw media type + a FILE, never a command substitution: `$(...)` strips trailing newlines,
@@ -1394,7 +1412,10 @@ jobs:
                 f"PR #{os.environ['PR_NUMBER']}'s own complete merge-base diff touched only {path} "
                 f"and added {handle} to account_pool lines while moving no other member")
           PY
-          granted=$(printf '%s\n' "$body" | sed -n 's/^grant_targets:[[:space:]]*\(.*\)$/\1/p' | head -1 | tr -d '\r')
+          # [#889] `sed` drains its input; the first line is then taken by a builtin expansion, so no
+          # early-exiting `head` is ever left downstream of a live producer (see the reconcile step).
+          granted=$(printf '%s\n' "$body" | sed -n 's/^grant_targets:[[:space:]]*\(.*\)$/\1/p' | tr -d '\r')
+          granted=${granted%%$'\n'*}
           labels=$(gh issue view "$num" -R "$REPO" --json labels --jq '[.labels[].name]|join(" ")')
           case " $labels " in
             *" status:available "*) echo "$handle (issue #$num) already status:available — nothing to do"; exit 0 ;;
@@ -1419,7 +1440,8 @@ jobs:
             --body "✅ Activated: \`$handle\` is now \`status:available\` for its authorized targets \`$granted\` (account_pool PR #$PR_NUMBER merged; the merged policy was re-proved against the pre-merge commit — the handle appears exactly once in each authorized row, and every other row and field is byte-identical)." || echo "::warning title=set-up-account::the activation notice failed to post — the refusal/outcome above is the authoritative record"
           # Close the linked request issue (request_issue: <n> in the account issue body).
           req=$(printf '%s\n' "$body" \
-                  | sed -n 's/^request_issue:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1)
+                  | sed -n 's/^request_issue:[[:space:]]*\([0-9][0-9]*\).*/\1/p')
+          req=${req%%$'\n'*}
           if [ -n "$req" ]; then
             # PR #595 finding 5 audit: same disposition as the activate path above — the label flip
             # is fail-loud, the request-issue close is a courtesy whose failure leaves the issue OPEN

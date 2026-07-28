@@ -284,6 +284,91 @@ _sigpipe_shape_hits() {
   ' "$@"
 }
 
+# PURE (self-tested, positive-control included): print the shell of every workflow `run:` block in
+# the files named by "$@", with each pipefail-DISABLED region replaced by comment lines, so that
+# _sigpipe_shape_hits can be run over workflows too. [#889] The scanner above covers scripts/*.sh
+# only; #888 fixed all 16 shell sites of the #879 class and left 13 in workflow `run:` blocks, which
+# is where this repo's trust-sensitive control flow actually lives (set-up-account.yml alone held
+# 12). Parsing is PyYAML over the document — never a regex over YAML — because `run:` bodies are
+# block scalars whose indentation, not their text, says where they end; an unparseable workflow is
+# unverifiable and REFUSES (rc 1) rather than contributing a comfortable zero. The awk-based
+# _workflow_step_run above is deliberately NOT reused: it selects ONE step by its `id:`, and most
+# steps have none, so a sweep built on it would silently cover only the handful of identified steps
+# — under-counting is the one direction this guard must never fail in.
+#
+# The pipefail state machine is what makes this precise instead of merely noisy. The 141 inversion
+# needs `set -o pipefail`: with pipefail off a SIGPIPEd producer cannot set the pipeline's status at
+# all, so a deliberately-tolerant step (fingerprint-accounts.yml's `rl()` opens `set +e +o pipefail`
+# to tolerate 401s) is out of the class, not an exception carved into the guard. Two directions are
+# deliberate: state starts ON — `shell: bash` runs `-o pipefail`, so a body that never states one
+# way or the other is assumed vulnerable and counted (fail closed) — and the state is tracked PER
+# LINE, so a body that disables pipefail for a few lines still has the rest of it scanned. Blanked
+# lines become `#`, which is exactly what the awk scanner already skips. Each body is additionally
+# separated by one more `#` so that a body ending mid-continuation (a heredoc line ending in `|`,
+# say) cannot splice onto the next body and score a shape present in neither — defence in depth,
+# and the only property here the control fixture's count does NOT pin, because a well-formed body
+# cannot end mid-continuation in the first place.
+_workflow_run_shell() {
+  python3 - "$@" <<'PY'
+import re
+import sys
+
+import yaml
+
+
+def run_bodies(node):
+    """Every `run:` string in the document, at any depth (`defaults.run` is a dict, so it is
+    skipped by the isinstance guard rather than by knowing where steps live)."""
+    if isinstance(node, dict):
+        body = node.get("run")
+        if isinstance(body, str):
+            yield body
+        for value in node.values():
+            yield from run_bodies(value)
+    elif isinstance(node, list):
+        for item in node:
+            yield from run_bodies(item)
+
+
+SET_LINE = re.compile(r"^\s*set\s+(.*)$")
+
+
+def pipefail_delta(line):
+    """True if this line enables pipefail, False if it disables it, None if it says nothing.
+    Reads the flag WORD (`-euo pipefail` enables just as `-o pipefail` does; `+e +o pipefail`
+    disables), and the last mention on the line wins."""
+    match = SET_LINE.match(line)
+    if not match:
+        return None
+    state = None
+    tokens = match.group(1).split()
+    for index, token in enumerate(tokens):
+        if len(token) >= 2 and token[0] in "-+" and token.endswith("o"):
+            if tokens[index + 1:index + 2] == ["pipefail"]:
+                state = token[0] == "-"
+    return state
+
+
+out = []
+for path in sys.argv[1:]:
+    try:
+        with open(path, encoding="utf-8") as handle:
+            doc = yaml.safe_load(handle)
+    except Exception as exc:  # unparseable == unverifiable == refuse
+        print(f"sigpipe scan: {path} does not parse: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+    for body in run_bodies(doc):
+        out.append("#")
+        pipefail = True
+        for line in body.splitlines():
+            delta = pipefail_delta(line)
+            out.append(line if pipefail else "#")
+            if delta is not None:
+                pipefail = delta
+print("\n".join(out))
+PY
+}
+
 # PURE (issue #134): emit the nested READ-ONLY bind mount that pins the selected account credential
 # immutable inside the model's container HOME. The credential HOME is mounted read-write so the CLI
 # can persist its own session/cache, but the credential FILE itself must never be writable by the
@@ -2896,10 +2981,16 @@ self_test() {
     "$(printf '%s\n' "$gate_body" | grep -c '_selftest_env_blocked')" "1"
   chk "#824 wiring: an ENV-BLOCKED preflight REFUSES the gate, it does not warn and continue" \
     "$(printf '%s\n' "$gate_body" | grep -c "die 'registry-selftest gate: ENV-BLOCKED")" "1"
+  # [#889] CAPTURE then test: this row landed with `grep -n … | head -1 | grep -c`, the exact shape
+  # #888 removed, and it put scripts/*.sh back to ONE hit — i.e. Guard 2 below was RED on master.
+  # `grep -n` drains into `$( )`, and the first line is taken by a builtin expansion, so no
+  # early-exiting consumer is left downstream of a live producer. `|| true` keeps a no-match a
+  # normal empty capture (which then fails this assertion honestly) rather than a `set -e` abort.
+  local wiring_order
+  wiring_order=$(printf '%s\n' "$gate_body" \
+    | grep -n '_selftest_env_blocked\|_porcelain_changed_paths' || true)
   chk "#824 wiring: the preflight runs BEFORE any changed-path classification" \
-    "$(printf '%s\n' "$gate_body" \
-      | grep -n '_selftest_env_blocked\|_porcelain_changed_paths' \
-      | head -1 | grep -c '_selftest_env_blocked')" "1"
+    "$([[ "${wiring_order%%$'\n'*}" == *_selftest_env_blocked* ]] && echo 1 || echo 0)" "1"
 
   # --- codex provider-model argv contract (sol/luna, and terra on docs lanes). Claude empty
   # is rejected upstream by the _run_headless_harness normalization, so it never reaches this
@@ -4448,6 +4539,40 @@ PY
     "$(_sigpipe_shape_hits "$SCRIPT_DIR/fixtures/sigpipe-shapes-879.txt")" "7"
   chk "no \`producer | early-exiting consumer\` survives anywhere in scripts/*.sh (#879)" \
     "$(_sigpipe_shape_hits "$SCRIPT_DIR"/*.sh)" "0"
+
+  # Guard 3 — the same STATIC scanner over workflow `run:` blocks (#889). scripts/*.sh was only half
+  # the estate: #888 fixed 16 shell sites and left 13 in workflows, 12 of them in set-up-account.yml,
+  # which is where enrolment decides what gets a credential. Extraction is PyYAML, so the count below
+  # is over SHELL, not over YAML that happens to look like shell. The control comes first and its
+  # number pins the whole chain at once — mutation-checked, each of these lands somewhere other than
+  # 4: losing the `run:` walk gives 0, dropping the pipefail state machine 6, making the exemption a
+  # whole-body skip 3, and defaulting pipefail to OFF (the fail-OPEN direction) 3.
+  # Each row captures the extractor's own failure into a SENTINEL rather than letting `set -e` abort
+  # here: an absent PyYAML (the unprivileged model container has no pip — #824) must turn these two
+  # rows red, not silently take every later row of the suite down with it. Red is the fail-closed
+  # reading anyway: a guard that could not be evaluated has not passed.
+  local wf_control wf_all
+  if _workflow_run_shell "$SCRIPT_DIR/fixtures/sigpipe-workflow-889.yml" > "$tmp/wf-control.txt" 2>/dev/null
+  then wf_control=$(_sigpipe_shape_hits "$tmp/wf-control.txt"); else wf_control=extractor-unavailable; fi
+  chk "the workflow \`run:\` extractor finds the shapes in pipefail-ON shell and exempts only the rest (control)" \
+    "$wf_control" "4"
+  # ...and an unparseable workflow REFUSES rather than contributing a comfortable zero: a file the
+  # scanner cannot read is unverified, which is exactly the state this guard exists to reject.
+  # An unterminated flow mapping — invalid at EOF under any conforming YAML parser, so this row
+  # cannot pass for the wrong reason on a parser that happens to tolerate odd indentation.
+  printf 'jobs: {unterminated\n' > "$tmp/wf-broken.yml"
+  # Matching the REASON, not merely a non-zero status: any crash (an absent PyYAML, say) would also
+  # exit non-zero, so a bare `|| echo refused` would pass this row without the parse check ever
+  # having run. `grep -c` drains its input, so it is not itself the shape under test.
+  chk "...and a workflow that does not parse fails the scan closed (never a silent zero)" \
+    "$(_workflow_run_shell "$tmp/wf-broken.yml" 2>&1 >/dev/null | grep -c 'does not parse' || true)" "1"
+  # The real estate. fingerprint-accounts.yml still carries one shape and is expected to: its probe
+  # step opens `set +e +o pipefail` to tolerate 401s, so the pipeline status it produces is not the
+  # 141 this class is about — the state machine exempts it on that ground, not by name.
+  if _workflow_run_shell "$SCRIPT_DIR/../.github/workflows/"*.yml > "$tmp/wf-all.txt" 2>/dev/null
+  then wf_all=$(_sigpipe_shape_hits "$tmp/wf-all.txt"); else wf_all=extractor-unavailable; fi
+  chk "no \`producer | early-exiting consumer\` survives in any pipefail-ON workflow \`run:\` block (#889)" \
+    "$wf_all" "0"
 
   # --- crate-scoped gate package validation (defect #2, run 29634738177): the area:<label> →
   # `cargo -p` mapping crashed with exit 101 when the label was not a workspace-member name.
