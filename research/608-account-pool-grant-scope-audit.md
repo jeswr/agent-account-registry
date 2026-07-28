@@ -40,7 +40,7 @@ sparq-org/sparq                33 records across 8 distinct accounts
 jeswr/agent-account-registry    0 records   -> insufficient-evidence
 ```
 
-Two honest caveats, both of which are why this document does not propose a revocation:
+Three honest caveats, all of which are why this document does not propose a revocation:
 
 1. **8 distinct accounts is not "all 8 granted accounts".** Without `PROVENANCE_SALT` a
    fingerprint cannot be mapped to a handle, and the retired `acct03`/`acct06` served sparq during
@@ -51,9 +51,16 @@ Two honest caveats, both of which are why this document does not propose a revoc
    where records have been written since #96; the copies on `master` are the pre-#96 location that
    `effective_record_body` still reads as a fallback, and they are sparq-only. A complete audit
    needs a `ledger` checkout.
+3. **sparq's 33 is missing evidence too — just less obviously.** For the same #96 reason the
+   `master` corpus is a partial sample of that row's history (its PR numbers have gaps), and on a
+   partial corpus "no record names this handle" is indistinguishable from "the record that named
+   it is not in this checkout". A *nonempty* corpus is therefore no more a licence to revoke than
+   an empty one, so the audit will not propose a candidate from a corpus whose completeness has
+   not been independently established (see below).
 
-Both inputs — the salt and the `ledger` corpus — are available to the maintainer and not to a
-worker, which is the concrete reason this issue terminates in a human decision rather than a PR.
+All three inputs — the salt, the `ledger` corpus, and the enumeration of the PRs that corpus must
+contain — are available to the maintainer and not to a worker, which is the concrete reason this
+issue terminates in a human decision rather than a PR.
 
 ## How the tool refuses to cause the accident it is auditing for
 
@@ -61,6 +68,14 @@ The dangerous failure mode is proposing a revocation that is really just missing
 
 - A target with **zero records** is `insufficient-evidence` and proposes **nothing** — an
   unevidenced pool is never reported as an unused pool.
+- A target with records but **no verified completeness claim** is `partial-evidence` and also
+  proposes **nothing**: the handles actually observed are named (a record naming a handle proves
+  use on any corpus), and the candidate list stays empty (absence proves disuse only on a corpus
+  known to hold every record). Completeness is never inferred from the record count — it must be
+  **asserted** by a durable expected-record manifest (`--expected-records`: per target, an
+  observation `window` and the PR numbers that corpus must contain, derived from the `ledger`
+  branch / PR list) and **verified** here: if any expected record is absent, the row stays
+  `partial-evidence`. This is what keeps caveat 3 above from becoming a false revocation.
 - **Mapping is opt-in** (`--salt-env`). Unmapped, *no* target ever yields a candidate, because
   every granted handle is unknown rather than unused. This is the default, so the tool is
   advisory-safe to run anywhere.
@@ -82,11 +97,19 @@ handle removed from a pool fails `policy-resolve` / `select-and-claim.claim()` /
 independent re-check. A worker must not make that call unilaterally, which is why #608 is filed as
 an audit and closes with this record rather than with a policy diff.
 
-For the maintainer, on a checkout that carries the `ledger` provenance records:
+For the maintainer, on a checkout that carries the `ledger` provenance records, with
+`expected.json` naming — per target — the observation window and every worker PR that window
+contains (`{"targets": {"sparq-org/sparq": {"window": "...", "records": [2434, 2439, ...]}}}`):
 
 ```
-PROVENANCE_SALT=... python3 scripts/grant-scope-audit.py --salt-env --json
+PROVENANCE_SALT=... python3 scripts/grant-scope-audit.py \
+    --salt-env --expected-records expected.json --json
 ```
+
+Both opt-ins are required: without the salt no fingerprint maps to a handle, and without a
+manifest whose every record is present the row is `partial-evidence` and proposes nothing. That
+is deliberate — the manifest is the maintainer *asserting* what the corpus must contain, which is
+the only thing that turns "this handle appears in no record" into "this handle was not used".
 
 Then, **one reviewed `policy/repos.toml` change per revocation** — never a batch. The scoping
 primitives to prove such an edit is exactly bounded already exist in `scripts/grant-account.py`:
