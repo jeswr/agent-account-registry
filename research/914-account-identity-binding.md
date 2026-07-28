@@ -6,8 +6,10 @@
 > that record. It specifies the mechanism, argues its soundness, states plainly what it does
 > **not** buy, maps the blast radius against verified line numbers, names a defect in
 > `dispatch-secrets-guard.py` that the redesign would otherwise walk straight into, **removes**
-> one of the four touch-points #914 assumed, and fixes the sequencing so no PR in the series is
-> ever in a state where an already-enrolled account cannot activate.
+> one of the four touch-points #914 assumed, **adds** the credential edit the binding write cannot
+> land without (§4.2.1 — the register step holds no contents-write token today), and fixes the
+> sequencing so no PR in the series is ever in a state where an already-enrolled account cannot
+> activate.
 
 ## 0. State of the tree this record was written against
 
@@ -170,6 +172,78 @@ Three fail-closed obligations:
    writer per handle, is a re-run, and must be treated as idempotent-success only if the existing
    ref is for the number we just created. Any other collision is a state corruption and must die.
 
+### 4.2.1 The write identity — the credential the register step does not have
+
+§4.1 says ref creation requires push access. **The register step does not have push access.** In
+this tree:
+
+- the `login` job grants `issues: write` + `contents: read` (`:144-146`), and the comment there
+  records that the narrowness is deliberate — "the account_pool PR branch/PUT/PR use the scoped
+  App token";
+- the register step runs under exactly that identity, `GH_TOKEN: ${{ github.token }}` (`:773-774`);
+- the only `permission-contents: write` credential anywhere in the job is the App token minted at
+  `:861-871` — **after** the register step, and for the account_pool PR.
+
+So §4.2 as written would create the issue and then 403 on the ref write, on **every** enrollment,
+with the credential already captured (`gh secret set`, `:752`) and the claim ref already burned —
+manufacturing the exact stranded state this redesign exists to prevent. §5.1's edits are therefore
+incomplete: a fourth, *credential* edit is required, and it is the one that has to land first.
+
+**The same gap already sits under the shipped claim write, and that is the load-bearing fact.** The
+claim ref creation at `:715-716` is the *same* `POST git/refs` call, with the *same* `github.token`,
+in the *same* job. The claim write landed in #236 (`2bea89e4a`, 2026-07-18); the `contents: read`
+grant landed a day later in #383 (`a10c7e754`, 2026-07-19), *after* it. Only two things can be true:
+
+- **(i) `POST git/refs` genuinely requires `contents: write`.** Then enrollment is already broken —
+  every run dies at `:715`, fail-closed but unable to enrol — and the binding write inherits that
+  break. That is a live defect in shipped code, out of this record's scope; it is filed separately,
+  and PR 1 must not be written as though the claim write is known-good.
+- **(ii) It does not.** Then the binding write needs no new credential and this subsection reduces
+  to a comment.
+
+This record cannot settle (i) against (ii) from the tree (§9), and it will not guess: the empirical
+check is now a **precondition of PR 1**, not a post-hoc confirmation. The design below is the one
+that is correct under **either** answer.
+
+**The identity: a second, minimally scoped App token, minted before the irreversible capture, used
+inline on the binding call only.**
+
+```
+step  id: app-token-binding   (actions/create-github-app-token, SHA-pinned exactly as :864)
+      owner / repositories:   this repo, as :868-869
+      permission-contents: write      # and NOTHING else — no issues, no pull-requests
+      placed BEFORE the store step (:653) — before the claim ref AND before `gh secret set`
+
+register step:
+  gh issue create ...                                        # unchanged: ${{ github.token }}
+  GH_TOKEN="$BINDING_TOKEN" gh api .../git/refs -f ref=... -f sha=...   # binding write only
+```
+
+Three properties, each of which is why §6 gains a mutation row:
+
+1. **Narrow, and per-call.** The binding token carries `contents: write` and nothing else, so it
+   cannot create issues, comment, or open PRs; and the issue operations keep the default
+   `github.token`, so the contents-write credential never touches them. This is the per-call
+   `GH_TOKEN="…" gh …` override idiom the store step already uses for `REGISTRY_PAT` (`:693`,
+   `:733`, `:752`), not a job-level grant. Raising the job's `permissions:` to `contents: write` is
+   the obvious alternative and this record **rejects** it: it would hand contents-write to every
+   step of a job that also runs `npm install` and third-party provider login CLIs, which is
+   precisely what #188's per-step token doctrine (`:155-160`) exists to prevent.
+2. **Minted before the irreversible capture, not merely before the write.** A mint sitting between
+   `gh secret set` (`:752`) and the binding write turns any mint failure — App outage, rotated key,
+   rate limit — into the stranded state of §4.4. Minting before the store step makes a mint failure
+   cost *nothing*: no claim ref, no secret, no issue, clean abort and retry. Same doctrine as `:677`
+   ("visible BEFORE the irreversible claim"). It also places the token in scope for `:715`, which is
+   what answer (i) would require. And because the provider-login CLI steps all precede the store
+   step (`:513-651`), a mint at this position is still *after* every untrusted-code step — no
+   third-party CLI ever runs in a job where the binding token is an available step output.
+3. **Distinct from `app-token-pool`.** Reusing the pool token would mean dragging a
+   `pull-requests: write` credential earlier and across the capture. Two minimal mints cost less
+   than one over-broad token held longer.
+
+This shrinks the §4.4 window but does not close it: `gh issue create` → binding write remains, and
+it remains the state §5.4's alarm must name.
+
 ### 4.3 The read (both activation paths, replacing `:1153-1191` and its merged-path twin)
 
 ```
@@ -217,11 +291,12 @@ slot. That is the honest claim and it is the one worth making.
 
 ## 5. Blast radius
 
-### 5.1 `.github/workflows/set-up-account.yml` — three edits
+### 5.1 `.github/workflows/set-up-account.yml` — four edits
 
 | # | Where | Change |
 |---|---|---|
-| A | register step, after `:824` | capture + validate the issue number; create the binding ref (§4.2) |
+| A0 | new step immediately before the store step (`:653`) | mint `app-token-binding`: SHA-pinned `create-github-app-token`, this repo, `permission-contents: write` and nothing else (§4.2.1). **Prerequisite for A** — without it the binding write 403s under the job's `contents: read` (`:144-146`) |
+| A | register step, after `:824` | capture + validate the issue number; create the binding ref (§4.2) with `GH_TOKEN="$BINDING_TOKEN"` inline on that call only, leaving `gh issue create` on `${{ github.token }}` (§4.2.1) |
 | B | `activate_inline`, `:1153-1191` | replace the title match with the binding read (§4.3); keep the sentinels |
 | C | `activate_merged` (the `# <<<`-delimited twin near `:1337`) | the same replacement |
 
@@ -259,6 +334,25 @@ whose ref is `refs/acct-records/$HANDLE/$<captured>`, and (c) the create is text
 `gh issue create`. Plus, at minimum, making the namespace assertion at `:1649-1653` explicit about
 *which* `git/refs` occurrence it binds, so the order-fragility is closed rather than left latent.
 
+**Also required — the write identity of §4.2.1 must be guarded, or it silently decays.** Nothing in
+the guard today looks at *which* credential a mutation runs under, so a later edit could drop the
+inline override and the binding write would fail closed only in production. Three further
+assertions, all textual and all within reach of the existing narrow line parsers:
+
+- (d) the binding `git/refs` call carries the `GH_TOKEN="$BINDING_TOKEN"` inline prefix — the
+  credential is *bound to the call*, not inherited;
+- (e) `gh issue create` in that step does **not** carry it, so the contents-write token stays off
+  every issue operation;
+- (f) the mint step grants `permission-contents: write` and no other `permission-*` key, and appears
+  textually **before** the store step's `gh secret set` capture.
+
+Mechanical constraint, the analogue of the `SETUP_ACCOUNT_LISTING_RE` note below:
+`setup_account_store_step_lines` (`:1482-1502`) locates a step by an exact `id: <name>` line and
+takes every line up to the next `      - name:`, so it already retains a step's `env:` block and an
+`id:`-anchored twin extracts the register step unchanged. The mint step, however, is a `uses:` step
+whose grants live in a `with:` mapping rather than a `run:` script — (f) needs its own extractor
+over that block, and it must fail closed when the step cannot be located, exactly as `:1567` does.
+
 **Open question for sign-off (§8 Q2):** whether `git/matching-refs/acct-records/` should join
 `SETUP_ACCOUNT_UNION_REQUIRED` (`:1406-1411`) as a fifth pre-claim listing. The union's doctrine is
 "if an allocation record exists anywhere, the slot is taken", and a record ref is such a record.
@@ -287,6 +381,18 @@ created". After §4.2 the register step has two distinct partial states — *iss
 not* and *neither created* — with different recoveries. The alarm must distinguish them and, for
 the former, tell the operator to create `refs/acct-records/<handle>/<number>` for the issue this run
 created (whose number the step log carries) rather than to retract anything.
+
+§4.2.1's mint adds a third failure point, and placing it before the store step is what keeps it
+benign — the alarm text must say so rather than leaving an operator to guess:
+
+| failing step | state after | recovery |
+|---|---|---|
+| `app-token-binding` mint | nothing captured — no claim ref, no secret, no issue | **none required.** Re-run the request; the enrollment is clean. This is the whole reason the mint precedes `:653` |
+| binding `git/refs` write (after `:824`) | secret captured, claim burned, issue created, **no binding** | forward-recovery only: create `refs/acct-records/<handle>/<number>` for the issue this run created. Do **not** retract the issue and do **not** attempt to release the claim (#186: claim refs are never deleted) |
+| binding write 403s specifically | as above, and the mint or its grant is misconfigured | same forward recovery, **plus** fix A0 before the next enrollment — a 403 here means every subsequent run strands identically |
+
+There is no cleanup path for either binding-write row, only forward recovery: the capture at `:752`
+is irreversible by construction, so the alarm must never suggest an undo it cannot perform.
 
 ### 5.5 `README.md`
 
@@ -328,7 +434,16 @@ mutations must go **red** —
 - the digits-only assertion on the captured number deleted;
 - the binding write moved textually **before** `gh issue create`;
 - a second `git/refs` call added to the store step, proving the order-fragility of §5.2 is closed
-  rather than merely described.
+  rather than merely described;
+- the `GH_TOKEN="$BINDING_TOKEN"` prefix stripped from the binding write, so it falls back to the
+  job's `contents: read` default identity (§5.2 (d)) — the mutation that proves the guard, not just
+  production, catches the credential regression;
+- that same prefix added to `gh issue create` (§5.2 (e)) — the contents-write token must not spread
+  to issue operations;
+- the mint step granting `permission-issues: write` (or `permission-pull-requests: write`) in
+  addition to contents (§5.2 (f)) — over-broad is red, not merely un-asserted;
+- the mint step moved textually **after** the store step's `gh secret set` capture, which is the
+  reorder that reintroduces the stranded state of §5.4.
 
 Every mutation row must be shown failing for the *stated* reason, not merely failing.
 
@@ -343,8 +458,15 @@ re-drives it for a partially-enrolled handle. So a single PR that lands the read
 write (§4.2) together makes every existing handle un-reactivatable the moment it merges — a
 self-inflicted instance of the very wedge being fixed.
 
-1. **PR 1 — write only.** §4.2 + §5.2's new guard + §5.4 alarm + §5.5 runbook. Activation still
-   resolves by title. Nothing depends on the binding yet, so nothing can be wedged by its absence.
+1. **PR 1 — write only.** §4.2.1's mint step (A0) + §4.2 + §5.2's new guard, *including* the
+   identity assertions (d)–(f) + §5.4 alarm + §5.5 runbook. Activation still resolves by title.
+   Nothing depends on the binding yet, so nothing can be wedged by its absence.
+   **Precondition, blocking:** settle §4.2.1's (i)-vs-(ii) empirically — create and delete a
+   throwaway ref under `github.token` with the job's live `contents: read` grant — *before* writing
+   PR 1. Under (i) the shipped claim write at `:715` is already failing and its repair, not this
+   binding, is the first thing that must land; under (ii) A0 is defence in depth and PR 1's
+   description must not claim it fixes a live break. Either way the answer is recorded in the PR
+   body, because everything downstream rests on it.
 2. **PR 2 — backfill.** Create `refs/acct-records/<handle>/<number>` for every currently-enrolled
    handle, from a runbook with the numbers recorded in the PR body, plus a check that refuses if any
    enrolled, non-retired handle lacks a binding. Auditable by hand at this size (eight handles), and
@@ -370,6 +492,11 @@ This mirrors the two-PR discipline the repo already enforces for self-test retir
   title uniqueness is no longer load-bearing. Should #895 land first and its post-create re-read
   later be **retained** as defence in depth (recommended: yes — it is cheap, and it keeps the
   catalog clean for humans reading it), or should PR 3 remove it?
+- **Q5 — the write identity.** Adopt §4.2.1: a second minimally scoped App token
+  (`permission-contents: write` only) minted before the store step and applied inline to the binding
+  call alone, rather than raising the `login` job to `contents: write`? And confirm the PR-1
+  precondition — that the (i)/(ii) ref-permission question is settled empirically before PR 1 is
+  written, since under (i) the shipped claim write at `:715` is already broken and takes priority.
 
 Until Q1 is answered, `#914` should keep its `needs:design` gate: `needs:design` is a hard
 design-hold that `triage.py`/`ready-issues.py` refuse to auto-clear (`triage.py:18-19` — "never
@@ -380,8 +507,11 @@ auto-cleared here — a human/architect"), which is exactly the intended state f
 - It writes no code and changes no behaviour. Every file cited is unmodified.
 - It does not verify GitHub's ref-creation permission semantics against the live API. The claim
   that `POST git/refs` requires push access is taken from the documented API and from the fact that
-  the existing claim protocol (#186/#237) already relies on it; if Q1 is approved, PR 1 should
-  confirm it empirically on a throwaway ref before the binding is trusted.
+  the existing claim protocol (#186/#237) already relies on it. **§4.2.1 makes this the record's one
+  load-bearing unverified fact, so it is no longer deferrable to "PR 1 should confirm":** the same
+  call already ships at `:715` under a `contents: read` job, so the answer decides whether
+  enrollment is broken *today* (i) or the binding needs no new credential (ii). §7 makes settling it
+  a blocking precondition of PR 1 rather than a step inside it.
 - It does not size the residual §4.4 write window against real workflow-cancellation rates.
 - It does not establish the account **issue numbers** for the eight enrolled handles — PR 2's
   backfill must read them from live state, and this record's coverage claim is only as good as that
