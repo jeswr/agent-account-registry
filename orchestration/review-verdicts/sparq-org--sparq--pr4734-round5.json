@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4734,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "6dad83ee3ad4ee7d93b2756e78c0e6af72a39edf",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Report::total_derived is documented to receive no contribution from incremental maintenance, but MaterializedOwlGraph::rematerialize invokes materialize_owl_rl under the same active profiler. Its round() calls and final reconcile_total() add the delegated rebuild's derived count to the enclosing incremental report. Those facts can include consequences that were already visible before the mutation, so they are neither the mutation's net closure change nor valid incremental derived accounting. Direct counting-mode maintenance reports zero, leaving the public metric path-dependent. The revised fallback test still never asserts report.total_derived().",
+    "file": "crates/sparq-reason/src/profile.rs",
+    "fix_hint": "Isolate or suppress total_derived accounting for the delegated batch materialization when it runs as an incremental fallback, while preserving INCREMENTAL_REBUILD timing and the explicitly documented batch-round ticks. Strengthen an_owl_fallback_rebuild_ticks_the_batch_run_it_delegates_to with pre-existing derived facts and assert report.total_derived() == 0. Alternatively, change the public contract and expose rebuild accounting in a separate operation-aware field so rebuilt closure facts cannot be mistaken for incremental net-new consequences.",
+    "severity": "major",
+    "title": "Fallback rebuilds still count rebuilt closure facts as incremental derivations"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 4's major accounting defect remains unchanged. MaterializedOwlGraph::rematerialize still delegates its Fallback path to materialize_owl_rl while the enclosing thread-local profiler is active. The delegated batch run's round() calls and reconcile_total() therefore add the rebuilt closure's net-new count to Report::total_derived, despite the public contract stating that incremental maintenance contributes nothing. The fallback integration test still asserts only rule groups and ticks; it does not seed a pre-existing derived closure or assert total_derived() == 0. Progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
