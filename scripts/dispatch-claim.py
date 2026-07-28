@@ -3688,6 +3688,60 @@ LIVE_CHECK_RUN_PAGE_LIMIT = 10   # 1000 runs per aggregator NAME on one head —
 _UNPROVABLE_READ = object()   # the live check-run walk could not be PROVEN complete
 
 
+def _paged_check_runs(repo, head_sha, check_name, fetch):
+    """The paginated, total_count-CROSS-CHECKED check-run walk for ONE head — filtered to a single
+    `check_name`, or unfiltered when `check_name` is None. Returns the rows or _UNPROVABLE_READ.
+
+    ONE spelling for both readings on purpose: the aggregator read (`_live_aggregator_runs`) and
+    the whole-head read (`_live_head_check_runs`) must apply the SAME completeness discipline, and
+    two hand-written walks is precisely how one of them would quietly lose its `total_count`
+    cross-check and start reading a truncated page as a conclusion."""
+    query = "" if check_name is None else f"check_name={urllib.parse.quote(check_name, safe='')}&"
+    runs, total = [], None
+    for page in range(1, LIVE_CHECK_RUN_PAGE_LIMIT + 1):
+        doc = fetch(f"repos/{repo}/commits/{head_sha}/check-runs?{query}per_page=100&page={page}")
+        if not isinstance(doc, dict):
+            return _UNPROVABLE_READ
+        batch = doc.get("check_runs")
+        if not isinstance(batch, list):
+            return _UNPROVABLE_READ
+        if page == 1:
+            total = doc.get("total_count")
+        runs.extend(batch)
+        if len(batch) < 100:
+            break
+    else:
+        print(f"::warning::check-run read for {repo}@{head_sha} check_name={check_name!r} "
+              f"exceeded {LIVE_CHECK_RUN_PAGE_LIMIT} pages — treating the gate as UNKNOWN")
+        return _UNPROVABLE_READ
+    # total_count is the endpoint's own claim about the (possibly filtered) set. A disagreement
+    # means the walk did not see everything it should have; an absent/garbage count is equally
+    # unprovable. Either way the reading is UNKNOWN, never "missing".
+    if not isinstance(total, int) or isinstance(total, bool) or total != len(runs):
+        print(f"::warning::check-run read for {repo}@{head_sha} check_name={check_name!r} "
+              f"collected {len(runs)} run(s) against total_count={total!r} — treating the "
+              "gate as UNKNOWN rather than a silent 'no gate row'")
+        return _UNPROVABLE_READ
+    return runs
+
+
+def _live_head_check_runs(repo, head_sha, fetch=None):
+    """EVERY check-run on one head, over the same proven-complete walk. The sibling-leg reading
+    (issue #940 follow-up) needs the whole head, not the aggregator names — a leg that started
+    after the aggregator concluded has, by construction, a name the aggregator read does not ask
+    for.
+
+    COST, STATED: this is a SECOND paginated read on top of the aggregator's filtered one, and on
+    the churned heads this fleet produces (224-588 rows measured) that is up to six extra
+    requests per arm. The issue's follow-up says the sibling check "costs nothing extra — the same
+    call the guard already makes"; that is true of an unfiltered implementation and NOT true of
+    this one, which keeps the name-filtered aggregator read because a page-1 unfiltered read was
+    measured to drop the aggregator row entirely on 196/277 heads. Arms are rare, so the trade is
+    a few requests against a reading that cannot lose the row it exists to find."""
+    rows = _paged_check_runs(repo, head_sha, None, fetch or (lambda p: _gh_json(["api", p])))
+    return rows
+
+
 def _live_aggregator_runs(repo, head_sha, check_names, fetch=None):
     """LIVE, PAGINATED, total_count-CROSS-CHECKED check-run rows for the given aggregator NAMES on
     one head. Returns the merged rows, or _UNPROVABLE_READ when the walk cannot be proven complete
@@ -3708,32 +3762,8 @@ def _live_aggregator_runs(repo, head_sha, check_names, fetch=None):
     fetch = fetch or (lambda path: _gh_json(["api", path]))
     collected = []
     for check_name in check_names:
-        quoted = urllib.parse.quote(check_name, safe="")
-        runs, total = [], None
-        for page in range(1, LIVE_CHECK_RUN_PAGE_LIMIT + 1):
-            doc = fetch(f"repos/{repo}/commits/{head_sha}/check-runs"
-                        f"?check_name={quoted}&per_page=100&page={page}")
-            if not isinstance(doc, dict):
-                return _UNPROVABLE_READ
-            batch = doc.get("check_runs")
-            if not isinstance(batch, list):
-                return _UNPROVABLE_READ
-            if page == 1:
-                total = doc.get("total_count")
-            runs.extend(batch)
-            if len(batch) < 100:
-                break
-        else:
-            print(f"::warning::check-run read for {repo}@{head_sha} check_name={check_name!r} "
-                  f"exceeded {LIVE_CHECK_RUN_PAGE_LIMIT} pages — treating the gate as UNKNOWN")
-            return _UNPROVABLE_READ
-        # total_count is the endpoint's own claim about the FILTERED set. A disagreement means
-        # the walk did not see everything it should have; an absent/garbage count is equally
-        # unprovable. Either way the aggregator is UNKNOWN, never "missing".
-        if not isinstance(total, int) or isinstance(total, bool) or total != len(runs):
-            print(f"::warning::check-run read for {repo}@{head_sha} check_name={check_name!r} "
-                  f"collected {len(runs)} run(s) against total_count={total!r} — treating the "
-                  "gate as UNKNOWN rather than a silent 'no gate row'")
+        runs = _paged_check_runs(repo, head_sha, check_name, fetch)
+        if runs is _UNPROVABLE_READ:
             return _UNPROVABLE_READ
         collected.extend(runs)
     return collected
@@ -3808,6 +3838,112 @@ def _live_repair_gate(repo, head_sha, draft, fetch=None):
 # `pull_request` event produces a run whose merge ref composes the newer base tip. So the caller's
 # refusal has to keep that producer reachable rather than suppressing it; see worker-pr.py's
 # ARM_DECLINE_GATE_STALE for the bounded re-admission that guarantees it.
+# ---- THE SECOND SHAPE, NO BASE MOVEMENT REQUIRED (issue #940 follow-up) ---------------------
+# MEASURED live on sparq #4709:
+#
+#   gate                     started 04:56:50  completed 05:01:46  SUCCESS
+#   artifact-exact-equality  started 04:56:50  completed/success   <- the run `gate` polled
+#   artifact-exact-equality  started 05:10:51  completed/success
+#   artifact-exact-equality  started 05:15:01  IN PROGRESS         <- 13 min AFTER gate concluded
+#
+# `gate` concluded on the FIRST leg run and does not re-run. Nothing about the PR changed — same
+# head, same diff — and the aggregator's conclusion is genuinely correct about the runs it polled.
+# The staleness is entirely in the relationship between two check-runs on ONE commit. So the
+# invariant is weaker than "the gate is green": it is "the gate is green AND no sibling leg has
+# concluded, or is still running, since the gate concluded".
+#
+# WHAT COUNTS AS A SIBLING PROBLEM, AND THE TWO DELIBERATE EXCEPTIONS. The follow-up states the
+# rule as "conclusion != success". Taken literally that includes `skipped` and `neutral`, and this
+# fleet's heads carry those constantly — `assemble feature matrix` is SKIPPED, not failed, on
+# essentially every sparq head (the #892 block above turns on exactly that distinction), so a
+# literal reading would refuse every arm forever and the guard would be a blanket hold rather than
+# a guard. `skipped`/`neutral` are therefore BENIGN here and everything else — including an
+# unrecognised or absent conclusion on a completed run — is a sibling red, which keeps the
+# fail direction closed on anything genuinely unknown.
+SIBLING_CLEAR = "clear"
+SIBLING_RUNNING = "running"
+SIBLING_RED = "red"
+SIBLING_UNPROVABLE = "unprovable"
+SIBLING_BENIGN_CONCLUSIONS = frozenset({"success", "skipped", "neutral"})
+
+
+def sibling_leg_verdict(check_runs, gate_run):
+    """PURE: has anything happened on THIS head since the aggregator concluded?
+
+    Returns {"state", "reason", "leg"} with state in
+    {clear | running | red | unprovable}:
+      * `running` — a non-aggregator leg STARTED after the gate concluded and has not finished.
+        The gate cannot have polled it, so the green is not yet evidence about this head.
+      * `red`     — a non-aggregator leg COMPLETED after the gate concluded with a
+        non-benign conclusion. The green predates a failing sibling.
+      * `unprovable` — no resolvable gate run, an unparseable `completed_at`, a malformed
+        listing, or a leg whose own stamps cannot be parsed. Refuses, like every other
+        unprovable operand in this module.
+
+    The aggregator's OWN tier names are excluded (in either spelling): a later `gate` run is the
+    newest-run resolution's business, not a sibling."""
+    verdict = {"state": SIBLING_UNPROVABLE, "reason": "", "leg": ""}
+    if not isinstance(check_runs, list):
+        verdict["reason"] = "the head's check-run listing is malformed"
+        return verdict
+    if not isinstance(gate_run, dict):
+        verdict["reason"] = "no aggregator run resolved on this head"
+        return verdict
+    try:
+        concluded = _park_policy.parse_ts(gate_run.get("completed_at"))
+    except ValueError:
+        verdict["reason"] = ("the aggregator's completed_at is unparseable "
+                             f"({str(gate_run.get('completed_at'))[:64]!r})")
+        return verdict
+    running, red = None, None
+    for run in check_runs:
+        if not isinstance(run, dict):
+            verdict["reason"] = "a check-run row is malformed"
+            return verdict
+        name = run.get("name")
+        if not isinstance(name, str) or name in CI_REPAIR_GATE_CHECKS:
+            continue
+        completed_raw, started_raw = run.get("completed_at"), run.get("started_at")
+        if run.get("status") != "completed":
+            try:
+                started = _park_policy.parse_ts(started_raw)
+            except ValueError:
+                # An in-flight leg with no readable start cannot be placed relative to the
+                # aggregator — refuse rather than assume it started first.
+                verdict["reason"] = (f"in-flight leg {_sanitize_leg(name)!r} carries an "
+                                     f"unparseable started_at ({str(started_raw)[:64]!r})")
+                verdict["leg"] = _sanitize_leg(name)
+                return verdict
+            if started > concluded and running is None:
+                running = (_sanitize_leg(name), started)
+            continue
+        try:
+            completed = _park_policy.parse_ts(completed_raw)
+        except ValueError:
+            verdict["reason"] = (f"leg {_sanitize_leg(name)!r} carries an unparseable "
+                                 f"completed_at ({str(completed_raw)[:64]!r})")
+            verdict["leg"] = _sanitize_leg(name)
+            return verdict
+        if completed > concluded and run.get("conclusion") not in SIBLING_BENIGN_CONCLUSIONS:
+            if red is None:
+                red = (_sanitize_leg(name), run.get("conclusion"))
+    # RED wins over RUNNING: a proven non-pass is the stronger statement, and reporting the
+    # in-flight leg instead would tell an operator to wait for something already decided.
+    if red is not None:
+        verdict.update(state=SIBLING_RED, leg=red[0],
+                       reason=(f"leg `{red[0]}` concluded `{red[1]}` AFTER the aggregator "
+                               "concluded, so the green predates a failing sibling"))
+        return verdict
+    if running is not None:
+        verdict.update(state=SIBLING_RUNNING, leg=running[0],
+                       reason=(f"leg `{running[0]}` started AFTER the aggregator concluded and "
+                               "is still running, so the green cannot have polled it"))
+        return verdict
+    verdict.update(state=SIBLING_CLEAR,
+                   reason="no leg started or concluded after the aggregator did")
+    return verdict
+
+
 GATE_FRESH = "fresh"
 GATE_STALE = "stale"
 GATE_FRESHNESS_UNPROVABLE = "unprovable"
@@ -3927,19 +4063,46 @@ def _live_base_tip(repo, base_ref, fetch=None):
     return sha, date
 
 
-def live_gate_freshness(repo, head_sha, base_ref, draft, pr_number, fetch=None, base_fetch=None):
+def live_gate_freshness(repo, head_sha, base_ref, draft, pr_number, fetch=None, base_fetch=None,
+                        head_fetch=None):
     """LIVE freshness verdict for one PR head, over the SAME paginated, total_count-cross-checked,
     newest-run-wins walk `_live_repair_gate` uses — never a second spelling of it.
 
-    An unprovable check-run walk is `unprovable`, exactly as it is `unknown` for the grade: a
-    partial listing must never be read as "no newer run exists"."""
+    BOTH AXES, CONJUNCTIVE. The base-move axis (`gate_freshness`) asks whether the green is about
+    the tree this PR would merge into; the same-head axis (`sibling_leg_verdict`) asks whether it
+    is about the whole of this head. A green must pass both, and the verdict reports which one
+    refused — they have different remedies (move the head vs. wait for the leg).
+
+    An unprovable check-run walk on EITHER axis is `unprovable`, exactly as it is `unknown` for
+    the grade: a partial listing must never be read as "no newer run exists"."""
     rows = _live_aggregator_runs(repo, head_sha, repair_gate_checks_for(draft), fetch=fetch)
     if rows is _UNPROVABLE_READ:
         return {"state": GATE_FRESHNESS_UNPROVABLE, "gap_seconds": None, "run_base_sha": "",
-                "base_tip_sha": "", "started_at": "",
+                "base_tip_sha": "", "started_at": "", "sibling_state": SIBLING_UNPROVABLE,
+                "sibling_leg": "",
                 "reason": "the head's aggregator check-run walk could not be proven complete"}
+    deciding = deciding_gate_run(rows)
     tip_sha, tip_at = _live_base_tip(repo, base_ref, fetch=base_fetch)
-    return gate_freshness(tip_sha, tip_at, deciding_gate_run(rows), pr_number)
+    verdict = gate_freshness(tip_sha, tip_at, deciding, pr_number)
+    head_rows = _live_head_check_runs(repo, head_sha, fetch=head_fetch or fetch)
+    siblings = sibling_leg_verdict(
+        None if head_rows is _UNPROVABLE_READ else head_rows, deciding)
+    if head_rows is _UNPROVABLE_READ:
+        siblings["reason"] = "the head's full check-run walk could not be proven complete"
+    verdict["sibling_state"] = siblings["state"]
+    verdict["sibling_leg"] = siblings["leg"]
+    if siblings["state"] == SIBLING_CLEAR:
+        return verdict
+    # The sibling axis can only ever DOWNGRADE — a clear sibling reading never rescues a gate the
+    # base-move axis refused, and a refused sibling reading overrides a `fresh` one. `red` is a
+    # PROVEN non-pass (stale); `running`/`unprovable` are "cannot tell yet" (unprovable). Both
+    # refuse at the arm, and the distinction is for the operator, who waits in one case and moves
+    # the head in the other.
+    downgraded = GATE_STALE if siblings["state"] == SIBLING_RED else GATE_FRESHNESS_UNPROVABLE
+    if verdict["state"] == GATE_FRESH or downgraded == GATE_STALE:
+        verdict["state"] = downgraded
+        verdict["reason"] = siblings["reason"]
+    return verdict
 
 
 # (#761 added `_live_strict_gate`, a live role-(a) reading, for `stranded` — its ONLY consumer.
@@ -12531,9 +12694,13 @@ def _self_test():
     _784_TIP = "eb30f3de4fea4ea22332fc35cceed957be0cfc5b"        # #876, landed after it
     _784_TIP_AT = "2026-07-28T00:42:12+01:00"
 
-    def _gate_row(base_sha, started, number=752, name=CI_GATE_CHECK, conclusion="success"):
+    def _gate_row(base_sha, started, number=752, name=CI_GATE_CHECK, conclusion="success",
+                  completed=None):
+        # `completed_at` defaults to the START instant (a zero-length run) so the base-move
+        # assertions below turn on the ONE stamp they are about; the fixtures that exercise the
+        # started-vs-completed distinction (d3) and the sibling axis set it explicitly.
         return {"name": name, "status": "completed", "conclusion": conclusion,
-                "started_at": started,
+                "started_at": started, "completed_at": completed or started,
                 "pull_requests": [{"number": number,
                                    "base": {"ref": "master", "sha": base_sha}}]}
 
@@ -12576,8 +12743,8 @@ def _self_test():
     #        ~100s gate straddling a merge. Its recorded base already matches, so only the
     #        timestamp choice decides: on `started_at` it is STALE (it cannot have composed a tip
     #        that landed mid-run), on `completed_at` it would read FRESH and merge.
-    _straddle = dict(_gate_row(_752_TIP, "2026-07-27T19:48:00+01:00", 752),
-                     completed_at="2026-07-27T19:55:00+01:00")
+    _straddle = _gate_row(_752_TIP, "2026-07-27T19:48:00+01:00", 752,
+                          completed="2026-07-27T19:55:00+01:00")
     _straddled = gate_freshness(_752_TIP, _752_TIP_AT, _straddle, 752)
     assert _straddled["state"] == GATE_STALE, _straddled
     assert _straddled["gap_seconds"] == -107, _straddled
@@ -12664,6 +12831,20 @@ def _self_test():
     # check-run listing is `unprovable`, never a freshness claim drawn from a partial page.
     _live_row = _gate_row(_752_TIP, "2026-07-27T20:49:47+01:00", 752)
     _tip_fetch = (lambda _p: {"sha": _752_TIP, "commit": {"committer": {"date": _752_TIP_AT}}})
+
+    _NO_TOTAL_OVERRIDE = object()
+
+    def _live_all_fetch(rows, total_override=_NO_TOTAL_OVERRIDE, seen=None):
+        """The UNFILTERED whole-head walk's fixture — serves every row regardless of name, and
+        records the requested paths so the absence of a `check_name=` filter is assertable."""
+        def fetch(path):
+            if seen is not None:
+                seen.append(path)
+            page = int(re.search(r"[?&]page=([0-9]+)", path).group(1))
+            chunk = list(rows)[(page - 1) * 100:page * 100]
+            total = len(rows) if total_override is _NO_TOTAL_OVERRIDE else total_override
+            return {"check_runs": chunk, "total_count": total}
+        return fetch
     assert live_gate_freshness("o/r", "a" * 40, "master", False, 752,
                                fetch=_live_fetch({CI_GATE_CHECK: [_live_row]}),
                                base_fetch=_tip_fetch)["state"] == GATE_FRESH
@@ -12684,6 +12865,137 @@ def _self_test():
     assert live_gate_freshness("o/r", "a" * 40, "master", False, 752,
                                fetch=_live_fetch({CI_GATE_DRAFT_TIER_CHECK: [_draft_row]}),
                                base_fetch=_tip_fetch)["state"] == GATE_FRESHNESS_UNPROVABLE
+
+    # ---- #940 follow-up: THE SAME-HEAD AXIS — the aggregator concluded before its siblings -----
+    # THE REPLAY, sparq #4709's real shape: `gate` concluded 05:01:46 on the FIRST run of a leg
+    # that then ran twice more on the SAME head, the third still in flight 13 minutes later.
+    # Nothing about the PR changed, so no base-move test can see this.
+    _gate_4709 = {"name": CI_GATE_CHECK, "status": "completed", "conclusion": "success",
+                  "started_at": "2026-07-28T04:56:50Z", "completed_at": "2026-07-28T05:01:46Z",
+                  "pull_requests": [{"number": 4709, "base": {"sha": _752_TIP}}]}
+
+    def _leg(started, completed=None, conclusion="success", status="completed",
+             name="artifact-exact-equality"):
+        return {"name": name, "status": status, "conclusion": conclusion,
+                "started_at": started, "completed_at": completed}
+
+    _4709_rows = [_gate_4709,
+                  _leg("2026-07-28T04:56:50Z", "2026-07-28T05:00:00Z"),
+                  _leg("2026-07-28T05:10:51Z", "2026-07-28T05:12:00Z"),
+                  _leg("2026-07-28T05:15:01Z", None, conclusion=None, status="in_progress")]
+    _sib = sibling_leg_verdict(_4709_rows, _gate_4709)
+    assert _sib["state"] == SIBLING_RUNNING, _sib
+    assert _sib["leg"] == "artifact-exact-equality", _sib
+    # CONTROL — without it this could pass by refusing every head. Drop ONLY the in-flight third
+    # run and the same head is CLEAR: the two concluded runs are `success`, so nothing since the
+    # aggregator concluded contradicts it.
+    #
+    # NOTE the second run CONCLUDED at 05:12, after the gate concluded at 05:01:46, and is still
+    # clear — because `success` is benign. That is the whole reason the rule is "concluded
+    # non-benign", not "concluded at all".
+    _clear = sibling_leg_verdict(_4709_rows[:3], _gate_4709)
+    assert _clear["state"] == SIBLING_CLEAR, _clear
+    # ...and the failing half of the same shape: had that third run CONCLUDED red, the green is
+    # provably about a head that now has a failing leg.
+    _red_rows = _4709_rows[:3] + [_leg("2026-07-28T05:15:01Z", "2026-07-28T05:20:00Z",
+                                       conclusion="failure")]
+    _red = sibling_leg_verdict(_red_rows, _gate_4709)
+    assert (_red["state"], _red["leg"]) == (SIBLING_RED, "artifact-exact-equality"), _red
+    # RED WINS OVER RUNNING — a proven non-pass is the stronger statement, and reporting the
+    # in-flight leg instead would tell an operator to wait for something already decided.
+    assert sibling_leg_verdict(_red_rows + [_4709_rows[3]], _gate_4709)["state"] == SIBLING_RED
+    # THE TWO DELIBERATE EXCEPTIONS. `skipped` (assemble-matrix, on essentially every sparq head)
+    # and `neutral` are benign; a literal "conclusion != success" reading would refuse every arm
+    # forever and the guard would be a blanket hold. Everything else — including an unrecognised
+    # or absent conclusion on a COMPLETED run — is a red, so the fail direction stays closed.
+    for _conc, _want in (("skipped", SIBLING_CLEAR), ("neutral", SIBLING_CLEAR),
+                         ("success", SIBLING_CLEAR), ("failure", SIBLING_RED),
+                         ("timed_out", SIBLING_RED), ("cancelled", SIBLING_RED),
+                         ("action_required", SIBLING_RED), ("startup_failure", SIBLING_RED),
+                         ("stale", SIBLING_RED), (None, SIBLING_RED),
+                         ("brand_new_conclusion", SIBLING_RED)):
+        _v = sibling_leg_verdict(
+            [_gate_4709, _leg("2026-07-28T05:10:00Z", "2026-07-28T05:12:00Z", conclusion=_conc)],
+            _gate_4709)
+        assert _v["state"] == _want, (_conc, _v)
+    # THE AGGREGATOR IS NOT ITS OWN SIBLING, in EITHER tier spelling — a later `gate` run is the
+    # newest-run resolution's business. Without this exclusion a re-run aggregator would refuse
+    # its own head forever.
+    for _name in (CI_GATE_CHECK, CI_GATE_DRAFT_TIER_CHECK):
+        assert sibling_leg_verdict(
+            [_gate_4709, _leg("2026-07-28T05:10:00Z", "2026-07-28T05:12:00Z",
+                              conclusion="failure", name=_name)],
+            _gate_4709)["state"] == SIBLING_CLEAR, _name
+    # A leg that started BEFORE the aggregator concluded and is still running is NOT a refusal:
+    # the aggregator polled it and concluded anyway, and refusing here would hold every head that
+    # carries one long leg.
+    assert sibling_leg_verdict(
+        [_gate_4709, _leg("2026-07-28T04:57:00Z", None, conclusion=None, status="in_progress")],
+        _gate_4709)["state"] == SIBLING_CLEAR
+    # EVERY UNRESOLVABLE OPERAND REFUSES, on the same terms as the base-move axis.
+    for _label, _v in (
+            ("no gate run", sibling_leg_verdict(_4709_rows, None)),
+            ("unparseable gate completed_at",
+             sibling_leg_verdict(_4709_rows, dict(_gate_4709, completed_at="soon"))),
+            ("missing gate completed_at",
+             sibling_leg_verdict(_4709_rows, dict(_gate_4709, completed_at=None))),
+            ("malformed listing", sibling_leg_verdict("nope", _gate_4709)),
+            ("malformed row", sibling_leg_verdict([_gate_4709, 7], _gate_4709)),
+            ("unparseable leg completed_at",
+             sibling_leg_verdict([_gate_4709, _leg("2026-07-28T05:10:00Z", "whenever")],
+                                 _gate_4709)),
+            ("unparseable in-flight started_at",
+             sibling_leg_verdict([_gate_4709, _leg("whenever", None, conclusion=None,
+                                                   status="in_progress")], _gate_4709))):
+        assert _v["state"] == SIBLING_UNPROVABLE, (_label, _v)
+        assert _v["reason"], _label
+    # THE COMPOSITION at the live reading: the sibling axis can only ever DOWNGRADE. A head whose
+    # base-move axis says FRESH is refused when a leg is still running after the gate concluded,
+    # and the reason reported is the SIBLING one (different remedy: wait, do not move the head).
+    _fresh_gate = _gate_row(_752_TIP, "2026-07-27T20:49:47+01:00", 752,
+                            completed="2026-07-27T20:51:00+01:00")
+    _running_leg = _leg("2026-07-27T20:55:00+01:00", None, conclusion=None, status="in_progress")
+    _composed = live_gate_freshness(
+        "o/r", "a" * 40, "master", False, 752,
+        fetch=_live_fetch({CI_GATE_CHECK: [_fresh_gate]}), base_fetch=_tip_fetch,
+        head_fetch=_live_all_fetch([_fresh_gate, _running_leg]))
+    assert _composed["state"] == GATE_FRESHNESS_UNPROVABLE, _composed
+    assert _composed["sibling_state"] == SIBLING_RUNNING, _composed
+    assert "still running" in _composed["reason"], _composed
+    # ...a concluded-red sibling is a PROVEN non-pass, so it downgrades to STALE, not unprovable.
+    _composed_red = live_gate_freshness(
+        "o/r", "a" * 40, "master", False, 752,
+        fetch=_live_fetch({CI_GATE_CHECK: [_fresh_gate]}), base_fetch=_tip_fetch,
+        head_fetch=_live_all_fetch([_fresh_gate,
+                                    _leg("2026-07-27T20:55:00+01:00", "2026-07-27T20:56:00+01:00",
+                                         conclusion="failure")]))
+    assert _composed_red["state"] == GATE_STALE, _composed_red
+    assert _composed_red["sibling_state"] == SIBLING_RED, _composed_red
+    # CONTROL for the composition — WITHOUT IT the sibling axis could pass by refusing everything.
+    # The same head with a clear sibling reading is still FRESH and still arms.
+    _composed_ok = live_gate_freshness(
+        "o/r", "a" * 40, "master", False, 752,
+        fetch=_live_fetch({CI_GATE_CHECK: [_fresh_gate]}), base_fetch=_tip_fetch,
+        head_fetch=_live_all_fetch([_fresh_gate,
+                                    _leg("2026-07-27T20:45:00+01:00", "2026-07-27T20:46:00+01:00")]))
+    assert _composed_ok["state"] == GATE_FRESH, _composed_ok
+    assert _composed_ok["sibling_state"] == SIBLING_CLEAR, _composed_ok
+    # ...and a sibling axis that CANNOT be proven complete refuses too — an unfiltered walk whose
+    # total_count disagrees must never read as "nothing has happened since".
+    _composed_short = live_gate_freshness(
+        "o/r", "a" * 40, "master", False, 752,
+        fetch=_live_fetch({CI_GATE_CHECK: [_fresh_gate]}), base_fetch=_tip_fetch,
+        head_fetch=_live_all_fetch([_fresh_gate], total_override=9))
+    assert _composed_short["state"] == GATE_FRESHNESS_UNPROVABLE, _composed_short
+    assert _composed_short["sibling_state"] == SIBLING_UNPROVABLE, _composed_short
+    assert "could not be proven complete" in _composed_short["reason"], _composed_short
+    # ...and the UNFILTERED read really is unfiltered: the whole-head walk must NOT carry a
+    # check_name filter, or it would only ever see the aggregator and no sibling could exist.
+    _seen_paths = []
+    live_gate_freshness("o/r", "a" * 40, "master", False, 752,
+                        fetch=_live_fetch({CI_GATE_CHECK: [_fresh_gate]}), base_fetch=_tip_fetch,
+                        head_fetch=_live_all_fetch([_fresh_gate], seen=_seen_paths))
+    assert _seen_paths and all("check_name=" not in p for p in _seen_paths), _seen_paths
 
     # ---- GAP-A/B enumeration: zero-manual repair states over the same surface ----
     def status_of(status_sha, gate="success", conflicting=False, armed=False, legs=(),

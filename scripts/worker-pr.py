@@ -4665,6 +4665,7 @@ def arm_freshness_census_row(repo, pr_number, reviewed_sha, freshness, refused, 
             f"head={reviewed_sha[:12]} verdict={state or 'unprovable'} "
             f"gap_seconds={'none' if gap is None else gap} "
             f"gate_base={run_base[:12] or 'none'} base_tip={tip[:12] or 'none'} "
+            f"siblings={(freshness.get('sibling_state') if isinstance(freshness, dict) else None) or 'unread'} "
             f"refused={'true' if refused else 'false'} "
             f"readmitted={'true' if readmitted else 'false'}")
 
@@ -10815,6 +10816,25 @@ def _self_test():
               (ARM_FRESHNESS_CENSUS_PREFIX in raa_prints[-1],
                "verdict=fresh" in raa_prints[-1], "refused=false" in raa_prints[-1]),
               (True, True, True))
+        # [#940 follow-up] THE SAME-HEAD AXIS IS CENSUSED SEPARATELY. The two axes have different
+        # remedies — move the head vs. wait for the leg — so a row that collapsed them into one
+        # verdict would tell an operator to do the wrong thing. A verdict dict that never carried
+        # a sibling reading reports `unread`, never a silent `clear`.
+        run_raa(benign_diff=True, arm_gate="green:merge-required",
+                arm_freshness={"state": "unprovable", "gap_seconds": None, "run_base_sha": "",
+                               "base_tip_sha": "", "started_at": "",
+                               "sibling_state": "running", "sibling_leg": "artifact-exact-equality",
+                               "reason": "leg `artifact-exact-equality` started AFTER the "
+                                         "aggregator concluded and is still running"})
+        check("a still-running sibling leg refuses the arm and is NAMED in the census row",
+              (bool(raa_latches()), raa_outputs.get("arm_declined"),
+               "siblings=running" in raa_prints[-1], "refused=true" in raa_prints[-1]),
+              (False, ARM_DECLINE_GATE_STALE, True, True))
+        check("...and a verdict carrying NO sibling reading censuses `unread`, never `clear`",
+              arm_freshness_census_row("o/r", 41, "b" * 40, {"state": "fresh"}, refused=False),
+              f"{ARM_FRESHNESS_CENSUS_PREFIX} repo=o/r pr=41 head=bbbbbbbbbbbb verdict=fresh "
+              "gap_seconds=none gate_base=none base_tip=none siblings=unread refused=false "
+              "readmitted=false")
         # NO DEADLOCK. Both operands of the freshness test are FROZEN, so a refusal stands until
         # a NEW gate run exists — and this lane's only producer of one is the `gh pr ready` a
         # refusal placed above it suppresses. The bound is the exit: the SECOND arm at the SAME
