@@ -627,9 +627,14 @@ the parsed document in memory and required to come back named.
     short-circuited invocation is a refusal that names the fact. The text of a command is not its
     execution.
 - Account metadata + selection logic: only in this private repo.
-- Script convention: retry via `scripts/gh_retry.py` for idempotent reads; **NEVER** wrap CAS/ledger
-  writes or mutation-confirmations (their conflict/fail-loud semantics are caller-owned — a replayed
-  mutation can double-dispatch a worker, #559/#558).
+- Script convention: retry via `scripts/gh_retry.py` for idempotent reads; **NEVER** wrap a CAS/ledger
+  write or a mutation-confirmation in `gh_retry.run_gh` (their conflict/fail-loud semantics are
+  caller-owned — a replayed mutation can double-dispatch a worker, #559/#558). A ledger CAS writer
+  that needs to survive a throttle/availability blip takes the **classification and the wait
+  schedule** from `scripts/ledger_retry.py` (which delegates both to `gh_retry`) and does the retry
+  in **its own loop**, re-reading the ledger and re-deriving the expected blob SHA every time —
+  `select-and-claim.py`'s lease writer is the reference implementation (#558). Never add a third
+  retry/sleep loop.
 - Public codebases request a worker and receive an opaque claim; they never see account internals.
 - Worker publication is re-attested LIVE, twice (issue #568). The pre-model `trust` step runs tens
   of minutes before push/PR (the job budget is up to 90 minutes, which is why the lane mints two
