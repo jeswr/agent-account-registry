@@ -20115,6 +20115,9 @@ def _starvation_sweep_self_test():
     _starvation_yaml_seam_self_test()
     _census_yaml_seam_self_test()
 
+    # ---- [registry #972] THE REFUSED REVIEW'S EXIT — seam + executed block -------------------
+    _identity_refusal_seam_self_test()
+
 
 # ==================================================================================================
 # [registry #758, ROUND 3] "THIS STATEMENT RUNS ON EVERY PASS" — DECIDED ON THE AST, NOT ON TEXT.
@@ -20939,6 +20942,431 @@ def _starvation_yaml_seam_self_test():
     assert not survivors, f"dispatch.yml seam mutants NOT caught: {survivors}"
     print(f"  ok   #677 YAML seam: all {len(seam_mutants)} structural dispatch.yml mutants are "
           "caught as named violations")
+
+
+# ==================================================================================================
+# [registry #972] THE REFUSED REVIEW'S MISSING EXIT — review-fix.yml's target-identity seam.
+#
+# THE DEFECT, measured: the `run` job's `Verify target App identity and default branch` step refused
+# jeswr/agent-account-registry#961 (`pull request author is not the registry App bot`, review run
+# 30340804869) and the `outcome` job was SKIPPED — its `if:` conjunct could not be satisfied because
+# the run job died before binding any of the three outputs it tests. So NOTHING durable was written:
+# no verdict, no round, no `review:*` transition. The next PLAN/CLAIM tick re-derived a
+# byte-identical world and launched the identical run. A refusal with no recorded outcome is an
+# infinite retry, and the interlock in `enrolment_enable_error` could see none of it.
+#
+# THIS IS ENTIRELY A YAML-SEAM FIX, which is where this repo keeps measuring its vacuous guards. So
+# every pin below is STRUCTURAL, on PARSED nodes, compared for EQUALITY — never a substring
+# containment. A `&& false` conjunct, an `if: false`, a deleted `needs:`, an env re-pointed at the
+# neighbouring output and a step demoted to a comment are ALL invisible to containment, and every
+# one of them silently restores the loop.
+_IDENTITY_SEAM_RUN_OUTPUT = "${{ steps.target.outputs.refusal }}"
+_IDENTITY_SEAM_REFUSE_IF = "${{ steps.target.outputs.bot_login == '' }}"
+_IDENTITY_SEAM_RECORD_IF = "${{ needs.run.outputs.identity_refusal != '' }}"
+_IDENTITY_SEAM_REVERIFY_IF = (
+    "${{ inputs.mode == 'review' && needs.run.outputs.identity_refusal == '' }}")
+_IDENTITY_SEAM_OUTCOME_IF = (
+    "${{ always() && needs.claim.outputs.acquired == 'true' && "
+    "(needs.run.outputs.verdict_ok == 'success' || needs.run.outputs.fix_done == 'success' || "
+    "needs.run.outputs.verdict_stale_reason != '' || "
+    "needs.run.outputs.identity_refusal != '') }}")
+_IDENTITY_SEAM_RECORD_ENV = "${{ needs.run.outputs.identity_refusal }}"
+
+
+def _identity_step(steps):
+    """The `run` job's target-identity step, addressed by its STEP ID (parsed), not by a string in
+    its script — the id is what every downstream `steps.target.outputs.*` reference resolves to, so
+    it is the only address that cannot drift from the consumers."""
+    for index, step in enumerate(steps or []):
+        if isinstance(step, dict) and step.get("id") == "target":
+            return index, step
+    return -1, None
+
+
+def _identity_block_run(script, *, full_name="o/r", default_branch="main",
+                        login="registry-admin[bot]", user_id="42",
+                        pr_author="registry-admin[bot]", target_repo="o/r"):
+    """EXECUTE review-fix.yml's target-identity python over one shaped input; return the outputs
+    the WORKFLOW's own code bound.
+
+    Executed and never grepped, for a reason this PR measured on its own first draft: a structural
+    check for the substring ``refusal=`` in the step's script SURVIVED a mutant that demoted the
+    write to ``pass  # refusal={code}``. Text containment cannot tell a live statement from a dead
+    one; running it can."""
+    import tempfile
+    begin = script.index("<<'PY'\n") + len("<<'PY'\n")
+    block = textwrap.dedent(script[begin:script.index("\nPY", begin)])
+    with tempfile.TemporaryDirectory() as tmp:
+        repo_json = Path(tmp) / "target.json"
+        user_json = Path(tmp) / "app-user.json"
+        out_file = Path(tmp) / "github-output"
+        repo_json.write_text(json.dumps(
+            {"full_name": full_name, "default_branch": default_branch}), encoding="utf-8")
+        user_json.write_text(json.dumps({"login": login, "id": user_id}), encoding="utf-8")
+        out_file.write_text("", encoding="utf-8")
+        saved_argv, saved_env = sys.argv, dict(os.environ)
+        sys.argv = ["-", str(repo_json), str(user_json)]
+        os.environ.update({"TARGET_REPO": target_repo, "PR_AUTHOR": pr_author,
+                           "GITHUB_OUTPUT": str(out_file)})
+        try:
+            exec(compile(block, "<review-fix.yml target identity>", "exec"),  # noqa: S102
+                 {"__name__": "__rf_identity__"})
+            code = 0
+        except SystemExit as exc:
+            code = exc.code
+        finally:
+            sys.argv = saved_argv
+            os.environ.clear()
+            os.environ.update(saved_env)
+        bound = dict(line.split("=", 1)
+                     for line in out_file.read_text(encoding="utf-8").splitlines() if line)
+    return code, bound
+
+
+def _identity_block_violations(step):
+    """The two properties the #972 exit rests on, proved by RUNNING the workflow's own block:
+    a genuine App-bot PR still passes and binds `bot_login`, and a refusal binds a REFUSAL CODE
+    and NO `bot_login`. Never raises — an unrunnable block is a violation, not a pass."""
+    try:
+        script = step.get("run")
+        if not isinstance(script, str):
+            return ["jobs.run step `target` has no `run:` script"]
+        ok_code, ok_bound = _identity_block_run(script)
+        no_code, no_bound = _identity_block_run(script, pr_author="some-human")
+    except Exception as exc:      # noqa: BLE001 — an unrunnable seam proves nothing
+        return [f"jobs.run step `target` could not be executed ({exc!r}), so the #972 exit "
+                "cannot be proved — treated as broken"]
+    out = []
+    if ok_code != 0 or ok_bound.get("bot_login") != "registry-admin[bot]" \
+            or "refusal" in ok_bound:
+        out.append(f"the identity block no longer ADMITS a genuine App-bot-authored PR "
+                   f"(exit={ok_code!r}, bound={ok_bound!r})")
+    if no_bound.get("bot_login"):
+        out.append(f"the identity block BINDS bot_login on a refused PR (bound={no_bound!r}) — "
+                   "the fail-closed stop would not fire and the run would continue past an "
+                   "unverified target identity")
+    if not no_bound.get("refusal"):
+        out.append(f"the identity block RECORDS NO refusal code for a non-App-bot author "
+                   f"(bound={no_bound!r}) — the refusal is invisible to the outcome job and the "
+                   "PR is re-dispatched forever (registry #972 verbatim)")
+    return out
+
+
+def _identity_refusal_seam_violations(document):
+    """Every way review-fix.yml's #972 exit can be silently disabled, as NAMED violations.
+
+    Returns a sorted list — empty means the seam is intact. Positive proof only: an unreadable or
+    unexpectedly-shaped document is a violation, never a pass."""
+    out = []
+    jobs = (document or {}).get("jobs") if isinstance(document, dict) else None
+    if not isinstance(jobs, dict):
+        return ["review-fix.yml exposes no jobs mapping"]
+    run_job = jobs.get("run") if isinstance(jobs.get("run"), dict) else {}
+    outcome_job = jobs.get("outcome") if isinstance(jobs.get("outcome"), dict) else {}
+
+    # (1) The refusal must LEAVE the run job. Without this output nothing downstream can see it.
+    got = (run_job.get("outputs") or {}).get("identity_refusal")
+    if got != _IDENTITY_SEAM_RUN_OUTPUT:
+        out.append(f"jobs.run.outputs.identity_refusal must be {_IDENTITY_SEAM_RUN_OUTPUT!r} "
+                   f"(found {got!r}) — re-pointing or dropping it makes every refusal invisible "
+                   "to the outcome job again")
+
+    # (2) The identity step must still exist under the id the whole seam addresses...
+    index, step = _identity_step(run_job.get("steps"))
+    if step is None:
+        out.append("jobs.run has no step with id `target` — the #972 seam has no anchor")
+    else:
+        # ...and it must still WRITE the refusal, and still bind bot_login ONLY on its success
+        # path. Both are decided by RUNNING the workflow's own block — never by grepping it. A
+        # containment check here survived a `pass  # refusal={code}` mutant on this PR's first
+        # draft, which is precisely the class of false green the seam keeps producing.
+        out.extend(_identity_block_violations(step))
+
+    # (3) The FAIL-CLOSED stop. It is the only thing standing between a refusal and the model, now
+    #     that the identity step exits 0 on refusal. Compared for EQUALITY: `!= ''`, an added
+    #     `&& false`, an `always()`, or a re-point at another output all change this string.
+    stop = None
+    for candidate in (run_job.get("steps") or []):
+        if isinstance(candidate, dict) and candidate.get("if") == _IDENTITY_SEAM_REFUSE_IF:
+            stop = candidate
+            break
+    if stop is None:
+        ifs = [s.get("if") for s in (run_job.get("steps") or []) if isinstance(s, dict)]
+        out.append(f"jobs.run has no step whose `if:` is EXACTLY {_IDENTITY_SEAM_REFUSE_IF!r} — "
+                   f"without it a refused identity check no longer STOPS the run (found {ifs!r})")
+    else:
+        stop_index = (run_job.get("steps") or []).index(stop)
+        if index >= 0 and stop_index != index + 1:
+            out.append("the refusal stop must be the step IMMEDIATELY after `target`: any step "
+                       "between them runs with an unverified target identity")
+        if "exit 1" not in (stop.get("run") or ""):
+            out.append("the refusal stop no longer FAILS the job (`exit 1` is gone) — the run "
+                       "would continue past an unverified target identity")
+
+    # (4) The outcome job must ADMIT the refusal path...
+    if outcome_job.get("if") != _IDENTITY_SEAM_OUTCOME_IF:
+        out.append(f"jobs.outcome.if must be EXACTLY {_IDENTITY_SEAM_OUTCOME_IF!r} (found "
+                   f"{outcome_job.get('if')!r}) — dropping the identity_refusal disjunct, or "
+                   "the `always()`, skips the job and restores the no-exit loop")
+    if "run" not in (outcome_job.get("needs") or []):
+        out.append("jobs.outcome must still `needs: run` — the refusal reaches it as a job "
+                   "output and nothing else")
+
+    # (5) ...and it must SURVIVE it. reverify fails on an empty verdict handoff, and a failed
+    #     step takes the recording step down with the job.
+    steps = outcome_job.get("steps") if isinstance(outcome_job.get("steps"), list) else []
+    reverify = next((s for s in steps if isinstance(s, dict) and s.get("id") == "reverify"), None)
+    if reverify is None:
+        out.append("jobs.outcome has no step with id `reverify` — the #972 gating cannot be "
+                   "pinned")
+    elif reverify.get("if") != _IDENTITY_SEAM_REVERIFY_IF:
+        out.append(f"jobs.outcome step `reverify` `if:` must be EXACTLY "
+                   f"{_IDENTITY_SEAM_REVERIFY_IF!r} (found {reverify.get('if')!r}) — without the "
+                   "identity_refusal conjunct it fails on the empty verdict handoff and takes "
+                   "the refusal record down with the whole job")
+
+    # (6) The recording step itself: present, correctly gated, fed from the job output via ENV,
+    #     invoking the CLI that owns the closed enum — and AFTER the token it needs.
+    record = next((s for s in steps if isinstance(s, dict)
+                   and isinstance(s.get("run"), str)
+                   and "identity-refusal" in s["run"]), None)
+    if record is None:
+        out.append("jobs.outcome has no step invoking `worker-pr.py identity-refusal` — the "
+                   "refusal reaches no durable outcome")
+    else:
+        if record.get("if") != _IDENTITY_SEAM_RECORD_IF:
+            out.append(f"the identity-refusal step's `if:` must be EXACTLY "
+                       f"{_IDENTITY_SEAM_RECORD_IF!r} (found {record.get('if')!r})")
+        env_got = (record.get("env") or {}).get("IDENTITY_REFUSAL")
+        if env_got != _IDENTITY_SEAM_RECORD_ENV:
+            out.append(f"the identity-refusal step's env.IDENTITY_REFUSAL must be "
+                       f"{_IDENTITY_SEAM_RECORD_ENV!r} (found {env_got!r}) — re-pointing it at a "
+                       "neighbouring output feeds the recorder the wrong reason")
+        if '--reason "$IDENTITY_REFUSAL"' not in record["run"]:
+            out.append("the identity-refusal step must pass --reason from $IDENTITY_REFUSAL "
+                       "(env, never interpolated into the shell source — issue #199)")
+        token_index = next((i for i, s in enumerate(steps) if isinstance(s, dict)
+                            and s.get("id") == "app-token-outcome"), None)
+        if token_index is None or steps.index(record) < token_index:
+            out.append("the identity-refusal step must run AFTER `app-token-outcome`: it writes "
+                       "the park with that token, and before it there is none")
+    return sorted(out)
+
+
+def _identity_refusal_seam_self_test():
+    import yaml  # self-test-only, same lazy import as _workflow_step_python
+    import ast
+    worker_pr = _probe_worker_pr()
+    path = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "review-fix.yml"
+    text = path.read_text(encoding="utf-8")
+    live = yaml.safe_load(text)
+    assert _identity_refusal_seam_violations(live) == [], \
+        _identity_refusal_seam_violations(live)
+
+    # ---- (A) THE BLOCK ITSELF, EXECUTED. Not a re-implementation: the workflow's own python.
+    _, step = _identity_step(live["jobs"]["run"]["steps"])
+    block = textwrap.dedent(step["run"][step["run"].index("<<'PY'\n") + 7:
+                                        step["run"].index("\nPY", step["run"].index("<<'PY'\n"))])
+
+    def drive(**kwargs):
+        return _identity_block_run(step["run"], **kwargs)
+
+    # THE PASS. The App bot authored its own PR: bot_login binds, no refusal is written.
+    code, bound = drive()
+    assert code == 0 and bound.get("bot_login") == "registry-admin[bot]" \
+        and "refusal" not in bound, (code, bound)
+    print("  ok   #972 the identity block still PASSES a genuine App-bot-authored PR")
+
+    # THE RED TEST'S FIRST HALF, by execution: the #657 self-attested class (human author) is
+    # refused with a NAMED code, and binds NO bot_login — which is what fails the run.
+    code, bound = drive(pr_author="jeswr")
+    assert code == 0 and bound == {"refusal": "author-not-app-bot"}, (code, bound)
+    print("  ok   #972 a self-attested (human-authored) PR refuses with a NAMED reason and "
+          "binds no bot_login")
+
+    # THE PAIRED CONTROL: a genuine foreign author — a spoofed `*[bot]` login from some OTHER
+    # App, the exact attacker this gate exists for — is refused identically. The missing exit is
+    # closed WITHOUT becoming an admission hole.
+    for hostile in ("evil[bot]", "mallory", "registry-admin[bot]x"):
+        code, bound = drive(pr_author=hostile)
+        assert code == 0 and bound == {"refusal": "author-not-app-bot"}, (hostile, code, bound)
+    print("  ok   #972 CONTROL: a spoofed/foreign author is STILL refused and still binds no "
+          "bot_login (the exit is not an admission hole)")
+
+    # ...and each of the other three refusals reaches its own declared code.
+    for name, kwargs, want in (
+            ("wrong target", {"full_name": "other/repo"}, "wrong-target"),
+            ("unsafe default branch", {"default_branch": "../evil"}, "unsafe-default-branch"),
+            ("non-App login", {"login": "human", "pr_author": "human"}, "not-an-app-bot"),
+            ("non-numeric App id", {"user_id": "abc", "pr_author": "registry-admin[bot]"},
+             "not-an-app-bot")):
+        code, bound = drive(**kwargs)
+        assert code == 0 and bound == {"refusal": want}, (name, code, bound)
+    print("  ok   #972 every refusal in the block reaches its own declared code and binds no "
+          "bot_login")
+
+    # ---- (B) THE DRIFT LOCK. The codes the workflow EMITS are exactly the codes worker-pr.py
+    # DECLARES. Derived from the AST of the workflow's own block (a regex over the text would
+    # count a code named in a comment), and from the production dict — not from a third list.
+    emitted = {node.args[0].value
+               for node in ast.walk(ast.parse(block))
+               if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+               and node.func.id == "refuse" and node.args
+               and isinstance(node.args[0], ast.Constant)
+               and isinstance(node.args[0].value, str)}
+    assert emitted == set(worker_pr.IDENTITY_REFUSAL_REASONS), (
+        "review-fix.yml's refusal codes and worker-pr.IDENTITY_REFUSAL_REASONS have DRIFTED: "
+        f"workflow emits {sorted(emitted)}, worker-pr declares "
+        f"{sorted(worker_pr.IDENTITY_REFUSAL_REASONS)}. An undeclared code makes the recording "
+        "step fail, which puts the PR straight back into the #972 loop.")
+    print(f"  ok   #972 drift lock: all {len(emitted)} workflow refusal codes are declared in "
+          "worker-pr.IDENTITY_REFUSAL_REASONS (AST-derived, both directions)")
+
+    # ---- (C) THE SECOND TICK. What the exit DELIVERS INTO: the production enumerator must stop
+    # seeing the PR. An exit that re-admits into the identical failing state produces nothing.
+    def _enumerated(labels):
+        return [item["state"] for item in enumerate_review_items(
+            PROBE_REPO,
+            [orchestrator_probe_pull() | {"labels": [{"name": n} for n in labels]}],
+            {orchestrator_probe_pull()["number"]: orchestrator_probe_record()},
+            [], {}, "2026-07-28T00:00:00Z",
+            enrolled_authors=(PROBE_ENROLLED_LOGIN,))]
+
+    before = _enumerated(("review:needs",))
+    after = _enumerated(("review:needs", "review:needs-user"))
+    assert before and not after, (
+        "the #972 exit must REMOVE the PR from the review frontier: the enumerator saw "
+        f"{before!r} before the park and {after!r} after (it must be empty, or the next tick "
+        "re-dispatches the identical run)")
+    print(f"  ok   #972 the terminal park DELIVERS an exit: enumerated {before} before, nothing "
+          "after — the second tick cannot re-dispatch it")
+
+    # ---- (D) THE YAML-SEAM MUTANTS. Two per guard: DELETED and CONDITIONALLY INERT. Every one
+    # is non-crashing (the violation list is returned, never an exception), and each must be
+    # caught as a NAMED violation.
+    # A mutant that does not actually MUTATE is a false kill waiting to happen: the violations it
+    # "caught" would be some pre-existing condition, not its own edit. So every mutant is required
+    # to change the parsed document, and to be caught by a NAMED violation.
+    def mutant(edit):
+        document = yaml.safe_load(text)
+        edit(document)
+        changed = document != yaml.safe_load(text)
+        return changed, _identity_refusal_seam_violations(document)
+
+    def run_steps(d):
+        return d["jobs"]["run"]["steps"]
+
+    def outcome_steps(d):
+        return d["jobs"]["outcome"]["steps"]
+
+    def find(steps, pred):
+        return next(s for s in steps if isinstance(s, dict) and pred(s))
+
+    def record_step(d):
+        return find(outcome_steps(d), lambda s: isinstance(s.get("run"), str)
+                    and "identity-refusal" in s["run"])
+
+    def stop_step(d):
+        return find(run_steps(d), lambda s: s.get("if") == _IDENTITY_SEAM_REFUSE_IF)
+
+    seam_mutants = {
+        # --- the run-job output (the wire out of the refusal) ---
+        "run output identity_refusal DELETED":
+            lambda d: d["jobs"]["run"]["outputs"].pop("identity_refusal"),
+        "run output identity_refusal re-pointed at a NEIGHBOURING step output":
+            lambda d: d["jobs"]["run"]["outputs"].__setitem__(
+                "identity_refusal", "${{ steps.target.outputs.bot_login }}"),
+        # --- the identity step's refusal writer ---
+        "the refuse() helper is DELETED (raise-instead-of-record, i.e. the #972 defect)":
+            lambda d: _identity_step(run_steps(d))[1].__setitem__(
+                "run", _identity_step(run_steps(d))[1]["run"].replace("def refuse(", "def _x(")),
+        "the refusal output write is COMMENTED OUT":
+            lambda d: _identity_step(run_steps(d))[1].__setitem__(
+                "run", _identity_step(run_steps(d))[1]["run"].replace(
+                    'handle.write(f"refusal={code}\\n")', 'pass  # refusal={code}')),
+        "the identity step loses its id (every steps.target.* reference dangles)":
+            lambda d: _identity_step(run_steps(d))[1].pop("id"),
+        # --- the fail-closed stop ---
+        "the refusal stop step is DELETED":
+            lambda d: d["jobs"]["run"].__setitem__(
+                "steps", [s for s in run_steps(d)
+                          if not (isinstance(s, dict)
+                                  and s.get("if") == _IDENTITY_SEAM_REFUSE_IF)]),
+        "the refusal stop is made CONDITIONALLY INERT (&& false)":
+            lambda d: stop_step(d).__setitem__(
+                "if", "${{ steps.target.outputs.bot_login == '' && false }}"),
+        "the refusal stop no longer FAILS (exit 1 -> exit 0)":
+            lambda d: stop_step(d).__setitem__(
+                "run", stop_step(d)["run"].replace("exit 1", "exit 0")),
+        "the refusal stop is moved AFTER the target checkout":
+            lambda d: run_steps(d).insert(
+                _identity_step(run_steps(d))[0] + 1, {"name": "wedge", "run": "true"}),
+        # --- the outcome job's admission ---
+        "the outcome job's identity_refusal disjunct is DELETED":
+            lambda d: d["jobs"]["outcome"].__setitem__(
+                "if", _IDENTITY_SEAM_OUTCOME_IF.replace(
+                    " || needs.run.outputs.identity_refusal != ''", "")),
+        # The exact shape that survived a CONTAINMENT check on a sibling PR tonight: the disjunct
+        # is still present character-for-character, and is dead. Equality sees it.
+        "the outcome job's disjunct is made CONDITIONALLY INERT (&& false)":
+            lambda d: d["jobs"]["outcome"].__setitem__(
+                "if", _IDENTITY_SEAM_OUTCOME_IF.replace(
+                    "needs.run.outputs.identity_refusal != '') }}",
+                    "(needs.run.outputs.identity_refusal != '' && false)) }}")),
+        "the outcome job loses always() (a failed run job skips it again)":
+            lambda d: d["jobs"]["outcome"].__setitem__(
+                "if", _IDENTITY_SEAM_OUTCOME_IF.replace("always() && ", "")),
+        "the outcome job stops depending on run":
+            lambda d: d["jobs"]["outcome"].__setitem__(
+                "needs", [n for n in d["jobs"]["outcome"]["needs"] if n != "run"]),
+        # --- surviving the path once admitted ---
+        "reverify's identity_refusal conjunct is DELETED (the job dies before recording)":
+            lambda d: find(outcome_steps(d), lambda s: s.get("id") == "reverify").__setitem__(
+                "if", "${{ inputs.mode == 'review' }}"),
+        "reverify's conjunct is made CONDITIONALLY INERT (|| true)":
+            lambda d: find(outcome_steps(d), lambda s: s.get("id") == "reverify").__setitem__(
+                "if", _IDENTITY_SEAM_REVERIFY_IF.replace(
+                    "needs.run.outputs.identity_refusal == ''",
+                    "(needs.run.outputs.identity_refusal == '' || true)")),
+        # --- the recording step ---
+        "the identity-refusal recording step is DELETED":
+            lambda d: d["jobs"]["outcome"].__setitem__(
+                "steps", [s for s in outcome_steps(d)
+                          if not (isinstance(s.get("run"), str)
+                                  and "identity-refusal" in s["run"])]),
+        "the recording step is guarded by if: false":
+            lambda d: record_step(d).__setitem__("if", "${{ false }}"),
+        "the recording step is made CONDITIONALLY INERT (&& false)":
+            lambda d: record_step(d).__setitem__(
+                "if", "${{ needs.run.outputs.identity_refusal != '' && false }}"),
+        "the recording step's env is re-pointed at a NEIGHBOURING output":
+            lambda d: record_step(d)["env"].__setitem__(
+                "IDENTITY_REFUSAL", "${{ needs.run.outputs.verdict_stale_reason }}"),
+        "the recording step stops passing --reason from the env":
+            lambda d: record_step(d).__setitem__(
+                "run", record_step(d)["run"].replace(
+                    '--reason "$IDENTITY_REFUSAL"', "--reason author-not-app-bot")),
+        "the recording step is hoisted ABOVE the App-token mint it needs":
+            lambda d: outcome_steps(d).insert(0, outcome_steps(d).pop(
+                outcome_steps(d).index(record_step(d)))),
+        # --- whole-document shapes ---
+        "the run job's steps are replaced by a scalar":
+            lambda d: d["jobs"]["run"].__setitem__("steps", "nope"),
+        "the document is not a jobs mapping at all":
+            lambda d: d.__setitem__("jobs", "nope"),
+    }
+    results = {name: mutant(edit) for name, edit in seam_mutants.items()}
+    inert = [name for name, (changed, _v) in results.items() if not changed]
+    assert not inert, (
+        f"#972 seam mutants that did not actually MUTATE the document (a no-op mutant proves "
+        f"nothing and would report a pre-existing violation as its own kill): {inert}")
+    survivors = [name for name, (_c, violations) in results.items() if not violations]
+    assert not survivors, f"#972 review-fix.yml seam mutants NOT caught: {survivors}"
+    for name, (_c, violations) in results.items():
+        print(f"    killed by [{violations[0][:88]}] <- {name}")
+    print(f"  ok   #972 YAML seam: all {len(seam_mutants)} structural review-fix.yml mutants "
+          "(deleted AND conditionally-inert, per guard) MUTATE the document and are caught as "
+          "named violations")
 
 
 # ---- [registry #764] THE ABSORBING-PARK MACHINE EXIT ----------------------------------

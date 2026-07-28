@@ -7929,8 +7929,11 @@ def _self_test():
                                  if klass == _pp.PARK_CLASS_QUESTION)
         check("[#869] the question half of the taxonomy is the set this covers",
               question_causes,
+              # [registry #972] `target-identity` joins the question half: review-fix.yml's
+              # target-App identity gate refused the run, and the gate's inputs cannot change
+              # on a re-dispatch, so there is nothing for a machine re-admission to recover.
               ["history-rewritten", "human-arm", "injection", "marker-corrupt",
-               "routing-unresolvable"])
+               "routing-unresolvable", "target-identity"])
         question_bodies = {}
         for cause in question_causes:
             park_route_calls.clear()
@@ -11617,6 +11620,121 @@ def _self_test():
           "(validate_park_cause is wired, and the choices admit the question half)",
           (_bad_class.returncode, "invalid choice" in _bad_class.stderr,
            "not 'capacity'" in _bad_class.stderr), (1, False, True))
+
+    # ---- [registry #972] THE TARGET-IDENTITY REFUSAL'S EXIT ----------------------------------
+    # The defect was that a refused review wrote NOTHING, so the next tick re-derived a
+    # byte-identical world. These rows are therefore about what the refusal DELIVERS: a census
+    # row naming the reason, a terminal question-class park, and NO round charged.
+    _ir_bot = "registry-admin[bot]"
+
+    class _IdentityWrites:
+        """Captures every write `identity_refusal` performs, in order."""
+
+        def __init__(self, existing=()):
+            self.comments, self.states, self.issue_status, self.alerts = [], [], [], []
+            self.existing = list(existing)
+
+        def install(self):
+            self.saved = {name: globals()[name] for name in (
+                "_comment", "_paginated_comments", "set_review_state", "_ops_alert",
+                "_load_worker_issue")}
+            globals()["_comment"] = lambda repo, pr, body: self.comments.append(body)
+            globals()["_paginated_comments"] = lambda repo, pr: self.existing
+            globals()["set_review_state"] = (
+                lambda repo, pr, state, **kw: self.states.append(state))
+            globals()["_ops_alert"] = lambda *a, **kw: self.alerts.append(a)
+            globals()["_load_worker_issue"] = lambda: types.SimpleNamespace(
+                set_status=lambda repo, issue, status: self.issue_status.append(
+                    (issue, status)))
+            return self
+
+        def restore(self):
+            globals().update(self.saved)
+
+    def _drive_identity_refusal(reason, existing=(), issue=77):
+        writes = _IdentityWrites(existing).install()
+        raised = None
+        try:
+            identity_refusal("o/r", 41, reason, issue=issue, bot_login=_ir_bot,
+                             head_sha="c" * 40)
+        except WorkerPrError as exc:      # the closed-enum refusal
+            raised = str(exc)
+        finally:
+            writes.restore()
+        return writes, raised
+
+    # (1) THE RED TEST, by execution: a refusal produces a CENSUS ROW naming the reason, a
+    #     TERMINAL question-class park on both surfaces, and NO round marker.
+    _ir_writes, _ir_raised = _drive_identity_refusal("author-not-app-bot")
+    check("[#972] a target-identity refusal is RECORDED (census receipt + park comment), "
+          "not silently dropped",
+          (_ir_raised, len(_ir_writes.comments)), (None, 2))
+    check("[#972] the census row NAMES the refusal reason (countable, not invisible)",
+          f"{IDENTITY_REFUSAL_MARKER} reason=author-not-app-bot -->" in _ir_writes.comments[0],
+          True)
+    check("[#972] the refusal's declared prose reaches the receipt (writer bound to the "
+          "closed table, not to a re-typed sentence)",
+          IDENTITY_REFUSAL_REASONS["author-not-app-bot"] in _ir_writes.comments[0], True)
+    check("[#972] the exit is TERMINAL on both surfaces (review:needs-user + needs:user)",
+          (_ir_writes.states, _ir_writes.issue_status),
+          (["needs-user"], [(77, "needs-user")]))
+    check("[#972] the park receipt is QUESTION-class and names cause=target-identity",
+          f"class={_park_policy().PARK_CLASS_QUESTION} cause=target-identity"
+          in _ir_writes.comments[1], True)
+    # (2) THE ROUND IS NOT CONSUMED. Asserted over EVERY body this path writes, so a future
+    #     edit that starts charging a round here reds this row rather than silently walking the
+    #     PR into the CAPACITY `budget` park (whose automatic re-admission would hand it back
+    #     to the identical refusal).
+    check("[#972] NO review round is charged by a refusal (no reviewer ran)",
+          any(ROUND_MARKER in body for body in _ir_writes.comments), False)
+    # (3) THE CAP IS ONE. Feed the receipt this run wrote back as the PR's comment history:
+    #     the second tick must write NOTHING AT ALL — no comment, no park, no ops alert.
+    _ir_second, _ = _drive_identity_refusal(
+        "author-not-app-bot",
+        existing=[{"user": {"login": _ir_bot}, "body": _ir_writes.comments[0]}])
+    check("[#972] a SECOND tick on an already-receipted refusal writes nothing (cap = 1)",
+          (_ir_second.comments, _ir_second.states, _ir_second.issue_status,
+           _ir_second.alerts), ([], [], [], []))
+    # ...and the cap is per REASON, not a blanket "any receipt silences everything".
+    _ir_other, _ = _drive_identity_refusal(
+        "wrong-target",
+        existing=[{"user": {"login": _ir_bot}, "body": _ir_writes.comments[0]}])
+    check("[#972] a DIFFERENT refusal reason is still recorded (the cap is per-reason)",
+          len(_ir_other.comments), 2)
+    # (4) THE READER'S TRUST FILTER. A receipt authored by anyone but the bot must not be able
+    #     to SUPPRESS the exit — that would be a remote off-switch for the loop's only exit.
+    _ir_forged, _ = _drive_identity_refusal(
+        "author-not-app-bot",
+        existing=[{"user": {"login": "mallory"}, "body": _ir_writes.comments[0]}])
+    check("[#972] a FORGED (non-bot) receipt cannot suppress the exit",
+          len(_ir_forged.comments), 2)
+    check("[#972] identity_refusal_records reads bot receipts only",
+          (identity_refusal_records(
+              [{"user": {"login": _ir_bot}, "body": _ir_writes.comments[0]}], _ir_bot),
+           identity_refusal_records(
+               [{"user": {"login": "mallory"}, "body": _ir_writes.comments[0]}], _ir_bot)),
+          ({"author-not-app-bot"}, set()))
+    # (5) THE CLOSED ENUM, in both directions and BEFORE any write. An undeclared code must
+    #     raise rather than park the PR under a bucket nothing counts.
+    _ir_undeclared, _ir_undeclared_msg = _drive_identity_refusal("brand-new-refusal")
+    check("[#972] an UNDECLARED refusal code raises and writes NOTHING",
+          (_ir_undeclared.comments, _ir_undeclared.states,
+           bool(_ir_undeclared_msg and "undeclared target-identity refusal reason"
+                in _ir_undeclared_msg)), ([], [], True))
+    # (6) The CLI seam accepts every declared code and refuses an undeclared one, answered by
+    #     the PRODUCTION argparse (subprocess), on the REFUSING path only — no GitHub call.
+    _ir_cli = subprocess.run(
+        [sys.executable, "-B", str(Path(__file__).resolve()), "identity-refusal",
+         "--repo", "o/r", "--pr", "41", "--reason", "brand-new-refusal"],
+        capture_output=True, text=True, check=False)
+    check("[#972] the CLI rejects a reason outside the closed enum (argparse choices)",
+          (_ir_cli.returncode, "invalid choice" in _ir_cli.stderr), (2, True))
+    _ir_cli_help = subprocess.run(
+        [sys.executable, "-B", str(Path(__file__).resolve()), "identity-refusal", "--help"],
+        capture_output=True, text=True, check=False)
+    check("[#972] the CLI's declared choices ARE the closed table (no second hand-written list)",
+          all(code in _ir_cli_help.stdout for code in IDENTITY_REFUSAL_REASONS)
+          and _ir_cli_help.returncode == 0, True)
 
     print("worker-pr self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
