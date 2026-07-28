@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 801,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "9f95cb56c2ad4303daf1903ff9ee1dace8955ecb",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "_issue_is_measurement_run classifies one live response, but _escalate_repeated_declines then posts the durable receipt and _gate_issue_as_measurement_run adds needs:ec2 without comparing the current issue identity, state, labels, title, or body to that classified snapshot. Any classifier input can change after the read and produce a stale durable action. The marked_action == GATE_ACTION reconciliation path is still more permissive: it restores needs:ec2 from the receipt and cached labels without reclassifying the current issue. The relabel_live tests only alter the response used by the classifier; they do not mutate inputs after classification but before the comment or label write.",
+    "file": "scripts/dispatch-claim.py",
+    "fix_hint": "Bind the escalation and receipt to a validated snapshot and compare every classifier input, including issue identity and open state, immediately before both receipt persistence and label mutation; abort without either write if anything changed. Reconciliation must re-read and revalidate current qualification before restoring needs:ec2. Add tripwires for labels, title, body, state, and identity changing after classification but before each durable write.",
+    "severity": "major",
+    "title": "Gate receipt and label remain unbound to the classified issue state"
+   },
+   {
+    "body": "_apply_cli obtains current labels through view(), then performs the separate live_text() read and classifies the earlier labels with the later title/body. These inputs are not proven to have coexisted. A bench-surface label added between reads can be missed and admit a measurement run; a removal can plan a false durable gate. apply_triage's revision/post-condition machinery does not establish coherence of the inputs used to make the decision, and the new self-tests cover malformed/static text rather than either split-read race or a post-classification change.",
+    "file": "scripts/triage.py",
+    "fix_hint": "Acquire labels, title, and body from one coherent live document, or re-read and compare every classifier input immediately before mutation and abort on any change. Add end-to-end tests for bench-label addition and removal between the reads and for classifier-input mutation after planning, asserting no admission and no stale gate write.",
+    "severity": "major",
+    "title": "Triage still classifies labels and text from separate live snapshots"
+   },
+   {
+    "body": "_apply_cli still gets labels from read_state() and then gets title, body, and state from the separate read_live_body() call. Adding title to the latter read makes title/body/state coherent with each other, but not with the load-bearing bench labels. A concurrent bench-label addition can allow an impossible run to be promoted, while a removal can plan a stale needs:ec2 gate. The post-condition checks do not prove that the labels and text used for planning ever coexisted, and the added tests do not exercise either race direction.",
+    "file": "scripts/retriage.py",
+    "fix_hint": "Read labels, title, body, and state atomically where possible, or compare all classifier inputs again immediately before applying the decision and abort on change. Add tests for bench-surface addition and removal between read_state() and read_live_body(), plus changes after classification, and assert fail-closed behavior without a false durable gate.",
+    "severity": "major",
+    "title": "Retriage still plans from a mixed labels/text snapshot"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 5 leaves the same three major TOCTOU findings unresolved. Dispatch classifies one live snapshot but does not bind or revalidate that snapshot before posting the durable receipt and adding needs:ec2; receipt reconciliation still restores the gate without reclassifying the current issue. Triage still combines labels from view() with title/body from a separate live_text() read. Retriage still combines labels from read_state() with title/body/state from a separate read_live_body() read. The added relabel tests change what the classifier itself reads, not any classifier input after classification and before the durable write, and no tests exercise the split-read race in triage or retriage. Progress is therefore stagnant.",
+  "verdict": "request_changes"
+ }
+}
