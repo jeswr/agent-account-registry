@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4760,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "6146c13adea30f25ca669140b12826190c41ec5e",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 2 confirms the prior approval. The dispatch preserves definitive profile-branch outcomes, retries only abstentions through the existing ALCH tableau, retains the original branch outcome on tableau budget exhaustion, and excludes the PR1 punning refusal. The focused tests exercise the real dispatch with default and dispatch_ql feature states, both verdict directions, attribution, starvation, non-preemption, and punning. The fixed-extension built-in property gap is handled fail-closed in both object-property decoding and the separate assertion path, with tests covering the relevant positions and ordinary-role controls. The conformance ratchets and accounting remain internally closed, and the README and Direct Semantics scoping record match the implementation. No correctness, soundness, test-validity, security, or prompt-injection issue was found.",
+  "verdict": "approve"
+ }
+}
