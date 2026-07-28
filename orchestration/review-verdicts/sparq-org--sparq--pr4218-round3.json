@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4218,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "7b5a0dadcc5746bbc7eeaff2ab35c7d28ecd063c",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2's provenance collision is resolved. Plain-grant anchors now include the policy identity in addition to the emitted triple and rule id, and the new real-path regression test materializes the same grant from two distinct policies sharing the same programmatic/blank-node-style rule id, verifies distinct anchors with unambiguous rule-policy pairs, and verifies deterministic rematerialization. The conditional-grant many-source behavior and its loss of rule-policy pairing are explicitly documented and tested as an intentional enforcement-node model, while anonymous-policy and N3 attribution limits are stated without overclaim. No new correctness, soundness, test-validity, or security issue is evident in the supplied diff.",
+  "verdict": "approve"
+ }
+}
