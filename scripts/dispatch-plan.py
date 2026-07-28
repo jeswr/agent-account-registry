@@ -1025,7 +1025,7 @@ def _routing_doc():
         "def _routing_doc():",
         'INERT_FIELD = "inert"\nMACHINE_PARK_PR_LABEL = "review:parked"\n\n\ndef _routing_doc():')
 
-    def _run_readiness(rows_by_target, planners, attest=True, produce=None):
+    def _run_readiness(rows_by_target, planners, attest=True, produce=None, catch=False):
         """EXECUTE the real readiness step over a synthetic snapshot; return (plan, printed).
 
         `rows_by_target[i]` is the `/issues?state=open` listing for target i (PR rows included,
@@ -1042,6 +1042,14 @@ def _routing_doc():
         `raw-*.json` this target needs. That closes the round-1 gap where THIS HARNESS wrote
         `raw-inertness-<i>.json` itself: the producer could rename the file (and its own
         assertion) and both self-tests stayed green while production silently lost the carve-out.
+
+        `catch=True` returns the STRING `"STEP ABORTED: <ExceptionType>"` in place of the plan
+        instead of letting the exception escape. OPT-IN, and used by exactly the rows whose
+        mutants kill the step outright (a Unicode key, a truncated document): without it those
+        mutants surface as a bare traceback with no verdict line, and a crash is not a kill — the
+        mutant has to red a row that NAMES what it broke. It is deliberately not the default,
+        because swallowing an abort everywhere would let a step that dies mid-way report an empty
+        plan and satisfy any assertion expecting nothing.
         """
         import json as _json
         import shutil
@@ -1113,10 +1121,15 @@ def _routing_doc():
             os.environ["TARGET_ROOT"] = root
             os.environ["PATH"] = bindir + os.pathsep + (saved[2] or "")
             sys.argv = ["-", repos_path, workdir]
+            aborted = None
             try:
                 printed = _captured(
                     lambda: exec(_readiness_source,                     # noqa: S102 — the step
                                  {"__name__": "__main__"}))
+            except BaseException as exc:                # noqa: BLE001 — see `catch` below
+                if not catch:
+                    raise
+                aborted, printed = f"STEP ABORTED: {type(exc).__name__}", ""
             finally:
                 sys.argv = saved[0]
                 os.environ["PATH"] = saved[2] or ""
@@ -1124,6 +1137,8 @@ def _routing_doc():
                     os.environ.pop("TARGET_ROOT", None)
                 else:
                     os.environ["TARGET_ROOT"] = saved[1]
+            if aborted is not None:
+                return aborted, printed
             with open(os.path.join(workdir, "issue-plan.json"), encoding="utf-8") as handle:
                 return _json.load(handle), printed
         finally:
@@ -1142,6 +1157,16 @@ def _routing_doc():
 
     def _planned(plan, index=0):
         return sorted(item["number"] for item in plan["repositories"][index]["items"])
+
+    def _planned_or_abort(plan, index=0):
+        """`_planned`, except a `catch=True` abort reports itself BY NAME instead of raising.
+
+        [sparq#4819 round 2] The two rows that use this exist to prove the step SURVIVES a hostile
+        document. Their mutants (`isdigit()` back for `isdecimal()`; a bare `json.loads`) kill the
+        step outright, and without this the suite ends in a traceback with no verdict line — a
+        crash, not a kill. Returning `"STEP ABORTED: ValueError"` makes the mutant red a NAMED row
+        that says exactly what it broke."""
+        return plan if isinstance(plan, str) else _planned(plan, index)
 
     _READY = ["status:ready", "role:impl", "priority:P1"]
 
@@ -1420,11 +1445,11 @@ def _routing_doc():
     # as "the tick survives AND the good row still works", because a mutant that dropped the
     # whole document would also stop the crash while losing every attestation with it.
     _plan_uni, _out_uni = _run_readiness(
-        [_park_rows], [_INERT_AWARE_PLANNER],
+        [_park_rows], [_INERT_AWARE_PLANNER], catch=True,
         attest={"complete": True, "items": {"²": True, "700": True, "7e2": True, "-700": True},
                 "reasons": {}})
     chk("[sparq#4819] a Unicode digit-but-not-decimal key drops its row, it does not kill the tick",
-        (_planned(_plan_uni),
+        (_planned_or_abort(_plan_uni),
          "1 machine-parked row(s) release their areas: pr#700:usage" in _out_uni),
         ([701, 702], True))
     # TRUNCATED/UNREADABLE degrades, it does not abort. Round-1 review: `json.loads` raised
@@ -1432,9 +1457,10 @@ def _routing_doc():
     # target — while an ABSENT document (the same accident one fsync earlier) degraded cleanly.
     # The words claimed fail-closed-at-every-seam; now the behaviour matches them.
     _plan_trunc, _out_trunc = _run_readiness(
-        [_park_rows], [_INERT_AWARE_PLANNER], attest="{\"complete\": true, \"items\": {\"700\":")
+        [_park_rows], [_INERT_AWARE_PLANNER], catch=True,
+        attest="{\"complete\": true, \"items\": {\"700\":")
     chk("[sparq#4819] a TRUNCATED attestation degrades to every-PR-reserves, loudly",
-        (_planned(_plan_trunc),
+        (_planned_or_abort(_plan_trunc),
          "::warning::o/t0: inertness attestation is unreadable (JSONDecodeError)" in _out_trunc),
         ([702], True))
     # An engine that declares the contract but never consults it must NOT be fed attestations.
@@ -1538,19 +1564,29 @@ def _routing_doc():
             raise AssertionError(f"stub fetch got an unexpected URL: {url}")
 
         snapshot.snapshot_targets(fetch, snapshot._load_claim(), [repo], workdir)
-        # The producer is asserted to have actually PROVED something — a run where nothing
-        # attested would let the consumer row below pass for the wrong reason.
-        document = _json.loads(open(os.path.join(workdir, f"raw-inertness-{index}.json"),
-                                    encoding="utf-8").read())
-        assert sum(document["items"].values()) == 1, document
+        # Observed, NEVER asserted here: an `assert`/open() in this hook would abort the suite
+        # with a traceback, and a crash is not a kill — the mutant has to red a NAMED row. The
+        # producer's own count rides out so the row below can also prove it PROVED something,
+        # which is how "the consumer released" could otherwise pass for the wrong reason.
+        try:
+            with open(os.path.join(workdir, f"raw-inertness-{index}.json"),
+                      encoding="utf-8") as handle:
+                _e2e_seen["attested"] = sum(_json.load(handle)["items"].values())
+        except (OSError, ValueError, KeyError, TypeError):
+            _e2e_seen["attested"] = None
+        _e2e_seen["files"] = sorted(name for name in os.listdir(workdir)
+                                    if name.startswith("raw-"))
 
+    _e2e_seen = {}
     _plan_e2e, _out_e2e = _run_readiness(
         [_park_rows], [_INERT_AWARE_PLANNER], produce=_real_producer)
     chk("[sparq#4819] the REAL producer's file is the one the REAL consumer reads (rename => red)",
         (_planned(_plan_e2e),
          "1 machine-parked row(s) release their areas: pr#700:usage" in _out_e2e,
-         "no inertness attestation" in _out_e2e),
-        ([701, 702], True, False))
+         "no inertness attestation" in _out_e2e,
+         _e2e_seen["attested"],
+         "raw-inertness-0.json" in _e2e_seen["files"]),
+        ([701, 702], True, False, 1, True))
 
     # issue #112: a MULTI-area issue reserves BOTH its areas, NOT the alphabetically-first one —
     # else a busy secondary area (here 'worker') could not exclude it and it would double-dispatch.
