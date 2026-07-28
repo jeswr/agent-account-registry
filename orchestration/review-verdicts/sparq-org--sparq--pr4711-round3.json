@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4711,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "7c2491a40ab45f2a8e0108caf26f854876ba1e00",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2's grant-replay authorization flaw is fixed. Both public combination paths now require the current authenticated agent and target, compare them with the grant's stored holder/target, and return the original WAC decision on mismatch; the unchecked union is private. The integration test creates one genuine Jesse/resourceX grant and reuses that exact clone against resourceY, Mallory, both mismatches, and an absent authenticated requester, covering both union APIs and preserving unrelated allows. The feature remains default-off and handler-unwired, and the research/externally-unaudited limitations are stated without making a privacy or ZK-soundness claim. No new correctness, soundness, test-validity, or security issue is evident in the diff-scoped change.",
+  "verdict": "approve"
+ }
+}
