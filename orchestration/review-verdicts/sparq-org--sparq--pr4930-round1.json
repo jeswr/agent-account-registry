@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4930,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "48e1d6adaa0ffed6fe75c961852cda1fb879b848",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "In `resolve_point_in_time`, `current` is pinned before polling, but when the newest log record trails `current.number()`, `base_generation` is stepped back and `resolve_generation` is allowed to resolve an instant at or after the log tail to that older recorded generation. If a commit has already been published to the ring but its CDC hook has not appended yet, a request for a sufficiently recent/future `at` instant should include that commit, yet this path returns the preceding snapshot with HTTP 200. The code comments explicitly acknowledge this lag window, so this violates the feature's central claim that incomplete coverage refuses rather than approximates.",
+    "file": "crates/sparq-server/src/http.rs",
+    "fix_hint": "Do not serve while the pinned ring generation is ahead of the durable log tail unless the implementation can prove the requested instant precedes the unrecorded commit. The simplest fail-closed behavior is to return a retryable server error whenever `current.number()` exceeds the newest recorded generation; alternatively synchronize snapshot capture with CDC append so the pin and log tail are atomic. Add a real-path test using a controllable/delayed append hook that publishes a generation, pauses before log append, and verifies `?at=` refuses rather than returning the previous generation.",
+    "severity": "major",
+    "title": "CDC lag silently serves an older state for the requested instant"
+   }
+  ],
+  "progress": null,
+  "summary": "The reverse-replay core and its order-sensitive test are substantial, but the HTTP wiring has a correctness race that contradicts the advertised fail-closed semantics. A generation is published before its CDC record is appended; during that interval, a point-in-time request whose instant includes the published commit deliberately steps back to the newest recorded generation and returns that older state. This is a silent nearby-instant substitution, not a refusal. The integration tests exercise steady-state reconstruction but do not cover the acknowledged publish-to-log lag.",
+  "verdict": "request_changes"
+ }
+}
