@@ -131,9 +131,27 @@ CLOSING_REF_RE = re.compile(
 # self-test pins that the FULL refusal comment for every reason code is inert when fed back in,
 # even when the passed-through message is itself hostile.
 #
-# Stripping order matters: an HTML comment can contain a fence, a fence can contain backticks, and
-# a blockquote line can contain either.
-HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
+# STRIPPING ORDER, and why it is what it is. The two LINE-LEVEL strips run first, over the author's
+# own line structure: indented code is decided by the blank line that opens it, and a blockquote is
+# decided by a `>` at the start of a line. Everything after them substitutes a NEWLINE (see
+# `strip_quoted_contexts`), which REWRITES line structure — so running either line-level strip after
+# one of them reads lines the author did not write.
+#
+# MEASURED, on the live population: with the blockquote strip last, substituting a newline for the
+# code span in PR #781's line 0 —
+#     > 🤖 **SPARQ agent** … no `VERDICT:` line. Closes #777.
+# — split that ONE quoted line into two, the second of which no longer began with `>`, so the strip
+# stopped seeing it and `Closes #777` became a live declaration out of a self-identification banner
+# the author never meant as one. That is the round-1 blocking class exactly, reintroduced by the
+# substitution. The order below is what makes the newline safe; the self-test pins that shape.
+#
+# Among the remaining three, an HTML comment can contain a fence and a fence can contain backticks.
+#
+# An UNCLOSED `<!--` strips to the end of the body, exactly as an unclosed fence does. GitHub hides
+# the remainder of the description from the author in that case, so text they cannot see must not be
+# able to bind the lease; the two constructs disagreeing about the unclosed case was an
+# inconsistency, not a design.
+HTML_COMMENT_RE = re.compile(r"<!--.*?(?:-->|\Z)", re.S)
 FENCED_BLOCK_RE = re.compile(
     r"^[ \t]{0,3}(`{3,}|~{3,})[^\n]*$.*?(?:^[ \t]{0,3}\1[ \t]*$|\Z)", re.M | re.S)
 # Content that holds no backtick, delimited by a run of the same length: linear, and an UNBALANCED
@@ -303,17 +321,61 @@ def _load_policy_resolve():
 
 
 # ---- pure decisions (every one unit-tested by --self-test) -------------------------------------
+def strip_indented_code(text):
+    """`text` with every CommonMark INDENTED CODE BLOCK blanked out.
+
+    An indented code block is four spaces (or a tab) of indent on a line that a BLANK line opened —
+    the blank-line requirement is what keeps this off a wrapped paragraph continuation, which is
+    indented prose and really does declare. GitHub renders these as code and does not resolve a
+    closing keyword inside one, so neither may this.
+
+    HONEST LIMIT, stated because it is a real false NEGATIVE and not a theoretical one: a paragraph
+    that continues a LIST ITEM is also blank-line-opened and four-space indented, so a declaration
+    written there is stripped and the PR refuses `no-issue-reference`. That is the deliberate
+    direction of this whole file — a refusal is a comment naming the one edit that fixes it, while a
+    wrong mint is silent, permanent and censused as a success (see the strip preamble above). No
+    live enrolled body declares from an indented line; --self-test pins both directions."""
+    kept, in_block, prev_blank = [], False, True
+    for line in (text or "").split("\n"):
+        blank = not line.strip()
+        indented = line.startswith("    ") or line.startswith("\t")
+        if in_block and (blank or indented):
+            kept.append("")
+            prev_blank = True
+            continue
+        in_block = False
+        if indented and prev_blank and not blank:
+            in_block = True
+            kept.append("")
+            prev_blank = True
+            continue
+        kept.append(line)
+        prev_blank = blank
+    return "\n".join(kept)
+
+
 def strip_quoted_contexts(text):
-    """`text` with every QUOTED context removed: HTML comments, fenced code blocks, inline code
-    spans and blockquote lines.
+    """`text` with every QUOTED context removed: indented code blocks, blockquote lines, HTML
+    comments, fenced code blocks and inline code spans — in that order, for the reason given above
+    the regexes.
 
     A closing keyword inside any of those is something the author QUOTED — a template, another
     PR's description, this tool's own refusal comment — not something they declared. GitHub itself
-    does not resolve one, and neither may this."""
-    text = HTML_COMMENT_RE.sub(" ", text or "")
-    text = FENCED_BLOCK_RE.sub(" ", text)
-    text = CODE_SPAN_RE.sub(" ", text)
-    return BLOCKQUOTE_LINE_RE.sub(" ", text)
+    does not resolve one, and neither may this.
+
+    WHAT IS SUBSTITUTED IS A NEWLINE, NOT A SPACE, and that is load-bearing. A space SPLICES: the
+    grammar's `keyword[ \\t]*:?[ \\t]*#N` would read `` Fixes `mod` #1234 `` as a declaration that
+    the author never wrote, because removing the span manufactured the keyword→`#` adjacency. A
+    newline cannot be crossed by `[ \\t]*`, so a construct the author put BETWEEN a keyword and a
+    number breaks the reference instead of completing it — the safe direction for a strip that is
+    an enumeration and therefore incomplete by nature. It also means a code span sitting between a
+    negator and its keyword ends the `is_negated` window (`\\n` is a SENTENCE_BREAK), so that one
+    corner degrades to no suppression — i.e. to GitHub's own behaviour, which is the documented
+    degradation mode for the negation rule and never a different binding."""
+    text = BLOCKQUOTE_LINE_RE.sub("\n", strip_indented_code(text))
+    text = HTML_COMMENT_RE.sub("\n", text)
+    text = FENCED_BLOCK_RE.sub("\n", text)
+    return CODE_SPAN_RE.sub("\n", text)
 
 
 def is_negated(text, keyword_start):
@@ -954,6 +1016,46 @@ def _self_test():                                                       # noqa: 
           closing_issue_candidates("t", "> quoted: Closes #1234\n\nCloses #7"), [7])
     check("an unbalanced backtick consumes nothing",
           closing_issue_candidates("t", "a ` stray tick, then Closes #7"), [7])
+
+    # ---- WHAT THE STRIP SUBSTITUTES, and the order it substitutes in --------------------------
+    # A strip that leaves a SPACE behind SPLICES: removing the span manufactures the
+    # `keyword[ \t]*#N` adjacency the grammar reads, so a declaration appears that the author never
+    # wrote and GitHub would never resolve. A NEWLINE cannot be crossed by `[ \t]*`, so the same
+    # removal breaks the reference instead of completing it.
+    check("a code span BETWEEN the keyword and the number does not splice into a declaration",
+          closing_issue_candidates("t", "Fixes `mod` #1234"), [])
+    check("...nor when it is spliced with no spaces at all",
+          closing_issue_candidates("t", "Closes`x`#1234"), [])
+    check("...and a span INSIDE the keyword still breaks it, as it always did",
+          closing_issue_candidates("t", "clo`x`ses #1234"), [])
+    # THE ORDER CONTROL, and the reason the newline is not free. This is PR #781's live line 0: a
+    # self-identification banner that is a blockquote AND contains a code span. Substituting a
+    # newline for that span splits the quoted line in two, and the second half no longer starts with
+    # `>` — so with the blockquote strip running last, a banner nobody meant as a declaration binds
+    # the lease. It reds this check by name.
+    check("a code span in a BLOCKQUOTE line does not un-quote the rest of that line (live #781)",
+          closing_issue_candidates(
+              "t", "> 🤖 **SPARQ agent** — AUTHOR ONLY; no `VERDICT:` line. Closes #777."), [])
+    check("...and the same shape with a fence marker in the quoted line stays quoted too",
+          closing_issue_candidates("t", "> see ```x``` then Closes #777"), [])
+    # AN UNCLOSED `<!--` strips to the end of the body, exactly as an unclosed fence does — GitHub
+    # hides that remainder from the author, so it must not be able to bind.
+    check("an UNCLOSED HTML comment strips to the end rather than leaking",
+          closing_issue_candidates("t", "<!-- draft\nCloses #1234"), [])
+    check("...while a CLOSED one still stops at its terminator",
+          closing_issue_candidates("t", "<!-- t: Closes #1234 -->\n\nCloses #7"), [7])
+    # AN INDENTED CODE BLOCK is code, and GitHub does not resolve a keyword inside one.
+    check("a keyword in a 4-space INDENTED code block is quoted, not declared",
+          closing_issue_candidates("t", "prose\n\n    Closes #1234"), [])
+    check("...and a tab-indented one too",
+          closing_issue_candidates("t", "prose\n\n\tCloses #1234"), [])
+    # BOTH CONTROLS, because an indented strip that fires on ordinary prose refuses everything: an
+    # indented line that merely CONTINUES a paragraph is not blank-line-opened and still declares,
+    # and a declaration after the code block is untouched.
+    check("...while an indented PARAGRAPH CONTINUATION is prose and still declares",
+          closing_issue_candidates("t", "some prose that wraps\n    Closes #7"), [7])
+    check("...and a real declaration after the code block still binds",
+          closing_issue_candidates("t", "prose\n\n    Closes #1234\n\nCloses #7"), [7])
 
     # ---- NEGATED PROSE: a suppressor that can only ever cause a refusal ------------------------
     check("negated prose does not declare anything",
