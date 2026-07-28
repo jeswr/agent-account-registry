@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4841,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "0e591239be553bb7419f6fc9fe16c0f3a246d7a0",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The global `emitted` set makes only the first soft edge reaching a target component emit that component's class and attribute patterns. A later OPTIONAL or NOT EXISTS edge to the same target emits only its edge triple. For example, `?a OPTIONAL ex:p ?b` and `?c OPTIONAL ex:q ?b` with `?b a ex:B` constrains `?b` only in the first OPTIONAL; when that branch does not match, the second may bind any `ex:q` object regardless of class. The comment that this correlates branches is not valid SPARQL correlation because variables unbound by an earlier OPTIONAL can be independently bound later. This silently changes answers, and the new chain tests do not cover converging/shared targets.",
+    "file": "gui/app/src/lib/query-builder.ts",
+    "fix_hint": "Do not use one global emission bit to suppress target constraints across independent soft groups. Emit the target component's constraints in every branch that can independently bind it, or define and implement an explicit shared-target lowering whose SPARQL preserves all node constraints. Add a result-oriented test with two OPTIONAL branches converging on the same typed/filtered target where the first fails and the second points to an object that violates the target constraint; add the analogous NOT EXISTS/shared-target case.",
+    "severity": "major",
+    "title": "Multiply reached soft targets lose constraints in later branches"
+   },
+   {
+    "body": "`applyHandoff` always sets `handoffRef.current = true`. If the Query panel has already hydrated the current workspace, no workspace effect runs to clear that flag. On the next workspace switch, the hydration effect sees the stale flag, clears it, and returns without loading `workspace.editor.query`, leaving the handed query visible in the newly selected workspace. Thus the explicit handoff incorrectly wins over a future workspace switch rather than only a concurrent mount/restore race. The pure handoff tests cannot detect this component-state interaction.",
+    "file": "gui/app/src/components/workbench/query-workbench.tsx",
+    "fix_hint": "Track whether workspace hydration is currently pending (or associate the handoff with the workspace id) and suppress restoration only for the mount/same-workspace race the comment describes. A handoff delivered after the current workspace is hydrated must not set a flag that survives into another workspace. Add a component test: hydrate workspace A, deliver a live handoff, switch to workspace B, and assert B's saved query is restored.",
+    "severity": "major",
+    "title": "Live handoff causes the next workspace restoration to be skipped"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 2 fixes both prior major findings: soft-edge descendants are now lowered inside their branch with non-vacuous chain tests, and shape-only target classes are merged into the UI options with an end-to-end reachability test. However, two new correctness defects remain. Shared targets across multiple soft branches receive their constraints in only the first branch, so later branches can match values that violate the target node's class/attributes. In addition, a live query handoff leaves a flag set after the current workspace was already hydrated, causing the next workspace switch to skip restoration and retain the handed query. Because these are new major findings, progress is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
