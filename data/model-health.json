@@ -1,93 +1,6 @@
 {
  "records": [
   {
-   "ts": 1785254622,
-   "provider": "anthropic",
-   "account": "9e13ea21abf27e68",
-   "model_alias": "opus5",
-   "exit_class": "no_change",
-   "run_id": "30376032723.1",
-   "input_tokens": 2254,
-   "output_tokens": 11493,
-   "wall_seconds": 188,
-   "issue": 968,
-   "why_no_diff": "other"
-  },
-  {
-   "ts": 1785254672,
-   "provider": "anthropic",
-   "account": "efb4eb2781de6958",
-   "model_alias": "opus5",
-   "exit_class": "success",
-   "run_id": "30375950552.1"
-  },
-  {
-   "ts": 1785254822,
-   "provider": "anthropic",
-   "account": "efb4eb2781de6958",
-   "model_alias": "opus5",
-   "exit_class": "success",
-   "run_id": "30375938364.1"
-  },
-  {
-   "ts": 1785254963,
-   "provider": "fleet",
-   "account": "5f5b2dc3fb8e231b",
-   "model_alias": "",
-   "exit_class": "success",
-   "run_id": "30376207847.1"
-  },
-  {
-   "ts": 1785255018,
-   "provider": "openai",
-   "account": "dc2d751954080e13",
-   "model_alias": "sol",
-   "exit_class": "success",
-   "run_id": "30376803438.1"
-  },
-  {
-   "ts": 1785255086,
-   "provider": "openai",
-   "account": "dc2d751954080e13",
-   "model_alias": "sol",
-   "exit_class": "success",
-   "run_id": "30376834756.1"
-  },
-  {
-   "ts": 1785255149,
-   "provider": "anthropic",
-   "account": "efb4eb2781de6958",
-   "model_alias": "opus5",
-   "exit_class": "no_change",
-   "run_id": "30376886385.1",
-   "input_tokens": 2105,
-   "output_tokens": 6096,
-   "wall_seconds": 100,
-   "issue": 811,
-   "why_no_diff": "blocked_on_decision"
-  },
-  {
-   "ts": 1785255213,
-   "provider": "anthropic",
-   "account": "efb4eb2781de6958",
-   "model_alias": "opus5",
-   "exit_class": "no_change",
-   "run_id": "30376721702.1",
-   "input_tokens": 3902,
-   "output_tokens": 11043,
-   "wall_seconds": 217,
-   "issue": 2747,
-   "why_no_diff": "blocked_on_decision"
-  },
-  {
-   "ts": 1785255336,
-   "provider": "anthropic",
-   "account": "efb4eb2781de6958",
-   "model_alias": "opus5",
-   "exit_class": "success",
-   "run_id": "30375975085.1"
-  },
-  {
    "ts": 1785256003,
    "provider": "anthropic",
    "account": "9e13ea21abf27e68",
@@ -1755,6 +1668,14 @@
    "model_alias": "opus5",
    "exit_class": "success",
    "run_id": "30405139649.1"
+  },
+  {
+   "ts": 1785280695,
+   "provider": "anthropic",
+   "account": "efb4eb2781de6958",
+   "model_alias": "opus5",
+   "exit_class": "unknown",
+   "run_id": "30407494348.1"
   }
  ]
 }
