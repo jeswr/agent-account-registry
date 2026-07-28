@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 980,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "7db46ebc97c190ef3a5e648aee734afd6a168354",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 4 recommends adding the class-2 clamp as a fifth ALERT_CLASSES member reading the top-level queue and says it would gain the existing sustained/recovery behavior. In the current code, however, evaluate_alerts explicitly iterates current.targets; _recent_rows and _sustained read snapshots[].targets[target]; compute_recoveries iterates collected targets and applies every ALERT_CLASSES predicate to those target rows; and reconciliation identities are (target, classification). Adding a top-level predicate to ALERT_CLASSES would either be unused for firing or be invoked against unrelated target rows during recovery. Worse, tying recovery to collected target tokens would make a fleet-global queue alarm's closure depend on target collection, contrary to the proposed data model. The record therefore does not yet establish a correct or fail-closed implementation path for its main metrics recommendation.",
+    "file": "research/636-queue-observability-export.md",
+    "fix_hint": "Design the global alert path explicitly: define its stable marker/target identity, a top-level recent-queue-row helper and sustained predicate, a fleet-level threshold source, and recovery logic that requires consecutive valid queue snapshots and never clears on missing/malformed queue data. Document the self-tests that prove firing, insufficient-history behavior, missing-data fail-closed behavior, dedupe, and hysteretic recovery.",
+    "severity": "major",
+    "title": "Fleet-global queue alert is incompatible with the target-scoped alert machinery"
+   },
+   {
+    "body": "Section 1c says a repo-wide search outside dashboard-gen.py returns only app.js comments, dashboard.yml, and one select-and-claim.py docstring. The checkout also contains observability references in data/README.md, dashboard/index.html, dashboard/styles.css, and .github/workflows/metrics.yml. These do not appear to write data/observability.json, so the producer-gap conclusion may still be correct, but the stated evidence is false and not reproducible.",
+    "file": "research/636-queue-observability-export.md",
+    "fix_hint": "Replace the exhaustive-search claim with the exact writer-oriented search performed and distinguish harmless schema/UI references from code or workflow steps that can persist data/observability.json.",
+    "severity": "minor",
+    "title": "The claimed repo-wide observability search result is inaccurate"
+   }
+  ],
+  "progress": null,
+  "summary": "The record correctly identifies the dashboard shape mismatch and the absence of task-queue.py at this checkout, but its recommended metrics design is not complete against the collector's actual alert architecture. A fleet-global queue alert cannot be added merely as a fifth alert class: all sustained-history and recovery machinery is target-row scoped. The document needs to specify a sound global alert identity, history predicate, threshold source, and fail-closed recovery behavior before it can serve as an implementation design.",
+  "verdict": "request_changes"
+ }
+}
