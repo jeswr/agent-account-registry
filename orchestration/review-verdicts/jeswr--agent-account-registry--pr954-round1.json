@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 954,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "5e267c5290bb88ea507af9cb3c9a4a2151a952ee",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 4.1 correctly says ref creation requires push access, but sections 4.2, 5.1, and 7 prescribe creating the binding in the existing register step without specifying how that step obtains such authority. In the reviewed tree the login job grants `contents: read`; the register step uses `${{ github.token }}`; and the scoped App token with `permission-contents: write` is minted only after registration. Thus the stated three workflow edits are incomplete. A literal implementation would create the issue, fail the ref write, and strand the irreversible claim/credential on every enrollment. This is a correctness and least-privilege design gap, not an empirical detail that can safely be deferred to PR 1.",
+    "file": "research/914-account-identity-binding.md",
+    "fix_hint": "Specify the exact write identity and reorder/mint it before registration, include those edits in the blast radius and PR-1 sequence, and require guard/self-test coverage proving the binding call uses only that narrowly scoped contents-write token while issue operations retain the default issues-write token. Update the partial-state alarm and cleanup/forward-recovery analysis for token-mint or binding failures after the irreversible capture.",
+    "severity": "major",
+    "title": "The binding writer has no contents-write credential at the register step"
+   }
+  ],
+  "progress": null,
+  "summary": "The design correctly identifies title-based identity as outsider-writable and gives a thoughtful fail-closed migration sequence, but its proposed write path is not implementable with the permissions and step ordering of the tree it claims to cover. The register step runs with the job's read-only contents permission, while the contents-write App token is minted only later. Because creating refs requires contents write, PR 1 would either fail every registration after issue creation or require additional credential/ordering changes absent from the stated blast radius and tests.",
+  "verdict": "request_changes"
+ }
+}
