@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1081,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "29e1ca6c8057ac19c48e74896029f97e3b85450f",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The store step creates `BINDING_REF` before its final repository and environment secret-absence probes. Those probes explicitly cover an out-of-protocol write racing the earlier union enumeration. If such a secret now exists, the step exits without running `gh secret set`, but the binding remains. On retry, reconciliation probes only whether `${handle^^}_TOKEN` exists; it cannot prove who wrote it. It therefore counts the out-of-band secret as this binding's completed capture, emits `resume=true`/`stage=register`, and creates an account record around a credential this enrollment never captured. The new tests model bound+404 and bound+exists, but omit the critical transition `binding created -> final absence probe reports exists -> retry`, so they bless the ambiguous state as resumable.",
+    "file": ".github/workflows/set-up-account.yml",
+    "fix_hint": "Do not publish resumable capture evidence until both final absence probes have proved the target secret absent. Move the repository and environment absence probes before binding creation, then create the binding immediately before `gh secret set` (preserving binding-before-capture ordering), and add a transition test showing that a probe-detected pre-existing secret cannot leave evidence that a retry interprets as this enrollment's stored credential. Extend the static guard to pin both absence proofs before binding creation.",
+    "severity": "major",
+    "title": "A binding left by an absence-probe refusal can adopt an out-of-band credential"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 2 correctly closes the prior finding: the jq stage no longer filters malformed refs, every enumerated entry reaches the default-deny grammar check, and the executable/static tests pin refusal before either outcome is emitted. However, the new claim-time binding is created before the existing final secret-absence probes. If either probe discovers the out-of-band secret race it was designed to catch, this run exits without storing, but its durable binding remains; the next run sees that pre-existing secret plus the binding and treats it as proof this workflow captured the credential, then registers it. That converts a current fail-closed race refusal into a resumable identity misbinding. The prior issue improved, but this is a new major finding, so progress is regressing under the required rubric.",
+  "verdict": "request_changes"
+ }
+}
