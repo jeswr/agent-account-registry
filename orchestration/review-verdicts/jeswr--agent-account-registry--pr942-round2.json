@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 942,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "fe3d53d493cc5b4597ec91b7b6868ae0247ae52d",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 1's major fail-open is resolved in both activation paths. The jq pipeline now runs inside a command substitution whose exit status is explicitly checked, so a malformed later page cannot leave a partial one-record result that proceeds to activation. Empty output is also preserved as zero matches. The added executed self-tests exercise the exact regression boundary for both merged and inline activation: a valid matching record followed by an unparseable page must produce a parse error, perform no issue edit, and never resolve via the partial count. The authoritative endpoint remains fully paginated, exact-title matched, state=all, and filtered to exclude pull requests. No new correctness, security, or test-validity issue is evident in the diff.",
+  "verdict": "approve"
+ }
+}
