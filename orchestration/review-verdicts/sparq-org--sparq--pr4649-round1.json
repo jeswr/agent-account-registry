@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4649,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a602e8c27b8a6281e56ca8dd455bfab17d094b98",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`keyword_hints` starts a candidate at any ASCII letter whose immediately preceding byte is not accepted by the ASCII-only `is_ident_char`. In a valid SPARQL variable containing non-ASCII name characters (for example an ASCII typo-like suffix after `\u00e9`) the preceding UTF-8 byte is treated as a delimiter, so the suffix can be reported as a keyword typo. The same problem applies after a PN_LOCAL escape such as a backslash in a valid prefixed-name local. This contradicts the public contract that every valid query returns an empty vector and makes the public helper noisy on legal SPARQL syntax. The valid-query test exercises only ASCII names, so it does not establish that contract.",
+    "file": "crates/sparq-terse/src/diagnose.rs",
+    "fix_hint": "Tokenize according to the vendored parser's SPARQL lexical rules, or at minimum make candidate-boundary detection aware of Unicode PN/VARNAME characters and PN_LOCAL escapes. Add real-parser-backed regression tests using valid Unicode variable names and escaped prefixed-name locals whose ASCII suffix is close to a keyword, asserting both that parsing succeeds and that `keyword_hints` is empty.",
+    "severity": "major",
+    "title": "Valid Unicode and escaped identifiers can produce keyword hints"
+   }
+  ],
+  "progress": null,
+  "summary": "The non-rewriting integration and failure-path test are sound, but the public diagnostic does not meet its documented guarantee of returning no hints for every valid query. Its ASCII-only standalone-token check can interpret ASCII substrings inside valid non-ASCII variables or escaped prefixed-name locals as bare keyword typos. The current tests cover only ASCII identifiers and therefore miss the load-bearing false-positive case.",
+  "verdict": "request_changes"
+ }
+}
