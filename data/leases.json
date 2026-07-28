@@ -13,12 +13,12 @@
   {
    "account": "488920c2efe2b3fb",
    "claim_id": "125d3be5937e4be789ea56fdd8b6b349",
-   "holder": "sparq-org/sparq#3297@dispatch-30320028546.1",
+   "holder": "sparq-org/sparq#3297@30320300769.1",
    "package": "sparq-fedplan-mpc",
    "role": "soundness",
    "model": "opus5",
-   "issued_at": 1785202043,
-   "expires_at": 1785208343
+   "issued_at": 1785202080,
+   "expires_at": 1785208380
   },
   {
    "account": "488920c2efe2b3fb",
