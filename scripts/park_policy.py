@@ -2156,6 +2156,84 @@ def probe_maintainer(repo, login, read_permission, log=print):
     return permission in HUMAN_MAINTAINER_PERMISSIONS
 
 
+# [registry #958] THE YAML SEAM. `.github/workflows/review-fix.yml`'s PR-admission step stands
+# down on the park labels as BARE LITERALS — it is Python inside a heredoc inside a workflow, so it
+# cannot import this module, and until now nothing parsed it. That made it the one FAIL-OPEN copy
+# of these names: repoint MACHINE_PARK_PR_LABEL here and every Python consumer goes red while
+# review-fix.yml keeps refusing a name nothing writes any more, i.e. the fix lane starts running
+# models on PRs a park was meant to protect. A constant duplicated across a Python/YAML boundary
+# has no single owner, so the seam gets its own pin, HERE, in the module a renamer actually edits.
+_REVIEW_FIX_WORKFLOW = (".github", "workflows", "review-fix.yml")
+
+
+def _review_fix_source():
+    """The live review-fix.yml text. Missing/unreadable RAISES — fail closed, never a skip."""
+    from pathlib import Path  # self-test-only: this module is pure policy in production
+    path = Path(__file__).resolve().parents[1].joinpath(*_REVIEW_FIX_WORKFLOW)
+    assert path.is_file(), f"review-fix.yml not found for the park-label seam pin: {path}"
+    return path.read_text(encoding="utf-8")
+
+
+def _review_fix_standdown_labels(source=None):
+    """The label literals review-fix.yml's admission steps REFUSE to run on, read straight out of
+    the workflow and returned sorted.
+
+    Parsed, never substring-matched: each inline `<<'PY'` step body is AST-walked for an `if` that
+    raises SystemExit and whose test reads the PR's own `labels`, in both spellings the workflow
+    uses (`"x" in labels` and `{...} & set(labels)`). A comment or a dead string mentioning a park
+    label therefore proves nothing here — only an executed guard does.
+
+    Every failure direction shrinks the result: an unparsable body is skipped, a guard that stopped
+    raising is not collected, a dropped guard simply is not there. The caller asserts EQUALITY
+    against the constants above, so all three land as a RED rather than a quiet pass."""
+    import ast  # self-test-only, same lazy-import idiom as _review_fix_source
+    import textwrap
+
+    if source is None:
+        source = _review_fix_source()
+    bodies = re.findall(r"<<'PY'\n(.*?)\n *PY(?:\n|$)", source, re.S)
+    assert bodies, "review-fix.yml exposed no inline python step bodies to pin"
+
+    def guarded(test):
+        """The label literals `test` compares against the PR's `labels` name."""
+        out = set()
+        if (isinstance(test, ast.Compare) and len(test.ops) == 1
+                and isinstance(test.ops[0], ast.In)
+                and isinstance(test.left, ast.Constant) and isinstance(test.left.value, str)
+                and isinstance(test.comparators[0], ast.Name)
+                and test.comparators[0].id == "labels"):
+            out.add(test.left.value)
+        if isinstance(test, ast.BinOp) and isinstance(test.op, ast.BitAnd):
+            sides = (test.left, test.right)
+            literals = [side for side in sides if isinstance(side, ast.Set)]
+            over_labels = [
+                side for side in sides
+                if isinstance(side, ast.Call) and isinstance(side.func, ast.Name)
+                and side.func.id == "set" and len(side.args) == 1
+                and isinstance(side.args[0], ast.Name) and side.args[0].id == "labels"]
+            if literals and over_labels:
+                out |= {element.value for element in literals[0].elts
+                        if isinstance(element, ast.Constant) and isinstance(element.value, str)}
+        return out
+
+    found = set()
+    for body in bodies:
+        try:
+            tree = ast.parse(textwrap.dedent(body))
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.If):
+                continue
+            if not any(isinstance(inner, ast.Raise) and isinstance(inner.exc, ast.Call)
+                       and isinstance(inner.exc.func, ast.Name)
+                       and inner.exc.func.id == "SystemExit"
+                       for inner in node.body):
+                continue
+            found |= guarded(node.test)
+    return sorted(found)
+
+
 def _self_test():
     ok = True
 
@@ -4047,6 +4125,39 @@ def _self_test():
     check("deny wins even when the injection flag is the NEWEST comment",
           reclassify_legacy_park(
               [bot_comment(budget_prose), bot_comment(injection_prose)], bot)[0], None)
+
+    # ---- [registry #958] THE WIRE VALUES, AND THE YAML SEAM THAT CARRIES THEM ----
+    # `review:parked` had FOUR independent definitions and every assertion on it compared what a
+    # module WROTE against the same constant it writes from — a tautology that cannot fail. So the
+    # pins here are on LITERALS. A rename of these names is a wire-protocol change across a
+    # Python/YAML boundary; it must be a deliberate, visibly multi-site edit, not a one-liner that
+    # leaves the workflow refusing a label nothing writes.
+    check("the park-label wire values are pinned to LITERALS — never to the constant a writer "
+          "writes from, which is the comparison that let the blind consumers stay green",
+          (MACHINE_PARK_PR_LABEL, MACHINE_PARK_LABEL, HUMAN_PR_PARK_LABEL, HUMAN_PARK_LABEL),
+          ("review:parked", "status:parked", "review:needs-user", "needs:user"))
+    _standdown = sorted({MACHINE_PARK_PR_LABEL, HUMAN_PR_PARK_LABEL, HUMAN_PARK_LABEL})
+    check("review-fix.yml's PR admission stands down on EXACTLY the three PR-side park labels "
+          "this module owns — the seam nothing parsed, whose bare `review:parked` literal is the "
+          "one FAIL-OPEN copy (repoint it and the fix lane runs models on parked PRs)",
+          attempt(_review_fix_standdown_labels), _standdown)
+
+    # THE INSTRUMENT IS VALIDATED AGAINST KNOWN POSITIVES, because a checker that has never
+    # reported anything has not been shown to be ABLE to — and both mutants below are exactly the
+    # edits #958 measured surviving: repoint the literal, or drop the guard.
+    _rf_src = attempt(_review_fix_source)
+    if not isinstance(_rf_src, str):
+        _rf_src = ""
+    _repointed = _rf_src.replace('"review:parked" in labels', '"review:parked-mutant" in labels')
+    check("KNOWN POSITIVE 1 — a REPOINTED workflow literal is reported as the mutant it is, so a "
+          "clean report above is evidence rather than silence",
+          (_repointed != _rf_src, attempt(lambda: _review_fix_standdown_labels(_repointed))),
+          (True, sorted({"review:parked-mutant", HUMAN_PR_PARK_LABEL, HUMAN_PARK_LABEL})))
+    _dropped = _rf_src.replace('if "review:parked" in labels:', "if False:")
+    check("KNOWN POSITIVE 2 — DELETING the stand-down (the fail-open direction itself) reds, and "
+          "reds by ABSENCE, so a guard that stops executing cannot pass as one that does",
+          (_dropped != _rf_src, attempt(lambda: _review_fix_standdown_labels(_dropped))),
+          (True, sorted({HUMAN_PR_PARK_LABEL, HUMAN_PARK_LABEL})))
 
     print("park-policy self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1

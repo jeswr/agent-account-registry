@@ -281,6 +281,17 @@ jobs:
               label.get("name") for label in (pull.get("labels") or [])
               if isinstance(label, dict) and isinstance(label.get("name"), str)
           })
+          # [registry #958] THE THREE STAND-DOWN LITERALS BELOW ARE PINNED. This step is Python
+          # inside a heredoc inside a workflow, so it cannot import park_policy.py — it spells the
+          # park labels out. That made it the one FAIL-OPEN copy of those names: repoint the
+          # constant and every Python consumer reds while this step keeps refusing a label nothing
+          # writes any more, i.e. the fix lane starts running models on PRs a park protects.
+          # park_policy._review_fix_standdown_labels now AST-parses these guards out of this file
+          # and asserts them equal to {MACHINE_PARK_PR_LABEL, HUMAN_PR_PARK_LABEL,
+          # HUMAN_PARK_LABEL}. Renaming, deleting, or stopping-to-raise any of them fails
+          # park_policy.py --self-test; keep the guards in a shape that pin can read (a literal or
+          # a literal set, tested against `labels`, raising SystemExit).
+          #
           # review:needs-user (loop escalation) and needs:user (groom's parked-PR "Human
           # attention required" marker) are BOTH human-owned terminal for every mode/flavour.
           if {"review:needs-user", "needs:user"} & set(labels):

@@ -428,6 +428,88 @@ def _self_test():
           ("closed" in audit_body(1, auto, 2, "d", "retire"),
            "closed" in audit_body(1, auto, 2, "d", "reclassify")), (True, False))
 
+    # ---- [registry #958] THE WRITE PATH, COVERED AT ALL ----
+    # Everything above exercises `verdict` (pure) and `audit_body` (a string). NOTHING executed the
+    # thing this script exists to DO: main()'s label writes. Measured 2026-07-28, this whole suite
+    # stayed rc=0 fully green under a mutant that repointed park_policy.MACHINE_PARK_PR_LABEL —
+    # while main() POSTs that label to a live PR. A writer whose suite cannot see its own writes is
+    # the blindest consumer in the set, so main() is driven end-to-end here against stubbed gh.
+    #
+    # THE ASSERTIONS ARE ON LITERALS, deliberately. Comparing the recorded write against
+    # `park_policy.MACHINE_PARK_PR_LABEL` would be the tautology #958 names: the write is made FROM
+    # that constant, so the check agrees with itself for every value the constant could ever hold.
+    worker_pr = _load("registry_worker_pr", "worker-pr.py")
+    bot, pr_number, issue_number = "sparq-orchestrator[bot]", 41, 7
+    pr_comments = [
+        {"user": {"login": bot},
+         "body": f"capacity park\n\n{worker_pr.PARK_GENERATION_MARKER} gen=2 cutoff={auto} -->"},
+        {"user": {"login": bot},
+         "body": f"re-admitted\n\n{worker_pr.AUTO_READMIT_MARKER} evidence=k/1 at={auto} -->"},
+    ]
+
+    def labelled(name, login=bot):
+        return [{"event": "labeled", "label": {"name": name},
+                 "created_at": "2026-07-27T09:00:00Z", "actor": {"login": login},
+                 "performed_via_github_app": None}]
+
+    writes = []
+
+    def fake_gh(argv, token=None, check=True):
+        writes.append(list(argv))
+        return None
+
+    def fake_gh_json(argv, token=None):
+        target = argv[1] if len(argv) > 1 else ""
+        if target.startswith("repos/o/r/issues?state=open"):
+            return [[{"number": pr_number,
+                      "pull_request": {"url": f"repos/o/r/pulls/{pr_number}"},
+                      "labels": [{"name": park_policy.HUMAN_PR_PARK_LABEL}]}]]
+        if target == f"repos/o/r/pulls/{pr_number}":
+            return {"head": {"ref": f"sparq-agent/issue-{issue_number}-park-seam"}}
+        if target == f"repos/o/r/issues/{issue_number}":
+            return {"labels": [{"name": park_policy.HUMAN_PARK_LABEL}]}
+        raise AssertionError(f"unexpected read: {argv!r}")
+
+    def fake_paginated(repo, number, kind, token=None):
+        if number == pr_number:
+            return pr_comments if kind == "comments" else labelled(
+                park_policy.HUMAN_PR_PARK_LABEL)
+        if number == issue_number and kind == "timeline":
+            return labelled(park_policy.HUMAN_PARK_LABEL)
+        raise AssertionError(f"unexpected page read: {repo}#{number} {kind}")
+
+    def run_main(*extra):
+        writes.clear()
+        saved = (_gh, _gh_json, _paginated)
+        globals().update(_gh=fake_gh, _gh_json=fake_gh_json, _paginated=fake_paginated)
+        try:
+            return main(["--repo", "o/r", "--bot-login", bot, *extra])
+        finally:
+            globals().update(_gh=saved[0], _gh_json=saved[1], _paginated=saved[2])
+
+    rc = run_main("--apply")
+    applied = [part.split("=", 1)[1] for argv in writes for part in argv
+               if isinstance(part, str) and part.startswith("labels[]=")]
+    deleted = [argv[3] for argv in writes if argv[:3] == ["api", "-X", "DELETE"]]
+    check("the WRITE PATH posts the MACHINE park pair — the PR half then the source-issue half — "
+          "as the literal wire values it must put on the wire",
+          (rc, applied), (0, ["review:parked", "status:parked"]))
+    check("...and deletes exactly the two human-owned labels it converted, url-encoded, on the "
+          "PR and on its source issue",
+          deleted, ["repos/o/r/issues/41/labels/review%3Aneeds-user",
+                    "repos/o/r/issues/7/labels/needs%3Auser"])
+    # Indexed through a total default, never `writes[0]` directly: a regression that writes
+    # NOTHING must report as a clean FAIL row, not abort the remaining checks (park_policy's
+    # `attempt` lesson — a kill on a suite that stopped running is not evidence).
+    receipt = writes[0] if writes else ["", "", "", ""]
+    check("...RECEIPT FIRST: the audit comment is on the wire before any label write, so a crash "
+          "mid-correction leaves an EXPLAINED PR rather than a silently-moved one",
+          (receipt[:3], receipt[3].endswith(f"/issues/{pr_number}/comments"),
+           RECONCILE_MARKER in " ".join(receipt)),
+          (["api", "-X", "POST"], True, True))
+    check("DRY RUN IS THE DEFAULT: without --apply the same population mutates nothing at all",
+          (run_main(), writes), (0, []))
+
     print("reconcile-park-misescalation self-test " + ("PASSED" if ok else "FAILED"))
     return 0 if ok else 1
 
