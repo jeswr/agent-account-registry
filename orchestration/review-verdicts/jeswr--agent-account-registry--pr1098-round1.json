@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1098,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "3327147902554a75fab51ddab6eb4963bacb3bf5",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The worker output `exhausted` remains `${{ steps.budget.outputs.exhausted }}`. That step runs before `trust` and before `record-refusal`, so with max_attempts=2 the second refusal sees budget.used=1/exhausted=false, records refusal.used=2, but still exports exhausted=false. final_state consequently falls through to `status=deferred`; its exhaustion arm cannot observe the newly spent slot. The claim-side `budget_used` check should prevent another runner allocation on the following dispatcher tick, but that does not make the stated worker-side convergence true and leaves the issue in the retry frontier until another sweep repairs it. The seam test is vacuous for this connection: `parks_when_exhausted` only finds an already-existing generic `$EXHAUSTED` arm and never proves that a terminal refusal makes the worker's EXHAUSTED input true.",
+    "file": ".github/workflows/worker.yml",
+    "fix_hint": "Surface an exhaustion result from `record-refusal` (or otherwise compute a post-refusal worker output) and bind the worker job's `exhausted` output to that result on the refusal path while preserving the original budget result elsewhere. Add a behavioral/seam assertion that starts with budget N-1, records a refusal, follows the exact worker-output expression into final_state, and fails unless the resulting status is parked; separately mutate/drop that binding to demonstrate the test goes red.",
+    "severity": "major",
+    "title": "Terminal refusal exports the stale pre-refusal exhaustion value"
+   }
+  ],
+  "progress": null,
+  "summary": "The refusal receipt is durably counted and the claim-side gate will stop a later dispatch, but the worker-side exhaustion consequence claimed by the change is not actually wired. On the refusal that consumes the last budget slot, the worker job continues to export the pre-refusal budget step's `exhausted=false`; final_state therefore writes `status:deferred`, not `status:parked`. The new self-test does not exercise that data path: it proves the generic final-state park arm exists independently of the refusal and then states that the refusal parks without testing the worker output consumed by that arm.",
+  "verdict": "request_changes"
+ }
+}
