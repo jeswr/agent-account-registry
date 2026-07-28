@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4872,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "532b875cb377569e2634255bcc8a9e16a47f1bfe",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Sections 3.1 and 3.4 choose public methods such as add_rm<let MODE: u8>, but only five MODE values have semantics. Reusing named constants does not prevent callers from instantiating add_rm::<255>, and the decision record gives implementers no required fail-closed behavior for such a value. Depending on how the mode predicates/table are written, an invalid value could silently select truncation, an overflow fallback, or another inconsistent result. This is part of the API and trust-boundary design, not merely an implementation detail; the acceptance criteria also omit it.",
+    "file": "research/noir-ieee754-directed-rounding-design.md",
+    "fix_hint": "Specify that every mode-generic entry point must enforce at compile time that MODE is exactly one of RNE/RNA/RNDZ/RNDU/RNDD (using the face repo's supported comptime assertion/type mechanism), or replace raw u8 with a closed comptime representation if Noir supports one. Add an acceptance criterion/mutation test showing an invalid MODE cannot compile, and require both kernels to use the same validated mode domain.",
+    "severity": "major",
+    "title": "Public numeric MODE has no specified invalid-value behavior"
+   }
+  ],
+  "progress": null,
+  "summary": "The IEEE-754 rounding predicates, overflow table, zero-sign rule, audit caveats, and targeted acceptance criteria are generally coherent. However, the chosen public API exposes MODE as an unrestricted u8 while the design neither defines behavior for values outside the five named modes nor requires a compile-time rejection. That leaves the central API and kernel specification incomplete and can create silently wrong semantics on an invalid instantiation.",
+  "verdict": "request_changes"
+ }
+}
