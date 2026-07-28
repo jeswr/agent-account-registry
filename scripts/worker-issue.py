@@ -877,22 +877,28 @@ _UNREAD = object()
 def followup_label_plan(declared, known_labels):
     """`(apply, dropped, area_missing)` for ONE follow-up's label set. Pure.
 
-    THE RETRY MUST NEVER GO LABEL-FREE. `gh issue create` fails the WHOLE create when any one
-    `--label` does not exist on the target, and the previous recovery here re-issued the create
-    with NO labels at all. So a model that supplied a correct `area:dispatch` alongside a single
-    typo'd or not-yet-declared label had EVERY label discarded — including the `area:`.
+    A LABEL-FREE CREATE MUST NEVER BE THE *FIRST* RECOVERY. `gh issue create` fails the WHOLE
+    create when any one `--label` does not exist on the target, and the original recovery here
+    re-issued the create with NO labels at all, immediately. So a model that supplied a correct
+    `area:dispatch` alongside a single typo'd or not-yet-declared label had EVERY label discarded
+    — including the `area:`.
 
     That is the one input no lane in this estate can manufacture. `curate-frontier.derive_area`
     refuses rather than guesses (measured: the directory-hint fallback it replaced was 12.9%
     precise on this repository, #809), and `triage.triage()` can never mint an `area:*` at all, so
     a follow-up minted label-free lands in the `status:untriaged` pile with no route out and is
-    counted, permanently, by `triage-stock-alert.census()`'s `unattributable` bucket. The failure
-    also SHRINKS a population rather than marking it bad (#971's shape): the create SUCCEEDS, so
-    nothing goes red and the loss is invisible at the call site.
+    counted, permanently, by `triage-stock-alert.census()`'s `unattributable` bucket.
 
     `known_labels` of `None` means the label vocabulary could not be read. That is not evidence
     that a label is invalid, so nothing is dropped — the caller retries with the declared set
     unchanged and lets `gh` be the judge, which is the fail-closed direction for a DROP decision.
+
+    What this function does NOT decide is the last rung. `create_followups` still falls back to a
+    label-free create when every labelled attempt has failed, because the alternative there is not
+    "a correctly-labelled issue", it is NO ISSUE AT ALL — and an item that is never created is
+    absent from every census, which is a strictly worse instance of the #971 population-shrink
+    shape than an item that is created unattributable and therefore COUNTED. That rung is loud,
+    and it records the intended labels in the issue body. See `create_followups`.
     """
     declared = {label for label in (declared or []) if isinstance(label, str) and label}
     area_missing = not any(label.startswith("area:") for label in declared)
@@ -903,8 +909,24 @@ def followup_label_plan(declared, known_labels):
 
 
 def _known_labels(repo):
-    """The target's declared label vocabulary, or None when it cannot be read (never a guess)."""
-    rows = _gh_json(["label", "list", "-R", repo, "--limit", "200", "--json", "name"])
+    """The target's declared label vocabulary, or None when it cannot be read (never a guess).
+
+    The `except` is the whole contract, not defensive padding. `_gh_json` -> `_run_gh(check=True)`
+    RAISES on a non-zero `gh`, and a non-zero `gh` is exactly what "cannot be read" means here, so
+    without this the documented `None` was reachable only via the degenerate `gh`-succeeded-but-
+    returned-non-list case and the fail-closed branch in `followup_label_plan` could not be
+    entered in production by the cause that names it.
+
+    It is also the CORRELATED case: this call is made only after an `issue create` already failed,
+    so whatever broke that create (rate limit, 502, token scope) is likely to break this read in
+    the same second. Raising here propagated that one entry's bad luck into the whole batch.
+    """
+    try:
+        rows = _gh_json(["label", "list", "-R", repo, "--limit", "200", "--json", "name"])
+    except WorkerIssueError as exc:
+        print(f"::warning::could not read {repo}'s label vocabulary ({exc}); no label will be "
+              "dropped on the strength of an unreadable vocabulary")
+        return None
     if not isinstance(rows, list):
         return None
     names = {str(row.get("name", "")) for row in rows if isinstance(row, dict)}
@@ -914,14 +936,44 @@ def _known_labels(repo):
 def create_followups(repo, source_issue, spec_file):
     """Create de-duplicated follow-up issues from a JSONL file the model wrote (one {title, body, labels}
     per line) while implementing `source_issue`. Each is linked back + labelled from:agent +
-    self-improvement so the issue-sweeper actions them. Best-effort: NEVER raises (a follow-up failure
-    must not fail the worker). This is the procedure for the orchestrator to capture discovered work."""
+    self-improvement so the issue-sweeper actions them. This is the procedure for the orchestrator
+    to capture discovered work.
+
+    THE BATCH PROPERTY, and it is the point of the per-entry `try` below: ONE follow-up failing
+    must not stop the others from being created. Each line is an INDEPENDENT item of discovered
+    work; there is no ordering or dependency between them, so nothing about entry 1's bad luck is
+    evidence about entry 2. An earlier revision put a raising helper (`_known_labels`) inside this
+    loop and a single unlucky entry destroyed the whole remaining batch while both call sites
+    (`worker.yml`, `review-fix.yml`) swallow the exit code with `|| true` — a silent
+    population-shrink, which is the exact failure class this function was being fixed for.
+
+    Fail directions, in order:
+      * a create that fails with the model's labels is retried with the labels the target actually
+        DECLARES, so a typo cannot take a valid `area:` down with it;
+      * an UNREADABLE vocabulary drops nothing (see `_known_labels`);
+      * if every labelled attempt fails, the issue is created WITHOUT labels rather than lost, and
+        said out loud, with the intended labels recorded in its body.
+
+    Honest scope of "best-effort": a failure creating any ONE follow-up is contained here and
+    never raises. The `gh issue list` read ABOVE the loop is not contained — if the existing-title
+    set cannot be read there is no de-duplication, and re-minting issues the model already filed
+    is a worse outcome than deferring the batch, so that one propagates to `main()` (exit 1, which
+    both call sites deliberately swallow) after this annotation.
+    """
     path = Path(spec_file)
     if not path.exists():
         print("no follow-ups declared")
         return
-    existing = {str(i.get("title", "")) for i in (_gh_json(
-        ["issue", "list", "-R", repo, "--state", "open", "--limit", "300", "--json", "title"]) or [])}
+    try:
+        existing = {str(i.get("title", "")) for i in (_gh_json(
+            ["issue", "list", "-R", repo, "--state", "open", "--limit", "300",
+             "--json", "title"]) or [])}
+    except WorkerIssueError as exc:
+        # Both call sites `|| true` the exit code, so the ANNOTATION is the only surviving signal
+        # that a whole batch of discovered work was deferred. Emit it, then let it propagate.
+        print(f"::error::follow-up capture skipped for {repo}: the open-issue list could not be "
+              f"read ({exc}), so de-duplication is impossible and NO follow-up was created")
+        raise
     created = 0
     # Read the label vocabulary at most once, and only if a create actually fails: the happy path
     # must not pay a `gh label list` per worker run.
@@ -943,25 +995,55 @@ def create_followups(repo, source_issue, spec_file):
         labels = sorted({label for label in (spec.get("labels") or [])
                          if isinstance(label, str) and label}
                         | {"from:agent", "self-improvement"})
-        _, _, area_missing = followup_label_plan(labels, None)
         args = ["issue", "create", "-R", repo, "--title", title, "--body", body]
         for label in labels:
             args += ["--label", label]
-        result = _run_gh(args, check=False)
-        if result.returncode != 0:
-            # An unknown label fails the whole create. Retry with the labels the target actually
-            # DECLARES — never label-free (see `followup_label_plan`): dropping the model's
-            # `area:` is the one loss no later lane can repair.
-            if known_labels is _UNREAD:
-                known_labels = _known_labels(repo)
-            keep, dropped, _ = followup_label_plan(labels, known_labels)
-            if dropped:
-                print(f"::warning::follow-up {title!r}: dropping undeclared label(s) "
-                      f"{', '.join(dropped)}; retrying with {', '.join(keep) or 'no labels'}")
-            retry = ["issue", "create", "-R", repo, "--title", title, "--body", body]
-            for label in keep:
-                retry += ["--label", label]
-            result = _run_gh(retry, check=False)
+        # The labels that actually reach the created issue. NOT the declared set: the whole point
+        # of the ladder below is that they can differ, and the area-missing signal has to be read
+        # off what LANDED or it goes quiet on the one path that needs it most — a model that
+        # declared `area:dsipatch` has a label starting `area:`, so a declared-set test says
+        # "area present" while the retry drops it and the issue is born unattributable anyway.
+        applied = labels
+        try:
+            result = _run_gh(args, check=False)
+            if result.returncode != 0:
+                # An unknown label fails the whole create. Retry with the labels the target
+                # actually DECLARES — not label-free at this rung (see `followup_label_plan`):
+                # dropping the model's `area:` is the one loss no later lane can repair.
+                if known_labels is _UNREAD:
+                    known_labels = _known_labels(repo)
+                keep, dropped, _ = followup_label_plan(labels, known_labels)
+                if dropped:
+                    print(f"::warning::follow-up {title!r}: dropping undeclared label(s) "
+                          f"{', '.join(dropped)}; retrying with {', '.join(keep) or 'no labels'}")
+                retry = ["issue", "create", "-R", repo, "--title", title, "--body", body]
+                for label in keep:
+                    retry += ["--label", label]
+                applied = keep
+                result = _run_gh(retry, check=False)
+                if result.returncode != 0 and keep:
+                    # LAST RUNG. Every labelled attempt has failed, so the choice is no longer
+                    # "right labels vs wrong labels", it is "an unattributable issue vs no issue".
+                    # An issue that is never created is absent from every census — including the
+                    # `unattributable` bucket that exists to find exactly this — so it is created
+                    # bare, loudly, with the intended labels written into the body so the
+                    # attribution is recoverable by whoever reads it.
+                    print(f"::warning::follow-up {title!r}: could not be created carrying "
+                          f"{', '.join(keep)}; creating it WITHOUT labels so the discovered work "
+                          "is not lost. It is born unattributable — the intended labels are "
+                          "recorded in its body.")
+                    bare = body + f"\n<!-- sparq-followup-labels: {','.join(labels)} -->"
+                    applied = []
+                    result = _run_gh(["issue", "create", "-R", repo, "--title", title,
+                                      "--body", bare], check=False)
+        except (WorkerIssueError, OSError) as exc:
+            # ISOLATION (see the docstring). Contain it to THIS entry and keep going: the rest of
+            # the batch is independent work and there is no evidence against it. Deliberately NOT
+            # a bare `except` — a TypeError/AttributeError here is a defect in this file, not an
+            # operational failure of one follow-up, and must stay loud.
+            print(f"::warning::follow-up {title!r} abandoned: {exc}. The remaining follow-ups are "
+                  "still attempted — one failure must not shrink the batch.")
+            continue
         if result.returncode == 0:
             created += 1
             existing.add(title)
@@ -969,8 +1051,8 @@ def create_followups(repo, source_issue, spec_file):
             # manufacture, so a follow-up minted without one is born into the unattributable
             # class. Say so at the point of creation, where the model that knows the answer is
             # still in the loop — the alternative is discovering it in a census days later.
-            if area_missing:
-                print(f"::warning::follow-up {title!r} declares no `area:` label — it cannot be "
+            if followup_label_plan(applied, None)[2]:
+                print(f"::warning::follow-up {title!r} carries no `area:` label — it cannot be "
                       "staged by any lane until one is attributed "
                       "(triage-stock-alert.census: unattributable)")
     print(f"follow-up issues created: {created}")
@@ -1903,16 +1985,152 @@ def _followup_label_self_test():
         "the retry's kept/dropped labels are no longer bound by a LIVE followup_label_plan call "
         "in create_followups — the retry can discard the model's area: label again")
 
-    # The old shape, pinned so it cannot come back: a `_run_gh` retry whose argument list is a
-    # literal ["issue", "create", ...] with nothing appended to it.
-    for node in nodes:
-        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-                and node.func.id == "_run_gh" and node.args
-                and isinstance(node.args[0], ast.List)):
-            elements = [e.value for e in node.args[0].elts if isinstance(e, ast.Constant)]
-            assert not (elements[:2] == ["issue", "create"]), (
-                "create_followups issues a label-free `issue create` inline again; the retry must "
-                "build from followup_label_plan's kept labels")
+    # DELETED, deliberately: an assertion that scanned for a `_run_gh` call whose FIRST ARGUMENT
+    # is a literal `["issue", "create", ...]`. On this tree the loop body executed ZERO times —
+    # both live calls are handed a Name (`args`, `retry`), so the assertion inside it had never
+    # once been evaluated and could not have failed for any edit. A check that has never visited a
+    # node is not a check, and keeping it inflated the apparent coverage of this function. What it
+    # was trying to pin — "the retry does not go label-free" — is now asserted on the argv that
+    # actually reaches `gh`, in `_followup_create_behaviour_self_test` below, which is strictly
+    # stronger: it fails on a label-free retry however that retry is spelled.
+    _followup_create_behaviour_self_test()
+
+
+def _followup_create_behaviour_self_test():
+    """EXECUTE `create_followups` and assert on what reaches the outside world.
+
+    Everything above this is a structural (AST) claim, and structure is not behaviour. MEASURED:
+    two mutants that reproduce the ORIGINAL defect exactly — replacing the retry's label loop with
+    `for label in []`, and deleting that loop outright — survive every assertion above, because
+    `keep`/`dropped` are still bound by a live `followup_label_plan` tuple-assign and `_run_gh` is
+    still handed a Name. Both send a label-free retry to `gh`. They die here, on the argv.
+
+    The `gh` stub reproduces the behaviour that caused the defect: `gh issue create` fails the
+    WHOLE create when any one `--label` is not declared on the target.
+    """
+    import contextlib
+    import io
+
+    spec_rows = [
+        {"title": "T1 typo", "body": "b1", "labels": ["area:dispatch", "aera:worker"]},
+        {"title": "T2 valid", "body": "b2", "labels": ["area:worker", "role:impl"]},
+        {"title": "T3 valid", "body": "b3", "labels": ["area:review"]},
+    ]
+    vocab = {"area:dispatch", "area:worker", "area:review", "role:impl",
+             "from:agent", "self-improvement"}
+    auto = {"from:agent", "self-improvement"}
+
+    class _Result:
+        def __init__(self, returncode):
+            self.returncode, self.stdout, self.stderr = returncode, "", ""
+
+    def _labels_of(argv):
+        return {argv[i + 1] for i, item in enumerate(argv) if item == "--label"}
+
+    def _title_of(argv):
+        return argv[argv.index("--title") + 1]
+
+    def drive(rows=None, *, vocabulary_readable=True, create_raises_on=None):
+        argvs = []
+
+        def fake_run_gh(args, *, input_text=None, check=True):
+            argvs.append(list(args))
+            if args[:2] != ["issue", "create"]:
+                return _Result(0)
+            if create_raises_on is not None and _title_of(args) == create_raises_on:
+                raise WorkerIssueError("simulated transport failure on create")
+            # THE REAL `gh` SEMANTICS: one undeclared label fails the entire create.
+            return _Result(1 if _labels_of(args) - vocab else 0)
+
+        def fake_gh_json(args, *, input_doc=None):
+            if args[:2] == ["issue", "list"]:
+                return []
+            if args[:2] == ["label", "list"]:
+                if not vocabulary_readable:
+                    # EXACTLY how the live read fails: `_gh_json` -> `_run_gh(check=True)` raises.
+                    raise WorkerIssueError("GitHub API request failed for label")
+                return [{"name": name} for name in sorted(vocab)]
+            raise AssertionError(f"unexpected _gh_json call: {args}")
+
+        saved = {"_run_gh": globals()["_run_gh"], "_gh_json": globals()["_gh_json"]}
+        globals().update({"_run_gh": fake_run_gh, "_gh_json": fake_gh_json})
+        log = io.StringIO()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                spec_file = Path(tmp) / "followups.jsonl"
+                spec_file.write_text(
+                    "\n".join(json.dumps(row) for row in (spec_rows if rows is None else rows)),
+                    encoding="utf-8")
+                with contextlib.redirect_stdout(log):
+                    create_followups("o/r", 42, str(spec_file))
+        finally:
+            globals().update(saved)
+        creates = [argv for argv in argvs if argv[:2] == ["issue", "create"]]
+        # What the stub ACCEPTED is what exists on the target afterwards.
+        landed = {_title_of(argv): _labels_of(argv)
+                  for argv in creates if not _labels_of(argv) - vocab}
+        return creates, landed, log.getvalue()
+
+    # (A) SUCCESS PATH — the vocabulary is readable. All three follow-ups are created, and the one
+    # carrying a typo keeps its `area:` instead of being minted bare.
+    creates, landed, log = drive()
+    t1 = [argv for argv in creates if _title_of(argv) == "T1 typo"]
+    assert len(t1) == 2, ("expected exactly one retry for the typo'd follow-up", t1)
+    assert "area:dispatch" in _labels_of(t1[1]), (
+        "RETRY_KEEPS_AREA: the retry argv carries no `area:dispatch` — the unknown-label recovery "
+        "discarded the model's area label again, which no later lane can repair")
+    assert "aera:worker" not in _labels_of(t1[1]), (
+        "RETRY_DROPS_UNDECLARED: the retry re-sent the undeclared label that failed the create")
+    assert set(landed) == {"T1 typo", "T2 valid", "T3 valid"}, (
+        "BATCH_COMPLETE_READABLE: not every follow-up was created", sorted(landed))
+    assert landed["T1 typo"] == {"area:dispatch"} | auto, landed["T1 typo"]
+    assert landed["T2 valid"] == {"area:worker", "role:impl"} | auto, landed["T2 valid"]
+    assert landed["T3 valid"] == {"area:review"} | auto, landed["T3 valid"]
+    assert "follow-up issues created: 3" in log, log
+
+    # (B) FIRST-FAILURE PATH — `gh label list` RAISES, which is what a rate limit or 502 on the
+    # already-failing create looks like (the read happens seconds later, against the same API).
+    # This is the regression under review: the raise escaped `create_followups` and destroyed the
+    # two follow-ups whose labels were entirely valid, while both call sites `|| true` the exit.
+    creates, landed, log = drive(vocabulary_readable=False)
+    assert set(landed) == {"T1 typo", "T2 valid", "T3 valid"}, (
+        "BATCH_COMPLETE_UNREADABLE: one follow-up's failure removed the others from the batch — "
+        "the population-shrink shape this function exists to prevent", sorted(landed))
+    assert landed["T2 valid"] == {"area:worker", "role:impl"} | auto, landed["T2 valid"]
+    assert landed["T3 valid"] == {"area:review"} | auto, landed["T3 valid"]
+    t1 = [argv for argv in creates if _title_of(argv) == "T1 typo"]
+    assert len(t1) == 3, ("declared retry, then the bare last rung", t1)
+    assert _labels_of(t1[1]) == {"area:dispatch", "aera:worker"} | auto, (
+        "UNREADABLE_DROPS_NOTHING: an unreadable vocabulary is not evidence that a label is "
+        "invalid, so the retry must re-send the declared set unchanged", _labels_of(t1[1]))
+    assert landed["T1 typo"] == set(), landed["T1 typo"]
+    assert "creating it WITHOUT labels" in log, log
+    assert "sparq-followup-labels: aera:worker,area:dispatch,from:agent,self-improvement" in (
+        t1[2][t1[2].index("--body") + 1]), t1[2]
+
+    # (C) ISOLATION, on a raise that is NOT the one just fixed: any per-entry failure is contained.
+    # `_known_labels` no longer raises, so without the per-entry guard this property would rest on
+    # a single `except` in a single helper — one more raising call added to this loop later and the
+    # batch shrinks again, silently, exactly as it did here.
+    creates, landed, log = drive(create_raises_on="T1 typo")
+    assert set(landed) == {"T2 valid", "T3 valid"}, (
+        "BATCH_ISOLATION: a raise while creating ONE follow-up prevented the others from being "
+        "created", sorted(landed))
+    assert "abandoned" in log, log
+
+    # (D) THE AREA WARNING MUST READ WHAT LANDED, NOT WHAT WAS DECLARED. A model that typo'd the
+    # area itself (`area:dsipatch`) declares a label starting `area:`, so a declared-set test says
+    # "area present" and stays silent — on the ONE path where the created issue really is born
+    # unattributable, because the retry drops that very label.
+    creates, landed, log = drive(
+        [{"title": "T4 typo'd area", "body": "b4", "labels": ["area:dsipatch"]}])
+    assert landed["T4 typo'd area"] == auto, landed["T4 typo'd area"]
+    assert "carries no `area:` label" in log, (
+        "AREA_WARNING_READS_APPLIED: the follow-up landed with no `area:` and said nothing", log)
+    # ...and it stays quiet when an area really did land, so the signal is not a constant.
+    _, landed, log = drive([{"title": "T5 ok", "body": "b5", "labels": ["area:review"]}])
+    assert landed["T5 ok"] == {"area:review"} | auto, landed["T5 ok"]
+    assert "carries no `area:` label" not in log, log
 
 
 
