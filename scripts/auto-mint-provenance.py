@@ -153,7 +153,14 @@ NEGATOR_RE = re.compile(
     r"(?<![0-9A-Za-z_])(?:not|no|never|neither|nor|without|cannot|unable|instead|rather"
     r"|[A-Za-z]+n['’]t)(?![0-9A-Za-z_])", re.IGNORECASE)
 NEGATION_WINDOW = 64
-SENTENCE_BREAK_RE = re.compile(r"[.!?\n]")
+# A negator only suppresses within its own PROPOSITION. `|` is here with the sentence enders because
+# a markdown TABLE CELL boundary separates independent statements exactly as a full stop does —
+# MEASURED on the live population: without it, PR #710's row `... the only caller not routed through
+# `gh_retry` | **ALREADY FIXED** | #729 routed it; #749 fixed #729 ...` read the `not` from a
+# DIFFERENT CELL and suppressed a reference that should refuse as `reference-is-a-pull-request`
+# instead. Both outcomes are refusals, so nothing was at risk; the boundary just makes the refusal
+# name the real defect.
+SENTENCE_BREAK_RE = re.compile(r"[.!?\n|]")
 
 # ADVISORY ONLY. Every same-repository `#N` the PR mentions, closing keyword or not. It is used in
 # exactly one place — the prose of a `no-issue-reference` refusal comment, to name the numbers the
@@ -959,6 +966,11 @@ def _self_test():                                                       # noqa: 
               closing_issue_candidates("t", f"this PR {phrase} #1234"), [])
     check("a negator in the PREVIOUS sentence does not suppress the next one",
           closing_issue_candidates("t", "This is not a revert. Closes #7"), [7])
+    check("...nor one in a different TABLE CELL (live shape, PR #710)",
+          closing_issue_candidates("t", "| not routed through `x` | ALREADY FIXED | fixed #7 |"),
+          [7])
+    check("...while a negator in the SAME cell still suppresses",
+          closing_issue_candidates("t", "| a | this does not fix #7 |"), [])
     # THE PROPERTY that makes the suppressor safe, asserted directly rather than described: a
     # negated reference is still counted for AMBIGUITY, so suppression can only turn a mint into a
     # refusal — never a refusal into a mint, and never a DIFFERENT binding.
