@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4799,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "dbf0ea5e7f1d562e19b9a5bdff2ddfde93bce86e",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "RustScalar::String routes every accepted datatype through scalar_string, which only checks the datatype IRI and copies the lexical form. Consequently an xsd:integer field accepts values such as \"not-an-integer\", and the same issue affects xsd:decimal and other constrained datatypes lowered to String. SHACL's datatype constraint requires a well-formed lexical representation, and the README describes sh:datatype as a checked scalar, so the generated reader can accept data that violates the represented structural datatype constraint. The new beyond-i64 test proves range preservation but never tests an invalid xsd:integer lexical form.",
+    "file": "crates/sparq-wrapper-shacl/src/emit.rs",
+    "fix_hint": "Preserve String as the output representation while adding datatype-specific lexical validation before copying it (at minimum for every recognized XSD datatype mapped to String). Add generated-loader cases proving a valid beyond-i64 xsd:integer loads and a malformed xsd:integer lexical form returns LoadError::LexicalForm.",
+    "severity": "major",
+    "title": "String-backed XSD datatypes accept malformed lexical forms"
+   },
+   {
+    "body": "xsd:long, xsd:int, xsd:short, and xsd:byte all use scalar_i64, which only parses as i64. This accepts out-of-range values for the narrower datatypes, such as \"2147483648\"^^xsd:int or \"128\"^^xsd:byte. The lowering comment says these mappings represent each datatype's complete value space without loss, but a checked reader must also reject values outside that datatype's value space.",
+    "file": "crates/sparq-wrapper-shacl/src/emit.rs",
+    "fix_hint": "Make integer parsing aware of the actual datatype and enforce the XSD bounds for int, short, and byte after parsing (long already matches i64). Add generated-loader tests for each boundary and at least one just-outside value, asserting LoadError::LexicalForm or a more specific typed error.",
+    "severity": "major",
+    "title": "Narrow signed integer datatypes are not range-checked"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 2 fixes both prior major findings: unbounded xsd:integer is retained as String and exercised beyond i64::MAX, and Self is now reserved with a focused regression test. However, the generated reader still does not implement the advertised checked-scalar behavior completely. String-backed constrained datatypes accept malformed lexical forms, while the shared i64 parser accepts values outside the narrower xsd:int/short/byte value spaces. These are new major correctness findings, so progress is regressing under the required rubric despite the prior fixes.",
+  "verdict": "request_changes"
+ }
+}
