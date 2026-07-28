@@ -101,7 +101,12 @@ def is_transient(error_text):
 
 
 def retry_after_seconds(error_text):
-    """The server's requested wait (capped) parsed out of a gh error, or None when it sent none."""
+    """The server's requested wait (capped) parsed out of a gh error, or None when it sent none.
+
+    None also covers a NON-POSITIVE value: `Retry-After: 0` from an already-throttling endpoint
+    would otherwise zero this writer's backoff and hot-loop the contents API. See
+    `gh_retry.retry_after_seconds`.
+    """
     return gh_retry.retry_after_seconds(error_text)
 
 
@@ -143,6 +148,13 @@ def _self_test():
         ("Retry-After capped", retry_after_seconds("Retry-After: 100000"),
          gh_retry.RETRY_AFTER_CAP),
         ("absent Retry-After is None", retry_after_seconds("HTTP 500: oops"), None),
+        # A zero wait is ABSENT at this boundary too: the ledger writers feed this straight into
+        # their throttle sleep, so a literal 0 would hot-loop the contents API that is already
+        # rate-limiting the fleet.
+        ("Retry-After 0 is ABSENT at the ledger boundary",
+         retry_after_seconds("gh: temporarily blocked; Retry-After: 0 (HTTP 403)"), None),
+        ("a positive Retry-After still parses at the ledger boundary (control)",
+         retry_after_seconds("gh: temporarily blocked; Retry-After: 3 (HTTP 403)"), 3.0),
     ]
     # ---- the two schedules are DISTINCT and both bounded ----
     contention, throttle = [], []
@@ -157,6 +169,15 @@ def _self_test():
     served = []
     sleep_transient(1, 99999.0, sleeper=served.append)
     checks.append(("throttle honours a capped Retry-After", served, [gh_retry.RETRY_AFTER_CAP]))
+    # A `Retry-After: 0` must NOT zero the throttle wait — the writer would then re-PUT immediately
+    # against the very limiter that just rejected it. Asserted on a NON-ZERO sleep end to end
+    # (parse -> sleep), which is how the writers actually compose these two.
+    zeroed = []
+    sleep_transient(1, retry_after_seconds("gh: temporarily blocked; Retry-After: 0 (HTTP 403)"),
+                    sleeper=zeroed.append, draw=lambda lo, hi: hi)
+    checks.append(("a zero Retry-After never zeroes the throttle sleep",
+                   (zeroed, bool(zeroed) and zeroed[0] > 0.0),
+                   ([gh_retry.backoff_ceiling(1) + gh_retry.JITTER], True)))
     jittered = []
     sleep_transient(2, sleeper=jittered.append, draw=lambda lo, hi: lo)
     checks.append(("throttle jitter bounded below by the ceiling",

@@ -169,9 +169,19 @@ def is_transient_stderr(text):
 def retry_after_seconds(text):
     """The server's requested wait from a `gh` error body/headers, capped at RETRY_AFTER_CAP.
 
-    Returns None when absent, unparseable, or negative so the caller falls back to the exponential
-    schedule. HTTP-date Retry-After forms (rare from GitHub) are treated as absent rather than
-    mis-parsed into a wrong delay.
+    Returns None when absent, unparseable, or NON-POSITIVE so the caller falls back to the
+    exponential schedule. HTTP-date Retry-After forms (rare from GitHub) are treated as absent
+    rather than mis-parsed into a wrong delay.
+
+    ZERO IS ABSENT, NOT "WAIT ZERO SECONDS". `Retry-After: 0` only ever arrives from an endpoint
+    that is ALREADY throttling us, and honouring it literally disables the backoff and converts the
+    retry loop into a HOT LOOP against that endpoint — i.e. the retry policy would amplify the
+    exact request-rate exhaustion it exists to survive, and it would do so for every caller in the
+    fleet at once, since this module is shared. The pre-existing bound excluded only NEGATIVE
+    values, which could never fire: `_RETRY_AFTER_RE`'s capture group has no sign, so
+    `Retry-After: -5` does not parse as a negative at all — it fails to match and returns None as
+    unparseable. Zero was always the only reachable degenerate value, and it was the one let
+    through. The bound must therefore EXCLUDE zero, not merely clamp at it.
     """
     match = _RETRY_AFTER_RE.search(text or "")
     if match is None:
@@ -180,7 +190,7 @@ def retry_after_seconds(text):
         seconds = float(match.group(1))
     except (TypeError, ValueError):  # pragma: no cover - the regex already constrains the shape
         return None
-    if seconds < 0:
+    if seconds <= 0:
         return None
     return min(seconds, RETRY_AFTER_CAP)
 
@@ -309,9 +319,18 @@ def backoff_ceiling(attempt, base=BASE_DELAY, cap=MAX_DELAY):
 def sleep_backoff(attempt, retry_after=None, *, sleeper=time.sleep, draw=random.uniform):
     """Sleep before retry `attempt`: honour a (capped) server Retry-After when given, else the
     exponential ceiling plus additive uniform jitter, clamped to MAX_DELAY. Injection points keep
-    callers' self-tests deterministic and sleepless."""
-    if retry_after is not None:
-        sleeper(min(max(0.0, retry_after), RETRY_AFTER_CAP))
+    callers' self-tests deterministic and sleepless.
+
+    A NON-POSITIVE `retry_after` is treated as ABSENT and falls back to the exponential schedule.
+    That is the same rule `retry_after_seconds` applies, deliberately restated at THIS layer rather
+    than trusted from the parser: `retry_after` is an ordinary caller-supplied argument (worker-pr
+    and the ledger writers both pass values through their own plumbing), so a single guard at the
+    parse site would leave the zero-backoff hot loop reachable from any other producer. Each layer
+    carries its own named check, so neither guard is vacuous — deleting either one reds a test that
+    names it.
+    """
+    if retry_after is not None and retry_after > 0:
+        sleeper(min(retry_after, RETRY_AFTER_CAP))
     else:
         sleeper(min(MAX_DELAY, backoff_ceiling(attempt) + draw(0, JITTER)))
 
@@ -594,6 +613,27 @@ def _self_test():
     check("HTTP-date Retry-After treated as absent",
           retry_after_seconds("Retry-After: Wed, 21 Oct 2026 07:28:00 GMT"), None)
     check("empty text Retry-After is None", retry_after_seconds(""), None)
+    # ZERO. A `Retry-After: 0` reaches us only from an endpoint that is already rate-limiting, and
+    # honouring it literally disables the backoff — the retry loop becomes a HOT LOOP against that
+    # endpoint. It must parse as ABSENT so the caller falls back to the exponential schedule. The
+    # bound has to EXCLUDE zero: a `>= 0` (or a `< 0`) guard admits exactly this value.
+    check("Retry-After 0 is ABSENT, never a zero wait",
+          retry_after_seconds("HTTP 403: slow down; Retry-After: 0"), None)
+    check("Retry-After 0.0 is ABSENT, never a zero wait",
+          retry_after_seconds('{"retry-after":"0.0"}'), None)
+    # The neighbouring malformed shapes, so the zero fix is not the only degenerate input pinned.
+    check("whitespace-only text Retry-After is None", retry_after_seconds("  \t\n "), None)
+    check("non-numeric Retry-After value is None",
+          retry_after_seconds("HTTP 429: Retry-After: soon"), None)
+    # A sign-prefixed value never reaches the numeric bound at all (the capture group has no sign),
+    # which is why the old `< 0` guard was unreachable. Pinned so that stays true.
+    check("sign-prefixed Retry-After does not parse (the old `< 0` bound was unreachable)",
+          retry_after_seconds("Retry-After: -5"), None)
+    # CONTROL for the zero fix: it must be "zero is absent", NOT "ignore the header". A genuine
+    # positive wait — including a sub-second one — is still parsed and still honoured.
+    check("a genuine positive Retry-After is still honoured (control for the zero fix)",
+          (retry_after_seconds("Retry-After: 0.5"),
+           retry_after_seconds("HTTP 403: throttled; Retry-After: 30")), (0.5, 30.0))
 
     # [registry #772] The truncated-body class, verbatim from the six worker.yml runs that lost a
     # provenance record. It carries NO HTTP status, so it reaches the text table or nothing at all.
@@ -646,6 +686,29 @@ def _self_test():
     slept.clear()
     sleep_backoff(1, retry_after=9999.0, sleeper=slept.append)
     check("Retry-After honoured but capped", slept, [RETRY_AFTER_CAP])
+    # A NON-POSITIVE retry_after that reaches the sleeper from any producer must fall back to the
+    # computed schedule. The assertion is on a NON-ZERO sleep, and on the exact fallback value: a
+    # `>= 0` guard, or a clamp to 0.0, would sleep nothing and hot-loop.
+    zero_slept = []
+    sleep_backoff(1, retry_after=0.0, sleeper=zero_slept.append, draw=lambda a, b: b)
+    check("a zero Retry-After falls back to the computed backoff (NON-ZERO sleep)",
+          (zero_slept, zero_slept and zero_slept[0] > 0.0),
+          ([backoff_ceiling(1) + JITTER], True))
+    # The two layers COMPOSED — parse then sleep — which is the shape that shipped as a hot loop.
+    composed = []
+    sleep_backoff(2, retry_after_seconds("gh: ... (HTTP 403) Retry-After: 0"),
+                  sleeper=composed.append, draw=lambda a, b: b)
+    check("parse+sleep composed: a Retry-After 0 never sleeps zero",
+          (composed, composed and composed[0] > 0.0),
+          ([backoff_ceiling(2) + JITTER], True))
+    # CONTROL: a genuine positive Retry-After still OVERRIDES the exponential schedule exactly —
+    # the fix must not have turned Retry-After honouring off. 7s here is deliberately unequal to
+    # attempt 4's ceiling (16s), so "fell back to the backoff" cannot pass this check.
+    positive = []
+    sleep_backoff(4, retry_after_seconds("HTTP 403: throttled; Retry-After: 7"),
+                  sleeper=positive.append, draw=lambda a, b: b)
+    check("a positive Retry-After still overrides the exponential schedule (control)",
+          (positive, backoff_ceiling(4)), ([7.0], 16.0))
 
     # ---- run_gh loop mechanics (stubbed subprocess.run; no live gh) ----
     real_run = subprocess.run
