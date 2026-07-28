@@ -1,3 +1,14 @@
 {
- "leases": []
+ "leases": [
+  {
+   "account": "dc2d751954080e13",
+   "claim_id": "afa7493492384138992770c4bc7d70ee",
+   "holder": "review:sparq-org/sparq#4711@dispatch-30334306841.1",
+   "package": "sparq-lws-core",
+   "role": "review",
+   "model": "sol",
+   "issued_at": 1785219749,
+   "expires_at": 1785223949
+  }
+ ]
 }
