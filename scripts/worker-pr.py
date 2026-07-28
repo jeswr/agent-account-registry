@@ -4440,6 +4440,51 @@ def _arm_hold_recheck(repo, pr_number, issue):
 #     draft head, which branch protection already treats as blocking. A pending/missing gate is
 #     therefore already held safely by the latch itself, and making the arm wait on it would
 #     rebuild the #326/#334 clean-status regression for no gain.
+# ---- registry #940: THE ARM REFUSES A GREEN THAT GRADED A TREE THAT NO LONGER EXISTS ----------
+# The #892 reading above asks "has this head's aggregator concluded red?". #940 is the ORTHOGONAL
+# question it cannot ask: "is that conclusion — green or otherwise — still ABOUT the tree this PR
+# would merge into?" Measured on the registry (issue #940), two PRs read MERGEABLE / CLEAN with a
+# green `gate` and would each have reddened `gate` for every subsequent PR, because master moved
+# under them after their gate ran. `pr-gate.yml` fires only on `pull_request` events, the registry
+# has no merge queue, and the ruleset requires only `gate` — so nothing re-derives the green when
+# the tree it graded stops existing. The mitigation in force was a human refusing to arm.
+#
+# The comparison itself lives in dispatch-claim.`gate_freshness` (structural sha equality AND a
+# 300s temporal backstop, both conjunctive, every unresolvable operand refusing) — see that block
+# comment for the measurement behind the margin. What is decided HERE is the CONSEQUENCE.
+#
+# THE CONSEQUENCE IS A BOUNDED DEFERRAL, NOT A HOLD — AND THE BOUND IS WHAT KEEPS THE LANE ALIVE.
+# Both operands of the freshness test are FROZEN: the deciding run's start and the base tip's date
+# do not change. So a refusal is not a wait that time resolves — it stands until a NEW gate run
+# exists on the head, and `gh run rerun` cannot make one (it re-tests the same tree; measured on
+# #916 as `behind_by=1, status=diverged`). The ONLY producer of a run against a base containing
+# the newer tip is a fresh `pull_request` event — and in this lane that event is `gh pr ready`,
+# the undraft this very function performs a few lines below. A refusal placed above it therefore
+# SUPPRESSES the mechanism that would refute it, which is the #892 self-sustaining trap exactly.
+#
+# So the refusal is bounded to AT MOST ONCE PER HEAD on its own durable, SHA-bound, bot-authored
+# receipt — the same primitive #892 uses, with a SEPARATE marker so the two budgets cannot spend
+# each other. First arm at a stale head: refuse, receipt, census row, and leave the PR EXACTLY as
+# the review found it (an unmodified, correctly-labelled DRAFT), which enumerate_review_items
+# routes to `stranded` (drafted + reviewed + green + unarmed) and re-reviews under the bounded
+# round budget. Second arm at that SAME head: re-admitted on the receipt, so `gh pr ready` runs,
+# GitHub queues a ready_for_review `gate` against the CURRENT base, and the latch — which GitHub
+# refuses outright while the PR is in clean status — waits for that fresh run natively. The stale
+# green is never what merges the PR in either branch; what the deferral buys is one tick in which
+# a naturally-fresh gate can land without spending a re-review, and what the BOUND buys is the
+# guarantee that this can never become a terminal park. It writes no label, opens no needs:user,
+# and re-derives from live state every tick.
+ARM_DECLINE_GATE_STALE = "gate-stale"
+ARM_STALE_MARKER_PREFIX = "<!-- sparq-arm-stale-gate:v1 sha="
+ARM_FRESHNESS_CENSUS_PREFIX = "arm-freshness census:"
+# The ONE freshness state that admits an arm, spelled here so `arm_freshness_decision` stays PURE
+# (no lazy module load on a decision path). It is asserted equal to dispatch-claim's own
+# GATE_FRESH by --self-test, so the two spellings cannot drift into a guard that admits nothing —
+# or, far worse, one that admits everything because the literal it compares against is unreachable.
+_GATE_FRESH = "fresh"
+# The bounded-re-admission budget for a staleness deferral at ONE head. One, for the reason above:
+# the second arm is what PRODUCES the fresh gate, so a larger budget would only delay it.
+ARM_STALE_MAX_PER_HEAD = 1
 ARM_DECLINE_GATE_RED = "gate-red"
 ARM_DECLINE_MARKER_PREFIX = "<!-- sparq-arm-declined:v1 sha="
 # The bounded-re-admission budget: how many times a non-merge-required aggregator row may defer
@@ -4531,7 +4576,8 @@ def _record_arm_decline(repo, pr_number, reviewed_sha, grade, bot_login=""):
     _run_gh(["pr", "comment", str(pr_number), "-R", repo, "--body", body], check=False)
 
 
-def arm_decline_receipted(comments, reviewed_sha, bot_login):
+def arm_decline_receipted(comments, reviewed_sha, bot_login,
+                          marker_prefix=ARM_DECLINE_MARKER_PREFIX):
     """Has the arm at THIS head already been deferred once? The bounded-re-admission predicate,
     and the idempotency predicate for the receipt itself — ONE spelling for both, because they
     ask the same question and drifting them apart is how the bound would silently stop applying.
@@ -4544,13 +4590,169 @@ def arm_decline_receipted(comments, reviewed_sha, bot_login):
 
     An empty `bot_login` proves nothing and returns False, which is deliberately the safe answer
     for both callers: the receipt writer fails toward a duplicate rather than a missing record,
-    and the arm path fails toward DEFERRING rather than toward an unearned re-admission."""
-    marker = f"{ARM_DECLINE_MARKER_PREFIX}{reviewed_sha} -->"
+    and the arm path fails toward DEFERRING rather than toward an unearned re-admission.
+
+    `marker_prefix` selects WHICH deferral budget is being asked about. The #892 gate-red budget
+    and the #940 stale-gate budget are separate populations answering separate questions, so they
+    carry separate markers and neither receipt may re-admit the other's refusal — a PR deferred
+    once for a red aggregator has spent nothing of its staleness budget, and vice versa. Passing
+    the prefix explicitly (rather than deriving it from the reason) is what keeps that true when a
+    third deferral class is added."""
+    marker = f"{marker_prefix}{reviewed_sha} -->"
     if not bot_login:
         return False
     return any(marker in str(c.get("body", ""))
                and str((c.get("user") or {}).get("login", "")) == bot_login
                for c in comments or ())
+
+
+def _live_arm_gate_freshness(repo, pr_number, head_sha, base_ref):
+    """The LIVE freshness verdict for the reviewed head — is the deciding aggregator run still
+    evidence about the tree this PR would merge into?
+
+    Taken through dispatch-claim's OWN `live_gate_freshness` rather than a second spelling of it,
+    for the reason `_live_arm_gate` gives: that walk requests each aggregator name by EQUALITY,
+    pages to exhaustion, cross-checks `total_count`, resolves newest-run-wins across the tiered
+    names, and yields an UNPROVABLE verdict rather than a silent claim on any unprovable read.
+
+    `draft=True` is passed unconditionally, exactly as `_live_arm_gate` does and correct by the
+    same construction: this runs BEFORE `gh pr ready`, so the head is still a draft and both tier
+    names are in scope. Narrowing it here would read "no aggregator run" on every sparq draft and
+    refuse every arm forever.
+
+    SECOND READ, DELIBERATELY. This does not share `_live_arm_gate`'s listing: the two answer
+    different questions and keeping them independently substitutable is what lets each be pinned
+    on its own. The window between them is safe in every combination — a newer run landing in it
+    can only make the freshness verdict MORE accurate, and the merge-required `gate` (not this
+    reading) is what the latch waits on either way."""
+    return _dispatch_claim().live_gate_freshness(repo, head_sha, base_ref, True, pr_number)
+
+
+def arm_freshness_decision(freshness):
+    """PURE: may the merge latch be placed, given the freshness verdict at the reviewed head?
+
+    Returns `ARM_DECLINE_GATE_STALE` unless the verdict is explicitly `fresh`, and "" (proceed)
+    only then. The fail direction is INVERTED relative to `arm_gate_decision` and that inversion
+    is the whole point: an unknown aggregator GRADE must arm (the measured 25.3%-pending stall),
+    but an unprovable FRESHNESS must refuse, because "we cannot tell which tree this green is
+    about" is not evidence that it is about the right one. A malformed/absent verdict is treated
+    as unprovable — a caller that lost the verdict must not thereby buy an arm."""
+    state = freshness.get("state") if isinstance(freshness, dict) else None
+    return "" if state == _GATE_FRESH else ARM_DECLINE_GATE_STALE
+
+
+def arm_freshness_census_row(repo, pr_number, reviewed_sha, freshness, refused, readmitted=False):
+    """PURE: the ONE census line emitted for EVERY arm attempt that reaches the freshness read —
+    admitted, refused, or re-admitted. A per-stage success rate cannot express a missing edge, so
+    this is a POPULATION row: every arm attempt produces exactly one, and `refused=` partitions
+    them. `gap_seconds` is the age gap the issue asks for, signed and reported even on the
+    unprovable verdicts (where it is `none` because no stamp could be established).
+
+    A silent guard converts a visible hazard into an invisible one — this line is what makes
+    "arms attempted / arms refused as stale / the age gap for each" countable from a run log
+    without re-deriving anything.
+
+    `refused` means THIS guard withheld the latch, not that it was the only one to. An arm that
+    is both stale and sitting on a concluded-red aggregator exits through the #892 decline (the
+    stronger statement) and still reports `refused=true` here, because the staleness count must
+    not silently shrink whenever a second guard happens to agree; the #892 receipt records the
+    other half. Counting `verdict=stale` rows answers the same question without the overlap."""
+    state = freshness.get("state") if isinstance(freshness, dict) else None
+    gap = freshness.get("gap_seconds") if isinstance(freshness, dict) else None
+    run_base = (freshness.get("run_base_sha") or "") if isinstance(freshness, dict) else ""
+    tip = (freshness.get("base_tip_sha") or "") if isinstance(freshness, dict) else ""
+    return (f"{ARM_FRESHNESS_CENSUS_PREFIX} repo={repo} pr={pr_number} "
+            f"head={reviewed_sha[:12]} verdict={state or 'unprovable'} "
+            f"gap_seconds={'none' if gap is None else gap} "
+            f"gate_base={run_base[:12] or 'none'} base_tip={tip[:12] or 'none'} "
+            f"siblings={(freshness.get('sibling_state') if isinstance(freshness, dict) else None) or 'unread'} "
+            f"refused={'true' if refused else 'false'} "
+            f"readmitted={'true' if readmitted else 'false'}")
+
+
+def arm_freshness_summary(rows):
+    """PURE aggregate over the per-PR census rows an orchestrator tick produced:
+    `attempted` / `refused` / the `gap_seconds` of each refusal. Emitted alongside the rows, not
+    instead of them — the rows say WHICH PR, the summary says whether the guard is refusing
+    nothing (a guard that has gone quiet) or refusing everything (a guard that has become a
+    blanket hold). Both are failure modes and neither is visible from a single row."""
+    refused = [row for row in rows if row.get("refused")]
+    gaps = [str(row.get("gap_seconds")) if row.get("gap_seconds") is not None else "none"
+            for row in refused]
+    return (f"{ARM_FRESHNESS_CENSUS_PREFIX} attempted={len(rows)} refused_stale={len(refused)} "
+            f"refused_prs={[row.get('pr') for row in refused] or 'none'} "
+            f"age_gaps_seconds={gaps or 'none'}")
+
+
+def arm_freshness_report(repo, pr_numbers, log=print):
+    """The ORCHESTRATOR-side arm-time guard: the same freshness question `ready_and_arm` asks,
+    asked from where a human stands when they are about to arm by hand.
+
+    This exists because the measured hazard in #940 is not the machine lane — `ready_and_arm`
+    only ever arms a DRAFT, and its undraft queues a fresh gate the latch then waits on. It is
+    the by-hand arm of a READY PR reading `MERGEABLE`/`CLEAN` on a green that graded a superseded
+    tree, and the mitigation in force for it was a human remembering. This replaces the
+    remembering, not the human.
+
+    READ-ONLY BY CONSTRUCTION: it resolves, it reports, it exits non-zero. It never latches,
+    never labels, and never writes to the head branch — an orchestrator-class PR must not buy
+    write access to its own branch, and the remedy (moving the head) is the caller's call.
+    Returns the exit code: 1 if any PR is refused, 0 only if every one is provably fresh."""
+    rows = []
+    for pr_number in pr_numbers:
+        live = _gh_json(["api", f"repos/{repo}/pulls/{pr_number}"])
+        head = str((live.get("head") or {}).get("sha", "")) if isinstance(live, dict) else ""
+        base_ref = str((live.get("base") or {}).get("ref", "")) if isinstance(live, dict) else ""
+        draft = bool(live.get("draft")) if isinstance(live, dict) else True
+        freshness = _dispatch_claim().live_gate_freshness(repo, head, base_ref, draft, pr_number)
+        refused = bool(arm_freshness_decision(freshness))
+        log(arm_freshness_census_row(repo, pr_number, head, freshness, refused=refused))
+        if refused:
+            log(f"  REFUSE arming {repo}#{pr_number}: {freshness.get('reason', '')}. "
+                "`gh run rerun` cannot clear this — it re-tests the same tree; move the head "
+                "(update-branch / rebase) so a new pull_request event gates the real merge base.")
+        rows.append({"pr": pr_number, "refused": refused,
+                     "gap_seconds": freshness.get("gap_seconds")})
+    log(arm_freshness_summary(rows))
+    return 1 if any(row["refused"] for row in rows) else 0
+
+
+def _record_arm_stale_decline(repo, pr_number, reviewed_sha, freshness, bot_login=""):
+    """The durable, SHA-bound receipt for a staleness deferral — the census row on the PR itself
+    rather than only in a run log that ages out, AND the counter the one-per-head bound reads.
+
+    Idempotent on exactly `_record_arm_decline`'s terms (EXACT App identity + this head's
+    marker), and best-effort for the same reason: a failed receipt must not convert a correct
+    refusal into a raised arm step. NOTE the asymmetry this creates and why it is the right one —
+    a lost receipt means the NEXT arm at this head is refused again rather than re-admitted, i.e.
+    the failure mode is one extra deferral, never an unearned latch."""
+    marker = f"{ARM_STALE_MARKER_PREFIX}{reviewed_sha} -->"
+    if arm_decline_receipted(_paginated_comments(repo, pr_number), reviewed_sha, bot_login,
+                             marker_prefix=ARM_STALE_MARKER_PREFIX):
+        return
+    gap = freshness.get("gap_seconds") if isinstance(freshness, dict) else None
+    reason = (freshness.get("reason") or "") if isinstance(freshness, dict) else ""
+    state = (freshness.get("state") or "unprovable") if isinstance(freshness, dict) else "unprovable"
+    age = ("its age gap could not be established"
+           if gap is None else f"the gap is {gap}s (negative = the gate predates the tip)")
+    body = ("> 🤖 SPARQ agent — the cross-provider review APPROVED this PR, and the arm was "
+            f"DEFERRED once: the CI aggregator at the reviewed head {reviewed_sha[:12]} is "
+            f"`{state}` with respect to the base branch tip — {reason}; {age}.\n\n"
+            "A green `gate` is evidence about a TREE, not about a PR (registry #940). "
+            "`pr-gate.yml` fires only on `pull_request` events, so a base move never re-runs it, "
+            "and this repository has no merge queue to re-gate the real merge result — two PRs "
+            "measured on 2026-07-28 read MERGEABLE/CLEAN on a green gate and would each have "
+            "reddened `gate` for every subsequent PR.\n\n"
+            "**`gh run rerun` cannot clear this** — it re-tests the same tree. Only a new "
+            "`pull_request` event produces a run whose merge ref composes the current base tip: "
+            "move the head (update-branch / rebase), or let the next review round undraft this "
+            "PR, which queues a fresh `ready_for_review` gate that the merge latch then waits on "
+            "natively.\n\n"
+            f"This defers the arm **at most once per head** ({ARM_STALE_MAX_PER_HEAD}). The next "
+            "arm at this same commit is re-admitted on this receipt, so a base that keeps moving "
+            "can cost one round trip and never more — this is not a hold and no human action is "
+            "required.\n\n" + marker)
+    _run_gh(["pr", "comment", str(pr_number), "-R", repo, "--body", body], check=False)
 
 
 def _arm_auto_merge(repo, pr_number, reviewed_sha, attempts=ARM_ATTEMPTS, issue=None):
@@ -4801,6 +5003,59 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
         # over.
         arm_gate = _live_arm_gate(repo, reviewed_sha)
         declined = arm_gate_decision(arm_gate)
+        # [registry #940] THE FRESHNESS READING, taken BEFORE the gate-red decision consumes its
+        # own exit so that EVERY arm attempt lands exactly one census row — a per-stage rate
+        # cannot express a missing edge, and an arm that short-circuited out through #892 with no
+        # freshness row would be a state exit with no record.
+        # `reviewed_sha` and `live_base` — the commit the verdict is bound to and the base ref
+        # that same fresh read just asserted the review was against. Reading any other head would
+        # grade a tree the approval never covered; reading any other base would compare against a
+        # branch this PR is not merging into. Both are pinned by assertions over the CALL SITE
+        # (the M-STALE-CALLSITE mutants), because a direct test of `_live_arm_gate_freshness` can
+        # only pin the function's own parameters.
+        # NAMED `gate_evidence`, not `freshness`: this function already binds `freshness` to
+        # revalidate_outcome_head's HEAD verdict a few lines above, and two different questions
+        # sharing one name in one scope is how a later edit silently reads the wrong one.
+        gate_evidence = _live_arm_gate_freshness(repo, pr_number, reviewed_sha, live_base)
+        stale = arm_freshness_decision(gate_evidence)
+        # THE BOUND (see ARM_DECLINE_GATE_STALE). Its own marker, its own budget: a #892 gate-red
+        # receipt must not spend this one, or a PR deferred for a red aggregator would arm on a
+        # stale green the very next tick.
+        stale_readmitted = bool(stale) and arm_decline_receipted(
+            _paginated_comments(repo, pr_number), reviewed_sha, bot_login,
+            marker_prefix=ARM_STALE_MARKER_PREFIX)
+        print(arm_freshness_census_row(repo, pr_number, reviewed_sha, gate_evidence,
+                                       refused=bool(stale) and not stale_readmitted,
+                                       readmitted=stale_readmitted))
+        if stale_readmitted:
+            stale = ""
+            print(f"arm RE-ADMITTED at {reviewed_sha[:12]}: this head's arm was already deferred "
+                  "once for a gate that graded a superseded base, and no fresher run appeared — "
+                  f"the {ARM_STALE_MAX_PER_HEAD}-deferral budget is spent, so the arm proceeds. "
+                  "The undraft below queues a ready_for_review `gate` against the CURRENT base "
+                  "and the latch waits on that run, which is what actually re-derives the green")
+        if stale and not declined:
+            # Ordering: a CONCLUDED red (#892) is the stronger statement and keeps its own exit
+            # and its own receipt, so it is reported when both fire. This branch is the
+            # staleness-only one.
+            _record_arm_stale_decline(repo, pr_number, reviewed_sha, gate_evidence,
+                                      bot_login=bot_login)
+            # Same routing half as the #892 decline, for the same reason: the review DID complete
+            # end to end on this head, so binding the marker is honest — and a DRAFT, review:needs
+            # PR with a bound marker and a GREEN gate is exactly what enumerate_review_items
+            # routes to `stranded`, which re-reviews the current head under the bounded round
+            # budget and brings the arm back for its re-admission. Leaving it unbound would
+            # re-emit needs-review and spend a cross-provider round on an untouched tree.
+            _write_outputs({"armed": False, "head_moved": False, "arm_complete": False,
+                            "arm_declined": stale, "arm_gate": arm_gate,
+                            "arm_gate_freshness": (gate_evidence or {}).get("state", ""),
+                            "bind_reviewed_sha": True})
+            print(f"arm DEFERRED ({stale}): {(gate_evidence or {}).get('reason', '')} — no ready, no "
+                  "latch, no review-state mutation; the PR stays a draft. `gh run rerun` cannot "
+                  "clear this (it re-tests the same tree); only a new pull_request event can. "
+                  "This applies AT MOST ONCE at this head — the next arm at this commit is "
+                  "re-admitted on the receipt, so this can never become a terminal park")
+            return
         # THE BOUND (see ARM_DECLINE_GATE_RED). A non-merge-required row may defer the arm at one
         # head AT MOST ONCE. The durable, SHA-bound, bot-authored receipt IS the counter, so the
         # budget survives a crash and cannot be forged by another App. Consuming it here is what
@@ -9865,7 +10120,7 @@ def _self_test():
     real_raa = {name: globals()[name] for name in (
         "_gh_json", "_run_gh", "_pr_changed_files", "set_review_state",
         "_paginated_comments", "needs_user", "_write_outputs", "_arm_sleep_backoff",
-        "_live_arm_gate")}
+        "_live_arm_gate", "_live_arm_gate_freshness")}
 
     def raa_gh_json(args, **_kw):
         path = args[1] if len(args) > 1 else ""
@@ -9902,6 +10157,9 @@ def _self_test():
     # the PR left draft AND the draft undo also failed — is the fifth question-class write site,
     # and it had no check of its own at all.
     raa_kwargs = []
+    # [registry #940] stdout of the arm under test — the census row is emitted by `print`, and a
+    # census nobody can read is the invisible-guard failure this change exists to avoid.
+    raa_prints = []
 
     def raa_needs_user(repo, pr, reason, **kwargs):
         raa_calls.append("needs-user")
@@ -9938,8 +10196,9 @@ def _self_test():
                 issue_labels=(), issue=None, probe_garbage=False, labels_payload=None,
                 benign_diff=False, security_keywords=(), merge_script=None,
                 hold_after_fail=None, draft=True, author="sparq[bot]", head_repo="o/r",
-                state="open", late_after_read=None, arm_gate="pending", undo_fails=False):
-        raa_calls.clear(); raa_outputs.clear(); raa_kwargs.clear()
+                state="open", late_after_read=None, arm_gate="pending", undo_fails=False,
+                arm_freshness=None):
+        raa_calls.clear(); raa_outputs.clear(); raa_kwargs.clear(); raa_prints.clear()
         sha = "b" * 40
         raa_state.update(undo_fails=undo_fails,
                          head=(sha if head_ok else "c" * 40), merge_fails=merge_fails,
@@ -9948,7 +10207,8 @@ def _self_test():
                          benign_diff=benign_diff, merge_script=merge_script,
                          hold_after_fail=hold_after_fail, draft=draft, author=author,
                          head_repo=head_repo, state=state, late_after_read=late_after_read,
-                         pr_reads=0, arm_gate=arm_gate, arm_gate_args=[])
+                         pr_reads=0, arm_gate=arm_gate, arm_gate_args=[],
+                         arm_freshness=arm_freshness, freshness_args=[])
         globals()["_gh_json"] = raa_gh_json
         globals()["_run_gh"] = raa_run_gh
         globals()["_pr_changed_files"] = lambda repo, pr: ["scripts/worker-pr.py"]
@@ -9969,11 +10229,33 @@ def _self_test():
             return raa_state.get("arm_gate", "pending")
 
         globals()["_live_arm_gate"] = raa_arm_gate
+        # [registry #940] the live FRESHNESS reading, substituted at the same seam. The DEFAULT is
+        # a provably-FRESH verdict, deliberately: every pre-existing check in this block must keep
+        # exercising the unchanged arm path, so a regression that widened the refusal beyond a
+        # non-fresh verdict turns them red rather than passing quietly behind a default that had
+        # already declined. (A stale default would have made this entire block vacuous.)
+        raa_state["freshness_args"] = []
+
+        def raa_freshness(repo, pr_number, head_sha, base_ref):
+            # ARGUMENTS RECORDED: the call site's head AND base are guards in their own right —
+            # a direct test of this function can only pin its own parameters.
+            raa_state["freshness_args"].append((repo, pr_number, head_sha, base_ref))
+            return raa_state.get("arm_freshness") or {
+                "state": "fresh", "reason": "self-test default", "gap_seconds": 3600,
+                "run_base_sha": "e" * 40, "base_tip_sha": "e" * 40,
+                "started_at": "2026-07-27T20:49:47+01:00"}
+
+        globals()["_live_arm_gate_freshness"] = raa_freshness
         globals()["_write_outputs"] = raa_outputs.update
-        ready_and_arm("o/r", 41, sha, "anthropic", "ab" * 8, "openai", "acctX", True,
-                      issue=issue, bot_login="sparq[bot]",
-                      reviewed_base=raa_state.get("reviewed_base", "main"),
-                      security_keywords=security_keywords or None)
+        captured = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(captured):
+                ready_and_arm("o/r", 41, sha, "anthropic", "ab" * 8, "openai", "acctX", True,
+                              issue=issue, bot_login="sparq[bot]",
+                              reviewed_base=raa_state.get("reviewed_base", "main"),
+                              security_keywords=security_keywords or None)
+        finally:
+            raa_prints.append(captured.getvalue())
 
     # (sol r4 on #334) mutation-NAME matching, not flag matching: the latch argv is
     # recognised by the literal GraphQL mutation name, and "merge-capable" argv is the
@@ -10473,6 +10755,248 @@ def _self_test():
                    "(steps.arm.outcome == 'success' && "
                    "(steps.arm.outputs.arm_complete == 'true' || "
                    "steps.arm.outputs.bind_reviewed_sha == 'true'))) }}"})
+        # ---- [registry #940] A GREEN GATE IS EVIDENCE ABOUT A TREE, NOT ABOUT A PR ------------
+        # THE REPLAY. #752's real numbers: its gate graded master@b1050ae9 on 2026-07-26 22:25,
+        # then #799 and #687 landed and the tip became 7aeafaaeb — 21h24m47s later. Read
+        # MERGEABLE / CLEAN with a GREEN `gate`, and merging it would have reddened `gate` for
+        # every subsequent PR. The comparison itself is dispatch-claim's (unit-tested there,
+        # against these same commits); what is asserted here is the CONSEQUENCE at the arm.
+        stale_752 = {"state": "stale", "gap_seconds": -77087,
+                     "run_base_sha": "b1050ae9f67ac037fb21696d2891101d4b75e24a",
+                     "base_tip_sha": "7aeafaaeb7d61613fdbd5715275ec25ce4571160",
+                     "started_at": "2026-07-26T22:25:00+01:00",
+                     "reason": "the gate graded a tree based on b1050ae9f67a, but the base "
+                               "branch tip is now 7aeafaaeb7d6"}
+        run_raa(benign_diff=True, arm_gate="green:merge-required", arm_freshness=stale_752)
+        check("#752 REPLAY: a GREEN gate that predates the base tip DECLINES the arm",
+              (any(c.startswith("pr ready") for c in raa_calls),
+               bool(raa_latches()),
+               "state:pass" in raa_calls,
+               raa_outputs.get("armed"),
+               raa_outputs.get("arm_complete"),
+               raa_outputs.get("arm_declined"),
+               raa_outputs.get("arm_gate_freshness"),
+               raa_outputs.get("bind_reviewed_sha")),
+              (False, False, False, False, False, ARM_DECLINE_GATE_STALE, "stale", True))
+        check("...and it leaves its OWN sha-bound receipt (separate marker from the #892 one)",
+              (any(ARM_STALE_MARKER_PREFIX + sha in c and c.startswith("pr comment")
+                   for c in raa_calls),
+               any(ARM_DECLINE_MARKER_PREFIX + sha in c for c in raa_calls)),
+              (True, False))
+        check("...writing NO trust-surface audit and NO other mutation (the PR is untouched)",
+              any("trust-surface" in c for c in raa_calls), False)
+        stale_receipt_text = next(c for c in raa_calls if c.startswith("pr comment"))
+        check("the receipt names the age gap, the rerun trap, and that no human is needed",
+              ("-77087s" in stale_receipt_text,
+               "`gh run rerun` cannot clear this" in stale_receipt_text,
+               "at most once per head" in stale_receipt_text,
+               "no human action is\nrequired" in stale_receipt_text
+               or "no human action is required" in stale_receipt_text),
+              (True, True, True, True))
+        # THE CENSUS ROW — emitted on the refusal, carrying the age gap. A silent guard converts
+        # a visible hazard into an invisible one.
+        check("the refusal emits a census row with verdict, age gap and both base shas",
+              (ARM_FRESHNESS_CENSUS_PREFIX in raa_prints[-1],
+               "verdict=stale" in raa_prints[-1],
+               "gap_seconds=-77087" in raa_prints[-1],
+               "refused=true" in raa_prints[-1],
+               "gate_base=b1050ae9f67a" in raa_prints[-1],
+               "base_tip=7aeafaaeb7d6" in raa_prints[-1]),
+              (True, True, True, True, True, True))
+        # THE CONTROL, and the load-bearing half: WITHOUT IT this could pass by refusing every
+        # arm. A gate that graded the CURRENT base tip still arms, end to end, with no receipt.
+        run_raa(benign_diff=True, arm_gate="green:merge-required")
+        check("CONTROL: a gate that POSTDATES the base tip still ARMS (no refusal, no receipt)",
+              (any(c.startswith("pr ready") for c in raa_calls), bool(raa_latches()),
+               raa_outputs.get("armed"), raa_outputs.get("arm_complete"),
+               "state:pass" in raa_calls, raa_outputs.get("arm_declined"),
+               any(ARM_STALE_MARKER_PREFIX in c for c in raa_calls)),
+              (True, True, True, True, True, None, False))
+        check("CONTROL: the admitted arm STILL emits its census row (population, not a rate)",
+              (ARM_FRESHNESS_CENSUS_PREFIX in raa_prints[-1],
+               "verdict=fresh" in raa_prints[-1], "refused=false" in raa_prints[-1]),
+              (True, True, True))
+        # [#940 follow-up] THE SAME-HEAD AXIS IS CENSUSED SEPARATELY. The two axes have different
+        # remedies — move the head vs. wait for the leg — so a row that collapsed them into one
+        # verdict would tell an operator to do the wrong thing. A verdict dict that never carried
+        # a sibling reading reports `unread`, never a silent `clear`.
+        run_raa(benign_diff=True, arm_gate="green:merge-required",
+                arm_freshness={"state": "unprovable", "gap_seconds": None, "run_base_sha": "",
+                               "base_tip_sha": "", "started_at": "",
+                               "sibling_state": "running", "sibling_leg": "artifact-exact-equality",
+                               "reason": "leg `artifact-exact-equality` started AFTER the "
+                                         "aggregator concluded and is still running"})
+        check("a still-running sibling leg refuses the arm and is NAMED in the census row",
+              (bool(raa_latches()), raa_outputs.get("arm_declined"),
+               "siblings=running" in raa_prints[-1], "refused=true" in raa_prints[-1]),
+              (False, ARM_DECLINE_GATE_STALE, True, True))
+        check("...and a verdict carrying NO sibling reading censuses `unread`, never `clear`",
+              arm_freshness_census_row("o/r", 41, "b" * 40, {"state": "fresh"}, refused=False),
+              f"{ARM_FRESHNESS_CENSUS_PREFIX} repo=o/r pr=41 head=bbbbbbbbbbbb verdict=fresh "
+              "gap_seconds=none gate_base=none base_tip=none siblings=unread refused=false "
+              "readmitted=false")
+        # NO DEADLOCK. Both operands of the freshness test are FROZEN, so a refusal stands until
+        # a NEW gate run exists — and this lane's only producer of one is the `gh pr ready` a
+        # refusal placed above it suppresses. The bound is the exit: the SECOND arm at the SAME
+        # head is re-admitted on its own receipt, undrafts, and the latch then waits on the fresh
+        # ready_for_review gate. Deleting the bound turns this red and the lane stalls forever.
+        stale_receipt = {"body": f"x {ARM_STALE_MARKER_PREFIX}{sha} -->",
+                         "user": {"login": "sparq[bot]"}}
+        run_raa(benign_diff=True, arm_gate="green:merge-required", arm_freshness=stale_752,
+                comments=(stale_receipt,))
+        check("NO-DEADLOCK: a head already deferred ONCE is RE-ADMITTED and arms (retryable, "
+              "never terminal)",
+              (any(c.startswith("pr ready") for c in raa_calls), bool(raa_latches()),
+               raa_outputs.get("armed"), raa_outputs.get("arm_complete"),
+               raa_outputs.get("arm_declined"), "state:pass" in raa_calls,
+               "needs-user" in raa_calls),
+              (True, True, True, True, None, True, False))
+        check("...and the re-admission is CENSUSED as such, not as a silent pass",
+              ("readmitted=true" in raa_prints[-1], "refused=false" in raa_prints[-1],
+               "verdict=stale" in raa_prints[-1]),
+              (True, True, True))
+        # THE TWO BUDGETS ARE SEPARATE. A #892 gate-red receipt must not re-admit a staleness
+        # refusal (or a PR deferred for a red aggregator would arm on a stale green next tick),
+        # and the converse must hold too. Collapsing the two markers into one turns these red.
+        run_raa(benign_diff=True, arm_gate="green:merge-required", arm_freshness=stale_752,
+                comments=({"body": f"x {ARM_DECLINE_MARKER_PREFIX}{sha} -->",
+                           "user": {"login": "sparq[bot]"}},))
+        check("CONTROL: a #892 gate-red receipt does NOT spend the staleness budget",
+              (raa_outputs.get("arm_declined"), bool(raa_latches())),
+              (ARM_DECLINE_GATE_STALE, False))
+        run_raa(benign_diff=True, arm_gate="failure", comments=(stale_receipt,))
+        check("CONTROL: a #940 staleness receipt does NOT spend the gate-red budget",
+              (raa_outputs.get("arm_declined"), bool(raa_latches())),
+              (ARM_DECLINE_GATE_RED, False))
+        # ...and a forged / stale-head receipt buys nothing, on the same terms as #892's.
+        for label, comment in (
+                ("a staleness receipt for a DIFFERENT head",
+                 {"body": f"x {ARM_STALE_MARKER_PREFIX}{'d' * 40} -->",
+                  "user": {"login": "sparq[bot]"}}),
+                ("a FOREIGN app's staleness receipt for this head",
+                 {"body": f"x {ARM_STALE_MARKER_PREFIX}{sha} -->",
+                  "user": {"login": "mallory[bot]"}})):
+            run_raa(benign_diff=True, arm_gate="green:merge-required", arm_freshness=stale_752,
+                    comments=(comment,))
+            check(f"CONTROL: {label} does NOT consume the deferral budget",
+                  (raa_outputs.get("arm_declined"), bool(raa_latches())),
+                  (ARM_DECLINE_GATE_STALE, False))
+        # M-STALE-CALLSITE-1/2: THE CALL SITE's ARGUMENTS. A direct test of
+        # `_live_arm_gate_freshness` can only pin its own parameters (the P12 blind spot); these
+        # pin WHICH head and WHICH base ref the arm hands it. Replacing `reviewed_sha` with the
+        # live head read, or `live_base` with a constant "master"/"main", passes every other
+        # check in this file and grades the wrong comparison.
+        run_raa(benign_diff=True, arm_gate="green:merge-required", arm_freshness=stale_752)
+        check("the freshness read is taken at the REVIEWED sha and the LIVE base ref "
+              "(call site pinned, not just the fn)",
+              raa_state.get("freshness_args"), [("o/r", 41, sha, "main")])
+        # EVERY ARM ATTEMPT IS CENSUSED — including one that exits through the #892 gate-red
+        # decline. A per-stage rate cannot express a missing edge, so the population must be
+        # complete; moving the freshness read below the gate-red exit turns this red.
+        run_raa(benign_diff=True, arm_gate="failure")
+        check("an arm that exits through the #892 gate-red decline STILL lands a census row",
+              (ARM_FRESHNESS_CENSUS_PREFIX in raa_prints[-1],
+               raa_state.get("freshness_args") != [],
+               raa_outputs.get("arm_declined")),
+              (True, True, ARM_DECLINE_GATE_RED))
+        # PURE table: only an explicit `fresh` admits. The fail direction is INVERTED relative to
+        # arm_gate_decision, deliberately — an unknown GRADE arms (the 25.3%-pending stall), an
+        # unprovable FRESHNESS refuses. Making `unprovable` fail open turns this red.
+        check("arm_freshness_decision admits ONLY an explicit `fresh` verdict (fail closed)",
+              {str(v): arm_freshness_decision(v) for v in (
+                  {"state": "fresh"}, {"state": "stale"}, {"state": "unprovable"},
+                  {"state": ""}, {}, None, "fresh", [])},
+              {str({"state": "fresh"}): "",
+               str({"state": "stale"}): ARM_DECLINE_GATE_STALE,
+               str({"state": "unprovable"}): ARM_DECLINE_GATE_STALE,
+               str({"state": ""}): ARM_DECLINE_GATE_STALE,
+               str({}): ARM_DECLINE_GATE_STALE,
+               str(None): ARM_DECLINE_GATE_STALE,
+               str("fresh"): ARM_DECLINE_GATE_STALE,
+               str([]): ARM_DECLINE_GATE_STALE})
+        # UNPROVABLE END TO END — "if you cannot establish the base tip's date, refuse".
+        run_raa(benign_diff=True, arm_gate="green:merge-required",
+                arm_freshness={"state": "unprovable", "gap_seconds": None, "run_base_sha": "",
+                               "base_tip_sha": "", "started_at": "",
+                               "reason": "the base branch tip sha is unresolvable"})
+        check("an UNPROVABLE base tip refuses the arm and censuses a `none` age gap",
+              (bool(raa_latches()), raa_outputs.get("arm_declined"),
+               "verdict=unprovable" in raa_prints[-1],
+               "gap_seconds=none" in raa_prints[-1], "refused=true" in raa_prints[-1]),
+              (False, ARM_DECLINE_GATE_STALE, True, True, True))
+        # THE TIER + DELEGATION ARGUMENT of the live read, asserted directly — the harness above
+        # substitutes `_live_arm_gate_freshness` wholesale, so nothing there can see which names
+        # it requests. `draft=True` for the same reason `_live_arm_gate` needs it: a sparq DRAFT
+        # head publishes `gate, draft-tier` and nothing named plain `gate`, so draft=False would
+        # read "no aggregator run" -> unprovable -> refuse EVERY arm forever. That regression is
+        # invisible to every behavioural check above, which stubs this function out.
+        real_dc = globals()["_dispatch_claim"]
+        fresh_calls = []
+        try:
+            globals()["_dispatch_claim"] = lambda: types.SimpleNamespace(
+                live_gate_freshness=lambda repo, head, base, draft, pr: (
+                    fresh_calls.append((repo, head, base, draft, pr)) or {"state": "fresh"}))
+            seen = real_raa["_live_arm_gate_freshness"]("o/r", 41, sha, "main")
+        finally:
+            globals()["_dispatch_claim"] = real_dc
+        check("the live freshness read passes draft=True, the PR number and the base ref "
+              "through dispatch-claim's own walk",
+              (fresh_calls, seen), ([("o/r", sha, "main", True, 41)], {"state": "fresh"}))
+        # The two modules' `fresh` literal must be the SAME string. If they drift, the guard
+        # either refuses everything or — the dangerous direction — the comparison becomes
+        # unreachable and it admits everything.
+        check("worker-pr's _GATE_FRESH matches dispatch-claim's GATE_FRESH",
+              (_GATE_FRESH, _dispatch_claim().GATE_FRESH), ("fresh", "fresh"))
+        # The staleness decline rides the SAME `bind_reviewed_sha` output the YAML seam above
+        # already admits — asserted as a COMPOSITION, because the seam report and the decline
+        # were written in different PRs and nothing else makes them meet.
+        check("the staleness decline's routing output is the one review-fix.yml's bind step reads",
+              "steps.arm.outputs.bind_reviewed_sha == 'true'"
+              in arm_decline_workflow_seam_report()["condition"], True)
+        # ---- the ORCHESTRATOR-side surface (arm_freshness_report / _summary) -----------------
+        check("arm_freshness_summary counts the population and lists each refusal's age gap",
+              arm_freshness_summary([{"pr": 752, "refused": True, "gap_seconds": -77087},
+                                     {"pr": 900, "refused": False, "gap_seconds": 3600},
+                                     {"pr": 784, "refused": True, "gap_seconds": None}]),
+              f"{ARM_FRESHNESS_CENSUS_PREFIX} attempted=3 refused_stale=2 "
+              "refused_prs=[752, 784] age_gaps_seconds=['-77087', 'none']")
+        check("arm_freshness_summary says so plainly when nothing was refused",
+              arm_freshness_summary([{"pr": 900, "refused": False, "gap_seconds": 3600}]),
+              f"{ARM_FRESHNESS_CENSUS_PREFIX} attempted=1 refused_stale=0 "
+              "refused_prs=none age_gaps_seconds=none")
+        report_lines, report_gh, report_dc = [], [], []
+        real_dc = globals()["_dispatch_claim"]
+        real_gh = globals()["_gh_json"]
+        try:
+            globals()["_gh_json"] = lambda a, **k: (
+                report_gh.append(a[1]) or {"head": {"sha": "f" * 40}, "base": {"ref": "master"},
+                                           "draft": False})
+            globals()["_dispatch_claim"] = lambda: types.SimpleNamespace(
+                live_gate_freshness=lambda repo, head, base, draft, pr: (
+                    report_dc.append((repo, head, base, draft, pr))
+                    or (stale_752 if pr == 752 else {"state": "fresh", "gap_seconds": 3600,
+                                                     "run_base_sha": "e" * 40,
+                                                     "base_tip_sha": "e" * 40})))
+            rc = arm_freshness_report("o/r", [752, 900], log=report_lines.append)
+        finally:
+            globals()["_dispatch_claim"] = real_dc
+            globals()["_gh_json"] = real_gh
+        check("arm-freshness (orchestrator CLI) refuses the stale PR, passes the fresh one, "
+              "and exits non-zero",
+              (rc, sum(1 for line in report_lines if "refused=true" in line),
+               sum(1 for line in report_lines if "refused=false" in line),
+               any("REFUSE arming o/r#752" in line for line in report_lines),
+               any("attempted=2 refused_stale=1" in line for line in report_lines)),
+              (1, 1, 1, True, True))
+        check("...it reads the LIVE head and base ref of each PR (never a cached one) and "
+              "reports the PR's own draft tier",
+              (report_gh, report_dc),
+              (["repos/o/r/pulls/752", "repos/o/r/pulls/900"],
+               [("o/r", "f" * 40, "master", False, 752),
+                ("o/r", "f" * 40, "master", False, 900)]))
+        check("...and it is READ-ONLY: an all-fresh tick exits 0 and mutates nothing",
+              (arm_freshness_report("o/r", [], log=lambda _line: None), raa_latches()),
+              (0, []))
         run_raa(benign_diff=True)
         check("benign-path diff with NO security posture ARMS with NO audit (#153 control)",
               (any(LATCH_MUTATION in c for c in raa_calls),
@@ -11145,6 +11669,14 @@ def main():
 
     # The live reviewer handle arrives via env WORKER_REVIEWER_ACCOUNT (not argv — argv is echoed
     # into public logs) and is compared against the recorded hash under PROVENANCE_SALT.
+    # [registry #940] The orchestrator-side arm-time guard. READ-ONLY: it reports and exits
+    # non-zero; it never arms, labels, or writes to a head branch. `--pr` is repeatable so one
+    # invocation covers a whole tick and emits the aggregate census row alongside the per-PR ones.
+    fresh = subparsers.add_parser("arm-freshness")
+    fresh.add_argument("--repo", required=True)
+    fresh.add_argument("--pr", required=True, type=int, action="append",
+                       help="PR number to check (repeatable)")
+
     arm = subparsers.add_parser("ready-and-arm", parents=[common])
     arm.add_argument("--reviewed-sha", required=True)
     arm.add_argument("--impl-provider", required=True)
@@ -11305,6 +11837,8 @@ def main():
             disarm(args.repo, args.pr, args.when,
                    preserve_review_state=args.preserve_review_state,
                    bot_login=args.bot_login)
+        elif args.command == "arm-freshness":
+            return arm_freshness_report(args.repo, args.pr)
         elif args.command == "ready-and-arm":
             ready_and_arm(args.repo, args.pr, args.reviewed_sha, args.impl_provider,
                           args.impl_account_h, args.reviewer_provider,
