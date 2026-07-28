@@ -8,7 +8,10 @@ Given an issue's labels + type, decide the labels to ADD/REMOVE and whether it i
   * role     — from a `kind:*` label, the issue type, or (last resort, issue #225) the issue's
                `area:*` default; a trust-surface area forces the trust-plane role (see
                TRUST_PLANE_ROLE).
-  * priority — kept if a valid single `priority:P0..P4` is present; else triage is incomplete.
+  * priority — a stated valid single `priority:P0..P4` is authoritative and never touched;
+               otherwise one is DERIVED at the BOTTOM of the range (`derive_priority`), so a
+               derived priority can never outrank a stated one. An issue carrying an UNREADABLE
+               stated priority (two labels, or one out of range) is declined, not overwritten.
   * package  — the existing `area:<section>` labels are the package. A NO-area issue is parked
                `needs:area` (it would otherwise reserve the serializing __global__ partition).
   * ready    — `status:ready` iff a valid single priority AND a role AND an `area:<section>` AND
@@ -197,6 +200,105 @@ def _valid_priority(labels):
     return len(ps) == 1
 
 
+# ---------------------------------------------------------------------------------------------------
+# [OPUS-5] PRIORITY DERIVATION — the classifier's own missing input (sparq#4809).
+#
+# THE DEFECT. `_role` has a five-rung derivation ladder ending in a type/area default, so a role is
+# almost always produced. Priority had NO derivation at all: it was read, never written. That
+# asymmetry is the whole bug. `triage()` declares `ready` only when a valid `priority:P0..P4` is
+# ALREADY present, and it is the only writer `retriage.py --apply` has, so an issue opened without
+# one was TERMINAL — and `status:untriaged` is itself a busy state in both engines
+# (`ready-issues.BUSY_STATUS`, dispatch-claim), so such an issue is not merely unlabelled, it is
+# excluded from the frontier entirely. scripts/triage-stock-alert.py already names this exactly:
+# `classifier-incomplete` is a FIXED POINT, "the classifier cannot produce its own missing input",
+# measured at 263 of 274 stuck issues missing `priority:*`. retriage.yml has reported success on
+# every scheduled run for two weeks while that population grew.
+#
+# THE TENSION, AND WHY THE VALUE IS P4 AND NOT P3. A blanket mid-range default really does destroy
+# prioritisation: `ready-issues.compute_ready` sorts candidates by `(priority, number)`, so a
+# default that lands ABOVE the bottom rung displaces hand-triaged work and P0 loses its lane. The
+# resolution is not to classify more cleverly, it is to pick the one value that CANNOT displace
+# anything. `DERIVED_PRIORITY` is the bottom of the range, so:
+#
+#     A DERIVED PRIORITY CAN NEVER OUTRANK A STATED ONE.
+#
+# That is an ordering invariant, checked directly in `_self_test`, not a heuristic that happens to
+# behave. It also means P4 here is NOT a guess about urgency — guessing is what a mid-range default
+# does. It is the true statement "no human has prioritised this", rendered in the only vocabulary
+# the frontier reads, and ordered last accordingly. A derived-P4 issue can only ever be selected
+# when its partition is otherwise idle, i.e. when the alternative was dispatching nothing at all.
+#
+# DELIBERATELY NOT A `needs:priority` GATE. The obvious alternative — mark the absence loud with a
+# new `needs:*` label — is the one shape that is definitely wrong here, and this repo has already
+# paid for learning it. `retriage.plan()` skips every `needs:*`-gated issue BEFORE it classifies,
+# so minting such a gate would strand the issue behind a door the sweep itself refuses to open;
+# retriage.py declines to mint `needs:area` for precisely that reason ("re-creating the exact hole
+# #586 closes"). A gate would convert silent invisibility into loud invisibility, which is not the
+# outcome being bought.
+#
+# WHAT IS DECLINED. Exactly one class, and it is the class where writing would DESTROY information:
+# an issue that already carries a `priority:*` label the engine cannot read — two of them, or one
+# out of range. There a human HAS expressed intent and the machine simply cannot recover it, so
+# overwriting it with the floor would silently discard a possible P0. Those keep their labels
+# untouched and stay out of the frontier, and the contradiction is visible on the issue itself.
+# This is a small population by construction, and that is the honest outcome, not a hedge: with a
+# bottom-of-range floor there is no OTHER class where declining beats ordering-last, because the
+# floor makes no claim that could be wrong.
+DERIVED_PRIORITY = "priority:P4"
+
+
+def derive_priority(labels):
+    """(label_to_add | None, reason, labels_to_remove). Never overrides a stated priority.
+
+    reason ∈ {"stated", "floor-retracted", "stated-unreadable", "ready-attested-regression",
+    "unprioritised-floor"}. Only the last one writes; only `floor-retracted` removes.
+    """
+    if _valid_priority(labels):
+        return None, "stated", frozenset()          # a human's priority is authoritative
+    valid = {lb for lb in labels if _PRIO.match(lb)}
+    if DERIVED_PRIORITY in valid and len(valid) == 2:
+        # ---- THE RETRACT RUNG (PR #1053 review) — WITHOUT THIS, THE FLOOR CREATES THE CLASS IT
+        # ---- FIXES, ON THE MAJORITY PATH.
+        # `triage-issue.yml` fires on `opened`, so the floor lands within a second or two of
+        # creation. But a priority usually arrives LATER: measured on this board, 16 of the 30 most
+        # recent prioritised open issues (53%) were priority-labelled more than 90s after creation,
+        # almost all by `sparq-orchestrator[bot]` — which will not strip a floor it did not write.
+        # Two valid priorities make `_valid_priority` return False, so without this rung that
+        # perfectly ordinary sequence (open -> floored -> labelled P1) DEMOTED the issue off the
+        # frontier and left it there until a human manually removed `priority:P4`.
+        #
+        # The ordering invariant was never wrong — a derived priority still cannot OUTRANK a stated
+        # one — but the argument was about outranking and the effect was about BLOCKING. Those are
+        # different failures and only the first was guarded.
+        #
+        # So: exactly the floor plus exactly ONE other valid rank means the floor is ours and the
+        # other is authoritative. Retract the floor and keep theirs. This converges in one tick and
+        # cannot oscillate: the post-state has a single valid priority, which returns "stated"
+        # above and derives nothing further.
+        #
+        # DELIBERATELY NOT EXTENDED to a pair with no floor in it (P1+P2): that ambiguity is
+        # genuine, is a human's to resolve, and stays declined below. The residual case this rung
+        # DOES decide against a human is a deliberate `priority:P4` plus a second actor's
+        # `priority:P1` — indistinguishable from ours, since the floor carries no provenance. That
+        # pair was already ambiguous-and-stuck before this change, so resolving it toward the
+        # non-floor value is strictly better than the status quo, not a new loss.
+        return None, "floor-retracted", frozenset({DERIVED_PRIORITY})
+    if any(lb.startswith("priority:") for lb in labels):
+        return None, "stated-unreadable", frozenset()   # DECLINE: ambiguous/out-of-range, human's
+    if "status:ready" in labels:
+        # DECLINE — THE LABEL-REGRESSION LANE (#586), and the one rung this derivation cannot go
+        # without. `triage()` only ever attests `status:ready` on an issue that HAD a valid
+        # priority, so a `status:ready` issue with no readable priority did not arrive here
+        # unprioritised: it LOST one. Flooring it would overwrite a human's P0..P3 with P4 and,
+        # worse, is not even stable — retriage's re-park lane exists so a human restores the real
+        # value, and a restored `priority:P2` landing next to a derived `priority:P4` is an
+        # AMBIGUOUS pair, i.e. permanently stuck. This decline is what keeps the #586 re-park lane
+        # intact; the "lost priority is re-parked" and "ROUND TRIP" fixtures in retriage.py's
+        # self-test fail without it, which is how it was found.
+        return None, "ready-attested-regression", frozenset()
+    return DERIVED_PRIORITY, "unprioritised-floor", frozenset()
+
+
 def _area_default(labels):
     """The role ALL of the issue's `area:<value>` labels agree on; None whenever that cannot be
     established — the mapped areas disagree, no `area:*` label is present, or ANY `area:*` label is
@@ -276,7 +378,8 @@ def triage(labels, issue_type="task", trusted=True, known_labels=None):
     """
     labels = set(labels)
     if not trusted or "trust:untrusted" in labels:
-        return {"add": set(), "remove": set(), "ready": False, "role": None, "warnings": []}
+        return {"add": set(), "remove": set(), "ready": False, "role": None, "warnings": [],
+                "priority_reason": "untrusted"}
     role = _role(labels, issue_type)
     add, remove, warnings = set(), set(), []
     existing = _roles_of(labels)
@@ -302,8 +405,20 @@ def triage(labels, issue_type="task", trusted=True, known_labels=None):
     has_area = any(lb.startswith("area:") for lb in labels)
     # ANY needs:* gate (needs:design B2, needs:user, needs:area) blocks ready. kind:epic too.
     gated = any(lb.startswith("needs:") for lb in labels)
-    ready = (bool(role) and _valid_priority(labels) and has_area and not gated
+    # The derived priority is part of the label set the rest of this function reasons over, exactly
+    # as a derived `role:*` is — `effective`, not `labels`, is what "does this issue have a
+    # priority" now means. Deriving it but testing the UNDERIVED set is the vacuous shape: the
+    # value would be written and the readiness verdict would not move, which is the status quo
+    # with an extra API call. `kind:epic` is excluded because an epic is a tracking umbrella that
+    # is never dispatchable, so writing a priority onto one is pure churn.
+    derived, priority_reason, retract = ((None, "epic", frozenset()) if "kind:epic" in labels
+                                         else derive_priority(labels))
+    effective = (labels | ({derived} if derived else set())) - retract
+    ready = (bool(role) and _valid_priority(effective) and has_area and not gated
              and "kind:epic" not in labels)
+    if derived:
+        add.add(derived)
+    remove |= retract
     if ready:
         add.add("status:ready")
         remove.add("status:untriaged")
@@ -312,12 +427,15 @@ def triage(labels, issue_type="task", trusted=True, known_labels=None):
         add.add("status:untriaged")
         remove.add("status:ready")
         # a triage-complete-but-no-area, non-gated, non-epic issue parks needs:area (actionable).
-        if (bool(role) and _valid_priority(labels) and not has_area
+        if (bool(role) and _valid_priority(effective) and not has_area
                 and "kind:epic" not in labels and not gated):
             add.add("needs:area")
     add, remove = add - labels, remove & labels
     _assert_role_invariant(labels, add, remove, ready)
-    return {"add": add, "remove": remove, "ready": ready, "role": role, "warnings": warnings}
+    return {"add": add, "remove": remove, "ready": ready, "role": role, "warnings": warnings,
+            # Reported so a caller can COUNT the decline population instead of inferring it from
+            # the absence of a write — scripts/triage-stock-alert.py keys its worklist on this.
+            "priority_reason": priority_reason}
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -700,11 +818,23 @@ def _self_test():
     r = triage(["priority:P2", "kind:docs", "area:docs"], "task")
     chk("docs ready", (r["ready"], "role:docs" in r["add"], "status:ready" in r["add"]),
         (True, True, True))
-    # missing priority -> untriaged.
+    # [sparq#4809] A MISSING priority is now DERIVED at the floor, so this issue is ready and the
+    # priority label is written. This assertion used to read `(False, True)` — that WAS the defect:
+    # the classifier could not produce its own missing input, so the issue was terminal.
     r = triage(["area:usage"], "feature")
-    chk("no priority -> untriaged", (r["ready"], "status:untriaged" in r["add"]), (False, True))
-    # ambiguous priority -> untriaged.
-    chk("ambiguous priority", triage(["priority:P1", "priority:P2"], "feature")["ready"], False)
+    chk("no priority -> DERIVED at the floor, and ready",
+        (r["ready"], DERIVED_PRIORITY in r["add"], "status:untriaged" in r["add"]),
+        (True, True, False))
+    # ...but deriving a priority does NOT relax any other gate: no area is still not ready.
+    chk("derived priority does not substitute for a missing area",
+        (triage(["role:impl"], "feature")["ready"],
+         "needs:area" in triage(["role:impl"], "feature")["add"]), (False, True))
+    # ambiguous priority -> untriaged, AND the floor is NOT written over it (the DECLINE exit).
+    r = triage(["priority:P1", "priority:P2", "area:usage"], "feature")
+    chk("ambiguous priority", r["ready"], False)
+    chk("[sparq#4809] a STATED-but-unreadable priority is DECLINED, never overwritten",
+        (any(lb.startswith("priority:") for lb in r["add"]), r["priority_reason"]),
+        (False, "stated-unreadable"))
     # trust-surface area forces the trust-plane role.
     chk("trust surface -> trust-plane role",
         triage(["priority:P1", "area:worker"], "feature")["role"], TRUST_PLANE_ROLE)
@@ -863,7 +993,12 @@ def _self_test():
         False)
     # untrusted -> no-op.
     chk("untrusted no-op", triage(["priority:P1", "trust:untrusted"], "feature"),
-        {"add": set(), "remove": set(), "ready": False, "role": None, "warnings": []})
+        {"add": set(), "remove": set(), "ready": False, "role": None, "warnings": [],
+         "priority_reason": "untrusted"})
+    # ...and the derivation must not become a way IN for untrusted content either: an untrusted
+    # issue with NO priority is still a total no-op, not a floor write.
+    chk("[sparq#4809] untrusted + no priority is still a no-op — the derivation writes nothing",
+        triage(["area:usage", "trust:untrusted"], "feature")["add"], set())
     # respect an explicit role:* on a NON-trust area — do NOT derive a second (ambiguity broke
     # autonomous dispatch upstream).
     r = triage(["priority:P2", "role:research", "area:usage"], "feature")
@@ -1494,6 +1629,122 @@ def _self_test():
     chk("the label mutation argv is one `gh issue edit` with per-label flags",
         calls, [["gh", "issue", "edit", "7", "-R", "o/r", "--add-label", "role:impl",
                  "--remove-label", "role:docs"]])
+
+    # ---------------------------------------------------------------------------------------------
+    # [sparq#4809] THE HEADLINE GUARD: A DERIVED PRIORITY CAN NEVER OUTRANK A STATED ONE.
+    #
+    # This is the property the whole change rests on. If it does not hold, deriving a priority
+    # really does destroy prioritisation — hand-triaged P0..P3 work starts losing its lane to
+    # issues nobody ranked — and the right answer would have been to leave the backlog invisible.
+    # So it is asserted twice: once about the CONSTANT, and once about the CONSEQUENCE, executed
+    # through the real frontier engine rather than restated as a fact about the source.
+    _ranks = {f"priority:P{n}": n for n in range(5)}
+    chk("[sparq#4809] the derived priority is READABLE by the engine that consumes it — a typo "
+        "here writes a label `_valid_priority` rejects, and nothing is ever ready again",
+        _valid_priority({DERIVED_PRIORITY}), True)
+    chk("[sparq#4809] the derived priority is the numerically LOWEST rank the engine accepts — "
+        "the entire reason supplying the missing input does not displace triaged work",
+        _ranks[DERIVED_PRIORITY], max(_ranks.values()))
+    # `derive_priority` may return the floor or NOTHING — never any other rank. Exhaustive over the
+    # stated-priority shapes a label set can take, so a future rung that returns P0/P1/P2 for some
+    # signal is caught even where no hand-written case covers that signal.
+    _returned = {derive_priority(set(extra) | {"area:usage"})[0] for extra in (
+        (), ("priority:P0",), ("priority:P3",), ("priority:P4",), ("priority:P7",),
+        ("priority:P1", "priority:P2"), ("priority:",), ("kind:epic",), ("needs:user",),
+        ("role:impl", "from:agent", "self-improvement"))}
+    chk("[sparq#4809] derive_priority returns ONLY the floor or nothing, never another rank",
+        _returned - {None, DERIVED_PRIORITY}, set())
+
+    # THE CONSEQUENCE, EXECUTED. The two rows below contest ONE package, so the frontier must pick
+    # exactly one of them. The derived row's labels are produced by RUNNING triage() — this consumes
+    # the real derivation, so a test that still passed after the derivation was deleted or re-ranked
+    # would have to be lying about something it actually ran.
+    _ready_mod = load_sibling("ready-issues.py", "registry_ready_issues_selftest_priority")
+    _quiet = lambda *_a, **_k: None                                            # noqa: E731
+    _derived_labels = sorted({"role:impl", "area:usage"} | triage(["role:impl", "area:usage"],
+                                                                  "task")["add"])
+    _derived_row = {"number": 900, "state": "OPEN", "labels": _derived_labels, "open_blockers": 0}
+    _stated_row = {"number": 100, "state": "OPEN", "open_blockers": 0,
+                   "labels": ["status:ready", "role:impl", "area:usage", "priority:P1"]}
+    chk("[sparq#4809] HEADLINE: a DERIVED-priority issue never displaces a STATED-priority one on "
+        "a contested package (run through the real ready-issues frontier)",
+        [i["number"] for i in _ready_mod.compute_ready([_derived_row, _stated_row], log=_quiet)],
+        [100])
+    # ...and the mirror image, which is what makes the guard above a TRADE-OFF rather than a no-op:
+    # the derived row IS dispatchable when nothing stated contests its package. Without this, the
+    # change could buy visibility while dispatching nothing — the status quo with extra writes.
+    chk("[sparq#4809] HEADLINE: a DERIVED-priority issue IS selected when its package is idle",
+        [i["number"] for i in _ready_mod.compute_ready([_derived_row], log=_quiet)], [900])
+
+    # ---------------------------------------------------------------------------------------------
+    # [OPUS-5 #1053 review] THE COLLISION THE FLOOR ITSELF CREATES — the majority path, not an edge.
+    #
+    # The ordering invariant above ("a derived priority can never OUTRANK a stated one") is true and
+    # was never the problem. The problem is that the argument is about outranking and the damage is
+    # about BLOCKING: a floor written at `opened` and a priority stated 90s later are TWO valid
+    # priorities, `_valid_priority` returns False for the pair, and the issue leaves the frontier.
+    # Measured on this board, 53% of recently-prioritised issues are labelled >90s after creation,
+    # so without the retract rung this change MANUFACTURES the stuck state it exists to remove.
+    #
+    # Driven as a real loop to a fixed point rather than as three hand-written expectations: the
+    # bound is the claim, so a rung that re-derives on the next tick has to fail here.
+    _labels = {"role:impl", "area:groom"}
+    _trace, _injected = [], False
+    for _tick in range(6):
+        _r = triage(_labels, "task")
+        _trace.append(_r["priority_reason"])
+        _next = (_labels | _r["add"]) - _r["remove"]
+        if not _injected:                       # the actor states the real priority, post-floor
+            _next |= {"priority:P1"}
+            _injected = True
+        if _next == _labels:
+            break
+        _labels = _next
+    chk("[#1053] open-without-priority -> floor -> a stated P1 arrives -> CONVERGES on the stated "
+        "value, floor retracted, in BOUNDED ticks with no oscillation",
+        (_labels == {"role:impl", "area:groom", "priority:P1", "status:ready"}, len(_trace),
+         _trace), (True, 3, ["unprioritised-floor", "floor-retracted", "stated"]))
+    chk("[#1053] the retract is a REMOVE of the floor, not an overwrite of the stated value",
+        (triage({"role:impl", "area:groom", "priority:P4", "priority:P1"}, "task")["remove"],
+         triage({"role:impl", "area:groom", "priority:P4", "priority:P1"}, "task")["ready"]),
+        ({DERIVED_PRIORITY}, True))
+    # THE LINE THE RETRACT MUST NOT CROSS. A pair with no floor in it is a GENUINE ambiguity and is
+    # a human's to resolve — retracting there would be the machine picking a winner between two
+    # stated values. Asserted for every unordered P0..P3 pair, not just one example.
+    for _a in range(4):
+        for _b in range(_a + 1, 4):
+            _pair = {f"priority:P{_a}", f"priority:P{_b}", "role:impl", "area:groom"}
+            chk(f"[#1053] P{_a}+P{_b} (no floor) still DECLINES untouched — not the machine's to "
+                f"resolve", (derive_priority(_pair)[1], derive_priority(_pair)[2],
+                             triage(_pair, "task")["ready"]),
+                ("stated-unreadable", frozenset(), False))
+    # ...and three-way sets, including ones containing the floor, are ambiguous too: "exactly one
+    # other rank" is the whole precondition, so a floor + two stated values must not retract.
+    chk("[#1053] floor + TWO stated ranks is still ambiguous — the retract needs exactly one",
+        derive_priority({"priority:P4", "priority:P1", "priority:P2"})[1], "stated-unreadable")
+    chk("[#1053] a LONE floor is authoritative — nothing to retract against",
+        derive_priority({DERIVED_PRIORITY})[1], "stated")
+
+    # ---- guards that were correct but unasserted (#1053 review: surviving mutants N1/N2/N7/N9) ----
+    chk("[#1053/N2] a lone OUT-OF-RANGE priority declines — it is a human's typo, not a vacancy",
+        (derive_priority({"priority:P7"})[1], derive_priority({"priority:P7"})[0]),
+        ("stated-unreadable", None))
+    chk("[#1053/N9] an epic is never given a priority — a tracking umbrella is not dispatchable",
+        (triage(["kind:epic", "role:impl", "area:groom"], "task")["priority_reason"],
+         any(lb.startswith("priority:")
+             for lb in triage(["kind:epic", "role:impl", "area:groom"], "task")["add"])),
+        ("epic", False))
+    chk("[#1053/N1] RUNG ORDER: an unreadable stated priority is decided BEFORE the ready-attested "
+        "regression rung, so a doubly-broken issue reports the human-owned reason",
+        derive_priority({"status:ready", "priority:P1", "priority:P2"})[1], "stated-unreadable")
+    # [#1053/N7] PINNED DECISION, not an accident: the floor IS written to an issue that cannot
+    # become ready (here, `needs:user`-gated). It is deliberate — the value is correct the moment
+    # the gate lifts, and the retract rung means a later stated priority is not a trap. What must
+    # NOT happen is the gate being bypassed.
+    _gated = triage(["role:impl", "area:groom", "needs:user"], "task")
+    chk("[#1053/N7] a gated issue IS floored (deliberate) but is NEVER made ready by it",
+        (DERIVED_PRIORITY in _gated["add"], _gated["ready"], "status:ready" in _gated["add"]),
+        (True, False, False))
 
     print("triage self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1

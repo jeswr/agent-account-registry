@@ -815,20 +815,63 @@ def _self_test():
     chk("a contradictory dual-status issue loses its stale status:ready",
         plan(dual, "owner", "app[bot]", "none"),
         {"action": "repark", "add": [], "remove": ["status:ready"], "role": ROLE})
-    chk("a second sweep over the de-contradicted board plans ZERO writes",
-        plan(applied(dual, plan(dual, "owner", "app[bot]", "none")), "owner", "app[bot]", "none"),
-        {"action": "skip", "reason": "classifier-incomplete"})
-    chk("an incomplete untriaged issue with NO stale attestation is still left alone",
-        plan(labelled("status:untriaged", ROLE_LABEL, "area:groom"),
-             "owner", "app[bot]", "none"),
-        {"action": "skip", "reason": "classifier-incomplete"})
+    # [sparq#4809] The de-contradicted board no longer STOPS here: the stale `status:ready` is gone,
+    # so the issue is a never-prioritised one and the floor applies. What still has to hold is
+    # CONVERGENCE — the sweep must reach a fixed point, in a BOUNDED number of ticks, with no
+    # oscillation. It now takes two writes (strip the stale attestation, then promote) instead of
+    # stalling forever, so the third sweep is asserted stable rather than the second.
+    _dedup = applied(dual, plan(dual, "owner", "app[bot]", "none"))
+    _dedup_plan = plan(_dedup, "owner", "app[bot]", "none")
+    chk("[sparq#4809] the de-contradicted board PROMOTES at the floor (it used to stall forever)",
+        (_dedup_plan["action"], static_triage.DERIVED_PRIORITY in _dedup_plan.get("add", [])),
+        ("promote", True))
+    chk("[sparq#4809] ...and the sweep reaches a FIXED POINT on the third tick — no oscillation",
+        plan(applied(_dedup, _dedup_plan), "owner", "app[bot]", "none"),
+        {"action": "skip", "reason": "ready-consistent"})
+    # [sparq#4809] THE HEADLINE, END TO END, THROUGH THE SWEEP'S OWN CALL SITE. This is the exact
+    # population that was terminal: untriaged, role + area present, no priority, nothing gated.
+    # `plan()` — not `triage()` — is what the workflow invokes, so a call-site filter that dropped
+    # `priority:*` from the action's `add` (the applier writes `sorted(add)` verbatim) would leave
+    # triage.py's own assertions green while nothing reached the API. Assert the LABEL is in the
+    # planned write, not merely that the action is a promotion.
+    _stuck = plan(labelled("status:untriaged", ROLE_LABEL, "area:groom"),
+                  "owner", "app[bot]", "none")
+    chk("[sparq#4809] HEADLINE: the terminal untriaged-no-priority issue is PROMOTED, and the "
+        "derived priority is in the write the applier will send",
+        (_stuck["action"], sorted(_stuck.get("add", [])), _stuck.get("remove", [])),
+        ("promote", [static_triage.DERIVED_PRIORITY, "status:ready"], ["status:untriaged"]))
 
     # ---- IDEMPOTENCE + the round trip (re-park -> restore the label -> promote lands back on
     # the ORIGINAL label set, with no oscillation and no second write) ----
     reparked = applied(lost_priority, plan(lost_priority, "owner", "app[bot]", "none"))
-    chk("a second sweep over the re-parked board plans ZERO writes",
-        plan(reparked, "owner", "app[bot]", "none"),
-        {"action": "skip", "reason": "classifier-incomplete"})
+    # [sparq#4809] THE TRADE, PINNED — read this before widening or narrowing the derivation.
+    # While the issue still carried its stale `status:ready`, `derive_priority` DECLINED it
+    # (`ready-attested-regression`): a ready-attested issue with no readable priority LOST one, and
+    # flooring it would overwrite a human's P0..P3. That decline is what makes the re-park above
+    # happen at all. Once re-parked the attestation is gone, so the next sweep can no longer tell
+    # this issue from one that was never prioritised, and it floors it.
+    #
+    # That is deliberate and it is the lesser harm: the alternative is the starvation this change
+    # exists to fix — the old behaviour left the issue untriaged indefinitely, waiting on a human
+    # who, measured across two weeks of green retriage runs, did not come.
+    _floored = plan(reparked, "owner", "app[bot]", "none")
+    chk("[sparq#4809] a re-parked lost-priority issue is floored by the NEXT sweep, not stalled",
+        (_floored["action"], static_triage.DERIVED_PRIORITY in _floored.get("add", [])), ("promote", True))
+    # ...and a LATE restore — the human's real priority arriving AFTER that floor landed — is now
+    # RESOLVED rather than declined. An earlier revision of this fixture asserted the pair stayed
+    # declined-and-visible and called that the acceptable failure mode of the trade; PR #1053's
+    # review showed that is the majority path, not an edge case, so the retract rung decides it.
+    # The floor is withdrawn and the restored value governs.
+    _late = applied(applied(reparked, _floored), {"add": ["priority:P2"]})
+    _late_plan = plan(_late, "owner", "app[bot]", "none")
+    chk("[sparq#4809] a LATE restore RETRACTS the floor and keeps the human's value",
+        (static_triage.derive_priority(label_set(_late))[1],
+         static_triage.DERIVED_PRIORITY in _late_plan.get("remove", []),
+         any(lb.startswith("priority:") for lb in _late_plan.get("add", []))),
+        ("floor-retracted", True, False))
+    chk("[sparq#4809] ...landing on the human's priority, with the floor gone",
+        {lb for lb in label_set(applied(_late, _late_plan)) if lb.startswith("priority:")},
+        {"priority:P2"})
     restored = dict(reparked)
     restored["labels"] = reparked["labels"] + [{"name": "priority:P2"}]
     promotion = plan(restored, "owner", "app[bot]", "none")
