@@ -1906,11 +1906,19 @@ jobs:
       # ABORTED before writing even the early plan summary records `claim-abort` (review defect
       # #6, counted as a zero-dispatch tick); dispatch-claim writes the plan-derived summary
       # BEFORE claim-side work so a mid-claim abort still surfaces as planned>0/launched-0.
-      # A truly empty frontier (planned == 0 AND an empty defer histogram) stays recordless by
-      # design; a snapshot-skip-only tick (issue #109) is degraded and records zero-dispatch.
+      # A truly empty frontier (planned == 0 AND an empty defer histogram) records `idle` (issue
+      # #341 — see below); a snapshot-skip-only tick (issue #109) is degraded and records
+      # zero-dispatch.
       # NOTE (issue #205): an open zero-dispatch alert is recovered on the decide side even when
       # the fleet has aged out of the window (model-health.py classify_records + open-alert
-      # markers), so the recordless empty tick no longer leaves the alert open forever.
+      # markers), so an unrecorded empty tick no longer leaves the alert open forever — but that
+      # recovery had to wait out the full 48 h window. Issue #341: a completed tick that found an
+      # EMPTY ready frontier is positive evidence that "launched nothing while work was ready" is
+      # no longer true, so it records the fleet `idle` class and the alert recovers on the spot.
+      # NOT a `success` (that would fabricate fleet-health evidence for the aged-out park exit) and
+      # NOT once per tick (model-health.py's fleet_idle_is_redundant suppresses the write while the
+      # fleet's newest record is already `idle`, so the ~288 idle ticks per window cannot evict the
+      # per-provider health signal the outage/transient/capped detectors read).
       # always() so a claim FAILURE (exactly when nothing launches) is still surfaced. No issue
       # numbers or account handles are emitted.
       - name: Surface + record the dispatch-tick health state
@@ -2021,11 +2029,27 @@ jobs:
                   if fix_stalled:
                       out.write("- **fix** lane planned work but launched nothing "
                                 "(every item errored)\n")
+          # Issue #341: a QUIET tick — the claim step ran to SUCCESS, the ready frontier was empty
+          # (planned == 0, dispatched == 0) and nothing deferred, so there is no histogram and
+          # `degraded`/`lane_unhealthy` above are both false. That is a POSITIVE observation
+          # ("there was nothing to launch"), which is why it is derived from the claim step's own
+          # outcome rather than from the fallback below: a claim that FAILED, or a summary that
+          # never landed, is an absence of information and must stay unrecorded.
+          # HONESTY NOTE on `not reasons`: it is DELIBERATELY redundant with `degraded` (a nonempty
+          # histogram with dispatched == 0 is already classified `zero` one line down, which wins).
+          # It is kept because this predicate must state its OWN precondition — a later narrowing of
+          # `degraded` must not silently turn a deferring tick into a quiet one — but it is not an
+          # independently reachable branch, and the self-test does not pretend it is.
+          quiet = summary is not None and os.environ.get("CLAIM_OUTCOME") == "success" \
+              and isinstance(planned, int) and planned == 0 \
+              and isinstance(dispatched, int) and dispatched == 0 and not reasons
           # Emit a marker file the record step reads (keeps the record invocation out of this
           # inline python so the salted-hash discipline stays in model-health.py). A lane stall or a
           # failed safety disarm counts as a zero-dispatch tick even when the fleet dispatched>0.
+          # `none` is the FAIL-CLOSED fallback (no summary, an unclassifiable tick, or the marker
+          # file missing entirely on the shell side): it records nothing at all.
           state = "zero" if (zero or lane_unhealthy or degraded) else "abort" if abort \
-              else "ok" if productive else "none"
+              else "ok" if productive else "idle" if quiet else "none"
           with open(os.environ["RUNNER_TEMP"] + "/dispatch-tick-state", "w",
                     encoding="utf-8") as flag:
               flag.write(state)
@@ -2054,6 +2078,16 @@ jobs:
               python3 registry/scripts/model-health.py record \
                 --provider fleet \
                 --exit-class success \
+                --run-id "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
+              ;;
+            idle)
+              # empty-frontier record (issue #341): recovers an open zero-dispatch alert without
+              # waiting out the 48 h window, and WITHOUT claiming the dispatcher launched anything.
+              # model-health.py suppresses this write while the fleet's newest record is already
+              # `idle`, so a permanently-quiet fleet writes one record, not one per tick.
+              python3 registry/scripts/model-health.py record \
+                --provider fleet \
+                --exit-class idle \
                 --run-id "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
               ;;
           esac

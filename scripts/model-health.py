@@ -13,7 +13,8 @@
 #
 # Two subcommands over one bounded, privacy-safe ledger (data/model-health.json):
 #   record  — called from the always()-guarded worker.yml/review-fix.yml outcome jobs (so FAILURES
-#             record too — that is the whole point) and from dispatch.yml on a zero-dispatch tick.
+#             record too — that is the whole point) and from dispatch.yml on a zero-dispatch tick
+#             or an empty-frontier (`idle`) tick.
 #             Appends {ts, provider, account (SALTED HASH only — decision 22a), model_alias,
 #             exit_class, run_id, reset_hint?, no-change usage fields?} via the SAME contents-API
 #             CAS pattern as the lease ledger, bounded to a rolling window (max(MAX_RECORDS,
@@ -159,6 +160,26 @@ CLASS_SETUP = "setup"        # runner/tooling problem (NOT a provider-access sig
 CLASS_UNKNOWN = "unknown"    # unattributable failure: counts toward PERSISTENCE, never OUTAGE
 CLASS_NO_CHANGE = "no_change"  # clean model exit that produced no repository change
 CLASS_ZERO_DISPATCH = "zero-dispatch"  # dispatch planned >0 but launched 0 (fleet-wide signal)
+# [issue #341] `idle` == the dispatcher RAN TO COMPLETION and the ready frontier was EMPTY: nothing
+# was planned, nothing deferred, nothing to launch. It is the fleet's POSITIVE evidence that the
+# zero-dispatch condition ("launched nothing while work was ready") is not currently true, and it
+# exists because an empty frontier is otherwise recordless — a fleet that fires zero-dispatch and
+# then goes permanently empty had to wait the full WINDOW_HOURS for its stale zero-dispatch records
+# to age out before #205's orphan recovery could close the alert.
+#
+# WHY NOT REUSE `success` (the obvious fix, deliberately NOT taken). A fleet `success` asserts the
+# allocator PLANNED AND LAUNCHED work, and two other consumers read it that way: it counts toward
+# SUSTAINED_HEALTH_MIN_SUCCESSES and it may ANCHOR FRESHNESS on its own for the aged-out park exit
+# (see the sustained-health block below and its self-test). Minting one per idle tick would
+# manufacture fleet-health evidence out of an empty backlog — a park exit released by the absence
+# of work. `idle` is therefore its own class: it is neither health nor ill health.
+#
+# WHO CAN WRITE IT. Only a caller already holding a registry token, through _cmd_record's provider/
+# class pairing guard (fleet-only, refused on every real provider). That is the SAME authority that
+# can already write the fleet `success` which closes this alert today — and `success` is the
+# STRONGER capability of the two, since it additionally feeds the sustained-health evidence `idle`
+# is defined to stay out of. So this class grants no new authority over the zero-dispatch alert.
+CLASS_IDLE = "idle"          # dispatch ran; the ready frontier was empty (fleet-wide signal)
 
 # The ONLY providers a health record may carry (issue #199). `provider` is CATALOG-controlled
 # (an account issue's free-form `provider:` line, parsed verbatim), so a record command whose
@@ -199,6 +220,9 @@ _EXIT_CLASS_MAP = {
     # claim-abort: the dispatcher's claim phase died before launching anything (review defect #6);
     # it counts toward the zero-dispatch consecutive-tick run.
     "claim-abort": CLASS_ZERO_DISPATCH,
+    # [#341] the empty-frontier tick. Raw and decision spelling coincide, so this one entry both
+    # accepts the workflow's `--exit-class idle` and admits `idle` into DECISION_CLASSES.
+    CLASS_IDLE: CLASS_IDLE,
     SUCCESS: SUCCESS,
     # decision classes are also accepted verbatim (a caller may pass the already-folded class, and
     # the self-test uses them directly).
@@ -1503,9 +1527,8 @@ def classify_records(records, provider_accounts, now, open_alerts=()):
 
     `open_alerts` is the set of (condition, provider) pairs whose alert issue is currently OPEN
     (issue #205). Actions are keyed on records, but a provider whose records have all aged out of
-    the rolling window would otherwise produce NO action at all — so its open alert (and, most
-    acutely, the fleet zero-dispatch alert, whose empty-frontier ticks intentionally record
-    nothing) could stay open forever. For every open marker the record-driven pass did not already
+    the rolling window would otherwise produce NO action at all — so its open alert could stay
+    open forever. For every open marker the record-driven pass did not already
     cover — AND whose provider has no records left in the window at all — an explicit recovery
     (fire=False) is emitted so `decide` can close it. Alerts for a provider still present in the
     window are left to the per-condition logic above (closing on absent side-knowledge, e.g. a
@@ -1518,7 +1541,8 @@ def classify_records(records, provider_accounts, now, open_alerts=()):
       provider-capped    : EVERY enabled account's LATEST limit/success outcome is limit-class.
       account-auth-cooldown: >=AUTH_COOLDOWN_MIN consecutive `auth` outcomes put one or more of the
                            provider's accounts in a bounded credential cooldown (registry #596).
-      zero-dispatch      : >=3 consecutive zero-dispatch ticks (provider == 'fleet').
+      zero-dispatch      : >=3 consecutive zero-dispatch ticks (provider == 'fleet'), and the
+                           newest fleet tick is not `idle` (an empty ready frontier — issue #341).
     """
     records, _ = _no_change_limit_view(records, now)
     # Live per-account credential cooldowns (registry #596), derived from the SAME window. Keyed by
@@ -1540,19 +1564,38 @@ def classify_records(records, provider_accounts, now, open_alerts=()):
         # record on every productive planned>0 tick (review defect #5), so the tail run below
         # resets on a real dispatch and the fire=False action closes an open alert.
         if provider == "fleet":
+            # [#341] An `idle` tick (empty ready frontier) is TRANSPARENT to the consecutive run:
+            # it neither extends nor breaks it, which is EXACTLY the pre-#341 semantics, when such
+            # a tick recorded nothing at all. Letting it break the run would quietly desensitise
+            # the alert — `zd, idle, zd, zd` fires today and must keep firing.
+            #
+            # What `idle` DOES decide is the present tense. The condition is "the dispatcher
+            # launched nothing WHILE WORK WAS READY", so once the newest fleet tick reports an
+            # empty frontier that claim is no longer true and the alert recovers on the spot,
+            # instead of waiting up to WINDOW_HOURS for the stale zero-dispatch records to age out
+            # into #205's orphan path.
+            #
+            # `quiet` is read ONLY alongside a threshold-length run below, so `not quiet` and
+            # `not (quiet and zd_tail)` are the same predicate — that second form is a declared
+            # EQUIVALENT mutant, not a hole in the suite.
+            quiet = prov_records[-1].get("exit_class") == CLASS_IDLE
             zd_tail = []
             for r in reversed(prov_records):
-                if r.get("exit_class") == CLASS_ZERO_DISPATCH:
+                cls = r.get("exit_class")
+                if cls == CLASS_ZERO_DISPATCH:
                     zd_tail.append(r)
+                elif cls == CLASS_IDLE:
+                    continue
                 else:
                     break
-            fire = len(zd_tail) >= ZERO_DISPATCH_MIN
+            fire = len(zd_tail) >= ZERO_DISPATCH_MIN and not quiet
             actions.append({
                 "condition": "zero-dispatch",
                 "provider": "fleet",
                 "fire": fire,
                 "reason": (f"{len(zd_tail)} consecutive ticks planned ready work but launched "
                            f"nothing (>= {ZERO_DISPATCH_MIN} pages)" if fire
+                           else "the ready frontier is empty — there is no work to launch" if quiet
                            else "dispatch is placing work again"),
             })
             continue
@@ -2054,7 +2097,44 @@ def _record_identity(record):
             record.get("exit_class"), record.get("model_alias"))
 
 
-def append_record(api, registry_repo, record, now, retries=CAS_RETRIES):
+def fleet_idle_is_redundant(records, now):
+    """[issue #341] THE NON-FLOODING GATE, pure so it is unit-tested without gh. True when the
+    fleet's NEWEST in-window record is already `idle`, i.e. another empty-frontier record would say
+    something the window already says.
+
+    WHY A GATE AT ALL. dispatch ticks roughly every 10 minutes plus doorbell triggers (~288+
+    scheduled ticks per 48 h WINDOW_HOURS) against MAX_RECORDS=200, so recording every idle tick
+    would evict the real per-provider health signal the outage/transient/capped conditions are
+    derived from — a recovery mechanism that blinds the detectors it shares a window with is a net
+    loss. Suppressing the redundant repeat bounds the fleet's idle records at ONE PER TRANSITION
+    into quiet, which is exactly the evidence classify_records reads (the NEWEST fleet record).
+
+    It costs no extra API call: append_record already reads the ledger before its CAS write, so
+    this runs on records that are in hand. The suppressed case skips the WRITE outright.
+
+    Only the WINDOW counts: a record older than WINDOW_SECONDS (or implausibly future-stamped) is
+    invisible to classify_records, so it must not suppress a write here either — an `idle` that has
+    aged out is not evidence of anything. Falls back to False (write) whenever the newest record is
+    anything else or there is no fleet record at all, so the gate can only ever suppress a
+    provably-redundant duplicate; it can never drop the first idle record of a quiet stretch.
+
+    `newest` is resolved EXACTLY as classify_records resolves it — a STABLE sort by ts, then the
+    last element — so same-second records (two ticks whose write stamps collide) break the tie by
+    ledger append order in both places. A `max()` here would have taken the FIRST of the tied
+    records instead and suppressed a write the classifier had already moved past."""
+    fleet = sorted((r for r in records
+                    if isinstance(r, dict)
+                    and r.get("provider") == FLEET_PSEUDO_PROVIDER
+                    and isinstance(r.get("ts"), int) and not isinstance(r.get("ts"), bool)
+                    and (now - r["ts"]) <= WINDOW_SECONDS
+                    and r["ts"] <= now + FUTURE_SKEW_SECONDS),
+                   key=lambda r: r["ts"])
+    if not fleet:
+        return False
+    return fleet[-1].get("exit_class") == CLASS_IDLE
+
+
+def append_record(api, registry_repo, record, now, retries=CAS_RETRIES, skip_if=None):
     """CAS-append one record and prune the window (bounded write). Retries on conflict with a
     full-jitter exponential backoff BETWEEN attempts (issue #200) — a synchronized completion burst
     that retried in lockstep with no delay could exhaust the budget and DISCARD records. The write
@@ -2063,7 +2143,13 @@ def append_record(api, registry_repo, record, now, retries=CAS_RETRIES):
     unchanged), the append is a confirmed no-op, so a duplicate can never falsely escalate the
     derived backoff or an alert. A re-EXECUTED outcome (full re-run: same GITHUB_RUN_ID, fresh
     producing-job attempt) is NOT a replay and still appends. Returns the pruned
-    record count on success, or the unchanged window count on a dedup no-op."""
+    record count on success, or the unchanged window count on a dedup no-op.
+
+    `skip_if(records, now) -> bool` (issue #341) is an optional REDUNDANCY gate evaluated against
+    the ledger this writer has already read: True suppresses the write and returns the unchanged
+    window count. It is a NON-FLOODING device for the fleet's `idle` signal, never a correctness
+    device — it must never be handed a predicate that could suppress a record some threshold
+    counts, because a suppressed record is indistinguishable from a tick that never happened."""
     identity = _record_identity(record)
     for attempt in range(retries):
         if attempt:
@@ -2072,6 +2158,8 @@ def append_record(api, registry_repo, record, now, retries=CAS_RETRIES):
         # Idempotent no-op: this outcome is already recorded (a replayed recorder). Do NOT append a
         # duplicate that would double-count toward backoff/alert escalation (issue #200).
         if identity is not None and any(_record_identity(r) == identity for r in records):
+            return len(prune(records, now))
+        if skip_if is not None and skip_if(records, now):
             return len(prune(records, now))
         records = prune(records + [record], now)
         # Validate the COMPLETE assembled document before the PUT (issue #202): a malformed record —
@@ -2494,21 +2582,22 @@ def _cmd_record(args):
               f"{args.provider!r} (must be one of {sorted(VALID_RECORD_PROVIDERS)})")
         return 1
     # Fail closed on a provider/class MISMATCH (review round 1 of #423): `fleet` is the
-    # pseudo-provider for the fleet-wide zero-dispatch signal ONLY — its legitimate classes are
-    # the zero-dispatch tick (raw `zero-dispatch`/`claim-abort`) and the `success` record that
-    # resets the consecutive-tick run (dispatch.yml's three call sites). A `fleet` record with an
-    # ordinary per-account class (e.g. auth) or a real-provider record claiming zero-dispatch
-    # would corrupt health classification, so neither may reach the ledger.
+    # pseudo-provider for the fleet-wide dispatch-tick signal ONLY — its legitimate classes are
+    # the zero-dispatch tick (raw `zero-dispatch`/`claim-abort`), the `success` record that
+    # resets the consecutive-tick run, and the `idle` empty-frontier tick (issue #341)
+    # (dispatch.yml's four call sites). A `fleet` record with an ordinary per-account class (e.g.
+    # auth) or a real-provider record claiming a fleet-only class would corrupt health
+    # classification, so neither may reach the ledger.
     folded_class = _decision_class(args.exit_class)
     if args.provider == "fleet":
-        if folded_class not in (CLASS_ZERO_DISPATCH, SUCCESS):
+        if folded_class not in (CLASS_ZERO_DISPATCH, SUCCESS, CLASS_IDLE):
             print(f"::error::model-health record: refusing fleet record with per-account exit "
                   f"class {args.exit_class!r} (fleet carries only zero-dispatch/claim-abort/"
-                  f"success)")
+                  f"success/idle)")
             return 1
-    elif folded_class == CLASS_ZERO_DISPATCH:
+    elif folded_class in (CLASS_ZERO_DISPATCH, CLASS_IDLE):
         print(f"::error::model-health record: refusing {args.provider!r} record with exit class "
-              f"{args.exit_class!r} (zero-dispatch is the fleet pseudo-provider's signal)")
+              f"{args.exit_class!r} ({folded_class} is the fleet pseudo-provider's signal)")
         return 1
     salt = os.environ.get("PROVENANCE_SALT", "")
     # provider=fleet carries NO account (there is no single account); everything else salts the
@@ -2550,9 +2639,21 @@ def _cmd_record(args):
     except ValueError as exc:
         print(f"::error::model-health record: refusing malformed record ({exc})")
         return 1
+    # [#341] The empty-frontier tick is the ONLY class that rides the non-flooding gate: dispatch
+    # emits it on every quiet tick, and the window can afford one per transition into quiet, not one
+    # per tick. Nothing else may be gated — every other class feeds a threshold that counts ticks.
+    suppressed = []
+
+    def _skip_redundant_idle(existing, at):
+        if not fleet_idle_is_redundant(existing, at):
+            return False
+        suppressed.append(True)
+        return True
+
     try:
         api = GitHubAPI(os.environ.get("GH_TOKEN") or os.environ.get("REGISTRY_ALERT_TOKEN") or "")
-        kept = append_record(api, os.environ["REGISTRY_REPO"], record, time.time())
+        kept = append_record(api, os.environ["REGISTRY_REPO"], record, time.time(),
+                             skip_if=_skip_redundant_idle if folded_class == CLASS_IDLE else None)
     except HealthError as exc:
         # A dropped record leaves an outage invisibly below threshold, so this exits NONZERO
         # (review defect #8 — the old warning-and-exit-0 silently discarded failures on CAS
@@ -2561,6 +2662,10 @@ def _cmd_record(args):
         # failing or reclassifying the run.
         print(f"::error::model-health record failed ({exc})")
         return 1
+    if suppressed:
+        print(f"model-health: fleet is already recorded {CLASS_IDLE} — skipped the redundant "
+              f"empty-frontier record (window={kept}, unchanged)")
+        return 0
     print(f"model-health: recorded {record['provider']}/{record['exit_class']} "
           f"(window={kept})")
     return 0
@@ -2665,6 +2770,8 @@ def _self_test():
     def fires(actions, condition, provider):
         return any(a["condition"] == condition and a["provider"] == provider and a["fire"]
                    for a in actions)
+
+    _action = _action_for
 
     import contextlib
     import io
@@ -2956,6 +3063,37 @@ def _self_test():
     zd_abort = zd[:2] + [zrec("claim-abort", 200)]
     chk("zero-dispatch ACT (claim-abort completes the run)",
         fires(classify_records(zd_abort, {}, now + 300), "zero-dispatch", "fleet"), True)
+
+    # ---- [#341] the EMPTY-FRONTIER (`idle`) tick: recovery without desensitising the alert -----
+    # (i) RECOVERY. A firing run followed by one empty-frontier tick recovers immediately, because
+    #     "launched nothing WHILE WORK WAS READY" stops being true the moment the frontier empties.
+    #     Before #341 this window fired for up to WINDOW_HOURS (the run's records are all still
+    #     here — only their staleness changed). Deleting `and not quiet` flips this red.
+    zd_idle = zd + [zrec(CLASS_IDLE, 400)]
+    chk("zero-dispatch RECOVERS on an empty-frontier (idle) tick",
+        fires(classify_records(zd_idle, {}, now + 500), "zero-dispatch", "fleet"), False)
+    chk("the idle recovery says WHY it recovered (empty frontier, not 'placing work again')",
+        _action(classify_records(zd_idle, {}, now + 500), "zero-dispatch", "fleet")["reason"],
+        "the ready frontier is empty — there is no work to launch")
+    # (ii) NON-DESENSITISATION, the half that makes (i) safe. An idle tick is TRANSPARENT to the
+    #      consecutive run — exactly as it was when an empty tick recorded nothing at all. These
+    #      four ticks contain THREE zero-dispatch ticks with one idle tick interleaved, so the run
+    #      still reaches the threshold and still pages. Making `idle` BREAK the run (the obvious
+    #      simplification) leaves only two and flips this red — a real stall that flaps through one
+    #      quiet tick would then never page.
+    zd_interleaved = [zrec(CLASS_ZERO_DISPATCH, 0, "i0"), zrec(CLASS_IDLE, 60, "i1"),
+                      zrec(CLASS_ZERO_DISPATCH, 120, "i2"), zrec(CLASS_ZERO_DISPATCH, 180, "i3")]
+    chk("zero-dispatch ACT: an interleaved idle tick does NOT reset the consecutive run",
+        fires(classify_records(zd_interleaved, {}, now + 300), "zero-dispatch", "fleet"), True)
+    # (iii) a fleet that has only ever been idle pages nothing at all...
+    chk("an idle-only fleet window never fires",
+        fires(classify_records([zrec(CLASS_IDLE, i * 60, f"q{i}") for i in range(4)], {},
+                               now + 300), "zero-dispatch", "fleet"), False)
+    # (iv) ...and a productive tick AFTER the quiet stretch still breaks the run outright, so the
+    #      idle records cannot resurrect a stale run once real dispatch resumes.
+    chk("a dispatch-success after an idle stretch still breaks the run",
+        fires(classify_records(zd_idle + [zrec(SUCCESS, 460)], {}, now + 500),
+              "zero-dispatch", "fleet"), False)
 
     # ---- ORPHANED OPEN ALERTS (issue #205): a provider that aged out of the window still closes --
     def recovers(actions, condition, provider):
@@ -4040,6 +4178,9 @@ def _self_test():
     # ---- #199: record REFUSES a catalog-controlled provider outside the known set ------------
     ok = _test_record_provider_guard(chk) and ok
 
+    # ---- #341: the empty-frontier record + its non-flooding write gate -----------------------
+    ok = _test_fleet_idle_gate(chk) and ok
+
     # ---- decide exits NONZERO on an unreadable ledger (review r3) ----------------------------
     ok = _test_decide_exit(chk) and ok
 
@@ -4068,6 +4209,17 @@ def _self_test():
 
     print("model-health self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
+
+
+def _action_for(actions, condition, provider):
+    """SELF-TEST HELPER: the one action for (condition, provider) — so an assertion can read the
+    REASON (or feed the real action to the real upsert) rather than only its boolean. Raises when
+    the action is absent or duplicated, so a silently-missing action can never read as a pass."""
+    found = [a for a in actions if a["condition"] == condition and a["provider"] == provider]
+    if len(found) != 1:
+        raise AssertionError(
+            f"expected exactly one {condition}/{provider} action, got {len(found)}")
+    return found[0]
 
 
 def _raises(fn):
@@ -4544,7 +4696,11 @@ def _test_record_provider_guard(chk):
             _cmd_record(_rec("anthropic", "zero-dispatch")), 1)
         chk("record refuses real provider with claim-abort",
             _cmd_record(_rec("openai", "claim-abort")), 1)
-        chk("real-provider zero-dispatch writes NO record", _CountingAPI.put_count, 1)
+        # [#341] `idle` is a fleet-only signal for the same reason: an empty READY FRONTIER is a
+        # property of the dispatcher, not of one account's model access.
+        chk("record refuses real provider with idle",
+            _cmd_record(_rec("anthropic", "idle")), 1)
+        chk("real-provider zero-dispatch/idle writes NO record", _CountingAPI.put_count, 1)
         # Every legitimate fleet call site (dispatch.yml: zero tick, claim abort, tick-run-resetting
         # success) still records — one write each.
         chk("record accepts fleet zero-dispatch", _cmd_record(_rec("fleet", "zero-dispatch")), 0)
@@ -4575,6 +4731,167 @@ def _test_record_provider_guard(chk):
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+    return True
+
+
+def _test_fleet_idle_gate(chk):
+    """[#341] The empty-frontier (`idle`) record and its NON-FLOODING write gate, both directions.
+
+    Two halves, each with its own failure mode:
+      * the PURE gate (fleet_idle_is_redundant) — it must suppress ONLY a provably-redundant
+        repeat: the newest FLEET record, inside the window, already `idle`;
+      * the WRITE path (_cmd_record end-to-end against a stateful ledger stub) — the first idle
+        record of a quiet stretch lands, the second does not, and NO OTHER CLASS is gated. That
+        last one is the dangerous mutant: widening the gate to every class would silently collapse
+        the consecutive zero-dispatch ticks the alert is counted from into a single record.
+    """
+    import argparse as _ap
+    import types
+    global GitHubAPI, _gh
+    real_api, real_gh = GitHubAPI, _gh
+    saved = {k: os.environ.get(k) for k in
+             ("REGISTRY_REPO", "WORKER_ACCOUNT_HANDLE", "PROVENANCE_SALT",
+              "GH_TOKEN", "REGISTRY_ALERT_TOKEN")}
+    salt, base = "s3cret", 5_000_000
+    sentinel = hashlib.sha256(b"fleet-zero-dispatch").hexdigest()[:16]
+
+    def frec(cls, dt, run):
+        return make_record(FLEET_PSEUDO_PROVIDER, sentinel, "", cls, run, base + dt)
+
+    # ---- the PURE gate -----------------------------------------------------------------------
+    # The bounds FIRST, from literals, so the fixtures below can be sized from literals too: a
+    # fixture derived from the constant it is probing shrinks with the constant and stays green.
+    chk("the window/skew bounds this gate reuses are the documented ones",
+        (WINDOW_SECONDS, FUTURE_SKEW_SECONDS), (48 * 3600, 300))
+    chk("idle gate: an empty ledger is never redundant (the first idle always writes)",
+        fleet_idle_is_redundant([], base), False)
+    chk("idle gate: the fleet's newest record already being idle IS redundant",
+        fleet_idle_is_redundant([frec(CLASS_IDLE, 0, "a")], base + 60), True)
+    chk("idle gate: a newer zero-dispatch tick makes the next idle record non-redundant",
+        fleet_idle_is_redundant([frec(CLASS_IDLE, 0, "a"), frec(CLASS_ZERO_DISPATCH, 60, "b")],
+                                base + 120), False)
+    chk("idle gate: a newer dispatch success makes the next idle record non-redundant",
+        fleet_idle_is_redundant([frec(CLASS_IDLE, 0, "a"), frec(SUCCESS, 60, "b")],
+                                base + 120), False)
+    # ORDER, not position: the newest record is found by TIMESTAMP, so an unsorted ledger (prune
+    # sorts, but this reads the RAW ledger the CAS writer just fetched) cannot fool the gate.
+    chk("idle gate: newest-by-TIMESTAMP, not by list position",
+        fleet_idle_is_redundant([frec(CLASS_ZERO_DISPATCH, 60, "b"), frec(CLASS_IDLE, 0, "a")],
+                                base + 120), False)
+    # SAME-SECOND TIE. Record stamps are write-time integers, so two ticks CAN collide; `newest`
+    # must then mean "last appended", which is what classify_records' stable sort yields. A `max()`
+    # takes the FIRST of the tied records and would suppress a write the classifier has already
+    # moved past — measured: this exact pair silently dropped an idle record on the first cut.
+    chk("idle gate: a same-second tie resolves by append order (idle, then zero-dispatch)",
+        fleet_idle_is_redundant([frec(CLASS_IDLE, 0, "a"), frec(CLASS_ZERO_DISPATCH, 0, "b")],
+                                base + 60), False)
+    chk("idle gate: a same-second tie resolves by append order (zero-dispatch, then idle)",
+        fleet_idle_is_redundant([frec(CLASS_ZERO_DISPATCH, 0, "b"), frec(CLASS_IDLE, 0, "a")],
+                                base + 60), True)
+    # WINDOW: an idle record that has already aged out is invisible to classify_records, so it must
+    # not suppress a write here either — otherwise the quiet fleet ends up with NO in-window
+    # evidence at all. 49 h is a literal, deliberately not WINDOW_SECONDS + something.
+    chk("idle gate: an idle record older than the window no longer suppresses the write",
+        fleet_idle_is_redundant([frec(CLASS_IDLE, 0, "a")], base + 49 * 3600), False)
+    # ...and an implausibly FUTURE-stamped idle (a forged/clock-skewed record that would otherwise
+    # never age out) is dropped by the same rule prune applies, so it cannot mute the fleet.
+    chk("idle gate: a future-stamped idle record cannot suppress the write",
+        fleet_idle_is_redundant([frec(CLASS_IDLE, 600, "a")], base), False)
+    # PROVIDER FILTER: only the FLEET's own records speak for the fleet. Dropping the filter makes
+    # the per-account record below the newest one and flips this to False.
+    chk("idle gate: a newer PER-ACCOUNT record does not un-redundant the fleet's idle state",
+        fleet_idle_is_redundant(
+            [frec(CLASS_IDLE, 0, "a"),
+             make_record("anthropic", account_hash("acct01", salt), "sonnet", SUCCESS, "b",
+                         base + 60)],
+            base + 120), True)
+
+    # ---- the WRITE path, end-to-end through _cmd_record ---------------------------------------
+    stub = _StubAPI(seed=[])
+
+    def _rec(provider, exit_class, run):
+        return _ap.Namespace(provider=provider, account="", model_alias="",
+                             exit_class=exit_class, run_id=run, reset_hint=None)
+
+    try:
+        os.environ.update(REGISTRY_REPO="o/r", WORKER_ACCOUNT_HANDLE="acct01",
+                          PROVENANCE_SALT=salt, GH_TOKEN="tok")
+        GitHubAPI = lambda token: stub                       # noqa: E731 — one-line test double
+        chk("record accepts the fleet idle class", _cmd_record(_rec("fleet", "idle", "1")), 0)
+        chk("the first idle tick of a quiet stretch WRITES", len(stub.records()), 1)
+        chk("a real provider may NOT claim the fleet idle class",
+            _cmd_record(_rec("anthropic", "idle", "2")), 1)
+        chk("the refused per-account idle record never reaches the ledger",
+            len(stub.records()), 1)
+        # THE GATE. A second idle tick is a successful no-op: exit 0 (the tick is healthy, not a
+        # failed record) and NO new record. Deleting the skip_if wiring flips the count assertion.
+        chk("a repeated idle tick still exits 0", _cmd_record(_rec("fleet", "idle", "3")), 0)
+        chk("a repeated idle tick writes NOTHING (the non-flooding gate)",
+            len(stub.records()), 1)
+        # ...and the gate re-opens the moment the fleet says something else, so the NEXT transition
+        # into quiet is recorded and can recover the alert.
+        chk("a zero-dispatch tick still writes", _cmd_record(_rec("fleet", "zero-dispatch", "4")),
+            0)
+        chk("zero-dispatch after idle writes one record", len(stub.records()), 2)
+        chk("the idle after a zero-dispatch tick writes again",
+            (_cmd_record(_rec("fleet", "idle", "5")), len(stub.records())), (0, 3))
+        # THE NARROWNESS OF THE GATE — the mutant that would break the alert itself. Two
+        # consecutive zero-dispatch ticks must BOTH land, or the consecutive-tick run the
+        # zero-dispatch alert counts could never reach ZERO_DISPATCH_MIN.
+        chk("consecutive zero-dispatch ticks are NOT gated (both records land)",
+            (_cmd_record(_rec("fleet", "zero-dispatch", "6")),
+             _cmd_record(_rec("fleet", "zero-dispatch", "7")),
+             len(stub.records())), (0, 0, 5))
+        # ...nor is a repeated dispatch SUCCESS (the productive tick's own signal).
+        chk("consecutive dispatch successes are NOT gated (both records land)",
+            (_cmd_record(_rec("fleet", "success", "8")),
+             _cmd_record(_rec("fleet", "success", "9")),
+             len(stub.records())), (0, 0, 7))
+        # END-TO-END: the ledger the gate produced is exactly the one classify_records needs — one
+        # idle record at the tail is enough to recover, and it is the ONLY idle at the tail.
+        tail = [r["exit_class"] for r in stub.records()]
+        chk("the gated ledger holds one idle per transition into quiet, not one per tick",
+            tail.count(CLASS_IDLE), 2)
+    finally:
+        GitHubAPI = real_api
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    # ---- WHAT THE RECOVERY DELIVERS INTO ------------------------------------------------------
+    # The headline of #341 is not "classify_records returns fire=False", it is "the open alert
+    # CLOSES". Assert that against the EVIDENCE path end to end: the ledger a quiet fleet produces
+    # -> the real classifier -> the real upsert -> a gh `issue close` on the marker issue. A
+    # recovery that stopped one layer short would leave the alert open exactly as before.
+    calls = []
+
+    def _fake_gh(open_issues):
+        def run(args, token, capture=False):
+            calls.append(list(args))
+            if args[:2] == ["issue", "list"]:
+                state = args[args.index("--state") + 1]
+                return types.SimpleNamespace(
+                    returncode=0, stdout=json.dumps(open_issues if state == "open" else []),
+                    stderr="")
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        return run
+
+    quiet_window = ([frec(CLASS_ZERO_DISPATCH, i * 60, f"z{i}") for i in range(3)]
+                    + [frec(CLASS_IDLE, 300, "z9")])
+    recovery = _action_for(classify_records(quiet_window, {}, base + 360),
+                           "zero-dispatch", FLEET_PSEUDO_PROVIDER)
+    try:
+        _gh, calls[:] = _fake_gh([{"number": 41,
+                                   "body": _marker("zero-dispatch", FLEET_PSEUDO_PROVIDER)}]), []
+        confirmed = _upsert_alert(recovery, "o/r", "t", "m")
+        verbs = [c[1] for c in calls if c and c[0] == "issue"]
+        chk("the idle-driven recovery CLOSES the open zero-dispatch alert issue",
+            (recovery["fire"], confirmed, "close" in verbs, "create" in verbs),
+            (False, True, True, False))
+    finally:
+        _gh = real_gh
     return True
 
 

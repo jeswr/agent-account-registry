@@ -16458,8 +16458,9 @@ agent = "impl"
     # histogram carries the plan-snapshot degradation -> degraded zero-dispatch, NOT a quiet `none`
     assert tick_state({"planned": 0, "dispatched": 0,
                        "defer_reasons": {"snapshot-skip:check-runs-overflow": 1}}) == "zero"
-    # a genuinely empty/quiet frontier (no histogram at all) still records nothing
-    assert tick_state({"planned": 0, "dispatched": 0, "defer_reasons": {}}) == "none"
+    # a genuinely empty/quiet frontier (no histogram at all) is NOT the degraded class — since
+    # issue #341 it is its own `idle` observation, asserted in full below
+    assert tick_state({"planned": 0, "dispatched": 0, "defer_reasons": {}}) != "zero"
     # the pre-existing classes are unchanged by the degraded rescue
     assert tick_state({"planned": 3, "dispatched": 0,
                        "defer_reasons": {"existing-pr": 3}}) == "zero"
@@ -16469,6 +16470,78 @@ agent = "impl"
     # (degraded requires dispatched == 0), else every healthy tick with a single defer flips red
     assert tick_state({"planned": 3, "dispatched": 1,
                        "defer_reasons": {"existing-pr": 2}}) == "ok"
+
+    # ---- Issue #341: a completed tick over an EMPTY ready frontier is POSITIVE evidence, and
+    # records the fleet `idle` class so an open zero-dispatch alert recovers at once instead of
+    # waiting out the 48 h health window. The whole value of the class is that it is an
+    # OBSERVATION, so every shape that is merely an ABSENCE of information must stay `none` (which
+    # records nothing at all). ----
+    assert tick_state({"planned": 0, "dispatched": 0, "defer_reasons": {}}) == "idle"
+    # ...but only when the claim step itself SUCCEEDED. A failed claim that already wrote its
+    # early planned==0 summary is not an observation of an empty frontier; recording `idle` there
+    # would recover the alert off the back of the failure that caused it.
+    assert tick_state({"planned": 0, "dispatched": 0, "defer_reasons": {}}, "failure") == "none"
+    # ...and neither a missing summary on a non-failing claim nor an unusable `planned` may be
+    # promoted to an observation (the fail-closed fallback, reachable when the summary write lost
+    # a disk error or the schema drifts).
+    assert tick_state(None, "success") == "none"
+    assert tick_state({"planned": None, "dispatched": 0, "defer_reasons": {}}) == "none"
+    # ...and an empty frontier does NOT mask a lane stall: the safety-disarm failure still wins,
+    # because `zero` is evaluated first. Reordering the chain would let a dead disarm lane report
+    # itself healthy on every quiet tick.
+    assert tick_state({"planned": 0, "dispatched": 0, "defer_reasons": {},
+                       "lanes": {"disarm": {"planned": 1, "launched": 0, "error": 1}}}) == "zero"
+
+    # ---- ...and the SHELL half of the same seam, which no assertion above can see: the `case`
+    # that turns each state into a model-health record. Pinned as the EXACT, WHOLE command each arm
+    # runs — line-continuations rejoined, comments dropped — never a substring or a flag search.
+    # Substring/flag-set pinning would miss the two mutants that matter most here, and both are
+    # live footguns rather than hypotheticals: wrapping the recorder in an `if` (it then vanishes
+    # on exactly the quiet tick it exists for — the #938 shape) and appending `|| true` (which
+    # swallows the deliberately-nonzero exit a dropped record must fail on). Re-pointing `idle` at
+    # `success` — the variant that would fabricate fleet-health evidence for the aged-out park
+    # exit — deleting an arm, or handing one the wrong --provider all fail here too. ----
+    _state_case = re.search(r'\n *case "\$state" in\n(.*?)\n *esac', workflow, re.DOTALL)
+    assert _state_case, "dispatch.yml lost the tick-state record dispatcher"
+    _record_arms, _arm = {}, None
+    for _line in _state_case.group(1).splitlines():
+        _stripped = _line.strip()
+        if not _stripped or _stripped.startswith("#") or _stripped == ";;":
+            continue
+        _label = re.match(r"^([a-z]+)\)$", _stripped)
+        if _label:
+            _arm = _label.group(1)
+            _record_arms[_arm] = [""]
+            continue
+        if _arm is None:
+            continue
+        _continues = _stripped.endswith("\\")
+        _record_arms[_arm][-1] += ((" " if _record_arms[_arm][-1] else "")
+                                   + (_stripped[:-1].strip() if _continues else _stripped))
+        if not _continues:
+            _record_arms[_arm].append("")
+    _record_arms = {_k: [_c for _c in _v if _c] for _k, _v in _record_arms.items()}
+
+    def _record_cmd(exit_class):
+        return ('python3 registry/scripts/model-health.py record --provider fleet '
+                f'--exit-class {exit_class} '
+                '--run-id "$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"')
+
+    assert _record_arms == {"zero": [_record_cmd("zero-dispatch")],
+                            "abort": [_record_cmd("claim-abort")],
+                            "ok": [_record_cmd("success")],
+                            "idle": [_record_cmd("idle")]}, _record_arms
+    # EVERY state the classification block can emit is either recorded or is the deliberate
+    # record-nothing fallback — nothing may fall between the two. A new state token added above
+    # with no arm below (or an arm for `none`, which would record an absence of information as an
+    # observation) reds here instead of silently dropping the tick's health signal.
+    _emitted_states = {tick_state(*case) for case in (
+        ({"planned": 0, "dispatched": 0, "defer_reasons": {"snapshot-skip:x": 1}},),
+        ({"planned": 0, "dispatched": 0, "defer_reasons": {}},),
+        ({"planned": 3, "dispatched": 2, "defer_reasons": {}},),
+        (None, "failure"),
+        (None, "success"))}
+    assert _emitted_states == set(_record_arms) | {"none"}, (_emitted_states, set(_record_arms))
 
     # ---- [issue #111, round 2] PLAN's trusted() author filter, exec'd from dispatch.yml itself
     # (not a re-implemented copy) so these pin the workflow's REAL advisory behavior. Two pinned
