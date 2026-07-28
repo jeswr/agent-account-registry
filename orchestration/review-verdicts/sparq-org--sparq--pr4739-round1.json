@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4739,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "60630a4a5b5be3f8f2f7da2a88065afef919678d",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 6 explicitly captures four newly discovered correctness/UX/documentation follow-ups\u2014the runaway-unroll hang, two source-location losses, a stale mem2reg ordering comment, and a changelog overclaim\u2014but says they should merely ride with a future substantive PR. The repository contract requires identified future work to be captured as beads and forbids leaving it as Markdown follow-up/TODO material. The measurement gate that justifies not promoting the eight optimization hypotheses does not apply to these independent findings. As written, the PR is incomplete because these actionable discoveries have no durable task-graph entry.",
+    "file": "research/noir-optimization-new-opportunities.md",
+    "fix_hint": "Create appropriately scoped bead(s) for the four independent follow-ups and cite their IDs here, or remove the follow-up list if the findings are not actionable. Keep the eight optimization candidate specs unpromoted until their stated measurement gate is met.",
+    "severity": "major",
+    "title": "Actionable follow-up work is left untracked in Markdown"
+   }
+  ],
+  "progress": null,
+  "summary": "The research note is unusually careful about its lack of measurements and generally separates hypotheses from results, but it is not complete under the repository's task-tracking contract. It records several newly discovered, actionable follow-ups in prose while explicitly declining to create tracking items for them. That makes the findings easy to lose and directly conflicts with AGENTS.md's requirement that future work be captured as beads rather than Markdown TODOs. The optimization candidates may reasonably remain promotion-gated, but the independent correctness/UX/documentation findings still require tracking or removal from the follow-up list.",
+  "verdict": "request_changes"
+ }
+}
