@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4811,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f1bb95be0a7337349e01d39f9e61eda9e4f9df60",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The script builds and streams each leg's human-readable output independently, but it never captures or compares the released and upstream triple counts and digests. Each binary only checks repeated parses against its own warm-up. Consequently, two parsers that deterministically produce different triple streams both succeed and the one-command A/B exits 0, despite README.md and the research record presenting equal count plus digest as the load-bearing differential invariant. This is materially the same first major finding from round 3.",
+    "file": "bench/parse/oxttl-prefix-alloc/ab.sh",
+    "fix_hint": "Have every compared leg emit a machine-readable result (the existing --json support can be used), compare both triples and digest against the released reference in ab.sh, and exit nonzero while reporting both sides on mismatch. Add a small script-level test or mutation check that deliberately changes one digest and proves the A/B command fails.",
+    "severity": "major",
+    "title": "The A/B command still does not enforce output equivalence"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 4 fixes the attribution-provenance defect: the global 9af7d59 substitution now updates the generated package description as well as dependency revisions. The load-bearing differential remains observational, however. ab.sh runs each parser independently and never compares the released and upstream triple counts or digests, so a stable wrong-answer regression still exits successfully. One of two prior major findings remains, so progress is improving but the PR is not yet approvable.",
+  "verdict": "request_changes"
+ }
+}
