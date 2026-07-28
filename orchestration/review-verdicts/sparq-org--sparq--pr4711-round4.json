@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4711,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "9fd64af3695ee0ba15af873e83b2a243c7e829bc",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "No correctness, soundness, test-validity, or security defect is evident. The round-3 grant-replay fix remains intact: both public union paths re-check the current authenticated agent and target against the grant's stored holder/target, while the unchecked union remains private. The integration test exercises the real signed-credential path and replays the same genuine grant across wrong-resource, wrong-requester, combined-mismatch, and absent-requester cases. The newly added feature-matrix leg closes the remaining CI coverage gap by compiling and testing the default-off trust-graph seam. The feature stays native-only, opt-in, and handler-unwired; the externally unaudited research scope is clearly caveated without asserting privacy or ZK soundness. Relative to round 3, the review remains clean with no findings.",
+  "verdict": "approve"
+ }
+}
