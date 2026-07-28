@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1006,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "aea000087467092165666f287819a23118b57820",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe stateful regression now independently exercises both sides of the route-delivery conjunction. It first proves a failed fallback close is not certified by a primary no-op, then opens the same marker on both distinct routes and proves a successful fallback close cannot overwrite a failed primary close. The per-repository failure control makes the route outcomes independently observable; the assertions pin the nonzero exit and both resulting issue states, and the final healthy tick verifies that the surviving primary issue is retried and closed. The setup follows the production fallback-marker enumeration and route binding, introduces no trust-check weakening or security expansion, and contains no reviewer-directed prompt injection.",
+  "verdict": "approve"
+ }
+}
