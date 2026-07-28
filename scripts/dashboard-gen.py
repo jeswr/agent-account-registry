@@ -2574,18 +2574,29 @@ def _self_test():
     # coverage and was not. The body is therefore EXTRACTED and EXECUTED against hermetic gh/jq
     # stubs, and every row below is an OUTCOME (which workflows got kicked) rather than a substring.
     # ------------------------------------------------------------------------------------------
+    def _keepalive_specs(script, leg):
+        """{workflow-file: (threshold-seconds, executed-marker or "")} read out of a leg's own
+        `for spec in ...` list. A watch list that cannot be read is a REFUSAL, never an empty
+        dict: the rows below would all pass trivially against a leg watching nothing."""
+        spec_line = re.search(r"for spec in ([^\n]+); do", script)
+        if spec_line is None:
+            raise DashboardError(
+                f"{leg}'s spec list could not be located in the extracted step body — refusing "
+                "to assert against a keepalive whose watch list cannot be read (fail closed)")
+        specs = {}
+        for raw in spec_line.group(1).split():
+            fields = raw.split(":")
+            if len(fields) not in (2, 3) or not fields[1].isdigit():
+                raise DashboardError(f"unparseable spec {raw!r} in {leg} — refusing")
+            specs[fields[0]] = (int(fields[1]), fields[2] if len(fields) > 2 else "")
+        if not specs:
+            raise DashboardError(f"{leg} watches no workflow at all — refusing")
+        return specs
+
     keepalive_script = _workflow_step_script(dashboard_workflow, "registry-keepalive")
-    spec_line = re.search(r"for spec in ([^\n]+); do", keepalive_script)
-    if spec_line is None:
-        raise DashboardError(
-            "cron-keepalive's spec list could not be located in the extracted step body — refusing "
-            "to assert against a keepalive whose watch list cannot be read (fail closed)")
-    keepalive_specs = {}
-    for raw in spec_line.group(1).split():
-        fields = raw.split(":")
-        if len(fields) not in (2, 3) or not fields[1].isdigit():
-            raise DashboardError(f"unparseable cron-keepalive spec {raw!r} — refusing")
-        keepalive_specs[fields[0]] = (int(fields[1]), fields[2] if len(fields) > 2 else "")
+    keepalive_specs = _keepalive_specs(keepalive_script, "cron-keepalive")
+    sparq_script = _workflow_step_script(dashboard_workflow, "sparq-keepalive-dispatch")
+    sparq_specs = _keepalive_specs(sparq_script, "the cross-repo cron-keepalive leg")
 
     # The floor module is the OTHER side of this wire contract. Loaded rather than restated, so the
     # marker name and the tick interval cannot drift out from under the threshold below.
@@ -2637,6 +2648,10 @@ case "${endpoint}" in
     jq -r "${filter}" < "${STUB_DIR}/artifacts.json"
     ;;
   *"/runs?per_page=30")
+    if [ "${STUB_LIVE_FAIL}" = 1 ]; then
+      printf 'gh-stub: live-run read failed\n' >&2
+      exit 1
+    fi
     wf="${endpoint#*/workflows/}"; wf="${wf%%/*}"
     jq -r "${filter}" < "${STUB_DIR}/live-${wf}.json"
     ;;
@@ -2658,11 +2673,14 @@ esac
     def _ka_run(age, status="completed"):
         return {"id": 1, "status": status, "conclusion": "success", "created_at": _ka_stamp(age)}
 
-    def run_keepalive_step(*, artifacts=(), runs=None, live=None, artifacts_fail=False):
-        """Execute the REAL cron-keepalive body. -> (exit code, [workflows kicked], log).
+    def run_keepalive_leg(script, specs, *, artifacts=(), runs=None, live=None,
+                          artifacts_fail=False, live_fail=False):
+        """Execute a REAL cron-keepalive leg body. -> (exit code, [dispatch argv], log).
 
         Every listed workflow defaults to one settled run a minute old and no live run, so a row
-        that says nothing about a workflow is asserting that leg stayed quiet."""
+        that says nothing about a workflow is asserting that leg stayed quiet. The dispatch argv is
+        returned WHOLE rather than reduced to workflow names, so a leg's target repository and ref
+        can be pinned by equality — the seam where a substring assertion goes vacuous."""
         runs, live = dict(runs or {}), dict(live or {})
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2673,7 +2691,7 @@ esac
             (binaries / "gh").chmod(0o755)
             (stubs / "artifacts.json").write_text(json.dumps({"artifacts": list(artifacts)}),
                                                   encoding="utf-8")
-            for workflow in keepalive_specs:
+            for workflow in specs:
                 (stubs / f"runs-{workflow}.json").write_text(
                     json.dumps({"workflow_runs": list(runs.get(workflow, [_ka_run(60)]))}),
                     encoding="utf-8")
@@ -2682,16 +2700,22 @@ esac
             calls = root / "calls"
             calls.write_text("", encoding="utf-8")
             completed = subprocess.run(
-                ["bash", "-c", keepalive_script], cwd=directory, capture_output=True, text=True,
+                ["bash", "-c", script], cwd=directory, capture_output=True, text=True,
                 timeout=120, check=False,
                 env=dict(os.environ,
                          PATH=f"{binaries}{os.pathsep}{os.environ.get('PATH', '')}",
                          GITHUB_REPOSITORY="o/r", GH_TOKEN="stub",
                          STUB_DIR=str(stubs), STUB_CALLS=str(calls),
-                         STUB_ARTIFACTS_FAIL="1" if artifacts_fail else "0"))
-            kicked = sorted(re.findall(r"workflows/(\S+?)/dispatches",
-                                       calls.read_text(encoding="utf-8")))
-        return completed.returncode, kicked, completed.stdout + completed.stderr
+                         STUB_ARTIFACTS_FAIL="1" if artifacts_fail else "0",
+                         STUB_LIVE_FAIL="1" if live_fail else "0"))
+            dispatched = sorted(line for line in calls.read_text(encoding="utf-8").split("\n")
+                                if "/dispatches" in line)
+        return completed.returncode, dispatched, completed.stdout + completed.stderr
+
+    def run_keepalive_step(**fixtures):
+        """The REGISTRY leg, subject of the #922 rows. -> (exit code, [workflows kicked], log)."""
+        code, dispatched, log = run_keepalive_leg(keepalive_script, keepalive_specs, **fixtures)
+        return code, sorted(re.findall(r"workflows/(\S+?)/dispatches", "\n".join(dispatched))), log
 
     marker_name = tick_floor.TICK_MARKER_ARTIFACT
     dispatch_limit = keepalive_specs["dispatch.yml"][0]
@@ -2762,6 +2786,74 @@ esac
     keepalive_check(
         "[#922] control: a fleet that is fresh on BOTH anchors is kicked not at all",
         (code, kicked), (0, []), log)
+    # #559's guard has TWO live statuses and the row above exercises one. A guard narrowed to
+    # `.status == "in_progress"` leaves a QUEUED run — the run a kick most directly duplicates,
+    # because the singleton group then runs the pair back to back — kicked behind, which is the
+    # storm itself.
+    code, kicked, log = run_keepalive_step(
+        artifacts=[_ka_marker(dispatch_limit + 600)],
+        live={"dispatch.yml": [_ka_run(30, status="queued")]})
+    keepalive_check(
+        "[#559] a QUEUED run is live too — the guard reads 'not completed', not 'in_progress'",
+        (code, kicked), (0, []), log)
+    # ...and the guard's OWN fail-open, which nothing executed before: a live check that cannot be
+    # read must fall through to the age check. A guard that treats an unreadable read as "live"
+    # silences the whole keepalive on exactly the API blip it was added to survive.
+    code, kicked, log = run_keepalive_step(
+        artifacts=[_ka_marker(dispatch_limit + 600)], live_fail=True)
+    keepalive_check(
+        "[#559] FAIL-OPEN: an unreadable live-run check still consults age, and still kicks a "
+        "stale target", (code, kicked), (0, ["dispatch.yml"]), log)
+
+    # --- #559: the CROSS-REPO leg. It kicks sparq-org/sparq, where a dup-dispatch storm shows up in
+    # ANOTHER repo's telemetry entirely, and until now nothing executed it: the live-run guard, the
+    # target repository and the ref were all covered by `bash -n` and actionlint, neither of which
+    # can see any of the three. Same hermetic harness, same stubs — a leg of the mesh with no
+    # executable coverage is a leg that silently reverts.
+    # ------------------------------------------------------------------------------------------
+    sparq_target = "rearm-sweeper.yml"
+    check("[#559] the cross-repo leg watches exactly the one RUN-anchored spec these rows drive — "
+          "a second target, or a marker-anchored one (which this leg's 2-field `${spec##*:}` parse "
+          "cannot express), must go red here rather than ship untested",
+          {name: marker for name, (_limit, marker) in sparq_specs.items()},
+          {sparq_target: ""})
+    if sparq_target not in sparq_specs:
+        raise DashboardError(
+            f"the cross-repo keepalive leg no longer watches {sparq_target} — refusing: the #559 "
+            "rows below cannot be driven against a target that is not there, and a NAMED refusal "
+            "beats aborting the suite half-way through on a KeyError")
+    sparq_limit = sparq_specs[sparq_target][0]
+    # Pinned by EQUALITY, and deliberately not assembled from anything the body supplies: owner,
+    # repo and ref are the three values a mis-edit here would silently redirect (a kick at `master`
+    # on a `main`-default repo 404s and the sweeper simply stops being revived).
+    sparq_dispatch = ("api -X POST "
+                      f"repos/sparq-org/sparq/actions/workflows/{sparq_target}/dispatches "
+                      "-f ref=main")
+    code, dispatched, log = run_keepalive_leg(
+        sparq_script, sparq_specs, runs={sparq_target: [_ka_run(sparq_limit + 600)]})
+    keepalive_check(
+        "[#559] the cross-repo leg kicks a stale sparq sweeper — at sparq-org/sparq, on `main`",
+        (code, dispatched), (0, [sparq_dispatch]), log)
+    for status in ("queued", "in_progress"):
+        code, dispatched, log = run_keepalive_leg(
+            sparq_script, sparq_specs,
+            runs={sparq_target: [_ka_run(sparq_limit + 600)]},
+            live={sparq_target: [_ka_run(30, status=status)]})
+        keepalive_check(
+            f"[#559] ...but never behind a run whose status is {status}: an ancient run listing is "
+            "NOT stale while that run is still live, which is the cancel-storm this guard ends",
+            (code, dispatched), (0, []), log)
+    code, dispatched, log = run_keepalive_leg(
+        sparq_script, sparq_specs, runs={sparq_target: [_ka_run(sparq_limit + 600)]},
+        live_fail=True)
+    keepalive_check(
+        "[#559] FAIL-OPEN cross-repo too: an unreadable live check falls through to the age check "
+        "rather than wedging the sweeper's only fallback shut",
+        (code, dispatched), (0, [sparq_dispatch]), log)
+    code, dispatched, log = run_keepalive_leg(sparq_script, sparq_specs)
+    keepalive_check(
+        "[#559] control: a sweeper that ran inside its threshold is not kicked at all — the leg is "
+        "not simply dispatching on every fire", (code, dispatched), (0, []), log)
 
     # --- #612 review round 2, finding 5 (MINOR): the successful CLI -> builder handoff. Deleting
     # `probe_status=probe_status` from main()'s build_dashboard call left every direct-builder test

@@ -539,6 +539,13 @@ jobs:
           permission-actions: write
 
       - name: Dispatch stale sparq scheduled workflows (cross-repo keepalive)
+        # `id:` so dashboard-gen.py's self-test can EXTRACT and EXECUTE this body too (#559): the
+        # registry leg above has been executed against hermetic stubs since #922, but this leg —
+        # the one that kicks ANOTHER repo, where a dup-dispatch storm is not even visible in this
+        # repo's telemetry — had its live-run guard covered by nothing. `bash -n` and actionlint
+        # both pass a body with the guard deleted, so the guard was one careless edit from silently
+        # reverting to the #559 machine-gun.
+        id: sparq-keepalive-dispatch
         if: steps.sparq-keepalive-token.outputs.token != ''
         env:
           GH_TOKEN: ${{ steps.sparq-keepalive-token.outputs.token }}
