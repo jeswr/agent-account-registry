@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4338,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "fec2830903c6a59ad843170b4e1700131f55d765",
+  "round": 6
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 5's major finding is resolved. The multi-part branch now requires exact alignment between select, gold_count, and gold_keys part names, compares each th03 part's returned first-column entity set against gold_keys[part], and retains the independent per-part row-count check. The new end-to-end mutations replace one truth_bearer and one info_bearer while preserving cardinality, drive main(), and assert a non-zero exit without a gold_count mismatch, so they exercise the real dispatch path and are not vacuous. The hermetic suite passes all 47 tests. No correctness, soundness, test-validity, or security issue remains in the reviewed diff.",
+  "verdict": "approve"
+ }
+}
