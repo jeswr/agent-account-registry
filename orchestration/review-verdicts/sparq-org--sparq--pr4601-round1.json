@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 4601,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "31b97579300ff755275af3ccf75606a074a1d910",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 6 says exit condition 3 becomes automatically detectable once P1 and P2 land, but condition 3 covers GPU-family crates appearing in any shipped bundle's dependency graph, explicitly \u201cnative or wasm.\u201d P1 only extends scripts/wasm-deps-guard.sh, and P2 only detects a dependency on sparq-gpu. A native shipped crate could depend directly on wgpu/naga (or otherwise acquire that closure) without depending on sparq-gpu, so neither proposed gate would fire. This makes the central claim that the deferral will mechanically expire incomplete.",
+    "file": "research/gpu-threat-model.md",
+    "fix_hint": "Either narrow exit condition 3 and the automatic-detection claim to wasm only, or add a planned native shipped-artifact dependency-graph guard that covers the native half. State precisely which P-item detects each exit condition.",
+    "severity": "major",
+    "title": "The proposed gates do not detect the native half of exit condition 3"
+   },
+   {
+    "body": "Section 7 calls P1\u2013P6 \u201ceach a future bead,\u201d but the document supplies no bead IDs and the task database contains only the broad sq-vrye deferral bead, whose description does not capture these concrete implementation items. The repository contract requires identified follow-up work to be created as beads rather than left as Markdown plans. Without tracked items, the promised isolation guards, malformed-input tests, bounded probe/poll work, exit model, and governance updates can be lost, undermining the record's claim of checkable deferral.",
+    "file": "research/gpu-threat-model.md",
+    "fix_hint": "Create beads for the independently actionable P1\u2013P6 work (combining tightly coupled items is fine), then replace the bare P labels or augment the table with their bead IDs and dependencies. Keep sq-vrye as the parent/exit-model tracker if appropriate.",
+    "severity": "major",
+    "title": "The phased plan records future work without actual beads"
+   },
+   {
+    "body": "T-GPU-INT is titled \u201cInformation disclosure via wrong answer,\u201d but the described behavior is silent result corruption/undercounting. That is a Tampering/query-result-integrity threat, not Information Disclosure; no confidential information is disclosed by the cited behavior. This conflicts with the section's own asset classification and can distort later threat accounting.",
+    "file": "research/gpu-threat-model.md",
+    "fix_hint": "Relabel the STRIDE category as Tampering (or omit the STRIDE parenthetical) and describe it as a query-result integrity failure.",
+    "severity": "minor",
+    "title": "Wrong-answer integrity failure is mislabeled as information disclosure"
+   }
+  ],
+  "progress": null,
+  "summary": "The deferral record is thoughtful and its cited GPU correctness/availability findings match the implementation, but it is not complete as written. Its claimed mechanical detection does not cover the native half of its own exit condition, and its six explicitly deferred work items are not represented by actual beads despite the repository's required task-tracking discipline. There is also a STRIDE-category error in the wrong-answer finding.",
+  "verdict": "request_changes"
+ }
+}
