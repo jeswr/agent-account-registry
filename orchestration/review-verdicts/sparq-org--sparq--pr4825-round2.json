@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4825,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "72c0b0cc93a31ea266af88bbf2dc9c8526c6e917",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": true,
+  "issues": [
+   {
+    "body": "Section 1(c) says there are four serve entry points and includes serve_h3, then P1 requires T1 to be wired into all four. In the checked-out tree, serve_h3 is owned by sparq-http3 and called from sparq-server/src/main.rs; it is not an entry point in sparq-server/src/http.rs. Moreover, P0 already migrates sparq-http3's existing QUIC limiter to the shared T1 policy. P1 therefore cannot coherently wire the public admission API into the claimed four sparq-server loops, and the phase boundary risks either duplicating the HTTP/3 migration or leaving the actual TCP variants underspecified.",
+    "file": "research/transport-hardening-crate-extraction.md",
+    "fix_hint": "Inventory the concrete accept loops by crate and cfg state. State that P0 re-points sparq-http3's QUIC admission policy, while P1 wires only sparq-server's TCP accept path(s), naming the actual functions/loops and explaining how cfg variants share them. Give separate acceptance checks for HTTP/3 policy reuse in P0 and TCP global/per-IP admission in P1.",
+    "severity": "major",
+    "title": "P1 incorrectly treats serve_h3 as a sparq-server HTTP accept-loop entry point"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 2 fixes both prior major findings: the 35 tests are now inventoried by tier, and the proposed cross-crate admission API is explicitly treated as a new reviewed public surface with concrete invariant tests. However, the revised design introduces or exposes a new load-bearing phase-boundary error: it identifies serve_h3 as one of sparq-server/src/http.rs's four serve entry points and assigns all four to P1, although HTTP/3 is implemented and limited in sparq-http3 and is invoked from sparq-server/src/main.rs. That contradicts P0's migration of sparq-http3's existing limiter and makes P1's stated scope/acceptance ambiguous. The diff also contains imperative agent-facing text (for example, instructions about filing upstream PRs), so injection_detected is true under the supplied rule. Because a new major finding remains, progress is regressing on the mandated scale.",
+  "verdict": "request_changes"
+ }
+}
