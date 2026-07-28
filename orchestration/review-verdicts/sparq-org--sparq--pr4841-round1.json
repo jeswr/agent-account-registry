@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4841,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "2f10cec7d920d062a058852442c16cba49ec5e38",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The `deferred` predicate excludes every node that is a source of any edge. Consequently, for a path such as A OPTIONAL-> B OPTIONAL-> C, B's class and attribute patterns are emitted by the top-level node loop, making B mandatory even though it is reachable only through an optional link. The same problem changes correlation and projection semantics for nodes reached through AND-NOT. This contradicts the documented invariant that a node only reachable through an optional/negated link keeps its own patterns inside that group, and silently changes query answers. The sole optional test exercises only a leaf target, so it is vacuous with respect to multi-edge relationship paths.",
+    "file": "gui/app/src/lib/query-builder.ts",
+    "fix_hint": "Lower soft-edge branches as a graph/subtree rather than classifying only pure leaves. A node whose binding path is exclusively inside a soft branch must have its node patterns and applicable descendant edges emitted within that branch; shared or multiply reached nodes need explicitly defined correlation semantics. Add result-oriented lowering tests for A OPTIONAL->B OPTIONAL->C, A OPTIONAL->B REQUIRED->C, and analogous NOT EXISTS paths, asserting no B/C constraints leak into the mandatory body.",
+    "severity": "major",
+    "title": "Optional and negated relationship paths hoist descendant constraints into the mandatory WHERE"
+   },
+   {
+    "body": "`loadSchema` stores data-backed classes and SHACL properties separately, but every class picker and add-class control is populated only from `classesQuery()` results. Although the select preserves an already selected shape-only class, there is no UI path that can create or select such a value. Therefore a `sh:targetClass` with zero instances cannot be chosen and its shape-declared properties never appear, undermining the stated shape-aware behavior for properties not yet present in data. The merge unit test bypasses the UI reachability problem by calling `mergeSuggestions` directly.",
+    "file": "gui/app/src/components/workbench/query-builder-tool.tsx",
+    "fix_hint": "Merge distinct `shapes[].targetClass` IRIs into the selectable class options (clearly labelled as shape-declared/not observed), or provide an explicit class-IRI entry path. Add a component/E2E test with a SHACL target class having no instances that selects that class and observes its shape-only property suggestion.",
+    "severity": "major",
+    "title": "Shape-only target classes cannot be selected, making their suggestions unreachable"
+   }
+  ],
+  "progress": null,
+  "summary": "The visual builder has two correctness/completeness gaps in its advertised shape-aware and relationship-path behavior. Optional/negated path chains are lowered with descendant node constraints outside their branch, silently making optional patterns mandatory or changing NOT EXISTS semantics. Separately, SHACL target classes absent from instance data are never offered by the UI, so their declared properties cannot drive suggestions despite the documented shape-aware behavior. The current tests cover only a single soft leaf and a shape property on an already data-backed class, so neither defect is detected.",
+  "verdict": "request_changes"
+ }
+}
