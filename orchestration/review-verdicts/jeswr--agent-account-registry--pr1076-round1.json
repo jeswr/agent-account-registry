@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 1076,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "424397c444690649cff8617c2b3cb6d1f80272b8",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "resolve_trust_surface_paths now deliberately subtracts any exact DEFAULT_TRUST_SURFACE_PATHS entry named by policy. For example, denying containers/ makes a containers/worker-model.Dockerfile change disappear from both review-outcome classification and ready_and_arm's live SHA-bound audit derivation. Keeping at least one unrelated surface does not fail closed for the removed path: a change wholly inside the denied tree receives no trust-surface audit evidence. The reviewer rules explicitly require rejection of changes that delete, relax, or skip the arm-side trust_surface_paths_touched classifier or weaken its audit trail.",
+    "file": "scripts/worker-pr.py",
+    "fix_hint": "Do not make mandatory defaults subtractable. Keep policy security_paths additive and the DEFAULT_TRUST_SURFACE_PATHS union unconditional. If a target needs a narrower concept, represent target applicability without removing the mandatory arm-side audit evidence, and obtain an explicit revision to the standing trust rule before implementing any subtraction.",
+    "severity": "blocker",
+    "title": "Mandatory arm-side trust surfaces can now be removed"
+   },
+   {
+    "body": "The new helper tests call resolve_trust_surface_paths directly, and policy-resolve tests only serialization. Nothing asserts that both live workflow sites pass --deny-surface-path, that the flag is exact and adjacent to each decoded value, or that main forwards args.deny_surface_path to both review_outcome and ready_and_arm. Deleting either new while-loop, renaming its flag, or dropping either production call-site argument would leave the added tests green. This is precisely the YAML/call-site seam where a control can become inert.",
+    "file": ".github/workflows/review-fix.yml",
+    "fix_hint": "Add offline structural tests that parse review-fix.yml and assert exact --deny-surface-path token membership at both the review-outcome and ready-and-arm sites, plus CLI/call-site tests that invoke main with a deny value and prove it reaches each consumer. Use an expected literal independent of the production constant, and include a mutation check showing each dropped site turns a named test red.",
+    "severity": "major",
+    "title": "The trust-sensitive YAML and CLI wiring has no non-vacuous seam test"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRequest changes. This introduces an explicit path for repository policy to remove entries from the arm-side mandatory trust-surface classifier. That weakens the audit trail protecting changes under those paths, contrary to the standing never-weaken rule; exact matching and a non-empty remainder do not preserve coverage of the removed surface. In addition, the new trust-sensitive value is tested only inside the Python helpers: there is no structural test of either workflow call site or of the CLI-to-function call site, so dropping or misspelling the new flag at the YAML seam would leave the full self-test suite green while silently changing the feature's behavior.",
+  "verdict": "request_changes"
+ }
+}
