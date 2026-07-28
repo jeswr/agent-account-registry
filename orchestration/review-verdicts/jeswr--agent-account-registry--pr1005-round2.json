@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1005,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "95e22184acedda521ff7f94105aca65490f22249",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "The round-1 provenance defect is corrected: the record now identifies its author only as `> \ud83e\udd16 SPARQ agent` and contains no hard-coded model marker. The design recommendation remains coherent and complete for its stated scope, and its load-bearing claims match the checked-out trust-plane implementation: clean cross-provider approval arms before the exhausted-budget branch; injection and self-attested provenance remain human stops; configured trust-surface paths extend the mandatory floor; trust-surface arming retains a SHA-bound audit trail; automatic re-admission is capped; and `needs:design` is a hard readiness gate. This documentation-only change weakens no gate or test, introduces no permissive path, and contains no instruction directed at the reviewer.",
+  "verdict": "approve"
+ }
+}
