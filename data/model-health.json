@@ -2092,6 +2092,14 @@
    "model_alias": "sol",
    "exit_class": "success",
    "run_id": "30330761852.1"
+  },
+  {
+   "ts": 1785215586,
+   "provider": "anthropic",
+   "account": "efb4eb2781de6958",
+   "model_alias": "opus5",
+   "exit_class": "success",
+   "run_id": "30330207083.1"
   }
  ]
 }
