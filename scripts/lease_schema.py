@@ -70,7 +70,15 @@ def plan_package(areas: Any) -> str:
     import it does (`plan_package_csv` below is the entry point for shell callers, so even a
     `run:` script has no reason to re-implement it)."""
     unique = {area for area in (areas or ()) if isinstance(area, str) and area}
-    if not unique:
+    if not unique or GLOBAL_PACKAGE in unique:
+        # [#938 review N2] `__global__` is the UNIVERSAL key, so it can never be an ordinary atom
+        # inside a composite: `plan_package(["__global__", "a"])` would otherwise be the key
+        # `"__global__,a"`, which `package_areas` reads as the NARROW set {"__global__", "a"} and
+        # which therefore does not conflict with `z` — a row that names the universal partition
+        # silently ceasing to reserve it. It absorbs instead. Unreachable through the live
+        # producers (`SAFE_AREA` in mint-provenance, `worker.yml`/`review-fix.yml`'s resolve
+        # gates, and `SAFE_PACKAGE` all reject that spelling), which is precisely why it must be
+        # closed by CONSTRUCTION here rather than left to those four gates staying correct.
         return GLOBAL_PACKAGE
     return PARTITION_SEPARATOR.join(sorted(unique))
 
@@ -86,8 +94,11 @@ def package_areas(package: Any) -> frozenset | None:
     if not isinstance(package, str) or not package or package == GLOBAL_PACKAGE:
         return None
     atoms = package.split(PARTITION_SEPARATOR)
-    if any(not atom for atom in atoms):
-        return None                       # a malformed key is unknown footprint, i.e. everything
+    if any(not atom or atom == GLOBAL_PACKAGE for atom in atoms):
+        # A malformed key — or one naming the universal partition as an atom — is unknown
+        # footprint, i.e. everything. `plan_package` cannot mint the second shape (it absorbs),
+        # but this reads keys off a ledger a different process wrote, so it decides it too.
+        return None
     return frozenset(atoms)
 
 
@@ -274,6 +285,22 @@ def _self_test() -> int:
     check("a readable key names EXACTLY its atoms",
           package_areas("a") == frozenset({"a"})
           and package_areas("a,b") == frozenset({"a", "b"}))
+    # [#938 review N2] `__global__` ABSORBS: it is the universal key, so it can never be one atom
+    # among others. Without this, `plan_package(["__global__", "a"])` is the key `"__global__,a"`,
+    # which reads as the NARROW set {"__global__", "a"} and does NOT conflict with `z` — a row
+    # that names the universal partition quietly ceasing to reserve it. Closed by construction
+    # rather than left to the four label-grammar gates upstream staying correct.
+    check("[N2] `__global__` absorbs — it is never an atom inside a composite key",
+          plan_package(["__global__", "a"]) == GLOBAL_PACKAGE
+          and plan_package(["a", "__global__", "b"]) == GLOBAL_PACKAGE
+          and plan_package(["__global__"]) == GLOBAL_PACKAGE
+          and plan_package_csv("__global__,a") == GLOBAL_PACKAGE)
+    check("[N2] ...and a key carrying it as an atom READS as the universal set, both directions",
+          package_areas("__global__,a") is None
+          and package_areas("a,__global__") is None
+          and packages_conflict("__global__,a", "z")
+          and packages_conflict("z", "__global__,a")
+          and package_conflicts_with_areas("__global__,a", {"z"}))
     # `package_conflicts_with_areas` is the same predicate against the busy UNION (a set of atoms
     # that may carry `__global__`). The two must agree wherever both are defined, or the assemble
     # leg and the allocator disagree about the same board.
