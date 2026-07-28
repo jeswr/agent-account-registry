@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1081,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "f352a7046417df18bf7cdef79de600f35868f2e9",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The workflow creates `BINDING_REF` and then runs `gh secret set`, but the binding is never advanced or qualified by evidence that this invocation stored the credential. If `gh secret set` fails before storing, the binding remains and reconciliation initially sees binding+404. A later out-of-band write to the same environment secret changes that state to binding+exists; the retry then emits `resume=true`/`stage=register` and creates an account around a credential this enrollment never captured. Thus moving the absence probes before the binding closes the prior refusal path but does not make the binding evidence of completed capture. The executable rows test bound+404 and bound+exists separately and explicitly bless the latter, but omit `binding created -> store fails -> 404 -> out-of-band secret appears -> retry`, so they cannot distinguish provenance.",
+    "file": ".github/workflows/set-up-account.yml",
+    "fix_hint": "Use durable protocol state that distinguishes capture intent from capture completion, and only let reconciliation register when completion is attributable to this enrollment. Add the full failed-store/later-out-of-band-write transition test and require it to refuse. If GitHub's secret API cannot provide an atomic or identity-bound completion proof across `gh secret set`, fail closed to manual recovery for the ambiguous pre-binding-only state rather than treating mere secret existence as successful capture.",
+    "severity": "major",
+    "title": "A pre-capture binding can still adopt a credential written after a failed store"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 3 fixes the prior round's exact ordering defect: both final secret-absence probes now precede creation of the claim-time binding, and the new static mutations pin each probe's refusal and 404 proof independently. However, the binding is still treated as proof of capture even though it is published before `gh secret set` and is not advanced by a successful store. A failed store can therefore leave the same durable state as a successful store; if the secret is subsequently created out of band, reconciliation adopts it and registers the account. The new tests cover binding+404 and binding+exists as isolated states but not the provenance-breaking transition between them. This is a new major finding, so progress is regressing under the required rubric.",
+  "verdict": "request_changes"
+ }
+}
