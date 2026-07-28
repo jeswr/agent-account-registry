@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4785,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ce8b77ff12970e823441e4f2c4712626a1ccc154",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves both prior findings. The design now explicitly limits the v1 elided target to checked unsigned add, excludes subtraction with a field-modulus underflow argument, disambiguates multiplication exclusions, and carries that scope consistently through the rule, proof, recommendation, and measurement caveats. The frequency result is now consistently described as 501 structural chain candidates and an upper bound, with the untested C0, C3, C5, and cover-survival conditions stated. The research-only scope, ACIR/Brillig boundary, prerequisite ordering, and absence of gate measurements are presented honestly. No correctness, soundness, test-validity, or security defect remains in the diff.",
+  "verdict": "approve"
+ }
+}
