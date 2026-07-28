@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4681,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "877b82c2b0919e8ef212390bf815a55cc62e7d1e",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 3 resolves the prior major finding. Both BEIR and materialization now invoke durable egress immediately after each completed unit, while the final sweep remains a retry and skips successfully uploaded files. The BEIR test is behavioral rather than a wiring-only grep: it kills the gather after the first cut, proves the final dump loop was not reached, and verifies that both completed envelopes were already sent while no envelope for the unfinished cut was uploaded. The success-path assertion also pins exactly-once uploads, and the materialization flow is split per scale so each scale can be swept before later work. The relevant hermetic tests pass. No new correctness, soundness, test-validity, or security issue was found in the diff.",
+  "verdict": "approve"
+ }
+}
