@@ -170,6 +170,16 @@ BLOCKQUOTE_LINE_RE = re.compile(r"^[ \t]{0,3}>.*$", re.M)
 # three of those rather than trusting the choice.
 SPAN_SENTINEL = "\x00"
 
+# BLOCK CONSTRUCTS, used only by `_continues_a_paragraph` to decide whether an indented line opens a
+# CommonMark indented code block. Each one is here because GitHub's own renderer puts `<pre><code>`
+# after it and this file used to bind the keyword instead — they are measured shapes, not a
+# from-first-principles list of markdown syntax.
+ATX_HEADING_RE = re.compile(r"^[ \t]{0,3}#{1,6}([ \t]|$)")
+SETEXT_UNDERLINE_RE = re.compile(r"^[ \t]{0,3}(=+|-+)[ \t]*$")
+THEMATIC_BREAK_RE = re.compile(r"^[ \t]{0,3}((\*[ \t]*){3,}|(-[ \t]*){3,}|(_[ \t]*){3,})$")
+FENCE_MARKER_RE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
+TABLE_ROW_RE = re.compile(r"^[ \t]{0,3}\|")
+
 # NEGATED PROSE — a best-effort suppressor, and honestly labelled as one.
 #
 # Unlike the four strips above, this is PROSE, so it cannot be a structural guarantee: an unlisted
@@ -332,36 +342,70 @@ def _load_policy_resolve():
 
 
 # ---- pure decisions (every one unit-tested by --self-test) -------------------------------------
+def _continues_a_paragraph(line):
+    """True when `line` leaves an OPEN PARAGRAPH that a following indented line would continue.
+
+    This is the predicate `strip_indented_code` turns on, and it is deliberately written as "what IS
+    paragraph text" rather than "what is a block construct", because the unknown case then falls to
+    NOT-a-paragraph — which strips, which refuses. An enumeration that fails safe is the only kind
+    worth having here.
+
+    Blockquote lines and HTML blocks other than a comment count as paragraph-ish ON PURPOSE, and
+    that is not a guess: GitHub renders `> quoted` + indented, and `<div>`/`</div>` + indented, as
+    PLAIN TEXT, because the indented line lazily continues the quote's paragraph in the first case
+    and is still inside the unterminated HTML block in the second. A comment is different — it is
+    the one HTML block that ends at its own terminator, so a line carrying `-->` really does close
+    it and the next indented line really is code. All of this is ground truth from GitHub's own
+    `POST /markdown`, not inference; see `_INDENTED_CODE_ORACLE` for the frozen table."""
+    if not line.strip():
+        return False                                  # a blank line closes any paragraph
+    if "-->" in line:
+        return False                                  # ...as does the END of an HTML comment
+    for pattern in (ATX_HEADING_RE, SETEXT_UNDERLINE_RE, THEMATIC_BREAK_RE, FENCE_MARKER_RE,
+                    TABLE_ROW_RE):
+        if pattern.match(line):
+            return False
+    return True
+
+
 def strip_indented_code(text):
     """`text` with every CommonMark INDENTED CODE BLOCK blanked out.
 
-    An indented code block is four spaces (or a tab) of indent on a line that a BLANK line opened —
-    the blank-line requirement is what keeps this off a wrapped paragraph continuation, which is
-    indented prose and really does declare. GitHub renders these as code and does not resolve a
-    closing keyword inside one, so neither may this.
+    CommonMark's rule is that an indented code block MAY NOT INTERRUPT A PARAGRAPH — so four spaces
+    (or a tab) of indent opens code exactly when the preceding line does not leave a paragraph open.
+    An earlier version of this function used "a BLANK line opened it", which is a DIFFERENT
+    predicate, and the difference was in the minting direction: wherever the preceding line ended a
+    NON-paragraph block, GitHub rendered `<pre><code>` while this file bound the reference as live.
+    MEASURED against GitHub's own renderer, 13 shapes diverged — ATX and setext headings, both
+    thematic-break forms, closed and multi-line HTML comments, closed ``` and ~~~ fences, a GFM
+    table, a tab or 8-space indent after a heading, and an indented FIRST body line. Each one minted
+    a real record end to end. That is round 1's blocking class, so the predicate is now the
+    CommonMark one and the seven-plus shapes are frozen as fixtures.
 
-    HONEST LIMIT, stated because it is a real false NEGATIVE and not a theoretical one: a paragraph
-    that continues a LIST ITEM is also blank-line-opened and four-space indented, so a declaration
-    written there is stripped and the PR refuses `no-issue-reference`. That is the deliberate
-    direction of this whole file — a refusal is a comment naming the one edit that fixes it, while a
-    wrong mint is silent, permanent and censused as a success (see the strip preamble above). No
-    live enrolled body declares from an indented line; --self-test pins both directions."""
-    kept, in_block, prev_blank = [], False, True
+    HONEST LIMIT — ONE divergence remains, and it is a false NEGATIVE, not a mint. A paragraph that
+    continues a LIST ITEM is blank-line-opened and four-space indented, so GitHub renders it as
+    prose and resolves a keyword in it while this file strips it and refuses `no-issue-reference`.
+    Closing it needs real list-context tracking (the marker's own content indent), which is the one
+    genuinely hard part of block parsing, and it buys a case nothing on the live population uses.
+    The direction is the deliberate one for this file: a refusal is a comment naming the single edit
+    that fixes it, while a wrong mint is silent, permanent and censused as a success. --self-test
+    pins BOTH directions, so this cannot drift into stripping ordinary prose."""
+    kept, in_block, prev_opens_code = [], False, True
     for line in (text or "").split("\n"):
         blank = not line.strip()
         indented = line.startswith("    ") or line.startswith("\t")
         if in_block and (blank or indented):
             kept.append("")
-            prev_blank = True
+            prev_opens_code = True
             continue
         in_block = False
-        if indented and prev_blank and not blank:
+        if indented and prev_opens_code and not blank:
             in_block = True
             kept.append("")
-            prev_blank = True
+            prev_opens_code = True
             continue
         kept.append(line)
-        prev_blank = blank
+        prev_opens_code = not _continues_a_paragraph(line)
     return "\n".join(kept)
 
 
@@ -415,6 +459,18 @@ def is_negated(text, keyword_start):
     return bool(NEGATOR_RE.search(window))
 
 
+def _stripped_title_and_body(title, body):
+    """The title and body stripped as the TWO SEPARATE DOCUMENTS GitHub renders them as, then joined.
+
+    Concatenating them first was itself a defect, and a measured one: the title occupied line 0, so
+    an indented FIRST body line always had a non-blank line above it and could never be recognised as
+    the code block GitHub renders it as. The same concatenation let an unclosed ``` or `<!--` in a
+    TITLE swallow the whole body, which GitHub — rendering the two independently — never does.
+
+    A title is a single line of plain text, so no block-level construct can span the two."""
+    return f"{strip_quoted_contexts(title or '')}\n{strip_quoted_contexts(body or '')}"
+
+
 def closing_references(title, body):
     """Every same-repository closing reference in the PR's title and body, split into what may
     BIND and what merely counts for AMBIGUITY.
@@ -422,7 +478,7 @@ def closing_references(title, body):
     Quoted context is stripped first, and the grammar then runs on what is left — so anything this
     returns is a keyword the author wrote in their own prose. It is still a textual `#N` in the
     original, so it also satisfies mint-provenance.references_issue's binding requirement."""
-    text = strip_quoted_contexts(f"{title or ''}\n{body or ''}")
+    text = _stripped_title_and_body(title, body)
     declared, seen = set(), set()
     for match in CLOSING_REF_RE.finditer(text):
         number = int(match.group(1))
@@ -442,7 +498,7 @@ def mentioned_issue_numbers(title, body):
 
     Reads the SAME stripped text the grammar does, so the hint never advertises a number that only
     exists inside a code block the author pasted."""
-    text = strip_quoted_contexts(f"{title or ''}\n{body or ''}")
+    text = _stripped_title_and_body(title, body)
     return sorted({int(number) for number in MENTION_RE.findall(text)})[:MAX_ADVISORY_MENTIONS]
 
 
@@ -1100,12 +1156,75 @@ def _self_test():                                                       # noqa: 
     check("...and a tab-indented one too",
           closing_issue_candidates("t", "prose\n\n\tCloses #1234"), [])
     # BOTH CONTROLS, because an indented strip that fires on ordinary prose refuses everything: an
-    # indented line that merely CONTINUES a paragraph is not blank-line-opened and still declares,
-    # and a declaration after the code block is untouched.
+    # indented line that merely continues a paragraph is not code and still declares, and a
+    # declaration after the code block is untouched.
     check("...while an indented PARAGRAPH CONTINUATION is prose and still declares",
           closing_issue_candidates("t", "some prose that wraps\n    Closes #7"), [7])
     check("...and a real declaration after the code block still binds",
           closing_issue_candidates("t", "prose\n\n    Closes #1234\n\nCloses #7"), [7])
+
+    # ---- THE PLATFORM IS THE ORACLE: GitHub's own renderer, frozen -----------------------------
+    # This file decides how GITHUB will interpret an author's text, so GitHub's renderer is the
+    # ground truth for it and it is one API call away (`POST /markdown`, mode `gfm`). It cannot be
+    # called per-body at sweep time — that would put a network dependency and a new failure mode on
+    # every derivation — so it is used as an ORACLE AT DEVELOPMENT TIME and its verdicts are frozen
+    # here as fixtures. Each row is a shape GitHub was actually asked about; `True` means GitHub put
+    # the keyword inside `<pre><code>`.
+    #
+    # WHY THE TABLE EXISTS. The predicate here used to be "an indented line that a BLANK line
+    # opened", which merely LOOKS like CommonMark's "may not interrupt a paragraph". They differ
+    # wherever the preceding line ends a NON-paragraph block, and every one of those differences was
+    # in the minting direction — 13 shapes where GitHub rendered code and this file bound the
+    # reference, each of which minted a real record end to end.
+    for label, body, github_renders_code in (
+            ("blank line then indented", "prose\n\n    Closes #4242", True),
+            ("ATX heading then indented", "## Evidence\n    Closes #4242", True),
+            ("setext heading then indented", "Evidence\n========\n    Closes #4242", True),
+            ("*** thematic break then indented", "prose\n\n***\n    Closes #4242", True),
+            ("--- underline then indented", "Evidence\n---\n    Closes #4242", True),
+            ("___ thematic break then indented", "prose\n\n___\n    Closes #4242", True),
+            ("closed HTML comment then indented", "<!-- c -->\n    Closes #4242", True),
+            ("multi-line HTML comment then indented", "<!-- a\nb -->\n    Closes #4242", True),
+            ("closed ``` fence then indented", "```\nx\n```\n    Closes #4242", True),
+            ("fence with a language then indented", "```python\nx\n```\n    Closes #4242", True),
+            ("closed ~~~ fence then indented", "~~~\nx\n~~~\n    Closes #4242", True),
+            ("GFM table then indented", "| a | b |\n|---|---|\n| c | d |\n    Closes #4242", True),
+            ("tab indent after a heading", "## Evidence\n\tCloses #4242", True),
+            ("8-space indent after a heading", "## Evidence\n        Closes #4242", True),
+            ("indented, then dedented prose after", "## E\n    Closes #4242\nmore prose", True),
+            ("two headings then indented", "# A\n## B\n    Closes #4242", True),
+            # ...and the shapes GitHub renders as PROSE, which therefore MUST still bind. Without
+            # these the strip could satisfy every row above by refusing everything.
+            ("paragraph continuation", "some prose that wraps\n    Closes #4242", False),
+            ("blockquote then indented (lazy continuation)", "> quoted\n    Closes #4242", False),
+            ("unterminated HTML block then indented", "<div>\n</div>\n    Closes #4242", False),
+            ("3-space indent is not code", "## E\n   Closes #4242", False),
+            ("`#Evidence` is not a heading", "#Evidence\n    Closes #4242", False),
+            ("heading, blank, paragraph, then indented",
+             "## E\n\nprose\n    Closes #4242", False)):
+        binds = closing_issue_candidates("t", body) == [4242]
+        check(f"GitHub ORACLE — {label}: renders as "
+              f"{'CODE, so the sweep must refuse' if github_renders_code else 'PROSE, so the sweep must bind'}",
+              binds, not github_renders_code)
+    # THE ONE REMAINING DIVERGENCE, asserted as the false negative it is rather than described. A
+    # list-item continuation is prose to GitHub and stripped here; closing it needs real list-context
+    # tracking. Pinned so it cannot silently flip to the MINTING direction, which is what would
+    # actually matter.
+    for label, body in (("a bullet item", "- item\n\n    Closes #4242"),
+                        ("a numbered item", "1. item\n\n    Closes #4242"),
+                        ("a nested item", "- a\n  - b\n\n    Closes #4242")):
+        check(f"KNOWN false negative — {label} continuation is prose to GitHub, refused here",
+              closing_issue_candidates("t", body), [])
+
+    # THE TITLE AND BODY ARE TWO DOCUMENTS, and concatenating them was itself a defect.
+    check("an indented FIRST body line is code, which a title on line 0 used to hide",
+          closing_issue_candidates("fix: thing", "    Closes #4242"), [])
+    check("...and an unclosed fence in the TITLE cannot swallow the body's declaration",
+          closing_issue_candidates("fix: add a ``` marker", "Closes #7"), [7])
+    check("...nor can an unclosed HTML comment in the title",
+          closing_issue_candidates("fix: <!-- wip", "Closes #7"), [7])
+    check("...while a fenced block WITHIN the body still strips as before",
+          closing_issue_candidates("fix: thing", "```\nCloses #4242\n```"), [])
 
     # ---- NEGATED PROSE: a suppressor that can only ever cause a refusal ------------------------
     check("negated prose does not declare anything",
