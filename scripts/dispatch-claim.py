@@ -21286,6 +21286,16 @@ def _identity_refusal_seam_self_test():
                     'handle.write(f"refusal={code}\\n")', 'pass  # refusal={code}')),
         "the identity step loses its id (every steps.target.* reference dangles)":
             lambda d: _identity_step(run_steps(d))[1].pop("id"),
+        "the identity step's `run:` is replaced by a non-string":
+            lambda d: _identity_step(run_steps(d))[1].__setitem__("run", ["nope"]),
+        # THE ADMISSION HOLE, stated as a mutant. Inverting the author comparison makes the gate
+        # refuse the App's OWN PRs and ADMIT every foreign author — the exact direction #972 must
+        # not drift in while closing the missing exit. It is caught on BOTH halves.
+        "the authorship comparison is INVERTED (admits every foreign author)":
+            lambda d: _identity_step(run_steps(d))[1].__setitem__(
+                "run", _identity_step(run_steps(d))[1]["run"].replace(
+                    'if os.environ["PR_AUTHOR"] != login:',
+                    'if os.environ["PR_AUTHOR"] == login:')),
         # --- the fail-closed stop ---
         "the refusal stop step is DELETED":
             lambda d: d["jobs"]["run"].__setitem__(
@@ -21323,6 +21333,8 @@ def _identity_refusal_seam_self_test():
         "reverify's identity_refusal conjunct is DELETED (the job dies before recording)":
             lambda d: find(outcome_steps(d), lambda s: s.get("id") == "reverify").__setitem__(
                 "if", "${{ inputs.mode == 'review' }}"),
+        "reverify loses its id (the #972 gating can no longer be addressed)":
+            lambda d: find(outcome_steps(d), lambda s: s.get("id") == "reverify").pop("id"),
         "reverify's conjunct is made CONDITIONALLY INERT (|| true)":
             lambda d: find(outcome_steps(d), lambda s: s.get("id") == "reverify").__setitem__(
                 "if", _IDENTITY_SEAM_REVERIFY_IF.replace(
