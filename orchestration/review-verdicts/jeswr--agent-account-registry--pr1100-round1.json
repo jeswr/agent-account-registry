@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1100,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "e7646f719f2969738ca17fbc069c550875d80c6e",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new text says a hand-created account must carry 4 for Anthropic or 12 for OpenAI and identifies a hand-written value of 1 as the fleet-capacity defect. However, `.github/ISSUE_TEMPLATE/account.yml`, the repository's dedicated manual registration UI, still pre-populates `max_concurrent_workers: 1` for every provider. An operator following that canonical path can accept the supplied value without encountering the corrected README example, leaving the exact defect in place. Updating only the prose therefore does not make the manual registration guidance correct and complete across the repository.",
+    "file": "README.md",
+    "fix_hint": "Include `.github/ISSUE_TEMPLATE/account.yml` in this change and make its provider-specific behavior unambiguous. Prefer separate provider-specific templates or a form/workflow that derives 12 for OpenAI and 4 for Anthropic; at minimum, remove the misleading literal 1 and force the operator to choose or enter the provider-appropriate value.",
+    "severity": "major",
+    "title": "The account issue template still mints the rejected cap of 1"
+   }
+  ],
+  "progress": null,
+  "summary": "The README's new provider-specific defaults are consistent with the broker and allocator, but the change is incomplete: the repository's primary account issue template still pre-fills every manually created account with the known-bad cap of 1. Thus a normal registration path continues to reproduce the fleet-capacity defect this documentation says to avoid.",
+  "verdict": "request_changes"
+ }
+}
