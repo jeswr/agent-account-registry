@@ -1008,6 +1008,13 @@ FULL_SELFTEST_SUITE=$(_derive_full_selftest_suite "$SCRIPT_DIR" "$SELFTEST_MANIF
 # scripts/dispatch-secrets-guard.py already do. A script-local fake is prepended AHEAD of this
 # sandbox, so it keeps winning and never reaches the shim.
 
+# Fixture identity for every hermeticity test below. A test that PROVES the sandbox refuses `gh`
+# must, by construction, be the one test that runs while the sandbox is mutated off -- so its argv
+# is the argv that reaches the live estate when the guard fails. It therefore names a repo that
+# CANNOT exist and a subcommand `gh` does not have. A third production-write incident tonight came
+# from a hermeticity fixture that named a LIVE pull request.
+SELFTEST_UNRESOLVABLE_REPO='sparq-selftest-invalid/does-not-exist-0000000000'
+
 # Materialize the sandbox `gh` into <bindir>. Refuses `gh` outright: logs the argv as evidence,
 # names itself on STDERR (never stdout -- self-tests parse stdout), and exits non-zero so the
 # escaping call does not receive a forged success.
@@ -1044,10 +1051,28 @@ _selftest_sandbox_intercepts() {
 # entry, and refuses any manifest entry that lost its entrypoint -- so "enrolled" and "sandboxed"
 # are the same set by construction, with no per-script opt-in to omit.
 run_enrolled_selftest() {
-  local script=$1 root=${2:-$SCRIPT_DIR}
-  local sandbox bindir log rc
+  local script=$1 root=${2:-$SCRIPT_DIR} sandbox rc
   sandbox=$(mktemp -d) || { printf '::error::self-test sandbox: mktemp failed\n' >&2; return 1; }
-  bindir="$sandbox/bin"; log="$sandbox/gh-escapes.log"
+  if _selftest_sandbox_materialize "$sandbox/bin"; then
+    _run_selftest_in_sandbox "$sandbox/bin" "$sandbox/gh-escapes.log" "$script" "$root"
+    rc=$?
+  else
+    printf '::error::self-test sandbox could not be materialized; refusing to run %s unsandboxed\n' \
+      "$script" >&2
+    rc=1
+  fi
+  # Removed by the EXACT path mktemp handed back -- never a glob. ~10 agents share /tmp on this box,
+  # and `rm -rf /tmp/<prefix>-*` from a sibling agent is a near miss that has already happened.
+  rm -rf -- "$sandbox"
+  return "$rc"
+}
+
+# The sandboxed run itself, with the shim directory passed IN so the self-test can drive it with a
+# deliberately BLIND sandbox and prove the canary refusal actually fires. Keeping the mktemp in the
+# caller is what makes that call site reachable from a test at all.
+_run_selftest_in_sandbox() {
+  local bindir=$1 log=$2 script=$3 root=$4
+  local rc
   local -a argv
   case "$script" in
     # migrate-secrets.sh accepts `--self-test | self-test`; every other enrolled shell script
@@ -1055,17 +1080,16 @@ run_enrolled_selftest() {
     *.py) argv=(python3 "$root/$script" --self-test) ;;
     *.sh) argv=(bash "$root/$script" self-test) ;;
     *) printf '::error::unsupported self-test suite entry: %s\n' "$script" >&2
-       rm -rf -- "$sandbox"; return 1 ;;
+       return 1 ;;
   esac
-  if ! _selftest_sandbox_materialize "$bindir"; then
-    printf '::error::self-test sandbox could not be materialized; refusing to run %s unsandboxed\n' \
-      "$script" >&2
-    rm -rf -- "$sandbox"; return 1
-  fi
+  # KNOWN-POSITIVE VALIDATION, on every single run. Prove the shim is really first on PATH BEFORE
+  # the emptiness assertion below is allowed to mean anything: a shim that never intercepts writes
+  # an empty log that is indistinguishable from success, and instruments fail toward
+  # "nothing to report".
   if ! _selftest_sandbox_intercepts "$bindir" "$log"; then
     printf '::error::self-test sandbox is NOT intercepting `gh` (the canary was not captured); refusing to run %s, because an empty escape log would prove nothing\n' \
       "$script" >&2
-    rm -rf -- "$sandbox"; return 1
+    return 1
   fi
   # WORKER_GH_BIN is an ABSOLUTE-path seam (`"${WORKER_GH_BIN:-/usr/bin/gh}"`, see _cmd_write_back)
   # that a PATH shim cannot see. Default it into the sandbox so the fallback cannot reach the real
@@ -1079,10 +1103,8 @@ run_enrolled_selftest() {
     printf '::error::self-test %s reached the real `gh` (%s intercepted invocation(s)) — a self-test must never touch the live estate\n' \
       "$script" "$(wc -l < "$log" | tr -d ' ')" >&2
     sed 's/^/::error::gh-escape /' "$log" >&2
-    rm -rf -- "$sandbox"
     return 1
   fi
-  rm -rf -- "$sandbox"
   return "$rc"
 }
 
@@ -5548,14 +5570,16 @@ HOOK
   : > "$sbxlog"
   local shim_out shim_rc
   shim_out=$(GH_ESCAPE_LOG="$sbxlog" SELFTEST_SANDBOX_SCRIPT=fixture.py \
-    "$sbxbin/gh" pr merge 903 --squash 2>/dev/null) && shim_rc=0 || shim_rc=$?
+    "$sbxbin/gh" __sandbox_probe__ --repo "$SELFTEST_UNRESOLVABLE_REPO" 2>/dev/null) \
+    && shim_rc=0 || shim_rc=$?
   chk "sandbox shim: REFUSES a gh invocation (non-zero, never a forged success)" \
     "$([[ "$shim_rc" -ne 0 ]] && printf refused || printf allowed)" "refused"
   # STDOUT must stay clean: several enrolled self-tests parse the stdout of what they drive, and a
   # chatty shim would corrupt their assertions instead of the escape being reported on its own.
   chk "sandbox shim: writes NOTHING to stdout" "${shim_out:-<empty>}" "<empty>"
   chk "sandbox shim: records the offending script AND the full argv as evidence" \
-    "$(cat "$sbxlog")" "$(printf 'fixture.py\tpr merge 903 --squash')"
+    "$(cat "$sbxlog")" \
+    "$(printf 'fixture.py\t__sandbox_probe__ --repo %s' "$SELFTEST_UNRESOLVABLE_REPO")"
   # The instrument must be canary-validated before its emptiness means anything (five instruments
   # failed for want of this in one night). Prove BOTH directions: a real shim is detected, and a
   # `gh` that does not log — i.e. a shim that is not really intercepting — is REFUSED, not trusted.
@@ -5577,14 +5601,16 @@ HOOK
   # production incidents looked exactly like this — a green suite over real writes — so the sandbox
   # must red on the ESCAPE LOG, never on the child's exit code.
   printf '%s\n' 'import subprocess, sys' \
-    'subprocess.run(["gh", "pr", "merge", "903", "--squash"], capture_output=True)' \
+    "REPO = '$SELFTEST_UNRESOLVABLE_REPO'" \
+    'subprocess.run(["gh", "__sandbox_probe__", "--repo", REPO], capture_output=True)' \
     'sys.exit(0)' > "$sfix/escaper.py"
-  printf '%s\n' '#!/usr/bin/env bash' 'gh issue comment 4534 --body hi || true' 'exit 0' \
+  printf '%s\n' '#!/usr/bin/env bash' \
+    "gh __sandbox_probe__ --repo $SELFTEST_UNRESOLVABLE_REPO || true" 'exit 0' \
     > "$sfix/escaper.sh"
   # The ABSOLUTE-path seam: `"${WORKER_GH_BIN:-/usr/bin/gh}"` bypasses PATH entirely, so a PATH shim
   # alone cannot see it. The sandbox defaults the variable into itself; this fixture proves it.
   printf '%s\n' 'import os, subprocess, sys' \
-    'subprocess.run([os.environ.get("WORKER_GH_BIN", "/usr/bin/gh"), "pr", "view", "1"],' \
+    'subprocess.run([os.environ.get("WORKER_GH_BIN", "/usr/bin/gh"), "__sandbox_probe__"],' \
     '               capture_output=True)' 'sys.exit(0)' > "$sfix/ghbin.py"
   printf '%s\n' 'import sys' 'sys.exit(3)' > "$sfix/failer.py"
   # The SUPPORTED escape hatch, and the reason no read allow-list is needed: a self-test that needs
@@ -5597,7 +5623,7 @@ HOOK
     '    open(p, "w").write("#!/bin/sh\nprintf FAKE-OK\n")' \
     '    os.chmod(p, 0o755)' \
     '    env = dict(os.environ, PATH=d + os.pathsep + os.environ["PATH"])' \
-    '    r = subprocess.run(["gh", "api", "x"], capture_output=True, text=True, env=env)' \
+    '    r = subprocess.run(["gh", "__sandbox_probe__"], capture_output=True, text=True, env=env)' \
     'sys.exit(0 if r.stdout == "FAKE-OK" else 1)' > "$sfix/ownfake.py"
 
   _sbx() { run_enrolled_selftest "$1" "$sfix" >/dev/null 2>&1 && printf clean || printf refused; }
@@ -5614,6 +5640,16 @@ HOOK
     "$(_sbx ownfake.py)" "clean"
   chk "sandbox: an unsupported suite entry is refused rather than run unsandboxed" \
     "$(_sbx notes.txt)" "refused"
+  # THE CANARY CALL SITE, not just the canary function: drive a real sandboxed run with a BLIND
+  # shim directory (a `gh` that does not log). The run must REFUSE rather than proceed and then
+  # report an empty escape log as a pass. Without this row, deleting the interception check from
+  # _run_selftest_in_sandbox leaves every other row above green.
+  chk "sandbox: a run whose shim is BLIND is refused, not reported clean on an empty log" \
+    "$(_run_selftest_in_sandbox "$deadbin" "$tmp/sandbox/blind.log" clean.py "$sfix" >/dev/null 2>&1 \
+       && printf clean || printf refused)" "refused"
+  chk "sandbox: the SAME run with a working shim is clean (the row above is not always-refused)" \
+    "$(_run_selftest_in_sandbox "$sbxbin" "$tmp/sandbox/live.log" clean.py "$sfix" >/dev/null 2>&1 \
+       && printf clean || printf refused)" "clean"
 
   # ---- THE YAML SEAM. pr-gate.yml is where the gate actually runs the suite, and a mutation there
   # is invisible to every python assertion in this repo. Pin the loop by EXACT WHOLE-BLOCK match:
