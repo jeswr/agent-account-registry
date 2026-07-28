@@ -1826,6 +1826,72 @@ def setup_account_binding_verdict(step_lines):
     return True, "ok"
 
 
+# ---- reading the #534 binding enumeration WHOLE (review round 1) ----------------------------------
+# The reconcile step's fresh-enrollment answer is a claim that NO credential was captured for this
+# request. A ref returned under the request's own namespace that the parser cannot read does not
+# support that claim — it may name a slot whose irreversible capture already happened — so it must
+# REFUSE, never be silently dropped. Two halves make that true, and only ONE of them is reachable by
+# the executable reconcile harness below (which stubs jq): so the half decided inside jq is kept
+# empty, and pinned empty here. `grep -vE` is the default-deny direction — a `grep -E` allowlist
+# would answer "some ref parsed", which is not the question.
+RECONCILE_BINDING_LIST_RE = re.compile(r"git/matching-refs/acct-requests/")
+RECONCILE_BINDING_GRAMMAR = "^acct[0-9]+/(openai|anthropic)/[a-z0-9]+(-[a-z0-9]+)*/[0-9a-f]{64}$"
+RECONCILE_BINDING_EMIT_RE = re.compile(r"printf 'resume=")
+
+
+def reconcile_binding_scan_verdict(body_text):
+    """Pure: (ok, reason). The reconcile body must (a) enumerate this request's claim-time bindings,
+    (b) decide NOTHING about them inside a jq program — no `select(`, no `test(` between the listing
+    and the shape check, because the harness stubs jq and anything decided there ships untested —
+    (c) apply the store step's binding grammar itself, DEFAULT-DENY, and (d) REFUSE on a non-empty
+    malformed set BEFORE any `resume=` answer is emitted. Losing (b) or (c) restores the review
+    round 1 fail-open exactly: an unreadable ref is dropped, `stage=fresh` is emitted, and the retry
+    burns a second slot around a credential the first run already captured."""
+    if not body_text:
+        return False, "the reconcile run-block could not be extracted from set-up-account.yml (fail closed)"
+    lines = [strip_shell_comments(line) for line in body_text.splitlines()]
+    list_index = grammar_index = emit_index = None
+    for index, line in enumerate(lines):
+        if list_index is None and RECONCILE_BINDING_LIST_RE.search(line):
+            list_index = index
+        if grammar_index is None and "grep -vE" in line and RECONCILE_BINDING_GRAMMAR in line:
+            grammar_index = index
+        if emit_index is None and RECONCILE_BINDING_EMIT_RE.search(line):
+            emit_index = index
+    if list_index is None:
+        return False, ("the reconcile step never lists `git/matching-refs/acct-requests/`, so the "
+                       "store->register gap cannot be detected at all (#534)")
+    if grammar_index is None:
+        return False, ("the binding grammar is not applied DEFAULT-DENY (`grep -vE "
+                       f"'{RECONCILE_BINDING_GRAMMAR}'`) to the enumerated bindings — an unreadable "
+                       "ref is then dropped and `stage=fresh` emitted without the negative having "
+                       "been proven, which mints a second slot around an already-captured "
+                       "credential (fail open; review round 1 of #534)")
+    if emit_index is None:
+        return False, "the reconcile step emits no `resume=` answer at all (fail closed)"
+    for index in range(list_index, grammar_index):
+        for decider in ("select(", "test("):
+            if decider in lines[index]:
+                return False, (f"the binding enumeration is filtered/classified by jq (`{decider}`) "
+                               "before the shape check — jq is STUBBED in the reconcile harness, so "
+                               "a ref dropped there is dropped untested (review round 1 of #534)")
+    guard_index = next((index for index in range(grammar_index, len(lines))
+                        if '-n "$malformed"' in lines[index]), None)
+    if guard_index is None:
+        return False, ("the malformed-binding set is computed but never TESTED — computing it and "
+                       "ignoring it is the same fail-open it exists to close (#534)")
+    exit_index = next((index for index in range(guard_index, min(guard_index + 4, len(lines)))
+                       if "exit 1" in lines[index]), None)
+    if exit_index is None:
+        return False, ("a malformed claim-time binding does not REFUSE (`exit 1`) — a warning still "
+                       "lets the fresh-enrollment answer through (#534)")
+    if not list_index < grammar_index < exit_index < emit_index:
+        return False, ("the malformed-binding refusal does not sit between the enumeration and the "
+                       "first `resume=` emission — a check that runs after the answer is written "
+                       "cannot withhold it (#534)")
+    return True, "ok"
+
+
 # BINDING-MAP CONTRACT (sol round 17 on the #275 PR; scan hardened round 18) — secrets-context
 # reads that make a job a secret CONSUMER. All three require the `${{` expression opener: a jq
 # `.secrets[].name` filter over an API listing, or prose quoting a reference, is not a context
@@ -3594,8 +3660,11 @@ esac
 # Hermetic jq stub: the harness controls each filter's OUTPUT directly (keyed on a fragment of
 # the filter PROGRAM, so the three filters the reconcile body runs stay distinguishable), and
 # the real jq binary is not required on the test host. NOTE the deliberate limit this inherits
-# from the #533 harness: injecting the outputs proves the reconcile body's CONTROL FLOW, not
-# the jq programs themselves — the ref-grammar `select(test(...))` is not exercised here.
+# from the #533 harness: injecting the outputs proves the reconcile body's CONTROL FLOW, not the
+# jq programs themselves. Review round 1 of #534 is why the binding filter now leaves jq with
+# nothing but an exact `ltrimstr` prefix strip: the BINDING GRAMMAR is a real `grep -E` in the
+# reconcile body, so injecting an entry here exercises the actual accept/reject decision rather
+# than a stubbed one.
 args="$*"
 cat > /dev/null 2>/dev/null || true
 case "$args" in
@@ -3789,6 +3858,95 @@ exit 0
         "still reachable (the new gate is not a blanket refusal)",
         (rc_nobind, "resume=false" in out_nobind, "resume=true" in out_nobind),
         (0, True, False))
+    # [#534, review round 1] A ref returned under THIS REQUEST'S OWN namespace that the grammar
+    # rejects is EVIDENCE, not noise: it may name a slot whose irreversible capture already
+    # happened. Dropping it and answering `stage=fresh` would burn a second slot and orphan that
+    # capture — the fail-OPEN round 1 found. So jq no longer filters: it strips the request prefix
+    # and the body itself grammar-checks EVERY entry default-deny, which is why these rows run the
+    # real accept/reject rather than a stubbed one. The stub emits what jq would: an entry under the
+    # prefix arrives stripped, anything else arrives with its `refs/` prefix intact.
+    MALFORMED_ENTRY = "acct09/bogus-provider/x"          # in-namespace, bogus provider, no digest
+    rc_bad, out_bad = run_reconcile("secret-404", bound=False, bindings=MALFORMED_ENTRY)
+    chk("[#534] reconcile: an UNPARSEABLE ref in the request's OWN binding namespace -> refuse, and "
+        "neither answer is emitted (dropping it emits exactly the `resume=false`/`stage=fresh` that "
+        "mints a second slot around an already-captured credential)",
+        (rc_bad != 0, "resume=false" in out_bad, "resume=true" in out_bad, "stage=" in out_bad),
+        (True, False, False, False))
+    # A ref the prefix strip did NOT touch — i.e. one this request-scoped listing should never have
+    # returned. Well-formed for ANOTHER request, so only the constant grammar (anchored at the
+    # handle, not at `refs/`) refuses it; resuming somebody else's binding is the worst outcome here.
+    FOREIGN_REF = "refs/acct-requests/9/acct09/anthropic/claude-oauth-token/" + "a" * 64
+    rc_foreign, out_foreign = run_reconcile("secret-exists", bound=False, bindings=FOREIGN_REF)
+    chk("[#534] reconcile: a ref outside this request's prefix (unstripped) is NOT a binding for it "
+        "-> refuse; never resume another request's slot, and never read the listing as empty",
+        (rc_foreign != 0, "resume=true" in out_foreign, "resume=false" in out_foreign),
+        (True, False, False))
+    MIXED_BINDINGS = MALFORMED_ENTRY + "\n" + ONE_BINDING
+    rc_mixed, out_mixed = run_reconcile("secret-exists", bound=False, bindings=MIXED_BINDINGS)
+    diag_mixed = reconcile_diag.get(("secret-exists", "ACCT07_TOKEN", True,
+                                     "jeswr/agent-account-registry", MIXED_BINDINGS), "")
+    chk("[#534] reconcile: one parseable binding does NOT license reading an enumeration that also "
+        "holds an unparseable ref as complete -> refuse NAMING the grammar (asserted on the message "
+        "because the generic ambiguity refusal would still fire with the shape check deleted)",
+        (rc_mixed != 0, "resume=true" in out_mixed,
+         "do not match the grammar" in diag_mixed),
+        (True, False, True))
+
+    # The rows above run the malformed-binding refusal for real, which is possible only because the
+    # DECISION lives in the shell rather than in the stubbed jq. That placement is itself the
+    # contract — move the shape test back inside a jq `select(...)` and the harness goes green while
+    # production silently drops refs again — so it is pinned statically here, both directions. The
+    # grammar is written out LITERALLY in the fixture: deriving it from the module constant the
+    # verdict reads would make the accept row unable to fail.
+    scan_sample = [
+        '''if ! refs=$(gh api --paginate "repos/$REPO/git/matching-refs/acct-requests/$ISSUE/"); then''',
+        '''  echo "::error::unreadable"; exit 1''',
+        '''fi''',
+        """if ! bindings=$(printf '%s' "$refs" | jq -r --arg req "$ISSUE" '""",
+        '''      .[].ref | ltrimstr("refs/acct-requests/" + $req + "/")\'); then''',
+        '''  echo "::error::unparseable"; exit 1''',
+        '''fi''',
+        """malformed=$(printf '%s' "$bindings" | grep -vE """
+        """'^acct[0-9]+/(openai|anthropic)/[a-z0-9]+(-[a-z0-9]+)*/[0-9a-f]{64}$' || true)""",
+        '''if [ -n "$malformed" ]; then''',
+        '''  echo "::error::malformed binding"; exit 1''',
+        '''fi''',
+        """printf 'resume=false\\n' >> "$GITHUB_OUTPUT\"""",
+    ]
+    chk("[#534] binding scan: enumerate -> jq strips only -> default-deny grammar -> refuse, all "
+        "before any `resume=` answer -> ok",
+        reconcile_binding_scan_verdict("\n".join(scan_sample)), (True, "ok"))
+    scan_jq = list(scan_sample)
+    scan_jq[4] = ('      .[].ref | select(test("^refs/acct-requests/" + $req + "/acct[0-9]+/.*$"))'
+                  '''\'); then''')
+    verdict_scan_jq = reconcile_binding_scan_verdict("\n".join(scan_jq))
+    chk("[#534] binding scan: the shape decision moved back INSIDE jq -> refuse, naming that jq is "
+        "stubbed (this mutant leaves every executable row above green, which is why it is pinned)",
+        (verdict_scan_jq[0], "STUBBED" in verdict_scan_jq[1]), (False, True))
+    scan_nogrammar = [line for line in scan_sample if "grep -vE" not in line]
+    verdict_scan_nogrammar = reconcile_binding_scan_verdict("\n".join(scan_nogrammar))
+    chk("[#534] binding scan: no grammar check at all -> refuse, naming the fail-open it restores",
+        (verdict_scan_nogrammar[0], "DEFAULT-DENY" in verdict_scan_nogrammar[1]), (False, True))
+    scan_allow = [line.replace("grep -vE", "grep -E") for line in scan_sample]
+    chk("[#534] binding scan: an ALLOWLIST direction (`grep -E`) answers 'some ref parsed', which is "
+        "not the question -> refuse",
+        reconcile_binding_scan_verdict("\n".join(scan_allow))[0], False)
+    scan_warn = [line.replace('  echo "::error::malformed binding"; exit 1',
+                              '  echo "::warning::malformed binding"') for line in scan_sample]
+    verdict_scan_warn = reconcile_binding_scan_verdict("\n".join(scan_warn))
+    chk("[#534] binding scan: malformed bindings only WARN -> refuse (a warning still lets the "
+        "fresh-enrollment answer through)",
+        (verdict_scan_warn[0], "REFUSE" in verdict_scan_warn[1]), (False, True))
+    scan_late = list(scan_sample)
+    scan_late.insert(7, scan_late.pop())     # the `resume=` emission, hoisted ahead of the check
+    verdict_scan_late = reconcile_binding_scan_verdict("\n".join(scan_late))
+    chk("[#534] binding scan: the refusal runs AFTER the answer is written -> refuse, ordering NAMED",
+        (verdict_scan_late[0], "cannot withhold it" in verdict_scan_late[1]), (False, True))
+    chk("[#534] binding scan: an unextractable reconcile body -> refuse (fail closed)",
+        reconcile_binding_scan_verdict("")[0], False)
+    chk("workflow: set-up-account reads request #ISSUE's claim-time binding enumeration WHOLE — "
+        "every returned ref must parse, or neither answer is emitted (#534 review round 1)",
+        reconcile_binding_scan_verdict(reconcile_script or ""), (True, "ok"))
     for key, expected_zero in (
             (("secret-exists", "ACCT07_TOKEN", True, "jeswr/agent-account-registry",
               ONE_BINDING), rc_bind),):

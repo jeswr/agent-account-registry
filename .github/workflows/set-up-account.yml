@@ -296,16 +296,29 @@ jobs:
             fi
             # `--paginate` emits one JSON array per page (an empty prefix is a legitimate `[]`, exit
             # 0 — distinguishable from the unreadable case above). jq's status is CAPTURED, not read
-            # through a process substitution: a filter that emitted an early page's match and then
-            # died on a later one would otherwise resume off a TRUNCATED enumeration. The shape is
-            # re-asserted here rather than trusted from the prefix — every component must match the
-            # grammar the store step wrote, so a ref hand-created in this namespace with a bogus
-            # provider/format is ignored rather than parsed into a record.
+            # through a process substitution: a filter that emitted an early page's entries and then
+            # died on a later one would otherwise resume off a TRUNCATED enumeration. jq does ONE
+            # thing here — the exact prefix strip, through `--arg` and never interpolation: a ref
+            # under this request's prefix becomes `<handle>/<provider>/<format>/<digest>`, anything
+            # else comes back UNTOUCHED (so it still carries its `refs/` prefix and cannot pass the
+            # grammar below), and NOTHING is filtered out. See the refusal for why.
             if ! bindings=$(printf '%s' "$refs" | jq -r --arg req "$ISSUE" '
-                  .[].ref
-                  | select(test("^refs/acct-requests/" + $req + "/acct[0-9]+/(openai|anthropic)/[a-z0-9]+(-[a-z0-9]+)*/[0-9a-f]{64}$"))
-                  | ltrimstr("refs/acct-requests/" + $req + "/")'); then
+                  .[].ref | ltrimstr("refs/acct-requests/" + $req + "/")'); then
               echo "::error::could not parse the claim-time slot bindings of request #$ISSUE to the end — it cannot be proven that no credential was captured for it (fail closed)"; exit 1
+            fi
+            # Review round 1: EVERY ref this request's OWN namespace returns is evidence, so one this
+            # parser cannot read may still be a binding — naming a slot whose (irreversible) capture
+            # already happened. Dropping it and falling through would emit `stage=fresh` without the
+            # negative ever having been PROVEN: fail-open into a second slot, orphaning the first
+            # capture — exactly the failure #534 exists to close. Only an enumeration in which EVERY
+            # returned ref parsed may authorize a fresh enrollment, so an unparseable one refuses
+            # here, before either answer is emitted. The grammar is the store step's, re-asserted
+            # rather than trusted from the prefix, and applied DEFAULT-DENY to every entry: it is a
+            # constant pattern (the request number was already pinned, exactly, by the strip above),
+            # so a ref for another request that this listing should never have returned fails it too.
+            malformed=$(printf '%s' "$bindings" | grep -vE '^acct[0-9]+/(openai|anthropic)/[a-z0-9]+(-[a-z0-9]+)*/[0-9a-f]{64}$' || true)
+            if [ -n "$malformed" ]; then
+              echo "::error::request #$ISSUE has claim-time slot binding entries that do not match the grammar the store step writes (relative to \`refs/acct-requests/$ISSUE/\`, unless they lie outside it: $(printf '%s' "$malformed" | tr '\n' ' ')) — a binding this parser cannot read may still name a slot whose credential was captured, so neither a resume nor a fresh enrollment can be authorized from here (fail closed). Resolve by hand: if nothing was captured for that ref, delete it; otherwise create the account issue for its slot (status:pending, \`secret_ref:\`, \`request_issue: $ISSUE\`) and re-apply set-up-account to resume it."; exit 1
             fi
             # A binding alone is not a credential: a run can claim a slot, bind it, and then die
             # before `gh secret set`. Only a slot whose secret is PROVEN present is resumable; a
