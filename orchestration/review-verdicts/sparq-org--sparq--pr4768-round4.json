@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4768,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "4b612e0df0945eec9d2b9d716e788e7977a9d799",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 4 remains clean. The migration removes rustls-pemfile coherently from both production TLS loaders, feature declarations, the lockfile, cargo-deny, cargo-vet, VEX, and compliance evidence. The replacement uses rustls-pki-types through rustls' own re-export, preserves certificate filtering and order, preserves first-supported-private-key behavior, and restores the prior no-key diagnostic for NoItemsFound. The focused loader test is non-vacuous: it checks ordered multi-certificate parsing, mixed cert/key bundles in both directions, and both missing-section errors. No correctness, soundness, test-validity, security, or instruction-injection issue is evident. Because round 3 also had no findings, progress is stagnant under the required comparison scale.",
+  "verdict": "approve"
+ }
+}
