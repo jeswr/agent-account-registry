@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4892,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "0dae34319205a988adafadc1e99cac937f806164",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change is documentation-only and accurately explains why the existing distroless runtime pin must remain an OCI multi-platform index digest for the amd64/arm64 buildx release. It does not alter the image reference, build behavior, dependency footprint, or runtime behavior. The maintainer-facing imperative in the Dockerfile comment is ordinary operational guidance tied to the pinning invariant, not an instruction directed at the reviewer.",
+  "verdict": "approve"
+ }
+}
