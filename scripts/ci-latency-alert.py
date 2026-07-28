@@ -1076,6 +1076,26 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
     finally:
         globals()["_find_open_alert"], globals()["_apply"] = _real_find, _real_apply
 
+    # `fetch_lanes` must carry the birth date the NEW-LANE WINDOW reads, or that guard is
+    # permanently unreachable in production while its unit tests stay green. (This check
+    # was collateral damage when the M2 region was cut; the battery caught its absence.)
+    _real_lanes_api = globals()["_api"]
+    try:
+        def _lanes_api(repo, path):
+            if path.startswith("actions/workflows?"):
+                return {"workflows": [{"path": GROOM_WORKFLOW, "state": "active",
+                                       "created_at": "2026-07-01T00:00:00Z"}]}
+            return {"workflow_runs": []}
+
+        globals()["_api"] = _lanes_api
+        _fetched = {lane["workflow"]: lane for lane
+                    in fetch_lanes("o/r", Path(__file__).resolve().parents[1],
+                                   CRON_WINDOW_HOURS, NOW)}
+        chk("fetch_lanes carries each lane's created_at off the workflow listing",
+            _fetched.get(GROOM_WORKFLOW, {}).get("created_at") == "2026-07-01T00:00:00Z")
+    finally:
+        globals()["_api"] = _real_lanes_api
+
     # --- QUEUE WAIT IS AN HONESTLY DOCUMENTED GAP, and must stay one ------------------
     # An alarm reading a variable that never moves answers "would we know if we were
     # starved?" with a confident yes. Two failure directions are pinned: silently RE-ADDING
