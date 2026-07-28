@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1010,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "b9221176dddd7d978ac55c26375cd0fae0cd89c2",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_live_nodes` claims to yield descendants that run with their parent, but its dead-branch test only uses `ast.literal_eval`. Python expressions that are certainly false but are not literal-evaluable\u2014such as `if not True:`, `if 1 == 0:`, or `while False or False:`\u2014are treated as live. It also descends into every `except` handler, so moving the counter into `try: pass` / `except Exception:` is accepted although that handler cannot execute. In each case `_escalation_call_site` still returns `dispatch` while no escalation increments `defer_reasons`. The eleven mutants cover only selected literal guards and nested scopes, so the production evidence path remains vacuous for these shapes.",
+    "file": "scripts/dispatch-claim.py",
+    "fix_hint": "Make the reachability analysis conservatively reject control-flow regions it cannot prove execute, including dead boolean/comparison expressions and exception handlers that are not on an unconditional path; alternatively narrow the seam check to the exact direct-loop-body structure required in production. Add parseable production-source mutants that place the counter under `if not True:` and inside a never-entered `except` handler, and assert `_escalation_call_site` returns `None` for both.",
+    "severity": "major",
+    "title": "Call-site proof still accepts counters in statically unreachable control flow"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 2's execution-scope finding is addressed: `_live_nodes` now stops at nested callable boundaries, deliberately traverses live class bodies, and the new `def`/`async def`/class-method mutants exercise that correction. However, the structural call-site proof still accepts other statically unreachable counters. `_branch_is_statically_dead` recognizes only values handled by `ast.literal_eval`, and `_live_nodes` traverses exception handlers without proving that they can run. Thus the production histogram can again be made silent while the marquee self-test remains green. This is a new major finding after the prior one was fixed, so the required progress grade is `regressing`.",
+  "verdict": "request_changes"
+ }
+}
