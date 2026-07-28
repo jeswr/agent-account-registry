@@ -20,6 +20,7 @@ by the existing policy-resolve.py core before any GitHub write is attempted.
 from __future__ import annotations
 
 import argparse
+import ast
 import base64
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -36,7 +37,7 @@ import sys
 import tempfile
 import time
 import tomllib
-from typing import Any
+from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
@@ -132,7 +133,178 @@ LABELS = {
                       "Machine-owned capacity park (soft hold; human unlabel, proven recovery, "
                       "or capped retry)"),
     "needs:user": ("b60205", "Human attention required"),
+    # The PR-side machine park (park_policy.MACHINE_PARK_PR_LABEL). Groom now writes it for the
+    # age hand-off, so groom must be able to CREATE it on a target that has never seen one.
+    "review:parked": ("1d76db",
+                      "Machine-owned capacity park (soft hold; human unlabel, proven recovery, "
+                      "or capped retry)"),
 }
+
+# ---- the age-park CLASS split (a TIMEOUT is not a human question) --------------------------------
+# Age says "this took too long". It does NOT say "a human must answer a question". Every reason
+# THIS sweep derives comes from an age threshold crossing plus a MACHINE-READABLE cause, and each
+# such cause has a MACHINE-CHECKABLE recovery predicate (age_park_cause_recovered), so the park it
+# writes is park_policy's MACHINE-owned soft hold, not the human-owned terminal.
+#
+# Why this mattered enough to change: `needs:user` / `review:needs-user` are exactly the labels
+# park_policy.capacity_park_admission treats as a HUMAN-OWNED hold and refuses to auto-re-admit
+# ("ANY `needs:*` label or `review:needs-user` among them ... blocks the automatic path
+# outright"). Stamping one on a PR that ALREADY carried the machine soft hold therefore did not
+# merely mislabel it — it DISABLED the automatic cause-recovery exit registry #614/#691 built, and
+# handed the item to the maintainer permanently. Measured on sparq-org/sparq 2026-07-27: of 11 open
+# age-parks, 6 also carried `review:parked`, and 3 (#3912/#3916/#3942) had a PROVABLY recovered
+# cause — an admissible provenance record on the live ledger ref — yet were still human-held.
+#
+# The mapping is CLOSED and keyed on the exact reason strings stale_worker_pr_reason returns.
+# An UNMAPPED reason keeps the HUMAN hand-off: a cause this table cannot name is a cause
+# age_park_cause_recovered cannot prove recovered, and a soft hold with no provable exit is a
+# SILENT permanent hold — strictly worse than a visible one.
+AGE_PARK_CAUSES: dict[str, str] = {ORPHAN_DRAFT_REASON: "orphan-draft"}
+AGE_PARK_CAUSES.update(
+    {reason: f"merge-{state}" for state, reason in BAD_MERGE_STATES.items()}
+)
+# At most this many AUTOMATIC re-admissions may ever be granted to one PR by the age sweep, and
+# the cap is enforced ONCE, at park time: a park in generation N > AGE_UNPARK_MAX is written in
+# the HUMAN class outright, so the un-park sweep can never see an over-cap park. A PR that keeps
+# re-entering the same machine-recoverable cause is not a capacity blip — it is a genuine human
+# question ("this flaps"), and the right disposition is escalation, not another retry.
+AGE_UNPARK_MAX = 2
+# Machine-readable park/un-park receipts. Bot-authored, durable, and the ONLY record the un-park
+# sweep reads: it never infers a park's class from prose or from label state alone. `cause` is an
+# AGE_PARK_CAUSES value, `head` the head SHA at park time, `gen` the 1-based park generation.
+# The (cause, head, gen) triple is the CONSUME-ONCE key: an un-park is granted for a given triple
+# at most once, so the same recovery can never be re-earned.
+#
+# The two marker spellings live in park_policy, NOT here (registry #769). groom WRITES them and
+# dispatch-claim's automatic re-admission sweep READS them — it must recognise a groom age park
+# in order to leave it alone — and those are separate entry points with separate checkout roots.
+# A hand-copied literal in the reader is a spelling that can drift silently from the writer's,
+# and the failure it produces is not a crash but a sweep that quietly stops recognising the class
+# it was written to skip. One spelling, imported by both, cannot drift; the aliases below keep
+# every existing call site in this file unchanged.
+AGE_PARK_MARKER = park_policy.GROOM_AGE_PARK_MARKER
+AGE_UNPARK_MARKER = park_policy.GROOM_AGE_UNPARK_MARKER
+_AGE_RECEIPT = re.compile(
+    r"cause=(?P<cause>[a-z-]{1,40}) head=(?P<head>[0-9a-f]{40}) gen=(?P<gen>[1-9][0-9]{0,3}) -->"
+)
+
+
+def age_park_cause(reason: str) -> str | None:
+    """The machine-readable cause token for an age-park reason, or None when unmapped."""
+    return AGE_PARK_CAUSES.get(reason)
+
+
+def age_park_label(reason: str, generation: int) -> str:
+    """The park label this age hand-off must write — the ONE place the class is decided.
+
+    MACHINE (`review:parked`) when the reason names a cause with a machine recovery predicate AND
+    the PR is still within its automatic-re-admission cap; HUMAN (`needs:user`) otherwise, i.e.
+    for an unmapped cause (no provable exit) or a park past AGE_UNPARK_MAX (a flap)."""
+    if age_park_cause(reason) is None:
+        return park_policy.HUMAN_PARK_LABEL
+    if generation > AGE_UNPARK_MAX:
+        return park_policy.HUMAN_PARK_LABEL
+    return park_policy.MACHINE_PARK_PR_LABEL
+
+
+def age_receipts(comments: list[dict[str, Any]], marker: str, bot_login: str
+                 ) -> list[dict[str, Any]]:
+    """Well-formed BOT-AUTHORED receipts of one kind, oldest-first.
+
+    Trust filter first (the worker-pr receipt-parser pattern): a receipt any other actor could
+    author is not a durable record of what THIS loop did, so a non-bot comment carrying the
+    marker is ignored entirely. A malformed receipt is DROPPED here but still counted by
+    age_park_generation, so a corrupt receipt can never buy an extra automatic re-admission."""
+    found: list[dict[str, Any]] = []
+    if not bot_login:
+        return found
+    for comment in comments:
+        if comment["user"]["login"].casefold() != bot_login.casefold():
+            continue
+        body = comment["body"]
+        index = body.find(marker)
+        if index < 0:
+            continue
+        match = _AGE_RECEIPT.match(body[index + len(marker):].lstrip(), 0)
+        if match is None:
+            continue
+        found.append({"cause": match.group("cause"), "head": match.group("head"),
+                      "gen": int(match.group("gen")),
+                      # The comment's own creation stamp. park_policy's receipt readers all key
+                      # recency off this, and without it a receipt cannot be compared against a
+                      # park application — which is the guard this file was missing.
+                      "at": comment.get("created_at")})
+    return found
+
+
+def age_park_generation(comments: list[dict[str, Any]], bot_login: str) -> int:
+    """The generation a NEW age-park would occupy: one past every park receipt already on record,
+    CLAMPED at AGE_UNPARK_MAX + 1.
+
+    Counts MARKERS, not well-formed records — a malformed receipt still consumed a generation,
+    exactly as park_policy's `auto_marker_count` counts markers rather than parsed records.
+
+    The clamp is what makes the terminal terminal. Without it every further sweep of an already
+    escalated PR mints a HIGHER generation, whose fingerprint no earlier receipt can match, so the
+    escalation comment is re-posted on every tick — forever, on a PR already handed to a human.
+    Escalated is an ABSORBING state: the generation stops at AGE_UNPARK_MAX + 1, the receipt stops
+    changing, and the dedupe holds. (The head SHA remains in the fingerprint, so genuinely NEW work
+    pushed after an escalation does re-state it once — one comment per head, the same bound
+    park_policy's park fingerprints use.)"""
+    if not bot_login:
+        return 1
+    return min(
+        AGE_UNPARK_MAX + 1,
+        1 + sum(
+            1 for comment in comments
+            if comment["user"]["login"].casefold() == bot_login.casefold()
+            and AGE_PARK_MARKER in comment["body"]
+        ),
+    )
+
+
+def age_unpark_state(comments: list[dict[str, Any]], bot_login: str
+                     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """``(park_receipt, grant_receipt)`` for the newest age park on record.
+
+    ``park_receipt`` is None when this is not an age park of ours, or when the park is OVER THE
+    CAP (generation > AGE_UNPARK_MAX) — an over-cap park was written in the HUMAN class by
+    age_park_label and must never be automatically re-admitted, so the exit phase must not even
+    consider it.
+
+    ``grant_receipt`` is the un-park receipt carrying the SAME (cause, head, gen) triple, or None
+    when the recovery is still unconsumed. That is the consume-exactly-once invariant: the
+    recovery can never be re-earned, and a further re-admission requires a NEW park at a new
+    fingerprint. The RECEIPT is returned rather than a bool because the caller needs its
+    TIMESTAMP: convergence is only legitimate while no park application is newer than the grant.
+
+    The two are returned SEPARATELY rather than collapsed into "owed or not" because the caller
+    needs to distinguish two states that look identical from the label alone (registry #614's
+    `auto-receipt` branch, mirrored):
+
+      - granted AND the machine label is GONE — the normal, finished case;
+      - granted AND the machine label is STILL LIVE — the receipt landed and the unlabel did
+        not. Receipt-first ordering guarantees this is the only crash residue possible, and
+        collapsing it into None strands the PR under `review:parked` FOREVER: nothing re-parks it
+        (its cause has recovered, so the hand-off derives no reason) and nothing clears it. One
+        plain HTTP transient on the DELETE is enough to reach it. The caller CONVERGES on that
+        state by retrying the unlabel, consuming no new evidence and minting no new receipt.
+
+    THE LABEL DOES NOT IDENTIFY ITS WRITER. `review:parked` is a SHARED MULTI-WRITER label —
+    dispatch-claim writes it at two sites and worker-pr's capacity park writes it too — so its
+    presence proves *a* writer parked this PR, never that THIS sweep did. The caller must
+    therefore also prove the grant is NEWER than every park application before converging."""
+    parks = age_receipts(comments, AGE_PARK_MARKER, bot_login)
+    if not parks:
+        return None, False
+    latest = parks[-1]
+    if latest["gen"] > AGE_UNPARK_MAX:
+        return None, False
+    key = (latest["cause"], latest["head"], latest["gen"])
+    for grant in age_receipts(comments, AGE_UNPARK_MARKER, bot_login):
+        if (grant["cause"], grant["head"], grant["gen"]) == key:
+            return latest, grant
+    return latest, None
 
 
 class GroomError(RuntimeError):
@@ -172,6 +344,16 @@ class RedraftUnavailable(GroomError):
 class Limits:
     worker_timeout_minutes: int
     max_attempts: int
+    # [registry #835] The repo's MASTER-protected `review_enrolment_authors` allowlist — the
+    # half of the #657 orchestrator-PR admission that lives behind branch protection. Groom is
+    # otherwise CLASS-BLIND: every one of its suppression guards (_admitted_review_prs,
+    # _live_issue_admission, _current_links) keys on WORKER identity, so an enrolled
+    # orchestrator PR under review could not hold its source issue out of the exhaustion park —
+    # and a parked source issue de-enumerates the PR from the review lane
+    # (dispatch-claim.enumerate_review_items excludes on `status:parked` / any `needs:*` there).
+    # Nothing alarmed, because groom's run SUCCEEDED and the PR was simply absent from the next
+    # enumeration. Empty (every repo's default) means groom behaves exactly as it did before.
+    enrolled_authors: tuple[str, ...] = ()
 
     @property
     def threshold_seconds(self) -> int:
@@ -412,6 +594,27 @@ def _provenance_record(
     by the review loop's one shared schema, else None (missing, unreadable, or schema-invalid —
     every case the review loop fails closed on). Resolution and validity semantics are documented
     on worker_pr_provenance_enumerable, the boolean wrapper."""
+    record = _read_provenance_json(repo, number, registry_root, ledger_root=ledger_root)
+    if record is None:
+        return None
+    if not _review_loop_module().is_enumerable_provenance(record, number):
+        return None
+    return record
+
+
+def _read_provenance_json(
+    repo: str, number: int, registry_root: Path = Path("."),
+    ledger_root: Path | None = None,
+) -> dict[str, Any] | None:
+    """The PARSED record for ``repo#number`` with NO admission applied, or None when it is
+    missing or not readable JSON.
+
+    [registry #835] Split out of ``_provenance_record`` because the two classes admit through
+    DIFFERENT predicates over the SAME bytes: a worker record through
+    ``is_enumerable_provenance`` (which deliberately has no orchestrator opt-in), an enrolled
+    orchestrator record through ``admits_orchestrator_pr`` + ``provenance_admission_error(...,
+    admit_orchestrator=True)``. Resolution is unchanged: the ``ledger`` data-plane checkout is
+    primary (issue #96), the master checkout is the legacy pre-outage fallback."""
     owner, _, name = repo.partition("/")
     if not owner or not name:
         raise GroomError("target repository name is malformed")
@@ -424,16 +627,72 @@ def _provenance_record(
     if not record_path.is_file():
         return None
     try:
-        record = json.loads(record_path.read_text(encoding="utf-8"))
+        return json.loads(record_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None  # unreadable/malformed JSON — the review loop fails closed on it too
-    if not _review_loop_module().is_enumerable_provenance(record, number):
+
+
+def _orchestrator_admission(repo: str, pull: dict[str, Any], enrolled_authors: Any) -> Any:
+    """[registry #835] The #657 orchestrator-class admission PREDICATE for one open PR, as a
+    ``(record, number) -> bool`` callable — or None when this PR is not even a candidate.
+
+    Returning None (rather than a predicate that always says False) is what lets the callers
+    skip the record read entirely for the overwhelming majority of PRs, and it keeps the two
+    NON-waivable facts at the top where no later change can reorder past them:
+
+    - the FORK GATE. ``head.repo == repo`` is the single attacker-facing predicate here; a fork
+      head is attacker-controlled and is never admitted, on any path, by any waiver.
+    - a non-empty allowlist and a plausible login. An EMPTY ``review_enrolment_authors`` — every
+      repo's default — makes this None for every PR, so groom behaves byte-for-byte as it did.
+
+    The returned predicate is ``admits_orchestrator_pr`` (#821's ONE waiver decision, reused
+    rather than re-derived, so "admitted at PLAN/CLAIM" and "suppresses groom's park here"
+    cannot drift) conjoined with the shared FIELD admission under its orchestrator opt-in. The
+    waived properties are exactly the two producer-shape gates the worker identity applies (the
+    head-ref pattern, the App-bot author and its body marker); nothing else."""
+    head = pull.get("head") or {}
+    head_repo = head.get("repo") or {}
+    if (head_repo.get("full_name") if isinstance(head_repo, dict) else None) != repo:
         return None
-    return record
+    login = (pull.get("user") or {}).get("login", "")
+    if not enrolled_authors or not isinstance(login, str) or not login:
+        return None
+    review = _review_loop_module()
+
+    def admits(record: Any, pr_number: int) -> bool:
+        return bool(
+            review.admits_orchestrator_pr(record, pr_number, login, enrolled_authors)
+            and review.provenance_admission_error(
+                record, pr_number, admit_orchestrator=True) is None)
+
+    return admits
+
+
+def _orchestrator_source_issue(
+    repo: str, number: int, pull: dict[str, Any], enrolled_authors: Any,
+    registry_root: Path = Path("."), ledger_root: Path | None = None,
+) -> int | None:
+    """[registry #835] The source issue an ADMITTED orchestrator-class PR is bound to, else None.
+
+    The binding is the RECORD's ``issue`` field and nothing else. That is not a weakening: it is
+    the same binding the review loop itself dispatches on, and
+    research/657-orchestrator-pr-admission.md §7.2 measured that the head ref was never the
+    binding for a worker PR either (``HEAD_REF_RE``'s capture group is not consumed anywhere in
+    this repository). A worker PR additionally cross-checks branch-vs-record because it HAS a
+    branch to cross-check; an orchestrator PR has an ordinary branch by definition."""
+    admits = _orchestrator_admission(repo, pull, enrolled_authors)
+    if admits is None:
+        return None
+    record = _read_provenance_json(repo, number, registry_root, ledger_root=ledger_root)
+    if not admits(record, number):
+        return None
+    issue = record["issue"]  # a positive int — guaranteed by the field admission above
+    return issue
 
 
 def _live_provenance_record(
-    registry_api: "GitHubAPI", registry_repo: str, repo: str, number: int
+    registry_api: "GitHubAPI", registry_repo: str, repo: str, number: int,
+    admits: Any = None,
 ) -> tuple[str, dict[str, Any] | None]:
     """Read target PR ``repo#number``'s registry provenance record from the LIVE authoritative
     ``ledger`` ref, returning ``(state, record)`` where ``state`` is one of:
@@ -458,7 +717,13 @@ def _live_provenance_record(
     This live read is the FINAL gate immediately before the write — it can only CANCEL a park, never
     cause one. Records live in the REGISTRY repo, so it reads via the registry client
     (``REGISTRY_GH_TOKEN``) pinned to the commit sha ``LEDGER_REF`` resolves to at read time —
-    the ref is verified to exist before any 404 is trusted, as _read_ledger's branch probe does."""
+    the ref is verified to exist before any 404 is trusted, as _read_ledger's branch probe does.
+
+    [registry #835] ``admits`` overrides the ADMISSION only — never the read, the ref probe or
+    any of the indeterminate cases. It is the ``(record, number) -> bool`` predicate the caller's
+    CLASS admits by, defaulting to the worker one (``is_enumerable_provenance``, which
+    deliberately has no orchestrator opt-in). One live-read function, one place where an
+    unreadable ledger becomes ``indeterminate``; only the predicate over the bytes differs."""
     owner, _, name = repo.partition("/")
     if not owner or not name:
         raise GroomError("target repository name is malformed")
@@ -501,38 +766,51 @@ def _live_provenance_record(
         )
     except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
         return "indeterminate", None  # present-but-undecodable — conflicting, never strand
-    if _review_loop_module().is_enumerable_provenance(record, number):
+    if admits is None:
+        admits = _review_loop_module().is_enumerable_provenance
+    if admits(record, number):
         return "admits", record
     return "denies", None  # cleanly read but not admissible — the orphan-park hand-off stands
 
 
 def _live_issue_admission(
     registry_api: "GitHubAPI", registry_repo: str, repo: str, number: int,
-    pulls: dict[int, dict[str, Any]], bot_login: str,
+    pulls: dict[int, dict[str, Any]], bot_login: str, enrolled_authors: Any = (),
 ) -> str:
     """Live-ref admission for a SINGLE source issue at the terminal mutation boundary (issue #174).
 
-    Among ``pulls`` (freshly re-read open PRs), is a worker PR BOUND TO ``number`` (worker identity
-    AND branch-encoded issue == ``number``) admitted by a schema-valid record on the LIVE ``ledger``
-    ref? Returns ``"admitted"`` (a valid record for its worker PR now exists live → cancel the
-    exhaustion park), ``"indeterminate"`` (a candidate worker PR's live read was unavailable or
-    conflicting → skip the park and raise an operational alert), or ``"denied"`` (the live ref
-    conclusively admits none → the park may proceed).
+    Among ``pulls`` (freshly re-read open PRs), is a PR BOUND TO ``number`` admitted by a
+    schema-valid record on the LIVE ``ledger`` ref? Returns ``"admitted"`` (a valid record for
+    its PR now exists live → cancel the exhaustion park), ``"indeterminate"`` (a candidate PR's
+    live read was unavailable or conflicting → skip the park and raise an operational alert), or
+    ``"denied"`` (the live ref conclusively admits none → the park may proceed).
 
-    Mirrors _admitted_worker_prs' identity + issue-binding (via _worker_pr_identity and the record's
-    ``issue`` field) so the on-disk and live admissions cannot drift; only the record SOURCE differs
-    (the live ref instead of the immutable checkout). An indeterminate read is scoped to THIS issue's
-    candidate PRs, so an unusable read on an unrelated PR never blocks this park."""
+    Mirrors _admitted_review_prs' identity + issue-binding so the on-disk and live admissions
+    cannot drift; only the record SOURCE differs (the live ref instead of the immutable
+    checkout). That includes the [#835] orchestrator class: a PR the on-disk admission would
+    suppress on but the live boundary would not is the same drift the worker path already
+    forbids. An indeterminate read is scoped to THIS issue's candidate PRs, so an unusable read
+    on an unrelated PR never blocks this park."""
     bot = bot_login.casefold()
     if not bot:
         return "denied"  # no bot identity — nothing proven, fail closed (park may proceed)
     indeterminate = False
     for pr_number, pull in pulls.items():
         branch = _worker_pr_identity(repo, pull, bot)
-        if branch is None or int(branch.group("issue")) != number:
-            continue  # only a worker PR bound to THIS issue can suppress its park
+        if branch is not None:
+            if int(branch.group("issue")) != number:
+                continue  # only a worker PR bound to THIS issue can suppress its park
+            admits = None                 # the worker predicate (is_enumerable_provenance)
+        else:
+            # [registry #835] Not worker-shaped — the #657 orchestrator class may still be
+            # admitted, on the SAME terms the on-disk admission applies. `None` here means "not
+            # even a candidate" (a fork head, an unenrolled author, an empty allowlist), which
+            # is the pre-#835 outcome for every PR.
+            admits = _orchestrator_admission(repo, pull, enrolled_authors)
+            if admits is None:
+                continue
         state, record = _live_provenance_record(
-            registry_api, registry_repo, repo, pr_number
+            registry_api, registry_repo, repo, pr_number, admits=admits
         )
         if state == "indeterminate":
             indeterminate = True
@@ -549,7 +827,7 @@ def _worker_pr_identity(
     ``repo`` — a worker-pattern head branch, a same-repository head (a fork head is
     attacker-controlled), the App-bot author, and the worker PR body marker — else None.
 
-    This is the identity subset shared by two admissions so they cannot drift: `_admitted_worker_prs`
+    This is the identity subset shared by two admissions so they cannot drift: `_admitted_review_prs`
     (which additionally requires the registry-provenance root of trust) and `_current_links`
     (recovery-suppression linkage, issue #172). An outsider's fork PR, a non-bot author, or a PR
     whose body merely says `Fixes #N` must never pass — any of those could otherwise hold a stale
@@ -574,16 +852,26 @@ def _worker_pr_identity(
     return branch
 
 
-def _admitted_worker_prs(
+def _admitted_review_prs(
     repo: str,
     pulls: dict[int, dict[str, Any]],
     bot_login: str,
     registry_root: Path = Path("."),
     ledger_root: Path | None = None,
+    enrolled_authors: Any = (),
 ) -> set[int]:
-    """Source-issue numbers among ``pulls`` (open PRs) with a PROVEN admitted worker attempt —
+    """Source-issue numbers among ``pulls`` (open PRs) with a PROVEN admitted attempt —
     the ONLY linkage strong enough to suppress the exhausted-attempt defer (issue #170, review
     round 1).
+
+    [registry #835] Named for what it answers — "which source issues does the REVIEW LOOP
+    already own a PR for?" — because it is no longer worker-only. Groom was class-blind: an
+    enrolled #657 orchestrator PR could not suppress its source issue's exhaustion park, and a
+    parked source issue de-enumerates that PR from the review lane silently (no `review:*` label
+    means `exclude_signalled` prints nothing, and the park's own machine exit could not see the
+    PR either — the other half of #835). The orchestrator class is admitted here on the SAME
+    terms a worker PR is, with the two producer-shape gates waived and nothing else; see
+    _orchestrator_source_issue.
 
     Linkage weaker than these admissions (a worker-looking branch or a `Fixes #N` body
     reference) is deliberately NOT trusted for suppression: anyone can open a PR whose body says `Fixes #N`,
@@ -607,6 +895,12 @@ def _admitted_worker_prs(
     for number, pull in pulls.items():
         branch = _worker_pr_identity(repo, pull, bot)
         if branch is None:
+            # [registry #835] Not worker-shaped. The #657 orchestrator class is admitted on the
+            # same terms; an empty allowlist (every repo's default) makes this constantly None.
+            issue = _orchestrator_source_issue(
+                repo, number, pull, enrolled_authors, registry_root, ledger_root=ledger_root)
+            if issue is not None:
+                admitted.add(issue)
             continue
         record = _provenance_record(repo, number, registry_root, ledger_root=ledger_root)
         if record is None:
@@ -842,6 +1136,17 @@ def _policy_document(policy_file: Path) -> Any:
         raise GroomError("repository policy could not be read") from exc
 
 
+def _enrolled_authors(resolver: Any, repo: str, document: Any) -> tuple[str, ...]:
+    """[registry #835] The repo's master-protected `review_enrolment_authors`, sorted.
+
+    Resolved through ``policy-resolve.review_enrolment_authors`` — the accessor that validates
+    the whole policy row — for the same reason PLAN, CLAIM and review-fix.yml resolve it that
+    way (#657): a hand-rolled read of the TOML key would happily parse a malformed or
+    `[bot]`-bearing list, and with the head-ref gate waived a `[bot]` entry would widen the
+    trusted-App author gate to ANY installed App. Absent/empty => enrolment OFF."""
+    return tuple(sorted(resolver.review_enrolment_authors(repo, document)))
+
+
 def load_limits(policy_file: Path, resolver_file: Path) -> dict[str, Limits]:
     document = _policy_document(policy_file)
     repos = document.get("repos") if isinstance(document, dict) else None
@@ -869,6 +1174,10 @@ def load_limits(policy_file: Path, resolver_file: Path) -> dict[str, Limits]:
             max_attempts=_positive_int(
                 row.get("max_attempts"), f"max attempts for {repo}"
             ),
+            # [registry #835] Read through policy-resolve's OWN accessor, never a hand-rolled
+            # TOML read: that accessor VALIDATES the whole row, and its validation is the only
+            # thing keeping a `[bot]` login (i.e. another GitHub App) out of the allowlist.
+            enrolled_authors=_enrolled_authors(resolver, repo, document),
         )
     if not limits:
         raise GroomError("repository policy has no enabled target rows")
@@ -1451,8 +1760,8 @@ def phase_exit_failure(outcome: PhaseOutcome) -> str | None:
 def sweep_exit_failure(outcomes: "list[PhaseOutcome] | tuple[PhaseOutcome, ...]") -> str | None:
     """EVERY phase's systemic failure, joined — never just the first (issue #647).
 
-    The sweep has four per-object phases — stale-PR detection, issue status repair, parked-PR
-    defuse, stale-PR hand-off — and they fail independently. Reporting only the first would hide a
+    The sweep has five per-object phases — stale-PR detection, issue status repair, parked-PR
+    defuse, age-park re-admission, stale-PR hand-off — and they fail independently. Reporting only the first would hide a
     second systemic failure behind a fixed one, so each phase is judged by the one precedence rule
     and every reason is named.
     """
@@ -1470,6 +1779,282 @@ def sweep_exit_failure(outcomes: "list[PhaseOutcome] | tuple[PhaseOutcome, ...]"
 # a second one).
 DefuseOutcome = PhaseOutcome
 defuse_exit_failure = phase_exit_failure
+
+
+def age_park_cause_recovered(
+    cause: str,
+    pull: dict[str, Any],
+    live_provenance: Callable[[], tuple[str, dict[str, Any] | None]],
+) -> tuple[bool, str]:
+    """Has THIS park's OWN cause provably recovered? Returns (recovered, why).
+
+    This is the machine exit, and it is gated on the CAUSE, never on elapsed time — the same
+    discipline park_policy invariant 3 applies to a capacity park. Each cause has one predicate:
+
+    - ``orphan-draft`` — an ADMISSIBLE registry provenance record now exists on the LIVE ledger
+      ref. That is exactly the predicate _live_provenance_record already computes to CANCEL a
+      park, reused to CLEAR one, so "the review loop will drive this PR" cannot mean two things.
+    - ``merge-*``      — the live ``mergeable_state`` is no longer one of BAD_MERGE_STATES.
+
+    Every ambiguity fails toward STAYING PARKED: an unreadable/conflicting provenance read, a
+    malformed merge state, and an unrecognised cause token all return False. An unrecognised
+    token in particular must never re-admit — a cause we cannot check is a cause we cannot prove
+    recovered, and guessing here would turn the bounded exit into an unbounded retry."""
+    if cause == "orphan-draft":
+        state, _record = live_provenance()
+        if state == "admits":
+            return True, "an admissible provenance record now exists on the live ledger ref"
+        if state == "indeterminate":
+            return False, "the live provenance read was unavailable or conflicting"
+        return False, "still no admissible provenance record on the live ledger ref"
+    if cause.startswith("merge-"):
+        merge_state = pull.get("mergeable_state")
+        if merge_state is None:
+            merge_state = "unknown"
+        if not isinstance(merge_state, str):
+            return False, "the live merge state is malformed"
+        if merge_state in BAD_MERGE_STATES:
+            return False, f"the merge state is still {merge_state}"
+        return True, f"the merge state recovered to {merge_state}"
+    return False, f"cause {cause!r} has no recovery predicate — never auto-re-admitted"
+
+
+def _execute_age_unpark_actions(
+    pulls: dict[str, dict[int, dict[str, Any]]],
+    apis: dict[str, GitHubAPI],
+    registry_api: "GitHubAPI",
+    registry_repo: str,
+    bot_login: str,
+) -> tuple[PhaseOutcome, int, int]:
+    """Re-admit MACHINE age-parks whose own cause has provably recovered — the exit that makes the
+    class split honest.
+
+    Relabelling an age park from the human terminal to the machine soft hold WITHOUT this phase
+    would be strictly worse than the defect it replaces: `needs:user` is at least visible in a
+    human census, whereas a `review:parked` nothing can clear is an INVISIBLE permanent hold.
+    park_policy's own automatic path cannot supply this exit WHOLESALE — capacity_park_admission is
+    gated on per-account model-health recovery evidence that no orphan-draft or wedged-merge-state
+    park will ever satisfy, and its cap counts worker-pr's AUTO_READMIT_MARKER, so routing groom's
+    age receipts through it would make the two re-admission budgets consume each other. The sweep
+    that KNOWS the cause therefore owns clearing it — but every GUARD that mechanism applies is
+    obtained by CALLING park_policy (park_vetoed, label_application_machine_owned,
+    park_applications for recency, valid_timestamp/parse_ts/canonical_ts), never by reproducing
+    it. Two rounds of this PR shipped a mirrored mechanism missing a guard the original had;
+    nothing here re-implements a park_policy decision.
+
+    Bounded exactly as invariant 3 bounds the capacity path:
+      - CAUSE-GATED. age_park_cause_recovered, never elapsed time.
+      - CONSUMED EXACTLY ONCE. The un-park receipt carries the park receipt's own
+        (cause, head, gen) triple; age_unpark_state reports that grant, so one recovery can never
+        be re-earned — a further re-admission needs a NEW park at a new fingerprint.
+      - CAPPED. Enforced upstream at park time by age_park_label: generation > AGE_UNPARK_MAX is
+        written in the HUMAN class, so an over-cap park never reaches this phase at all.
+      - NEVER CLEARS A LABEL IT CANNOT PROVE IS MACHINE-APPLIED. Every unlabel — the ordinary grant
+        AND the convergence retry — is authorised by park_policy.label_application_machine_owned
+        for THAT EXACT LABEL (the #690 predicate; park_applications is the wrong API for this and
+        is never used for it here). It returns False for every ambiguity: a human-latest
+        application, no `labeled` event at all, an unreadable timeline, a malformed shape.
+      - RECEIPT-FIRST, WITH A REAL CONVERGENCE BRANCH. The receipt is posted BEFORE the unlabel, so
+        the only crash residue is receipt-no-label. That does NOT resolve itself — nothing re-parks
+        a PR whose cause has recovered — so the branch below retries the unlabel, gated on the
+        grant being STRICTLY NEWER than every park application (registry #614's `auto-receipt`
+        recency conjunct). `review:parked` is a SHARED MULTI-WRITER label, so without that conjunct
+        a different writer's later park is deleted off this sweep's stale grant.
+
+    Every failure is PER-PR: one unreadable PR never stops the rest.
+
+    Returns (outcome, grants, convergences). GRANTS are new re-admissions and are what
+    AGE_UNPARK_MAX governs; CONVERGENCES are retries of one already-authorised, never-effected
+    write and change no decision — they are counted apart so neither can be read as the other."""
+    attempted = 0
+    completed = 0
+    unparked = 0      # NEW grants: one per park receipt, governed by AGE_UNPARK_MAX
+    converged = 0     # RETRIES of an already-granted, never-effected unlabel: state-change-free
+    deferrals: list[str] = []
+    for repo, api in apis.items():
+        for number, listed in sorted(pulls.get(repo, {}).items()):
+            labels = _labels(listed, f"target pull request {repo}#{number}")
+            if park_policy.MACHINE_PARK_PR_LABEL not in labels:
+                continue
+            attempted += 1
+            failed = False
+            try:
+                # THE ONE RULE, and this phase must obey it like every other automatic exit
+                # (park_policy.human_owned_holds; blocking review finding #769). Measured on the
+                # real function before this line existed: a PR wearing BOTH `review:parked` and
+                # `needs:user` was granted its re-admission — `grants=1`, one un-park receipt
+                # minted, `review:parked` deleted. Nothing human was cleared, so invariant 3 was
+                # not violated in the literal sense, and that is exactly what made it easy to
+                # miss: the harm is that the ONE automatic recovery this park will ever earn was
+                # SPENT on a PR that provably could not re-enter, because the live `needs:user`
+                # keeps every downstream admission refusing. The recovery is consume-once, so it
+                # could never be re-earned, and the PR's next age park would land a generation
+                # higher for no reason it caused.
+                #
+                # Checked BEFORE the comments read, so a held PR also costs no API call, and
+                # BEFORE both write branches — the ordinary grant AND the convergence retry —
+                # because both end in a label DELETE. The park simply stands; a human is the
+                # exit, which is what a human-owned hold means.
+                held = park_policy.human_owned_holds(labels)
+                if held:
+                    print(f"age park stands {repo}#{number}: human-owned hold(s) live "
+                          f"({'/'.join(held)}) — a machine never un-parks past a human decision, "
+                          "and spends no re-admission on a PR that could not re-enter anyway")
+                    continue
+                comments = _comments(api, repo, number)
+                owed, granted = age_unpark_state(comments, bot_login)
+                if owed is None:
+                    continue  # not an age park of ours, or over the cap (human class)
+
+                def _clearable() -> bool:
+                    """May an automated path delete THIS EXACT label right now?
+
+                    park_policy.label_application_machine_owned, never park_applications
+                    (blocking review finding #690). park_applications answers a question about
+                    READMISSION_LABELS *collectively* — "when was the newest park applied across
+                    needs:user / status:parked / review:parked, and was that human" — and using it
+                    to authorise deleting ONE specific label is a domain mismatch that fails in
+                    directions this call site reaches: a HUMAN-applied `review:parked` reads as
+                    machine-owned the moment any bot writes a LATER `needs:user` event, and a live
+                    label with no `labeled` event at all reads absence as permission. The correct
+                    predicate proves ownership OF THIS LABEL, and returns False for every
+                    ambiguity — human-latest, no event, unreadable, malformed. It is the same
+                    function dispatch-claim authorises its own label deletions with, so "may not
+                    clear there" and "may not clear here" cannot drift."""
+                    return park_policy.label_application_machine_owned(
+                        repo, number, park_policy.MACHINE_PARK_PR_LABEL,
+                        lambda r, n: api.paginate(f"/repos/{r}/issues/{n}/timeline"),
+                        is_human=lambda login: _is_human_maintainer(api, repo, login))
+
+                def _drop_label() -> None:
+                    api.request(
+                        "DELETE",
+                        f"/repos/{repo}/issues/{number}/labels/"
+                        f"{quote(park_policy.MACHINE_PARK_PR_LABEL, safe='')}",
+                        allow_404=True,
+                    )
+                    print(f"WRITE remove label repo={repo} issue={number} "
+                          f"label={park_policy.MACHINE_PARK_PR_LABEL}")
+
+                if granted is not None:
+                    # CONVERGENCE (registry #614's `auto-receipt` branch). The receipt for this
+                    # exact recovery is already on record, yet the machine label is still live.
+                    # Receipt-first ordering makes receipt-no-label the only crash residue
+                    # possible, and one plain HTTP transient on the DELETE reaches it. Treating it
+                    # as "already consumed, skip" strands the PR under `review:parked` permanently
+                    # — its cause has recovered, so the hand-off derives no reason and never
+                    # re-parks it, and nothing else clears it.
+                    #
+                    # THE RECENCY CONJUNCT, which the mirrored version dropped and which is what
+                    # makes this safe. `auto-receipt` fires only when the receipt is STRICTLY
+                    # NEWER than the newest park application (`parse_ts(stamp) > latest_park`).
+                    # Without it, "the label is present" was read as "my un-park never landed" —
+                    # but `review:parked` is a SHARED MULTI-WRITER label (dispatch-claim at two
+                    # sites, worker-pr's capacity park), so its presence proves *a* writer parked
+                    # this PR, never that THIS sweep did. A DIFFERENT writer's LATER park was
+                    # therefore deleted off this sweep's stale receipt. Live shape: age-park ->
+                    # recover -> unpark -> the account starves -> worker-pr capacity-parks ->
+                    # every groom tick deletes it -> re-park. Uncapped ping-pong, which is exactly
+                    # the flap #614/#691's cap exists to bound, and it sat OUTSIDE that cap
+                    # because convergence mints no receipt.
+                    #
+                    # Recency closes it STRUCTURALLY rather than by counting: a re-park is a NEWER
+                    # `labeled` event than the grant, so convergence refuses and the ordinary
+                    # capped path handles it as the new park it is. What remains under this branch
+                    # is only ever a RETRY of one already-authorised, never-effected write, so it
+                    # is counted separately from grants and can never become one.
+                    stamp = granted.get("at")
+                    if not park_policy.valid_timestamp(stamp):
+                        print(f"age park stands {repo}#{number}: the un-park receipt carries no "
+                              "readable timestamp, so it cannot be proven newer than the park")
+                        continue
+                    # park_applications is the RIGHT api here, and is NOT the #690 misuse: #690 is
+                    # about authorising the DELETE of one specific label with evidence about three.
+                    # This asks its documented question — "when was the newest park applied" — and
+                    # a park on ANY park label refuses, the conservative direction. The delete
+                    # authorisation remains _clearable() / label_application_machine_owned.
+                    latest_park, _human, readable = park_policy.park_applications(
+                        repo, number, None,
+                        lambda r, n: api.paginate(f"/repos/{r}/issues/{n}/timeline"),
+                        is_human=lambda login: _is_human_maintainer(api, repo, login))
+                    if not readable:
+                        print(f"age park stands {repo}#{number}: the park application timeline "
+                              "could not be read, so the grant cannot be proven current")
+                        continue
+                    if latest_park is not None and park_policy.parse_ts(stamp) <= latest_park:
+                        print(f"age park stands {repo}#{number}: a park application at "
+                              f"{park_policy.canonical_ts(latest_park.isoformat())} is NEWER than "
+                              f"the un-park receipt at {park_policy.canonical_ts(stamp)} — this "
+                              "label is a DIFFERENT park, not the one that receipt cleared")
+                        continue
+                    if not _clearable():
+                        print(f"age park stands {repo}#{number}: "
+                              f"`{park_policy.MACHINE_PARK_PR_LABEL}` is not provably "
+                              "machine-applied — only a human clears it")
+                        continue
+                    print(f"CONVERGE PR {repo}#{number}: an un-park receipt for "
+                          f"(cause={owed['cause']}, gen={owed['gen']}) is already on record and "
+                          "newer than every park application, but the label survived — completing "
+                          "the interrupted unlabel")
+                    _drop_label()
+                    converged += 1
+                    continue
+
+                pull = api.request("GET", f"/repos/{repo}/pulls/{number}", allow_404=True)
+                if not isinstance(pull, dict) or pull.get("state") != "open":
+                    print(f"SKIP PR {repo}#{number}: no longer open")
+                    continue
+                recovered, why = age_park_cause_recovered(
+                    owed["cause"], pull,
+                    lambda: _live_provenance_record(
+                        registry_api, registry_repo, repo, number),
+                )
+                if not recovered:
+                    print(f"age park stands {repo}#{number} (cause={owed['cause']} "
+                          f"gen={owed['gen']}): {why}")
+                    continue
+                if not _clearable():
+                    print(f"age park stands {repo}#{number}: "
+                          f"`{park_policy.MACHINE_PARK_PR_LABEL}` is not provably "
+                          "machine-applied — only a human clears it")
+                    continue
+                receipt = (f"{AGE_UNPARK_MARKER} cause={owed['cause']} head={owed['head']} "
+                           f"gen={owed['gen']} -->")
+                api.request(
+                    "POST", f"/repos/{repo}/issues/{number}/comments",
+                    {"body": ("> 🤖 SPARQ agent\n\n"
+                              f"Automatic re-admission: {why}, so the machine-owned "
+                              f"`{park_policy.MACHINE_PARK_PR_LABEL}` age park is cleared and this "
+                              "PR re-enters the ordinary review loop. This recovery is now "
+                              f"consumed and cannot be re-earned.\n\n{receipt}")},
+                )
+                print(f"WRITE age-unpark receipt repo={repo} pr={number} cause={owed['cause']} "
+                      f"gen={owed['gen']}")
+                _drop_label()
+                unparked += 1
+            except Exception as exc:  # noqa: BLE001 — see below; this PR defers, the sweep runs on
+                # DELIBERATELY BROADER than the GroomError the sibling loops catch (issue #647).
+                # This phase calls into park_policy, whose timestamp primitives raise ValueError on
+                # a shape they reject — and a non-GroomError escaping here aborts the whole sweep
+                # before _release_claims, which is precisely the head-of-line abort #644/#647 exist
+                # to prevent, reachable from one malformed receipt on one PR. "Each PR defers
+                # ITSELF" has to mean every failure, not just the anticipated class. The deferral
+                # is LOUD: it is ALERTed and fed to the shared exit precedence, so a systemic
+                # failure still reds the run.
+                failed = True
+                detail = _masked_detail(str(exc), "")
+                print(f"ALERT PR {repo}#{number}: {detail} — age un-park deferred")
+                deferrals.append(f"{repo}#{number}: {detail}")
+                continue
+            finally:
+                if not failed:
+                    completed += 1
+    return (
+        PhaseOutcome(label="age park re-admission", changed=completed, attempted=attempted,
+                     deferred=tuple(deferrals)),
+        unparked,
+        converged,
+    )
 
 
 def _execute_defuse_actions(
@@ -1781,7 +2366,7 @@ def _current_links(
     linking them would suppress stale/orphan recovery for unrelated issues the App is not
     actually working.
 
-    This is the identity gate WITHOUT the registry-provenance record `_admitted_worker_prs`
+    This is the identity gate WITHOUT the registry-provenance record `_admitted_review_prs`
     additionally requires: recovery suppression asks 'is the App itself actively working this issue
     right now', for which the authoring identity is authoritative — provenance-record visibility
     (issue #96) is not, and demanding it here would prematurely reset a legitimately in-progress
@@ -1894,7 +2479,7 @@ def _plan_actions(
             # An open PROVEN worker PR for this issue means the final allowed attempt SUCCEEDED —
             # parking the source issue (`needs:user`) would strip that PR from dispatch's review
             # loop (any source `needs:*` is terminal there), so exhaustion never defers while an
-            # ADMITTED attempt is open. Admission is `_admitted_worker_prs` — the review loop's
+            # ADMITTED attempt is open. Admission is `_admitted_review_prs` — the review loop's
             # own identity + registry-provenance checks — NEVER the loose `links` map below: an
             # arbitrary PR whose body says `Fixes #N` (or a fork with a worker-shaped head) must
             # not hold an exhausted issue out of `needs:user` (review round 1). This guard must
@@ -1908,7 +2493,14 @@ def _plan_actions(
                     IssueAction(repo, number, "defer", "attempt budget exhausted")
                 )
                 continue
-            if key in live_by_issue or number in links:
+            # [registry #835] `admitted` is added to the recovery-suppression linkage for the
+            # same reason the exhaustion guard above consults it: `links` is WORKER-shaped, so
+            # without this an issue whose enrolled orchestrator PR is under review is re-readied
+            # as "stale in-progress without PR" and a worker is dispatched onto work that is
+            # already in the review lane. It is a NO-OP for the worker class by construction —
+            # `_admitted_review_prs`' worker branch is `_current_links`' identity gate plus a
+            # record, so every worker issue in `admitted` is already a `links` key (asserted).
+            if key in live_by_issue or number in links or number in admitted[repo]:
                 continue
             stale = (
                 now - _epoch(issue["updated_at"], f"target issue {repo}#{number}")
@@ -2140,7 +2732,11 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
     )
 
     admitted = {
-        repo: _admitted_worker_prs(repo, pulls[repo], bot_login, ledger_root=ledger_root)
+        # [registry #835] The repo's master-protected enrolment allowlist, so an ADMITTED
+        # orchestrator-class PR suppresses its source issue's exhaustion park exactly as an
+        # admitted worker PR does. Hard-coding `()` here re-opens the silent de-enumeration.
+        repo: _admitted_review_prs(repo, pulls[repo], bot_login, ledger_root=ledger_root,
+                                   enrolled_authors=limits[repo].enrolled_authors)
         for repo in groomable
     }
     issue_actions, pull_actions, dead_claims = _plan_actions(
@@ -2172,6 +2768,15 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
     current_pulls = {repo: _pulls(api, repo) for repo, api in groomable.items()}
     current_links = {
         repo: _current_links(repo, repo_pulls, bot_login)
+        for repo, repo_pulls in current_pulls.items()
+    }
+    # [registry #835] The class-aware half of the same "is this issue already being worked?"
+    # question, re-derived at the mutation boundary from the SAME fresh listing (no extra API
+    # read — the admission is a local record lookup). Without it a PLAN->boundary window in
+    # which an enrolled orchestrator PR opens still re-readies its source issue.
+    current_admitted = {
+        repo: _admitted_review_prs(repo, repo_pulls, bot_login, ledger_root=ledger_root,
+                                   enrolled_authors=limits[repo].enrolled_authors)
         for repo, repo_pulls in current_pulls.items()
     }
     # #509 mutation-boundary guard for label/orphan reaping.  A claim selected from the earlier
@@ -2254,7 +2859,8 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
                         f"SKIP issue {action.repo}#{action.number}: status changed under grooming"
                     )
                     continue
-                elif action.number in current_links[action.repo]:
+                elif (action.number in current_links[action.repo]
+                        or action.number in current_admitted[action.repo]):
                     print(f"SKIP issue {action.repo}#{action.number}: an open PR appeared")
                     continue
                 elif (
@@ -2297,11 +2903,12 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
                 # simply wrong, so skipping — the fail-closed side, retried next sweep — wins any
                 # tie.
                 boundary_pulls = _pulls(api, action.repo)
-                if action.number in _admitted_worker_prs(
-                    action.repo, boundary_pulls, bot_login, ledger_root=ledger_root
+                if action.number in _admitted_review_prs(
+                    action.repo, boundary_pulls, bot_login, ledger_root=ledger_root,
+                    enrolled_authors=limits[action.repo].enrolled_authors,
                 ):
                     print(
-                        f"SKIP issue {action.repo}#{action.number}: an admitted worker PR is open"
+                        f"SKIP issue {action.repo}#{action.number}: an admitted PR is open"
                     )
                     continue
                 # Issue #174: the checkout the on-disk admission reads is IMMUTABLE for the whole
@@ -2315,6 +2922,7 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
                 live = _live_issue_admission(
                     registry_api, registry_repo, action.repo, action.number,
                     boundary_pulls, bot_login,
+                    enrolled_authors=limits[action.repo].enrolled_authors,
                 )
                 if live == "admitted":
                     print(
@@ -2360,6 +2968,10 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
 
     defuse_outcome = _execute_defuse_actions(
         pull_actions, groomable, target_tokens, now, defuse_stale_seconds, bot_login
+    )
+
+    unpark_outcome, unpark_count, converge_count = _execute_age_unpark_actions(
+        pulls, groomable, registry_api, registry_repo, bot_login
     )
 
     stale_count = 0
@@ -2418,51 +3030,124 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
                 if state == "indeterminate":
                     print(
                         f"ALERT PR {action.repo}#{action.number}: live provenance revalidation was "
-                        "unavailable or conflicting — deferring the terminal needs:user park to the "
-                        "next sweep"
+                        "unavailable or conflicting — deferring the age park to the next sweep"
                     )
                     continue
             labels = _labels(pull, f"target pull request {action.repo}#{action.number}")
+            # The park CLASS is decided here and nowhere else (age_park_label). Reading the
+            # comments BEFORE the label write is what makes that possible: the generation — how
+            # many times this sweep has already parked this PR — lives in the durable receipts,
+            # and it is the cap that decides machine-vs-human for a flapping PR. Both reads were
+            # already made in this block; only their order changed.
+            comments = _comments(api, action.repo, action.number)
+            generation = age_park_generation(comments, bot_login)
+            park_label = age_park_label(reason, generation)
+            cause = age_park_cause(reason)
+            head_sha = pull.get("head", {}).get("sha")
+            if not isinstance(head_sha, str) or re.fullmatch(r"[0-9a-f]{40}", head_sha) is None:
+                raise GroomError(
+                    f"target pull request head sha is malformed for {action.repo}#{action.number}")
+            machine_park = park_label == park_policy.MACHINE_PARK_PR_LABEL
+            # A receipt is minted for EVERY classified cause, machine park or over-cap human
+            # escalation alike. Both consume a generation, so both must be on record — and the
+            # escalation must not be silenced by the machine receipts that preceded it: those
+            # bodies carry STALE_PR_MARKER, so a plain marker dedupe would swallow the one comment
+            # that explains the flap and hand the maintainer a bare `needs:user`. An UNMAPPED
+            # cause mints nothing and keeps master's once-ever dedupe byte-for-byte.
+            receipt = (f"{AGE_PARK_MARKER} cause={cause} head={head_sha} gen={generation} -->"
+                       if cause is not None else "")
             label_changed = False
-            if "needs:user" not in labels:
-                # Sticky human unpark (park_policy.py defect 2): a human who removed needs:user
+            if park_label not in labels:
+                # Sticky human unpark (park_policy.py defect 2): a human who removed THIS label
                 # from this PR more recently than any application vetoes the re-park (the whole
-                # action — a repeated "human review is required" comment would spam a PR the human
-                # explicitly unparked). This PR park stays needs:user: an orphan draft / wedged
-                # merge state is a genuine human hand-off, not a capacity park.
+                # action — a repeated hand-off comment would spam a PR the human explicitly
+                # unparked). The veto is checked against the label actually being written, so the
+                # machine class is veto-gated exactly as the human class always was.
                 if park_policy.park_vetoed(
-                        action.repo, action.number, "needs:user",
+                        action.repo, action.number, park_label,
                         lambda r, n: api.paginate(f"/repos/{r}/issues/{n}/timeline"),
                         is_human=lambda login: _is_human_maintainer(
                             api, action.repo, login)):
-                    print(f"SKIP PR {action.repo}#{action.number}: needs:user park suppressed "
+                    print(f"SKIP PR {action.repo}#{action.number}: {park_label} park suppressed "
                           "(sticky human unpark)")
                     continue
-                _ensure_label(api, action.repo, "needs:user")
+                _ensure_label(api, action.repo, park_label)
                 api.request(
                     "POST",
                     f"/repos/{action.repo}/issues/{action.number}/labels",
-                    {"labels": ["needs:user"]},
+                    {"labels": [park_label]},
                 )
                 print(
-                    f"WRITE add labels repo={action.repo} issue={action.number} labels=needs:user"
+                    f"WRITE add labels repo={action.repo} issue={action.number} "
+                    f"labels={park_label}"
                 )
                 label_changed = True
-            comments = _comments(api, action.repo, action.number)
+            # A MACHINE park dedupes on its own receipt FINGERPRINT, not on "any hand-off comment
+            # ever": a PR that machine-parked, provably recovered, was re-admitted and then parked
+            # AGAIN must mint a NEW receipt — otherwise generation 2 is invisible, the cap can
+            # never be reached, and the escalation to the human class never happens. The HUMAN
+            # class keeps the original once-ever dedupe unchanged.
             already_commented = any(
                 comment["user"]["login"].casefold() == bot_login.casefold()
-                and STALE_PR_MARKER in comment["body"]
+                and ((receipt in comment["body"]) if receipt
+                     else (STALE_PR_MARKER in comment["body"]))
                 for comment in comments
             )
             comment_changed = False
             if not already_commented:
-                body = (
-                    "> 🤖 SPARQ agent\n\n"
-                    f"This worker PR has been untouched beyond the {limits[action.repo].worker_timeout_minutes}-"
-                    f"minute maintenance threshold, and {reason}. Grooming will not close, merge, or force-push "
-                    "it; human review is required.\n\n"
-                    f"{STALE_PR_MARKER}"
-                )
+                if machine_park:
+                    body = (
+                        "> 🤖 SPARQ agent\n\n"
+                        f"This worker PR has been untouched beyond the "
+                        f"{limits[action.repo].worker_timeout_minutes}-minute maintenance "
+                        f"threshold, and {reason}. That is a MACHINE-recoverable cause, not a "
+                        f"question for a human, so this is the machine-owned "
+                        f"`{park_label}` soft hold: grooming re-admits it automatically once the "
+                        "cause is proven recovered, and will not close, merge, or force-push it. "
+                        f"No action is required from you.\n\n{STALE_PR_MARKER}\n{receipt}"
+                    )
+                else:
+                    # The human class is now reached only by an UNMAPPED cause (no machine exit
+                    # can be proven, so a human really is the exit) or by exceeding the
+                    # automatic-re-admission cap. The over-cap case names the flap, because
+                    # "this recurred N times" is a genuinely different question from "this took
+                    # too long" and is the one a human should be asked.
+                    #
+                    # THE GRANT COUNT IS READ, NEVER ASSUMED (registry #769). The cap counts PARK
+                    # generations, and a generation is consumed by every re-park however the label
+                    # was cleared — a human unlabel, or (until #769 bound the class) another
+                    # sweep's heuristic. So "generation 3" does NOT imply "the machine granted 2
+                    # re-admissions", and the original wording asserted that it did. A comment
+                    # that tells a maintainer the machine already tried twice, when the durable
+                    # record shows it never tried at all, sends them looking for a flapping cause
+                    # instead of the thing that actually kept clearing the label. The grants are
+                    # on record as un-park receipts; the sentence states what they say.
+                    grants = len(age_receipts(comments, AGE_UNPARK_MARKER, bot_login))
+                    if cause is None:
+                        flap = ""
+                    elif grants:
+                        flap = (
+                            f" This is age-park generation {generation}; the machine granted "
+                            f"{grants} automatic re-admission(s) (cap {AGE_UNPARK_MAX}) and the "
+                            "PR returned to the same state, so a repeated failure — not a "
+                            "timeout — is what is being escalated."
+                        )
+                    else:
+                        flap = (
+                            f" This is age-park generation {generation}, past the cap of "
+                            f"{AGE_UNPARK_MAX} automatic re-admissions, so it escalates here. "
+                            "Note that the machine granted NO automatic re-admission on this PR: "
+                            "it re-parked without its cause ever being proven recovered, so what "
+                            "is worth looking at is what kept clearing the park, not a flapping "
+                            "cause."
+                        )
+                    body = (
+                        "> 🤖 SPARQ agent\n\n"
+                        f"This worker PR has been untouched beyond the {limits[action.repo].worker_timeout_minutes}-"
+                        f"minute maintenance threshold, and {reason}. Grooming will not close, merge, or force-push "
+                        f"it; human review is required.{flap}\n\n"
+                        f"{STALE_PR_MARKER}" + (f"\n{receipt}" if receipt else "")
+                    )
                 api.request(
                     "POST",
                     f"/repos/{action.repo}/issues/{action.number}/comments",
@@ -2499,6 +3184,8 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
         f"defuse_deferred={len(defuse_outcome.deferred) + len(defuse_outcome.unavailable)} "
         f"repair_deferred={len(repair_outcome.deferred)} "
         f"stale_pr_deferred={len(stale_outcome.deferred)} "
+        f"age_unparked={unpark_count} age_converged={converge_count} "
+        f"age_unpark_deferred={len(unpark_outcome.deferred)} "
         f"detect_deferred={len(detect_outcome.deferred)}"
     )
     # Issue #644 precedence rule 4, now covering all three per-object phases (issue #647): the
@@ -2508,7 +3195,7 @@ def run_sweep(args: argparse.Namespace) -> tuple[int, int, int, int]:
     # (rule 3) and leaves this green; it does not, and must not, buy silence for a whole-phase
     # failure. The exit status is the report, never the control flow.
     systemic_sweep_failure = sweep_exit_failure(
-        (detect_outcome, repair_outcome, defuse_outcome, stale_outcome)
+        (detect_outcome, repair_outcome, defuse_outcome, stale_outcome, unpark_outcome)
     )
     if systemic_sweep_failure is not None:
         raise GroomError(systemic_sweep_failure)
@@ -3809,7 +4496,7 @@ def _self_test() -> int:
         [(9, "defer")],
     )
 
-    # ---- _admitted_worker_prs: the admission that gates exhaustion suppression (round 1) ----
+    # ---- _admitted_review_prs: the admission that gates exhaustion suppression (round 1) ----
     # Only a PR carrying the review loop's OWN identity + provenance admissions may suppress the
     # exhausted-attempt defer; every weaker linkage (a `Fixes #N` body reference, a fork's
     # worker-shaped head, a bot PR with no registry provenance record) must be refused —
@@ -3844,7 +4531,7 @@ def _self_test() -> int:
         }
         check(
             "admission: a proven worker attempt (identity + provenance) suppresses",
-            _admitted_worker_prs("owner/repo", {91: proven_pull}, "app[bot]", admit_root),
+            _admitted_review_prs("owner/repo", {91: proven_pull}, "app[bot]", admit_root),
             {9},
         )
         arbitrary_pull = {
@@ -3855,12 +4542,12 @@ def _self_test() -> int:
         }
         check(
             "NEGATIVE: an arbitrary PR with a `Fixes #9` body reference is NOT admitted",
-            _admitted_worker_prs("owner/repo", {92: arbitrary_pull}, "app[bot]", admit_root),
+            _admitted_review_prs("owner/repo", {92: arbitrary_pull}, "app[bot]", admit_root),
             set(),
         )
         # issue #172: `_current_links` (recovery-suppression linkage) now applies the SAME
         # worker-PR identity gate, so an untrusted PR can no longer hold a stale issue out of
-        # recovery. Unlike `_admitted_worker_prs` it does NOT require a provenance record (see its
+        # recovery. Unlike `_admitted_review_prs` it does NOT require a provenance record (see its
         # docstring) — for "is the App working this issue right now" the authoring identity is
         # authoritative. Positive first, so the gate rejecting everything flips these red.
         check(
@@ -3921,12 +4608,12 @@ def _self_test() -> int:
         }
         check(
             "NEGATIVE: a fork PR with a spoofed worker-shaped head is NOT admitted",
-            _admitted_worker_prs("owner/repo", {91: fork_pull}, "app[bot]", admit_root),
+            _admitted_review_prs("owner/repo", {91: fork_pull}, "app[bot]", admit_root),
             set(),
         )
         check(
             "NEGATIVE: a worker-shaped branch from a NON-BOT author is NOT admitted",
-            _admitted_worker_prs(
+            _admitted_review_prs(
                 "owner/repo",
                 {91: {**proven_pull, "user": {"login": "mallory"}}},
                 "app[bot]",
@@ -3936,7 +4623,7 @@ def _self_test() -> int:
         )
         check(
             "NEGATIVE: a bot worker branch WITHOUT the worker PR marker is NOT admitted",
-            _admitted_worker_prs(
+            _admitted_review_prs(
                 "owner/repo",
                 {91: {**proven_pull, "body": "Fixes #9"}},
                 "app[bot]",
@@ -3956,12 +4643,12 @@ def _self_test() -> int:
         }
         check(
             "NEGATIVE: a worker-shaped bot PR with NO provenance record is NOT admitted",
-            _admitted_worker_prs("owner/repo", {93: unrecorded_pull}, "app[bot]", admit_root),
+            _admitted_review_prs("owner/repo", {93: unrecorded_pull}, "app[bot]", admit_root),
             set(),
         )
         check(
             "NEGATIVE: a record whose issue disagrees with the branch-encoded issue is refused",
-            _admitted_worker_prs(
+            _admitted_review_prs(
                 "owner/repo",
                 {91: {**proven_pull,
                       "head": {"ref": "sparq-agent/issue-8-91-1",
@@ -3973,7 +4660,7 @@ def _self_test() -> int:
         )
         check(
             "NEGATIVE: an unresolved (empty) bot login admits nothing (fail closed)",
-            _admitted_worker_prs("owner/repo", {91: proven_pull}, "", admit_root),
+            _admitted_review_prs("owner/repo", {91: proven_pull}, "", admit_root),
             set(),
         )
 
@@ -4085,7 +4772,7 @@ def _self_test() -> int:
     check("live provenance: a malformed target repo fails closed", live_repo_failed, True)
 
     # _live_issue_admission: the single-issue admission the defer boundary asks — mirrors
-    # _admitted_worker_prs' identity + issue-binding, only the record SOURCE differs (live ref).
+    # _admitted_review_prs' identity + issue-binding, only the record SOURCE differs (live ref).
     live_worker_pull = {
         "head": {"ref": "sparq-agent/issue-9-91-1", "repo": {"full_name": "owner/repo"}},
         "user": {"login": "app[bot]"},
@@ -4099,7 +4786,7 @@ def _self_test() -> int:
         "admitted",
     )
     # NEGATIVE: the live record's issue field disagrees with the branch-encoded issue — admit
-    # neither (exactly _admitted_worker_prs' cross-check, applied to the live record).
+    # neither (exactly _admitted_review_prs' cross-check, applied to the live record).
     check(
         "live admission: a record whose issue disagrees with the branch is DENIED",
         _live_issue_admission(
@@ -4139,6 +4826,255 @@ def _self_test() -> int:
             "owner/repo", 9, {91: live_worker_pull}, ""),
         "denied",
     )
+
+    # ---- [registry #835] GROOM IS NO LONGER CLASS-BLIND ---------------------------------------
+    # THE DEFECT: every suppression guard here keyed on WORKER identity, so an enrolled #657
+    # orchestrator PR under review could not hold its source issue out of the attempt-exhaustion
+    # park. Groom then wrote status:parked to that source issue, and
+    # dispatch-claim.enumerate_review_items excludes a PR whose source issue carries
+    # status:parked (or any needs:*) — SILENTLY, because a PR with no `review:*` label is not
+    # `signalled` and `exclude_signalled` prints nothing for it. Groom's run succeeded; the PR
+    # was simply absent from the next enumeration. Both directions are asserted, plus a worker
+    # regression control and the five shapes that must stay out.
+    orch_login = "enrolled-orchestrator"
+    orch_enrolled = (orch_login,)
+    orch_review = _review_loop_module()
+    orch_record = dict(orch_review.orchestrator_probe_record(95), issue=9)
+    check(
+        "[#835] the fixture really is the ORCHESTRATOR attestation class (else nothing below "
+        "tests the class at all)",
+        orch_review.provenance_attestation_class(orch_record),
+        orch_review.ORCHESTRATOR_CLASS,
+    )
+    orch_pull = {
+        "updated_at": datetime.fromtimestamp(now - 700, timezone.utc).isoformat(),
+        # The #657 population's shape: same-repo head on an ORDINARY branch, HUMAN author, and
+        # no worker body marker — it fails EVERY predicate _worker_pr_identity applies.
+        "head": {"ref": "fix/ordinary-branch", "repo": {"full_name": "owner/repo"}},
+        "user": {"login": orch_login},
+        "body": "an orchestrator-authored pull request",
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        orch_root = Path(tmp)
+        (orch_root / PROVENANCE_DIR).mkdir(parents=True)
+
+        def _write_record(number: int, record: Any) -> None:
+            (orch_root / PROVENANCE_DIR / f"owner--repo--pr{number}.json").write_text(
+                json.dumps(record), encoding="utf-8")
+
+        _write_record(95, orch_record)
+        _write_record(91, {
+            "pr_number": 91, "head_sha_at_open": "1" * 40, "impl_provider": "anthropic",
+            "impl_alias": "fable", "impl_account_h": "ab" * 8, "issue": 9,
+            "recorded_at_run": "29694084610.1"})
+
+        def admitted_for(pulls: dict[int, dict[str, Any]], authors: Any) -> set[int]:
+            return _admitted_review_prs("owner/repo", pulls, "app[bot]", orch_root,
+                                        enrolled_authors=authors)
+
+        check(
+            "[#835] an ENROLLED orchestrator-class PR suppresses its source issue's exhaustion "
+            "park (reverting the admission reds THIS check)",
+            admitted_for({95: orch_pull}, orch_enrolled), {9})
+        check(
+            "[#835] ...and with an EMPTY allowlist the very same PR suppresses NOTHING "
+            "(enrolment is the discriminator, not the branch shape)",
+            admitted_for({95: orch_pull}, ()), set())
+        orch_worker_pull = {
+            "updated_at": orch_pull["updated_at"],
+            "head": {"ref": "sparq-agent/issue-9-91-1", "repo": {"full_name": "owner/repo"}},
+            "user": {"login": "app[bot]"},
+            "body": WORKER_PR_MARKER + "\n\nFixes #9",
+        }
+        check(
+            "[#835] REGRESSION CONTROL: a worker-class PR still suppresses, in BOTH allowlist "
+            "states (frozen literals, not a re-call of the live predicate)",
+            [admitted_for({91: orch_worker_pull}, ()),
+             admitted_for({91: orch_worker_pull}, orch_enrolled)], [{9}, {9}])
+        for _why, _pull, _record in (
+                ("a THIRD-PARTY author is not enrolled",
+                 {**orch_pull, "user": {"login": "drive-by-contributor"}}, orch_record),
+                ("a FORK head is never admitted, on any path",
+                 {**orch_pull,
+                  "head": {"ref": "fix/x", "repo": {"full_name": "mallory/repo"}}}, orch_record),
+                ("the record must be THIS PR's record",
+                 orch_pull, dict(orch_review.orchestrator_probe_record(7), issue=9)),
+                ("a MACHINE-attested record is not the orchestrator class",
+                 orch_pull, {**orch_record, "recorded_at_run": "29694084610.1"}),
+                ("a malformed record fails closed",
+                 orch_pull, {**orch_record, "issue": 0})):
+            _write_record(95, _record)
+            check(f"[#835] NEGATIVE: {_why}", admitted_for({95: _pull}, orch_enrolled), set())
+        _write_record(95, orch_record)
+        check(
+            "[#835] NEGATIVE: no record at all fails closed",
+            admitted_for({96: {**orch_pull}}, orch_enrolled), set())
+
+        # END TO END, through the SAME composition run_sweep uses: the exhaustion planner reads
+        # the admitted set this allowlist produces. This is the check that expresses the actual
+        # harm — a defer action on issue #9 IS the silent de-enumeration of PR #95.
+        exhausted_issue = {"owner/repo": {9: {
+            "labels": [{"name": "status:in-progress"}],
+            "updated_at": datetime.fromtimestamp(now - 700, timezone.utc).isoformat()}}}
+
+        def exhaustion_modes(pulls: dict[int, dict[str, Any]], authors: Any) -> list[Any]:
+            acts, _prs, _dead = _plan_actions(
+                {"owner/repo": Limits(worker_timeout_minutes=10, max_attempts=2,
+                                      enrolled_authors=authors)},
+                exhausted_issue, {"owner/repo": pulls},
+                {"owner/repo": admitted_for(pulls, authors)},
+                {("owner/repo", 9): 2}, {}, [], {}, now, "app[bot]")
+            return [(a.number, a.mode) for a in acts]
+
+        check(
+            "[#835] END TO END: an exhausted issue whose ENROLLED orchestrator PR is open is "
+            "NOT parked — no silent de-enumeration",
+            exhaustion_modes({95: orch_pull}, orch_enrolled), [])
+        check(
+            "[#835] END TO END: the pre-#835 behaviour (empty allowlist) still parks it — this "
+            "is the defect, and it is what enrolment removes",
+            exhaustion_modes({95: orch_pull}, ()), [(9, "defer")])
+        check(
+            "[#835] END TO END REGRESSION CONTROL: an open worker PR still suppresses with the "
+            "allowlist enabled",
+            exhaustion_modes({91: orch_worker_pull}, orch_enrolled), [])
+        check(
+            "[#835] END TO END: an UNENROLLED third party cannot hold an exhausted issue out of "
+            "its park",
+            exhaustion_modes({95: {**orch_pull, "user": {"login": "mallory"}}}, orch_enrolled),
+            [(9, "defer")])
+        # The claim that makes adding `admitted` to the recovery-suppression guard worker-NEUTRAL:
+        # for the worker class the admitted set is a SUBSET of the links keys, so the new
+        # disjunct can never change a worker outcome. Asserted, not asserted-in-prose.
+        for _authors in ((), orch_enrolled):
+            check(
+                f"[#835] REGRESSION CONTROL: worker admitted ⊆ links keys (authors={_authors})",
+                admitted_for({91: orch_worker_pull}, _authors)
+                <= set(_current_links("owner/repo", {91: orch_worker_pull}, "app[bot]")),
+                True)
+        # ...and the recovery path itself: a stale in-progress issue with an ENROLLED
+        # orchestrator PR open is NOT re-readied (before #835 it was, and a worker was
+        # dispatched onto work already in the review lane).
+        stale_open = {"owner/repo": {9: {
+            "labels": [{"name": "status:in-progress"}],
+            "updated_at": datetime.fromtimestamp(now - 700, timezone.utc).isoformat()}}}
+
+        def recovery_modes(pulls: dict[int, dict[str, Any]], authors: Any) -> list[Any]:
+            acts, _prs, _dead = _plan_actions(
+                {"owner/repo": Limits(worker_timeout_minutes=10, max_attempts=9,
+                                      enrolled_authors=authors)},
+                stale_open, {"owner/repo": pulls},
+                {"owner/repo": admitted_for(pulls, authors)},
+                {("owner/repo", 9): 1}, {}, [], {}, now, "app[bot]")
+            return [(a.number, a.mode) for a in acts]
+
+        check(
+            "[#835] the stale-in-progress recovery does NOT re-ready an issue whose enrolled "
+            "orchestrator PR is open",
+            recovery_modes({95: orch_pull}, orch_enrolled), [])
+        check(
+            "[#835] ...and with an empty allowlist it still re-readies (the pre-#835 behaviour, "
+            "so the check above is not vacuous)",
+            recovery_modes({95: orch_pull}, ()), [(9, "ready")])
+        check(
+            "[#835] REGRESSION CONTROL: the recovery path is unchanged for a worker PR and for "
+            "an issue with no PR at all",
+            [recovery_modes({91: orch_worker_pull}, orch_enrolled), recovery_modes({}, ())],
+            [[], [(9, "ready")]])
+
+    # The MUTATION BOUNDARY re-read must admit the class on the same terms, or the on-disk
+    # admission suppresses and the live one lets the park through — the exact drift the worker
+    # path already forbids (issue #174).
+    orch_live_path = (
+        "/repos/owner/registry/contents/orchestration/provenance/"
+        f"owner--repo--pr95.json?ref={live_tip}")
+    orch_live_record = dict(orch_review.orchestrator_probe_record(95), issue=9)
+    check(
+        "[#835] live admission: an ENROLLED orchestrator PR's raced-in record ADMITS (cancel "
+        "the park)",
+        _live_issue_admission(
+            _StubAPI({**live_ref, orch_live_path: _contents(orch_live_record)}),
+            "owner/registry", "owner/repo", 9, {95: orch_pull}, "app[bot]",
+            enrolled_authors=orch_enrolled),
+        "admitted",
+    )
+    check(
+        "[#835] live admission: the same PR with an EMPTY allowlist is never even read (DENIED)",
+        _live_issue_admission(
+            _RaisingAPI(), "owner/registry", "owner/repo", 9, {95: orch_pull}, "app[bot]"),
+        "denied",
+    )
+    check(
+        "[#835] live admission: an enrolled PR whose live record binds ANOTHER issue is DENIED",
+        _live_issue_admission(
+            _StubAPI({**live_ref,
+                      orch_live_path: _contents({**orch_live_record, "issue": 8})}),
+            "owner/registry", "owner/repo", 9, {95: orch_pull}, "app[bot]",
+            enrolled_authors=orch_enrolled),
+        "denied",
+    )
+    check(
+        "[#835] live admission: an enrolled PR with an UNREADABLE live ledger is INDETERMINATE "
+        "(skip the park + alert), never a park on an unusable read",
+        _live_issue_admission(
+            _RaisingAPI(), "owner/registry", "owner/repo", 9, {95: orch_pull}, "app[bot]",
+            enrolled_authors=orch_enrolled),
+        "indeterminate",
+    )
+    check(
+        "[#835] live admission: a FORK head is never read and never suppresses, even enrolled",
+        _live_issue_admission(
+            _RaisingAPI(), "owner/registry", "owner/repo", 9,
+            {95: {**orch_pull,
+                  "head": {"ref": "fix/x", "repo": {"full_name": "mallory/repo"}}}},
+            "app[bot]", enrolled_authors=orch_enrolled),
+        "denied",
+    )
+
+    # THE POLICY READ. `Limits.enrolled_authors` defaults to `()`, so a load_limits that never
+    # populates it would leave every check above passing while production ran enrolment-off.
+    with tempfile.TemporaryDirectory() as tmp:
+        _pol_dir = Path(tmp)
+        (_pol_dir / "repos.toml").write_text(
+            '[repos."owner/repo"]\nenabled=true\nrouting="r.toml"\naccount_pool=["acct01"]\n'
+            'max_concurrent=1\nworker_timeout_minutes=30\ngate_profile="lint-only"\n'
+            'arm_auto_merge=false\nmax_attempts=3\ntrust="collaborators"\n'
+            f'review_enrolment_authors=["{orch_login}"]\n', encoding="utf-8")
+        _pol_limits = load_limits(_pol_dir / "repos.toml",
+                                  Path(__file__).resolve().with_name("policy-resolve.py"))
+        check(
+            "[#835] load_limits carries the repo's MASTER-protected allowlist onto Limits "
+            "(hard-coding `()` there turns groom's class awareness off in production)",
+            _pol_limits["owner/repo"].enrolled_authors, (orch_login,))
+        (_pol_dir / "repos.toml").write_text(
+            (_pol_dir / "repos.toml").read_text(encoding="utf-8").replace(
+                f'review_enrolment_authors=["{orch_login}"]\n', ""), encoding="utf-8")
+        check(
+            "[#835] ...and an unset allowlist is EMPTY, i.e. enrolment off by default",
+            load_limits(_pol_dir / "repos.toml",
+                        Path(__file__).resolve().with_name("policy-resolve.py")
+                        )["owner/repo"].enrolled_authors, ())
+
+    # THE CALL SITES, on the PARSED module. A behavioural test of the admissions cannot see
+    # `run_sweep` passing a hard-coded `()`; the guards would stay green while the feature was
+    # off in production. Parsed, never regexed — a source regex fails permissive under a reflow.
+    _sweep_fn = next(
+        node for node in ast.walk(ast.parse(
+            Path(__file__).resolve().read_text(encoding="utf-8")))
+        if isinstance(node, ast.FunctionDef) and node.name == "run_sweep")
+    _sweep_enrol = [
+        (getattr(node.func, "id", ""), ast.unparse(keyword.value))
+        for node in ast.walk(_sweep_fn) if isinstance(node, ast.Call)
+        and getattr(node.func, "id", "") in ("_admitted_review_prs", "_live_issue_admission")
+        for keyword in node.keywords if keyword.arg == "enrolled_authors"]
+    check(
+        "[#835] every class-aware admission in run_sweep is handed the LIVE per-repo allowlist "
+        "(not a literal), at all FOUR call sites",
+        sorted(_sweep_enrol),
+        sorted([("_admitted_review_prs", "limits[repo].enrolled_authors"),          # planning
+                ("_admitted_review_prs", "limits[repo].enrolled_authors"),          # boundary links
+                ("_admitted_review_prs", "limits[action.repo].enrolled_authors"),   # defer boundary
+                ("_live_issue_admission", "limits[action.repo].enrolled_authors")]))
 
     # Orphan repair: closed-unmerged worker PRs strip every status label ('complete' adds nothing),
     # and a dead review loop leaves status:in-progress-review. Both are recoverable ONLY when the
@@ -4711,6 +5647,10 @@ def _self_test() -> int:
                 return {"data": {"repository": {"pullRequest": {
                     "mergeQueueEntry": None, "autoMergeRequest": None}}}}
             terminal_sweep_env["writes"].append((method, path))
+            # The BODY, recorded separately so the pre-existing (method, path) assertions keep
+            # their shape. Asserting only that a POST to .../labels happened is what let the age
+            # hand-off's label go untested through every round of this file's history.
+            terminal_sweep_env.setdefault("write_bodies", []).append((method, path, body))
             return {}
 
         def paginate(self, path):
@@ -4718,7 +5658,7 @@ def _self_test() -> int:
                 return terminal_sweep_env["planned_issues"]
             if path == "/repos/owner/repo/pulls?state=open":
                 return terminal_sweep_env.get("pulls", [])
-            return []
+            return terminal_sweep_env.get("pages", {}).get(path, [])
 
     terminal_sweep_releases: list[set[str]] = []
 
@@ -4981,6 +5921,7 @@ def _self_test() -> int:
             pulls: tuple[dict[str, Any], ...] = (),
             issues: tuple[dict[str, Any], ...] = (),
             details: tuple[dict[str, Any], ...] | None = None,
+            extra_gets: dict[str, Any] | None = None,
         ) -> tuple[str, str, list[set[str]]]:
             """Run the REAL run_sweep with the given per-object refusals; report (log, error, releases).
 
@@ -4994,13 +5935,17 @@ def _self_test() -> int:
                 "issued_at": 1,
                 "expires_at": 2,
             }]
+            terminal_sweep_env.setdefault("write_bodies", []).clear()
             terminal_sweep_env.update(
                 planned_issues=list(issues),
                 fresh_issues={issue["number"]: issue for issue in issues},
                 pulls=list(pulls),
                 gets={
-                    f"/repos/owner/repo/pulls/{pull['number']}": pull
-                    for pull in (pulls if details is None else details)
+                    **{
+                        f"/repos/owner/repo/pulls/{pull['number']}": pull
+                        for pull in (pulls if details is None else details)
+                    },
+                    **(extra_gets or {}),
                 },
                 writes=[],
                 http_failures=dict(refusals),
@@ -5115,6 +6060,809 @@ def _self_test() -> int:
                 "Bad credentials for token *** (***) while adding labels" in masked_log,
             ),
             (False, False, True),
+        )
+
+        # ---- THE AGE-PARK CLASS SPLIT, driven END-TO-END through the real run_sweep ------------
+        # Every check below is on the LEG THIS CHANGE IS NAMED FOR — the label the hand-off
+        # actually POSTs — not on a helper. The pre-existing #647 checks above assert only that a
+        # POST to `.../labels` HAPPENED, which is exactly why swapping `needs:user` for
+        # `review:parked` left this whole file green: the body was never read. `write_bodies` is
+        # the seam that closes that.
+        def _park_bodies() -> list[Any]:
+            # `/issues/<n>/labels` only — `POST /repos/<r>/labels` is _ensure_label CREATING
+            # the label definition, which is not a park write.
+            return [body for method, path, body in terminal_sweep_env.get("write_bodies", [])
+                    if method == "POST" and "/issues/" in path and path.endswith("/labels")]
+
+        def _comment_bodies() -> list[str]:
+            return [body["body"] for method, path, body
+                    in terminal_sweep_env.get("write_bodies", [])
+                    if method == "POST" and path.endswith("/comments")]
+
+        # (A1) A machine-recoverable cause (a wedged merge state) age-parks into the MACHINE class.
+        # Invert age_park_label's return and this reds on the very first tuple element.
+        machine_log, _e, _r = _sweep_with_refusals({}, pulls=(_stale_worker_pr(31),))
+        machine_receipt = (f"{AGE_PARK_MARKER} cause=merge-dirty head={31:040x} gen=1 -->")
+        check(
+            "an AGE/timeout park lands in the MACHINE class: the hand-off POSTs review:parked, "
+            "never the human-owned needs:user, and mints a cause/head/gen receipt",
+            (
+                _park_bodies(),
+                any(machine_receipt in body for body in _comment_bodies()),
+                any("No action is required from you." in body for body in _comment_bodies()),
+                "labels=review:parked" in machine_log,
+            ),
+            ([{"labels": ["review:parked"]}], True, True, True),
+        )
+        check(
+            "the age hand-off writes NO human-owned label for a machine-recoverable cause "
+            "(the whole defect: needs:user is what park_policy refuses to auto-re-admit)",
+            [body for body in _park_bodies()
+             if park_policy.HUMAN_PARK_LABEL in body.get("labels", [])],
+            [],
+        )
+
+        # (A2) FAIL-CLOSED DEFAULT. A cause the taxonomy cannot name has no recovery predicate, so
+        # it keeps the HUMAN hand-off — a soft hold with no provable exit would be a SILENT
+        # permanent hold. Deleting the `age_park_cause(reason) is None` branch reds this.
+        _saved_dirty = AGE_PARK_CAUSES.pop(BAD_MERGE_STATES["dirty"])
+        try:
+            _unmapped_log, _e, _r = _sweep_with_refusals({}, pulls=(_stale_worker_pr(31),))
+            check(
+                "a cause with NO machine recovery predicate still lands in needs:user "
+                "(fail-closed: an unprovable exit stays a VISIBLE human hold)",
+                (
+                    _park_bodies(),
+                    any(AGE_PARK_MARKER in body for body in _comment_bodies()),
+                ),
+                ([{"labels": ["needs:user"]}], False),
+            )
+        finally:
+            AGE_PARK_CAUSES[BAD_MERGE_STATES["dirty"]] = _saved_dirty
+
+        # (A3) THE CAP, at the only place it is enforced. Two park receipts already on record means
+        # this park is generation 3 — past AGE_UNPARK_MAX — so the machine has already granted every
+        # automatic re-admission it may, and the disposition becomes ESCALATION to the human class.
+        # Raise AGE_UNPARK_MAX (or drop the generation comparison) and this reds.
+        def _park_receipt_comment(gen: int, number: int = 31, cause: str = "merge-dirty") -> dict:
+            # Faithful to what the hand-off actually posts — STALE_PR_MARKER INCLUDED. A
+            # fixture that omitted it would let a dedupe reverted to the once-ever marker pass.
+            return {"user": {"login": "app[bot]"},
+                    "body": f"> 🤖 SPARQ agent\n\n{STALE_PR_MARKER}\n{AGE_PARK_MARKER} "
+                            f"cause={cause} head={number:040x} gen={gen} -->"}
+
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/31/comments": [
+                _park_receipt_comment(1), _park_receipt_comment(2)]}
+        capped_log, _e, _r = _sweep_with_refusals({}, pulls=(_stale_worker_pr(31),))
+        # [#769] THE ESCALATION MUST NOT CLAIM GRANTS THAT WERE NEVER MADE. This fixture is the
+        # dominant live shape: two PARK receipts, ZERO un-park receipts. The cap counts park
+        # GENERATIONS, and a generation is consumed by every re-park however the label was
+        # cleared — so generation 3 does NOT imply the machine granted two re-admissions, and the
+        # first version of this comment asserted flatly that it did. A maintainer told the machine
+        # already tried twice goes looking for a flapping cause; the durable record says nobody
+        # tried at all, and what actually wants explaining is what kept clearing the park.
+        # BOTH DIRECTIONS are asserted, here and immediately below, because a wording that is
+        # honest for one grant count and false for the other is the defect itself.
+        check(
+            "[#769] re-admission is CAPPED: an age park past AGE_UNPARK_MAX escalates to "
+            "needs:user, and with NO grants on record the comment says the machine granted NONE "
+            "— it never claims re-admissions it did not make",
+            (
+                _park_bodies(),
+                any("age-park generation 3" in body for body in _comment_bodies()),
+                any("the machine granted NO automatic re-admission on this PR"
+                    in body for body in _comment_bodies()),
+                any("the machine already granted" in body for body in _comment_bodies()),
+                any("automatic re-admission(s)" in body for body in _comment_bodies()),
+            ),
+            ([{"labels": ["needs:user"]}], True, True, False, False),
+        )
+        # ... and the SAME escalation with two REAL grants on record states the count it can
+        # prove, and names the flap. Swap the two branches and one of these two checks reds.
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/32/comments": [
+                _park_receipt_comment(1, 32), _park_receipt_comment(2, 32),
+                {"user": {"login": "app[bot]"},
+                 "body": f"{AGE_UNPARK_MARKER} cause=merge-dirty head={32:040x} gen=1 -->"},
+                {"user": {"login": "app[bot]"},
+                 "body": f"{AGE_UNPARK_MARKER} cause=merge-dirty head={32:040x} gen=2 -->"}]}
+        granted_log, _e, _r = _sweep_with_refusals({}, pulls=(_stale_worker_pr(32),))
+        check(
+            "[#769] ...and when the machine DID grant re-admissions, the escalation states the "
+            "count the receipts prove and names the flap",
+            (
+                any("the machine granted 2 automatic re-admission(s)" in body
+                    for body in _comment_bodies()),
+                any("a repeated failure — not a timeout" in body
+                    for body in _comment_bodies()),
+                any("granted NO automatic re-admission" in body
+                    for body in _comment_bodies()),
+            ),
+            (True, True, False),
+        )
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/31/comments": [
+                _park_receipt_comment(1), _park_receipt_comment(2)]}
+        capped_log, _e, _r = _sweep_with_refusals({}, pulls=(_stale_worker_pr(31),))
+        # The escalation is itself RECEIPTED, and that receipt is what makes it idempotent. Drop it
+        # and `already_commented` can never match the body just written, so every subsequent sweep
+        # posts the same escalation again — comment spam on a PR already handed to a human, and a
+        # generation counter that climbs on its own. Replaying the tick with the escalation on
+        # record must write NOTHING.
+        escalation_receipt = f"{AGE_PARK_MARKER} cause=merge-dirty head={31:040x} gen=3 -->"
+        check(
+            "the over-cap ESCALATION is receipted too — both classes consume a generation, so both "
+            "must be on record",
+            any(escalation_receipt in body for body in _comment_bodies()),
+            True,
+        )
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/31/comments": [
+                _park_receipt_comment(1), _park_receipt_comment(2),
+                {"user": {"login": "app[bot]"},
+                 "body": f"> 🤖 SPARQ agent\n\n{STALE_PR_MARKER}\n{escalation_receipt}"}]}
+        replay_escalation_log, _e, _r = _sweep_with_refusals(
+            {}, pulls=({**_stale_worker_pr(31), "labels": [{"name": "needs:user"}]},))
+        check(
+            "an escalation already on record is IDEMPOTENT — the same tick replayed writes NOTHING "
+            "(a human hold that re-comments every sweep is the spam this replaces)",
+            (terminal_sweep_env["writes"], "stale_prs=0" in replay_escalation_log),
+            ([], True),
+        )
+        terminal_sweep_env["pages"] = {}
+
+        # ---- the MACHINE EXIT: cause-gated, consumed exactly once, never over a human hold ------
+        def _machine_parked_pr(number: int, merge_state: str, labels: tuple[str, ...],
+                               *, fresh: bool = False) -> dict[str, Any]:
+            """An already-age-parked worker PR, as the open-PR listing shows it.
+
+            `fresh` puts it inside the age threshold, which the hand-off skips — so a scenario can
+            exercise the EXIT phase in isolation. That it still runs is itself the point: the
+            re-admission sweep is deliberately NOT age-gated, because a cause that recovers five
+            minutes after the park must be re-admitted five minutes after the park."""
+            return {
+                "number": number,
+                "state": "open",
+                "draft": False,
+                "labels": [{"name": name} for name in labels],
+                "updated_at": datetime.fromtimestamp(
+                    int(time.time()) if fresh else 1_000, timezone.utc).isoformat(),
+                "head": {"sha": f"{number:040x}", "ref": f"sparq-agent/issue-9{number}-fix"},
+                "user": {"login": "app[bot]"},
+                "body": f"{WORKER_PR_MARKER}\n\nautomated work",
+                "mergeable_state": merge_state,
+                "auto_merge": None,
+            }
+
+        def _before(writes: list[Any], first: Any, second: Any) -> bool:
+            """`first` was written strictly before `second`. Total, never raises: an assertion
+            that CRASHES on a mutant reports a crash-kill, which hides WHICH guard failed."""
+            return (first in writes and second in writes
+                    and writes.index(first) < writes.index(second))
+
+        def _grant_comment(receipt: str, at: str = "2026-07-26T11:00:00Z") -> dict[str, Any]:
+            """A bot-authored un-park GRANT receipt, with the `created_at` the recency conjunct
+            compares against the newest park application. A grant with no readable stamp cannot be
+            proven current and must refuse."""
+            return {"user": {"login": "app[bot]"}, "body": receipt, "created_at": at}
+
+        def _labelled(label: str, at: str, actor: str) -> dict[str, Any]:
+            return {"event": "labeled", "label": {"name": label},
+                    "created_at": at, "actor": {"login": actor}}
+
+        # A BOT `labeled review:parked` event must EXIST for the label to be provably
+        # machine-applied. park_policy.label_application_machine_owned refuses on absence —
+        # "absence of evidence is NOT proof of machine ownership" — so every happy-path fixture
+        # here carries the event the live sweep would have written. The earlier fixtures omitted
+        # it and passed only because the predicate then in use (park_applications) read absence
+        # as permission: exactly reproduced direction 2 of #690.
+        def _bot_park_timeline(number: int) -> dict[str, list[dict[str, Any]]]:
+            return {f"/repos/owner/repo/issues/{number}/timeline": [
+                _labelled("review:parked", "2026-07-26T10:00:00Z", "app[bot]")]}
+
+        recovered_pr = _machine_parked_pr(33, "clean", ("review:parked",))
+        unpark_receipt = f"{AGE_UNPARK_MARKER} cause=merge-dirty head={33:040x} gen=1 -->"
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/33/comments": [_park_receipt_comment(1, 33)],
+            **_bot_park_timeline(33)}
+        unpark_log, _e, _r = _sweep_with_refusals({}, pulls=(recovered_pr,))
+        unpark_writes = terminal_sweep_env["writes"]
+        _label_delete = ("DELETE", "/repos/owner/repo/issues/33/labels/review%3Aparked")
+        check(
+            "PROVEN CAUSE-RECOVERY re-admits the machine age park: the receipt is posted FIRST, "
+            "then review:parked is deleted — and the un-park is reported",
+            (
+                any(unpark_receipt in body for body in _comment_bodies()),
+                _label_delete in unpark_writes,
+                _before(unpark_writes, ("POST", "/repos/owner/repo/issues/33/comments"),
+                        _label_delete),
+                "age_unparked=1" in unpark_log,
+            ),
+            (True, True, True, True),
+        )
+
+        # Consume-exactly-once: replay the SAME recovery with the un-park receipt already on
+        # record. Drop the `consumed` set from age_unpark_owed and this reds — the recovery would
+        # be re-earned every tick, i.e. the infinite-retry failure that is worse than a hold.
+        # Consumed AND the label is GONE — the normal finished state. Nothing is written, and in
+        # particular no SECOND receipt: the recovery cannot be re-earned.
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/33/comments": [
+                _park_receipt_comment(1, 33),
+                _grant_comment(unpark_receipt)],
+            **_bot_park_timeline(33)}
+        replay_log, _e, _r = _sweep_with_refusals(
+            {}, pulls=({**recovered_pr, "labels": []},))
+        check(
+            "a re-admission is CONSUMED EXACTLY ONCE: the same (cause, head, gen) recovery grants "
+            "nothing on a later tick — no receipt, no unlabel",
+            (terminal_sweep_env["writes"], "age_unparked=0" in replay_log),
+            ([], True),
+        )
+
+        # The cause has NOT recovered: the park stands, and it says why. Invert
+        # age_park_cause_recovered's merge branch and this reds.
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/34/comments": [_park_receipt_comment(1, 34)],
+            **_bot_park_timeline(34)}
+        stands_log, _e, _r = _sweep_with_refusals(
+            {}, pulls=(_machine_parked_pr(34, "dirty", ("review:parked",), fresh=True),))
+        check(
+            "an UNRECOVERED cause is never re-admitted, and the sweep NAMES the standing park "
+            "(a park with no stated reason is the state nothing can audit)",
+            (
+                terminal_sweep_env["writes"],
+                "age park stands owner/repo#34" in stands_log,
+                "the merge state is still dirty" in stands_log,
+            ),
+            ([], True, True),
+        )
+
+        # A GENUINE human-question park is never auto-re-admitted — it carries no machine label,
+        # so the exit phase never even considers it. Drop the MACHINE_PARK_PR_LABEL membership
+        # test at the top of _execute_age_unpark_actions and this reds.
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/35/comments": [_park_receipt_comment(1, 35)]}
+        human_log, _e, _r = _sweep_with_refusals(
+            {}, pulls=(_machine_parked_pr(35, "clean", ("needs:user",), fresh=True),))
+        check(
+            "a GENUINE needs:user park is NEVER auto-re-admitted, even with a recovered cause and "
+            "a receipt on record (park_policy invariant 3, preserved exactly)",
+            (terminal_sweep_env["writes"], "age_unparked=0" in human_log),
+            ([], True),
+        )
+
+        # [#769] THE ONE RULE, on the PAIR the previous check could not reach. The check above
+        # carries `needs:user` ALONE, so the MACHINE_PARK_PR_LABEL membership test refuses it and
+        # human_owned_holds is never consulted — which is exactly how this went missing. The
+        # defect is the PR wearing BOTH labels: it enters the phase (the machine label IS live),
+        # its cause HAS recovered, and before this guard it was GRANTED — measured on the real
+        # function: `grants=1`, an un-park receipt minted, `review:parked` deleted.
+        #
+        # No human label was cleared, so invariant 3 held literally, and that is what made it easy
+        # to miss. The harm is the BUDGET: the one automatic recovery this park will ever earn was
+        # spent on a PR that provably could not re-enter, because the live `needs:user` keeps
+        # every downstream admission refusing. Consume-once means it can never be re-earned.
+        #
+        # BOTH HOLD SPELLINGS are driven, because human_owned_holds covers `review:needs-user` and
+        # ANY `needs:*` and a guard scoped to one symptom does not generalise. Delete the
+        # `human_owned_holds` call and BOTH of these red.
+        for _hold in ("needs:user", "review:needs-user", "needs:external-audit"):
+            terminal_sweep_env["pages"] = {
+                "/repos/owner/repo/issues/37/comments": [_park_receipt_comment(1, 37)],
+                **_bot_park_timeline(37)}
+            held_log, _e, _r = _sweep_with_refusals(
+                {}, pulls=(_machine_parked_pr(37, "clean", ("review:parked", _hold),
+                                              fresh=True),))
+            check(
+                f"[#769] a PR wearing BOTH review:parked and `{_hold}` spends NO re-admission "
+                "budget: no grant receipt, no unlabel, and the park is NAMED as human-held",
+                (
+                    terminal_sweep_env["writes"],
+                    "age_unparked=0" in held_log,
+                    f"human-owned hold(s) live ({_hold})" in held_log,
+                ),
+                ([], True, True),
+            )
+        # THE CONVERGENCE PATH under the same hold. The three checks above all exercise the GRANT
+        # branch, so they pin the guard's POSITION only above that one: a guard moved below the
+        # `granted is not None` branch would still pass them while the convergence retry deleted
+        # the label off a human-held PR. Same fixture, plus the un-park receipt already on record
+        # and the machine label still live — the exact crash residue the convergence branch exists
+        # for — and it must refuse too.
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/37/comments": [
+                _park_receipt_comment(1, 37),
+                _grant_comment(f"{AGE_UNPARK_MARKER} cause=merge-dirty head={37:040x} gen=1 -->",
+                               at="2026-07-26T11:00:00Z")],
+            **_bot_park_timeline(37)}
+        held_converge_log, _e, _r = _sweep_with_refusals(
+            {}, pulls=(_machine_parked_pr(37, "clean", ("review:parked", "needs:user"),
+                                          fresh=True),))
+        check(
+            "[#769] the CONVERGENCE retry refuses under a human-owned hold too — the guard is "
+            "above BOTH write branches, not just the grant",
+            (
+                terminal_sweep_env["writes"],
+                "age_converged=0" in held_converge_log,
+                "human-owned hold(s) live (needs:user)" in held_converge_log,
+            ),
+            ([], True, True),
+        )
+        # ... and the SAME convergence fixture WITHOUT the hold does converge, so the check above
+        # cannot pass merely because convergence stopped working.
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/37/comments": [
+                _park_receipt_comment(1, 37),
+                _grant_comment(f"{AGE_UNPARK_MARKER} cause=merge-dirty head={37:040x} gen=1 -->",
+                               at="2026-07-26T11:00:00Z")],
+            **_bot_park_timeline(37)}
+        unheld_converge_log, _e, _r = _sweep_with_refusals(
+            {}, pulls=(_machine_parked_pr(37, "clean", ("review:parked",), fresh=True),))
+        check(
+            "[#769] CONTROL: the identical convergence WITHOUT the hold still completes the "
+            "interrupted unlabel",
+            (
+                ("DELETE", "/repos/owner/repo/issues/37/labels/review%3Aparked")
+                in terminal_sweep_env["writes"],
+                "age_converged=1" in unheld_converge_log,
+            ),
+            (True, True),
+        )
+
+        # THE OTHER DIRECTION, on the SAME fixture minus the hold — otherwise the three checks
+        # above would pass just as well if the exit had stopped granting anything at all. This is
+        # the same PR, same recovered cause, same receipts: it MUST still be re-admitted.
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/37/comments": [_park_receipt_comment(1, 37)],
+            **_bot_park_timeline(37)}
+        unheld_log, _e, _r = _sweep_with_refusals(
+            {}, pulls=(_machine_parked_pr(37, "clean", ("review:parked",), fresh=True),))
+        check(
+            "[#769] CONTROL: the identical PR WITHOUT the hold is still re-admitted — the hold "
+            "guard refuses the held case only, it does not disable the exit",
+            (
+                ("DELETE", "/repos/owner/repo/issues/37/labels/review%3Aparked")
+                in terminal_sweep_env["writes"],
+                "age_unparked=1" in unheld_log,
+            ),
+            (True, True),
+        )
+
+        # [#769] park_policy INVARIANT 3, pinned STRUCTURALLY rather than by scenario. The
+        # behavioural checks above can only speak about the label paths their fixtures reach; the
+        # claim that has to hold is about EVERY path — "this phase's only label DELETE is on
+        # MACHINE_PARK_PR_LABEL, and no path here auto-clears a human hold". The incident behind
+        # that invariant is a label re-applied 37 times, and the live control is sparq-org/sparq
+        # #3728, a conflict-resolver escalation carrying `needs:user`: nothing in this phase may
+        # ever reach it. Parsed, never regexed — a source regex passes permissively under a
+        # reflow, and the failure mode of a permissive guard here is silent.
+        _unpark_fn = next(
+            node for node in ast.walk(ast.parse(
+                Path(__file__).resolve().read_text(encoding="utf-8")))
+            if isinstance(node, ast.FunctionDef) and node.name == "_execute_age_unpark_actions")
+        _unpark_deletes = [
+            ast.unparse(node) for node in ast.walk(_unpark_fn)
+            if isinstance(node, ast.Call)
+            and any(isinstance(arg, ast.Constant) and arg.value == "DELETE"
+                    for arg in node.args)]
+        check(
+            "[#769] the age exit issues EXACTLY ONE label DELETE and it is on "
+            "MACHINE_PARK_PR_LABEL — invariant 3: no path here auto-clears a human hold "
+            "(#3728, a conflict-resolver needs:user escalation, is the live control)",
+            (
+                len(_unpark_deletes),
+                all("park_policy.MACHINE_PARK_PR_LABEL" in call for call in _unpark_deletes),
+                any(name in call for call in _unpark_deletes
+                    for name in ("HUMAN_PARK_LABEL", "HUMAN_PR_PARK_LABEL", "needs:user",
+                                 "needs-user")),
+            ),
+            (1, True, False),
+        )
+
+        # A machine label a PROVEN HUMAN applied is likewise never auto-cleared: the actor decides,
+        # not the label. Remove the park_applications human_park check and this reds.
+        # TWO events, bot FIRST and the human LATER, so "the latest application was human" is
+        # genuinely the deciding fact. The previous single-event fixture proved nothing: with only
+        # a human event, absence-of-a-bot-event would have refused it anyway, so the branch this
+        # names was never exercised. Delete the human event and the sweep DOES clear the label.
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/36/comments": [_park_receipt_comment(1, 36)],
+            "/repos/owner/repo/issues/36/timeline": [
+                _labelled("review:parked", "2026-07-26T10:00:00Z", "app[bot]"),
+                _labelled("review:parked", "2026-07-26T12:00:00Z", "jeswr")],
+        }
+        human_applied_log, _e, _r = _sweep_with_refusals(
+            {}, pulls=(_machine_parked_pr(36, "clean", ("review:parked",), fresh=True),),
+            extra_gets={"/repos/owner/repo/collaborators/jeswr/permission":
+                        {"permission": "admin"}},
+        )
+        check(
+            "a machine park whose LATEST application is a PROVEN HUMAN is never auto-cleared, "
+            "even though an EARLIER bot application exists",
+            (
+                terminal_sweep_env["writes"],
+                "not provably machine-applied" in human_applied_log,
+            ),
+            ([], True),
+        )
+
+        # ---- #690 direction 1: authorising a DELETE of one label with evidence about THREE ----
+        # A human applied `review:parked`; a bot later applied `needs:user`. park_applications
+        # reads the newest `labeled` event across READMISSION_LABELS, so it reports "latest park
+        # was a machine" and the human's label is deleted. label_application_machine_owned reads
+        # ONLY `review:parked` events and refuses. Swap the call back and this reds.
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/38/comments": [_park_receipt_comment(1, 38)],
+            "/repos/owner/repo/issues/38/timeline": [
+                _labelled("review:parked", "2026-07-26T10:00:00Z", "jeswr"),
+                _labelled("needs:user", "2026-07-26T12:00:00Z", "app[bot]")],
+        }
+        cross_label_log, _e, _r = _sweep_with_refusals(
+            {}, pulls=(_machine_parked_pr(38, "clean", ("review:parked",), fresh=True),),
+            extra_gets={"/repos/owner/repo/collaborators/jeswr/permission":
+                        {"permission": "admin"}},
+        )
+        check(
+            "#690 direction 1: a HUMAN-applied review:parked is NOT clearable because a LATER "
+            "bot event exists on a DIFFERENT park label — ownership is proven per-label",
+            (terminal_sweep_env["writes"], "not provably machine-applied" in cross_label_log),
+            ([], True),
+        )
+
+        # ---- #690 direction 3: absence of evidence is not permission ---------------------------
+        # A live `review:parked` with NO `labeled` event at all (timeline truncated, label applied
+        # before the window, or applied by an import). Nothing proves a machine applied it.
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/39/comments": [_park_receipt_comment(1, 39)]}
+        no_event_log, _e, _r = _sweep_with_refusals(
+            {}, pulls=(_machine_parked_pr(39, "clean", ("review:parked",), fresh=True),))
+        check(
+            "#690 direction 3: a live review:parked with NO `labeled` event is NOT clearable — "
+            "absence of evidence is not proof of machine ownership",
+            (terminal_sweep_env["writes"], "not provably machine-applied" in no_event_log),
+            ([], True),
+        )
+
+        # ---- the UNREADABLE timeline, which previously had no red test at all ------------------
+        # The PR body claims "unreadable timeline -> stay parked"; before this check that claim was
+        # unsupported (deleting the branch left the suite green). A raising timeline read must
+        # refuse, and must NOT be swallowed into a re-admission.
+        class _RaisingPages(dict):
+            def get(self, key, default=None):
+                if key.endswith("/timeline"):
+                    raise GroomError("timeline read failed")
+                return super().get(key, default)
+
+        terminal_sweep_env["pages"] = _RaisingPages(
+            {"/repos/owner/repo/issues/40/comments": [_park_receipt_comment(1, 40)]})
+        unreadable_log, _e, _r = _sweep_with_refusals(
+            {}, pulls=(_machine_parked_pr(40, "clean", ("review:parked",), fresh=True),))
+        check(
+            "an UNREADABLE park timeline keeps the park (the claim the body makes, now with a "
+            "test that reds when the refusal is removed)",
+            (terminal_sweep_env["writes"], "not provably machine-applied" in unreadable_log),
+            ([], True),
+        )
+        terminal_sweep_env["pages"] = {}
+
+        # ---- CONVERGENCE: receipt landed, unlabel did not (registry #614 `auto-receipt`) -------
+        # Reached by ONE HTTP transient on the DELETE. Without this branch the PR keeps
+        # `review:parked` forever: its cause has recovered so the hand-off derives no reason and
+        # never re-parks it, and nothing else clears it — the INVISIBLE permanent hold. Delete the
+        # `if consumed:` block and this reds.
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/33/comments": [
+                _park_receipt_comment(1, 33),
+                _grant_comment(unpark_receipt)],
+            **_bot_park_timeline(33)}
+        converge_log, _e, _r = _sweep_with_refusals({}, pulls=(recovered_pr,))
+        check(
+            "CONVERGENCE: a consumed receipt with the label STILL LIVE completes the interrupted "
+            "unlabel — no second receipt, no new evidence, the generation untouched",
+            (
+                _label_delete in terminal_sweep_env["writes"],
+                _comment_bodies(),
+                "CONVERGE PR owner/repo#33" in converge_log,
+                # A convergence is a RETRY of an already-authorised write, not a new grant. The
+                # two are counted apart so neither can be read as the other — the reviewer's
+                # probe C ("5 replays = 5 unparks against a cap of 2") is answered by this line:
+                # grants stay at 0 however many times the tick replays.
+                ("age_unparked=0" in converge_log, "age_converged=1" in converge_log),
+            ),
+            (True, [], True, (True, True)),
+        )
+
+        # ---- B: a DIFFERENT writer's LATER park must NOT be deleted off a stale grant ----------
+        # `review:parked` is written by dispatch-claim (x2) and worker-pr's capacity park as well
+        # as by this sweep, so its presence never proves THIS sweep parked the PR. Live shape:
+        # age-park -> recover -> unpark -> the account starves -> worker-pr capacity-parks -> every
+        # groom tick deletes it. Drop the recency conjunct and this reds.
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/33/comments": [
+                _park_receipt_comment(1, 33), _grant_comment(unpark_receipt)],
+            "/repos/owner/repo/issues/33/timeline": [
+                _labelled("review:parked", "2026-07-26T10:00:00Z", "app[bot]"),
+                _labelled("review:parked", "2026-07-26T12:00:00Z", "app[bot]")],
+        }
+        newer_park_log, _e, _r = _sweep_with_refusals({}, pulls=(recovered_pr,))
+        check(
+            "a LATER park application refuses convergence — a shared multi-writer label being "
+            "present never proves THIS sweep's un-park failed to land",
+            (
+                terminal_sweep_env["writes"],
+                "is NEWER than the un-park receipt" in newer_park_log,
+                "age_converged=0" in newer_park_log,
+            ),
+            ([], True, True),
+        )
+
+        # C/D: convergence can never span two parks, so it cannot escape the cap it sits outside
+        # of. Replaying the SAME tick grants nothing new each time, and the moment anything
+        # re-parks the PR the check above refuses — which is the structural bound, not a counter.
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/33/comments": [
+                _park_receipt_comment(1, 33), _grant_comment(unpark_receipt)],
+            **_bot_park_timeline(33)}
+        replay_grants = []
+        for _tick in range(3):
+            tick_log, _e, _r = _sweep_with_refusals({}, pulls=(recovered_pr,))
+            replay_grants.append(("age_unparked=0" in tick_log,
+                                  _comment_bodies() == []))
+        check(
+            "replaying the same tick mints NO new grant and NO second receipt, however many times "
+            "it runs — the cap governs grants, and convergence can never become one",
+            replay_grants,
+            [(True, True)] * 3,
+        )
+
+        # A TIE is not "newer". park_policy resolves every instant tie conservatively (its own
+        # comment: "an instant tie resolves toward HUMAN-owned"), and capacity_park_admission's
+        # recency test is STRICT. Relax `<=` to `<` and a park applied in the same second as the
+        # grant is treated as older, re-opening exactly the multi-writer hole above.
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/33/comments": [
+                _park_receipt_comment(1, 33),
+                _grant_comment(unpark_receipt, at="2026-07-26T10:00:00Z")],
+            **_bot_park_timeline(33)}
+        tie_log, _e, _r = _sweep_with_refusals({}, pulls=(recovered_pr,))
+        check(
+            "an instant TIE between the grant and a park application refuses convergence — the "
+            "comparison is STRICTLY newer, as park_policy's is",
+            (terminal_sweep_env["writes"],
+             "is NEWER than the un-park receipt" in tie_log),
+            ([], True),
+        )
+
+        # A malformed grant stamp must DEFER this PR, not abort the sweep: park_policy's timestamp
+        # primitives raise ValueError, which the per-PR handler must absorb like any other failure.
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/33/comments": [
+                _park_receipt_comment(1, 33),
+                _grant_comment(unpark_receipt, at="not-a-timestamp")],
+            **_bot_park_timeline(33)}
+        malformed_log, malformed_error, malformed_releases = _sweep_with_refusals(
+            {}, pulls=(recovered_pr,))
+        check(
+            "a MALFORMED grant stamp refuses convergence and never aborts the sweep — dead-lease "
+            "reclaim still runs (narrow the per-PR except to GroomError and this reds)",
+            (
+                terminal_sweep_env["writes"],
+                "carries no readable timestamp" in malformed_log,
+                malformed_releases,
+            ),
+            ([], True, [{"e" * 32}]),
+        )
+
+        # EVERY failure class defers ITSELF. The guard above closes the one ValueError path that
+        # exists today, so this drives a NON-GroomError out of the per-PR body directly: narrow the
+        # handler back to `except GroomError` and this unhandled exception aborts run_sweep before
+        # _release_claims — #644/#647's head-of-line abort, from one PR.
+        class _ValueErrorPages(dict):
+            def get(self, key, default=None):
+                if key == "/repos/owner/repo/issues/33/comments":
+                    raise ValueError("comment page is a shape park_policy rejects")
+                return super().get(key, default)
+
+        terminal_sweep_env["pages"] = _ValueErrorPages(_bot_park_timeline(33))
+        ve_log, ve_error, ve_releases = _sweep_with_refusals({}, pulls=(recovered_pr,))
+        check(
+            "a NON-GroomError from one PR defers THAT PR and never aborts the sweep — dead-lease "
+            "reclaim still runs and the phase reports the deferral",
+            (
+                ve_releases,
+                "age un-park deferred" in ve_log,
+                "age_unpark_deferred=1" in ve_log,
+                "every age park re-admission failed (1 attempted, 0 completed)" in ve_error,
+            ),
+            ([{"e" * 32}], True, True, True),
+        )
+        terminal_sweep_env["pages"] = {}
+
+        # A grant with no readable timestamp cannot be proven newer than the park, so it refuses.
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/33/comments": [
+                _park_receipt_comment(1, 33),
+                {"user": {"login": "app[bot]"}, "body": unpark_receipt}],
+            **_bot_park_timeline(33)}
+        no_stamp_log, _e, _r = _sweep_with_refusals({}, pulls=(recovered_pr,))
+        check(
+            "an un-park grant with NO readable timestamp refuses convergence (it cannot be proven "
+            "current)",
+            (terminal_sweep_env["writes"],
+             "carries no readable timestamp" in no_stamp_log),
+            ([], True),
+        )
+
+        # Convergence is NOT a licence to clear a human's label: a human who re-applied
+        # `review:parked` AFTER our receipt owns it. Remove the _clearable() gate from the
+        # convergence branch and this reds.
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/33/comments": [
+                _park_receipt_comment(1, 33),
+                _grant_comment(unpark_receipt)],
+            # The human application lands BEFORE the grant, so the recency conjunct PASSES and the
+            # ownership proof is the only thing that can refuse — isolating _clearable() inside the
+            # convergence branch rather than letting recency mask it.
+            "/repos/owner/repo/issues/33/timeline": [
+                _labelled("review:parked", "2026-07-26T09:00:00Z", "app[bot]"),
+                _labelled("review:parked", "2026-07-26T10:30:00Z", "jeswr")],
+        }
+        converge_human_log, _e, _r = _sweep_with_refusals(
+            {}, pulls=(recovered_pr,),
+            extra_gets={"/repos/owner/repo/collaborators/jeswr/permission":
+                        {"permission": "admin"}},
+        )
+        check(
+            "CONVERGENCE still refuses a human-owned label: a human who re-applied review:parked "
+            "after the receipt owns it",
+            (terminal_sweep_env["writes"],
+             "not provably machine-applied" in converge_human_log),
+            ([], True),
+        )
+
+        # ---- the OVER-CAP gate, which previously survived deletion ------------------------------
+        # A gen-3 park receipt is over AGE_UNPARK_MAX, so age_park_label wrote the HUMAN class and
+        # the exit phase must not consider it AT ALL — even with a recovered cause, a live machine
+        # label and a clean bot-applied timeline. Delete the `gen > AGE_UNPARK_MAX` branch from
+        # age_unpark_state and this reds.
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/42/comments": [_park_receipt_comment(3, 42)],
+            **_bot_park_timeline(42)}
+        over_cap_log, _e, _r = _sweep_with_refusals(
+            {}, pulls=(_machine_parked_pr(42, "clean", ("review:parked",), fresh=True),))
+        check(
+            "the OVER-CAP gate holds at the exit too: a gen-3 park is never automatically "
+            "re-admitted, however clean everything else looks",
+            (terminal_sweep_env["writes"], "age_unparked=0" in over_cap_log),
+            ([], True),
+        )
+        terminal_sweep_env["pages"] = {}
+
+        # (A4) THE STICKY VETO FOLLOWS THE LABEL BEING WRITTEN. A human who removed `review:parked`
+        # more recently than any application has explicitly unparked THIS PR, and the machine must
+        # not re-apply it. Hard-code the veto's label argument back to "needs:user" — a six-character
+        # change that leaves the park class, the receipt and every other check above intact — and
+        # the veto silently queries a label with no history, so the suppressed park is written
+        # anyway. That is the mutant this check exists for.
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/31/timeline": [
+                {"event": "labeled", "label": {"name": "review:parked"},
+                 "created_at": "2026-07-26T10:00:00Z", "actor": {"login": "app[bot]"}},
+                {"event": "unlabeled", "label": {"name": "review:parked"},
+                 "created_at": "2026-07-26T11:00:00Z", "actor": {"login": "jeswr"}}],
+        }
+        veto_log, _e, _r = _sweep_with_refusals(
+            {}, pulls=(_stale_worker_pr(31),),
+            extra_gets={"/repos/owner/repo/collaborators/jeswr/permission":
+                        {"permission": "admin"}},
+        )
+        check(
+            "the sticky human unpark is checked against the label ACTUALLY BEING WRITTEN: a human "
+            "who removed review:parked vetoes the MACHINE age park (not just needs:user)",
+            (
+                _park_bodies(),
+                "review:parked park suppressed" in veto_log,
+                _comment_bodies(),
+            ),
+            ([], True, []),
+        )
+        terminal_sweep_env["pages"] = {}
+
+        # (A5) A SECOND generation must be able to mint. The machine class dedupes on its own
+        # receipt fingerprint; revert it to the once-ever STALE_PR_MARKER dedupe and generation 2
+        # is never recorded — so the cap in (A3) can never be reached and the escalation to the
+        # human class becomes unreachable. The prior tick's receipt already carries
+        # STALE_PR_MARKER, so only the fingerprint dedupe distinguishes the two.
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/31/comments": [_park_receipt_comment(1)]}
+        gen2_log, _e, _r = _sweep_with_refusals({}, pulls=(_stale_worker_pr(31),))
+        check(
+            "a RE-park after a re-admission mints a NEW generation receipt — without it the cap "
+            "is unreachable and nothing ever escalates",
+            (
+                any(f"{AGE_PARK_MARKER} cause=merge-dirty head={31:040x} gen=2 -->" in body
+                    for body in _comment_bodies()),
+                _park_bodies(),
+            ),
+            (True, [{"labels": ["review:parked"]}]),
+        )
+        terminal_sweep_env["pages"] = {}
+
+        # (A6) The exit phase is judged by the SHARED precedence rule, like every other phase.
+        # Its ONLY candidate's receipt write is refused: nothing completed, so the run must exit
+        # NON-ZERO naming the deferral. Drop unpark_outcome from the sweep_exit_failure tuple and
+        # a whole re-admission phase can fail in total while the run reports success — the
+        # exit-zero-swallows-failure shape this module already carries three scars from.
+        terminal_sweep_env["pages"] = {
+            "/repos/owner/repo/issues/37/comments": [_park_receipt_comment(1, 37)],
+            **_bot_park_timeline(37)}
+        unpark_fail_log, unpark_fail_error, _r = _sweep_with_refusals(
+            {("POST", "/repos/owner/repo/issues/37/comments"): _live_http_failure(
+                "POST", "/repos/owner/repo/issues/37/comments", forbidden_envelope)},
+            pulls=(_machine_parked_pr(37, "clean", ("review:parked",), fresh=True),),
+        )
+        check(
+            "a re-admission phase in which NOTHING completed exits NON-ZERO naming the deferral "
+            "(the phase is enrolled in the shared exit precedence, not exempt from it)",
+            (
+                "every age park re-admission failed (1 attempted, 0 completed)"
+                in unpark_fail_error,
+                "owner/repo#37" in unpark_fail_error,
+                "age_unpark_deferred=1" in unpark_fail_log,
+                "age_unparked=0" in unpark_fail_log,
+            ),
+            (True, True, True, True),
+        )
+        terminal_sweep_env["pages"] = {}
+
+        # An UNKNOWN cause token can never be proven recovered, so it never re-admits. This is the
+        # quantifier direction that matters: "some causes recover" must not become "re-admit unless
+        # we can show it did not".
+        check(
+            "an UNRECOGNISED cause token is NEVER re-admitted (no predicate ⇒ no proof ⇒ parked)",
+            age_park_cause_recovered("teleported", {"mergeable_state": "clean"},
+                                     lambda: ("admits", {}))[0],
+            False,
+        )
+        check(
+            "an INDETERMINATE live provenance read keeps the orphan-draft park (never re-admit on "
+            "an unusable read)",
+            (age_park_cause_recovered("orphan-draft", {}, lambda: ("indeterminate", None))[0],
+             age_park_cause_recovered("orphan-draft", {}, lambda: ("denies", None))[0],
+             age_park_cause_recovered("orphan-draft", {}, lambda: ("admits", {}))[0]),
+            (False, False, True),
+        )
+        check(
+            "a MALFORMED live merge state keeps the park (fail-closed, never a re-admission)",
+            age_park_cause_recovered("merge-blocked", {"mergeable_state": 7},
+                                     lambda: ("denies", None))[0],
+            False,
+        )
+        # A malformed receipt still CONSUMES a generation — otherwise a corrupt comment buys an
+        # extra automatic re-admission (park_policy's auto_marker_count rule).
+        check(
+            "a MALFORMED park receipt still consumes a generation (it cannot buy an extra grant)",
+            age_park_generation(
+                [{"user": {"login": "app[bot]"}, "body": f"{AGE_PARK_MARKER} garbage -->"}],
+                "app[bot]"),
+            2,
+        )
+        check(
+            "a receipt authored by anyone but the bot proves nothing",
+            age_receipts(
+                [{"user": {"login": "mallory"},
+                  "body": f"{AGE_PARK_MARKER} cause=merge-dirty head={'a' * 40} gen=1 -->"}],
+                AGE_PARK_MARKER, "app[bot]"),
+            [],
+        )
+        check(
+            "every reason stale_worker_pr_reason can return is CLASSIFIED — a new bad merge state "
+            "cannot silently fall through to the human terminal",
+            sorted({age_park_cause(reason) for reason in
+                    [ORPHAN_DRAFT_REASON, *BAD_MERGE_STATES.values()]} - {None}),
+            sorted({"orphan-draft", *(f"merge-{state}" for state in BAD_MERGE_STATES)}),
         )
 
         # (2) ISSUE-REPAIR LOOP, head-of-line refusal. Same shape: the lower-numbered issue's

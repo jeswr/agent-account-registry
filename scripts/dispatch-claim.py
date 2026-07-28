@@ -836,8 +836,17 @@ def validate_plan(document):
 
 
 def _security_flagged(labels):
-    """Security surfaces never auto-arm (mirrors worker-pr.py security_flagged): substring
-    keywords per routing match_labels semantics plus the trust:* prefix namespace."""
+    """The PLAN row's ADVISORY `security` boolean: substring keywords per routing match_labels
+    SEMANTICS (this module's own SECURITY_KEYWORDS) plus the trust:* prefix namespace.
+
+    [#578 AC5] It does NOT read the TARGET routing's `match_labels`, and the doc now says so —
+    orchestration/routing.toml previously claimed it did. The classifier that DOES union them is
+    the arm-side one (review-fix.yml resolve -> policy-resolve.routing_security_keywords ->
+    worker-pr.security_flagged / live_security_flagged), and that is the gate which withholds the
+    auto-arm. This flag decides nothing: in particular it plays no part in fix-chain selection,
+    which is constrained from the RESOLVED ROUTE (_route_constrained_fix_chain), never from a
+    plan-persisted boolean. Widening it would mean handing a HOSTILE target's routing table to the
+    pure PLAN enumerator to compute a field no consumer reads."""
     return (any(keyword in label for label in labels for keyword in SECURITY_KEYWORDS)
             or any(label.startswith("trust:") for label in labels))
 
@@ -4084,7 +4093,8 @@ def _migrate_legacy_park(repo, number, issue_number, comments, labels, bot_login
 def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_login, script_dir,
                             worker_pr, evidence_probe, comments_fn=None, timeline_fn=None,
                             post_comment=None, clear_labels=None, log=print,
-                            migration_provable=False, convert_labels=None):
+                            migration_provable=False, convert_labels=None, *,
+                            enrolled_authors):
     """AUTOMATIC re-admission of MACHINE capacity parks whose starvation cause has demonstrably
     cleared (registry #614) — the sweep that closes the structural stall: a MACHINE-owned park
     could only ever be cleared by a HUMAN, so a capacity outage stranded every PR it parked even
@@ -4101,6 +4111,16 @@ def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_logi
     leaves receipt-no-label — which the receipt-driven proof gate admits and this sweep converges
     on the next tick — never label-no-receipt, which would erase the re-admission from every proof
     surface and re-strand the PR. Every failure is PER-PR: one unreadable PR never stops the rest.
+
+    [registry #835] `enrolled_authors` is the repo's MASTER-protected `review_enrolment_authors`
+    allowlist — REQUIRED keyword-only, exactly as `_dispatch_review_items` takes it (#821), so a
+    caller that forgets it is a TypeError rather than a silent enrolment-off sweep. Without it this
+    sweep's CANDIDATE FILTER (a worker head ref AND the App-bot author) excluded the #657
+    orchestrator class outright, so a machine-owned capacity park taken by an ENROLLED
+    orchestrator PR had NO machine exit at all: the #614 stall, reproduced on precisely the
+    population the enrolment feature serves, and invisible to every per-run success signal because
+    each individual sweep succeeded. Note #813 does not cover this — it fixed the LADDER's
+    machine-vs-human attribution; the candidate filter is a separate, shape-based gate.
 
     Returns the number of PRs re-admitted this tick."""
     comments_fn = comments_fn or _pr_comments
@@ -4169,19 +4189,41 @@ def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_logi
         if row.get("state") != "open":
             continue
         head = row.get("head") or {}
-        if (head.get("repo") or {}).get("full_name") != repo \
-                or not HEAD_REF_RE.match(str(head.get("ref", ""))):
-            continue                      # not a same-repo worker branch — never ours to re-admit
+        # FORK GATE FIRST, and unconditional — hoisted above every waivable predicate exactly as
+        # enumerate_review_items hoists it (#657), rather than left to the accident of ordering.
+        # `head.repo != repo` is the single attacker-facing predicate in this sweep: a fork head is
+        # attacker-controlled and is NEVER re-admitted, on any path, by any waiver.
+        if (head.get("repo") or {}).get("full_name") != repo:
+            continue
         login = str((row.get("user") or {}).get("login", ""))
-        if not bot_login or login != bot_login:
-            continue                      # only the trusted App bot's own worker PRs
+        if not bot_login:
+            continue                      # no App identity: receipts can be neither read nor minted
+        # [registry #835] ORCHESTRATOR-CLASS RE-ADMISSION. The two gates below are the WORKER
+        # lane's PRODUCER SHAPE (research/657-orchestrator-pr-admission.md §7.2), not a trust
+        # root; an orchestrator-authored PR satisfies NEITHER, which is exactly what #821's
+        # waiver exists to bypass. Reuse that ONE predicate rather than re-deriving the shape
+        # test, so "admitted at PLAN/CLAIM" and "re-admittable here" cannot drift. Both halves
+        # of the waiver still hold: an `orchestrator`-attested record for THIS PR on the
+        # unprotected `ledger` branch AND the author's login in the master-protected allowlist.
+        # An EMPTY allowlist — every repo's default — makes this constantly False and the two
+        # gates below stand byte-for-byte as they did before.
+        record = provenance.get(number) if isinstance(provenance, dict) else None
+        orchestrator_admitted = admits_orchestrator_pr(record, number, login, enrolled_authors)
+        if not orchestrator_admitted:
+            if not HEAD_REF_RE.match(str(head.get("ref", ""))):
+                continue                  # not a same-repo worker branch — never ours to re-admit
+            if login != bot_login:
+                continue                  # only the trusted App bot's own worker PRs
         try:
             # EVERYTHING that can fail on hostile/degraded data lives inside the per-PR try: a
             # malformed label list, an unreadable comments page, or a failed timeline read must
             # skip THIS PR (its park simply stands) and never abort the sweep — the whole tick's
             # claim runs under this call.
             labels = set(_labels(row))
-            record = provenance.get(number)
+            # `record` was read above the candidate filter (#835): the orchestrator waiver is a
+            # function OF the record, so the record has to exist before the gates it can waive
+            # are evaluated. ONE read per PR per tick — a second `provenance.get` here would be a
+            # second view of the same decision and could drift from the one the waiver used.
             issue_number = record.get("issue") if isinstance(record, dict) else None
             if not isinstance(issue_number, int) or isinstance(issue_number, bool) \
                     or issue_number <= 0:
@@ -4233,6 +4275,43 @@ def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_logi
             # sweep cannot drift from the admission it feeds.
             holds = _park_policy.human_owned_holds(set(labels) | set(source_labels))
             comments = comments_fn(repo, number)
+            # [registry #769] EPISODE BINDING. `review:parked` is a shared multi-writer label, and
+            # groom's AGE park now writes it too. An age park's cause is an orphan draft or a
+            # wedged merge state, which no model-health record can speak to — so the probe below
+            # skips both genuine gates and lands on the labelled sustained-fleet-health HEURISTIC,
+            # whose only condition this park can satisfy is BEING OLD ENOUGH. Measured on the real
+            # sweep with a byte-identical health window: `None` at 3 h, `auto-mint` at 7 h. That
+            # made age its own recovery proof, spent a re-admission budget groom never granted,
+            # and left groom's next hand-off escalating a flap that never happened.
+            #
+            # The heuristic is NOT removed — registry #691 added it for parks with no machine exit
+            # at all, and an age park is not one of those: its exit is groom's own cause proof.
+            # This class is simply made ineligible for health-only clearance. The check sits AFTER
+            # `holds` deliberately: a PR carrying a human-owned hold is HUMAN-TERMINAL, and that
+            # is the census classification a maintainer must see, so the hold keeps precedence.
+            if not holds:
+                age_park, age_detail = _park_policy.age_park_episode(
+                    # `labels` is the PR's own live set. The predicate refuses to answer at all
+                    # without a live `review:parked` — this sweep ALSO admits a PR whose SOURCE
+                    # ISSUE carries `status:parked` and which has no PR-side label, and such a PR
+                    # can still carry an age receipt from an earlier, already-cleared episode.
+                    labels, comments, bot_login,
+                    # The other mechanisms' durable PARK receipts. worker-pr owns the generation
+                    # marker's spelling, so it is passed from the literal this file already pins
+                    # against the real module rather than re-derived inside park_policy.
+                    superseding_markers=(PARK_GENERATION_MARKER_PREFIX,
+                                         _park_policy.PARK_REASON_MARKER),
+                    log=log)
+                if age_park:
+                    log(f"park stands {repo}#{number}: {age_detail}")
+                    # [G5] CENSUSED, like every other pre-admission exit. A refusal that skips the
+                    # census is exactly the invisible hold this whole class of defect is about —
+                    # and the code is EXIT-REACHABLE, which is the honest reading: groom's sweep
+                    # clears it on its own cause proof, with no human gesture required.
+                    _park_policy.park_census_record(
+                        park_census, repo, number,
+                        _park_policy.PARK_REFUSAL_FOREIGN_EPISODE, age_detail)
+                    continue
             # ONE timeline read per surface per PR: the admission consults the timelines several
             # times (the human cutoff, the park applications, the ownership probe) and every read
             # must see the SAME view anyway — a mid-decision change would mix two worlds.
@@ -4845,6 +4924,69 @@ def _resolvable_chain(chain, routing):
     return usable
 
 
+def _route_constrained_fix_chain(fix_aliases, route_chain):
+    """[#578] The fix lane's claim chain: the INTERSECTION of the provider-wide fix walk with the
+    PR's OWN trust-tier route, order preserved from `fix_aliases`.
+
+    WHY AN INTERSECTION AND NOT A FLOOR. `FIX_CHAIN[impl_provider]` (or its pinned truncation) is
+    a PROVIDER-wide preference walk; it knows nothing about the route the SOURCE ISSUE resolved
+    to. So a trust-surface PR whose issue routed to a restricted soundness chain could be FIXED by
+    a tier that route deliberately excludes — the fix lane silently re-widened what routing.toml
+    narrowed, and `escalate = true` (defer-not-fallback) was bypassed on the fix leg. A LADDER
+    FLOOR (the shape the closed PR #282 proposed) does not close this: a floor readmits every
+    ladder member ABOVE it, including ones the route omits, so a route naming a single mid-ladder
+    tier still leaks its successors. Only set membership expresses "this route does not authorize
+    that model".
+
+    `route_chain` is whatever the LIVE resolver derived from the source issue's LIVE labels; a
+    non-string entry is ignored so a hostile/garbled chain can only NARROW the result. An empty
+    result means the route authorizes no same-provider fix model at all — the caller FAILS CLOSED
+    (defer, or escalate per `escalate = true`) and never falls through to the provider default."""
+    allowed = {alias for alias in route_chain if isinstance(alias, str)}
+    return [alias for alias in fix_aliases if alias in allowed]
+
+
+def _fix_chain_model_pin(fix_chain, ladder):
+    """[#578] The `model_pin` value that carries `fix_chain` into review-fix.yml, or "" when it
+    cannot be carried faithfully.
+
+    review-fix.yml has exactly ONE input for restricting the fix chain: `model_pin`, a ladder
+    FLOOR it expands back to `ladder[ladder.index(pin):]`. For the workflow's own chain resolution
+    and its adopt-time `model not in models` assertion to agree with what the dispatcher claimed
+    against, that expansion must not readmit a tier the route excluded. So the pin is the
+    LOWEST-LADDER member of the intersection, returned only when its expansion holds exactly the
+    intersection's MEMBERS; otherwise "" and the caller fails closed. Returning the floor
+    regardless would hand the worker a WIDER chain than the dispatcher was allowed to claim from
+    — the very re-widening this issue is about, moved one hop downstream.
+
+    MEMBERSHIP, NOT ORDER, IS THE CONTRACT — deliberately, and the comparison below is on SETS
+    for that reason. The two sequences are two DIFFERENT documented orders over the same aliases:
+    `FIX_CHAIN` is the allocator PREFERENCE walk (strongest first) and is *by construction* the
+    REVERSE of `ESCALATION_LADDERS` (capability-ASCENDING), while `model_pin` is a FLOOR whose
+    expansion is ladder-ordered by definition — precisely what `pinned_fix_chain` already hands
+    the allocator for a round-budget pin. What a route AUTHORIZES is a set of tiers; an expansion
+    holding a tier the route excluded is the re-widening this helper exists to refuse, and that
+    is exactly what the set comparison catches. Demanding ORDERED equality instead would refuse
+    the widest-open case there is — an openai PR whose route excludes NOTHING, chain
+    `["sol", "luna"]` against the ladder's `["luna", "sol"]` — and hand every such fix to
+    needs-user over a preference order the workflow never claims against: on the dispatcher path
+    `claim_id` is always set, so review-fix.yml ADOPTS the claim and only membership-asserts the
+    expansion (`model not in models`); its own ordered `--models` claim runs solely when
+    `claim_id == ""`, where there is no dispatcher claim to disagree with and floor semantics
+    have always been cheapest-first.
+
+    Note the pinned-floor case is subsumed: `fix_chain` is already a subset of
+    `pinned_fix_chain(provider, pin_floor)`, so the returned pin can only ever be at or above the
+    recorded floor — the defer-not-fallback guarantee is preserved, never relaxed."""
+    ladder = list(ladder)
+    if not fix_chain or any(alias not in ladder for alias in fix_chain):
+        return ""
+    floor = min(fix_chain, key=ladder.index)
+    if set(ladder[ladder.index(floor):]) != set(fix_chain):
+        return ""
+    return floor
+
+
 def _chain_probe_exempt(chain, routing):
     """True iff EVERY alias in `chain` maps to a POSITIVELY probe-exempt provider in the target
     routing catalog (issue #115) — so a wholesale usage-probe outage (usage=None) does NOT gate a
@@ -4908,7 +5050,7 @@ def _missed_fix_budget(worker_pr, comments, bot_login, round_number, cutoff_fn, 
 def _dispatch_review_items(review_items, repo, policy, routing, allocator, worker_pr,
                            registry_repo, registry_root, workflow_ref, bot_login, usage, margin,
                            defer_reasons, lanes=None, ledger_root="", fix_dispatch=None, *,
-                           enrolled_authors):
+                           enrolled_authors, policy_doc, policy_module):
     """Hostile re-validation + claim + launch for the review/fix loop. Every item failure SKIPS
     that item (per-item resilience, like the issue loop). `defer_reasons` is the tick's SHARED
     histogram: allocator lease errors here must fold into the same `lease-error` counter the
@@ -4920,7 +5062,13 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
     (review vs fix via _review_item_lane); a launch folds into that lane's `launched` and a hard
     failure (lease error, revalidation DispatchError, failed workflow launch) into its `error`. This
     keeps a review/fix lane that launched NOTHING visible to the tick-health recorder even when the
-    worker lane launched — the exact masking this loop's bare launched-count return used to allow."""
+    worker lane launched — the exact masking this loop's bare launched-count return used to allow.
+
+    `policy_doc` + `policy_module` are the REGISTRY-owned policy document and the shared
+    `policy-resolve` module (issue #578). The fix lane re-derives the PR's trust-tier route from
+    the SOURCE ISSUE's LIVE labels through them — the same resolver `_route_matches` uses — and
+    intersects the provider fix chain with it. Nothing persisted in the hostile plan is trusted for
+    that decision, so these are REQUIRED: a caller that cannot supply them cannot dispatch a fix."""
     if lanes is None:
         lanes = _new_lane_counts()
     if fix_dispatch is None:
@@ -5358,6 +5506,35 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
             # budget still bounds how long it can defer before a loud needs-user.)
             fix_aliases = (worker_pr.pinned_fix_chain(impl_provider, pin_floor)
                            if pin_floor else FIX_CHAIN[impl_provider])
+            # ---- ISSUE #578: THE FIX LANE HONOURS THE PR's OWN TRUST-TIER ROUTE ----------------
+            # `fix_aliases` above is a PROVIDER-wide walk. On its own it re-widens exactly what
+            # routing.toml narrowed: a trust-surface PR whose source issue routed to a restricted
+            # soundness chain could be fixed by a tier that route excludes, and the route's
+            # `escalate = true` (defer, never degrade) never applied to the fix leg at all.
+            #
+            # The route is re-derived LIVE, from the SOURCE ISSUE's LIVE labels, through the SAME
+            # shared resolver `_route_matches` uses — never from anything the hostile plan
+            # persisted (`item["security"]`, `item["model_chain"]`, the plan's own route fields).
+            # The claim chain is then the INTERSECTION (never a ladder floor — see
+            # _route_constrained_fix_chain), and `fix_model_pin` is how that same constraint rides
+            # into review-fix.yml so the worker's chain resolution and its adopt-time model
+            # assertion agree with what was claimed here.
+            #
+            # A resolver refusal is CAPTURED, not raised: it must fail the FIX lane closed without
+            # taking down a cross-provider REVIEW of the same PR, which does not consume this
+            # route at all (the review chain is the INVERSE of the implementer's provider and is
+            # computed from REVIEW_CHAIN, not from routing.toml's implementor chain).
+            unconstrained_fix_aliases = list(fix_aliases)
+            route_error, route_chain, route_escalate = "", [], False
+            try:
+                route = policy_module.resolve(repo, list(source_labels_live), policy_doc, routing)
+                route_chain = list(route["model_chain"])
+                route_escalate = bool(route["escalate"])
+            except (ValueError, TypeError, KeyError) as exc:
+                route_error = f"{exc.__class__.__name__}: {exc}"
+            fix_aliases = _route_constrained_fix_chain(unconstrained_fix_aliases, route_chain)
+            fix_model_pin = _fix_chain_model_pin(
+                fix_aliases, worker_pr.ESCALATION_LADDERS.get(impl_provider, ()))
             # Privacy (locked decision 22a): provenance stores ONLY the salted account hash; a
             # raw-handle/missing hash already deferred above (provenance_admission_error).
             impl_account_h = record["impl_account_h"]
@@ -5461,6 +5638,42 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 mode, role = "fix", "fix"
                 chain = _resolvable_chain(fix_aliases, routing)
                 holder_namespace, ttl = "fix:", FIX_TTL
+            if mode == "fix" and (route_error or not fix_aliases or not fix_model_pin):
+                # [#578] FAIL CLOSED, and name WHICH of the three failures it is. The one thing
+                # that must never happen here is falling through to the provider-wide FIX_CHAIN:
+                # that is the hole. This guard sits BEFORE the generic `not chain` escalation
+                # because an empty intersection is a ROUTE refusal, not an unresolvable catalog,
+                # and the two want different diagnostics.
+                if route_error:
+                    detail = ("the source issue's route could not be resolved from its LIVE "
+                              f"labels ({route_error})")
+                elif not fix_aliases:
+                    detail = (f"the {impl_provider} fix chain {unconstrained_fix_aliases} and "
+                              f"issue #{issue_number}'s route chain {route_chain} share no "
+                              "model, so the route authorizes no same-provider fixer")
+                else:
+                    detail = (f"the route-constrained fix chain {fix_aliases} cannot be carried "
+                              "into review-fix.yml as a model_pin floor over the "
+                              f"{impl_provider} ladder "
+                              f"{list(worker_pr.ESCALATION_LADDERS.get(impl_provider, ()))} "
+                              "without readmitting a tier the route excluded")
+                if not route_error and not fix_aliases and not route_escalate:
+                    # A non-escalating route with no same-provider fixer DEFERS (the route's own
+                    # contract: only `escalate = true` routes hand chain exhaustion to a human).
+                    defer_reasons["fix-route-chain-empty"] += 1
+                    fix_dispatch["defer:route-chain-empty"] += 1
+                    print(f"defer review {repo}#{number}: {detail}; the fix lane never falls "
+                          "back to the provider-wide chain")
+                else:
+                    # `escalate = true` (the trust surfaces), an unresolvable route, or a
+                    # constraint the workflow input cannot express: all three are standing
+                    # table/code contradictions that repeat every tick, so they go to a human
+                    # rather than deferring forever behind a counter.
+                    _pr_needs_user(script_dir, repo, number, issue_number,
+                                   "the fix lane cannot honour the source issue's trust-tier "
+                                   f"route: {detail}; a human must reconcile the routing table "
+                                   "with the fix chain")
+                continue
             if not chain:
                 # The inverse (or same-provider) chain cannot resolve a concrete model right now
                 # (e.g. sol/luna not yet in the target routing catalog). Never silent-queue:
@@ -5681,9 +5894,15 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
             "-f", f"mode={mode}",
             "-f", f"fix_kind={fix_kind}",
             "-f", f"fix_context={fix_context}",
-            # The pinned fix-model floor rides along so the workflow's own chain resolution
+            # The EFFECTIVE fix-model floor rides along so the workflow's own chain resolution
             # honours it (review mode never carries a pin; the input is ladder-validated there).
-            "-f", f"model_pin={(pin_floor or '') if mode == 'fix' else ''}",
+            # [#578] "Effective" = the round-budget pin AND the source issue's route, folded
+            # together: `fix_model_pin` is derived from the route-constrained chain, which is
+            # already the pinned chain intersected with the route, so it is never below the
+            # recorded floor and never readmits a tier the route excluded. The guard above
+            # refused to dispatch at all when that value is empty, so mode=fix always carries a
+            # real pin here.
+            "-f", f"model_pin={fix_model_pin if mode == 'fix' else ''}",
             "-f", f"review_round={round_number}",
             "-f", f"account={account}",
             "-f", f"claim_id={claim_id}",
@@ -6341,7 +6560,13 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                     # (registry #691) so this call site and the admission probe above cannot
                     # drift apart.
                     migration_provable=_legacy_migration_provable(
-                        model_health, health_window, _now))
+                        model_health, health_window, _now),
+                    # [registry #835] The MASTER-protected half of orchestrator-PR admission,
+                    # read from the SAME validated policy document CLAIM reads it from below.
+                    # Hard-coding `()` here would leave the class with a machine-owned park and
+                    # no machine exit — the #614 stall on the enrolled population — with nothing
+                    # red anywhere, so the argument EXPRESSION is pinned by the self-test.
+                    enrolled_authors=policy_module.review_enrolment_authors(repo, policy_doc))
 
         # [registry #677] THE MACHINE EXIT FOR A STARVED PLAN. Four times on 2026-07-26 the
         # issue lane went to `PLAN complete: 0 issue item(s)` / `lane worker: planned=0 launched=0`
@@ -6981,7 +7206,13 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                 # authority is exactly what makes the pair pointless). Absent/empty => enrolment
                 # OFF => CLAIM's shape gates stand. CLAIM re-derives the waiver itself rather than
                 # trusting PLAN's `self_attested`, so a PLAN->CLAIM window edit fails closed.
-                enrolled_authors=policy_module.review_enrolment_authors(repo, policy_doc))
+                enrolled_authors=policy_module.review_enrolment_authors(repo, policy_doc),
+                # [#578] The fix lane re-derives each PR's trust-tier route LIVE through the SAME
+                # registry-owned resolver `_route_matches` uses, from the SAME policy document
+                # validated above. Passing the module + document (rather than a pre-resolved
+                # route) is what keeps the derivation inside CLAIM, on live source-issue labels,
+                # with nothing from the hostile plan in the loop.
+                policy_doc=policy_doc, policy_module=policy_module)
     print(f"dispatcher complete: {dispatched} worker/review/fix run(s) launched")
     print(_fix_dispatch_line(fix_dispatch))
     # Per-lane tick summary (issue #108) — coarse counts only (no issue numbers/handles). A stalled
@@ -7867,6 +8098,13 @@ def _self_test():
             def _policy_row(repo, document):
                 assert repo == "example/repo" and document["repos"][repo]["enabled"] is True
                 return policy
+
+            @staticmethod
+            def review_enrolment_authors(repo, _policy_doc):
+                # [#835] Enrolment OFF, the shipped default for every repo — this fixture is the
+                # no_change decline tripwire and must exercise the pre-#835 worker semantics.
+                assert repo == "example/repo"
+                return frozenset()
 
             @staticmethod
             def resolve(repo, issue_labels, policy_doc, routing_doc):
@@ -10770,6 +11008,38 @@ def _self_test():
          "leg off with nothing red anywhere else — every enrolled PR then defers on the "
          "plan/CLAIM self_attested disagreement, every tick, forever. Found: "
          f"{ast.dump(_enrol_args[0])}")
+    # (c6b) [#578] THE SAME PIN FOR THE ROUTE RE-DERIVATION ARGUMENTS. The fix lane's route
+    #       constraint is only as live as the resolver + document it is handed: passing a stub
+    #       module, a stale snapshot, or `{}` would make every route resolve permissively (or
+    #       fail-closed-forever) with nothing red in the wiring harness, which supplies its own
+    #       fixtures. So the ARGUMENT EXPRESSIONS are asserted to be dispatch()'s OWN validated
+    #       `policy_module` / `policy_doc` names — the very objects `_route_matches` resolves the
+    #       worker lane through.
+    _route_args = {
+        keyword.arg: keyword.value
+        for node in ast.walk(_dispatch_fn) if isinstance(node, ast.Call)
+        and getattr(node.func, "id", "") == "_dispatch_review_items"
+        for keyword in node.keywords if keyword.arg in ("policy_doc", "policy_module")}
+    assert sorted(_route_args) == ["policy_doc", "policy_module"], (
+        "dispatch() must hand CLAIM's review/fix loop the live policy document AND the shared "
+        "policy-resolve module — without both, the fix lane cannot re-derive the PR's trust-tier "
+        f"route and #578's intersection is unenforceable. Found: {sorted(_route_args)}")
+    for _name, _node in sorted(_route_args.items()):
+        assert isinstance(_node, ast.Name) and _node.id == _name, (
+            f"_dispatch_review_items must receive dispatch()'s own validated `{_name}`, not a "
+            f"literal or a substitute. Found: {ast.dump(_node)}")
+    # ...and the parameters are KEYWORD-ONLY and REQUIRED, so a caller that forgets them is a
+    # TypeError rather than a silently unconstrained fix lane.
+    _rf_fn = next(
+        node for node in ast.walk(ast.parse(
+            Path(__file__).resolve().read_text(encoding="utf-8")))
+        if isinstance(node, ast.FunctionDef) and node.name == "_dispatch_review_items")
+    assert ([arg.arg for arg in _rf_fn.args.kwonlyargs]
+            == ["enrolled_authors", "policy_doc", "policy_module"]
+            and _rf_fn.args.kw_defaults == [None, None, None]), (
+        "_dispatch_review_items' trust-plane inputs must stay REQUIRED keyword-only parameters; a "
+        "default would let a call site drop the route constraint silently. Found: "
+        f"{[a.arg for a in _rf_fn.args.kwonlyargs]}")
     # (c7) THE TWO SECURITY PROPERTIES THE WAIVER RESTS ON — asserted at EVERY consumer, because
     #      the waiver decision is now made in three places (PLAN, CLAIM, review-fix.yml resolve)
     #      and a property that holds in two of them is not a property.
@@ -12006,8 +12276,19 @@ def _self_test():
                 "user": {"login": bot, "type": "Bot"},
                 "labels": [{"name": name} for name in labels]}
 
+    # [#578] The route resolver every pre-existing wiring row runs against: it authorizes EVERY
+    # alias, so the intersection is the identity there and those rows keep measuring exactly what
+    # they measured before. The #578 rows below pass the REAL policy-resolve module instead, so
+    # the constraint itself is proved against a real routing table rather than this stub.
+    class _UnconstrainedRoute:
+        model_chain = sorted({alias for table in (REVIEW_CHAIN, FIX_CHAIN)
+                              for aliases in table.values() for alias in aliases})
+
+        def resolve(self, _repo, _labels, _policy_doc, _routing_doc):
+            return {"model_chain": list(self.model_chain), "agent": "x", "escalate": False}
+
     def run_items(items, allocator=None, routing=None, policy=None, usage=None,
-                  enrolled_authors=()):
+                  enrolled_authors=(), policy_doc=None, policy_module=None):
         helper_calls.clear()
         reasons = Counter()
         # Issue #108: a fresh per-lane accumulator each call; run_items.lanes exposes it for the
@@ -12019,7 +12300,9 @@ def _self_test():
             routing or {}, allocator, wiring_worker_pr, "reg/repo",
             wiring_root, "main", bot, usage, 0.10, reasons, lanes=lanes,
             ledger_root=wiring_ledger_root, fix_dispatch=fix_dispatch,
-            enrolled_authors=enrolled_authors)
+            enrolled_authors=enrolled_authors,
+            policy_doc=policy_doc if policy_doc is not None else {},
+            policy_module=policy_module or _UnconstrainedRoute())
         run_items.lanes = lanes
         run_items.fix_dispatch = fix_dispatch
         return launched, reasons
@@ -13379,6 +13662,317 @@ def _self_test():
                 globals()["_gh_json"] = fake_gh_json
                 globals()["_run_gh"] = real_run_gh
 
+            # ---- ISSUE #578: THE FIX LANE'S CLAIM CHAIN IS THE PR's OWN ROUTE ∩ FIX_CHAIN ----
+            # The defect: `FIX_CHAIN[impl_provider]` was the ONLY chain input, so a PR whose
+            # source issue routed to a restricted chain could be fixed by a tier that route
+            # deliberately excludes. Everything below is driven through the PRODUCTION
+            # `_dispatch_review_items` claim call with the REAL policy-resolve module — no slice
+            # helper — so a mutation that drops the intersection, or swaps it for the ladder
+            # floor PR #282 proposed, turns these red.
+            _pol578 = _load_module("registry_policy_resolve_578",
+                                   Path(__file__).resolve().parent / "policy-resolve.py")
+            _policy578 = {"repos": {repo: {
+                "enabled": True, "routing": "orchestration/routing.toml",
+                "account_pool": ["acct01"], "max_concurrent": 1, "worker_timeout_minutes": 30,
+                "gate_profile": "lint-only", "arm_auto_merge": False, "max_attempts": 1,
+                "trust": "collaborators"}}}
+            # A routing table with FOUR shapes the fix lane must treat differently. Note `role:ci`
+            # and `role:site` name the SAME anthropic tier but differ in `escalate`, which is what
+            # separates the human hand-off from the plain defer.
+            _routing578 = tomllib.loads("""
+[models.opus5]
+provider = "anthropic"
+harness = "claude"
+provider_model = "claude-opus-5"
+[models.sol]
+provider = "openai"
+harness = "codex"
+provider_model = "TBD"
+[models.luna]
+provider = "openai"
+harness = "codex"
+provider_model = "TBD"
+[defaults]
+model_chain = ["opus5", "sol"]
+agent = "impl"
+[[route]]
+match_labels = ["dispatch"]
+model_chain = ["opus5"]
+agent = "reviewer"
+escalate = true
+[[route]]
+role = "ci"
+model_chain = ["opus5", "sol"]
+agent = "impl"
+[[route]]
+role = "site"
+model_chain = ["opus5"]
+agent = "impl"
+[[route]]
+role = "perf"
+model_chain = ["luna", "opus5"]
+agent = "impl"
+""")
+            _pr578, _issue578 = 91, 910
+            _head578 = f"{_pr578:040x}"
+            _labels578 = ["area:crate-a", "role:ci"]
+
+            def _pull578():
+                return {"number": _pr578, "state": "open", "draft": True, "body": "",
+                        "mergeable": True, "auto_merge": None,
+                        "head": {"ref": f"sparq-agent/issue-{_issue578}-1-1",
+                                 "sha": _head578, "repo": {"full_name": repo}},
+                        "base": {"ref": "main", "repo": {"default_branch": "main"}},
+                        "user": {"login": bot, "type": "Bot"},
+                        "labels": [{"name": "review:changes"}, {"name": "area:crate-a"}]}
+
+            def _gh578(args):
+                path = args[-1]
+                if path.endswith(f"/pulls/{_pr578}"):
+                    return _pull578()
+                if "/check-runs" in path:
+                    return {"check_runs": [], "total_count": 0}
+                if "/timeline" in path:
+                    return [[]]
+                if f"/issues/{_pr578}/comments" in path:
+                    return [[]]
+                if f"/issues/{_issue578}" in path:
+                    return {"labels": [{"name": name} for name in _labels578]}
+                if "/compare/" in path:
+                    return {"status": "ahead", "files": [{"filename": "src/a.rs"}]}
+                raise AssertionError(f"unexpected #578 API read: {path}")
+
+            _rec578 = Path(wiring_root) / wiring_worker_pr.provenance_path(repo, _pr578)
+            _rec578.parent.mkdir(parents=True, exist_ok=True)
+            _rec578.write_text(json.dumps({
+                "head_sha_at_open": _head578, "impl_account_h": "ef" * 8, "impl_alias": "sol",
+                "impl_provider": "openai", "issue": _issue578, "pr_number": _pr578,
+                "recorded_at_run": "578.1"}), encoding="utf-8")
+            _verdict578 = Path(wiring_root) / wiring_worker_pr.verdict_path(repo, _pr578, 1)
+            _verdict578.parent.mkdir(parents=True, exist_ok=True)
+            _verdict578.write_text(json.dumps({
+                "verdict": "request_changes", "injection_detected": False, "summary": "s",
+                "issues": [], "progress": None}), encoding="utf-8")
+            _item578 = {"pr_number": _pr578, "head_sha": _head578, "state": "needs-fix",
+                        "impl_provider": "openai", "repo": repo, "package": "crate-a",
+                        "security": False, "self_attested": False, "context": ""}
+
+            class _Alloc578:
+                def __init__(self):
+                    self.chains = []
+
+                def claim(self, _repo, _package, _role, chain, *_args, **_kwargs):
+                    self.chains.append(list(chain))
+                    return {"account": "acct01", "claim_id": "57" * 16,
+                            "model": chain[0], "provider": "openai"}
+
+                def release(self, *_args, **_kwargs):
+                    return True
+
+            _runs578 = []
+
+            def _run_gh578(args, *, check=True):
+                _runs578.append(list(args))
+                return subprocess.CompletedProcess(args, 0)
+
+            def _argv578(key):
+                return [arg.split("=", 1)[1] for args in _runs578 for arg in args
+                        if arg.startswith(f"{key}=")]
+
+            try:
+                globals()["_gh_json"] = _gh578
+                globals()["_run_gh"] = _run_gh578
+
+                # (1) THE HEADLINE. `role:ci` routes to ["opus5", "sol"]; the openai fix walk is
+                # ["sol", "luna"]. The claim chain must be the INTERSECTION ["sol"] — luna is a
+                # tier this route never authorized, and the unpatched code offered it.
+                _alloc = _Alloc578()
+                _launched, _ = run_items([_item578], allocator=_alloc, routing=_routing578,
+                                         policy_doc=_policy578, policy_module=_pol578)
+                assert _launched == 1, _launched
+                assert _alloc.chains == [["sol"]], (
+                    "the fix lane must claim against FIX_CHAIN ∩ route.model_chain; a chain "
+                    "containing `luna` means the PR's own route was ignored", _alloc.chains)
+                assert FIX_CHAIN["openai"] == ["sol", "luna"], (
+                    "NON-VACUITY: the excluded tier must really be in the provider walk, or the "
+                    "assertion above proves nothing", FIX_CHAIN)
+                # (2) AC4 — the SAME constraint rides into review-fix.yml on `model_pin`, so the
+                # workflow's own chain resolution (`ladder[ladder.index(pin):]`) and its
+                # adopt-time `model not in models` check agree with what was claimed here.
+                assert _argv578("model_pin") == ["sol"], (
+                    "the route-constrained floor must reach review-fix.yml; an empty model_pin "
+                    "leaves the worker resolving the full provider fix chain", _runs578)
+
+                # (3) NON-VACUITY vs REMOVAL: the identical item under a resolver that authorizes
+                # every alias claims the UNCONSTRAINED walk. So (1) is measuring the route, not
+                # some unrelated narrowing.
+                _runs578.clear()
+                _alloc = _Alloc578()
+                run_items([_item578], allocator=_alloc, routing=_routing578)
+                assert _alloc.chains == [["sol", "luna"]], _alloc.chains
+
+                # (4) NON-VACUITY vs the LADDER FLOOR (the closed PR #282's shape). A route that
+                # names a MID-ladder tier and not its successor is where a floor and an
+                # intersection part company: the floor readmits `sol`, the intersection does not.
+                _ladder578 = wiring_worker_pr.ESCALATION_LADDERS["openai"]
+                assert _route_constrained_fix_chain(FIX_CHAIN["openai"], ["luna", "opus5"]) \
+                    == ["luna"], "the intersection must drop every tier the route omits"
+                assert wiring_worker_pr.pinned_fix_chain("openai", "luna") == ["luna", "sol"], (
+                    "NON-VACUITY: a ladder FLOOR at the same tier readmits `sol`, which is why a "
+                    "floor cannot implement this constraint", _ladder578)
+                # ...and that same route is refused end-to-end, because the constraint cannot be
+                # carried into review-fix.yml as a floor without readmitting `sol` (AC4).
+                _labels578 = ["area:crate-a", "role:perf"]
+                _runs578.clear()
+                _alloc = _Alloc578()
+                _launched, _ = run_items([_item578], allocator=_alloc, routing=_routing578,
+                                         policy_doc=_policy578, policy_module=_pol578)
+                assert _launched == 0 and _alloc.chains == [] and _runs578 == [], (
+                    _launched, _alloc.chains, _runs578)
+                assert [(script, args[0]) for script, args in helper_calls] == [
+                    ("worker-pr.py", "round-record"),
+                    ("worker-pr.py", "needs-user")], helper_calls
+
+                # (5) EMPTY INTERSECTION ON AN `escalate = true` ROUTE (the trust surface): the
+                # security override routes to opus5 only, the PR was implemented by openai, so no
+                # same-provider fixer is authorized. It must reach a HUMAN — never the provider
+                # default, never a silent forever-defer.
+                _labels578 = ["area:dispatch", "role:ci"]
+                _runs578.clear()
+                _alloc = _Alloc578()
+                _launched, _reasons = run_items([_item578], allocator=_alloc,
+                                                routing=_routing578, policy_doc=_policy578,
+                                                policy_module=_pol578)
+                assert _launched == 0 and _alloc.chains == [] and _runs578 == [], (
+                    "a trust-surface PR with no route-authorized fixer must never claim",
+                    _launched, _alloc.chains, _runs578)
+                assert [(script, args[0]) for script, args in helper_calls] == [
+                    ("worker-pr.py", "round-record"),
+                    ("worker-pr.py", "needs-user")], helper_calls
+
+                # (6) EMPTY INTERSECTION ON A NON-ESCALATING ROUTE: the route's own contract is
+                # defer-not-escalate, so this DEFERS with an attributed reason and mutates
+                # nothing — but it still never falls back to ["sol", "luna"].
+                _labels578 = ["area:crate-a", "role:site"]
+                _runs578.clear()
+                _alloc = _Alloc578()
+                _launched, _reasons = run_items([_item578], allocator=_alloc,
+                                                routing=_routing578, policy_doc=_policy578,
+                                                policy_module=_pol578)
+                assert _launched == 0 and _alloc.chains == [] and [
+                    args[0] for _script, args in helper_calls] == ["round-record"], (
+                    "a non-escalating route DEFERS: no claim, no launch, and no park mutation",
+                    _launched, _alloc.chains, helper_calls)
+                assert _reasons["fix-route-chain-empty"] == 1, _reasons
+                assert run_items.fix_dispatch["defer:route-chain-empty"] == 1, \
+                    run_items.fix_dispatch
+
+                # (7) A RESOLVER REFUSAL fails the FIX lane closed (never the provider default)...
+                class _RaisingRoute:
+                    def resolve(self, *_args, **_kwargs):
+                        raise ValueError("routing table unreadable")
+
+                _labels578 = ["area:crate-a", "role:ci"]
+                _runs578.clear()
+                _alloc = _Alloc578()
+                _launched, _ = run_items([_item578], allocator=_alloc, routing=_routing578,
+                                         policy_doc=_policy578, policy_module=_RaisingRoute())
+                assert _launched == 0 and _alloc.chains == [] and _runs578 == [], (
+                    _launched, _alloc.chains, _runs578)
+                assert [(script, args[0]) for script, args in helper_calls] == [
+                    ("worker-pr.py", "round-record"),
+                    ("worker-pr.py", "needs-user")], helper_calls
+            finally:
+                globals()["_gh_json"] = fake_gh_json
+                globals()["_run_gh"] = real_run_gh
+
+            # (8) ...and does NOT take down the cross-provider REVIEW of the same PR, which does
+            # not consume this route at all (its chain is the INVERSE of the implementer's
+            # provider, computed from REVIEW_CHAIN). Same raising resolver, review posture: the
+            # reviewer chain is still offered to the allocator.
+            fake.update(pull=live_pull(draft=True, labels=["review:needs"]))
+            fake["comments"] = []
+            alloc = FakeAllocator()
+            run_items([dict(fix_item, state="needs-review")], allocator=alloc,
+                      routing=routing_ok, policy_doc=_policy578,
+                      policy_module=_RaisingRoute())
+            assert alloc.chains == [["sol", "luna"]], (
+                "a fix-lane route failure must not starve the review lane", alloc.chains)
+            assert helper_calls == [], helper_calls
+
+            # (9) THE LIVE TABLES (acceptance criterion 2), resolved through the SAME shared
+            # resolver against THIS repository's own protected routing table. These are the rows
+            # the audit named, re-derived against the catalog as it stands today (`fable`/`opus`
+            # were retired from every chain on 2026-07-26, so the surviving live bite is `luna`).
+            _live578 = tomllib.loads(
+                (Path(__file__).resolve().parents[1] / "orchestration" / "routing.toml")
+                .read_text(encoding="utf-8"))
+            _live_policy578 = {"repos": {"probe/target": dict(_policy578["repos"][repo])}}
+
+            def _live_fix578(labels, provider):
+                _route = _pol578.resolve("probe/target", labels, _live_policy578, _live578)
+                return _route_constrained_fix_chain(FIX_CHAIN[provider], _route["model_chain"])
+
+            # A trust-surface issue routes to the opus5-only soundness chain: an anthropic PR is
+            # fixed there and NOWHERE else; an openai PR has no authorized fixer at all.
+            assert _live_fix578(["area:dispatch", "role:impl"], "anthropic") == ["opus5"]
+            assert _live_fix578(["area:dispatch", "role:impl"], "openai") == []
+            # role:ci is the frontier chain ["opus5", "sol"] — `luna` is in the openai fix walk
+            # and NOT in that route, so the fix lane must not offer it.
+            assert _live_fix578(["area:ci", "role:ci"], "anthropic") == ["opus5"]
+            assert _live_fix578(["area:ci", "role:ci"], "openai") == ["sol"]
+            assert _live_fix578(["area:docs", "role:docs"], "openai") == ["sol"]
+            assert "luna" in FIX_CHAIN["openai"], (
+                "NON-VACUITY: `luna` must be in the live openai fix walk for the three rows "
+                "above to be excluding anything", FIX_CHAIN)
+            # ...and the `model_pin` those live chains transmit is exactly the claimed tier.
+            assert _fix_chain_model_pin(["sol"], wiring_worker_pr.ESCALATION_LADDERS["openai"]) \
+                == "sol"
+            assert _fix_chain_model_pin(["opus5"],
+                                        wiring_worker_pr.ESCALATION_LADDERS["anthropic"]) \
+                == "opus5"
+            assert _fix_chain_model_pin([], wiring_worker_pr.ESCALATION_LADDERS["openai"]) == ""
+            assert _fix_chain_model_pin(["luna"],
+                                        wiring_worker_pr.ESCALATION_LADDERS["openai"]) == "", (
+                "a floor that would readmit `sol` must fail closed, not under-state the "
+                "constraint the dispatcher claimed against")
+            assert _fix_chain_model_pin(["ghost"],
+                                        wiring_worker_pr.ESCALATION_LADDERS["openai"]) == ""
+            # DEFER-NOT-FALLBACK IS PRESERVED, not relaxed: intersecting a PINNED chain can only
+            # ever raise the transmitted floor, never lower it below the recorded pin.
+            assert _fix_chain_model_pin(
+                _route_constrained_fix_chain(
+                    wiring_worker_pr.pinned_fix_chain("openai", "sol"), ["opus5", "sol"]),
+                wiring_worker_pr.ESCALATION_LADDERS["openai"]) == "sol"
+            # THE FULL CHAIN, end to end — the case the singleton/empty/unknown/non-suffix rows
+            # above never covered. A route that excludes NOTHING must still be transmissible, and
+            # the chain review-fix.yml derives from the pin must hold exactly the tiers the
+            # dispatcher claimed against. (No LIVE route authorizes `luna` today, so this drives
+            # the helper with an explicit both-tier route; the `luna in FIX_CHAIN` assertion above
+            # keeps the table side of that honest.)
+            _full578 = _route_constrained_fix_chain(FIX_CHAIN["openai"], ["luna", "sol"])
+            _ladder578 = list(wiring_worker_pr.ESCALATION_LADDERS["openai"])
+            assert _full578 == ["sol", "luna"], _full578
+            _pin578 = _fix_chain_model_pin(_full578, _ladder578)
+            assert _pin578 in _ladder578, (
+                "the fully-unconstrained openai fix chain must remain transmissible: an ORDERED "
+                "round-trip check here would refuse a route that excluded nothing and send every "
+                "openai fix to needs-user over FIX_CHAIN/ladder order, which is REVERSED by "
+                "construction — see _fix_chain_model_pin on why membership is the contract",
+                _pin578, _full578, _ladder578)
+            _expanded578 = _ladder578[_ladder578.index(_pin578):]
+            assert set(_expanded578) == set(_full578), (
+                "review-fix.yml's model_pin expansion must readmit no tier outside the chain the "
+                "dispatcher claimed against", _expanded578, _full578)
+            assert _expanded578 == _ladder578, (
+                "an unconstrained route must pin the ladder FLOOR: a higher pin would under-state "
+                "what the route authorized and starve the tiers below it",
+                _expanded578, _ladder578)
+            print("  ok   [#578] the fix lane claims FIX_CHAIN ∩ the source issue's LIVE route "
+                  "(never a ladder floor), carries that constraint into review-fix.yml on "
+                  "model_pin, and fails closed — escalating on `escalate = true`, deferring "
+                  "otherwise — when the route authorizes no same-provider fixer")
+
             # ---- issue #118: an unsafe/out-of-policy claim whose lease release FAILS (a CAS
             # conflict, or the garbage claim_id that was itself the violation) is a COUNTED
             # fix-lane error, NEVER a green "released + skipped" defer. The buggy path ignored
@@ -14608,7 +15202,7 @@ def _self_test():
     }
 
     def readmit_sweep(window, rows=None, labels=None, comments=(), holds=None, timeline=None,
-                      provenance=None, comments_fn=None):
+                      provenance=None, comments_fn=None, enrolled_authors=()):
         """Run the sweep with every GitHub seam injected; returns (count, posted, cleared).
 
         The sweep's OWN log is captured on `readmit_sweep.log` rather than discarded. It used to
@@ -14630,7 +15224,7 @@ def _self_test():
             timeline_fn=lambda _repo, number: list((timeline or park_timeline).get(number, [])),
             post_comment=lambda _repo, number, body: posted.append((number, body)),
             clear_labels=lambda pr, issue: cleared.append((pr, issue)),
-            log=readmit_sweep.log.append)
+            log=readmit_sweep.log.append, enrolled_authors=enrolled_authors)
         return count, posted, cleared
 
     # A(a): the machine park + a post-park success on the failing account => re-admitted ONCE,
@@ -14822,7 +15416,7 @@ def _self_test():
                                                     readmit_now),
             comments_fn=boom_comments,
             timeline_fn=lambda _repo, number: list(park_timeline.get(number, [])),
-            post_comment=lambda *_a: None, clear_labels=lambda *_a: None, log=lambda _l: None)
+            post_comment=lambda *_a: None, clear_labels=lambda *_a: None, log=lambda _l: None, enrolled_authors=())
         assert skipped == 0, skipped
         print("  ok   auto-readmit: an unreadable PR skips only itself (per-PR resilience)")
 
@@ -14867,7 +15461,7 @@ def _self_test():
                 post_comment=lambda _repo, number, body: posted.append(body),
                 clear_labels=lambda *_a: None, log=lambda _l: None,
                 migration_provable=provable,
-                convert_labels=lambda pr, issue: converted.append((pr, issue)))
+                convert_labels=lambda pr, issue: converted.append((pr, issue)), enrolled_authors=())
             return posted, converted
 
         posted, converted = migrate_sweep([budget_body])
@@ -14955,7 +15549,7 @@ def _self_test():
                 {"user": {"login": readmit_bot}, "body": budget_body}],
             timeline_fn=lambda _repo, number: list(migrate_timeline.get(number, [])),
             post_comment=lambda *_a: None, clear_labels=lambda *_a: None, log=lambda _l: None,
-            migration_provable=True, convert_labels=composed_convert)
+            migration_provable=True, convert_labels=composed_convert, enrolled_authors=())
         assert migrated_count == 0, "the migration must not re-admit in the same breath"
         assert composed_pr_labels == {MACHINE_PARK_PR_LABEL}, composed_pr_labels
         assert "needs:user" not in composed_issue_labels, composed_issue_labels
@@ -14971,7 +15565,7 @@ def _self_test():
             timeline_fn=lambda _repo, number: list(park_timeline.get(number, [])),
             post_comment=lambda *_a: None,
             clear_labels=lambda pr, issue: composed_cleared.append((pr, issue)),
-            log=lambda _l: None, migration_provable=False)
+            log=lambda _l: None, migration_provable=False, enrolled_authors=())
         assert composed_readmitted == 1, (composed_readmitted, sorted(composed_issue_labels))
         assert composed_cleared == [(41, 7)], composed_cleared
         print("  ok   legacy-migration COMPOSED: a migrated PR whose source issue carried "
@@ -15064,7 +15658,7 @@ def _self_test():
                     {"user": {"login": readmit_bot}, "body": budget_body}],
                 timeline_fn=lambda _repo, number: list(migrate_timeline.get(number, [])),
                 post_comment=lambda *_a: None, clear_labels=lambda *_a: None,
-                log=lambda _l: None, migration_provable=True)   # convert_labels=None => REAL
+                log=lambda _l: None, migration_provable=True, enrolled_authors=())   # convert_labels=None => REAL
         finally:
             globals()["_run_gh_target_api"] = prev_api
             globals()["_run_target_helper"] = prev_helper
@@ -15100,7 +15694,7 @@ def _self_test():
             timeline_fn=lambda _repo, number: list(park_timeline.get(number, [])),
             post_comment=lambda *_a: None, clear_labels=lambda *_a: None, log=lambda _l: None,
             migration_provable=True,
-            convert_labels=lambda pr, issue: many_converted.append(pr))
+            convert_labels=lambda pr, issue: many_converted.append(pr), enrolled_authors=())
         assert len(many_converted) == LEGACY_PARK_MIGRATION_MAX, many_converted
         print(f"  ok   legacy-migration: one tick migrates at most "
               f"{LEGACY_PARK_MIGRATION_MAX} parks (bounded re-entry)")
@@ -15270,7 +15864,7 @@ def _self_test():
                 aged_timeline[41] if number != 7 else []),
             post_comment=lambda *_a: None,
             clear_labels=lambda pr, issue: herd_cleared.append(pr),
-            log=lambda _l: None, migration_provable=False)
+            log=lambda _l: None, migration_provable=False, enrolled_authors=())
         assert herd_count == AUTO_READMISSION_PER_TICK_MAX, (herd_count, herd_cleared)
         assert len(herd_cleared) == AUTO_READMISSION_PER_TICK_MAX, herd_cleared
         # ...and the drain is DETERMINISTIC, not starving: ascending PR order, so the parks this
@@ -15384,7 +15978,7 @@ def _self_test():
                 post_comment=lambda *_a: None, clear_labels=lambda *_a: None,
                 log=lambda _l: None,
                 migration_provable=_legacy_migration_provable(
-                    model_health_mod, healthy_window, readmit_now))
+                    model_health_mod, healthy_window, readmit_now), enrolled_authors=())
         finally:
             globals()["_run_gh_target_api"] = prev_api2
             globals()["_run_target_helper"] = prev_helper2
@@ -15429,7 +16023,7 @@ def _self_test():
             post_comment=lambda *_a: None, clear_labels=lambda *_a: None, log=lambda _l: None,
             migration_provable=_legacy_migration_provable(
                 model_health_mod, healthy_window, readmit_now),
-            convert_labels=chain_convert)
+            convert_labels=chain_convert, enrolled_authors=())
         assert chain_migrated == 0, "the migration must not re-admit in the same breath"
         assert chain_pr_labels == {MACHINE_PARK_PR_LABEL}, chain_pr_labels
         assert "needs:user" not in chain_issue_labels, chain_issue_labels
@@ -15456,13 +16050,333 @@ def _self_test():
             timeline_fn=lambda _repo, number: list(chain_timeline.get(number, [])),
             post_comment=lambda *_a: None,
             clear_labels=lambda pr, issue: chain_cleared.append((pr, issue)),
-            log=lambda _l: None, migration_provable=False)
+            log=lambda _l: None, migration_provable=False, enrolled_authors=())
         assert chain_readmitted == 1, (chain_readmitted, sorted(chain_issue_labels))
         assert chain_cleared == [(41, 7)], chain_cleared
         print("  ok   aged-out exit CHAIN: a legacy park that could not migrate before #691 "
               "migrates AND is actually released one span later (both layers, end to end)")
+
+        # ---- [registry #769] THE AGE-PARK EPISODE BINDING, driven CROSS-MODULE ----------------
+        #
+        # THE DEFECT. groom's age hand-off writes `review:parked`, so an age park lands in exactly
+        # this sweep's candidate population. Its cause is an orphan draft or a wedged merge state,
+        # which no model-health record speaks to, so `capacity_recovery_evidence` finds nothing and
+        # `park_cause_provable` is False — and the probe falls through to the labelled
+        # sustained-fleet-health HEURISTIC, whose only condition such a park can satisfy is being
+        # OLD ENOUGH. The evidence clearing an AGE park was therefore, in substance, MORE AGE.
+        #
+        # THE TEST THAT NAMES IT: the SAME park under the SAME health window at 3 h and at 7 h must
+        # reach the SAME decision. If crossing SUSTAINED_HEALTH_SPAN_SECONDS alone changes the
+        # answer, the binding is absent — that is the whole assertion, and it is why the two
+        # timings are asserted as a PAIR rather than one at a time.
+        #
+        # EVERY FIXTURE BODY IS BUILT FROM groom's OWN CONSTANTS, never a literal copied into this
+        # file. That is what makes this a cross-module test rather than a restatement: the in-file
+        # half of #769 is well tested, so a test that only exercised dispatch-claim would pass for
+        # the same reason the existing ones do. Re-spell groom's marker and these go red.
+        def _load_self_registering(name, path):
+            """`_load_module` plus the `sys.modules` registration `@dataclass` needs.
+
+            groom declares frozen dataclasses under `from __future__ import annotations`, and
+            dataclasses resolves those string annotations through `sys.modules[cls.__module__]` —
+            which is None for a spec-loaded module that was never registered. Kept LOCAL to this
+            test rather than folded into `_load_module`: every production caller of that helper
+            loads a module that does not need it, and widening a shared loader for one test's
+            benefit is how a loader's behaviour drifts from what production exercises."""
+            spec = importlib.util.spec_from_file_location(name, path)
+            if spec is None or spec.loader is None:
+                raise DispatchError(f"cannot load registry helper {Path(path).name}")
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[name] = module
+            try:
+                spec.loader.exec_module(module)
+            except Exception:
+                sys.modules.pop(name, None)
+                raise
+            return module
+
+        groom_mod = _load_self_registering(
+            "registry_groom_agepark", Path(__file__).resolve().parent / "groom.py")
+        # The ONE spelling, asserted in both directions: groom must be writing the marker
+        # park_policy declares, and park_policy's must be the one this sweep reads.
+        assert groom_mod.AGE_PARK_MARKER == _park_policy.GROOM_AGE_PARK_MARKER, (
+            groom_mod.AGE_PARK_MARKER, _park_policy.GROOM_AGE_PARK_MARKER)
+        assert groom_mod.AGE_UNPARK_MARKER == _park_policy.GROOM_AGE_UNPARK_MARKER, (
+            groom_mod.AGE_UNPARK_MARKER, _park_policy.GROOM_AGE_UNPARK_MARKER)
+
+        def age_receipt_body(gen=1, cause="orphan-draft", head="c" * 40):
+            """Byte-faithful to what groom's hand-off POSTs — STALE_PR_MARKER included — so a
+            fixture cannot pass on a shape groom does not actually write."""
+            return (f"> 🤖 SPARQ agent\n\nThis worker PR has been untouched beyond the "
+                    f"maintenance threshold. That is a MACHINE-recoverable cause, not a question "
+                    f"for a human, so this is the machine-owned `{MACHINE_PARK_PR_LABEL}` soft "
+                    f"hold.\n\n{groom_mod.STALE_PR_MARKER}\n"
+                    f"{groom_mod.AGE_PARK_MARKER} cause={cause} head={head} gen={gen} -->")
+
+        def bot_at(body, seconds_ago, login=readmit_bot):
+            return {"user": {"login": login}, "body": body,
+                    "created_at": model_health_mod._iso_z(readmit_now - seconds_ago)}
+
+        def park_at(seconds_ago, actor=readmit_bot):
+            return {41: [{"event": "labeled", "label": {"name": MACHINE_PARK_PR_LABEL},
+                          "created_at": model_health_mod._iso_z(readmit_now - seconds_ago),
+                          "actor": {"login": actor}, "performed_via_github_app": None}], 7: []}
+
+        def census_codes():
+            """The [G5] census line the sweep itself emitted, parsed back to codes. Read from the
+            sweep's OWN log, so an assertion here cannot pass on a hand-built census row."""
+            rows = [line for line in readmit_sweep.log
+                    if line.startswith("park census example/repo: ")]
+            return rows[-1].split(": ", 1)[1] if rows else ""
+
+        young, old = 3 * 3600, 7 * 3600
+        assert young < span_secs < old, (young, span_secs, old)
+        age_comments = [bot_at(age_receipt_body(), 3000)]
+
+        # (1) NON-VACUITY FIRST, and it is load-bearing. The identical PR, identical window and
+        # identical timings WITHOUT groom's receipt must still show the heuristic doing its job:
+        # refuse at 3 h, ADMIT at 7 h. Without this control the pair-assertion below would pass
+        # just as well if the heuristic had been deleted, if `healthy_window` stopped being
+        # healthy, or if the fixture never reached the probe at all — and "removing the heuristic
+        # restores the #691 no-machine-exit stall" is precisely the outcome that must not happen.
+        control = {}
+        for hours, seconds in (("3h", young), ("7h", old)):
+            control[hours] = readmit_sweep(healthy_window, timeline=park_at(seconds))
+        assert control["3h"] == (0, [], []), control["3h"]
+        assert control["7h"][0] == 1 and control["7h"][2] == [(41, 7)], control["7h"]
+        assert "fleet-health" in control["7h"][1][0][1], control["7h"][1]
+        print("  ok   [#769] CONTROL (non-vacuity): with NO age receipt the sustained-health "
+              "heuristic still refuses at 3 h and ADMITS at 7 h — #691's exit is intact")
+
+        # (2) THE RED TEST. The same park, now carrying groom's age receipt, must reach the SAME
+        # decision at 3 h and at 7 h. Delete the `age_park_episode` guard from
+        # `_readmit_capacity_parks` and the 7 h leg admits again while the 3 h leg does not — the
+        # two stop agreeing, which is exactly the shape "crossing the span is the only variable"
+        # has. The decisions are compared to EACH OTHER as well as to the expected value, so a
+        # mutant that broke both legs identically cannot pass either.
+        aged = {}
+        for hours, seconds in (("3h", young), ("7h", old)):
+            aged[hours] = readmit_sweep(healthy_window, comments=age_comments,
+                                        timeline=park_at(seconds))
+            aged[hours + "-census"] = census_codes()
+        assert aged["3h"] == aged["7h"] == (0, [], []), (aged["3h"], aged["7h"])
+        assert aged["3h-census"] == aged["7h-census"] == "foreign-episode=1", aged
+        print("  ok   [#769] RED TEST: a groom AGE park reaches the SAME decision at 3 h and "
+              "7 h — crossing SUSTAINED_HEALTH_SPAN_SECONDS is no longer an exit")
+
+        # (3) The refusal is CENSUSED and classified EXIT-REACHABLE, not human-terminal. A park
+        # that silently drops out of the census is the invisible hold this whole class of defect
+        # is about, and the exit class is a CLAIM: groom's own cause-gated sweep clears it, so no
+        # maintainer should be told to go and look at it.
+        assert _park_policy.park_refusal_exit_class(
+            _park_policy.PARK_REFUSAL_FOREIGN_EPISODE) == "exit-reachable"
+        assert not [line for line in readmit_sweep.log
+                    if line.startswith("::warning::park census")], readmit_sweep.log
+        assert any("groom's cause-gated AGE park" in line for line in readmit_sweep.log), \
+            readmit_sweep.log
+        print("  ok   [#769] the age park is CENSUSED as `foreign-episode` / exit-reachable — "
+              "named every tick, and never reported as needing a human")
+
+        # (4) THE EPISODE CLOSES. worker-pr's capacity ladder parking this PR AFTER the age
+        # receipt means the live label is the LADDER's park, not groom's, and the ordinary
+        # capacity path must resume — otherwise this guard would strand every PR that ever wore a
+        # groom age park. STRICTLY newer closes it; a TIE does not, because a tie is the ambiguous
+        # case and the fail-closed direction is to leave the park alone.
+        ladder_body = f"x {PARK_GENERATION_MARKER_PREFIX} gen=1 cutoff=none -->"
+        reopened = readmit_sweep(
+            healthy_window, comments=age_comments + [bot_at(ladder_body, 2000)],
+            timeline=park_at(old))
+        assert reopened[0] == 1 and reopened[2] == [(41, 7)], reopened
+        tied = readmit_sweep(
+            healthy_window, comments=age_comments + [bot_at(ladder_body, 3000)],
+            timeline=park_at(old))
+        assert tied == (0, [], []), tied
+        # A park-REASON receipt (the legacy migration / the starvation park) closes it too.
+        reason_body = f"x {_park_policy.park_reason_marker(STARVATION_PARK_CAUSE)}"
+        assert readmit_sweep(healthy_window,
+                             comments=age_comments + [bot_at(reason_body, 2000)],
+                             timeline=park_at(old))[0] == 1
+        print("  ok   [#769] the age episode CLOSES on a strictly-newer park receipt from "
+              "another mechanism (a TIE does not) — no PR is stranded by this guard")
+
+        # (5) groom's OWN un-park receipt does NOT close the episode. groom posts it BEFORE it
+        # deletes the label, so a receipt with the label still live is groom's crash residue and
+        # groom's convergence branch owns it. Handing that to this sweep would clear it while
+        # minting a receipt claiming a starvation recovery that never happened.
+        unpark_body = (f"{groom_mod.AGE_UNPARK_MARKER} cause=orphan-draft head={'c' * 40} "
+                       "gen=1 -->")
+        assert readmit_sweep(healthy_window,
+                             comments=age_comments + [bot_at(unpark_body, 2000)],
+                             timeline=park_at(old)) == (0, [], []), "groom converges its own"
+        print("  ok   [#769] groom's own un-park receipt does NOT hand the park to this sweep — "
+              "receipt-no-label is groom's convergence, not a capacity re-admission")
+
+        # (6) TRUST FILTER + FAIL-CLOSED. A third party cannot forge an age receipt to freeze a
+        # genuine capacity park (it is not the bot's comment, so it is not a receipt at all); and
+        # once a REAL age receipt is on record, a bot comment whose stamp cannot be parsed leaves
+        # the episode boundary unprovable, which keeps the park with groom.
+        forged = readmit_sweep(healthy_window,
+                               comments=[bot_at(age_receipt_body(), 3000, login="drive-by")],
+                               timeline=park_at(old))
+        assert forged[0] == 1 and forged[2] == [(41, 7)], forged
+        unstamped = readmit_sweep(
+            healthy_window,
+            comments=age_comments + [{"user": {"login": readmit_bot}, "body": ladder_body,
+                                      "created_at": "not-a-timestamp"}],
+            timeline=park_at(old))
+        assert unstamped == (0, [], []), unstamped
+        print("  ok   [#769] a NON-bot age receipt is not a receipt, and an unreadable bot stamp "
+              "fails CLOSED (the park stays with groom)")
+
+        # (6b) THE PR-SIDE PARK MUST BE LIVE for the binding to speak at all. This sweep ALSO
+        # admits a PR whose SOURCE ISSUE carries `status:parked` with no PR-side label, and such a
+        # PR can still carry an age receipt from an EARLIER, already-closed episode — groom parked
+        # it, the cause recovered, groom cleared the label, the receipt stayed. Judging that
+        # receipt would refuse an issue-side capacity park groom has no exit for, i.e. this guard
+        # would itself become the stranding it exists to prevent. Delete clause 0 and this reds.
+        issue_side = readmit_sweep(
+            healthy_window, comments=age_comments, timeline=park_at(old),
+            rows=[[dict(parked_row, labels=[{"name": "review:needs"}])]],
+            labels={7: ["status:parked"]})
+        assert issue_side[0] == 1 and issue_side[2] == [(41, 7)], issue_side
+        print("  ok   [#769] an ISSUE-side `status:parked` with NO live `review:parked` is "
+              "unaffected — a closed age episode's receipt cannot strand another park")
+
+        # (7) PRECEDENCE. A human-owned hold outranks the episode binding in the census, because
+        # `human-hold` is HUMAN-TERMINAL and is the row a maintainer must actually see. The park
+        # is refused either way; what is asserted here is that the refusal is not misfiled.
+        held = readmit_sweep(healthy_window, comments=age_comments, timeline=park_at(old),
+                             labels={7: ["status:parked", "needs:user"]})
+        assert held == (0, [], []), held
+        assert census_codes() == "human-hold=1", census_codes()
+        print("  ok   [#769] a human-owned hold still outranks the episode binding in the "
+              "census — a human-terminal park is never filed as self-healing")
+
+        # ---- [registry #835] THE RE-ADMISSION CANDIDATE FILTER ADMITS THE #657 ORCHESTRATOR
+        # CLASS. The defect: `_readmit_capacity_parks` selected candidates on HEAD_REF_RE *and*
+        # the App-bot login — the WORKER lane's producer shape. An orchestrator-class PR
+        # satisfies NEITHER (that is what #821's waiver exists to bypass), so once such a PR took
+        # a MACHINE-owned capacity park NOTHING could ever re-admit it: the #614 stall, on
+        # precisely the population the feature serves, and invisible to every per-run signal
+        # because each sweep succeeded. Both directions are asserted, plus a FROZEN worker-class
+        # control and the three shapes that must stay out. ----
+        orch_login = "enrolled-orchestrator"
+        orch_enrolled = (orch_login,)
+
+        def orch_row(number=41, login=orch_login, ref="fix/ordinary-branch",
+                     head_repo="example/repo"):
+            """The #657 population's shape: same-repo head on an ORDINARY branch (fails
+            HEAD_REF_RE), HUMAN author (fails the `[bot]` gate), carrying the machine park."""
+            return {"number": number, "state": "open", "draft": False,
+                    "user": {"login": login},
+                    "head": {"sha": "b" * 40, "ref": ref,
+                             "repo": {"full_name": head_repo}},
+                    "labels": [{"name": MACHINE_PARK_PR_LABEL}]}
+
+        orch_record = dict(orchestrator_probe_record(41), issue=7)
+        assert provenance_attestation_class(orch_record) == ORCHESTRATOR_CLASS, orch_record
+
+        # (1) THE HEADLINE, POSITIVE. Reverting either waived gate in the candidate filter (or
+        #     hard-coding `enrolled_authors=()` at the production call site) reds THIS line.
+        count, posted, cleared = readmit_sweep(
+            recovered_window, rows=[[orch_row()]], provenance={41: orch_record},
+            enrolled_authors=orch_enrolled)
+        assert count == 1 and cleared == [(41, 7)], (
+            "[#835] a capacity-parked ORCHESTRATOR-class PR must be machine-re-admitted; "
+            "reverting either waived gate in the candidate filter reds THIS assertion. "
+            f"got {(count, cleared)!r}")
+        assert len(posted) == 1 and worker_pr_mod.AUTO_READMIT_MARKER in posted[0][1], (
+            f"[#835] the re-admission must be RECEIPTED first: {posted!r}")
+        print("  ok   [#835] a capacity-parked ORCHESTRATOR-class PR is MACHINE re-admitted "
+              "(receipt-first) — the #614 stall no longer has an unreachable population")
+
+        # (2) THE SAME ROW, ALLOWLIST EMPTY => still refused. This is what makes (1) a test of
+        #     the ENROLMENT waiver rather than of some incidental widening: the only thing that
+        #     changed between the two calls is the master-protected allowlist.
+        assert readmit_sweep(recovered_window, rows=[[orch_row()]],
+                             provenance={41: orch_record}) == (0, [], []), \
+            ("[#835] an EMPTY review_enrolment_authors must leave the two shape gates standing "
+             "byte-for-byte — enrolment is the discriminator, not the head-ref shape")
+        print("  ok   [#835] ...and with an EMPTY allowlist the very same PR is still refused")
+
+        # (3) WORKER-CLASS REGRESSION CONTROL, FROZEN. The worker row's outcome is pinned by
+        #     LITERAL expectation on both sides of the allowlist — not by re-calling the waiver
+        #     predicate, which would go quiet the moment that predicate changed.
+        assert readmit_sweep(recovered_window)[0::2] == (1, [(41, 7)]), \
+            "[#835] REGRESSION CONTROL: the worker-class capacity park must still re-admit"
+        assert readmit_sweep(recovered_window, enrolled_authors=orch_enrolled)[0::2] \
+            == (1, [(41, 7)]), (
+            "[#835] REGRESSION CONTROL: an enabled allowlist must not change ANY "
+            "worker-class re-admission outcome")
+        assert readmit_sweep(still_broken_window, enrolled_authors=orch_enrolled) == (0, [], []), (
+            "[#835] REGRESSION CONTROL: an enabled allowlist must not manufacture a worker "
+            "re-admission without proven recovery")
+        print("  ok   [#835] worker-class re-admission is unchanged in BOTH allowlist states "
+              "(regression control, frozen literals)")
+
+        # (4) NOTHING ELSE BECOMES RE-ADMITTABLE. Each of these differs from (1) in exactly one
+        #     property, so each pins one predicate the waiver must NOT reach.
+        for _why, _rows, _prov, _authors in (
+                ("a THIRD-PARTY author is not enrolled",
+                 [[orch_row(login="drive-by-contributor")]], {41: orch_record}, orch_enrolled),
+                ("a FORK head is never ours to re-admit, on any path",
+                 [[orch_row(head_repo="attacker/fork")]], {41: orch_record}, orch_enrolled),
+                ("the record must be THIS PR's record",
+                 [[orch_row()]], {41: dict(orchestrator_probe_record(9), issue=7)},
+                 orch_enrolled),
+                ("a MACHINE-attested record is not the orchestrator class",
+                 [[orch_row()]], {41: {"pr_number": 41, "issue": 7,
+                                       "impl_provider": sorted(IMPL_PROVIDERS)[0],
+                                       "impl_alias": "sol", "impl_account_h": "0" * 16,
+                                       "head_sha_at_open": "0" * 40,
+                                       "recorded_at_run": "6001.1"}}, orch_enrolled),
+                ("no record at all fails closed", [[orch_row()]], {}, orch_enrolled)):
+            assert readmit_sweep(recovered_window, rows=_rows, provenance=_prov,
+                                 enrolled_authors=_authors) == (0, [], []), f"[#835] {_why}"
+        print("  ok   [#835] no third-party, fork, foreign-record, machine-attested or "
+              "recordless PR becomes re-admittable (5 shapes, one differing property each)")
     finally:
         globals()["_target_is_human_maintainer"] = prev_target_probe
+
+    # ---- [registry #835] THE CALL SITE, on the PARSED module. A behavioural test of the sweep
+    # cannot see `dispatch()` passing a hard-coded `()` — the sweep would keep passing while the
+    # feature was off in production, which is exactly the vacuity shape #827's review found
+    # (`--self-test || true`, a bare `args+=(--apply)`). The parameter is REQUIRED keyword-only,
+    # so OMITTING it is a TypeError; what a signature cannot catch is the WRONG VALUE, and that
+    # is what is pinned here. Parsed, never regexed: #759 measured a source regex failing
+    # permissive under a two-line reflow with no behaviour change. ----
+    _readmit_fn = next(
+        node for node in ast.walk(ast.parse(
+            Path(__file__).resolve().read_text(encoding="utf-8")))
+        if isinstance(node, ast.FunctionDef) and node.name == "dispatch")
+    _readmit_enrol = [
+        keyword.value for node in ast.walk(_readmit_fn) if isinstance(node, ast.Call)
+        and getattr(node.func, "id", "") == "_readmit_capacity_parks"
+        for keyword in node.keywords if keyword.arg == "enrolled_authors"]
+    assert len(_readmit_enrol) == 1, \
+        (f"expected exactly one enrolled_authors argument to _readmit_capacity_parks in "
+         f"dispatch(), got {len(_readmit_enrol)}")
+    assert (isinstance(_readmit_enrol[0], ast.Call)
+            and getattr(_readmit_enrol[0].func, "attr", "") == "review_enrolment_authors"
+            and [getattr(a, "id", "") for a in _readmit_enrol[0].args] == ["repo", "policy_doc"]), \
+        ("dispatch() must hand the re-admission sweep the repo's MASTER-protected allowlist, "
+         "resolved live from the policy document it already validated — the same expression "
+         "CLAIM gets. Hard-coding `()` here re-opens the #614 stall for the enrolled class with "
+         f"nothing red anywhere else. Found: {ast.dump(_readmit_enrol[0])}")
+    # ...and the sweep's own signature keeps the parameter REQUIRED: a default would let a future
+    # caller (or a reverted call site) silently sweep with enrolment off.
+    _readmit_def = next(
+        node for node in ast.walk(ast.parse(
+            Path(__file__).resolve().read_text(encoding="utf-8")))
+        if isinstance(node, ast.FunctionDef) and node.name == "_readmit_capacity_parks")
+    assert ("enrolled_authors" in [a.arg for a in _readmit_def.args.kwonlyargs]
+            and _readmit_def.args.kw_defaults[
+                [a.arg for a in _readmit_def.args.kwonlyargs].index("enrolled_authors")] is None), \
+        ("_readmit_capacity_parks must take enrolled_authors as a REQUIRED keyword-only "
+         "parameter (as _dispatch_review_items does), so omitting it is a TypeError rather than "
+         "a silently enrolment-off sweep")
+    print("  ok   [#835] the sweep's allowlist is REQUIRED and its production call site resolves "
+          "it through policy-resolve.review_enrolment_authors (parsed call site, not a regex)")
 
     # ---- round-3 Opus finding: a maintainer probe-CALL failure emits the distinct loud
     # ::warning:: diagnostic (and still fails toward not-human); a genuine not-a-maintainer

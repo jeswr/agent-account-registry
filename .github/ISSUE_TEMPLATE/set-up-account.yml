@@ -2,13 +2,22 @@ name: Set up new account
 description: Register a new model account via web sign-in (maintainer only)
 title: "set up new account: <openai|anthropic>"
 labels: []
+# [#261] LABELS ARE THE ONLY CARRIER — this form collects NO request data, by design.
+# The broker (.github/workflows/set-up-account.yml) resolves the provider in its `meta` step from the
+# `provider:openai`/`provider:anthropic` LABELS, and the authorized targets in its grant preflight
+# from the `grant:` LABELS. It never parses this issue's body. The form used to collect a REQUIRED
+# `provider` dropdown whose value landed in the body and was then ignored, so a request could be
+# submitted "with a provider" and still be refused for having no provider label — the field taught
+# the wrong contract. A body field would also be a SECOND source of truth that can disagree with the
+# labels the broker actually enforces (see the `grant:` note below, where that gap is a live TOCTOU
+# window). GitHub issue forms cannot apply a label from a field value, so the honest shape is to
+# state the label contract and have the requester CONFIRM it, never to pretend to collect it.
 body:
-  - type: dropdown
-    id: provider
+  - type: markdown
     attributes:
-      label: Provider
-      options: [anthropic, openai]
-    validations: {required: true}
+      value: |
+        **Everything the broker reads is a LABEL.** Nothing you type below is parsed — this form
+        exists to state the label contract, in the order the labels must be applied.
   # [#579] AUTHORIZATION, not documentation. `account_pool` in policy/repos.toml is the
   # credential-authorization boundary (policy-resolve validates it, select-and-claim.claim()
   # filters on it, worker.yml re-checks it), so enrollment grants the new account ONLY to the
@@ -19,11 +28,28 @@ body:
   - type: markdown
     attributes:
       value: |
-        **Before adding `set-up-account`, label this issue with its authorized targets.** Add one
-        **`grant:<owner>/<repo>`** label per repository this account may be used by (each must be an
-        `enabled = true` row of `policy/repos.toml` — e.g. `grant:jeswr/agent-account-registry`).
-        With no `grant:` label the broker refuses to enroll: an account is never granted to every
-        repository by default.
+        **1. Authorized targets.** Add one **`grant:<owner>/<repo>`** label per repository this
+        account may be used by (each must be an `enabled = true` row of `policy/repos.toml` — e.g.
+        `grant:jeswr/agent-account-registry`). With no `grant:` label the broker refuses to enroll:
+        an account is never granted to every repository by default.
   - type: markdown
     attributes:
-      value: "Then add the **`provider:openai`/`provider:anthropic`** and **`set-up-account`** labels. The broker will comment a sign-in URL (encrypted to your GPG key); sign in and the token is captured + stored as a secret automatically. The account is registered `status:pending` and activates only when its `account_pool` PR — which touches ONLY the rows you granted — merges."
+      value: |
+        **2. Provider.** Add exactly one of **`provider:openai`** or **`provider:anthropic`**. There
+        is no default and no fallback to the issue title or body: with none — or with both — the
+        broker refuses before any login.
+  - type: markdown
+    attributes:
+      value: "**3. Start the broker.** Add **`set-up-account`** LAST — it fires immediately. The broker will comment a sign-in URL (encrypted to your GPG key); sign in and the token is captured + stored as a secret automatically. The account is registered `status:pending` and activates only when its `account_pool` PR — which touches ONLY the rows you granted — merges."
+  # An ACKNOWLEDGEMENT, not a data carrier: nothing reads these boxes. They exist so the label
+  # contract above is confirmed by the requester rather than skimmed, and so the form still has a
+  # fillable field once the decorative provider dropdown is gone.
+  - type: checkboxes
+    id: label_contract
+    attributes:
+      label: "Confirm the label contract (the broker reads labels only — never this body)"
+      options:
+        - label: "One `grant:<owner>/<repo>` label per authorized repository is applied."
+          required: true
+        - label: "Exactly one `provider:openai` / `provider:anthropic` label is applied."
+          required: true

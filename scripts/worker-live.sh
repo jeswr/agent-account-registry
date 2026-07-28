@@ -214,11 +214,74 @@ PY
 #   clock/date    "resets at 14:00 UTC" / "resets at 5pm" / "resets on 2026-07-18T14:00:00Z"
 #                 (display-only in the capped alert; parse_reset_hint falls back to exponential)
 # No match -> empty hint (downstream treats absent as "no hint"; BACKOFF_CAP bounds it anyway).
+# [#879] `| head -n1` used to sit downstream of the live grep: head exits after one line, grep
+# SIGPIPEs on its next write, and under `pipefail` (line 6) the whole function returned 141. The
+# only caller is `reset_hint="$(_extract_reset_hint …)" || reset_hint=""`, so a CORRECTLY extracted
+# hint was thrown away by the `||`. Measured: harmless while grep's own output stays under one
+# stdio flush, then 45/60 discarded at 400 hint-shaped matches and 60/60 at 2000 — i.e. exactly the
+# chatty rate-limited log this exists to read. Capture the matches, take the first line with a bash
+# parameter expansion: no consumer process exists, so nothing can early-exit and nothing is signalled.
 _extract_reset_hint() {
-  local signals_file=$1
-  grep -aioE \
+  local signals_file=$1 matches
+  matches="$(grep -aioE \
     '(resets?|try again|retry)([- ]?(at|on|in|after))?[ :]*([0-9]{4}-[0-9]{2}-[0-9]{2}([T ][0-9]{2}:[0-9]{2}(:[0-9]{2})?(Z|[+-][0-9]{2}:?[0-9]{2})?)?|[0-9]{1,2}:[0-9]{2}(:[0-9]{2})?( ?(am|pm))?( ?(utc|gmt))?|[0-9]{1,2} ?(am|pm)( ?(utc|gmt))?|[0-9]+(\.[0-9]+)?( ?(s|secs?|seconds?|m|mins?|minutes?|h|hrs?|hours?))?)' \
-    "$signals_file" 2>/dev/null | head -n1 | tr -cd 'A-Za-z0-9 :,/+.()-' | cut -c1-80
+    "$signals_file" 2>/dev/null || true)"
+  printf '%s' "${matches%%$'\n'*}" | tr -cd 'A-Za-z0-9 :,/+.()-' | cut -c1-80
+}
+
+# PURE (self-tested): the 1-based line number of the FIRST line of stdin matching BRE $1, or the
+# empty string when nothing matches. [#879] This exists so that no caller ever writes
+# `grep -n … | head -n1`: `head` exits after one line, the still-running `grep` takes SIGPIPE on its
+# next write, and under `pipefail` (line 6) the pipeline's status is 141 — which under `set -e`
+# aborts the whole self-test (skipping every later check, i.e. one defect hiding the next) and,
+# where a `|| true` was bolted on to stop that, swallows a genuine grep failure instead. Here the
+# consumer is a bash parameter expansion, so there is no second process at all: `$( )` runs grep to
+# completion, and nothing exists that could exit early or be signalled. A no-match is a NORMAL empty
+# result (status 0), which is what makes the callers' "…-or-missing" branches actually reachable.
+_first_match_line() {
+  local hits first
+  hits="$(grep -n -- "$1" || true)"
+  [[ -n "$hits" ]] || return 0
+  first="${hits%%$'\n'*}"
+  printf '%s' "${first%%:*}"
+}
+
+# PURE (self-tested, positive-control included): count `producer | EARLY-EXITING-consumer` pipelines
+# in the files named by "$@" and print the number. [#879] This is the SHAPE guard, not a fix for one
+# call site: a
+# consumer that can exit before draining stdin (grep -q/-m, head, sed …q, awk …exit, read) kills the
+# still-running producer with SIGPIPE, and `set -o pipefail` (line 6) then makes the pipeline report
+# 141 — a status the callers read as "did not match" / "failed". It is scheduling-dependent, so it
+# looks like flake and gets WORSE on a loaded runner; it was mis-diagnosed across this estate as a
+# harmless self-test flake for exactly that reason. Logical lines are reassembled across backslash /
+# trailing-operator continuations and split on `||`/`&&` so the OR operator is never mistaken for a
+# pipe; comment lines are skipped. The self-test runs it over scripts/fixtures/sigpipe-shapes-879.txt,
+# which carries one of each shape (so a regex that stopped matching goes red), and then over
+# scripts/*.sh demanding zero. Both fixtures are kept OUT of scripts/*.sh precisely so that carrying
+# the broken shape as evidence never becomes a hole in the scanner that must find it.
+_sigpipe_shape_hits() {
+  awk '
+    function shape(seg) {
+      if (seg ~ /\|[[:space:]]*head([[:space:]]|$)/) return 1
+      if (seg ~ /\|[^|]*grep[^|]*[[:space:]]-[-A-Za-z]*q[-A-Za-z]*([[:space:]]|$)/) return 1
+      if (seg ~ /\|[^|]*grep[^|]*[[:space:]]-[-A-Za-z]*m[[:space:]]*[0-9]/) return 1
+      if (seg ~ /\|[^|]*awk[^|]*[^A-Za-z_]exit[^A-Za-z_]/) return 1
+      if (seg ~ /\|[^|]*sed[^|]*[^A-Za-z_]q[^A-Za-z_]/) return 1
+      if (seg ~ /\|[[:space:]]*(IFS=[^[:space:]]*[[:space:]]*)?read([[:space:]]|$)/) return 1
+      return 0
+    }
+    {
+      s = $0
+      sub(/^[[:space:]]+/, "", s)
+      if (s ~ /^#/) { buf = ""; next }
+      buf = (buf == "" ? s : buf " " s)
+      if ($0 ~ /(\\|\||&)[[:space:]]*$/) next
+      m = split(buf, seg, /(\|\||&&)/)
+      for (i = 1; i <= m; i++) if (shape(seg[i])) n++
+      buf = ""
+    }
+    END { print n+0 }
+  ' "$@"
 }
 
 # PURE (issue #134): emit the nested READ-ONLY bind mount that pins the selected account credential
@@ -742,7 +805,20 @@ run_gate() {
         local changed_paths
         changed_paths="$(git status --porcelain=v1 --untracked-files=all -z | _porcelain_changed_paths)" \
           || die 'crate-scoped gate: changed-path listing refused (fail closed)'
-        if printf '%s\n' "$changed_paths" | grep -qE '^crates/|^Cargo\.toml$|^Cargo\.lock$'; then
+        # [#879] NOT `printf … | grep -qE …`. `grep -q` exits on its first match, SIGPIPEs the
+        # producer, and under `pipefail` (line 6) the pipeline reports 141 — which this `if` reads
+        # as "no crate source touched" and the gate PASSES WITHOUT BUILDING ANYTHING. That is the
+        # FAIL-OPEN direction on the one predicate standing between an unlabelled crate change and
+        # no gate at all, and it is reachable: `$changed_paths` is the whole porcelain listing, and
+        # `crates/`/`Cargo.toml` match near the front of it. Measured on this exact predicate —
+        # 2/60 inversions at 20 KB of paths, 14/60 at 48 KB, 54/60 at 80 KB, 60/60 at 200 KB.
+        # `grep -cE` DRAINS its input, so no producer is ever signalled and the count is the only
+        # thing the branch depends on; a producer failure would surface as a non-numeric count.
+        local crate_hits
+        crate_hits="$(printf '%s\n' "$changed_paths" | grep -cE '^crates/|^Cargo\.toml$|^Cargo\.lock$' || true)"
+        [[ "$crate_hits" =~ ^[0-9]+$ ]] \
+          || die 'crate-scoped gate: crate-source detection produced no count (fail closed)'
+        if [[ "$crate_hits" -gt 0 ]]; then
           die 'crate-scoped gate requires an area:<crate> label (diff touches crate source)'
         fi
         printf 'worker-live: docs/non-crate change (no crate source touched) — nothing to build; gate passed\n'
@@ -810,6 +886,32 @@ run_gate() {
 # advertised --self-test entrypoint enrolls it automatically instead of requiring a conflict-prone
 # edit here.
 SELFTEST_MANIFEST="$SCRIPT_DIR/selftest-suite.txt"
+
+# [issue #704] Minimum interpreter the self-test suite is allowed to run under. The floor is set by
+# the enrolled scripts themselves, not by taste: scripts/metrics.py and scripts/dispatch-secrets-guard.py
+# `import tomllib` with no fallback, and tomllib is stdlib only from 3.11. Below the floor the suite
+# does not fail cleanly -- it dies part-way through on the FIRST offending construct and every
+# assertion after that point is never reached, so a truncated run can be mistaken for a narrower
+# pass. Refuse up front instead.
+SELFTEST_PYTHON_FLOOR=3.11
+
+# PURE (self-tested): compare an interpreter's `major.minor` against a `major.minor` floor.
+# Prints `ok` (at or above the floor), `below`, or `unknown` when either side is unparseable.
+# `unknown` is deliberately NOT `ok`: an interpreter whose version we cannot read must fail closed
+# rather than be waved through. Components are compared NUMERICALLY -- string order would rank
+# "3.9" above "3.11" and wave through an interpreter two minors under the floor.
+_python_version_at_least() {
+  local have=$1 floor=$2 hmaj hmin fmaj fmin
+  [[ "$have" =~ ^([0-9]+)\.([0-9]+) ]] || { printf 'unknown\n'; return 0; }
+  hmaj=${BASH_REMATCH[1]} hmin=${BASH_REMATCH[2]}
+  [[ "$floor" =~ ^([0-9]+)\.([0-9]+)$ ]] || { printf 'unknown\n'; return 0; }
+  fmaj=${BASH_REMATCH[1]} fmin=${BASH_REMATCH[2]}
+  if (( hmaj > fmaj || (hmaj == fmaj && hmin >= fmin) )); then
+    printf 'ok\n'
+  else
+    printf 'below\n'
+  fi
+}
 
 _read_selftest_list() {
   local file=$1
@@ -885,7 +987,10 @@ FULL_SELFTEST_SUITE=$(_derive_full_selftest_suite "$SCRIPT_DIR" "$SELFTEST_MANIF
 # PURE: the touched paths (relative to the target root) that this gate must lint. Reads a
 # newline-delimited path list on stdin (the caller passes `git diff --name-only` output); the
 # self-test feeds a fixture. Prints, one per line: "self:<script>" for a touched script that has a
-# --self-test, "bash:<file>" for a touched *.sh, "wf:<file>" for a touched workflow yml.
+# --self-test, "py:<file>" for a touched *.py, "bash:<file>" for a touched *.sh, "wf:<file>" for a
+# touched workflow yml, "dockerfile:<file>" for a touched container definition, and "js:<file>" for
+# a touched dashboard renderer script. EVERY kind emitted here must have a validating loop in
+# registry_selftest_gate — its `direct == #targets` invariant fails the gate closed otherwise.
 _registry_selftest_targets() {
   local suite="$1" path base
   while IFS= read -r path; do
@@ -918,6 +1023,15 @@ _registry_selftest_targets() {
       # asserts its base images stay digest-pinned.
       containers/*Dockerfile|containers/*.Dockerfile|containers/*.dockerfile)
         printf 'dockerfile:%s\n' "$path"
+        ;;
+      # [issue #613] the public dashboard renderer — the LAST hop on the public surface, where
+      # dashboard-gen's decision-22 privacy assertions and fail-closed availability semantics are
+      # re-implemented defensively in JS (obsFlowCard's salted-label check, renderRepositoryAgents'
+      # lease-count invariant). It was classified into NOTHING, so a syntax error or a broken render
+      # path shipped unvalidated. Emit a js: target so the gate parses it. The .mjs/.cjs variants
+      # are matched too so a future module-flavoured renderer cannot land back in the same hole.
+      dashboard/*.js|dashboard/*.mjs|dashboard/*.cjs)
+        printf 'js:%s\n' "$path"
         ;;
     esac
   done
@@ -1367,6 +1481,21 @@ registry_selftest_gate() {
     if [[ "$kind" == dockerfile ]]; then
       printf 'worker-live: base-image pin check %s\n' "$name"
       _assert_dockerfile_pinned "$name" || die "container base image not digest-pinned: $name"
+      direct=$((direct + 1))
+    fi
+  done
+
+  # 6) [issue #613] every touched dashboard renderer script is parsed. `node --check` parses without
+  #    executing, so it is safe to run on untrusted PR content. When node is absent the gate DIES
+  #    rather than skipping: silently degrading would let an unvalidated public renderer count as
+  #    validated — the same hole #140 closed for actionlint.
+  for t in "${targets[@]}"; do
+    kind=${t%%:*}; name=${t#*:}
+    if [[ "$kind" == js ]]; then
+      printf 'worker-live: node --check %s\n' "$name"
+      command -v node >/dev/null 2>&1 \
+        || die "node unavailable: $name (fail closed — the public renderer cannot be under-validated)"
+      node --check "$name" || die "node --check failed: $name"
       direct=$((direct + 1))
     fi
   done
@@ -2583,6 +2712,35 @@ self_test() {
     fi
   }
 
+  # --- [issue #704] interpreter floor, asserted BEFORE any fixture runs. An unsupported python3
+  # must fail LOUDLY and IMMEDIATELY: the suite embeds python fixtures and drives enrolled scripts
+  # that need >= $SELFTEST_PYTHON_FLOOR, and under an older interpreter it used to abort mid-run,
+  # skipping every later assertion (the whole #575 bundle/publish block among them). A gate whose
+  # coverage silently depends on the runner's interpreter minor version is the wrong property for
+  # the repo that IS the trust plane. `die` here, not `chk` -- a partial suite is not a result. ---
+  local _pyver _pyfloor
+  _pyver=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || true)
+  _pyfloor=$(_python_version_at_least "$_pyver" "$SELFTEST_PYTHON_FLOOR")
+  [[ "$_pyfloor" == ok ]] || die "self-test requires python3 >= $SELFTEST_PYTHON_FLOOR (found ${_pyver:-<unreadable>}, verdict $_pyfloor); refusing to run a partial suite"
+
+  chk "python floor: the running interpreter satisfies the suite floor" "$_pyfloor" "ok"
+  chk "python floor: exactly the floor is accepted" \
+    "$(_python_version_at_least 3.11 3.11)" "ok"
+  chk "python floor: a newer minor is accepted" \
+    "$(_python_version_at_least 3.12 3.11)" "ok"
+  chk "python floor: a newer major is accepted" \
+    "$(_python_version_at_least 4.0 3.11)" "ok"
+  chk "python floor: one minor BELOW the floor is refused" \
+    "$(_python_version_at_least 3.10 3.11)" "below"
+  chk "python floor: minor is compared NUMERICALLY, not as a string (3.9 < 3.11)" \
+    "$(_python_version_at_least 3.9 3.11)" "below"
+  chk "python floor: an older MAJOR is refused" \
+    "$(_python_version_at_least 2.7 3.11)" "below"
+  chk "python floor: an unreadable interpreter version is NOT waved through" \
+    "$(_python_version_at_least "" 3.11)" "unknown"
+  chk "python floor: a garbage version string is NOT waved through" \
+    "$(_python_version_at_least 'not.a.version' 3.11)" "unknown"
+
   # --- codex provider-model argv contract (sol/luna, and terra on docs lanes). Claude empty
   # is rejected upstream by the _run_headless_harness normalization, so it never reaches this
   # flag builder. ---
@@ -2871,12 +3029,14 @@ print(", ".join(v for v in m.NO_CHANGE_REASONS if v != "unspecified"))' "$SCRIPT
   #     detection (not just deleting it) turns this red.
   local _rm_body _lift_at _detect_at
   _rm_body=$(sed -n '/^run_model() {/,/^}/p' "$SCRIPT_DIR/worker-live.sh")
-  # `|| true` on both: a DELETED call must be reported as a named MISORDERED failure, not abort the
-  # whole suite via `set -e` on grep's exit 1 — an abort here would also skip every later check,
-  # which is how one deletion hides a second defect. (Measured: the first draft did exactly that.)
-  _lift_at=$(grep -n '_lift_no_diff_declaration' <<< "$_rm_body" | head -n1 | cut -d: -f1 || true)
-  _detect_at=$(grep -n 'git status --porcelain=v1 --untracked-files=all' <<< "$_rm_body" \
-    | head -n1 | cut -d: -f1 || true)
+  # A DELETED call must be reported as a named MISORDERED failure, not abort the whole suite via
+  # `set -e` on grep's exit 1 — an abort here would also skip every later check, which is how one
+  # deletion hides a second defect. (Measured: the first draft did exactly that.) [#879] That used
+  # to be bought with `| head -n1 | … || true`, where the `|| true` covered grep's honest exit 1
+  # AND the pipeline's SIGPIPE 141 indiscriminately; _first_match_line returns the no-match case as
+  # a normal empty string, so the guard keeps its meaning without swallowing anything else.
+  _lift_at=$(_first_match_line '_lift_no_diff_declaration' <<< "$_rm_body")
+  _detect_at=$(_first_match_line 'git status --porcelain=v1 --untracked-files=all' <<< "$_rm_body")
   chk "run_model lifts the no-diff declaration BEFORE it detects changes" \
     "$([[ -n "$_lift_at" && -n "$_detect_at" && "$_lift_at" -lt "$_detect_at" ]] \
       && echo before || echo "MISORDERED($_lift_at,$_detect_at)")" "before"
@@ -3195,6 +3355,9 @@ PY
     "scripts/pat-validity.py" \
     "scripts/newhelper.py" \
     "containers/worker-model.Dockerfile" \
+    "dashboard/app.js" \
+    "dashboard/render.mjs" \
+    "dashboard/index.html" \
     | _registry_selftest_targets "$FULL_SELFTEST_SUITE" | sort | paste -sd',' -)
   chk "registry gate selects touched suite py" \
     "$(grep -c 'self:worker-pr.py' <<< "${sel//,/$'\n'}" || true)" "1"
@@ -3226,6 +3389,18 @@ PY
   # can validate its base-image pinning.
   chk "registry gate classifies a touched container definition" \
     "$(grep -c 'dockerfile:containers/worker-model.Dockerfile' <<< "${sel//,/$'\n'}" || true)" "1"
+  # [issue #613] the public dashboard renderer was classified into NOTHING, so a syntax error or a
+  # broken render path in the last hop of the public surface shipped unvalidated. Both directions:
+  # a touched *.js emits exactly one js: parse target, and it is not misfiled as a py/self target;
+  # a non-js dashboard asset stays unclassified (a spurious js: on it would fail closed wrongly).
+  chk "registry gate parses a touched dashboard renderer" \
+    "$(grep -c '^js:dashboard/app\.js$' <<< "${sel//,/$'\n'}" || true)" "1"
+  chk "registry gate parses a module-flavoured dashboard renderer too" \
+    "$(grep -c '^js:dashboard/render\.mjs$' <<< "${sel//,/$'\n'}" || true)" "1"
+  chk "registry gate does NOT self-test/compile a dashboard renderer" \
+    "$(grep -cE '^(self|py):.*app\.js' <<< "${sel//,/$'\n'}" || true)" "0"
+  chk "registry gate ignores a non-js dashboard asset" \
+    "$(grep -c 'index\.html' <<< "${sel//,/$'\n'}" || true)" "0"
 
   # --- [issue #141] porcelain parser feeding BOTH gate paths: `-z` + NUL-aware so a space/control
   # -char path or a rename's two paths cannot slip past classification. The old `cut -c4-` on the
@@ -3539,8 +3714,8 @@ WFFIX
   chk "#126: ...and that publish-job mint really does exist to be skipped (control)" \
     "$(grep -Ec '^        id: app-token-pub$' "$wf" || true)" "1"
   local verify_ln mint_ln
-  verify_ln=$(grep -n 'worker-live\.sh verify-bundle' "$wf" | head -n1 | cut -d: -f1)
-  mint_ln=$(grep -n '^        id: app-token-pub$' "$wf" | head -n1 | cut -d: -f1)
+  verify_ln=$(_first_match_line 'worker-live\.sh verify-bundle' < "$wf")
+  mint_ln=$(_first_match_line '^        id: app-token-pub$' < "$wf")
   chk "#575 (LIVE): the bundle is VERIFIED BEFORE the publisher mints any token" \
     "$([[ -n "$verify_ln" && -n "$mint_ln" && "$verify_ln" -lt "$mint_ln" ]] \
         && printf before || printf after-or-missing)" "before"
@@ -3864,8 +4039,8 @@ YAML
   # would attest to nothing. Moving the printf above it flips this red.
   local rb="$tmp/rp-block.txt" rev_at att_at
   _workflow_step_run "$wf" republish-trust > "$rb"
-  rev_at=$(grep -n 'python3 -I "\$driver" reverify' "$rb" | cut -d: -f1 | head -1)
-  att_at=$(grep -n "printf 'verified=%s" "$rb" | cut -d: -f1 | head -1)
+  rev_at=$(_first_match_line 'python3 -I "\$driver" reverify' < "$rb")
+  att_at=$(_first_match_line "printf 'verified=%s" < "$rb")
   chk "the pre-publish block writes its attestation only AFTER the reverify call returns" \
     "$([[ -n "$rev_at" && -n "$att_at" && "$rev_at" -lt "$att_at" ]] \
        && echo attest-last || echo attest-first-or-missing)" "attest-last"
@@ -3904,8 +4079,8 @@ YAML
   # pre-attempt interval. Reversing the two commands flips this red.
   local claim_body claim_at status_at
   claim_body="$(_workflow_step_body "$wf" claim-receipt)"
-  claim_at=$(printf '%s\n' "$claim_body" | grep -n 'worker-issue.py claim-receipt' | cut -d: -f1 | head -1)
-  status_at=$(printf '%s\n' "$claim_body" | grep -n 'worker-issue.py status' | cut -d: -f1 | head -1)
+  claim_at=$(_first_match_line 'worker-issue.py claim-receipt' <<< "$claim_body")
+  status_at=$(_first_match_line 'worker-issue.py status' <<< "$claim_body")
   chk "the ownership receipt is posted BEFORE the shared in-progress label is taken" \
     "$([[ -n "$claim_at" && -n "$status_at" && "$claim_at" -lt "$status_at" ]] \
        && echo receipt-first || echo label-first-or-missing)" "receipt-first"
@@ -4029,10 +4204,19 @@ PY
   # be unbound on both ends. Cross-check the two lists against each other so either drift goes red
   # HERE rather than on a runner. Non-vacuous: the loop demonstrably iterates (the fixture above
   # proves the list is read), and a fabricated extra module is reported as unbound.
-  local pinned_file unbound=0 bound=0
+  # [#879] The predicate is a CAPTURE-then-TEST, never `producer | grep -q`. An early-exiting
+  # consumer downstream of a live producer SIGPIPEs it, and under `pipefail` (line 6) the pipeline
+  # reports 141 — so a module that IS bound was counted `unbound`. Measured on this very step body
+  # (5000 bytes, first match at offset 2394): 69/200 inversions idle, 86/200 under load, i.e. the
+  # loop below reported a clean tree as drifted ~1 run in 8. The capture form has no second process
+  # to signal: `$(...)` runs the producer to completion and yields ITS status, and the `[[ == *…* ]]`
+  # test is a bash builtin with no pipe at all. Capturing once is also the cheaper shape — the old
+  # code re-extracted the same step body once per pinned module.
+  local rt_body pinned_file unbound=0 bound=0
+  rt_body="$(_workflow_step_body "$wf" republish-trust)"
   while read -r pinned_file; do
     [[ -n "$pinned_file" ]] || continue
-    if _workflow_step_body "$wf" republish-trust | grep -Fq "registry/scripts/$pinned_file'"; then
+    if [[ "$rt_body" == *"registry/scripts/$pinned_file'"* ]]; then
       bound=$((bound + 1))
     else
       unbound=$((unbound + 1))
@@ -4045,12 +4229,65 @@ PY
     "$([[ "$bound" -ge 2 ]] && echo covered || echo "only-$bound")" "covered"
   # The predicate itself, both directions: it must SEE a module the block really binds and MISS one
   # it does not. Without this the loop above could pass by matching everything (or nothing).
-  _bound_probe() { _workflow_step_body "$wf" republish-trust | grep -Fq "registry/scripts/$1'" \
-    && echo bound || echo unbound; }
+  _bound_probe() { [[ "$rt_body" == *"registry/scripts/$1'"* ]] && echo bound || echo unbound; }
   chk "the closure/binding predicate SEES a really-bound module (mutant, direction 1)" \
     "$(_bound_probe worker-issue.py)" "bound"
   chk "the closure/binding predicate MISSES an unbound one (mutant, direction 2)" \
     "$(_bound_probe definitely-not-bound.py)" "unbound"
+
+  # --- [#879] The predicate above is only trustworthy if it cannot be INVERTED by scheduling. The
+  # shape it used to have (`producer | grep -Fq`) reported "unbound" for a module that IS bound
+  # whenever grep won the race to exit, because SIGPIPE + `pipefail` (line 6) makes the pipeline 141
+  # and the `if` takes the else branch. Two guards, in the order that makes each non-vacuous.
+  #
+  # Guard 1 — BEHAVIOURAL, on an input sized to FORCE the race rather than merely permit it. The
+  # fixture's SINGLE-process producer emits the needle then ~4 MiB of tail — 64x the 64 KiB pipe
+  # buffer — so it MUST block on a write, which means the consumer MUST have been scheduled and MUST
+  # have exited on its match. A small fixture lets the producer finish into the buffer and the whole
+  # test then passes on the BROKEN shape too: the "assertion satisfied by a weaker input" trap. The
+  # first assertion is what proves the fixture is strong enough; delete it and the second proves
+  # nothing. Both properties are measured in the fixture's own header — including the two-writer
+  # draft of it that passed this assertion on 1 KiB and had to be replaced. (On the real
+  # republish-trust body, 5000 bytes: 69/200 inversions idle, 86/200 under load. At 4 MiB it is not
+  # probabilistic — 150/150.) ---
+  local sp_needle='NEEDLE-SIGPIPE-879' sp_repro="$SCRIPT_DIR/fixtures/sigpipe-repro-879.bash"
+  local sp_rc sp_cap
+  sp_rc="$(bash "$sp_repro" probe "$sp_needle")"
+  chk "the SIGPIPE fixture is large enough to FORCE the race (old shape inverts a REAL match)" \
+    "$([[ "$sp_rc" -ne 0 ]] && echo inverted || echo "not-forced(rc=$sp_rc)")" "inverted"
+  sp_cap="$(bash "$sp_repro" produce "$sp_needle")"
+  # ...and the SIZE is asserted DIRECTLY, not merely inferred from the inversion above. A mutation
+  # run showed why: an inversion can be produced by a WEAK fixture (two sequential writers let the
+  # consumer exit in the gap between them, inverting 53/60 on ~1 KiB), so the inversion alone does
+  # not establish that this input exceeds the pipe buffer. Measuring the stream cannot be faked.
+  chk "...and that fixture really is >= 4 MiB, i.e. past the 64 KiB pipe buffer (size IS the claim)" \
+    "$([[ "${#sp_cap}" -ge 4194304 ]] && echo big-enough || echo "only-${#sp_cap}-bytes")" "big-enough"
+  chk "...and the capture-then-test idiom still SEES that match on the identical input (#879)" \
+    "$([[ "$sp_cap" == *"$sp_needle"* ]] && echo match || echo MISSED)" "match"
+  chk "..._first_match_line too: no consumer process, so nothing can early-exit (#879)" \
+    "$(_first_match_line "$sp_needle" <<< "$sp_cap")" "1"
+
+  # _first_match_line replaced eight `grep -n … | head -n1 | cut` sites, so it needs its own direct
+  # tests — every one of its callers happens to use a pattern that matches EXACTLY ONCE, so the
+  # order assertions above cannot tell "first" from "last" and a mutation that returned the LAST
+  # match survived the whole suite. These two pin the contract instead of relying on its callers:
+  chk "_first_match_line returns the FIRST match, not the last (multi-match input)" \
+    "$(_first_match_line 'x' <<< $'a\nx\nb\nx\nc')" "2"
+  # ...and no-match is a NORMAL empty result with status 0, NOT a `set -e` abort. This is what makes
+  # the "after-or-missing" / "attest-first-or-missing" / "label-first-or-missing" arms of the order
+  # assertions reachable at all: under the old `grep -n … | head` shape a zero-match pipeline exited
+  # 1 through `pipefail` and killed the whole suite before the arm could ever be reported.
+  chk "..._first_match_line reports no-match as empty+status-0 (the -or-missing arms are reachable)" \
+    "$(_first_match_line 'zzz-no-such-string' <<< $'a\nb'; printf '|%s' "$?")" "|0"
+
+  # Guard 2 — STATIC, and this is the one that keeps the class out. A behavioural test only covers
+  # the call sites someone remembered to write a test for; the scanner covers every line of
+  # scripts/*.sh. Positive control FIRST so the zero below cannot be a scanner that matches nothing:
+  # the fixture carries one line per shape the scanner claims, and two decoys it must not count.
+  chk "the SIGPIPE-shape scanner detects every early-exiting consumer it claims to (control)" \
+    "$(_sigpipe_shape_hits "$SCRIPT_DIR/fixtures/sigpipe-shapes-879.txt")" "7"
+  chk "no \`producer | early-exiting consumer\` survives anywhere in scripts/*.sh (#879)" \
+    "$(_sigpipe_shape_hits "$SCRIPT_DIR"/*.sh)" "0"
 
   # --- crate-scoped gate package validation (defect #2, run 29634738177): the area:<label> →
   # `cargo -p` mapping crashed with exit 101 when the label was not a workspace-member name.
@@ -4495,8 +4732,13 @@ import time
 
 offset, refresh_value = int(sys.argv[1]), sys.argv[2]
 enc = lambda raw: base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
-access = (f"{enc(b'{\"alg\":\"RS256\"}')}."
-          "%s.sig" % enc(json.dumps({'exp': int(time.time()) + offset}).encode()))
+# [issue #704] The header is built OUTSIDE the join: a backslash inside an f-string expression
+# is 3.12-only (PEP 701), and on an older interpreter it is a SyntaxError that killed the suite
+# here, silently skipping every assertion below. Plain concatenation is 3.8-compatible and
+# byte-identical. Keep it that way.
+hdr = enc(b'{"alg":"RS256"}')
+payload = enc(json.dumps({'exp': int(time.time()) + offset}).encode())
+access = hdr + "." + payload + ".sig"
 print(json.dumps({"OPENAI_API_KEY": None, "auth_mode": "chatgpt",
                   "tokens": {"id_token": "ID_TOKEN_FIXTURE", "access_token": access,
                              "refresh_token": refresh_value,
@@ -4508,6 +4750,20 @@ PY
   # (a) VALID stored access token: no exchange, and the MOUNTED file carries NO refresh material.
   local pfroot="$tmp/pf-valid" pf_cred pf_rc pf_env="$tmp/pf-valid.env"
   pf_cred=$(_preflight_fixture "$pfroot" 864000 'REFRESH-TOKEN-SENTINEL-VALID')
+  # [issue #704] Pin the shape the hoisted builder above must keep producing: a three-segment JWT
+  # whose header decodes to exactly {"alg":"RS256"} and whose payload carries the requested exp.
+  # Without this, the only thing proving the header survived the hoist is the downstream pre-flight
+  # behaviour, which would still pass on a token that merely LOOKS well formed.
+  chk "(a) the fixture builds a 3-segment token with an exact RS256 header and the requested exp" \
+    "$(python3 -c '
+import base64, json, sys
+seg = json.loads(sys.argv[1])["tokens"]["access_token"].split(".")
+pad = lambda s: s + "=" * (-len(s) % 4)
+dec = lambda s: base64.urlsafe_b64decode(pad(s)).decode()
+delta = json.loads(dec(seg[1]))["exp"] - int(sys.argv[2])
+print(len(seg), dec(seg[0]), seg[2], "in-window" if 863990 <= delta <= 864000 else delta)' \
+      "$pf_cred" "$(date +%s)" 2>&1)" \
+    '3 {"alg":"RS256"} sig in-window'
   : > "$pf_env"
   if (
     export WORKER_ROOT="$pfroot" WORKER_ACCOUNT=acctexample WORKER_PROVIDER=openai \

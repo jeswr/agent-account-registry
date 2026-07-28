@@ -363,8 +363,17 @@ _has_name() {  # _has_name NAME NEWLINE-LIST
 }
 
 _in() {  # _in NAME ARRAY-ELEMENTS...
+  # [#879] NOT `printf … | grep -qxF`: `grep -q` exits on its first match, the producer takes
+  # SIGPIPE on its next write, and under `pipefail` (line 337) the pipeline reports 141 — which
+  # every caller reads as "NAME is not in the list", the fail-OPEN direction for the bootstrap /
+  # non-bootstrap classification. It only bites once the argument list outgrows the 64 KiB pipe
+  # buffer (measured: 0/80 at today's 14 names, 79/80 at 3000), so this is latent rather than live
+  # — but it is latent on a classifier, and the fixed form has no pipe: _has_name matches against a
+  # here-string bash materialises in full before grep ever runs, so there is no producer process
+  # left to signal, at any list size.
   local needle=$1; shift
-  printf '%s\n' "$@" | grep -qxF -- "$needle"
+  local list; list=$(printf '%s\n' "$@")
+  _has_name "$needle" "$list"
 }
 
 _env_names() {
