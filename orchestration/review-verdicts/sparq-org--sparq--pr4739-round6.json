@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4739,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "635be42f491c3df4689800bcc151c611fab75efd",
+  "round": 6
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Sections 3.1 and 9 still state that the ACIR runaway-unroll and diagnostic findings were captured in a filed self-improvement issue, yet identify it only with the author-defined marker `noir-acir-unroll-2026-07-28`. This is materially unchanged from round 5: a search phrase is not the tracker's durable identifier and does not make the claimed filing reliably auditable from the research record.",
+    "file": "research/noir-optimization-new-opportunities.md",
+    "fix_hint": "Add the actual issue number or URL to both the Section 3.1 disposition and the Section 9 status entry. If the issue was not filed, file the scoped issue first and then cite its resulting durable identifier; do not describe it as filed until that identifier exists.",
+    "severity": "major",
+    "title": "Filed ACIR follow-up still lacks its durable issue identifier"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 6 is stagnant. The round-5 major auditability defect remains: Sections 3.1 and 9 claim that a self-improvement issue was filed, but provide only the custom search/dedupe marker `noir-acir-unroll-2026-07-28`, not the issue number or URL. The document therefore still does not supply durable, directly auditable evidence for the claimed disposition.",
+  "verdict": "request_changes"
+ }
+}
