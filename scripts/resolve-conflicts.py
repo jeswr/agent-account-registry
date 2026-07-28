@@ -2181,6 +2181,57 @@ def _self_test():
         (True, False, False),
     )
 
+    # ...AND THE SAME PROPERTY AT THE CALL SITE, which is a separate assertion and not a
+    # restatement. MEASURED (review round 2, on the two checks immediately above): pinning only
+    # `escalation_body` left `grants=len(stuck_receipts(...))` -> `grants=generation - 1` ALIVE,
+    # because the pure function was never the thing that read the receipts. A guard on the
+    # function and a guard on the argument the call site computes are different guards; this is
+    # the same 1/N shape that hid the two `_escalate_two_head` sites in round 1, one layer in.
+    def over_cap_escalation(grants_on_record):
+        """A PR already carrying STUCK_UNPARK_MAX park receipts, so its NEXT grace-window exit is
+        generation STUCK_UNPARK_MAX + 1 — the human class — driven end to end through `run()`."""
+        over_head = "b" * 40
+        rows = [attempt_comment(over_head, iso(base_now))]
+        rows += [{"body": stuck_receipt(STUCK_PARK_MARKER, over_head, gen),
+                  "user": {"login": bot_login}, "created_at": iso(base_now)}
+                 for gen in range(1, STUCK_UNPARK_MAX + 1)]
+        rows += [{"body": stuck_receipt(STUCK_UNPARK_MARKER, over_head, gen),
+                  "user": {"login": bot_login}, "created_at": iso(base_now)}
+                 for gen in range(1, grants_on_record + 1)]
+        over_api = FakeAPI([pull(87, over_head)], now=base_now)
+        over_api.comment_rows[87] = rows
+        sweep = ConflictResolver(
+            over_api, snapshot, claim, [repo], bot_login, True, 5, FakeRebaser("conflict"),
+            stuck_grace_hours=grace, clock=lambda: base_now + 1000 * 3600.0)
+        with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+            sweep.run()
+        return (over_api.labels_added,
+                "\n".join(body for body in _comment_bodies(over_api.comment_rows[87])
+                          if ESCALATION_MARKER in body),
+                sweep.census[0])
+
+    over_zero_labels, over_zero_body, over_zero_row = over_cap_escalation(0)
+    over_one_labels, over_one_body, _over_one_row = over_cap_escalation(1)
+    check(
+        "[BODY] CALL SITE: an over-cap escalation POSTS the grant count on record — a "
+        f"generation-{STUCK_UNPARK_MAX + 1} flap with zero grants says zero, and takes the "
+        "human class",
+        (over_zero_labels,
+         f"park generation {STUCK_UNPARK_MAX + 1}" in over_zero_body,
+         "0 automatic re-admission(s) on record" in over_zero_body,
+         (over_zero_row["exit_stuck_grace"], over_zero_row["parked_human"],
+          over_zero_row["parked_machine"])),
+        ([(87, HUMAN_PARK_LABEL)], True, True, (1, 1, 0)),
+    )
+    check(
+        "[BODY] CALL SITE: ...and ONE grant on record says one at the SAME generation, so no "
+        "function of the generation alone can satisfy both rows",
+        ("1 automatic re-admission(s) on record" in over_one_body,
+         "0 automatic re-admission(s) on record" in over_one_body,
+         over_one_labels),
+        (True, False, [(87, HUMAN_PARK_LABEL)]),
+    )
+
     # (k3b) THE VETO ASYMMETRY. `_escalate_stuck` checks the sticky human-unpark veto BEFORE it
     # comments; the two-head exit checks it after, because that comment is once-ever
     # marker-deduped and cannot repeat. MEASURED (review round 1): deleting the `_escalate_stuck`
