@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 893,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "b5cb09dd92e7289aee9b2ca6aa9d8fac437f4ede",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The fail-closed check is `if not paths`, but `paths` includes `.github/ISSUE_TEMPLATE/config.yml`, which the loop explicitly excludes from form validation. If all actual issue forms are deleted or renamed while config.yml remains, `paths` is non-empty and the step succeeds with zero forms checked. This contradicts the stated rename/zero-template guarantee.",
+    "file": ".github/workflows/pr-gate.yml",
+    "fix_hint": "Track the number of non-config issue forms separately and fail when that count is zero; report that count rather than `len(paths)` as the number of templates checked.",
+    "severity": "major",
+    "title": "Chooser config makes the zero-form guard vacuous"
+   },
+   {
+    "body": "For each body element the check validates only that `type` is recognized. It therefore accepts forms GitHub rejects, such as an `input`/`textarea` without `id`, `attributes`, or `attributes.label`, a `dropdown` without non-empty `attributes.options`, a `checkboxes` element without valid labeled options, or a `markdown` element without `attributes.value`. It also does not enforce valid, unique element IDs. Thus malformed forms can still merge green despite the step's claim to assert GitHub's render-time minimum.",
+    "file": ".github/workflows/pr-gate.yml",
+    "fix_hint": "Validate the required per-type fields and their value shapes, plus the documented ID syntax and uniqueness rules (with the markdown-specific exception), or validate every form using a pinned authoritative issue-form schema/validator. Add negative fixtures/assertions for each required shape so the check demonstrably fails on forms GitHub would reject.",
+    "severity": "major",
+    "title": "Body elements are not validated against GitHub's required schema"
+   }
+  ],
+  "progress": null,
+  "summary": "The new check parses the files and catches two selected shape errors, but it is not yet a sound fail-closed issue-form schema gate. The zero-form assertion counts config.yml even though the code explicitly recognizes it is not a form, and the body validation accepts many element shapes that GitHub rejects. These gaps allow the exact silently broken-template failure class this change is intended to prevent.",
+  "verdict": "request_changes"
+ }
+}
