@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4711,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "64de73308bcf0b07ffd5d02091118fb2a1b1ead5",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`TrustGrantSet` stores the admitted `holder` and `target`, but `TrustGrantSet::union_onto(Decision)` and `union_trust_grants(Decision, Option<&TrustGrantSet>)` receive no current requester or resource and perform no binding check. Thus a valid, cloneable grant produced for Jesse/resourceX can be reused when combining the WAC `Forbidden` decision for Jesse/resourceY (or another authenticated requester), lifting that unrelated denial. The tests' resourceY case calls `trust_admit_verdict` again with resourceY; it does not attempt to reuse the already-issued resourceX grant, so it misses the flaw. This contradicts the documented claim that the grant is for one requester/resource pair and that the union is the safe, only route into a decision.",
+    "file": "crates/sparq-lws-core/src/authz/trust_admit.rs",
+    "fix_hint": "Make the public combination operation require the current authenticated agent and requested target (or a request context), verify both equal the grant's stored holder/target, and leave the WAC decision unchanged on mismatch. Prefer keeping any unchecked raw union private. Add an adversarial test that creates a valid resourceX grant once, then attempts to apply that exact grant to a `Forbidden` decision for resourceY and for a different authenticated agent; both must remain forbidden.",
+    "severity": "major",
+    "title": "Grant union does not enforce its holder and target binding"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The round-1 documentation finding is fixed, but the public union API introduces a reusable authorization-token flaw. `TrustGrantSet` records a holder and target, yet `union_onto` and `union_trust_grants` accept only a bare `Decision`; they cannot verify that the decision belongs to the same authenticated requester and resource. A caller can obtain a valid grant for resource X and then accidentally or maliciously apply that same cloneable grant to `Decision::Forbidden` for resource Y, which becomes `Allow`. The adversarial tests regenerate a verdict for Y and therefore do not exercise this cross-request reuse. This is a new major finding, so progress is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
