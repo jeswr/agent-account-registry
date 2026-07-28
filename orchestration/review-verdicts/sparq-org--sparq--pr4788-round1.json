@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4788,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "7143afbfa9fdc8eb6fe0943de7f9331988afbaec",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`crate_is_still_unpublished` only checks that a declaration line starts with `publish` and contains the substring `false`. Cargo also accepts a registry allow-list for `package.publish`; for example `publish = [\"false\"]` is publishable to the registry named `false`, yet this test passes. Thus removing the real `publish = false` premise need not fire trigger (b), contradicting the README and deferral record.",
+    "file": "crates/sparq-gpu/tests/deferral_premise.rs",
+    "fix_hint": "Parse the package manifest as TOML/Cargo metadata and assert that `package.publish` is the boolean `false`. If avoiding a parser is required, at minimum parse the assignment and require the trimmed RHS to equal exactly `false`, with a regression test covering a registry list containing the word `false`.",
+    "severity": "major",
+    "title": "Publication trip-wire accepts publishable manifests"
+   },
+   {
+    "body": "`nothing_in_the_workspace_depends_on_sparq_gpu` searches only each `crates/*/Cargo.toml` for the literal string `sparq-gpu`. A root `[workspace.dependencies] gpu = { package = \"sparq-gpu\", ... }` plus `gpu.workspace = true` in a member is a valid Cargo dependency, but the member manifest contains no `sparq-gpu` string and the root manifest is never scanned. The test therefore stays green after integration, invalidating exit trigger (a).",
+    "file": "crates/sparq-gpu/tests/deferral_premise.rs",
+    "fix_hint": "Use resolved Cargo metadata and inspect dependency package identities for every workspace member other than `sparq-gpu`, rather than grepping manifest text. Add a fixture or focused parser-level regression test for a renamed, workspace-inherited dependency.",
+    "severity": "major",
+    "title": "Dependency trip-wire misses inherited workspace dependencies"
+   }
+  ],
+  "progress": null,
+  "summary": "The deferral record is careful about scope and candid about unresolved GPU risks, but both load-bearing trip-wires use textual heuristics that do not actually enforce the conditions the documentation claims. Valid Cargo manifest forms can make the crate publishable or introduce a workspace dependency while these tests remain green. Because the safety rationale rests on those conditions being mechanically self-firing, these are major correctness gaps rather than robustness nits.",
+  "verdict": "request_changes"
+ }
+}
