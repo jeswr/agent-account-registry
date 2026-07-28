@@ -519,7 +519,14 @@ def admissible_by_the_review_lane(document, pr_number, admission_error):
 
 def issue_label_names(issue):
     """The `labels` of a live issue payload as a sorted list of names — the shape the review
-    enumerator's `issue_labels` map holds. Malformed entries are dropped, never raised on."""
+    enumerator's `issue_labels` map holds. Malformed entries are dropped, never raised on.
+
+    DEFENCE IN DEPTH, honestly labelled (mutation round 1): returning `[]` here changes no `mint()`
+    OUTCOME, because every source-issue label state the enumerator excludes on (`needs:*`,
+    `status:parked`) is already refused upstream by `issue_mint_refusal`. It is passed anyway so
+    that `delivery_refusal` asks the enumerator about the REAL issue rather than a blank one — a
+    property of the WIRING, and the self-test asserts it at the call site (a spy on the
+    `issue_labels` argument) plus the upstream-equivalence that makes it redundant today."""
     if not isinstance(issue, dict):
         return []
     return sorted({label.get("name") for label in (issue.get("labels") or [])
@@ -826,6 +833,10 @@ def census(repo, registry_repo, routing, enrolled_authors, *, impl_alias=DEFAULT
     # PLAN's own issue-label map covers ISSUES, not pull-request rows (registry #112) — the same
     # exclusion `issue_mint_refusal` refuses a PR-as-source-issue for. Applied here so a candidate
     # that is really a PR is reported as "not an OPEN issue" by the same reasoning.
+    #
+    # DEFENCE IN DEPTH, honestly labelled (mutation round 1): removing this filter does not change
+    # any VERDICT, because `issue_mint_refusal` refuses a pull-request row independently. What it
+    # changes is the REASON the operator reads, and that is what the self-test pins.
     open_issues = {row.get("number"): row for row in rows
                    if isinstance(row, dict) and "pull_request" not in row}
     recorded = read_recorded()
@@ -838,7 +849,12 @@ def census(repo, registry_repo, routing, enrolled_authors, *, impl_alias=DEFAULT
                         "reports what a mint would decide, and a mint cannot be decided without "
                         "the stamp this run would write")
     salt = os.urandom(16).hex()
-    tally = Counter({verdict: 0 for verdict in CENSUS_VERDICTS})
+    # [mutation round 1] A `Counter({v: 0 for v in CENSUS_VERDICTS})` pre-seed used to sit here and
+    # was measured UNKILLABLE: the summary below enumerates CENSUS_VERDICTS and `Counter[missing]`
+    # is 0, so seeding could never change an output. Two mechanisms for one property is one
+    # mechanism plus a control that can never fire — the ENUMERATION at the print is the mechanism,
+    # and it is the thing the self-test mutates.
+    tally = Counter()
     out = []
     for pull in sorted((p for p in pulls if isinstance(p, dict)),
                        key=lambda p: p.get("number") if isinstance(p.get("number"), int) else 0):
@@ -1370,6 +1386,40 @@ def _self_test():                                                       # noqa: 
     check("a machine-parked SOURCE ISSUE is refused before the record check even needs to run",
           decision.action, ACTION_REFUSE)
 
+    # THE SOURCE-LABEL CHANNEL, asserted at the CALL SITE (mutation round 1: `issue_label_names`
+    # returning [] killed nothing, because every label state the enumerator excludes on is already
+    # refused upstream). So the property is wiring, and it is measured as wiring: a spy over the
+    # production `dispatch_claim` module records what `mint()` actually handed the enumerator.
+    class _SpyClaim:
+        seen = {}
+
+        def __getattr__(self, name):                     # delegate everything else, unchanged
+            return getattr(dispatch_claim, name)
+
+        def enumerate_review_items(self, *args, **kwargs):
+            _SpyClaim.seen["issue_labels"] = args[4]
+            _SpyClaim.seen["provenance"] = args[2]
+            return dispatch_claim.enumerate_review_items(*args, **kwargs)
+
+    _spy = _SpyClaim()
+    mint(repo, 41, 7, "opus5", "reg/istry", routing, enrolled, env=good_env,
+         read_pull=lambda: pull(), read_issue=lambda: issue(labels=[{"name": "area:ci"},
+                                                                    {"name": "role:impl"}]),
+         read_record=lambda: None, write_record=lambda: None,
+         modules=(worker_pr, _spy, lease_schema), log=lambda *_a, **_k: None)
+    check("mint() hands the enumerator the SOURCE ISSUE's real labels, keyed by its number",
+          _SpyClaim.seen.get("issue_labels"), {7: ["area:ci", "role:impl"]})
+    check("...and the document it is about to write, keyed by the PR",
+          sorted((_SpyClaim.seen.get("provenance") or {})), [41])
+    # ...and WHY that is belt-and-braces today, asserted rather than asserted-in-a-comment: every
+    # source-issue label state the enumerator excludes on is refused upstream first.
+    for label in ("needs:user", "status:parked"):
+        check(f"issue_mint_refusal already refuses a source issue labelled {label!r}",
+              isinstance(issue_mint_refusal(7, issue(labels=[{"name": "area:ci"},
+                                                             {"name": label}]), pull(),
+                                            lease_schema.plan_package,
+                                            lease_schema.GLOBAL_PACKAGE), str), True)
+
     # ---- THE CENSUS: one disjoint verdict per open PR, decided by the production functions -----
     census_pulls = [
         pull(number=41, title="fix: a (#7)", body="closes #7"),                    # mintable
@@ -1407,9 +1457,20 @@ def _self_test():                                                       # noqa: 
           all(marker in next(d for n, _, d in verdicts if n == 42)
               for marker in ("binds", "does not enumerate")), True)
     summary = next(line for line in lines if line.startswith("census summary:"))
-    check("the summary seeds EVERY bucket at zero, so 'none' and 'not counted' differ",
+    check("the summary names EVERY bucket, so 'none' and 'not counted' differ",
           all(f"{verdict}=" in summary for verdict in CENSUS_VERDICTS), True)
     check("...and counts the whole population it walked", "open_prs=6" in summary, True)
+    # THE ZERO-BUCKET LEG (mutation round 1: the population above filled all five buckets, so the
+    # assertion above passed on a summary that printed only what it saw — the exact vacuity this
+    # repo keeps measuring). Walk a population that leaves four buckets EMPTY: the summary must
+    # still name all five, and `MINTABLE=0` is the reading a stalled feature actually produces.
+    _, zero_lines = run_census(pulls=[pull(number=42, title="fix: b (#7)", body="closes #7",
+                                           labels=[{"name": "needs:user"}])], recorded=frozenset())
+    zero_summary = next(line for line in zero_lines if line.startswith("census summary:"))
+    check("a census with FOUR empty buckets still names all five, and says MINTABLE=0",
+          (all(f"{verdict}=" in zero_summary for verdict in CENSUS_VERDICTS),
+           f"{CENSUS_MINTABLE}=0" in zero_summary, "open_prs=1" in zero_summary),
+          (True, True, True))
     # The refusal summary is BOUNDED but never silently truncated, and it puts the FIXABLE reason
     # first — the closed/absent lines are the ones a PR body full of cross-references generates.
     _many = ([f"#{n}: not an OPEN issue in this repo" for n in range(20)]
@@ -1422,7 +1483,17 @@ def _self_test():                                                       # noqa: 
     check("...and is bounded", _rendered.count("; ") < len(_many), True)
     check("no candidates at all says so", summarise_refusals([]),
           "the PR's title and body name no #<n> at all")
-    # A candidate that is really a PULL REQUEST is not an open issue for this purpose (#112).
+    # A candidate that is really a PULL REQUEST is not an open issue for this purpose (#112) — and
+    # this leg drives `census()` so the FILTER over the live issues listing is what is measured, not
+    # `issue_mint_refusal`'s independent refusal one layer down. The verdict is the same either way
+    # (mutation round 1), so the REASON is the observable: dropping the filter makes the census
+    # report "is a PULL REQUEST" where PLAN would have reported an absent label row.
+    _pr_row = {"number": 7, "state": "open", "pull_request": {"url": "x"}, "labels": []}
+    _, pr_row_lines = run_census(pulls=[pull(number=48, title="fix: h (#7)", body="closes #7")],
+                                 issues=[_pr_row], recorded=frozenset())
+    check("a candidate resolving to a PULL REQUEST row is reported as absent from the ISSUE map",
+          "not an OPEN issue in this repo" in next(
+              line for line in pr_row_lines if line.startswith("census ")), True)
     check("a `#<n>` that resolves to a PULL REQUEST is not offered as a candidate",
           census_verdict(repo, pull(number=47, title="fix: g (#8)", body="closes #8"),
                          {8: {"number": 8, "state": "open", "pull_request": {"url": "x"},
