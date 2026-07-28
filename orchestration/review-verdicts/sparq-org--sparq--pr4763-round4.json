@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4763,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "747d9162a4cd5e3582f1927dc22a1fb45f219b15",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "sort_key_is_total still only verifies that every projected variable appears in ORDER BY, then check_ordered compares truncated answers. That does not make the surviving RDF solution deterministic: SELECT ?k ... ORDER BY ?k LIMIT 1 over `1`^^xsd:integer and `1.0`^^xsd:decimal may legally return either distinct term. Both one-row answers pass sort_key_is_total, but their bags differ, so order_by_compare returns Differs immediately instead of recognizing boundary latitude. The new integer/decimal tie test compares complete sequences, while a_truncated_non_total_sort_key_stays_cardinality_only uses distinct integer ages and does not exercise a tie crossing LIMIT/OFFSET.",
+    "file": "crates/sparq-bench/src/fuzz.rs",
+    "fix_hint": "Fail closed for LIMIT/OFFSET whenever the truncation boundary can intersect an ORDER BY tie containing RDF-distinct solutions, even when every projected variable is named in the sort key. Add a hand-authored or live boundary test that permutes integer 1 and decimal 1.0 under ORDER BY ?k LIMIT 1 and requires SkippedRowChoice (or another counted boundary-tie skip), plus a strictly ordered boundary case that remains Compared. Apply the same rule to lossy f64/NaN ties and OFFSET boundaries.",
+    "severity": "major",
+    "title": "LIMIT oracle still treats value-tied distinct RDF terms as a total sort key"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 4 leaves the round-3 LIMIT/OFFSET boundary defect materially unchanged. The new ordering key correctly groups integer/decimal promotion ties for complete sequences, but check_ordered still treats mere projected-variable coverage as proof that a truncated result is deterministic. At a LIMIT boundary, two conforming engines may retain different RDF-distinct members of the same ORDER BY value-tie; their returned bags then differ, and order_by_compare returns Differs before tie handling. The added tests cover full-sequence tie permutations and a truncated query with distinct integer keys, but not the required tied boundary. Progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
