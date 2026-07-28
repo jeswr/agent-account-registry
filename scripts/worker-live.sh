@@ -984,7 +984,7 @@ _derive_full_selftest_suite() {
 FULL_SELFTEST_SUITE=$(_derive_full_selftest_suite "$SCRIPT_DIR" "$SELFTEST_MANIFEST") ||
   die 'registry-selftest gate: self-test manifest validation failed (fail closed)'
 
-# ─── SELF-TEST SANDBOX: an enrolled self-test must NEVER reach the real `gh` ──────────────────
+# ─── SELF-TEST SANDBOX: stop enrolled self-tests reaching the real `gh` ──────────────────────
 #
 # Measured twice in one night, both with a GREEN suite:
 #   * a watchdog suite wrote ~567 comments to a live PR (plus 4 to a live issue) across 175 runs,
@@ -997,8 +997,19 @@ FULL_SELFTEST_SUITE=$(_derive_full_selftest_suite "$SCRIPT_DIR" "$SELFTEST_MANIF
 # Every in-process control -- poisoning a module attribute, injecting a runner, asserting on a
 # double -- lives INSIDE the process the code can bypass, which is precisely how both incidents
 # happened. A PATH shim sits OUTSIDE it, so it catches default-argument bindings, optional runners,
-# bare `subprocess` calls, `bash -c` shell-outs from rendered YAML, and any spelling nobody
-# enumerated. It is the only control here that does not require predicting the escape.
+# bare `subprocess` calls and `bash -c` shell-outs from rendered YAML without anyone having to
+# enumerate them first. That is its value; it is not totality.
+#
+# WHAT IT DOES NOT CATCH, all three MEASURED on this tree rather than reasoned about. A PATH shim
+# binds the child's ENVIRONMENT, so a child that steps outside that environment is outside the
+# control:
+#   1. an ABSOLUTE path -- a plain `/usr/bin/gh` call reaches the real binary (gh 2.94.0), the run
+#      exits 0 and the escape log stays EMPTY;
+#   2. a child that REPLACES PATH (`env={"PATH": "/usr/bin", ...}`) -- likewise reaches it;
+#   3. a child that keeps PATH but drops GH_ESCAPE_LOG -- the shim still refuses (exit 97), so the
+#      write is PREVENTED, but nothing is recorded and the run exits 0.
+# No enrolled self-test does any of these today, and a repo sweep finds exactly one absolute-path
+# invocation -- the `${WORKER_GH_BIN:-/usr/bin/gh}` seam this sandbox defaults into itself.
 #
 # FAIL CLOSED, with NO read allow-list. `gh` is refused outright, reads included: an escaping read
 # is still a correctness and rate-limit problem, and an allow-list is an inventory of escapes
@@ -1151,16 +1162,49 @@ _run_selftest_cli_arm() {
   ' "$file"
 }
 
-# PURE (self-tested): how registry_selftest_gate reaches enrolled self-tests, as one comparable
-# value -- how many DIRECT invocations it still contains, and how many go through the sandbox
-# runner. Reverting either call site moves both numbers, so one assertion covers both without two
-# checks masking each other's mutants.
+# PURE (self-tested): the self-test DISPATCH blocks of registry_selftest_gate -- every top-level
+# loop in its body that runs an enrolled self-test -- printed VERBATIM and normalised, as one
+# comparable value.
+#
+# This replaced a COUNTING pin (`direct=N runner=M`). Review demonstrated that a count is FORGEABLE:
+# a compensating mutant reverted a real call site to `python3 "$SCRIPT_DIR/$name" --self-test`
+# (spelled past the counter's regex) and added a DEAD `if false; then run_enrolled_selftest ...; fi`
+# to restore the tally. It forged the expected value, SURVIVED at 433/433 with zero FAIL rows, and
+# put an UNSANDBOXED self-test back in the worker lane -- which runs with ambient `gh` credentials.
+# A decoy cannot satisfy an exact-block match, because the decoy IS a difference. Any counting
+# assertion on a security boundary has this hole; prefer exact source blocks.
 _registry_gate_selftest_dispatch() {
-  local body
-  body=$(_shell_function_body "$1" registry_selftest_gate)
-  printf 'direct=%s runner=%s\n' \
-    "$(printf '%s\n' "$body" | grep -cE '^(python3|bash) "(scripts/)?\$(name|script)"' || true)" \
-    "$(printf '%s\n' "$body" | grep -c 'run_enrolled_selftest ' || true)"
+  _shell_function_body "$1" registry_selftest_gate | python3 -c '
+import re, sys
+
+lines = [l.rstrip("\n") for l in sys.stdin]
+blocks, buf, depth = [], None, 0
+
+def opens(l):
+    return (l.endswith("; do") or l.endswith("; then") or l.endswith(" in")
+            or l == "do" or l == "then")
+
+def closes(l):
+    return l in ("done", "fi", "esac")
+
+for line in lines:
+    if buf is None:
+        if line.endswith("; do"):
+            buf, depth = [line], 1
+        continue
+    buf.append(line)
+    if opens(line):
+        depth += 1
+    elif closes(line):
+        depth -= 1
+        if depth == 0:
+            blocks.append(buf)
+            buf = None
+for b in blocks:
+    text = "\n".join(b)
+    if "run_enrolled_selftest" in text or "self-test" in text:
+        print("\n".join(b))
+'
 }
 
 # PURE (self-tested): print pr-gate.yml's self-test loop -- `for s in $suite; do` through its
@@ -5712,17 +5756,50 @@ HOOK
   # so pin both lanes: registry_selftest_gate structurally (it needs a git tree, actionlint and a
   # dependency preflight, so driving it hermetically is not worth the fixture), and the
   # `run-selftest` CLI arm pr-gate.yml calls by EXECUTING it. ----
-  chk "registry_selftest_gate reaches self-tests ONLY through the sandbox runner, at both sites" \
-    "$(_registry_gate_selftest_dispatch "$SCRIPT_DIR/worker-live.sh")" "direct=0 runner=2"
+  local expected_dispatch
+  expected_dispatch=$(cat <<'DISPATCH'
+for t in "${targets[@]}"; do
+kind=${t%%:*}; name=${t#*:}
+if [[ "$kind" == self ]]; then
+printf 'worker-live: self-test %s\n' "$name"
+run_enrolled_selftest "$name" || die "self-test failed: $name"
+direct=$((direct + 1))
+fi
+done
+for script in $FULL_SELFTEST_SUITE; do
+[[ -f "scripts/$script" ]] || continue
+printf 'worker-live: suite self-test %s\n' "$script"
+run_enrolled_selftest "$script" || die "suite self-test failed: $script"
+ran=$((ran + 1))
+done
+DISPATCH
+)
+  chk "registry_selftest_gate's self-test dispatch is EXACTLY the expected blocks" \
+    "$(_registry_gate_selftest_dispatch "$SCRIPT_DIR/worker-live.sh")" "$expected_dispatch"
   local gatefix="$tmp/sandbox/gatefix"
   mkdir -p "$gatefix"
   printf '%s\n' 'registry_selftest_gate() {' '  for t in "${targets[@]}"; do' \
     '    python3 "scripts/$name" --self-test || die "self-test failed: $name"' \
-    '  done' '  run_enrolled_selftest "$script" || die "x"' '}' > "$gatefix/reverted.sh"
-  chk "the dispatch check is NON-VACUOUS: a call site reverted to direct invocation is seen" \
-    "$(_registry_gate_selftest_dispatch "$gatefix/reverted.sh")" "direct=1 runner=1"
-  chk "the dispatch check fails CLOSED when the function cannot be read" \
-    "$(_registry_gate_selftest_dispatch "$gatefix/absent.sh")" "direct=0 runner=0"
+    '  done' '}' > "$gatefix/reverted.sh"
+  # THE FORGED-COUNT MUTANT that defeated the previous counting pin: a real call site reverted to a
+  # direct invocation SPELLED PAST the old regex, plus a DEAD `if false` decoy restoring the tally.
+  # It forged `direct=0 runner=2` and survived at 433/433. Against an exact block the decoy is
+  # itself the difference, so it cannot compensate.
+  printf '%s\n' 'registry_selftest_gate() {' '  for t in "${targets[@]}"; do' \
+    '    python3 "$SCRIPT_DIR/$name" --self-test || die "self-test failed: $name"' \
+    '    if false; then run_enrolled_selftest "$name"; fi' \
+    '  done' '  for script in $FULL_SELFTEST_SUITE; do' \
+    '    run_enrolled_selftest "$script" || die "suite self-test failed: $script"' \
+    '  done' '}' > "$gatefix/forged.sh"
+  chk "dispatch check is NON-VACUOUS: a call site reverted to direct invocation no longer matches" \
+    "$([[ "$(_registry_gate_selftest_dispatch "$gatefix/reverted.sh")" == "$expected_dispatch" ]] \
+       && printf missed || printf caught)" "caught"
+  chk "dispatch check is NON-VACUOUS: a DEAD-decoy forgery of the old count no longer matches" \
+    "$([[ "$(_registry_gate_selftest_dispatch "$gatefix/forged.sh")" == "$expected_dispatch" ]] \
+       && printf missed || printf caught)" "caught"
+  chk "dispatch check fails CLOSED when the function cannot be read" \
+    "$([[ "$(_registry_gate_selftest_dispatch "$gatefix/absent.sh" 2>/dev/null)" == "$expected_dispatch" ]] \
+       && printf missed || printf caught)" "caught"
 
   # The CLI arm, EXECUTED. A fixture SCRIPT_DIR carrying its own manifest lets the real
   # `run-selftest` arm run end to end: pr-gate.yml is pinned by exact-block match to a string
@@ -5787,7 +5864,8 @@ HOOK
   # renamed loop yields an empty extraction, which fails closed against the expected block. ----
   local expected_loop
   expected_loop=$(printf '%s\n' 'for s in $suite; do' 'echo "== self-test $s =="' \
-    'bash scripts/worker-live.sh run-selftest "$s"' '((n += 1))' 'done' | paste -sd'|' -)
+    'bash scripts/worker-live.sh run-selftest "$s" 2>&1 | tee -a "$escapes"' \
+    '((n += 1))' 'done' | paste -sd'|' -)
   chk "pr-gate.yml suite loop routes EVERY entry through the sandbox runner (exact block)" \
     "$(_pr_gate_suite_loop "$SCRIPT_DIR/../.github/workflows/pr-gate.yml" | paste -sd'|' -)" \
     "$expected_loop"
@@ -5800,7 +5878,7 @@ HOOK
     '            ((n += 1))' '          done' > "$loopfix/inert.yml"
   printf '%s\n' '      - name: x' '        run: |' '          for s in $suite; do' \
     '            echo "== self-test $s =="' '            if false; then' \
-    '              bash scripts/worker-live.sh run-selftest "$s"' '            fi' \
+    '              bash scripts/worker-live.sh run-selftest "$s" 2>&1 | tee -a "$escapes"' '            fi' \
     '            ((n += 1))' '          done' > "$loopfix/if-false.yml"
   chk "pr-gate loop check is NON-VACUOUS: an appended '&& false' no longer matches" \
     "$([[ "$(_pr_gate_suite_loop "$loopfix/inert.yml" | paste -sd'|' -)" == "$expected_loop" ]] \
@@ -5837,8 +5915,10 @@ case "${1:-}" in
     [[ $# -eq 3 ]] || die 'usage: worker-live.sh print-selftest-suite <base-manifest> <base-retirements>'
     _derive_full_selftest_suite "$SCRIPT_DIR" "$SELFTEST_MANIFEST" "$2" "$3"
     ;;
-  # The sandboxed self-test runner pr-gate.yml's suite loop calls. It is deliberately the ONLY
-  # entrypoint that executes an enrolled self-test, so no lane can run one unsandboxed.
+  # The sandboxed self-test runner pr-gate.yml's suite loop calls. It is the only entrypoint the
+  # ENROLLED-SUITE LANE uses -- it is NOT the only way an enrolled self-test runs in this repo:
+  # 21+ invocations across 10 production workflows call one directly as a preflight (issue #991),
+  # and this arm does not reach them.
   run-selftest)
     [[ $# -eq 2 ]] || die 'usage: worker-live.sh run-selftest <enrolled-script>'
     case " $FULL_SELFTEST_SUITE " in

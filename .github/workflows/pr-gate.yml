@@ -125,12 +125,23 @@ jobs:
           # the real binary. Two suites wrote to production in one night with a green gate, so the
           # control sits OUTSIDE the process rather than inside it. This loop is asserted verbatim
           # by worker-live.sh's self-test — a direct invocation reintroduced here fails that check.
+          escapes="$RUNNER_TEMP/gh-escape-report.txt"
+          : > "$escapes"
           for s in $suite; do
             echo "== self-test $s =="
-            bash scripts/worker-live.sh run-selftest "$s"
+            bash scripts/worker-live.sh run-selftest "$s" 2>&1 | tee -a "$escapes"
             ((n += 1))
           done
           [[ "$n" -gt 0 ]] || { echo "::error::self-test suite ran vacuously"; exit 1; }
+          # INDEPENDENT CHANNEL. The loop above trusts run-selftest's EXIT STATUS, so an edit that
+          # suppresses that status (`run_enrolled_selftest "$2" || true`) greens this step while the
+          # escape still happens — measured: the refusal row fires and the command still exits 0.
+          # Suppressing the status does NOT suppress the OUTPUT, so assert on the output too. These
+          # two signals fail independently; one silenced does not silence the other.
+          if grep -q '^::error::gh-escape ' "$escapes"; then
+            echo "::error::a self-test reached the real gh — see the gh-escape rows above"
+            exit 1
+          fi
           echo "ran $n self-tests"
 
       - name: bash -n every shell script
