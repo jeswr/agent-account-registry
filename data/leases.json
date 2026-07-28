@@ -49,6 +49,16 @@
    "model": "opus5",
    "issued_at": 1785250802,
    "expires_at": 1785253502
+  },
+  {
+   "account": "dc2d751954080e13",
+   "claim_id": "d6505289d72d40faaa15d938aea4f056",
+   "holder": "review:sparq-org/sparq#4519@dispatch-30371316609.1",
+   "package": "sparq-vectors",
+   "role": "review",
+   "model": "sol",
+   "issued_at": 1785251844,
+   "expires_at": 1785256044
   }
  ]
 }
