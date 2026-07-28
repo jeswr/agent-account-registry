@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4915,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "fa1f1196f7ce40caba140919f2b5fe5bda39ab5f",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new note explicitly retains floor 90 from the default-feature 92.02% measurement and defers re-seeding until after merge. The mandatory shard does resolve one part of round 1's concern: it prevents this PR from merging if with-Datalog coverage is below 90. It does not resolve the ratchet-seeding problem when coverage is at or above 90, because the gate only compares against the stale floor; it does not update that floor to floor(the new measurement)-2. Thus this PR can land with a materially looser floor than the expanded surface supports, contrary to the documented seed procedure, and the committed note remains an admission that the entry is not a measurement of what scripts/coverage.sh now measures.",
+    "file": "bench/coverage-floor.json",
+    "fix_hint": "Use the result from the PR's required coverage shard (or reproduce its pinned command), then update sparq-reason's floor to floor(the with-Datalog line percentage)-2 via the normal seed/monotonic-review procedure and replace the carried-forward/unmeasured note with the actual measurement. If the measured result yields 90, record that evidence explicitly; if the shard is not yet green, keep the PR open until it produces the measurement.",
+    "severity": "major",
+    "title": "Expanded-denominator coverage floor remains unseeded"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 2 explains correctly that the changed coverage command is a full-run trigger and that a sub-90 measurement will block merge, but it still does not supply the with-Datalog measurement or seed the ratchet from that measurement. The prior major finding therefore remains: the committed floor is knowingly derived from a different denominator, while tightening to the first measured expanded-surface result is deferred. CI can establish that 90 is not too high; it cannot make 90 the repository's intended floor(measured)-2 seed when the actual result is higher. Record the expanded-surface measurement and update the floor/note in this PR.",
+  "verdict": "request_changes"
+ }
+}
