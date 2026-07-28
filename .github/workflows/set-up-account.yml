@@ -843,12 +843,31 @@ jobs:
           module = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(module)
           handle = os.environ["NEW_HANDLE"]
-          accounts = {a["handle"]: a for a in module.read_accounts(os.environ["GITHUB_REPOSITORY"])}
-          account = accounts.get(handle)
-          if account is None or not account.get("models"):
+          records = module.read_accounts(os.environ["GITHUB_REPOSITORY"])
+          # >>> resolve-registered-record — EXTRACTED AND EXECUTED by grant-account.py's self-test
+          # against synthetic catalogs. Its only inputs are `records` and `handle`, its only output
+          # `account`; removing either sentinel makes that extraction FAIL CLOSED.
+          # #955: this used to be `{a["handle"]: a for a in records}` followed by `.get(handle)`, and
+          # read_accounts does NOT deduplicate — `a["handle"]` is only the issue TITLE, and on a
+          # public repo a drive-by issue titled `acctNN` is selectable (the `account` label comes
+          # from the issue template, not from author permission). Two records sharing the handle
+          # collapsed into the LAST one, so this step could assert `models` against an OUTSIDER's
+          # body instead of the record the broker just wrote: passing on a body the broker never
+          # stamped, or failing on a broker record that is in fact fine. Resolve into a LIST and
+          # refuse unless it holds exactly one, NAMING the count — the same discipline the
+          # activation paths already apply before they flip a label.
+          matches = [a for a in records if a.get("handle") == handle]
+          if len(matches) != 1:
+              raise SystemExit(
+                  f"registration validation FAILED: expected exactly one read_accounts record "
+                  f"titled {handle}, found {len(matches)} — refusing to validate an ambiguous "
+                  "handle (fail closed)")
+          account = matches[0]
+          if not account.get("models"):
               raise SystemExit(
                   f"registration validation FAILED: {handle} is invisible to read_accounts "
-                  "(missing or empty models line) — the allocator could never select it")
+                  "(empty models line) — the allocator could never select it")
+          # <<< resolve-registered-record
           print(f"registration validated: {handle} models={account['models']}")
           PY
 
