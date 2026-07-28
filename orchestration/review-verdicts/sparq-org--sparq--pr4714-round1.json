@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4714,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "10f6cf6e9ff15113ec429b7ce55b2d251be78542",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The documentation claims that the exposed FNV-1a fingerprint is a \"NON-REVERSIBLE hash\" and extends that claim to SPARQL UPDATEs. FNV-1a is a fast, unkeyed 64-bit checksum, so an observer with GET /queries access can test candidate UPDATE bodies or sensitive literals offline. This is especially material for INSERT DATA payloads, which may contain secrets or personal data. The new redaction tests only prove that raw text is absent from the JSON; they do not prove resistance to recovery or guessing. Thus the implementation does not support the stated confidentiality claim.",
+    "file": "skills/http-server/SKILL.md",
+    "fix_hint": "Use a keyed construction such as HMAC-SHA-256 with a per-process random secret and expose a suitably sized truncated digest, or stop exposing fingerprints for UPDATEs. If stable unkeyed correlation is intentionally retained, remove all \"non-reversible\" wording and explicitly document that fingerprints permit offline guessing; given UPDATE payload sensitivity, keyed fingerprints are the safer fix. Add a test that distinguishes the chosen security contract rather than merely searching the serialized row for plaintext.",
+    "severity": "major",
+    "title": "Unkeyed 64-bit FNV-1a does not make UPDATE text non-reversible"
+   }
+  ],
+  "progress": null,
+  "summary": "The update-registration and cooperative-cancellation wiring is coherent, and the end-to-end test exercises listing, cancellation, rollback, cleanup, and subsequent writer availability on the real HTTP path. However, the newly documented security property is false: the endpoint exposes an unkeyed 64-bit FNV-1a digest of UPDATE text while describing it as non-reversible. UPDATE bodies can contain sensitive literal data, and a short, predictable literal or statement can be recovered by dictionary/brute-force comparison. The added tests establish only that plaintext is not directly included; they do not establish the claimed confidentiality property. Because this expands the exposure to write payloads and makes an explicit security claim, it requires changes before approval.",
+  "verdict": "request_changes"
+ }
+}
