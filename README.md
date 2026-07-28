@@ -72,8 +72,20 @@ cache-affinity-preferred) has a free slot, append a lease with a **unique `claim
 then `PUT` the file with the read SHA. A concurrent writer changed the SHA → the `PUT` is rejected
 (409) → retry. Because every codebase CAS-updates the **same** ledger, capacity is enforced globally
 without reaction counting. **Release** and **heartbeat** are keyed by the unique `claim_id`
-(idempotent). The groomer **reclaims** leases past `expires_at` (a dead/cancelled worker frees its
-slot automatically — no receipt-guessing).
+(idempotent). The groomer (`groom-leases`, every 15 min) **reclaims** leases past `expires_at`, so a
+dead/cancelled worker frees its slot automatically — no receipt-guessing.
+
+That reclaim is **not blind** (issue #35). A lease whose holder records a still-**active** worker /
+review-fix run has its `expires_at` **renewed** instead, and renewed *before* it lapses rather than
+after, so a legitimately long run — the worker lease's TTL covers only the agent job, while the
+publish and review-prep jobs that follow it have their own timeouts — never has its slot handed to
+a second worker mid-run. It has to move `expires_at` rather than merely keep the row, because every
+duplicate-suppression consumer (`reclaim_expired`, `partition_available`, dispatch's
+`_live_holder_keys` / `sibling_lease_conflict`) reads *that field*, not the row's presence. A
+dead/absent run, a run outside the two lease-holding workflows, a holder with no run id (the
+TTL-managed `review:`/`fix:` repair leases), an unprovable probe past its ceiling, and any lease
+older than the **6-hour renewal ceiling** are all still reclaimed — the ceiling is what stops a run
+wedged in `in_progress` from trading the double-dispatch for a permanent capacity leak.
 
 ### The `package` partition has ONE canonical derivation (and one pinned copy)
 
