@@ -1044,12 +1044,20 @@ _selftest_sandbox_intercepts() {
   : > "$log"
 }
 
-# Run ONE enrolled self-test inside the sandbox. THIS IS THE ONLY PLACE THE REPO EXECUTES AN
-# ENROLLED SELF-TEST: both pr-gate.yml's suite loop and registry_selftest_gate below come through
-# here, so a newly added script cannot forget to opt in. Enrollment itself is already compulsory --
-# _derive_full_selftest_suite REFUSES any script that advertises `--self-test` without a manifest
-# entry, and refuses any manifest entry that lost its entrypoint -- so "enrolled" and "sandboxed"
-# are the same set by construction, with no per-script opt-in to omit.
+# Run ONE enrolled self-test inside the sandbox.
+#
+# SCOPE, stated precisely rather than as a totality claim. This is the only place THE ENROLLED-SUITE
+# RUNNER executes a self-test: pr-gate.yml's suite loop and registry_selftest_gate below both come
+# through here, and within that lane a newly added script cannot forget to opt in, because
+# enrollment is compulsory -- _derive_full_selftest_suite REFUSES any script that advertises
+# `--self-test` without a manifest entry, and refuses any manifest entry that lost its entrypoint.
+# For the SUITE lane, "enrolled" and "sandboxed" are therefore the same set by construction.
+#
+# It is NOT the only place in the repo. MEASURED: 21 further invocations across 10 production
+# workflows run an enrolled self-test DIRECTLY as a preflight, 15 of them in token-bearing jobs --
+# `groom.yml:445` runs `groom-alert.py --self-test` with both GH_TOKEN and ALERT_TOKEN in scope.
+# Those are outside this sandbox and are tracked in issue #991; they are a separate change because
+# several of those workflows use sparse checkouts that do not contain worker-live.sh at all.
 run_enrolled_selftest() {
   local script=$1 root=${2:-$SCRIPT_DIR} sandbox rc
   sandbox=$(mktemp -d) || { printf '::error::self-test sandbox: mktemp failed\n' >&2; return 1; }
@@ -1106,6 +1114,33 @@ _run_selftest_in_sandbox() {
     return 1
   fi
   return "$rc"
+}
+
+# PURE (self-tested): print the body of a shell function, normalised to stripped, comment-free
+# lines. Used to pin registry_selftest_gate's self-test call sites. Prints nothing for an absent
+# file or an absent function, which fails closed against any expected value.
+_shell_function_body() {
+  local file=$1 fn=$2
+  [[ -f "$file" ]] || return 0
+  awk -v fn="$fn" '
+    { line = $0; sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line) }
+    line ~ /^#/ || line == "" { next }
+    !on && line == fn "() {" { on = 1; next }
+    on && line == "}" { exit }
+    on { print line }
+  ' "$file"
+}
+
+# PURE (self-tested): how registry_selftest_gate reaches enrolled self-tests, as one comparable
+# value -- how many DIRECT invocations it still contains, and how many go through the sandbox
+# runner. Reverting either call site moves both numbers, so one assertion covers both without two
+# checks masking each other's mutants.
+_registry_gate_selftest_dispatch() {
+  local body
+  body=$(_shell_function_body "$1" registry_selftest_gate)
+  printf 'direct=%s runner=%s\n' \
+    "$(printf '%s\n' "$body" | grep -cE '^(python3|bash) "(scripts/)?\$(name|script)"' || true)" \
+    "$(printf '%s\n' "$body" | grep -c 'run_enrolled_selftest ' || true)"
 }
 
 # PURE (self-tested): print pr-gate.yml's self-test loop -- `for s in $suite; do` through its
@@ -5650,6 +5685,54 @@ HOOK
   chk "sandbox: the SAME run with a working shim is clean (the row above is not always-refused)" \
     "$(_run_selftest_in_sandbox "$sbxbin" "$tmp/sandbox/live.log" clean.py "$sfix" >/dev/null 2>&1 \
        && printf clean || printf refused)" "clean"
+
+  # ---- THE GUARD'S OWN INVOCATION. Everything above pins run_enrolled_selftest itself; none of it
+  # pins the two places that CALL it, and a guard whose call sites are unpinned can be bypassed
+  # without a single row going red. The marquee guard is the least-tested thing in a PR by default,
+  # so pin both lanes: registry_selftest_gate structurally (it needs a git tree, actionlint and a
+  # dependency preflight, so driving it hermetically is not worth the fixture), and the
+  # `run-selftest` CLI arm pr-gate.yml calls by EXECUTING it. ----
+  chk "registry_selftest_gate reaches self-tests ONLY through the sandbox runner, at both sites" \
+    "$(_registry_gate_selftest_dispatch "$SCRIPT_DIR/worker-live.sh")" "direct=0 runner=2"
+  local gatefix="$tmp/sandbox/gatefix"
+  mkdir -p "$gatefix"
+  printf '%s\n' 'registry_selftest_gate() {' '  for t in "${targets[@]}"; do' \
+    '    python3 "scripts/$name" --self-test || die "self-test failed: $name"' \
+    '  done' '  run_enrolled_selftest "$script" || die "x"' '}' > "$gatefix/reverted.sh"
+  chk "the dispatch check is NON-VACUOUS: a call site reverted to direct invocation is seen" \
+    "$(_registry_gate_selftest_dispatch "$gatefix/reverted.sh")" "direct=1 runner=1"
+  chk "the dispatch check fails CLOSED when the function cannot be read" \
+    "$(_registry_gate_selftest_dispatch "$gatefix/absent.sh")" "direct=0 runner=0"
+
+  # The CLI arm, EXECUTED. A fixture SCRIPT_DIR carrying its own manifest lets the real
+  # `run-selftest` arm run end to end: pr-gate.yml is pinned by exact-block match to a string
+  # naming this arm, so if the arm swallows the runner's exit code the gate goes GREEN over an
+  # escape and every other row here stays green with it.
+  local clifix="$tmp/sandbox/clifix"
+  mkdir -p "$clifix"
+  cp "$SCRIPT_DIR/worker-live.sh" "$clifix/worker-live.sh"
+  printf '%s\n' 'import subprocess, sys' \
+    "REPO = '$SELFTEST_UNRESOLVABLE_REPO'" \
+    'if "--self-test" in sys.argv:' \
+    '    subprocess.run(["gh", "__sandbox_probe__", "--repo", REPO], capture_output=True)' \
+    '    sys.exit(0)' > "$clifix/escaper.py"
+  # Present, NOT enrolled, and deliberately advertises no `--self-test` (a script that advertised
+  # one without a manifest entry could not exist -- the derivation refuses at load). It exits 0 on
+  # any argv, so deleting the enrollment check yields rc=0 rather than an incidental failure.
+  printf '%s\n' 'import sys' 'sys.exit(0)' > "$clifix/helper.py"
+  printf '%s\n' 'escaper.py' 'worker-live.sh' > "$clifix/selftest-suite.txt"
+  : > "$clifix/selftest-retirements.txt"
+  local cli_rc cli_out
+  cli_out=$(bash "$clifix/worker-live.sh" run-selftest escaper.py 2>&1) && cli_rc=0 || cli_rc=$?
+  chk "run-selftest CLI arm PROPAGATES the sandbox refusal (swallowing it greens the gate)" \
+    "$([[ "$cli_rc" -ne 0 ]] && printf propagated || printf swallowed)" "propagated"
+  chk "run-selftest CLI arm reports the escape it refused (value, not just a non-zero exit)" \
+    "$(grep -c '^::error::gh-escape escaper.py' <<< "$cli_out")" "1"
+  cli_out=$(bash "$clifix/worker-live.sh" run-selftest helper.py 2>&1) && cli_rc=0 || cli_rc=$?
+  chk "run-selftest CLI arm REFUSES an unenrolled script rather than running it" \
+    "$([[ "$cli_rc" -ne 0 ]] && printf refused || printf ran)" "refused"
+  chk "and the refusal names ENROLLMENT as the reason, not an incidental failure" \
+    "$(grep -c 'is not enrolled in the self-test manifest' <<< "$cli_out")" "1"
 
   # ---- THE YAML SEAM. pr-gate.yml is where the gate actually runs the suite, and a mutation there
   # is invisible to every python assertion in this repo. Pin the loop by EXACT WHOLE-BLOCK match:
