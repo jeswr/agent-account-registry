@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4218,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "7b5a0dadcc5746bbc7eeaff2ab35c7d28ecd063c",
+  "round": 6
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`refresh_prohibition` builds ambiguous-deny provenance with `naming_prohibition_ids`, whose filter uses `rule_action_target_match`. That predicate checks only action and target; it omits the assignee match and full constraint classification used by `prohibition_status`. If one prohibition is genuinely ambiguous while another action/target-identical prohibition is assignee-mismatched or definitely false under supplied evidence, the retained deny is annotated with both IDs even though the latter cannot be its source. Calling this \"honest over-attribution\" is incorrect, and the added provenance tests do not cover this mixed-classification refresh path.",
+    "file": "crates/sparq-solid/src/odrl_bridge.rs",
+    "fix_hint": "Expose or reuse the evaluator's per-rule three-valued prohibition classification so ambiguous refresh provenance contains only rules classified `Ambiguous` for this request, including assignee and complete constraint evaluation. Add a refresh regression test containing one ambiguous prohibition plus one action/target-identical but assignee-mismatched or definitely-false prohibition, and assert that only the ambiguous rule ID is emitted.",
+    "severity": "major",
+    "title": "Ambiguous refresh still attributes definitely inapplicable prohibitions"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 5's major correctness issue remains unchanged. On an ambiguous prohibition refresh, `naming_prohibition_ids` still selects every action/target-compatible prohibition via `rule_action_target_match`, even though the evaluator's actual three-valued classification also considers assignee and constraints. The re-emitted deny can therefore claim provenance from a definitely inapplicable sibling rule. The new tests still do not exercise a mixed ambiguous/definitely-inapplicable refresh case. Progress is stagnant because the same issue remains at the same severity.",
+  "verdict": "request_changes"
+ }
+}
