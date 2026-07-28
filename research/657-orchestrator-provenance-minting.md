@@ -357,3 +357,107 @@ orchestrator PR's actual shape rather than a worker PR's.
 
 **Ordering.** #821 merges first. Then this. Then §7 item 1. Only then does a login go into
 `review_enrolment_authors`, in small batches, watching the lane.
+
+---
+
+## 9. Why the writer minted for 0 PRs, and what that turned out to be (Claude Opus 5, 2026-07-28)
+
+> 🤖 **SPARQ agent** — this section records the follow-up that closed §8's "it does not mint
+> anything". §8.4 of the admission record called the minting path *"the only thing between the tree
+> and a working feature"*. It landed, the allowlist was enabled for this repo (#916), and the class
+> still reached **0 PRs**. This is why, measured rather than reasoned.
+
+### 9.1 The three counters, and which tier each one is
+
+The answer is not in the code. It is in what the system already counts — and it counted nothing,
+which is itself the finding.
+
+| counter | value on 2026-07-28 | tier |
+|---|---|---|
+| `mint-provenance.yml` runs, all time | **0** | authoritative (Actions run history) |
+| `ledger` records carrying an `orchestrator:` stamp | **0** of 463 | authoritative (every record on the branch, classified through `provenance_attestation_class`) |
+| the writer's own health | **works** — first-ever dispatch succeeded | executed (dry run) |
+| open PRs mintable **and** enumerable | **0** | executed (production `mint_decision` × production `enumerate_review_items` over the live population) |
+
+The other 462 records split 47 `backfill` / 1 `human` / 414 worker run-keys. So the honest headline
+is not "the minting path is broken". It is: **the only supported writer of the record is a manual
+`workflow_dispatch` that nobody had ever pressed, and pressing it on that day's population would
+have bought nothing.**
+
+### 9.2 The population, and why it was empty
+
+Of 36 open PRs in the enrolled repo, decided by calling the production functions rather than
+re-deriving their predicates:
+
+| | count |
+|---|---|
+| refused at the worker-namespace gate (worker.yml owns those records) | 16 |
+| refused as DRAFT (groom would age-park a drafted orchestrator PR) | 6 |
+| refused at `issue_mint_refusal` — no named `#<n>` binds | 11 |
+| **mintable** | **3** (#685, #689, #710) |
+| …of those, that the review lane would then enumerate | **0** — all three carry `needs:user` |
+
+Two distinct causes, and they are on different axes:
+
+1. **A mint could deliver nothing, and the script could not tell.** `mint()`'s last-mile check,
+   `admissible_by_the_review_lane`, is `provenance_admission_error(document, pr,
+   admit_orchestrator=True)` — a predicate over the **record**. It said *yes* to all three mintable
+   PRs. `enumerate_review_items` discards all three at `HUMAN_HOLD_PR_LABELS`. The record would have
+   been written, correct, admissible, and acted on by nothing; the only symptom would have been the
+   absence of a review. *A guard that proves the wrong half is not a guard.*
+2. **Nothing counted the class, so discovery cost one Actions dispatch per guess.** The workflow
+   requires `pr_number` *and* `issue_number`, and the issue must be open, not a PR, hold-free and
+   carry ≥1 `area:*` label — **307 of 406 open issues (76%) carry no `area:*` label at all**, and
+   zero areas reduce to the serializing `__global__` partition, refused by default. So the only way
+   to learn which `(PR, issue)` pair binds was to dispatch and read a refusal: ~130 dispatches over
+   the live population, to find 3 candidates, all dead. A gesture that expensive is a gesture nobody
+   performs — and the count of times nobody performed it was, correctly, 0.
+
+### 9.3 What landed
+
+* **`delivery_refusal`** — the second last mile. It drives the **production**
+  `enumerate_review_items` over the live PR and the exact document about to be written, and refuses
+  unless the lane emits a review item for that PR. It re-implements no admission predicate, so a
+  widened or narrowed enumerator changes its answer by construction (§9.1 of the admission record).
+  It is deliberately permissive in exactly one direction — no lease store and no CI snapshot are
+  passed, so a transient lease, a conflicting base or a red gate can never make it refuse; the only
+  refusals it can produce are terminal on the PR's own live state, and a false *"it would be
+  enumerated"* degrades to today's behaviour. The operator-facing **hint** reads the consumer's
+  exported constants and is explicitly advisory: the enumerator records an exclusion reason only for
+  PRs carrying a review-loop signal, and the enrollable population carries none.
+* **`--census` / `mode=census`** — one read-only run, one disjoint verdict per open PR
+  (`MINTABLE` / `MINTABLE-BUT-DEAD` / `NO-BINDABLE-ISSUE` / `ALREADY-RECORDED` / `NOT-THIS-LANE`),
+  every bucket seeded at zero so *"none"* and *"stopped being counted"* cannot print the same. It
+  decides through the same `mint_decision` a real `--apply` uses, so it cannot drift from what a mint
+  would do: to change the census you have to change the mint. It needs **no secret** — the salt feeds
+  only `impl_account_h`, which the census never prints, so it decides with a per-run ephemeral salt
+  and a census run cannot disclose `PROVENANCE_SALT` even by accident.
+* The workflow gains a **`mode` allowlist** (default `census`, the read-only one), and its
+  `target_repo` default moves to the **enrolled** repo — the master-protected allowlist names only
+  that one, so a default dispatch at any other target could only ever refuse.
+
+### 9.4 The never-arms property is unchanged, and re-proved by execution
+
+`self_attested` still buys **review** and never an arm. Re-verified on this tree, not quoted:
+`decide_review` over **6480** input combinations returns `"arm"` **0** times with
+`self_attested=True` and **180** times with it False (the non-vacuity control), and
+`ready_and_arm(self_attested=True)` raises *"refusing to arm: the provenance record is
+self-attested (orchestrator class)"*.
+
+### 9.5 What still blocks a **useful** mint — and it is not code
+
+The two axes above are closed. What remains is data, and one half of it is a human gesture:
+
+1. **Every mintable PR on 2026-07-28 was `needs:user`-held.** `needs:user` is human-owned by
+   definition; clearing it is a maintainer decision and this PR does not make one. Issue #287 already
+   records the same shape on the sparq side ("26/27 worker-PR source issues are needs:user-parked"),
+   and the machine-manufactured-escalation defect (#722, #941) is the live investigation into whether
+   those holds were generated by a human at all. **Until that is adjudicated, the enrolled
+   population's held PRs stay out — by design, loudly, with a named refusal instead of an inert
+   record.**
+2. **76% of open issues carry no `area:*` label**, so most PRs have no bindable source issue. That is
+   a labelling gap in the triage lane, not a mint defect: the `__global__` refusal exists because a
+   review lease on that partition serialises the whole fleet (sparq#4185). `--allow-global-partition`
+   remains the operator's explicit per-mint acceptance of that cost, and it is not the default.
+3. `AUTO_READMISSION_PER_TICK_MAX` and the constant-reviewer-side item from the admission record's
+   §9.5 are unchanged.

@@ -112,7 +112,7 @@ ISSUE_REF_RE = re.compile(rf"{ISSUE_REF_LEFT}#([0-9]+){ISSUE_REF_RIGHT}")
 # A census that only listed the mintable PRs would be indistinguishable from a census that had
 # stopped counting, so every open PR is classified and the summary names every bucket it saw.
 CENSUS_MINTABLE = "MINTABLE"            # mintable AND the review lane would enumerate it
-CENSUS_DEAD = "MINTABLE-BUT-DEAD"       # mintable, but the lane discards it — a mint delivers NOTHING
+CENSUS_DEAD = "MINTABLE-BUT-DEAD"       # mintable, but the lane discards it — mints nothing
 CENSUS_NO_ISSUE = "NO-BINDABLE-ISSUE"   # no `#<n>` it names survives issue_mint_refusal
 CENSUS_OTHER_LANE = "NOT-THIS-LANE"     # refused on the PR's own shape (worker namespace, draft, …)
 CENSUS_RECORDED = "ALREADY-RECORDED"    # a provenance record for this PR already exists
@@ -1366,7 +1366,7 @@ def _self_test():                                                       # noqa: 
         pull(number=44, title="fix: d", body="no reference at all"),               # names nothing
         pull(number=45, title="fix: e (#7)", body="closes #7",
              head={"ref": "sparq-agent/issue-7-1-1"}),                             # other lane
-        pull(number=46, title="fix: f (#7)", body="closes #7"),                    # already recorded
+        pull(number=46, title="fix: f (#7)", body="closes #7"),                   # recorded
     ]
 
     census_issues = [issue(), {"number": 8, "state": "open", "pull_request": {"url": "x"},
