@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1005,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "c3222af384bc636765a441733941eddd1d3e00e6",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The opening attribution says `design record by Claude Opus 5`. Reviewer/author provenance is required to be model-agnostic: the stable identity is `> \ud83e\udd16 SPARQ agent`, while the harness supplies the actual model. Embedding a model marker in a durable design record can become false when content is regenerated or transported and creates a second, manually maintained provenance source.",
+    "file": "research/967-adjudicator-override-arm-authority.md",
+    "fix_hint": "Replace the opening attribution with the model-agnostic `> \ud83e\udd16 SPARQ agent` identity (retaining the date and document purpose if desired) and remove the hard-coded model name.",
+    "severity": "major",
+    "title": "Provenance hard-codes a model identity"
+   }
+  ],
+  "progress": null,
+  "summary": "The design recommendation is coherent and its central trust-plane claims are supported by the current tree: a clean cross-provider approval arms before the round-budget branch, injection and self-attestation remain human stops, and configured trust-surface paths extend the built-in floor. However, the document's provenance line violates the required model-agnostic SPARQ identity rule by hard-coding a model name. Because provenance is part of this repository's trust discipline, this must be corrected before approval.",
+  "verdict": "request_changes"
+ }
+}
