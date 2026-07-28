@@ -898,6 +898,9 @@ def _cli_args(script, marker):
 
 
 def _self_test():   # noqa: C901 — one flat assertion table, deliberately
+    import contextlib   # noqa: PLC0415 — self-test only
+    import io           # noqa: PLC0415
+    import tempfile     # noqa: PLC0415
     ok = True
 
     def chk(name, got, want):
@@ -1581,7 +1584,6 @@ def _self_test():   # noqa: C901 — one flat assertion table, deliberately
     # (L8) CLAIM writes the dispatch summary; (L9) the recorder reads THAT file; (L10)
     # dispatch-claim mirrors each launch into the per-target map [tested in dispatch-claim.py].
 
-    import tempfile   # noqa: PLC0415 — self-test only
     # L4 — EXECUTED, against a real census file on disk. Replacing the merge with `pass` reds this
     # row; no comment can satisfy it, because nothing is being searched for.
     merge_block = _workflow_block(workflow, "assemble", "assemble-merge")
@@ -1724,6 +1726,113 @@ def _self_test():   # noqa: C901 — one flat assertion table, deliberately
          "plan/frontier-census.json" in _workflow_step_text(
              workflow, "dispatch-telemetry", strip_comments=True)),
         (True, True))
+
+    # ---- L11: THE RECORDER'S OWN ENTRY POINT, driven END TO END -------------------------------
+    # THE HOLE THIS CLOSES, stated plainly. Everything above pins one END of the chain: the YAML
+    # side by parsed value, and the pure helpers (`tick_records` / `build_record` /
+    # `append_records`) by calling them directly. NOTHING drove the GLUE that joins them —
+    # `cmd_record` and `_read_json` were 0% covered under this module's own `--self-test`, so:
+    #
+    #   * `tick_records(frontier_doc, {}, ...)` — dropping the CLAIM summary AT THE CALL SITE —
+    #     published `planned_rows=0 realised_dispatches=0` from a summary that said 4 and 3, and
+    #     `chain_unaccounted` was 0 in BOTH: the residual, i.e. this module's own missing-edge
+    #     detector, structurally cannot see a loss that never entered the chain. Worst failure
+    #     available to this module, invisible in every field and in the whole 45-test suite.
+    #   * deleting the `append_records` call while keeping the log line — the ring is never written.
+    #   * `_read_json` returning `{}` instead of raising — a missing `plan/frontier-census.json`,
+    #     the EXACT break every L2..L7 row above exists to catch, becomes a clean empty tick.
+    #
+    # It is round-2 survivor #2 one layer in: pinning a flag's VALUE is not pinning that the value
+    # REACHES THE READER. Driven through `main()` on purpose, so the argparse contract, the reader
+    # and the writer all sit on one path — the shape `model-health.py` has had all along.
+    written_rings = []
+
+    class _RecordingAPI(_StubAPI):
+        def __init__(self):
+            super().__init__()
+            written_rings.append(self)
+
+    def _run_cli(argv, frontier=None, summary=None):
+        """Run the REAL `main()` over REAL files on disk. Returns (rc, stdout, api-or-None)."""
+        saved_argv, saved_api = sys.argv[:], globals()["GitHubAPI"]
+        saved_token = os.environ.get("GH_TOKEN")
+        written_rings.clear()
+        buffer = io.StringIO()
+        with tempfile.TemporaryDirectory() as cli_dir:
+            paths = {}
+            for name, doc in (("frontier", frontier), ("summary", summary)):
+                if doc is None:
+                    paths[name] = str(Path(cli_dir, f"absent-{name}.json"))
+                    continue
+                paths[name] = str(Path(cli_dir, f"{name}.json"))
+                Path(paths[name]).write_text(json.dumps(doc), encoding="utf-8")
+            globals()["GitHubAPI"] = lambda _token: _RecordingAPI()
+            os.environ["GH_TOKEN"] = "self-test-token"
+            sys.argv = ["dispatch-telemetry.py"] + [
+                part.replace("<frontier>", paths["frontier"])
+                    .replace("<summary>", paths["summary"]) for part in argv]
+            try:
+                with contextlib.redirect_stdout(buffer):
+                    rc = main()
+            except TelemetryError as exc:
+                rc = f"TelemetryError: {exc}"
+            finally:
+                sys.argv, globals()["GitHubAPI"] = saved_argv, saved_api
+                if saved_token is None:
+                    os.environ.pop("GH_TOKEN", None)
+                else:
+                    os.environ["GH_TOKEN"] = saved_token
+        return rc, buffer.getvalue(), (written_rings[0] if written_rings else None)
+
+    cli_frontier = {"repositories": {"o/t": {
+        "open_issues": 20, "candidates": 9, "frontier_width": 6, "deferred_retry_width": 0,
+        "conflict_deferrals": 3, "conflict_by_area": {"ci": 3}, "attribution": "exact",
+        "plan_rows_before_assemble": 6, "assembler_deferrals": 1,
+        "census": {"total": 20, "population": 20, "unclassified": 0, "buckets": {"frontier": 6}}}}}
+    cli_summary = {"by_repo": {"o/t": {"planned": 4, "launched": 3}}}
+    rc, out, api = _run_cli(
+        ["record", "--frontier", "<frontier>", "--summary", "<summary>",
+         "--registry-repo", "o/r", "--run-id", "99.1"],
+        frontier=cli_frontier, summary=cli_summary)
+    # THE CALL-SITE JOIN. These two numbers exist ONLY in the summary file on disk; a recorder that
+    # does not pass it through reports 0 and 0 while every other field, and the residual, agree.
+    chk("[L11] cmd_record JOINS the CLAIM summary onto the PLAN census — the planned/realised "
+        "counts come from the file on disk, not from a default",
+        (rc, "planned_rows=4 realised_dispatches=3" in out,
+         "unrealised_rows=1" in out, "assembler_deferrals=1" in out),
+        (0, True, True, True))
+    # ...and the RING IS ACTUALLY WRITTEN. The log line and the ledger write are separate
+    # observable effects, so both are asserted: deleting either one alone reds this.
+    chk("[L11] ...and the record reaches the LEDGER, with those same joined counts",
+        ((api.puts if api else None),
+         [(r["repo"], r["planned_rows"], r["realised_dispatches"], r["assemble_leg"])
+          for r in (api.doc["records"] if api else [])],
+         "ring-size=1 written=1" in out),
+        (1, [("o/t", 4, 3, "reported")], True))
+    # THE MISSING FILE. `plan/frontier-census.json` absent is the exact break L2..L7 exist to
+    # catch; `_read_json` swallowing it turns that into a clean empty tick that writes nothing and
+    # says nothing. It must be LOUD, and nothing may be written.
+    rc_absent, out_absent, api_absent = _run_cli(
+        ["record", "--frontier", "<frontier>", "--registry-repo", "o/r", "--run-id", "99.1"],
+        frontier=None)
+    chk("[L11] a MISSING frontier census is LOUD and writes nothing — never a clean empty tick",
+        (rc_absent, api_absent, out_absent.strip()),
+        ("TelemetryError: cannot read the PLAN frontier census document", None, ""))
+    # An empty `--summary` is the DOCUMENTED degrade (CLAIM died before writing one), so it must
+    # still record the PLAN side with realised=0 rather than refuse the tick.
+    rc_nosum, out_nosum, api_nosum = _run_cli(
+        ["record", "--frontier", "<frontier>", "--registry-repo", "o/r", "--run-id", "99.2"],
+        frontier=cli_frontier)
+    chk("[L11] ...while an ABSENT summary still records the PLAN side with realised=0",
+        (rc_nosum, "planned_rows=0 realised_dispatches=0" in out_nosum,
+         (api_nosum.puts if api_nosum else None)), (0, True, 1))
+    # A census with no repositories at all is a no-op that writes NOTHING — the empty-tick branch,
+    # which must not manufacture a record keyed on a target that was never planned.
+    rc_empty, out_empty, api_empty = _run_cli(
+        ["record", "--frontier", "<frontier>", "--registry-repo", "o/r", "--run-id", "99.3"],
+        frontier={"repositories": {}})
+    chk("[L11] a census with no targets writes nothing and says so",
+        (rc_empty, "no-repositories=1" in out_empty, api_empty), (0, True, None))
 
     print("dispatch-telemetry self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
