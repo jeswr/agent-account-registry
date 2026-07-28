@@ -2633,6 +2633,53 @@ def admits_orchestrator_pr(record, pr_number, login, enrolled_authors):
     }
 
 
+def review_enrolment_class_error(record):
+    """Why a candidate class can NOT be enrolled into the cross-provider review lane, or None.
+
+    THE QUESTION THIS EXISTS TO MAKE ANSWERABLE BY EXECUTION (measured 2026-07-27 on live sparq:
+    four green, ready, `review:unreviewed` PRs that no reviewer ever arrives for). They are not one
+    class, they are three, and only one of them is enrollable:
+
+      1. ORCHESTRATOR-AUTHORED (sparq #3798, #4193; every `jeswr` PR in this repo). A human or an
+         orchestrator-side agent wrote the diff with a real model on a real provider, so the record
+         carries a truthful `impl_provider` and the lane can INVERT it. ENROLLED — this is the
+         class `review_enrolment_authors` serves, and note it is already head-ref-shape AGNOSTIC:
+         nothing anywhere encodes `fix/*`, so any branch name works today.
+      2. RELEASE PRs (sparq #4460, release-plz, App-bot-authored, `release-plz-<timestamp>` head).
+      3. DEPENDENCY-BUMP PRs (sparq #4488, dependabot).
+
+    Classes 2 and 3 fail here, and the reason is NOT the author allowlist. It is that the review
+    lane picks the reviewer's side by INVERTING `impl_provider` (REVIEW_CHAIN), and a release or a
+    dependency bump HAS NO IMPLEMENTING MODEL. Every honest value for that field is refused by
+    `provenance_admission_error`, so admitting one of these classes would require FABRICATING a
+    provider — and the cross-provider assertion would then be satisfied by construction against a
+    field that means nothing. That is not a weaker guarantee, it is the absence of one wearing its
+    name.
+
+    So relaxing the allowlist's `[bot]` refusal — the axis that LOOKS like the blocker, because it
+    is the one that rejects #4460's and #4488's logins — would buy nothing except the exact failure
+    mode this is about: a PR that looks enrolled and is never reviewed. Those classes need a
+    reviewer-selection rule that is not an inversion of a self-declared provider (a pinned constant
+    side, or a review that asserts something other than provider difference). That is a separate
+    design and a separate PR; this predicate is where it will attach, and until it exists this
+    function is the honest, executable answer to "can this class be enrolled at all?".
+
+    TOTAL and fail-closed, like every predicate on this path."""
+    if not isinstance(record, dict):
+        return "the provenance record is not a JSON object"
+    provider = record.get("impl_provider")
+    if not isinstance(provider, str) or provider not in IMPL_PROVIDERS:
+        return ("the class declares no implementing model provider, so the review lane has no "
+                "field to INVERT when choosing the reviewer's side — a release PR or a dependency "
+                "bump is not enrollable through a cross-provider inversion, and fabricating an "
+                f"`impl_provider` would make the assertion vacuous (want one of "
+                f"{sorted(IMPL_PROVIDERS)})")
+    if provider not in REVIEW_CHAIN:
+        return (f"no review chain is declared for implementer provider {provider!r}, so no "
+                "reviewer side can be resolved")
+    return None
+
+
 def enrolment_enable_error(policy_doc, claim_admits, rf_admits, outcome_admits, arm_refuses):
     """Why the tree must NOT ship an enabled `review_enrolment_authors` yet, or None.
 
@@ -10897,6 +10944,52 @@ def _self_test():
             "a TYPO'd enrolment key must be REFUSED by the row validator, never silently resolve "
             "to an empty allowlist — a fail-closed default indistinguishable from a typo is "
             "exactly how an enrolment silently never happens")
+    # (4) WHICH CLASSES ARE ENROLLABLE AT ALL. Measured on live sparq 2026-07-27: FOUR green,
+    #     ready, `review:unreviewed` PRs that no reviewer ever arrives for. They are THREE classes,
+    #     not one, and this pins which of them this mechanism can serve — by execution, so a future
+    #     widening cannot quietly assume all three are the same problem.
+    _orch_class_record = dict(provenance[41], recorded_at_run="orchestrator:30209757201.1")
+    assert review_enrolment_class_error(_orch_class_record) is None, \
+        "the ORCHESTRATOR class declares a real implementing provider — it IS enrollable"
+    for _class, _record in (
+            ("a RELEASE PR (release-plz, sparq #4460) has no implementing model",
+             {k: v for k, v in _orch_class_record.items() if k != "impl_provider"}),
+            ("a DEPENDENCY BUMP (dependabot, sparq #4488) has no implementing model",
+             {**_orch_class_record, "impl_provider": None}),
+            ("...and naming the tool is not a provider either",
+             {**_orch_class_record, "impl_provider": "release-plz"})):
+        _class_error = review_enrolment_class_error(_record)
+        assert _class_error is not None and "INVERT" in _class_error, f"[#657 enable] {_class}"
+        # ...and the SAME record is refused by the shared field admission, so this is not a second
+        # opinion that could drift from the one the lane enforces.
+        assert provenance_admission_error(_record, 41, admit_orchestrator=True) is not None, _class
+    # THE LOAD-BEARING HALF: the AUTHOR allowlist is NOT what blocks those two classes. It refuses
+    # their `[bot]` logins as well — but relaxing THAT alone would admit a PR the lane still cannot
+    # pick a reviewer for, i.e. it would manufacture exactly the "labelled but never reviewed"
+    # state this measurement found. Both facts are asserted together so nobody can fix the visible
+    # one and believe the class is served.
+    try:
+        _enable_policy.review_enrolment_authors(
+            "o/r", tomllib.loads(
+                '[repos."o/r"]\nenabled=true\nrouting="r.toml"\naccount_pool=["acct01"]\n'
+                'max_concurrent=1\nworker_timeout_minutes=1\ngate_profile="none"\n'
+                'arm_auto_merge=false\nmax_attempts=1\ntrust="collaborators"\n'
+                'review_enrolment_authors=["dependabot[bot]"]\n'))
+    except Exception as _bot_exc:         # noqa: BLE001 — the message is the assertion
+        assert "non-canonical" in str(_bot_exc), _bot_exc
+    else:
+        raise AssertionError("the allowlist must still refuse a `[bot]` login")
+    #     ...and the ENROLLED class is shape-agnostic, which is why it needs no widening: the
+    #     mechanism nowhere encodes `fix/*`, so ANY branch name is already covered.
+    for _any_branch in ("fix/anything", "research/knowledge-management-strategy",
+                        "ci/auto-arm-workflows-permission", "release-plz-2026-07-27T02-19-35Z"):
+        assert _enable_states(_ENABLED_REPO, _shipped_authors, ref=_any_branch,
+                              login=sorted(_shipped_authors)[0]) == ["needs-review"], _any_branch
+    print("  ok   [#657 enable] CLASS TAXONOMY: the orchestrator class is enrollable on ANY branch "
+          "name; a release PR and a dependency bump are NOT — they declare no implementing model, "
+          "so no reviewer side can be INVERTED, and relaxing the allowlist alone would only "
+          "manufacture a labelled-but-never-reviewed PR")
+
     print(f"  ok   [#657 enable] the SHIPPED policy enrols {sorted(_shipped_authors)} for "
           f"{_ENABLED_REPO} ONLY: a previously-skipped orchestrator-class PR is ENUMERATED there, "
           f"and the same PR in {_DEFERRED_REPO} — plus an unlisted author and a machine-attested "
@@ -12377,6 +12470,49 @@ def _self_test():
     assert armed_sha_mismatch(repo, bound, armed_status) is None
     for _junk in (None, "not-a-dict", [], 7, {}, {"number": 41}):
         assert armed_sha_mismatch(repo, _junk, armed_status) is None, repr(_junk)
+    # (5b) ITS SHAPE GATES, which the pre-refactor enumerator carried and NO test drove — a
+    #      mutation sweep over this PR found each of them surviving. They are defence in depth
+    #      against a hostile or stale listing (PLAN reads `state=open`, so production rows are
+    #      open and well-formed), and defence in depth that nothing exercises is just untested
+    #      code. Driven on BOTH lanes, because the write lane is the one that acts on the answer.
+    for _bad_state in ("closed", "merged", "", None):
+        _closed = dict(moved, state=_bad_state)
+        assert armed_sha_mismatch(repo, _closed, armed_status) is None, repr(_bad_state)
+        assert enumerate_disarm_items(repo, [_closed], armed_status, provenance) == [], \
+            f"a {_bad_state!r}-state PR must never be disarmed — its latch is already resolved"
+        assert _observe([dict(_obs_pull(), state=_bad_state)]) == [], repr(_bad_state)
+    for _bad_sha in ("", "zz" * 20, sha_b[:39], sha_b + "a", 7, None):
+        _malformed = dict(moved)
+        _malformed["head"] = dict(moved["head"], sha=_bad_sha)
+        assert armed_sha_mismatch(repo, _malformed, armed_status) is None, repr(_bad_sha)
+        assert enumerate_disarm_items(repo, [_malformed], armed_status, provenance) == [], \
+            "a malformed head sha is not a provable latch — never act on one"
+    for _bad_number in (0, -1, True, False, 41.0, "41", None, [], {}):
+        _numbered = dict(moved, number=_bad_number)
+        assert armed_sha_mismatch(repo, _numbered, armed_status) is None, repr(_bad_number)
+        assert enumerate_disarm_items(repo, [_numbered], armed_status, provenance) == [], \
+            repr(_bad_number)
+    # (5c) #570's EXACT-App author gate on the WRITE lane's own candidate filter. The CLAIM-side
+    #      re-binding is tested; this enumerator's copy was not, and it survived a mutation. It is
+    #      the gate this whole detection-only design exists to avoid waiving, so it is pinned on
+    #      both halves: a `[bot]` suffix is not enough, and a DIFFERENT App is refused.
+    _foreign_app = pull(41, "sparq-agent/issue-7-1-1", sha_b, login="other-app[bot]", draft=False,
+                        body=f"x <!-- sparq-reviewed-sha:{sha_a} -->")
+    assert enumerate_disarm_items(repo, [_foreign_app], armed_status, provenance,
+                                  bot_login=bot) == [], (
+        "[#570] a FOREIGN App's worker-shaped PR must never enter the disarm write path — `[bot]` "
+        "is a suffix every App with write access shares, which is the #570 defect itself")
+    _human_author = pull(41, "sparq-agent/issue-7-1-1", sha_b, login="jeswr", draft=False,
+                         body=f"x <!-- sparq-reviewed-sha:{sha_a} -->")
+    assert enumerate_disarm_items(repo, [_human_author], armed_status, provenance,
+                                  bot_login=bot) == [], \
+        "[#570] nor may a human-authored PR, whatever its branch shape"
+    #      NON-VACUITY: the trusted App's own PR on the same data IS emitted, so the two assertions
+    #      above are the author gate firing rather than the fixture failing some other predicate.
+    assert [row["pr_number"] for row in enumerate_disarm_items(
+        repo, [pull(41, "sparq-agent/issue-7-1-1", sha_b, login=bot, draft=False,
+                    body=f"x <!-- sparq-reviewed-sha:{sha_a} -->")],
+        armed_status, provenance, bot_login=bot)] == [41]
     # (6) THE EMISSION. One alert per violation plus a census line that prints EVEN AT ZERO — an
     #     absent bucket and a zero bucket must not look the same, and a per-violation alert alone
     #     can never prove the observer ran at all.
