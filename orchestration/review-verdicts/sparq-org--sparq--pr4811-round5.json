@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4811,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "8ebb746bc15184ee722c07eca3078fc263dd06ec",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 5 resolves the remaining major finding. bench/parse/oxttl-prefix-alloc/ab.sh now captures a machine-readable triples count and digest from every configuration and revision, compares each against the released/default reference, accumulates mismatches, and exits nonzero when any leg diverges or omits the required fields. Its self-test exercises equal results, a digest mutation with unchanged count, a count mutation, and missing fields, so the load-bearing gate is no longer merely observational or vacuous. The implementation and README/research claims are aligned, and no new correctness, soundness, test-validity, or security issue is evident in the diff.",
+  "verdict": "approve"
+ }
+}
