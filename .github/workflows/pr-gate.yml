@@ -64,8 +64,19 @@ jobs:
           # findings, AND this step swallows any non-zero exit into a warning. Enforcement is a
           # FOLLOW-UP decision once the rate is measured — a lint that gets disabled is worth
           # less than no lint. What is NOT advisory is the analyser itself:
-          # `callsite-coverage.py --self-test` is enrolled in the required suite above, so a
-          # broken walk reds this gate even though a finding does not.
+          # `callsite-coverage.py --self-test` is enrolled in the required suite run BELOW (this
+          # step deliberately precedes it), so a broken walk reds this gate even though a finding
+          # does not.
+          #
+          # SCOPE, stated in its own output on every run: a site that shares every fingerprint
+          # with a sibling site is NOT ASSESSED by this check, and neither is a symbol with fewer
+          # than two production call sites. Both counts are printed. MEASURED over a 19-PR sample,
+          # the not-assessed site bucket is 41% of all sites. Line coverage of a module under its
+          # own `--self-test` (issue #960) is the complementary mechanism for that bucket; on the
+          # #941 instance this check is mute on, it reports 3 of the 4 site lines as never
+          # executed. Neither mechanism subsumes the other — MEASURED on #886's pre-fix head,
+          # 3 of the 4 sites this check flags are line-COVERED, and 1 of the 2 it credits as
+          # `named by` is never executed at all.
           #
           # No `if:` guards this step and it precedes every step that can fail, so the census
           # line reaches the log on EVERY run. A silent lint is worthless.

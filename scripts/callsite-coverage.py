@@ -42,6 +42,33 @@ maximum bipartite matching: one piece of evidence covers at most one site, and t
 unmatched are the report. That is the mechanical reading of the rule this repo learnt the hard
 way: an assertion quantified over a set gives 1/N coverage at N/N confidence.
 
+WHAT THIS DOES **NOT** ASSESS — printed in the headline on every run, because a detector that
+renders `ok` over a site it never assessed manufactures false confidence, which is worse than
+staying silent:
+  * `sites_not_assessed` — a site that shares EVERY fingerprint with a sibling site cannot be
+    told from it BY NAME, so no claim is made about it. MEASURED over a 19-PR sample this bucket
+    is 186 of 457 sites (41%), LARGER than the 155 unnamed sites. It contains a real instance:
+    `_escalate_two_head` (#941) reads `sites=4 uncovered=0 not_assessed=4` on the DEFECTIVE head
+    `e85d2472` and BYTE-IDENTICALLY on the fixed head `fcf9d6f1`. This check cannot see it.
+  * `symbols_single_site` — a symbol with fewer than `min_sites` production call sites is dropped
+    with no claim at all. This analyser's own `render` and `census_line` are in that bucket, which
+    is why its dogfood run reported `0 uncovered` about the emission path where its one real hole
+    turned out to be.
+  * `named by` is NOT "this site is tested". It is a substring match between a harness string and
+    this site's enclosing name or one of its own literals, drawn from a repo-wide pool, so it can
+    be coincidental — one `_pre_write_jitter` site on the current tree is credited to a regex
+    literal about dispatcher leases. MEASURED on #886's pre-fix head, one of the two
+    `_pr_needs_user` sites this check credits as `named by` is never EXECUTED by the owning
+    script's own self-test.
+
+THE COMPLEMENTARY MECHANISM (#960), and why neither subsumes the other. Line coverage of a module
+under its OWN `--self-test` answers a different question — "is this site reached at all" — and it
+is a fact rather than a naming heuristic. On the four #941 sites this check is mute on, it reports
+3 as NEVER EXECUTED. Conversely, on #886's pre-fix head, 3 of the 4 sites THIS check flags are
+line-covered, so line coverage is silent on them: they are executed and still nothing names them,
+which is the #939 class in its purest form. Cross-tabulated over those 8 sites the two verdicts are
+orthogonal in both directions. Use both.
+
 ADVISORY, DELIBERATELY (#939). It emits findings and a census; it never fails the gate. The
 false-positive rate against a real tree is not yet known well enough to enforce, and a lint that
 gets disabled is worth less than no lint. `--self-test` IS enrolled in the required suite, so a
@@ -57,11 +84,14 @@ from __future__ import annotations
 
 import argparse
 import ast
+import contextlib
+import io
 import json
 import os
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -430,7 +460,7 @@ def audit(sources: dict[str, str], changed: dict[str, set[int]], *,
     for path, symbols in index.defs.items():
         for symbol in symbols:
             owners_by_name.setdefault(symbol["name"], {}).setdefault(path, []).append(symbol)
-    findings, examined = [], 0
+    findings, examined, single_site = [], 0, 0
     total_sites = uncovered_total = mute_total = 0
     for (path, name), trigger in sorted(touched_symbols(index, changed, owners_by_name).items()):
         by_path = owners_by_name[name]
@@ -438,6 +468,15 @@ def audit(sources: dict[str, str], changed: dict[str, set[int]], *,
         examined += 1
         sites = production_sites(index, name, path, symbols, unique_owner=len(by_path) == 1)
         if len(sites) < min_sites:
+            # NOT ASSESSED, and counted so: a symbol with fewer than `min_sites` production call
+            # sites cannot have a per-site coverage gap by this check's definition, so it is
+            # dropped WITHOUT any claim about it. This counter exists because the omission was
+            # read as a clean result: this analyser's own `render` and `census_line` have exactly
+            # ONE production call site each, so the dogfood run in #945's body reported
+            # `sites_without_distinct_named_check=0` for its own diff while saying nothing
+            # whatever about its emission path — which is where its one real hole turned out to
+            # be. A censored denominator reads as a pass; print it.
+            single_site += 1
             continue
         assigned = assign_evidence(sites, index.evidence)
         distinct = discriminating_fingerprints(sites)
@@ -470,21 +509,31 @@ def audit(sources: dict[str, str], changed: dict[str, set[int]], *,
                                  & set(range(site["line"], site["end"] + 1))),
             "sites": rows,
             "uncovered": len(uncovered),
-            "indistinguishable": len(muted),
+            "not_assessed": len(muted),
         })
     return {
         "files_changed": len([p for p in changed if p.endswith(".py")]),
         "symbols_examined": examined,
         "symbols_triggered": len(findings),
+        "symbols_single_site": single_site,
         "sites_found": total_sites,
+        "sites_named": total_sites - uncovered_total - mute_total,
         "sites_without_distinct_named_check": uncovered_total,
-        "sites_indistinguishable": mute_total,
+        "sites_not_assessed": mute_total,
         "findings": findings,
     }
 
 
-CENSUS_KEYS = ("files_changed", "symbols_examined", "symbols_triggered", "sites_found",
-               "sites_without_distinct_named_check", "sites_indistinguishable")
+CENSUS_KEYS = ("files_changed", "symbols_examined", "symbols_triggered", "symbols_single_site",
+               "sites_found", "sites_named", "sites_without_distinct_named_check",
+               "sites_not_assessed")
+
+# The three site buckets partition `sites_found`, and every run prints all three. The mute
+# (`sites_not_assessed`) was previously reported only per finding while the symbol rendered `ok`;
+# MEASURED over the 19-PR sample in #945's body it is 186 of 457 sites — 41%, LARGER than the 155
+# the body headlines. A detector that renders `ok` over an unassessed site manufactures false
+# confidence, which is worse than staying silent.
+SITE_BUCKETS = ("sites_named", "sites_without_distinct_named_check", "sites_not_assessed")
 
 
 def census_line(census: dict) -> str:
@@ -493,29 +542,71 @@ def census_line(census: dict) -> str:
         f"{key}={census[key]}" for key in CENSUS_KEYS)
 
 
+def scope_line(census: dict) -> str | None:
+    """The headline sentence naming what this check did NOT assess, or `None` if it assessed
+    everything it examined.
+
+    Two populations are out of scope and both used to be invisible in the headline:
+      * `sites_not_assessed` — sites that share every fingerprint with a sibling, so the walk
+        cannot tell them apart BY NAME. MEASURED: `_escalate_two_head` (one of the five instances
+        in the tally this check is built against) reads `sites=4 uncovered=0 not_assessed=4` on
+        #941's DEFECTIVE head and BYTE-IDENTICALLY on its fixed head. This check cannot see that
+        defect, and must not print `ok` over it.
+      * `symbols_single_site` — symbols below `min_sites`, dropped with no claim at all.
+    Line coverage of the owning script under its own `--self-test` (#960) is the mechanism that
+    covers the first population; it is cheap, it is not a naming heuristic, and on 3 of those 4
+    `_escalate_two_head` sites it reports the site line as never executed."""
+    mute, single = census["sites_not_assessed"], census["symbols_single_site"]
+    if not mute and not single:
+        return None
+    parts = []
+    if mute:
+        parts.append(f"{mute} of {census['sites_found']} site(s) NOT ASSESSED "
+                     f"(each shares every fingerprint with a sibling site, so this check cannot "
+                     f"tell them apart by name — use line coverage of the owning script under "
+                     f"its own --self-test, #960)")
+    if single:
+        parts.append(f"{single} symbol(s) NOT ASSESSED (fewer than 2 production call sites)")
+    return "callsite-coverage NOT ASSESSED: " + "; ".join(parts)
+
+
 def render(census: dict) -> list[str]:
     lines = [census_line(census)]
+    scope = scope_line(census)
+    if scope:
+        lines.append(scope)
     for finding in census["findings"]:
         if not finding["uncovered"]:
-            lines.append(f"  ok      {finding['path']}:{finding['line']} {finding['symbol']} — "
+            # `ok` is claimed ONLY when every site of this symbol was actually assessed. With any
+            # not-assessed site the honest render is `PARTLY`, because the check is mute on those
+            # sites rather than satisfied by them.
+            mark = "ok    " if not finding["not_assessed"] else "PARTLY"
+            lines.append(f"  {mark}  {finding['path']}:{finding['line']} {finding['symbol']} — "
                          f"{len(finding['sites'])} site(s), "
-                         f"{finding['indistinguishable']} indistinguishable, none unnamed")
+                         f"{finding['not_assessed']} NOT ASSESSED, "
+                         f"{len(finding['sites']) - finding['not_assessed']} named")
             continue
         lines.append(
             f"::warning file={finding['path']},line={finding['line']}::callsite-coverage "
             f"[#939 advisory]: `{finding['symbol']}` is {finding['trigger']}-changed in this PR "
             f"and called from {len(finding['sites'])} production site(s) "
             f"({finding['touched_sites']} of them touched here); "
-            f"{finding['uncovered']} of them have no DISTINCT named check. Remove the mechanism "
+            f"{finding['uncovered']} of them have no DISTINCT named check and "
+            f"{finding['not_assessed']} are NOT ASSESSED at all. Remove the mechanism "
             f"from exactly one of these sites — if no test that NAMES that site goes red, the "
             f"coverage is 1/N at N/N confidence.")
         for row in finding["sites"]:
             if row["evidence"] is not None:
+                # DELIBERATELY not "covered": this is a harness string that CONTAINS this site's
+                # enclosing name or one of its own literals. It is a substring match against a
+                # repo-wide pool, so it can be coincidental — on the current tree one
+                # `_pre_write_jitter` site is credited to a regex literal about dispatcher
+                # leases. Treat it as "something names this site", not as "this site is tested".
                 mark, detail = "named by ", repr(row["evidence"][:60])
             elif row["distinguishable"]:
                 mark, detail = "UNCOVERED", ""
             else:
-                mark, detail = "no-name  ", "(shares every fingerprint with a sibling site)"
+                mark, detail = "NOTASSESS", "(shares every fingerprint with a sibling site; #960)"
             lines.append(f"    {mark} {row['path']}:{row['line']} in {row['enclosing']} {detail}")
     return lines
 
@@ -787,21 +878,55 @@ def _self_test() -> int:
           "the changed line is in app.py, and lib.py's `render` is not this PR's mechanism",
           audit(foreign, {"scripts/app.py": {3}})["symbols_examined"], 0)
 
-    # ---- INDISTINGUISHABLE sites are counted apart from UNNAMED ones ------------------------
+    # ---- NOT-ASSESSED sites are counted apart from UNNAMED ones, and never render `ok` --------
     # Two calls in the SAME function passing no literal of their own share every fingerprint.
-    # Calling them "unnamed" would be a claim this check cannot support.
+    # Calling them "unnamed" would be a claim this check cannot support — but neither may the
+    # symbol render `ok`, which is the #941 hole: `_escalate_two_head` reads
+    # `sites=4 uncovered=0 not_assessed=4` on the DEFECTIVE head and byte-identically on the
+    # fixed one, and used to print `ok` for both.
     twinned = ("def _mech(x):\n    return x\n"
                "def one_writer(a, b):\n    _mech(a)\n    _mech(b)\n")
     twin_sites = audit({"scripts/t.py": twinned}, {"scripts/t.py": {1}})
     check("discriminating_fingerprints SITE audit: sites sharing every fingerprint are NOT reported as unnamed",
           (twin_sites["sites_without_distinct_named_check"],
-           twin_sites["sites_indistinguishable"]), (0, 2))
+           twin_sites["sites_not_assessed"]), (0, 2))
+    check("#941 SHAPE: a symbol whose sites are all NOT ASSESSED renders PARTLY, never `ok` — "
+          "printing `ok` over a site this check is mute on manufactures false confidence",
+          [line.split()[0] for line in render(twin_sites) if line.startswith("  ")], ["PARTLY"])
     told_apart = twinned.replace("_mech(a)", "_mech('the first writer path')")
     apart = audit({"scripts/t.py": told_apart}, {"scripts/t.py": {1}})
     check("literal_text SITE _arg_literals: give one site a literal of its own and it becomes "
           "nameable — and is then reported as UNNAMED until something names it",
-          (apart["sites_without_distinct_named_check"], apart["sites_indistinguishable"]),
+          (apart["sites_without_distinct_named_check"], apart["sites_not_assessed"]),
           (1, 1))
+    # One uncovered site and one mute site in the same symbol, so both per-site markers render.
+    check("#941 SHAPE: ...and the per-site marker for a mute site says NOT ASSESSED and points "
+          "at #960, rather than reading as a coverage verdict",
+          (sum(1 for line in render(apart) if "UNCOVERED scripts/t.py" in line),
+           sum(1 for line in render(apart) if "NOTASSESS scripts/t.py" in line and "#960" in line),
+           sum(1 for line in render(apart) if "NOT ASSESSED at all" in line)), (1, 1, 1))
+    # MIN_ARG_TOKEN, by value and by behaviour: a literal SHORTER than the floor is not a
+    # fingerprint, so its site stays not-assessed rather than becoming nameable. Removing the
+    # floor from `_arg_literals` flips this row.
+    short_literal = twinned.replace("_mech(a)", f"_mech({'x' * (MIN_ARG_TOKEN - 1)!r})")
+    short = audit({"scripts/t.py": short_literal}, {"scripts/t.py": {1}})
+    check(f"literal_text SITE _arg_literals: a literal below MIN_ARG_TOKEN ({MIN_ARG_TOKEN}) "
+          "cannot name a site — one character shorter than the floor and both sites stay "
+          "NOT ASSESSED",
+          (short["sites_without_distinct_named_check"], short["sites_not_assessed"]), (0, 2))
+    check("literal_text SITE _arg_literals: ...and exactly AT the floor it does name the site",
+          [audit({"scripts/t.py": twinned.replace("_mech(a)",
+                                                  f"_mech({'x' * MIN_ARG_TOKEN!r})")},
+                 {"scripts/t.py": {1}})[key]
+           for key in ("sites_without_distinct_named_check", "sites_not_assessed")], [1, 1])
+    # MIN_NAME_TOKEN, by value: an enclosing function whose name (underscores stripped) is
+    # SHORTER than the floor cannot discriminate one site from another.
+    short_name = "z" * (MIN_NAME_TOKEN - 1)
+    check(f"site_fingerprints: an enclosing name below MIN_NAME_TOKEN ({MIN_NAME_TOKEN}) is not "
+          "a fingerprint — `repo`/`main`/`pr` would match everything",
+          (site_fingerprints({"stack": (short_name,), "args": []}),
+           site_fingerprints({"stack": ("z" * MIN_NAME_TOKEN,), "args": []})),
+          ([], ["z" * MIN_NAME_TOKEN]))
 
     # ---- The MECHANISM's own name is not a site fingerprint ---------------------------------
     check("`_mech` itself is not a fingerprint: a check that names only the MECHANISM covers "
@@ -831,25 +956,154 @@ def _self_test() -> int:
     check("CENSUS: the line names each counter",
           census_line(empty),
           "callsite-coverage census: files_changed=0 symbols_examined=0 symbols_triggered=0 "
-          "sites_found=0 sites_without_distinct_named_check=0 sites_indistinguishable=0")
+          "symbols_single_site=0 sites_found=0 sites_named=0 "
+          "sites_without_distinct_named_check=0 sites_not_assessed=0")
+    check("CENSUS: the three site buckets PARTITION sites_found — no site is silently dropped "
+          "from the headline arithmetic",
+          [sum(c[k] for k in SITE_BUCKETS) == c["sites_found"]
+           for c in (empty, quantified, twin_sites, apart, short)], [True] * 5)
     check("CENSUS: a finding renders as an ADVISORY warning, never an error",
           any(line.startswith("::warning") for line in render(quantified))
           and not any("::error" in line for line in render(quantified)), True)
+    # The mute and the below-threshold symbols must be visible in the HEADLINE, not only inside a
+    # finding. #941's `_escalate_two_head` rendered `ok` at a defective head precisely because the
+    # only place its four not-assessed sites were counted was a per-finding field nobody reads.
+    check("CENSUS: the headline states what was NOT ASSESSED, with the count and the reason",
+          scope_line(twin_sites),
+          "callsite-coverage NOT ASSESSED: 2 of 2 site(s) NOT ASSESSED (each shares every "
+          "fingerprint with a sibling site, so this check cannot tell them apart by name — use "
+          "line coverage of the owning script under its own --self-test, #960)")
+    check("CENSUS: a symbol below min_sites is counted as NOT ASSESSED, not silently dropped — "
+          "this analyser's own `render`/`census_line` have ONE call site each, which is why its "
+          "dogfood run said `0 uncovered` about an emission path it never examined",
+          (audit({"scripts/s.py": single}, {"scripts/s.py": {1}})["symbols_single_site"],
+           scope_line(audit({"scripts/s.py": single}, {"scripts/s.py": {1}}))),
+          (1, "callsite-coverage NOT ASSESSED: 1 symbol(s) NOT ASSESSED (fewer than 2 production "
+              "call sites)"))
+    all_assessed = audit({"scripts/d.py": both}, {"scripts/d.py": {1}})
+    check("CENSUS: ...and there is NO not-assessed headline when everything examined was assessed",
+          scope_line(all_assessed), None)
+    check("CENSUS: `ok` is claimed only when every site of the symbol was assessed",
+          [line.split()[0] for line in render(all_assessed) if line.startswith("  ")], ["ok"])
+
+    # ---- THE EMISSION PATH: the census must reach STDOUT, not merely be computed --------------
+    # THE HEADLINE CLAIM of this whole check is "a silent lint is worthless", and until now it was
+    # pinned only by a REGEX over pr-gate.yml's text — which cannot observe whether a byte was
+    # emitted. MEASURED on head 3f230051: deleting `print("\n".join(text))` from `run_advisory`
+    # left `--advisory` printing NOTHING AT ALL while all three `WIRING:` checks below still
+    # reported ok. That is this check's own defect class, inside this check, on its headline.
+    # So: drive `main()` end to end over a fixture tree and read the census back out of STDOUT.
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / SCRIPTS_DIR).mkdir()
+        (root / SCRIPTS_DIR / "q.py").write_text(shared, encoding="utf-8")
+        body = shared.splitlines()
+        diff_path = root / "one.diff"
+        diff_path.write_text("--- a/scripts/q.py\n+++ b/scripts/q.py\n"
+                             f"@@ -0,0 +1,{len(body)} @@\n"
+                             + "".join(f"+{line}\n" for line in body), encoding="utf-8")
+        summary_path = root / "step-summary.md"
+        json_path = root / "census.json"
+        previous = os.environ.get("GITHUB_STEP_SUMMARY")
+        os.environ["GITHUB_STEP_SUMMARY"] = str(summary_path)
+        buffer = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buffer):
+                code = main(["--advisory", "--root", str(root), "--diff-file", str(diff_path),
+                             "--json", str(json_path)])
+        finally:
+            if previous is None:
+                os.environ.pop("GITHUB_STEP_SUMMARY", None)
+            else:
+                os.environ["GITHUB_STEP_SUMMARY"] = previous
+        emitted = buffer.getvalue().splitlines()
+        headline = [line for line in emitted if line.startswith("callsite-coverage census: ")]
+        counters = dict(pair.split("=", 1)
+                        for pair in (headline[0].split(": ", 1)[1].split() if headline else []))
+        # `symbols_examined` and `files_changed` are read out of the EMITTED text, and the
+        # expected values come from the fixture the diff describes: ONE changed file, and the TWO
+        # PRODUCTION defs in `shared` (`_pr_needs_user` and `_dispatch_review_items`;
+        # `_quantified_self_test` is harness and is not a symbol under audit).
+        # `changed = {}` gives 0/0; a deleted print gives no census line at all.
+        check("EMISSION SITE run_advisory: `--advisory` PRINTS the census line — expected values "
+              "read back out of STDOUT, so deleting the print or analysing an empty diff reds this",
+              (len(headline), counters.get("files_changed"), counters.get("symbols_examined")),
+              (1, "1", "2"))
+        check("EMISSION SITE run_advisory: the FINDING rows reach stdout too, not only the "
+              "counters — one ::warning for the shared symbol and one row per call site",
+              (sum(1 for line in emitted if line.startswith("::warning file=scripts/q.py")),
+               sum(1 for line in emitted if "UNCOVERED scripts/q.py" in line)), (1, 3))
+        check("EMISSION SITE run_advisory: a tree WITH findings still exits 0 — advisory way "
+              "(1) of the two, which had no test of its own at all",
+              (code, counters.get("sites_without_distinct_named_check")), (0, "3"))
+        check("EMISSION SITE run_advisory: the census is APPENDED to GITHUB_STEP_SUMMARY when "
+              "the runner provides one",
+              summary_path.exists() and headline[0] in summary_path.read_text(encoding="utf-8"),
+              True)
+        check("EMISSION SITE run_advisory: --json writes the same census that was printed",
+              census_line(json.loads(json_path.read_text(encoding="utf-8"))), headline[0])
+
+    # ---- diff_against: `--unified=0`, pinned by BEHAVIOUR on a real repository ----------------
+    # `--unified=0` is load-bearing, not cosmetic. `changed_lines` collects the whole `+` RANGE of
+    # each hunk, so any context at all drags unchanged lines into the changed set — and a
+    # BODY-only edit three lines below a `def` then reads as a SIGNATURE touch, which silently
+    # removes the false-positive valve. Asserting the flag string would be a presence test; this
+    # runs the real `git diff` through `run_advisory` and reads the trigger back out of stdout.
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = Path(tmp)
+        (repo / SCRIPTS_DIR).mkdir()
+        target = repo / SCRIPTS_DIR / "m.py"
+        source = ("def _mech(x, y):\n    a = x\n    b = y\n    return a + b\n"
+                  "def alpha_writer():\n    _mech(1, 2)\n"
+                  "def beta_writer():\n    _mech(3, 4)\n")
+        target.write_text(source, encoding="utf-8")
+        env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@invalid",
+                   GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@invalid",
+                   GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull)
+        first, git_ok = "", True
+        try:
+            for args in (("init", "-q"), ("add", "-A"),
+                         ("commit", "-q", "--no-gpg-sign", "-m", "v1")):
+                subprocess.run(["git", "-C", str(repo), *args], env=env, check=True,
+                               capture_output=True, text=True)
+            first = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], env=env,
+                                   check=True, capture_output=True, text=True).stdout.strip()
+            target.write_text(source.replace("    return a + b\n", "    return a - b\n"),
+                              encoding="utf-8")
+            for args in (("add", "-A"), ("commit", "-q", "--no-gpg-sign", "-m", "v2")):
+                subprocess.run(["git", "-C", str(repo), *args], env=env, check=True,
+                               capture_output=True, text=True)
+        except (OSError, subprocess.CalledProcessError) as exc:  # never a silent skip
+            git_ok, first = False, f"{exc}"
+        check("diff_against: a real `git` two-commit fixture was built, so the check below is "
+              "not silently skipped", (git_ok, len(first)), (True, 40))
+        if git_ok:
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                main(["--advisory", "--root", str(repo), "--base", first])
+            printed = buffer.getvalue()
+            check("diff_against SITE run_advisory: the diff is `--unified=0`, so a BODY-only edit "
+                  "3 lines below the `def` is NOT read as a signature touch — with any context "
+                  "the false-positive valve disappears",
+                  ("files_changed=1" in printed, "symbols_triggered=0" in printed), (True, True))
 
     # ---- The gate wiring is real ------------------------------------------------------------
     # #939 requires that a workflow change be pinned at the `if:`, the step AND the call site.
     # This is the call-site half: pr-gate.yml must actually invoke this script, in ADVISORY mode,
-    # in a step that cannot fail the required check.
+    # in a step that cannot fail the required check. An ABSENT workflow is a FAILURE, not a skip —
+    # deleting pr-gate.yml used to make all three rows below vanish while the suite reported
+    # `ok (0 failure(s))`, which is the same silent-skip class.
     workflow = Path(__file__).resolve().parent.parent / ".github" / "workflows" / "pr-gate.yml"
-    if workflow.exists():
-        text = workflow.read_text(encoding="utf-8")
-        check("WIRING: pr-gate.yml invokes this script's ADVISORY mode",
-              "scripts/callsite-coverage.py --advisory" in text, True)
-        check("WIRING: the advisory step cannot fail the required gate",
-              "|| echo \"::warning::callsite-coverage (advisory) could not run\"" in text, True)
-        check("WIRING: the census reaches the log unconditionally (no `if:` can skip it)",
-              re.search(r"\n      - name: [^\n]*callsite-coverage[^\n]*\n        run:", text)
-              is not None, True)
+    check("WIRING: pr-gate.yml is present — an absent workflow must not silently retire the "
+          "three wiring checks below", workflow.exists(), True)
+    text = workflow.read_text(encoding="utf-8") if workflow.exists() else ""
+    check("WIRING: pr-gate.yml invokes this script's ADVISORY mode",
+          "scripts/callsite-coverage.py --advisory" in text, True)
+    check("WIRING: the advisory step cannot fail the required gate",
+          "|| echo \"::warning::callsite-coverage (advisory) could not run\"" in text, True)
+    check("WIRING: the census reaches the log unconditionally (no `if:` can skip it)",
+          re.search(r"\n      - name: [^\n]*callsite-coverage[^\n]*\n        run:", text)
+          is not None, True)
 
     print(f"callsite-coverage self-test: {'FAILED' if failures else 'ok'} "
           f"({len(failures)} failure(s))")
