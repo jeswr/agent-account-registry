@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4681,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "fdb93a1a5ea20217ed3140f9a6ff98c62fba5904",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "bench_egress_push is only called in the final loop after all materialization/HDT work. If the self-terminating box dies after producing an earlier envelope but before reaching this loop, that completed result is never sent to S3. The same deferred pattern exists in canonical-beir-gather-instance.sh. This contradicts scripts/bench/README.md and launcher comments claiming each envelope is uploaded as produced and that completed work survives termination mid-run. The test merely greps for bench_egress_push, so it passes even when the call is too late to provide the advertised durability.",
+    "file": "scripts/bench/canonical-materialize-gather-instance.sh",
+    "fix_hint": "Call bench_egress_push immediately after each envelope is successfully written and JSON-validated in both the materialization and BEIR gather flows; keep or remove the final sweep as a retry. Add a hermetic behavioral test that stops the gather after the first completed envelope and verifies the AWS stub recorded that upload, instead of checking only that the function name appears.",
+    "severity": "major",
+    "title": "Completed envelopes are not uploaded until the entire gather finishes"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 2 fixes both prior major findings: bare --dry-run now avoids STS and has a hermetic assertion, while instance-profile attachment now queries the current role and tests same-role and conflicting-role reruns. However, the new durable-egress contract is still not implemented on the real BEIR and materialization paths. Their gather scripts defer all uploads until the final envelope-enumeration loop, despite the README and launcher comments promising upload as each envelope is produced and survival of mid-run termination. The wiring-only test cannot detect this. Because this is a new major finding despite resolution of the prior findings, progress is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
