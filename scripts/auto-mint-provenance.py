@@ -158,6 +158,12 @@ FENCED_BLOCK_RE = re.compile(
 # backtick therefore consumes nothing rather than swallowing the document.
 CODE_SPAN_RE = re.compile(r"(`+)[^`]*?\1")
 BLOCKQUOTE_LINE_RE = re.compile(r"^[ \t]{0,3}>.*$", re.M)
+# What an INLINE code span leaves behind. See `strip_quoted_contexts` for why this is not a space
+# (it would splice) and not a newline (it would end the negation window mid-sentence). A control
+# character cannot occur in the keyword grammar, in NEGATOR_RE's character classes, or in
+# SENTENCE_BREAK_RE, which is exactly the set of properties required — and --self-test asserts all
+# three of those rather than trusting the choice.
+SPAN_SENTINEL = "\x00"
 
 # NEGATED PROSE — a best-effort suppressor, and honestly labelled as one.
 #
@@ -363,19 +369,33 @@ def strip_quoted_contexts(text):
     PR's description, this tool's own refusal comment — not something they declared. GitHub itself
     does not resolve one, and neither may this.
 
-    WHAT IS SUBSTITUTED IS A NEWLINE, NOT A SPACE, and that is load-bearing. A space SPLICES: the
-    grammar's `keyword[ \\t]*:?[ \\t]*#N` would read `` Fixes `mod` #1234 `` as a declaration that
-    the author never wrote, because removing the span manufactured the keyword→`#` adjacency. A
-    newline cannot be crossed by `[ \\t]*`, so a construct the author put BETWEEN a keyword and a
-    number breaks the reference instead of completing it — the safe direction for a strip that is
-    an enumeration and therefore incomplete by nature. It also means a code span sitting between a
-    negator and its keyword ends the `is_negated` window (`\\n` is a SENTENCE_BREAK), so that one
-    corner degrades to no suppression — i.e. to GitHub's own behaviour, which is the documented
-    degradation mode for the negation rule and never a different binding."""
+    NOTHING IS SUBSTITUTED WITH A SPACE, and that is load-bearing. A space SPLICES: the grammar's
+    `keyword[ \\t]*:?[ \\t]*#N` would read `` Fixes `mod` #1234 `` as a declaration that the author
+    never wrote, because removing the span manufactured the keyword→`#` adjacency that was not in
+    the source. What replaces a construct has to be something `[ \\t]*` cannot cross, so that a
+    construct the author put BETWEEN a keyword and a number BREAKS the reference instead of
+    completing it — the safe direction for a strip that is an enumeration, and therefore incomplete
+    by nature.
+
+    WHICH separator, though, is not one choice but two, and MEASURED — the differential over 4,245
+    inputs is what separated them:
+
+    * The four BLOCK constructs are replaced by a NEWLINE. They genuinely end a proposition, so
+      `is_negated`'s sentence window should stop at them.
+    * An INLINE code span is replaced by `SPAN_SENTINEL`, which is deliberately NOT a
+      SENTENCE_BREAK. A newline here over-signals: it ends the negation window mid-sentence, so
+      `this does not `x` close #7` stopped being suppressed and MINTED #7 — a refusal turning into
+      a mint, which is the one direction this file never permits. The sentinel is not `[ \\t]`, so
+      it still cannot be crossed by the grammar; it is not `[0-9A-Za-z_-]`, so it does not break
+      the keyword's `\\b` or the `#`'s preceding-character guard; and it is not in
+      SENTENCE_BREAK_RE, so the proposition continues across it exactly as the author wrote it.
+
+    --self-test pins both halves, and the differential pins the composition: 0 refusal→mint and 0
+    rebindings across the whole generated + live population."""
     text = BLOCKQUOTE_LINE_RE.sub("\n", strip_indented_code(text))
     text = HTML_COMMENT_RE.sub("\n", text)
     text = FENCED_BLOCK_RE.sub("\n", text)
-    return CODE_SPAN_RE.sub("\n", text)
+    return CODE_SPAN_RE.sub(SPAN_SENTINEL, text)
 
 
 def is_negated(text, keyword_start):
@@ -1028,16 +1048,41 @@ def _self_test():                                                       # noqa: 
           closing_issue_candidates("t", "Closes`x`#1234"), [])
     check("...and a span INSIDE the keyword still breaks it, as it always did",
           closing_issue_candidates("t", "clo`x`ses #1234"), [])
-    # THE ORDER CONTROL, and the reason the newline is not free. This is PR #781's live line 0: a
-    # self-identification banner that is a blockquote AND contains a code span. Substituting a
-    # newline for that span splits the quoted line in two, and the second half no longer starts with
-    # `>` — so with the blockquote strip running last, a banner nobody meant as a declaration binds
-    # the lease. It reds this check by name.
+    # THE SEPARATOR IS TWO CHOICES, NOT ONE, and the inline one is the subtle half. A NEWLINE for an
+    # inline span over-signals: it ends `is_negated`'s sentence window mid-sentence, so
+    # `this does not `x` close #7` stopped being suppressed and MINTED #7 — a refusal turning into a
+    # mint, the one direction this file never permits. MEASURED on the differential before this
+    # check existed. Both the outcome and the three properties that produce it are pinned.
+    check("a code span between a NEGATOR and its keyword does not end the proposition",
+          closing_issue_candidates("t", "this PR does not `x` close #7"), [])
+    check("...and the block constructs still DO end it, so a negator cannot reach across them",
+          closing_issue_candidates("t", "this does not close anything\n\n    quoted\n\nCloses #7"),
+          [7])
+    check("...the span sentinel cannot be crossed by the grammar's own separator",
+          bool(re.fullmatch(r"[ \t]", SPAN_SENTINEL)), False)
+    check("...is not a word character, so it breaks no keyword boundary and no `#` guard",
+          bool(re.fullmatch(r"[0-9A-Za-z_-]", SPAN_SENTINEL)), False)
+    check("...and is deliberately NOT a sentence break",
+          bool(SENTENCE_BREAK_RE.search(SPAN_SENTINEL)), False)
+    # THE ORDER CONTROL: a newline substitution REWRITES line structure, so any strip that runs
+    # after one is reading lines the author did not write. Discovered on PR #781's live line 0 — a
+    # self-ID banner that is a blockquote AND contains a code span — where substituting a newline
+    # for the span split the quoted line in two, the second half no longer began with `>`, and
+    # `Closes #777` became a live declaration out of a banner nobody meant as one.
+    #
+    # HONEST NOTE ON WHAT KILLS WHAT. That original code-span vector no longer distinguishes the
+    # two orders, because `SPAN_SENTINEL` is not a newline any more — the sentinel fix closed it
+    # independently. Keeping only that fixture would have left the ORDER guard vacuous: the
+    # blockquote strip could be moved back to last and nothing would red. The HTML-comment vector
+    # below is the one that still separates them (MEASURED both ways), so it is the fixture the
+    # order is credited to. The code-span line stays as the sentinel's own pin, not the order's.
     check("a code span in a BLOCKQUOTE line does not un-quote the rest of that line (live #781)",
           closing_issue_candidates(
               "t", "> 🤖 **SPARQ agent** — AUTHOR ONLY; no `VERDICT:` line. Closes #777."), [])
-    check("...and the same shape with a fence marker in the quoted line stays quoted too",
-          closing_issue_candidates("t", "> see ```x``` then Closes #777"), [])
+    check("an inline HTML COMMENT in a blockquote line does not un-quote the rest of it",
+          closing_issue_candidates("t", "> 🤖 agent <!-- marker --> Closes #777."), [])
+    check("...nor does one that spans two quoted lines",
+          closing_issue_candidates("t", "> 🤖 agent <!-- m\n> ore --> Closes #777."), [])
     # AN UNCLOSED `<!--` strips to the end of the body, exactly as an unclosed fence does — GitHub
     # hides that remainder from the author, so it must not be able to bind.
     check("an UNCLOSED HTML comment strips to the end rather than leaking",
