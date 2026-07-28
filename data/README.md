@@ -63,13 +63,33 @@ always fatal (decision 22): a `flow.leases[].label` that is not the 8-hex HMAC-s
 label raises, trigger `evidence` links are pinned to `https://github.com/`, and the existing
 `_assert_private` raw-handle sweep runs over the finished document.
 
-**Collector input ≠ published output for `flow.leases` (issue #374).** The collector still sends
-one row per account (`{label, provider, utilization_1h}`) and every row is still label-validated as
-above — but the ROWS are not republished. `_normalize_observability` emits
-`flow.lease_utilization_1h = {"mean", "max"}` over the utilizations that parsed, and nothing else:
-a per-account row array is a direct read of the fleet's size, and its salted labels are stable
-across builds, which is exactly what the dashboard's own `accounts` array was removed for. Keep
-sending the rows — the privacy check needs them — and expect only the aggregate on the page.
+**`flow.leases` rows are DEPRECATED — send `flow.lease_utilization_1h` instead (issues #374,
+#841).** Issue #374 stopped the per-account rows being PUBLISHED: a `{label, provider,
+utilization_1h}` array is a direct read of the fleet's size and its salted labels are stable
+across builds, which is exactly what the dashboard's own `accounts` array was removed for. But
+#374 only fixed the Pages surface — this snapshot itself is a file on the **public** `ledger`
+branch, so a contract that says "keep sending the rows and we will drop them" still parks that
+same array one branch over from the page it cleaned (issue #841).
+
+So the aggregate is now the contract. Send `flow.lease_utilization_1h = {"mean", "max"}`,
+computed collector-side, and write no per-account rows anywhere:
+
+- **Preferred (row-free).** `flow.lease_utilization_1h` is published as-is once both fields are
+  real fractions and `max >= mean`. An incoherent or half-supplied aggregate is DROPPED (the stat
+  hides) rather than published as a plausible number — it carries no identity, so it takes the
+  malformed-row tolerance, not the fatal path.
+- **Legacy (rows).** `flow.leases[]` is still accepted and still aggregated to the same
+  `{mean, max}`. Precedence is ROWS-FIRST and total, and it keys on the PRESENCE of the `leases`
+  key rather than on whether a row parsed: send that key at all and the rows decide the published
+  value, down to the `null` you get when none of them reports a usable `utilization_1h`. The
+  aggregate is consulted only by the genuinely row-free form. So a collector mid-migration that
+  sends both publishes exactly its pre-#841 value and nothing changes silently underneath it.
+- **The decision-22 label check is unconditional over whatever rows ARE present** — supplying the
+  aggregate is not a way past it. A raw (non-salted) handle in a lease row is a privacy incident
+  whether or not this build would have published that row, and it still fails the build LOUD.
+
+Note this closes only the dashboard's half of #841: `data/leases.json` on the same branch is one
+row per live lease and is producer-side (`select-and-claim.py`), still tracked there.
 
 ## `data/metrics-history.json` — throughput time-series (ring)
 
