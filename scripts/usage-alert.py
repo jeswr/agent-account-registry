@@ -188,7 +188,8 @@ def _alert_route(alert_repo, alert_token, registry_repo, confirmed_private=None)
 def classify(pool, usage, margin, now=None):
     """Return (eligible_count, rows[(handle, status_str, ok_bool)]). Mirrors usage_eligible's
     fail-closed posture: an account is usable ONLY with a positive, parseable probe result — missing
-    entry, non-allowed status, or a missing/unparseable 5h/7d window is UNAVAILABLE. PROBE-EXEMPT
+    entry, a status that is not EXACTLY `allowed` (an empty/absent one included, issue #421), or a
+    5h/7d window that is missing, unparseable, or outside [0,1] is UNAVAILABLE. PROBE-EXEMPT
     providers (openai/codex — maintainer decision 2026-07-17, registry issue #29) are `ok` by design
     (never flagged probe-missing) UNLESS the reactive-backoff stamp on the entry is still active, in
     which case the backoff is surfaced (BACKED OFF) so degraded exempt capacity is visible."""
@@ -229,13 +230,30 @@ def classify(pool, usage, margin, now=None):
             eligible += 1
             rows.append((h, "ok — probe-exempt provider (reactive rate-limit backoff)", True))
             continue
-        if str(u.get("status", "")).lower() not in ("allowed", ""):
-            rows.append((h, f"UNAVAILABLE — provider status `{u.get('status')}` (throttled/rejected)", False))
+        # [ISSUE #421] Require status EXACTLY `allowed`, character-for-character with
+        # usage_eligible (strip + lower). The old `not in ("allowed", "")` accepted an EMPTY or
+        # ABSENT status as allowed — the same fail-open issue #196 closed on the admission gate and
+        # the producer. Leaving it here meant a forged/hand-authored usage map could report an
+        # account eligible on the monitoring surface while dispatch refused it (a monitoring split).
+        if str(u.get("status", "")).strip().lower() != "allowed":
+            stated = u.get("status")
+            rows.append((h, "UNAVAILABLE — provider status not stated by the probe (fail-closed)"
+                            if stated is None or not str(stated).strip()
+                            else f"UNAVAILABLE — provider status `{stated}` (throttled/rejected)",
+                         False))
             continue
         u5 = _util(u.get("5h_util"))
         u7 = _util(u.get("7d_util"))
         if u5 is None or u7 is None:
             rows.append((h, "UNAVAILABLE — usage window missing/unparseable (fail-closed)", False))
+            continue
+        # [ISSUE #421] Validate the SHAPE before trusting the headroom comparison, exactly as
+        # usage_eligible does: `_util` only rejects nan/inf, so a NEGATIVE base utilization (-1
+        # looks like excess headroom) or one ABOVE 1.0 slipped past the CAPPED threshold and
+        # classified `ok`. A base window is a fraction in [0,1]; anything else is fail-closed.
+        # (Deliberately NOT folded into `_util`, which also parses the backoff_until EPOCH.)
+        if not (0.0 <= u5 <= 1.0) or not (0.0 <= u7 <= 1.0):
+            rows.append((h, "UNAVAILABLE — usage window out of range (fail-closed)", False))
             continue
         cap = 1.0 - margin
         if u5 >= cap or u7 >= cap:
@@ -460,10 +478,14 @@ def _self_test():
 
     pool = ["a", "b", "c", "d"]
     usage = {
-        "a": {"5h_util": "0.2", "7d_util": "0.3", "5h_reset": "t1", "7d_reset": "t2"},  # ok
+        # [#421] every metered entry states `status: allowed` — an absent status is no longer read
+        # as allowed, so these fixtures carry the shape the producer actually writes.
+        "a": {"status": "allowed", "5h_util": "0.2", "7d_util": "0.3",
+              "5h_reset": "t1", "7d_reset": "t2"},                                      # ok
         # [#639] an exempt entry carries its reachability; `live` is the probed-healthy shape
         "b": {"exempt": True, "reachability": "live"},                                   # ok (codex)
-        "c": {"5h_util": "0.95", "7d_util": "0.1", "5h_reset": "14:00"},                # capped 5h
+        "c": {"status": "allowed", "5h_util": "0.95", "7d_util": "0.1",
+              "5h_reset": "14:00"},                                                     # capped 5h
         # "d" missing -> token bad -> UNAVAILABLE
     }
     eligible, rows = classify(pool, usage, 0.10)
@@ -474,12 +496,17 @@ def _self_test():
     e2, _ = classify(["a", "b"], usage, 0.10)
     chk("small pool all ok", e2, 2)
     # FAIL-CLOSED alignment with usage_eligible (the old classify read missing windows as 0.0 "ok"):
-    e3, r3 = classify(["x"], {"x": {"5h_util": "0.1"}}, 0.10)          # 7d window missing
-    chk("missing window -> unavailable", (e3, "UNAVAILABLE" in r3[0][1]), (0, True))
+    # [#421] each of these states `allowed` so the assertion actually reaches the WINDOW arm it
+    # names — without it the status guard short-circuits first and they pass for the wrong reason.
+    e3, r3 = classify(["x"], {"x": {"status": "allowed", "5h_util": "0.1"}}, 0.10)  # 7d missing
+    chk("missing window -> unavailable",
+        (e3, "usage window missing/unparseable" in r3[0][1]), (0, True))
     e4, r4 = classify(["x"], {"x": {"status": "rejected", "5h_util": "0", "7d_util": "0"}}, 0.10)
     chk("rejected status -> unavailable", (e4, "UNAVAILABLE" in r4[0][1]), (0, True))
-    e5, r5 = classify(["x"], {"x": {"5h_util": "nan-ish%", "7d_util": "0"}}, 0.10)
-    chk("unparseable -> unavailable", (e5, r5[0][2]), (0, False))
+    e5, r5 = classify(["x"], {"x": {"status": "allowed", "5h_util": "nan-ish%", "7d_util": "0"}},
+                      0.10)
+    chk("unparseable -> unavailable",
+        (e5, r5[0][2], "usage window missing/unparseable" in r5[0][1]), (0, False, True))
     # Wholesale probe failure: empty usage + configured pool -> every account UNAVAILABLE -> degraded.
     e6, r6 = classify(pool, {}, 0.10)
     chk("empty probe -> all unavailable", (e6, all(not o for _h, _s, o in r6)), (0, True))
@@ -513,6 +540,72 @@ def _self_test():
         (e_bare, "UNAVAILABLE" in r_bare[0][1]), (0, True))
     e_forged, _r = classify(["x"], {"x": {"exempt": True, "reachability": "LIVE"}}, 0.10)
     chk("[#639] a forged reachability spelling does not read as usable", e_forged, 0)
+
+    # ---- [registry #421] THE METERED ARM must not split from dispatch either. Issue #196 hardened
+    # usage_eligible + the producer to require status EXACTLY `allowed` and a base utilization in
+    # [0,1]; classify still carried the OLD semantics (empty status == allowed; no range check, so
+    # `-1` read as excess headroom and classified `ok`). On a forged/hand-authored usage map the
+    # monitor therefore reported an account ELIGIBLE while the gate refused it. Every shape below is
+    # asserted against the ALLOCATOR's own verdict (pre-flight question (b): the expected value does
+    # NOT come from the code under test) — reverting either guard turns these RED.
+    # Margins are 0.10 with utils of 0.0/0.1, well clear of the cap, so only the shape is under test.
+    for _label, _entry, _want_ok in (
+            ("an EMPTY status", {"status": "", "5h_util": "0.1", "7d_util": "0.1"}, False),
+            ("an ABSENT status", {"5h_util": "0.1", "7d_util": "0.1"}, False),
+            ("a whitespace-only status", {"status": "   ", "5h_util": "0.1", "7d_util": "0.1"},
+             False),
+            ("a padded/upper-case allowed", {"status": " ALLOWED ", "5h_util": "0.1",
+                                             "7d_util": "0.1"}, True),
+            ("a NEGATIVE 5h util", {"status": "allowed", "5h_util": "-1", "7d_util": "0.1"}, False),
+            ("a NEGATIVE 7d util", {"status": "allowed", "5h_util": "0.1", "7d_util": "-0.5"},
+             False),
+            ("an ABOVE-1 5h util", {"status": "allowed", "5h_util": "1.5", "7d_util": "0.1"},
+             False),
+            ("an ABOVE-1 7d util", {"status": "allowed", "5h_util": "0.1", "7d_util": "2"}, False),
+            ("a zero-boundary util", {"status": "allowed", "5h_util": "0.0", "7d_util": "0.0"},
+             True)):
+        _e421, _r421 = classify(["x"], {"x": dict(_entry)}, 0.10, now=1000)
+        chk(f"[#421] classify and usage_eligible agree for {_label}",
+            (bool(_e421), _r421[0][2], _allocator.usage_eligible(dict(_entry), 0.10, now=1000)),
+            (_want_ok, _want_ok, _want_ok))
+    # The two rejections must be DISTINGUISHABLE in the body (and neither may render as `ok`), so a
+    # maintainer reading the private alert can tell a throttled provider from a malformed snapshot.
+    _e_nostat, _r_nostat = classify(["x"], {"x": {"5h_util": "0.1", "7d_util": "0.1"}}, 0.10)
+    chk("[#421] an absent status renders 'status not stated', never `None` or ok",
+        (_e_nostat, "status not stated" in _r_nostat[0][1], "None" in _r_nostat[0][1],
+         _r_nostat[0][1].startswith("ok")), (0, True, False, False))
+    _e_neg, _r_neg = classify(["x"], {"x": {"status": "allowed", "5h_util": "-1",
+                                            "7d_util": "0.1"}}, 0.10)
+    chk("[#421] an out-of-range util renders 'out of range', not a negative percentage",
+        (_e_neg, "out of range" in _r_neg[0][1], "-100%" in _r_neg[0][1]), (0, True, False))
+    # The UPPER bound needs its OWN row: an above-1 util is ineligible either way (1.5 also trips the
+    # CAPPED threshold), so the eligibility-parity row above is VALUE-IDENTICAL there and cannot see
+    # the bound being dropped — it survived exactly that mutant. What the upper bound actually buys
+    # is the DIAGNOSIS: an above-1 window is a MALFORMED snapshot, and reporting it as genuine quota
+    # exhaustion ("CAPPED — 5h window 150% used, resets 14:00") sends the maintainer to reset a
+    # window that is not the problem. So assert the MESSAGE, not just the verdict.
+    _e_hi, _r_hi = classify(["x"], {"x": {"status": "allowed", "5h_util": "1.5", "7d_util": "0.1",
+                                          "5h_reset": "14:00"}}, 0.10)
+    chk("[#421] an ABOVE-1 util is MALFORMED, not a capped account (never rendered as `150%`)",
+        (_e_hi, "out of range" in _r_hi[0][1], "CAPPED" in _r_hi[0][1], "150%" in _r_hi[0][1]),
+        (0, True, False, False))
+    # The upper bound is INCLUSIVE: a util of exactly 1.0 is a well-formed FULLY-CONSUMED window, so
+    # it must still report CAPPED (with its reset time) rather than being mislabelled malformed —
+    # tightening the guard to `< 1.0` flips this row and goes RED.
+    _e_full, _r_full = classify(["x"], {"x": {"status": "allowed", "5h_util": "1.0",
+                                              "7d_util": "0.1", "5h_reset": "14:00"}}, 0.10)
+    chk("[#421] a util of exactly 1.0 is IN RANGE -> CAPPED with its reset, not 'out of range'",
+        (_e_full, "CAPPED" in _r_full[0][1], "14:00" in _r_full[0][1],
+         "out of range" in _r_full[0][1]), (0, True, True, False))
+    # `_util` stays the BACKOFF-STAMP parser: the [0,1] gate belongs to the 5h/7d windows only, so an
+    # exempt account's `backoff_until` epoch (far outside [0,1]) must still suppress eligibility.
+    chk("[#421] _util still parses an out-of-[0,1] epoch (the backoff stamp is not range-gated)",
+        _util(1_700_000_000), 1_700_000_000.0)
+    _e_bo, _r_bo = classify(["cx"], {"cx": {"exempt": True, "reachability": "live",
+                                            "backoff_until": 1_700_000_300}}, 0.10,
+                            now=1_700_000_000)
+    chk("[#421] an epoch backoff stamp still backs the account off (range gate is windows-only)",
+        (_e_bo, "BACKED OFF" in _r_bo[0][1]), (0, True))
 
     # ---- [registry #639] the PROBE-OUTCOME SIDECAR: `probe_empty = not usage` cannot tell an idle
     # fleet from an unmeasured one, and misses a partial failure entirely. Read fail-closed. --------
@@ -945,7 +1038,7 @@ def _self_test():
     # (4) recovery side: a failed `issue list` is a LOOKUP FAILURE (rc 1, stale alert may remain
     # open), never parsed as "no open alert"; a healthy fleet with working gh stays rc 0.
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as uf:
-        json.dump({"acct-wire-h1": {"5h_util": "0.1", "7d_util": "0.1"},
+        json.dump({"acct-wire-h1": {"status": "allowed", "5h_util": "0.1", "7d_util": "0.1"},
                    "acct-wire-h2": {"exempt": True, "reachability": "live"}}, uf)
         healthy_usage = uf.name
     HEALTHY = dict(CONF, ALERT_REPO=None, ALERT_TOKEN=None, WORKER_USAGE_FILE=healthy_usage)
@@ -958,6 +1051,25 @@ def _self_test():
         (rc_rf, "stale alert" in out_rf), (1, True))
     chk("e2e healthy fleet + working gh -> rc 0, degraded=false",
         (rc_rok, "degraded=false" in out_rok), (0, True))
+    # [#421] BINDING LAYER: the whole point of the tightening is that main() can no longer report a
+    # fleet HEALTHY on a snapshot dispatch would refuse. This is the forged-map scenario from the
+    # issue — an empty status and a negative utilization, the two shapes the producer can no longer
+    # emit — driven through main() rather than through classify() alone. Before the fix both
+    # accounts read `ok` and the tick printed `degraded=false`; now both are UNAVAILABLE, so the
+    # alert fires. `_util`'s own nan/inf guard cannot catch either shape.
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as ff:
+        json.dump({"acct-wire-h1": {"status": "", "5h_util": "0.1", "7d_util": "0.1"},
+                   "acct-wire-h2": {"status": "allowed", "5h_util": "-1", "7d_util": "0.1"}}, ff)
+        forged_usage = ff.name
+    FORGED = dict(CONF, ALERT_REPO=None, ALERT_TOKEN=None, WORKER_USAGE_FILE=forged_usage)
+    calls_forged = []
+    rc_forged, out_forged = _e2e(FORGED, _fail_stub(set(), calls_forged))
+    os.unlink(forged_usage)
+    forged_created = next((c for c in calls_forged if c[:3] == ["gh", "issue", "create"]), None)
+    chk("[#421] e2e a forged map (empty status + negative util) is DEGRADED end-to-end, "
+        "never 'degraded=false'",
+        (rc_forged, "degraded=false" in out_forged, "degraded=true" in out_forged,
+         forged_created is not None), (0, False, True, True))
     # Probe-exempt backoff surfacing (decision 2026-07-17, registry issue #29): an exempt account
     # is `ok` by design (never probe-missing), but an ACTIVE backoff is surfaced + not eligible,
     # an EXPIRED one clears, and a forged/malformed stamp fails open to `ok` (never crashes).
@@ -1005,8 +1117,9 @@ def _self_test():
     chk("inf header -> None (fail-closed)", _util("inf"), None)
     chk("-inf header -> None (fail-closed)", _util("-inf"), None)
     chk("decimal header still parses", _util("0.42"), 0.42)
-    e7, r7 = classify(["x"], {"x": {"5h_util": "nan", "7d_util": "0"}}, 0.10)
-    chk("nan util -> unavailable, not ok", (e7, r7[0][2]), (0, False))
+    e7, r7 = classify(["x"], {"x": {"status": "allowed", "5h_util": "nan", "7d_util": "0"}}, 0.10)
+    chk("nan util -> unavailable, not ok",
+        (e7, r7[0][2], "usage window missing/unparseable" in r7[0][1]), (0, False, True))
     print("usage-alert self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 
