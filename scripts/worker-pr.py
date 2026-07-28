@@ -4650,7 +4650,13 @@ def arm_freshness_census_row(repo, pr_number, reviewed_sha, freshness, refused, 
 
     A silent guard converts a visible hazard into an invisible one — this line is what makes
     "arms attempted / arms refused as stale / the age gap for each" countable from a run log
-    without re-deriving anything."""
+    without re-deriving anything.
+
+    `refused` means THIS guard withheld the latch, not that it was the only one to. An arm that
+    is both stale and sitting on a concluded-red aggregator exits through the #892 decline (the
+    stronger statement) and still reports `refused=true` here, because the staleness count must
+    not silently shrink whenever a second guard happens to agree; the #892 receipt records the
+    other half. Counting `verdict=stale` rows answers the same question without the overlap."""
     state = freshness.get("state") if isinstance(freshness, dict) else None
     gap = freshness.get("gap_seconds") if isinstance(freshness, dict) else None
     run_base = (freshness.get("run_base_sha") or "") if isinstance(freshness, dict) else ""
@@ -5006,15 +5012,18 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
         # branch this PR is not merging into. Both are pinned by assertions over the CALL SITE
         # (the M-STALE-CALLSITE mutants), because a direct test of `_live_arm_gate_freshness` can
         # only pin the function's own parameters.
-        freshness = _live_arm_gate_freshness(repo, pr_number, reviewed_sha, live_base)
-        stale = arm_freshness_decision(freshness)
+        # NAMED `gate_evidence`, not `freshness`: this function already binds `freshness` to
+        # revalidate_outcome_head's HEAD verdict a few lines above, and two different questions
+        # sharing one name in one scope is how a later edit silently reads the wrong one.
+        gate_evidence = _live_arm_gate_freshness(repo, pr_number, reviewed_sha, live_base)
+        stale = arm_freshness_decision(gate_evidence)
         # THE BOUND (see ARM_DECLINE_GATE_STALE). Its own marker, its own budget: a #892 gate-red
         # receipt must not spend this one, or a PR deferred for a red aggregator would arm on a
         # stale green the very next tick.
         stale_readmitted = bool(stale) and arm_decline_receipted(
             _paginated_comments(repo, pr_number), reviewed_sha, bot_login,
             marker_prefix=ARM_STALE_MARKER_PREFIX)
-        print(arm_freshness_census_row(repo, pr_number, reviewed_sha, freshness,
+        print(arm_freshness_census_row(repo, pr_number, reviewed_sha, gate_evidence,
                                        refused=bool(stale) and not stale_readmitted,
                                        readmitted=stale_readmitted))
         if stale_readmitted:
@@ -5028,7 +5037,7 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
             # Ordering: a CONCLUDED red (#892) is the stronger statement and keeps its own exit
             # and its own receipt, so it is reported when both fire. This branch is the
             # staleness-only one.
-            _record_arm_stale_decline(repo, pr_number, reviewed_sha, freshness,
+            _record_arm_stale_decline(repo, pr_number, reviewed_sha, gate_evidence,
                                       bot_login=bot_login)
             # Same routing half as the #892 decline, for the same reason: the review DID complete
             # end to end on this head, so binding the marker is honest — and a DRAFT, review:needs
@@ -5038,9 +5047,9 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
             # re-emit needs-review and spend a cross-provider round on an untouched tree.
             _write_outputs({"armed": False, "head_moved": False, "arm_complete": False,
                             "arm_declined": stale, "arm_gate": arm_gate,
-                            "arm_gate_freshness": (freshness or {}).get("state", ""),
+                            "arm_gate_freshness": (gate_evidence or {}).get("state", ""),
                             "bind_reviewed_sha": True})
-            print(f"arm DEFERRED ({stale}): {(freshness or {}).get('reason', '')} — no ready, no "
+            print(f"arm DEFERRED ({stale}): {(gate_evidence or {}).get('reason', '')} — no ready, no "
                   "latch, no review-state mutation; the PR stays a draft. `gh run rerun` cannot "
                   "clear this (it re-tests the same tree); only a new pull_request event can. "
                   "This applies AT MOST ONCE at this head — the next arm at this commit is "
