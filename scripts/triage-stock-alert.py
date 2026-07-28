@@ -199,6 +199,7 @@ def census(issues, now, classify=static_triage.triage, known_labels=None, derive
         derive_area = _load_curator().derive_area
     vocabulary = area_vocabulary(issues)
     unattributable = []
+    unprioritisable = []
     for issue in issues:
         if not isinstance(issue, dict) or "pull_request" in issue:
             continue
@@ -225,6 +226,20 @@ def census(issues, now, classify=static_triage.triage, known_labels=None, derive
             attributed = None
         if attributed is None:
             unattributable.append(issue.get("number"))
+        # [OPUS-5 sparq#4809] The SYMMETRIC worklist for the other input the classifier cannot
+        # manufacture. `derive_priority` now supplies a floor for the never-prioritised residue,
+        # so what remains here is the population it DECLINES on purpose — a stated-but-unreadable
+        # priority, or a `status:ready` attestation whose priority was lost. Both are human-owned
+        # by construction, and both were previously indistinguishable from "not looked at yet".
+        # Counting them is what stops a decline from being a silent second starvation: a pass that
+        # declines everything and a pass that fixes everything produce the SAME per-run success
+        # signal, which is the exact failure this whole alert exists to measure.
+        try:
+            unprioritisable_reason = static_triage.derive_priority(labels)[1]
+        except Exception:
+            unprioritisable_reason = None
+        if unprioritisable_reason in ("stated-unreadable", "ready-attested-regression"):
+            unprioritisable.append(issue.get("number"))
         try:
             result = classify(labels, "task", trusted=True, known_labels=known_labels)
             complete = bool(result.get("ready"))
@@ -243,6 +258,8 @@ def census(issues, now, classify=static_triage.triage, known_labels=None, derive
         # The WORKLIST, not just the number. The `##[warning]` this replaces named 5 issues and an
         # ellipsis, so nobody could act on it even having read it.
         "unattributable_numbers": sorted(n for n in unattributable if isinstance(n, int)),
+        "unprioritisable": len(unprioritisable),
+        "unprioritisable_numbers": sorted(n for n in unprioritisable if isinstance(n, int)),
         "machine_gated": machine_gated,
         "gated_ec2": gated_ec2,
         "oldest_age_days": oldest_age,
@@ -542,8 +559,27 @@ def _self_test():
     chk("a PR row is never censused", census([iss(1, ["status:untriaged"], pr=True)], now),
         {"untriaged": 0, "machine_owed": 0, "unclassifiable": 0,
          "unattributable": 0, "unattributable_numbers": [],
+         "unprioritisable": 0, "unprioritisable_numbers": [],
          "machine_gated": 0, "gated_ec2": 0,
          "oldest_age_days": None, "oldest_number": None})
+    # [OPUS-5 sparq#4809] The DECLINE worklist, with both halves. A counter that only ever reads
+    # zero is indistinguishable from one that is not wired up, so the negative control (a row the
+    # derivation FLOORS is not on the list) is asserted next to the positives.
+    chk("a floored row is NOT on the decline worklist",
+        census([iss(1, ["status:untriaged", "role:impl", "area:groom"])], now)["unprioritisable"],
+        0)
+    chk("[sparq#4809] a STATED-but-unreadable priority IS on the decline worklist",
+        census([iss(7, ["status:untriaged", "role:impl", "area:groom",
+                        "priority:P1", "priority:P2"])], now)["unprioritisable_numbers"], [7])
+    # ...and the SCOPE of this worklist, pinned so nobody reads it as covering both declines. The
+    # OTHER decline class — `ready-attested-regression`, a `status:ready` issue whose priority was
+    # lost — is invisible HERE by construction: `status:ready` is in OTHER_OWNED_STATUS, so the row
+    # is excluded before the check above runs, and retriage's own #586 re-park lane owns it. This
+    # alert measures the machine's debt on the UNTRIAGED queue; the regression lane is not that.
+    chk("[sparq#4809] SCOPE: a lost-priority regression is NOT this alert's worklist — the #586 "
+        "re-park lane owns it, and status:ready excludes the row before the decline check",
+        census([iss(8, ["status:untriaged", "status:ready", "role:impl", "area:groom"])],
+               now)["unprioritisable_numbers"], [])
 
     # THE MACHINE-WRITTEN ONE-WAY HOLD IS COUNTED, NOT KEYED ON. `needs:ec2` is written by
     # `curate-frontier.is_ec2_measurement` and removed by nothing, so a mis-fenced row leaves the
