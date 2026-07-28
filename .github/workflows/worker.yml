@@ -686,7 +686,15 @@ jobs:
       # timeout/cancel the incomplete steps leave these empty, and the downstream job fails closed
       # to `deferred` — taking the issue OUT of status:in-progress and back into the redispatch pool.
       # (pr_url now comes from the isolated `publish` job — see issue #575.)
-      exhausted: ${{ steps.budget.outputs.exhausted }}
+      # [issue #1075 review round 1] The REFUSAL result wins when there is one. `budget` runs
+      # before `trust`, so on the terminal refusal it reports the PRE-charge state (used=N-1,
+      # exhausted=false) and final_state fell through to `deferred` — its exhaustion arm could
+      # not see the slot this very run had just spent, so the run that ended the budget was also
+      # the one that left the issue in the retry frontier. `refusal` publishes the POST-charge
+      # predicate; GitHub's `||` yields the first NON-EMPTY operand, so a skipped/never-reached
+      # refusal step (the overwhelmingly common case) leaves the budget result exactly as it was,
+      # and a refusal step that died before writing outputs falls back the same way.
+      exhausted: ${{ steps.refusal.outputs.exhausted || steps.budget.outputs.exhausted }}
       trust_outcome: ${{ steps.trust.outcome }}
       attempt_number: ${{ steps.attempt.outputs.number }}
       # [registry #596] 'true' when THIS run's attempt receipt was voided as a credential outage.

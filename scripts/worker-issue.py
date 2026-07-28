@@ -603,6 +603,18 @@ def record_attempt(repo, issue, max_attempts, bot_login, run_key):
     print(f"worker attempt recorded: {number}/{max_attempts}")
 
 
+def _refusal_outputs(used, max_attempts):
+    """The refusal recorder's step outputs — the POST-charge budget state.
+
+    [issue #1075 review round 1] `exhausted` is here because the worker job's own `exhausted`
+    output cannot come from `attempt-check` alone on this path: that step runs BEFORE `trust`,
+    so on the terminal refusal it reports the PRE-charge state (used=N-1, exhausted=false) and
+    final_state's exhaustion arm — which reads that output — could never observe the slot this
+    very run just spent. It is the same `used >= max_attempts` predicate attempt_check applies,
+    evaluated after the charge instead of before it, so the two can only ever agree."""
+    return {"used": used, "exhausted": used >= max_attempts}
+
+
 def record_refusal(repo, issue, max_attempts, bot_login, run_key, run_url):
     """[issue #1075] Charge THIS dispatch cycle to the durable per-issue budget when the
     last-step trust/revision revalidation REFUSED before the model launched.
@@ -632,7 +644,7 @@ def record_refusal(repo, issue, max_attempts, bot_login, run_key, run_url):
     for comment in comments:
         if (str(comment.get("user", {}).get("login", "")).casefold() == bot_login.casefold()
                 and exact_marker in str(comment.get("body", ""))):
-            _write_outputs({"used": min(charged, max_attempts)})
+            _write_outputs(_refusal_outputs(min(charged, max_attempts), max_attempts))
             print(f"pre-model refusal already recorded (run {run_key})")
             return
     used = min(charged + 1, max_attempts)
@@ -653,7 +665,7 @@ def record_refusal(repo, issue, max_attempts, bot_login, run_key, run_url):
         ["api", "-X", "POST", f"repos/{repo}/issues/{issue}/comments", "--input", "-"],
         input_doc={"body": body},
     )
-    _write_outputs({"used": used})
+    _write_outputs(_refusal_outputs(used, max_attempts))
     print(f"pre-model refusal charged to the dispatch budget: {used}/{max_attempts}")
 
 
@@ -2087,6 +2099,106 @@ def _workflow_steps(text):
 _PARK_ARM_RE = re.compile(r'"\$EXHAUSTED" == true \]\]; then(?:(?!\n\s*elif ).)*?\n\s*status=parked',
                           re.S)
 
+# The `worker` job output the park arm above is the consumer of. Exactly one such binding must
+# exist: two would mean the arm reads a value this seam is not following.
+_WORKER_EXHAUSTED_OUTPUT_RE = re.compile(r"^      exhausted: \$\{\{(?P<expr>[^{}]*)\}\}$", re.M)
+_STEP_OUTPUT_REF_RE = re.compile(r"steps\.(?P<step>[A-Za-z0-9_-]+)\.outputs\.(?P<name>[A-Za-z0-9_-]+)")
+_FINAL_STATE_STEP = "Set final target issue state"
+_ENV_BINDING_RE = re.compile(r"^          (?P<name>[A-Z_][A-Z0-9_]*): \$\{\{(?P<expr>[^{}]*)\}\}$",
+                             re.M)
+_RUN_BLOCK_RE = re.compile(r"^        run: \|\n(?P<body>(?:^ {10}.*\n)+)", re.M)
+_GHA_INTERPOLATION_RE = re.compile(r"\$\{\{[^{}]*\}\}")
+
+
+def _refusal_charge_step(text):
+    """worker.yml's refusal-charging step and its `id:`.
+
+    The id is READ from the file, never assumed: it is the name the worker job's `exhausted`
+    output has to reference, so a rename that leaves that output pointing at nothing must break
+    the seam rather than slide past it."""
+    charge = [step for step in _workflow_steps(text)
+              if "worker-issue.py record-refusal" in step["body"]]
+    step = charge[0] if len(charge) == 1 else {"gate": "", "body": ""}
+    ident = re.search(r"^        id: (?P<id>\S+)$", step["body"], re.M)
+    return charge, step, (ident.group("id") if ident else "")
+
+
+def _worker_exhausted_expr(text):
+    """The expression bound to the `worker` job's `exhausted` output, as written."""
+    found = _WORKER_EXHAUSTED_OUTPUT_RE.findall(text)
+    if len(found) != 1:
+        raise WorkerIssueError(
+            f"expected exactly one `exhausted:` worker job output, found {len(found)}")
+    return found[0].strip()
+
+
+def _eval_step_output_expr(expr, step_outputs):
+    """Evaluate a `A || B || ...` GitHub-Actions expression over step outputs.
+
+    GitHub coerces a string operand to false ONLY when it is empty, and `||` yields the first
+    truthy operand (the last one when every operand is falsy). An output that was never written —
+    a skipped step, or one that died before writing — is the empty string, which is why the
+    fallback works at all. An operand this cannot model RAISES instead of evaluating to empty: an
+    expression the seam does not understand must fail it, never quietly satisfy it."""
+    value = ""
+    for operand in expr.split("||"):
+        match = _STEP_OUTPUT_REF_RE.fullmatch(operand.strip())
+        if match is None:
+            raise WorkerIssueError(
+                f"unmodelled operand in the `exhausted` output: {operand.strip()!r}")
+        value = str(step_outputs.get(match.group("step"), {}).get(match.group("name"), ""))
+        if value:
+            return value
+    return value
+
+
+def _final_state_status(text, needs):
+    """The status final_state converges to — derived by RUNNING worker.yml's own shell body.
+
+    Deliberately not a Python re-implementation of that if/elif ladder: an expected value
+    re-derived from a copy of the code under test cannot fail (AGENTS.md pre-flight 2b), and this
+    seam is precisely where review round 1 of #1075 found a live gap — the worker exported the
+    PRE-refusal exhaustion value, so the ladder's exhaustion arm was unreachable on the very run
+    that ended the budget.
+
+    `needs` maps a `needs.<job>.outputs.<name>` expression to its value; the step's OWN `env:`
+    block supplies the wiring, so a rename or a re-point of a binding this test supplies is an
+    error rather than a silent empty string. Bindings it does not supply (the App token) are
+    empty, exactly as a skipped upstream job would leave them. `python3` is shadowed by a shell
+    function (functions beat PATH lookup), so the status is captured from the ARGUMENTS of the
+    real write call — not from a variable the body might no longer pass to it."""
+    step = next((s for s in _workflow_steps(text) if s["name"] == _FINAL_STATE_STEP), None)
+    if step is None:
+        raise WorkerIssueError(f"worker.yml has no {_FINAL_STATE_STEP!r} step")
+    bindings = {match.group("expr").strip(): match.group("name")
+                for match in _ENV_BINDING_RE.finditer(step["body"])}
+    unbound = sorted(set(needs) - set(bindings))
+    if unbound:
+        raise WorkerIssueError(f"{_FINAL_STATE_STEP!r} no longer binds {unbound}")
+    run = _RUN_BLOCK_RE.search(step["body"])
+    if run is None:
+        raise WorkerIssueError(f"{_FINAL_STATE_STEP!r} has no runnable shell body")
+    body = _GHA_INTERPOLATION_RE.sub(
+        "gha-interpolated", re.sub(r"^ {10}", "", run.group("body"), flags=re.M))
+    env = {name: str(needs.get(expr, "")) for expr, name in bindings.items()}
+    env["PATH"] = os.environ.get("PATH", "/usr/bin:/bin")
+    with tempfile.TemporaryDirectory() as tmp:
+        capture = Path(tmp) / "status-write.txt"
+        script = Path(tmp) / "final-state.sh"
+        script.write_text('python3() { printf "%s\\n" "$*" > "$SEAM_CAPTURE"; }\n' + body,
+                          encoding="utf-8")
+        env["SEAM_CAPTURE"] = str(capture)
+        result = subprocess.run(["bash", str(script)], env=env,
+                                capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            raise WorkerIssueError(f"{_FINAL_STATE_STEP!r} body failed: {result.stderr.strip()}")
+        if not capture.is_file():
+            raise WorkerIssueError(f"{_FINAL_STATE_STEP!r} never called the status writer")
+        written = capture.read_text(encoding="utf-8").split()
+    if "--status" not in written:
+        raise WorkerIssueError(f"the final-state write carries no --status: {written}")
+    return written[written.index("--status") + 1]
+
 
 def worker_refusal_seam(text):
     """[issue #1075] Findings about worker.yml's refusal-charging wiring. Pure over the workflow
@@ -2095,10 +2207,19 @@ def worker_refusal_seam(text):
     The counter change is inert without this wiring — that is the whole shape of the defect it
     fixes (a documented invariant that nothing implemented) — so the seam is asserted, not
     assumed."""
-    steps = _workflow_steps(text)
-    charge = [step for step in steps if "worker-issue.py record-refusal" in step["body"]]
-    park = [step for step in steps if '"$EXHAUSTED" == true' in step["body"]]
-    step = charge[0] if len(charge) == 1 else {"gate": "", "body": ""}
+    park = [step for step in _workflow_steps(text) if '"$EXHAUSTED" == true' in step["body"]]
+    charge, step, charge_id = _refusal_charge_step(text)
+
+    def exhausted_output(refusal, budget):
+        """What the `worker` job exports for `exhausted`, per the workflow's own expression."""
+        if not charge_id:
+            return ""
+        try:
+            return _eval_step_output_expr(
+                _worker_exhausted_expr(text), {charge_id: refusal, "budget": budget})
+        except WorkerIssueError:
+            return ""
+
     return {
         # The charging step exists, exactly once.
         "charges_refusal": len(charge) == 1,
@@ -2126,6 +2247,15 @@ def worker_refusal_seam(text):
         # `budget_used` charge. This finding pins the worker-side half; the claim-side half is
         # pinned by dispatch-claim's own #1075 seam assertion.
         "parks_when_exhausted": len(park) == 1 and bool(_PARK_ARM_RE.search(park[0]["body"])),
+        # [review round 1] ...and the arm above must be REACHABLE from a terminal refusal. The
+        # `budget` step runs BEFORE `trust`, so exporting its result alone means the terminal
+        # refusal exports exhausted=false: the run that ENDED the budget is also the one that
+        # leaves the issue in the retry frontier. The refusal's POST-charge result wins.
+        "exhaustion_follows_refusal": exhausted_output(
+            {"exhausted": "true"}, {"exhausted": "false"}) == "true",
+        # ...without discarding the budget result on the runs that never reach a refusal at all
+        # (a skipped step writes no output), which is nearly every run.
+        "exhaustion_keeps_budget": exhausted_output({}, {"exhausted": "true"}) == "true",
     }
 
 
@@ -2138,18 +2268,27 @@ def _refusal_budget_self_test():
     same issue forever (target #834: ~34 dispatches in one day, ~18% of the day's capacity).
 
     Asserted here, end to end: (1) a simulated refusal increments the durable counter; (2)
-    `max_attempts` consecutive refusals exhaust the budget, so the model is refused a launch and
-    final_state's exhaustion arm applies the machine-owned park — the deferred-retry lane's own
-    gate is dispatch-claim's budget arm, which charges the SAME `budget_used` quantity and is
-    pinned by that module's #1075 seam assertion; (3) the refusal counter and the MODEL-attempt
-    counter are distinct, not aliased
-    — including the consent surface (a refusal must not move find_maintainer_approval's staleness
-    anchor); (4) the wiring that makes (1) reachable from the workflow actually exists.
+    `max_attempts` consecutive refusals exhaust the budget, so the model is refused a launch —
+    the deferred-retry lane's own gate is dispatch-claim's budget arm, which charges the SAME
+    `budget_used` quantity and is pinned by that module's #1075 seam assertion; (3) the refusal
+    counter and the MODEL-attempt counter are distinct, not aliased — including the consent
+    surface (a refusal must not move find_maintainer_approval's staleness anchor); (4) the wiring
+    that makes (1) reachable from the workflow actually exists; (5) the TERMINAL refusal actually
+    reaches final_state's exhaustion arm.
+
+    (5) is review round 1's finding, and it is why (2) stops at "refused a launch": (2) proved
+    the budget exhausts and then ASSUMED the worker told final_state so. It did not — the
+    `exhausted` output was the `budget` step's result, and that step runs BEFORE `trust`, so the
+    run that spent the last cycle exported exhausted=false and the ladder converged it to
+    `deferred`. Nothing on the path between the two was executed, so nothing went red. (5) now
+    executes all of it: the recorder's REAL outputs, joined by worker.yml's OWN `exhausted`
+    expression, fed into worker.yml's OWN final_state shell body.
 
     MUTATION-CHECKED (the acceptance criterion): deleting the refusal charge from budget_used
-    turns (1) and (2) red, aliasing the two markers turns (3) red, and each workflow mutation
-    below turns its own seam finding red — every one of those is executed here, not asserted
-    about."""
+    turns (1) and (2) red, aliasing the two markers turns (3) red, dropping `exhausted` from the
+    recorder or re-pointing the worker output back at `budget` turns (5) red, and each workflow
+    mutation below turns its own seam finding red — every one of those is executed here, not
+    asserted about."""
     bot = "sparq[bot]"
     # --- (3) DISTINCT COUNTERS, not one counter with two names ---------------------------------
     # Substring containment either way would make one marker silently count the other's receipts.
@@ -2244,24 +2383,33 @@ def _refusal_budget_self_test():
             assert outputs(lambda: attempt_check("o/r", 834, 2, bot)) == {
                 "used": "0", "exhausted": "false"}
             # (1) ONE refusal charges exactly ONE cycle — the increment the refusal path lacked.
-            outputs(lambda: record_refusal("o/r", 834, 2, bot, "77.1", "https://run/77"))
+            # The recorder publishes the POST-charge budget state (review round 1): the `budget`
+            # step ran before `trust`, so it is the ONLY step on this path that can tell the
+            # worker job whether the cycle it just charged was the last one.
+            charged = outputs(lambda: record_refusal("o/r", 834, 2, bot, "77.1", "https://run/77"))
+            assert charged == {"used": "1", "exhausted": "false"}, charged
             assert len(posts) == 1 and f"{REFUSAL_MARKER} run=77.1 -->" in posts[0]
             assert ATTEMPT_MARKER not in posts[0]   # never masquerades as model spend
             assert outputs(lambda: attempt_check("o/r", 834, 2, bot)) == {
                 "used": "1", "exhausted": "false"}
-            # Idempotent per run key: a re-entered step re-uses its receipt, never double-charges.
-            outputs(lambda: record_refusal("o/r", 834, 2, bot, "77.1", "https://run/77"))
+            # Idempotent per run key: a re-entered step re-uses its receipt, never double-charges
+            # — and republishes the same post-charge state, so a retried step cannot un-exhaust.
+            replayed = outputs(lambda: record_refusal("o/r", 834, 2, bot, "77.1", "https://run/77"))
+            assert replayed == charged, (replayed, charged)
             assert len(posts) == 1
-            assert outputs(lambda: attempt_check("o/r", 834, 2, bot))["used"] == "1"
+            # This is the budget the LAST admitted run's `budget` step sees: N-1, not exhausted.
+            pre_charge = outputs(lambda: attempt_check("o/r", 834, 2, bot))
+            assert pre_charge == {"used": "1", "exhausted": "false"}, pre_charge
             # (2) THE BOUND: max_attempts consecutive pre-model refusals exhaust the budget...
-            outputs(lambda: record_refusal("o/r", 834, 2, bot, "78.1", "https://run/78"))
+            terminal = outputs(lambda: record_refusal("o/r", 834, 2, bot, "78.1", "https://run/78"))
+            assert terminal == {"used": "2", "exhausted": "true"}, terminal
             assert len(posts) == 2
             assert outputs(lambda: attempt_check("o/r", 834, 2, bot)) == {
                 "used": "2", "exhausted": "true"}
             # ...so the next dispatch is refused a model launch (worker.yml gates `prepare` and
-            # `model` on this, and final_state's exhaustion arm applies the machine-owned park;
-            # dispatch-claim's budget arm reads the same charge and stops re-admitting the row
-            # before a runner is ever allocated).
+            # `model` on this; dispatch-claim's budget arm reads the same charge and stops
+            # re-admitting the row before a runner is ever allocated). The park THIS run converges
+            # to is (5) below — executed, not assumed.
             try:
                 record_attempt("o/r", 834, 2, bot, "79.1")
                 raise AssertionError("a budget spent on refusals still launched the model")
@@ -2301,6 +2449,79 @@ def _refusal_budget_self_test():
     live = worker_refusal_seam(text)
     assert all(live.values()), f"worker.yml refusal wiring is incomplete: {live}"
 
+    # --- (5) TERMINAL REFUSAL -> PARK, end to end through the workflow's own expressions --------
+    # Review round 1 of #1075: (2) above proved the BUDGET exhausts, and then ASSUMED the worker
+    # told final_state about it. It did not — `exhausted` was the `budget` step's result, read
+    # before `trust` ran, so the run that spent the last cycle still exported exhausted=false and
+    # final_state fell through to `deferred`. Nothing between the two was executed, so nothing
+    # went red. This closes that gap by EXECUTION: `terminal`/`pre_charge` are the real outputs
+    # the recorder wrote above, the join is worker.yml's own `exhausted` expression, and the
+    # ladder is worker.yml's own shell body — no re-implementation anywhere on the path.
+    _, _, charge_id = _refusal_charge_step(text)
+    assert charge_id, "the refusal-charging step has no `id:` for the worker output to reference"
+    exported = _eval_step_output_expr(_worker_exhausted_expr(text),
+                                      {charge_id: terminal, "budget": pre_charge})
+
+    def converged(exhausted, source=None):
+        """final_state's status for THIS run: claimed, refused pre-model, no attempt, no PR."""
+        return _final_state_status(text if source is None else source, {
+            "needs.claim.outputs.acquired": "true",
+            "needs.worker.outputs.exhausted": exhausted,
+            "needs.worker.outputs.trust_outcome": "failure",
+            "needs.worker.outputs.attempt_number": "",
+            "needs.worker.outputs.attempt_voided": "",
+            "needs.resolve.outputs.max_attempts": "2",
+            "needs.publish.outputs.pr_url": "",
+        })
+
+    assert exported == "true", (exported, terminal, pre_charge)
+    assert converged(exported) == "parked", converged(exported)
+    # ...and the PRE-charge value the worker used to export is what converged the SAME run to
+    # `deferred`. One input differs; the defect is the difference, executed rather than described.
+    assert pre_charge["exhausted"] == "false", pre_charge
+    assert converged(pre_charge["exhausted"]) == "deferred", converged(pre_charge["exhausted"])
+
+    # The (5) harness must FAIL CLOSED on a workflow it can no longer model, or a rename quietly
+    # degrades it into a check that evaluates to "" and passes anyway. Every guard below is a line
+    # the assertions above never execute, so each one is proved REACHABLE here rather than assumed.
+    def refuses(call, fragment):
+        try:
+            call()
+        except WorkerIssueError as exc:
+            assert fragment in str(exc), (fragment, exc)
+            return
+        raise AssertionError(f"the seam harness accepted a workflow it cannot model: {fragment}")
+
+    refuses(lambda: _worker_exhausted_expr(_WORKER_EXHAUSTED_OUTPUT_RE.sub("", text, count=1)),
+            "expected exactly one")
+    refuses(lambda: _eval_step_output_expr("github.event_name", {}), "unmodelled operand")
+    refuses(lambda: converged("true", text.replace(_FINAL_STATE_STEP, "Renamed step", 1)),
+            "has no")
+    # The arm stops reading the worker's exhaustion output at all: caught by the binding check...
+    refuses(lambda: converged("true", text.replace("needs.worker.outputs.exhausted",
+                                                   "needs.worker.outputs.exhausted_x", 1)),
+            "no longer binds")
+    # ...and the env var alone renamed is caught by the body's own `set -u`, which is why this
+    # harness runs the shell instead of paraphrasing it.
+    refuses(lambda: converged("true", text.replace("          EXHAUSTED: ",
+                                                   "          EXHAUSTION: ", 1)),
+            "EXHAUSTED: unbound variable")
+    # The writer call dropped. Mutated INSIDE the step's own body: that command line occurs twice
+    # in worker.yml, and a whole-file replace silently hits the other one (AGENTS.md mutation
+    # hygiene — mutate by line and verify the tree actually changed).
+    final_step = next(s for s in _workflow_steps(text) if s["name"] == _FINAL_STATE_STEP)
+    writer_line = "          python3 registry/scripts/worker-issue.py status \\\n"
+    no_writer = text.replace(
+        final_step["body"], final_step["body"].replace(writer_line, "            true \\\n", 1))
+    assert no_writer != text, "the missing-writer mutation no longer applies to worker.yml"
+    refuses(lambda: converged("true", no_writer), "never called the status writer")
+    # ...and a binding re-pointed at something that is not a step output at all must make the seam
+    # finding FALSE, never accidentally satisfy it.
+    unmodelled = _WORKER_EXHAUSTED_OUTPUT_RE.sub(
+        "      exhausted: ${{ github.event_name }}", text, count=1)
+    assert unmodelled != text
+    assert worker_refusal_seam(unmodelled)["exhaustion_follows_refusal"] is False
+
     charge_step = next(step for step in _workflow_steps(text)
                        if "worker-issue.py record-refusal" in step["body"])
     mutants = {
@@ -2330,11 +2551,40 @@ def _refusal_budget_self_test():
         # issue in the very label the deferred-retry lane re-admits on.
         "parks_when_exhausted": _PARK_ARM_RE.sub(
             lambda match: match.group(0)[:-len("parked")] + "deferred", text, count=1),
+        # The binding reverted to the PRE-refusal value — the exact defect review round 1 found.
+        "exhaustion_follows_refusal": text.replace(
+            "exhausted: ${{ steps.refusal.outputs.exhausted "
+            "|| steps.budget.outputs.exhausted }}",
+            "exhausted: ${{ steps.budget.outputs.exhausted }}"),
+        # ...and the opposite over-correction: the budget fallback dropped, so every run that
+        # never reached a refusal (the overwhelming majority) exports an empty exhaustion value
+        # and a genuinely exhausted budget stops parking at all.
+        "exhaustion_keeps_budget": text.replace(
+            "exhausted: ${{ steps.refusal.outputs.exhausted "
+            "|| steps.budget.outputs.exhausted }}",
+            "exhausted: ${{ steps.refusal.outputs.exhausted }}"),
     }
     for finding, mutated in mutants.items():
         assert mutated != text, f"the {finding} mutation no longer applies to worker.yml"
         broken = worker_refusal_seam(mutated)
         assert broken[finding] is False, f"the {finding} seam check survived its own mutation"
+    # The two workflow mutants that break the terminal-refusal -> park path must ALSO be caught by
+    # the executed (5) join, not only by the structural findings above: run each through the same
+    # expression + shell body and require the convergence to stop being `parked`.
+    for finding in ("exhaustion_follows_refusal", "parks_when_exhausted"):
+        mutated = mutants[finding]
+        stale = _eval_step_output_expr(_worker_exhausted_expr(mutated),
+                                       {charge_id: terminal, "budget": pre_charge})
+        status = _final_state_status(mutated, {
+            "needs.claim.outputs.acquired": "true",
+            "needs.worker.outputs.exhausted": stale,
+            "needs.worker.outputs.trust_outcome": "failure",
+            "needs.worker.outputs.attempt_number": "",
+            "needs.worker.outputs.attempt_voided": "",
+            "needs.resolve.outputs.max_attempts": "2",
+            "needs.publish.outputs.pr_url": "",
+        })
+        assert status != "parked", f"the {finding} mutation still parked the terminal refusal"
 
 
 def _followup_label_self_test():
