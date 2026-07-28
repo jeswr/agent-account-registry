@@ -44,6 +44,18 @@ ATTEMPT_RE = re.compile(
     r"<!-- conflict-resolver attempt=([1-9][0-9]*) head=([0-9a-f]{40}) -->"
 )
 ESCALATION_MARKER = "<!-- conflict-resolver escalated -->"
+# --- THE TWO ESCALATION EXITS, named ------------------------------------------------------------
+# `_escalate` used to post ONE hard-coded body for BOTH of them, so a grace-window TIMEOUT was
+# reported to the reader as "two distinct-head conflict attempts". MEASURED on the live registry
+# 2026-07-28: of the 10 conflicting PRs holding a machine-applied `needs:user` from this program,
+# exactly ONE (#685) had two attempt markers; the other NINE had one and came through the
+# grace-window branch. The body asserted a specific fact that was false in 9 of 10 cases.
+#
+# The exits differ in KIND, not merely in wording, which is why they are constants and not a
+# boolean: two distinct heads failing to converge is a genuine human question, while a window
+# elapsing is a TIMEOUT — and a timeout is not a human question (registry #769).
+EXIT_TWO_HEAD = "two-distinct-heads"
+EXIT_STUCK_GRACE = "stuck-grace"
 SAFE_REPO = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*")
 SAFE_BRANCH = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*")
 SAFE_SHA = re.compile(r"[0-9a-f]{40}")
@@ -57,6 +69,18 @@ DEFAULT_REBASE_CAP = 5
 # escalates exactly as a second failed attempt would. It is a grace period for the author to push
 # a fix, not a hold.
 DEFAULT_STUCK_GRACE_HOURS = 6.0
+# The CLOSED cause taxonomy of the grace-window park, and the automatic re-admission cap.
+#
+# One cause today, spelled out rather than implied, because `stuck_park_cause_recovered` refuses
+# any token it does not recognise: a cause we cannot check is a cause we cannot prove recovered,
+# and guessing there turns a bounded exit into an unbounded retry (groom's rule, same words).
+STUCK_PARK_CAUSE = "head-unmoved"
+# At most this many AUTOMATIC re-admissions may ever be granted to one PR by the grace-window
+# exit, and the cap is enforced ONCE, at park time (stuck_park_label): a park in generation
+# N > STUCK_UNPARK_MAX is written in the HUMAN class outright, so the exit phase can never see an
+# over-cap park. A PR that keeps re-entering the same stuck state is not a timeout, it is a flap,
+# and "this recurred N times" is a genuinely different question to put to a human.
+STUCK_UNPARK_MAX = 2
 # A conflicting PR that is neither parked by a hard label nor repairable nor escalatable is in a
 # state with NO exit. That is a defect in this program, not a property of the fleet, so the run
 # FAILS on it. It is self-clearing: the grace-window escalation drains the population into the
@@ -126,6 +150,20 @@ def _load_helper(name, filename):
 # Shared park-label policy: the terminal needs:user write consults the sticky human-unpark
 # veto before every application (park_policy.py).
 _park_policy = _load_helper("registry_park_policy", "park_policy.py")
+
+# The two park LABELS and the two durable receipt markers of the grace-window exit. All four
+# spellings are park_policy's, never literals here: dispatch-claim's automatic re-admission sweep
+# READS the park receipt in order to leave this episode alone (park_policy.
+# CAUSE_GATED_PARK_OWNERS), and a hand-copied literal in either entry point is a spelling that can
+# drift silently from the other's — the failure being not a crash but a sweep that quietly stops
+# recognising the class it was written to skip.
+MACHINE_PARK_LABEL = _park_policy.MACHINE_PARK_PR_LABEL
+HUMAN_PARK_LABEL = _park_policy.HUMAN_PARK_LABEL
+STUCK_PARK_MARKER = _park_policy.CONFLICT_STUCK_PARK_MARKER
+STUCK_UNPARK_MARKER = _park_policy.CONFLICT_STUCK_UNPARK_MARKER
+STUCK_RECEIPT_RE = re.compile(
+    r"cause=(?P<cause>[a-z-]{1,40}) head=(?P<head>[0-9a-f]{40}) gen=(?P<gen>[1-9][0-9]{0,3}) -->"
+)
 
 
 def _is_human_maintainer(api, repo, login):
@@ -257,6 +295,18 @@ class GitHubAPI:
             "POST", f"/repos/{repo}/issues/{number}/labels", {"labels": [label]}
         )
 
+    def remove_label(self, repo, number, label):
+        """DELETE one label. 404 means it is already gone, which is the state this call wants."""
+        try:
+            return self.request(
+                "DELETE",
+                f"/repos/{repo}/issues/{number}/labels/{quote(label, safe='')}",
+            )
+        except ResolverError as exc:
+            if "HTTP 404" in str(exc):
+                return {}
+            raise
+
     def app_identity(self, bot_slug):
         login = f"{bot_slug}[bot]"
         user = self.request("GET", f"/users/{quote(login, safe='[]')}")
@@ -359,6 +409,204 @@ def prior_conflicting_files(comments, bot_login):
             if isinstance(path, str) and path not in files:
                 files.append(path)
     return tuple(files)
+
+
+# --- the grace-window park: class, receipts, and the CAUSE-GATED exit -------------------------
+#
+# registry #769 in one sentence: a clock must not decide an outcome. The grace window may decide
+# WHEN to stop waiting — that is what a grace period is — but it may not decide WHAT the stop
+# means, and it may certainly not be the evidence that ENDS the resulting hold. Everything below
+# is shaped after groom's age-park primitives (age_park_label / age_receipts /
+# age_park_generation / age_unpark_state / age_park_cause_recovered) for exactly that reason.
+
+
+def stuck_park_label(generation):
+    """The park label the grace-window exit must write — the ONE place its class is decided.
+
+    MACHINE (`review:parked`) while the PR is within its automatic re-admission cap; HUMAN
+    (`needs:user`) past it, which is a flap rather than a timeout. There is no unmapped-cause
+    branch here as there is in groom's `age_park_label`: this exit derives exactly one cause and
+    that cause has a recovery predicate, so the cap is the only way out of the machine class."""
+    return HUMAN_PARK_LABEL if generation > STUCK_UNPARK_MAX else MACHINE_PARK_LABEL
+
+
+def stuck_receipts(comments, bot_login, marker):
+    """Well-formed BOT-AUTHORED grace-window receipts of one kind, oldest-first.
+
+    Trust filter first, as everywhere else in this file: a receipt any other actor could author is
+    not a durable record of what THIS program did. A malformed receipt is dropped here but still
+    counted by ``stuck_park_generation``, so a corrupt receipt can never buy an extra automatic
+    re-admission."""
+    found = []
+    if not bot_login:
+        return found
+    for comment in _self_authored_comments(comments, bot_login):
+        body = comment.get("body")
+        if not isinstance(body, str):
+            continue
+        index = body.find(marker)
+        if index < 0:
+            continue
+        match = STUCK_RECEIPT_RE.match(body[index + len(marker):].lstrip())
+        if match is None:
+            continue
+        found.append({"cause": match.group("cause"), "head": match.group("head"),
+                      "gen": int(match.group("gen"))})
+    return found
+
+
+def stuck_park_generation(comments, bot_login):
+    """The generation a NEW grace-window park would occupy: one past every park receipt already on
+    record, CLAMPED at STUCK_UNPARK_MAX + 1.
+
+    Counts MARKERS, not well-formed records. The clamp is what makes the terminal terminal: without
+    it every later sweep of an already-escalated PR mints a higher generation whose receipt no
+    earlier one matches, so the escalation comment is re-posted forever on a PR already handed to a
+    human."""
+    if not bot_login:
+        return 1
+    return min(
+        STUCK_UNPARK_MAX + 1,
+        1 + sum(STUCK_PARK_MARKER in body
+                for body in _comment_bodies(_self_authored_comments(comments, bot_login))),
+    )
+
+
+def stuck_unpark_state(comments, bot_login):
+    """``(park_receipt, grant_receipt)`` for the newest grace-window park on record.
+
+    ``park_receipt`` is None when this is not a park of ours, or when the park is OVER THE CAP
+    (generation > STUCK_UNPARK_MAX) — an over-cap park was written in the HUMAN class by
+    ``stuck_park_label`` and must never be automatically re-admitted, so the exit phase must not
+    even consider it.
+
+    ``grant_receipt`` is the un-park receipt carrying the SAME (cause, head, gen) triple, or None
+    when the recovery is still unconsumed. That triple is the CONSUME-EXACTLY-ONCE key: one
+    recovery can never be re-earned, and a further re-admission requires a NEW park at a new
+    fingerprint.
+
+    The two are returned separately rather than collapsed into "owed or not" because granted +
+    label-still-live is a distinct state from granted + label-gone. Receipt-first ordering makes
+    the former the only crash residue possible, and collapsing it strands the PR under
+    `review:parked` forever — one HTTP transient on the DELETE is enough to reach it."""
+    parks = stuck_receipts(comments, bot_login, STUCK_PARK_MARKER)
+    if not parks:
+        return None, None
+    latest = parks[-1]
+    if latest["gen"] > STUCK_UNPARK_MAX:
+        return None, None
+    key = (latest["cause"], latest["head"], latest["gen"])
+    for grant in stuck_receipts(comments, bot_login, STUCK_UNPARK_MARKER):
+        if (grant["cause"], grant["head"], grant["gen"]) == key:
+            return latest, grant
+    return latest, None
+
+
+def stuck_park_cause_recovered(cause, detail, parked_head):
+    """Has THIS park's OWN cause provably recovered? Returns ``(recovered, why)``.
+
+    THE EXIT IS GATED ON THE CAUSE, NEVER ON ELAPSED TIME. Re-introducing a timer here would
+    rebuild precisely what registry #769 removed: an age park whose only clearing evidence is more
+    age is its own recovery proof, which is not a proof at all.
+
+    The cause is `head-unmoved` — one recorded conflict attempt, on a head nobody has pushed to,
+    against a base this program could not mechanically rebase onto. Two facts refute it, and each
+    is independently sufficient:
+
+      * THE HEAD MOVED. `detail`'s live head SHA differs from the one the receipt was minted
+        against, i.e. the author did the thing the grace window was waiting for. The attempt
+        markers are keyed by head, so the very next sweep performs a FRESH mechanical rebase.
+      * THE CONFLICT RESOLVED. The PR is no longer `mergeable is False` (somebody merged, rebased
+        or retargeted it). There is nothing left to park for.
+
+    DELIBERATELY NOT ACCEPTED: "the base advanced". It is a real change in the world and it is
+    machine-checkable, but it grants this program NO NEW ACTION — the attempt marker for the
+    unmoved head still short-circuits every later sweep before any rebase is attempted, so a
+    base-advance exit would clear the label, re-derive the identical stuck state on the next tick,
+    and burn a generation each time. On a fast-moving default branch that spends the whole
+    re-admission cap within a few ticks and lands the PR in the human terminal SOONER than doing
+    nothing. An exit that grants no new attempt is a churn generator, not an exit.
+
+    THE CONTINGENCY THAT EXCLUSION STANDS ON, written down rather than left implicit: it is sound
+    ONLY BECAUSE the attempt marker is keyed by HEAD, so an unmoved head short-circuits every
+    later sweep before any rebase is attempted. A base advance can genuinely turn a conflict
+    clean, so if this program ever learns to retry a mechanical rebase when the BASE moves — key
+    the marker by (head, base), say — then a base advance WOULD grant a new action and this
+    exclusion becomes wrong and must be revisited here. That is a property of the marker's key,
+    not of this predicate, which is exactly why it is recorded at the predicate that depends on
+    it.
+
+    Every ambiguity fails toward STAYING PARKED: a malformed live head, a missing mergeability
+    field, and an unrecognised cause token all return False."""
+    if cause != STUCK_PARK_CAUSE:
+        return False, f"cause {cause!r} has no recovery predicate — never auto-re-admitted"
+    live_head = str(((detail or {}).get("head") or {}).get("sha", ""))
+    if SAFE_SHA.fullmatch(live_head) is None:
+        return False, "the live head SHA is malformed, so the head cannot be proven to have moved"
+    if live_head != parked_head:
+        return True, (f"the head moved from {parked_head[:12]} to {live_head[:12]} — the author "
+                      "pushed, and the next sweep rebases the new head")
+    if (detail or {}).get("mergeable") is not False:
+        return True, "the PR is no longer conflicting with its base"
+    return False, (f"the head is still {parked_head[:12]} and the base is still conflicting — "
+                   "nothing this program can act on has changed")
+
+
+def stuck_receipt(marker, head, generation):
+    """One durable grace-window receipt. The (cause, head, gen) triple is the consume-once key."""
+    return f"{marker} cause={STUCK_PARK_CAUSE} head={head} gen={generation} -->"
+
+
+def escalation_body(exit_kind, conflicts, attempts, park_label, receipt="", generation=None,
+                    grants=0):
+    """The comment body for ONE exit — the single place the escalation wording is decided.
+
+    THE DEFECT THIS CLOSES. One hard-coded body served both exits, so a grace-window timeout told
+    its reader "automatic rebase stopped after two distinct-head conflict attempts". That is not
+    vague, it is FALSE: nine of the ten live cases had exactly one attempt marker. Whoever reads
+    it — a maintainer, or a machine keying on the prose (park_policy.LEGACY_PARK_PROSE reads
+    exactly these sentences) — is told the resolver tried twice on different heads when it tried
+    once and then waited.
+
+    So the body is DERIVED from the exit and the counts actually observed, and an unknown exit
+    kind raises rather than falling through to a default sentence — an unrepresentable body must
+    fail LOUD at the writer, exactly as `park_policy.park_reason_marker` refuses an unknown cause.
+
+    `grants` is READ from the un-park receipts, never inferred from the generation (registry #769,
+    same finding): a generation is consumed by every re-park however the label was cleared, so
+    "generation 3" does not imply "the machine granted 2 re-admissions", and telling a maintainer
+    it did sends them hunting a flap that never happened."""
+    if exit_kind == EXIT_TWO_HEAD:
+        lead = (
+            f"automatic rebase stopped after {attempts} distinct-head conflict attempts "
+            "(the two-distinct-head exhaustion exit). The machine tried on more than one head "
+            "and cannot converge, so human resolution is required; no semantic resolution was "
+            "guessed."
+        )
+    elif exit_kind != EXIT_STUCK_GRACE:
+        raise ResolverError(f"unknown conflict-resolver escalation exit {exit_kind!r}")
+    elif park_label == MACHINE_PARK_LABEL:
+        lead = (
+            f"automatic rebase is holding after {attempts} conflict attempt(s) on an UNMOVED "
+            "head: the author grace window elapsed with no new push (the stuck-attempt "
+            "grace-window exit). A timeout is not a human question, so this is the MACHINE-owned "
+            f"`{MACHINE_PARK_LABEL}` soft hold and NOT a request for human resolution. It clears "
+            "itself, with no action from you, as soon as the head moves or the conflict resolves."
+        )
+    else:
+        lead = (
+            f"automatic rebase escalated at grace-window park generation {generation} "
+            f"(cap {STUCK_UNPARK_MAX}), with {attempts} conflict attempt(s) recorded and "
+            f"{grants} automatic re-admission(s) on record (the stuck-attempt grace-window exit, "
+            "past its automatic re-admission cap). This PR keeps re-entering the same stuck "
+            "state, so a repeated failure — not a timeout, and not two distinct heads — is what "
+            "is being escalated."
+        )
+    listed = "\n".join(f"- `{json.dumps(path)}`" for path in conflicts)
+    return (
+        f"> 🤖 SPARQ agent — {lead}\n\nConflicting files:\n"
+        f"{listed or '- `(Git did not report a path)`'}\n\n{receipt}"
+    )
 
 
 def owned_by_review_rebase_lane(pr, repo, claim):
@@ -594,6 +842,22 @@ class RepoCensus:
     attempted: int = 0
     resolved: int = 0
     escalated: int = 0
+    # --- PER-EXIT ACCOUNTING ------------------------------------------------------------------
+    # `escalated` alone cannot say WHICH exit an escalation took, and the two exits being
+    # indistinguishable in the output is why a timeout was reported as exhausted iteration for as
+    # long as it was: every run said "escalated=N" and nothing said "N of them were timeouts".
+    # These four split it two ways — by EXIT (which branch fired) and by CLASS (which label was
+    # written) — because the cap makes them independent: a grace-window exit past
+    # STUCK_UNPARK_MAX writes the human terminal, so exit alone no longer implies class.
+    # `exit_two_head + exit_stuck_grace == parked_machine + parked_human == escalated` in every
+    # run, which is the arithmetic that makes a silently-added third exit visible.
+    exit_two_head: int = 0
+    exit_stuck_grace: int = 0
+    parked_machine: int = 0
+    parked_human: int = 0
+    # The machine exit actually firing, and the population still waiting on it.
+    stuck_readmitted: int = 0
+    stuck_park_stands: int = 0
     awaiting_author: int = 0
     no_exit: int = 0
     errors: int = 0
@@ -613,6 +877,12 @@ class RepoCensus:
             "attempted": self.attempted,
             "resolved": self.resolved,
             "escalated": self.escalated,
+            "exit_two_head": self.exit_two_head,
+            "exit_stuck_grace": self.exit_stuck_grace,
+            "parked_machine": self.parked_machine,
+            "parked_human": self.parked_human,
+            "stuck_readmitted": self.stuck_readmitted,
+            "stuck_park_stands": self.stuck_park_stands,
             "awaiting_author": self.awaiting_author,
             "no_exit": self.no_exit,
             "errors": self.errors,
@@ -624,8 +894,9 @@ def _aggregate_census(rows):
     total = {
         key: sum(row[key] for row in rows)
         for key in ("considered", "conflicting", "conflicting_draft", "conflicting_ready",
-                    "selected", "attempted", "resolved", "escalated", "awaiting_author",
-                    "no_exit", "errors")
+                    "selected", "attempted", "resolved", "escalated", "exit_two_head",
+                    "exit_stuck_grace", "parked_machine", "parked_human", "stuck_readmitted",
+                    "stuck_park_stands", "awaiting_author", "no_exit", "errors")
     }
     skipped = {}
     for row in rows:
@@ -642,14 +913,19 @@ def render_census_summary(rows, total):
         "### conflict-resolver census",
         "",
         "| repo | considered | conflicting (ready/draft) | attempted | resolved | escalated "
-        "| awaiting author | no exit | errors |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| exit: 2-head | exit: stuck-grace | park: machine | park: human | re-admitted "
+        "| park stands | awaiting author | no exit | errors |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: "
+        "| ---: | ---: | ---: |",
     ]
     for row in [*rows, {**total, "repo": f"**all {total['repos']} repo(s)**"}]:
         lines.append(
             f"| {row['repo']} | {row['considered']} | "
             f"{row['conflicting']} ({row['conflicting_ready']}/{row['conflicting_draft']}) | "
             f"{row['attempted']} | {row['resolved']} | {row['escalated']} | "
+            f"{row['exit_two_head']} | {row['exit_stuck_grace']} | "
+            f"{row['parked_machine']} | {row['parked_human']} | "
+            f"{row['stuck_readmitted']} | {row['stuck_park_stands']} | "
             f"{row['awaiting_author']} | {row['no_exit']} | {row['errors']} |"
         )
     if total["skipped"]:
@@ -729,45 +1005,187 @@ class ConflictResolver:
         if self.apply:
             self.api.comment(repo, number, body)
 
-    def _escalate(self, repo, pr, comments, conflicts):
+    def _count_exit(self, exit_kind, park_label):
+        """Record ONE escalation against both of its axes — which exit fired, and which class it
+        wrote. An unknown exit kind raises rather than defaulting into a bucket: a silently added
+        third exit that quietly counted as one of these two is precisely the invisibility this
+        census exists to remove."""
+        if exit_kind == EXIT_TWO_HEAD:
+            self.current.exit_two_head += 1
+        elif exit_kind == EXIT_STUCK_GRACE:
+            self.current.exit_stuck_grace += 1
+        else:
+            raise ResolverError(f"unknown conflict-resolver escalation exit {exit_kind!r}")
+        if park_label == MACHINE_PARK_LABEL:
+            self.current.parked_machine += 1
+        else:
+            self.current.parked_human += 1
+        self.current.escalated += 1
+
+    def _apply_park_label(self, repo, number, park_label, exit_kind, conflicts):
+        """Write the park label, honouring the sticky human-unpark veto (park_policy.py defect 2):
+        a human who removed THIS label more recently than any application is never overridden, and
+        an unreadable timeline never parks. The veto is checked against the label ACTUALLY being
+        written, so the machine class is veto-gated exactly as the human class always was."""
+        if self.apply:
+            if _park_policy.park_vetoed(
+                    repo, number, park_label,
+                    lambda r, n: self.api.timeline(r, n),
+                    is_human=lambda login: _is_human_maintainer(self.api, repo, login)):
+                self._record(f"{park_label}-suppressed", repo, number,
+                             "sticky human unpark (or unreadable timeline)")
+                # A human who un-parked this PR OWNS it: the exit is theirs, not a missing one.
+                self._count_exit(exit_kind, park_label)
+                return False
+            self.api.add_label(repo, number, park_label)
+        self._count_exit(exit_kind, park_label)
+        self._record(park_label, repo, number, ", ".join(conflicts))
+        return True
+
+    def _escalate_two_head(self, repo, pr, comments, conflicts):
+        """THE TWO-DISTINCT-HEAD EXHAUSTION EXIT — and the ONLY exit that keeps `needs:user`.
+
+        The machine attempted a mechanical rebase on more than one head and could not converge.
+        That is a genuine human question, so the human terminal is the right class and nothing
+        about it changes here."""
         number = pr["number"]
         bodies = _comment_bodies(_self_authored_comments(comments, self.bot_login))
         if not any(ESCALATION_MARKER in body for body in bodies):
-            listed = "\n".join(f"- `{json.dumps(path)}`" for path in conflicts)
-            body = (
-                "> 🤖 SPARQ agent — automatic rebase stopped after two distinct-head "
-                "conflict attempts. Human resolution is required; no semantic resolution "
-                "was guessed.\n\nConflicting files:\n"
-                f"{listed or '- `(Git did not report a path)`'}\n\n{ESCALATION_MARKER}"
-            )
-            self._post(repo, number, body)
+            self._post(repo, number, escalation_body(
+                EXIT_TWO_HEAD, conflicts, len(attempt_heads(comments, self.bot_login)),
+                HUMAN_PARK_LABEL, receipt=ESCALATION_MARKER))
         # Label last: if either mutation is interrupted, the next tick still sees an
         # unheld PR and converges the missing mutation without duplicating the loud marker.
-        # This park stays needs:user — an unresolvable merge conflict is a genuine human
-        # question — but the sticky human-unpark veto (park_policy.py defect 2) still applies:
-        # a human who removed the label more recently than any application is never overridden,
-        # and an unreadable timeline never parks.
+        self._apply_park_label(repo, number, HUMAN_PARK_LABEL, EXIT_TWO_HEAD, conflicts)
+
+    def _escalate_stuck(self, repo, pr, comments, conflicts):
+        """THE GRACE-WINDOW EXIT — a TIMEOUT, which takes the MACHINE class (registry #769).
+
+        One recorded attempt, a head nobody pushed to, and a window that elapsed. Nothing here is
+        a question anyone can answer: the machine tried ONCE and then waited. So this writes
+        park_policy's machine-owned soft hold and mints the durable receipt whose (cause, head,
+        gen) triple `_stuck_park_phase` clears on PROVEN CAUSE RECOVERY. The human terminal is
+        reached only past STUCK_UNPARK_MAX — a flap, which is a different question.
+
+        THE VETO IS CHECKED BEFORE THE COMMENT here, unlike the two-head exit above, and the
+        asymmetry is deliberate rather than an oversight: that exit's comment is deduped
+        once-ever on ESCALATION_MARKER and so can never repeat, while this one is deduped per
+        GENERATION (it must be, or generation 2 is invisible and the cap is unreachable). Posting
+        first would therefore mint a receipt for a park the veto then refuses to apply, spend a
+        generation on it, and re-comment on the next tick — spamming a PR a human explicitly
+        un-parked. groom's age hand-off checks the veto first for the same reason."""
+        number = pr["number"]
+        head = str((pr.get("head") or {}).get("sha", ""))
+        if SAFE_SHA.fullmatch(head) is None:
+            raise ResolverError(f"PR head SHA is malformed for {repo}#{number}")
+        generation = stuck_park_generation(comments, self.bot_login)
+        park_label = stuck_park_label(generation)
+        receipt = stuck_receipt(STUCK_PARK_MARKER, head, generation)
+        if self.apply and _park_policy.park_vetoed(
+                repo, number, park_label,
+                lambda r, n: self.api.timeline(r, n),
+                is_human=lambda login: _is_human_maintainer(self.api, repo, login)):
+            self._record(f"{park_label}-suppressed", repo, number,
+                         "sticky human unpark (or unreadable timeline)")
+            self._count_exit(EXIT_STUCK_GRACE, park_label)
+            return
+        bodies = _comment_bodies(_self_authored_comments(comments, self.bot_login))
+        # A MACHINE park dedupes on its own receipt FINGERPRINT, not on "any escalation comment
+        # ever": a PR that machine-parked, provably recovered, was re-admitted and then parked
+        # AGAIN must mint a NEW receipt — otherwise generation 2 is invisible, the cap is never
+        # reached, and the escalation to the human class never happens.
+        if not any(receipt in body for body in bodies):
+            self._post(repo, number, escalation_body(
+                EXIT_STUCK_GRACE, conflicts, len(attempt_heads(comments, self.bot_login)),
+                park_label,
+                receipt=(receipt if park_label == MACHINE_PARK_LABEL
+                         else f"{ESCALATION_MARKER}\n{receipt}"),
+                generation=generation,
+                # READ, never inferred from the generation: a generation is consumed by every
+                # re-park however the label was cleared, so telling a maintainer the machine
+                # already granted N re-admissions when the record shows none sends them hunting a
+                # flap that never happened (registry #769, same finding).
+                grants=len(stuck_receipts(comments, self.bot_login, STUCK_UNPARK_MARKER))))
+        self._apply_park_label(repo, number, park_label, EXIT_STUCK_GRACE, conflicts)
+
+    def _clear_stuck_park(self, repo, number):
         if self.apply:
-            if _park_policy.park_vetoed(
-                    repo, number, "needs:user",
-                    lambda r, n: self.api.timeline(r, n),
-                    is_human=lambda login: _is_human_maintainer(self.api, repo, login)):
-                self._record("needs:user-suppressed", repo, number,
-                             "sticky human unpark (or unreadable timeline)")
-                # A human who un-parked this PR OWNS it: the exit is theirs, not a missing one.
-                self.current.escalated += 1
-                return
-            self.api.add_label(repo, number, "needs:user")
-        self.current.escalated += 1
-        self._record("needs:user", repo, number, ", ".join(conflicts))
+            self.api.remove_label(repo, number, MACHINE_PARK_LABEL)
+
+    def _stuck_park_phase(self, repo, number, detail):
+        """THE MACHINE EXIT of the grace-window park. Returns ``(status, detail)`` where status is
+        ``"none"`` (no live park of ours), ``"cleared"`` or ``"stands"``.
+
+        CAUSE-GATED, NEVER TIMED. `stuck_park_cause_recovered` reads the live PR: the head moving
+        or the conflict resolving clears the park, and nothing else does. No branch here consults
+        a clock, and that is the whole point of the class split — a hold whose only exit is more
+        elapsed time is the human terminal wearing a machine label.
+
+        RECEIPT-FIRST (#610's ordering): the un-park receipt is posted BEFORE the label is
+        removed, so a crash between them leaves receipt-with-label — which the `grant is not None`
+        branch converges on the next tick — never label-without-receipt, which would erase the
+        re-admission from the durable record and let the same recovery be earned twice.
+
+        EPISODE BINDING. `review:parked` is a shared multi-writer label, so its presence proves
+        only that SOMEONE parked this PR. `stuck_unpark_state` answers None unless one of THIS
+        program's own bot-authored park receipts is on record, so another mechanism's park is
+        never cleared here — and, symmetrically, park_policy.CAUSE_GATED_PARK_OWNERS makes this
+        park ineligible for dispatch-claim's sustained-fleet-health heuristic, whose only
+        condition this class could ever satisfy is being old enough.
+
+        A HUMAN-OWNED HOLD OUTRANKS THIS PHASE ENTIRELY (park_policy.human_owned_holds — the ONE
+        rule, shared with capacity_park_admission's own refusal rather than re-derived). A PR
+        wearing `needs:user` or `review:needs-user` alongside our machine park is a PR a human has
+        taken, and no automatic path may act on it: this program's remit is its OWN park, not the
+        maintainer's queue. It is also what keeps this change strictly forward-looking — the ten
+        live PRs holding a machine-applied `needs:user` are untouched by construction, because
+        they carry no receipt of ours AND they carry a human-owned hold."""
+        labels = _label_names(detail)
+        if MACHINE_PARK_LABEL not in labels:
+            return "none", ""
+        holds = _park_policy.human_owned_holds(labels)
+        if holds:
+            return "none", ""
+        comments = self.api.comments(repo, number)
+        park, grant = stuck_unpark_state(comments, self.bot_login)
+        if park is None:
+            # Not our episode, or a park already past the cap (which was written in the HUMAN
+            # class and must never be automatically re-admitted). Either way: leave it alone.
+            return "none", ""
+        if grant is not None:
+            self._clear_stuck_park(repo, number)
+            self._record("stuck-park-converged", repo, number,
+                         f"gen={park['gen']} head={park['head']}")
+            self.current.stuck_readmitted += 1
+            return "cleared", "converging an already-receipted re-admission"
+        recovered, why = stuck_park_cause_recovered(park["cause"], detail, park["head"])
+        if not recovered:
+            self.current.stuck_park_stands += 1
+            return "stands", why
+        self._post(repo, number, (
+            "> 🤖 SPARQ agent — the machine-owned grace-window park on this PR is cleared: "
+            f"{why}. This is the CAUSE-GATED exit, not a timer — no amount of further waiting "
+            "would have cleared it.\n\n"
+            f"{stuck_receipt(STUCK_UNPARK_MARKER, park['head'], park['gen'])}"))
+        self._clear_stuck_park(repo, number)
+        self._record("stuck-park-readmitted", repo, number, why)
+        self.current.stuck_readmitted += 1
+        return "cleared", why
 
     def _handle_conflict(self, repo, pr, conflicts, comments):
         number = pr["number"]
         head = (pr.get("head") or {}).get("sha", "")
         heads = attempt_heads(comments, self.bot_login)
         if head in heads:
+            # PRE-EXISTING DEAD BRANCH, and stated here so the next mutation sweep does not
+            # re-flag it as an uncovered call site. `_handle_conflict` is reached ONLY from
+            # `_process_pr`'s rebase leg, which every `head_sha in heads` branch returns before —
+            # so by construction `head` is never already in `heads` here, and a `raise` in this
+            # arm leaves the whole self-test suite green. It is defensive residue that predates
+            # this change; deleting it is a separate, behaviour-touching decision and is not
+            # folded into a PR whose remit is the class split.
             if len(heads) >= 2:
-                self._escalate(repo, pr, comments, conflicts)
+                self._escalate_two_head(repo, pr, comments, conflicts)
             else:
                 self._skip(repo, number, "this head already has a recorded conflict attempt",
                            "duplicate-attempt-this-run")
@@ -786,7 +1204,7 @@ class ConflictResolver:
         if len(heads) >= 2:
             # Include the just-posted marker for exact-once convergence within this run.
             synthetic = comments + [{"body": marker, "user": {"login": self.bot_login}}]
-            self._escalate(repo, pr, synthetic, conflicts)
+            self._escalate_two_head(repo, pr, synthetic, conflicts)
 
     def _process_pr(self, repo, default_branch, listed_pr):
         number = listed_pr.get("number")
@@ -797,6 +1215,13 @@ class ConflictResolver:
         detail = self.snapshot.resolve_mergeable_detail(self.api.fetch, detail_url)
         if not isinstance(detail, dict):
             raise ResolverError(f"PR detail is malformed for {repo}#{number}")
+        # THE MACHINE EXIT runs FIRST, before the mergeability classification, because one of the
+        # two recovery facts is "the PR is no longer conflicting" — evaluating it after the
+        # `not-conflicting` return would leave the park live on a PR with nothing left to park
+        # for. It performs its own writes and returns a verdict; the SHORT-CIRCUIT is applied
+        # below, after the conflicting/draft counting, so a standing park is still counted in the
+        # population it belongs to.
+        stuck_status, stuck_detail = self._stuck_park_phase(repo, number, detail)
         mergeable = detail.get("mergeable")
         if mergeable is not False:
             if mergeable is None:
@@ -808,6 +1233,12 @@ class ConflictResolver:
         self.current.conflicting += 1
         if detail.get("draft") is True:
             self.current.conflicting_draft += 1
+        if stuck_status == "stands":
+            # NOT a no-exit: this PR is held by a park whose exit is proven cause recovery, and
+            # the census says so by name every tick (`stuck_park_stands`).
+            self._skip(repo, number,
+                       f"grace-window machine park stands: {stuck_detail}", "stuck-park-stands")
+            return
         labels = _label_names(detail)
         holds = sorted(labels & HARD_EXCLUDE_LABELS)
         if holds:
@@ -861,14 +1292,18 @@ class ConflictResolver:
         heads = [attempted for attempted, _ in records]
         if head_sha in heads:
             if len(heads) >= 2:
-                self._escalate(
+                self._escalate_two_head(
                     repo, detail, comments, prior_conflicting_files(comments, self.bot_login)
                 )
                 return
-            # THE MACHINE EXIT (issue #753). One attempt, head unmoved. The two-distinct-head
-            # rule can never fire here on its own, so bound the wait on the clock instead: inside
-            # the grace window the author may still push; past it, this is the same conclusion the
-            # second failed attempt would reach — a human must resolve it.
+            # THE GRACE WINDOW (issue #753). One attempt, head unmoved. The two-distinct-head rule
+            # can never fire here on its own, so the WAIT is bounded on the clock: inside the
+            # window the author may still push; past it, waiting longer has stopped being the
+            # plan. What the clock decides is WHEN TO STOP WAITING — and nothing else. It does not
+            # decide the CLASS (that is stuck_park_label, on the re-admission cap) and it is not
+            # the evidence that ENDS the resulting hold (that is stuck_park_cause_recovered, on
+            # the head or the conflict). A window elapsing is a TIMEOUT, and registry #769's
+            # finding is that a timeout is not a human question.
             age_hours = self._attempt_age_hours(records, head_sha)
             if age_hours is None:
                 self._skip(repo, number,
@@ -882,7 +1317,7 @@ class ConflictResolver:
                 self._record("stuck-attempt-escalation", repo, number,
                              f"single attempt {age_hours:.1f}h old "
                              f"(grace {self.stuck_grace_hours}h)")
-                self._escalate(
+                self._escalate_stuck(
                     repo, detail, comments, prior_conflicting_files(comments, self.bot_login)
                 )
                 return
@@ -893,7 +1328,7 @@ class ConflictResolver:
                        "awaiting-author-grace")
             return
         if len(heads) >= 2:
-            self._escalate(
+            self._escalate_two_head(
                 repo, detail, comments, prior_conflicting_files(comments, self.bot_login)
             )
             return
@@ -1070,6 +1505,18 @@ def _self_test():
                               for number, values in (sequences or {}).items()}
             self.comment_rows = {pr["number"]: [] for pr in pulls}
             self.labels_added = []
+            self.labels_removed = []
+            # THE ORDERED MUTATION LOG. Without it this fixture cannot express an ORDERING
+            # property at all: `comment_rows` and `labels_removed` are separate lists, so
+            # "the receipt was posted BEFORE the label was deleted" and "…after" produce
+            # byte-identical state and no assertion over them can tell the two apart.
+            # MEASURED (review round 1): inverting `_stuck_park_phase`'s receipt-first ordering
+            # left the WHOLE 44-script suite green, and the two checks credited with killing it
+            # were in fact killed by a DIFFERENT mutant — deleting the `_post` outright, i.e. a
+            # receipt never minted rather than a receipt minted late. That is #594's stale-SHA
+            # stub again: a fixture that cannot express the property it is credited with testing.
+            # One interleaved log, appended by every mutating entry point, closes it.
+            self.events = []
             self.timelines = {number: [deepcopy(event) for event in events]
                               for number, events in (timelines or {}).items()}
 
@@ -1107,18 +1554,38 @@ def _self_test():
             raise AssertionError(f"unexpected FakeAPI request: {method} {url}")
 
         def comment(self, _repo, number, body):
+            # The event carries a COARSE KIND, not the whole body: an ordering assertion that
+            # pinned prose would go red on any wording change and would then be "fixed" by
+            # loosening it, which is how an ordering guard quietly stops guarding ordering.
+            kind = ("unpark-receipt" if STUCK_UNPARK_MARKER in body
+                    else "park-receipt" if STUCK_PARK_MARKER in body
+                    else "escalation" if ESCALATION_MARKER in body
+                    else "comment")
+            self.events.append((number, "comment", kind))
             self.comment_rows[number].append(
                 {"body": body, "user": {"login": bot_login}, "created_at": iso(self.now)}
             )
 
         def add_label(self, _repo, number, label):
+            self.events.append((number, "add-label", label))
             self.labels_added.append((number, label))
             names = _label_names(self.prs[number])
             if label not in names:
                 self.prs[number].setdefault("labels", []).append({"name": label})
 
+        def remove_label(self, _repo, number, label):
+            self.events.append((number, "remove-label", label))
+            self.labels_removed.append((number, label))
+            self.prs[number]["labels"] = [
+                row for row in self.prs[number].get("labels") or []
+                if (row.get("name") if isinstance(row, dict) else row) != label
+            ]
+
         def set_head(self, number, head):
             self.prs[number]["head"]["sha"] = head
+
+        def set_mergeable(self, number, value):
+            self.prs[number]["mergeable"] = value
 
     class FakeRebaser:
         def __init__(self, outcome="clean"):
@@ -1481,13 +1948,20 @@ def _self_test():
         (["callback", "retry", "final-pass"], 1, [((0.1,), {})], True),
     )
 
-    # (k) THE MACHINE EXIT (issue #753). ONE recorded attempt on a head nobody ever pushes to was
-    # a hold with NO exit: the two-distinct-head escalation cannot fire without a second head, so
-    # the sweep re-skipped those PRs ~3x/hour forever — unlabelled, uncounted, and invisible to
-    # every label-driven lane. Inside the grace window that wait is correct (the author may still
-    # push); past it, it is the same conclusion a second failed attempt reaches. BOTH directions
-    # are asserted: deleting the age branch reds the second check, inverting the comparison reds
-    # the first, and widening the grace to infinity reds the second.
+    # (k) THE TWO EXITS ARE DIFFERENT EXITS, and this block is written as PAIRS so that neither
+    # can pass by collapsing into the other.
+    #
+    # (k0) THE GRACE WINDOW itself (issue #753) is unchanged: ONE recorded attempt on a head
+    # nobody ever pushes to was a hold with NO exit, because the two-distinct-head escalation
+    # cannot fire without a second head. Inside the window the wait is correct (the author may
+    # still push); past it, waiting has stopped being the plan.
+    #
+    # WHAT CHANGED (this PR). Past the window is a TIMEOUT, and a timeout is not a human question
+    # (registry #769) — so it takes park_policy's MACHINE class with a cause-gated exit, while the
+    # two-distinct-head exhaustion keeps `needs:user`. MEASURED on the live registry 2026-07-28:
+    # 10 conflicting PRs held a machine-applied `needs:user` from this program and exactly ONE had
+    # two attempt markers, so nine of ten were this branch wearing the other one's label AND
+    # quoting the other one's sentence.
     def stuck_sweep(elapsed_hours):
         stuck_api = FakeAPI([pull(80, "b" * 40)], now=base_now)
         stuck_rebaser = FakeRebaser("conflict")
@@ -1507,9 +1981,12 @@ def _self_test():
         sweep_bodies = _comment_bodies(stuck_api.comment_rows[80])
         return {
             "rc": sweep_rc,
+            "api": stuck_api,
             "labels": list(stuck_api.labels_added),
             "escalations": sum(ESCALATION_MARKER in body for body in sweep_bodies),
             "attempts": sum(bool(ATTEMPT_RE.search(body)) for body in sweep_bodies),
+            "park_receipts": sum(STUCK_PARK_MARKER in body for body in sweep_bodies),
+            "bodies": sweep_bodies,
             "row": sweep.census[0],
             "rebase_calls": len(stuck_rebaser.calls),
         }
@@ -1523,12 +2000,547 @@ def _self_test():
          within["row"]["skipped"].get("awaiting-author-grace")),
         (0, [], 0, 1, 1, 0, 0, 1),
     )
+    # (k1) THE GRACE-WINDOW EXIT TAKES THE MACHINE CLASS. This is the named check for the
+    # `_escalate_stuck` CALL SITE: point that one line at `_escalate_two_head` and this reds
+    # alone, while every two-head check below stays green.
     check(
-        "past the grace window the lone attempt escalates itself with no second head",
-        (past["rc"], past["labels"], past["escalations"], past["attempts"],
-         past["rebase_calls"], past["row"]["escalated"], past["row"]["awaiting_author"],
-         past["row"]["no_exit"]),
-        (0, [(80, "needs:user")], 1, 1, 1, 1, 0, 0),
+        "[EXIT stuck-grace] past the window the lone attempt takes the MACHINE class, mints its "
+        "park receipt, and is NOT a human escalation",
+        (past["rc"], past["labels"], past["escalations"], past["park_receipts"],
+         past["attempts"], past["rebase_calls"], past["row"]["escalated"],
+         past["row"]["awaiting_author"], past["row"]["no_exit"]),
+        (0, [(80, MACHINE_PARK_LABEL)], 0, 1, 1, 1, 1, 0, 0),
+    )
+    check(
+        "[EXIT stuck-grace] ...and the CENSUS attributes it to the grace-window exit and the "
+        "machine class, with the two-distinct-head buckets left at zero",
+        (past["row"]["exit_stuck_grace"], past["row"]["parked_machine"],
+         past["row"]["exit_two_head"], past["row"]["parked_human"]),
+        (1, 1, 0, 0),
+    )
+
+    # (k2) THE TWO-DISTINCT-HEAD EXIT KEEPS `needs:user`. The PAIRED CONTROL for (k1): the same
+    # program, the same PR, one extra pushed head — and the opposite class. This is the named
+    # check for the `_escalate_two_head` CALL SITES: point them at `_escalate_stuck` and this
+    # reds alone, while (k1) stays green.
+    two_head_api = FakeAPI([pull(82, "a" * 40)], now=base_now)
+    two_head_rebaser = FakeRebaser("conflict")
+
+    def two_head_sweep():
+        sweep = ConflictResolver(
+            two_head_api, snapshot, claim, [repo], bot_login, True, 5, two_head_rebaser,
+            stuck_grace_hours=grace, clock=lambda: base_now)
+        with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+            sweep.run()
+        return sweep
+
+    two_head_sweep()
+    two_head_api.set_head(82, "c" * 40)
+    two_head_final = two_head_sweep()
+    two_head_bodies = _comment_bodies(two_head_api.comment_rows[82])
+    two_head_row = two_head_final.census[0]
+    check(
+        "[EXIT two-distinct-heads] two heads that both conflict take the HUMAN terminal, and "
+        "mint NO machine park receipt",
+        (two_head_api.labels_added,
+         sum(ESCALATION_MARKER in body for body in two_head_bodies),
+         sum(STUCK_PARK_MARKER in body for body in two_head_bodies),
+         two_head_api.labels_removed),
+        ([(82, HUMAN_PARK_LABEL)], 1, 0, []),
+    )
+    check(
+        "[EXIT two-distinct-heads] ...and the CENSUS attributes it to the exhaustion exit and "
+        "the human class, with the grace-window buckets left at zero",
+        (two_head_row["exit_two_head"], two_head_row["parked_human"],
+         two_head_row["exit_stuck_grace"], two_head_row["parked_machine"]),
+        (1, 1, 0, 0),
+    )
+
+    # (k2b) THE OTHER TWO-HEAD CALL SITES. MEASURED while writing this block, and it is the
+    # finding that matters most here: re-pointing EITHER of the two `_escalate_two_head` call
+    # sites in `_process_pr` at `_escalate_stuck` left the WHOLE 44-script suite green. (k2)
+    # above drives the rebaser, so it only ever reaches the `_handle_conflict` tail — the
+    # exhaustion exit had 1/3 site coverage at 3/3 confidence, which is the exact shape that hid
+    # this defect class in #594 and #886. Each site now gets a case that reaches IT alone, off
+    # pre-seeded durable markers rather than through a rebase.
+    def seeded_attempt(attempt, head):
+        return {"body": f"<!-- conflict-resolver attempt={attempt} head={head} -->\n"
+                        "- conflict-file: \"src/value.py\"",
+                "user": {"login": bot_login}, "created_at": iso(base_now)}
+
+    def seeded_two_head_sweep(number, live_head):
+        """A PR with TWO recorded attempt heads already on record, swept 1000 h past the grace
+        window — so if the exhaustion exit ever routed through the grace-window exit, it would
+        park machine-class here instead of escalating."""
+        seeded_api = FakeAPI([pull(number, live_head)], now=base_now)
+        seeded_api.comment_rows[number] = [seeded_attempt(1, "1" * 40),
+                                           seeded_attempt(2, "2" * 40)]
+        seeded_rebaser = FakeRebaser("conflict")
+        sweep = ConflictResolver(
+            seeded_api, snapshot, claim, [repo], bot_login, True, 5, seeded_rebaser,
+            stuck_grace_hours=grace, clock=lambda: base_now + 1000 * 3600.0)
+        with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+            sweep.run()
+        seeded_bodies = _comment_bodies(seeded_api.comment_rows[number])
+        return (seeded_api.labels_added,
+                sum(ESCALATION_MARKER in body for body in seeded_bodies),
+                sum(STUCK_PARK_MARKER in body for body in seeded_bodies),
+                len(seeded_rebaser.calls),
+                (sweep.census[0]["exit_two_head"], sweep.census[0]["exit_stuck_grace"],
+                 sweep.census[0]["parked_machine"], sweep.census[0]["parked_human"]))
+
+    check(
+        "[EXIT two-distinct-heads] CALL SITE `head in heads`: a head that ALREADY has an attempt "
+        "marker, with a second head on record, takes the HUMAN terminal — not the grace-window "
+        "park, even 1000 h past the window",
+        seeded_two_head_sweep(84, "2" * 40),
+        ([(84, HUMAN_PARK_LABEL)], 1, 0, 0, (1, 0, 0, 1)),
+    )
+    check(
+        "[EXIT two-distinct-heads] CALL SITE `head not in heads`: a NEW head with two failed "
+        "heads on record escalates to the HUMAN terminal without spending another rebase",
+        seeded_two_head_sweep(85, "3" * 40),
+        ([(85, HUMAN_PARK_LABEL)], 1, 0, 0, (1, 0, 0, 1)),
+    )
+
+    # (k3) THE BODY MATCHES THE EXIT — both directions (Fix 2). ONE hard-coded body served both
+    # exits, so a timeout was reported as "two distinct-head conflict attempts": a specific,
+    # checkable, FALSE claim in 9 of the 10 live cases. Asserting only that "a comment was posted"
+    # is what let that stand, so each direction asserts BOTH that its own exit's sentence is
+    # present AND that the other exit's sentence is absent.
+    two_head_text = "\n".join(body for body in two_head_bodies if ESCALATION_MARKER in body)
+    stuck_text = "\n".join(body for body in past["bodies"] if STUCK_PARK_MARKER in body)
+    check(
+        "[BODY] the two-distinct-head body states ITS OWN exit and the attempt count it "
+        "observed, and never claims a grace window",
+        ("2 distinct-head conflict attempts" in two_head_text,
+         "two-distinct-head exhaustion exit" in two_head_text,
+         "grace window" in two_head_text, "UNMOVED" in two_head_text),
+        (True, True, False, False),
+    )
+    check(
+        "[BODY] the grace-window body states ITS OWN exit and the ONE attempt it observed, and "
+        "never claims two distinct-head attempts",
+        ("1 conflict attempt(s) on an UNMOVED head" in stuck_text,
+         "stuck-attempt grace-window exit" in stuck_text,
+         "distinct-head conflict attempts" in stuck_text,
+         "Human resolution is required" in stuck_text),
+        (True, True, False, False),
+    )
+    check(
+        "[BODY] ...and the machine-class body says so in as many words, so a reader is not told "
+        "to act on a hold that clears itself",
+        (f"MACHINE-owned `{MACHINE_PARK_LABEL}` soft hold" in stuck_text,
+         "as soon as the head moves or the conflict resolves" in stuck_text),
+        (True, True),
+    )
+    # The wording is DERIVED from the exit, not chosen at the call site: an unrepresentable body
+    # fails LOUD at the writer rather than falling through to whichever sentence came first.
+    unknown_exit_rejected = False
+    try:
+        escalation_body("some-third-exit", ("a.py",), 1, HUMAN_PARK_LABEL)
+    except ResolverError:
+        unknown_exit_rejected = True
+    check("[BODY] an unknown exit kind is refused, never given a default sentence",
+          unknown_exit_rejected, True)
+    # The attempt count is READ, not baked in: three heads must say three.
+    check("[BODY] the attempt count in the body is the count observed, not a literal",
+          ("3 distinct-head conflict attempts"
+           in escalation_body(EXIT_TWO_HEAD, ("a.py",), 3, HUMAN_PARK_LABEL)),
+          True)
+    # THE OVER-CAP BODY, AND ITS GRANT COUNT — the third exit-body shape, and the one that had NO
+    # assertion at all in round 1. MEASURED then: replacing `grants=len(stuck_receipts(...))` with
+    # `generation - 1` SURVIVED the whole suite. Under that mutant a generation-3 escalation tells
+    # a maintainer "2 automatic re-admission(s) on record" when the durable record shows NONE —
+    # which is verbatim the registry #769 finding this PR cites as the reason the count must be
+    # read. It sends the reader hunting a flapping cause instead of whatever kept clearing the
+    # label. So the count is pinned at TWO values: a generation whose grants are 0, and the SAME
+    # generation whose grants are 1. `generation - 1` disagrees with at least one of them for
+    # every generation, so no arithmetic on the generation can satisfy both rows.
+    over_cap_gen = STUCK_UNPARK_MAX + 1
+    over_cap_zero = escalation_body(EXIT_STUCK_GRACE, ("a.py",), 1, HUMAN_PARK_LABEL,
+                                    generation=over_cap_gen, grants=0)
+    over_cap_one = escalation_body(EXIT_STUCK_GRACE, ("a.py",), 1, HUMAN_PARK_LABEL,
+                                   generation=over_cap_gen, grants=1)
+    check(
+        "[BODY] the over-cap body names ITS OWN exit, states the generation, and reports the "
+        "grants READ FROM THE RECEIPTS — 0 grants says 0, not `generation - 1`",
+        (f"park generation {over_cap_gen}" in over_cap_zero,
+         "0 automatic re-admission(s) on record" in over_cap_zero,
+         "stuck-attempt grace-window exit" in over_cap_zero,
+         "distinct-head conflict attempts" in over_cap_zero,
+         f"MACHINE-owned `{MACHINE_PARK_LABEL}` soft hold" in over_cap_zero),
+        (True, True, True, False, False),
+    )
+    check(
+        "[BODY] ...and the SAME generation with one grant on record says 1 — the count tracks "
+        "the receipts, not the generation",
+        ("1 automatic re-admission(s) on record" in over_cap_one,
+         "0 automatic re-admission(s) on record" in over_cap_one,
+         over_cap_zero == over_cap_one),
+        (True, False, False),
+    )
+
+    # ...AND THE SAME PROPERTY AT THE CALL SITE, which is a separate assertion and not a
+    # restatement. MEASURED (review round 2, on the two checks immediately above): pinning only
+    # `escalation_body` left `grants=len(stuck_receipts(...))` -> `grants=generation - 1` ALIVE,
+    # because the pure function was never the thing that read the receipts. A guard on the
+    # function and a guard on the argument the call site computes are different guards; this is
+    # the same 1/N shape that hid the two `_escalate_two_head` sites in round 1, one layer in.
+    def over_cap_escalation(grants_on_record):
+        """A PR already carrying STUCK_UNPARK_MAX park receipts, so its NEXT grace-window exit is
+        generation STUCK_UNPARK_MAX + 1 — the human class — driven end to end through `run()`."""
+        over_head = "b" * 40
+        rows = [attempt_comment(over_head, iso(base_now))]
+        rows += [{"body": stuck_receipt(STUCK_PARK_MARKER, over_head, gen),
+                  "user": {"login": bot_login}, "created_at": iso(base_now)}
+                 for gen in range(1, STUCK_UNPARK_MAX + 1)]
+        rows += [{"body": stuck_receipt(STUCK_UNPARK_MARKER, over_head, gen),
+                  "user": {"login": bot_login}, "created_at": iso(base_now)}
+                 for gen in range(1, grants_on_record + 1)]
+        over_api = FakeAPI([pull(87, over_head)], now=base_now)
+        over_api.comment_rows[87] = rows
+        sweep = ConflictResolver(
+            over_api, snapshot, claim, [repo], bot_login, True, 5, FakeRebaser("conflict"),
+            stuck_grace_hours=grace, clock=lambda: base_now + 1000 * 3600.0)
+        with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+            sweep.run()
+        return (over_api.labels_added,
+                "\n".join(body for body in _comment_bodies(over_api.comment_rows[87])
+                          if ESCALATION_MARKER in body),
+                sweep.census[0])
+
+    over_zero_labels, over_zero_body, over_zero_row = over_cap_escalation(0)
+    over_one_labels, over_one_body, _over_one_row = over_cap_escalation(1)
+    check(
+        "[BODY] CALL SITE: an over-cap escalation POSTS the grant count on record — a "
+        f"generation-{STUCK_UNPARK_MAX + 1} flap with zero grants says zero, and takes the "
+        "human class",
+        (over_zero_labels,
+         f"park generation {STUCK_UNPARK_MAX + 1}" in over_zero_body,
+         "0 automatic re-admission(s) on record" in over_zero_body,
+         (over_zero_row["exit_stuck_grace"], over_zero_row["parked_human"],
+          over_zero_row["parked_machine"])),
+        ([(87, HUMAN_PARK_LABEL)], True, True, (1, 1, 0)),
+    )
+    check(
+        "[BODY] CALL SITE: ...and ONE grant on record says one at the SAME generation, so no "
+        "function of the generation alone can satisfy both rows",
+        ("1 automatic re-admission(s) on record" in over_one_body,
+         "0 automatic re-admission(s) on record" in over_one_body,
+         over_one_labels),
+        (True, False, [(87, HUMAN_PARK_LABEL)]),
+    )
+
+    # (k3b) THE VETO ASYMMETRY. `_escalate_stuck` checks the sticky human-unpark veto BEFORE it
+    # comments; the two-head exit checks it after, because that comment is once-ever
+    # marker-deduped and cannot repeat. MEASURED (review round 1): deleting the `_escalate_stuck`
+    # veto SURVIVED the whole suite — `_apply_park_label`'s veto still suppressed the LABEL, so
+    # the end state looked identical while the behaviour the docstring warns about was fully
+    # restored: a receipt minted for a park that is never applied, a generation spent on it, and
+    # a fresh comment on every tick of a 20-minute cron, on a PR a human explicitly un-parked.
+    stuck_veto_timeline = [
+        {"event": "labeled", "label": {"name": MACHINE_PARK_LABEL},
+         "created_at": "2026-07-18T10:00:00Z", "actor": {"login": bot_login}},
+        {"event": "unlabeled", "label": {"name": MACHINE_PARK_LABEL},
+         "created_at": "2026-07-18T11:00:00Z", "actor": {"login": "jeswr"}},
+    ]
+
+    def stuck_veto_ticks(timelines):
+        """One attempt recorded, then TWO further ticks past the grace window. Two, not one:
+        the defect this pins is per-TICK repetition, which a single tick cannot express."""
+        veto_api = FakeAPI([pull(86, "b" * 40)], timelines=timelines, now=base_now)
+        veto_rebaser = FakeRebaser("conflict")
+        with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+            ConflictResolver(veto_api, snapshot, claim, [repo], bot_login, True, 5, veto_rebaser,
+                             stuck_grace_hours=grace, clock=lambda: base_now).run()
+        rows = []
+        for _tick in range(2):
+            sweep = ConflictResolver(
+                veto_api, snapshot, claim, [repo], bot_login, True, 5, veto_rebaser,
+                stuck_grace_hours=grace, clock=lambda: base_now + 1000 * 3600.0)
+            with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                sweep.run()
+            rows.append(sweep.census[0])
+        veto_bodies = _comment_bodies(veto_api.comment_rows[86])
+        return (sum(STUCK_PARK_MARKER in body for body in veto_bodies),
+                veto_api.labels_added,
+                (rows[0]["exit_stuck_grace"], rows[0]["parked_machine"]))
+
+    check(
+        "[EXIT stuck-grace] a human un-park VETOES the machine park BEFORE the comment: no "
+        "receipt is minted, no generation is spent, and a second tick adds nothing",
+        stuck_veto_ticks({86: stuck_veto_timeline}),
+        (0, [], (1, 1)),
+    )
+    check(
+        "[EXIT stuck-grace] ...PAIRED CONTROL: with no human un-park the SAME two ticks mint "
+        "EXACTLY ONE receipt — so the check above is not passing because nothing ever posts",
+        stuck_veto_ticks({}),
+        (1, [(86, MACHINE_PARK_LABEL)], (1, 1)),
+    )
+
+    # (k4) THE MACHINE EXIT IS REAL, AND IT IS CAUSE-GATED. A relabelled hold with no exit is
+    # worse than the visible one it replaced, so the class split is only honest if the park
+    # actually clears — on the CAUSE, never on the clock.
+    def parked_pr_api(head="b" * 40, generation=1, granted=False, now=base_now):
+        """A PR sitting in exactly the state _escalate_stuck leaves behind."""
+        parked = pull(83, head, labels=(MACHINE_PARK_LABEL,))
+        rows = [attempt_comment(head, iso(now))]
+        rows.append({"body": stuck_receipt(STUCK_PARK_MARKER, head, generation),
+                     "user": {"login": bot_login}, "created_at": iso(now)})
+        if granted:
+            rows.append({"body": stuck_receipt(STUCK_UNPARK_MARKER, head, generation),
+                         "user": {"login": bot_login}, "created_at": iso(now)})
+        parked_api = FakeAPI([parked], now=now)
+        parked_api.comment_rows[83] = rows
+        return parked_api
+
+    def exit_sweep(parked_api, elapsed_hours=0.0):
+        sweep = ConflictResolver(
+            parked_api, snapshot, claim, [repo], bot_login, True, 5, FakeRebaser("clean"),
+            stuck_grace_hours=grace, clock=lambda: base_now + elapsed_hours * 3600.0)
+        with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+            rc = sweep.run()
+        return rc, sweep, parked_api
+
+    # THE ANTI-TIMER CONTROL. The identical park, evaluated 1000 h later, is the identical
+    # answer. Registry #769's whole finding was that "the evidence clearing an age park was, in
+    # substance, MORE AGE"; wire any clock into stuck_park_cause_recovered and this reds.
+    held_rc, held, held_api = exit_sweep(parked_pr_api(), elapsed_hours=1000.0)
+    check(
+        "[EXIT MACHINE] the park STANDS while its cause has not recovered — 1000 h of further "
+        "waiting is not evidence, and a standing park is not a no-exit",
+        (held_rc, held_api.labels_removed, held.census[0]["stuck_park_stands"],
+         held.census[0]["stuck_readmitted"], held.census[0]["no_exit"],
+         held.census[0]["escalated"],
+         held.census[0]["skipped"].get("stuck-park-stands")),
+        (0, [], 1, 0, 0, 0, 1),
+    )
+    # RECOVERY 1: the head moved — the author did the thing the window was waiting for.
+    moved_api = parked_pr_api()
+    moved_api.set_head(83, "e" * 40)
+    moved_rc, moved, moved_api = exit_sweep(moved_api)
+    moved_bodies = _comment_bodies(moved_api.comment_rows[83])
+    check(
+        "[EXIT MACHINE] a MOVED HEAD clears the park, receipt-first, and the PR re-enters the "
+        "ordinary mechanical-rebase path in the same tick",
+        (moved_rc, moved_api.labels_removed,
+         sum(STUCK_UNPARK_MARKER in body for body in moved_bodies),
+         moved.census[0]["stuck_readmitted"], moved.census[0]["stuck_park_stands"],
+         moved.census[0]["resolved"]),
+        (0, [(83, MACHINE_PARK_LABEL)], 1, 1, 0, 1),
+    )
+    # RECEIPT-FIRST IS AN ORDERING PROPERTY, so it is asserted over the ORDERED event log and
+    # not over end-state. MEASURED (review round 1): the check above was credited with killing
+    # the inverted-ordering mutant and does not — it cannot, because `comment_rows` and
+    # `labels_removed` are separate lists in which "receipt then unlabel" and "unlabel then
+    # receipt" are byte-identical. What it actually kills is `_post` DELETED, which is the other
+    # defect (a receipt never minted, rather than minted late).
+    #
+    # WHY THE ORDER IS LOAD-BEARING (#610): dying between the two writes must leave
+    # receipt-with-label, which the `grant is not None` branch converges on the next tick.
+    # Inverted, the crash leaves label-gone-with-no-receipt: nothing records that the recovery
+    # was consumed, the PR re-enters the stuck state, and the SAME recovery is earned a second
+    # time — the consume-exactly-once invariant broken by an ordering alone.
+    moved_events = [event for event in moved_api.events if event[0] == 83]
+    check(
+        "[EXIT MACHINE] RECEIPT-FIRST: the un-park receipt is durable BEFORE the label is "
+        "deleted, so the only crash residue is the one the convergence branch can complete",
+        (moved_events.index((83, "comment", "unpark-receipt"))
+         < moved_events.index((83, "remove-label", MACHINE_PARK_LABEL)),
+         [event for event in moved_events
+          if event[2] in ("unpark-receipt", MACHINE_PARK_LABEL)]),
+        (True, [(83, "comment", "unpark-receipt"), (83, "remove-label", MACHINE_PARK_LABEL)]),
+    )
+    # RECOVERY 2: the conflict resolved. This is why the exit phase runs BEFORE the mergeability
+    # classification — after it, the `not-conflicting` return strands the label forever.
+    merged_api = parked_pr_api()
+    merged_api.set_mergeable(83, True)
+    merged_rc, merged, merged_api = exit_sweep(merged_api)
+    check(
+        "[EXIT MACHINE] a RESOLVED CONFLICT clears the park even though the PR is no longer in "
+        "the conflicting population",
+        (merged_rc, merged_api.labels_removed, merged.census[0]["stuck_readmitted"],
+         merged.census[0]["conflicting"]),
+        (0, [(83, MACHINE_PARK_LABEL)], 1, 0),
+    )
+    # CONSUME-EXACTLY-ONCE + CONVERGENCE. A grant already on record with the label still live is
+    # the only crash residue receipt-first ordering can produce: converge the unlabel, mint
+    # NOTHING, consume no new evidence.
+    granted_api = parked_pr_api(granted=True)
+    granted_rc, granted, granted_api = exit_sweep(granted_api, elapsed_hours=1000.0)
+    granted_bodies = _comment_bodies(granted_api.comment_rows[83])
+    check(
+        "[EXIT MACHINE] an already-granted recovery CONVERGES the unlabel and mints no second "
+        "receipt — the same recovery can never be re-earned",
+        (granted_rc, granted_api.labels_removed,
+         sum(STUCK_UNPARK_MARKER in body for body in granted_bodies),
+         granted.census[0]["stuck_readmitted"]),
+        (0, [(83, MACHINE_PARK_LABEL)], 1, 1),
+    )
+
+    # (k4b) THE RECEIPT KEY IS ROUND-TRIPPED — the WRITE side, which had no guard at all.
+    #
+    # MEASURED (review round 3): both arguments of the minted un-park key
+    # `stuck_receipt(STUCK_UNPARK_MARKER, park["head"], park["gen"])` were unpinned, INCLUDING by
+    # the check immediately above whose name carries the property. That check drives
+    # `parked_pr_api(granted=True)`, and the fixture builds the grant from the SAME head and
+    # generation as the park — so the read side matches by construction and the row cannot
+    # disagree however wrong the written key is.
+    #
+    # THIS IS A DIFFERENT FAILURE FROM M23, and worth naming separately because the question that
+    # catches it is different. M23 was "a value pinned through a pure helper while the call site
+    # recomputes it" — ask *which layer computes this?*. This one is "the fixture derives its
+    # expected value from the same source as the code under test" — ask *does my expected value
+    # come from the same place the code gets it?*. When both sides read `park[...]`, the
+    # assertion is a tautology and no amount of naming it makes it a guard.
+    #
+    # Three assertions, none of which can read its expectation out of `park[...]`, and each
+    # pinning a different consequence:
+    roundtrip_api = parked_pr_api()                    # parked at head "b"*40, generation 1
+    roundtrip_api.set_head(83, "e" * 40)               # the author pushed: the cause recovers
+    _roundtrip_rc, _roundtrip, roundtrip_api = exit_sweep(roundtrip_api)
+    minted = [body for body in _comment_bodies(roundtrip_api.comment_rows[83])
+              if STUCK_UNPARK_MARKER in body]
+    check(
+        "[EXIT MACHINE] ROUND TRIP: the minted un-park key names the PARKED head and the PARKED "
+        "generation — matched against a LITERAL, not against `park[...]`",
+        (len(minted),
+         ("<!-- conflict-resolver stuck-unpark:v1 cause=head-unmoved "
+          f"head={'b' * 40} gen=1 -->") in (minted[0] if minted else "")),
+        (1, True),
+    )
+    # CONSEQUENCE 1 — a WRONG HEAD breaks convergence. The receipt landed and the DELETE did not
+    # (the only crash residue receipt-first ordering can produce); the next tick must recognise
+    # the grant it minted itself, which it can only do if the key it WROTE is the key it READS.
+    # Point the key at the live head and this tick mints a SECOND receipt instead.
+    roundtrip_api.prs[83].setdefault("labels", []).append({"name": MACHINE_PARK_LABEL})
+    residue_rc, residue, roundtrip_api = exit_sweep(roundtrip_api, elapsed_hours=1000.0)
+    check(
+        "[EXIT MACHINE] ROUND TRIP: the crash-residue tick CONVERGES on the receipt it minted "
+        "itself — still exactly ONE, because the key written is the key read",
+        (residue_rc,
+         sum(STUCK_UNPARK_MARKER in body
+             for body in _comment_bodies(roundtrip_api.comment_rows[83])),
+         residue.census[0]["stuck_readmitted"], len(roundtrip_api.labels_removed)),
+        (0, 1, 1, 2),
+    )
+    # CONSEQUENCE 2 — a WRONG GENERATION PRE-GRANTS a park that has not happened yet, and this is
+    # the serious one: a machine hold that clears itself with NO cause proof, i.e. the exact
+    # fail-open this whole PR exists to prevent. Generation 1 recovers by the conflict resolving
+    # (so the head is unchanged and only the GENERATION can be wrong), the PR conflicts again on
+    # the same head and is parked at generation 2 — whose cause has NOT recovered. It must STAND.
+    pregrant_api = parked_pr_api()                     # parked at head "b"*40, generation 1
+    pregrant_api.set_mergeable(83, True)               # the conflict resolved: the cause recovers
+    exit_sweep(pregrant_api)
+    pregrant_api.set_mergeable(83, False)              # ...and it conflicts again, same head
+    pregrant_api.comment_rows[83].append(
+        {"body": stuck_receipt(STUCK_PARK_MARKER, "b" * 40, 2),
+         "user": {"login": bot_login}, "created_at": iso(base_now)})
+    pregrant_api.prs[83].setdefault("labels", []).append({"name": MACHINE_PARK_LABEL})
+    pregrant_rc, pregrant, pregrant_api = exit_sweep(pregrant_api, elapsed_hours=1000.0)
+    check(
+        "[EXIT MACHINE] ROUND TRIP: a LATER park is NOT pre-granted by the previous grant — "
+        "generation 2 with an unmoved head STANDS, and 1000 h does not change that",
+        (pregrant_rc, pregrant.census[0]["stuck_park_stands"],
+         pregrant.census[0]["stuck_readmitted"], pregrant_api.labels_removed[1:]),
+        (0, 1, 0, []),
+    )
+
+    # THE CAP. An over-cap park was written in the HUMAN class at park time, so the exit phase
+    # must not even consider it — `stuck_unpark_state` refuses to answer.
+    check(
+        "[EXIT MACHINE] the cap is enforced at PARK time: over-cap parks are the human class and "
+        "the exit phase never sees them",
+        (stuck_park_label(1), stuck_park_label(STUCK_UNPARK_MAX),
+         stuck_park_label(STUCK_UNPARK_MAX + 1),
+         stuck_unpark_state(
+             [{"body": stuck_receipt(STUCK_PARK_MARKER, "b" * 40, STUCK_UNPARK_MAX + 1),
+               "user": {"login": bot_login}}], bot_login)),
+        (MACHINE_PARK_LABEL, MACHINE_PARK_LABEL, HUMAN_PARK_LABEL, (None, None)),
+    )
+    over_cap_api = parked_pr_api(generation=STUCK_UNPARK_MAX + 1)
+    over_cap_rc, over_cap, over_cap_api = exit_sweep(over_cap_api, elapsed_hours=1000.0)
+    check(
+        "[EXIT MACHINE] ...so an over-cap park is neither cleared nor counted as one of ours",
+        (over_cap_rc, over_cap_api.labels_removed,
+         over_cap.census[0]["stuck_readmitted"], over_cap.census[0]["stuck_park_stands"]),
+        (0, [], 0, 0),
+    )
+    # NOTHING THIS PROGRAM DOES CLEARS A HUMAN HOLD. The ten live PRs this change exists to stop
+    # producing keep their machine-applied `needs:user`: the fix is the SOURCE fix, applied
+    # forward, and the triage deliberately cleared none of them. Two independent reasons make that
+    # true here — they carry no receipt of ours, and a human-owned hold outranks the exit phase —
+    # so this asserts the SECOND one, which is the only one a later PR could accidentally remove.
+    held_by_human = parked_pr_api()
+    held_by_human.prs[83].setdefault("labels", []).append({"name": HUMAN_PARK_LABEL})
+    held_by_human.set_head(83, "e" * 40)             # its cause HAS recovered — and it stays put
+    human_rc, human_sweep, held_by_human = exit_sweep(held_by_human, elapsed_hours=1000.0)
+    check(
+        "[EXIT MACHINE] a human-owned hold outranks the exit: a PROVEN recovery clears NOTHING "
+        "while `needs:user` is live, and the machine park is left exactly as it was",
+        (human_rc, held_by_human.labels_removed, held_by_human.labels_added,
+         human_sweep.census[0]["stuck_readmitted"],
+         human_sweep.census[0]["skipped"].get("hard-exclusion-label")),
+        (0, [], [], 0, 1),
+    )
+    # THE TRUST FILTER. A third party cannot forge a park receipt and talk this program into
+    # clearing a `review:parked` it never applied, nor into skipping a PR it owns.
+    forged = parked_pr_api()
+    forged.comment_rows[83] = [
+        dict(row, user={"login": "drive-by"}) for row in forged.comment_rows[83]
+    ]
+    check(
+        "[EXIT MACHINE] a FORGED park receipt is not ours: nothing is cleared and no park is "
+        "attributed to this program",
+        (stuck_unpark_state(forged.comment_rows[83], bot_login),
+         stuck_receipts(forged.comment_rows[83], bot_login, STUCK_PARK_MARKER)),
+        ((None, None), []),
+    )
+    # THE SHARED-LABEL GUARD, in the direction that matters for the OTHER sweeps: a park receipt
+    # of ours makes dispatch-claim's capacity sweep leave the park alone, so the machine exit
+    # cannot be pre-empted by the sustained-fleet-health heuristic — whose only condition this
+    # class could ever satisfy is being old enough. That is the same "more age is not evidence"
+    # defect registry #769 closed for groom, and the spelling is shared, not hand-copied.
+    check(
+        "[EXIT MACHINE] park_policy binds this episode so the capacity sweep cannot clear it on "
+        "age, and the two marker spellings are WIRE FORMAT shared with the reader",
+        (_park_policy.cause_gated_park_episode(
+            {MACHINE_PARK_LABEL},
+            [{"user": {"login": bot_login},
+              "body": stuck_receipt(STUCK_PARK_MARKER, "b" * 40, 1),
+              "created_at": "2026-07-28T10:00:00Z"}],
+            bot_login)[0],
+         _park_policy.age_park_episode is _park_policy.cause_gated_park_episode,
+         (STUCK_PARK_MARKER, STUCK_UNPARK_MARKER)),
+        (True, True,
+         ("<!-- conflict-resolver stuck-park:v1", "<!-- conflict-resolver stuck-unpark:v1")),
+    )
+    # ...and the LABELS themselves, against literals. Found by re-asking the round-3 question of
+    # every row in this block: every class assertion above compares what the resolver wrote
+    # against `MACHINE_PARK_LABEL` / `HUMAN_PARK_LABEL`, which is the SAME constant the resolver
+    # writes from — so repoint either one and every class check still passes while this program
+    # writes a hold no other lane honours. (`needs:user` was already literal-pinned, by the
+    # pre-existing `two distinct attempts add needs:user exactly once`; `review:parked` was not
+    # pinned anywhere.) The cause token is the third value on that wire and is pinned the same
+    # way, since a durable receipt already on a live PR stops parsing if it changes.
+    check(
+        "[EXIT MACHINE] the park LABELS and the cause token are WIRE FORMAT too — pinned to "
+        "literals, because every other class check reads them from the same constant the "
+        "resolver writes from",
+        (MACHINE_PARK_LABEL, HUMAN_PARK_LABEL, STUCK_PARK_CAUSE),
+        ("review:parked", "needs:user", "head-unmoved"),
+    )
+    check(
+        "[EXIT MACHINE] ...control: a `review:parked` with NO receipt of ours is NOT bound, so "
+        "no existing capacity park loses its own exit",
+        _park_policy.cause_gated_park_episode(
+            {MACHINE_PARK_LABEL},
+            [{"user": {"login": bot_login}, "body": "an ordinary capacity park",
+              "created_at": "2026-07-28T10:00:00Z"}],
+            bot_login),
+        (False, ""),
     )
 
     # (l) A marker we cannot date is NOT silently treated as forever-young: the grace window is
@@ -1631,6 +2643,31 @@ def _self_test():
         ("### conflict-resolver census" in summary_text
          and "| awaiting author | no exit |" in summary_text
          and "rebase-cap-reached" in summary_text), True,
+    )
+    # (n2) THE PER-EXIT CENSUS ROW. The two exits being indistinguishable in the output is why a
+    # timeout was reported as exhausted iteration for as long as it was: every run printed
+    # `escalated=N` and nothing printed how many of the N were which. Assert BOTH that the
+    # operator-facing table names each exit and each class, and that the machine-readable row
+    # balances — `two_head + stuck_grace == machine + human == escalated` — because that identity
+    # is what makes a silently added third exit visible instead of absorbed.
+    exits_seen = [
+        _aggregate_census([past["row"]]), _aggregate_census([two_head_row]),
+    ]
+    check(
+        "the census names BOTH exits and BOTH classes, per repo and in aggregate",
+        ([column for column in ("| exit: 2-head |", "| exit: stuck-grace |", "| park: machine |",
+                                "| park: human |", "| re-admitted |", "| park stands |")
+          if column not in summary_text],
+         [(row["exit_two_head"], row["exit_stuck_grace"], row["parked_machine"],
+           row["parked_human"]) for row in exits_seen]),
+        ([], [(0, 1, 1, 0), (1, 0, 0, 1)]),
+    )
+    check(
+        "every escalation is attributed to exactly one exit AND one class",
+        [(row["exit_two_head"] + row["exit_stuck_grace"] == row["escalated"],
+          row["parked_machine"] + row["parked_human"] == row["escalated"])
+         for row in exits_seen + [mixed_row, _aggregate_census(mixed_resolver.census)]],
+        [(True, True)] * 4,
     )
 
     # (o) THE YAML SEAM. Every uncaught mutant in this repo's measured mutation runs lived in a
