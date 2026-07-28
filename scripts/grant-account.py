@@ -2140,6 +2140,283 @@ else:
               [call for call in run_activate(head_ref="account-pool/x")[2]], ),
           (1, ["status:pending"], []))
 
+    # ------------------------------------------------------------------------------------------
+    # [#394] REGISTRATION IS NEVER THE SOURCE OF A DUPLICATE — EXECUTED. Round 2 of #383 made both
+    # activation paths refuse unless EXACTLY ONE exact-title account issue exists, so a duplicate
+    # `acctNN` record WEDGES the account permanently: no automated path can tell two records apart,
+    # and the slot's claim ref is never released. That defence sits downstream of the defect — the
+    # register step created the record without proving the title was free, and GitHub permits
+    # duplicate titles, so a retried enrollment could MINT the second record itself.
+    #
+    # THE BOUND ON WHAT IS PROVEN HERE (review round 2), because a row below asserts it: this is
+    # NOT create-once and cannot be made so by adding reads. GitHub exposes no atomic
+    # create-if-title-absent, an issue title is not a write-gated capability on a public repo (the
+    # `account` issue FORM even applies the `account` label for an arbitrary author), the claim ref
+    # (#186) serializes only writers inside the protocol, and no read observes a write that happens
+    # after it. What IS enforced: the run never itself leaves a second record and never reports
+    # success over an ambiguity it can observe — a pre-create read as a cheap early refusal, and a
+    # post-create re-read after which the record counts as registered only if it is the SOLE
+    # exact-title issue, the run otherwise RETRACTING the record it created. A duplicate landing
+    # after that re-read is the residual window, and the `outsider_late` row below EXECUTES it:
+    # the run succeeds, two exact-title records remain, and the state that leaves is fed straight
+    # into the activate harness to prove the consequence is a fail-closed REFUSAL, never a
+    # mis-activation. That whole protocol is RUN, not asserted in prose: the REAL fragment,
+    # against a fake `gh` that serves the issue listing, MINTS the issues the fragment creates,
+    # applies its retraction edits and RECORDS every call — so the observation is the fragment's
+    # exit code plus which records still occupy the exact `acct07` title when it is done, which is
+    # exactly what a later activation path would trust. A deleted guard, a listing narrowed to open
+    # issues, a swallowed listing failure, a comparison against the wrong title, a dropped
+    # post-create re-read and a retraction that renames nothing all flip a row below red. The fake
+    # refuses any unexpected invocation, and refuses to mutate an issue this run did not create, so
+    # a mutation that reads some other endpoint or retracts the WRONG issue fails closed instead of
+    # passing quietly.
+    #
+    # What the fake MODELS rather than executes: `--jq` projects each issue to `<number> <title>`
+    # and drops pull requests, so the fake serves lines already in that shape. The EXACT-title
+    # decision — the part that can fail OPEN — is the fragment's own, and the near-miss rows below
+    # drive it. Two adversarial interleavings are executed, not described: `outsider` (review round
+    # 1) lands a same-title issue after the pre-create listing and before the create — the ordering
+    # the post-create proof catches — and `outsider_late` (review round 2) lands one after the
+    # post-create listing has already been SERVED, the ordering no read can catch.
+    # ------------------------------------------------------------------------------------------
+    register_fragment = workflow_block(workflow, "register", "register-uniqueness")
+    register_gh = r'''#!/usr/bin/env python3
+import json, os, sys
+argv = sys.argv[1:]
+with open(os.environ["FAKE_GH_LOG"], "a", encoding="utf-8") as log:
+    log.write(json.dumps(argv) + "\n")
+path = os.environ["FAKE_GH_STATE"]
+with open(path, encoding="utf-8") as fh:
+    state = json.load(fh)
+
+
+def save():
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(state, fh)
+
+
+def flag(name):
+    return argv[argv.index(name) + 1] if name in argv else None
+
+
+def mine():
+    """The record THIS run created that `argv` names — mutating any other issue is a defect."""
+    targets = [word for word in argv[2:] if word.isdigit()]
+    owned = [record for record in state["created"] if targets == [str(record["number"])]]
+    if len(owned) != 1:
+        sys.stderr.write("fake-gh: refusing to mutate an issue this run did not create: "
+                         + " ".join(argv) + "\n")
+        sys.exit(4)
+    return owned[0]
+
+
+if argv[:1] == ["api"]:
+    # The listing must be the FULLY PAGINATED, ALL-STATE issues read: a closed duplicate wedges
+    # activation exactly like an open one, and an unpaginated read proves nothing past page 1.
+    endpoints = [word for word in argv[1:] if word.startswith("repos/")]
+    if (len(endpoints) != 1 or not endpoints[0].endswith("/issues?state=all&per_page=100")
+            or "--paginate" not in argv):
+        sys.stderr.write("fake-gh: unexpected listing " + " ".join(argv) + "\n"); sys.exit(4)
+    state["listings"] = state.get("listings", 0) + 1
+    save()
+    if state["listings"] in state.get("fail_listings", []):
+        sys.stderr.write("fake-gh: issue listing rejected\n"); sys.exit(1)
+    for number, title in state["issues"]:
+        print(str(number) + " " + title)
+    for record in state["created"]:
+        print(str(record["number"]) + " " + record["title"])
+    # THE RESIDUAL WINDOW: the outside writer's issue lands AFTER this listing was served. No read
+    # can observe a write that happens after it, so the fragment cannot detect this one and must
+    # not pretend to — the row driving this asserts the honest outcome, not a refusal.
+    late = state.get("outsider_late")
+    if late is not None and late[0] == state["listings"]:
+        state["issues"].append(late[1])
+        state.pop("outsider_late")
+        save()
+elif argv[:2] == ["label", "create"]:
+    sys.exit(1)                      # the normal case: the label already exists
+elif argv[:2] == ["issue", "create"]:
+    # THE ADVERSARIAL INTERLEAVING: the outside writer's issue lands HERE — after the listing the
+    # fragment already read, before this create is recorded. No pre-create read can observe it.
+    if state.get("outsider"):
+        state["issues"].append(state.pop("outsider"))
+    number = state.get("next_number", 4001)
+    state["next_number"] = number + 1
+    state["created"].append(
+        {"number": number, "title": flag("--title"), "state": "open",
+         "labels": [argv[index + 1] for index, word in enumerate(argv) if word == "--label"]})
+    save()
+    print("https://github.com/jeswr/agent-account-registry/issues/" + str(number))
+elif argv[:2] == ["issue", "edit"]:
+    if state.get("retract_fails"):
+        sys.stderr.write("fake-gh: issue edit rejected\n"); sys.exit(1)
+    record = mine()
+    if flag("--title") is not None:
+        record["title"] = flag("--title")
+    dropped = {argv[index + 1] for index, word in enumerate(argv) if word == "--remove-label"}
+    record["labels"] = [name for name in record["labels"] if name not in dropped]
+    save()
+elif argv[:2] == ["issue", "close"]:
+    mine()["state"] = "closed"
+    save()
+else:
+    sys.stderr.write("fake-gh: unexpected invocation " + " ".join(argv) + "\n"); sys.exit(4)
+'''
+
+    def run_register(issues, script=None, handle="acct07", **scenario):
+        """Execute the REAL register-uniqueness fragment against a fake GitHub pre-loaded with the
+        issues `issues` (a list of [number, title] pairs), which mints and mutates the issues the
+        fragment creates. Returns (exit code, the gh calls, the fake's FINAL state)."""
+        with tempfile.TemporaryDirectory() as directory:
+            work = pathlib.Path(directory)
+            (work / "bin").mkdir()
+            (work / "bin" / "gh").write_text(register_gh, encoding="utf-8")
+            (work / "bin" / "gh").chmod(0o755)
+            state = {"issues": issues, "created": []}
+            state.update(scenario)
+            state_file, log_file = work / "state.json", work / "calls.jsonl"
+            state_file.write_text(json.dumps(state), encoding="utf-8")
+            log_file.write_text("", encoding="utf-8")
+            body = "set -euo pipefail\n" + render_gha_expressions(
+                register_fragment if script is None else script, [])
+            done = subprocess.run(
+                ["bash", "-c", body], cwd=str(work), capture_output=True, text=True,
+                timeout=300, check=False,
+                env={**os.environ, "PATH": f"{work / 'bin'}:{os.environ['PATH']}",
+                     "HANDLE": handle, "PROVIDER": "openai",
+                     "body": "provider: openai\nmodels: [sol, luna, terra]\n",
+                     "FAKE_GH_STATE": str(state_file), "FAKE_GH_LOG": str(log_file)})
+            calls = [json.loads(line) for line in
+                     log_file.read_text(encoding="utf-8").split("\n") if line.strip()]
+            return done.returncode, calls, json.loads(state_file.read_text(encoding="utf-8"))
+
+    def register_view(issues, handle="acct07", **scenario):
+        """(exit code, [(title, labels, state)] of every record THIS run created that STILL holds
+        the exact `handle` title — i.e. precisely the records a later activation would trust)."""
+        code, _calls, final = run_register(issues, handle=handle, **scenario)
+        return code, [(record["title"], record["labels"], record["state"])
+                      for record in final["created"] if record["title"] == handle]
+
+    minted_record = ("acct07", ["account", "provider:openai", "status:pending"], "open")
+    check("[#394] EXECUTED register: a FREE title is registered — status:pending, never available",
+          register_view([[9, "acct08"], [10, "some unrelated issue"]]), (0, [minted_record]))
+    check("[#394] EXECUTED register: an existing issue with that exact title creates NOTHING",
+          register_view([[5, "acct07"]]), (1, []))
+    check("[#394] EXECUTED register: ...and two of them refuse too (the wedged state)",
+          register_view([[5, "acct07"], [6, "acct07"]]), (1, []))
+    check("[#394] EXECUTED register: an unreadable issue listing refuses (freeness unprovable)",
+          register_view([[9, "acct08"]], fail_listings=[1]), (1, []))
+    # Both directions of the EXACT comparison, in one fixture: near-miss titles must NOT block the
+    # registration (a substring/prefix test would false-refuse every enrollment past acct07)...
+    check("[#394] EXECUTED register: near-miss titles are not this handle",
+          register_view([[5, "acct7"], [6, "acct070"], [7, "Acct07"], [8, "acct07 spare"]]),
+          (0, [minted_record]))
+    # ...and the same fixture with the exact title added back must refuse, so a comparison against
+    # the wrong variable (which matches nothing at all) cannot pass the two rows above.
+    check("[#394] EXECUTED register: the exact title among near-misses still refuses",
+          register_view([[5, "acct7"], [6, "acct070"], [7, "acct07"], [8, "acct07 spare"]]),
+          (1, []))
+    # THE CONCURRENT INTERLEAVING (review round 1). Everything above only exercises a title already
+    # taken when the fragment looked — the case a pre-create read handles. Here the outside writer's
+    # `acct07` lands in the window a check-then-create CANNOT cover: after the listing was served,
+    # before the create was recorded. The protocol must still end with no trusted record of its own.
+    check("[#394] EXECUTED register: a duplicate landing BETWEEN the read and the create leaves NO "
+          "trusted record — the post-create proof retracts what this run made",
+          register_view([[9, "acct08"]], outsider=[77, "acct07"]), (1, []))
+    # ...and that emptiness must come from a RETRACTION, not from never having created: the create
+    # happened exactly once, and the record it made is renamed out of the `acctNN` namespace (both
+    # activation paths match on the exact title, so renaming — not closing — is what resolves the
+    # ambiguity), stripped of `account` so read_accounts can never select it, and closed.
+    raced_code, raced_calls, raced_state = run_register([[9, "acct08"]], outsider=[77, "acct07"])
+    check("[#394] EXECUTED register: ...and the retraction is REAL (created once, then renamed, "
+          "unlabelled and closed)",
+          (raced_code, [call[:2] for call in raced_calls].count(["issue", "create"]),
+           [(record["title"] != "acct07", "account" in record["labels"], record["state"])
+            for record in raced_state["created"]]),
+          (1, 1, [(True, False, "closed")]))
+    # An unreadable POST-create listing is uniqueness UNPROVEN, which is not uniqueness: the same
+    # retraction runs, so an outage can never leave a record this run could not vouch for.
+    check("[#394] EXECUTED register: an unreadable POST-create listing retracts and fails closed",
+          register_view([[9, "acct08"]], fail_listings=[2]), (1, []))
+    # THE RESIDUAL WINDOW (review round 2). Every row above lands the outsider somewhere a read can
+    # still see it. Here it lands after the post-create listing has already been SERVED — the
+    # interleaving NO read can close, because a further uniqueness read would only move the same
+    # window. So this row asserts the honest outcome rather than a refusal the fragment cannot
+    # deliver: the run SUCCEEDS, nothing is retracted, and two exact-title records remain. It exists
+    # so the bound is pinned by an executed test — if a later change claims to have made
+    # registration create-once, this row is where that claim has to be confronted. The two rows are
+    # COUPLED on purpose: the numbers this one leaves behind are the activate harness's input below,
+    # so a fragment that left only ONE record here would flip that row red too (activation would
+    # succeed where it is asserted to refuse) rather than silently weakening the pair.
+    late_code, late_calls, late_state = run_register(
+        [[9, "acct08"]], outsider_late=[2, [6, "acct07"]], next_number=5)
+    late_titled = ([str(number) for number, title in late_state["issues"] if title == "acct07"]
+                   + [str(record["number"]) for record in late_state["created"]
+                      if record["title"] == "acct07"])
+    check("[#394 r2] EXECUTED register: a duplicate landing AFTER the post-create proof is NOT "
+          "caught — the run succeeds, retracts nothing, and two exact-title records remain",
+          (late_code, sorted(late_titled),
+           [call[:2] for call in late_calls].count(["issue", "edit"])),
+          (0, ["5", "6"], 0))
+    # ...and the CONSEQUENCE of that window is bounded, executed rather than argued: the very pair
+    # of numbers the run above left behind is fed into the activate harness, which must REFUSE on
+    # ambiguous identity. Registration's residual window can cost a wedged account (recoverable, and
+    # the always() alarm documents retracting the intruder); it can never cost a mis-activation.
+    check("[#394 r2] EXECUTED: the state that window leaves is REFUSED by activation, never "
+          "mis-activated",
+          activated_view(issue_numbers=late_titled), (1, ["status:pending"], False, False))
+    # If the retraction itself cannot be applied the step must still FAIL — loudly, having tried —
+    # rather than exiting 0 over a record it knows may be one of two.
+    stuck_code, stuck_calls, stuck_state = run_register(
+        [[9, "acct08"]], outsider=[77, "acct07"], retract_fails=True)
+    check("[#394] EXECUTED register: a retraction that FAILS is attempted and still fails the step",
+          (stuck_code, [call[:2] for call in stuck_calls].count(["issue", "edit"]),
+           [record["title"] for record in stuck_state["created"]]),
+          (1, 1, ["acct07"]))
+    # NON-VACUITY: the pre-#394 form — create with no proof — MUST create the duplicate against the
+    # very fixture the real fragment refuses. Without this row a harness that never reached
+    # `gh issue create` at all would leave every refusal row above green while proving nothing.
+    legacy_register = ('gh issue create -R "${{ github.repository }}" --title "$HANDLE" '
+                       '--label account --label "provider:$PROVIDER" --label status:pending '
+                       '--body "$body"\n')
+    check("[#394] NON-VACUOUS: the pre-#394 form DOES create a duplicate on that same fixture",
+          register_view([[5, "acct07"]], script=legacy_register), (0, [minted_record]))
+    # ...and on the INTERLEAVING fixture too: the old form exits 0 leaving its `acct07` record
+    # standing beside the outsider's — the two-trusted-records wedge this protocol now resolves. A
+    # pre-create read alone would pass this row as well, which is why it is the fix's yardstick.
+    check("[#394] NON-VACUOUS: on the interleaving the pre-#394 form leaves its record standing",
+          register_view([[9, "acct08"]], outsider=[77, "acct07"], script=legacy_register),
+          (0, [minted_record]))
+    # The pre-create refusal must sit BEFORE the create in the step the runner executes (the
+    # fragment is a region of it) and the post-create PROOF after it — one shared listing helper, so
+    # the two reads cannot drift apart. The handle proved unique must be the CLAIMED slot from the
+    # store step, not `meta`'s pre-login hint, which is the stale snapshot #186 removed.
+    check("[#394] the register step refuses a taken title BEFORE creating and re-proves the record "
+          "unique AFTER, on the CLAIMED slot",
+          (0 <= register.find("exact_title_issues() {")
+           < register.find("prior=$(exact_title_issues)")
+           < register.find("gh issue create")
+           < register.find("after=$(exact_title_issues)"),
+           register.count("issues?state=all&per_page=100"),
+           register_env.get("HANDLE")),
+          (True, 1, "${{ steps.store.outputs.handle }}"))
+    # ...and the always() alarm OWNS the recovery for both outcomes (the issue asked for it
+    # explicitly): a human must not answer a duplicate-title refusal — or a retraction — by
+    # hand-creating the second record. Comment-stripped, so the guidance has to be in the comment
+    # the alarm POSTS.
+    alarm = workflow_step(workflow, "alarm")
+    check("[#394] the always() alarm's recovery guidance covers the refusal AND the retraction",
+          ("#394" in alarm, "do **not** hand-create a second" in alarm,
+           "allocates a FRESH slot" in alarm, "RETRACTED" in alarm),
+          (True, True, True, True))
+    # ...and (review round 2) the RESIDUAL window has an owner too: when the duplicate lands after
+    # registration succeeded, the failure surfaces on the activation branch, where the operator must
+    # retract the INTRUDER rather than the broker's record — the opposite choice destroys the record
+    # whose credential is actually stored.
+    check("[#394 r2] the alarm's activation branch owns the post-registration duplicate",
+          ("RETRACTING THE INTRUDER" in alarm, "If the log says TWO were found" in alarm),
+          (True, True))
+
     template = (root / ".github/ISSUE_TEMPLATE/set-up-account.yml").read_text(encoding="utf-8")
     form = strip_yaml_comments(template)
     check("the request form documents the grant label (in the form itself, not a comment)",
