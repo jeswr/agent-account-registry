@@ -1576,6 +1576,19 @@ def _self_test():
     # Still a FIXED POINT under the new branch: the withheld plan must be EMPTY, not oscillating.
     chk("[#1054] the withheld plan is a fixed point (no add, no remove, no churn)",
         (sorted(r["add"]), sorted(r["remove"])), ([], []))
+    # [#1054 round 2] THE SECOND ROUTE OUT OF THE FRONTIER. The `status:untriaged` strip is
+    # DELIBERATELY outside the withhold: `status:untriaged` is triage's OWN label, and clearing it
+    # is exactly what leaves a clean lone-`status:deferred` row the retry lane can select. Move the
+    # strip inside the guard and the issue lands `status:untriaged` + `status:deferred` instead —
+    # which `dispatch.yml`'s `retry_gated` refuses — re-stranding it by a DIFFERENT route while
+    # every row above stays green. Found by review; it survived the first round of mutants.
+    _du = ["area:dispatch", "priority:P1", "role:impl", "status:deferred", "status:untriaged"]
+    _rdu = triage(_du, "task")
+    _post_du = (set(_du) | _rdu["add"]) - _rdu["remove"]
+    chk("[#1054] a DEFERRED+UNTRIAGED complete issue is left as a CLEAN lone-deferred row "
+        "(untriaged stripped, ready still withheld) — the retry lane's only admissible shape",
+        (sorted(_post_du), "status:untriaged" in _rdu["remove"]),
+        (["area:dispatch", "priority:P1", "role:impl", "status:deferred"], True))
 
     # MUTATION. Every row above passes against a guard that is present but INERT, so the guard is
     # re-derived from this file's own source with the behaviour broken and the STRUCTURE those rows
@@ -1621,6 +1634,23 @@ def _self_test():
     chk("[#1054] ...while its surviving members still withhold — so only the per-member rows kill it",
         "status:ready" in _m4(["area:dispatch", "priority:P1", "role:impl",
                                "status:in-progress"], "task")["add"], False)
+    # (m5) THE REVIEW-FOUND SURVIVOR: the guard fires, `status:ready` is correctly withheld, and the
+    # issue is STILL stranded — because the `status:untriaged` strip moved inside the guard, so a
+    # deferred+untriaged row keeps a label `retry_gated` refuses. Withholding the promotion is not
+    # sufficient; the row also has to be left in a shape the retry lane can take.
+    _m5 = _mutant("            add.add(\"status:ready\")\n        remove.add(\"status:untriaged\")\n"
+                  "        remove.add(\"needs:area\")\n",
+                  "            add.add(\"status:ready\")\n            remove.add(\"status:untriaged\")\n"
+                  "            remove.add(\"needs:area\")\n", "strip-inside-guard")
+    _r5 = _m5(_du, "task")
+    chk("[#1054] MUTANT strip-inside-guard withholds ready CORRECTLY but re-strands the row as "
+        "untriaged+deferred, which retry_gated refuses",
+        sorted((set(_du) | _r5["add"]) - _r5["remove"]),
+        ["area:dispatch", "priority:P1", "role:impl", "status:deferred", "status:untriaged"])
+    chk("[#1054] ...and it leaves the CLEAN promotion untouched — so only the deferred+untriaged "
+        "row above can kill it",
+        sorted(_m5(["area:dispatch", "priority:P1", "role:impl", "status:untriaged"],
+                   "task")["add"]), ["status:ready"])
 
     # -----------------------------------------------------------------------------------------------
     # THE LIVE `gh` ARGV live_gh builds (shared by triage --apply and retriage --apply): an EMPTY

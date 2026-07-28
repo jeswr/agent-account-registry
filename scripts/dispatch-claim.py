@@ -4510,8 +4510,22 @@ def _current_issue_matches(repo, item, trusted_bots, allow_actions_bot_issues=Fa
         # busy/gated label still fails closed. CLAIM flips deferred->ready on dispatch.
         if "status:deferred" not in labels:
             return False, "issue is no longer deferred"
-        if "status:ready" in labels:
-            return False, "issue already re-attested ready (normal path will dispatch it)"
+        # [registry #1054] THE SAME FALSE PREMISE, WRITTEN TWICE. This used to read
+        #     if "status:ready" in labels:
+        #         return False, "issue already re-attested ready (normal path will dispatch it)"
+        # The normal path will NOT dispatch it. Reaching this line requires `status:deferred`
+        # (asserted immediately above), and `status:deferred` is in `BUSY_OR_GATED` /
+        # `ready-issues.BUSY_STATUS`, so the ready lane refuses the identical row — the deferred
+        # row can never appear in `compute_ready`'s output, which is exactly why no double
+        # dispatch is possible here. PLAN's candidate filter carried the same sentence and the
+        # same error (dispatch.yml, fixed in this PR); removing it there alone changed NOTHING,
+        # because PLAN's deferred->ready swap is IN-MEMORY for the readiness computation only —
+        # dispatch.yml emits `details[number]`, the REAL labels, and this function re-fetches
+        # them live. MEASURED against the live board at the first draft of this PR: of 32
+        # ready+deferred pairs, PLAN admitted 32 and this line rejected 32, with no backfill;
+        # deleting only this `return` admitted 32/32, and the lone-deferred control was unmoved
+        # at 6/49 both ways. So the PLAN-side census moved from 1 to 9 while dispatchable work
+        # stayed at 1. A fix at one layer of a two-layer premise is not a fix.
         if any(label in DEFERRED_GATED or label.startswith("needs:") for label in labels):
             return False, "deferred issue is otherwise busy or gated"
         return True, ""
@@ -22713,6 +22727,72 @@ def _absorbing_park_leg_self_test():
     chk("[#1054] ...and the restored clause leaves a LONE deferred row admitted — so only the "
         "pair row above can kill it",
         run_filter([lb for lb in pair if lb != "status:ready"], regressed), [1])
+
+    # (11) [registry #1054 round 2] THE PLAN->CLAIM COMPOSITION — the seam this fix first FAILED at,
+    # and the reason a PLAN-side census is not evidence of work. PLAN's deferred->ready swap is
+    # IN-MEMORY, for the readiness computation only: `dispatch.yml` emits `details[number]` — the
+    # REAL labels — so every admitted pair arrives at CLAIM still carrying `status:deferred` AND
+    # `status:ready`, and CLAIM re-fetches them live anyway. The first draft of this PR removed the
+    # `status:ready` clause from PLAN alone; PLAN's frontier went 1 -> 9 and dispatchable work
+    # stayed at 1, because `_current_issue_matches` carried a SECOND copy of the same false premise
+    # ("normal path will dispatch it") and rejected 32 of 32 pairs with no backfill. `grep` for that
+    # sentence returned exactly one hit — the source line — so nothing anywhere covered this seam.
+    # These rows are that cover: they run PLAN's real block, build the item EXACTLY as dispatch.yml
+    # builds it, and put it through the real CLAIM predicate.
+    _real_labels = sorted(pair)
+    _planned = run_filter_rows(pair)
+    chk("[#1054] the swap is IN-MEMORY: PLAN's row carries ready-without-deferred, but the ITEM "
+        "dispatch.yml emits carries the REAL labels — so CLAIM sees the pair, not the swap",
+        (_planned[0]["labels"] if _planned else None, "status:deferred" in _real_labels),
+        (sorted(set(pair) - {"status:deferred"}), True))
+    _body = "deferred retry work"
+
+    def _live_issue(labels, body=_body):
+        """The payload CLAIM's own live re-fetch returns — the shape that makes the swap moot."""
+        return {"state": "open", "user": {"login": "maintainer"}, "author_association": "MEMBER",
+                "labels": [{"name": name} for name in labels], "body": body}
+
+    def _claim_admits(match_fn, labels, module_globals=None):
+        item = {"number": 700, "labels": sorted(labels), "author": "maintainer",
+                "body_sha": hashlib.sha256(_body.encode()).hexdigest(), "deferred": True}
+        target = globals() if module_globals is None else module_globals
+        prev_json, prev_trust = target.get("_gh_json"), target.get("_issue_is_trusted")
+        target["_gh_json"] = lambda _args: _live_issue(item["labels"])
+        target["_issue_is_trusted"] = lambda *a, **k: True
+        try:
+            return match_fn("example/repo", item, frozenset())
+        finally:
+            target["_gh_json"], target["_issue_is_trusted"] = prev_json, prev_trust
+
+    _passed, _why = _claim_admits(_current_issue_matches, _real_labels)
+    chk("[#1054] END-TO-END: a pair PLAN admits is also admitted by CLAIM (PLAN-side census alone "
+        "is NOT dispatchable work)", (_passed, _why), (True, ""))
+    chk("[#1054] ...and CLAIM still REFUSES a deferred row that is genuinely gated",
+        _claim_admits(_current_issue_matches, _real_labels + ["needs:user"])[0], False)
+    # The CLAIM-side mutant: restore the second copy of the premise. PLAN still admits the row —
+    # every row above this one stays green — and the composition dies. That is precisely the shape
+    # that shipped, so it must be pinned from BOTH ends.
+    _claim_src = Path(__file__).resolve().read_text(encoding="utf-8")
+    # The anchor is ASSEMBLED at runtime so the full literal never appears in this file — a test
+    # that quotes its own target counts itself and fails closed on a healthy tree (it did, once).
+    _anchor = '        return False, "issue is no longer ' + 'deferred"\n'
+    assert _claim_src.count(_anchor) == 1, (
+        "[#1054] the deferred CLAIM gate moved — this mutation must stay live "
+        f"(anchor occurrences: {_claim_src.count(_anchor)})")
+    _regressed_claim = _claim_src.replace(
+        _anchor,
+        _anchor
+        + '        if "status:ready" in labels:\n'
+        + '            return False, "issue already re-' + 'attested ready"\n')
+    _ns = {"__name__": "dispatch_claim_mutant", "__file__": str(Path(__file__).resolve())}
+    exec(compile(_regressed_claim, "<mutant:claim-reattested>", "exec"), _ns)  # noqa: S102
+    _mut_match = _ns["_current_issue_matches"]
+    chk("[#1054] MUTANT claim-reattested: restoring the SECOND copy of the premise makes CLAIM "
+        "reject the pair PLAN just admitted — the exact defect that shipped",
+        _claim_admits(_mut_match, _real_labels, _ns)[0], False)
+    chk("[#1054] ...while that mutant still admits a LONE deferred row — so only the pair row "
+        "above can kill it, and a lone-deferred control cannot mask it",
+        _claim_admits(_mut_match, sorted(set(pair) - {"status:ready"}), _ns)[0], True)
 
 
 def _dispatch_yaml_block(path, step_id, marker):
