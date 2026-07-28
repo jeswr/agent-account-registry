@@ -2,16 +2,6 @@
  "leases": [
   {
    "account": "488920c2efe2b3fb",
-   "claim_id": "66de08ff8ccf47d0886c4a8d9d8b8aac",
-   "holder": "fix:sparq-org/sparq#4338@dispatch-30340312044.1",
-   "package": "knowledge-graph",
-   "role": "fix",
-   "model": "opus5",
-   "issued_at": 1785225666,
-   "expires_at": 1785231966
-  },
-  {
-   "account": "488920c2efe2b3fb",
    "claim_id": "c3e207199f9d41dbaee14e0cbea7e341",
    "holder": "fix:sparq-org/sparq#4355@dispatch-30340312044.1",
    "package": "site-papers",
