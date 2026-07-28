@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 930,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "5fbcf80dfea7e42316e991ee1d1a82de6e7632f5",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly repairs the dashboard's residual-disclosure documentation: active_agents and repository/model counts are lease counts, while per-account concurrency can exceed one, so the prior claim that N leases implied at least N accounts was false. The HTML and generator comments consistently describe the weaker inference without changing the published surface or trust-plane behavior. The new fixture is non-vacuous: one account with three distinct valid live leases must produce the same lease/model counts as three accounts with one lease each, and its explicit expected values would fail if active_agents were changed to count busy accounts. Claim IDs and holders remain unique, so the fixture exercises the intended ledger shape rather than relying on duplicates. No security checks, workflow permissions, routing, labels, or fail-closed behavior are weakened.",
+  "verdict": "approve"
+ }
+}
