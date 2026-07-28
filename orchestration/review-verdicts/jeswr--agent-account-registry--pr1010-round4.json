@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1010,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "6956b327d67aa22205f01e16b994e9762f4c77e8",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_branch_is_statically_dead` still treats any expression rejected by `ast.literal_eval` as potentially live. Therefore certainly-false expressions such as `if not True:`, `if 1 == 0:`, and `while False or False:` are accepted. `_live_nodes` also descends into all `except` handlers, so a counter placed in `try: pass` / `except Exception:` is certified even though that handler cannot execute. In these shapes `_escalation_call_site` returns `dispatch` while no escalation increments `defer_reasons`. The eleven mutants cover selected literal guards and nested scopes, but omit both previously reported reachability holes.",
+    "file": "scripts/dispatch-claim.py",
+    "fix_hint": "Conservatively reject control-flow regions that are not proven to execute, including foldable boolean/comparison expressions and exception handlers without a proven execution path; alternatively require the counter in the exact direct loop-body structure used by production. Add parseable production-source mutants placing the counter under `if not True:` and inside a never-entered `except` handler, and assert `_escalation_call_site` returns `None` for both.",
+    "severity": "major",
+    "title": "Call-site proof still accepts counters in statically unreachable control flow"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe round-3 major remains unchanged. `_branch_is_statically_dead` still relies exclusively on `ast.literal_eval`, so constant boolean/comparison expressions such as `if not True:` and `if 1 == 0:` are treated as live. `_live_nodes` also still traverses every exception handler without proving that it can execute. Consequently, the production counter can be moved into statically unreachable control flow while `_escalation_call_site` continues to certify `dispatch`. The newly listed mutants cover literal guards and nested callable scopes, but still do not exercise either reported shape. This is materially the same finding at the same severity, so progress is `stagnant`.",
+  "verdict": "request_changes"
+ }
+}
