@@ -59,11 +59,31 @@ below.
 `--observability ledger/data/observability.json`, and the comment immediately above it
 (`:391`) says the snapshot is *"OPTIONAL on the ledger until its collector"* ships.
 
-**Nothing in this repository writes `data/observability.json`.** A repo-wide search for
-`observability` outside `dashboard-gen.py` returns only `dashboard/app.js` comments, the
-`dashboard.yml` flag, and an unrelated docstring in `select-and-claim.py:1147`. So the queue panel
-is a fully-built, fully-tested consumer wired to a file no workflow produces — it is permanently
-hidden in production.
+**Nothing in this repository writes `data/observability.json`.** The evidence is a *writer*-oriented
+search, not a mention count — the word appears in more places than a reader might expect, and all of
+them are consumers, UI, or prose. `grep -ril observability` (excluding `.git`) matches twelve files
+— this record plus the eleven below:
+
+| file | what it is | can it persist `data/observability.json`? |
+|---|---|---|
+| `scripts/dashboard-gen.py` | the consumer (`--observability`, `_normalize_observability`) | no — reads a path handed to it |
+| `.github/workflows/dashboard.yml:391,401` | passes `--observability ledger/data/observability.json` | no — read-side flag + the "until its collector" comment |
+| `dashboard/app.js`, `dashboard/index.html:108`, `dashboard/styles.css:189` | render the published `site/data.json` key | no — browser-side |
+| `data/README.md:46-63` | documents the snapshot's schema and names its intended producer | no — prose |
+| `research/orchestrator-task-queue.md:66` | the #243 design doc's "Observability" bullet | no — prose |
+| `.github/workflows/metrics.yml:1`, `scripts/metrics.py:2`, `scripts/policy-resolve.py:111` | header comments using the word for the *throughput* surface | no — unrelated surface |
+| `scripts/select-and-claim.py:1147` | `return_reason` docstring, "observability-only extension" | no — unrelated word |
+
+The load-bearing check is the write side: `grep -rn 'observability\.json'` matches only the
+`dashboard.yml` read flag, three explanatory comments in `dashboard-gen.py`/`app.js`, and
+`data/README.md` — no script opens or CAS-writes that path, and no workflow step commits it to the
+`ledger` branch. So the queue panel is a fully-built, fully-tested consumer wired to a file no
+workflow produces — it is permanently hidden in production.
+
+`data/README.md:50-53` is worth reading before designing §3: it already fixes the producer as "a
+snapshot the **metrics collector** persists on the `ledger` branch", and states the collector-author
+contract is `dashboard-gen._normalize_observability()` "not this prose". That narrows §6's open
+question — the documented intent is that the #246 collector, not the drain, owns this file.
 
 > This is the single most useful thing this record establishes: **#636's dashboard half is not a
 > `dashboard-gen.py` change at all.** It is "write the #246 collector, and have it emit
@@ -185,14 +205,79 @@ a skipped target must have no row — so queue depth would vanish for reasons un
 **C. Both**: top-level `queue` for the fleet truth, per-target `queue_depth` for alerting.
 *Against*: two sources for one number is how they drift. Not recommended without a stated reason.
 
-**Recommendation**: A, with the class-2 clamp alarm added as a **fifth `ALERT_CLASSES` member**
-that reads the top-level `queue` key rather than a `targets` row. This is where #636's real value
-is: `metrics.py`'s ring gives class-2 age a *sustained* predicate over `recover_snapshots`
-(`_sustained`, `:231`), whereas both existing trend surfaces are weaker than they look —
-`drain.yml`'s alarm is per-tick, and the dashboard's own `obsTrend` is **client-side and in-memory,
-keyed on `generated_at` and lost on page reload** (`dashboard/app.js:586-588`). Only the metrics
-ring makes "the class-2 backlog has been growing for six ticks" a durable, alertable fact. That,
-and not the panel, is the part of #636 that is not already built.
+**Recommendation**: A. The value #636 adds is the *ring*: `metrics.py` gives class-2 age a
+**sustained** predicate over K snapshots (`_sustained`, `:231`), whereas both existing trend
+surfaces are weaker than they look — `drain.yml`'s alarm is per-tick, and the dashboard's own
+`obsTrend` is **client-side and in-memory, keyed on `generated_at` and lost on page reload**
+(`dashboard/app.js:586-588`). Only the metrics ring makes "the class-2 backlog has been growing for
+six ticks" a durable, alertable fact. That, and not the panel, is the part of #636 that is not
+already built.
+
+### 4a. The alert path must be built alongside `ALERT_CLASSES`, NOT inside it
+
+An earlier draft of this record recommended adding the clamp alarm as a *fifth `ALERT_CLASSES`
+member reading the top-level `queue` key*. **That is not implementable as stated** — the existing
+alert machinery is target-scoped end to end, and the fifth-member shape breaks on all three legs:
+
+- **Firing.** `evaluate_alerts` only ever evaluates inside `for target, m in targets.items()`
+  (`:275`); a predicate whose data lives at `current["queue"]` is never reached with the queue in
+  hand. It would be dead code on the fire path.
+- **Recovery.** `compute_recoveries` iterates `collected_targets` and applies **every**
+  `ALERT_CLASSES` predicate via `_CLASS_PRED[cls](th)` to that target's rows (`:1074-1082`). A
+  fifth member would therefore be invoked against unrelated `targets[repo]` rows — finding no queue
+  fields, returning false for all of them, and "recovering" the fleet alarm on zero queue evidence.
+- **Identity.** Reconciliation keys are `(target, classification)` (`_marker`, `:949-950`;
+  `reconcile_alerts`, `:1088-1091`). Routing a fleet-global alarm through `collected_targets` would
+  make a *fleet* queue alarm's closure depend on *target collection* — a repo losing its read token
+  would close the queue alert. That inverts the blocker `compute_recoveries` was written to prevent.
+
+The correct shape keeps the fleet rule **parallel to**, not inside, the per-target machinery, and
+reuses only `reconcile_alerts` (which is already generic over `(target, classification)` pairs):
+
+1. **Identity.** A module constant `QUEUE_BACKLOG = "queue-backlog"` plus a reserved pseudo-target
+   `FLEET_TARGET = "(fleet)"`. It must be unable to collide with any `owner/repo` key from
+   `policy/repos.toml` — parentheses are not legal in a GitHub repo name and the token carries no
+   `/`. `_marker`/`_alert_title` then produce a stable, unique marker with no change to either.
+2. **History helper.** A separate `_recent_queue_rows(history, k)` returning the last k snapshots'
+   `snap["queue"]` blocks **only where the block is a well-formed dict of class rows** — not
+   `_recent_rows`, which is hard-wired to `snapshots[].targets[target]`. Note the `queue` key must
+   ride on the normal snapshot: `validate_history` drops any snapshot lacking a dict `targets`
+   (`:848-860`), so a queue-only snapshot would silently vanish from the ring.
+3. **Sustained predicate.** `_queue_clamp_pred(th)` over one queue block (class-2 rows at or past
+   the clamp), applied by a `_queue_sustained(history, k, pred)` that mirrors `_sustained`'s
+   `len(rows) >= k and all(...)` contract — insufficient history never fires, one spiky tick never
+   fires. Called from `evaluate_alerts` **after** the target loop, appending at most one row.
+4. **Threshold source.** Fleet-level, not per-target: `thresholds_by_target` is keyed by repo, so
+   there is no honest entry to read. Add a `DEFAULT_FLEET_THRESHOLDS` carrying
+   `queue_age_clamp_minutes` (same resolved heal-wait value §3 sends to the dashboard's
+   `thresholds`) plus its own `sustain_snapshots`/`recover_snapshots`. Borrowing an arbitrary
+   target's overrides would be exactly the silent-default this repo forbids.
+5. **Recovery, fail-closed.** A separate `compute_queue_recovery(history, th)` returning
+   `{(FLEET_TARGET, QUEUE_BACKLOG)}` or `set()`, unioned into the set handed to `reconcile_alerts`.
+   It recovers **only** when the last `recover_snapshots` snapshots each carry a *valid* queue block
+   AND the fire predicate is false in every one. A missing or malformed `queue` block in any of
+   those snapshots yields **no recovery** — the alert stays open on absent evidence, mirroring the
+   skipped-target blocker. The fleet class stays **out of `ALERT_CLASSES` and `_CLASS_PRED`**, so
+   `compute_recoveries` can never apply it to a target row.
+
+Dedupe then comes free and unchanged: `reconcile_alerts` already upserts one issue per
+`(target, classification)` and skips any pair that is firing this tick (`:1088-1094`).
+
+**Self-tests that would make this non-vacuous** (each must go red if the behaviour regresses):
+
+- **fires**: clamp condition true in all K queue blocks ⇒ exactly one `(FLEET_TARGET,
+  QUEUE_BACKLOG)` row, with the tripping values in `metrics`.
+- **insufficient history**: same condition with only K-1 snapshots ⇒ no row; and one spiky tick
+  inside K ⇒ no row.
+- **missing data fails closed, both directions**: a snapshot with no `queue` key, and one with a
+  malformed block, each ⇒ (a) no fire, and (b) **not** in the recovery set — asserting the alert
+  is left open rather than auto-closed.
+- **dedupe**: a pair both firing and nominally recovered this tick is upserted once, as a fire.
+- **hysteretic recovery**: clear across all `recover_snapshots` *valid* blocks ⇒ recovered; clear
+  across `recover_snapshots - 1` ⇒ not yet.
+- **identity/regression guard**: `QUEUE_BACKLOG not in ALERT_CLASSES`, `"/" not in FLEET_TARGET`,
+  and `FLEET_TARGET` absent from the targets loaded from `policy/repos.toml` — this is the
+  assertion that goes red if a future change folds the rule back into `_CLASS_PRED`.
 
 On the read path: `metrics.py` already holds a `GitHubAPI(registry_token)` reading the ledger
 branch (`:777`, `:820-846`), so `data/task-queue.json` is reachable with no new credential. For
@@ -219,8 +304,10 @@ duplicate or a silently-empty panel.
 
 ## 6. What this record does not establish
 
-- Whether the #246 collector is planned, in flight elsewhere, or abandoned. Unknown from the repo;
-  only `dashboard.yml:391`'s "until its collector" comment and `app.js:573-577` reference it.
+- Whether the #246 collector is planned, in flight elsewhere, or abandoned. The repo states the
+  *intent* — `data/README.md:50-53` names the metrics collector as the producer and pins the
+  collector-author contract to `_normalize_observability()`, and `dashboard.yml:391` says "until its
+  collector" — but nothing records whether anyone is building it. Status is a maintainer call.
 - Whether class 2 should be exported at `heal_rank` resolution (`2a..2d`). The dashboard *accepts*
   it; the queue does not *produce* it. Maintainer call.
 - No claim that the existing validation boundary is *audited*. `_obs_flow` enforces the decision-22
