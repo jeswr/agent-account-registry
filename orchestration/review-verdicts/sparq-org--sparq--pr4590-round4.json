@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4590,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "025c9afa604ca37459f52a5b89f17ac3da749e18",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The fromTerm case asserts only termType and equals, while the fromQuad case asserts termType, nested-subject type, equals, and canonical-key equality. Returning the input unchanged satisfies every assertion. In particular, the test named \"fromQuad deep-copies a quad whose subject is a quoted triple\" still does not establish that the returned outer Quad or nested Quad subject has distinct identity. This leaves the README's deep-copy claim and the named test materially unverified.",
+    "file": "packages/rdfjs-conformance/src/index.mjs",
+    "fix_hint": "For factory-produced inputs, assert copy !== original in both fromTerm and fromQuad cases. In the nested fromQuad case, also assert copy.subject !== original.subject, while retaining the existing structural-equality assertions. If identity reuse is intentionally permitted by the relevant contract, remove the deep-copy claim from the test name and README instead.",
+    "severity": "major",
+    "title": "Nested-Quad copy tests still do not prove that a copy is made"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 4 is stagnant: the same major test-validity gap from round 3 remains. The new fromTerm and fromQuad tests still check only type and structural equality, so implementations that return the original objects unchanged pass despite the advertised deep-copy behavior. No hostile prompt-injection content was detected in the diff.",
+  "verdict": "request_changes"
+ }
+}
