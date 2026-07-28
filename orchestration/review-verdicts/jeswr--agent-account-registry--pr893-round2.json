@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 893,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "110ab8586def84afd539527457a5272148db46e1",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`check_form` skips ID validation whenever `\"id\" not in element`, and the self-test positively locks in that behavior with \u201c`id` is OPTIONAL\u201d. GitHub's issue-form syntax requires an `id` for each non-markdown input, textarea, dropdown, and checkboxes element. Therefore the validator still accepts structurally invalid forms, including `{type: input, attributes: {label: A}}`, leaving part of the prior round's schema-soundness finding unresolved.",
+    "file": "scripts/issue-form-check.py",
+    "fix_hint": "Require an `id` on every non-markdown element, then apply the existing non-empty/syntax/uniqueness checks. Replace the self-test assertion that a labelled field without an ID is accepted with an assertion that it is rejected, and add a missing-ID rejection assertion for each fillable type.",
+    "severity": "major",
+    "title": "Fillable elements incorrectly accept a missing required id"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 2 materially improves the gate: it counts real forms separately from chooser config, fails closed on zero forms, validates the required per-type attribute shapes, and enrolls a substantial non-vacuous self-test. However, the prior schema-validation finding is not fully resolved. The new validator explicitly accepts missing `id` values on every fillable field, even though GitHub's issue-form schema requires `id` for input, textarea, dropdown, and checkboxes elements. Consequently a form GitHub rejects can still merge green. This is one remaining major finding rather than the two major findings from round 1, so progress is improving.",
+  "verdict": "request_changes"
+ }
+}
