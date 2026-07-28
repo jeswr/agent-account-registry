@@ -1000,14 +1000,20 @@ def _self_test():   # noqa: C901 — one flat assertion table, deliberately
     # `assembler_deferrals=0` — and 0 on that field means "the assemble leg ran and deferred
     # nothing", i.e. the leg where the frontier was MEASURED to die would have read HEALTHY
     # forever. Delete the PLAN-side merge and this is the row that goes red.
-    lost_leg = build_record("o/t", "99.1",
-                            dict(frontier_doc, frontier_width=10, deferred_retry_width=0),
-                            {"planned": 0, "launched": 0}, 100)
+    lost_leg, lost_leg_error = None, None
+    try:
+        lost_leg = build_record("o/t", "99.1",
+                                dict(frontier_doc, frontier_width=10, deferred_retry_width=0),
+                                {"planned": 0, "launched": 0}, 100)
+    except Exception as exc:            # noqa: BLE001 — claiming a missing leg REPORTED crashes
+        lost_leg_error = f"{type(exc).__name__}: {exc}"
     chk("[null-leg] a census that reached CLAIM with NO assemble leg records null, never 0",
-        (lost_leg["assemble_leg"], lost_leg["assembler_deferrals"],
-         lost_leg["plan_rows_before_assemble"], lost_leg["chain"]["assembler_deferrals"],
-         lost_leg["chain"]["unaccounted"]),
-        ("missing", None, None, None, None))
+        (lost_leg_error,
+         (lost_leg or {}).get("assemble_leg"), (lost_leg or {}).get("assembler_deferrals"),
+         (lost_leg or {}).get("plan_rows_before_assemble"),
+         ((lost_leg or {}).get("chain") or {}).get("assembler_deferrals"),
+         ((lost_leg or {}).get("chain") or {}).get("unaccounted")),
+        (None, "missing", None, None, None, None))
     # ...and a leg that DID report zero is a different record. Both rows are needed: either one
     # alone is satisfied by hard-coding the other answer.
     reported_zero = build_record(
@@ -1593,9 +1599,15 @@ def _self_test():   # noqa: C901 — one flat assertion table, deliberately
         (["frontier-census.json"], ["o/t"], ["frontier-census.json"]))
     # L5 — EXACT path members, not a substring. Renaming a member (`…json` -> `…json.disabled`)
     # leaves `if-no-files-found: error` silent, because the OTHER member still resolves.
+    # MEMBERSHIP, not list equality. Requiring the EXACT member list also reds when a future PR
+    # adds an unrelated third member — a change detector, and my own robustness probe (H-R2)
+    # caught this row being one. Membership of the two EXACT paths has identical kill power (a
+    # rename to `…json.disabled` is simply not the required string) with none of the brittleness.
+    upload_members = {_norm_runner_temp(member) for member in _artifact_paths(upload)}
     chk("[hand-off L5] the upload step carries BOTH artifact members as EXACT paths, and refuses "
         "to upload an empty artifact",
-        (sorted(_norm_runner_temp(member) for member in _artifact_paths(upload)),
+        (sorted(upload_members & {"<runner-temp>/frontier-census.json",
+                                  "<runner-temp>/plan.json"}),
          ((upload.get("with") or {}).get("if-no-files-found"))),
         (["<runner-temp>/frontier-census.json", "<runner-temp>/plan.json"], "error"))
     # L5/L6 — the two ends must name the SAME artifact. A name drift downloads nothing at all, and
@@ -1612,9 +1624,8 @@ def _self_test():   # noqa: C901 — one flat assertion table, deliberately
         str(_workflow_step_node(workflow, "claim").get("run", "")), "dispatch-claim.py")
     chk("[hand-off L7] every consumer path RESOLVES to a member that actually lands — upload "
         "path + artifact name + download path + the reader's flag, COMPOSED",
-        (sorted(landed),
-         _cli_args(str(recorder.get("run", "")),
-                   "dispatch-telemetry.py record").get("--frontier") in landed,
+        (sorted(landed & {"plan/frontier-census.json", "plan/plan.json"}),
+         recorder_args.get("--frontier") in landed,
          claim_plan_args.get("--plan") in landed),
         (["plan/frontier-census.json", "plan/plan.json"], True, True))
 
