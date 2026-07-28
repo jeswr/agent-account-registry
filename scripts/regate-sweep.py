@@ -95,17 +95,27 @@
 # earlier revision of this header called the label "the single label that authorises arming" in a
 # way that read as a disarm. It is not one.
 #
-# THAT CASE IS ACCEPTED DELIBERATELY, and this script does not call `--disable-auto`. Reasons, in
-# order of weight: (1) the green it merges on is FRESH — computed against a base that contains the
-# repair — so it is the opposite of #940's stale-green hazard; (2) a base move adds no author
-# commits, so the diff the reviewer approved is byte-identical and only the SHA naming it changed;
-# (3) it is exactly what the six hand-moves of #927 did, and what the maintainer recorded as the
-# procedure — substance still applies, a fresh green is still required; (4) disarming has its own
-# failure mode, because nothing re-arms a PR whose deliberate arm this stripped, which converts a
-# transient red into a stall needing a human. What the script owes instead is VISIBILITY: a latched
-# arm is detected, counted in the census as `latched-arm=N`, and named in the PR comment, so the
-# merge that follows is never a surprise. If that trade is ever rejected the change is small and
-# local — one auto-merge-off call in `_act` plus a census field — not a redesign.
+# THAT CASE IS ACCEPTED DELIBERATELY, and this script does not call `--disable-auto`. Reasons:
+# (1) THE LOAD-BEARING ONE — the green it merges on is FRESH, computed against a base containing the
+# repair, which is the inverse of #940's stale-green hazard; (2) it is what the six hand-moves of
+# #927 did and what the maintainer recorded as the procedure — substance still applies, a fresh
+# green is still required; (3) disarming has its own failure mode, because nothing re-arms a PR
+# whose deliberate arm this stripped, converting a transient red into a stall needing a human.
+#
+# ⚠️ A FOURTH REASON WAS WITHDRAWN AS FALSE. It read "a base move adds no author commits, so the
+# diff the reviewer approved is byte-identical". Measured over four `git merge` cases: a DIFFERENT
+# file gives a byte-identical diff; a SAME-FILE NON-OVERLAPPING change does NOT — blob ids differ
+# and hunk headers shift (`@@ -6,5` -> `@@ -7,5`) with content unchanged; a SEMANTIC conflict can be
+# byte-identical while the merged tree BEHAVES differently; a true conflict 422s into `move-failed`.
+# So the reviewer's approval is evidence about the OLD base and only the fresh gate speaks for the
+# new one. The decision stands on reason (1) alone, which is where it always actually rested. The
+# claim also shipped inside LATCHED_ARM_NOTE, i.e. onto other people's PRs — which is why it is
+# withdrawn outright rather than softened.
+#
+# What the script owes instead is VISIBILITY: a latched arm is detected, counted in the census as
+# `latched-arm=N`, and named in the PR comment, so the merge that follows is never a surprise. If
+# the trade is ever rejected the change is small and local — one auto-merge-off call in `_act` plus
+# a census field — not a redesign.
 #
 # HOW THIS COMPOSES WITH #940. #940 is the DEFENSIVE half: at arm time, refuse a green `gate` that
 # was computed against a tree that no longer exists. This is the RECOVERY half: regenerate the
@@ -676,14 +686,25 @@ def confirm_head_moved(repo, branch, old_sha, runner=None, sleeper=time.sleep):
     return False
 
 
+# ⚠️ THIS TEXT IS POSTED ONTO OTHER PEOPLE'S PULL REQUESTS, so every clause has to be true. An
+# earlier revision claimed "a base move adds no author commits, so the approved diff is
+# byte-identical". Re-measured here: with a same-file NON-OVERLAPPING change the hunk header shifts
+# (`@@ -5,4` -> `@@ -6,4`) and the blob id changes (fcaed2f1 -> c8b58bc0) though the content is
+# identical; and a textually clean merge can still change how the tree behaves. Withdrawn outright
+# rather than softened — a wrong justification published on someone else's PR is worse than none.
 LATCHED_ARM_NOTE = (
     "\n\n**This PR already had auto-merge armed, and moving the head did NOT retract that.** "
     "`review:pass` is consulted when DECIDING to arm; `enablePullRequestAutoMerge` holds the intent "
-    "independently once latched, so this PR will merge when the fresh `gate` goes green. That is "
-    "deliberate and is the opposite of the #940 hazard — the green it merges on is computed against "
-    "a base containing the fix, and a base move adds no author commits, so the approved diff is "
-    "byte-identical. It is also exactly what the six hand-moves in #927 did. Noted here rather than "
-    "silently, and counted as `latched-arm` in this tick's census.")
+    "independently once latched, so this PR will merge when the fresh `gate` goes green.\n\n"
+    "That is deliberate, and it rests on ONE claim: **the green it merges on is fresh** — computed "
+    "against a base that contains the repair, which is the inverse of the stale-green hazard in "
+    "#940. It is also what the six hand-moves in #927 did.\n\n"
+    "It deliberately does NOT rest on the change being unaltered by the move. A base move can shift "
+    "hunk headers and blob ids even when content is identical, and a textually clean merge can "
+    "still change how the tree behaves — so **a prior approval is evidence about the old base, and "
+    "only the fresh gate speaks for the new one**. If that is not enough for this PR, disarm it: "
+    "the sweeper deliberately does not, because nothing would re-arm a PR whose owner's arm it "
+    "stripped. Counted as `latched-arm` in this tick's census.")
 
 
 def sweep_comment(repair, repair_pr_merged_at, gate_completed_at, old_sha, fails,
@@ -1347,9 +1368,22 @@ class FakeGh:
 
     def __call__(self, args):
         self.calls.append(tuple(args))
+        # ⚠️ FAIL CLOSED. This double used to answer ANY argv whose first word was not `api` with
+        # the repository payload, because `path` fell back to "" and `tail == ""` is the repo
+        # endpoint. That made the `unexpected FakeGh request` raise UNREACHABLE for every CLI form —
+        # and `gh pr merge 903 -R o/r`, which is exactly how scripts/worker-pr.py and
+        # scripts/gh_retry.py invoke gh, was silently accepted. A test double that answers calls the
+        # production code would never make cannot witness "no path arms"; it only witnesses "no path
+        # arms via a REST path spelling".
+        if not args or args[0] != "api":
+            raise AssertionError(
+                f"unexpected FakeGh request: this double serves `gh api` only, got {list(args)!r}")
         method = args[args.index("--method") + 1] if "--method" in args else "GET"
         prefix = f"/repos/{self.repo}"
-        path = next((a for a in args if a.startswith(prefix)), "")
+        path = next((a for a in args if a.startswith(prefix)), None)
+        if path is None:
+            raise AssertionError(
+                f"unexpected FakeGh request: no /repos/{self.repo} path in {list(args)!r}")
         tail = path[len(prefix):]
         if method == "PUT" and tail.endswith("/update-branch"):
             number = int(tail.split("/")[2])
@@ -1395,6 +1429,12 @@ class FakeGh:
                       for c in self.calls
                       if "--method" in c and c[c.index("--method") + 1] == "PUT")
 
+    def posted_bodies(self):
+        """Every comment body this double was asked to POST."""
+        return [a[len("body="):] for c in self.calls
+                if "--method" in c and c[c.index("--method") + 1] == "POST"
+                for a in c if a.startswith("body=")]
+
     def deleted_labels(self):
         return [c[-1] for c in self.calls
                 if "--method" in c and c[c.index("--method") + 1] == "DELETE"]
@@ -1403,6 +1443,52 @@ class FakeGh:
 REPAIR_DETAIL = {"merged_at": "2026-07-28T02:26:49Z", "merge_commit_sha": "f" * 40,
                  "base": {"ref": DEFAULT_BRANCH}}
 NOW = parse_rfc3339("2026-07-28T02:30:00Z")
+
+
+# ---------------------------------------------------------------------------------------------
+# "NEVER ARMS" — enumerated by SPELLING, not by endpoint
+# ---------------------------------------------------------------------------------------------
+# ⚠️ The controls here used to substring-search the JOINED argv for `/merge`, `enablePull` and the
+# like. That catches the REST and GraphQL spellings and MISSES the one this estate actually uses:
+# `gh pr merge 903 -R o/r` is `["pr","merge","903","-R","o/r"]`, and no token in it contains `/merge`
+# (scripts/worker-pr.py:1485 and scripts/gh_retry.py:820 are both this form). An arming call was
+# therefore invisible to the assertion whose name is this PR's central safety claim.
+#
+# So enumerate the SPELLINGS. Each entry is (label, predicate over the argv tuple).
+ARMING_SPELLINGS = (
+    # CLI subcommands — the form the production helpers use. Matched STRUCTURALLY on the leading
+    # words, because a joined-string search can never see them.
+    ("cli:pr merge", lambda a: a[:2] == ("pr", "merge")),
+    ("cli:pr ready", lambda a: a[:2] == ("pr", "ready")),
+    ("cli:pr edit --add-label", lambda a: a[:2] == ("pr", "edit") and "--add-label" in a),
+    ("cli:issue edit --add-label", lambda a: a[:2] == ("issue", "edit") and "--add-label" in a),
+    ("cli:pr review --approve", lambda a: a[:2] == ("pr", "review") and "--approve" in a),
+    ("cli:run rerun", lambda a: a[:2] == ("run", "rerun")),
+    ("cli:workflow run", lambda a: a[:2] == ("workflow", "run")),
+    # REST paths.
+    ("rest:merge", lambda a: any(re.search(r"/pulls/\d+/merge\b", x) for x in a)),
+    ("rest:auto_merge", lambda a: any("/auto_merge" in x for x in a)),
+    ("rest:rerun", lambda a: any(re.search(r"/(runs|jobs)/\d+/rerun", x) for x in a)),
+    ("rest:add review:pass", lambda a: any(x.endswith("/labels") for x in a)
+     and REVIEW_PASS_LABEL in " ".join(a)),
+    # GraphQL mutations.
+    ("graphql:enablePullRequestAutoMerge",
+     lambda a: any("enablePullRequestAutoMerge" in x for x in a)),
+    ("graphql:mergePullRequest", lambda a: any("mergePullRequest" in x for x in a)),
+    ("graphql:addLabelsToLabelable", lambda a: any("addLabelsToLabelable" in x for x in a)),
+)
+
+
+def arming_calls(calls):
+    """Every recorded call that matches an arming SPELLING. -> [(label, argv)]."""
+    found = []
+    for call in calls:
+        argv = tuple(str(x) for x in call)
+        for label, matches in ARMING_SPELLINGS:
+            if matches(argv):
+                found.append((label, argv))
+                break
+    return found
 
 
 BOT_SLUG = "registry-admin"
@@ -1431,10 +1517,28 @@ def _fixture(*, labels=(), comments=None, refuse_update=(), cap=MAX_MOVES_PER_TI
     return gh, sweeper
 
 
+def _row(sweeper, index=0):
+    """A census row, or "" when there is none. TOTAL on purpose: `sweeper.rows[0]` on an empty list
+    raises IndexError, and a raise here ABORTS every assertion after it — so one mutant would mask
+    the rest of the section and the reported check count would stop meaning what it says."""
+    rows = getattr(sweeper, "rows", [])
+    return rows[index] if len(rows) > index else ""
+
+
+def _run_total(chk, label, sweeper):
+    """Run one tick, turning an ESCAPING exception into a NAMED red rather than an abort."""
+    try:
+        return sweeper.run()
+    except BaseException as exc:                                          # noqa: BLE001
+        chk(f"tick[{label}] completed without raising",
+            f"{type(exc).__name__}: {exc}"[:140], "no exception")
+        return None
+
+
 def _test_live_sweep(chk):
     """THE REPLAY. Tonight's case end-to-end through the live path, PAIRED WITH THE CONTROL."""
     gh, sweeper = _fixture()
-    chk("live: the tick exits 0", sweeper.run(), 0)
+    chk("live: the tick exits 0", _run_total(chk, "main", sweeper), 0)
     chk("live: the attributable PR's BRANCH IS MOVED (not its job re-run — no rerun endpoint is "
         "ever called)", gh.updated(), [903])
     # Scoped to the API PATH, not to the whole command line: the marker comment this posts
@@ -1450,63 +1554,63 @@ def _test_live_sweep(chk):
         [a for c in gh.calls for a in c if a.startswith("expected_head_sha=")],
         ["expected_head_sha=" + "a" * 40])
     chk("live: the control's refusal is named in the census",
-        "own-merits:1" in sweeper.rows[0], True)
-    chk("live: the census names the class and the move", "class=1 moved=1" in sweeper.rows[0], True)
+        "own-merits:1" in _row(sweeper), True)
+    chk("live: the census names the class and the move", "class=1 moved=1" in _row(sweeper), True)
 
     # IDEMPOTENCE, twice over: by marker, and by the head now containing the fix.
     gh2, sweeper2 = _fixture(comments={903: [MARKER.format(repair=917, head="a" * 40)]})
-    sweeper2.run()
+    _run_total(chk, 'sweeper2', sweeper2)
     chk("idempotence: a PR already swept for THIS repair is not moved again",
         gh2.updated(), [])
     chk("idempotence: it is censused as already-swept, not silently dropped",
-        "already-swept=1" in sweeper2.rows[0], True)
+        "already-swept=1" in _row(sweeper2), True)
     spoof = {"body": MARKER.format(repair=917, head="a" * 40), "user": {"login": "someone-else"}}
     gh2b, sweeper2b = _fixture(comments={903: [spoof]})
-    sweeper2b.run()
+    _run_total(chk, 'sweeper2b', sweeper2b)
     chk("idempotence: a marker posted by ANYONE ELSE does not suppress the sweep — an "
         "unrestricted marker scan is a denial of recovery, not an idempotence key",
         gh2b.updated(), [903])
     gh2c, sweeper2c = _fixture(comments={903: [spoof]}, bot_login="")
-    sweeper2c.run()
+    _run_total(chk, 'sweeper2c', sweeper2c)
     chk("idempotence: with NO known bot login the polarity flips to trusting every marker — a "
         "missed move is safe and retried, a repeated move is not",
         gh2c.updated(), [])
 
     gh3, sweeper3 = _fixture(comments={903: [MARKER.format(repair=999, head="a" * 40)]})
-    sweeper3.run()
+    _run_total(chk, 'sweeper3', sweeper3)
     chk("idempotence: a marker for a DIFFERENT repair does not suppress this one",
         gh3.updated(), [903])
     gh4, sweeper4 = _fixture()
     gh4.contains["a" * 40] = True
-    sweeper4.run()
+    _run_total(chk, 'sweeper4', sweeper4)
     chk("idempotence: once the head contains the fix the PR leaves the class on its own",
-        (gh4.updated(), "already-contains-fix:1" in sweeper4.rows[0]), ([], True))
+        (gh4.updated(), "already-contains-fix:1" in _row(sweeper4)), ([], True))
 
     # A failed READ is its own state. Collapsing it into an evidence bucket would let a listing
     # outage read, in the census, as a population that WAS examined and found unattributable.
     gh4b, sweeper4b = _fixture()
     gh4b.contains["a" * 40] = None
-    sweeper4b.run()
+    _run_total(chk, 'sweeper4b', sweeper4b)
     chk("read-failure: an unreadable containment compare is censused as read-failed, never as an "
-        "examined-and-refused PR", (gh4b.updated(), "read-failed:1" in sweeper4b.rows[0]),
+        "examined-and-refused PR", (gh4b.updated(), "read-failed:1" in _row(sweeper4b)),
         ([], True))
     gh4d, sweeper4d = _fixture()
     gh4d.logs[90164408722] = None          # the log REQUEST fails, rather than returning nothing
-    sweeper4d.run()
+    _run_total(chk, 'sweeper4d', sweeper4d)
     chk("read-failure: a FAILED log REQUEST is read-failed, not log-unavailable — an API outage "
         "must not be censused as an expired retention window",
-        (gh4d.updated(), "read-failed:1" in sweeper4d.rows[0]), ([], True))
+        (gh4d.updated(), "read-failed:1" in _row(sweeper4d)), ([], True))
     gh4e, sweeper4e = _fixture()
     gh4e.logs[90164408722] = ""            # the request SUCCEEDS and yields nothing
-    sweeper4e.run()
+    _run_total(chk, 'sweeper4e', sweeper4e)
     chk("read-failure: a log request that succeeds and yields NOTHING is log-unavailable",
-        (gh4e.updated(), "log-unavailable:1" in sweeper4e.rows[0]), ([], True))
+        (gh4e.updated(), "log-unavailable:1" in _row(sweeper4e)), ([], True))
 
     gh4c, sweeper4c = _fixture(refuse_comment_reads=True)
-    sweeper4c.run()
+    _run_total(chk, 'sweeper4c', sweeper4c)
     chk("read-failure: an unreadable MARKER listing refuses the move — reading it as 'not swept' "
         "would move a head this tick cannot prove it has not already moved",
-        (gh4c.updated(), "read-failed:1" in sweeper4c.rows[0]), ([], True))
+        (gh4c.updated(), "read-failed:1" in _row(sweeper4c)), ([], True))
 
     # THE CAP, on the live path.
     many = [_pr(n, head=f"{n:040x}", ref=f"fix/{n}") for n in (903, 923, 895, 893, 886, 856)]
@@ -1516,22 +1620,61 @@ def _test_live_sweep(chk):
                  repair_detail=REPAIR_DETAIL)
     sweeper5 = Sweeper("jeswr/agent-account-registry", [dict(REPAIR)], runner=gh5, apply=True,
                        cap=MAX_MOVES_PER_TICK, clock=lambda: NOW, sleeper=lambda _s: None)
-    sweeper5.run()
+    _run_total(chk, 'sweeper5', sweeper5)
     chk("cap: six attributable PRs -> exactly MAX_MOVES_PER_TICK moved this tick",
         len(gh5.updated()), MAX_MOVES_PER_TICK)
-    chk("cap: the residue is REPORTED, never dropped", "deferred-cap=1" in sweeper5.rows[0], True)
+    chk("cap: the residue is REPORTED, never dropped", "deferred-cap=1" in _row(sweeper5), True)
+
+    # ------------------------------------------------------------------------------------
+    # THE DOUBLE ITSELF. A control that says "no arming call was issued" is worth exactly as
+    # much as the double's ability to NOTICE one.
+    # ------------------------------------------------------------------------------------
+    probe = FakeGh("jeswr/agent-account-registry", [])
+    for label, argv in (
+            ("gh pr merge (worker-pr.py / gh_retry.py's own idiom)", ("pr", "merge", "903",
+                                                                      "-R", "o/r")),
+            ("gh pr merge --auto --squash", ("pr", "merge", "903", "--auto", "--squash")),
+            ("gh pr merge --admin", ("pr", "merge", "903", "--admin")),
+            ("gh pr edit --add-label review:pass", ("pr", "edit", "903", "--add-label",
+                                                    REVIEW_PASS_LABEL)),
+            ("gh run rerun --failed", ("run", "rerun", "123", "--failed"))):
+        chk(f"double: RAISES on `{label}` instead of answering it with the repository payload — "
+            "the raise must be REACHABLE for CLI argv, which is what it was not",
+            isinstance(_raises(lambda a=argv: probe(a)), AssertionError), True)
+    chk("double: still serves the `gh api` calls the sweeper really makes",
+        isinstance(_raises(lambda: probe(("api", "/repos/jeswr/agent-account-registry"))), Exception),
+        False)
+
+    # AND the control must be able to SEE those spellings. Without this the "no arming call" checks
+    # could pass by matching nothing at all — the vacuity that hid the CLI form in the first place.
+    for label, argv in (("cli:pr merge", ("pr", "merge", "7")),
+                        ("cli:pr merge", ("pr", "merge", "903", "--auto", "--squash")),
+                        ("cli:pr edit --add-label", ("pr", "edit", "9", "--add-label",
+                                                     REVIEW_PASS_LABEL)),
+                        ("cli:run rerun", ("run", "rerun", "1", "--failed")),
+                        ("rest:auto_merge", ("api", "--method", "PUT",
+                                             "/repos/o/r/pulls/9/auto_merge")),
+                        ("rest:merge", ("api", "--method", "PUT", "/repos/o/r/pulls/9/merge")),
+                        ("graphql:enablePullRequestAutoMerge",
+                         ("api", "graphql", "-f", "query=mutation{enablePullRequestAutoMerge}"))):
+        chk(f"never-arm control: `{' '.join(argv)[:44]}` is DETECTED as {label}",
+            [name for name, _ in arming_calls([argv])], [label])
+    chk("never-arm control: an ordinary read is NOT flagged (so the control is not simply true "
+        "of everything)",
+        arming_calls([("api", "/repos/o/r/pulls?state=open"),
+                      ("api", "--method", "POST", "/repos/o/r/issues/1/comments")]), [])
 
     # NEVER ARM.
     gh6, sweeper6 = _fixture(labels=[REVIEW_PASS_LABEL])
-    sweeper6.run()
+    _run_total(chk, 'sweeper6', sweeper6)
     chk("never-arm: moving the head REMOVES the arming label — the verdict was bound to a head "
         "that no longer exists", gh6.deleted_labels(),
         [f"/repos/jeswr/agent-account-registry/issues/903/labels/{REVIEW_PASS_LABEL}"])
-    chk("never-arm: no merge/auto-merge/arming call is ever issued",
-        [c for c in gh6.calls if any(w in " ".join(c) for w in ("merge\"", "/merge", "enablePull"))],
-        [])
+    chk("never-arm: no ARMING SPELLING is ever issued — CLI (`gh pr merge …`, the form "
+        "worker-pr.py/gh_retry.py use), REST path, or GraphQL mutation",
+        arming_calls(gh6.calls), [])
     gh7, sweeper7 = _fixture()
-    sweeper7.run()
+    _run_total(chk, 'sweeper7', sweeper7)
     chk("never-arm: a PR WITHOUT the arming label gets no label write at all",
         gh7.deleted_labels(), [])
 
@@ -1540,16 +1683,16 @@ def _test_live_sweep(chk):
     # That case is accepted (the green it merges on is fresh) but it must be VISIBLE.
     gh7b, sweeper7b = _fixture(labels=[REVIEW_PASS_LABEL],
                                auto_merge={"enabled_by": {"login": "someone"}})
-    sweeper7b.run()
+    _run_total(chk, 'sweeper7b', sweeper7b)
     chk("latched-arm: an ALREADY-armed PR is moved, counted and named — the head move does not "
         "retract auto-merge, so the census must not report this merge as unattended",
-        ("latched-arm=1" in sweeper7b.rows[0], gh7b.updated()), (True, [903]))
+        ("latched-arm=1" in _row(sweeper7b), gh7b.updated()), (True, [903]))
     chk("latched-arm: no auto-merge-off / disable call is issued — the case is accepted, not "
         "silently disarmed",
         [c for c in gh7b.calls if any(w in " ".join(c)
                                       for w in ("auto_merge", "disable-auto", "DisableAuto"))], [])
     chk("latched-arm: an UNARMED moved PR reports zero, so the field cannot read as decoration",
-        "latched-arm=0" in sweeper7.rows[0], True)
+        "latched-arm=0" in _row(sweeper7), True)
     # A MISSING `auto_merge` field is a third state. Reading it as "not armed" would let the control
     # stop reporting without anything saying so — the silent-default shape.
     chk("latched-arm: an ABSENT auto_merge field is unknown, not False",
@@ -1558,47 +1701,92 @@ def _test_live_sweep(chk):
     gh7c, sweeper7c = _fixture()
     for pull in gh7c.pulls:
         pull.pop("auto_merge")
-    sweeper7c.run()
+    _run_total(chk, 'sweeper7c', sweeper7c)
     chk("latched-arm: a payload with no auto_merge field censuses latched-arm-unknown instead of "
         "silently reporting zero armed PRs",
-        ("latched-arm-unknown=1" in sweeper7c.rows[0], gh7c.updated()), (True, [903]))
+        ("latched-arm-unknown=1" in _row(sweeper7c), gh7c.updated()), (True, [903]))
     chk("latched-arm: and the unknown field is ABSENT when every payload carried auto_merge, so it "
-        "cannot become permanent noise", "latched-arm-unknown" in sweeper7.rows[0], False)
+        "cannot become permanent noise", "latched-arm-unknown" in _row(sweeper7), False)
+    chk("latched-arm: the published note does NOT claim the approved diff is unchanged — measured "
+        "false (same-file non-overlapping merges shift hunk headers and blob ids), and this text "
+        "is posted onto other people's PRs",
+        [phrase for phrase in ("byte-identical", "diff is unchanged", "no author commits",
+                               "identical diff") if phrase in LATCHED_ARM_NOTE], [])
+    chk("latched-arm: the note states the one claim it DOES rest on (the green is fresh)",
+        "green it merges on is fresh" in LATCHED_ARM_NOTE.lower(), True)
+    chk("latched-arm: and it tells the reader what to do if that is not enough for their PR",
+        "disarm it" in LATCHED_ARM_NOTE, True)
     chk("latched-arm: the PR comment names the latched arm explicitly",
         LATCHED_ARM_NOTE[:40] in sweep_comment(917, "t", "t", "a" * 40, ("x",), latched_arm=True),
         True)
     chk("latched-arm: and says nothing when there is no latched arm",
         LATCHED_ARM_NOTE[:40] in sweep_comment(917, "t", "t", "a" * 40, ("x",)), False)
 
+    # ------------------------------------------------------------------------------------
+    # THE MARKER COMMENT. It is the ENTIRE operator-facing record of what the sweeper did, and
+    # it had no test at all: deleting the post, dropping the marker, deleting the
+    # verdict-invalidation sentence and posting an empty body ALL survived. So assert CONTENT,
+    # not merely that a call happened.
+    # ------------------------------------------------------------------------------------
+    ghc, sweeperc = _fixture()
+    _run_total(chk, "comment", sweeperc)
+    bodies = ghc.posted_bodies()
+    chk("comment: exactly one comment is posted, on the PR that moved", len(bodies), 1)
+    body = bodies[0] if bodies else ""
+    chk("comment: it is not empty", bool(body.strip()), True)
+    chk("comment: it carries the idempotence MARKER for THIS repair and the OLD head — without it "
+        "the next tick has no record that this move happened",
+        MARKER.format(repair=917, head="a" * 40) in body, True)
+    chk("comment: the marker is machine-readable by the same regex `already_swept` scans with",
+        [(int(m.group(1)), m.group(2)) for m in MARKER_RE.finditer(body)], [(917, "a" * 40)])
+    chk("comment: it states the VERDICT INVALIDATION — a moved head is a head no verdict has seen",
+        all(phrase in body for phrase in ("not an arm", "invalidates any review verdict")), True)
+    chk("comment: it names the repair PR, so a reader can check the attribution claim",
+        "#917" in body, True)
+    chk("comment: it quotes the failing assertion(s) it attributed, verbatim",
+        f"    FAIL {SIG}: 1 (want 0)" in body, True)
+    chk("comment: it says why a rerun cannot substitute (the #920 mechanism)",
+        "rerun" in body and "#920" in body, True)
+    chk("comment: it identifies the agent, per the estate's self-id rule",
+        body.startswith("> \N{ROBOT FACE} **SPARQ agent**"), True)
+    chk("comment: the CONTROL PR that was not moved gets no comment at all",
+        [b for b in bodies if "#92" in b.split("\n")[0]], [])
+    # And the body must be REACHED from _act, not merely constructible: the assertion above reads
+    # what the double was actually asked to POST, so deleting the post_comment call reds it.
+    chk("comment: it is posted through the API, addressed to the moved PR",
+        [c for c in ghc.calls if "--method" in c and c[c.index("--method") + 1] == "POST"
+         and any("/issues/903/comments" in a for a in c)] != [], True)
+
     # DRY RUN and failure handling.
     gh8, sweeper8 = _fixture(apply=False)
-    chk("dry-run: exits 0", sweeper8.run(), 0)
+    chk("dry-run: exits 0", _run_total(chk, "sweeper8", sweeper8), 0)
     chk("dry-run: issues no write of any kind",
         [c for c in gh8.calls if "--method" in c], [])
     gh9, sweeper9 = _fixture(refuse_update=(903,))
-    chk("failure: a refused update-branch makes the tick exit NON-ZERO", sweeper9.run(), 1)
-    chk("failure: and is censused as move-failed", "move-failed=1" in sweeper9.rows[0], True)
+    chk("failure: a refused update-branch makes the tick exit NON-ZERO",
+        _run_total(chk, "sweeper9", sweeper9), 1)
+    chk("failure: and is censused as move-failed", "move-failed=1" in _row(sweeper9), True)
     gh10, sweeper10 = _fixture(ref_moves=False)
-    sweeper10.run()
+    _run_total(chk, 'sweeper10', sweeper10)
     chk("head-lag: an unconfirmed ref is reported, not retried (update-branch answers 202)",
-        "head-confirmed=0/1" in sweeper10.rows[0], True)
+        "head-confirmed=0/1" in _row(sweeper10), True)
 
     # The repair itself must be live.
     gh11, sweeper11 = _fixture()
     gh11.repair_detail = {**REPAIR_DETAIL, "merged_at": None}
-    sweeper11.run()
+    _run_total(chk, 'sweeper11', sweeper11)
     chk("repair: an UNMERGED declared repair sweeps nobody and says so",
-        (gh11.updated(), sweeper11.rows[0]), ([], repair_census_line(917, "repair-not-merged")))
+        (gh11.updated(), _row(sweeper11)), ([], repair_census_line(917, "repair-not-merged")))
     gh12, sweeper12 = _fixture()
     gh12.repair_detail = {**REPAIR_DETAIL, "merged_at": "2026-07-26T02:26:49Z"}
-    sweeper12.run()
+    _run_total(chk, 'sweeper12', sweeper12)
     chk("repair: a repair older than the lookback is inert",
-        (gh12.updated(), sweeper12.rows[0]),
+        (gh12.updated(), _row(sweeper12)),
         ([], repair_census_line(917, "repair-outside-lookback")))
     gh14, _ = _fixture()
     sweeper14 = Sweeper("jeswr/agent-account-registry", [], runner=gh14, apply=True,
                         clock=lambda: NOW, sleeper=lambda _s: None)
-    sweeper14.run()
+    _run_total(chk, 'sweeper14', sweeper14)
     chk("silence: a tick with NO declared repairs still emits a census row — a sweeper that prints "
         "nothing is indistinguishable from one that is not running",
         sweeper14.rows, ["CENSUS repair=none scanned=2 class=0 skipped=no-declared-repairs"])
@@ -1610,7 +1798,7 @@ def _test_live_sweep(chk):
     gh15.refuse_pr_list = True
     chk("fail-closed: an unreadable PR listing exits 1, sweeps nobody, and emits NO census row "
         "that could be mistaken for an empty class",
-        (sweeper15.run(), gh15.updated(), sweeper15.rows), (1, [], []))
+        (_run_total(chk, "sweeper15", sweeper15), gh15.updated(), sweeper15.rows), (1, [], []))
 
     gh13, sweeper13 = _fixture()
     gh13.default_branch = "main"
@@ -1724,17 +1912,18 @@ def _test_published_census(chk):
     try:
         gh, sweeper = _fixture()
         sweeper.summary_path = path
-        sweeper.run()
+        _run_total(chk, 'sweeper', sweeper)
         written = open(path, encoding="utf-8").read()
         chk("published census: the row reaches the step summary, not only stdout",
             [line.strip() for line in written.splitlines() if line.strip().startswith("CENSUS")],
-            [sweeper.rows[0]])
+            [_row(sweeper)])
         chk("published census: it is headed, so a reader can find it", "### regate-sweep census"
             in written, True)
         gh2, sweeper2 = _fixture()
         sweeper2.summary_path = "/nonexistent-dir/summary.md"
         chk("published census: an unwritable summary path warns and does NOT fail the tick — the "
-            "sweep already happened, and losing the receipt must not re-run it", sweeper2.run(), 0)
+            "sweep already happened, and losing the receipt must not re-run it",
+            _run_total(chk, "publish", sweeper2), 0)
     finally:
         os.unlink(path)
 
@@ -1773,8 +1962,18 @@ def _job(workflow, name):
     return jobs[name]
 
 
+def _job_or_empty(workflow, name):
+    """`_job` that REPORTS instead of raising. A raise here masked 31 seam assertions when the job
+    was renamed (measured: Y19 ran 131 of 162 with zero named reds), so one mutant could hide the
+    rest. The named `exactly one job` / `job is named` checks still red."""
+    try:
+        return _job(workflow, name)
+    except RegateSweepError:
+        return {}
+
+
 def _steps(job):
-    return job.get("steps") or []
+    return (job or {}).get("steps") or []
 
 
 def _invocations(step, script):
@@ -1817,7 +2016,10 @@ def _test_workflow_seam(chk):
     """THE YAML SEAM. Measured on this estate: Python mutants die, and every UNCAUGHT mutant lived
     in a workflow `if:`, a step, or a call site. Mutate each of those here, one at a time."""
     workflow = _load_workflow(SWEEP_WORKFLOW)
-    job = _job(workflow, SWEEP_JOB)
+    chk("seam: the workflow declares the sweep job (renaming or deleting it reds HERE, and the "
+        "rest of this section still runs)",
+        SWEEP_JOB in ((workflow or {}).get("jobs") or {}), True)
+    job = _job_or_empty(workflow, SWEEP_JOB)
     steps = _steps(job)
     triggers = workflow.get("on", workflow.get(True)) or {}
 
