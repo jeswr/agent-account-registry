@@ -1495,6 +1495,28 @@ def _test_dispatch_panel(chk):
          "read_dispatch_telemetry(api, registry_repo)" in body,
          body.index("append_snapshot(") < body.index("attach_dispatch_panels(")),
         (True, True, True))
+    # ...AND UNCONDITIONALLY, which the substring row above structurally cannot see. Wrapping the
+    # call in `if os.environ.get("REGISTRY_DISPATCH_PANEL"):` keeps every substring it looks for
+    # and silently removes `targets.<repo>.dispatch` from the PUBLIC feed (review round 5, mutant
+    # MW-B). `run()` is 0%-covered — it is the orchestrating entry point, so its call sites cannot
+    # be reached by any unit test — which makes an AST check on its top-level statements the only
+    # instrument that can see this. Coverage PREDICTED this survivor: the 0% unit is where it was.
+    import ast   # noqa: PLC0415 — self-test only
+    run_fn = next(node for node in ast.walk(ast.parse(source))
+                  if isinstance(node, ast.FunctionDef) and node.name == "run")
+
+    def _calls_named(scope, name):
+        return [n for n in ast.walk(scope) if isinstance(n, ast.Call)
+                and getattr(n.func, "id", getattr(n.func, "attr", "")) == name]
+
+    panel_total = len(_calls_named(run_fn, "attach_dispatch_panels"))
+    panel_top = sum(len(_calls_named(stmt, "attach_dispatch_panels")) for stmt in run_fn.body)
+    nested = sum(len(_calls_named(stmt, "attach_dispatch_panels"))
+                 for stmt in run_fn.body if isinstance(stmt, (ast.If, ast.Try, ast.For,
+                                                              ast.While, ast.With)))
+    chk("[gate-a feed] ...and it is a TOP-LEVEL statement of run(), never guarded — a conditional "
+        "there removes the panel from the public feed with every substring still present",
+        (panel_total, panel_top, nested), (1, 1, 0))
 
 
 def _self_test():

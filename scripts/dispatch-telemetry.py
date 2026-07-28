@@ -877,6 +877,49 @@ def _landed_artifact_paths(upload, download):
             for member in _artifact_paths(upload)}
 
 
+_SHELL_CONTROL = ("if ", "if[", "case ", "while ", "until ", "for ", "&&", "||", "elif ")
+
+
+def _shell_commands(script):
+    """The TOP-LEVEL command list of a step's `run:`, with heredoc bodies removed.
+
+    WHY THIS EXISTS. Every other assertion in this file reads the step's YAML KEYS — the `if:`, the
+    flags, the paths — and none of them reads the step's SHELL. Wrapping the invocation in
+    `if [ -n "${X:-1}" ]; then ... fi` leaves `if:` parsing exactly `always()`, every flag pinned by
+    value, and `--summary` still equal to the writer's path, while the command never runs. Measured
+    (review round 5, mutant MW-A) and it is not one step's problem: `readiness`, `assemble`, `claim`
+    and the recorder all have the same shape.
+
+    Heredoc bodies are dropped first because they are PYTHON, not shell — the `if` in a census
+    block is not a shell conditional, and treating it as one would make this check unusable exactly
+    where the interesting code lives.
+    """
+    text, out, heredoc = str(script or ""), [], None
+    for raw in text.replace("\\\n", " ").split("\n"):
+        line = raw.rstrip()
+        if heredoc is not None:
+            if line.strip() == heredoc:
+                heredoc = None
+            continue
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        marker = re.search(r"<<-?'?([A-Za-z_][A-Za-z0-9_]*)'?", stripped)
+        if marker:
+            heredoc = marker.group(1)
+            out.append(stripped)
+            continue
+        out.append(stripped)
+    return out
+
+
+def _control_flow_commands(script, needle):
+    """Top-level shell commands that could SKIP or GUARD `needle`'s invocation."""
+    return [command for command in _shell_commands(script)
+            if any(token in command for token in _SHELL_CONTROL)
+            or (needle in command and command.startswith(("#", "echo ")))]
+
+
 def _cli_args(script, marker):
     """`{flag: value}` for the ONE invocation in a step's `run:` whose text contains `marker`.
 
@@ -1740,6 +1783,36 @@ def _self_test():   # noqa: C901 — one flat assertion table, deliberately
          recorder_args.get("--frontier") in landed,
          claim_plan_args.get("--plan") in landed),
         (["plan/frontier-census.json", "plan/plan.json"], True, True))
+
+    # ---- THE GENERIC LINK INVARIANT, over an ENUMERATED list of participating steps -----------
+    # A PIN PER LINK IS THE WRONG SHAPE and this row is the correction. Round 5's MW-A wrapped the
+    # recorder's invocation in a shell `if`: the `if:` key still parsed `always()`, all four flags
+    # were still pinned by value, `--summary` still equalled the writer's path — and no record was
+    # ever written. Pinning that ONE step would have left the identical hole in `readiness`,
+    # `assemble` and `claim`, which is the twelfth link and the reason this is a loop over a LIST
+    # rather than a fourth hand-authored assertion. A step added to the chain without being added
+    # here is itself the failure this catches, so the list is asserted to be complete too.
+    CHAIN_STEPS = {
+        "readiness": "python3 - ",          # writes the census (L2)
+        "assemble": "python3 - ",           # merges the assemble leg (L4)
+        "claim": "dispatch-claim.py",       # writes the dispatch summary (L8)
+        "dispatch-telemetry": "dispatch-telemetry.py",   # reads both, writes the ring (L9/L11)
+    }
+    guarded = {step: _control_flow_commands(
+                   str(_workflow_step_node(workflow, step).get("run", "")), needle)
+               for step, needle in CHAIN_STEPS.items()}
+    chk("[chain-invariant] NO step in the PLAN->CLAIM chain may guard, skip or short-circuit its "
+        "own invocation in shell — the `if:` key and the flags are both blind to that",
+        guarded, {step: [] for step in CHAIN_STEPS})
+    # ...and the recorder's body is pinned as an EXACT flat command list, because it is the one
+    # step whose whole purpose is a single unconditional invocation.
+    chk("[chain-invariant] the recorder's shell body is a FLAT command list: set -e, self-test, "
+        "record — nothing else, in that order",
+        [" ".join(command.replace("registry/scripts/", "").split()[:3])
+         for command in _shell_commands(str(recorder.get("run", "")))],
+        ["set -euo pipefail",
+         "python3 dispatch-telemetry.py --self-test",
+         "python3 dispatch-telemetry.py record"])
 
     claim_step = _workflow_step_text(workflow, "dispatch-telemetry")
     chk("[YAML seam] the CLAIM call site runs the recorder, always(), and cannot fail the tick",
