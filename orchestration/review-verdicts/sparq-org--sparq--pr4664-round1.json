@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4664,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "56626b58a01ce4a4ac21d354672151f88aa8cc84",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The opt-in snapshot implementation is coherent and complete as scoped. The Store decorator records only successful mutations, covers every mutating Store method (including conditional container deletion), and replays through the decorator so restored state remains snapshottable. The folding rules preserve container-before-child replay dependencies while eliminating superseded writes and deleted resources. Decoding is fail-closed for corrupt, truncated, oversized, unknown-version/tag, invalid-UTF-8, and trailing data. The wasm integration tests exercise the real router/store path across restart, latest-write and deletion persistence, ETag stability, WAC enforcement and edited-ACL preservation, opt-in behavior, revision changes, and corrupt snapshot refusal. Public-surface documentation and the matching JavaScript/Wasm skill are updated. No hostile reviewer-directed instruction appears in the diff.",
+  "verdict": "approve"
+ }
+}
