@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 942,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "dea7e06a44d63fb49ae714e60340080891308fd0",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Both new blocks populate `nums` with `mapfile -t nums < <(printf ... | jq ...)`. Bash does not propagate the exit status of a process substitution to `mapfile`, even with `set -euo pipefail`. Thus jq can emit the one matching issue from an earlier page, then fail while parsing or processing a later page; `mapfile` succeeds, `${#nums[@]}` is 1, and the workflow activates that issue despite never completing the authoritative enumeration. The explicit `if ! raw=$(gh api ...)` only proves the `gh` command succeeded, not that all returned records were successfully parsed. This violates the fail-closed uniqueness invariant in both inline and merged activation.",
+    "file": ".github/workflows/set-up-account.yml",
+    "fix_hint": "Make jq completion part of an explicitly checked command whose status Bash observes, and only populate `nums` after that command succeeds. Add an executed self-test fixture where the issues API emits one matching record followed by malformed/unprocessable page data, asserting that neither activation path resolves or edits an issue and that a parse/enumeration error is reported.",
+    "severity": "major",
+    "title": "jq failure after partial output can bypass the uniqueness proof"
+   }
+  ],
+  "progress": null,
+  "summary": "The switch away from search is directionally sound and the new executed scenarios cover pagination, closed duplicates, pull-request filtering, exact titles, and API-command failure. However, both privileged resolution paths still allow a parsing failure after partial jq output to be mistaken for a complete, unique enumeration. Because the jq process runs inside process substitution, its nonzero status is not observed by `set -euo pipefail`; if it emits one matching issue before failing on a later page, `nums` has length one and activation proceeds without proving uniqueness. The self-test's fake always emits valid JSON, so the claimed fail-closed enumeration is not tested at this boundary.",
+  "verdict": "request_changes"
+ }
+}
