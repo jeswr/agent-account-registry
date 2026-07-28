@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 924,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "e9fa3d601617760a04c145f0dcbcfe3e54d27a3f",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_workflow_run_shell` changes its global lexical `pipefail` state whenever a line begins with `set`, without understanding whether that line is executed or scoped. For example, `set +o pipefail` inside a heredoc, an uncalled function, a false conditional, or a subshell causes all following lines to be replaced with comments, even though the outer shell can still have pipefail enabled. A later `producer | head -1` would then be omitted and the real-workflow assertion would report zero. This is a fail-open false negative in the new trust-sensitive static guard. The positive control tests only straight-line state changes, so it cannot catch this defect.",
+    "file": "scripts/worker-live.sh",
+    "fix_hint": "Make extraction conservatively shell-aware: only exempt a region when pipefail is provably disabled in the same execution scope, and never let heredoc contents, unexecuted branches, functions, or subshell-local settings disable scanning of outer commands. Add positive controls where each of those constructs contains `set +o pipefail` followed by an outer vulnerable pipeline, and assert every outer pipeline is still counted.",
+    "severity": "major",
+    "title": "Flat pipefail state tracking can be bypassed by non-executed shell text"
+   }
+  ],
+  "progress": null,
+  "summary": "The workflow call-site rewrites appear behavior-preserving and remove the targeted early-exit pipelines, but the new workflow guard is not sound enough to enforce its stated fail-closed invariant. Its pipefail tracker treats shell text as a flat sequence of lines, so a non-executed or scoped `set +o pipefail` can suppress scanning of later, actually pipefail-enabled commands. Because this guard is intended to protect future trust-sensitive workflow changes, that bypass is a major issue. Round 1, so progress is null.",
+  "verdict": "request_changes"
+ }
+}
