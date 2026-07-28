@@ -564,7 +564,7 @@ def _legacy_global_minting(package, areas):
     `dispatch.yml` plans every target with THAT TARGET'S OWN `scripts/dispatch-plan.py`, cloned
     from the target repo at run time; only the CLAIM half lives here. So a target still carrying
     the old `len(pkgs) == 1 else GLOBAL` reduction mints `__global__` for its multi-area rows while
-    this side re-derives the composite key, and `_route_check`'s equality would reject every one of
+    this side re-derives the composite key, and `_route_matches`'s equality would reject every one of
     them — permanently, on every tick, which is exactly the #112 shape. Accepting the legacy shape
     is therefore a bounded compatibility rule, not a widening of the schema.
 
@@ -590,7 +590,7 @@ def item_partition(item):
     Re-derived rather than read off `item["package"]` because that field is minted by the TARGET
     repository's planner and a target that has not adopted the area-set reduction still mints
     `__global__` for a multi-area row (see `_legacy_global_minting`). The labels are validated by
-    `validate_plan` (sorted, unique, non-empty strings), and `_route_check` independently proves
+    `validate_plan` (sorted, unique, non-empty strings), and `_route_matches` independently proves
     they agree with the minted value, so this is a re-derivation of the same fact from the
     authoritative side rather than a second opinion.
 
@@ -16151,7 +16151,7 @@ agent = "impl"
 
     # -- (7) the CROSS-REPOSITORY plan seam ----------------------------------------------------
     # PLAN runs the TARGET repo's dispatch-plan.py. A target still on the pre-area-set reduction
-    # mints `__global__` for its multi-area rows; rejecting those at _route_check would defer every
+    # mints `__global__` for its multi-area rows; rejecting those at _route_matches would defer every
     # one of them forever (the #112 shape, one artifact over). The tolerance is guarded by
     # ">=2 declared areas" so a ZERO-area row can never be narrowed by it.
     assert _legacy_global_minting(GLOBAL_PACKAGE, ["a", "b"]) is True

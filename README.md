@@ -126,7 +126,7 @@ And it is the one seam that genuinely straddles two repositories: PLAN runs **th
 own** `dispatch-plan.py`, cloned at run time, so a target still on the pre-set reduction mints
 `__global__` for its multi-area rows. The registry therefore does not trust the minted string —
 `dispatch-claim.item_partition` re-derives every impl row's reservation from that row's own
-(schema-validated) `area:*` labels, and `_route_check` accepts the legacy `__global__` spelling
+(schema-validated) `area:*` labels, and `_route_matches` accepts the legacy `__global__` spelling
 **only** where those labels prove two or more distinct areas. A zero-area row reduces to
 `__global__` on both sides, matches the equality directly, and can never be narrowed by that rule.
 The routing tables `review-fix.yml` re-derives inline (`review_chain` / `fix_chain` / `ladders`) are
