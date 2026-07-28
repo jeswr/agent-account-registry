@@ -328,12 +328,20 @@ def build_record(repo, run_id, frontier, dispatch, now):
     assembler_deferrals = _maybe(frontier, "assembler_deferrals")
     leg_reported = before_assemble is not None and assembler_deferrals is not None
     entering = frontier_width + _n(frontier, "deferred_retry_width")
+    # `is not None`, NOT truthiness. `before_assemble == 0` is a REAL measurement — the assemble
+    # leg reporting that ZERO rows reached it, i.e. routing rejected the entire frontier — and
+    # `if before_assemble` treated that identically to the leg being absent. Measured: with
+    # `frontier_width=15, plan_rows_before_assemble=0` the chain published `route_rejections=0` and
+    # pushed all 15 rows into `unaccounted`, misattributing the loss to "unknown" when the leg had
+    # said exactly where it went. Loud (the residual fired) but wrong, and the whole point of
+    # `_maybe` is that absent and zero are now distinguishable — so distinguish them here too.
     chain = {
         "frontier_and_retry_rows": entering,
-        "route_rejections": max(0, entering - before_assemble) if before_assemble else 0,
+        "route_rejections": (max(0, entering - before_assemble)
+                             if before_assemble is not None else 0),
         "assembler_deferrals": assembler_deferrals,
         "claim_deferrals": (max(0, before_assemble - assembler_deferrals - planned_rows)
-                            if leg_reported and before_assemble else 0),
+                            if leg_reported else 0),
         "realised_dispatches": realised,
         "unrealised_planned_rows": planned_rows - realised,
     }
@@ -1034,6 +1042,21 @@ def _self_test():   # noqa: C901 — one flat assertion table, deliberately
         (reported_zero["assemble_leg"], reported_zero["assembler_deferrals"],
          reported_zero["chain"]["assembler_deferrals"], reported_zero["chain"]["unaccounted"]),
         ("reported", 0, 0, 0))
+    # ZERO IS A MEASUREMENT, not a synonym for absent — the other half of `_maybe`. A leg reporting
+    # that ZERO rows reached assembly means routing rejected the ENTIRE frontier, and the truthiness
+    # test `if before_assemble` scored that as "no leg", publishing `route_rejections=0` and pushing
+    # all 15 rows into `unaccounted`: loud, because the residual fired, but attributed to "unknown"
+    # when the leg had said exactly where they went.
+    routed_away = build_record(
+        "o/t", "99.1",
+        dict(frontier_doc, frontier_width=15, deferred_retry_width=0,
+             plan_rows_before_assemble=0, assembler_deferrals=0),
+        {"planned": 0, "launched": 0}, 100)
+    chk("[null-leg] a leg reporting ZERO rows reached assembly attributes the whole frontier to "
+        "ROUTE REJECTIONS, not to the residual",
+        (routed_away["assemble_leg"], routed_away["chain"]["route_rejections"],
+         routed_away["chain"]["unaccounted"], routed_away["plan_rows_before_assemble"]),
+        ("reported", 15, 0, 0))
     chk("[null-leg] the ledger ACCEPTS a null leg (it must be able to carry the fact) but "
         "refuses a malformed one",
         (_valid_record(lost_leg),
@@ -1099,6 +1122,41 @@ def _self_test():   # noqa: C901 — one flat assertion table, deliberately
                 self.doc = json.loads(base64.b64decode(body["content"]).decode())
                 return {"content": {"sha": "cafe"}}
             return None
+
+    # THE MISSING-BRANCH FAIL-LOUD, driven. Lines 585-590 never executed and deleting the raise
+    # survived: a missing `ledger` branch would then seed an EMPTY ring and every tick would record
+    # cleanly into nothing — silently-empty hiding the exact outage the fail-loud exists for. The
+    # two 404s mean different things and must stay distinguishable.
+    class _Missing404API:
+        """404s the telemetry FILE, and optionally the ledger BRANCH ref too."""
+
+        def __init__(self, *, branch_exists):
+            self.branch_exists = branch_exists
+            self.paths = []
+
+        def request(self, method, path, body=None, allow_404=False, retry_conflict=False):
+            del method, body, retry_conflict
+            self.paths.append(path)
+            if path.endswith(f"git/ref/heads/{LEDGER_REF}"):
+                return {"ref": LEDGER_REF} if self.branch_exists else None
+            return None if allow_404 else {}
+
+    no_branch = _Missing404API(branch_exists=False)
+    branch_error = None
+    try:
+        read_ledger(no_branch, "o/r")
+    except TelemetryError as exc:
+        branch_error = str(exc)
+    chk("[fail-loud] a MISSING ledger branch raises — it must never seed an empty ring and record "
+        "every tick cleanly into nothing",
+        (branch_error is not None and "is missing" in (branch_error or ""),
+         [p.split("/contents/")[-1].split("?")[0] if "/contents/" in p else p.split("/git/")[-1]
+          for p in no_branch.paths]),
+        (True, [LEDGER_PATH, f"ref/heads/{LEDGER_REF}"]))
+    present_branch = _Missing404API(branch_exists=True)
+    chk("[fail-loud] ...while a missing FILE on a PRESENT branch seeds an empty ring, which is a "
+        "different fact and stays a different outcome",
+        read_ledger(present_branch, "o/r"), ([], None))
 
     api = _StubAPI()
     first = append_records(api, "o/r", [rec], 100)
@@ -1654,6 +1712,18 @@ def _self_test():   # noqa: C901 — one flat assertion table, deliberately
         (["<runner-temp>/frontier-census.json", "<runner-temp>/plan.json"], "error"))
     # L5/L6 — the two ends must name the SAME artifact. A name drift downloads nothing at all, and
     # nothing in either step's own text reveals it.
+    # STEP-LEVEL GUARDS, by PARSED VALUE — the same treatment the recorder's `if:` already gets,
+    # extended to the two producing steps. `if: ${{ false }}` on `upload-plan` and
+    # `continue-on-error: true` on `assemble` both survived: the first stops the artifact existing,
+    # the second lets a FAILED assemble leave a silently incomplete plan without failing PLAN.
+    # Both are loud at runtime, which is why they are not the blocking class — but a guard whose
+    # only defence is "someone will notice the run" is not a guard.
+    assemble_step = _workflow_step_node(workflow, "assemble")
+    chk("[hand-off L3/L5] neither producing step may be disabled or made non-failing: `assemble` "
+        "carries NO truthy continue-on-error, and `upload-plan` carries no `if:` at all",
+        (assemble_step.get("continue-on-error"), assemble_step.get("if"),
+         upload.get("if"), upload.get("continue-on-error")),
+        (None, None, None, None))
     chk("[hand-off L5+L6] upload and download name the SAME artifact",
         ((upload.get("with") or {}).get("name") == (download.get("with") or {}).get("name"),
          str((download.get("with") or {}).get("path", ""))),
