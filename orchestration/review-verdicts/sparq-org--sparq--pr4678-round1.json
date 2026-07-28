@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4678,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "fbf97ca09dcc9c4cb70143dbd30dc5339c54e687",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The public method documentation says that a depth of 0 projects the focus itself as a reference, but write_term handles Term::Literal before checking depth >= max_depth. Consequently, JsonProjection::new().with_max_depth(0).project() emits a literal value object for a literal focus rather than an @ref object. This makes the public contract inaccurate and leaves the boundary behavior untested.",
+    "file": "crates/sparq-wrapper/src/proposed/json.rs",
+    "fix_hint": "Either clarify the documentation that the depth bound applies only to expandable non-literal nodes (the more natural contract, since literals have no outgoing recursion), or move the depth check ahead of literal handling if literal references are genuinely intended. Add a test for a literal focus with max_depth(0) that pins the chosen behavior.",
+    "severity": "minor",
+    "title": "with_max_depth(0) does not reference a literal focus as documented"
+   }
+  ],
+  "progress": null,
+  "summary": "The projection logic is cycle-safe, deterministic for the represented graph, preserves literal metadata, and is covered by meaningful public-surface tests. One public API contract is nevertheless false for literal focuses: the documented depth-zero behavior is bypassed for literals. The feature test could not be executed in this checkout because the Rust toolchain is unavailable, so this verdict is based on diff-scoped inspection.",
+  "verdict": "request_changes"
+ }
+}
