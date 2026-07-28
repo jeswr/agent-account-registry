@@ -1041,6 +1041,52 @@ def _self_test():   # noqa: C901 — one flat assertion table, deliberately
         ledger_retry.is_transient(_http_error_text(
             _UnreadableHTTPError(403, "Forbidden", ""))), False)
 
+    # THE WIRING, not only the classifier. The three rows above exercise `_http_error_text` +
+    # `ledger_retry.is_transient` directly, and the CAS-loop rows below drive a stub that ALREADY
+    # raises TelemetryRetryable — so the branch inside `GitHubAPI.request` that turns a throttled
+    # HTTPError INTO that class had no test at all, and deleting it survived the whole suite
+    # (mutant M26). That branch IS the #594 adoption: the headline guard was the least-tested
+    # thing in the change. Drive the real method over a stubbed transport.
+    import io as _io                       # noqa: PLC0415 — self-test only
+    import urllib.error as _urlerror       # noqa: PLC0415
+    import urllib.request as _urlrequest   # noqa: PLC0415
+
+    def _always_raises(error):
+        def _open(_request, timeout=None):
+            del timeout
+            raise error
+        return _open
+
+    _saved_urlopen = _urlrequest.urlopen
+    try:
+        _api = GitHubAPI("self-test-token")
+        transport = []
+        for label, error in (
+                ("throttle-403", _urlerror.HTTPError(
+                    "https://api.github.com/x", 403, "Forbidden", {"Retry-After": "20"},
+                    _io.BytesIO(b"You have exceeded a secondary rate limit"))),
+                ("credential-403", _urlerror.HTTPError(
+                    "https://api.github.com/x", 403, "Forbidden", {},
+                    _io.BytesIO(b"Resource not accessible by integration"))),
+                ("validation-422", _urlerror.HTTPError(
+                    "https://api.github.com/x", 422, "Unprocessable Entity", {},
+                    _io.BytesIO(b"Validation Failed"))),
+                ("network", _urlerror.URLError("connection refused"))):
+            _urlrequest.urlopen = _always_raises(error)
+            try:
+                _api.request("PUT", "/repos/o/r/contents/x", {"content": "x"})
+                transport.append((label, "returned"))
+            except TelemetryRetryable:
+                transport.append((label, "retryable"))
+            except TelemetryError:
+                transport.append((label, "fatal"))
+        chk("[#594] GitHubAPI.request ITSELF classifies — a throttled PUT becomes retryable while "
+            "a credential 403 and a validation 422 stay fatal",
+            transport, [("throttle-403", "retryable"), ("credential-403", "fatal"),
+                        ("validation-422", "fatal"), ("network", "retryable")])
+    finally:
+        _urlrequest.urlopen = _saved_urlopen
+
     class _ThrottlingAPI(_StubAPI):
         """PUTs are throttled `throttle` times before one lands; GETs are always served."""
 
@@ -1063,9 +1109,16 @@ def _self_test():   # noqa: C901 — one flat assertion table, deliberately
     globals()["_sleep_throttled"] = lambda attempt, after: slept.append(("throttle", attempt, after))
     try:
         throttling = _ThrottlingAPI(2)
-        landed = append_records(throttling, "o/r", [dict(rec, run_id="77.1")], 100)
+        landed = escaped = None
+        try:
+            landed = append_records(throttling, "o/r", [dict(rec, run_id="77.1")], 100)
+        except TelemetryError as exc:
+            # NAMED, not a crash. Without the CAS loop's TelemetryRetryable arm the throttle
+            # escapes `append_records` and the tick's record is simply LOST; catching it here
+            # makes that mutant red a row that says so instead of an anonymous traceback.
+            escaped = f"{type(exc).__name__}: {exc}"
         chk("[#594] a THROTTLED ledger PUT is retried and the tick's record still lands",
-            (landed, throttling.puts, len(throttling.doc["records"])), (1, 1, 1))
+            (escaped, landed, throttling.puts, len(throttling.doc["records"])), (None, 1, 1, 1))
         chk("[#594] ...on the THROTTLE schedule (2s-30s), never the sub-second CAS-contention one "
             "that just re-trips the limiter",
             slept, [("throttle", 1, 1), ("throttle", 2, 1)])
