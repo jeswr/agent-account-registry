@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4847,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "bc24dbaab4865d89a21ea87de1a98a36c4c58a71",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 4 finds no correctness, soundness, test-validity, or security defect. The diagnostic remains confined to the already-failed query/update parse path, preserves the failed SPARQL byte-for-byte, and cannot alter execution. The scanner now handles dotted PN_PREFIX runs and the broader PN_LOCAL forms without turning valid prefixed-name data into keyword hints; the focused unit tests and the public-path CanaryFailed integration regressions exercise those boundaries with an unrelated parse failure. The keyword table has sortedness and vendored-grammar drift checks, arbitrary-input properties cover bounded/deduplicated well-formed output, and the public error/API documentation consistently describes suggestions as optional and non-rewriting. This materially matches round 3's clean finding set, so progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
