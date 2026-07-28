@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4663,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "71aab6a75cc4dd04062bedda3cda487bc6cd22fd",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change correctly moves nonce validation into a non-empty ChallengeNonce type, adds an explicit OS-CSPRNG constructor with fail-closed entropy handling, preserves wire values verbatim for externally supplied nonces, and propagates the typed nonce through request construction, response generation, and equality-based replay checking. The expression feature alone enables the new optional dependency, preserving the lean default build. The focused tests exercise rejection, verbatim adoption, generated format/non-repetition, contract propagation, and mismatch rejection; the documentation is appropriately explicit that from_wire does not establish freshness and that this is hardening rather than a cryptographic soundness claim. No injected reviewer instructions were found in the diff.",
+  "verdict": "approve"
+ }
+}
