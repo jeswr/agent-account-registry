@@ -62,16 +62,6 @@
   },
   {
    "account": "efb4eb2781de6958",
-   "claim_id": "e7c6d6128bb346b4ac3fd48d3b17bac7",
-   "holder": "sparq-org/sparq#3813@30364151229.1",
-   "package": "release",
-   "role": "impl",
-   "model": "opus5",
-   "issued_at": 1785245718,
-   "expires_at": 1785252018
-  },
-  {
-   "account": "efb4eb2781de6958",
    "claim_id": "aa6ba67536814c5faa1b4f3e9fd3d533",
    "holder": "sparq-org/sparq#903@30364162018.1",
    "package": "sparq-fedplan",
