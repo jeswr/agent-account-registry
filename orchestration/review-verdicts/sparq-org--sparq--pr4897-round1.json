@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4897,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "6e4a0c280547eb66f012047e16b22ea7f81025fc",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The change is a documentation-only architecture assessment plus a module-level pointer to that record. Its central recommendation is internally consistent with the evidence presented, preserves the existing synchronous public seam, respects the opt-in/core-lean policy, and clearly time-bounds claims that can become stale. The line-count comparison is consistent with the diff (93 pre-change lines in jsonrpc.rs plus 53 in transport.rs), and the protocol-version claim matches the referenced server constant. No executable behavior, dependency graph, public API, or security boundary changes. No test addition is necessary for this documentation-only change.",
+  "verdict": "approve"
+ }
+}
