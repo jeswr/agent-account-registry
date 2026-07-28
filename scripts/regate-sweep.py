@@ -912,7 +912,13 @@ def _require(path):
         return handle.read()
 
 
-def main(argv=None):
+def main(argv=None, runner=None):
+    """The CLI entry point. `runner` exists so the self-test can exercise THIS function.
+
+    It was at 0% line coverage until a coverage run said so: the CLI-flag gate proves each flag is
+    DECLARED, not that it is wired, so a typo in the slug validation, in the `[bot]` login the
+    marker scan depends on, or in the repairs-file read would have passed the whole suite and failed
+    only in production."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--self-test", action="store_true",
                         help="run the in-file test suite and exit")
@@ -941,7 +947,7 @@ def main(argv=None):
         repairs = load_repairs(handle.read())
     if args.bot_slug and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", args.bot_slug):
         parser.error("--bot-slug must be a safe GitHub App slug")
-    sweeper = Sweeper(args.repo, repairs, apply=args.apply, cap=args.max_moves,
+    sweeper = Sweeper(args.repo, repairs, runner=runner, apply=args.apply, cap=args.max_moves,
                       lookback_hours=args.lookback_hours,
                       bot_login=f"{args.bot_slug}[bot]" if args.bot_slug else "",
                       summary_path=os.environ.get("GITHUB_STEP_SUMMARY") or None)
@@ -967,6 +973,8 @@ def _self_test():
     _test_cap_and_ordering(chk)
     _test_repairs_declaration(chk)
     _test_live_sweep(chk)
+    _test_entry_point(chk)
+    _test_published_census(chk)
     _test_census(chk)
     _test_workflow_seam(chk)
 
@@ -1026,8 +1034,14 @@ def _test_failure_ledger(chk):
     """The evidence layer. Every clause here is a way "every failure is explained" could be TRUE
     while the harness had in fact observed nothing."""
     good = failure_ledger(_worker_live_log(f"{SIG}: 1 (want 0)"))
+    # Compared as a WHOLE LEDGER, not field-by-field: it pins all three fields at once, and it is
+    # what exercises __eq__/__repr__ — both were at 0% coverage, i.e. dead code, until measured.
     chk("ledger: a clean single-failure log reconciles",
-        (good.reason, good.harness, good.fails), (None, "worker-live", (f"{SIG}: 1 (want 0)",)))
+        good, FailureLedger("worker-live", (f"{SIG}: 1 (want 0)",), None))
+    chk("ledger: an unequal ledger does NOT compare equal (so the assertion above has teeth)",
+        good == FailureLedger("worker-live", (), None), False)
+    chk("ledger: a ledger never compares equal to a same-shaped tuple",
+        good == ("worker-live", (f"{SIG}: 1 (want 0)",), None), False)
     chk("ledger: the extractor is LINE-ANCHORED — the fixture carries a passing `ok  … FAIL CLOSED "
         "…` row, so weakening `^[ \\t]*` to `^.*?` extracts a SECOND body out of a line that "
         "passed (and a substring grep over the signature would find 3 hits here, not 1)",
@@ -1192,6 +1206,9 @@ def _test_cap_and_ordering(chk):
     chk("cap: a cap of zero moves nothing and defers everything",
         plan_moves([1, 2], 0), ([], [1, 2]))
     chk("cap: nothing is deferred when the class fits", plan_moves([1, 2], 5), ([1, 2], []))
+    chk("cap: a NEGATIVE cap raises rather than silently slicing from the end (`ordered[:-1]` would "
+        "quietly move all but one)",
+        isinstance(_raises(lambda: plan_moves([1, 2], -1)), RegateSweepError), True)
 
 
 def _test_repairs_declaration(chk):
@@ -1228,6 +1245,51 @@ def _test_repairs_declaration(chk):
         refuses("schema", lambda d: d.__setitem__("schema", 2)), True)
     chk("declaration: non-JSON is refused",
         isinstance(_raises(lambda: load_repairs("{")), RegateSweepError), True)
+    # The remaining validator branches, which the coverage run showed were never entered. Each is a
+    # shape a hand-edited declaration file really takes.
+    for label, mutate in (
+            ("a repair that is not an object", lambda d: d["repairs"].__setitem__(0, "917")),
+            ("a non-int repair_pr", lambda d: d["repairs"][0].__setitem__("repair_pr", "917")),
+            ("a boolean repair_pr (bool is an int in Python)",
+             lambda d: d["repairs"][0].__setitem__("repair_pr", True)),
+            ("a zero repair_pr", lambda d: d["repairs"][0].__setitem__("repair_pr", 0)),
+            ("a padded harness", lambda d: d["repairs"][0].__setitem__("harness", " x.py ")),
+            ("a missing harness", lambda d: d["repairs"][0].pop("harness")),
+            ("a non-string signature", lambda d: d["repairs"][0]["signatures"].__setitem__(0, 7)),
+            ("a whitespace-only signature",
+             lambda d: d["repairs"][0]["signatures"].__setitem__(0, "   ")),
+            ("a padded signature",
+             lambda d: d["repairs"][0]["signatures"].__setitem__(0, " x ")),
+            ("a non-list repairs key", lambda d: d.__setitem__("repairs", {})),
+            ("a whitespace-only why", lambda d: d["repairs"][0].__setitem__("why", "  "))):
+        chk(f"declaration: {label} is refused", refuses(label, mutate), True)
+
+    # The repair-liveness refusals the coverage run showed were never entered.
+    for label, detail, want in (
+            ("a repair merged into a NON-default branch", {**REPAIR_DETAIL, "base": {"ref": "dev"}},
+             "repair-not-on-default-branch"),
+            ("a merged repair with no merge commit",
+             {**REPAIR_DETAIL, "merge_commit_sha": None}, "repair-has-no-merge-commit"),
+            ("an unparseable merged_at", {**REPAIR_DETAIL, "merged_at": "yesterday"},
+             "repair-unreadable"),
+            ("a merged_at in the FUTURE (a clock this sweeper must not trust)",
+             {**REPAIR_DETAIL, "merged_at": "2026-07-29T00:00:00Z"}, "repair-unreadable"),
+            ("a detail payload that is not an object", None, "repair-unreadable")):
+        chk(f"repair-window: {label} -> {want}", repair_window(detail, NOW)[1], want)
+
+
+def _exit_code(fn):
+    """The SystemExit code `fn` raises, or None. Separate from `_raises` on purpose: SystemExit
+    derives from BaseException, so an `except Exception` helper lets an argparse rejection escape
+    and abort the whole self-test — which is exactly what it did the first time."""
+    import contextlib
+    import io
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            fn()
+    except SystemExit as exc:
+        return exc.code
+    return None
 
 
 def _raises(fn):
@@ -1245,7 +1307,8 @@ class FakeGh:
 
     def __init__(self, repo, pulls, *, gate_by_head=None, logs=None, contains=None,
                  comments=None, default_branch=DEFAULT_BRANCH, repair_detail=None,
-                 refuse_update=(), ref_moves=True, refuse_comment_reads=False):
+                 refuse_update=(), ref_moves=True, refuse_comment_reads=False,
+                 refuse_pr_list=False):
         self.repo = repo
         self.pulls = pulls
         self.gate_by_head = gate_by_head or {}
@@ -1257,6 +1320,7 @@ class FakeGh:
         self.refuse_update = set(refuse_update)
         self.ref_moves = ref_moves
         self.refuse_comment_reads = refuse_comment_reads
+        self.refuse_pr_list = refuse_pr_list
         self.calls = []
 
     def __call__(self, args):
@@ -1273,7 +1337,7 @@ class FakeGh:
         if tail == "":
             return 0, json.dumps({"default_branch": self.default_branch})
         if tail.startswith("/pulls?state=open"):
-            return 0, json.dumps(self.pulls)
+            return (1, "") if self.refuse_pr_list else (0, json.dumps(self.pulls))
         if re.fullmatch(r"/pulls/\d+", tail):
             return 0, json.dumps(self.repair_detail)
         if "/check-runs" in tail:
@@ -1503,10 +1567,87 @@ def _test_live_sweep(chk):
         "nothing is indistinguishable from one that is not running",
         sweeper14.rows, ["CENSUS repair=none scanned=2 class=0 skipped=no-declared-repairs"])
 
+    # THE FAIL-CLOSED EXIT. An unreadable PR listing must exit NON-ZERO and sweep nobody: a tick
+    # that cannot see the population is not a tick that found nothing, and reporting 0 either way is
+    # how a listing outage becomes an invisible one.
+    gh15, sweeper15 = _fixture()
+    gh15.refuse_pr_list = True
+    chk("fail-closed: an unreadable PR listing exits 1, sweeps nobody, and emits NO census row "
+        "that could be mistaken for an empty class",
+        (sweeper15.run(), gh15.updated(), sweeper15.rows), (1, [], []))
+
     gh13, sweeper13 = _fixture()
     gh13.default_branch = "main"
     chk("repair: a default-branch drift FAILS CLOSED rather than moving branches onto a base it "
         "cannot name", isinstance(_raises(sweeper13.run), RegateSweepError), True)
+
+
+def _test_entry_point(chk):
+    """`main()` was at 0% line coverage. The CLI-flag gate proves flags are DECLARED; nothing
+    proved they were WIRED — including the `--bot-slug` -> `<slug>[bot]` construction the whole
+    marker-authorship control rests on."""
+    import tempfile
+    repairs = json.dumps({"schema": 1, "repairs": [dict(REPAIR)]})
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+        handle.write(repairs)
+        path = handle.name
+    try:
+        # A marker written by SOMEONE ELSE. If `main` mis-wires the slug into the login the marker
+        # scan compares against, this PR is wrongly skipped and the sweep silently does nothing.
+        spoof = {"body": MARKER.format(repair=917, head="a" * 40), "user": {"login": "nobody"}}
+        gh, _ = _fixture(comments={903: [spoof]})
+        code = main(["--repo", "jeswr/agent-account-registry", "--repairs-file", path,
+                     "--bot-slug", BOT_SLUG, "--max-moves", "5", "--apply"], runner=gh)
+        chk("entry point: main() runs the sweep end to end and exits 0", code, 0)
+        chk("entry point: main() wires --bot-slug through as `<slug>[bot]`, so a foreign marker is "
+            "ignored and the attributable PR is still moved", gh.updated(), [903])
+
+        gh2, _ = _fixture(comments={903: [{"body": MARKER.format(repair=917, head="a" * 40),
+                                          "user": {"login": BOT_LOGIN}}]})
+        main(["--repo", "jeswr/agent-account-registry", "--repairs-file", path,
+              "--bot-slug", BOT_SLUG, "--apply"], runner=gh2)
+        chk("entry point: and OUR OWN marker read through main() does suppress the move",
+            gh2.updated(), [])
+
+        gh3, _ = _fixture()
+        main(["--repo", "jeswr/agent-account-registry", "--repairs-file", path], runner=gh3)
+        chk("entry point: main() DEFAULTS to dry-run — --apply is opt-in, so a mis-wired workflow "
+            "cannot write", [c for c in gh3.calls if "--method" in c], [])
+
+        for label, argv in (
+                ("a malformed --bot-slug", ["--repo", "o/r", "--repairs-file", path,
+                                            "--bot-slug", "bad slug; rm -rf /"]),
+                ("a negative --max-moves", ["--repo", "o/r", "--repairs-file", path,
+                                            "--max-moves", "-1"]),
+                ("no --repo at all", ["--repairs-file", path])):
+            chk(f"entry point: {label} exits 2 rather than sweeping",
+                _exit_code(lambda a=argv: main(a, runner=_fixture()[0])), 2)
+    finally:
+        os.unlink(path)
+
+
+def _test_published_census(chk):
+    """The step-summary write was at 22% coverage — the census's PUBLISHED surface, which is the
+    half a human actually reads."""
+    import tempfile
+    with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as handle:
+        path = handle.name
+    try:
+        gh, sweeper = _fixture()
+        sweeper.summary_path = path
+        sweeper.run()
+        written = open(path, encoding="utf-8").read()
+        chk("published census: the row reaches the step summary, not only stdout",
+            [line.strip() for line in written.splitlines() if line.strip().startswith("CENSUS")],
+            [sweeper.rows[0]])
+        chk("published census: it is headed, so a reader can find it", "### regate-sweep census"
+            in written, True)
+        gh2, sweeper2 = _fixture()
+        sweeper2.summary_path = "/nonexistent-dir/summary.md"
+        chk("published census: an unwritable summary path warns and does NOT fail the tick — the "
+            "sweep already happened, and losing the receipt must not re-run it", sweeper2.run(), 0)
+    finally:
+        os.unlink(path)
 
 
 def _test_census(chk):
