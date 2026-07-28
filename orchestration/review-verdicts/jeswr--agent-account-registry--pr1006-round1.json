@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 1006,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "aea000087467092165666f287819a23118b57820",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The added stateful regression test correctly exercises the previously unpinned conjunction in `_deliver_alerts`: with the same recovery marker open on both distinct routes, a successful fallback close cannot overwrite a failed primary close. The per-repository close-failure control makes the two route outcomes independently observable, the assertion checks both the nonzero command result and resulting issue states, and the final healthy phase verifies retry behavior. The setup remains consistent with the production route enumeration and recovery binding, and no security or trust check is weakened.",
+  "verdict": "approve"
+ }
+}
