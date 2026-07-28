@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4799,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a4cdb5c1af2e44caddfcb6eb502a7d329a357cbc",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`parse_float` maps both `INF` and `+INF` to positive infinity, but the XSD float/double special lexical representations are `INF`, `-INF`, and `NaN`; `+INF` is not one of them. This contradicts the generated module's claim that float lexical well-formedness is enforced. The round-3 datatype harness covers integer and decimal families but includes no float/double cases, so it does not catch this real-path acceptance error.",
+    "file": "crates/sparq-wrapper-shacl/src/emit.rs",
+    "fix_hint": "Remove `+INF` from the accepted special forms and add generated-loader behavioral cases for both xsd:float and xsd:double covering `INF`, `-INF`, `NaN`, ordinary exponent syntax, and rejection of `+INF` plus Rust-only/non-XSD spellings.",
+    "severity": "major",
+    "title": "Floating-point validator accepts the non-XSD `+INF` lexical form"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 3 fixes both round-2 major findings: String-backed integer/decimal values now pass through datatype-specific lexical validation, narrow signed integer ranges are enforced, and the generated-loader test exercises malformed unbounded integers plus signed boundaries and out-of-range values. One new correctness gap remains in the advertised floating-point lexical validation: the implementation explicitly accepts `+INF`, which is not an XSD float/double lexical representation, while the new behavioral test does not cover either floating datatype. Because this is a new major finding relative to round 2, progress is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
