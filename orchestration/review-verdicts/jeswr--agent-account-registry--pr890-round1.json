@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 890,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "c44e9744a515c080eaae11ef4195cfc41fe47e68",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The branch `if lease_utilizations` treats the collector aggregate as a fallback whenever a legacy `leases` list has zero valid utilization values, even if that list is present and contains validated rows. Before this change such input published `lease_utilization_1h: null`; when both forms are sent during migration it now publishes the supplied aggregate. That contradicts the stated total rows-first contract that sending both preserves exactly the pre-#841 value, and allows the new field to override the legacy result for rows whose utilization is absent or malformed. The precedence self-test is non-vacuous but incomplete because its legacy fixture contains valid 0.8 and 0.4 measurements.",
+    "file": "scripts/dashboard-gen.py",
+    "fix_hint": "Define explicitly whether legacy-source presence or valid legacy samples controls precedence, then implement the documented total rule. If any supplied legacy rows must preserve old behavior, derive from rows whenever `leases` is present/non-empty and leave the result null when none parse; use the collector aggregate only for the row-free form. Add a self-test with both an aggregate and legacy rows whose utilizations are missing or invalid, asserting the intended pre-#841 result.",
+    "severity": "major",
+    "title": "Rows-first precedence is conditional on a parsed utilization"
+   }
+  ],
+  "progress": null,
+  "summary": "The row-free aggregate path is well validated for ordinary inputs, and the privacy-fatal label check remains unconditional. However, the implementation does not satisfy the documented total rows-first migration guarantee: it chooses the legacy source only when at least one lease utilization parses. With both fields present but no parseable row utilization, the new aggregate changes the published result from the pre-change null to the supplied value. The self-test covers only rows containing valid measurements, so this edge is untested.",
+  "verdict": "request_changes"
+ }
+}
