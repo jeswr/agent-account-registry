@@ -140,14 +140,61 @@ CRON_MIN_EXPECTED = 1
 CRON_DELIVERY_FLOOR = 0.60
 
 # --- M2 -----------------------------------------------------------------------------
-# MEASURED run-level queue wait over COMPLETED runs on this repo: N=3,920, p50/p90/p99 all
-# 0s, max 99.5m. ZERO-INFLATED — only 8 of 3,920 (0.20%) ever recorded a non-zero wait.
-# That is why this is NOT stated as a multiple of the observed maximum: multiplying a max
-# of 99.5m gives a threshold nothing reaches, and multiplying a p99 of 0s gives 0. For this
-# shape the honest statement is the false-positive rate. 15 min fires on 6 of 3,920 runs
-# (0.153%) — and those six are NOT false positives, they are the real 00:58Z-02:24Z
-# `pr-gate` queue event of 2026-07-28, which is exactly what this mode exists to report.
+#
+# THE RE-RUN TRAP — read before touching anything in this mode.
+# `created_at` on the RUN-level object is the creation time of ATTEMPT 1 and does NOT
+# reset when a run is re-run, while `run_attempt` and `run_started_at` DO track the live
+# attempt. MEASURED 2026-07-28 on THIS repo, run 30318886362:
+#     run-level    run_attempt=2  created_at=00:58:13Z  run_started_at=02:37:40Z
+#     /attempts/1                 created_at=00:58:13Z  run_started_at=00:58:13Z   0s
+#     /attempts/2                 created_at=02:37:41Z  run_started_at=02:37:40Z   0s
+# Neither attempt ever queued. The 99-minute "wait" is the IDLE GAP between attempt 1
+# failing at 01:00Z and a re-run being pressed at 02:37Z. Executed on that exact payload,
+# `now - run["created_at"]` reports waited_seconds=5967 for an attempt picked up in under
+# a second — so the naive form fires on EVERY re-run older than the threshold, which is
+# the normal case, and a permanently-red alarm is a muted alarm. `attempt_created_at()`
+# below is the fix. Do not reintroduce a bare `run.get("created_at")` here.
+#
+# THRESHOLD — and an HONEST statement of what does and does not support it.
+# WITHDRAWN: an earlier revision claimed "15 min fires on 6 of 3,920 runs (0.153%) — and
+# those six are NOT false positives, they are the real 00:58Z-02:24Z `pr-gate` queue
+# event". Both halves were wrong. The six were produced by the contaminated estimator,
+# and the "queue event" was seven `run_attempt: 2` re-runs pressed in a single batch at
+# 02:35-02:37Z. That evidence is retracted.
+#
+# RE-DERIVED 2026-07-28 over a per-workflow scan of this repo, N=9,062 completed runs:
+#   contaminated estimator (run-level created_at, all runs) : 6 over 15 min
+#                                     ... of which re-runs  : 6   (ALL of them)
+#   decontaminated (run_attempt == 1 only), N=9,053         : 0 over 15 min
+#                                    non-zero wait AT ALL   : 0     max 0.0s
+#   re-runs resolved against their own /attempts/{n}, N=9    : 0 over 15 min
+#                                                  true max : -1.0s (instant pickup)
+#
+# SO M2 HAS NO VALIDATED KNOWN POSITIVE. There is no run in the observed corpus that this
+# mode would have fired on. Two consequences that must not be lost:
+#
+#   (i)  The threshold CANNOT be derived from the observed distribution. After
+#        decontamination it is not zero-INFLATED, it is exactly ALL ZERO across 9,053
+#        runs — there is no percentile, multiple or maximum to anchor to. The corpus
+#        constrains this constant from BELOW only (any value above 0 has a measured
+#        false-positive rate of 0); it says nothing about where in that half-line to sit.
+#        15 min is a JUDGMENT about how long a human should wait before being told, not a
+#        measurement, and is labelled as such.
+#   (ii) The corpus proxy is itself weak. `run_started_at - created_at` is a RUN-level
+#        statistic, and the measurement trap in the header is precisely that a run whose
+#        jobs are throttled behind `max-parallel` reads `status=queued` ZERO for hours. A
+#        zero here is consistent with "no queueing happened" AND with "the API does not
+#        express the queueing that happened". It cannot distinguish them.
+#
+# M2 therefore ships as an UNVALIDATED detector for the maintainer's stated concern, with
+# a measured false-positive rate of 0 over N=9,053 and no demonstrated true positive. It
+# is cheap (it reads live state already fetched for M3) and it is the only watcher on
+# `status=queued` at all. It is not evidence that queue waits are being caught.
 QUEUE_MAX_WAIT_SECONDS = 15 * 60
+# Key the fetch layer writes onto a queued run whose live attempt is NOT attempt 1: the
+# `created_at` of that attempt's own `/attempts/{n}` record. Absent on attempt-1 runs by
+# design — for those the run-level field IS the attempt's field.
+ATTEMPT_CREATED_KEY = "_attempt_created_at"
 
 # --- M3 -----------------------------------------------------------------------------
 # Threshold = max(MULTIPLE x p90(completed durations for this workflow+event), FLOOR).
@@ -320,6 +367,26 @@ def find_cron_deficits(lanes: list[dict], now: dt.datetime,
         if lane.get("state") != "active":
             bump("disabled")
             continue
+        # NEW-LANE WINDOW. A lane that did not EXIST for the whole window looks identical
+        # to a lane that stopped firing: out of run times alone the detector cannot tell
+        # "did not fire" from "did not exist yet", so a lane added two hours ago reads far
+        # below the floor and alarms for the next ~14 hours. The workflow's own
+        # `created_at` (carried on the `actions/workflows` listing) is the signal that
+        # resolves it.
+        # PRORATING THE EXPECTATION WAS TRIED AND REJECTED: scaling the cap by the lane's
+        # observed lifetime gives a young lane an expectation of ~2, and at a floor of
+        # 0.60 a single undelivered firing (1 of 2) still alarms. A prorated expectation
+        # is not a smaller measurement, it is noise — the cap it derives from is itself a
+        # RATE measured over a full 24h, and GitHub's delivery is bursty at short scales.
+        # So a lane younger than the window is COUNTED and skipped, never guessed at; it
+        # becomes watchable one window after it appears. The gap is deliberate, bounded,
+        # and visible in the census rather than silent.
+        created = lane.get("created_at")
+        if created:
+            born = created if isinstance(created, dt.datetime) else _ts(created)
+            if born > start:
+                bump("lane-too-new-for-an-expectation")
+                continue
         try:
             nominal = sum(expected_firings(c, start, end) for c in lane["crons"])
         except CronError:
@@ -352,6 +419,25 @@ def find_cron_deficits(lanes: list[dict], now: dt.datetime,
     return findings, census
 
 
+def attempt_created_at(run: dict) -> str | None:
+    """The creation time of the run's CURRENTLY-EXECUTING attempt, or None if it cannot
+    be determined.
+
+    This is NOT `run["created_at"]`. See the RE-RUN TRAP note on QUEUE_MAX_WAIT_SECONDS:
+    the run-level `created_at` is frozen at attempt 1 and does not reset on re-run, so
+    reading it for a re-run charges the idle gap before the re-run press as queue wait.
+
+    Attempt 1 -> the run-level field IS the attempt's field (MEASURED equal on all 9,053
+    attempt-1 runs in this repo's corpus). Attempt N>1 -> the value the fetch layer
+    resolved from `/actions/runs/{id}/attempts/{n}`; None when that resolution was
+    unavailable, which the caller must treat as INDETERMINATE and count, never as the
+    run-level value.
+    """
+    if int(run.get("run_attempt") or 1) > 1:
+        return run.get(ATTEMPT_CREATED_KEY) or None
+    return run.get("created_at") or None
+
+
 def find_queue_overruns(live_runs: list[dict], now: dt.datetime,
                         max_wait: float = QUEUE_MAX_WAIT_SECONDS
                         ) -> tuple[list[dict], dict]:
@@ -365,9 +451,14 @@ def find_queue_overruns(live_runs: list[dict], now: dt.datetime,
     for run in live_runs:
         if run.get("status") != "queued":
             continue
-        created = run.get("created_at")
+        created = attempt_created_at(run)
         if not created:
-            bump("queued-no-timestamp")
+            # A re-run whose own attempt record could not be resolved is INDETERMINATE.
+            # Fail-safe QUIET but COUNTED: the run-level `created_at` is available and
+            # known-wrong here, and firing a known-false alarm is worse than a visible
+            # gap. Two distinct census states so the two causes stay separable.
+            bump("queued-rerun-attempt-unresolved"
+                 if int(run.get("run_attempt") or 1) > 1 else "queued-no-timestamp")
             continue
         waited = (now - _ts(created)).total_seconds()
         if waited > max_wait:
@@ -379,6 +470,7 @@ def find_queue_overruns(live_runs: list[dict], now: dt.datetime,
                 "event": run.get("event"),
                 "waited_seconds": int(waited),
                 "threshold_seconds": int(max_wait),
+                "run_attempt": int(run.get("run_attempt") or 1),
                 "head_branch": run.get("head_branch"),
             })
         else:
@@ -451,13 +543,6 @@ def _ts(value: str) -> dt.datetime:
 
 def percentile(values: list[float], q: float) -> float:
     ordered = sorted(values)
-    idx = min(len(ordered) - 1, int(round(q * (len(ordered) - 1))))
-    return ordered[idx]
-
-
-
-def percentile(values: list[float], q: float) -> float:
-    ordered = sorted(values)
     return ordered[min(len(ordered) - 1, int(round(q * (len(ordered) - 1))))]
 
 
@@ -508,6 +593,38 @@ def _api(repo, path):
     return payload
 
 
+def resolve_attempt_created(repo, runs):
+    """Enrich every QUEUED run whose live attempt is not attempt 1 with that attempt's own
+    `created_at`, under ATTEMPT_CREATED_KEY.
+
+    WITHOUT THIS CALL M2 IS A FALSE-POSITIVE GENERATOR — see the RE-RUN TRAP note. It is
+    a separate pass rather than logic inside `find_queue_overruns` so the detectors stay
+    pure functions over already-fetched state and remain hermetically testable.
+
+    REQUEST COST is zero in the common case, which matters against this repo's live
+    request budget: the pass touches only `queued` runs at attempt > 1. MEASURED over a
+    9,062-run per-workflow scan on 2026-07-28, re-runs were 9 of 9,062 (0.1%), and the
+    `queued` population is normally empty. A failed lookup leaves the key absent, which
+    the detector counts as `queued-rerun-attempt-unresolved` rather than falling back to
+    the known-wrong value.
+    """
+    for run in runs:
+        if run.get("status") != "queued":
+            continue
+        attempt = int(run.get("run_attempt") or 1)
+        if attempt <= 1 or not run.get("id"):
+            continue
+        try:
+            payload = _api(repo, f"actions/runs/{run['id']}/attempts/{attempt}")
+        except AlarmError:
+            # Quiet + counted downstream. One unresolvable attempt record must not abort
+            # the whole tick and take M1 and M3 down with it.
+            continue
+        if isinstance(payload, dict) and payload.get("created_at"):
+            run[ATTEMPT_CREATED_KEY] = payload["created_at"]
+    return runs
+
+
 def fetch_live_runs(repo):
     """Every run currently `queued` or `in_progress` — the LIVE read M2 and M3 key on.
     Terminates on a SHORT page, never on `len >= total_count`: a total_count read before a
@@ -526,7 +643,7 @@ def fetch_live_runs(repo):
             page += 1
         else:
             raise AlarmError(f"live `{status}` listing exceeded {RUNS_PAGE_CAP} pages")
-    return live
+    return resolve_attempt_created(repo, live)
 
 
 def fetch_baseline(repo, workflow_path, event):
@@ -559,6 +676,9 @@ def fetch_lanes(repo, root, window_hours, now):
     if listing.get("workflows") is None:
         raise AlarmError("workflow listing carries no workflows")
     state_by_path = {w["path"]: w.get("state") for w in listing["workflows"]}
+    # The lane's own birth date, which is the ONLY thing that separates "did not fire"
+    # from "did not exist yet" — see the NEW-LANE WINDOW note in find_cron_deficits.
+    created_by_path = {w["path"]: w.get("created_at") for w in listing["workflows"]}
     start = now - dt.timedelta(hours=window_hours)
     lanes = []
     for path in sorted(wf_dir.glob("*.yml")) + sorted(wf_dir.glob("*.yaml")):
@@ -567,6 +687,7 @@ def fetch_lanes(repo, root, window_hours, now):
         in_scope, crons, cron_only = m1_scope(on)
         lane = {"workflow": rel, "crons": crons, "cron_only": cron_only,
                 "in_scope": in_scope, "state": state_by_path.get(rel, "active"),
+                "created_at": created_by_path.get(rel),
                 "schedule_run_times": []}
         if in_scope and lane["state"] == "active":
             payload = _api(repo, f"actions/workflows/{path.name}/runs"
@@ -696,21 +817,55 @@ def capped_expectation(window_hours=CRON_WINDOW_HOURS):
 
 
 def _lane(workflow="a.yml", crons=("*/10 * * * *",), cron_only=False, in_scope=True,
-          state="active", fires=0, now=None, spacing_min=20):
+          state="active", fires=0, now=None, spacing_min=20, created_hours_ago=None):
+    """`created_hours_ago` gives the lane a birth date, for the NEW-LANE WINDOW. `None`
+    means an established lane (no `created_at`), which must behave exactly as before."""
     now = now or dt.datetime(2026, 7, 28, 12, 0, tzinfo=dt.timezone.utc)
     first = now - dt.timedelta(minutes=CRON_GRACE_MINUTES + 1)
-    return {"workflow": workflow, "crons": list(crons), "cron_only": cron_only,
+    lane = {"workflow": workflow, "crons": list(crons), "cron_only": cron_only,
             "in_scope": in_scope, "state": state,
             "schedule_run_times": [first - dt.timedelta(minutes=spacing_min * i)
                                    for i in range(fires)]}
+    if created_hours_ago is not None:
+        lane["created_at"] = (now - dt.timedelta(hours=created_hours_ago)
+                              ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return lane
 
 
 def _run_obj(status="in_progress", event="schedule", path=".github/workflows/a.yml",
-             age_min=10, now=None, name="A"):
+             age_min=10, now=None, name="A", attempt=1, created_age_min=None,
+             attempt_created_age_min=None):
+    """The REAL shape of an `actions/runs` element, not a minimal hand-built dict.
+
+    A narrow fixture is a vacuity generator. `started = run.get("updated_at") or
+    run_started_at` SURVIVED the first mutation battery for exactly one reason: no fixture
+    carried `updated_at`, while EVERY live run does — and on a live run `updated_at` is
+    bumped continuously, so that mutant collapses M3's age to ~0 and the mode never fires
+    again. The keys and their relationships below are taken from a real payload
+    (this repo's run 30318886362).
+
+    `created_age_min` exists to reproduce the RE-RUN shape, where the run-level
+    `created_at` is FROZEN at attempt 1 while `run_started_at` tracks the live attempt.
+    """
     now = now or dt.datetime(2026, 7, 28, 12, 0, tzinfo=dt.timezone.utc)
-    stamp = (now - dt.timedelta(minutes=age_min)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    return {"id": 1, "name": name, "path": path, "event": event, "status": status,
-            "created_at": stamp, "run_started_at": stamp, "head_branch": "master"}
+
+    def stamp(minutes):
+        return (now - dt.timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    obj = {
+        "id": 1, "name": name, "path": path, "event": event, "status": status,
+        "conclusion": None, "run_attempt": attempt, "workflow_id": 99, "run_number": 7,
+        "display_title": name, "head_branch": "master", "head_sha": "0" * 40,
+        "created_at": stamp(created_age_min if created_age_min is not None else age_min),
+        "run_started_at": stamp(age_min),
+        # A LIVE run's `updated_at` tracks the PRESENT moment, which is what makes it a
+        # catastrophic substitute for `run_started_at` in M3.
+        "updated_at": stamp(0) if status != "completed" else stamp(age_min),
+        "html_url": "https://example.invalid/run/1",
+    }
+    if attempt_created_age_min is not None:
+        obj[ATTEMPT_CREATED_KEY] = stamp(attempt_created_age_min)
+    return obj
 
 
 def _self_test():  # noqa: C901 - a flat table of named assertions reads best flat
@@ -724,6 +879,29 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
     H6 = NOW - dt.timedelta(hours=6)
     D1 = NOW - dt.timedelta(hours=24)
     CAP = capped_expectation()
+
+    # --- THE CONSTANTS, pinned against LITERALS that do not derive from them ----------
+    # Every threshold here was previously exercised only through fixtures COMPUTED FROM
+    # the constant, so the fixture rescaled with the mutant and the mutant survived.
+    # MEASURED instances on this file: `CRON_DELIVERY_FLOOR 0.60 -> 0.05` survived the
+    # entire self-test because `at_floor = ceil(CAP * FLOOR)` moved with it and CAP=30
+    # leaves `fires=1` at ratio 0.033, still below 0.05; and `CRON_WINDOW_HOURS
+    # 24.0 -> 6.0` survived — 6.0 being the value the header says was TRIED AND REJECTED.
+    # A constant is only pinned by a value written down independently of it.
+    chk("CRON_WINDOW_HOURS is 24h — the value the rejected 6h trial was replaced by",
+        CRON_WINDOW_HOURS == 24.0)
+    chk("CRON_DELIVERY_FLOOR is inside its validated band (worst healthy lane 0.87)",
+        0.50 <= CRON_DELIVERY_FLOOR <= 0.70)
+    chk("CRON_MAX_CREDIBLE_FIRINGS_PER_HOUR matches THIS repo's measured ceiling "
+        "(1.25/h = 30/day; the sparq deployment's 0.5 is a different repo's load)",
+        CRON_MAX_CREDIBLE_FIRINGS_PER_HOUR == 1.25)
+    chk("CRON_GRACE_MINUTES is 15", CRON_GRACE_MINUTES == 15)
+    chk("QUEUE_MAX_WAIT_SECONDS is 15 minutes", QUEUE_MAX_WAIT_SECONDS == 15 * 60)
+    chk("EXEC_OVERRUN_MULTIPLE is inside the band that still catches the 2.08x outlier",
+        1.25 <= EXEC_OVERRUN_MULTIPLE <= 2.0)
+    chk("EXEC_FLOOR_SECONDS is GitHub's 6h hosted-runner job ceiling",
+        EXEC_FLOOR_SECONDS == 6 * 60 * 60)
+    chk("BASELINE_MIN_N is 5", BASELINE_MIN_N == 5)
 
     # --- cron expansion, canary-validated against hand-computed answers ---
     chk("cron */10 over 6h == 36", expected_firings("*/10 * * * *", H6, NOW) == 36)
@@ -792,6 +970,48 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
     chk("M1 does raise just BELOW the delivery floor",
         len(find_cron_deficits([_lane(fires=at_floor - 1, now=NOW)], NOW)[0]) == 1)
 
+    # --- M1 threshold pins against LITERALS ------------------------------------------
+    # The two boundary checks above derive `at_floor` FROM CRON_DELIVERY_FLOOR, so they
+    # rescale with it and cannot fail when it moves. `0 */4 * * *` has a 24h nominal of 5,
+    # BELOW the cap, so `expected` is 5 regardless of the cap constant. Nothing in these
+    # three fixtures is computed from CRON_DELIVERY_FLOOR or from the cap.
+    FOUR_HOURLY = ("0 */4 * * *",)
+    f, _ = find_cron_deficits([_lane(crons=FOUR_HOURLY, fires=2, now=NOW)], NOW)
+    chk("M1 raises at 2 of a literal 5 (ratio 0.40) — pins the floor from BELOW",
+        len(f) == 1 and f[0]["expected"] == 5 and f[0]["ratio"] == 0.4)
+    f, _ = find_cron_deficits([_lane(crons=FOUR_HOURLY, fires=3, now=NOW)], NOW)
+    chk("M1 is quiet at 3 of a literal 5 (ratio 0.60) — pins the floor from ABOVE",
+        not f)
+    f, _ = find_cron_deficits([_lane(crons=FOUR_HOURLY, fires=2, now=NOW)], NOW)
+    chk("M1's DEFAULT window makes a 4-hourly lane's expectation exactly 5 "
+        "(it is 1 at the rejected 6h window)", len(f) == 1 and f[0]["expected"] == 5)
+
+    # --- M1 new-lane window: 'did not fire' vs 'did not exist yet' --------------------
+    young = _lane(fires=1, now=NOW, created_hours_ago=2)
+    f, c = find_cron_deficits([young], NOW)
+    chk("M1 does not alarm on a lane that did not EXIST for most of the window", not f)
+    chk("M1 counts a too-young lane as its own census state",
+        c.get("lane-too-new-for-an-expectation") == 1)
+    # ANTI-VACUITY: the identical fixture WITHOUT a birth date must still alarm, or the
+    # new-lane exit is just an unconditional mute.
+    chk("M1 still alarms on the same delivery from an ESTABLISHED lane",
+        len(find_cron_deficits([_lane(fires=1, now=NOW)], NOW)[0]) == 1)
+    chk("M1 judges a lane older than the window on delivery alone",
+        len(find_cron_deficits([_lane(fires=1, now=NOW, created_hours_ago=48)],
+                               NOW)[0]) == 1)
+    chk("M1 birth-date check does not change an established lane's verdict",
+        not find_cron_deficits([_lane(fires=CAP, now=NOW, created_hours_ago=48)],
+                               NOW)[0])
+    # THE BOUNDARY, pinned from both sides against the 24h window: a lane born just
+    # INSIDE the window is skipped, one born just OUTSIDE it is judged. Without both
+    # directions, `if born > start` and `if born > start - 100 years` are the same test.
+    f, c = find_cron_deficits([_lane(fires=1, now=NOW, created_hours_ago=23)], NOW)
+    chk("M1 skips a lane born 23h ago (inside the 24h window)",
+        not f and c.get("lane-too-new-for-an-expectation") == 1)
+    f, c = find_cron_deficits([_lane(fires=1, now=NOW, created_hours_ago=25)], NOW)
+    chk("M1 judges a lane born 25h ago (outside the 24h window)",
+        len(f) == 1 and c.get("firing-deficit") == 1)
+
     # --- M2 ---
     f, c = find_queue_overruns(
         [_run_obj(status="queued", age_min=int(QUEUE_MAX_WAIT_SECONDS / 60) + 5, now=NOW)],
@@ -807,11 +1027,86 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
     chk("an hour in `queued` raises under the SHIPPED threshold",
         len(find_queue_overruns([_run_obj(status="queued", age_min=60, now=NOW)],
                                 NOW)[0]) == 1)
+    chk("two minutes in `queued` stays quiet under the SHIPPED threshold",
+        not find_queue_overruns([_run_obj(status="queued", age_min=2, now=NOW)], NOW)[0])
     chk("the queue threshold stays inside its validated band",
         5 * 60 <= QUEUE_MAX_WAIT_SECONDS <= 30 * 60)
     chk("M2 ignores in_progress runs (that is M3's job)",
         not find_queue_overruns([_run_obj(status="in_progress", age_min=9999, now=NOW)],
                                 NOW)[0])
+
+    # --- M2 RE-RUN TRAP: the reason the shipped detector is not `now - created_at` -----
+    # The exact shape of this repo's run 30318886362: attempt 2, whose own creation was 1
+    # minute ago, on a run-level object still reporting attempt 1's creation 99 minutes
+    # ago. The naive form reports a 99-minute queue wait for a sub-second pickup — and
+    # the seven runs of that shape were this mode's ENTIRE published known positive.
+    rerun = _run_obj(status="queued", age_min=1, attempt=2, created_age_min=99,
+                     attempt_created_age_min=1, now=NOW)
+    naive_wait = (NOW - _ts(rerun["created_at"])).total_seconds()
+    chk("the re-run fixture reproduces the FROZEN run-level created_at",
+        naive_wait > 90 * 60
+        and (NOW - _ts(rerun[ATTEMPT_CREATED_KEY])).total_seconds() < 5 * 60)
+    chk("the naive `now - created_at` WOULD have fired on it (fixture is not vacuous)",
+        naive_wait > QUEUE_MAX_WAIT_SECONDS)
+    f, c = find_queue_overruns([rerun], NOW)
+    chk("M2 does NOT charge a re-run's idle gap as queue wait", not f)
+    chk("M2 counts the re-run as within threshold, not as a skip",
+        c.get("queued-within-threshold") == 1)
+    unresolved = _run_obj(status="queued", age_min=1, attempt=2, created_age_min=99,
+                          now=NOW)
+    f, c = find_queue_overruns([unresolved], NOW)
+    chk("an unresolved re-run is quiet", not f)
+    chk("an unresolved re-run is COUNTED in its own census state",
+        c.get("queued-rerun-attempt-unresolved") == 1)
+    chk("a genuine ATTEMPT-1 queue wait still raises after the re-run fix",
+        len(find_queue_overruns(
+            [_run_obj(status="queued", age_min=60, attempt=1, now=NOW)], NOW)[0]) == 1)
+    chk("a genuine queue wait ON a re-run attempt still raises",
+        len(find_queue_overruns(
+            [_run_obj(status="queued", age_min=60, attempt=3, created_age_min=999,
+                      attempt_created_age_min=60, now=NOW)], NOW)[0]) == 1)
+
+    # THE CALL SITE. A pure detector that reads ATTEMPT_CREATED_KEY is worthless if
+    # nothing ever writes it, and that omission is invisible to every assertion above.
+    _real_api = globals()["_api"]
+    try:
+        seen = []
+
+        def _fake_api(repo, path):
+            seen.append(path)
+            return {"created_at": "2026-07-28T11:59:00Z",
+                    "run_started_at": "2026-07-28T11:59:00Z", "run_attempt": 2}
+
+        globals()["_api"] = _fake_api
+        enriched = resolve_attempt_created("o/r", [
+            _run_obj(status="queued", age_min=1, attempt=2, created_age_min=99, now=NOW),
+            _run_obj(status="queued", age_min=99, attempt=1, now=NOW),
+            _run_obj(status="in_progress", age_min=99, attempt=2, now=NOW),
+        ])
+        chk("the fetch layer resolves a QUEUED re-run against /attempts/{n}",
+            enriched[0].get(ATTEMPT_CREATED_KEY) == "2026-07-28T11:59:00Z")
+        chk("the fetch layer asks for the LIVE attempt number",
+            len(seen) == 1 and seen[0].endswith("/attempts/2"))
+        chk("the fetch layer spends no request on an attempt-1 run",
+            ATTEMPT_CREATED_KEY not in enriched[1])
+        chk("the fetch layer spends no request on an in_progress run (M3's population)",
+            ATTEMPT_CREATED_KEY not in enriched[2])
+        chk("enrichment turns the re-run false positive into silence",
+            [x["run_attempt"] for x in find_queue_overruns(enriched, NOW)[0]] == [1])
+
+        def _raising_api(repo, path):
+            raise AlarmError("attempt lookup unavailable")
+
+        globals()["_api"] = _raising_api
+        degraded = resolve_attempt_created("o/r", [
+            _run_obj(status="queued", age_min=1, attempt=2, created_age_min=99, now=NOW)])
+        chk("a failed attempt lookup does not abort the tick",
+            ATTEMPT_CREATED_KEY not in degraded[0])
+        chk("a failed attempt lookup lands in the unresolved census state",
+            find_queue_overruns(degraded, NOW)[1]
+            .get("queued-rerun-attempt-unresolved") == 1)
+    finally:
+        globals()["_api"] = _real_api
 
     # --- M3 ---
     base = {(".github/workflows/a.yml", "schedule"): {"p90": 3600.0, "n": 50}}
@@ -845,6 +1140,24 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
     # DETECTION VARIABLE IS LIVE STATE: a baseline alone can never produce a finding.
     chk("no live run => nothing to say",
         find_execution_overruns([], big, NOW) == ([], {}))
+    # --- M3 threshold pins against LITERALS ------------------------------------------
+    # 9h against an 8h p90 is 1.13x — inside the band at K=2.0, outside it at K<=1.13.
+    # The 17.3h check pins the multiple from ABOVE (K=2.5 misses it); this pins it from
+    # BELOW, which nothing did before.
+    chk("M3 is quiet at 9h against an 8h p90 — pins the multiple from BELOW",
+        not find_execution_overruns([_run_obj(age_min=9 * 60, now=NOW)], big, NOW)[0])
+    chk("M3 is quiet at 5h with no baseline — pins the 6h floor from BELOW",
+        not find_execution_overruns([_run_obj(age_min=5 * 60, now=NOW)], {}, NOW)[0])
+    chk("M3 raises at 7h with no baseline — pins the 6h floor from ABOVE",
+        len(find_execution_overruns([_run_obj(age_min=7 * 60, now=NOW)], {}, NOW)[0]) == 1)
+    # THE `updated_at` SUBSTITUTION. A live run's `updated_at` tracks the present moment,
+    # so `started = run.get("updated_at") or run_started_at` collapses every age to ~0 and
+    # M3 never fires again. It survived the first battery only because the fixture was a
+    # hand-built dict with no `updated_at`; the fixture now carries the real shape.
+    _live = _run_obj(age_min=17 * 60, now=NOW)
+    chk("the M3 fixture carries a live run's real `updated_at`",
+        (NOW - _ts(_live["updated_at"])).total_seconds() < 60
+        and (NOW - _ts(_live["run_started_at"])).total_seconds() > 16 * 3600)
 
     # --- census on the all-clear ---
     res = classify([_lane(fires=CAP, now=NOW)],
@@ -897,6 +1210,48 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
         _rc([_lane(in_scope=False, now=NOW)]) == 2)
     chk("a populated, healthy scan set is exit 0", _rc([_lane(fires=CAP, now=NOW)]) == 0)
 
+    # --- THE CONSUMER of the hard/soft read (NOT just decide() in isolation) ----------
+    # `decide()` is exercised above as a pure function, but the guard that actually
+    # protects the transport lives in its CALLER: on a failed or unparseable
+    # `gh issue list` the dedupe/recovery data is missing, so acting anyway would mint a
+    # DUPLICATE ops-alert on every sub-hourly groom tick. Making `if hard or soft:
+    # continue` inert SURVIVED the entire suite, because nothing exercised run()'s WRITE
+    # path at all — a tested pure function whose consumer is untested is a tested nothing.
+    _real_find, _real_apply = globals()["_find_open_alert"], globals()["_apply"]
+    try:
+        applied = []
+
+        def _spy_apply(action, repo, token, num, mode, body, note):
+            applied.append(action)
+            return 0
+
+        globals()["_apply"] = _spy_apply
+        # A lane that fired ZERO times, so M1 has a finding and the write path is live.
+        deficit = {"repo": "o/r", "baselines": {}, "live_runs": [],
+                   "lanes": [dict(_lane(fires=0, now=NOW), schedule_run_times=[])]}
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+            json.dump(deficit, fh)
+            deficit_path = fh.name
+        argv = ["--state-file", deficit_path, "--now", "2026-07-28T12:00:00Z"]
+
+        for label, ret, want_rc in (("a hard gh failure", (None, True, False), 1),
+                                    ("an unparseable listing", (None, False, True), 0)):
+            applied.clear()
+            globals()["_find_open_alert"] = (
+                lambda repo, token, mode, _r=ret: _r)
+            rc = main(argv)
+            chk(f"{label} writes NOTHING (no duplicate ops-alert)", applied == [])
+            chk(f"{label} returns rc={want_rc}", rc == want_rc)
+        # ANTI-VACUITY: on a CLEAN read the very same input DOES write, so the two checks
+        # above are pinning the guard and not merely a broken fixture.
+        applied.clear()
+        globals()["_find_open_alert"] = lambda repo, token, mode: (None, False, False)
+        main(argv)
+        chk("a clean issue read DOES upsert the M1 alert (guard test is not vacuous)",
+            applied == ["upsert", "noop", "noop"])
+    finally:
+        globals()["_find_open_alert"], globals()["_apply"] = _real_find, _real_apply
+
     # --- YAML SEAM. Neither `bash -n` nor actionlint can see which inputs a watchdog
     # keys on, so the hosting job is asserted structurally, by EXACT match. ---
     root = Path(__file__).resolve().parents[1]
@@ -932,6 +1287,29 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
                          if r == "python3 registry/scripts/ci-latency-alert.py"), None)
         chk("seam: the self-test runs BEFORE the detector",
             idx_self is not None and idx_live is not None and idx_self < idx_live)
+        # THE SELF-TEST STEP MUST BE ABLE TO FAIL THE JOB. It is the only thing standing
+        # between a broken detector and a live tick, and both the workflow comment and the
+        # PR body claim the detector "proves itself first" — so `continue-on-error` there
+        # would let a broken detector ship silently while the prose said otherwise. The
+        # words and the wiring have to agree, and only an assertion keeps them agreeing.
+        selftest_steps = [s for s in job.get("steps", [])
+                          if str(s.get("run", "")).strip().endswith("--self-test")]
+        chk("seam: exactly one self-test step", len(selftest_steps) == 1)
+        for s in selftest_steps:
+            chk("seam: the self-test step carries NO `continue-on-error`",
+                "continue-on-error" not in s)
+            chk("seam: the self-test step carries NO `if:`", "if" not in s)
+        chk("seam: the JOB carries no `continue-on-error`", "continue-on-error" not in job)
+        # ANTI-VACUITY for the three checks above. The ALERT step legitimately DOES carry
+        # `continue-on-error: true` (a watchdog fault must never red the grooming sweep),
+        # so a blanket "no continue-on-error anywhere" would be pinning the wrong thing
+        # and would pass vacuously if the steps were reordered or renamed. The asymmetry
+        # between the two steps is the actual invariant.
+        alert_steps = [s for s in job.get("steps", [])
+                       if str(s.get("run", "")).strip()
+                       == "python3 registry/scripts/ci-latency-alert.py"]
+        chk("seam: the ALERT step DOES carry continue-on-error (asymmetry is deliberate)",
+            len(alert_steps) == 1 and alert_steps[0].get("continue-on-error") is True)
         for step in job.get("steps", []):
             uses = step.get("uses")
             if uses:
