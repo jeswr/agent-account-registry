@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 998,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "40274280df00a0ea2f2fe3a02aaa21b014cfdc7d",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nRound 2 resolves both prior findings. The workflow now binds label-event authorization to `github.event.sender.login`, independently probes author and actor trust, excludes GitHub's `triage` permission from the exact write+ trusted set, and routes the quarantine step through a single fail-closed Python decision. For an external author, an untrusted/triage-role actor's `unlabeled` event re-adds and verifies both quarantine labels; a write+ actor can deliberately remove the gate. The added tests execute a hand-written event \u00d7 author-trust \u00d7 actor-trust truth table, cover unknown/missing inputs and fail-closed CLI defaults, inspect the workflow's actual argv, include asymmetric rows that detect swapped trust arguments, and pin the relevant workflow seams with exact assertions. I found no remaining correctness, soundness, test-validity, or security issue in the diff.",
+  "verdict": "approve"
+ }
+}
