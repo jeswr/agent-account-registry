@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4574,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "a52fe109124fe59ba29ce5334482fd5d384003a9",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The release note says a fact that is asserted and layer-derivable is \"charged to the base while asserted\" and that mutating the base copy \"hands ownership\" via the affected layer's local fixpoint. But `insert` intentionally excludes an already-present closure fact from `pending`, so no local fixpoint runs and `layer_derived` retains its copy alongside `base`; the new source comment and behavioral witness explicitly call this lazy double ownership. Thus the outward behavioral description is false for insertion until a later relevant recomputation.",
+    "file": "CHANGELOG.md",
+    "fix_hint": "Rewrite the changelog claim to describe the implemented lazy, observationally inert double ownership and explain that ownership is normalized on the next relevant layer recomputation. Make the corresponding eager-hand-off wording in `bench/reason-deletion/README.md` consistent as well.",
+    "severity": "minor",
+    "title": "Release note still claims eager base-only ownership"
+   }
+  ],
+  "progress": "improving",
+  "summary": "Round 3 materially improves the implementation and tests: the prior unreachable insertion-transfer branch is no longer presented as eagerly reachable, and the deterministic witness now exercises the lazy double-ownership state through derivation loss and final base retraction. The randomized test also explicitly proves that insertion-side cases occur. The remaining issue is an honesty/documentation mismatch: the changelog and benchmark README still describe eager, base-only ownership and immediate local-fixpoint hand-off, while the implementation deliberately retains simultaneous base and layer ownership until a later relevant recomputation. The code comments and behavioral test describe the actual lazy invariant; the outward claims should match them.",
+  "verdict": "request_changes"
+ }
+}
