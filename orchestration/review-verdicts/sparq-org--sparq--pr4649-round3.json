@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4649,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "1666fe0bd80a5ad5f3bddf89edb8178bef31c397",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 3 resolves the prior major finding. The revised left- and right-boundary checks treat `-`, internal `.`, `%` escapes, PN_LOCAL escapes, and Unicode as name continuations only with the necessary prefixed-name context, while retaining a positive control for a genuine typo adjacent to `.`. The new `prefixed_names_with_punctuation_are_never_flagged` test validates all reported examples against the real vendored parser before asserting that hints are empty, so it is non-vacuous. The bounded scans also conservatively prevent adversarial punctuation runs from causing quadratic work. I found no remaining correctness, soundness, test-validity, or security issue in the diff.",
+  "verdict": "approve"
+ }
+}
