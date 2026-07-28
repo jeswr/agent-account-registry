@@ -2178,10 +2178,10 @@ def _review_fix_standdown_labels(source=None):
     """The label literals review-fix.yml's admission steps REFUSE to run on, read straight out of
     the workflow and returned sorted.
 
-    Parsed, never substring-matched: each inline `<<'PY'` step body is AST-walked for an `if` that
-    raises SystemExit and whose test reads the PR's own `labels`, in both spellings the workflow
-    uses (`"x" in labels` and `{...} & set(labels)`). A comment or a dead string mentioning a park
-    label therefore proves nothing here — only an executed guard does.
+    Parsed, never substring-matched: each inline `<<'PY'` step body is read for a TOP-LEVEL `if`
+    that raises SystemExit and whose test reads the PR's own `labels`, in both spellings the
+    workflow uses (`"x" in labels` and `{...} & set(labels)`). A comment or a dead string
+    mentioning a park label therefore proves nothing here — only an executed guard does.
 
     Every failure direction shrinks the result: an unparsable body is skipped, a guard that stopped
     raising is not collected, a dropped guard simply is not there. The caller asserts EQUALITY
@@ -2222,7 +2222,14 @@ def _review_fix_standdown_labels(source=None):
             tree = ast.parse(textwrap.dedent(body))
         except SyntaxError:
             continue
-        for node in ast.walk(tree):
+        # REACHABILITY, not mere presence (review round 1). `ast.walk` accepted an `if` ANYWHERE
+        # in the tree, so burying the live guard under dead control flow — `if False:`, a
+        # never-called `def`, a SystemExit-swallowing `try` — left this set UNCHANGED while the
+        # workflow ran models on parked PRs: exactly the conditionally-inert fail-open this pin
+        # exists to catch. These heredoc bodies are straight-line scripts, so the admission path
+        # IS the module body: only a guard that is a STATEMENT OF IT counts. Any nesting drops
+        # the guard, which shrinks the set, which reds the caller's equality assertion.
+        for node in tree.body:
             if not isinstance(node, ast.If):
                 continue
             if not any(isinstance(inner, ast.Raise) and isinstance(inner.exc, ast.Call)
@@ -4158,6 +4165,31 @@ def _self_test():
           "reds by ABSENCE, so a guard that stops executing cannot pass as one that does",
           (_dropped != _rf_src, attempt(lambda: _review_fix_standdown_labels(_dropped))),
           (True, sorted({HUMAN_PR_PARK_LABEL, HUMAN_PARK_LABEL})))
+    # KNOWN POSITIVE 3 is the review-round-1 escape: the guard is left textually intact and
+    # merely BURIED under a false branch, so a presence-scan reports all three labels while the
+    # workflow admits parked PRs. The mutant must stay VALID python (the inner `if` is indented
+    # one column past `if False:`, the raise stays deeper still) — and the surviving sibling
+    # guard in the expectation is what proves that: a mutant that failed to parse would skip the
+    # whole body and return [], failing this row for the wrong reason.
+    _buried = _rf_src.replace('if "review:parked" in labels:\n',
+                              'if False:\n           if "review:parked" in labels:\n')
+    check("KNOWN POSITIVE 3 — a stand-down BURIED under `if False:` reds too: the pin reports "
+          "what the admission path EXECUTES, not what the file merely contains, so a "
+          "conditionally-inert trust check cannot pass as a live one",
+          (_buried != _rf_src, attempt(lambda: _review_fix_standdown_labels(_buried))),
+          (True, sorted({HUMAN_PR_PARK_LABEL, HUMAN_PARK_LABEL})))
+    # ...and KNOWN POSITIVE 3's kill only MEANS "unreachable" because its mutant still parses.
+    # This row is that discriminator — the same `if False:` inserted WITHOUT indenting the guard
+    # under it is a SyntaxError, so the body is skipped WHOLE and the answer collapses to [],
+    # visibly different from KP3's two surviving siblings. It is also the only thing that ever
+    # executes the unparsable-body skip, which was the one never-run line in this function.
+    _unparsable = _rf_src.replace('if "review:parked" in labels:\n',
+                                  'if False:\nif "review:parked" in labels:\n')
+    check("KNOWN POSITIVE 4 — an UNPARSABLE step body collapses to the EMPTY set (fail closed, "
+          "never a quiet skip), which is what makes KP3's surviving sibling guards evidence that "
+          "it died of unreachability rather than of a syntax error the pin merely stepped over",
+          (_unparsable != _rf_src, attempt(lambda: _review_fix_standdown_labels(_unparsable))),
+          (True, []))
 
     print("park-policy self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1

@@ -289,8 +289,12 @@ jobs:
           # park_policy._review_fix_standdown_labels now AST-parses these guards out of this file
           # and asserts them equal to {MACHINE_PARK_PR_LABEL, HUMAN_PR_PARK_LABEL,
           # HUMAN_PARK_LABEL}. Renaming, deleting, or stopping-to-raise any of them fails
-          # park_policy.py --self-test; keep the guards in a shape that pin can read (a literal or
-          # a literal set, tested against `labels`, raising SystemExit).
+          # park_policy.py --self-test; so does BURYING one under dead control flow, because the
+          # pin reads only TOP-LEVEL statements of this step — nesting a guard inside `if False:`,
+          # a never-called def, or a SystemExit-swallowing try leaves it textually intact while
+          # this step admits parked PRs, and the pin reports what EXECUTES. Keep the guards in a
+          # shape it can read: a top-level `if`, testing a literal or a literal set against
+          # `labels`, raising SystemExit.
           #
           # review:needs-user (loop escalation) and needs:user (groom's parked-PR "Human
           # attention required" marker) are BOTH human-owned terminal for every mode/flavour.
