@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1069,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "5ac859a48868d65c4f204eda6dac20b75a0e7548",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "In plan_renewal(), state == \"unknown\" for an expired row appends the lease byte-identically. Its expires_at remains <= now. As this diff itself correctly documents, reclaim_expired(), partition_available(), _live_holder_keys(), and sibling_lease_conflict all treat such a row as absent. Therefore a transient 403/5xx/malformed response does not actually defer the ownership decision: it immediately makes the account/holder eligible to other dispatchers while the original run may still be active. This recreates the double-dispatch bug whenever the liveness API is unavailable. The self-test `an UNPROVEN probe defers the row unchanged` is vacuous with respect to the safety claim because it asserts row presence, not that any real suppression consumer sees the row as live; the e2e unknown test similarly asserts only no PUT.",
+    "file": "scripts/select-and-claim.py",
+    "fix_hint": "For an expired due row whose liveness is unknown and whose timestamps/run binding are otherwise valid and below the absolute ceiling, preserve effective exclusivity by moving expires_at to a short, ceiling-clamped retry/grace deadline (or otherwise make every suppression consumer treat the deferred row as live). Add a red test that passes the unknown-path output through reclaim_expired/partition or the dispatch live-holder logic and proves it still suppresses a competing claim. Keep the absolute ceiling so repeated probe failure remains bounded.",
+    "severity": "blocker",
+    "title": "Unknown liveness leaves an expired lease fail-open to duplicate dispatch"
+   }
+  ],
+  "progress": null,
+  "summary": "The liveness-aware reclaim has a blocking fail-open path: when the Actions probe is unavailable or returns an unrecognized response, an already-expired lease is retained without extending its expiry. All duplicate-suppression consumers intentionally ignore that row because they require expires_at > now, so the holder can be dispatched a second time during the exact API-failure case called \"deferred.\" The new tests encode the unsafe behavior and never exercise the retained row through a suppression consumer.",
+  "verdict": "request_changes"
+ }
+}
