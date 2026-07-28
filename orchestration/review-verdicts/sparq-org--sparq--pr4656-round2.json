@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4656,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "4327a37acd94f63b11a84cd3045a99855e257e8c",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`write_offset` calls `sync_data` on the temporary file and then renames it, but it does not fsync the parent directory. Persisting file contents does not durably commit the directory-entry creation/replacement; after the function returns successfully, a crash can therefore restore the old watermark or lose the first watermark entirely. That contradicts the public durable-resume contract and can replay broker-confirmed records after restart. The replacement test checks ordinary reopen behavior only and cannot establish crash durability.",
+    "file": "crates/sparq-serve/src/change_sink.rs",
+    "fix_hint": "After the atomic rename, open and sync the containing directory on platforms that support it, and provide an equivalent platform-specific durability operation or an explicitly documented limitation elsewhere. Factor the sequence into a tested durable-replace helper and add fault/crash-oriented coverage around the post-rename durability boundary; keep the previous valid offset intact on every reported failure.",
+    "severity": "major",
+    "title": "Watermark rename is not made durable in the containing directory"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The prior Windows replacement concern is addressed: Rust's file rename operation supports replacing an existing file on Windows, and the new repeated-watermark test exercises replacement and reopening. However, the implementation still does not satisfy its advertised crash-durable watermark contract. It syncs the temporary file's contents but never syncs the containing directory after the rename, so a successful pump can report and expose an advanced watermark that is lost after a power failure or kernel crash. That can cause already-confirmed broker records to be replayed after restart. This is a new major finding, so progress is regressing.",
+  "verdict": "request_changes"
+ }
+}
