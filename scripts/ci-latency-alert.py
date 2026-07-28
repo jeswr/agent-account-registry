@@ -162,13 +162,24 @@ CRON_DELIVERY_FLOOR = 0.60
 # and the "queue event" was seven `run_attempt: 2` re-runs pressed in a single batch at
 # 02:35-02:37Z. That evidence is retracted.
 #
-# RE-DERIVED 2026-07-28 over a per-workflow scan of this repo, N=9,062 completed runs:
-#   contaminated estimator (run-level created_at, all runs) : 6 over 15 min
-#                                     ... of which re-runs  : 6   (ALL of them)
-#   decontaminated (run_attempt == 1 only), N=9,053         : 0 over 15 min
-#                                    non-zero wait AT ALL   : 0     max 0.0s
-#   re-runs resolved against their own /attempts/{n}, N=9    : 0 over 15 min
-#                                                  true max : -1.0s (instant pickup)
+# RE-DERIVED 2026-07-28 over a per-workflow scan (the repo-wide `actions/runs` listing
+# hard-caps at 1000), splitting on `run_attempt` and resolving every re-run's TRUE wait
+# against its own `/attempts/{n}` record:
+#
+#                                   jeswr/agent-account-registry   sparq-org/sparq
+#   completed runs scanned                                 9,062            35,128
+#   contaminated estimator, over 15 min                        6                 7
+#     ... of which are RE-RUNS                           6 (ALL)           7 (ALL)
+#   DECONTAMINATED (run_attempt == 1)                      9,053            35,070
+#     over 15 min                                              0                 0
+#     with ANY non-zero wait at all                            0                 0
+#     maximum observed wait                                 0.0s              0.0s
+#   re-runs resolved per-attempt                               9                58
+#     over 15 min                                              0                 0
+#     true maximum wait                                    -1.0s             -1.0s
+#
+# Every single row the old estimator flagged, on BOTH repos, was a re-run artefact. Across
+# 44,190 completed runs there is not ONE attempt whose own queue wait was even non-zero.
 #
 # SO M2 HAS NO VALIDATED KNOWN POSITIVE. There is no run in the observed corpus that this
 # mode would have fired on. Two consequences that must not be lost:
@@ -1246,6 +1257,19 @@ def _self_test():  # noqa: C901 - a flat table of named assertions reads best fl
 
     chk("a bad repo slug is fail-loud exit 2",
         main(["--repo", "not-a-slug", "--dry-run"]) == 2)
+    # THE ANNOTATION ITSELF, not just the exit code. An `::error::` prefix that is only
+    # claimed in a docstring and asserted nowhere survives deletion: the job still reds on
+    # the exit code, but the reason stops appearing in the Actions UI and the failure
+    # becomes a bare non-zero exit someone has to go digging for. Capture and assert it.
+    import contextlib
+    import io
+    _buf = io.StringIO()
+    with contextlib.redirect_stdout(_buf):
+        main(["--repo", "not-a-slug", "--dry-run"])
+    chk("the infrastructure-failure path emits an ::error:: annotation",
+        "::error::" in _buf.getvalue())
+    chk("the ::error:: annotation names the cause, not just that something failed",
+        "no usable repo slug" in _buf.getvalue())
     # 100% question: if NO workflow carried a `schedule:`, M1's population would be empty
     # and a `return 0` would report health over zero lanes. Both empty shapes are loud.
     chk("an empty workflow set is fail-loud exit 2", _rc([]) == 2)
