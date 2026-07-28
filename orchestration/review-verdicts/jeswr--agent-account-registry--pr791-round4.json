@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 791,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "66a16f35d5bc0de3da5cbf09e7b42c639f996188",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The file explicitly says \"THIS MODULE IS THE DECISION PLANE ONLY, AND IT HAS NO CALLER YET\" and that nothing imports it. This diff adds neither a workflow nor an existing orchestration caller, so no terminal review-loop park or backlog row can collect trusted marker, label, receipt, security, trust-surface, and gate-weakening facts; resolve per-owner credentials and an opposite-provider orchestrator-tier judge; invoke this decision plane; reassert the exact PR head/base before mutation; perform the guarded label/state transition; or write the durable receipt. The self-tests cover isolated helpers only and cannot demonstrate the feature acting on a PR. Consequently the change still drains no stuck park and is incomplete for the stated auto-adjudication feature.",
+    "file": "scripts/stuck_adjudicator.py",
+    "fix_hint": "Add and test the actual review-loop and bounded backlog-sweep integration. It must fail closed on account, token, routing, ownership, marker, and trusted-input ambiguity; resolve and assert an opposite-provider orchestrator-tier judge; derive all authority-bearing facts from trusted sources; bind every transition and receipt to the exact PR head/base; revalidate that binding immediately before mutation; and cover the end-to-end paths with non-vacuous tests.",
+    "severity": "blocker",
+    "title": "The adjudicator still has no executable orchestration path"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 4 leaves the round-3 blocker unchanged. The new module explicitly states that it has no caller, changes no orchestration behavior, and drains no parked PR. Its isolated decision helpers and self-tests are substantial and generally fail closed, but the authority-bearing feature remains absent: no review-loop or bounded backlog integration gathers trusted facts, resolves an opposite-provider orchestrator-tier judge, invokes adjudication, revalidates the exact head/base before mutation, performs a guarded transition, or persists a trusted SHA-bound receipt. The claimed stuck-escalation capability therefore still cannot operate on a PR.",
+  "verdict": "request_changes"
+ }
+}
