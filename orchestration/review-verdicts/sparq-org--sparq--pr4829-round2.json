@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4829,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "8182f6df1221cbaa6aed2144ecb82c38f30d833e",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior major finding. The harness now obtains the emitted test-function list from the generator, cross-checks it against the clean Noir file, creates a separate variant with exactly one corrupted live assertion for each function, and requires every corresponding `nargo test` invocation to fail. The Rust tests additionally pin complete site coverage, live-assertion placement, per-function isolation, deterministic generation, and rejection of unknown names. The changes therefore establish the claimed per-test non-vacuity rather than allowing one functioning section to mask others.",
+  "verdict": "approve"
+ }
+}
