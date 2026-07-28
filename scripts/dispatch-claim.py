@@ -5120,6 +5120,16 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
     counter — an all-review/fix tick whose claims all errored would otherwise report ledger=ok
     and dodge the zero-dispatch fail-loud.
 
+    Issue #262: EVERY other defer outcome folds into that same histogram too, so a zero-dispatch
+    tick dominated by review/fix contention reports its real categories instead of a near-empty
+    summary. Each POST-claim outcome carries the issue loop's own category name where the two
+    loops share a failure (`lease-error`, `unsafe-claim`, `unsafe-claim-release-failed`,
+    `dispatch-launch-failed`); the no-free-lease leg keeps its lane-qualified allocator category
+    (`{lane}:{_claim_defer_category(...)}`) because the review/fix lanes contend separately. The
+    PRE-claim revalidation/policy `continue`s are swept up by finish_pending's coarse
+    `{lane}:preclaim-defer`, which is why every post-claim leg must count itself explicitly — an
+    uncounted one would silently be reported as a pre-claim defer.
+
     `lanes` is the tick's per-lane accumulator (issue #108). Each item's plan state selects its lane
     (review vs fix via _review_item_lane); a launch folds into that lane's `launched` and a hard
     failure (lease error, revalidation DispatchError, failed workflow launch) into its `error`. This
@@ -5943,6 +5953,13 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 print(f"::error::review {repo}#{number}: {violation}; lease release FAILED "
                       "(claim still active until expiry)")
                 continue
+            # Issue #262: a released unsafe claim is a DECIDED post-claim cross-provider refusal,
+            # so it carries the issue loop's own `unsafe-claim` category. Without this it counted
+            # nothing here and fell through to finish_pending's `{lane}:preclaim-defer` catch-all
+            # — reporting a lease that was allocated, inspected and refused as if the item had
+            # never reached the allocator, and erasing the only fleet-wide signal that the
+            # cross-provider assertions are firing.
+            defer_reasons["unsafe-claim"] += 1
             if mode == "fix":
                 fix_dispatch["defer:unsafe-claim"] += 1
             print(f"defer review {repo}#{number}: {violation}; released + skipped")
@@ -14586,6 +14603,9 @@ agent = "impl"
             assert alloc.released == ["cd" * 16], alloc.released  # release WAS attempted
             assert reasons["unsafe-claim-release-failed"] == 1, reasons
             assert _lane_summary(run_items.lanes)["fix"]["error"] == 1, run_items.lanes
+            # ... and the hard-error leg is NOT also counted as the green defer (the two
+            # categories stay distinct, so one refusal is one histogram entry)
+            assert reasons["unsafe-claim"] == 0, reasons
             # release SUCCEEDS: the SAME unsafe claim is a clean released+skipped defer with NO
             # lane error and NO hard-error reason — proving the boolean is actually consulted.
             alloc = UnsafeClaimAllocator(release_ok=True)
@@ -14594,6 +14614,26 @@ agent = "impl"
             assert alloc.released == ["cd" * 16], alloc.released
             assert reasons["unsafe-claim-release-failed"] == 0, reasons
             assert _lane_summary(run_items.lanes)["fix"]["error"] == 0, run_items.lanes
+            # ---- issue #262: that green defer is VISIBLE in the tick's shared histogram, under
+            # the issue loop's own category name. It used to count nothing at all, so the item
+            # was swept into finish_pending's PRE-claim catch-all and the summary reported a
+            # decided cross-provider refusal as "never reached the allocator".
+            # MUTANT: drop `defer_reasons["unsafe-claim"] += 1` from the released leg => the
+            # first assertion goes red (0 != 1) and the second goes red too (the item reappears
+            # as fix:preclaim-defer). MUTANT: count it on the release-FAILED leg as well => the
+            # `== 0` assertion above goes red. MUTANT: rename the bucket (e.g. lane-qualify it)
+            # => the first assertion goes red, holding the issue-loop-consistent name. ----
+            assert reasons["unsafe-claim"] == 1, reasons
+            assert reasons["fix:preclaim-defer"] == 0, reasons
+            # the fleet-line counterpart agrees rather than reporting its own preclaim bucket
+            assert run_items.fix_dispatch["defer:unsafe-claim"] == 1, run_items.fix_dispatch
+            assert run_items.fix_dispatch["defer:preclaim-defer"] == 0, run_items.fix_dispatch
+            # and it is a REAL defer for tick health: planned>0, launched=0, error=0 (contention
+            # posture), with a non-empty histogram so the zero-dispatch tick is attributable
+            assert _lane_summary(run_items.lanes)["fix"] == {
+                "planned": 1, "launched": 0, "deferred": 1, "error": 0}, run_items.lanes
+            assert _ledger_health(reasons) == "ok", reasons
+            assert _ledger_rot_zeroed_dispatch(launched, reasons) is False
         finally:
             (globals()["_gh_json"], globals()["_run_target_helper"],
              globals()["_target_token"], globals()["_target_is_human_maintainer"]) = real_io
