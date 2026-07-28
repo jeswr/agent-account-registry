@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 965,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "dc75bafdcd9722c5ec214e79486c1ed78c97a7e4",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The code reads `head_sha`, verdict, comments, round history, trust classification, and receipt state before the mutation boundary, but the boundary re-reads only issue labels/timelines. It never re-fetches the PR or asserts that its current head still equals `head_sha`. If the PR is pushed between those reads, the sweep can add `review:needs`, clear both holds, and post/recognize a receipt for the old SHA while acting on the new head. The new head therefore receives admission based on another head's review history and verdict, violating the required exact head binding.",
+    "file": "scripts/adjudicate-stuck.py",
+    "fix_hint": "At the mutation boundary, re-fetch the PR and require an exact current-head match before the first write; stand down on mismatch. Add a non-vacuous test where the head changes between planning and the boundary and assert that no comment or label mutation occurs.",
+    "severity": "blocker",
+    "title": "The mutation boundary is not bound to the pull request head"
+   },
+   {
+    "body": "`readmission_in_flight` is computed from the initial timeline and then copied through `probe` into the mutation-boundary `admission`. Although `_live_hold` fetches a fresh timeline for ownership, it does not return the live hold application timestamp and the in-flight ordering proof is not recomputed. If the old receipt initially postdates the hold but the hold is removed and machine-reapplied after that receipt during the API gap, the fresh ownership check still says machine-owned while the stale `readmission_in_flight=True` bypasses the cap. This is exactly the new-park case `incomplete_readmission` says must remain capped.",
+    "file": "scripts/adjudicate-stuck.py",
+    "fix_hint": "At the mutation boundary, derive the newest live hold application and recompute `incomplete_readmission` from a fresh timeline (and fresh relevant receipt/comment state) before allowing the cap exception. Add a test that changes the live application from before to after the receipt between planning and mutation and asserts `readmissions-spent` with no writes.",
+    "severity": "major",
+    "title": "The final-slot exception reuses stale hold-ordering evidence"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The two prior-round findings are substantively addressed: collaborator permissions now define human ownership, and the final-slot replay is recognized and tested. However, the mutation boundary does not bind the write transaction to the head and timeline facts used to authorize it. A force-push can cause the sweep to mutate a new head using the old head's verdict/history and receipt, and the cap-widening in-flight proof is reused after its ordering evidence may have changed. These are new trust-plane race findings, so the round is regressing under the required scale.",
+  "verdict": "request_changes"
+ }
+}
