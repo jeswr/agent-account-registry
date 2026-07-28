@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 980,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "7987d68ed7122f82e26b55ac477c5758243bf0a0",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 3a defines heal_max_wait_minutes as optional, says absence means 10, and identifies resolve()'s get(..., 10) behavior as the single authoritative default. Its earlier fail-closed test correctly distinguishes malformed field values from a missing registry row. But section 4a later requires a \"malformed/absent heal_max_wait_minutes\" to make the fleet tick raise. An absent field is resolvable under the stated contract, so an implementation cannot satisfy both requirements. This is load-bearing because it determines whether a valid policy using the documented default produces metrics or fails every tick.",
+    "file": "research/636-queue-observability-export.md",
+    "fix_hint": "Make the final test match the canonical resolver contract: malformed values and an absent/invalid registry row must raise, while an absent heal_max_wait_minutes field must resolve to the authoritative default and feed both sinks identically. Alternatively, if absence should truly fail closed, remove the optional/default-10 contract everywhere and require the field explicitly.",
+    "severity": "major",
+    "title": "The fail-closed self-test contradicts the optional-field default"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "The prior round's canonical-threshold concern is substantially addressed: the record now names one policy field, requires a shared validated resolver, defines distinct fail-closed behavior for the metrics and observability callers, and specifies non-vacuous provenance tests. However, the final metrics acceptance test contradicts that design by requiring an absent heal_max_wait_minutes field to fail the tick, even though section 3a explicitly makes that field optional and the shared resolver defaults its absence to 10. This leaves the implementation contract internally impossible to satisfy without either deleting the documented default or weakening the stated test. Because this is a new material contradiction in a load-bearing acceptance criterion, progress is regressing under the mandated scale.",
+  "verdict": "request_changes"
+ }
+}
