@@ -16164,10 +16164,20 @@ agent = "impl"
     assert unprovenanced_narrowed_holders(
         [("parked-free", 62, frozenset({"crate-a"}), "parked", True,
           CAUSE_NO_PROVENANCE_NARROWED)]) == []
-    # A pre-cause 5-tuple is SKIPPED, not indexed. Kills relaxing `len(row) < 6` to `< 5`, which
-    # raises IndexError on the legacy shape this file still constructs in places.
-    assert unprovenanced_narrowed_holders(
-        [("busy", 63, frozenset({"crate-a"}), "not-parked", False)]) == []
+    # A pre-cause 5-tuple is SKIPPED, not indexed. Kills relaxing `len(row) < 6` to `< 5`.
+    # Caught and re-raised for the same reason the `area:__global__` census assertion above is: the
+    # relaxed guard raises IndexError, and a bare `assert` would let that surface as a CRASH. A
+    # crash is not a kill — nothing detected anything, the file merely broke — so the mutant is
+    # converted into a failure that names the contract it violated. MEASURED: mutant M13 was scored
+    # `killed` by an exit-code-only harness and `CRASH-NOT-KILL` by one that reads the exception.
+    try:
+        _legacy_row_holders = unprovenanced_narrowed_holders(
+            [("busy", 63, frozenset({"crate-a"}), "not-parked", False)])
+    except IndexError as exc:                                             # pragma: no cover
+        raise AssertionError(
+            "a pre-cause 5-tuple must be SKIPPED by unprovenanced_narrowed_holders, not indexed: "
+            f"the length guard admitted a row with no cause slot and it raised — {exc}") from exc
+    assert _legacy_row_holders == [], _legacy_row_holders
     # Ascending and de-duplicated by construction, whatever order the listing arrived in.
     assert unprovenanced_narrowed_holders([
         ("busy", 90, frozenset({"c"}), "not-parked", False, CAUSE_NO_PROVENANCE_NARROWED),
