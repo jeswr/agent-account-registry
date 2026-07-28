@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4768,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "0274a911ce187282160c5d4e3aca986a9050df71",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Immediately after the updated ignore-list guidance, the section `The advisories-gate gap` says `cargo deny check advisories` is currently `continue-on-error`, that cargo-deny cannot parse CVSS v4, and that there is no PR-time vulnerability gate. This contradicts the changed `.github/workflows/supply-chain.yml` commentary, AGENTS.md, and compliance evidence, all of which state the check is fail-closed and gating after the CVSS-v4 blocker was resolved. Since this file is operational guidance for agents, the contradiction is not harmless historical prose: following it would produce a false audit answer and could lead agents to treat a live gate as degraded.",
+    "file": ".claude/skills/rust-supply-chain-attestation/SKILL.md",
+    "fix_hint": "Replace or remove the obsolete GX-1 gap section in the same PR. State that the CVSS-v4 parsing blocker tracked by sq-q8de is resolved, the PR-time `cargo deny check advisories` step is gating with no `continue-on-error`, and the daily dependency monitor is defense in depth rather than the primary gate.",
+    "severity": "major",
+    "title": "Supply-chain skill still says the advisory check is non-gating"
+   },
+   {
+    "body": "The paragraph correctly updates the synchronized set to four advisory IDs, but its negative-test sentence still says that dropping `either` deny.toml ignore fails. With four entries this is stale and makes the described evidence internally inconsistent.",
+    "file": "compliance/sbom/evidence.md",
+    "fix_hint": "Change `dropping either deny.toml ignore` to `dropping any deny.toml ignore`.",
+    "severity": "minor",
+    "title": "Four-entry drift check is still described as dropping 'either' ignore"
+   }
+  ],
+  "progress": null,
+  "summary": "The rustls-pemfile removal and PemObject migration appear mechanically sound: the replacement APIs filter by PEM object type, preserve certificate order, find the first supported private key, and the new loader test exercises bundled cert/key input plus missing-item diagnostics. However, the edited supply-chain skill now directly contradicts the repository's actual gating posture and the other documentation changed by this PR. Because this is an agent instruction surface, retaining an obsolete statement that PR-time advisory checking is non-gating can cause future agents and auditors to make materially incorrect security claims.",
+  "verdict": "request_changes"
+ }
+}
