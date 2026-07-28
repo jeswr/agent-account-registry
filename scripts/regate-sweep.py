@@ -65,6 +65,13 @@
 # declared one. Anything else is `unreconciled-log` and is REFUSED. A self-test that died by
 # exception prints no roll-up at all and is refused on exactly this clause.
 #
+# THE COUNT CLAUSE IS EXACT, NOT ADVISORY, and that is a property of the harnesses rather than of
+# this parser. `worker-live.sh`'s `chk` runs EVERY assertion and increments an exact counter, so the
+# roll-up's number is the true failure count for that harness; and any `die` or `set -e` abort
+# terminates before the roll-up prints, so a truncated run cannot present a self-consistent
+# accounting. Together those mean a log which reconciles cannot be hiding a failure from that
+# harness — five candidate shapes were tried against it and none closes while concealing one.
+#
 # WHY THE DECLARATION IS A CHECKED-IN FILE. `orchestration/gate-repairs.json` names, per repair,
 # the assertion signatures that repair fixes. It lives on master and reaches this script only
 # through review + merge, so a pull request cannot declare itself attributable. The sweeper reads
@@ -75,10 +82,30 @@
 # ---------------------------------------------------------------------------------------------
 # Moving the head INVALIDATES any review verdict bound to the old head. This script's job ends at
 # "a fresh gate is running on a fresh head". It routes for re-review rather than preserving a
-# verdict it cannot re-derive: on a successful move it removes `review:pass` (the single label that
-# authorises arming) and records, in a comment, why the reviewer's finding about the COMPOSITION is
-# unaffected by a base move while the SHA the verdict named no longer exists. It never arms, never
-# merges, and never adds an arming label.
+# verdict it cannot re-derive: on a successful move it removes `review:pass` and records, in a
+# comment, why the reviewer's finding about the COMPOSITION is unaffected by a base move while the
+# SHA the verdict named no longer exists. It never arms, never merges, and never adds an arming
+# label — three writes exist in total and none of them is an arm.
+#
+# WHAT REMOVING `review:pass` IS AND IS NOT. It is DE-AUTHORISATION, not DISARMING. The real arming
+# primitive is `enablePullRequestAutoMerge`, whose `expectedHeadOid` is a compare-and-swap evaluated
+# AT ARM TIME; once auto-merge is latched the intent is held independently and the label is never
+# re-read. So dropping the label withdraws consent from any FUTURE arm decision and does NOT retract
+# an existing one: an already-armed PR that this sweeper moves WILL merge on its fresh green. An
+# earlier revision of this header called the label "the single label that authorises arming" in a
+# way that read as a disarm. It is not one.
+#
+# THAT CASE IS ACCEPTED DELIBERATELY, and this script does not call `--disable-auto`. Reasons, in
+# order of weight: (1) the green it merges on is FRESH — computed against a base that contains the
+# repair — so it is the opposite of #940's stale-green hazard; (2) a base move adds no author
+# commits, so the diff the reviewer approved is byte-identical and only the SHA naming it changed;
+# (3) it is exactly what the six hand-moves of #927 did, and what the maintainer recorded as the
+# procedure — substance still applies, a fresh green is still required; (4) disarming has its own
+# failure mode, because nothing re-arms a PR whose deliberate arm this stripped, which converts a
+# transient red into a stall needing a human. What the script owes instead is VISIBILITY: a latched
+# arm is detected, counted in the census as `latched-arm=N`, and named in the PR comment, so the
+# merge that follows is never a surprise. If that trade is ever rejected the change is small and
+# local — one auto-merge-off call in `_act` plus a census field — not a redesign.
 #
 # HOW THIS COMPOSES WITH #940. #940 is the DEFENSIVE half: at arm time, refuse a green `gate` that
 # was computed against a tree that no longer exists. This is the RECOVERY half: regenerate the
@@ -478,7 +505,7 @@ def seal_population(accounted, population):
         f"{population} open pull request(s) — some PR left the sweep through an uncounted exit")
 
 
-def census_line(repair, scanned, counts, confirmed=None):
+def census_line(repair, scanned, counts, confirmed=None, latched_arms=0):
     """The one line this emits every tick it holds. A silent sweeper turns a visible 58-minute
     outage into an invisible one, so the class size is reported even when nothing was moved."""
     attributable = sum(counts.get(name, 0) for name in ATTRIBUTABLE_BUCKETS)
@@ -496,6 +523,10 @@ def census_line(repair, scanned, counts, confirmed=None):
     ]
     if confirmed is not None:
         fields.append(f"head-confirmed={confirmed}/{counts.get('moved', 0)}")
+    # NOT a bucket — a moved PR is already counted under `moved`. This is a property OF the moved
+    # set: how many carried an auto-merge that the head move did not retract and will therefore
+    # merge on the fresh green. Silence here would make that merge look unattended.
+    fields.append(f"latched-arm={latched_arms}")
     fields.append("refusals=" + (",".join(f"{k}:{v}" for k, v in sorted(refused.items())) or "-"))
     return "CENSUS " + " ".join(fields)
 
@@ -561,10 +592,17 @@ def head_contains(repo, base_sha, head_sha, runner=None):
 
 
 def read_job_log(repo, job_id, runner=None):
+    """The `gate` job log. -> text on success, None when the REQUEST failed.
+
+    The two are different census states and were briefly conflated. A failed request is
+    `read-failed` (this tick could not ask); a request that succeeds and yields nothing, or a
+    check-run whose job cannot be located at all, is `log-unavailable` (there is nothing to read —
+    typically an expired retention window). Collapsing them lets an API outage read, in the census,
+    as a population that was examined and found unattributable."""
     rc, out = _gh(["api", api_path(repo, f"/actions/jobs/{job_id}/logs")], runner)
     if rc != 0:
-        print(f"::warning::regate-sweep: log for job {job_id} is unreadable (rc={rc})")
-        return ""
+        print(f"::warning::regate-sweep: log request for job {job_id} failed (rc={rc})")
+        return None
     return out
 
 
@@ -635,7 +673,18 @@ def confirm_head_moved(repo, branch, old_sha, runner=None, sleeper=time.sleep):
     return False
 
 
-def sweep_comment(repair, repair_pr_merged_at, gate_completed_at, old_sha, fails):
+LATCHED_ARM_NOTE = (
+    "\n\n**This PR already had auto-merge armed, and moving the head did NOT retract that.** "
+    "`review:pass` is consulted when DECIDING to arm; `enablePullRequestAutoMerge` holds the intent "
+    "independently once latched, so this PR will merge when the fresh `gate` goes green. That is "
+    "deliberate and is the opposite of the #940 hazard — the green it merges on is computed against "
+    "a base containing the fix, and a base move adds no author commits, so the approved diff is "
+    "byte-identical. It is also exactly what the six hand-moves in #927 did. Noted here rather than "
+    "silently, and counted as `latched-arm` in this tick's census.")
+
+
+def sweep_comment(repair, repair_pr_merged_at, gate_completed_at, old_sha, fails,
+                  latched_arm=False):
     quoted = "\n".join(f"    FAIL {body}" for body in fails)
     return (
         f"{SELF_ID}\n\n"
@@ -650,8 +699,9 @@ def sweep_comment(repair, repair_pr_merged_at, gate_completed_at, old_sha, fails
         f"A reviewer's finding about this PR's own composition is not changed by a base move, but "
         f"the verdict named a head that no longer exists — so this PR needs a verdict bound to the "
         f"NEW head as well as a green gate before it can merge. `review:pass` has been removed if "
-        f"it was present. (registry #927; the arm-time half of this problem is #940.)\n\n"
-        + MARKER.format(repair=repair, head=old_sha))
+        f"it was present. (registry #927; the arm-time half of this problem is #940.)"
+        + (LATCHED_ARM_NOTE if latched_arm else "")
+        + f"\n\n{MARKER.format(repair=repair, head=old_sha)}")
 
 
 def post_comment(repo, number, body, runner=None):
@@ -699,6 +749,7 @@ class Sweeper:
         self.summary_path = summary_path
         self.bot_login = bot_login
         self.errors = 0
+        self.latched_arms = 0
         self.rows = []
         self.budget_used = 0
 
@@ -762,7 +813,9 @@ class Sweeper:
             counts[outcome] += 1
             confirmed += 1 if was_confirmed else 0
         seal_population(sum(counts.values()), len(pulls))
-        self.rows.append(census_line(number, len(pulls), counts, confirmed if self.apply else None))
+        self.rows.append(census_line(number, len(pulls), counts,
+                                     confirmed if self.apply else None,
+                                     latched_arms=self.latched_arms))
         print(self.rows[-1])
 
     def _classify(self, pr, repair, merged_epoch, merge_sha):
@@ -784,7 +837,10 @@ class Sweeper:
         if contains:
             return "already-contains-fix", empty, gate
         job_id = gate_run_id(gate)
-        ledger = failure_ledger(read_job_log(self.repo, job_id, self.runner) if job_id else "")
+        log = read_job_log(self.repo, job_id, self.runner) if job_id else ""
+        if log is None:
+            return "read-failed", empty, gate
+        ledger = failure_ledger(log)
         bucket = attribute(pr, self.repo, gate, merged_epoch, contains, ledger, repair)
         if bucket != "attributable":
             return bucket, ledger, gate
@@ -807,10 +863,17 @@ class Sweeper:
         if not move_branch(self.repo, number, head, self.runner):
             self.errors += 1
             return "move-failed", False
+        latched = bool(pr.get("auto_merge"))
+        if latched:
+            self.latched_arms += 1
+            print(f"::warning::regate-sweep: #{number} had auto-merge ALREADY latched — removing "
+                  "`review:pass` de-authorises a future arm but does not retract this one, so it "
+                  "will merge on the fresh gate. Deliberate (the green is fresh, the diff is "
+                  "unchanged); recorded on the PR and censused as latched-arm.")
         post_comment(self.repo, number,
                      sweep_comment(repair["repair_pr"], merged_at,
                                    (gate or {}).get("completed_at") or "an unrecorded time",
-                                   head, ledger.fails), self.runner)
+                                   head, ledger.fails, latched_arm=latched), self.runner)
         drop_review_pass(self.repo, number, label_names(pr), self.runner)
         confirmed = confirm_head_moved(self.repo, branch, head, self.runner, self.sleeper)
         if not confirmed:
@@ -936,9 +999,20 @@ OWN = "the partition key covers every declared area"
 def _worker_live_log(*fail_bodies, count=True, harness="worker-live", header="worker-live.sh"):
     lines = [f"== self-test {header} =="]
     lines.append("  ok   leftover markers fail the staged check")
-    # A PASSING line that quotes failure text verbatim. This is not decoration: the real log
-    # carries 30+ of these, and a substring search for a signature matches them.
+    # TWO passing lines that a substring search mistakes for failures, and they are NOT
+    # interchangeable. Measured on the real #910 log: 62 lines contain the substring `FAIL`, 44 of
+    # them PASSING `ok` rows.
+    #
+    #   (1) `FAILED guard` - no whitespace after `FAIL`, so `FAIL:?[ \t]+` cannot match it however
+    #       the anchor is weakened. It catches a signature-level substring search and NOTHING else.
+    #   (2) `FAIL CLOSED` - whitespace DOES follow `FAIL`, so removing the line anchor extracts
+    #       `CLOSED - ...` from a passing row. This is the only decoy shape that can observe the
+    #       anchor, and it is a verbatim shape from the live suite.
+    #
+    # Decoy (1) alone left the assertion named "the extractor is LINE-ANCHORED" unable to observe
+    # the property in its own name: `^[ \t]*` -> `^.*?` kept the whole suite green.
     lines.append(f"  ok   a FAILED guard is refused: {SIG}")
+    lines.append("  ok   age_park_episode: FAIL CLOSED - the taxonomy cannot name this cause")
     lines.extend(f"  FAIL {body}" for body in fail_bodies)
     if count:
         lines.append(f"{harness} self-test FAILED ({len(fail_bodies)} failure(s))")
@@ -954,8 +1028,9 @@ def _test_failure_ledger(chk):
     good = failure_ledger(_worker_live_log(f"{SIG}: 1 (want 0)"))
     chk("ledger: a clean single-failure log reconciles",
         (good.reason, good.harness, good.fails), (None, "worker-live", (f"{SIG}: 1 (want 0)",)))
-    chk("ledger: the extractor is LINE-ANCHORED — a passing `ok` line quoting the same signature "
-        "is not counted as a failure (a substring grep would find 2 here, not 1)",
+    chk("ledger: the extractor is LINE-ANCHORED — the fixture carries a passing `ok  … FAIL CLOSED "
+        "…` row, so weakening `^[ \\t]*` to `^.*?` extracts a SECOND body out of a line that "
+        "passed (and a substring grep over the signature would find 3 hits here, not 1)",
         len(good.fails), 1)
 
     two = failure_ledger(_worker_live_log(f"{SIG}: 1 (want 0)", f"{OWN}: 0 (want 1)"))
@@ -1017,8 +1092,9 @@ def _test_signature_matching(chk):
         signature_matches(f"some other assertion mentioning {SIG}", SIG), False)
 
 
-def _pr(number, *, head="a" * 40, repo="jeswr/agent-account-registry", labels=(), ref="feature"):
-    return {"number": number, "labels": [{"name": n} for n in labels],
+def _pr(number, *, head="a" * 40, repo="jeswr/agent-account-registry", labels=(), ref="feature",
+        auto_merge=None):
+    return {"number": number, "labels": [{"name": n} for n in labels], "auto_merge": auto_merge,
             "head": {"sha": head, "ref": ref, "repo": {"full_name": repo}}}
 
 
@@ -1210,7 +1286,8 @@ class FakeGh:
                 return 1, ""      # the compare could not be read at all
             return 0, json.dumps({"status": "ahead" if state else "diverged"})
         if "/actions/jobs/" in tail:
-            return 0, self.logs.get(int(tail.split("/")[3]), "")
+            body = self.logs.get(int(tail.split("/")[3]), "")
+            return (1, "") if body is None else (0, body)
         if "/comments" in tail:
             if self.refuse_comment_reads:
                 return 1, ""
@@ -1247,10 +1324,10 @@ BOT_LOGIN = f"{BOT_SLUG}[bot]"
 
 
 def _fixture(*, labels=(), comments=None, refuse_update=(), cap=MAX_MOVES_PER_TICK, apply=True,
-             ref_moves=True, refuse_comment_reads=False, bot_login=BOT_LOGIN):
+             ref_moves=True, refuse_comment_reads=False, bot_login=BOT_LOGIN, auto_merge=None):
     """Tonight's board, reduced to its two load-bearing members: #903 (attributable) and #92 (red
     on its own merits, identical in every other respect)."""
-    pulls = [_pr(903, head="a" * 40, ref="fix/903", labels=labels),
+    pulls = [_pr(903, head="a" * 40, ref="fix/903", labels=labels, auto_merge=auto_merge),
              _pr(92, head="b" * 40, ref="fix/92")]
     gh = FakeGh(
         "jeswr/agent-account-registry", pulls,
@@ -1327,6 +1404,18 @@ def _test_live_sweep(chk):
     chk("read-failure: an unreadable containment compare is censused as read-failed, never as an "
         "examined-and-refused PR", (gh4b.updated(), "read-failed:1" in sweeper4b.rows[0]),
         ([], True))
+    gh4d, sweeper4d = _fixture()
+    gh4d.logs[90164408722] = None          # the log REQUEST fails, rather than returning nothing
+    sweeper4d.run()
+    chk("read-failure: a FAILED log REQUEST is read-failed, not log-unavailable — an API outage "
+        "must not be censused as an expired retention window",
+        (gh4d.updated(), "read-failed:1" in sweeper4d.rows[0]), ([], True))
+    gh4e, sweeper4e = _fixture()
+    gh4e.logs[90164408722] = ""            # the request SUCCEEDS and yields nothing
+    sweeper4e.run()
+    chk("read-failure: a log request that succeeds and yields NOTHING is log-unavailable",
+        (gh4e.updated(), "log-unavailable:1" in sweeper4e.rows[0]), ([], True))
+
     gh4c, sweeper4c = _fixture(refuse_comment_reads=True)
     sweeper4c.run()
     chk("read-failure: an unreadable MARKER listing refuses the move — reading it as 'not swept' "
@@ -1359,6 +1448,27 @@ def _test_live_sweep(chk):
     sweeper7.run()
     chk("never-arm: a PR WITHOUT the arming label gets no label write at all",
         gh7.deleted_labels(), [])
+
+    # DE-AUTHORISATION IS NOT DISARMING. Removing `review:pass` withdraws consent from a FUTURE arm
+    # decision; a latched auto-merge is held by `enablePullRequestAutoMerge` and is never re-read.
+    # That case is accepted (the green it merges on is fresh) but it must be VISIBLE.
+    gh7b, sweeper7b = _fixture(labels=[REVIEW_PASS_LABEL],
+                               auto_merge={"enabled_by": {"login": "someone"}})
+    sweeper7b.run()
+    chk("latched-arm: an ALREADY-armed PR is moved, counted and named — the head move does not "
+        "retract auto-merge, so the census must not report this merge as unattended",
+        ("latched-arm=1" in sweeper7b.rows[0], gh7b.updated()), (True, [903]))
+    chk("latched-arm: no auto-merge-off / disable call is issued — the case is accepted, not "
+        "silently disarmed",
+        [c for c in gh7b.calls if any(w in " ".join(c)
+                                      for w in ("auto_merge", "disable-auto", "DisableAuto"))], [])
+    chk("latched-arm: an UNARMED moved PR reports zero, so the field cannot read as decoration",
+        "latched-arm=0" in sweeper7.rows[0], True)
+    chk("latched-arm: the PR comment names the latched arm explicitly",
+        LATCHED_ARM_NOTE[:40] in sweep_comment(917, "t", "t", "a" * 40, ("x",), latched_arm=True),
+        True)
+    chk("latched-arm: and says nothing when there is no latched arm",
+        LATCHED_ARM_NOTE[:40] in sweep_comment(917, "t", "t", "a" * 40, ("x",)), False)
 
     # DRY RUN and failure handling.
     gh8, sweeper8 = _fixture(apply=False)
@@ -1500,6 +1610,18 @@ def _test_workflow_seam(chk):
         str(MAX_MOVES_PER_TICK))
     chk("seam: the live call passes --bot-slug, so the marker scan is restricted to markers this "
         "sweeper itself wrote", "--bot-slug" in live, True)
+    # Passing the flag is not enough. An EMPTY slug flips marker_author_admitted to trusting every
+    # author, which restores the denial-of-recovery this sweeper exists not to have. The guard that
+    # refuses an empty slug is therefore part of the control, and deleting it must go red HERE.
+    body = step.get("run") or ""
+    chk("seam: the step REFUSES to run on an empty APP_SLUG — an empty slug silently re-enables "
+        "the spoofable marker scan, so the mint failing open is a hard stop",
+        [line.strip() for line in body.splitlines()
+         if "APP_SLUG" in line and "-n" in line and "exit 1" in line],
+        ["""[[ -n "${APP_SLUG:-}" ]] || { echo '::error::the App mint delivered no slug'; exit 1; }"""])
+    chk("seam: APP_SLUG is bound to the mint's own slug output, not to a literal",
+        {k: str(v) for k, v in (step.get("env") or {}).items()}.get("APP_SLUG"),
+        "${{ steps.%s.outputs.app-slug }}" % TOKEN_STEP_ID)
     chk("seam: every flag the workflow passes is declared by this script's parser",
         sorted(f for f in live if f.startswith("--")
                if f not in ("--apply", "--dry-run", "--repo", "--repairs-file", "--max-moves",
