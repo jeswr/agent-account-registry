@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4671,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "d043c28bebb22cfb8f23ef1bc29a1dfcd8855e9d",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new admissibility rule says reconstruction plus full forward replay catches a jointly-required overlap because a one-site reading leaves the other site's quads unproduced. That is false when the sites overlap on the same RDF quad: replaying one production emits the same distinct quad present in the dataset, and RDF set semantics erase whether it was emitted once or by both required sites. Requiring replay to reproduce every quad that the chosen production emits validates that production locally, but does not prove that all required emit sites or surrounding derivations were discharged. Consequently the promised negative case can still be accepted by the proposed rule.",
+    "file": "research/shuttle-generic-print-mode-2026-07.md",
+    "fix_hint": "Do not admit overlaps merely because one reconstructed production replays to the same RDF dataset. Define a proof obligation over the complete derivation/production instance, including satisfaction of every mandatory emit clause and caller context, or conservatively reject any non-mutually-exclusive overlap whose required-site provenance cannot be reconstructed. Update the replay wording and acceptance case so the algorithm explicitly demonstrates why the jointly-required identical-quad example is rejected.",
+    "severity": "major",
+    "title": "Forward replay still cannot resolve overlapping identical emissions"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The revision correctly separates fresh-node linearity from emission overlap and now rejects bare @prefer as a solution, but the proposed replay exception remains unsound for the exact set-semantics problem identified in round 1. Full forward replay of one candidate production cannot establish whether another overlapping emit site was also required when both sites emit the same quad: RDF dataset equality collapses the duplicate in both the input and replay. Thus a one-site derivation can reproduce every distinct quad of its production while still losing the multiplicity/provenance needed to satisfy the jointly-required derivation. The acceptance case says the jointly-required variant must reject, but the stated algorithm does not provide a criterion capable of distinguishing it. Progress is stagnant because the same major semantic defect remains, albeit more precisely discussed.",
+  "verdict": "request_changes"
+ }
+}
