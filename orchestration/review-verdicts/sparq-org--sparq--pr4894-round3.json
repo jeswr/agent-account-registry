@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4894,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "112f0bacebc8f1ca9683a7ff6a898d05345b48a8",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 3 remains correct and complete. Rule C2 is conservative and recall-safe as scoped: it only considers bound-predicate patterns sharing the same subject variable, requires a common candidate source, verifies per-predicate characteristic-set accounting with checked addition, rejects repeated normalized set keys, and declines on truncated, unknown, malformed, or unalignable evidence. Descriptor identity and pattern-permutation validation prevent applying summaries to the wrong source or BGP pattern. The per-combination predicate preserves cross-source assignments, while candidate/BGP collapse occurs only where the dead pairing makes every relevant assignment impossible. The tests are non-vacuous and exercise the live pruning path, negative controls, truncation, unknown accounting, duplicate keys, overflow, malformed selections, source mismatch, non-subject joins, unbound predicates, and cross-source survival. Documentation keeps the feature opt-in and explicitly disclaims cryptographic privacy or soundness guarantees. No hostile reviewer-directed instruction appears in the diff. With no prior-round or current findings, progress is stagnant under the required scale.",
+  "verdict": "approve"
+ }
+}
