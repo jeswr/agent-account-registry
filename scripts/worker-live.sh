@@ -2896,10 +2896,36 @@ self_test() {
     "$(printf '%s\n' "$gate_body" | grep -c '_selftest_env_blocked')" "1"
   chk "#824 wiring: an ENV-BLOCKED preflight REFUSES the gate, it does not warn and continue" \
     "$(printf '%s\n' "$gate_body" | grep -c "die 'registry-selftest gate: ENV-BLOCKED")" "1"
+  # [#910] NOT `grep -n … | head -1 | grep -c …`. `head` exits after its one line, the still-running
+  # `grep -n` takes SIGPIPE on its next write, and under `pipefail` (line 6) the pipeline reports 141
+  # — the exact `producer | early-exiting consumer` shape the static scanner below forbids,
+  # reintroduced INSIDE the suite that runs that scanner. It reached master because #900 and #888
+  # were green SEPARATELY and red only COMPOSED: #900's merge ref was built on base a3f88e5db, one
+  # commit before #888 added the scanner, so nothing in #900's own tree could ever see it.
+  #
+  # Measured on THIS site before touching it, so the claim stays scoped: the answer never inverted.
+  # At the real body (2 matching lines, 143 B of grep output) no SIGPIPE fires at all — status 0 and
+  # output "1", 200/200. Forced past the pipe buffer (10 MB of grep output) the SIGPIPE does fire,
+  # 141 in 200/200 — yet the output is STILL "1" in 200/200, because `grep -c` sits DOWNSTREAM of
+  # `head -1` and always receives head's complete single line; the 141 is then discarded outright,
+  # because a command substitution used as an ARGUMENT does not set the enclosing command's status
+  # (measured rc=0). So master's red here was 100% deterministic — the scanner, never a flake.
+  #
+  # Fixed rather than exempted, because the same shape is NOT inert in the other two contexts this
+  # file uses it in (measured on an identical 141 pipeline: as a bare assignment it aborts the suite
+  # under `set -e`, rc=141; as an `if` condition it silently takes the ELSE branch). Leaving it here
+  # leaves a real inversion one refactor away. _first_match_line is the sanctioned replacement:
+  # `$( )` runs grep to completion and the consumer is a bash parameter expansion, so no second
+  # process exists to exit early or be signalled, and a no-match is a normal empty string — which is
+  # what keeps the MISORDERED arm reportable instead of aborting the suite and hiding later checks.
+  # Line numbers (not a substring of the first hit) also make a DELETED classification call visible:
+  # the old form scored a pass when `_porcelain_changed_paths` was gone entirely.
+  local _preflight_at _classify_at
+  _preflight_at=$(_first_match_line '_selftest_env_blocked' <<< "$gate_body")
+  _classify_at=$(_first_match_line '_porcelain_changed_paths' <<< "$gate_body")
   chk "#824 wiring: the preflight runs BEFORE any changed-path classification" \
-    "$(printf '%s\n' "$gate_body" \
-      | grep -n '_selftest_env_blocked\|_porcelain_changed_paths' \
-      | head -1 | grep -c '_selftest_env_blocked')" "1"
+    "$([[ -n "$_preflight_at" && -n "$_classify_at" && "$_preflight_at" -lt "$_classify_at" ]] \
+      && echo before || echo "MISORDERED($_preflight_at,$_classify_at)")" "before"
 
   # --- codex provider-model argv contract (sol/luna, and terra on docs lanes). Claude empty
   # is rejected upstream by the _run_headless_harness normalization, so it never reaches this
