@@ -114,9 +114,12 @@ jobs:
           )"
           export TARGET_GH_TOKENS
           python3 scripts/resolve-conflicts.py --self-test
-          # --stuck-grace-hours is the MACHINE EXIT from the single-attempt state (issue #753):
-          # a lone recorded attempt on a head nobody pushes to can never reach the two-distinct-
-          # head escalation, so after this many hours it escalates itself to needs:user.
+          # --stuck-grace-hours bounds the WAIT in the single-attempt state (issue #753): a lone
+          # recorded attempt on a head nobody pushes to can never reach the two-distinct-head
+          # escalation, so after this many hours the resolver stops waiting. It stops into the
+          # MACHINE class (`review:parked`) with a cause-gated exit, not into the human terminal
+          # — a timeout is not a human question (registry #769) — and the clock decides only WHEN
+          # to stop waiting, never what the stop means and never when the hold ends.
           # --no-exit-threshold 0 reds the run the moment any conflicting PR is left in a state
           # this resolver can neither repair nor escalate — the population alarm a per-run exit
           # code otherwise cannot express. Both flags are asserted at this call site by
