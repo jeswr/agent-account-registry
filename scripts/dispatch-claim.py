@@ -3838,6 +3838,14 @@ def _pr_needs_user(script_dir, repo, pr_number, issue, reason, park_class="quest
     # [registry #677] State the capacity park's cause so the park EPISODE is attributable in its
     # own receipt. Omitted, worker-pr records `capacity-unspecified` — honest, and still a
     # receipt, which is what closes the "a stale cause receipt stays newest forever" hole.
+    # [registry #869] The QUESTION-class stops on this path state theirs too
+    # (`history-rewritten`, `marker-corrupt`, `routing-unresolvable`), which is what keeps the
+    # prose classifier's population strictly historical. This forwarding line is the SHARED SEAM
+    # for all four of them: deleting it silently reverts every dispatch-claim write site at once,
+    # so the per-site checks in the self-test drive THIS function and assert the argv it builds,
+    # not merely that the call sites name a cause. worker-pr's CLI seam refuses a cause that
+    # disagrees with `park_class` in either direction (validate_park_cause), so a wrong cause here
+    # fails LOUD rather than writing a receipt whose class contradicts the park.
     if park_cause:
         args += ["--park-cause", park_cause]
     if bot_login:
@@ -5457,7 +5465,12 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                     # Rewritten history — the worker-opened commit is no longer an ancestor.
                     _pr_needs_user(script_dir, repo, number, issue_number,
                                    "the PR head no longer descends from the worker-opened commit "
-                                   "(history was rewritten); refusing autonomous review")
+                                   "(history was rewritten); refusing autonomous review",
+                                   # [registry #869] the taxonomy's own name for this stop, so
+                                   # the park is machine-readable without re-parsing this
+                                   # sentence (park_policy.LEGACY_PARK_PROSE matches it only for
+                                   # the HISTORICAL, pre-marker population).
+                                   park_cause="history-rewritten")
                     continue
             if not draft and item["state"] in {"needs-review", "needs-fix"}:
                 # Label-driven re-entry may arrive while the PR is READY (and possibly armed).
@@ -5660,7 +5673,10 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
             except worker_pr.WorkerPrError as exc:
                 _pr_needs_user(script_dir, repo, number, issue_number,
                                f"round-budget escalation-marker validation failed ({exc}); a "
-                               "human must inspect this PR's round/model/pin markers")
+                               "human must inspect this PR's round/model/pin markers",
+                               # [registry #869] `marker-corrupt` — "durable round/model/pin
+                               # markers failed validation", which is this branch verbatim.
+                               park_cause="marker-corrupt")
                 continue
             if budget["action"] == "needs-user":
                 # Budget-driven stop -> the MACHINE-owned soft-hold pair (finding A:
@@ -5876,7 +5892,17 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                     _pr_needs_user(script_dir, repo, number, issue_number,
                                    "the fix lane cannot honour the source issue's trust-tier "
                                    f"route: {detail}; a human must reconcile the routing table "
-                                   "with the fix chain")
+                                   "with the fix chain",
+                                   # [registry #869] `routing-unresolvable`. All three `detail`
+                                   # branches above are the same fact about the same surface —
+                                   # the routing table and the fix chain together authorise NO
+                                   # concrete model to run — which is the taxonomy's entry
+                                   # verbatim, and the same cause the chain-exhaustion park
+                                   # below states. It is NOT `marker-corrupt` (nothing failed
+                                   # marker validation) and not a capacity cause (this
+                                   # contradiction repeats every tick; no fleet capacity
+                                   # clears it).
+                                   park_cause="routing-unresolvable")
                 continue
             if not chain:
                 # The inverse (or same-provider) chain cannot resolve a concrete model right now
@@ -5884,7 +5910,11 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 # hand to a human.
                 _pr_needs_user(script_dir, repo, number, issue_number,
                                f"the {mode} model chain for a {impl_provider}-implemented PR is "
-                               "unresolvable in the target routing (no concrete provider model)")
+                               "unresolvable in the target routing (no concrete provider model)",
+                               # [registry #869] `routing-unresolvable` — the taxonomy's name for
+                               # exactly this stop. review-fix.yml's `unresolvable` job writes
+                               # the SAME park through the CLI and passes the same cause.
+                               park_cause="routing-unresolvable")
                 continue
         except DispatchError as exc:
             lanes[lane]["error"] += 1
@@ -18731,6 +18761,9 @@ def _starvation_sweep_self_test():
     # ---- [registry #822] THE PARK BATCH, EXECUTED on production source -----------------------
     _starvation_park_batch_seam_self_test()
 
+    # ---- [registry #869] EVERY PARK WRITE SITE STATES ITS CAUSE — ONE CHECK PER SITE ---------
+    _park_cause_site_self_test()
+
     # ---- THE YAML SEAM: structural, on PARSED nodes ------------------------------------------
     _starvation_yaml_seam_self_test()
     _census_yaml_seam_self_test()
@@ -19282,6 +19315,147 @@ def _census_yaml_seam_self_test():
         assert _fragment in census_step(_doc)["run"], _fragment
     print(f"  ok   #762 YAML seam: all {len(seam_mutants)} structural dispatch.yml census "
           "mutants are caught, including the two that survive a raw-text grep as comments")
+
+
+# ---- [registry #869] ONE NAMED CHECK PER PARK WRITE SITE ---------------------------------------
+#
+# THE DEFECT THIS EXISTS FOR, measured on the previous head of this PR: mutating the single
+# forwarding line in `_pr_needs_user` (`if park_cause: args += [...]`) to `pass` silently reverted
+# THREE of the five write sites the PR's title names, and the whole suite still exited 0. A
+# suite-wide assertion over the call sites gave 1/N coverage at N/N confidence — the recurring
+# shape on this repo, where the feature in the TITLE is the one without a red test.
+#
+# So each site is pinned TWICE, and each row is named after ITS OWN site:
+#   (a) STATED — the call site passes the cause, decided on the PARSED tree (a keyword in a dead
+#       branch, a commented-out flag, or a reflow must not change the answer); and
+#   (b) FORWARDED — `_pr_needs_user` actually puts `--park-cause <cause>` on the argv it hands
+#       worker-pr, EXECUTED against the real function with the process boundary stubbed.
+# Dropping one site's `park_cause=` reds only that site's (a). Deleting the shared forwarding line
+# reds every site's (b) — which is correct: it breaks all of them.
+#
+# The sites are keyed by a distinctive slice of the REASON each one writes, so a row names the
+# behaviour rather than a line number, and a re-worded reason fails loudly here instead of
+# silently re-pointing the pin at a different site.
+PARK_CAUSE_SITES_869 = (
+    ("the PR head no longer descends from the worker-opened commit",
+     "question", "history-rewritten", 1),
+    ("round-budget escalation-marker validation failed",
+     "question", "marker-corrupt", 1),
+    ("the fix lane cannot honour the source issue's trust-tier route",
+     "question", "routing-unresolvable", 1),
+    ("model chain for a", "question", "routing-unresolvable", 1),
+    ("the review round budget is exhausted at", "capacity", "budget", 1),
+    ("consecutive fix dispatches missed for round", "capacity", "dispatch-missed", 2),
+    # THE ONE DOCUMENTED EXCLUSION. This park fires when the durable missed-fix MARKER COULD NOT
+    # BE RECORDED — a write failure, not a validation failure. `marker-corrupt` names "durable
+    # round/model/pin markers failed VALIDATION", a different fact about a different PR state, and
+    # claiming it would put a wrong cause in a durable receipt to satisfy a coverage count. No
+    # cause in the CLOSED taxonomy names this stop and #869 may not extend the taxonomy, so it
+    # stays prose-only. Its prose matches no LEGACY_PARK_PROSE pattern either, so
+    # reclassify_legacy_park already returns None for it and the park stands.
+    ("the durable missed-fix marker could not be recorded", "question", None, 1),
+)
+
+
+def _park_cause_call_sites(source):
+    """Every `_pr_needs_user(...)` call in `source` as [(reason_literals, park_class, park_cause)],
+    decided on the PARSED tree.
+
+    `reason_literals` is the call's `reason` argument with its f-string holes removed — the
+    literal text the site actually writes — so a site is identified by what it SAYS.
+
+    PRODUCTION functions only: the `*_self_test` definitions are skipped, so the harness's own
+    probe calls below cannot masquerade as write sites (and, more importantly, cannot let a real
+    site hide behind one)."""
+    tree = ast.parse(source)
+    calls = []
+    for top in tree.body:
+        if isinstance(top, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                and top.name.endswith("_self_test"):
+            continue
+        calls.extend(node for node in ast.walk(top)
+                     if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                     and node.func.id == "_pr_needs_user")
+    found = []
+    for node in calls:
+        reason = node.args[4] if len(node.args) > 4 else None
+        chunks = []
+        if isinstance(reason, ast.Constant):
+            chunks = [str(reason.value)]
+        elif isinstance(reason, ast.JoinedStr):
+            chunks = [str(v.value) for v in reason.values if isinstance(v, ast.Constant)]
+        park_class = next((kw.value.value for kw in node.keywords
+                           if kw.arg == "park_class" and isinstance(kw.value, ast.Constant)),
+                          "question")
+        park_cause = next((kw.value.value for kw in node.keywords
+                           if kw.arg == "park_cause" and isinstance(kw.value, ast.Constant)),
+                          None)
+        found.append(("".join(chunks), park_class, park_cause))
+    return found
+
+
+def _park_cause_site_self_test():
+    source = Path(__file__).resolve().read_text(encoding="utf-8")
+    sites = _park_cause_call_sites(source)
+
+    # (a) STATED — per site, on the parsed tree.
+    for key, want_class, want_cause, want_n in PARK_CAUSE_SITES_869:
+        matched = [(klass, cause) for reason, klass, cause in sites if key in reason]
+        assert len(matched) == want_n, (
+            f"#869 site {key!r}: expected {want_n} `_pr_needs_user` call site(s), found "
+            f"{len(matched)}. A reworded reason silently re-points this pin at a different site.")
+        assert all(m == (want_class, want_cause) for m in matched), (
+            f"#869 site {key!r} must STATE park_class={want_class!r} park_cause={want_cause!r} "
+            f"— found {matched}. A question-class park with no cause ships an unreadable stop "
+            "reason into the human terminal, which is exactly what #869 closes.")
+        print(f"  ok   #869 site STATED [{key[:46]}] -> {want_class}/{want_cause}")
+
+    # No UNPINNED site may exist: a NEW `_pr_needs_user` call must be added to the table above
+    # deliberately, with a reason. (#858's trust-tier park landed mid-review and this caught it.)
+    unpinned = [reason[:60] for reason, _c, _u in sites
+                if not any(key in reason for key, *_ in PARK_CAUSE_SITES_869)]
+    assert not unpinned, (
+        f"#869: unpinned `_pr_needs_user` call site(s) {unpinned} — add each to "
+        "PARK_CAUSE_SITES_869 with its cause, or state why it is excluded.")
+    print(f"  ok   #869 no unpinned park write site exists ({len(sites)} pinned)")
+
+    # (b) FORWARDED — per site, EXECUTED against the real `_pr_needs_user`, with only the process
+    # boundary stubbed. This is the half the previous head lacked: `pass` at the forwarding line
+    # reverted three sites with nothing red.
+    captured = []
+    real_helper = globals()["_run_target_helper"]
+    try:
+        globals()["_run_target_helper"] = (
+            lambda script_dir, repo, script, args: captured.append((script, list(args))))
+        for key, want_class, want_cause, _n in PARK_CAUSE_SITES_869:
+            captured.clear()
+            _pr_needs_user("/sd", "o/r", 41, 7, f"reason for {key}",
+                           park_class=want_class,
+                           **({"park_cause": want_cause} if want_cause else {}))
+            assert len(captured) == 1 and captured[0][0] == "worker-pr.py", captured
+            argv = captured[0][1]
+            got = (argv[argv.index("--park-cause") + 1] if "--park-cause" in argv else None)
+            assert got == want_cause, (
+                f"#869 site {key!r}: `_pr_needs_user` must FORWARD --park-cause "
+                f"{want_cause!r} to worker-pr — got {got!r} in {argv}. Without this the call "
+                "site's cause never reaches the writer and no receipt is emitted.")
+            got_class = (argv[argv.index("--park-class") + 1]
+                         if "--park-class" in argv else None)
+            assert got_class == want_class, (
+                f"#869 site {key!r}: --park-class must be {want_class!r}, got {got_class!r}")
+            print(f"  ok   #869 site FORWARDED [{key[:44]}] -> --park-cause {want_cause}")
+    finally:
+        globals()["_run_target_helper"] = real_helper
+
+    # ...and every question-class cause any site states is QUESTION-class in the taxonomy: a
+    # `class=capacity` receipt on a review:needs-user park is the one shape that could talk it
+    # open (dispatch-claim's own release proof keys on the newest cause).
+    question_causes = {cause for _k, klass, cause, _n in PARK_CAUSE_SITES_869
+                       if klass == "question" and cause}
+    assert question_causes <= set(_park_policy.PARK_CAUSES) and all(
+        _park_policy.park_cause_class(c) == _park_policy.PARK_CLASS_QUESTION
+        for c in question_causes), sorted(question_causes)
+    print("  ok   #869 every question-class site's cause is QUESTION-class in the taxonomy")
 
 
 def _starvation_yaml_seam_self_test():

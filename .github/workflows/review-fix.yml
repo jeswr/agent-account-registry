@@ -1735,10 +1735,17 @@ jobs:
           ALERT_TOKEN: ${{ secrets.ALERT_TOKEN || '' }}
           MAINTAINER_HANDLE: jeswr
         run: |
+          # [registry #869] --park-cause makes this park's stop reason MACHINE-READABLE. Without
+          # it the only record of why this PR sits on the human terminal is the English --reason
+          # below, and park_policy's prose classifier is the only thing that can read it. The
+          # cause is the taxonomy's own `routing-unresolvable`; worker-pr's CLI seam refuses any
+          # cause that disagrees with the (default `question`) --park-class, so this cannot
+          # silently become a capacity receipt on a review:needs-user park.
           python3 registry/scripts/worker-pr.py needs-user \
             --repo "${{ inputs.target_repo }}" \
             --pr "${{ inputs.pr_number }}" \
             --issue "${{ needs.resolve.outputs.issue }}" \
+            --park-cause routing-unresolvable \
             --reason "the ${{ inputs.mode }} model chain for a ${{ needs.resolve.outputs.impl_provider }}-implemented PR is unresolvable in the target routing (no concrete provider model)"
 
   # Model-access health record (registry #32): consumes the review/fix model exit CLASS (success OR
