@@ -4721,7 +4721,9 @@ def _capacity_recovery_probe(model_health, health_window, now):
 
     Both exits return the SAME evidence shape and are consumed by the SAME admission, so both
     inherit — unchanged, and this is deliberate rather than incidental — the unconditional refusal
-    on any human-owned hold or human-applied park, the strictly-after-the-park ordering check, the
+    on any human-owned hold, on a human-applied HUMAN-terminal park, and on a human-applied
+    MACHINE park with no bot `class=capacity` park-reason receipt, the strictly-after-the-park
+    ordering check, the
     consumed-exactly-once evidence key, and the AUTO_READMISSION_MAX cap."""
     def probe(parked_at):
         if health_window is None or not parked_at:
@@ -5141,7 +5143,18 @@ def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_logi
                 auto_receipts=worker_pr.auto_readmission_records(comments, bot_login),
                 auto_marker_count=worker_pr.auto_readmission_marker_count(comments, bot_login),
                 auto_evidence=evidence_probe, live_holds=holds, log=log,
-                census=park_census)
+                census=park_census,
+                # The BOT's own machine-readable classification of this park episode. Required
+                # only on the human-applied-machine-park branch, where nothing else can prove the
+                # park was a capacity stop rather than a judgement; a bot park carries one by
+                # construction (PARK_CAUSES.capacity-unspecified exists so it always does).
+                reason_records=_park_policy.park_reason_records(comments, bot_login, log=log),
+                # The INSTANCE binding's evidence: reconcile attestations, from the SAME comments
+                # page already read. Deliberately NOT bot-filtered here — park_instance_attested
+                # applies the sound filter (written by the actor that applied THIS park), because
+                # reconcile-park-misescalation.py is hand-run under a maintainer token and its
+                # markers are authored by that maintainer, not by the App.
+                attestations=_park_policy.reconcile_attestations(comments))
             if action == "auto-mint":
                 # RECEIPT FIRST, then the labels (see the docstring).
                 post_comment(repo, number, worker_pr.auto_readmission_receipt(
@@ -6054,7 +6067,12 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                         auto_receipts=worker_pr.auto_readmission_records(comments, bot_login),
                         auto_marker_count=worker_pr.auto_readmission_marker_count(
                             comments, bot_login),
-                        live_holds=sorted(HUMAN_HOLD_PR_LABELS & set(labels)))
+                        live_holds=sorted(HUMAN_HOLD_PR_LABELS & set(labels)),
+                        # Same classification proof the minting sweep applies, from the SAME
+                        # comments this gate already read — the read-only proof gate and the
+                        # minting sweep must never disagree about whether a park is admissible.
+                        reason_records=_park_policy.park_reason_records(comments, bot_login),
+                        attestations=_park_policy.reconcile_attestations(comments))
                 if not park_action:
                     print(f"defer review {repo}#{number}: machine capacity park stands "
                           f"(durable receipts/label; {park_detail})")
@@ -17424,13 +17442,87 @@ agent = "impl"
         assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
         print("  ok   auto-readmit (e): a human-owned hold on either surface is never "
               "auto-re-admitted")
-        # A(e'): a park the MAINTAINER applied is human-owned — only a human clears it.
-        human_park = {41: [{"event": "labeled", "label": {"name": MACHINE_PARK_PR_LABEL},
-                            "created_at": park_stamp, "actor": {"login": "jeswr"},
-                            "performed_via_github_app": None}], 7: []}
-        count, posted, cleared = readmit_sweep(recovered_window, timeline=human_park)
+        # A(e'): BOTH OWNERSHIP FACTS, END TO END THROUGH THE REAL SWEEP — the real timeline
+        # parser, the real comment reader, the real label writes.
+        #
+        # A maintainer who stamps the MACHINE-owned soft hold is re-admitted ONLY when this bot's
+        # own park-reason receipt already classified the episode `class=capacity`. A maintainer who
+        # stamps the HUMAN-owned terminal is asking a question and still refuses. And a
+        # maintainer-stamped machine park with NO bot receipt refuses too — that is the population
+        # review measured (5 of 12 live sparq PRs), where `cause_gated_park_episode` is inert by
+        # its own clause 1 so #769's age guard cannot fire either.
+        def maintainer_park(label):
+            return {41: [{"event": "labeled", "label": {"name": label},
+                          "created_at": park_stamp, "actor": {"login": "jeswr"},
+                          "performed_via_github_app": None}], 7: []}
+
+        # The class receipt (bot-authored) AND the INSTANCE attestation (authored by the actor
+        # that applies the park, one second before it — the real reconcile script's receipt-first
+        # ordering). Both are required now; the rows below vary each independently.
+        capacity_receipt_comment = [
+            {"user": {"login": readmit_bot},
+             "body": "capacity park\n\n" + _park_policy.park_reason_marker("budget")},
+            {"user": {"login": "jeswr"}, "created_at": park_stamp,
+             "body": f"audit\n\n{_park_policy.RECONCILE_MARKER} pr=41 window=w -->"},
+        ]
+        class_only_comment = capacity_receipt_comment[:1]
+        attestation_only_comment = capacity_receipt_comment[1:]
+        count, posted, cleared = readmit_sweep(
+            recovered_window, timeline=maintainer_park(MACHINE_PARK_PR_LABEL),
+            comments=capacity_receipt_comment)
+        assert (count, cleared) == (1, [(41, 7)]), (count, posted, cleared)
+        assert len(posted) == 1 and worker_pr_mod.AUTO_READMIT_MARKER in posted[0][1], posted
+        print("  ok   auto-readmit (e): a MAINTAINER-applied MACHINE park with the bot's own "
+              "class=capacity receipt IS re-admitted (receipt-first)")
+        count, posted, cleared = readmit_sweep(
+            recovered_window, timeline=maintainer_park(MACHINE_PARK_PR_LABEL))
         assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
-        print("  ok   auto-readmit (e): a MAINTAINER-applied park is never auto-re-admitted")
+        print("  ok   auto-readmit (e): the SAME park with NO bot receipt is NOT re-admitted — "
+              "the machine never clears a park it never classified")
+        # THE INSTANCE BINDING, end to end: the class receipt alone is not enough, and the
+        # attestation alone is not enough. Each is removed independently from the pair above.
+        count, posted, cleared = readmit_sweep(
+            recovered_window, timeline=maintainer_park(MACHINE_PARK_PR_LABEL),
+            comments=class_only_comment)
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        print("  ok   auto-readmit (e): the class receipt WITHOUT an instance attestation is "
+              "refused — the record must be about THIS park, not about the PR")
+        count, posted, cleared = readmit_sweep(
+            recovered_window, timeline=maintainer_park(MACHINE_PARK_PR_LABEL),
+            comments=attestation_only_comment)
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        print("  ok   auto-readmit (e): an instance attestation WITHOUT a class receipt is "
+              "refused too — the two conjuncts are independent")
+        count, posted, cleared = readmit_sweep(
+            recovered_window, timeline=maintainer_park(MACHINE_PARK_PR_LABEL),
+            comments=[capacity_receipt_comment[0],
+                      {"user": {"login": "drive-by"}, "created_at": park_stamp,
+                       "body": f"x\n\n{_park_policy.RECONCILE_MARKER} pr=41 -->"}])
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        print("  ok   auto-readmit (e): an attestation by an actor that did NOT apply the park "
+              "is ignored — a third party cannot bind somebody else's act")
+        injection_receipt_comment = [{
+            "user": {"login": readmit_bot},
+            "body": "flagged\n\n" + _park_policy.park_reason_marker("injection"),
+        }]
+        count, posted, cleared = readmit_sweep(
+            recovered_window, timeline=maintainer_park(MACHINE_PARK_PR_LABEL),
+            comments=injection_receipt_comment)
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        print("  ok   auto-readmit (e): a QUESTION-class bot receipt refuses the same park")
+        # A third party cannot forge the classification: same marker, non-bot author.
+        forged = [{"user": {"login": "drive-by"},
+                   "body": "x\n\n" + _park_policy.park_reason_marker("budget")}]
+        count, posted, cleared = readmit_sweep(
+            recovered_window, timeline=maintainer_park(MACHINE_PARK_PR_LABEL), comments=forged)
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        print("  ok   auto-readmit (e): a NON-bot author cannot forge the capacity receipt")
+        count, posted, cleared = readmit_sweep(
+            recovered_window, timeline=maintainer_park(_park_policy.HUMAN_PARK_LABEL),
+            comments=capacity_receipt_comment)
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        print("  ok   auto-readmit (e): a MAINTAINER-applied HUMAN TERMINAL is still never "
+              "auto-re-admitted, receipt or no receipt")
 
         # ------------------------------------------------------------------------------------
         # [G5] END-TO-END: the census the REAL sweep emits, from the REAL sweep's own log.
@@ -17451,7 +17543,10 @@ agent = "impl"
         # window is still broken, so nothing is re-admitted and both PRs reach a refusal.
         census_row_42 = dict(parked_row, number=42,
                              head={**parked_row["head"], "ref": "sparq-agent/issue-8-def"})
-        census_timeline = dict(human_park)
+        # #41's park must be the HUMAN TERMINAL specifically: a maintainer-applied MACHINE soft
+        # hold is re-admitted now, so it would no longer produce a `human-applied` census row at
+        # all and this fixture would be asserting an empty cohort.
+        census_timeline = dict(maintainer_park(_park_policy.HUMAN_PARK_LABEL))
         census_timeline[42] = [{"event": "labeled",
                                 "label": {"name": MACHINE_PARK_PR_LABEL},
                                 "created_at": park_stamp, "actor": {"login": readmit_bot},
@@ -18028,14 +18123,40 @@ agent = "impl"
         count, posted, cleared = readmit_sweep(healthy_window, timeline=aged_timeline,
                                                labels={7: ["status:parked", "needs:user"]})
         assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
-        human_aged_park = {41: [{"event": "labeled",
-                                 "label": {"name": MACHINE_PARK_PR_LABEL},
-                                 "created_at": aged_park_stamp, "actor": {"login": "jeswr"},
-                                 "performed_via_github_app": None}], 7: []}
-        count, posted, cleared = readmit_sweep(healthy_window, timeline=human_aged_park)
+        # BOTH ownership gates decide here too — the aged-out heuristic exit inherits them
+        # UNCHANGED from the cause-recovery exit, so the two can never drift. This is the exit
+        # review measured firing for 12 of 12 admissions, so an untested "inherits unchanged"
+        # claim here is precisely the one that would have mattered.
+        def human_aged_park(label):
+            return {41: [{"event": "labeled", "label": {"name": label},
+                          "created_at": aged_park_stamp, "actor": {"login": "jeswr"},
+                          "performed_via_github_app": None}], 7: []}
+
+        aged_capacity_receipt = [
+            {"user": {"login": readmit_bot},
+             "body": "capacity park\n\n" + _park_policy.park_reason_marker("budget")},
+            {"user": {"login": "jeswr"}, "created_at": aged_park_stamp,
+             "body": f"audit\n\n{_park_policy.RECONCILE_MARKER} pr=41 window=w -->"},
+        ]
+        count, posted, cleared = readmit_sweep(
+            healthy_window, timeline=human_aged_park(_park_policy.HUMAN_PARK_LABEL),
+            comments=aged_capacity_receipt)
         assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
-        print("  ok   aged-out exit: a human-owned hold and a MAINTAINER-applied park refuse it "
-              "exactly as they refuse the cause-recovery path")
+        count, posted, cleared = readmit_sweep(
+            healthy_window, timeline=human_aged_park(MACHINE_PARK_PR_LABEL))
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        count, posted, cleared = readmit_sweep(
+            healthy_window, timeline=human_aged_park(MACHINE_PARK_PR_LABEL),
+            comments=aged_capacity_receipt)
+        assert (count, cleared) == (1, [(41, 7)]), (count, posted, cleared)
+        count, posted, cleared = readmit_sweep(
+            healthy_window, timeline=human_aged_park(MACHINE_PARK_PR_LABEL),
+            comments=aged_capacity_receipt[:1])
+        assert (count, posted, cleared) == (0, [], []), (count, posted, cleared)
+        print("  ok   aged-out exit: a human-owned hold, a MAINTAINER-applied HUMAN TERMINAL, a "
+              "MAINTAINER-applied MACHINE park with NO bot capacity receipt, and one with a class "
+              "receipt but NO instance attestation all refuse it exactly as they refuse the "
+              "cause-recovery path — neither gate is bypassable via the #691 heuristic")
 
         # ---- the MIGRATION PRECONDITION, as the production function computes it -------------
         # Never hand-set: _legacy_migration_provable is the expression main() evaluates.

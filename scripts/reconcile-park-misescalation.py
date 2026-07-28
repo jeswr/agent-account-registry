@@ -56,7 +56,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import park_policy
 
-RECONCILE_MARKER = "<!-- sparq-park-misescalation-reconciled:v1"
+# Declared in park_policy so the WRITER here and the READER in capacity_park_admission
+# (park_instance_attested) can never drift onto two spellings.
+RECONCILE_MARKER = park_policy.RECONCILE_MARKER
 
 
 def _load(modname, filename):

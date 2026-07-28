@@ -2274,11 +2274,34 @@ def _bot_login(api: GitHubAPI, app_slug: str = "") -> str:
 
 
 def _ensure_label(api: GitHubAPI, repo: str, label: str) -> bool:
+    """Create `label`; RECONCILE the description of a PARK label whose text is a promise.
+
+    The early return used to make every description write-once-at-creation, so the correct text
+    already sitting in LABELS above never reached a repo whose label predated it. Measured live on
+    sparq-org/sparq: `status:parked` still carried the superseded #614 wording and `review:parked`
+    carried a generic review-loop string, while the machine's automatic exit was being justified by
+    what those labels "promise". A promise a reader cannot see is not a promise.
+
+    RECONCILED FOR park_policy.MACHINE_OWNED_PARK_LABELS ONLY — the SAME set the admission rule
+    reads, so "the label whose description promises a machine exit" and "the label that gets that
+    description reconciled" cannot drift into two different lists. Deliberately NOT all of
+    PARK_LABELS: `needs:user` is the human terminal and its description promises no machine exit,
+    so narrowing is the conservative direction (its first spelling of this test caught the wider
+    set rewriting `needs:user`). Every other label in LABELS is create-only, so a human-curated
+    description elsewhere in the repo is never overwritten. The PATCH fires only on a difference."""
     encoded = quote(label, safe="")
     existing = api.request("GET", f"/repos/{repo}/labels/{encoded}", allow_404=True)
-    if existing is not None:
-        return False
     colour, description = LABELS[label]
+    reconcilable = label in park_policy.MACHINE_OWNED_PARK_LABELS
+    if existing is not None:
+        if not reconcilable or not isinstance(existing, dict):
+            return False
+        if str(existing.get("description") or "") == description:
+            return False
+        print(f"WRITE reconcile label description repo={repo} label={label}: "
+              f"{existing.get('description')!r} -> {description!r}")
+        api.request("PATCH", f"/repos/{repo}/labels/{encoded}", {"description": description})
+        return False
     api.request(
         "POST",
         f"/repos/{repo}/labels",
@@ -3210,6 +3233,58 @@ def _self_test() -> int:
         good = got == want
         ok = ok and good
         print(f"  {'ok  ' if good else 'FAIL'} {name}: {got!r} (want {want!r})")
+
+    # ---- _ensure_label: reconcile the PARK label descriptions, and ONLY those -----------------
+    #
+    # The twin of worker-pr's fix. groom already carried the CORRECT text in LABELS, but the
+    # early-return meant it never reached a repo whose label predated it — measured live on
+    # sparq-org/sparq, `status:parked` still read the superseded #614 wording while the machine's
+    # automatic exit was being justified by what that label "promises".
+    class _LabelAPI:
+        def __init__(self, existing):
+            self.existing, self.calls = existing, []
+
+        def request(self, method, path, body=None, allow_404=False, **_kw):
+            self.calls.append((method, path, body))
+            if method == "GET":
+                return self.existing
+            return {}
+
+    def ensure_calls(label, existing):
+        api = _LabelAPI(existing)
+        try:
+            _ensure_label(api, "o/r", label)
+        except Exception as exc:  # noqa: BLE001
+            # TOTAL: a mutant that deletes the `isinstance(existing, dict)` guard makes the
+            # PRODUCTION call raise on a non-dict payload; an un-total driver aborts the suite
+            # (MEASURED: 308 of 314 checks lost) and the sweep still scores it as a kill.
+            return [("raised", type(exc).__name__, None)]
+        return [call for call in api.calls if call[0] != "GET"]
+
+    park_desc = LABELS["status:parked"][1]
+    check("groom _ensure_label: a DRIFTED park description is PATCHED",
+          ensure_calls("status:parked",
+                       {"description": "Machine-owned capacity park (soft hold; cleared on "
+                                       "readmission)"}),
+          [("PATCH", "/repos/o/r/labels/status%3Aparked", {"description": park_desc})])
+    check("groom _ensure_label: the PR-side twin is reconciled too",
+          len(ensure_calls("review:parked", {"description": "Registry cross-provider "
+                                                           "review-loop state"})), 1)
+    check("groom _ensure_label: an ALREADY-CORRECT park description writes NOTHING",
+          ensure_calls("status:parked", {"description": park_desc}), [])
+    check("groom _ensure_label: a NON-MACHINE-park label is NEVER reconciled, however far it has "
+          "drifted — including the HUMAN terminal, whose text promises no machine exit",
+          [ensure_calls("needs:user", {"description": "something a human wrote"}),
+           ensure_calls("status:ready", {"description": "something a human wrote"})], [[], []])
+    check("groom reconciles EXACTLY park_policy's machine-owned set, no more and no less",
+          sorted(park_policy.MACHINE_OWNED_PARK_LABELS), ["review:parked", "status:parked"])
+    check("groom _ensure_label: a MISSING label is still CREATED",
+          [call[0] for call in ensure_calls("status:parked", None)], ["POST"])
+    check("groom _ensure_label: a non-dict GET payload proves no drift and writes nothing",
+          ensure_calls("status:parked", "not-a-label"), [])
+    check("groom's park text and park_policy's constant are the SAME string (no drifted copy)",
+          {LABELS["status:parked"][1], LABELS["review:parked"][1]},
+          {park_policy.MACHINE_PARK_DESCRIPTION})
 
     now = 10_000
     limits = Limits(worker_timeout_minutes=10, max_attempts=2)
