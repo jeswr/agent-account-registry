@@ -3513,6 +3513,33 @@ def identity_refusal_records(comments, bot_login):
     return found
 
 
+def identity_refusal_parked(repo, pr_number, read_review_labels=None):
+    """Is the #972 terminal park actually LIVE on this PR — i.e. did the EXIT land, not merely its
+    receipt?
+
+    [registry #979 round-2 finding 3] The receipt and the park are two writes with one API call
+    between them, and the receipt is deliberately written FIRST. So `receipt-written /
+    park-NOT-written` is a reachable state (a `set_review_state` failure, a secondary rate limit,
+    a runner death), and it is the one state in which the receipt must NOT silence the next tick:
+    the PR is still on the review frontier, the refusal is deterministic, and nothing else can
+    re-drive it — `groom` backstops worker-branch PRs, and every PR on the #657 orchestrator class
+    this exit exists for is human-authored on an arbitrary branch.
+
+    FAIL DIRECTION, and it is the OPPOSITE of every other label read in this file, deliberately:
+    an unreadable label surface answers FALSE, i.e. re-drive the park. Everywhere else the hazard
+    is writing a hold that was not earned, so the read fails closed. Here the hazard is #972's
+    infinite re-dispatch, and the write being re-driven is an idempotent label the PR has already
+    earned — a duplicate is a no-op, a missing one is the loop."""
+    reader = read_review_labels or _live_review_labels
+    try:
+        return "review:needs-user" in reader(repo, pr_number)
+    except Exception as exc:      # noqa: BLE001 — see FAIL DIRECTION above
+        print(f"::warning::identity-refusal: could not read the live review labels on "
+              f"{repo}#{pr_number} ({exc}); treating the terminal park as NOT landed and "
+              "re-driving it (a duplicate park write is a no-op; a missing one is #972)")
+        return False
+
+
 def identity_refusal(repo, pr_number, reason, issue=None, bot_login="",
                      alert_repo=None, alert_token=None, head_sha=""):
     """Record review-fix.yml's target-identity refusal as a DURABLE, COUNTED, TERMINAL outcome.
@@ -3554,8 +3581,14 @@ def identity_refusal(repo, pr_number, reason, issue=None, bot_login="",
     park. Minting an automatic re-admission for a cause the machine cannot prove has recovered is
     the park-readmit cycle this repo has already measured.
 
-    Idempotent: a re-run whose reason is already receipted writes NOTHING (no second comment, no
-    second park, no second ops alert)."""
+    IDEMPOTENT, ON TWO SEPARATE KEYS ([registry #979] round-2 finding 3). The RECEIPT caps the
+    census row and the comment: a re-run whose reason is already receipted writes no second
+    comment, ever. The PARK is keyed on the park itself, re-read live — because the receipt is
+    written FIRST and a failure in the one-API-call window between them leaves receipt-no-park,
+    the one state in which honouring the receipt as an idempotence key would silence the exit and
+    strand the PR on the review frontier forever. A re-run that finds the park already live writes
+    NOTHING (no comment, no park, no ops alert); a re-run that finds it MISSING re-drives the park
+    ALONE."""
     prose = identity_refusal_reason_prose(reason)      # closed enum, BEFORE any write
     issue = identity_refusal_issue(issue)
     try:
@@ -3567,13 +3600,41 @@ def identity_refusal(repo, pr_number, reason, issue=None, bot_login="",
         print(f"::warning::could not read {repo}#{pr_number} comments for the identity-refusal "
               f"receipt ({exc}); recording the refusal anyway (a missing exit is the defect)")
         already = set()
+    def _park():
+        needs_user(repo, pr_number,
+                   f"the review run was refused by the target-App identity gate: {prose}. No "
+                   "review round was charged, and a re-dispatch would be identical",
+                   issue=issue, alert_repo=alert_repo, alert_token=alert_token,
+                   park_class="question", park_cause="target-identity",
+                   bot_login=bot_login, head_sha=head_sha)
+
     if reason in already:
+        # [registry #979 round-2 finding 3] THE CAP AND THE IDEMPOTENCE KEY ARE NOT THE SAME
+        # OBJECT, and conflating them removed the exit this whole function is. The receipt caps
+        # the CENSUS ROW and the COMMENT — one per (PR, reason), ever, unchanged. It does NOT
+        # stand in for the PARK, because the park is a SEPARATE write that happens AFTER it: this
+        # `return` used to fire on a PR that carried a receipt and no park, so a tick-1 failure in
+        # the one-API-call window between them (the ~25-minute secondary content-creation limit
+        # this repo measured on 2026-07-28 is exactly wide enough) left the PR on the review
+        # frontier with a receipt that silenced every later tick — #972 restored THROUGH its own
+        # exit, and the docstring above claimed this function "re-drives" a state it could not
+        # reach. So the park's idempotence key is the PARK ITSELF, re-read here.
+        if identity_refusal_parked(repo, pr_number):
+            print(f"identity-refusal census: repo={repo} pr={pr_number} reason={reason} "
+                  "cause=target-identity outcome=already-recorded")
+            return
+        # Re-drive the park ALONE: no second receipt, no second census row, no duplicated cap.
+        # This also covers the human who un-parks without removing the cause — the gate refuses
+        # identically, and re-parking with the reason in front of them is the honest answer;
+        # writing nothing would resume the infinite re-dispatch.
         print(f"identity-refusal census: repo={repo} pr={pr_number} reason={reason} "
-              "cause=target-identity outcome=already-recorded")
+              "cause=target-identity outcome=receipt-without-park re-driving the terminal park")
+        _park()
         return
     # RECEIPT FIRST, exactly like every other park write: a crash between the two leaves
-    # receipt-no-park (which this function re-drives, and which the reader can still count), never
-    # park-no-receipt, where the census row that names the cause would be the thing that vanished.
+    # receipt-no-park (which the `reason in already` arm above re-drives on the next tick, and
+    # which the reader can still count), never park-no-receipt, where the census row that names
+    # the cause would be the thing that vanished.
     _comment(repo, pr_number,
              f"> 🤖 **SPARQ agent** — the review run was refused before the reviewer launched: "
              f"{prose}.\n\nNo review round was charged (no reviewer ran). This refusal cannot "
@@ -3583,12 +3644,7 @@ def identity_refusal(repo, pr_number, reason, issue=None, bot_login="",
              f"{IDENTITY_REFUSAL_MARKER} reason={reason} -->")
     print(f"identity-refusal census: repo={repo} pr={pr_number} reason={reason} "
           "cause=target-identity outcome=recorded")
-    needs_user(repo, pr_number,
-               f"the review run was refused by the target-App identity gate: {prose}. No review "
-               "round was charged, and a re-dispatch would be identical",
-               issue=issue, alert_repo=alert_repo, alert_token=alert_token,
-               park_class="question", park_cause="target-identity",
-               bot_login=bot_login, head_sha=head_sha)
+    _park()
 
 
 # ---- terminal escalation + arm --------------------------------------------------------------------
@@ -11652,18 +11708,27 @@ def _self_test():
     class _IdentityWrites:
         """Captures every write `identity_refusal` performs, in order."""
 
-        def __init__(self, existing=()):
+        def __init__(self, existing=(), live=(), labels_unreadable=False):
             self.comments, self.states, self.issue_status, self.alerts = [], [], [], []
             self.existing = list(existing)
+            self.live = set(live)
+            self.labels_unreadable = labels_unreadable
 
         def install(self):
             self.saved = {name: globals()[name] for name in (
                 "_comment", "_paginated_comments", "set_review_state", "_ops_alert",
-                "_load_worker_issue")}
+                "_load_worker_issue", "_live_review_labels")}
             globals()["_comment"] = lambda repo, pr, body: self.comments.append(body)
             globals()["_paginated_comments"] = lambda repo, pr: self.existing
             globals()["set_review_state"] = (
-                lambda repo, pr, state, **kw: self.states.append(state))
+                lambda repo, pr, state, **kw: (self.states.append(state),
+                                               self.live.add(f"review:{state}"))[0])
+            # [registry #979 round-2 finding 3] The LIVE park surface, which is now a distinct
+            # idempotence key from the receipt. `set_review_state` above adds to it, so a driver
+            # that lets tick 1 park sees the park on tick 2 exactly as production would.
+            globals()["_live_review_labels"] = lambda repo, pr: (
+                (_ for _ in ()).throw(WorkerPrError("live PR label payload is malformed"))
+                if self.labels_unreadable else set(self.live))
             globals()["_ops_alert"] = lambda *a, **kw: self.alerts.append(a)
             globals()["_load_worker_issue"] = lambda: types.SimpleNamespace(
                 set_status=lambda repo, issue, status: self.issue_status.append(
@@ -11673,8 +11738,9 @@ def _self_test():
         def restore(self):
             globals().update(self.saved)
 
-    def _drive_identity_refusal(reason, existing=(), issue=77):
-        writes = _IdentityWrites(existing).install()
+    def _drive_identity_refusal(reason, existing=(), issue=77, live=(),
+                                labels_unreadable=False):
+        writes = _IdentityWrites(existing, live, labels_unreadable).install()
         raised = None
         try:
             identity_refusal("o/r", 41, reason, issue=issue, bot_login=_ir_bot,
@@ -11709,20 +11775,77 @@ def _self_test():
     #     to the identical refusal).
     check("[#972] NO review round is charged by a refusal (no reviewer ran)",
           any(ROUND_MARKER in body for body in _ir_writes.comments), False)
-    # (3) THE CAP IS ONE. Feed the receipt this run wrote back as the PR's comment history:
-    #     the second tick must write NOTHING AT ALL — no comment, no park, no ops alert.
+    # (3) THE CAP IS ONE. Feed BOTH of tick 1's writes back — the receipt as the PR's comment
+    #     history AND the park it landed as the PR's live review label. The second tick must then
+    #     write NOTHING AT ALL: no comment, no park, no ops alert.
+    _ir_receipt = [{"user": {"login": _ir_bot}, "body": _ir_writes.comments[0]}]
     _ir_second, _ = _drive_identity_refusal(
-        "author-not-app-bot",
-        existing=[{"user": {"login": _ir_bot}, "body": _ir_writes.comments[0]}])
-    check("[#972] a SECOND tick on an already-receipted refusal writes nothing (cap = 1)",
+        "author-not-app-bot", existing=_ir_receipt, live=("review:needs-user",))
+    check("[#972] a SECOND tick on a refusal that is already receipted AND parked writes nothing "
+          "(cap = 1)",
           (_ir_second.comments, _ir_second.states, _ir_second.issue_status,
            _ir_second.alerts), ([], [], [], []))
     # ...and the cap is per REASON, not a blanket "any receipt silences everything".
     _ir_other, _ = _drive_identity_refusal(
-        "wrong-target",
-        existing=[{"user": {"login": _ir_bot}, "body": _ir_writes.comments[0]}])
+        "wrong-target", existing=_ir_receipt, live=("review:needs-user",))
     check("[#972] a DIFFERENT refusal reason is still recorded (the cap is per-reason)",
           len(_ir_other.comments), 2)
+    # (3b) [registry #979 round-2 finding 3] THE STATE THE RECEIPT-FIRST ORDER CREATES:
+    #      receipt-written, park-NOT-written. The receipt caps the CENSUS ROW; it must not cap the
+    #      EXIT. Before this fix `if reason in already: return` fired first, so this tick wrote
+    #      nothing at all, the PR stayed on the review frontier with the refusal invisible, and
+    #      #972's infinite re-dispatch was restored THROUGH the exit built to close it — with no
+    #      backstop, because `groom` only covers worker-branch PRs and the whole #657 class this
+    #      gate refuses is human-authored on an arbitrary branch.
+    _ir_half, _ = _drive_identity_refusal("author-not-app-bot", existing=_ir_receipt, live=())
+    check("[#979] a receipted-but-UNPARKED refusal RE-DRIVES the terminal park on the next tick "
+          "(the receipt caps the census row, not the exit)",
+          (_ir_half.states, _ir_half.issue_status), (["needs-user"], [(77, "needs-user")]))
+    check("[#979] ...and it re-drives the PARK ALONE — no second census receipt, no second "
+          "census row (the cap is still one per (PR, reason))",
+          [body for body in _ir_half.comments if IDENTITY_REFUSAL_MARKER in body], [])
+    # ...and the whole two-tick sequence, driven end to end through the PRODUCTION function with
+    # tick 1's park write FAILING — the exact one-API-call window (a secondary content-creation
+    # limit, a runner death) the receipt-first order opens.
+    _ir_t1 = _IdentityWrites().install()
+    _ir_saved_set = globals()["set_review_state"]
+    globals()["set_review_state"] = lambda repo, pr, state, **kw: (_ for _ in ()).throw(
+        WorkerPrError("secondary rate limit on the label write"))
+    _ir_t1_raised = None
+    try:
+        identity_refusal("o/r", 41, "author-not-app-bot", issue=77, bot_login=_ir_bot,
+                         head_sha="c" * 40)
+    except WorkerPrError as exc:
+        _ir_t1_raised = str(exc)
+    finally:
+        globals()["set_review_state"] = _ir_saved_set
+        _ir_t1.restore()
+    check("[#979] tick 1 crashing between the receipt and the park leaves receipt-written, "
+          "park-NOT-written (the window this fix exists for is REAL, not hypothetical)",
+          (bool(_ir_t1_raised), len(_ir_t1.comments), _ir_t1.states),
+          (True, 1, []))
+    _ir_t2, _ = _drive_identity_refusal(
+        "author-not-app-bot",
+        existing=[{"user": {"login": _ir_bot}, "body": _ir_t1.comments[0]}], live=())
+    check("[#979] ...and tick 2 reading tick 1's own receipt COMPLETES the exit instead of "
+          "returning silently (the loop terminates on the second tick)",
+          (_ir_t2.states, _ir_t2.issue_status, len(_ir_t2.alerts)),
+          (["needs-user"], [(77, "needs-user")], 1))
+    # (3c) THE FAIL DIRECTION of the park re-read, which is the OPPOSITE of every other label
+    #      read in this file: unreadable labels must re-drive the park, never suppress it.
+    _ir_blind_labels, _ = _drive_identity_refusal(
+        "author-not-app-bot", existing=_ir_receipt, live=(), labels_unreadable=True)
+    check("[#979] an UNREADABLE live-label surface re-drives the park (fail toward the exit; a "
+          "duplicate label write is a no-op, a missing one is #972)",
+          _ir_blind_labels.states, ["needs-user"])
+    check("[#979] identity_refusal_parked answers on the LIVE label, and answers FALSE when the "
+          "read raises",
+          (identity_refusal_parked("o/r", 41, lambda r, p: {"review:needs-user"}),
+           identity_refusal_parked("o/r", 41, lambda r, p: {"review:needs"}),
+           identity_refusal_parked("o/r", 41, lambda r, p: set()),
+           identity_refusal_parked("o/r", 41, lambda r, p: (_ for _ in ()).throw(
+               WorkerPrError("boom")))),
+          (True, False, False, False))
     # (4) THE READER'S TRUST FILTER. A receipt authored by anyone but the bot must not be able
     #     to SUPPRESS the exit — that would be a remote off-switch for the loop's only exit.
     _ir_forged, _ = _drive_identity_refusal(
@@ -11774,14 +11897,26 @@ def _self_test():
           (_ir_no_issue.states, _ir_no_issue.issue_status, len(_ir_no_issue.comments)),
           (["needs-user"], [], 2))
     # ...and the CLI seam declares NO `type=int`, so nothing upstream of the coercion can reject
-    # the value first. Asserted through the PRODUCTION parser: an empty --issue must NOT be an
-    # argparse error (exit 2 / "invalid int value") — it reaches the code above instead.
+    # the value first. Asserted through the PRODUCTION parser, on a path that makes NO GitHub call.
+    #
+    # [registry #979 round-2 finding 2] ARGUMENT ORDER IS THE WHOLE PROOF, and round 1 had it
+    # backwards. argparse converts and validates each option AS IT REACHES IT and exits on the
+    # FIRST error, so with `--reason` first the parser died on the reason and never converted
+    # `--issue` at all: "invalid int value" was absent whether or not `--issue` declared
+    # `type=int`, and the row was vacuous — MEASURED, it was the sole survivor of round 1's
+    # eleven production mutants. `--issue` now comes FIRST, so the parser must get PAST it to
+    # reach the reason, and the assertion is POSITIVE rather than an absence: stderr must name
+    # the REASON error (proving the empty `--issue` was accepted and parsing continued) and must
+    # NOT name an int-conversion error. Adding `type=int` inverts both halves.
     _ir_issue_cli = subprocess.run(
         [sys.executable, "-B", str(Path(__file__).resolve()), "identity-refusal",
-         "--repo", "o/r", "--pr", "41", "--reason", "not-a-declared-code", "--issue", ""],
+         "--repo", "o/r", "--pr", "41", "--issue", "", "--reason", "not-a-declared-code"],
         capture_output=True, text=True, check=False)
-    check("[#972] the CLI's --issue is not `type=int` (an empty value is never an argparse error)",
-          "invalid int value" in _ir_issue_cli.stderr, False)
+    check("[#972] the CLI's --issue is not `type=int`: parsing gets PAST an empty --issue and "
+          "fails on the LATER argument instead (an empty value is never an argparse error)",
+          (_ir_issue_cli.returncode,
+           "invalid choice: 'not-a-declared-code'" in _ir_issue_cli.stderr,
+           "invalid int value" in _ir_issue_cli.stderr), (2, True, False))
     # (8) THE FAIL DIRECTION of the idempotence read. An unreadable comment page must never
     #     SUPPRESS the exit — a duplicate receipt is noise, a missing one is the #972 loop.
     _ir_blind = _IdentityWrites().install()

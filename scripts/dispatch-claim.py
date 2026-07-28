@@ -20956,10 +20956,27 @@ def _starvation_yaml_seam_self_test():
 # infinite retry, and the interlock in `enrolment_enable_error` could see none of it.
 #
 # THIS IS ENTIRELY A YAML-SEAM FIX, which is where this repo keeps measuring its vacuous guards. So
-# every pin below is STRUCTURAL, on PARSED nodes, compared for EQUALITY — never a substring
-# containment. A `&& false` conjunct, an `if: false`, a deleted `needs:`, an env re-pointed at the
-# neighbouring output and a step demoted to a comment are ALL invisible to containment, and every
-# one of them silently restores the loop.
+# every pin below is one of exactly TWO kinds, and NEVER a substring containment:
+#
+#   (1) EQUALITY on a PARSED node — an `if:` expression, an `env:` value, a job output, a `needs:`
+#       list, a step id or a step ORDER. A `&& false` conjunct, an `if: false`, a deleted `needs:`
+#       and an env re-pointed at the neighbouring output are all invisible to containment and
+#       every one of them silently restores the loop; equality sees each of them.
+#
+#   (2) EXECUTION of the workflow's own code — the identity python block (`_identity_block_run`),
+#       the fail-closed stop (`_identity_stop_violations`) and the recording invocation
+#       (`_identity_record_violations`). Text containment cannot tell a LIVE statement from a dead
+#       one, which is not a theory: this PR's round-1 review MEASURED eight non-crashing mutants
+#       that survived precisely because two pins here were containment checks on shell source —
+#       `: # exit 1`, `if false; then exit 1; fi`, `echo "would exit 1"` and `continue-on-error:
+#       true` for the stop, and `echo <cmd>`, a commented-out command, `false && <cmd>` and
+#       `if false; then <cmd>; fi` for the recorder. Four of them left the refusal with NO durable
+#       outcome (#972 restored invisibly while this suite printed "all mutants caught"); three
+#       disabled the only barrier between a refusal and a model holding a target-scoped App token.
+#
+# The claim is CHECKED, not asserted: `_identity_seam_pin_discipline_violations` walks this
+# module's own AST and reds if any pin in this section reaches a containment operator over a
+# workflow script — the negation of the claim, grepped by the code that makes it.
 _IDENTITY_SEAM_RUN_OUTPUT = "${{ steps.target.outputs.refusal }}"
 _IDENTITY_SEAM_REFUSE_IF = "${{ steps.target.outputs.bot_login == '' }}"
 _IDENTITY_SEAM_RECORD_IF = "${{ needs.run.outputs.identity_refusal != '' }}"
@@ -21021,6 +21038,203 @@ def _identity_block_run(script, *, full_name="o/r", default_branch="main",
         bound = dict(line.split("=", 1)
                      for line in out_file.read_text(encoding="utf-8").splitlines() if line)
     return code, bound
+
+
+# [registry #979 round-2 finding 1] A workflow `run:` script is not shell until the runner has
+# substituted its GitHub expressions, so `${{ … }}` becomes an inert literal before bash sees it
+# (bash would otherwise reject `${{` as a bad substitution and every execution below would degrade
+# into an unrunnable-seam "violation" that is really a harness bug).
+_IDENTITY_SEAM_GHA_EXPR_RE = re.compile(r"\$\{\{.*?\}\}", re.S)
+# The runner's DEFAULT shell for a `run:` step on ubuntu-latest. Executing the script under any
+# other semantics would prove a property the production runner does not have, so the steps below
+# are additionally pinned to declare NO `shell:` of their own.
+_IDENTITY_SEAM_SHELL = ["bash", "-e"]
+
+
+def _identity_shell_step(script, *, env=None, path_prefix=None):
+    """EXECUTE one workflow `run:` script the way the runner does and return its exit status.
+
+    [registry #979 round-2 finding 1] This exists because ``"exit 1" in step["run"]`` cannot tell a
+    LIVE statement from a dead one: `: # exit 1`, `if false; then exit 1; fi` and
+    `echo "would exit 1"` all contain the substring and all leave the job GREEN. Only running it
+    can distinguish them, exactly as `_identity_block_run` above already does for the python
+    block."""
+    source = _IDENTITY_SEAM_GHA_EXPR_RE.sub("__gha_expr__", script)
+    with tempfile.TemporaryDirectory() as tmp:
+        entry = Path(tmp) / "step.sh"
+        entry.write_text(source, encoding="utf-8")
+        run_env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": tmp,
+                   "LC_ALL": "C"}
+        if path_prefix:
+            run_env["PATH"] = f"{path_prefix}:{run_env['PATH']}"
+        run_env.update(env or {})
+        return subprocess.run(_IDENTITY_SEAM_SHELL + [str(entry)], cwd=tmp, env=run_env,
+                              capture_output=True, text=True, timeout=60, check=False).returncode
+
+
+def _identity_stop_violations(step):
+    """The FAIL-CLOSED STOP, proved by RUNNING it. It is the only thing between a refused identity
+    and a model launched with a target-scoped App token, so nothing here is a containment check.
+
+    Three properties, all of which a green-looking mutant can break independently: the script
+    EXITS NON-ZERO when executed; the step declares no `shell:` of its own (so the thing executed
+    here is the thing the runner executes); and the step declares no `continue-on-error:` (a
+    truthy one keeps the job going past a failed stop, which is the same admission hole with the
+    `exit 1` still sitting there in plain text)."""
+    out = []
+    script = step.get("run")
+    if not isinstance(script, str):
+        return ["the refusal stop has no `run:` script, so it cannot FAIL the job — the run "
+                "would continue past an unverified target identity"]
+    if step.get("shell") is not None:
+        out.append(f"the refusal stop declares its own `shell:` ({step.get('shell')!r}); the "
+                   "#972 stop is pinned by EXECUTION under the runner's default `bash -e`, and a "
+                   "different shell is a different set of semantics than the one proved here")
+    if step.get("continue-on-error") is not None:
+        out.append(f"the refusal stop declares `continue-on-error: "
+                   f"{step.get('continue-on-error')!r}` — a failed stop would no longer stop the "
+                   "JOB, so the run continues to the target checkout and the model launches with "
+                   "an unverified target identity (the `exit 1` is still there and is inert)")
+    try:
+        code = _identity_shell_step(script)
+    except Exception as exc:      # noqa: BLE001 — an unrunnable stop proves nothing
+        return out + [f"the refusal stop could not be executed ({exc!r}), so its failure cannot "
+                      "be proved — treated as broken"]
+    if code == 0:
+        out.append(f"the refusal stop EXECUTES to exit {code} — it no longer FAILS the job, so "
+                   "the run would continue past an unverified target identity (a demoted, "
+                   "commented-out or conditionally-dead `exit 1` still contains the text)")
+    return out
+
+
+def _identity_record_violations(step):
+    """The RECORDING invocation, proved by RUNNING the step with `python3` shimmed.
+
+    [registry #979 round-2 finding 1] ``'--reason "$IDENTITY_REFUSAL"' in step["run"]`` survives
+    `echo python3 …`, a whole-command comment-out, and `false && python3 …` — three mutants under
+    which the refusal reaches NO durable outcome and #972's loop is restored invisibly. The shim
+    answers the only question that matters: was the recorder actually INVOKED, and with which
+    argv."""
+    out = []
+    script = step.get("run")
+    if not isinstance(step.get("run"), str):
+        return ["the identity-refusal step has no `run:` script, so no recorder is invoked and "
+                "the refusal reaches no durable outcome"]
+    if step.get("shell") is not None:
+        out.append(f"the identity-refusal step declares its own `shell:` ({step.get('shell')!r}); "
+                   "the invocation is pinned by EXECUTION under the runner's default `bash -e`")
+    sentinel = "seam-sentinel-not-a-declared-code"
+    with tempfile.TemporaryDirectory() as shim_dir:
+        argv_log = Path(shim_dir) / "argv.json"
+        shim = Path(shim_dir) / "python3"
+        shim.write_text(
+            # An ABSOLUTE interpreter shebang, never `/usr/bin/env python3`: the shim IS `python3`
+            # and is first on PATH, so an env lookup would resolve back to itself and hang.
+            f"#!{sys.executable}\n"
+            "import json, sys\n"
+            f"open({str(argv_log)!r}, 'a', encoding='utf-8').write("
+            "json.dumps(sys.argv[1:]) + '\\n')\n",
+            encoding="utf-8")
+        shim.chmod(0o755)
+        try:
+            code = _identity_shell_step(script, env={"IDENTITY_REFUSAL": sentinel},
+                                        path_prefix=shim_dir)
+        except Exception as exc:      # noqa: BLE001
+            return out + [f"the identity-refusal step could not be executed ({exc!r}), so the "
+                          "recorder invocation cannot be proved — treated as broken"]
+        invocations = [json.loads(line) for line in
+                       argv_log.read_text(encoding="utf-8").splitlines() if line.strip()] \
+            if argv_log.exists() else []
+    recorder = next((argv for argv in invocations if "identity-refusal" in argv), None)
+    if recorder is None:
+        out.append(f"the identity-refusal step EXECUTES without ever INVOKING the recorder "
+                   f"(exit={code}, python3 invocations={invocations!r}) — the command is echoed, "
+                   "commented out or conditionally dead, so the refusal reaches no durable "
+                   "outcome and the PR is re-dispatched forever (registry #972 verbatim)")
+        return out
+    if code != 0:
+        out.append(f"the identity-refusal step exits {code} even when the recorder succeeds — a "
+                   "failing recording step takes the whole outcome job, and therefore the "
+                   "refusal record, down with it")
+    if [sentinel] != [value for flag, value in zip(recorder, recorder[1:])
+                      if flag == "--reason"]:
+        out.append(f"the identity-refusal step did not pass --reason from $IDENTITY_REFUSAL "
+                   f"exactly once (argv={recorder!r}) — a hard-coded or absent reason records "
+                   "the wrong refusal, or none (env, never interpolated into the shell source — "
+                   "issue #199)")
+    return out
+
+
+# [registry #979 round-2 finding 1] THE NEGATION OF THIS SECTION'S OWN CLAIM, MADE CHECKABLE.
+# Round 1 asserted "never a substring containment" in prose while two pins were exactly that, and
+# nothing could tell. So the claim is now derived from the AST of these functions instead of being
+# written down: every containment operator that survives inside a pin function must appear in the
+# inventory below WITH the reason it is not a text check on a workflow script, and an inventory
+# entry that no longer matches anything is itself a violation (a stale exemption is how the next
+# containment pin hides).
+_IDENTITY_SEAM_PIN_FUNCTIONS = (
+    "_identity_refusal_seam_violations",
+    "_identity_block_violations",
+    "_identity_stop_violations",
+    "_identity_record_violations",
+)
+_IDENTITY_SEAM_CONTAINMENT_METHODS = (
+    "startswith", "endswith", "find", "rfind", "index", "count", "search", "match", "fullmatch")
+_IDENTITY_SEAM_DECLARED_CONTAINMENT = {
+    # Membership in a PARSED `needs:` LIST of job names. Not text: the list IS the thing pinned,
+    # and no rewriting of any script can add or remove a member of it.
+    ("_identity_refusal_seam_violations", "'run' not in (outcome_job.get('needs') or [])"),
+    # The step FINDER, not a pin. It ADDRESSES the recording step; whether that step actually
+    # records anything is decided by EXECUTING it in _identity_record_violations. A mutant that
+    # renames the command away makes this find nothing, which is its own named violation.
+    ("_identity_refusal_seam_violations", "'identity-refusal' in s['run']"),
+    # POSITION lookups in the PARSED steps list — this is `list.index`, not `str.find`: they are
+    # what pins step ORDER (the stop immediately after `target`; the recorder after the App-token
+    # mint), and no rewriting of any script text can move a step.
+    ("_identity_refusal_seam_violations", "(run_job.get('steps') or []).index(stop)"),
+    ("_identity_refusal_seam_violations", "steps.index(record)"),
+    # Membership in the dict of OUTPUTS the workflow's own python actually BOUND (parsed from the
+    # step's GITHUB_OUTPUT file), not in its source text.
+    ("_identity_block_violations", "'refusal' in ok_bound"),
+    # Membership in the ARGV the recorder was actually INVOKED with — a runtime value produced by
+    # executing the step, not a substring of the step.
+    ("_identity_record_violations", "'identity-refusal' in argv"),
+}
+
+
+def _identity_seam_pin_discipline_violations(source=None):
+    """The seam's methodology claim, PROVED over its own AST rather than asserted in a comment.
+
+    Returns named violations for every containment operator inside a #972 pin function that is not
+    declared in `_IDENTITY_SEAM_DECLARED_CONTAINMENT`, and for every declaration that no longer
+    matches anything. `source` is for driving the check against a KNOWN POSITIVE in the self-test
+    (an instrument that has never reported a defect has not been shown to be able to)."""
+    if source is None:
+        source = Path(__file__).resolve().read_text(encoding="utf-8")
+    found = set()
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.FunctionDef) or node.name not in _IDENTITY_SEAM_PIN_FUNCTIONS:
+            continue
+        for inner in ast.walk(node):
+            if isinstance(inner, ast.Compare) and any(
+                    isinstance(op, (ast.In, ast.NotIn)) for op in inner.ops):
+                found.add((node.name, ast.unparse(inner)))
+            elif isinstance(inner, ast.Call) and isinstance(inner.func, ast.Attribute) \
+                    and inner.func.attr in _IDENTITY_SEAM_CONTAINMENT_METHODS:
+                found.add((node.name, ast.unparse(inner)))
+    out = []
+    for name, expression in sorted(found - _IDENTITY_SEAM_DECLARED_CONTAINMENT):
+        out.append(f"{name} contains an UNDECLARED containment operator {expression!r}. The #972 "
+                   "seam claims every pin is equality on a parsed node or execution of the "
+                   "workflow's own code; a containment check on workflow SOURCE survives "
+                   "`: # exit 1`, `echo <cmd>` and `false && <cmd>`. Replace it with execution or "
+                   "equality, or declare it in _IDENTITY_SEAM_DECLARED_CONTAINMENT with the "
+                   "reason it is not a text check")
+    for name, expression in sorted(_IDENTITY_SEAM_DECLARED_CONTAINMENT - found):
+        out.append(f"_IDENTITY_SEAM_DECLARED_CONTAINMENT declares {expression!r} in {name}, which "
+                   "no longer exists — a stale exemption is exactly the hole a future containment "
+                   "pin would hide in; delete the declaration")
+    return out
 
 
 def _identity_block_violations(step):
@@ -21099,9 +21313,9 @@ def _identity_refusal_seam_violations(document):
         if index >= 0 and stop_index != index + 1:
             out.append("the refusal stop must be the step IMMEDIATELY after `target`: any step "
                        "between them runs with an unverified target identity")
-        if "exit 1" not in (stop.get("run") or ""):
-            out.append("the refusal stop no longer FAILS the job (`exit 1` is gone) — the run "
-                       "would continue past an unverified target identity")
+        # ...and it must actually FAIL, proved by EXECUTING it — never by looking for `exit 1` in
+        # its text, which four independently green mutants satisfy while the stop is inert.
+        out.extend(_identity_stop_violations(stop))
 
     # (4) The outcome job must ADMIT the refusal path...
     if outcome_job.get("if") != _IDENTITY_SEAM_OUTCOME_IF:
@@ -21142,9 +21356,10 @@ def _identity_refusal_seam_violations(document):
             out.append(f"the identity-refusal step's env.IDENTITY_REFUSAL must be "
                        f"{_IDENTITY_SEAM_RECORD_ENV!r} (found {env_got!r}) — re-pointing it at a "
                        "neighbouring output feeds the recorder the wrong reason")
-        if '--reason "$IDENTITY_REFUSAL"' not in record["run"]:
-            out.append("the identity-refusal step must pass --reason from $IDENTITY_REFUSAL "
-                       "(env, never interpolated into the shell source — issue #199)")
+        # ...and the recorder must actually be INVOKED with that reason, proved by EXECUTING the
+        # step against a `python3` shim — never by looking for the flag in the step's text, which
+        # `echo <cmd>`, a commented-out command and `false && <cmd>` all satisfy inertly.
+        out.extend(_identity_record_violations(record))
         token_index = next((i for i, s in enumerate(steps) if isinstance(s, dict)
                             and s.get("id") == "app-token-outcome"), None)
         if token_index is None or steps.index(record) < token_index:
@@ -21162,6 +21377,33 @@ def _identity_refusal_seam_self_test():
     live = yaml.safe_load(text)
     assert _identity_refusal_seam_violations(live) == [], \
         _identity_refusal_seam_violations(live)
+
+    # ---- (0) [registry #979 round-2 finding 1] THE METHODOLOGY CLAIM, CHECKED RATHER THAN
+    # ASSERTED. Round 1's comment said "never a substring containment" while two pins were exactly
+    # that, and nothing in the suite could contradict the sentence. This walks the pins' own AST.
+    #
+    # THE INSTRUMENT IS VALIDATED AGAINST A KNOWN POSITIVE FIRST, because a checker that has never
+    # reported anything has not been shown to be ABLE to: the same source, with one containment
+    # pin injected into a pin function, must red — and the guard is worthless if it does not.
+    _pin_canary = re.sub(
+        r"(def _identity_stop_violations\(step\):\n)",
+        r"\1    _canary = 'exit 1' in str(step.get('run'))\n",
+        Path(__file__).resolve().read_text(encoding="utf-8"), count=1)
+    _canary_found = _identity_seam_pin_discipline_violations(_pin_canary)
+    assert "'exit 1' in str(step.get('run'))" in " ".join(_canary_found), (
+        "the containment-discipline checker FAILED ITS OWN KNOWN POSITIVE: an injected "
+        "`'exit 1' in step['run']` pin was not reported, so a clean report from it proves "
+        f"nothing (got {_canary_found!r})")
+    assert _pin_canary != Path(__file__).resolve().read_text(encoding="utf-8"), \
+        "the containment canary did not actually edit the source (a no-op canary validates " \
+        "nothing)"
+    print("  ok   #979 the containment-discipline checker REDS on a known-positive injected "
+          "containment pin (instrument validated before it is trusted)")
+    _pin_violations = _identity_seam_pin_discipline_violations()
+    assert _pin_violations == [], _pin_violations
+    print(f"  ok   #979 every containment operator surviving in the "
+          f"{len(_IDENTITY_SEAM_PIN_FUNCTIONS)} #972 pin functions is DECLARED with the reason "
+          "it is not a text check on workflow source (and no declaration is stale)")
 
     # ---- (A) THE BLOCK ITSELF, EXECUTED. Not a re-implementation: the workflow's own python.
     _, step = _identity_step(live["jobs"]["run"]["steps"])
@@ -21311,6 +21553,24 @@ def _identity_refusal_seam_self_test():
         "the refusal stop is moved AFTER the target checkout":
             lambda d: run_steps(d).insert(
                 _identity_step(run_steps(d))[0] + 1, {"name": "wedge", "run": "true"}),
+        # [registry #979 round-2 finding 1] THE FOUR THAT SURVIVED ROUND 1. Every one of them
+        # leaves `exit 1` in the step's text — the pin here used to be `"exit 1" not in run` —
+        # and every one of them lets the job continue to the target checkout and the model with
+        # an UNVERIFIED target identity. They die now because the stop is EXECUTED.
+        "the refusal stop's `exit 1` is COMMENTED OUT (the text survives, the exit does not)":
+            lambda d: stop_step(d).__setitem__(
+                "run", stop_step(d)["run"].replace("exit 1", ": # exit 1")),
+        "the refusal stop's `exit 1` is made CONDITIONALLY DEAD (if false; then exit 1; fi)":
+            lambda d: stop_step(d).__setitem__(
+                "run", stop_step(d)["run"].replace(
+                    "exit 1", "if false; then exit 1; fi")),
+        "the refusal stop's `exit 1` is DEMOTED TO A MESSAGE (echo \"would exit 1\")":
+            lambda d: stop_step(d).__setitem__(
+                "run", stop_step(d)["run"].replace("exit 1", 'echo "would exit 1"')),
+        "the refusal stop gains continue-on-error: true (it fails, the JOB does not)":
+            lambda d: stop_step(d).__setitem__("continue-on-error", True),
+        "the refusal stop declares its own shell (different semantics than the one proved)":
+            lambda d: stop_step(d).__setitem__("shell", "bash --noprofile {0}"),
         # --- the outcome job's admission ---
         "the outcome job's identity_refusal disjunct is DELETED":
             lambda d: d["jobs"]["outcome"].__setitem__(
@@ -21361,6 +21621,35 @@ def _identity_refusal_seam_self_test():
         "the recording step is hoisted ABOVE the App-token mint it needs":
             lambda d: outcome_steps(d).insert(0, outcome_steps(d).pop(
                 outcome_steps(d).index(record_step(d)))),
+        # [registry #979 round-2 finding 1] THE FOUR THAT SURVIVED ROUND 1 on this side. Each
+        # keeps `--reason "$IDENTITY_REFUSAL"` character-for-character — the pin here used to be
+        # a containment check for exactly that string — while the recorder is NEVER INVOKED. On
+        # every one of them the refusal writes no census row and no park, so #972's loop is
+        # restored INVISIBLY while this suite prints "all mutants caught". They die now because
+        # the step is EXECUTED against a `python3` shim that reports whether it ran.
+        "the recording invocation is DEMOTED TO AN ECHO (argv printed, recorder never runs)":
+            lambda d: record_step(d).__setitem__(
+                "run", record_step(d)["run"].replace(
+                    "python3 registry/scripts/worker-pr.py",
+                    "echo python3 registry/scripts/worker-pr.py")),
+        "the recording invocation is COMMENTED OUT entirely":
+            lambda d: record_step(d).__setitem__(
+                "run", record_step(d)["run"].replace(
+                    "python3 registry/scripts/worker-pr.py",
+                    "# python3 registry/scripts/worker-pr.py")),
+        "the recording invocation is made CONDITIONALLY INERT (false && <cmd>)":
+            lambda d: record_step(d).__setitem__(
+                "run", record_step(d)["run"].replace(
+                    "python3 registry/scripts/worker-pr.py",
+                    "false && python3 registry/scripts/worker-pr.py")),
+        "the recording invocation is wrapped in a DEAD branch (if false; then <cmd>; fi)":
+            lambda d: record_step(d).__setitem__(
+                "run", record_step(d)["run"].replace(
+                    "python3 registry/scripts/worker-pr.py",
+                    "if false; then python3 registry/scripts/worker-pr.py").replace(
+                    '--reason "$IDENTITY_REFUSAL"', '--reason "$IDENTITY_REFUSAL"; fi')),
+        "the recording step declares its own shell (different semantics than the one proved)":
+            lambda d: record_step(d).__setitem__("shell", "bash --noprofile {0}"),
         # --- whole-document shapes ---
         "the run job's steps are replaced by a scalar":
             lambda d: d["jobs"]["run"].__setitem__("steps", "nope"),
