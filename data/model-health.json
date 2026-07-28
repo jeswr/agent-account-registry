@@ -2018,6 +2018,14 @@
    "model_alias": "opus5",
    "exit_class": "unknown",
    "run_id": "30336222418.1"
+  },
+  {
+   "ts": 1785221793,
+   "provider": "anthropic",
+   "account": "488920c2efe2b3fb",
+   "model_alias": "opus5",
+   "exit_class": "success",
+   "run_id": "30336193454.1"
   }
  ]
 }
