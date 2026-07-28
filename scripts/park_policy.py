@@ -1248,10 +1248,43 @@ PARK_CLASS_QUESTION = "question"
 GROOM_AGE_PARK_MARKER = "<!-- registry-groom-age-park:v1"
 GROOM_AGE_UNPARK_MARKER = "<!-- registry-groom-age-unpark:v1"
 
+# --- the CONFLICT RESOLVER's stuck-attempt park, declared here for the same reason -------------
+#
+# resolve-conflicts.py's grace-window exit used to write the HUMAN terminal for a TIMEOUT — the
+# identical defect #769 closed for groom, on a program #769 did not touch. It now writes the
+# machine class with its own cause-gated exit, which puts a SECOND foreign episode into the
+# `review:parked` population the capacity sweep reads. The writer (resolve-conflicts) and the
+# reader (dispatch-claim's re-admission sweep) are, again, separate entry points, so the spelling
+# lives here and neither side hand-copies it.
+CONFLICT_STUCK_PARK_MARKER = "<!-- conflict-resolver stuck-park:v1"
+CONFLICT_STUCK_UNPARK_MARKER = "<!-- conflict-resolver stuck-unpark:v1"
 
-def age_park_episode(labels, comments, bot_login, superseding_markers=(), log=print):
-    """``(owned, detail)`` — whether the live machine park belongs to groom's AGE-park episode,
-    and therefore is NOT the capacity sweep's to clear.
+# Every mechanism whose `review:parked` park is CAUSE-GATED and cleared by its OWN sweep, as
+# (durable park-receipt marker, what to call it, why fleet health cannot speak to its cause).
+# The capacity sweep must leave EVERY row here alone; adding a mechanism is adding a row.
+#
+# THIS TUPLE IS THE POINT. `age_park_episode` is a per-mechanism predicate only by accident of
+# having had one mechanism; the property it actually tests — "some other sweep owns this park's
+# exit, and the sustained-fleet-health heuristic would clear it on AGE ALONE" — is shared by
+# every cause-gated writer. Keeping it per-mechanism means each new writer silently re-acquires
+# #769's defect until someone remembers to add a guard at the reader, which is a checkout root
+# away.
+CAUSE_GATED_PARK_OWNERS = (
+    (GROOM_AGE_PARK_MARKER,
+     "groom's cause-gated AGE park",
+     "its exit is groom's own cause proof, and sustained fleet health is not evidence about an "
+     "orphan draft or a wedged merge state"),
+    (CONFLICT_STUCK_PARK_MARKER,
+     "the conflict resolver's cause-gated STUCK-ATTEMPT park",
+     "its exit is the resolver's own cause proof — the PR head moving, or the conflict "
+     "resolving — and sustained fleet health is evidence about neither"),
+)
+
+
+def cause_gated_park_episode(labels, comments, bot_login, superseding_markers=(), log=print):
+    """``(owned, detail)`` — whether the live machine park belongs to a CAUSE-GATED episode owned
+    by another sweep (CAUSE_GATED_PARK_OWNERS), and therefore is NOT the capacity sweep's to
+    clear. `detail` names WHICH mechanism owns it.
 
     THE DEFECT THIS EXISTS TO CLOSE (registry #769, reproduced end to end against the real
     dispatch-claim sweep over real model-health records). groom's age park writes
@@ -1295,10 +1328,11 @@ def age_park_episode(labels, comments, bot_login, superseding_markers=(), log=pr
          and such a PR can still carry an age receipt from an EARLIER, already-closed episode
          (groom parked it, the cause recovered, groom cleared the label). Judging that receipt
          would refuse an issue-side capacity park groom has no exit for.
-      1. INERT UNLESS PROVEN RELEVANT. With no bot-authored age-park receipt anywhere in the
-         history the answer is False with no timestamp parsing at all. This is what makes the
-         change safe for the entire existing capacity population: a PR that has never seen a
-         groom age park cannot reach a single new branch, so no legacy park loses the #691 exit.
+      1. INERT UNLESS PROVEN RELEVANT. With no bot-authored receipt from ANY row of
+         CAUSE_GATED_PARK_OWNERS anywhere in the history the answer is False with no timestamp
+         parsing at all. This is what makes the change safe for the entire existing capacity
+         population: a PR that has never seen a cause-gated park cannot reach a single new
+         branch, so no legacy park loses the #691 exit.
       2. TRUST FILTER FIRST. Only the orchestration bot's own comments are receipts (the rule
          every other receipt reader here applies), so a third party cannot forge an age receipt
          and talk a genuine capacity park into standing forever.
@@ -1319,14 +1353,21 @@ def age_park_episode(labels, comments, bot_login, superseding_markers=(), log=pr
     the receipt BEFORE it deletes the label, so a receipt with the label still live is groom's
     own crash residue, which groom's convergence branch completes. Treating it as an episode
     boundary would hand that residue to the capacity sweep, which would clear it while minting a
-    receipt claiming a starvation recovery that never happened."""
+    receipt claiming a starvation recovery that never happened. The SAME reasoning covers
+    CONFLICT_STUCK_UNPARK_MARKER, which is written receipt-first by the same discipline.
+
+    MULTI-OWNER RESOLUTION. When receipts from more than one owner are on record the NEWEST one
+    names the episode, by the same strictly-newer rule the superseding markers use — an older
+    mechanism's receipt cannot claim a park a newer mechanism has since applied. A tie keeps the
+    FIRST row of CAUSE_GATED_PARK_OWNERS, which is arbitrary but deterministic: both answers are
+    True, and only the `detail` prose differs."""
     if MACHINE_PARK_PR_LABEL not in {label for label in (labels or ())
                                      if isinstance(label, str)}:
         return (False, "")
     if not bot_login:
         return (False, "")
     rows = []
-    seen_age = False
+    seen_owned = False
     for comment in comments if isinstance(comments, list) else []:
         if not isinstance(comment, dict):
             continue
@@ -1341,37 +1382,44 @@ def age_park_episode(labels, comments, bot_login, superseding_markers=(), log=pr
         if login.casefold() != str(bot_login).casefold():
             continue
         body = str(comment.get("body", ""))
-        if GROOM_AGE_PARK_MARKER in body:
-            seen_age = True
+        if any(marker in body for marker, _name, _why in CAUSE_GATED_PARK_OWNERS):
+            seen_owned = True
         rows.append((comment.get("created_at"), body))
-    if not seen_age:
+    if not seen_owned:
         return (False, "")
-    newest_age = None
+    newest_owned = None
+    owner_name = owner_why = ""
     stamped = []
     for stamp, body in rows:
         if not valid_timestamp(stamp):
             log(f"::warning::a bot receipt carries an unreadable stamp {stamp!r}, so the "
-                "age-park episode boundary cannot be established; the age park stands")
-            return (True, "a bot receipt carries an unreadable stamp, so the age-park episode "
-                          "boundary cannot be established")
+                "cause-gated park episode boundary cannot be established; the park stands")
+            return (True, "a bot receipt carries an unreadable stamp, so the cause-gated park "
+                          "episode boundary cannot be established")
         instant = parse_ts(stamp)
         stamped.append((instant, body))
-        if GROOM_AGE_PARK_MARKER in body and (newest_age is None or instant > newest_age):
-            newest_age = instant
+        for marker, name, why in CAUSE_GATED_PARK_OWNERS:
+            if marker in body and (newest_owned is None or instant > newest_owned):
+                newest_owned, owner_name, owner_why = instant, name, why
     for instant, body in stamped:
-        if instant <= newest_age:
+        if instant <= newest_owned:
             continue                    # a tie is ambiguous: it does NOT close the episode
         for marker in superseding_markers:
             if marker and marker in body:
                 return (False,
                         f"another park mechanism receipted at {canonical_ts(instant.isoformat())}"
-                        ", strictly after the newest age-park receipt — the age episode is "
+                        ", strictly after the newest cause-gated park receipt — that episode is "
                         "closed and this park is the capacity sweep's again")
     return (True,
-            f"groom's cause-gated AGE park (newest receipt "
-            f"{canonical_ts(newest_age.isoformat())}) — its exit is groom's own cause proof, and "
-            "sustained fleet health is not evidence about an orphan draft or a wedged merge "
-            "state")
+            f"{owner_name} (newest receipt {canonical_ts(newest_owned.isoformat())}) — "
+            f"{owner_why}")
+
+
+# The spelling dispatch-claim's re-admission sweep calls. It is NOT deprecated prose: the two
+# names are the same object, and the old one is kept because scripts/dispatch-claim.py is
+# concurrently owned by other in-flight work — a one-line rename there would be a merge conflict
+# bought for nothing, while the predicate it resolves to is the one that must not drift.
+age_park_episode = cause_gated_park_episode
 
 # The CLOSED taxonomy of park causes and the class each belongs to. The class decides label
 # ownership (invariant 1): a capacity cause takes the MACHINE-owned soft hold (review:parked /
@@ -3024,6 +3072,54 @@ def _self_test():
            park_refusal_exit_class(PARK_REFUSAL_FOREIGN_EPISODE),
            PARK_REFUSAL_FOREIGN_EPISODE in PARK_REFUSAL_HUMAN_TERMINAL),
           (True, "exit-reachable", False))
+
+    # ---- the predicate is PER-CLASS, not per-mechanism: the conflict resolver's stuck-attempt
+    # park is the second cause-gated writer of `review:parked`, and it acquired #769's defect on
+    # a program #769 did not touch. Its exit is the resolver's own cause proof (the head moving,
+    # the conflict resolving), so the sustained-fleet-health heuristic — whose only condition
+    # this class can satisfy is BEING OLD ENOUGH — must not reach it either. ----
+    _stuck = (f"{CONFLICT_STUCK_PARK_MARKER} cause=head-unmoved head={'b' * 40} gen=1 -->")
+    check("cause_gated_park_episode: the CONFLICT RESOLVER's stuck-attempt park is bound too, "
+          "and the detail names WHICH mechanism owns the exit",
+          (cause_gated_park_episode(_live, [_epi(_stuck, "2026-07-28T10:00:00Z")],
+                                    _epi_bot, _sup)[0],
+           "conflict resolver" in cause_gated_park_episode(
+               _live, [_epi(_stuck, "2026-07-28T10:00:00Z")], _epi_bot, _sup)[1],
+           "groom" in cause_gated_park_episode(
+               _live, [_epi(_stuck, "2026-07-28T10:00:00Z")], _epi_bot, _sup)[1]),
+          (True, True, False))
+    check("cause_gated_park_episode: CONTROL — the groom age park still answers with GROOM's "
+          "detail, so the two owners are not collapsed into one another",
+          ("groom" in cause_gated_park_episode(
+              _live, [_epi(_age, "2026-07-28T10:00:00Z")], _epi_bot, _sup)[1],
+           "conflict resolver" in cause_gated_park_episode(
+               _live, [_epi(_age, "2026-07-28T10:00:00Z")], _epi_bot, _sup)[1]),
+          (True, False))
+    check("cause_gated_park_episode: with BOTH owners on record the NEWEST receipt names the "
+          "episode — an older mechanism cannot claim a park a newer one has since applied",
+          ("conflict resolver" in cause_gated_park_episode(
+              _live, [_epi(_age, "2026-07-28T09:00:00Z"), _epi(_stuck, "2026-07-28T10:00:00Z")],
+              _epi_bot, _sup)[1],
+           "groom" in cause_gated_park_episode(
+               _live, [_epi(_stuck, "2026-07-28T09:00:00Z"), _epi(_age, "2026-07-28T10:00:00Z")],
+               _epi_bot, _sup)[1]),
+          (True, True))
+    check("cause_gated_park_episode: a stuck-attempt park is superseded on exactly the same "
+          "rule the age park is — strictly newer, ties leave the park alone",
+          (cause_gated_park_episode(
+              _live, [_epi(_stuck, "2026-07-28T10:00:00Z"),
+                      _epi(PARK_REASON_MARKER, "2026-07-28T11:00:00Z")], _epi_bot, _sup)[0],
+           cause_gated_park_episode(
+               _live, [_epi(_stuck, "2026-07-28T10:00:00Z"),
+                       _epi(PARK_REASON_MARKER, "2026-07-28T10:00:00Z")], _epi_bot, _sup)[0]),
+          (False, True))
+    check("cause_gated_park_episode: the stuck-attempt marker spellings are WIRE FORMAT too, and "
+          "`age_park_episode` is the SAME object (dispatch-claim's call site cannot drift)",
+          (CONFLICT_STUCK_PARK_MARKER, CONFLICT_STUCK_UNPARK_MARKER,
+           age_park_episode is cause_gated_park_episode,
+           tuple(marker for marker, _n, _w in CAUSE_GATED_PARK_OWNERS)),
+          ("<!-- conflict-resolver stuck-park:v1", "<!-- conflict-resolver stuck-unpark:v1", True,
+           (GROOM_AGE_PARK_MARKER, CONFLICT_STUCK_PARK_MARKER)))
     logs.clear()
 
     # ---- probe_maintainer (round-3 Opus finding): a probe-call FAILURE warns loudly and
