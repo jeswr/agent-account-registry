@@ -749,6 +749,25 @@ def _self_test():
               "does not name exactly one ref" in
               (_refusal(lambda: rewrite(shorthand, shorthand_head, stream=io.StringIO())) or ""),
               True)
+        # SYMBOLIC-REF ALIAS. `git symbolic-ref refs/heads/<x> refs/remotes/origin/ledger` puts a
+        # name INSIDE refs/heads/ that stands for a ref outside it, and ref updates dereference
+        # symrefs — so if resolution reported the alias's own name, the guard would wave it through
+        # and filter-branch would move the remote-tracking ref. It does not: rev-parse
+        # `--symbolic-full-name` follows the symref (a whole chain of them) to the final direct ref
+        # name, which is what the guard then matches and what filter-branch acts on. That is a
+        # contract with GIT, not with this module, and nothing else here pins it — so pin it with a
+        # real alias rather than trusting the shorthand cases above to imply it.
+        _git(["symbolic-ref", "refs/heads/ledger-purge", "refs/remotes/origin/ledger"],
+             repo=shorthand)
+        check("rewrite refuses a refs/heads/ alias whose symref target is a remote-tracking ref",
+              "not a local branch under refs/heads/" in
+              (_refusal(lambda: rewrite(shorthand, "refs/heads/ledger-purge",
+                                        stream=io.StringIO())) or ""), True)
+        check("the refused alias still points where it did, undereferenced",
+              _git(["symbolic-ref", "refs/heads/ledger-purge"], repo=shorthand).decode().strip(),
+              "refs/remotes/origin/ledger")
+        # The two aggregate checks below now also cover the alias: rewriting THROUGH it would move
+        # refs/remotes/origin/ledger and leave a refs/original/ backup behind.
         check("no refused spelling moved the remote-tracking ref",
               _git(["rev-parse", "refs/remotes/origin/ledger"], repo=shorthand).decode().strip(),
               shorthand_head)
