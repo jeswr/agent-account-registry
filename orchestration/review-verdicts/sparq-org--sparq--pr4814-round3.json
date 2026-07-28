@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4814,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ea7da9797996b6b64e0a06e82a25f74e9ef0e961",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 3 remains clean. The published-bundle CI leg resolves the complete feature list from js/package.json's build:wasm command, fails closed when the expected --features argument is absent, and applies the resolved list to both wasm32 build and clippy checks. The current package script matches the documented feature set. The nightly-only change is an accurate comment update. No correctness, soundness, security, or test-validity issue is present.",
+  "verdict": "approve"
+ }
+}
