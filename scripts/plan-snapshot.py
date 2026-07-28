@@ -605,9 +605,26 @@ def inertness_attestation(claim, pulls, status_items):
     produced the defect.
 
     Returned as `{"items": {"<number>": bool}, "reasons": {"<number>": str}}`; the reasons ride
-    along ONLY for the census line and diagnostics — nothing decides on them. Runs in the
-    authenticated registry-inline snapshot step, which precedes ALL target-code execution
-    (REG-4), so no target can influence the attestation it later consumes.
+    along ONLY for the census line and diagnostics — nothing decides on them.
+
+    WHERE IT RUNS, STATED CORRECTLY. This function runs in the authenticated registry-inline
+    snapshot step, which precedes all target-code execution (REG-4) — so the attestation is
+    COMPUTED from data no target has touched. An earlier draft of this docstring went one step
+    further and said "no target can influence the attestation it later consumes". That is FALSE
+    and was corrected in round 2: the readiness step `exec_module`s the target's
+    `dispatch-plan.py` (dispatch.yml line ~399) BEFORE it reads `raw-inertness-<i>.json`
+    (line ~644), both in the same job on the same filesystem, so a hostile target can rewrite the
+    file at import time and hand itself any map it likes. DEMONSTRATED by execution: a target that
+    rewrote the document turned `0 of 1` into `2999 of 2999`.
+
+    That is not a hole this function opens or can close, and it is NOT the trust boundary that
+    matters, which is why the architecture is deliberately left alone. PLAN is the unprivileged,
+    advisory half by design (see this step's own header): it holds no token, and CLAIM
+    independently re-derives `_pull_inactivity_decision` over its OWN authenticated read before
+    any worker launches. A target that forges this map can therefore only over-propose rows CLAIM
+    then drops — the same fail-direction as the trust and linked-PR filters above it. Verified by
+    execution against a working positive control: latched, non-draft, resumed and unprovable PRs
+    all read `busy` at CLAIM, and only a genuinely-inert one reads `parked-free`.
 
     FAILS CLOSED IN EVERY DIRECTION. A malformed row, an unparseable number, a latch, a
     non-draft bit, a head that moved between the listing and the detail read — every one of them

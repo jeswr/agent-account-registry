@@ -218,7 +218,16 @@ jobs:
       # check-run listing skips THAT PR with a recorded reason instead of failing the sweep —
       # the run-29617040167 fix) and reads check runs gate-filtered (check_name=gate, the
       # d2c0dd0 pattern) so merge-queue churn heads with hundreds of runs stay one small page.
+      # [sparq#4819 round 2] `id:` so scripts/dispatch-plan.py --self-test can LOCATE this step and
+      # refuse the ways it can stop producing while every assertion downstream stays green. The
+      # readiness (consumer) seam has been pinned since #4329; this PRODUCER seam was not, and the
+      # round-1 review measured four survivors here — the step disabled with `if: false`, its
+      # failure swallowed by `continue-on-error:`, its invocation neutralised with `|| true`, and
+      # the output file renamed. Each degrades to the fail-safe every-PR-reserves path WITH a
+      # warning, so none of them is a correctness hole; all four are silent throughput loss, which
+      # is the same class as the defect this whole change closes.
       - name: Snapshot target issues and pull requests (authenticated, registry-inline only)
+        id: snapshot
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -586,9 +595,26 @@ jobs:
               # `occupancy_input` carried only {number,state,labels,open_blockers,pull_request} —
               # no `draft`, no `auto_merge` — so the predicate could not be evaluated where the
               # decision was made. PLAN reserved exactly the crates CLAIM was about to free. The
-              # registry's carve-out was live, loud, and DEAD. MEASURED on the live sparq snapshot
-              # (2026-07-28, 1623 open issues / 89 open PRs, sparq's own engine + real workspace
-              # roots): frontier 1 -> 9 with the attestation carried, candidates unchanged at 386.
+              # registry's carve-out was live, loud, and DEAD.
+              #
+              # WHAT IT IS WORTH, AND WHAT THAT NUMBER IS NOT. A round-1 comment here read
+              # "frontier 1 -> 9 with the attestation carried" and claimed a verbatim replay as
+              # its source. That measured the LEVER — this consumer against a planner that
+              # already honoured the field — not the state either PR shipped: sparq's
+              # `dispatch-plan.py` did not export `INERT_FIELD`, so a verbatim replay of the
+              # merged trees printed `NOT STAMPED (planner declares no inertness contract)` and
+              # released nothing. The re-export landed in sparq#4823 round 2; the figure below is
+              # a replay of THAT pair. It is a per-tick yield, not a property of this code —
+              # releasing a key only moves the frontier when some candidate was waiting on
+              # exactly that key, so it swings with the board and a repeat run will differ.
+              #
+              # MEASURED by replaying this step verbatim (2026-07-28, live sparq snapshot: 1721
+              # issue rows / 91 open PRs / 33 `review:parked`, sparq's own engine, this repo's
+              # `inertness_attestation` as producer): 33 of 33 parked PRs attested inert; PR-held
+              # `area:` keys 40 -> 25, 15 fully released with NO key losing a holder that is not
+              # itself an attested machine park; ready-lane frontier 0 -> 2 and plan rows 2 -> 4,
+              # candidates unchanged at 385. `docs` 34 -> 25 and `ci` 30 -> 27 stay held, as the
+              # union rule requires.
               #
               # NOT a second predicate — an ANSWER. `raw-inertness-<i>.json` is written by the
               # AUTHENTICATED registry-inline snapshot step (plan-snapshot.py), which runs before
@@ -598,13 +624,24 @@ jobs:
               # "would parking this PR really free its crates?" is the drift that caused the
               # defect; a third would make it worse.
               #
-              # FAIL-CLOSED AT EVERY SEAM. Missing file, incomplete document, non-dict items,
-              # non-numeric key, non-True value, PR absent from the map -> False -> the row keeps
-              # its areas, i.e. exactly today's behaviour. And the field is stamped ONLY on a
-              # planner that PROVES it consumes it correctly in BOTH directions (`inert_aware`,
-              # probed by execution against the loaded engine — never sniffed from an attribute,
-              # the `pr_row_aware` doctrine). A target that has not shipped the consumer is
-              # byte-identical to today and says so out loud.
+              # FAIL-CLOSED AT EVERY SEAM, AND THE LIST IS EXHAUSTIVE. Missing file, UNREADABLE OR
+              # TRUNCATED file, incomplete document, non-dict items, non-decimal key, non-True
+              # value, PR absent from the map -> False -> the row keeps its areas, i.e. exactly
+              # today's behaviour. Round 2 made the truncated case match these words: it used to
+              # raise out of `json.loads` and kill the step for every target. And the field is
+              # stamped ONLY on a planner that PROVES it consumes it correctly in BOTH directions
+              # (`inert_aware`, probed by execution against the loaded engine — never sniffed from
+              # an attribute, the `pr_row_aware` doctrine). A target that has not shipped the
+              # consumer is byte-identical to today and says so out loud, with an ANNOTATION.
+              #
+              # WHAT FAIL-CLOSED DOES *NOT* MEAN HERE. It does not mean the map is unforgeable.
+              # The target's `dispatch-plan.py` is `exec_module`d ~250 lines above, BEFORE this
+              # read, in this job, on this filesystem — a hostile target can rewrite
+              # `raw-inertness-<i>.json` at import time (demonstrated: `0 of 1` -> `2999 of
+              # 2999`). PLAN is the unprivileged advisory half by construction; CLAIM re-derives
+              # `_pull_inactivity_decision` over its own authenticated read before any launch, so
+              # a forged map can only over-propose rows CLAIM then drops. Same fail-direction as
+              # the trust and linked-PR filters below.
               inert_map = {}
               inert_path = Path(out_dir, f"raw-inertness-{index}.json")
               if not inert_path.is_file():
@@ -613,13 +650,37 @@ jobs:
                         "including provably-inert machine-parked drafts CLAIM will free later "
                         "this tick. PLAN and CLAIM will disagree (sparq#4819).")
               else:
-                  inert_doc = json.loads(inert_path.read_text(encoding="utf-8"))
+                  # UNREADABLE/TRUNCATED DEGRADES, it does not abort. Round-2 review: the words
+                  # above claim every seam degrades to today's behaviour, but a truncated or
+                  # empty document raised out of `json.loads` and killed the step for EVERY
+                  # target repo. `raw-issues-*.json` DOES hard-fail that way and is right to —
+                  # a partial issue listing plans the wrong frontier. This document is different
+                  # in kind: it is an OPTIONAL enhancement whose ABSENT case already degrades two
+                  # lines up, so hard-failing on truncation made "absent" and "half-written" —
+                  # the same accident, one fsync apart — behave oppositely. The words and the
+                  # behaviour now agree, and the direction is the conservative one: every PR
+                  # reserves its areas, exactly as before sparq#4819.
+                  try:
+                      inert_doc = json.loads(inert_path.read_text(encoding="utf-8"))
+                  except (ValueError, OSError, UnicodeDecodeError) as exc:
+                      inert_doc = None
+                      print(f"::warning::{repo}: inertness attestation is unreadable "
+                            f"({type(exc).__name__}) — falling back to every-PR-reserves "
+                            "(fail closed, sparq#4819).")
                   if (isinstance(inert_doc, dict) and inert_doc.get("complete") is True
                           and isinstance(inert_doc.get("items"), dict)):
+                      # `isdecimal`, NOT `isdigit`. Round-2 review found a real crash: `isdigit()`
+                      # admits Unicode digit-but-not-decimal characters — "²" (SUPERSCRIPT
+                      # TWO) and every other superscript/circled digit answer True — and `int()`
+                      # then raises ValueError out of the comprehension, killing the readiness
+                      # step for EVERY target repo. The key is a JSON object key, i.e. attacker-
+                      # reachable in any hostile-producer story, and one such key was a total
+                      # PLAN outage rather than a dropped row. `isdecimal()` is exactly the set
+                      # `int()` accepts, so the guard and the conversion now agree.
                       inert_map = {int(number): value is True
                                    for number, value in inert_doc["items"].items()
-                                   if str(number).isdigit()}
-                  else:
+                                   if str(number).isdecimal()}
+                  elif inert_doc is not None:
                       print(f"::warning::{repo}: inertness attestation is malformed or "
                             "incomplete — falling back to "
                             "every-PR-reserves (fail closed, sparq#4819).")
@@ -662,6 +723,25 @@ jobs:
               occupancy_input = []
               pr_aware, pr_aware_why = pr_row_aware(dispatch)
               inert_field, inert_why = inert_aware(dispatch)
+              if inert_field is None:
+                  # THE ANNOTATION ASYMMETRY THAT HID THE FIRST ROUND'S NO-OP. Both `::warning::`
+                  # annotations above cover the FILE seams — attestation absent, attestation
+                  # malformed. This one, the PLANNER seam, was a plain `print` buried mid-line in
+                  # the census. It is also the ONLY degradation that fired: the producer wrote a
+                  # complete document, every parked PR attested, and the target's dispatch-plan.py
+                  # did not export the two names, so the whole answer was computed and DISCARDED
+                  # with no annotation anywhere in the run. Round 1 shipped as a measured no-op
+                  # underneath a green run for exactly this reason.
+                  #
+                  # ALWAYS annotated when it fires, including when nothing attested inert this
+                  # tick: a degradation that only announces itself on ticks that had something to
+                  # lose is invisible on precisely the ticks where the loss is being established.
+                  # The counts ride along so the magnitude is readable without a second query.
+                  print(f"::warning::{repo}: PLAN computed an inertness attestation "
+                        f"({sum(1 for value in inert_map.values() if value)} of "
+                        f"{len(inert_map)} open PR(s) provably inert) and DISCARDED it — "
+                        f"{inert_why}. Machine-parked areas stay reserved here while CLAIM frees "
+                        "them later this tick, so PLAN and CLAIM disagree (sparq#4819).")
               if pr_aware:
                   for pull in pr_rows:
                       pr_number = pull.get("number")

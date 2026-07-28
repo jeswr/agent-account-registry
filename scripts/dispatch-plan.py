@@ -816,6 +816,69 @@ def _self_test():
                 f"({trailing[0].strip()!r}) — that command's exit status becomes the step's, so a "
                 "failing planner would be swallowed. Refusing.")
 
+    def _refuse_producer_swallow(path, step_id, invocation):
+        """Refuse any way the PRODUCER step can stop producing while the run stays green.
+
+        [sparq#4819 round 2, BLOCKING] `_refuse_exit_zero_swallow` pins the CONSUMER (`readiness`)
+        seam and cannot be reused here: it requires a `PY` heredoc terminator, and this step runs a
+        checked-in script. So the producer seam had NO refusal at all, and the round-1 review
+        measured three survivors on it — `if: false` on the step, `continue-on-error: true` on the
+        step, `|| true` on the invocation. Every one of them degrades to the fail-safe
+        every-PR-reserves path WITH a `::warning::`, so this is throughput loss with a detector
+        rather than a correctness hole; it is pinned anyway, because "the answer is computed and
+        discarded" with a warning nobody reads is precisely how round 1 shipped as a no-op.
+
+        Same three independent swallows as the consumer's, plus one this step has and that one
+        does not: the `plan-snapshot.py` INVOCATION must be the script's last command, because a
+        shell exits with its last command's status.
+        """
+        import yaml  # lazy, same as _refuse_exit_zero_swallow
+        with open(path, encoding="utf-8") as handle:
+            document = yaml.safe_load(handle)
+        found = []
+        for job_name, job in (document.get("jobs") or {}).items():
+            for step in (job or {}).get("steps") or []:
+                if isinstance(step, dict) and step.get("id") == step_id:
+                    found.append((job_name, job, step))
+        if len(found) != 1:
+            raise AssertionError(
+                f"expected exactly one step `id: {step_id}` in the parsed workflow, "
+                f"found {len(found)} — refusing")
+        job_name, job, step = found[0]
+        for scope, mapping in (("step", step), (f"job `{job_name}`", job)):
+            if mapping.get("continue-on-error"):
+                raise AssertionError(
+                    f"{scope} owning `id: {step_id}` carries a truthy `continue-on-error` — the "
+                    "producer could fail while the job stays green, and PLAN would silently plan "
+                    "with no inertness attestation. Refusing.")
+            if "if" in mapping and not _is_modelled_tick_floor_gate(scope, mapping, document):
+                raise AssertionError(
+                    f"{scope} owning `id: {step_id}` carries an `if:` condition — the producer "
+                    "would never run while every assertion over its output stayed green. "
+                    "Refusing.")
+        run = step.get("run")
+        if not isinstance(run, str):
+            raise AssertionError(f"step `id: {step_id}` has no `run:` script — refusing")
+        flattened = run.replace("\\\n", " ")
+        commands = [line for line in flattened.split("\n")
+                    if line.strip() and not line.lstrip().startswith("#")]
+        if not any(line.strip() == "set -euo pipefail" for line in commands):
+            raise AssertionError(
+                f"step `id: {step_id}`'s `run:` does not `set -euo pipefail` — refusing")
+        if "|| true" in "\n".join(commands):
+            raise AssertionError(
+                f"step `id: {step_id}` neutralises a command with `|| true` — the snapshot would "
+                "produce nothing and the step would still succeed. Refusing.")
+        last = commands[-1] if commands else "<none>"
+        # `--self-test` is excluded deliberately: it also matches `invocation`, so without this a
+        # reordering that left the SELF-TEST last — producing no snapshot at all — would pass.
+        if invocation not in last or "--self-test" in last:
+            raise AssertionError(
+                f"step `id: {step_id}`'s LAST command is {last.strip()!r}, not the `{invocation}` "
+                "snapshot invocation — a shell exits with its last command's status, so a failing "
+                "producer would be swallowed. Refusing.")
+        return step
+
     def _workflow_heredoc(path, step_id):
         """The dedented python heredoc of the ONE workflow step whose `id:` is `step_id`.
 
@@ -856,6 +919,13 @@ def _self_test():
 
     _readiness_source = _workflow_heredoc(
         os.path.join(_root, ".github", "workflows", "dispatch.yml"), "readiness")
+    # [sparq#4819 round 2] ...and the PRODUCER seam, refused the same way. Called at extraction
+    # time (not inside a `chk`) so a disabled/swallowed producer aborts this self-test outright
+    # rather than reporting one red row among the greens — the same posture `_workflow_heredoc`
+    # takes for the consumer.
+    _refuse_producer_swallow(
+        os.path.join(_root, ".github", "workflows", "dispatch.yml"), "snapshot",
+        "plan-snapshot.py")
 
     # A PR-AWARE planner, written to sparq's contract: an OPEN PR row reserves the `area:` keys it
     # declares (and NOTHING when it declares none — the occupancy-side rule, see the GLOBAL
@@ -955,7 +1025,7 @@ def _routing_doc():
         "def _routing_doc():",
         'INERT_FIELD = "inert"\nMACHINE_PARK_PR_LABEL = "review:parked"\n\n\ndef _routing_doc():')
 
-    def _run_readiness(rows_by_target, planners, attest=True):
+    def _run_readiness(rows_by_target, planners, attest=True, produce=None):
         """EXECUTE the real readiness step over a synthetic snapshot; return (plan, printed).
 
         `rows_by_target[i]` is the `/issues?state=open` listing for target i (PR rows included,
@@ -966,6 +1036,12 @@ def _routing_doc():
         `raw-inertness-<i>.json` the snapshot step writes. `attest=False` omits that file entirely
         (the PRODUCER-DELETED case); a DICT is written verbatim as the document, so a malformed or
         hostile attestation can be handed to the consumer. All three are asserted below.
+
+        [sparq#4819 round 2] `produce` replaces ALL of that with the REAL producer. Called as
+        `produce(workdir, index, repo, rows)`, it is then solely responsible for writing every
+        `raw-*.json` this target needs. That closes the round-1 gap where THIS HARNESS wrote
+        `raw-inertness-<i>.json` itself: the producer could rename the file (and its own
+        assertion) and both self-tests stayed green while production silently lost the carve-out.
         """
         import json as _json
         import shutil
@@ -1000,6 +1076,11 @@ def _routing_doc():
             with open(repos_path, "w", encoding="utf-8") as handle:
                 handle.write("\n".join(names) + "\n")
             for index, rows in enumerate(rows_by_target):
+                if produce is not None:
+                    # THE REAL PRODUCER writes every raw-*.json for this target, including the
+                    # attestation, at whatever path IT chooses. See the R1 row below.
+                    produce(workdir, index, names[index], rows)
+                    continue
                 pulls = [{"number": r["number"], "state": "open", "body": r.get("body", ""),
                           "author_association": "OWNER",
                           "head": {"ref": "sparq-agent/x", "sha": "0" * 40,
@@ -1012,14 +1093,20 @@ def _routing_doc():
                               encoding="utf-8") as handle:
                         _json.dump({"complete": True, "items": items}, handle)
                 if attest is not False:
-                    document = (attest if isinstance(attest, dict) else
-                                {"complete": True,
-                                 "items": {str(r["number"]): bool(r.get("_inert"))
-                                           for r in rows if "pull_request" in r},
-                                 "reasons": {}})
-                    with open(os.path.join(workdir, f"raw-inertness-{index}.json"), "w",
-                              encoding="utf-8") as handle:
-                        _json.dump(document, handle)
+                    path = os.path.join(workdir, f"raw-inertness-{index}.json")
+                    if isinstance(attest, str):
+                        # RAW BYTES, unserialised — the only way to write a document that is not
+                        # valid JSON at all (truncated / empty / half-flushed).
+                        with open(path, "w", encoding="utf-8") as handle:
+                            handle.write(attest)
+                    else:
+                        document = (attest if isinstance(attest, dict) else
+                                    {"complete": True,
+                                     "items": {str(r["number"]): bool(r.get("_inert"))
+                                               for r in rows if "pull_request" in r},
+                                     "reasons": {}})
+                        with open(path, "w", encoding="utf-8") as handle:
+                            _json.dump(document, handle)
             with open(os.path.join(workdir, "trusted-bots.json"), "w", encoding="utf-8") as handle:
                 _json.dump({name: [] for name in names}, handle)
             saved = (sys.argv[:], os.environ.get("TARGET_ROOT"), os.environ.get("PATH"))
@@ -1121,11 +1208,22 @@ def _routing_doc():
     _plan_own, _out_own = _run_readiness([_own_rows], [None])
     chk("[#768] this repo's OWN planner PASSES the probe — it holds the PR's area, plans no PR",
         (500 in _planned(_plan_own), _planned(_plan_own)), (False, [502]))
+    # [sparq#4819 round 2] The first element USED to be `"::warning::" in _out_own` -> False,
+    # i.e. "no annotation of any kind fired". That is the blanket shape this file warns about
+    # elsewhere — it is satisfied by the absence of ANY warning, including ones it does not mean —
+    # and it went red the moment the planner-side inertness degradation gained the `::warning::`
+    # it should always have had. It is REPLACED, not relaxed: the row now asserts the specific
+    # PR-awareness warning is absent (which is what its name claims) AND that the inertness
+    # warning IS present with its reason. This repository's own readiness engine has no
+    # `INERT_FIELD` — it does not implement the machine-park carve-out — so the honest state for
+    # it is exactly "attestation computed and discarded", loudly.
     chk("[#768] ...and the interlock OPENS for it, naming the capability and the reserved count",
-        ("::warning::" in _out_own, "NOT pull-request-aware" in _out_own,
+        ("NOT pull-request-aware" in _out_own,
          "PLAN occupancy carries 1 open pull-request row(s)" in _out_own,
-         "reserves PR areas and never dispatches a PR row" in _out_own),
-        (False, False, True, True))
+         "reserves PR areas and never dispatches a PR row" in _out_own,
+         "::warning::o/t0: PLAN computed an inertness attestation" in _out_own,
+         "planner declares no inertness contract" in _out_own),
+        (False, True, True, True, True))
 
     # (5b) THE SAFETY REFUSAL, which (5) no longer exercises now that this repo's planner passes.
     # Without this the `planner DISPATCHES a pull-request row` branch of `pr_row_aware` would have
@@ -1314,6 +1412,31 @@ def _routing_doc():
         (_planned(_plan_incomplete),
          "::warning::o/t0: inertness attestation is malformed or incomplete" in _out_incomplete),
         ([702], True))
+    # A UNICODE DIGIT-BUT-NOT-DECIMAL KEY. Round-1 review, real crash: the guard was
+    # `str(number).isdigit()`, which answers True for "²" (SUPERSCRIPT TWO) and every other
+    # superscript/circled digit, while `int()` accepts only DECIMALS — so one such key raised
+    # ValueError out of the comprehension and killed the readiness step for EVERY target repo,
+    # not just this one. The key is a JSON object key, i.e. reachable by any producer. Asserted
+    # as "the tick survives AND the good row still works", because a mutant that dropped the
+    # whole document would also stop the crash while losing every attestation with it.
+    _plan_uni, _out_uni = _run_readiness(
+        [_park_rows], [_INERT_AWARE_PLANNER],
+        attest={"complete": True, "items": {"²": True, "700": True, "7e2": True, "-700": True},
+                "reasons": {}})
+    chk("[sparq#4819] a Unicode digit-but-not-decimal key drops its row, it does not kill the tick",
+        (_planned(_plan_uni),
+         "1 machine-parked row(s) release their areas: pr#700:usage" in _out_uni),
+        ([701, 702], True))
+    # TRUNCATED/UNREADABLE degrades, it does not abort. Round-1 review: `json.loads` raised
+    # straight out of the step, so a half-written document was a total PLAN outage for every
+    # target — while an ABSENT document (the same accident one fsync earlier) degraded cleanly.
+    # The words claimed fail-closed-at-every-seam; now the behaviour matches them.
+    _plan_trunc, _out_trunc = _run_readiness(
+        [_park_rows], [_INERT_AWARE_PLANNER], attest="{\"complete\": true, \"items\": {\"700\":")
+    chk("[sparq#4819] a TRUNCATED attestation degrades to every-PR-reserves, loudly",
+        (_planned(_plan_trunc),
+         "::warning::o/t0: inertness attestation is unreadable (JSONDecodeError)" in _out_trunc),
+        ([702], True))
     # An engine that declares the contract but never consults it must NOT be fed attestations.
     _plan_ignoring, _out_ignoring = _run_readiness(
         [[dict(_park_rows[0], _inert=True)] + _park_rows[1:]], [_INERT_DECLARING_ONLY_PLANNER])
@@ -1338,6 +1461,96 @@ def _routing_doc():
         ("RELEASES a machine-parked area with no attestation" in _out_uncond,
          "NOT STAMPED" in _out_uncond, _planned(_plan_uncond)),
         (True, True, [701, 702]))
+    # THE PLANNER-SIDE DEGRADATION IS ANNOTATED. Round 1 printed `NOT STAMPED` as a plain `print`
+    # inside the census line while both FILE seams carried `::warning::` — so the only degradation
+    # that actually fired in production (sparq's dispatch-plan.py exported neither name) was the
+    # one with no annotation, and the pair shipped as a measured no-op under a green run. The
+    # `::warning::` PREFIX is asserted ATTACHED, for the reason the neighbouring rows already are:
+    # this fixture raises an unrelated warning either way, so a bare `"::warning::" in out` is
+    # satisfied by the wrong absence (mutant C7's lesson).
+    chk("[sparq#4819] a planner that cannot consume the attestation is ANNOTATED, not just printed",
+        (f"::warning::o/t0: PLAN computed an inertness attestation (1 of 1 open PR(s) provably "
+         f"inert) and DISCARDED it" in _out_legacy,
+         "planner declares no inertness contract" in _out_legacy,
+         # ...and the healthy path does NOT raise it, so this cannot be passing unconditionally.
+         "and DISCARDED it" in _out_free),
+        (True, True, False))
+
+    # ------------------------------------------------------------------------------------------
+    # [sparq#4819 round 2] THE PRODUCER SEAM. Round 1's YAML pins covered only the CONSUMER
+    # (`readiness`). The round-1 review measured four survivors on the producer, all of which
+    # degrade to the fail-safe every-PR-reserves path WITH a warning — throughput loss with a
+    # detector, not a correctness hole, and unpinned either way. Pinned here the same way the
+    # consumer seam is: by injecting each mutation into a real copy of the workflow and asserting
+    # the refusal FIRES, so these rows cannot be green because the refusal is unreachable.
+    # ------------------------------------------------------------------------------------------
+    def _producer_refusal(path):
+        try:
+            _refuse_producer_swallow(path, "snapshot", "plan-snapshot.py")
+        except AssertionError as exc:
+            return str(exc)
+        finally:
+            os.remove(path)
+        return ""
+
+    _prod_off = _producer_refusal(_with_line("        id: snapshot", "        if: false"))
+    chk("[sparq#4819][YAML seam] `if: false` on the PRODUCER step is REFUSED",
+        ("step owning `id: snapshot`" in _prod_off, "never run" in _prod_off), (True, True))
+    _prod_coe = _producer_refusal(
+        _with_line("        id: snapshot", "        continue-on-error: true"))
+    chk("[sparq#4819][YAML seam] `continue-on-error: true` on the PRODUCER step is REFUSED",
+        ("truthy `continue-on-error`" in _prod_coe,
+         "no inertness attestation" in _prod_coe), (True, True))
+    _prod_or_true = _producer_refusal(_with_line(
+        '            "$RUNNER_TEMP/dispatch-targets/repos.txt" "$RUNNER_TEMP"',
+        "          true"))
+    chk("[sparq#4819][YAML seam] a command AFTER the producer invocation is REFUSED",
+        ("LAST command is 'true'" in _prod_or_true,
+         "exits with its last command's status" in _prod_or_true), (True, True))
+    # ...and the refusal is not passing because it refuses everything: the REAL workflow passes.
+    chk("[sparq#4819][YAML seam] ...and the real producer step passes the same refusal",
+        _producer_refusal(_with_line("        id: snapshot", "        # a harmless comment")), "")
+
+    # THE FILENAME CHAIN, END TO END. Round 1's rows all fed the consumer an attestation THIS
+    # HARNESS wrote, so the producer could rename `raw-inertness-<i>.json` — and rename its own
+    # assertion with it — and both self-tests stayed green while PLAN silently stopped seeing
+    # attestations. Here the REAL `plan-snapshot.snapshot_targets` writes every file, over a stub
+    # fetch, and the REAL readiness step then consumes that same directory. Nothing in between
+    # names the file, so the two sides have to agree by construction.
+    def _real_producer(workdir, index, repo, rows):
+        import json as _json
+        snapshot = _load("registry_plan_snapshot_e2e", "plan-snapshot.py")
+        # A GENUINELY inert PR: draft + the `auto_merge` key PRESENT and null is the atomic
+        # single-read proof `_pull_inactivity_decision` accepts. The head ref is deliberately NOT
+        # worker-prefixed so `_pr_status_snapshot` issues no per-PR detail read and the stub fetch
+        # stays two endpoints; that is also the dominant live shape.
+        pulls = [{"number": r["number"], "state": "open", "body": "",
+                  "author_association": "OWNER", "draft": True, "auto_merge": None,
+                  "head": {"ref": "feature/x", "sha": "a" * 40, "repo": {"full_name": repo}},
+                  "user": {"login": "u", "type": "User"}, "labels": r.get("labels", [])}
+                 for r in rows if "pull_request" in r]
+
+        def fetch(url):
+            if "/issues?" in url:
+                return rows if "page=1" in url else []
+            if "/pulls?" in url:
+                return pulls if "page=1" in url else []
+            raise AssertionError(f"stub fetch got an unexpected URL: {url}")
+
+        snapshot.snapshot_targets(fetch, snapshot._load_claim(), [repo], workdir)
+        # The producer is asserted to have actually PROVED something — a run where nothing
+        # attested would let the consumer row below pass for the wrong reason.
+        document = _json.loads(open(os.path.join(workdir, f"raw-inertness-{index}.json"),
+                                    encoding="utf-8").read())
+        assert sum(document["items"].values()) == 1, document
+
+    _plan_e2e, _out_e2e = _run_readiness(
+        [_park_rows], [_INERT_AWARE_PLANNER], produce=_real_producer)
+    chk("[sparq#4819] the REAL producer's file is the one the REAL consumer reads (rename => red)",
+        (_planned(_plan_e2e),
+         "1 machine-parked row(s) release their areas: pr#700:usage" in _out_e2e,
+         "no inertness attestation" in _out_e2e),
+        ([701, 702], True, False))
 
     # issue #112: a MULTI-area issue reserves BOTH its areas, NOT the alphabetically-first one —
     # else a busy secondary area (here 'worker') could not exclude it and it would double-dispatch.
