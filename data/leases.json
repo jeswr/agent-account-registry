@@ -32,16 +32,6 @@
   },
   {
    "account": "efb4eb2781de6958",
-   "claim_id": "4617b793a5684deaaa86b8f399409fe3",
-   "holder": "sparq-org/sparq#2890@30371013666.1",
-   "package": "zk,zk-xpath",
-   "role": "soundness",
-   "model": "opus5",
-   "issued_at": 1785250715,
-   "expires_at": 1785257015
-  },
-  {
-   "account": "efb4eb2781de6958",
    "claim_id": "522dd863a374431cae72e7215bd448ab",
    "holder": "jeswr/agent-account-registry#1025@30371129338.1",
    "package": "dispatch",
