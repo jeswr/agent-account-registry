@@ -927,9 +927,13 @@ def _self_test():                                                       # noqa: 
           True)
 
     # ---- the enrolment ordering constraint ----------------------------------------------------
-    # This PR must not enable anything. Read the SHIPPED policy and assert it enrols nobody, so an
-    # enabling line added alongside a minting change goes red here as well as in the two
-    # interlocked self-tests.
+    # [#657 enable] This assertion used to read "the shipped policy enrols NOBODY" — the correct
+    # statement while the minting path shipped ahead of the enable. The enable has now landed, and
+    # the guard is REPOINTED rather than deleted: it pins the exact enabled SET, so it still goes
+    # red on the two changes that matter — a SECOND repo enabled alongside a minting change (the
+    # blast-radius widening this rollout deliberately deferred), or this repo's list emptied,
+    # which would silently make every mint refusal permanent again. A guard that only ever says
+    # "empty" cannot survive the feature it guards; one that names the population can.
     import tomllib
 
     policy_doc = tomllib.loads(
@@ -938,10 +942,15 @@ def _self_test():                                                       # noqa: 
     enrolled_live = sorted(
         (name, sorted(policy_resolve.review_enrolment_authors(name, policy_doc)))
         for name in (policy_doc.get("repos") or {}))
-    check("the shipped policy enrols NO author (minting is inert until step 5)",
-          [row for row in enrolled_live if row[1]], [])
-    # NON-VACUOUS: the same reader, over the same LIVE rows, WOULD surface an enabled list — so
-    # the assertion above is a fact about the shipped policy, not about a constantly-empty reader.
+    check("the shipped policy enrols EXACTLY the registry, and only `jeswr` (one-repo rollout; "
+          "sparq is a deliberate follow-up)",
+          [row for row in enrolled_live if row[1]],
+          [("jeswr/agent-account-registry", ["jeswr"])])
+    # NON-VACUOUS in the other direction too: the same reader, over the same LIVE rows, surfaces an
+    # EMPTY list for a repo that is not enrolled — so the assertion above is a fact about the
+    # shipped policy rather than about a reader that returns whatever it is given.
+    check("...and the reader still reports an un-enrolled repo as empty",
+          sorted(policy_resolve.review_enrolment_authors("sparq-org/sparq", policy_doc)), [])
 
 
     probe_doc = copy.deepcopy(policy_doc)
