@@ -45,6 +45,9 @@ DEFERRED_RE = re.compile(r"^\S+\s+defer(?:red)?\s", re.MULTILINE)
 # document. Issue #374 additionally stops the SALTED per-account rows being published at all — see
 # the fleet-composition block below — but the label validation stays, because a raw handle reaching
 # the collector output is a privacy incident whether or not this build would have published it.
+# Issue #841: the snapshot itself is readable on the PUBLIC `ledger` branch, so this contract no
+# longer REQUIRES the per-account rows either — `flow.lease_utilization_1h` may be sent already
+# aggregated, and a collector that does so writes no per-account row array to a public branch.
 OBS_SCHEMA = "registry-observability/v1"
 OBS_SALTED_LABEL_RE = re.compile(r"[0-9a-f]{8}")
 OBS_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:+-]{0,63}")
@@ -90,9 +93,17 @@ PROBE_MAX_SKEW_SECONDS = 300
 # so a future field cannot silently re-open the surface this closes.
 #
 # KNOWN RESIDUAL, stated rather than hidden: `fleet.active_agents` (and the per-repository model
-# counts it summarizes) is a count of LIVE LEASES, not of accounts — but because the catalog's
-# `max_concurrent_workers` is 1, N concurrent agents implies at least N accounts, so it is a lower
-# BOUND on the fleet size. It is kept because it is the dashboard's core operational number and
+# counts it summarizes) is a count of LIVE LEASES, not of accounts. It used to be documented here as
+# a lower BOUND on the fleet size — "the catalog's `max_concurrent_workers` is 1, so N concurrent
+# agents implies at least N accounts" — and that premise is false (#882): accounts carry their own
+# cap, acct01 was hand-set to 12 long ago, and since #278 set-up-account MINTS at the per-provider
+# default (openai 12, anthropic 4). One account can therefore hold many of these leases at once, so
+# N live leases implies only ceil(N / the largest cap in the catalog) accounts — a far weaker
+# inference, and one whose divisor is not even published. The residual is thus WEAKER than it was
+# stated to be, never stronger; nothing that was safe becomes unsafe. Do not restore the cap-1
+# reasoning: a future minimization pass that trusts it would be reading a false invariant, and the
+# suite pins the counter-example (one account, three concurrent leases, `active_agents` 3).
+# It is kept because it is the dashboard's core operational number and
 # because the same count is already public on the `ledger` branch (`data/leases.json`); removing it
 # is a product call for the maintainer, tracked separately, not something to decide inside a
 # minimization pass.
@@ -1239,11 +1250,30 @@ def _obs_exit_rows(items):
     return rows[:16]
 
 
+def _obs_lease_aggregate(value):
+    """A lease-utilization aggregate the COLLECTOR computed, i.e. the row-free form of the input
+    (issue #841). Same published shape as the rows-derived one: ``{"mean", "max"}``.
+
+    Fail-closed to None — the panel stat hides — rather than to a plausible-looking number: both
+    fields must be real fractions and ``max >= mean``, which no aggregate over real samples can
+    violate. DROPPING rather than raising is the tolerance this document already declares: inside
+    a well-formed snapshot a malformed row is dropped and only a privacy violation is fatal, and
+    this value carries no identity to violate."""
+    if not isinstance(value, dict):
+        return None
+    mean = _obs_fraction(value.get("mean"))
+    maximum = _obs_fraction(value.get("max"))
+    if mean is None or maximum is None or maximum < mean:
+        return None
+    return {"mean": round(mean, 2), "max": round(maximum, 2)}
+
+
 def _obs_flow(flow):
     """Queue depth/age per class, fleet-wide lease utilization, review rounds, park rates,
     arm→merge latency, target-CI congestion. A lease row whose label is not the 8-hex salted shape
     is a raw account identity reaching the collector output — a decision-22 privacy incident,
-    fatal — and since issue #374 the rows themselves are aggregated away rather than republished."""
+    fatal — and since issue #374 the rows themselves are aggregated away rather than republished
+    (issue #841: and since the rows sit on a PUBLIC branch, they need not be sent at all)."""
     if not isinstance(flow, dict):
         return None
     queue = []
@@ -1266,6 +1296,22 @@ def _obs_flow(flow):
     # carrying the fleet?") survives as summary statistics that are invariant under cloning the
     # fleet. The decision-22 label check still runs on every INPUT row: a raw handle in the
     # collector's output is a privacy incident regardless of what this build would have published.
+    #
+    # Issue #841: #374 fixed what this build PUBLISHES; it did not stop the rows EXISTING. The
+    # collector's snapshot lives at data/observability.json on the `ledger` branch of this PUBLIC
+    # repo, so a consumer contract that says "keep sending one row per account and we will drop
+    # them" still parks a per-account row array — fleet size, stable salted labels — one branch
+    # over from the page #374 cleaned. So the aggregate is now accepted DIRECTLY as
+    # `flow.lease_utilization_1h`, and a collector can satisfy this panel while writing no rows to
+    # the public branch at all. Two properties this must NOT trade away, both self-tested:
+    #   * rows-first precedence, keyed on the PRESENCE of the legacy `leases` key rather than on
+    #     whether a row happened to parse. A collector mid-migration that sends both keeps exactly
+    #     today's published value — including the null it publishes when the rows it sent carry no
+    #     usable `utilization_1h` — so the new key can never override a legacy result. Only the
+    #     genuinely row-free form (no `leases` key at all) consults the collector's aggregate.
+    #   * the decision-22 label check is unconditional over the rows that ARE present. Supplying
+    #     the aggregate is not a way to smuggle an unvalidated row past it, and a collector that
+    #     regresses to writing rows is still caught the moment a raw handle appears in one.
     lease_utilizations = []
     for item in flow.get("leases") if isinstance(flow.get("leases"), list) else []:
         if not isinstance(item, dict):
@@ -1277,12 +1323,13 @@ def _obs_flow(flow):
         utilization = _obs_fraction(item.get("utilization_1h"))
         if utilization is not None:
             lease_utilizations.append(utilization)
-    lease_utilization = None
-    if lease_utilizations:
+    if "leases" in flow:
         lease_utilization = {
             "mean": round(sum(lease_utilizations) / len(lease_utilizations), 2),
             "max": round(max(lease_utilizations), 2),
-        }
+        } if lease_utilizations else None
+    else:
+        lease_utilization = _obs_lease_aggregate(flow.get("lease_utilization_1h"))
 
     rounds = flow.get("review_rounds")
     review_rounds = None
@@ -1650,8 +1697,10 @@ def _self_test():
     # single_account (True vs False), accounts_available (1 vs 3), remaining_account_windows
     # (0.58 vs 1.74), limit_remaining (580 vs 1740), limits_known/accounts_reporting (1 vs 3) and
     # fleet.capacity (eligible/total 1/1 vs 3/3) — i.e. on every field this change touched.
-    def clone_fleet(size, busy=0):
-        """`size` identical accounts, the first `busy` of them holding one live lease each."""
+    def clone_fleet(size, busy=0, leases_per_account=1):
+        """`size` identical accounts, the first `busy` of them holding `leases_per_account` live
+        leases each (accounts really do run several at once — see the #882 note in the
+        FLEET-COMPOSITION block: mint-time `max_concurrent_workers` is 12/4, not 1)."""
         clone_issues, clone_usage, clone_leases = [], {}, []
         for index in range(size):
             clone_handle = f"acct-clone-{index}"
@@ -1666,12 +1715,14 @@ def _self_test():
                                          "5h_reset": now + 3600, "7d_util": "0.8",
                                          "7d_reset": now + 86400}
             if index < busy:
-                clone_leases.append({
-                    "account": hashlib.sha256(
-                        f"{clone_handle}:fixture-salt".encode()).hexdigest()[:16],
-                    "claim_id": f"{index:x}" * 32, "holder": f"owner/repo#{index + 1}@run.1",
-                    "package": "pkg", "role": "impl", "model": "opus",
-                    "issued_at": now - 60, "expires_at": now + 60})
+                for slot in range(leases_per_account):
+                    clone_leases.append({
+                        "account": hashlib.sha256(
+                            f"{clone_handle}:fixture-salt".encode()).hexdigest()[:16],
+                        "claim_id": f"{len(clone_leases):032x}",
+                        "holder": f"owner/repo#{index + 1}@run.{slot + 1}",
+                        "package": "pkg", "role": "impl", "model": "opus",
+                        "issued_at": now - 60, "expires_at": now + 60})
         built = build_dashboard(clone_issues, {"leases": clone_leases}, clone_usage, history, None,
                                 now, "fixture-salt", probe_status=measured_sidecar)
         return {"provider_quota": built["provider_quota"], "fleet": built["fleet"],
@@ -1707,6 +1758,20 @@ def _self_test():
             clone_fleet(size, busy=size)["active_by_repository"]["repositories"][0]["counts"])
            for size in (1, 3)],
           [(1, {"opus": 1}), (3, {"opus": 3})])
+    # #882: and the residual is exactly that — a LEASE count, which bounds the account count only
+    # by ceil(N / the largest `max_concurrent_workers` in the catalog). ONE account holding three
+    # concurrent leases publishes the same `active_agents` as three accounts holding one each, so
+    # the retired "cap is 1, therefore ≥N accounts" reading is refuted here rather than in prose
+    # alone. This goes red if `active_agents` is ever redefined as a count of BUSY ACCOUNTS (the
+    # shape a pass that believed the old invariant would think equivalent): the first tuple would
+    # read 1, not 3.
+    check("[#882] active_agents counts LEASES: 1 account x3 leases == 3 accounts x1 lease",
+          [(clone_fleet(1, busy=1, leases_per_account=3)["fleet"]["active_agents"],
+            clone_fleet(1, busy=1,
+                        leases_per_account=3)["active_by_repository"]["repositories"][0]["counts"]),
+           (clone_fleet(3, busy=3)["fleet"]["active_agents"],
+            clone_fleet(3, busy=3)["active_by_repository"]["repositories"][0]["counts"])],
+          [(3, {"opus": 3}), (3, {"opus": 3})])
     check("[#374] ...and that payload still reports the headroom honestly (not blanked out)",
           (clone_fleet(3)["provider_quota"][0]["headroom"],
            clone_fleet(3)["provider_quota"][0]["windows"][0]["remaining_fraction"],
@@ -2498,6 +2563,206 @@ def _self_test():
           (produced, sorted(uploaded), sorted(set(produced) - set(uploaded))),
           (["usage-probe.json", "usage.json"], ["usage-probe.json", "usage.json"], []))
 
+    # --- #922: cron-keepalive, the liveness mesh that revives every other scheduled workflow. The
+    # only thing that makes a leg of it real is WHICH EVENT it keys on, and nothing static can see
+    # that: `bash -n` and actionlint parse the shell, and a YAML assertion can only read the spec
+    # list back to itself. The pre-#922 body anchored every leg on `.workflow_runs[0].created_at`,
+    # which since the #819 tick floor is satisfied by a within-floor ring that concludes `success`
+    # in ~30s having executed NOTHING — and #79's registry-internal ring sources make those no-op
+    # runs the normal case (dispatch is rung roughly every <=7 min). So the dispatch leg reported a
+    # dispatcher that had not executed a tick in hours as permanently fresh: it looked like
+    # coverage and was not. The body is therefore EXTRACTED and EXECUTED against hermetic gh/jq
+    # stubs, and every row below is an OUTCOME (which workflows got kicked) rather than a substring.
+    # ------------------------------------------------------------------------------------------
+    keepalive_script = _workflow_step_script(dashboard_workflow, "registry-keepalive")
+    spec_line = re.search(r"for spec in ([^\n]+); do", keepalive_script)
+    if spec_line is None:
+        raise DashboardError(
+            "cron-keepalive's spec list could not be located in the extracted step body — refusing "
+            "to assert against a keepalive whose watch list cannot be read (fail closed)")
+    keepalive_specs = {}
+    for raw in spec_line.group(1).split():
+        fields = raw.split(":")
+        if len(fields) not in (2, 3) or not fields[1].isdigit():
+            raise DashboardError(f"unparseable cron-keepalive spec {raw!r} — refusing")
+        keepalive_specs[fields[0]] = (int(fields[1]), fields[2] if len(fields) > 2 else "")
+
+    # The floor module is the OTHER side of this wire contract. Loaded rather than restated, so the
+    # marker name and the tick interval cannot drift out from under the threshold below.
+    floor_path = Path(__file__).resolve().parent / "dispatch-tick-floor.py"
+    floor_spec = importlib.util.spec_from_file_location("registry_dispatch_tick_floor", floor_path)
+    if floor_spec is None or floor_spec.loader is None:
+        raise DashboardError(f"cannot load {floor_path} for the #922 keepalive anchor contract")
+    tick_floor = importlib.util.module_from_spec(floor_spec)
+    floor_spec.loader.exec_module(tick_floor)
+    dispatch_workflow = _repo_file(".github", "workflows", "dispatch.yml")
+
+    check("[#922] EXACTLY the dispatch leg is anchored on an executed-work marker — reverting it "
+          "to run-anchoring (or anchoring a leg whose runs really do imply work) goes red here",
+          {name: marker for name, (_limit, marker) in keepalive_specs.items() if marker},
+          {"dispatch.yml": tick_floor.TICK_MARKER_ARTIFACT})
+    check("[#922] the anchor names an artifact dispatch.yml actually UPLOADS — a keepalive keyed "
+          "on an artifact nobody writes reads as permanently stale and kicks every 15 minutes",
+          bool(re.search(r"uses: actions/upload-artifact@\S+[^\n]*\n\s*with:\n\s*name: "
+                         + re.escape(tick_floor.TICK_MARKER_ARTIFACT) + r"\s*\n",
+                         dispatch_workflow)),
+          True)
+    check("[#922] the dispatch threshold clears the tick floor with a whole missed tick of slack "
+          "(a threshold at or under the floor would kick a perfectly healthy held dispatcher)",
+          keepalive_specs["dispatch.yml"][0] >= 2 * tick_floor.MIN_TICK_INTERVAL_SECONDS, True)
+
+    keepalive_gh_stub = r'''#!/usr/bin/env bash
+# Hermetic `gh` for dashboard.yml's cron-keepalive body. Every argv is recorded; the three reads
+# the body makes are served from fixture files; an argv this stub does not model exits 64, so a
+# reshaped request fails LOUDLY instead of quietly satisfying the rows above.
+set -u
+printf '%s\n' "$*" >> "${STUB_CALLS}"
+filter=""; want=0; endpoint=""
+for a in "$@"; do
+  if [ "$want" = 1 ]; then filter="$a"; want=0; continue; fi
+  case "$a" in
+    --jq) want=1 ;;
+    repos/*) endpoint="$a" ;;
+  esac
+done
+case "${endpoint}" in
+  */dispatches)
+    exit 0
+    ;;
+  *"/actions/artifacts?"*)
+    if [ "${STUB_ARTIFACTS_FAIL}" = 1 ]; then
+      printf 'gh-stub: artifacts read failed\n' >&2
+      exit 1
+    fi
+    jq -r "${filter}" < "${STUB_DIR}/artifacts.json"
+    ;;
+  *"/runs?per_page=30")
+    wf="${endpoint#*/workflows/}"; wf="${wf%%/*}"
+    jq -r "${filter}" < "${STUB_DIR}/live-${wf}.json"
+    ;;
+  *"/runs?per_page=1")
+    wf="${endpoint#*/workflows/}"; wf="${wf%%/*}"
+    jq -r "${filter}" < "${STUB_DIR}/runs-${wf}.json"
+    ;;
+  *)
+    printf 'gh-stub: unexpected argv: %s\n' "$*" >&2
+    exit 64
+    ;;
+esac
+'''
+    keepalive_now = int(time.time())
+
+    def _ka_stamp(age):
+        return _utc_iso(keepalive_now - age)
+
+    def _ka_run(age, status="completed"):
+        return {"id": 1, "status": status, "conclusion": "success", "created_at": _ka_stamp(age)}
+
+    def run_keepalive_step(*, artifacts=(), runs=None, live=None, artifacts_fail=False):
+        """Execute the REAL cron-keepalive body. -> (exit code, [workflows kicked], log).
+
+        Every listed workflow defaults to one settled run a minute old and no live run, so a row
+        that says nothing about a workflow is asserting that leg stayed quiet."""
+        runs, live = dict(runs or {}), dict(live or {})
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binaries, stubs = root / "bin", root / "stub"
+            binaries.mkdir()
+            stubs.mkdir()
+            (binaries / "gh").write_text(keepalive_gh_stub, encoding="utf-8")
+            (binaries / "gh").chmod(0o755)
+            (stubs / "artifacts.json").write_text(json.dumps({"artifacts": list(artifacts)}),
+                                                  encoding="utf-8")
+            for workflow in keepalive_specs:
+                (stubs / f"runs-{workflow}.json").write_text(
+                    json.dumps({"workflow_runs": list(runs.get(workflow, [_ka_run(60)]))}),
+                    encoding="utf-8")
+                (stubs / f"live-{workflow}.json").write_text(
+                    json.dumps({"workflow_runs": list(live.get(workflow, []))}), encoding="utf-8")
+            calls = root / "calls"
+            calls.write_text("", encoding="utf-8")
+            completed = subprocess.run(
+                ["bash", "-c", keepalive_script], cwd=directory, capture_output=True, text=True,
+                timeout=120, check=False,
+                env=dict(os.environ,
+                         PATH=f"{binaries}{os.pathsep}{os.environ.get('PATH', '')}",
+                         GITHUB_REPOSITORY="o/r", GH_TOKEN="stub",
+                         STUB_DIR=str(stubs), STUB_CALLS=str(calls),
+                         STUB_ARTIFACTS_FAIL="1" if artifacts_fail else "0"))
+            kicked = sorted(re.findall(r"workflows/(\S+?)/dispatches",
+                                       calls.read_text(encoding="utf-8")))
+        return completed.returncode, kicked, completed.stdout + completed.stderr
+
+    marker_name = tick_floor.TICK_MARKER_ARTIFACT
+    dispatch_limit = keepalive_specs["dispatch.yml"][0]
+
+    def _ka_marker(age, **overrides):
+        return dict({"name": marker_name, "created_at": _ka_stamp(age), "expired": False},
+                    **overrides)
+
+    def keepalive_check(name, got, want, log):
+        """`check` with the step log attached ONLY on failure — a hermetic shell harness that fails
+        silently is unusable, and attaching the log unconditionally would bury every row."""
+        check(name, got if got == want else (got, log), want)
+
+    check("[#922] jq is available for the hermetic harness below (a missing dependency must be "
+          "NAMED, never silently skipped into a green run)",
+          subprocess.run(["jq", "--version"], capture_output=True).returncode, 0)
+    # THE REGRESSION. Fresh runs everywhere — exactly the steady state #79's ring sources produce —
+    # and no executed tick for well past the threshold. The pre-#922 body kicked nothing here.
+    code, kicked, log = run_keepalive_step(artifacts=[_ka_marker(dispatch_limit + 600)])
+    keepalive_check(
+        "[#922] a dispatcher that RUNS constantly but has executed no tick is kicked",
+        (code, kicked), (0, ["dispatch.yml"]), log)
+    code, kicked, log = run_keepalive_step(artifacts=[_ka_marker(dispatch_limit - 600)])
+    keepalive_check(
+        "[#922] ...and one that executed a tick inside the threshold is left alone (the leg is "
+        "not simply kicking dispatch on every fire)", (code, kicked), (0, []), log)
+    # The mirror: run-anchoring and marker-anchoring disagree in BOTH directions, so pin both.
+    code, kicked, log = run_keepalive_step(
+        artifacts=[_ka_marker(60)], runs={"dispatch.yml": [_ka_run(dispatch_limit + 600)]})
+    keepalive_check(
+        "[#922] a fresh executed tick keeps dispatch fresh even when its RUN listing is ancient — "
+        "the leg reads the marker, not the run", (code, kicked), (0, []), log)
+    code, kicked, log = run_keepalive_step(artifacts=[_ka_marker(60, expired=True)])
+    keepalive_check(
+        "[#922] an EXPIRED marker is not evidence of a recent tick",
+        (code, kicked), (0, ["dispatch.yml"]), log)
+    # The stub serves the artifact page UNFILTERED, so what is under test here is the body's own
+    # `select(.name == env.ANCHOR)` rather than the `?name=` query parameter beside it. Two
+    # neighbours, one per mutation: `dispatch-plan-9-1` is the real artifact dispatch.yml uploads
+    # next to the marker and catches dropping the name test altogether; `dispatch-tick-9-1` catches
+    # relaxing equality into a prefix, which is exactly the confusion dispatch-tick-floor.py's
+    # newest_marker_epoch warns about.
+    code, kicked, log = run_keepalive_step(
+        artifacts=[{"name": "dispatch-plan-9-1", "created_at": _ka_stamp(60), "expired": False},
+                   {"name": f"{marker_name}-9-1", "created_at": _ka_stamp(60), "expired": False}])
+    keepalive_check(
+        "[#922] the marker is matched by EQUALITY — neither a sibling dispatch artifact nor a "
+        "name that merely starts with it is evidence that a tick executed",
+        (code, kicked), (0, ["dispatch.yml"]), log)
+    code, kicked, log = run_keepalive_step(
+        artifacts=[_ka_marker(dispatch_limit + 600)],
+        live={"dispatch.yml": [_ka_run(30, status="in_progress")]})
+    keepalive_check(
+        "[#922] the #559 live-run guard still wins: a queued/in-progress dispatch run is never "
+        "kicked behind", (code, kicked), (0, []), log)
+    code, kicked, log = run_keepalive_step(artifacts=[_ka_marker(60)], artifacts_fail=True)
+    keepalive_check(
+        "[#922] FAIL-OPEN: an unreadable artifact listing still kicks — the keepalive's whole job "
+        "is liveness, and a mesh that goes quiet when a read fails IS the outage",
+        (code, kicked), (0, ["dispatch.yml"]), log)
+    # ...and the run-anchored legs are untouched by all of the above.
+    code, kicked, log = run_keepalive_step(artifacts=[_ka_marker(60)],
+                                           runs={"groom.yml": [_ka_run(99_999)]})
+    keepalive_check(
+        "[#922] the run-anchored legs still key on run age, and only the stale one is kicked",
+        (code, kicked), (0, ["groom.yml"]), log)
+    code, kicked, log = run_keepalive_step(artifacts=[_ka_marker(60)])
+    keepalive_check(
+        "[#922] control: a fleet that is fresh on BOTH anchors is kicked not at all",
+        (code, kicked), (0, []), log)
+
     # --- #612 review round 2, finding 5 (MINOR): the successful CLI -> builder handoff. Deleting
     # `probe_status=probe_status` from main()'s build_dashboard call left every direct-builder test
     # AND the missing-flag negative test above green, while production parsed a valid sidecar and
@@ -2892,6 +3157,60 @@ const degraded = (node) =>
           (four_leases, True, False))
     check("[#374] no reported lease utilization publishes nothing rather than a zero",
           obs_leases([])["lease_utilization_1h"], None)
+    # ---- [#841] the ROW-FREE collector contract. #374 stopped this build PUBLISHING the rows; it
+    # did not stop them EXISTING at data/observability.json on the public `ledger` branch. So the
+    # aggregate is accepted directly and a collector need write no per-account rows anywhere.
+    def obs_flow_without_rows(aggregate):
+        fixture = copy.deepcopy(obs_fixture)
+        fixture["flow"].pop("leases", None)          # the collector sends NO per-account rows
+        fixture["flow"]["lease_utilization_1h"] = aggregate
+        return _normalize_observability(fixture)["flow"]["lease_utilization_1h"]
+
+    check("[#841] a collector that sends NO lease rows still publishes the aggregate it computed",
+          obs_flow_without_rows({"mean": 0.31, "max": 0.77}), {"mean": 0.31, "max": 0.77})
+    # Precedence is ROWS-FIRST and total, so a collector mid-migration that sends both publishes
+    # exactly its pre-#841 value — the new key can never silently override real measurements.
+    # Flipping the precedence turns this into {0.99, 0.99}.
+    both = copy.deepcopy(obs_fixture)
+    both["flow"]["lease_utilization_1h"] = {"mean": 0.99, "max": 0.99}
+    check("[#841] lease ROWS outrank a collector-supplied aggregate (no silent override)",
+          _normalize_observability(both)["flow"]["lease_utilization_1h"],
+          {"mean": 0.6, "max": 0.8})
+    # ...and precedence keys on the legacy KEY, not on a row happening to parse. Rows that are
+    # present but report no usable utilization published null pre-#841 and must still publish null:
+    # make the fallback conditional on `lease_utilizations` instead and these become {0.99, 0.99},
+    # i.e. the new key overriding a legacy source that was sent.
+    for case, rows in (
+        ("no utilization field", [{"label": "ab12cd34", "provider": "anthropic"}]),
+        ("malformed utilization", [{"label": "ab12cd34", "provider": "anthropic",
+                                    "utilization_1h": "busy"}]),
+        ("zero rows", []),
+    ):
+        unparseable = copy.deepcopy(both)
+        unparseable["flow"]["leases"] = rows
+        check(f"[#841] legacy rows with {case} keep their pre-#841 null, aggregate or not",
+              _normalize_observability(unparseable)["flow"]["lease_utilization_1h"], None)
+    # ...and sending the aggregate is NOT a way around the decision-22 check on the rows that ARE
+    # present. Make the label check conditional on the rows being used and this normalizes happily.
+    both_raw = copy.deepcopy(both)
+    both_raw["flow"]["leases"][0]["label"] = handle    # a raw account handle alongside a valid mean
+    try:
+        _normalize_observability(both_raw)
+    except DashboardError:
+        aggregate_is_no_bypass = True
+    else:
+        aggregate_is_no_bypass = False
+    check("[#841] a raw lease label stays fatal even when an aggregate is also supplied",
+          aggregate_is_no_bypass, True)
+    for case, aggregate in (
+        ("incoherent (max < mean)", {"mean": 0.8, "max": 0.4}),
+        ("out-of-range fraction", {"mean": 0.2, "max": 1.4}),
+        ("half-supplied (no max)", {"mean": 0.2}),
+        ("non-numeric", {"mean": "busy", "max": "busy"}),
+        ("non-object", [0.2, 0.4]),
+    ):
+        check(f"[#841] {case} collector aggregate is dropped, never published",
+              obs_flow_without_rows(aggregate), None)
     with_observability = build_dashboard(
         issues, leases, usage, history, None, now, "fixture-salt", observability=obs_fixture)
     check("build_dashboard publishes the normalized observability key",

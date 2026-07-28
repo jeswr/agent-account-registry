@@ -41,11 +41,16 @@ Two independent mechanisms close it, and they compose:
      `read_cli_reject`, so it cannot make a write replayable.
 
 HARD SCOPE RULE (do not widen):
-  * Wrap IDEMPOTENT READS only (``gh api`` GETs, --paginate list/search reads, actions-run reads).
-  * NEVER wrap compare-and-swap / ledger CAS writes (the contents-API PUTs on the ``ledger``
-    branch): their 409/422 conflict semantics are handled by the callers' own bounded re-read
-    loops (``ledger_retry.py`` + each writer's CAS loop) — a transparent replay here would
-    consume the very conflict signal those loops key on.
+  * ``run_gh`` wraps IDEMPOTENT READS only (``gh api`` GETs, --paginate list/search reads,
+    actions-run reads).
+  * NEVER call ``run_gh`` on a compare-and-swap / ledger CAS write (the contents-API PUTs on the
+    ``ledger`` branch): their 409/422 conflict semantics are handled by the callers' own bounded
+    re-read loops (``ledger_retry.py`` + each writer's CAS loop) — a transparent replay here would
+    consume the very conflict signal those loops key on, and it would replay a now-stale
+    expected-SHA. The CLASSIFIER and the SLEEP SCHEDULE below are nevertheless shared with those
+    writers via ``ledger_retry`` (issue #558): deciding whether an error is a throttle/availability
+    blip, and how long to wait, is provider knowledge with no CAS semantics in it, while the
+    re-read/re-derive step stays owned by each writer's own loop.
   * NEVER wrap mutations or mutation-confirmations (POST/PATCH/PUT/DELETE, ``gh workflow run``,
     label edits, comments): an ambiguous transient failure does not prove GitHub skipped the
     attempt — a replay duplicates comments, repeats state transitions, or double-dispatches a
@@ -109,7 +114,21 @@ _TRANSIENT_TEXT = (
     # is safe; a 4xx that happens to mention it still short-circuits FATAL above.
     "unexpected end of json input",
 )
-_SECONDARY_403 = ("secondary rate limit", "abuse detection", "retry-after", "retry later")
+# THROTTLE-shaped 403s. GitHub answers a *secondary* rate limit (the burst limiter that a fan-out
+# of concurrent contents-API PUTs to one branch trips — incident #558) with 403 and one of these
+# markers, and a *primary* limit exhaustion with 'API rate limit exceeded'. Both are throttle
+# signals that clear by waiting; a permission/credential 403 ('Resource not accessible by
+# integration', 'Bad credentials') carries none of them and stays FATAL.
+_THROTTLE_403 = (
+    "rate limit",           # 'secondary rate limit' (the #558 PUT-burst limiter) AND
+                            # 'API rate limit exceeded' (primary-window exhaustion)
+    "abuse detection",      # the legacy name for the secondary limiter
+    "temporarily blocked",  # '...temporarily blocked from content creation' — the PUT-burst form
+    "retry-after",          # any throttle that sent an explicit wait
+    "retry later",
+)
+_RETRY_AFTER_RE = re.compile(r"retry[-_ ]?after[\"'\s:=]+(\d+(?:\.\d+)?)", re.IGNORECASE)
+
 # Statusless failures that retrying CANNOT fix: gh usage/flag errors and "no credential configured".
 # Everything ELSE that is statusless is retried on a read (registry #748) — this table exists so a
 # typo'd flag does not cost four jittered attempts, NOT to decide availability questions.
@@ -127,19 +146,53 @@ _MESSAGE_STATUS_RE = re.compile(r"HTTP[ :]*([1-5]\d\d)\b|\(HTTP ([1-5]\d\d)\)")
 def is_transient_stderr(text):
     """Conservative transient classifier for `gh` CLI stderr. Fatal classes short-circuit.
 
+    Shared with the ledger CAS writers through ``ledger_retry.is_transient`` (issue #558) — one
+    classifier, so a throttle shape learned in one lane is understood in all of them. HTTP 409 is
+    deliberately NEITHER fatal nor transient here: it is the CAS-conflict signal each ledger writer
+    owns, and it must reach that writer's re-read loop unchanged.
+
     Unchanged by registry #748 and deliberately so: callers that only want a LABEL for a failure
     (worker-pr's `class=`, groom's domain predicate) keep the historical answer, and the widened
     read-scoped decision lives in `classify_read_failure`."""
     raw = text or ""
     lowered = raw.lower()
     if _FATAL_HTTP.search(raw):
-        # The one 403 exception: GitHub's secondary-rate-limit / Retry-After 403s are throttle
-        # signals, not permission verdicts. 401/404/422 have no such exception — NEVER retried.
-        return (("403" in raw) and any(marker in lowered for marker in _SECONDARY_403))
+        # The one 403 exception: GitHub's secondary/primary rate-limit and Retry-After 403s are
+        # throttle signals, not permission verdicts. 401/404/422 have no such exception — NEVER
+        # retried.
+        return (("403" in raw) and any(marker in lowered for marker in _THROTTLE_403))
     if _TRANSIENT_HTTP.search(raw):
         return True
     return any(marker in lowered for marker in _TRANSIENT_TEXT)
 
+
+def retry_after_seconds(text):
+    """The server's requested wait from a `gh` error body/headers, capped at RETRY_AFTER_CAP.
+
+    Returns None when absent, unparseable, or NON-POSITIVE so the caller falls back to the
+    exponential schedule. HTTP-date Retry-After forms (rare from GitHub) are treated as absent
+    rather than mis-parsed into a wrong delay.
+
+    ZERO IS ABSENT, NOT "WAIT ZERO SECONDS". `Retry-After: 0` only ever arrives from an endpoint
+    that is ALREADY throttling us, and honouring it literally disables the backoff and converts the
+    retry loop into a HOT LOOP against that endpoint — i.e. the retry policy would amplify the
+    exact request-rate exhaustion it exists to survive, and it would do so for every caller in the
+    fleet at once, since this module is shared. The pre-existing bound excluded only NEGATIVE
+    values, which could never fire: `_RETRY_AFTER_RE`'s capture group has no sign, so
+    `Retry-After: -5` does not parse as a negative at all — it fails to match and returns None as
+    unparseable. Zero was always the only reachable degenerate value, and it was the one let
+    through. The bound must therefore EXCLUDE zero, not merely clamp at it.
+    """
+    match = _RETRY_AFTER_RE.search(text or "")
+    if match is None:
+        return None
+    try:
+        seconds = float(match.group(1))
+    except (TypeError, ValueError):  # pragma: no cover - the regex already constrains the shape
+        return None
+    if seconds <= 0:
+        return None
+    return min(seconds, RETRY_AFTER_CAP)
 
 # ---------------------------------------------------------------------------------------------------
 # Registry #748: STATUS RECOVERY off gh's debug channel, and the read-scoped classifier.
@@ -235,8 +288,8 @@ def classify_read_failure(message, status=None):
     read predicate refuses, and caps it at one attempt."""
     lowered = (message or "").lower()
     if status in _REFUSAL_STATUSES:
-        if status == "403" and any(marker in lowered for marker in _SECONDARY_403):
-            return True, "secondary-rate-limit-403"
+        if status == "403" and any(marker in lowered for marker in _THROTTLE_403):
+            return True, "throttle-403"
         return False, f"refused-http-{status}"
     if status and (status.startswith("5") or status == "429"):
         return True, f"transient-http-{status}"
@@ -266,9 +319,18 @@ def backoff_ceiling(attempt, base=BASE_DELAY, cap=MAX_DELAY):
 def sleep_backoff(attempt, retry_after=None, *, sleeper=time.sleep, draw=random.uniform):
     """Sleep before retry `attempt`: honour a (capped) server Retry-After when given, else the
     exponential ceiling plus additive uniform jitter, clamped to MAX_DELAY. Injection points keep
-    callers' self-tests deterministic and sleepless."""
-    if retry_after is not None:
-        sleeper(min(max(0.0, retry_after), RETRY_AFTER_CAP))
+    callers' self-tests deterministic and sleepless.
+
+    A NON-POSITIVE `retry_after` is treated as ABSENT and falls back to the exponential schedule.
+    That is the same rule `retry_after_seconds` applies, deliberately restated at THIS layer rather
+    than trusted from the parser: `retry_after` is an ordinary caller-supplied argument (worker-pr
+    and the ledger writers both pass values through their own plumbing), so a single guard at the
+    parse site would leave the zero-backoff hot loop reachable from any other producer. Each layer
+    carries its own named check, so neither guard is vacuous — deleting either one reds a test that
+    names it.
+    """
+    if retry_after is not None and retry_after > 0:
+        sleeper(min(retry_after, RETRY_AFTER_CAP))
     else:
         sleeper(min(MAX_DELAY, backoff_ceiling(attempt) + draw(0, JITTER)))
 
@@ -516,6 +578,15 @@ def _self_test():
           is_transient_stderr("HTTP 403: You have exceeded a secondary rate limit"), True)
     check("Retry-After 403 transient",
           is_transient_stderr("HTTP 403: rate limited; Retry-After: 30"), True)
+    # The exact #558 shape: a burst of concurrent contents-API PUTs to one branch.
+    check("content-creation secondary-limit 403 transient",
+          is_transient_stderr("gh: You have exceeded a secondary rate limit and have been "
+                              "temporarily blocked from content creation. Please retry your "
+                              "request again later. (HTTP 403)"), True)
+    check("primary rate-limit 403 transient",
+          is_transient_stderr("HTTP 403: API rate limit exceeded for installation"), True)
+    check("abuse-detection 403 transient",
+          is_transient_stderr("HTTP 403: You have triggered an abuse detection mechanism"), True)
     check("timeout transient", is_transient_stderr("Post ...: net/http: TLS handshake timeout"), True)
     check("connection reset transient", is_transient_stderr("connection reset by peer"), True)
     check("RemoteDisconnected transient",
@@ -526,7 +597,44 @@ def _self_test():
     check("422 mentioning a gateway is still fatal",
           is_transient_stderr("HTTP 422: upstream 502 bad gateway text"), False)
     check("permission 403 fatal", is_transient_stderr("HTTP 403: Resource not accessible"), False)
+    check("bad-credentials 403 fatal", is_transient_stderr("HTTP 403: Bad credentials"), False)
     check("empty stderr not transient", is_transient_stderr(""), False)
+    # 409 is the ledger CAS-conflict signal: neither fatal nor transient here, so it reaches the
+    # writer's own re-read loop untouched (issue #558 / #179).
+    check("409 is NOT classified transient (CAS conflict belongs to the writer)",
+          is_transient_stderr("gh: Conflict (HTTP 409)"), False)
+
+    # ---- Retry-After extraction (shared with the ledger writers via ledger_retry) ----
+    check("Retry-After header parsed", retry_after_seconds("HTTP 403: ... Retry-After: 30"), 30.0)
+    check("retry_after JSON-ish form parsed",
+          retry_after_seconds('{"retry-after":"12"}'), 12.0)
+    check("Retry-After capped", retry_after_seconds("Retry-After: 9999"), RETRY_AFTER_CAP)
+    check("absent Retry-After is None", retry_after_seconds("HTTP 503: unavailable"), None)
+    check("HTTP-date Retry-After treated as absent",
+          retry_after_seconds("Retry-After: Wed, 21 Oct 2026 07:28:00 GMT"), None)
+    check("empty text Retry-After is None", retry_after_seconds(""), None)
+    # ZERO. A `Retry-After: 0` reaches us only from an endpoint that is already rate-limiting, and
+    # honouring it literally disables the backoff — the retry loop becomes a HOT LOOP against that
+    # endpoint. It must parse as ABSENT so the caller falls back to the exponential schedule. The
+    # bound has to EXCLUDE zero: a `>= 0` (or a `< 0`) guard admits exactly this value.
+    check("Retry-After 0 is ABSENT, never a zero wait",
+          retry_after_seconds("HTTP 403: slow down; Retry-After: 0"), None)
+    check("Retry-After 0.0 is ABSENT, never a zero wait",
+          retry_after_seconds('{"retry-after":"0.0"}'), None)
+    # The neighbouring malformed shapes, so the zero fix is not the only degenerate input pinned.
+    check("whitespace-only text Retry-After is None", retry_after_seconds("  \t\n "), None)
+    check("non-numeric Retry-After value is None",
+          retry_after_seconds("HTTP 429: Retry-After: soon"), None)
+    # A sign-prefixed value never reaches the numeric bound at all (the capture group has no sign),
+    # which is why the old `< 0` guard was unreachable. Pinned so that stays true.
+    check("sign-prefixed Retry-After does not parse (the old `< 0` bound was unreachable)",
+          retry_after_seconds("Retry-After: -5"), None)
+    # CONTROL for the zero fix: it must be "zero is absent", NOT "ignore the header". A genuine
+    # positive wait — including a sub-second one — is still parsed and still honoured.
+    check("a genuine positive Retry-After is still honoured (control for the zero fix)",
+          (retry_after_seconds("Retry-After: 0.5"),
+           retry_after_seconds("HTTP 403: throttled; Retry-After: 30")), (0.5, 30.0))
+
     # [registry #772] The truncated-body class, verbatim from the six worker.yml runs that lost a
     # provenance record. It carries NO HTTP status, so it reaches the text table or nothing at all.
     check("truncated JSON body transient",
@@ -538,6 +646,32 @@ def _self_test():
           is_transient_stderr("gh: Not Found (HTTP 404): unexpected end of JSON input"), False)
     check("422 mentioning a truncated body is still fatal",
           is_transient_stderr("HTTP 422: unexpected end of JSON input"), False)
+
+    # ---- ONE 403 throttle table across BOTH classifiers (issue #558 x registry #748) ----
+    # `is_transient_stderr` (writes/labels) and `classify_read_failure` (reads) previously read two
+    # DIFFERENT 403 tables: this file's throttle table and a narrower `_SECONDARY_403`. A read path
+    # and a write path that disagree about which 403s clear by waiting is the drift #558 exists to
+    # remove — the PUT-burst form ('temporarily blocked from content creation') and a PRIMARY
+    # window exhaustion ('API rate limit exceeded') were refused on reads while being retried on
+    # writes. These assert the SINGLE table, in BOTH directions, on BOTH classifiers.
+    for _label, _text in (
+            ("secondary", "HTTP 403: You have exceeded a secondary rate limit"),
+            ("primary", "HTTP 403: API rate limit exceeded for installation"),
+            ("content-creation", "HTTP 403: ... temporarily blocked from content creation"),
+            ("retry-after", "HTTP 403: Retry-After: 30")):
+        check(f"read classifier retries the {_label} throttle 403",
+              classify_read_failure(_text, "403"), (True, "throttle-403"))
+        check(f"write classifier retries the {_label} throttle 403",
+              is_transient_stderr(_text), True)
+    # QUANTIFIER DIRECTION: "some 403s throttle" must never widen into "every 403 does" — a
+    # permission/credential 403 carries no throttle marker and stays a REFUSAL on both paths.
+    for _label, _text in (
+            ("permission", "HTTP 403: Resource not accessible by integration"),
+            ("credential", "HTTP 403: Bad credentials")):
+        check(f"read classifier still REFUSES the {_label} 403",
+              classify_read_failure(_text, "403"), (False, "refused-http-403"))
+        check(f"write classifier still refuses the {_label} 403",
+              is_transient_stderr(_text), False)
 
     # ---- backoff: exponential 2->30 ceiling, monotonic, jitter bounded ----
     ceilings = [backoff_ceiling(i) for i in range(1, 7)]
@@ -552,6 +686,29 @@ def _self_test():
     slept.clear()
     sleep_backoff(1, retry_after=9999.0, sleeper=slept.append)
     check("Retry-After honoured but capped", slept, [RETRY_AFTER_CAP])
+    # A NON-POSITIVE retry_after that reaches the sleeper from any producer must fall back to the
+    # computed schedule. The assertion is on a NON-ZERO sleep, and on the exact fallback value: a
+    # `>= 0` guard, or a clamp to 0.0, would sleep nothing and hot-loop.
+    zero_slept = []
+    sleep_backoff(1, retry_after=0.0, sleeper=zero_slept.append, draw=lambda a, b: b)
+    check("a zero Retry-After falls back to the computed backoff (NON-ZERO sleep)",
+          (zero_slept, zero_slept and zero_slept[0] > 0.0),
+          ([backoff_ceiling(1) + JITTER], True))
+    # The two layers COMPOSED — parse then sleep — which is the shape that shipped as a hot loop.
+    composed = []
+    sleep_backoff(2, retry_after_seconds("gh: ... (HTTP 403) Retry-After: 0"),
+                  sleeper=composed.append, draw=lambda a, b: b)
+    check("parse+sleep composed: a Retry-After 0 never sleeps zero",
+          (composed, composed and composed[0] > 0.0),
+          ([backoff_ceiling(2) + JITTER], True))
+    # CONTROL: a genuine positive Retry-After still OVERRIDES the exponential schedule exactly —
+    # the fix must not have turned Retry-After honouring off. 7s here is deliberately unequal to
+    # attempt 4's ceiling (16s), so "fell back to the backoff" cannot pass this check.
+    positive = []
+    sleep_backoff(4, retry_after_seconds("HTTP 403: throttled; Retry-After: 7"),
+                  sleeper=positive.append, draw=lambda a, b: b)
+    check("a positive Retry-After still overrides the exponential schedule (control)",
+          (positive, backoff_ceiling(4)), ([7.0], 16.0))
 
     # ---- run_gh loop mechanics (stubbed subprocess.run; no live gh) ----
     real_run = subprocess.run

@@ -635,6 +635,44 @@ jobs:
                       and trusted(details[row["number"]][0], repo_trusted_bots))
               ]
               ready = dispatch.compute_ready(ready_input)
+              # >>> partition-census — EXECUTED by scripts/dispatch-plan.py --self-test.
+              # THE LARGEST REFUSAL IN THIS DISPATCHER HAD NO CENSUS ROW. `compute_ready` admits
+              # ONE unit per `area:` package, so it silently discards most of the drainable
+              # backlog every tick. MEASURED 2026-07-28 against live sparq-org/sparq (473
+              # status:ready issues, 94 open PRs, sparq's own planner + real workspace roots):
+              # 452 candidates -> frontier 7. That is 445 refusals per tick, and NOTHING named
+              # them: the per-lane summary (#108) starts at `planned`, which is already the
+              # post-frontier number, and CLAIM's histogram only ever sees rows that survived.
+              # So the fleet-capacity question kept being answered with account arithmetic while
+              # the real limiter was invisible — the same missing-edge class as #700/#708, one
+              # stage further upstream. Every other cap here names itself every tick; this one
+              # now does too, ZERO INCLUDED, so a quiet tick is distinguishable from an
+              # uninstrumented one. Derived from the planner's OWN candidate set so the
+              # denominator can never drift from the frontier it explains. `log` is stubbed
+              # because the candidate walk already printed its per-issue attributions when
+              # `compute_ready` ran — re-printing them would double the readiness noise. Costs
+              # ZERO additional GitHub API requests: it re-walks the in-memory snapshot only.
+              # Its only inputs are `dispatch`, `ready_input`, `ready` and `repo`.
+              candidates_fn = getattr(dispatch, "ready_candidates", None)
+              if candidates_fn is None:
+                  print(f"::warning::{repo}: target planner has no ready_candidates() — "
+                        "partition attrition is UNMEASURABLE on this target")
+              else:
+                  _cands = candidates_fn(ready_input, log=lambda *a, **k: None)
+                  _selected = {row.get("number") for row in ready}
+                  _contended = {}
+                  for _entry in _cands:
+                      if _entry[2].get("number") in _selected:
+                          continue
+                      for _pkg in _entry[3]:
+                          _contended[_pkg] = _contended.get(_pkg, 0) + 1
+                  _ranked = sorted(_contended.items(), key=lambda kv: (-kv[1], kv[0]))[:8]
+                  _top = ", ".join(f"{_k}={_v}" for _k, _v in _ranked) or "none"
+                  print(f"partition census {repo}: candidates={len(_cands)} "
+                        f"frontier={len(ready)} "
+                        f"partition-deferred={max(0, len(_cands) - len(ready))} "
+                        f"top-contended: {_top}")
+              # <<< partition-census
               # Issue #225: a `status:ready` issue carrying NO role:* label is dropped by the
               # readiness engine (has_role) BEFORE any plan row exists — it shows up in no plan,
               # no diagnostic, and never drains. 117 accumulated before a human noticed. Report
@@ -964,6 +1002,16 @@ jobs:
 
           review_items = []
           disarm_items = []
+          # [#657 enable] DETECTION-ONLY, and deliberately NOT part of `document`. The disarm lane
+          # selects candidates on the worker producer shape plus registry #570's exact-App author
+          # gate, so it cannot see the enrolled orchestrator class at all — and admitting that
+          # class there would waive #570 on a dequeue/redraft/relabel WRITE path, which is an
+          # authority escalation rather than a shape widening. So the #42 invariant is OBSERVED for
+          # that class instead: these rows are printed and never planned, so nothing downstream
+          # (CLAIM's `_apply_disarm_items` above all) can act on them. Keeping them OUT of the plan
+          # artifact is the structural half of "detection only" — a field CLAIM cannot read is a
+          # field CLAIM cannot act on.
+          disarm_observations = []
           snapshot_skips = []
           # [registry #677] Per-repo starvation evidence for the CLAIM-side self-healing sweep:
           # how many READY issue rows the busy partition dropped behind a `__global__` occupant.
@@ -1079,6 +1127,11 @@ jobs:
               # sweep, re-deriving every precondition live (matching SHAs are never disarmed).
               disarm_items.extend(claim_mod.enumerate_disarm_items(
                   repo, pulls, pr_status, provenance))
+              # ...and the SAME invariant over the class that enumerator cannot see, as an
+              # OBSERVATION. Same `enrolled_authors` the review enumerator just used, so the
+              # observed population is exactly the admitted one.
+              disarm_observations.extend(claim_mod.enumerate_disarm_observations(
+                  repo, pulls, pr_status, provenance, enrolled_authors))
               # Deferred-retry items with a still-live lease are dropped registry-side, then the
               # busy-area union over ALL open worker PRs (issue #27) keeps impl items out of any
               # crate with an in-flight review-loop PR. The busy partition reads the SAME
@@ -1284,6 +1337,13 @@ jobs:
               f"{bucket}={count}" for bucket, count in sorted(review_census.items()))
           print(f"review-enumeration census over {sum(review_census.values())} drafted "
                 f"already-reviewed worker PR(s): {census_detail or 'none'}")
+          # [#657 enable] The detection-only #42 emission for the enrolled orchestrator class, on
+          # EVERY plan — one ::warning:: per live violation plus a census line that prints even at
+          # zero, so an unresolved detection is re-stated every tick instead of being reported once
+          # and going quiet. Emission only: `disarm_observations` never entered `document`, so
+          # CLAIM cannot read it and no write path exists for this class.
+          for observation_line in claim_mod.format_disarm_observations(disarm_observations):
+              print(observation_line)
           PY
 
       - name: Upload immutable plan artifact (pinned)

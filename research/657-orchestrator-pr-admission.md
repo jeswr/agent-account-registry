@@ -453,3 +453,85 @@ hour, which is exactly why §7.1 marked it time-bound. The structural claims are
 shape gates remain perfectly correlated over the unlabelled set, and the fork gate is still
 excluding nothing (0/121), so hoisting it above the waiver costs nothing and guards the one
 attacker-facing predicate.
+
+---
+
+## 9. §7.4 step 2b — the last three shape tests (Claude Opus 5, 2026-07-27)
+
+> 🤖 **SPARQ agent** — this section closes §8.4 item 5. The three regexes it named are handled;
+> what it says about each is *different*, and the differences are the point.
+
+### 9.1 The rule this applied
+
+Every site was extended (or explicitly *not* extended) **through the predicate the other
+consumers already use** — `admits_orchestrator_pr` — rather than through a second shape test.
+Re-deriving "is this the class?" locally is the drift that §8.1 spent a whole PR eliminating.
+
+The **fork gate** is hoisted above every waivable predicate at each site touched. §8's framing
+needs one correction, which #844's review made and which applies again here: master's fork test
+was already the *first disjunct of an `or`*, so it was safe by **fusion, not ordering** — inside
+a boolean list the order is irrelevant. The hazard the hoist removes is **co-waiver**: a waiver
+written into that `or`/`and` would carry the fork gate with it. That is why each site now has the
+fork test standing alone.
+
+### 9.2 `worker-pr.py` — a fail-OPEN on a non-waivable gate
+
+`live_human_holds` / `live_machine_parks` / `live_security_flagged` derived the **source issue**
+from the worker head ref whenever no explicit `--issue` was passed. The class has an ordinary
+branch by definition, so the regex could not match and the non-match read as *no source issue*,
+i.e. **no holds found**. The source-issue hold is one of the gates #657 explicitly does **not**
+waive, so that is a fail-open on a non-waivable gate.
+
+One shared derivation (`hold_surface_source_issue`) now serves all three, and the class without an
+explicit issue **raises**. The class is the already-resolved `self_attested` answer review-fix.yml
+computes host-side, never a second record read — one view of one decision.
+
+`run_disarm` still **refuses** the class, deliberately. It retracts *machine* latches and
+`ready_and_arm` refuses the class outright, so no autonomous path can arm an orchestrator PR;
+admitting it would also require waiving the #570 exact-App author gate, which buys write access to
+someone's branch. Both halves are asserted executably rather than argued in a comment.
+
+### 9.3 `backfill-provenance.py` — the class must stay out, but not by accident
+
+`HEAD_RE`'s run id is backfill's **only** identity source (no trailer fallback: trailers on this
+population are model-forgeable), and a self-authored PR has no worker run. So the class must never
+enter that loop — and minting for it is `mint-provenance.py`'s job. It stayed out by accident of
+the shape test; it is now **recognised** through the shared predicate and skipped with a reason.
+Two live hazards this forecloses: hunting a run log that does not exist (NEEDS-HUMAN for every
+orchestrator PR), and **draft-converting** a class the review lane admits *because* it stands the
+draft requirement down.
+
+`review_enrolment_authors` is read through policy-resolve's validating accessor. That accessor is
+the **only** thing refusing a `[bot]` login; `admits_orchestrator_pr` is a plain casefolded
+membership test and would happily admit one. Asserted where it lives.
+
+### 9.4 `resolve-conflicts.py` — the honest non-change
+
+`owned_by_review_rebase_lane` is a **hand-over**: True means the resolver walks away. Sound only
+while the lane it hands to will take the PR — and `review_fix_pr_admission` waives for
+`mode == "review"` **alone**, because a fix run pushes commits to the PR head (§3). So the class
+must **never** be ceded, or a CONFLICTING PR — the population that gets no `pr-gate` run at all —
+is stranded.
+
+A runtime `and not admits_orchestrator_pr(...)` here would be a **dead conjunct**: that predicate
+needs the author's login in `review_enrolment_authors`, policy-resolve refuses `[bot]` logins
+there, and this predicate requires a `[bot]` author, so the conjunction is empty by construction.
+Shipping it would be a guard that can never fire. The *justification* is asserted instead: the
+self-test runs the live `review_fix_pr_admission` over a fully-admissible enrolled orchestrator PR
+and requires `review` to admit and `fix` to refuse.
+
+### 9.5 What still blocks enrolment after this
+
+1. **The disarm lane cannot see the class.** `enumerate_disarm_items` and
+   `_disarm_row_admissible` (dispatch-claim.py) both require a worker head ref, and `run_disarm`
+   requires the exact App author. Today that is consistent — nothing autonomous arms the class.
+   The moment a **human** arms an enrolled orchestrator PR, the #42 invariant (never merge a
+   never-reviewed tree on green CI) has no enforcement on it. Admitting the class needs a
+   *design* decision about the #570 author gate, not a shape widening; it is not residue.
+2. **`AUTO_READMISSION_PER_TICK_MAX = 5`** (#844's surface, raised by #856's review): ~50 minutes
+   to drain a 21-PR cohort at the 10-minute floor.
+3. **A constant reviewer side** (§8.4 item 4) — quality, not safety, but a self-declared field
+   should not choose which account pool is spent.
+4. **`enrolment_enable_error` returning `None` is not a green light.** It checks *wiring*, not
+   readiness; every blocker found so far was outside what it can express. `policy/repos.toml` is
+   again deliberately unchanged.

@@ -1278,6 +1278,53 @@ def stranded_live(draft, armed, reviewed_match, mergeable, gate):
             and mergeable is True and gate in TIER_REACHABLE_GREEN)
 
 
+def armed_sha_mismatch(repo, pull, pr_status):
+    """THE #42 armed-SHA-mismatch INVARIANT itself, as ONE pure predicate, with NO class in it.
+
+    Returns the row ``{pr_number, head_sha, reviewed_sha, repo}`` when this PR's live head carries
+    a latch (armed, or READY with an interrupted disarm) that is NOT bound to the head the
+    reviewed-sha marker names — and None otherwise. Everything here is class-independent: the fork
+    gate, the open/number/sha shape checks, the snapshot-coherence check, the unarmed-draft
+    carve-out and the matching-marker carve-out. The CALLER supplies (a) the CANDIDATE FILTER —
+    which PRs it is entitled to look at — and (b), separately and by construction, whether it may
+    ACT on the answer or only REPORT it.
+
+    WHY IT IS SHARED. Two consumers now ask "is #42 violated here?": the write-authorised worker
+    enumerator (`enumerate_disarm_items` -> CLAIM -> `worker-pr.py disarm`) and the DETECTION-ONLY
+    orchestrator-class observer (`enumerate_disarm_observations`). An invariant with two spellings
+    drifts, and the observer's entire value is that it reports the SAME condition the disarm lane
+    would act on — a second copy would let "what the lane disarms" and "what the census calls a
+    violation" diverge silently, which is the failure this detection exists to rule out.
+
+    PURE and TOTAL: every malformed input yields None, never a raise (it runs inside the PLAN
+    walk, where an exception aborts the whole tick instead of skipping one PR)."""
+    if not isinstance(pull, dict):
+        return None
+    number = pull.get("number")
+    head = pull.get("head") or {}
+    sha = str(head.get("sha", ""))
+    if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
+        return None
+    if pull.get("state") != "open":
+        return None
+    # FORK GATE, unconditional and ahead of every caller-supplied predicate: a fork head is
+    # attacker-controlled and is never disarmed, admitted, enrolled — or censused.
+    if (head.get("repo") or {}).get("full_name") != repo:
+        return None
+    if not SAFE_SHA.fullmatch(sha):
+        return None
+    status = pr_status.get(number) if isinstance(pr_status, dict) else None
+    if not isinstance(status, dict) or status.get("head_sha") != sha:
+        return None                       # stale/unknown snapshot — unknown never acts
+    if status.get("armed") is not True and pull.get("draft") is True:
+        return None                       # unarmed draft — nothing latched, nothing interrupted
+    reviewed = REVIEWED_SHA_RE.search(pull.get("body") or "")
+    reviewed_sha = reviewed.group(1) if reviewed else "none"
+    if reviewed_sha == sha:
+        return None                       # the arm is bound to this exact head — valid, keep it
+    return {"pr_number": number, "head_sha": sha, "reviewed_sha": reviewed_sha, "repo": repo}
+
+
 def enumerate_disarm_items(repo, pulls, pr_status, provenance, bot_login=""):
     """PURE armed-SHA-mismatch enumerator (registry issue #42): any ARMED worker PR whose live
     head no longer equals its recorded reviewed-sha marker is a safety violation — the GitHub
@@ -1296,56 +1343,123 @@ def enumerate_disarm_items(repo, pulls, pr_status, provenance, bot_login=""):
     purpose (PR #60 round-1): the disarm reads only head_sha + the armed bit — both detail
     fields — so check-run volume must never stand this net down (that would be fail-OPEN:
     the one admission whose ACT is the safety measure, defeatable by churning a head past
-    the check-run ceiling)."""
+    the check-run ceiling).
+
+    The #42 invariant itself lives in `armed_sha_mismatch` (shared with the detection-only
+    orchestrator-class observer). What remains HERE is exactly this lane's CANDIDATE FILTER — the
+    worker lane's producer shape plus #570's exact-App gate — because this is the lane that gets
+    to ACT, and its authority is bounded by that filter and nothing else. Issue #105: a human hold
+    (review:needs-user / needs:user) parks autonomous PUSHES and reviews, but it must NEVER
+    suppress this safety-only latch retraction — a stale armed head escalated to review:needs-user
+    after a failed disarm would otherwise strand the latch and merge an unreviewed tree on green
+    CI. Held PRs are enumerated here on the same footing as any other armed-SHA mismatch;
+    worker-pr.py disarm --when mismatch retracts the latch while PRESERVING the hold label."""
     items = []
     for pull in pulls:
         if not isinstance(pull, dict):
             raise DispatchError("disarm enumeration met a malformed pull request")
-        number = pull.get("number")
+        row = armed_sha_mismatch(repo, pull, pr_status)
+        if row is None:
+            continue
+        number = row["pr_number"]
         head = pull.get("head") or {}
-        ref = str(head.get("ref", ""))
-        sha = str(head.get("sha", ""))
-        head_repo = (head.get("repo") or {}).get("full_name")
         login = str((pull.get("user") or {}).get("login", ""))
-        if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
-            continue
-        if pull.get("state") != "open":
-            continue
-        if not HEAD_REF_RE.match(ref) or head_repo != repo:
+        if not HEAD_REF_RE.match(str(head.get("ref", ""))):
             continue
         if not login.endswith("[bot]") or (bot_login and login != bot_login):
             continue
-        record = provenance.get(number)
+        record = provenance.get(number) if isinstance(provenance, dict) else None
         record_number = record.get("pr_number") if isinstance(record, dict) else None
         # Strict int identity, bool excluded — same float/bool-equality hazard as
         # provenance_admission_error: 41.0 == 41 and True == 1 under a bare !=.
         if (not isinstance(record_number, int) or isinstance(record_number, bool)
                 or record_number != number):
             continue                      # never loop-armed without provenance — leave to humans
-        if not SAFE_SHA.fullmatch(sha):
-            continue
-        # Issue #105: a human hold (review:needs-user / needs:user) parks autonomous PUSHES and
-        # reviews, but it must NEVER suppress this safety-only latch retraction. A stale armed
-        # head escalated to review:needs-user after a failed disarm — or a human label applied
-        # while auto-merge stays latched — would otherwise strand the latch and merge an
-        # unreviewed tree on green CI. Held PRs are enumerated here on the same footing as any
-        # other armed-SHA mismatch; worker-pr.py disarm --when mismatch retracts the latch
-        # (disable-auto/dequeue + redraft) while PRESERVING the hold label (it drops the relabel
-        # that would strip review:needs-user and re-admit the PR). enumerate_review_items still
-        # skips held PRs, so the hold keeps stopping pushes/reviews.
-        status = pr_status.get(number) if isinstance(pr_status, dict) else None
-        if not isinstance(status, dict) or status.get("head_sha") != sha:
-            continue                      # stale/unknown snapshot — unknown never acts
-        if status.get("armed") is not True and pull.get("draft") is True:
-            continue                      # unarmed draft — nothing latched, nothing interrupted
-        reviewed = REVIEWED_SHA_RE.search(pull.get("body") or "")
-        reviewed_sha = reviewed.group(1) if reviewed else "none"
-        if reviewed_sha == sha:
-            continue                      # the arm is bound to this exact head — valid, keep it
-        items.append({"pr_number": number, "head_sha": sha,
-                      "reviewed_sha": reviewed_sha, "repo": repo})
+        items.append(row)
     items.sort(key=lambda item: (item["repo"], item["pr_number"]))
     return items
+
+
+# The DETECTION-ONLY emission's stable log prefixes. Named so the workflow seam carries no text of
+# its own and the self-test asserts against the same literals production prints.
+DISARM_OBSERVATION_ALERT = "::warning::armed-SHA mismatch on an enrolled orchestrator-class PR"
+DISARM_OBSERVATION_CENSUS = "disarm-observation census"
+
+
+def enumerate_disarm_observations(repo, pulls, pr_status, provenance, enrolled_authors):
+    """DETECTION-ONLY census of the #42 armed-SHA invariant over the ENROLLED ORCHESTRATOR CLASS —
+    the population `enumerate_disarm_items` structurally cannot see (registry #876 review).
+
+    WHY THIS IS EMISSION AND NOT A LANE. `enumerate_disarm_items` selects candidates on the worker
+    lane's producer shape (`HEAD_REF_RE`) AND #570's exact-App author gate, so an orchestrator-class
+    PR is invisible to the whole disarm path. Making it VISIBLE to that path would mean waiving
+    #570's exact-App gate on a dequeue/redraft/relabel WRITE path — an authority escalation, not a
+    shape widening, and one nothing in #657 argued for. So the invariant is OBSERVED instead: this
+    function is read-only, its rows are never merged into `disarm_items`, they are never written to
+    the plan artifact, and no consumer of them can reach `_apply_disarm_items`. The residual risk
+    is unchanged from today (a human retracts the latch); what changes is that today the condition
+    is INVISIBLE and after this it is named on every tick.
+
+    EVERY TICK, not once. An unresolved detection that reports itself once and then goes quiet is
+    indistinguishable from a resolved one. This is a pure function of the tick's own live snapshot,
+    so it re-derives — and PLAN re-prints — for as long as the condition holds; see
+    `format_disarm_observations`, whose census line is emitted even at zero so "no violations" and
+    "this stopped being counted" cannot look the same.
+
+    ``enrolled_authors`` is the repo's MASTER-protected `review_enrolment_authors`. EMPTY — every
+    repo's default — makes `admits_orchestrator_pr` constantly False, so this observer emits
+    nothing at all until a reviewed master commit opts a login in. The class predicate is the SAME
+    `admits_orchestrator_pr` that PLAN, CLAIM, review-fix.yml's resolve step and the re-admission
+    sweep use: "admitted for review over there" and "observed here" cannot drift into two
+    populations.
+
+    PURE. Raises only on a malformed `pulls` element, exactly as `enumerate_disarm_items` does."""
+    observations = []
+    for pull in pulls:
+        if not isinstance(pull, dict):
+            raise DispatchError("disarm observation met a malformed pull request")
+        row = armed_sha_mismatch(repo, pull, pr_status)
+        if row is None:
+            continue
+        number = row["pr_number"]
+        login = str((pull.get("user") or {}).get("login", ""))
+        record = provenance.get(number) if isinstance(provenance, dict) else None
+        if not admits_orchestrator_pr(record, number, login, enrolled_authors):
+            continue
+        observations.append(row)
+    observations.sort(key=lambda item: (item["repo"], item["pr_number"]))
+    return observations
+
+
+def format_disarm_observations(observations):
+    """The detection-only emission, as LINES — one alert per live violation plus ONE census line
+    that is printed unconditionally, including at zero.
+
+    It lives here rather than in the workflow so the YAML seam is "call it, print every line" and
+    the emission's text is unit-testable. The census line is the half that must not be
+    conditional: a per-violation alert can only ever prove that something WAS reported, never that
+    the observer ran and found nothing — and an absent bucket and a zero bucket must not look the
+    same (the #753/#762 population-census rule this repo already applies to the review lane).
+
+    TOTAL: malformed rows are ignored rather than raised on, because this runs at the end of a PLAN
+    that has already done all of its real work."""
+    rows = [row for row in observations
+            if isinstance(row, dict) and isinstance(row.get("pr_number"), int)
+            and not isinstance(row.get("pr_number"), bool)]
+    lines = []
+    for row in sorted(rows, key=lambda item: (str(item.get("repo")), item["pr_number"])):
+        lines.append(
+            f"{DISARM_OBSERVATION_ALERT} {row.get('repo')}#{row['pr_number']}: the live head "
+            f"{row.get('head_sha')} is latched but the reviewed-sha marker names "
+            f"{row.get('reviewed_sha')}. The disarm lane is DETECTION-ONLY for this class — "
+            "acting would require waiving registry #570's exact-App author gate on a write path — "
+            "so a human must retract the latch (worker-pr.py disarm --when mismatch).")
+    detail = ", ".join(f"{row.get('repo')}#{row['pr_number']}"
+                       for row in sorted(rows, key=lambda item: (str(item.get("repo")),
+                                                                 item["pr_number"])))
+    lines.append(f"{DISARM_OBSERVATION_CENSUS}: {len(rows)} enrolled orchestrator-class PR(s) "
+                 f"with an armed-SHA mismatch ({detail or 'none'})")
+    return lines
 
 
 _NO_PR_DETAIL = object()
@@ -1780,17 +1894,108 @@ def filter_busy_area_items(items, repo, pulls, issue_labels, provenance, pr_stat
     return kept
 
 
-# [registry #677] How many `__global__` holders ONE tick may park, per target repository. One.
-# The recurrence in #677 is that parking a holder by hand simply PROMOTES the next one, so a
-# sweep that drained the whole holder set in a single tick would be exactly that mistake
-# automated — it would park PRs whose reservation was never the binding one, and each park costs
-# real review progress. One per tick converges over ticks (each park frees the partition and the
-# NEXT tick re-measures whether the lane is still starved) and never over-shoots.
-STARVATION_PARKS_PER_TICK_MAX = 1
+# [registry #677 + #822] How many `__global__` holders ONE tick may park, per target repository.
+#
+# THIS CONSTANT WAS 1, AND THE 1 WAS WRONG IN TWO INDEPENDENT WAYS.
+#
+# (a) IT NEVER CONVERGED THE WAY ITS COMMENT CLAIMED. The old rationale was "each park frees the
+#     partition and the NEXT tick re-measures". It does not. `filter_busy_area_items` reads
+#     `global_reserved = GLOBAL_PACKAGE in busy`, and `busy` is a UNION over every occupant — so
+#     `__global__` stays reserved while ANY holder holds it. With N inert holders, parking one
+#     frees exactly nothing: the lane is still fully starved on the next tick, and the next, until
+#     the LAST holder is parked. Every intermediate park spent real review progress and bought
+#     zero throughput. Parking all N is therefore not "the hand-parking mistake automated" — it is
+#     the only batch size at which the action does anything at all.
+#
+# (b) THE TICK FLOOR MULTIPLIED ITS COST. #822 imposes a 10-minute minimum between EXECUTED ticks
+#     (scripts/dispatch-tick-floor.MIN_TICK_INTERVAL_SECONDS). A cap denominated in TICKS is
+#     denominated in 10-minute units now. MEASURED on sparq-org/sparq 2026-07-27: `assemble-census`
+#     read `kept=0` on four consecutive executed ticks (20:12:40Z -> 20:47:36Z), every row deferred
+#     by `reason.global-reservation`, zero impl workers launched; it cleared at 21:07:30Z. Four
+#     holders at one park per 10-minute tick is ~55 minutes of TOTAL dispatch outage. Before #822
+#     ticks ran every ~7 minutes (briefly ~4), so the same cap was cheap. THE FLOOR IS CORRECT AND
+#     STAYS — it exists because exceeding ~6 ticks/h exhausted the request budget and took the
+#     fleet down twice. The cap is what changes.
+#
+# WHY BATCHING IS SAFE, from the sweep's OWN predicate. `starvation_park_targets` fires only when
+# `planned_items` is empty AND `deferred > 0` — nothing whatsoever is dispatchable and something is
+# queued behind the partition. Under that condition there is no lane left to starve by parking too
+# many: the lane is already at zero. The eligibility predicate (BUSY + holds `__global__` +
+# un-parked + provably inert) is UNCHANGED — this constant governs how many of the holders that
+# predicate already admits may be acted on in one tick, and nothing else.
+#
+# THE BOUND, and its arithmetic. A bound still exists so a pathological board cannot turn one tick
+# into an unbounded mutation burst, but it is derived from the measured board and the measured
+# request budget rather than from the number 1:
+#
+#   cost of ONE park            <= 5 authenticated requests
+#       ITEMISED in STARVATION_PARK_REQUEST_ITEMS below, because prose cannot be mutation-tested
+#       and this derivation was WRONG on its face in round 1: the sticky-unpark veto's timeline
+#       read was written as "(1)", which is a count of `gh api --paginate` INVOCATIONS, not of
+#       HTTP requests. At `per_page=100` that read costs ceil(events/100) requests.
+#       RE-MEASURED on the live target (sparq-org/sparq), as `len(timeline?per_page=100)`. THE
+#       POPULATION IS THE FOUR PRs THE SWEEP ACTUALLY PARKED, and it identifies itself: their
+#       `review:parked` labels landed 20:15:53Z, 20:28:37Z, 20:41:20Z and 20:50:16Z — FOUR
+#       CONSECUTIVE TICKS, ONE PARK EACH, which is this defect visible in the label timeline.
+#           #4599 = 8, #4601 = 5, #4604 = 7, #4607 = 4 events
+#       and the three OLDEST open PRs (#1487/#1509/#1607) — the widest timelines the fleet
+#       actually holds — carry 19 / 32 / 25. ONE page each, so the itemised 1 is right.
+#       (An EARLIER round of this comment named #4360/#4509/#4528/#4571 as the board. That was
+#       wrong and is corrected rather than quietly dropped: #4571 is an ISSUE, #4360 is a CLOSED
+#       PR, and #4509/#4528 carry `needs:user` — a human-owned hold that
+#       park_starved_partition_holder REFUSES. They are the UNPROVENANCED population this file
+#       names elsewhere, which is a different set from the PARKED board.)
+#       These counts DRIFT — they moved within hours of being taken, and two read methods
+#       disagreed by one — so the exact numbers are not what the bound rests on. What it rests on
+#       is the margin to the 100/page boundary: at a cap of 12 the spare affords FOUR pages per
+#       holder (12 * (4 + 4) = 96 <= 102) before the budget binds, i.e. ~400 timeline events on
+#       every holder at once.
+#   spare requests per tick     ~= 102
+#       the floor sizes a clean tick at MEASURED_REQUESTS_PER_TICK=613 and 6 ticks/h = 3,678/h,
+#       against OBSERVED_SAFE_REQUESTS_PER_HOUR = 7*613 = 4,291/h that ran clean for thirteen
+#       hours. Spare = 4,291 - 3,678 = 613/h = ~102 per tick at 6 ticks/h.
+#   12 parks * 5 requests       =  60  <=  102     (59% of the spare, 9.8% of a tick)
+#
+# and 12 is 3x the largest starved board actually measured (4 holders, the window above), so the
+# measured case drains in ONE tick (10 min) rather than FOUR (40 min); the observed outage ran ~55
+# min because that window also spans the tick that first measured it and the one that cleared it. A
+# board wider than the bound is paced onto later ticks exactly as before, loudly. _starvation_sweep_self_test asserts BOTH halves
+# of this arithmetic against dispatch-tick-floor.py's own constants, so neither the floor nor this
+# bound can drift away from the reasoning that produced it.
+#
+# EVERY MEASURED INPUT THAT ARITHMETIC CONSUMES IS PINNED BY EQUALITY, not merely by the inequality
+# that reads it (registry #871). An inequality pins exactly ONE direction, and for the inputs below
+# the direction it leaves open is the UNSAFE one: `_batch_cost <= _spare_per_tick` reads the park
+# cost only on the LEFT, so understating it makes the assertion strictly EASIER. MEASURED on this
+# file before the pins existed: `STARVATION_PARK_REQUESTS_EACH = 1` SURVIVED the entire self-test,
+# and `= 1` with the cap widened to 100 survived it too — a green suite sanctioning ~500 real
+# requests per tick (6 x 1,113 = 6,678/h) against an OBSERVED-SAFE 4,291/h. Only the OVER-stating
+# mutant (`= 50`) ever died. That is exactly the shape of the MEASURED_STARVED_HOLDER_BOARD hole,
+# one constant over.
+#
+# The per-park request cost, ITEMISED so the total cannot drift away from its own derivation: a
+# mutant that rewrites the total is caught by the equality pin on the total, and one that rewrites
+# a line item is caught by the equality pin on the itemisation.
+STARVATION_PARK_REQUEST_ITEMS = (
+    # the sticky-unpark veto's timeline read: ONE `--paginate` invocation, ceil(events/100)
+    # requests at per_page=100; MEASURED one page for every holder on the live board
+    ("unpark-veto timeline read", 1),
+    ("collaborator-permission probes behind the veto", 2),
+    ("the park receipt comment", 1),
+    ("the machine-park label write", 1),
+)
+STARVATION_PARK_REQUESTS_EACH = sum(_n for _what, _n in STARVATION_PARK_REQUEST_ITEMS)   # == 5
+STARVATION_PARKS_PER_TICK_MAX = 12
+
+# The widest starved `__global__` holder board MEASURED on a live target (sparq-org/sparq,
+# 2026-07-27 20:12:40Z-20:47:36Z). The bound must drain it in ONE tick or the floor multiplies the
+# outage again; the self-test asserts exactly that.
+MEASURED_STARVED_HOLDER_BOARD = 4
 
 
-def starvation_park_target(planned_items, deferred, occupancy, log=print):
-    """PURE. The ONE `__global__` occupant to park because the issue lane is STARVED, or None.
+def starvation_park_targets(planned_items, deferred, occupancy, log=print,
+                            cap=STARVATION_PARKS_PER_TICK_MAX):
+    """PURE. EVERY `__global__` occupant to park because the issue lane is STARVED (ascending).
 
     This is the trigger for the self-healing sweep in registry #677. It fires on the MEASURED
     condition, never on a timer, and every clause below is load-bearing:
@@ -1812,13 +2017,19 @@ def starvation_park_target(planned_items, deferred, occupancy, log=print):
       free one single crate. Registry #677 measured exactly that outcome by hand. A holder whose
       park would not demonstrably free the partition is not a candidate.
 
-    Deterministic and bounded: candidates are considered in ascending PR number and exactly one is
-    returned, so at most STARVATION_PARKS_PER_TICK_MAX == 1 holder is parked per repository per
-    tick, and two runs over the same input pick the same PR."""
+    ALL of them, not one (registry #822 composition defect — see STARVATION_PARKS_PER_TICK_MAX).
+    `busy` is a UNION, so the partition stays reserved while any holder holds it: parking one of N
+    frees nothing and the next tick — now 10 minutes away, not 7 — re-measures the identical
+    starvation. Under this function's own predicate (`planned_items` empty AND `deferred > 0`)
+    there is no dispatch left to protect, so the batch cannot starve anything.
+
+    Deterministic and bounded: candidates are returned in ascending PR number, at most `cap` of
+    them, so two runs over the same input pick the same PRs and a pathological board is paced onto
+    later ticks instead of becoming an unbounded mutation burst."""
     if planned_items:
-        return None                       # the plan is HEALTHY — never park a holder
+        return []                         # the plan is HEALTHY — never park a holder
     if not isinstance(deferred, int) or isinstance(deferred, bool) or deferred <= 0:
-        return None                       # nothing was starved (empty backlog / unreadable count)
+        return []                         # nothing was starved (empty backlog / unreadable count)
     candidates = []
     for row in occupancy if isinstance(occupancy, list) else []:
         if not isinstance(row, tuple) or len(row) < 5:
@@ -1840,12 +2051,21 @@ def starvation_park_target(planned_items, deferred, occupancy, log=print):
         log("starvation sweep: the issue lane planned 0 item(s) behind "
             f"{deferred} partition-deferred row(s), but no UN-PARKED, provably-inert "
             f"`{GLOBAL_PACKAGE}` holder was found — parking nobody")
-        return None
-    target = min(candidates)
+        return []
+    candidates.sort()
+    targets = candidates[:cap] if isinstance(cap, int) and not isinstance(cap, bool) else []
     log(f"starvation sweep: issue lane planned 0 item(s) while {deferred} ready row(s) deferred "
         f"behind the `{GLOBAL_PACKAGE}` partition; {len(candidates)} un-parked inert holder(s) "
-        f"{sorted(candidates)} — parking pr#{target} (cap {STARVATION_PARKS_PER_TICK_MAX}/tick)")
-    return target
+        f"{candidates} — parking {targets} (cap {cap}/tick)")
+    if len(candidates) > len(targets):
+        # LOUD, because this is the ONLY residue of the old defect: the partition is a union, so a
+        # board wider than the bound still frees nothing this tick and the remainder waits a full
+        # floor interval. It has never been observed (widest measured board:
+        # MEASURED_STARVED_HOLDER_BOARD), and if it is, the bound is what needs re-deriving.
+        log(f"::warning::starvation park paced: {len(candidates)} inert `{GLOBAL_PACKAGE}` "
+            f"holder(s) exceed the {cap}/tick bound; {candidates[len(targets):]} wait for the "
+            "next tick, and the partition stays reserved until the LAST holder is parked")
+    return targets
 
 
 def record_global_reservation_cause(census, cause):
@@ -1887,9 +2107,22 @@ def global_reservation_census(occupancy):
 
 
 # [registry #772] How many unprovenanced `__global__` holders ONE tick may escalate, per target
-# repository. The same pacing doctrine as STARVATION_PARKS_PER_TICK_MAX: an escalation is a loud,
-# operator-facing artifact, and emitting one per holder per tick would bury the signal it exists
-# to raise. One per tick converges — each tick re-measures the live occupancy.
+# repository. An escalation is a loud, operator-facing artifact, and emitting one per holder per
+# tick would bury the signal it exists to raise, so it is paced.
+#
+# NO LONGER "the same pacing doctrine as STARVATION_PARKS_PER_TICK_MAX" — that cross-reference was
+# true until #822 and is retracted rather than left standing. The two caps bound DIFFERENT harms
+# and are now sized independently:
+#   * a PARK is a throughput action on a lane that is already at zero, so under-acting is the
+#     expensive direction and its bound is the request budget (see STARVATION_PARKS_PER_TICK_MAX);
+#   * an ESCALATION is a WARNING, so OVER-acting is the expensive direction and 1/tick is right on
+#     its own terms — the harm it guards is a buried signal, not a starved lane.
+#
+# The tick cost is stated so nobody has to re-derive it: at #822's 10-minute floor, N stuck
+# holders take N * 10 minutes for ALL of them to be NAMED in a run log. The measured population
+# was 3 (sparq-org/sparq #4360/#4509/#4528) = 30 minutes to enumerate. That is VISIBILITY latency
+# on a condition that is already permanent and already counted every tick under
+# `partition-starvation-unprovenanced`, not dispatch outage — which is why it is left at 1.
 STARVATION_ESCALATIONS_PER_TICK_MAX = 1
 
 
@@ -1897,7 +2130,7 @@ def starvation_provenance_escalation(planned_items, deferred, occupancy, log=pri
                                      cap=STARVATION_ESCALATIONS_PER_TICK_MAX):
     """PURE. The unprovenanced `__global__` holder(s) to ESCALATE — the starved lane's MISSING EDGE.
 
-    [registry #772] `starvation_park_target` is the only remedy the sweep has, and it declines
+    [registry #772] `starvation_park_targets` is the only remedy the sweep has, and it declines
     every holder that is not an un-parked provably-inert draft, because parking an ACTIVE holder
     writes a label and frees nothing. That refusal is correct. What was missing is what happens
     NEXT: the sweep logged "parking nobody" and the tick ended, so a lane annihilated by a PR with
@@ -1922,7 +2155,7 @@ def starvation_provenance_escalation(planned_items, deferred, occupancy, log=pri
         its source issue carries no `area:` labels is a partition working as designed and has no
         provenance recovery — escalating it would be noise;
       - and the park sweep's remedy must NOT apply. An un-parked, provably-inert holder is
-        exactly what `starvation_park_target` selects, so escalating it too would double-report
+        exactly what `starvation_park_targets` selects, so escalating it too would double-report
         the one case that already self-heals.
 
     Returns at most `cap` PR numbers in ascending order — deterministic, like the park half."""
@@ -2517,6 +2750,53 @@ def admits_orchestrator_pr(record, pr_number, login, enrolled_authors):
     return login.casefold() in {
         author.casefold() for author in enrolled_authors if isinstance(author, str)
     }
+
+
+def review_enrolment_class_error(record):
+    """Why a candidate class can NOT be enrolled into the cross-provider review lane, or None.
+
+    THE QUESTION THIS EXISTS TO MAKE ANSWERABLE BY EXECUTION (measured 2026-07-27 on live sparq:
+    four green, ready, `review:unreviewed` PRs that no reviewer ever arrives for). They are not one
+    class, they are three, and only one of them is enrollable:
+
+      1. ORCHESTRATOR-AUTHORED (sparq #3798, #4193; every `jeswr` PR in this repo). A human or an
+         orchestrator-side agent wrote the diff with a real model on a real provider, so the record
+         carries a truthful `impl_provider` and the lane can INVERT it. ENROLLED — this is the
+         class `review_enrolment_authors` serves, and note it is already head-ref-shape AGNOSTIC:
+         nothing anywhere encodes `fix/*`, so any branch name works today.
+      2. RELEASE PRs (sparq #4460, release-plz, App-bot-authored, `release-plz-<timestamp>` head).
+      3. DEPENDENCY-BUMP PRs (sparq #4488, dependabot).
+
+    Classes 2 and 3 fail here, and the reason is NOT the author allowlist. It is that the review
+    lane picks the reviewer's side by INVERTING `impl_provider` (REVIEW_CHAIN), and a release or a
+    dependency bump HAS NO IMPLEMENTING MODEL. Every honest value for that field is refused by
+    `provenance_admission_error`, so admitting one of these classes would require FABRICATING a
+    provider — and the cross-provider assertion would then be satisfied by construction against a
+    field that means nothing. That is not a weaker guarantee, it is the absence of one wearing its
+    name.
+
+    So relaxing the allowlist's `[bot]` refusal — the axis that LOOKS like the blocker, because it
+    is the one that rejects #4460's and #4488's logins — would buy nothing except the exact failure
+    mode this is about: a PR that looks enrolled and is never reviewed. Those classes need a
+    reviewer-selection rule that is not an inversion of a self-declared provider (a pinned constant
+    side, or a review that asserts something other than provider difference). That is a separate
+    design and a separate PR; this predicate is where it will attach, and until it exists this
+    function is the honest, executable answer to "can this class be enrolled at all?".
+
+    TOTAL and fail-closed, like every predicate on this path."""
+    if not isinstance(record, dict):
+        return "the provenance record is not a JSON object"
+    provider = record.get("impl_provider")
+    if not isinstance(provider, str) or provider not in IMPL_PROVIDERS:
+        return ("the class declares no implementing model provider, so the review lane has no "
+                "field to INVERT when choosing the reviewer's side — a release PR or a dependency "
+                "bump is not enrollable through a cross-provider inversion, and fabricating an "
+                f"`impl_provider` would make the assertion vacuous (want one of "
+                f"{sorted(IMPL_PROVIDERS)})")
+    if provider not in REVIEW_CHAIN:
+        return (f"no review chain is declared for implementer provider {provider!r}, so no "
+                "reviewer side can be resolved")
+    return None
 
 
 def enrolment_enable_error(policy_doc, claim_admits, rf_admits, outcome_admits, arm_refuses):
@@ -3558,6 +3838,14 @@ def _pr_needs_user(script_dir, repo, pr_number, issue, reason, park_class="quest
     # [registry #677] State the capacity park's cause so the park EPISODE is attributable in its
     # own receipt. Omitted, worker-pr records `capacity-unspecified` — honest, and still a
     # receipt, which is what closes the "a stale cause receipt stays newest forever" hole.
+    # [registry #869] The QUESTION-class stops on this path state theirs too
+    # (`history-rewritten`, `marker-corrupt`, `routing-unresolvable`), which is what keeps the
+    # prose classifier's population strictly historical. This forwarding line is the SHARED SEAM
+    # for all four of them: deleting it silently reverts every dispatch-claim write site at once,
+    # so the per-site checks in the self-test drive THIS function and assert the argv it builds,
+    # not merely that the call sites name a cause. worker-pr's CLI seam refuses a cause that
+    # disagrees with `park_class` in either direction (validate_park_cause), so a wrong cause here
+    # fails LOUD rather than writing a receipt whose class contradicts the park.
     if park_cause:
         args += ["--park-cause", park_cause]
     if bot_login:
@@ -3756,11 +4044,44 @@ def _read_model_health_window(model_health, registry_repo, now, api=None):
     try:
         api = api or model_health.GitHubAPI(os.environ.get("GH_TOKEN", ""))
         records, _ = model_health.read_ledger(api, registry_repo)
-        return model_health.prune(records, now)
+        window = model_health.prune(records, now)
+        _warn_health_coverage_shortfall(model_health, window, now)
+        return window
     except (model_health.HealthError, ValueError) as exc:
         print("::error::dispatch decline escalation: validated model-health ledger is "
               f"unreadable ({exc}); NO task escalation will fire")
         return None
+
+
+def _warn_health_coverage_shortfall(model_health, window, now):
+    """[registry #699] Say ONCE PER TICK, at the one place the window is loaded, when the health
+    ledger cannot cover the sustained-health span — and say WHICH cause.
+
+    WHY. The aged-out park exit (registry #691) refuses on under-coverage exactly as it refuses on
+    a park that is simply not old enough yet, and both surface as the same `no-evidence` census
+    row. On 2026-07-26 that ambiguity produced a wrong operational conclusion. Since prune gained
+    its time-based retention floor an under-covered window has only two causes and they need
+    different responses: a YOUNG or sparse ledger fills in on its own and needs nothing, while a
+    RETENTION-BOUND one is the absolute ceiling binding — a real capacity condition. Emitted here,
+    not inside the predicate, because the predicate runs once per parked PR and this runs once per
+    window load. Never raises and never changes the returned window: diagnosis only."""
+    try:
+        shortfall = model_health.sustained_health_coverage_shortfall(window, now)
+    except Exception:                      # diagnostics must never break the read path
+        return None
+    if not shortfall:
+        return None
+    cause = ("the absolute RETENTION CEILING is binding (registry #699): the fleet record rate is "
+             "above what the ledger can retain, so this will not clear on its own"
+             if shortfall["retention_bound"] else
+             "the ledger is simply young or sparse; it fills in on its own. This is NOT the same "
+             "as 'the parks are not old enough yet'")
+    print(f"::warning::dispatch: the model-health window covers "
+          f"{shortfall['coverage_seconds'] / 3600.0:.2f} h of the "
+          f"{shortfall['span_seconds'] // 3600} h sustained-health span "
+          f"({shortfall['records']} records), so the registry #691 aged-out park exit CANNOT open "
+          f"this tick — {cause}", flush=True)
+    return shortfall
 
 
 def _capacity_recovery_probe(model_health, health_window, now):
@@ -4156,6 +4477,43 @@ def _readmit_capacity_parks(repo, pull_pages, issue_labels, provenance, bot_logi
             # sweep cannot drift from the admission it feeds.
             holds = _park_policy.human_owned_holds(set(labels) | set(source_labels))
             comments = comments_fn(repo, number)
+            # [registry #769] EPISODE BINDING. `review:parked` is a shared multi-writer label, and
+            # groom's AGE park now writes it too. An age park's cause is an orphan draft or a
+            # wedged merge state, which no model-health record can speak to — so the probe below
+            # skips both genuine gates and lands on the labelled sustained-fleet-health HEURISTIC,
+            # whose only condition this park can satisfy is BEING OLD ENOUGH. Measured on the real
+            # sweep with a byte-identical health window: `None` at 3 h, `auto-mint` at 7 h. That
+            # made age its own recovery proof, spent a re-admission budget groom never granted,
+            # and left groom's next hand-off escalating a flap that never happened.
+            #
+            # The heuristic is NOT removed — registry #691 added it for parks with no machine exit
+            # at all, and an age park is not one of those: its exit is groom's own cause proof.
+            # This class is simply made ineligible for health-only clearance. The check sits AFTER
+            # `holds` deliberately: a PR carrying a human-owned hold is HUMAN-TERMINAL, and that
+            # is the census classification a maintainer must see, so the hold keeps precedence.
+            if not holds:
+                age_park, age_detail = _park_policy.age_park_episode(
+                    # `labels` is the PR's own live set. The predicate refuses to answer at all
+                    # without a live `review:parked` — this sweep ALSO admits a PR whose SOURCE
+                    # ISSUE carries `status:parked` and which has no PR-side label, and such a PR
+                    # can still carry an age receipt from an earlier, already-cleared episode.
+                    labels, comments, bot_login,
+                    # The other mechanisms' durable PARK receipts. worker-pr owns the generation
+                    # marker's spelling, so it is passed from the literal this file already pins
+                    # against the real module rather than re-derived inside park_policy.
+                    superseding_markers=(PARK_GENERATION_MARKER_PREFIX,
+                                         _park_policy.PARK_REASON_MARKER),
+                    log=log)
+                if age_park:
+                    log(f"park stands {repo}#{number}: {age_detail}")
+                    # [G5] CENSUSED, like every other pre-admission exit. A refusal that skips the
+                    # census is exactly the invisible hold this whole class of defect is about —
+                    # and the code is EXIT-REACHABLE, which is the honest reading: groom's sweep
+                    # clears it on its own cause proof, with no human gesture required.
+                    _park_policy.park_census_record(
+                        park_census, repo, number,
+                        _park_policy.PARK_REFUSAL_FOREIGN_EPISODE, age_detail)
+                    continue
             # ONE timeline read per surface per PR: the admission consults the timelines several
             # times (the human cutoff, the park applications, the ownership probe) and every read
             # must see the SAME view anyway — a mid-decision change would mix two worlds.
@@ -4247,11 +4605,21 @@ def _log_park_census(repo, census, log=print):
             "population is uncounted")
 
 
-# [registry #677] How many partition-starvation parks ONE tick may UN-park, per repository. The
-# park side is capped at 1 because each park changes the measured condition; the un-park side is
-# capped at the same value the ordinary capacity re-admission uses, for the same stated reason —
-# a whole cohort re-entering the review lane in one tick starves the allocator that parked most of
-# them. An un-park deferred by this ceiling writes nothing and is simply retried next tick.
+# [registry #677] How many partition-starvation parks ONE tick may UN-park, per repository.
+#
+# DELIBERATELY ASYMMETRIC with STARVATION_PARKS_PER_TICK_MAX, and the asymmetry is the point. The
+# two directions have opposite failure modes: a park batch acts on a lane that is ALREADY at zero
+# (the sweep's predicate is `planned=0 and deferred>0`), so it cannot starve anything and is
+# bounded only by the request budget; an un-park batch puts a whole cohort BACK into a live review
+# lane, which is exactly what starves the allocator that parked most of them. So the release side
+# stays pinned to the ordinary capacity re-admission ceiling, for that reason and no other.
+#
+# The residual coupling, stated rather than hidden: a wide park batch can now be released more
+# slowly than it was applied. That is the benign direction (a release is throughput coming back,
+# not an outage), and releases are driven by each PR's provenance record landing, which does not
+# arrive in a batch. An un-park deferred by this ceiling writes nothing and is retried next tick —
+# which is now a 10-minute unit (#822), so the drain of a full cohort is
+# ceil(N / AUTO_READMISSION_PER_TICK_MAX) * 10 minutes. Re-derive this if that ever binds.
 STARVATION_UNPARKS_PER_TICK_MAX = AUTO_READMISSION_PER_TICK_MAX
 
 # The park cause this sweep owns. It is written into the park receipt and re-read before any
@@ -4480,10 +4848,13 @@ def starvation_park_body(repo, pr_number, deferred, issue_url):
         f"`{GLOBAL_PACKAGE}` to the reservation. Adding `area:*` labels to the PR cannot remove "
         "it — the fail-closed default is unioned in on top of them.\n\n"
         "## Why this PR\n\n"
-        "It is the lowest-numbered open worker PR that (a) holds that partition, (b) is not "
-        "already parked, and (c) is a provably inert draft with no arm latch — so parking it "
-        "**demonstrably frees the partition**. A holder whose park would not free anything is "
-        "never selected. At most one holder is parked per tick.\n\n"
+        "It is an open worker PR that (a) holds that partition, (b) is not already parked, and "
+        "(c) is a provably inert draft with no arm latch — so parking it **contributes to freeing "
+        "the partition**. A holder whose park would not free anything is never selected.\n\n"
+        "The reservation is a **union**, so the partition is only released once the **last** such "
+        "holder is parked. Every eligible holder is therefore parked on the same tick (up to a "
+        f"bound of {STARVATION_PARKS_PER_TICK_MAX}); parking them one per tick would leave the "
+        "lane fully starved for the whole drain and buy nothing until the final one.\n\n"
         "## What the label means\n\n"
         f"`{MACHINE_PARK_PR_LABEL}` is the **machine-recoverable capacity** class. A parked, "
         "inactive PR releases its crate reservation — that release is the entire purpose of this "
@@ -4516,7 +4887,7 @@ def park_starved_partition_holder(repo, pr_number, deferred, labels, park_pr, po
     The three refusals, all failing toward DOING NOTHING:
 
     - `labels` already carries the machine park -> nothing to do (idempotence, defence in depth;
-      starvation_park_target already declines an already-parked holder).
+      starvation_park_targets already declines an already-parked holder).
     - `labels` carries a HUMAN-owned hold -> a human is already holding this PR and the machine
       has no business writing a second hold on top of it.
     - `vetoed(pr_number)` -> park_policy's sticky human-unpark veto. A human who un-parked this PR
@@ -4889,6 +5260,16 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
     counter — an all-review/fix tick whose claims all errored would otherwise report ledger=ok
     and dodge the zero-dispatch fail-loud.
 
+    Issue #262: EVERY other defer outcome folds into that same histogram too, so a zero-dispatch
+    tick dominated by review/fix contention reports its real categories instead of a near-empty
+    summary. Each POST-claim outcome carries the issue loop's own category name where the two
+    loops share a failure (`lease-error`, `unsafe-claim`, `unsafe-claim-release-failed`,
+    `dispatch-launch-failed`); the no-free-lease leg keeps its lane-qualified allocator category
+    (`{lane}:{_claim_defer_category(...)}`) because the review/fix lanes contend separately. The
+    PRE-claim revalidation/policy `continue`s are swept up by finish_pending's coarse
+    `{lane}:preclaim-defer`, which is why every post-claim leg must count itself explicitly — an
+    uncounted one would silently be reported as a pre-claim defer.
+
     `lanes` is the tick's per-lane accumulator (issue #108). Each item's plan state selects its lane
     (review vs fix via _review_item_lane); a launch folds into that lane's `launched` and a hard
     failure (lease error, revalidation DispatchError, failed workflow launch) into its `error`. This
@@ -5084,7 +5465,12 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                     # Rewritten history — the worker-opened commit is no longer an ancestor.
                     _pr_needs_user(script_dir, repo, number, issue_number,
                                    "the PR head no longer descends from the worker-opened commit "
-                                   "(history was rewritten); refusing autonomous review")
+                                   "(history was rewritten); refusing autonomous review",
+                                   # [registry #869] the taxonomy's own name for this stop, so
+                                   # the park is machine-readable without re-parsing this
+                                   # sentence (park_policy.LEGACY_PARK_PROSE matches it only for
+                                   # the HISTORICAL, pre-marker population).
+                                   park_cause="history-rewritten")
                     continue
             if not draft and item["state"] in {"needs-review", "needs-fix"}:
                 # Label-driven re-entry may arrive while the PR is READY (and possibly armed).
@@ -5287,7 +5673,10 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
             except worker_pr.WorkerPrError as exc:
                 _pr_needs_user(script_dir, repo, number, issue_number,
                                f"round-budget escalation-marker validation failed ({exc}); a "
-                               "human must inspect this PR's round/model/pin markers")
+                               "human must inspect this PR's round/model/pin markers",
+                               # [registry #869] `marker-corrupt` — "durable round/model/pin
+                               # markers failed validation", which is this branch verbatim.
+                               park_cause="marker-corrupt")
                 continue
             if budget["action"] == "needs-user":
                 # Budget-driven stop -> the MACHINE-owned soft-hold pair (finding A:
@@ -5503,7 +5892,17 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                     _pr_needs_user(script_dir, repo, number, issue_number,
                                    "the fix lane cannot honour the source issue's trust-tier "
                                    f"route: {detail}; a human must reconcile the routing table "
-                                   "with the fix chain")
+                                   "with the fix chain",
+                                   # [registry #869] `routing-unresolvable`. All three `detail`
+                                   # branches above are the same fact about the same surface —
+                                   # the routing table and the fix chain together authorise NO
+                                   # concrete model to run — which is the taxonomy's entry
+                                   # verbatim, and the same cause the chain-exhaustion park
+                                   # below states. It is NOT `marker-corrupt` (nothing failed
+                                   # marker validation) and not a capacity cause (this
+                                   # contradiction repeats every tick; no fleet capacity
+                                   # clears it).
+                                   park_cause="routing-unresolvable")
                 continue
             if not chain:
                 # The inverse (or same-provider) chain cannot resolve a concrete model right now
@@ -5511,7 +5910,11 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 # hand to a human.
                 _pr_needs_user(script_dir, repo, number, issue_number,
                                f"the {mode} model chain for a {impl_provider}-implemented PR is "
-                               "unresolvable in the target routing (no concrete provider model)")
+                               "unresolvable in the target routing (no concrete provider model)",
+                               # [registry #869] `routing-unresolvable` — the taxonomy's name for
+                               # exactly this stop. review-fix.yml's `unresolvable` job writes
+                               # the SAME park through the CLI and passes the same cause.
+                               park_cause="routing-unresolvable")
                 continue
         except DispatchError as exc:
             lanes[lane]["error"] += 1
@@ -5712,6 +6115,13 @@ def _dispatch_review_items(review_items, repo, policy, routing, allocator, worke
                 print(f"::error::review {repo}#{number}: {violation}; lease release FAILED "
                       "(claim still active until expiry)")
                 continue
+            # Issue #262: a released unsafe claim is a DECIDED post-claim cross-provider refusal,
+            # so it carries the issue loop's own `unsafe-claim` category. Without this it counted
+            # nothing here and fell through to finish_pending's `{lane}:preclaim-defer` catch-all
+            # — reporting a lease that was allocated, inspected and refused as if the item had
+            # never reached the allocator, and erasing the only fleet-wide signal that the
+            # cross-provider assertions are firing.
+            defer_reasons["unsafe-claim"] += 1
             if mode == "fix":
                 fix_dispatch["defer:unsafe-claim"] += 1
             print(f"defer review {repo}#{number}: {violation}; released + skipped")
@@ -6474,9 +6884,18 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
 
         starved = next((entry["deferred"] for entry in plan["partition_starvation"]
                         if entry["repo"] == repo), 0)
-        starvation_target = starvation_park_target(
+        # EVERY inert holder, not the lowest one (registry #822). `busy` is a union: the partition
+        # is only released once the LAST holder is parked, so a per-tick cap of 1 multiplied by
+        # #822's 10-minute floor turned a 4-holder board into ~55 minutes of total dispatch
+        # outage. The loop is per-holder-resilient — one failed park never costs the others.
+        #
+        # >>> starvation-park-batch — EXECUTED by _starvation_park_batch_seam_self_test against
+        # stubs. The sentinels delimit the exact source it runs, so "one tick parks all N" is
+        # proven on the PRODUCTION statements rather than on a copy of them or on their shape.
+        starvation_targets = starvation_park_targets(
             repository["items"], starved, live_occupancy)
-        if starvation_target is not None and bot_login and _target_token(repo):
+        for starvation_target in (starvation_targets
+                                  if bot_login and _target_token(repo) else []):
             try:
                 _live_row = next(
                     (row for page in pull_pages if isinstance(page, list)
@@ -6496,11 +6915,13 @@ def dispatch(plan_path, policy_path, registry_repo, workflow_ref, script_dir,
                             is_human=lambda probe: _target_is_human_maintainer(repo, probe))):
                     defer_reasons["partition-starvation-park"] += 1
             except DispatchError as exc:
-                # One failed park never stops the tick: the lane is already starved, and the next
-                # tick re-measures and retries. Loud, because a park that cannot be applied is the
-                # difference between a self-healing fleet and a stalled one.
+                # One failed park never stops the tick — nor the OTHER parks in this batch: the
+                # lane is already starved, the remaining holders each still hold the partition,
+                # and the next tick re-measures and retries. Loud, because a park that cannot be
+                # applied is the difference between a self-healing fleet and a stalled one.
                 print(f"::warning::starvation park FAILED {repo}#{starvation_target}: {exc}; the "
                       f"`{GLOBAL_PACKAGE}` partition is still held")
+        # <<< starvation-park-batch
 
         # [registry #772] The starved lane's MISSING EDGE. The park sweep above declines every
         # holder that is not an un-parked provably-inert draft — correctly, because parking an
@@ -8192,6 +8613,66 @@ def _self_test():
     assert len(_issue_no_change_outcomes(
         model_health, auth_records + [no_change_a, no_change_b], 500)) == 2
     print("  ok   decline tripwire (f): a run of auth outcomes never advances the decline ladder")
+
+    # ---- [registry #699] THE COVERAGE-SHORTFALL DIAGNOSTIC --------------------------------------
+    # A `no-evidence` census row for a capacity park has two very different causes — the parks are
+    # not old enough yet, or the health window cannot COVER the span it would have to claim — and
+    # they were indistinguishable, which produced a wrong operational read on 2026-07-26. The
+    # window loader now names the second one, and distinguishes a young ledger (self-clearing) from
+    # the retention ceiling binding (a real capacity condition that will not clear on its own).
+    def coverage_warning(window, at):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            shortfall = _warn_health_coverage_shortfall(model_health, window, at)
+        return shortfall, buf.getvalue()
+
+    cov_now = 2_000_000
+    span = model_health.SUSTAINED_HEALTH_SPAN_SECONDS
+
+    def cov_stream(seconds, rate, tag):
+        gap = 3600.0 / rate
+        return [model_health.make_record(
+            "anthropic", "e" * 16, "opus5", "success", f"{tag}{i}", cov_now - int(i * gap))
+            for i in range(int(seconds / gap))]
+
+    covered = model_health.prune(cov_stream(span + 3600, 62.1, "cv"), cov_now)
+    covered_shortfall, covered_out = coverage_warning(covered, cov_now)
+    assert covered_shortfall is None and covered_out == "", (covered_shortfall, covered_out)
+    young = model_health.prune(cov_stream(3 * 3600, 62.1, "yg"), cov_now)
+    young_shortfall, young_out = coverage_warning(young, cov_now)
+    assert young_shortfall and young_shortfall["retention_bound"] is False, young_shortfall
+    assert "::warning::" in young_out and "young or sparse" in young_out, young_out
+    assert "aged-out park exit CANNOT open" in young_out, young_out
+    over_err = io.StringIO()
+    with contextlib.redirect_stderr(over_err):
+        over = model_health.prune(cov_stream(4 * 3600, 600.0, "ov"), cov_now)
+    over_shortfall, over_out = coverage_warning(over, cov_now)
+    assert over_shortfall and over_shortfall["retention_bound"] is True, over_shortfall
+    assert "RETENTION CEILING" in over_out and "will not clear on its own" in over_out, over_out
+    # ...and the diagnostic is DIAGNOSIS ONLY: it never raises and never alters the window the
+    # loader returns, so a broken model-health module can never take dispatch down with it.
+    class _BrokenHealth:
+        def sustained_health_coverage_shortfall(self, *_args):
+            raise RuntimeError("boom")
+
+    assert _warn_health_coverage_shortfall(_BrokenHealth(), over, cov_now) is None
+    # THE CALL SITE, driven for real. Asserting the helper alone would stay green if
+    # _read_model_health_window stopped calling it — the loader is what every consumer of the
+    # window goes through, so the loader is what has to emit the diagnostic.
+    class _CoverageAPI:
+        def request(self, method, path, *_args, **_kwargs):
+            assert method == "GET" and path == model_health.ledger_read_path("o/r"), (method, path)
+            blob = json.dumps({"records": young}).encode()
+            return {"content": base64.b64encode(blob).decode(), "sha": "deadbeef"}
+
+    loader_buf = io.StringIO()
+    with contextlib.redirect_stdout(loader_buf):
+        loaded = _read_model_health_window(model_health, "o/r", cov_now, api=_CoverageAPI())
+    assert loaded is not None and len(loaded) == len(young), len(loaded or [])
+    assert "::warning::" in loader_buf.getvalue(), loader_buf.getvalue()
+    assert "young or sparse" in loader_buf.getvalue(), loader_buf.getvalue()
+    print("  ok   [#699] coverage shortfall is reported once per window load, and names whether "
+          "the cause is a young ledger or the retention ceiling")
 
     # ---- [registry #701] NO_CHANGE MUST NOT RE-DISPATCH THE TIER THAT PRODUCED IT ---------------
     # Measured 2026-07-26: 196 completed worker runs, 70 success / 126 failure, dominated by
@@ -10652,6 +11133,135 @@ def _self_test():
     _live_error = enrolment_enable_error(_repos_doc, _claim_admits, _rf_admits,
                                          _outcome_admits, _arm_refuses)
     assert _live_error is None, _live_error
+
+    # ---- [#657 ENABLE] THE SHIPPED POLICY, DRIVEN THROUGH THE ENUMERATOR ----------------------
+    # `enrolment_enable_error(...) is None` checks WIRING, not READINESS — and it reads None just
+    # as happily when NOBODY is enrolled, which is what it meant for every tree before this one. So
+    # the enable itself is asserted where it is observable: the SHIPPED allowlist, resolved by the
+    # SAME accessor PLAN uses, is fed to the SAME enumerator, and the previously-skipped PR is
+    # enumerated. Emptying `review_enrolment_authors` in policy/repos.toml reds the positive leg;
+    # widening it to every repo reds the control.
+    _enable_policy = _load_module(
+        "registry_policy_resolve_enable",
+        Path(__file__).resolve().parents[1] / "scripts" / "policy-resolve.py")
+    _ENABLED_REPO = "jeswr/agent-account-registry"
+    _DEFERRED_REPO = "sparq-org/sparq"
+    _shipped_authors = _enable_policy.review_enrolment_authors(_ENABLED_REPO, _repos_doc)
+    _deferred_authors = _enable_policy.review_enrolment_authors(_DEFERRED_REPO, _repos_doc)
+    assert _shipped_authors, (
+        "policy/repos.toml must ENABLE review_enrolment_authors for "
+        f"{_ENABLED_REPO} — that is what this change is")
+    assert _deferred_authors == frozenset(), (
+        f"{_DEFERRED_REPO} is deliberately DEFERRED to a follow-up; enabling it here would widen "
+        f"the blast radius past one repo. Found: {sorted(_deferred_authors)}")
+
+    def _enable_states(target_repo, authors, *, login, ref="fix/869-question-park-marker",
+                       record=None):
+        return [item["state"] for item in enumerate_review_items(
+            target_repo,
+            [pull(41, ref, sha_a, head_repo=target_repo, login=login, draft=False,
+                  labels=("review:needs",))],
+            {41: record if record is not None else dict(
+                provenance[41], recorded_at_run="orchestrator:30209757201.1")},
+            [], issue_labels, now, enrolled_authors=authors)]
+
+    # (1) THE RED TEST: a PR of the shape the lane measurably SKIPPED — `jeswr`-authored, ordinary
+    #     branch, non-draft, in THIS repo — is now enumerated, under the allowlist the shipped
+    #     policy actually resolves. Not a hand-written `("jeswr",)`: the literal in the TOML is the
+    #     thing under test, and a test that supplies its own allowlist cannot see it disappear.
+    assert _enable_states(_ENABLED_REPO, _shipped_authors,
+                          login=sorted(_shipped_authors)[0]) == ["needs-review"], (
+        "the shipped allowlist must make an orchestrator-class PR in this repo reviewable")
+    # (2) THE CONTROL, without which (1) could pass by admitting everything. Three PRs that are
+    #     genuinely out of scope stay skipped under the SAME shipped policy — one per axis the
+    #     enable must not widen: the un-enrolled repo, an un-enrolled author, and a record that is
+    #     not orchestrator-attested.
+    assert _enable_states(_DEFERRED_REPO, _deferred_authors,
+                          login=sorted(_shipped_authors)[0]) == [], (
+        "sparq is NOT enrolled by this change — an identical PR there must still be skipped")
+    assert _enable_states(_ENABLED_REPO, _shipped_authors, login="drive-by-contributor") == [], \
+        "an author the shipped allowlist does not name is still skipped"
+    assert _enable_states(_ENABLED_REPO, _shipped_authors, login=sorted(_shipped_authors)[0],
+                          record=provenance[41]) == [], \
+        "a machine-attested record is not the orchestrator class — still skipped"
+    # (3) ...and the enabled row is otherwise UNREMARKABLE policy. `review_enrolment_authors`
+    #     resolves through `_policy_row`, which validates the WHOLE row — required fields, types,
+    #     unknown keys — so the two calls above already prove the enable was not smuggled in by
+    #     breaking the row it sits in (a typo'd key raises "unknown fields" rather than resolving
+    #     to nobody). Asserted explicitly so that reasoning is a test rather than a comment.
+    assert "review_enrolment_authors" in _enable_policy.OPTIONAL_POLICY_FIELDS
+    try:
+        _enable_policy.review_enrolment_authors(
+            _ENABLED_REPO,
+            {"repos": {_ENABLED_REPO: {**_repos_doc["repos"][_ENABLED_REPO],
+                                       "review_enrolment_author": ["jeswr"]}}})
+    except Exception as _typo_exc:        # noqa: BLE001 — the message is the assertion
+        assert "unknown fields" in str(_typo_exc), _typo_exc
+    else:
+        raise AssertionError(
+            "a TYPO'd enrolment key must be REFUSED by the row validator, never silently resolve "
+            "to an empty allowlist — a fail-closed default indistinguishable from a typo is "
+            "exactly how an enrolment silently never happens")
+    # (4) WHICH CLASSES ARE ENROLLABLE AT ALL. Measured on live sparq 2026-07-27: FOUR green,
+    #     ready, `review:unreviewed` PRs that no reviewer ever arrives for. They are THREE classes,
+    #     not one, and this pins which of them this mechanism can serve — by execution, so a future
+    #     widening cannot quietly assume all three are the same problem.
+    _orch_class_record = dict(provenance[41], recorded_at_run="orchestrator:30209757201.1")
+    assert review_enrolment_class_error(_orch_class_record) is None, \
+        "the ORCHESTRATOR class declares a real implementing provider — it IS enrollable"
+    for _class, _record in (
+            ("a RELEASE PR (release-plz, sparq #4460) has no implementing model",
+             {k: v for k, v in _orch_class_record.items() if k != "impl_provider"}),
+            ("a DEPENDENCY BUMP (dependabot, sparq #4488) has no implementing model",
+             {**_orch_class_record, "impl_provider": None}),
+            ("...and naming the tool is not a provider either",
+             {**_orch_class_record, "impl_provider": "release-plz"})):
+        _class_error = review_enrolment_class_error(_record)
+        assert _class_error is not None and "INVERT" in _class_error, f"[#657 enable] {_class}"
+        # ...and the SAME record is refused by the shared field admission, so this is not a second
+        # opinion that could drift from the one the lane enforces.
+        assert provenance_admission_error(_record, 41, admit_orchestrator=True) is not None, _class
+    # The predicate's SECOND clause (no review chain for a declared provider) is UNREACHABLE today
+    # and a mutation sweep says so — it survives, honestly, because these two tables agree. It is
+    # kept as defence in depth for the moment they do not, and the premise that makes it
+    # unreachable is asserted here so the redundancy is a checked fact rather than an assumption:
+    # add a provider to IMPL_PROVIDERS without a REVIEW_CHAIN entry and THIS line reds, which is
+    # the review that would then have to consider the clause.
+    assert set(REVIEW_CHAIN) == set(IMPL_PROVIDERS), (
+        "every registered implementer provider must have a review chain to invert INTO, or "
+        "review_enrolment_class_error's second clause stops being unreachable",
+        sorted(REVIEW_CHAIN), sorted(IMPL_PROVIDERS))
+    # THE LOAD-BEARING HALF: the AUTHOR allowlist is NOT what blocks those two classes. It refuses
+    # their `[bot]` logins as well — but relaxing THAT alone would admit a PR the lane still cannot
+    # pick a reviewer for, i.e. it would manufacture exactly the "labelled but never reviewed"
+    # state this measurement found. Both facts are asserted together so nobody can fix the visible
+    # one and believe the class is served.
+    try:
+        _enable_policy.review_enrolment_authors(
+            "o/r", tomllib.loads(
+                '[repos."o/r"]\nenabled=true\nrouting="r.toml"\naccount_pool=["acct01"]\n'
+                'max_concurrent=1\nworker_timeout_minutes=1\ngate_profile="none"\n'
+                'arm_auto_merge=false\nmax_attempts=1\ntrust="collaborators"\n'
+                'review_enrolment_authors=["dependabot[bot]"]\n'))
+    except Exception as _bot_exc:         # noqa: BLE001 — the message is the assertion
+        assert "non-canonical" in str(_bot_exc), _bot_exc
+    else:
+        raise AssertionError("the allowlist must still refuse a `[bot]` login")
+    #     ...and the ENROLLED class is shape-agnostic, which is why it needs no widening: the
+    #     mechanism nowhere encodes `fix/*`, so ANY branch name is already covered.
+    for _any_branch in ("fix/anything", "research/knowledge-management-strategy",
+                        "ci/auto-arm-workflows-permission", "release-plz-2026-07-27T02-19-35Z"):
+        assert _enable_states(_ENABLED_REPO, _shipped_authors, ref=_any_branch,
+                              login=sorted(_shipped_authors)[0]) == ["needs-review"], _any_branch
+    print("  ok   [#657 enable] CLASS TAXONOMY: the orchestrator class is enrollable on ANY branch "
+          "name; a release PR and a dependency bump are NOT — they declare no implementing model, "
+          "so no reviewer side can be INVERTED, and relaxing the allowlist alone would only "
+          "manufacture a labelled-but-never-reviewed PR")
+
+    print(f"  ok   [#657 enable] the SHIPPED policy enrols {sorted(_shipped_authors)} for "
+          f"{_ENABLED_REPO} ONLY: a previously-skipped orchestrator-class PR is ENUMERATED there, "
+          f"and the same PR in {_DEFERRED_REPO} — plus an unlisted author and a machine-attested "
+          "record — are still skipped")
     # (b) ...and (a) alone is UNFALSIFIABLE while no repo enables the key: deleting the interlock
     #     changes no outcome, which a mutation run reports as a surviving mutant. So drive the
     #     same predicate with a policy that DOES enable it. Each row removes exactly ONE fact, so
@@ -11014,8 +11624,8 @@ def _self_test():
         (PROBE_ENROLLED_LOGIN,), "review") == (True, None)
     print(f"  ok   #657 enable interlock: CLAIM={_claim_admits}, review-fix resolve={_rf_admits}, "
           f"outcome={_outcome_admits}, arm-refuses={_arm_refuses} — ALL FOUR derived by execution "
-          f"and fail-closed; policy/repos.toml enables enrolment for NOBODY (the minting path, "
-          f"design record section 7.4 step 4, does not exist yet)")
+          f"and fail-closed, which is the PRECONDITION policy/repos.toml's now-non-empty "
+          f"review_enrolment_authors ships against")
 
     # YAML SEAM: the attestation checks live in provenance_admission_error, so they are only
     # load-bearing on the path that actually runs a model against a PR if review-fix.yml's
@@ -12062,6 +12672,245 @@ def _self_test():
     assert enumerate_disarm_items(repo, [moved], armed_status,
                                   {41: {**provenance[41], "pr_number": True}}) == []
 
+    # ---- [#657 enable / #876 review] THE DISARM-SIDE RESIDUE: DETECTION-ONLY OBSERVATION OF THE
+    # ---- #42 INVARIANT OVER THE ENROLLED ORCHESTRATOR CLASS ------------------------------------
+    # The disarm lane selects candidates on the worker producer shape AND registry #570's exact-App
+    # author gate, so the orchestrator class is invisible to it. Admitting the class THERE would
+    # waive #570 on a dequeue/redraft/relabel WRITE path — an authority escalation. So the
+    # invariant is OBSERVED for that class: same predicate, no write authority.
+    _obs_enrolled = ("jeswr",)
+    _obs_record = dict(provenance[41], recorded_at_run="orchestrator:30209757201.1")
+
+    def _obs_pull(*, sha=sha_b, ref="fix/869-question-park-marker", login="jeswr", draft=False,
+                  marker=sha_a, head_repo=repo, number=41, labels=()):
+        body = "" if marker is None else f"x <!-- sparq-reviewed-sha:{marker} -->"
+        return pull(number, ref, sha, head_repo=head_repo, login=login, draft=draft,
+                    labels=labels, body=body)
+
+    def _observe(pulls_in, status=None, prov=None, authors=_obs_enrolled):
+        return enumerate_disarm_observations(
+            repo, pulls_in, status if status is not None else armed_status,
+            prov if prov is not None else {41: _obs_record}, authors)
+
+    # (1) THE HEADLINE. An enrolled orchestrator-class PR with an armed head off its reviewed-sha
+    #     marker is DETECTED — the exact condition the worker lane disarms, on a PR the worker
+    #     lane's own enumerator returns nothing for. The pair is asserted together, because
+    #     "detected" is only meaningful next to "and the write lane still sees nothing".
+    _obs_row = {"pr_number": 41, "head_sha": sha_b, "reviewed_sha": sha_a, "repo": repo}
+    assert _observe([_obs_pull()]) == [_obs_row], _observe([_obs_pull()])
+    assert enumerate_disarm_items(repo, [_obs_pull()], armed_status, {41: _obs_record}) == [], (
+        "the WRITE-authorised enumerator must still see nothing here — if this ever returns a row, "
+        "#570's exact-App gate has been waived on a write path and this whole design is wrong")
+    # (2) DEFAULT OFF. An empty allowlist — every repo's default — observes nothing at all, so this
+    #     emits exactly nothing for any repo that has not opted in.
+    assert _observe([_obs_pull()], authors=()) == []
+    assert _observe([_obs_pull()], authors=frozenset()) == []
+    # (3) NON-VACUITY: the observer reports a VIOLATION, not merely a class. The same enrolled PR
+    #     whose marker names its live head emits nothing — otherwise (1) would pass just as well
+    #     with the mismatch test deleted, and the census would be a count of enrolled PRs.
+    assert _observe([_obs_pull(marker=sha_b)]) == []
+    #     ...and the unarmed-draft and stale-snapshot DO-NOTHING legs hold for this class too.
+    assert _observe([_obs_pull(draft=True)], status={41: status_of(sha_b)}) == []
+    assert _observe([_obs_pull()], status={}) == []
+    assert _observe([_obs_pull()], status={41: status_of(sha_a, armed=True)}) == []
+    #     ...while a READY-but-unarmed interrupted disarm IS observed, exactly as for the worker
+    #     class — the shared predicate is what makes these agree without a second spelling.
+    assert [row["pr_number"] for row in _observe([_obs_pull()], status={41: status_of(sha_b)})] \
+        == [41]
+    # (4) THE CLASS PREDICATE IS THE SHARED ONE, so nothing else becomes observable. Each row
+    #     differs from (1) in exactly one property.
+    for _why, _pulls, _prov in (
+            ("a FORK head is never observed, on any path — the one predicate no waiver reaches",
+             [_obs_pull(head_repo="attacker/repo")], {41: _obs_record}),
+            ("an author the allowlist does not name", [_obs_pull(login="mallory")],
+             {41: _obs_record}),
+            ("a MACHINE-attested record is not the orchestrator class", [_obs_pull()],
+             {41: provenance[41]}),
+            ("a record minted for a DIFFERENT PR waives nothing", [_obs_pull()],
+             {41: dict(_obs_record, pr_number=40)}),
+            ("no record at all fails closed", [_obs_pull()], {})):
+        assert _observe(_pulls, prov=_prov) == [], f"[#657 enable] {_why}"
+    # (5) THE INVARIANT HAS ONE SPELLING. Driving the shared predicate directly over the WORKER row
+    #     from the block above must yield the row the worker enumerator emits — so "what the lane
+    #     disarms" and "what the census calls a violation" cannot drift into two definitions.
+    assert armed_sha_mismatch(repo, moved, armed_status) == acted[0], armed_sha_mismatch(
+        repo, moved, armed_status)
+    assert armed_sha_mismatch(repo, bound, armed_status) is None
+    for _junk in (None, "not-a-dict", [], 7, {}, {"number": 41}):
+        assert armed_sha_mismatch(repo, _junk, armed_status) is None, repr(_junk)
+    # (5b) ITS SHAPE GATES, which the pre-refactor enumerator carried and NO test drove — a
+    #      mutation sweep over this PR found each of them surviving. They are defence in depth
+    #      against a hostile or stale listing (PLAN reads `state=open`, so production rows are
+    #      open and well-formed), and defence in depth that nothing exercises is just untested
+    #      code. Driven on BOTH lanes, because the write lane is the one that acts on the answer.
+    for _bad_state in ("closed", "merged", "", None):
+        _closed = dict(moved, state=_bad_state)
+        assert armed_sha_mismatch(repo, _closed, armed_status) is None, repr(_bad_state)
+        assert enumerate_disarm_items(repo, [_closed], armed_status, provenance) == [], \
+            f"a {_bad_state!r}-state PR must never be disarmed — its latch is already resolved"
+        assert _observe([dict(_obs_pull(), state=_bad_state)]) == [], repr(_bad_state)
+    for _bad_sha in ("", "zz" * 20, sha_b[:39], sha_b + "a", 7, None):
+        _malformed = dict(moved)
+        _malformed["head"] = dict(moved["head"], sha=_bad_sha)
+        assert armed_sha_mismatch(repo, _malformed, armed_status) is None, repr(_bad_sha)
+        assert enumerate_disarm_items(repo, [_malformed], armed_status, provenance) == [], \
+            "a malformed head sha is not a provable latch — never act on one"
+        # ...and with a HOSTILE status map that AGREES with the malformed head, so the sha shape
+        # gate is what refuses rather than the snapshot-coherence check downstream of it. Without
+        # this the two are indistinguishable and the shape gate is untested (measured: it survived
+        # a mutation until this line existed).
+        _agreeing = {41: dict(status_of(sha_b, armed=True), head_sha=_bad_sha)}
+        assert armed_sha_mismatch(repo, _malformed, _agreeing) is None, repr(_bad_sha)
+        assert enumerate_disarm_items(repo, [_malformed], _agreeing, provenance) == [], \
+            repr(_bad_sha)
+    for _bad_number in (0, -1, True, False, 41.0, "41", None, [], {}):
+        _numbered = dict(moved, number=_bad_number)
+        assert armed_sha_mismatch(repo, _numbered, armed_status) is None, repr(_bad_number)
+        assert enumerate_disarm_items(repo, [_numbered], armed_status, provenance) == [], \
+            repr(_bad_number)
+    # (5c) #570's EXACT-App author gate on the WRITE lane's own candidate filter. The CLAIM-side
+    #      re-binding is tested; this enumerator's copy was not, and it survived a mutation. It is
+    #      the gate this whole detection-only design exists to avoid waiving, so it is pinned on
+    #      both halves: a `[bot]` suffix is not enough, and a DIFFERENT App is refused.
+    _foreign_app = pull(41, "sparq-agent/issue-7-1-1", sha_b, login="other-app[bot]", draft=False,
+                        body=f"x <!-- sparq-reviewed-sha:{sha_a} -->")
+    assert enumerate_disarm_items(repo, [_foreign_app], armed_status, provenance,
+                                  bot_login=bot) == [], (
+        "[#570] a FOREIGN App's worker-shaped PR must never enter the disarm write path — `[bot]` "
+        "is a suffix every App with write access shares, which is the #570 defect itself")
+    _human_author = pull(41, "sparq-agent/issue-7-1-1", sha_b, login="jeswr", draft=False,
+                         body=f"x <!-- sparq-reviewed-sha:{sha_a} -->")
+    assert enumerate_disarm_items(repo, [_human_author], armed_status, provenance,
+                                  bot_login=bot) == [], \
+        "[#570] nor may a human-authored PR, whatever its branch shape"
+    #      NON-VACUITY: the trusted App's own PR on the same data IS emitted, so the two assertions
+    #      above are the author gate firing rather than the fixture failing some other predicate.
+    assert [row["pr_number"] for row in enumerate_disarm_items(
+        repo, [pull(41, "sparq-agent/issue-7-1-1", sha_b, login=bot, draft=False,
+                    body=f"x <!-- sparq-reviewed-sha:{sha_a} -->")],
+        armed_status, provenance, bot_login=bot)] == [41]
+    # (5d) ...and the HEAD-REF half of that candidate filter, which the author gate alone does NOT
+    #      cover. This is not hypothetical: sparq #4460 is the release-plz RELEASE PR — authored by
+    #      the CORRECT App bot, on `release-plz-<timestamp>`. The worker producer shape is what
+    #      keeps the disarm write path off it, so deleting the head-ref gate would aim
+    #      dequeue/redraft/relabel at the crates.io release PR. Measured: this survived a mutation
+    #      until this line existed, because every author-gate fixture also failed the ref gate.
+    for _non_worker in ("release-plz-2026-07-27T02-19-35Z", "fix/ordinary-branch",
+                        "dependabot/github_actions/actions-minor"):
+        assert enumerate_disarm_items(
+            repo, [pull(41, _non_worker, sha_b, login=bot, draft=False,
+                        body=f"x <!-- sparq-reviewed-sha:{sha_a} -->")],
+            armed_status, provenance, bot_login=bot) == [], (
+            "[#570/#657] the TRUSTED App's own PR on a NON-worker branch must still be outside "
+            f"the disarm write path — {_non_worker!r} is the release/dependabot shape")
+    # (6) THE EMISSION. One alert per violation plus a census line that prints EVEN AT ZERO — an
+    #     absent bucket and a zero bucket must not look the same, and a per-violation alert alone
+    #     can never prove the observer ran at all.
+    _zero_lines = format_disarm_observations([])
+    assert len(_zero_lines) == 1 and _zero_lines[0].startswith(DISARM_OBSERVATION_CENSUS), \
+        _zero_lines
+    assert "0 enrolled" in _zero_lines[0] and "none" in _zero_lines[0], _zero_lines
+    _live_lines = format_disarm_observations(_observe([_obs_pull()]))
+    assert len(_live_lines) == 2, _live_lines
+    assert _live_lines[0].startswith(DISARM_OBSERVATION_ALERT), _live_lines
+    assert f"{repo}#41" in _live_lines[0] and sha_b in _live_lines[0] \
+        and sha_a in _live_lines[0], _live_lines
+    assert _live_lines[-1].startswith(DISARM_OBSERVATION_CENSUS) \
+        and "1 enrolled" in _live_lines[-1] and f"{repo}#41" in _live_lines[-1], _live_lines
+    # ...and the alert is a GitHub-Actions ::warning::, i.e. it reaches the run summary rather than
+    # only the log body. This is the whole "continuously visible" claim.
+    assert _live_lines[0].startswith("::warning::"), _live_lines[0]
+    assert format_disarm_observations([None, 7, {"pr_number": True}]) == _zero_lines
+    # (7) DEFENCE IN DEPTH: even if an observation row somehow reached CLAIM's disarm applier, the
+    #     #570 re-binding refuses it. Detection-only is enforced by TWO independent facts — the row
+    #     never enters the plan artifact (asserted at the YAML seam below), and the actor would
+    #     refuse it anyway.
+    _obs_admissible, _obs_reason = _disarm_row_admissible(
+        _obs_row, repo, _obs_pull(), _obs_record, bot)
+    assert _obs_admissible is False and "worker branch" in _obs_reason, (
+        "an observation row must be refused by the disarm applier's own re-binding: this class "
+        f"has no write path. got {(_obs_admissible, _obs_reason)!r}")
+    print("  ok   [#657 enable] the disarm lane DETECTS the #42 armed-SHA invariant on the "
+          "enrolled orchestrator class (every tick, censused even at zero) and has NO write "
+          "authority over it — the write enumerator returns nothing and #570's re-binding "
+          "refuses the row")
+
+    # ---- [#657 enable] THE YAML SEAM. Everything above is a pure function nothing runs. The
+    # measured lesson on this repo is that uncaught mutants live at the workflow seam — an `if:`, a
+    # deleted step, a call site rewired to a constant — so the PLAN step's own two lines are
+    # EXTRACTED and EXECUTED, and the containment claim ("these rows never enter the plan") is
+    # asserted against the PARSED python rather than trusted. ----
+    _obs_seam = _workflow_step_python(
+        "dispatch.yml", "plan", r"(?m)^[ \t]*disarm_observations\.extend\(",
+        r"(?m)^[ \t]*# Deferred-retry items", "detection-only disarm observation")
+    _obs_seam_tree = ast.parse(textwrap.dedent(_obs_seam))
+    _obs_calls = [node for node in ast.walk(_obs_seam_tree) if isinstance(node, ast.Call)
+                  and getattr(node.func, "attr", "") == "enumerate_disarm_observations"]
+    assert len(_obs_calls) == 1, (
+        "dispatch.yml's plan step must call enumerate_disarm_observations exactly once; a deleted "
+        f"call is a silently dark detector. Found {len(_obs_calls)}")
+    # The enrolment argument must be the SAME `enrolled_authors` name the review enumerator was
+    # just handed — hard-coding `()` here leaves every assertion above green while production
+    # observes nothing at all, which is precisely this class of vacuity.
+    assert [getattr(arg, "id", None) for arg in _obs_calls[0].args] == [
+        "repo", "pulls", "pr_status", "provenance", "enrolled_authors"], (
+        "the observation call must be handed the tick's live views and the repo's resolved "
+        f"allowlist, by NAME. Found: {ast.dump(_obs_calls[0])}")
+    # EXECUTED, not merely parsed: the workflow's own line, against a recording stub.
+    _seam_seen = []
+
+    class _ObsStub:
+        @staticmethod
+        def enumerate_disarm_observations(*args):
+            _seam_seen.append(args)
+            return [_obs_row]
+
+    _seam_ns = {"claim_mod": _ObsStub, "disarm_observations": [], "repo": repo,
+                "pulls": [_obs_pull()], "pr_status": armed_status,
+                "provenance": {41: _obs_record}, "enrolled_authors": _obs_enrolled}
+    exec(compile(_obs_seam, "<dispatch.yml plan observation>", "exec"), _seam_ns)  # noqa: S102
+    assert _seam_seen == [(repo, [_obs_pull()], armed_status, {41: _obs_record}, _obs_enrolled)], \
+        _seam_seen
+    assert _seam_ns["disarm_observations"] == [_obs_row], _seam_ns["disarm_observations"]
+
+    # THE EMISSION STEP, executed the same way: the workflow must PRINT every line the formatter
+    # returns. A loop that drops the census line, or a `for` body reduced to `pass`, reds here.
+    _emit_seam = _workflow_step_python(
+        "dispatch.yml", "plan", r"(?m)^[ \t]*for observation_line in ",
+        r"(?m)^[ \t]*PY[ \t]*$", "detection-only disarm emission")
+    _emit_out = io.StringIO()
+
+    class _EmitStub:
+        @staticmethod
+        def format_disarm_observations(rows):
+            return [f"line-{row['pr_number']}" for row in rows] + ["census-line"]
+
+    with contextlib.redirect_stdout(_emit_out):
+        exec(compile(_emit_seam, "<dispatch.yml plan emission>", "exec"),   # noqa: S102
+             {"claim_mod": _EmitStub, "disarm_observations": [_obs_row]})
+    assert _emit_out.getvalue().splitlines() == ["line-41", "census-line"], _emit_out.getvalue()
+
+    # THE CONTAINMENT CLAIM, asserted rather than described: `disarm_observations` must appear in
+    # NO plan-document construction anywhere in the plan step. If it ever becomes a plan field,
+    # CLAIM can read it — and a row CLAIM can read is a row CLAIM can act on, which is exactly the
+    # write authority this design refuses to buy. The whole step is parsed, not just the block
+    # above, so a later addition cannot hide from this.
+    _plan_step = _workflow_step_python(
+        "dispatch.yml", "plan", r"(?m)^[ \t]*document = \{",
+        r"(?m)^[ \t]*PY[ \t]*$", "plan document literal")
+    _doc_assign = next(node for node in ast.walk(ast.parse(textwrap.dedent(_plan_step)))
+                       if isinstance(node, ast.Assign)
+                       and any(getattr(t, "id", "") == "document" for t in node.targets))
+    assert "disarm_observations" not in {
+        getattr(node, "id", "") for node in ast.walk(_doc_assign.value)}, (
+        "the detection-only observations must NEVER be written into the plan artifact — CLAIM "
+        "re-validates and ACTS on plan rows, so a field it can read is a write path for a class "
+        "whose whole point is that it has none")
+    assert "disarm_observations" not in json.dumps(list(PLAN_FIELDS)), PLAN_FIELDS
+    print("  ok   [#657 enable] YAML SEAM (executed): dispatch.yml's plan step calls the observer "
+          "with the repo's RESOLVED allowlist and prints every emitted line — and the rows never "
+          "enter `document`, so CLAIM has no field to act on")
+
     # ---- decide_repair_admission: the LIVE trigger gates the defuse (defect-1 regression) ----
     # trigger holds: drafted proceeds, ready/armed defuses
     assert decide_repair_admission("needs-rebase", False, None, True) == ("proceed", "rebase")
@@ -12596,6 +13445,110 @@ def _self_test():
                 #      review-only class by a PLAN->CLAIM window edit.
                 _stale_log = _claim_log(dict(_orch_item, self_attested=False), ("jeswr",))
                 assert "disagrees with CLAIM's live re-derivation" in _stale_log, _stale_log
+
+                # ==== [#657 ENABLE] THE PROPERTY THAT MAKES ENROLMENT SAFE RATHER THAN
+                # ==== SELF-APPROVAL: THE CLASS INHERITS CROSS-PROVIDER REVIEWER SELECTION.
+                # Enrolment lets the lane review PRs an orchestrator-side agent WROTE. That is only
+                # sound because review is cross-provider — an anthropic-implemented diff is reviewed
+                # from the openai side and vice versa — and the enrolled class must inherit BOTH
+                # halves of that: the chain is the INVERSION `REVIEW_CHAIN[impl_provider]`, and the
+                # claim-layer assertion refuses any claim whose provider equals the implementer's.
+                # Neither is keyed off `self_attested`, so the class cannot bypass them; this drives
+                # the production loop to prove that by EXECUTION rather than by reading.
+                class _ProviderAllocator:
+                    """An allocator that returns a claim on a CHOSEN provider, so the refusal is
+                    driven by the production assertion rather than asserted about."""
+
+                    def __init__(self, provider):
+                        self.provider = provider
+                        self.calls = []
+
+                    def claim(self, _repo, _package, role, chain, *_args, **_kwargs):
+                        self.calls.append((role, list(chain)))
+                        return ({"account": "acct09", "claim_id": "cd" * 16, "model": chain[0],
+                                 "provider": self.provider}, "")
+
+                    def release(self, *_args, **_kwargs):
+                        self.released = True
+                        return True
+
+                record_file.write_text(json.dumps(_orch_record), encoding="utf-8")
+
+                def _provider_run(provider):
+                    fake.update(pull=dict(_orch_pull))
+                    launch_runs.clear()
+                    alloc = _ProviderAllocator(provider)
+                    buffer = io.StringIO()
+                    with contextlib.redirect_stdout(buffer):
+                        launched, _reasons = run_items(
+                            [_orch_item], allocator=alloc, routing=strand_routing,
+                            enrolled_authors=("jeswr",))
+                    return launched, alloc, buffer.getvalue()
+
+                # (v) THE CHAIN IS THE CROSS-PROVIDER INVERSION, for the enrolled class, and it is
+                #     the SAME table the worker class gets. `_orch_item` declares
+                #     impl_provider=anthropic, so the reviewer chain offered to the allocator must
+                #     be REVIEW_CHAIN["anthropic"] — the openai side — not the implementer's own.
+                _xp_launched, _xp_alloc, _xp_log = _provider_run("openai")
+                assert [chain for _role, chain in _xp_alloc.calls] == [
+                    _resolvable_chain(REVIEW_CHAIN["anthropic"], strand_routing)], _xp_alloc.calls
+                assert _xp_alloc.calls and _xp_alloc.calls[0][1] != REVIEW_CHAIN["openai"], (
+                    "the enrolled class must be offered the INVERTED chain, never the "
+                    "implementer's own", _xp_alloc.calls)
+                assert _xp_launched == 1, (_xp_launched, _xp_log)
+
+                # (vi) THE RED TEST. Same enrolled PR, same record, a reviewer claim whose provider
+                #      EQUALS the implementer's. It must be REFUSED — for the enrolled class
+                #      exactly as for the worker class — and no review-fix run may launch. Deleting
+                #      the `claim_provider == impl_provider` clause, or conditioning it on
+                #      `self_attested`, reds this line and nothing else in the suite covers the
+                #      enrolled class here.
+                _same_launched, _same_alloc, _same_log = _provider_run("anthropic")
+                assert _same_launched == 0, (_same_launched, _same_log)
+                assert "reviewer provider would equal implementer provider" in _same_log, _same_log
+                assert launch_runs == [], launch_runs
+                assert getattr(_same_alloc, "released", False) is True, (
+                    "an unsafe claim must be RELEASED, not left holding the account until expiry")
+
+                # (vii) THE CONTROL, so (vi) cannot pass by refusing everything: the WORKER class
+                #       reaches the identical refusal on the identical allocator, and both classes
+                #       launch on a cross-provider one. The assertion is shared code, not a
+                #       class-specific guard, and this is what proves it.
+                record_file.write_text(json.dumps(provenance[41]), encoding="utf-8")
+                fake.update(pull=live_pull(draft=True, labels=("review:needs",)))
+                _worker_same = io.StringIO()
+                with contextlib.redirect_stdout(_worker_same):
+                    _wl, _ = run_items([dict(ci_item, state="needs-review", context="")],
+                                       allocator=_ProviderAllocator("anthropic"),
+                                       routing=strand_routing)
+                assert _wl == 0 and "reviewer provider would equal implementer provider" \
+                    in _worker_same.getvalue(), _worker_same.getvalue()
+                record_file.write_text(json.dumps(provenance[41]), encoding="utf-8")
+                print("  ok   [#657 enable] CROSS-PROVIDER INHERITANCE: an enrolled "
+                      "orchestrator-class PR is offered the INVERTED review chain, and a claim "
+                      "whose provider equals the implementer's is REFUSED + released — the same "
+                      "assertion, on the same code path, as the worker class")
+
+                # (viii) ...AND THE CLASS CAN NEVER ARM. The cross-provider inversion is derived
+                #        from a field the implementer asserted about ITSELF, so §3's residual risk
+                #        is only acceptable because it degrades to an advisory comment. Both arm
+                #        boundaries are driven directly, in both directions, so an always-refusing
+                #        state machine cannot pass this.
+                assert _wp.decide_review("approve", False, False, 1, 3, False,
+                                         self_attested=True) != "arm"
+                assert _wp.decide_review("approve", False, False, 1, 3, False) == "arm"
+                try:
+                    _wp.ready_and_arm(repo, 41, sha_a, "anthropic", "0" * 16, "openai",
+                                      "acct01", True, self_attested=True)
+                except _wp.WorkerPrError as _arm_exc:
+                    assert "self-attested" in str(_arm_exc), _arm_exc
+                else:
+                    raise AssertionError(
+                        "ready_and_arm must REFUSE the self-attested class even when the "
+                        "cross-provider assertion would pass — that refusal is the reason "
+                        "enrolling the class is not self-approval")
+                print("  ok   [#657 enable] ...and the enrolled class can never reach an "
+                      "automatic arm: the approve hands off to a human and ready_and_arm raises")
                 record_file.write_text(json.dumps(provenance[41]), encoding="utf-8")
                 print("  ok   #657 CLAIM leg (real dispatch loop): an enrolled orchestrator PR "
                       "passes the shape gates, an unenrolled one is refused by the PRE-FEATURE "
@@ -13891,6 +14844,9 @@ agent = "impl"
             assert alloc.released == ["cd" * 16], alloc.released  # release WAS attempted
             assert reasons["unsafe-claim-release-failed"] == 1, reasons
             assert _lane_summary(run_items.lanes)["fix"]["error"] == 1, run_items.lanes
+            # ... and the hard-error leg is NOT also counted as the green defer (the two
+            # categories stay distinct, so one refusal is one histogram entry)
+            assert reasons["unsafe-claim"] == 0, reasons
             # release SUCCEEDS: the SAME unsafe claim is a clean released+skipped defer with NO
             # lane error and NO hard-error reason — proving the boolean is actually consulted.
             alloc = UnsafeClaimAllocator(release_ok=True)
@@ -13899,6 +14855,26 @@ agent = "impl"
             assert alloc.released == ["cd" * 16], alloc.released
             assert reasons["unsafe-claim-release-failed"] == 0, reasons
             assert _lane_summary(run_items.lanes)["fix"]["error"] == 0, run_items.lanes
+            # ---- issue #262: that green defer is VISIBLE in the tick's shared histogram, under
+            # the issue loop's own category name. It used to count nothing at all, so the item
+            # was swept into finish_pending's PRE-claim catch-all and the summary reported a
+            # decided cross-provider refusal as "never reached the allocator".
+            # MUTANT: drop `defer_reasons["unsafe-claim"] += 1` from the released leg => the
+            # first assertion goes red (0 != 1) and the second goes red too (the item reappears
+            # as fix:preclaim-defer). MUTANT: count it on the release-FAILED leg as well => the
+            # `== 0` assertion above goes red. MUTANT: rename the bucket (e.g. lane-qualify it)
+            # => the first assertion goes red, holding the issue-loop-consistent name. ----
+            assert reasons["unsafe-claim"] == 1, reasons
+            assert reasons["fix:preclaim-defer"] == 0, reasons
+            # the fleet-line counterpart agrees rather than reporting its own preclaim bucket
+            assert run_items.fix_dispatch["defer:unsafe-claim"] == 1, run_items.fix_dispatch
+            assert run_items.fix_dispatch["defer:preclaim-defer"] == 0, run_items.fix_dispatch
+            # and it is a REAL defer for tick health: planned>0, launched=0, error=0 (contention
+            # posture), with a non-empty histogram so the zero-dispatch tick is attributable
+            assert _lane_summary(run_items.lanes)["fix"] == {
+                "planned": 1, "launched": 0, "deferred": 1, "error": 0}, run_items.lanes
+            assert _ledger_health(reasons) == "ok", reasons
+            assert _ledger_rot_zeroed_dispatch(launched, reasons) is False
         finally:
             (globals()["_gh_json"], globals()["_run_target_helper"],
              globals()["_target_token"], globals()["_target_is_human_maintainer"]) = real_io
@@ -15944,6 +16920,202 @@ agent = "impl"
         print("  ok   aged-out exit CHAIN: a legacy park that could not migrate before #691 "
               "migrates AND is actually released one span later (both layers, end to end)")
 
+        # ---- [registry #769] THE AGE-PARK EPISODE BINDING, driven CROSS-MODULE ----------------
+        #
+        # THE DEFECT. groom's age hand-off writes `review:parked`, so an age park lands in exactly
+        # this sweep's candidate population. Its cause is an orphan draft or a wedged merge state,
+        # which no model-health record speaks to, so `capacity_recovery_evidence` finds nothing and
+        # `park_cause_provable` is False — and the probe falls through to the labelled
+        # sustained-fleet-health HEURISTIC, whose only condition such a park can satisfy is being
+        # OLD ENOUGH. The evidence clearing an AGE park was therefore, in substance, MORE AGE.
+        #
+        # THE TEST THAT NAMES IT: the SAME park under the SAME health window at 3 h and at 7 h must
+        # reach the SAME decision. If crossing SUSTAINED_HEALTH_SPAN_SECONDS alone changes the
+        # answer, the binding is absent — that is the whole assertion, and it is why the two
+        # timings are asserted as a PAIR rather than one at a time.
+        #
+        # EVERY FIXTURE BODY IS BUILT FROM groom's OWN CONSTANTS, never a literal copied into this
+        # file. That is what makes this a cross-module test rather than a restatement: the in-file
+        # half of #769 is well tested, so a test that only exercised dispatch-claim would pass for
+        # the same reason the existing ones do. Re-spell groom's marker and these go red.
+        def _load_self_registering(name, path):
+            """`_load_module` plus the `sys.modules` registration `@dataclass` needs.
+
+            groom declares frozen dataclasses under `from __future__ import annotations`, and
+            dataclasses resolves those string annotations through `sys.modules[cls.__module__]` —
+            which is None for a spec-loaded module that was never registered. Kept LOCAL to this
+            test rather than folded into `_load_module`: every production caller of that helper
+            loads a module that does not need it, and widening a shared loader for one test's
+            benefit is how a loader's behaviour drifts from what production exercises."""
+            spec = importlib.util.spec_from_file_location(name, path)
+            if spec is None or spec.loader is None:
+                raise DispatchError(f"cannot load registry helper {Path(path).name}")
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[name] = module
+            try:
+                spec.loader.exec_module(module)
+            except Exception:
+                sys.modules.pop(name, None)
+                raise
+            return module
+
+        groom_mod = _load_self_registering(
+            "registry_groom_agepark", Path(__file__).resolve().parent / "groom.py")
+        # The ONE spelling, asserted in both directions: groom must be writing the marker
+        # park_policy declares, and park_policy's must be the one this sweep reads.
+        assert groom_mod.AGE_PARK_MARKER == _park_policy.GROOM_AGE_PARK_MARKER, (
+            groom_mod.AGE_PARK_MARKER, _park_policy.GROOM_AGE_PARK_MARKER)
+        assert groom_mod.AGE_UNPARK_MARKER == _park_policy.GROOM_AGE_UNPARK_MARKER, (
+            groom_mod.AGE_UNPARK_MARKER, _park_policy.GROOM_AGE_UNPARK_MARKER)
+
+        def age_receipt_body(gen=1, cause="orphan-draft", head="c" * 40):
+            """Byte-faithful to what groom's hand-off POSTs — STALE_PR_MARKER included — so a
+            fixture cannot pass on a shape groom does not actually write."""
+            return (f"> 🤖 SPARQ agent\n\nThis worker PR has been untouched beyond the "
+                    f"maintenance threshold. That is a MACHINE-recoverable cause, not a question "
+                    f"for a human, so this is the machine-owned `{MACHINE_PARK_PR_LABEL}` soft "
+                    f"hold.\n\n{groom_mod.STALE_PR_MARKER}\n"
+                    f"{groom_mod.AGE_PARK_MARKER} cause={cause} head={head} gen={gen} -->")
+
+        def bot_at(body, seconds_ago, login=readmit_bot):
+            return {"user": {"login": login}, "body": body,
+                    "created_at": model_health_mod._iso_z(readmit_now - seconds_ago)}
+
+        def park_at(seconds_ago, actor=readmit_bot):
+            return {41: [{"event": "labeled", "label": {"name": MACHINE_PARK_PR_LABEL},
+                          "created_at": model_health_mod._iso_z(readmit_now - seconds_ago),
+                          "actor": {"login": actor}, "performed_via_github_app": None}], 7: []}
+
+        def census_codes():
+            """The [G5] census line the sweep itself emitted, parsed back to codes. Read from the
+            sweep's OWN log, so an assertion here cannot pass on a hand-built census row."""
+            rows = [line for line in readmit_sweep.log
+                    if line.startswith("park census example/repo: ")]
+            return rows[-1].split(": ", 1)[1] if rows else ""
+
+        young, old = 3 * 3600, 7 * 3600
+        assert young < span_secs < old, (young, span_secs, old)
+        age_comments = [bot_at(age_receipt_body(), 3000)]
+
+        # (1) NON-VACUITY FIRST, and it is load-bearing. The identical PR, identical window and
+        # identical timings WITHOUT groom's receipt must still show the heuristic doing its job:
+        # refuse at 3 h, ADMIT at 7 h. Without this control the pair-assertion below would pass
+        # just as well if the heuristic had been deleted, if `healthy_window` stopped being
+        # healthy, or if the fixture never reached the probe at all — and "removing the heuristic
+        # restores the #691 no-machine-exit stall" is precisely the outcome that must not happen.
+        control = {}
+        for hours, seconds in (("3h", young), ("7h", old)):
+            control[hours] = readmit_sweep(healthy_window, timeline=park_at(seconds))
+        assert control["3h"] == (0, [], []), control["3h"]
+        assert control["7h"][0] == 1 and control["7h"][2] == [(41, 7)], control["7h"]
+        assert "fleet-health" in control["7h"][1][0][1], control["7h"][1]
+        print("  ok   [#769] CONTROL (non-vacuity): with NO age receipt the sustained-health "
+              "heuristic still refuses at 3 h and ADMITS at 7 h — #691's exit is intact")
+
+        # (2) THE RED TEST. The same park, now carrying groom's age receipt, must reach the SAME
+        # decision at 3 h and at 7 h. Delete the `age_park_episode` guard from
+        # `_readmit_capacity_parks` and the 7 h leg admits again while the 3 h leg does not — the
+        # two stop agreeing, which is exactly the shape "crossing the span is the only variable"
+        # has. The decisions are compared to EACH OTHER as well as to the expected value, so a
+        # mutant that broke both legs identically cannot pass either.
+        aged = {}
+        for hours, seconds in (("3h", young), ("7h", old)):
+            aged[hours] = readmit_sweep(healthy_window, comments=age_comments,
+                                        timeline=park_at(seconds))
+            aged[hours + "-census"] = census_codes()
+        assert aged["3h"] == aged["7h"] == (0, [], []), (aged["3h"], aged["7h"])
+        assert aged["3h-census"] == aged["7h-census"] == "foreign-episode=1", aged
+        print("  ok   [#769] RED TEST: a groom AGE park reaches the SAME decision at 3 h and "
+              "7 h — crossing SUSTAINED_HEALTH_SPAN_SECONDS is no longer an exit")
+
+        # (3) The refusal is CENSUSED and classified EXIT-REACHABLE, not human-terminal. A park
+        # that silently drops out of the census is the invisible hold this whole class of defect
+        # is about, and the exit class is a CLAIM: groom's own cause-gated sweep clears it, so no
+        # maintainer should be told to go and look at it.
+        assert _park_policy.park_refusal_exit_class(
+            _park_policy.PARK_REFUSAL_FOREIGN_EPISODE) == "exit-reachable"
+        assert not [line for line in readmit_sweep.log
+                    if line.startswith("::warning::park census")], readmit_sweep.log
+        assert any("groom's cause-gated AGE park" in line for line in readmit_sweep.log), \
+            readmit_sweep.log
+        print("  ok   [#769] the age park is CENSUSED as `foreign-episode` / exit-reachable — "
+              "named every tick, and never reported as needing a human")
+
+        # (4) THE EPISODE CLOSES. worker-pr's capacity ladder parking this PR AFTER the age
+        # receipt means the live label is the LADDER's park, not groom's, and the ordinary
+        # capacity path must resume — otherwise this guard would strand every PR that ever wore a
+        # groom age park. STRICTLY newer closes it; a TIE does not, because a tie is the ambiguous
+        # case and the fail-closed direction is to leave the park alone.
+        ladder_body = f"x {PARK_GENERATION_MARKER_PREFIX} gen=1 cutoff=none -->"
+        reopened = readmit_sweep(
+            healthy_window, comments=age_comments + [bot_at(ladder_body, 2000)],
+            timeline=park_at(old))
+        assert reopened[0] == 1 and reopened[2] == [(41, 7)], reopened
+        tied = readmit_sweep(
+            healthy_window, comments=age_comments + [bot_at(ladder_body, 3000)],
+            timeline=park_at(old))
+        assert tied == (0, [], []), tied
+        # A park-REASON receipt (the legacy migration / the starvation park) closes it too.
+        reason_body = f"x {_park_policy.park_reason_marker(STARVATION_PARK_CAUSE)}"
+        assert readmit_sweep(healthy_window,
+                             comments=age_comments + [bot_at(reason_body, 2000)],
+                             timeline=park_at(old))[0] == 1
+        print("  ok   [#769] the age episode CLOSES on a strictly-newer park receipt from "
+              "another mechanism (a TIE does not) — no PR is stranded by this guard")
+
+        # (5) groom's OWN un-park receipt does NOT close the episode. groom posts it BEFORE it
+        # deletes the label, so a receipt with the label still live is groom's crash residue and
+        # groom's convergence branch owns it. Handing that to this sweep would clear it while
+        # minting a receipt claiming a starvation recovery that never happened.
+        unpark_body = (f"{groom_mod.AGE_UNPARK_MARKER} cause=orphan-draft head={'c' * 40} "
+                       "gen=1 -->")
+        assert readmit_sweep(healthy_window,
+                             comments=age_comments + [bot_at(unpark_body, 2000)],
+                             timeline=park_at(old)) == (0, [], []), "groom converges its own"
+        print("  ok   [#769] groom's own un-park receipt does NOT hand the park to this sweep — "
+              "receipt-no-label is groom's convergence, not a capacity re-admission")
+
+        # (6) TRUST FILTER + FAIL-CLOSED. A third party cannot forge an age receipt to freeze a
+        # genuine capacity park (it is not the bot's comment, so it is not a receipt at all); and
+        # once a REAL age receipt is on record, a bot comment whose stamp cannot be parsed leaves
+        # the episode boundary unprovable, which keeps the park with groom.
+        forged = readmit_sweep(healthy_window,
+                               comments=[bot_at(age_receipt_body(), 3000, login="drive-by")],
+                               timeline=park_at(old))
+        assert forged[0] == 1 and forged[2] == [(41, 7)], forged
+        unstamped = readmit_sweep(
+            healthy_window,
+            comments=age_comments + [{"user": {"login": readmit_bot}, "body": ladder_body,
+                                      "created_at": "not-a-timestamp"}],
+            timeline=park_at(old))
+        assert unstamped == (0, [], []), unstamped
+        print("  ok   [#769] a NON-bot age receipt is not a receipt, and an unreadable bot stamp "
+              "fails CLOSED (the park stays with groom)")
+
+        # (6b) THE PR-SIDE PARK MUST BE LIVE for the binding to speak at all. This sweep ALSO
+        # admits a PR whose SOURCE ISSUE carries `status:parked` with no PR-side label, and such a
+        # PR can still carry an age receipt from an EARLIER, already-closed episode — groom parked
+        # it, the cause recovered, groom cleared the label, the receipt stayed. Judging that
+        # receipt would refuse an issue-side capacity park groom has no exit for, i.e. this guard
+        # would itself become the stranding it exists to prevent. Delete clause 0 and this reds.
+        issue_side = readmit_sweep(
+            healthy_window, comments=age_comments, timeline=park_at(old),
+            rows=[[dict(parked_row, labels=[{"name": "review:needs"}])]],
+            labels={7: ["status:parked"]})
+        assert issue_side[0] == 1 and issue_side[2] == [(41, 7)], issue_side
+        print("  ok   [#769] an ISSUE-side `status:parked` with NO live `review:parked` is "
+              "unaffected — a closed age episode's receipt cannot strand another park")
+
+        # (7) PRECEDENCE. A human-owned hold outranks the episode binding in the census, because
+        # `human-hold` is HUMAN-TERMINAL and is the row a maintainer must actually see. The park
+        # is refused either way; what is asserted here is that the refusal is not misfiled.
+        held = readmit_sweep(healthy_window, comments=age_comments, timeline=park_at(old),
+                             labels={7: ["status:parked", "needs:user"]})
+        assert held == (0, [], []), held
+        assert census_codes() == "human-hold=1", census_codes()
+        print("  ok   [#769] a human-owned hold still outranks the episode binding in the "
+              "census — a human-terminal park is never filed as self-healing")
+
         # ---- [registry #835] THE RE-ADMISSION CANDIDATE FILTER ADMITS THE #657 ORCHESTRATOR
         # CLASS. The defect: `_readmit_capacity_parks` selected candidates on HEAD_REF_RE *and*
         # the App-bot login — the WORKER lane's producer shape. An orchestrator-class PR
@@ -16027,6 +17199,43 @@ agent = "impl"
                                  enrolled_authors=_authors) == (0, [], []), f"[#835] {_why}"
         print("  ok   [#835] no third-party, fork, foreign-record, machine-attested or "
               "recordless PR becomes re-admittable (5 shapes, one differing property each)")
+
+        # ---- [#657 enable] #769's EPISODE BINDING IS INHERITED BY THE WIDENED CLASS. #769 placed
+        # its `age_park_episode` guard DOWNSTREAM of #844's candidate filter precisely so the class
+        # #835 widened would inherit it. That inheritance was never asserted on an orchestrator-
+        # class row — the #769 block above drives the WORKER fixture — so enabling enrolment is the
+        # moment it stops being a structural argument and has to be a test. If the enable ever
+        # breaks it, a groom AGE park on an enrolled PR becomes its own recovery proof again: it
+        # would re-admit purely by getting old enough, spending a budget groom never granted. ----
+        orch_aged = {}
+        for hours, seconds in (("3h", young), ("7h", old)):
+            orch_aged[hours] = readmit_sweep(
+                healthy_window, rows=[[orch_row()]], provenance={41: orch_record},
+                comments=age_comments, timeline=park_at(seconds),
+                enrolled_authors=orch_enrolled)
+            orch_aged[hours + "-census"] = census_codes()
+        assert orch_aged["3h"] == orch_aged["7h"] == (0, [], []), (
+            "[#657 enable] an ENROLLED orchestrator-class PR carrying groom's age receipt must "
+            f"reach the SAME decision at 3 h and 7 h: {orch_aged['3h']!r} vs {orch_aged['7h']!r}")
+        assert orch_aged["3h-census"] == orch_aged["7h-census"] == "foreign-episode=1", orch_aged
+        # THE CONTROL, and it is what makes the pair above a test of #769 rather than of the class:
+        # the identical enrolled row WITHOUT the age receipt is still ADMITTED at 7 h. Without it,
+        # a widened class that had simply become unre-admittable would pass the assertion above.
+        orch_no_receipt = readmit_sweep(
+            healthy_window, rows=[[orch_row()]], provenance={41: orch_record},
+            timeline=park_at(old), enrolled_authors=orch_enrolled)
+        assert orch_no_receipt[0] == 1 and orch_no_receipt[2] == [(41, 7)], (
+            "[#657 enable] CONTROL: with NO age receipt the enrolled class must still re-admit on "
+            f"the sustained-health heuristic — otherwise the pair above proves nothing. "
+            f"got {orch_no_receipt!r}")
+        assert readmit_sweep(
+            healthy_window, rows=[[orch_row()]], provenance={41: orch_record},
+            timeline=park_at(young), enrolled_authors=orch_enrolled) == (0, [], []), (
+            "[#657 enable] CONTROL: ...and it still refuses at 3 h, so crossing the span is the "
+            "only variable in the receipt-bearing pair")
+        print("  ok   [#657 enable] #769's `foreign-episode` binding is INHERITED by the enrolled "
+              "orchestrator class: refused with an age receipt at BOTH 3 h and 7 h, admitted at "
+              "7 h without one")
     finally:
         globals()["_target_is_human_maintainer"] = prev_target_probe
 
@@ -16536,82 +17745,368 @@ def _escalation_call_site(source):
     return None
 
 
+def _park_call_site(source):
+    """[registry #822] STRUCTURAL proof that some PRODUCTION function iterates EVERY target
+    `starvation_park_targets(...)` returned and parks EACH one. Returns that function's name,
+    or None.
+
+    This is the seam for the leg named in the title, and it is the one a plausible regression
+    actually lands on. The pure-function tests above all stay green if the call site quietly
+    re-scalarises the batch — `park(targets[0])`, `for t in targets[:1]`, `cap=1` at the call
+    site — which restores the exact 1-per-tick defect while every assertion in this file passes.
+    So the check is on ANCESTRY, and it refuses:
+
+      - no `for` over the assigned result           -> the batch is not iterated at all;
+      - `park_starved_partition_holder` outside it  -> at most one holder is ever written;
+      - any SLICE in the loop's iterable            -> `[:1]` is the defect wearing a loop;
+      - a `cap=` keyword at the call site           -> the bound must be the DERIVED constant,
+                                                       not a number retyped at the call site.
+    """
+    import ast
+    tree = ast.parse(source)
+    for func in ast.walk(tree):
+        if not isinstance(func, ast.FunctionDef) or func.name.endswith("_self_test"):
+            continue
+        bound = set()
+        for node in ast.walk(func):
+            if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
+                continue
+            if getattr(node.value.func, "id", None) != "starvation_park_targets":
+                continue
+            if any(keyword.arg == "cap" for keyword in node.value.keywords):
+                continue                  # a call-site cap can silently restore the 1/tick defect
+            bound.update(target.id for target in node.targets
+                         if isinstance(target, ast.Name))
+        if not bound:
+            continue
+        for loop in ast.walk(func):
+            if not isinstance(loop, ast.For):
+                continue
+            iter_names = {node.id for node in ast.walk(loop.iter)
+                          if isinstance(node, ast.Name)}
+            if not (iter_names & bound):
+                continue
+            if any(isinstance(node, ast.Slice) for node in ast.walk(loop.iter)):
+                continue                  # `targets[:1]` is the per-tick cap of 1, re-typed
+            for stmt in ast.walk(loop):
+                if (isinstance(stmt, ast.Call)
+                        and getattr(stmt.func, "id", None)
+                        == "park_starved_partition_holder"):
+                    return func.name
+    return None
+
+
+def _starvation_park_batch_source():
+    """The PRODUCTION park-batch statements, lifted verbatim from `dispatch()` by sentinel."""
+    source = inspect.getsource(dispatch)
+    begin = source.index("# >>> starvation-park-batch")
+    begin = source.index("\n", source.index("proven on the PRODUCTION", begin)) + 1
+    end = source.index("# <<< starvation-park-batch")
+    block = textwrap.dedent(source[begin:end])
+    assert block.startswith("starvation_targets = starvation_park_targets("), block[:80]
+    return block
+
+
+def _run_starvation_park_batch(holders, *, token=True, bot="bot", failing=(), planned=()):
+    """EXECUTE the production park-batch block over `holders` inert `__global__` occupants.
+
+    Returns `(parked, counted)` — the PR numbers whose label write actually happened, and the
+    `defer_reasons` count. Every collaborator is a stub, so what is under test is exclusively the
+    production control flow between `starvation_park_targets` and `park_starved_partition_holder`.
+    `failing` names holders whose label write raises, proving the batch is per-holder resilient.
+    """
+    parked, comments = [], []
+
+    def park_pr(number):
+        if number in failing:
+            raise DispatchError("label write failed")
+        parked.append(number)
+
+    occupancy = [_starvation_row(number, packages={GLOBAL_PACKAGE}) for number in holders]
+    namespace = {
+        "starvation_park_targets": starvation_park_targets,
+        "park_starved_partition_holder": park_starved_partition_holder,
+        "_starvation_row": _starvation_row,
+        "DispatchError": DispatchError,
+        "GLOBAL_PACKAGE": GLOBAL_PACKAGE,
+        "MACHINE_PARK_PR_LABEL": MACHINE_PARK_PR_LABEL,
+        "_park_policy": _park_policy,
+        "_issue_timeline_events": lambda *a, **k: [],
+        "_target_is_human_maintainer": lambda *a, **k: False,
+        "_labels": lambda row: [],
+        "_run_gh_target_comment": lambda repo, number, body: comments.append(number),
+        # the production `park_pr=` lambda closes over _run_gh_target_api; the stub reads the
+        # SAME arguments the real call site passes, so a re-pointed label would be visible here
+        "_run_gh_target_api": lambda repo, method, path, payload=None: park_pr(
+            int(path.rsplit("/", 2)[-2])),
+        "repo": "o/r",
+        "repository": {"items": list(planned)},
+        "starved": 12,
+        "live_occupancy": occupancy,
+        "bot_login": bot,
+        "_target_token": lambda _repo: token,
+        "pull_pages": [[{"number": number, "labels": []} for number in holders]],
+        "defer_reasons": Counter(),
+        "print": lambda *a, **k: None,
+    }
+    with contextlib.redirect_stdout(io.StringIO()):
+        exec(compile(_starvation_park_batch_source(),   # noqa: S102 — this repository's own source
+                     "<dispatch starvation-park-batch>", "exec"), namespace)
+    return parked, namespace["defer_reasons"]["partition-starvation-park"]
+
+
+def _starvation_park_batch_seam_self_test():
+    """[registry #822] THE DEFECT, PINNED ON EXECUTED PRODUCTION SOURCE.
+
+    Every other assertion about the batch calls the pure selector directly, so all of them stay
+    green if the production tick acts on only the first target — which IS the defect. This runs
+    the real statements and counts the real writes.
+    """
+    # the real PR numbers of the board the sweep parked one-per-tick on the measured window
+    board = [4599, 4601, 4604, 4607][:MEASURED_STARVED_HOLDER_BOARD]
+    parked, counted = _run_starvation_park_batch(list(reversed(board)))
+    assert parked == board, (
+        f"ONE tick must park ALL {len(board)} inert `{GLOBAL_PACKAGE}` holders — the reservation "
+        f"is a union, so parking a subset frees nothing and #822's 10-minute floor makes each "
+        f"un-parked holder another 10 minutes of TOTAL dispatch outage (parked {parked})")
+    assert counted == len(board), counted
+    print(f"  ok   #822 park batch (EXECUTED production source): {len(board)} inert holders -> "
+          f"{len(parked)} label writes on ONE tick, and {counted} counted defer reason(s)")
+
+    # PER-HOLDER RESILIENT: one failed write must not cost the others their park. Under a cap of 1
+    # this case could not even arise; under a batch it is the difference between a partial drain
+    # and none, and the partition needs the LAST holder parked.
+    parked, counted = _run_starvation_park_batch(board, failing={board[0]})
+    assert parked == board[1:] and counted == len(board) - 1, (parked, counted)
+    print("  ok   #822 park batch: one FAILED label write does not abort the batch — the "
+          "remaining holders are still parked this tick")
+
+    # ...and the token/bot gate still stands the whole batch down, writing nothing.
+    assert _run_starvation_park_batch(board, token=False) == ([], 0)
+    assert _run_starvation_park_batch(board, bot="") == ([], 0)
+    # a HEALTHY plan writes nothing even with a full board of eligible holders — the production
+    # block must read the plan's own items, not a constant
+    assert _run_starvation_park_batch(board, planned=[{"number": 900}]) == ([], 0)
+    print("  ok   #822 park batch: no target token, no bot identity, and a HEALTHY plan each "
+          "stand the WHOLE batch down — writing nothing at all")
+
+
 def _starvation_sweep_self_test():
     item = {"number": 900, "package": "crate-a", "deferred": False}
     holder = _starvation_row(41, packages={GLOBAL_PACKAGE})
 
     # ---- TRIGGER: fires only on the measured starvation --------------------------------------
     logs = []
-    assert starvation_park_target([], 12, [holder], log=logs.append) == 41
-    assert any("planned 0 item(s)" in line and "parking pr#41" in line for line in logs), logs
+    assert starvation_park_targets([], 12, [holder], log=logs.append) == [41]
+    assert any("planned 0 item(s)" in line and "parking [41]" in line for line in logs), logs
     print("  ok   #677 starvation sweep: a starved lane behind an inert __global__ holder "
           "selects exactly that holder")
 
     # A HEALTHY plan is the guard the brief calls out by name: over-parking costs real review
     # progress, so ANY planned item must stand the sweep down. Deleting the `if planned_items`
     # clause reds HERE.
-    assert starvation_park_target([item], 12, [holder]) is None
-    assert starvation_park_target([item], 0, [holder]) is None
+    assert starvation_park_targets([item], 12, [holder]) == []
+    assert starvation_park_targets([item], 0, [holder]) == []
     print("  ok   #677 starvation sweep: NEVER fires while the plan is healthy (>=1 planned item)")
 
     # An EMPTY backlog is not starvation. Deleting the `deferred <= 0` clause reds HERE — and
     # this is the case that would otherwise park a holder for no throughput at all.
-    assert starvation_park_target([], 0, [holder]) is None
-    assert starvation_park_target([], -1, [holder]) is None
-    assert starvation_park_target([], True, [holder]) is None      # bool is not a count
-    assert starvation_park_target([], "12", [holder]) is None      # unreadable count
+    assert starvation_park_targets([], 0, [holder]) == []
+    assert starvation_park_targets([], -1, [holder]) == []
+    assert starvation_park_targets([], True, [holder]) == []      # bool is not a count
+    assert starvation_park_targets([], "12", [holder]) == []      # unreadable count
     print("  ok   #677 starvation sweep: an EMPTY backlog (0 deferred rows) parks nobody")
 
     # ---- CANDIDATE SELECTION: each declining clause, one at a time ----------------------------
     # already parked -> idempotence. Re-running the sweep against its own output selects nobody.
-    assert starvation_park_target(
-        [], 12, [_starvation_row(41, packages={GLOBAL_PACKAGE}, parked=True)]) is None
+    assert starvation_park_targets(
+        [], 12, [_starvation_row(41, packages={GLOBAL_PACKAGE}, parked=True)]) == []
     # parked AND inert -> busy_packages_of_pulls already freed it (decision `parked-free`)
-    assert starvation_park_target(
+    assert starvation_park_targets(
         [], 12, [_starvation_row(41, packages={GLOBAL_PACKAGE}, parked=True,
-                                 decision="parked-free")]) is None
+                                 decision="parked-free")]) == []
     # ...and the decision filter is checked INDEPENDENTLY of the reason slot. Today a
     # `parked-free` row always carries a park reason, so the two guards overlap and deleting
     # either alone still declines. This fixture is the row that separates them: a NON-`busy`
     # decision whose reason slot reads "not-parked". It cannot arise from the current
     # busy_packages_of_pulls, and that is exactly why it is here — a new decision kind added
     # later must not silently become a park candidate.
-    assert starvation_park_target(
-        [], 12, [("parked-free", 41, frozenset({GLOBAL_PACKAGE}), "not-parked", True)]) is None
-    assert starvation_park_target(
+    assert starvation_park_targets(
+        [], 12, [("parked-free", 41, frozenset({GLOBAL_PACKAGE}), "not-parked", True)]) == []
+    assert starvation_park_targets(
         [], 12, [("some-future-decision", 41, frozenset({GLOBAL_PACKAGE}),
-                  "not-parked", True)]) is None
+                  "not-parked", True)]) == []
     print("  ok   #677 starvation sweep: an ALREADY-PARKED holder is never re-parked "
           "(idempotent), and only a `busy` decision is ever a candidate")
 
     # ACTIVE holder -> parking it would write a label and free NOTHING (busy_packages_of_pulls
     # frees only `parked AND inactive`). Deleting the `inactive is not True` clause reds HERE.
-    assert starvation_park_target(
-        [], 12, [_starvation_row(41, packages={GLOBAL_PACKAGE}, inactive=False)]) is None
-    assert starvation_park_target(
-        [], 12, [_starvation_row(41, packages={GLOBAL_PACKAGE}, inactive=None)]) is None
+    assert starvation_park_targets(
+        [], 12, [_starvation_row(41, packages={GLOBAL_PACKAGE}, inactive=False)]) == []
+    assert starvation_park_targets(
+        [], 12, [_starvation_row(41, packages={GLOBAL_PACKAGE}, inactive=None)]) == []
     print("  ok   #677 starvation sweep: an ACTIVE holder — whose park would free NOTHING — "
           "is never parked")
 
     # a holder of REAL crates is not a __global__ holder: parking it does not unstarve the lane.
-    assert starvation_park_target(
-        [], 12, [_starvation_row(41, packages={"crate-a", "crate-b"})]) is None
+    assert starvation_park_targets(
+        [], 12, [_starvation_row(41, packages={"crate-a", "crate-b"})]) == []
     # a malformed occupancy row is not evidence to act on
-    assert starvation_park_target([], 12, [("busy", 41, frozenset({GLOBAL_PACKAGE}))]) is None
-    assert starvation_park_target([], 12, ["junk"]) is None
-    assert starvation_park_target([], 12, None) is None
-    assert starvation_park_target(
-        [], 12, [_starvation_row(0, packages={GLOBAL_PACKAGE})]) is None
+    assert starvation_park_targets([], 12, [("busy", 41, frozenset({GLOBAL_PACKAGE}))]) == []
+    assert starvation_park_targets([], 12, ["junk"]) == []
+    assert starvation_park_targets([], 12, None) == []
+    assert starvation_park_targets(
+        [], 12, [_starvation_row(0, packages={GLOBAL_PACKAGE})]) == []
     print("  ok   #677 starvation sweep: crate-only holders and malformed occupancy rows are "
           "not candidates")
 
-    # ---- BOUND: at most ONE per tick, deterministically -------------------------------------
+    # ---- [registry #822] THE DEFECT THIS CHANGE FIXES: ONE tick parks EVERY inert holder ------
+    #
+    # `busy` is a UNION over occupants, so `__global__` stays reserved while ANY holder holds it:
+    # parking 1 of N frees NOTHING and the lane is identically starved next tick — which #822's
+    # 10-minute floor makes a 10-minute unit. MEASURED on sparq-org/sparq 2026-07-27: kept=0 on
+    # four consecutive executed ticks 20:12:40Z->20:47:36Z, zero impl workers launched, ~55 min of
+    # total dispatch outage. THIS IS THE ASSERTION THE PRE-FIX CODE REDS ON — it returned
+    # `min(candidates)`, i.e. `41`, for every fixture below.
     many = [_starvation_row(n, packages={GLOBAL_PACKAGE}) for n in (77, 41, 63)]
-    assert STARVATION_PARKS_PER_TICK_MAX == 1
-    assert starvation_park_target([], 12, many) == 41
-    assert starvation_park_target([], 12, list(reversed(many))) == 41
-    print("  ok   #677 starvation sweep: THREE eligible holders yield exactly ONE target, the "
-          "lowest-numbered, order-independently")
+    assert starvation_park_targets([], 12, many) == [41, 63, 77]
+    assert starvation_park_targets([], 12, list(reversed(many))) == [41, 63, 77]
+    print("  ok   #822 starvation sweep: THREE eligible holders are ALL parked on ONE tick, "
+          "ascending and order-independently — parking one of three frees nothing")
+
+    # The measured board itself, at its real PR numbers: one tick, one floor interval, drained.
+    # These are the four PRs the sweep ACTUALLY parked, one per tick, on the window this change is
+    # justified by — `review:parked` applied at 20:15:53Z / 20:28:37Z / 20:41:20Z / 20:50:16Z.
+    board_numbers = [4599, 4601, 4604, 4607][:MEASURED_STARVED_HOLDER_BOARD]
+    board = [_starvation_row(n, packages={GLOBAL_PACKAGE}) for n in reversed(board_numbers)]
+    assert starvation_park_targets([], 30, board) == board_numbers, board_numbers
+    _floor = _load_module("registry_tick_floor_pin",
+                          Path(__file__).resolve().parent / "dispatch-tick-floor.py")
+    _drain_ticks = -(-MEASURED_STARVED_HOLDER_BOARD // STARVATION_PARKS_PER_TICK_MAX)
+    _drain_minutes = _drain_ticks * _floor.MIN_TICK_INTERVAL_SECONDS // 60
+    assert _drain_ticks == 1 and _drain_minutes == 10, (
+        f"the widest MEASURED starved board ({MEASURED_STARVED_HOLDER_BOARD} holders) must drain "
+        f"in ONE executed tick; at a cap of {STARVATION_PARKS_PER_TICK_MAX} it takes "
+        f"{_drain_ticks} tick(s) = {_drain_minutes} min of TOTAL dispatch outage, because the "
+        "union keeps the partition reserved until the LAST holder is parked")
+    # THE OBSERVATION ITSELF IS PINNED. Everything above is satisfied by a SMALLER board, so a
+    # mutant that quietly understates the measurement leaves the whole battery green while the
+    # bound it justifies stops being justified — measured: `MEASURED_STARVED_HOLDER_BOARD = 1`
+    # survived this file until this assertion existed. A recorded observation can only be
+    # defended by pinning it; it is re-derived from a NEW measurement, never from code.
+    assert MEASURED_STARVED_HOLDER_BOARD == 4, (
+        "MEASURED_STARVED_HOLDER_BOARD is an OBSERVATION — sparq-org/sparq, four consecutive "
+        "executed dispatch ticks 2026-07-27 20:12:40Z-20:47:36Z, assemble-census kept=0 with "
+        "every row deferred by reason.global-reservation. Change it only with a new measurement, "
+        "and re-derive STARVATION_PARKS_PER_TICK_MAX when you do")
+    assert (MEASURED_STARVED_HOLDER_BOARD * _floor.MIN_TICK_INTERVAL_SECONDS // 60) == 40, \
+        "the PRE-FIX drain of the measured board is the number this change is justified by " \
+        "(4 holders x a 10-minute floor); if either input moved, the justification moved with it"
+    print(f"  ok   #822 drain time: the measured {MEASURED_STARVED_HOLDER_BOARD}-holder board "
+          f"drains in {_drain_ticks} tick ({_drain_minutes} min), not "
+          f"{MEASURED_STARVED_HOLDER_BOARD} ticks "
+          f"({MEASURED_STARVED_HOLDER_BOARD * _floor.MIN_TICK_INTERVAL_SECONDS // 60} min)")
+
+    # ---- THE BOUND IS STILL A BOUND, and its arithmetic is pinned to the FLOOR's own numbers --
+    # A bound exists so a pathological board cannot become an unbounded mutation burst. It is
+    # derived, not chosen: park cost * bound must fit the request headroom the floor left behind.
+    _ticks_per_hour = 3600 / _floor.MIN_TICK_INTERVAL_SECONDS
+    _spare_per_tick = (_floor.OBSERVED_SAFE_REQUESTS_PER_HOUR
+                       - _ticks_per_hour * _floor.MEASURED_REQUESTS_PER_TICK) / _ticks_per_hour
+    _batch_cost = STARVATION_PARKS_PER_TICK_MAX * STARVATION_PARK_REQUESTS_EACH
+    assert _batch_cost <= _spare_per_tick, (
+        f"a full park batch costs {_batch_cost} requests but the floor's own budget leaves only "
+        f"{_spare_per_tick:.0f} spare per tick — re-derive STARVATION_PARKS_PER_TICK_MAX, or the "
+        "sweep becomes the next rate-limit outage (#819)")
+    assert STARVATION_PARKS_PER_TICK_MAX >= MEASURED_STARVED_HOLDER_BOARD
+    print(f"  ok   #822 bound arithmetic: {STARVATION_PARKS_PER_TICK_MAX} parks x "
+          f"{STARVATION_PARK_REQUESTS_EACH} requests = {_batch_cost} <= "
+          f"{_spare_per_tick:.0f} spare/tick — asserted against dispatch-tick-floor's OWN "
+          "constants, so neither can drift alone")
+
+    # ---- ...AND EVERY MEASURED INPUT THAT ARITHMETIC READS IS PINNED BY EQUALITY [#871] -------
+    #
+    # The inequality above can only ever pin ONE direction per input, and for three of the four it
+    # is the SAFE direction that is pinned — the unsafe one runs free:
+    #
+    #   input                             read on   an inequality alone leaves open
+    #   STARVATION_PARK_REQUESTS_EACH     LEFT      UNDERSTATING the per-park cost
+    #   OBSERVED_SAFE_REQUESTS_PER_HOUR   RIGHT     OVERSTATING the ceiling the budget is judged by
+    #   MEASURED_REQUESTS_PER_TICK        RIGHT     OVERSTATING tick cost (spare = M/6 grows with M)
+    #   MIN_TICK_INTERVAL_SECONDS         both      only [600, 614] — the drain asserts floor-divide
+    #                                               by 60, and MEASURED: `= 601` survived them
+    #
+    # MEASURED, on this file before these four assertions existed: `STARVATION_PARK_REQUESTS_EACH
+    # = 1` SURVIVED the whole self-test; so did `= 1` together with `STARVATION_PARKS_PER_TICK_MAX
+    # = 100`, which sanctions ~500 real requests per tick (6 x 1,113 = 6,678/h) against an
+    # OBSERVED-SAFE 4,291/h — the exact outage class #819 is. Only the OVER-stating `= 50` died.
+    # Same shape as MEASURED_STARVED_HOLDER_BOARD, one constant over: if a constant records a
+    # measurement, assert the measurement.
+    assert STARVATION_PARK_REQUEST_ITEMS == (
+        ("unpark-veto timeline read", 1),
+        ("collaborator-permission probes behind the veto", 2),
+        ("the park receipt comment", 1),
+        ("the machine-park label write", 1),
+    ), ("the per-park cost is an ITEMISED MEASUREMENT of the requests park_starved_partition_"
+        "holder issues. THE POPULATION TO RE-MEASURE IS THE PRs THE SWEEP ACTUALLY PARKED — on "
+        "sparq-org/sparq that is #4599/#4601/#4604/#4607, identifiable without trusting this "
+        "sentence because their `review:parked` labels landed 20:15:53Z/20:28:37Z/20:41:20Z/"
+        "20:50:16Z, one per tick, which is the defect itself. It is NOT the unprovenanced "
+        "population (#4360/#4509/#4528) this file names elsewhere: those are a different set, one "
+        "is closed and two carry a `needs:user` hold this writer refuses. Their `--paginate` "
+        "timeline reads measured 8/5/7/4 events, and the three OLDEST open PRs 19/32/25 — one "
+        "page each, and the counts DRIFT, so re-measure rather than trust them. Then up to 2 "
+        "collaborator-permission probes, the receipt comment and the label write. Change a line "
+        "item only with a new measurement of that call path, and re-derive "
+        "STARVATION_PARKS_PER_TICK_MAX when you do")
+    assert STARVATION_PARK_REQUESTS_EACH == 5, (
+        "STARVATION_PARK_REQUESTS_EACH is a MEASUREMENT, and it is read only on the LEFT of "
+        "`_batch_cost <= _spare_per_tick`, so an inequality cannot defend it downward: at `= 1` "
+        "the batch is costed at a fifth of what it issues and the bound stops bounding anything")
+    assert _floor.MEASURED_REQUESTS_PER_TICK == 613, (
+        "MEASURED_REQUESTS_PER_TICK is dispatch-tick-floor's instrumented per-tick request count "
+        "(#721). This file's spare is (7M - 6M)/6 = M/6, so it GROWS with M — an overstated tick "
+        "cost silently buys this batch headroom that does not exist")
+    assert _floor.OBSERVED_SAFE_REQUESTS_PER_HOUR == 7 * 613, (
+        "OBSERVED_SAFE_REQUESTS_PER_HOUR is an OBSERVATION — 7 executed ticks in the 10Z hour, "
+        "ran clean; 13 (OBSERVED_BREAKING) did not. It sits only on the RIGHT of every `<=` that "
+        "reads it, in BOTH files, so overstating it is invisible to all of them. This PR is what "
+        "made a second file's bound lean on it, so it is pinned from the consumer")
+    assert _floor.MIN_TICK_INTERVAL_SECONDS == 10 * 60, (
+        "the #822 floor is what turns a per-TICK cap into a per-10-MINUTE cap; if it moves, every "
+        "drain time in this block and the bound they justify must be re-derived")
+
+    # ...and the itemised timeline read is the one line item that is not a constant of the API: a
+    # holder with >100 timeline events costs a page more, so the margin to that boundary is worth
+    # having in the run log. It is COMPUTED AND REPORTED, NOT ASSERTED, and deliberately so:
+    # `_pages_afforded >= 1` is algebraically the same statement as `_batch_cost <= _spare_per_tick`
+    # above, so it could never fire on its own. An assertion that cannot fail is the vacuity this
+    # very block exists to eliminate, and writing one here would have been the same mistake in a
+    # new costume. Strengthening it to `>= 2` WOULD bite — but it would narrow the bound's honest
+    # interval from [4, 20] to [4, 16] as a side effect of a comment, which is a different change.
+    _pages_afforded = (int(_spare_per_tick) // STARVATION_PARKS_PER_TICK_MAX
+                       - (STARVATION_PARK_REQUESTS_EACH - 1))
+    print(f"  ok   #871 measured inputs PINNED BY EQUALITY: park cost "
+          f"{STARVATION_PARK_REQUESTS_EACH} (itemised), floor {_floor.MIN_TICK_INTERVAL_SECONDS}s, "
+          f"tick {_floor.MEASURED_REQUESTS_PER_TICK} req, safe "
+          f"{_floor.OBSERVED_SAFE_REQUESTS_PER_HOUR}/h — and the batch affords "
+          f"{_pages_afforded} timeline page(s) per holder (reported, not asserted: it restates "
+          f"the batch-cost bound) against a MEASURED 1")
+
+    # ...and a board WIDER than the bound is paced, ascending, loudly — never silently truncated.
+    paced_logs = []
+    wide = [_starvation_row(n, packages={GLOBAL_PACKAGE})
+            for n in range(100, 100 + STARVATION_PARKS_PER_TICK_MAX + 3)]
+    taken = starvation_park_targets([], 40, list(reversed(wide)), log=paced_logs.append)
+    assert taken == list(range(100, 100 + STARVATION_PARKS_PER_TICK_MAX)), taken
+    assert any(line.startswith("::warning::starvation park paced:") for line in paced_logs), \
+        paced_logs
+    # the explicit `cap=` override is the same code path, so the bound is testable without
+    # rewriting the constant
+    assert starvation_park_targets([], 40, wide, cap=2, log=lambda _m: None) == [100, 101]
+    assert starvation_park_targets([], 40, wide, cap=0, log=lambda _m: None) == []
+    print("  ok   #822 pacing: a board wider than the bound takes the LOWEST `cap` holders and "
+          "WARNS that the partition stays reserved until the remainder is parked")
 
     # ---- THE WRITE: the exact mutation set, and what it must never contain --------------------
     def run_park(labels, *, vetoed=None):
@@ -16808,14 +18303,14 @@ def _starvation_sweep_self_test():
                                           "repo": {"full_name": "o/r"}}}
     active_ready = dict(inert_draft, draft=False)
     latched_draft = dict(inert_draft, auto_merge={"enabled_by": {"login": "x"}})
-    for row, want_inactive, want_target in ((inert_draft, True, 41),
-                                            (active_ready, False, None),
-                                            (latched_draft, False, None)):
+    for row, want_inactive, want_target in ((inert_draft, True, [41]),
+                                            (active_ready, False, []),
+                                            (latched_draft, False, [])):
         produced = occupancy_of(row)
         assert len(produced) == 1 and produced[0][0] == "busy", produced
         # the bit the sweep reads IS _pull_inactivity_decision's own answer, not a constant
         assert produced[0][4] is _pull_inactivity_decision(row)[0] is want_inactive, produced
-        assert starvation_park_target([], 12, produced) == want_target, (row, produced)
+        assert starvation_park_targets([], 12, produced) == want_target, (row, produced)
     print("  ok   #677 starvation end-to-end: the inertness bit is PRODUCED by "
           "busy_packages_of_pulls — a live non-draft or latched holder is never selected")
 
@@ -16905,24 +18400,24 @@ def _starvation_sweep_self_test():
           "undeclared cause raises instead of silently minting a bucket")
 
     # ---- [registry #772] THE MISSING EDGE: the holder the park sweep cannot help ---------------
-    # This is the whole defect. `starvation_park_target` correctly declines an ACTIVE holder
+    # This is the whole defect. `starvation_park_targets` correctly declines an ACTIVE holder
     # (parking it writes a label and frees nothing), and before this change the tick simply ended
     # there — "parking nobody" — so a lane annihilated by a recordless PR stayed at zero with no
     # terminal state and no named recovery. MEASURED: 5 of 84 successful dispatch ticks on
     # 2026-07-27, holders #4360/#4509/#4528 still recordless 16h/8h/4h later.
     active_unprov = occupancy_of(unprovenanced)
-    assert starvation_park_target([], 12, active_unprov) is None, "park sweep should decline it"
+    assert starvation_park_targets([], 12, active_unprov) == [], "park sweep should decline it"
     assert starvation_provenance_escalation([], 12, active_unprov) == [51], active_unprov
     # A PARKED-but-active holder is equally stuck: busy_packages_of_pulls frees only
     # `parked AND inactive`, and the park sweep skips anything already parked.
     parked_active = occupancy_of(dict(unprovenanced, labels=[{"name": MACHINE_PARK_PR_LABEL}]))
     assert parked_active[0][0] == "busy", parked_active
-    assert starvation_park_target([], 12, parked_active) is None
+    assert starvation_park_targets([], 12, parked_active) == []
     assert starvation_provenance_escalation([], 12, parked_active) == [51], parked_active
     # ...but the one holder the PARK sweep DOES remedy is never double-reported: an un-parked,
     # provably-inert draft is the park half's own candidate and self-heals next tick.
     inert_unprov = occupancy_of(dict(unprovenanced, draft=True))
-    assert starvation_park_target([], 12, inert_unprov) == 51, inert_unprov
+    assert starvation_park_targets([], 12, inert_unprov) == [51], inert_unprov
     assert starvation_provenance_escalation([], 12, inert_unprov) == [], inert_unprov
     print("  ok   #772 missing edge: an unprovenanced holder with NO park remedy reaches the "
           "escalation, and the park half's own candidate is never double-reported")
@@ -17247,8 +18742,8 @@ def _starvation_sweep_self_test():
     # labelled as such rather than dressed up as behavioural coverage. Same technique the
     # `migration_provable=` call-site pin above uses.
     _dispatch_src = inspect.getsource(dispatch)
-    assert "starvation_park_target(" in _dispatch_src, \
-        "main()'s dispatch loop no longer CALLS starvation_park_target — the starved-plan sweep " \
+    assert "starvation_park_targets(" in _dispatch_src, \
+        "main()'s dispatch loop no longer CALLS starvation_park_targets — the starved-plan sweep " \
         "is unreachable and every test above is vacuous"
     assert "park_starved_partition_holder(" in _dispatch_src, \
         "main()'s dispatch loop no longer CALLS park_starved_partition_holder — the sweep " \
@@ -17280,7 +18775,7 @@ def _starvation_sweep_self_test():
         f"(found {_unpark_write.group(1) if _unpark_write else None!r}) — this sweep must never "
         "be able to remove a human-owned hold")
     assert _dispatch_src.index("starvation_unpark_targets(") \
-        < _dispatch_src.index("starvation_park_target("), \
+        < _dispatch_src.index("starvation_park_targets("), \
         "the un-park half must run BEFORE the park half in the tick, so a tick that releases a " \
         "holder re-measures the lane before deciding whether to park another"
     # The label the production call site actually writes. The injected `park_pr` in the tests
@@ -17294,7 +18789,7 @@ def _starvation_sweep_self_test():
         f"(found {_park_write.group(1) if _park_write else None!r}) — registry #703: this action "
         "must never become a conveyor into the human terminal")
     # ...and it must not route through the escalating capacity-park ladder either.
-    _sweep_block = _dispatch_src[_dispatch_src.index("starvation_park_target("):]
+    _sweep_block = _dispatch_src[_dispatch_src.index("starvation_park_targets("):]
     _sweep_block = _sweep_block[:_sweep_block.index("for item in repository[\"items\"]")]
     for forbidden in ("_pr_needs_user", "_park_source_issue", "_issue_needs_user_landed"):
         assert forbidden not in _sweep_block, (
@@ -17316,6 +18811,26 @@ def _starvation_sweep_self_test():
         f"both, an unprovenanced __global__ holder is silent again (found {seam!r})")
     print("  ok   #772 call-site seam (AST): the production tick ITERATES the escalation and "
           "COUNTS every escalated holder — a deleted call site or a dropped counter reds here")
+
+    # ---- [registry #822] THE PARK CALL SITE, on the PARSED tree -------------------------------
+    # The pure-function tests prove `starvation_park_targets` returns the whole batch. NONE of them
+    # can see whether the production tick acts on the whole batch. `park(targets[0])`, `[:1]`, or a
+    # `cap=1` at the call site each restore the exact defect this PR removes while leaving every
+    # other assertion in this file green — which is the vacuity class this repo keeps measuring, on
+    # the leg named in the title. Decided on ancestry, so a comment cannot satisfy it.
+    park_seam = _park_call_site(Path(__file__).resolve().read_text(encoding="utf-8"))
+    assert park_seam == "dispatch", (
+        "the production tick must ITERATE starvation_park_targets(...) and call "
+        "park_starved_partition_holder for EACH target, un-sliced and without a call-site `cap=` "
+        f"— otherwise the 1-holder-per-tick defect is back at 10 min/holder (found {park_seam!r})")
+    print("  ok   #822 park call-site seam (AST): the production tick PARKS EVERY selected "
+          "holder — a re-scalarised call site, a `[:1]`, or a call-site cap= reds here")
+
+    # ---- [registry #822] THE PARK BATCH, EXECUTED on production source -----------------------
+    _starvation_park_batch_seam_self_test()
+
+    # ---- [registry #869] EVERY PARK WRITE SITE STATES ITS CAUSE — ONE CHECK PER SITE ---------
+    _park_cause_site_self_test()
 
     # ---- THE YAML SEAM: structural, on PARSED nodes ------------------------------------------
     _starvation_yaml_seam_self_test()
@@ -17878,6 +19393,147 @@ def _census_yaml_seam_self_test():
         assert _fragment in census_step(_doc)["run"], _fragment
     print(f"  ok   #762 YAML seam: all {len(seam_mutants)} structural dispatch.yml census "
           "mutants are caught, including the two that survive a raw-text grep as comments")
+
+
+# ---- [registry #869] ONE NAMED CHECK PER PARK WRITE SITE ---------------------------------------
+#
+# THE DEFECT THIS EXISTS FOR, measured on the previous head of this PR: mutating the single
+# forwarding line in `_pr_needs_user` (`if park_cause: args += [...]`) to `pass` silently reverted
+# THREE of the five write sites the PR's title names, and the whole suite still exited 0. A
+# suite-wide assertion over the call sites gave 1/N coverage at N/N confidence — the recurring
+# shape on this repo, where the feature in the TITLE is the one without a red test.
+#
+# So each site is pinned TWICE, and each row is named after ITS OWN site:
+#   (a) STATED — the call site passes the cause, decided on the PARSED tree (a keyword in a dead
+#       branch, a commented-out flag, or a reflow must not change the answer); and
+#   (b) FORWARDED — `_pr_needs_user` actually puts `--park-cause <cause>` on the argv it hands
+#       worker-pr, EXECUTED against the real function with the process boundary stubbed.
+# Dropping one site's `park_cause=` reds only that site's (a). Deleting the shared forwarding line
+# reds every site's (b) — which is correct: it breaks all of them.
+#
+# The sites are keyed by a distinctive slice of the REASON each one writes, so a row names the
+# behaviour rather than a line number, and a re-worded reason fails loudly here instead of
+# silently re-pointing the pin at a different site.
+PARK_CAUSE_SITES_869 = (
+    ("the PR head no longer descends from the worker-opened commit",
+     "question", "history-rewritten", 1),
+    ("round-budget escalation-marker validation failed",
+     "question", "marker-corrupt", 1),
+    ("the fix lane cannot honour the source issue's trust-tier route",
+     "question", "routing-unresolvable", 1),
+    ("model chain for a", "question", "routing-unresolvable", 1),
+    ("the review round budget is exhausted at", "capacity", "budget", 1),
+    ("consecutive fix dispatches missed for round", "capacity", "dispatch-missed", 2),
+    # THE ONE DOCUMENTED EXCLUSION. This park fires when the durable missed-fix MARKER COULD NOT
+    # BE RECORDED — a write failure, not a validation failure. `marker-corrupt` names "durable
+    # round/model/pin markers failed VALIDATION", a different fact about a different PR state, and
+    # claiming it would put a wrong cause in a durable receipt to satisfy a coverage count. No
+    # cause in the CLOSED taxonomy names this stop and #869 may not extend the taxonomy, so it
+    # stays prose-only. Its prose matches no LEGACY_PARK_PROSE pattern either, so
+    # reclassify_legacy_park already returns None for it and the park stands.
+    ("the durable missed-fix marker could not be recorded", "question", None, 1),
+)
+
+
+def _park_cause_call_sites(source):
+    """Every `_pr_needs_user(...)` call in `source` as [(reason_literals, park_class, park_cause)],
+    decided on the PARSED tree.
+
+    `reason_literals` is the call's `reason` argument with its f-string holes removed — the
+    literal text the site actually writes — so a site is identified by what it SAYS.
+
+    PRODUCTION functions only: the `*_self_test` definitions are skipped, so the harness's own
+    probe calls below cannot masquerade as write sites (and, more importantly, cannot let a real
+    site hide behind one)."""
+    tree = ast.parse(source)
+    calls = []
+    for top in tree.body:
+        if isinstance(top, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                and top.name.endswith("_self_test"):
+            continue
+        calls.extend(node for node in ast.walk(top)
+                     if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                     and node.func.id == "_pr_needs_user")
+    found = []
+    for node in calls:
+        reason = node.args[4] if len(node.args) > 4 else None
+        chunks = []
+        if isinstance(reason, ast.Constant):
+            chunks = [str(reason.value)]
+        elif isinstance(reason, ast.JoinedStr):
+            chunks = [str(v.value) for v in reason.values if isinstance(v, ast.Constant)]
+        park_class = next((kw.value.value for kw in node.keywords
+                           if kw.arg == "park_class" and isinstance(kw.value, ast.Constant)),
+                          "question")
+        park_cause = next((kw.value.value for kw in node.keywords
+                           if kw.arg == "park_cause" and isinstance(kw.value, ast.Constant)),
+                          None)
+        found.append(("".join(chunks), park_class, park_cause))
+    return found
+
+
+def _park_cause_site_self_test():
+    source = Path(__file__).resolve().read_text(encoding="utf-8")
+    sites = _park_cause_call_sites(source)
+
+    # (a) STATED — per site, on the parsed tree.
+    for key, want_class, want_cause, want_n in PARK_CAUSE_SITES_869:
+        matched = [(klass, cause) for reason, klass, cause in sites if key in reason]
+        assert len(matched) == want_n, (
+            f"#869 site {key!r}: expected {want_n} `_pr_needs_user` call site(s), found "
+            f"{len(matched)}. A reworded reason silently re-points this pin at a different site.")
+        assert all(m == (want_class, want_cause) for m in matched), (
+            f"#869 site {key!r} must STATE park_class={want_class!r} park_cause={want_cause!r} "
+            f"— found {matched}. A question-class park with no cause ships an unreadable stop "
+            "reason into the human terminal, which is exactly what #869 closes.")
+        print(f"  ok   #869 site STATED [{key[:46]}] -> {want_class}/{want_cause}")
+
+    # No UNPINNED site may exist: a NEW `_pr_needs_user` call must be added to the table above
+    # deliberately, with a reason. (#858's trust-tier park landed mid-review and this caught it.)
+    unpinned = [reason[:60] for reason, _c, _u in sites
+                if not any(key in reason for key, *_ in PARK_CAUSE_SITES_869)]
+    assert not unpinned, (
+        f"#869: unpinned `_pr_needs_user` call site(s) {unpinned} — add each to "
+        "PARK_CAUSE_SITES_869 with its cause, or state why it is excluded.")
+    print(f"  ok   #869 no unpinned park write site exists ({len(sites)} pinned)")
+
+    # (b) FORWARDED — per site, EXECUTED against the real `_pr_needs_user`, with only the process
+    # boundary stubbed. This is the half the previous head lacked: `pass` at the forwarding line
+    # reverted three sites with nothing red.
+    captured = []
+    real_helper = globals()["_run_target_helper"]
+    try:
+        globals()["_run_target_helper"] = (
+            lambda script_dir, repo, script, args: captured.append((script, list(args))))
+        for key, want_class, want_cause, _n in PARK_CAUSE_SITES_869:
+            captured.clear()
+            _pr_needs_user("/sd", "o/r", 41, 7, f"reason for {key}",
+                           park_class=want_class,
+                           **({"park_cause": want_cause} if want_cause else {}))
+            assert len(captured) == 1 and captured[0][0] == "worker-pr.py", captured
+            argv = captured[0][1]
+            got = (argv[argv.index("--park-cause") + 1] if "--park-cause" in argv else None)
+            assert got == want_cause, (
+                f"#869 site {key!r}: `_pr_needs_user` must FORWARD --park-cause "
+                f"{want_cause!r} to worker-pr — got {got!r} in {argv}. Without this the call "
+                "site's cause never reaches the writer and no receipt is emitted.")
+            got_class = (argv[argv.index("--park-class") + 1]
+                         if "--park-class" in argv else None)
+            assert got_class == want_class, (
+                f"#869 site {key!r}: --park-class must be {want_class!r}, got {got_class!r}")
+            print(f"  ok   #869 site FORWARDED [{key[:44]}] -> --park-cause {want_cause}")
+    finally:
+        globals()["_run_target_helper"] = real_helper
+
+    # ...and every question-class cause any site states is QUESTION-class in the taxonomy: a
+    # `class=capacity` receipt on a review:needs-user park is the one shape that could talk it
+    # open (dispatch-claim's own release proof keys on the newest cause).
+    question_causes = {cause for _k, klass, cause, _n in PARK_CAUSE_SITES_869
+                       if klass == "question" and cause}
+    assert question_causes <= set(_park_policy.PARK_CAUSES) and all(
+        _park_policy.park_cause_class(c) == _park_policy.PARK_CLASS_QUESTION
+        for c in question_causes), sorted(question_causes)
+    print("  ok   #869 every question-class site's cause is QUESTION-class in the taxonomy")
 
 
 def _starvation_yaml_seam_self_test():

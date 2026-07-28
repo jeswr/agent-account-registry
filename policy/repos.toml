@@ -156,6 +156,45 @@ max_review_rounds = 3
 review_queue_ttl_minutes = 30
 cross_provider_fallback = false
 
+# [OPUS-5 #657] REVIEW-LANE ENROLMENT, ON, FOR THIS REPO ONLY. The MASTER-protected half of
+# orchestrator-PR admission (research/657-orchestrator-pr-admission.md §6, Option 2(b)). #876
+# landed the wiring with this list deliberately EMPTY; this is the line that turns it on.
+#
+# WHAT IT DOES: a PR authored by a login named here becomes reviewable by the cross-provider review
+# lane even though it fails the worker lane's two producer-shape gates (`sparq-agent/issue-<N>-`
+# head ref, App-bot author). BOTH halves are still required — this master-protected list AND an
+# `orchestrator`-attested provenance record for that exact PR on the unprotected `ledger` branch —
+# so neither authority admits anything on its own.
+#
+# WHAT IT DOES NOT DO, and why enabling it is not self-approval:
+#   * The reviewer is still chosen by INVERTING the record's `impl_provider` through the SAME
+#     REVIEW_CHAIN the worker class uses, and CLAIM's cross-provider assertion ("reviewer provider
+#     would equal implementer provider") is applied to this class exactly as to any other — it is
+#     not keyed off the class at all. An enrolled PR whose allocator returns a same-provider
+#     reviewer is REFUSED and its lease released.
+#   * The class can never ARM. `worker-pr.decide_review` returns a human hand-off instead of "arm"
+#     for a self-attested record, and `ready_and_arm` raises outright. An `orchestrator` record is
+#     written by the actor that wrote the diff, so its `impl_provider` is an assertion about
+#     itself; §3's residual risk is only acceptable because it degrades to an advisory comment and
+#     a human's merge click, never an automatic one. `enrolment_enable_error` asserts that refusal
+#     as a PRECONDITION of this list being non-empty.
+#   * The lane is REVIEW-ONLY for the class (enumerate_review_items' single emit choke point): no
+#     needs-fix / needs-ci-fix / needs-rebase / stranded state is emitted, so no run that pushes
+#     commits can ever be dispatched against a self-attested record.
+#   * The DISARM lane is NOT widened. It keeps registry #570's exact-App gate on its write path;
+#     the #42 armed-SHA invariant is DETECTED and reported for this class every tick
+#     (dispatch-claim.enumerate_disarm_observations) and acted on by a human.
+#
+# SCOPE: this repo ONLY, deliberately. sparq-org/sparq has the denser population (30 of 34 open
+# non-draft PRs on 2026-07-27) but it is not the repo this lane maintains; a one-repo rollout gives
+# a real signal on the trust plane itself before widening. sparq is a follow-up, not an oversight.
+#
+# ORDERING: mint-provenance.py REFUSES to mint an orchestrator record for a repo whose list is
+# empty, so this line is the PRECONDITION for the record half existing at all. On the tick this
+# merges the candidate set is UNCHANGED (there are zero orchestrator-attested records on `ledger`);
+# each PR becomes enumerable only once its record is minted, one explicit gesture at a time.
+review_enrolment_authors = ["jeswr"]
+
 # [FABLE-5] Throughput alert thresholds (scripts/metrics.py). The trust plane drains slowly (small
 # max_concurrent) so its healthy backlog is much smaller — a lower open-PR bar. Its readiness is
 # its own open `from:agent` backlog (readiness.kind below), not the sparq status:ready engine.

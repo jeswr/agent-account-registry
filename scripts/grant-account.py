@@ -1729,6 +1729,79 @@ def _self_test():
           provider_of(["provider:openai", "provider:openai"]), (0, "openai"))
 
     # ------------------------------------------------------------------------------------------
+    # [#278] THE PER-PROVIDER MINT DEFAULTS ARE EXECUTED, AND THE RECORD STEP CONSUMES THEM.
+    #
+    # The broker derived `models` here and then hard-coded `max_concurrent_workers: 1` in the
+    # register step, so every account it minted was capped at ONE concurrent worker whatever the
+    # provider (#278: openai plans run 12, anthropic 4) — and the sibling defect in the same issue,
+    # an openai `models: [terra]` that no sol/luna claim could ever match, is what an UNEXECUTED
+    # derivation drifting silently looks like. Both values now come out of one fragment, which is
+    # RUN per provider below with the alias lists and the numbers pinned exactly: reverting either
+    # default, or splitting them back apart, flips these rows red.
+    # ------------------------------------------------------------------------------------------
+    defaults_fragment = workflow_block(workflow, "meta", "provider-defaults")
+
+    def defaults_for(provider):
+        """(exit code, models, workers) from the REAL derivation fragment, for one provider.
+
+        `$prov` — the fragment's only input — arrives through the environment, exactly as its only
+        producer (the provider-label predicate above) leaves it in the step's shell."""
+        script = ('set -euo pipefail\nprov="$SELFTEST_PROV"\n' + defaults_fragment
+                  + '\nprintf "M=%s\\nW=%s\\n" "$models" "$workers"\n')
+        done = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                              env={**os.environ, "SELFTEST_PROV": provider},
+                              timeout=120, check=False)
+
+        def field(name):
+            match = re.search(rf"^{name}=(.*)$", done.stdout, re.M)
+            return match.group(1) if match else None
+        return done.returncode, field("M"), field("W")
+
+    check("[#278] openai mints the FULL codex alias set at the openai parallelism",
+          defaults_for("openai"), (0, "[sol, luna, terra]", "12"))
+    check("[#278] anthropic mints the opus5-led chain at the anthropic parallelism",
+          defaults_for("anthropic"), (0, "[opus5, fable, opus, sonnet, haiku]", "4"))
+    check("[#278] the derivation evaluates NO Actions expression (no untrusted text reaches it)",
+          "${{" in defaults_fragment, False)
+    # END TO END through the REAL allocator: the values the fragment just produced, in a record of
+    # the shape the register step writes, must be ACCEPTED and must read back as the intended
+    # routing. A default that parses to something else (or is rejected) strands a captured
+    # credential in an unallocatable record, which is the failure mode this whole path guards.
+    minted = {}
+    for provider, harness_name, credential in (("openai", "codex", "codex-auth-json"),
+                                               ("anthropic", "claude", "claude-oauth-token")):
+        _, models_line, workers = defaults_for(provider)
+        minted_body = (f"provider: {provider}\nharness: {harness_name}\n"
+                       f"models: {models_line}\ncredential_format: {credential}\n"
+                       f"max_concurrent_workers: {workers}\n"
+                       "secret_ref: ACCT42_TOKEN\nrequest_issue: 42\n")
+        parsed_record = real_parser(claim.validate_account_record, "acct42", minted_body)
+        minted[provider] = (parsed_record if isinstance(parsed_record, str) else
+                            (parsed_record["models"], parsed_record["max_concurrent_workers"]))
+    check("[#278] a record minted from those defaults is accepted, and routes as intended",
+          minted, {"openai": (["sol", "luna", "terra"], 12),
+                   "anthropic": (["opus5", "fable", "opus", "sonnet", "haiku"], 4)})
+    # ...and the register step takes the cap FROM that derivation. A literal here is the defect.
+    register_env = workflow_step_env(workflow, "register")
+    check("[#278] the register step stamps the DERIVED cap, never a literal",
+          (register_env.get("WORKERS"),
+           "max_concurrent_workers: %s" in register,
+           "max_concurrent_workers: 1" in register),
+          ("${{ steps.meta.outputs.workers }}", True, False))
+    # WHY that step guards the value rather than trusting it: an EMPTY cap field is not a schema
+    # error — the real parser maps a non-numeric value to 1 SILENTLY, which is precisely the defect
+    # #278 removed, and the credential is already captured and stored by then. So a lost `meta`
+    # output would quietly re-mint a cap-1 account, and this guard is the only thing preventing it.
+    empty_cap = real_parser(claim.validate_account_record, "acct42",
+                            "provider: openai\nharness: codex\nmodels: [sol, luna, terra]\n"
+                            "credential_format: codex-auth-json\nmax_concurrent_workers:\n"
+                            "secret_ref: ACCT42_TOKEN\n")
+    check("[#278] an EMPTY cap parses to 1 instead of failing, so the register step guards it",
+          (empty_cap if isinstance(empty_cap, str) else empty_cap["max_concurrent_workers"],
+           '"${WORKERS:?' in register),
+          (1, True))
+
+    # ------------------------------------------------------------------------------------------
     # [#263] A LABEL NAME IS DATA, NEVER SHELL — EXECUTED, not asserted in prose.
     #
     # The pre-login `meta` step used to expand `${{ join(github.event.issue.labels.*.name, ' ') }}`
