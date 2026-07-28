@@ -398,7 +398,12 @@ def verdict(*, pr_labels, issue_labels, live_head, live_mergeable, heads, escala
         basis = "the PR is no longer `mergeable is False`: the park's stated cause is gone"
     elif live_head and live_head not in heads:
         cause = "head-moved"
-        basis = (f"the live head {live_head[:8]} is not the attempted head {heads[-1][:8]}, so the "
+        # `heads` is non-empty here because the not-population guard above requires it. The
+        # fallback exists so that BYPASSING that guard yields a WRONG ANSWER a named check catches,
+        # rather than an IndexError that aborts the suite before any `FAIL:` row prints — a mutant
+        # killed only by a traceback tells you the code crashed, not that the guard was load-bearing.
+        attempted = heads[-1][:8] if heads else "(no attempt on record)"
+        basis = (f"the live head {live_head[:8]} is not the attempted head {attempted}, so the "
                  "next sweep's duplicate-attempt short-circuit does not fire and it performs a "
                  "FRESH mechanical rebase")
     else:
