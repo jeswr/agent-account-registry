@@ -1746,6 +1746,17 @@ def busy_packages_of_pulls(repo, pulls, issue_labels, provenance, pr_status=None
     `area:` label re-arms `__global__`); a partial hand-removal narrows, and that requires repo
     write — the same trust boundary as the ledger this function already believes.
 
+    AND THE PLACE THAT ASSUMPTION IS WEAKER THAN IT SOUNDS, because "fail-closed deriver" claims
+    more than the mechanism delivers. `derive_areas` cannot emit a PARTIAL set for one run — but
+    what ends up on the PR is `derived ∪ pre-existing`, ACCUMULATED across pushes, and the deriver
+    has no removal path. So a PR whose first push resolved to `area:a` and whose later pushes grew
+    into the `cross-cutting` refusal keeps `area:a` and reserves only `a`, while its true footprint
+    is wider. That exposure is NOT introduced here: the identical accumulated set is already
+    unioned in on the provenanced path above (`areas |= issue_areas or ...`) and is already the
+    whole of PLAN's `_reserving_packages` rule, so this branch inherits it rather than creating it.
+    Removing it means teaching the deriver to RETRACT a label that a later push contradicts, which
+    is a change to the deriver and not to this predicate.
+
     HELD != INACTIVE (round-2 P1 on the 2026-07-18 frontier collapse, DRAFTS-ONLY since
     round 3, listing-or-newer-detail coherent since #519): a human-parked PR —
     `review:needs-user`/`needs:user` on the PR, or `needs:*` on the provenance-linked
@@ -1804,12 +1815,23 @@ def busy_packages_of_pulls(repo, pulls, issue_labels, provenance, pr_status=None
                 areas |= {GLOBAL_PACKAGE}  # closed/unlisted source: the enumerator still
                                            # emits this PR as `__global__` — mirror it
                 cause = GLOBAL_CAUSE_SOURCE_UNLISTED
-        elif areas:
+        elif areas and GLOBAL_PACKAGE not in areas:
             # [sparq#4821] missing/invalid linkage, but the PR's OWN path-derived `area:*` labels
             # bound its blast radius — reserve exactly those. Still fail-closed (it reserves
             # SOMETHING, so no crate is left unguarded); the blast radius is just no longer the
             # whole workspace. `areas` is already the PR's declared set from above; nothing is
             # unioned in.
+            #
+            # `GLOBAL_PACKAGE not in areas` is a CLOSED-ENUM guard, not defensive padding. A PR
+            # wearing the literal label `area:__global__` would otherwise take this branch, reserve
+            # `__global__`, and carry cause `missing-provenance-narrowed` — which is deliberately
+            # NOT a member of GLOBAL_RESERVATION_CAUSES — so `global_reservation_census` would
+            # RAISE DispatchError on a board that is merely unusual, aborting a tick that pre-#4821
+            # completed. Unreachable on today's sparq board (no such label exists among its 99, and
+            # the deriver never auto-creates one), which is exactly why it needs a guard rather than
+            # a comment: nothing would have found it. Such a PR falls to the `else` below and
+            # reserves `__global__` under `missing-provenance`, which is both the correct
+            # attribution and the fail-closed answer.
             cause = CAUSE_NO_PROVENANCE_NARROWED
         else:
             areas |= {GLOBAL_PACKAGE}      # missing/invalid linkage AND nothing declared — the
@@ -16057,6 +16079,52 @@ agent = "impl"
                            labels=["area:crate-a", "area:crate-z"])
     assert busy_packages_of_pulls(repo, [_stray_labelled], issue_labels, {}) == {
         "crate-a", "crate-z"}, "an unprovenanced PR's OWN areas must bound its reservation"
+    # A SINGLE declared area is the SAME rule, and it needs its own row because the multi-area
+    # fixture above cannot see it. MEASURED: `elif areas:` -> `elif len(areas) > 1:` reverts this
+    # branch to byte-identical pre-#4821 behaviour for every one-area PR — the whole-lane stall,
+    # restored — and survived all 241 checks, because every assertion that reached the branch used
+    # the two-area fixture. One area is not a corner: 23 of 67 open sparq worker PRs declare
+    # exactly one, INCLUDING sparq-org/sparq#4562 (`area:sparq-hdt`), one of the six holders this
+    # change was measured to narrow. A fixture narrower than its population scores honestly and
+    # proves nothing about half the input.
+    _stray_one_area = pull(64, "sparq-agent/issue-999-1-1", sha_a, labels=["area:crate-a"])
+    assert busy_packages_of_pulls(repo, [_stray_one_area], issue_labels, {}) == {"crate-a"}, \
+        "a SINGLE declared area must bound the reservation exactly as two do (len(areas) > 1)"
+    assert GLOBAL_PACKAGE not in busy_packages_of_pulls(
+        repo, [_stray_one_area], issue_labels, {}), \
+        "a one-area unprovenanced PR must not seize the serializing partition"
+    # ...and the whole-lane consequence for the one-area case, at the leg that actually drops rows:
+    # the holder's own crate goes, its sibling survives. Under `len(areas) > 1` this returns [].
+    assert [item["number"] for item in filter_busy_area_items(
+        plan_items, repo, [_stray_one_area], issue_labels, {}, leases=[], now=now)] == [9], \
+        "one SINGLE-area unprovenanced holder must no longer drop every item"
+    # THE CLOSED-ENUM EDGE. A PR wearing the literal label `area:__global__` reserves the
+    # serializing partition, so its cause must be one `global_reservation_census` accepts;
+    # `missing-provenance-narrowed` is deliberately NOT in that enum, so routing this row through
+    # the narrowed branch makes the census RAISE and aborts a tick that used to complete. Kills
+    # dropping the `GLOBAL_PACKAGE not in areas` conjunct.
+    _stray_global_label = pull(65, "sparq-agent/issue-999-1-1", sha_a,
+                               labels=[f"area:{GLOBAL_PACKAGE}", "area:crate-a"])
+    _global_label_occ = []
+    assert busy_packages_of_pulls(repo, [_stray_global_label], issue_labels, {},
+                                  occupancy=_global_label_occ) == {GLOBAL_PACKAGE, "crate-a"}
+    assert [row[5] for row in _global_label_occ] == [GLOBAL_CAUSE_NO_PROVENANCE], _global_label_occ
+    # Caught as an AssertionError ON PURPOSE. Without the `except`, dropping the guard makes the
+    # closed-enum recorder raise `DispatchError` straight out of the suite — which reads as a
+    # CRASH, and a crash is not a kill: a harness that only checks the exit code would score this
+    # guard as covered when nothing had detected anything. Converting it here makes the mutant die
+    # by NAME, at the assertion written for it.
+    try:
+        _global_label_census = global_reservation_census(_global_label_occ)
+    except DispatchError as exc:                                          # pragma: no cover
+        raise AssertionError(
+            "an `area:__global__`-labelled unprovenanced PR must NOT be routed through the "
+            "narrowed cause: `missing-provenance-narrowed` is not in GLOBAL_RESERVATION_CAUSES, "
+            f"so the closed-enum census raised instead of counting it and aborted the tick — {exc}"
+        ) from exc
+    assert _global_label_census == {GLOBAL_CAUSE_NO_PROVENANCE: 1}, \
+        "an `area:__global__`-labelled PR must land in a DECLARED global cause, not raise"
+    assert unprovenanced_narrowed_holders(_global_label_occ) == [], _global_label_occ
     # ...and the narrowing is EXACTLY the declared set — not a superset that quietly still
     # contains the serializing partition, which would leave the lane at zero while the assertion
     # above passed if it had been written as a membership test.
@@ -16123,6 +16191,16 @@ agent = "impl"
         format_unprovenanced_narrowed_census(repo, []))
     assert "pr#61" in format_unprovenanced_narrowed_census(repo, _narrow_occ)
     assert "none" in format_unprovenanced_narrowed_census(repo, _global_occ)
+    # ...and at TWO holders, because a one-holder fixture cannot see a formatter that names only
+    # the first. Self-audit prompted by the sparq#4821 review: the single-area miss was one
+    # instance of "fixture narrower than population", and this line had the same shape (n<=1 only).
+    _two_narrow = [("busy", 61, frozenset({"crate-a"}), "not-parked", False,
+                    CAUSE_NO_PROVENANCE_NARROWED),
+                   ("busy", 77, frozenset({"crate-b"}), "not-parked", False,
+                    CAUSE_NO_PROVENANCE_NARROWED)]
+    assert "2 open worker PR(s)" in format_unprovenanced_narrowed_census(repo, _two_narrow)
+    assert "— pr#61, pr#77." in format_unprovenanced_narrowed_census(repo, _two_narrow), \
+        format_unprovenanced_narrowed_census(repo, _two_narrow)
     # A PROVENANCED PR is untouched by any of this: its source issue's areas still union in, so a
     # PR declaring one crate whose source issue names another reserves BOTH. Kills a "tidy-up"
     # that routes every PR through the declared-only branch.
@@ -19612,14 +19690,19 @@ def _partition_starvation_record_seam_self_test():
     with contextlib.redirect_stdout(census_out):
         exec(compile(textwrap.dedent(census_block), "<dispatch.yml assemble census>",  # noqa: S102
                      "exec"),
-             {"repo": "example/repo", "rows_before_assemble": 4,
-              "partition_census": {"total": 4, "kept": 0,
-                                   "by_reason": {"global-reservation": 4, "crate-conflict": 0},
-                                   "by_held_area": {GLOBAL_PACKAGE: 4},
-                                   "by_holder": {"4804": 4}}})
+             {"repo": "example/repo", "rows_before_assemble": 6,
+              # TWO entries in EVERY bucket, deliberately. A fixture with one area and one holder
+              # cannot distinguish "emits the bucket list" from "emits the bucket list's first
+              # element" — the same fixture-narrower-than-population miss the sparq#4821 review
+              # caught on the single-area branch, one layer over.
+              "partition_census": {"total": 6, "kept": 0,
+                                   "by_reason": {"global-reservation": 4, "crate-conflict": 2},
+                                   "by_held_area": {GLOBAL_PACKAGE: 4, "crate-b": 2},
+                                   "by_holder": {"3620": 2, "4804": 4}}})
     assert census_out.getvalue().strip() == (
-        "assemble-census example/repo rows_before=4 deferred=4 kept=0 reason.crate-conflict=0 "
-        f"reason.global-reservation=4 area.{GLOBAL_PACKAGE}=4 holder.pr4804=4"), \
+        "assemble-census example/repo rows_before=6 deferred=6 kept=0 reason.crate-conflict=2 "
+        f"reason.global-reservation=4 area.{GLOBAL_PACKAGE}=4 area.crate-b=2 "
+        "holder.pr3620=2 holder.pr4804=4"), \
         census_out.getvalue()
     # BRACE-FREE, asserted rather than described: GitHub's secret masker rewrites `{`/`}` to `***`,
     # so a census that ever grew a JSON dump would arrive corrupted on the feed that reads it.
@@ -20158,6 +20241,34 @@ def _starvation_sweep_self_test():
     inert_unprov = occupancy_of(dict(unprovenanced, draft=True))
     assert starvation_park_targets([], 12, inert_unprov) == [51], inert_unprov
     assert starvation_provenance_escalation([], 12, inert_unprov) == [], inert_unprov
+
+    # ---- [sparq#4821] THE TWO PARK RECEIPTS, WHICH HAD NO ASSERTION AT ALL. ------------------
+    # `starvation_park_body` has exactly ONE production call site and was unguarded anywhere, so
+    # reverting it to the sentence it used to carry — "Adding `area:*` labels to the PR cannot
+    # remove it — the fail-closed default is unioned in on top of them" — passed green. That
+    # sentence is now FALSE, and it is worse than stale: it is read by the one person who can act,
+    # and it tells them the only remedy available to them does not work. A text nothing asserts is
+    # a text anything can revert.
+    _park_receipt = starvation_park_body("o/r", 51, 12, "https://example.invalid/issues/1")
+    assert "cannot remove" not in _park_receipt, _park_receipt
+    assert "**A human remedy now exists and takes effect on the next tick:** add the `area:*` " \
+        "label(s) this PR actually touches" in _park_receipt, _park_receipt
+    assert f"reserves *those* and not `{GLOBAL_PACKAGE}`" in _park_receipt, _park_receipt
+    # ...and the receipt still states the cause it is parking for, which is now the CONJUNCTION —
+    # a missing record AND no declared area. Dropping either half misdescribes the population.
+    assert "missing or unreadable registry provenance record" in _park_receipt, _park_receipt
+    assert "no `area:*` label of its own" in _park_receipt, _park_receipt
+    # The park receipt must keep carrying its attributable cause marker, or the un-park half can
+    # never prove the park is one this sweep applied and the park loses its machine exit.
+    assert _park_policy.park_reason_marker(STARVATION_PARK_CAUSE) in _park_receipt, _park_receipt
+    # The UN-park receipt names the second way the reservation can clear, which this change
+    # created. Without it the comment claims a provenance record landed when none did.
+    _unpark_receipt = starvation_unpark_body(frozenset({"crate-a"}))
+    assert "acquired `area:*` labels of its own" in _unpark_receipt, _unpark_receipt
+    assert "sparq#4821" in _unpark_receipt, _unpark_receipt
+    assert STARVATION_UNPARK_MARKER in _unpark_receipt, _unpark_receipt
+    print("  ok   [sparq#4821] the park / un-park / escalation receipts state the `area:*` remedy "
+          "that now exists — asserted, so the old false sentence cannot come back green")
     print("  ok   #772 missing edge: an unprovenanced holder with NO park remedy reaches the "
           "escalation, and the park half's own candidate is never double-reported")
 
@@ -20197,6 +20308,13 @@ def _starvation_sweep_self_test():
     assert "o/r#51" in receipt and "backfill-provenance" in receipt and "apply=true" in receipt, \
         receipt
     assert "12 ready row(s)" in receipt, receipt
+    # [sparq#4821] The escalated population is now NARROWER than "unprovenanced": a PR that
+    # declares its own areas no longer holds the partition at all, so the only PRs reaching this
+    # receipt are those declaring NONE. The receipt must say so, or it tells its reader the cause
+    # is the missing record alone and sends them to the backfill when a label would clear the lane
+    # today. Unasserted, this qualifier could be reverted green.
+    assert "declares no `area:*` label of its own" in receipt, receipt
+    assert "labelling the PR with the `area:*` sections it actually touches" in receipt, receipt
     print("  ok   #772 escalation pacing + receipt: ascending, capped, and the body names the "
           "backfill recovery that actually clears the hold")
 
