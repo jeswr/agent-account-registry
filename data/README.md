@@ -79,8 +79,11 @@ computed collector-side, and write no per-account rows anywhere:
   hides) rather than published as a plausible number — it carries no identity, so it takes the
   malformed-row tolerance, not the fatal path.
 - **Legacy (rows).** `flow.leases[]` is still accepted and still aggregated to the same
-  `{mean, max}`. Precedence is ROWS-FIRST and total, so a collector mid-migration that sends both
-  publishes exactly its pre-#841 value and nothing changes silently underneath it.
+  `{mean, max}`. Precedence is ROWS-FIRST and total, and it keys on the PRESENCE of the `leases`
+  key rather than on whether a row parsed: send that key at all and the rows decide the published
+  value, down to the `null` you get when none of them reports a usable `utilization_1h`. The
+  aggregate is consulted only by the genuinely row-free form. So a collector mid-migration that
+  sends both publishes exactly its pre-#841 value and nothing changes silently underneath it.
 - **The decision-22 label check is unconditional over whatever rows ARE present** — supplying the
   aggregate is not a way past it. A raw (non-salted) handle in a lease row is a privacy incident
   whether or not this build would have published that row, and it still fails the build LOUD.

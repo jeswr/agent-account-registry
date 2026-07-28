@@ -1296,8 +1296,11 @@ def _obs_flow(flow):
     # over from the page #374 cleaned. So the aggregate is now accepted DIRECTLY as
     # `flow.lease_utilization_1h`, and a collector can satisfy this panel while writing no rows to
     # the public branch at all. Two properties this must NOT trade away, both self-tested:
-    #   * rows-first precedence. A collector mid-migration that sends both keeps exactly today's
-    #     published value; the new key can never silently override a fleet's real measurements.
+    #   * rows-first precedence, keyed on the PRESENCE of the legacy `leases` key rather than on
+    #     whether a row happened to parse. A collector mid-migration that sends both keeps exactly
+    #     today's published value — including the null it publishes when the rows it sent carry no
+    #     usable `utilization_1h` — so the new key can never override a legacy result. Only the
+    #     genuinely row-free form (no `leases` key at all) consults the collector's aggregate.
     #   * the decision-22 label check is unconditional over the rows that ARE present. Supplying
     #     the aggregate is not a way to smuggle an unvalidated row past it, and a collector that
     #     regresses to writing rows is still caught the moment a raw handle appears in one.
@@ -1312,11 +1315,11 @@ def _obs_flow(flow):
         utilization = _obs_fraction(item.get("utilization_1h"))
         if utilization is not None:
             lease_utilizations.append(utilization)
-    if lease_utilizations:
+    if "leases" in flow:
         lease_utilization = {
             "mean": round(sum(lease_utilizations) / len(lease_utilizations), 2),
             "max": round(max(lease_utilizations), 2),
-        }
+        } if lease_utilizations else None
     else:
         lease_utilization = _obs_lease_aggregate(flow.get("lease_utilization_1h"))
 
@@ -2947,6 +2950,20 @@ const degraded = (node) =>
     check("[#841] lease ROWS outrank a collector-supplied aggregate (no silent override)",
           _normalize_observability(both)["flow"]["lease_utilization_1h"],
           {"mean": 0.6, "max": 0.8})
+    # ...and precedence keys on the legacy KEY, not on a row happening to parse. Rows that are
+    # present but report no usable utilization published null pre-#841 and must still publish null:
+    # make the fallback conditional on `lease_utilizations` instead and these become {0.99, 0.99},
+    # i.e. the new key overriding a legacy source that was sent.
+    for case, rows in (
+        ("no utilization field", [{"label": "ab12cd34", "provider": "anthropic"}]),
+        ("malformed utilization", [{"label": "ab12cd34", "provider": "anthropic",
+                                    "utilization_1h": "busy"}]),
+        ("zero rows", []),
+    ):
+        unparseable = copy.deepcopy(both)
+        unparseable["flow"]["leases"] = rows
+        check(f"[#841] legacy rows with {case} keep their pre-#841 null, aggregate or not",
+              _normalize_observability(unparseable)["flow"]["lease_utilization_1h"], None)
     # ...and sending the aggregate is NOT a way around the decision-22 check on the rows that ARE
     # present. Make the label check conditional on the rows being used and this normalizes happily.
     both_raw = copy.deepcopy(both)
