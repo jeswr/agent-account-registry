@@ -4737,6 +4737,10 @@ def ready_and_arm(repo, pr_number, reviewed_sha, impl_provider, impl_account_h, 
             # review round on a tree nobody has touched. `review:pass` is deliberately NOT
             # applied: no valid flow leaves a DRAFT labelled review:pass, and the disarm net and
             # the stranded recovery both key stand-downs off that label.
+            # `bind_reviewed_sha` is the only one of these review-fix.yml reads; `arm_declined`
+            # and `arm_gate` have NO consumer today and are step outputs for the run log alone.
+            # Said plainly so nobody later mistakes them for a census signal something acts on:
+            # the DURABLE record of this deferral is the receipt comment above, not these rows.
             _write_outputs({"armed": False, "head_moved": False, "arm_complete": False,
                             "arm_declined": declined, "arm_gate": arm_gate,
                             "bind_reviewed_sha": True})
