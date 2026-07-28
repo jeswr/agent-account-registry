@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 980,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "9eff9313ba2037800e13af677df3aee6a0b83fd8",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 3 says the observability collector should emit `queue_age_clamp_minutes` from the resolved heal-wait policy, while section 4a says metrics should add `DEFAULT_FLEET_THRESHOLDS` carrying the same resolved value. A module default is not a resolved policy value, and the record identifies neither the authoritative policy field nor how `metrics.py` and the future observability collector read and validate it. If the drain-side heal wait is tuned, the dashboard can turn red at one age while the durable fleet alert fires at another. Missing or malformed policy is also unspecified, leaving an implementer to choose a potentially permissive fallback.",
+    "file": "research/636-queue-observability-export.md",
+    "fix_hint": "Name one authoritative fleet-level policy field and specify the shared resolver used by the drain, metrics collector, and observability producer, including type/range validation and fail-closed behavior for missing or malformed values. If a hard-coded default is intentionally authoritative, state that explicitly and remove the contradictory language about a resolved policy value; add a self-test proving both exported dashboard thresholds and the fleet predicate receive the identical resolved value.",
+    "severity": "major",
+    "title": "The fleet clamp threshold still has no canonical resolution path"
+   }
+  ],
+  "progress": "improving",
+  "summary": "The revision fixes both prior findings: it accurately distinguishes writer-oriented evidence from harmless mentions, and it now designs a parallel fleet-global alert path with a non-colliding identity, dedicated history/predicate/recovery logic, fail-closed missing-data behavior, and meaningful self-tests. One material design gap remains in the threshold source. The record alternates between a resolved heal-wait policy value and a new metrics-local default without defining how either producer obtains one canonical fleet value. That can make the dashboard alarm and durable metrics alert disagree, so the implementation path is not yet complete.",
+  "verdict": "request_changes"
+ }
+}
