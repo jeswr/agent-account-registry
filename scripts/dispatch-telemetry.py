@@ -229,7 +229,7 @@ def parse_conflict_areas(lines, total):
 
 
 def census(open_numbers, admitted_numbers, exclusion_reasons, candidate_numbers,
-           frontier_numbers, conflict_areas):
+           frontier_numbers, conflict_areas, declared_population=None):
     """Partition the WHOLE open-issue population into disjoint, summing buckets.
 
     Inputs are all sets/dicts of issue numbers, so a repeated emission of the same issue cannot
@@ -273,10 +273,24 @@ def census(open_numbers, admitted_numbers, exclusion_reasons, candidate_numbers,
     classified = sum(buckets.values())
     unclassified = len(population) - classified
     buckets["unclassified"] = unclassified
-    return {"buckets": {k: v for k, v in buckets.items() if v or k == "unclassified"},
-            "total": classified + unclassified,
+    # THE POPULATION ITSELF CAN BE SHORT, and `unclassified` structurally cannot see it. Every
+    # bucket above is computed OVER `open_numbers`, so a TRUNCATED listing shrinks the population
+    # and the residual stays a perfect 0 while `total` quietly drops — the census reports a clean
+    # partition of the wrong set. `unclassified` answers "did I bucket everything I was given";
+    # only a DECLARED count answers "was I given everything". Supply it and the shortfall becomes
+    # its own named bucket; omit it and `declared_population` echoes what was given, which is
+    # honest about the fact that nothing was cross-checked.
+    shortfall = (max(0, int(declared_population) - len(population))
+                 if declared_population is not None else 0)
+    buckets["listing-shortfall"] = shortfall
+    return {"buckets": {k: v for k, v in buckets.items()
+                        if v or k in ("unclassified", "listing-shortfall")},
+            "total": classified + unclassified + shortfall,
             "population": len(population),
-            "unclassified": unclassified}
+            "declared_population": (int(declared_population) if declared_population is not None
+                                    else len(population)),
+            "unclassified": unclassified,
+            "listing_shortfall": shortfall}
 
 
 # =================================================================================================
@@ -353,6 +367,14 @@ def build_record(repo, run_id, frontier, dispatch, now):
         "realised_dispatches": realised,
         "unrealised_planned_rows": planned_rows - realised,
     }
+    # TWO OF THESE SIX LEGS ARE SUBTRACTION-DERIVED SINKS — `route_rejections` and
+    # `claim_deferrals` are both `total - accounted`, and a term defined that way is
+    # ARITHMETICALLY INCAPABLE of reporting a discrepancy: it absorbs whatever is missing and the
+    # residual stays 0. That is exactly why round-4's mutant R1 was invisible in every field.
+    # `__uncensused__` and `__unattributed__` are the two buckets that get this right, because they
+    # MARK their loss instead of inferring it. The derived legs are named here so a reader can see
+    # which numbers are measurements and which are balances; making them measured requires a
+    # counter at each leg inside dispatch.yml, which is the follow-up, not a comment.
     # ...and the RESIDUAL is not computable without the leg. Attributing the whole gap to the legs
     # that did report would be the same fabrication one level up, so it is null too.
     chain["unaccounted"] = None if not leg_reported else entering - (
@@ -378,6 +400,12 @@ def build_record(repo, run_id, frontier, dispatch, now):
         "assembler_by_area": _areas("assembler_by_area"),
         "assemble_leg": "reported" if leg_reported else "missing",
         "chain": chain,
+        # NOT inside `chain`, which is summed: two of its six legs (`route_rejections`,
+        # `claim_deferrals`) are `total - accounted` and therefore arithmetically incapable of
+        # reporting a discrepancy — they absorb whatever is missing while the residual stays 0.
+        # Named here so a reader can tell a measurement from a balance. (Making them measured needs
+        # a counter at each leg inside dispatch.yml; that is a follow-up, not a comment.)
+        "derived_legs": ["route_rejections", "claim_deferrals"],
         "census": {str(k): int(v) for k, v in (census_doc.get("buckets") or {}).items()
                    if isinstance(v, int)},
         "census_total": _n(census_doc, "total"),
@@ -988,12 +1016,27 @@ def _self_test():   # noqa: C901 — one flat assertion table, deliberately
     frontier = {7}
     areas = {"bench": 2, "ci": 1}
     doc = census(population, admitted, reasons, candidates, frontier, areas)
+    # A TRUNCATED LISTING is invisible to the residual, because every bucket is computed OVER the
+    # listing. 20 issues declared, 14 returned: the old census reported `unclassified=0` — a
+    # perfect partition of the wrong set — while `total` silently fell to 14.
+    truncated = census(set(range(1, 15)), set(range(1, 15)), {}, set(), set(), {},
+                       declared_population=20)
+    chk("[buckets-sum] a SHORT listing is its own named bucket, not a silent drop in `total`",
+        (truncated["listing_shortfall"], truncated["declared_population"],
+         truncated["population"], truncated["total"], truncated["unclassified"]),
+        (6, 20, 14, 20, 14))
+    chk("[buckets-sum] ...and with no declared count the census says so instead of claiming a "
+        "cross-check it never made",
+        (lambda d: (d["listing_shortfall"], d["declared_population"], d["total"]))(
+            census(set(range(1, 15)), set(range(1, 15)), {}, set(), set(), {})),
+        (0, 14, 14))
     chk("[buckets-sum] the census partitions the WHOLE open population",
         (doc["total"], doc["population"], doc["unclassified"]), (10, 10, 0))
     chk("[buckets-sum] every bucket is named and they add up",
         (sum(doc["buckets"].values()), sorted(doc["buckets"])),
         (10, ["conflict-deferred", "excluded:blocked", "excluded:busy", "excluded:gated",
-              "excluded:no-attestation", "frontier", "trust-or-linked-excluded", "unclassified"]))
+              "excluded:no-attestation", "frontier", "listing-shortfall",
+              "trust-or-linked-excluded", "unclassified"]))
     # NON-VACUOUS: drop one bucket's contribution (the missing-edge shape) and the residual MUST
     # appear as `unclassified` rather than the totals quietly rebalancing.
     gap = census(population, admitted, reasons, candidates, frontier, {"bench": 1, "ci": 1})
@@ -1544,7 +1587,7 @@ def _self_test():   # noqa: C901 — one flat assertion table, deliberately
          live["open_issues"], sorted(live["census"]["buckets"])),
         (10, 10, 0, 10,
          ["conflict-deferred", "excluded:blocked", "excluded:busy", "excluded:gated", "frontier",
-          "trust-or-linked-excluded", "unclassified"]))
+          "listing-shortfall", "trust-or-linked-excluded", "unclassified"]))
     degraded = _run_census(_StubPlanner(conflict_log=False))
     chk("[YAML seam] a planner with no attribution sink degrades LOUDLY, never fakes an area",
         (degraded["attribution"], degraded["conflict_deferrals"], degraded["conflict_by_area"]),
