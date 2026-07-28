@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4739,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "582dd3ba25b975a413db456f34c790cfc4966372",
+  "round": 5
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Sections 3.1 and 9 still claim that a self-improvement follow-up issue was filed, but cite only the custom dedupe marker `noir-acir-unroll-2026-07-28`. This is materially identical to the round-4 finding: a search marker is neither the issue's durable tracker identifier nor evidence that the claimed issue exists, leaving the disposition unauditable from the research record.",
+    "file": "research/noir-optimization-new-opportunities.md",
+    "fix_hint": "Replace or supplement the dedupe marker with the actual issue number or URL in the Section 3.1 disposition and Section 9 status entry. If no issue was filed, file the scoped issue first and cite its resulting durable identifier.",
+    "severity": "major",
+    "title": "Filed ACIR follow-up still lacks its durable issue identifier"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 5 is stagnant. The round-4 major auditability defect remains unchanged: the new research record repeatedly says a self-improvement issue was filed, but identifies it only by the author-created search marker `noir-acir-unroll-2026-07-28`. A dedupe/search phrase is not the durable issue number or URL, does not establish that the issue exists, and does not let a reader reliably trace the claimed disposition.",
+  "verdict": "request_changes"
+ }
+}
