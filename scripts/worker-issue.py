@@ -869,6 +869,48 @@ def claim_receipt(repo, issue, model, run_url, run_key, bot_login):
     print(f"claim ownership receipt posted (run {run_key})")
 
 
+# Distinguishes "not looked up yet" from a lookup that legitimately answered None (unreadable
+# vocabulary). Using None for both would re-issue the `gh label list` on every subsequent failure.
+_UNREAD = object()
+
+
+def followup_label_plan(declared, known_labels):
+    """`(apply, dropped, area_missing)` for ONE follow-up's label set. Pure.
+
+    THE RETRY MUST NEVER GO LABEL-FREE. `gh issue create` fails the WHOLE create when any one
+    `--label` does not exist on the target, and the previous recovery here re-issued the create
+    with NO labels at all. So a model that supplied a correct `area:dispatch` alongside a single
+    typo'd or not-yet-declared label had EVERY label discarded — including the `area:`.
+
+    That is the one input no lane in this estate can manufacture. `curate-frontier.derive_area`
+    refuses rather than guesses (measured: the directory-hint fallback it replaced was 12.9%
+    precise on this repository, #809), and `triage.triage()` can never mint an `area:*` at all, so
+    a follow-up minted label-free lands in the `status:untriaged` pile with no route out and is
+    counted, permanently, by `triage-stock-alert.census()`'s `unattributable` bucket. The failure
+    also SHRINKS a population rather than marking it bad (#971's shape): the create SUCCEEDS, so
+    nothing goes red and the loss is invisible at the call site.
+
+    `known_labels` of `None` means the label vocabulary could not be read. That is not evidence
+    that a label is invalid, so nothing is dropped — the caller retries with the declared set
+    unchanged and lets `gh` be the judge, which is the fail-closed direction for a DROP decision.
+    """
+    declared = {label for label in (declared or []) if isinstance(label, str) and label}
+    area_missing = not any(label.startswith("area:") for label in declared)
+    if known_labels is None:
+        return sorted(declared), [], area_missing
+    known = set(known_labels)
+    return sorted(declared & known), sorted(declared - known), area_missing
+
+
+def _known_labels(repo):
+    """The target's declared label vocabulary, or None when it cannot be read (never a guess)."""
+    rows = _gh_json(["label", "list", "-R", repo, "--limit", "200", "--json", "name"])
+    if not isinstance(rows, list):
+        return None
+    names = {str(row.get("name", "")) for row in rows if isinstance(row, dict)}
+    return {name for name in names if name} or None
+
+
 def create_followups(repo, source_issue, spec_file):
     """Create de-duplicated follow-up issues from a JSONL file the model wrote (one {title, body, labels}
     per line) while implementing `source_issue`. Each is linked back + labelled from:agent +
@@ -881,6 +923,9 @@ def create_followups(repo, source_issue, spec_file):
     existing = {str(i.get("title", "")) for i in (_gh_json(
         ["issue", "list", "-R", repo, "--state", "open", "--limit", "300", "--json", "title"]) or [])}
     created = 0
+    # Read the label vocabulary at most once, and only if a create actually fails: the happy path
+    # must not pay a `gh label list` per worker run.
+    known_labels = _UNREAD
     for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line:
@@ -898,15 +943,36 @@ def create_followups(repo, source_issue, spec_file):
         labels = sorted({label for label in (spec.get("labels") or [])
                          if isinstance(label, str) and label}
                         | {"from:agent", "self-improvement"})
+        _, _, area_missing = followup_label_plan(labels, None)
         args = ["issue", "create", "-R", repo, "--title", title, "--body", body]
         for label in labels:
             args += ["--label", label]
         result = _run_gh(args, check=False)
-        if result.returncode != 0:            # an unknown label fails the create → retry label-free
-            result = _run_gh(["issue", "create", "-R", repo, "--title", title, "--body", body], check=False)
+        if result.returncode != 0:
+            # An unknown label fails the whole create. Retry with the labels the target actually
+            # DECLARES — never label-free (see `followup_label_plan`): dropping the model's
+            # `area:` is the one loss no later lane can repair.
+            if known_labels is _UNREAD:
+                known_labels = _known_labels(repo)
+            keep, dropped, _ = followup_label_plan(labels, known_labels)
+            if dropped:
+                print(f"::warning::follow-up {title!r}: dropping undeclared label(s) "
+                      f"{', '.join(dropped)}; retrying with {', '.join(keep) or 'no labels'}")
+            retry = ["issue", "create", "-R", repo, "--title", title, "--body", body]
+            for label in keep:
+                retry += ["--label", label]
+            result = _run_gh(retry, check=False)
         if result.returncode == 0:
             created += 1
             existing.add(title)
+            # An `area:` is the one label neither `triage.triage()` nor `curate-frontier` can
+            # manufacture, so a follow-up minted without one is born into the unattributable
+            # class. Say so at the point of creation, where the model that knows the answer is
+            # still in the loop — the alternative is discovering it in a census days later.
+            if area_missing:
+                print(f"::warning::follow-up {title!r} declares no `area:` label — it cannot be "
+                      "staged by any lane until one is attributed "
+                      "(triage-stock-alert.census: unattributable)")
     print(f"follow-up issues created: {created}")
 
 
@@ -1761,7 +1827,93 @@ def _self_test():
             os.environ.pop("GITHUB_OUTPUT", None)
         else:
             os.environ["GITHUB_OUTPUT"] = saved_output
+
+    _followup_label_self_test()
     print("worker-issue self-test PASSED")
+
+
+def _followup_label_self_test():
+    """`followup_label_plan` + the structural claim that `create_followups` CONSULTS it.
+
+    The behavioural half alone is vacuous against the regression it exists to prevent: the old
+    label-free retry would keep every one of these assertions green while still discarding the
+    model's `area:` at the call site, because the discard lived in `create_followups`, not in any
+    function a unit test called. So the AST half below is the load-bearing one.
+    """
+    known = {"area:dispatch", "from:agent", "self-improvement", "role:impl"}
+
+    # (i) THE REGRESSION. A typo'd label must not take the valid `area:` down with it.
+    keep, dropped, missing = followup_label_plan(
+        ["area:dispatch", "from:agent", "aera:worker"], known)
+    assert keep == ["area:dispatch", "from:agent"], keep
+    assert dropped == ["aera:worker"], dropped
+    assert missing is False
+
+    # (ii) an UNREADABLE vocabulary drops NOTHING (a failed read is not evidence of invalidity).
+    keep, dropped, _ = followup_label_plan(["area:dispatch", "aera:worker"], None)
+    assert keep == ["aera:worker", "area:dispatch"], keep
+    assert dropped == [], dropped
+
+    # (iii) the area-missing signal, both directions.
+    assert followup_label_plan(["from:agent"], known)[2] is True
+    assert followup_label_plan(["area:dispatch"], known)[2] is False
+    # An area declaration is a PREFIX, not a substring. `needs:area` does not discriminate (it
+    # has no trailing colon, so a substring test agrees by accident); a label that embeds the
+    # prefix does, and pins the intended contract.
+    assert followup_label_plan(["needs:area"], known)[2] is True
+    assert followup_label_plan(["sub-area:dispatch"], known)[2] is True
+
+    # (iv) malformed entries are ignored, never crash the best-effort path.
+    assert followup_label_plan([None, "", 7, "area:dispatch"], known)[0] == ["area:dispatch"]
+
+    # (v) STRUCTURAL: `create_followups` must call `followup_label_plan`, on a live branch, and
+    # must retain NO `issue create` retry that passes a bare arg list with no labels appended.
+    import ast
+    tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    func = next(n for n in ast.walk(tree)
+                if isinstance(n, ast.FunctionDef) and n.name == "create_followups")
+
+    def live(node):
+        """Nodes of `node` excluding statically-dead `if False:` / `while False:` bodies."""
+        out = []
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.If, ast.While)):
+                dead = (isinstance(child.test, ast.Constant) and not child.test.value)
+                if dead:
+                    out.extend(live(ast.Module(body=child.orelse, type_ignores=[])))
+                    continue
+            out.append(child)
+            out.extend(live(child))
+        return out
+
+    nodes = live(func)
+    # NOT "is the name called somewhere" — `create_followups` calls it twice (once for the
+    # area-missing signal), so a mere name check stays green while the RETRY stops using it.
+    # Measured: that weaker assertion let both the deleted-call and the dead-branch mutant
+    # survive. Bind the check to the names the retry actually consumes.
+    planned = set()
+    for node in nodes:
+        if (isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Name)
+                and node.value.func.id == "followup_label_plan"):
+            for target in node.targets:
+                if isinstance(target, ast.Tuple):
+                    planned |= {e.id for e in target.elts if isinstance(e, ast.Name)}
+    assert {"keep", "dropped"} <= planned, (
+        "the retry's kept/dropped labels are no longer bound by a LIVE followup_label_plan call "
+        "in create_followups — the retry can discard the model's area: label again")
+
+    # The old shape, pinned so it cannot come back: a `_run_gh` retry whose argument list is a
+    # literal ["issue", "create", ...] with nothing appended to it.
+    for node in nodes:
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "_run_gh" and node.args
+                and isinstance(node.args[0], ast.List)):
+            elements = [e.value for e in node.args[0].elts if isinstance(e, ast.Constant)]
+            assert not (elements[:2] == ["issue", "create"]), (
+                "create_followups issues a label-free `issue create` inline again; the retry must "
+                "build from followup_label_plan's kept labels")
+
 
 
 def main():
