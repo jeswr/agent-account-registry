@@ -3756,11 +3756,44 @@ def _read_model_health_window(model_health, registry_repo, now, api=None):
     try:
         api = api or model_health.GitHubAPI(os.environ.get("GH_TOKEN", ""))
         records, _ = model_health.read_ledger(api, registry_repo)
-        return model_health.prune(records, now)
+        window = model_health.prune(records, now)
+        _warn_health_coverage_shortfall(model_health, window, now)
+        return window
     except (model_health.HealthError, ValueError) as exc:
         print("::error::dispatch decline escalation: validated model-health ledger is "
               f"unreadable ({exc}); NO task escalation will fire")
         return None
+
+
+def _warn_health_coverage_shortfall(model_health, window, now):
+    """[registry #699] Say ONCE PER TICK, at the one place the window is loaded, when the health
+    ledger cannot cover the sustained-health span — and say WHICH cause.
+
+    WHY. The aged-out park exit (registry #691) refuses on under-coverage exactly as it refuses on
+    a park that is simply not old enough yet, and both surface as the same `no-evidence` census
+    row. On 2026-07-26 that ambiguity produced a wrong operational conclusion. Since prune gained
+    its time-based retention floor an under-covered window has only two causes and they need
+    different responses: a YOUNG or sparse ledger fills in on its own and needs nothing, while a
+    RETENTION-BOUND one is the absolute ceiling binding — a real capacity condition. Emitted here,
+    not inside the predicate, because the predicate runs once per parked PR and this runs once per
+    window load. Never raises and never changes the returned window: diagnosis only."""
+    try:
+        shortfall = model_health.sustained_health_coverage_shortfall(window, now)
+    except Exception:                      # diagnostics must never break the read path
+        return None
+    if not shortfall:
+        return None
+    cause = ("the absolute RETENTION CEILING is binding (registry #699): the fleet record rate is "
+             "above what the ledger can retain, so this will not clear on its own"
+             if shortfall["retention_bound"] else
+             "the ledger is simply young or sparse; it fills in on its own. This is NOT the same "
+             "as 'the parks are not old enough yet'")
+    print(f"::warning::dispatch: the model-health window covers "
+          f"{shortfall['coverage_seconds'] / 3600.0:.2f} h of the "
+          f"{shortfall['span_seconds'] // 3600} h sustained-health span "
+          f"({shortfall['records']} records), so the registry #691 aged-out park exit CANNOT open "
+          f"this tick — {cause}", flush=True)
+    return shortfall
 
 
 def _capacity_recovery_probe(model_health, health_window, now):
@@ -8195,6 +8228,66 @@ def _self_test():
     assert len(_issue_no_change_outcomes(
         model_health, auth_records + [no_change_a, no_change_b], 500)) == 2
     print("  ok   decline tripwire (f): a run of auth outcomes never advances the decline ladder")
+
+    # ---- [registry #699] THE COVERAGE-SHORTFALL DIAGNOSTIC --------------------------------------
+    # A `no-evidence` census row for a capacity park has two very different causes — the parks are
+    # not old enough yet, or the health window cannot COVER the span it would have to claim — and
+    # they were indistinguishable, which produced a wrong operational read on 2026-07-26. The
+    # window loader now names the second one, and distinguishes a young ledger (self-clearing) from
+    # the retention ceiling binding (a real capacity condition that will not clear on its own).
+    def coverage_warning(window, at):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            shortfall = _warn_health_coverage_shortfall(model_health, window, at)
+        return shortfall, buf.getvalue()
+
+    cov_now = 2_000_000
+    span = model_health.SUSTAINED_HEALTH_SPAN_SECONDS
+
+    def cov_stream(seconds, rate, tag):
+        gap = 3600.0 / rate
+        return [model_health.make_record(
+            "anthropic", "e" * 16, "opus5", "success", f"{tag}{i}", cov_now - int(i * gap))
+            for i in range(int(seconds / gap))]
+
+    covered = model_health.prune(cov_stream(span + 3600, 62.1, "cv"), cov_now)
+    covered_shortfall, covered_out = coverage_warning(covered, cov_now)
+    assert covered_shortfall is None and covered_out == "", (covered_shortfall, covered_out)
+    young = model_health.prune(cov_stream(3 * 3600, 62.1, "yg"), cov_now)
+    young_shortfall, young_out = coverage_warning(young, cov_now)
+    assert young_shortfall and young_shortfall["retention_bound"] is False, young_shortfall
+    assert "::warning::" in young_out and "young or sparse" in young_out, young_out
+    assert "aged-out park exit CANNOT open" in young_out, young_out
+    over_err = io.StringIO()
+    with contextlib.redirect_stderr(over_err):
+        over = model_health.prune(cov_stream(4 * 3600, 600.0, "ov"), cov_now)
+    over_shortfall, over_out = coverage_warning(over, cov_now)
+    assert over_shortfall and over_shortfall["retention_bound"] is True, over_shortfall
+    assert "RETENTION CEILING" in over_out and "will not clear on its own" in over_out, over_out
+    # ...and the diagnostic is DIAGNOSIS ONLY: it never raises and never alters the window the
+    # loader returns, so a broken model-health module can never take dispatch down with it.
+    class _BrokenHealth:
+        def sustained_health_coverage_shortfall(self, *_args):
+            raise RuntimeError("boom")
+
+    assert _warn_health_coverage_shortfall(_BrokenHealth(), over, cov_now) is None
+    # THE CALL SITE, driven for real. Asserting the helper alone would stay green if
+    # _read_model_health_window stopped calling it — the loader is what every consumer of the
+    # window goes through, so the loader is what has to emit the diagnostic.
+    class _CoverageAPI:
+        def request(self, method, path, *_args, **_kwargs):
+            assert method == "GET" and path == model_health.ledger_read_path("o/r"), (method, path)
+            blob = json.dumps({"records": young}).encode()
+            return {"content": base64.b64encode(blob).decode(), "sha": "deadbeef"}
+
+    loader_buf = io.StringIO()
+    with contextlib.redirect_stdout(loader_buf):
+        loaded = _read_model_health_window(model_health, "o/r", cov_now, api=_CoverageAPI())
+    assert loaded is not None and len(loaded) == len(young), len(loaded or [])
+    assert "::warning::" in loader_buf.getvalue(), loader_buf.getvalue()
+    assert "young or sparse" in loader_buf.getvalue(), loader_buf.getvalue()
+    print("  ok   [#699] coverage shortfall is reported once per window load, and names whether "
+          "the cause is a young ledger or the retention ceiling")
 
     # ---- [registry #701] NO_CHANGE MUST NOT RE-DISPATCH THE TIER THAT PRODUCED IT ---------------
     # Measured 2026-07-26: 196 completed worker runs, 70 success / 126 failure, dominated by

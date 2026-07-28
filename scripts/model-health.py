@@ -16,8 +16,9 @@
 #             record too — that is the whole point) and from dispatch.yml on a zero-dispatch tick.
 #             Appends {ts, provider, account (SALTED HASH only — decision 22a), model_alias,
 #             exit_class, run_id, reset_hint?, no-change usage fields?} via the SAME contents-API
-#             CAS pattern as the lease ledger, bounded to a rolling window (last MAX_RECORDS /
-#             WINDOW_HOURS; pruned on write).
+#             CAS pattern as the lease ledger, bounded to a rolling window (max(MAX_RECORDS,
+#             RETENTION_FLOOR_SECONDS) inside WINDOW_HOURS, under an absolute ceiling; pruned on
+#             write).
 #   decide  — reads the record window (+ the enabled provider->account fleet) and returns alert
 #             ACTIONS. Idempotent: exactly ONE open alert issue per (condition, provider), updated
 #             not duplicated (a hidden marker in the body keys the upsert). decide also probes the
@@ -73,9 +74,65 @@ LEDGER_REF = os.environ.get("REGISTRY_LEDGER_REF", "ledger")
 # --- ledger bounds (WHY): a rolling window is enough to decide "is access failing NOW"; an
 # unbounded append would grow the committed file forever and slow every CAS write. 200 records / 48h
 # comfortably covers the ~40-slot fleet across several dispatch ticks while staying tiny in git.
+# MAX_RECORDS is now the NOMINAL FLOOR of retention, not its bound: it is what retention reaches
+# back to on a QUIET ledger (200 records at 5 rec/h is 40 h of coverage). On a busy one the
+# TIME FLOOR below takes over — see the registry #699 block that follows.
 MAX_RECORDS = 200
 WINDOW_HOURS = 48
 WINDOW_SECONDS = WINDOW_HOURS * 3600
+
+# --- [OPUS-5] TIME-BASED RETENTION FLOOR (registry #699). ---------------------------------------
+#
+# THE DEFECT THE FLOOR FIXES. MAX_RECORDS bounds retention BY COUNT, so the wall-clock the retained
+# window COVERS is MAX_RECORDS / record-rate — a busier fleet covers LESS time. The aged-out park
+# exit (sustained_fleet_health_evidence, registry #691) requires the window to cover
+# SUSTAINED_HEALTH_SPAN_SECONDS, so with a count cap alone that exit opens only while the fleet
+# stays under MAX_RECORDS / SPAN = 200/6h = ~33 records/h. Measured on the live ledger 2026-07-26:
+# 200 records / 6.69 h = 29.9 rec/h — 41 minutes and 11% of rate headroom from the trip line — and
+# both sides of the line were observed inside one hour that day (11.2 rec/h fired, 61.5 rec/h
+# refused). Every throughput gain shrinks coverage, so the count cap makes the standing 60/60
+# throughput goal ANTI-CORRELATED with keeping the park exit open.
+#
+# THE RULE. prune retains max(count-cap, time-floor): everything stamped within
+# RETENTION_FLOOR_SECONDS is kept REGARDLESS of count, on top of the newest MAX_RECORDS and the
+# never-evicted live-backoff/dead-credential preservation (issues #82/#639). Coverage therefore
+# stops depending on the record rate at all, which is the property the exit actually needs — a
+# larger MAX_RECORDS would only move the trip point and would need raising again at every
+# throughput step.
+#
+# WHY 7 h AND NOT 6. The floor must exceed SUSTAINED_HEALTH_SPAN_SECONDS (6 h, defined with the
+# predicate below) by a margin, because the floor bounds the OLDEST RETAINED RECORD, not the
+# coverage: at a floor of exactly 6 h the oldest surviving record sits somewhere INSIDE the span
+# and `window[0]["ts"] > span_start` still refuses. The margin is the largest inter-record gap the
+# coverage check can absorb at the floor boundary; one hour is ~30x the gap at the measured
+# 30 rec/h and comfortably covers cross-runner clock skew. The two constants are coupled by an
+# assertion at the point SUSTAINED_HEALTH_SPAN_SECONDS is defined, so they cannot drift apart.
+RETENTION_FLOOR_MARGIN_SECONDS = 3600
+RETENTION_FLOOR_SECONDS = 7 * 3600
+# ABSOLUTE SAFETY CEILING (obligation: a pure time floor is unbounded at high rates). Retention is
+# floor-selected but NEVER exceeds these, whichever binds first:
+#   * RETENTION_CEILING_RECORDS — the crisp bound, and the one that states the tolerated rate:
+#     2000 / 7 h = ~285 records/h sustained. That is ~4.6x today's live rate, ~9x the count-cap
+#     trip point this replaces, and above the ~200 rec/h the 60/60 throughput goal implies.
+#   * RETENTION_CEILING_BYTES — the PHYSICAL bound. read_ledger consumes the contents API's INLINE
+#     base64 `content`, which GitHub stops populating above 1 MB; past that every reader of this
+#     ledger fails loud and account-usage fails OPEN (accounts admitted with no rate-limit
+#     backoff). 750 KB leaves 25% headroom. Measured live record sizes are 161 B mean / 283 B max,
+#     so at realistic sizes the RECORD ceiling binds first (2000 x 283 B = 566 KB); the byte
+#     ceiling binds only if records ever fatten past ~375 B mean.
+# WHEN THE CEILING BINDS the oldest non-preserved records are evicted, so coverage CAN fall back
+# below the span and the aged-out exit CAN close again — but never silently: prune emits a
+# ::warning:: naming the condition, which bound bound, and the resulting coverage. The failure
+# direction is unchanged (under-coverage DEFERS, it never releases).
+RETENTION_CEILING_RECORDS = 2000
+RETENTION_CEILING_BYTES = 750_000
+# Per-record byte estimate overhead. _record_bytes must never UNDER-estimate the record's
+# contribution to `json.dumps({"records": [...]}, indent=1)`, or the byte ceiling could admit a
+# document the contents API will not inline; the nesting adds one indent level per line plus the
+# separator, and the self-test asserts the estimate dominates the real document for both a live-
+# shaped and a validator-maximal record set.
+RECORD_BYTES_OVERHEAD = 32
+LEDGER_ENVELOPE_BYTES = 64
 # Future-stamp guard (cross-provider review r2 finding 2): record stamps are write-time, but the
 # ledger is CAS-writable by every outcome job — a forged or clock-skewed stamp far in the FUTURE
 # would (a) never age out of the rolling window and (b) anchor account_backoffs' per-record clamp
@@ -385,11 +442,85 @@ def make_record(provider, account_h, model_alias, exit_class, run_id, now, reset
     return rec
 
 
+def _record_bytes(record):
+    """Upper bound on ONE record's contribution to the serialized ledger document (registry #699).
+    Deliberately an OVER-estimate: `json.dumps(record, indent=1)` plus RECORD_BYTES_OVERHEAD for the
+    extra indent level and separator the record picks up once it is nested inside
+    {"records": [...]}. Under-estimating here would let the byte ceiling admit a document the
+    contents API refuses to inline, which fails every reader — so the estimate must dominate, and
+    the self-test asserts it does."""
+    return len(json.dumps(record, indent=1)) + RECORD_BYTES_OVERHEAD
+
+
+def _ledger_bytes(records):
+    """Upper bound on the serialized size of a whole window (see _record_bytes)."""
+    return sum(_record_bytes(r) for r in records) + LEDGER_ENVELOPE_BYTES
+
+
+def _apply_retention_ceiling(kept, selected, preserved, now):
+    """Clamp the floor-selected index set to the ABSOLUTE ceiling (registry #699), evicting OLDEST
+    non-preserved first, and say so LOUDLY when it binds.
+
+    A time-based retention floor is unbounded at high record rates, so it needs a ceiling; a
+    ceiling that trims silently would merely MOVE the coverage cliff instead of removing it. Two
+    invariants hold through the trim:
+      * a record preserved for a LIVE BACKOFF or a PROVEN-DEAD credential (issues #82/#639) is
+        never evicted, exactly as under the count cap — correctness beats the ceiling; and
+      * the eviction can only SHRINK coverage, and under-coverage DEFERS the aged-out park exit,
+        so the fail-safe direction is unchanged.
+    The warning names the condition, which bound bound, how many records went, and the coverage
+    that resulted — a `no-evidence` census row must never be confusable with "the parks simply are
+    not old enough yet"."""
+    order = sorted(selected)
+    total = _ledger_bytes([kept[i] for i in order])
+    over_records = len(order) > RETENTION_CEILING_RECORDS
+    over_bytes = total > RETENTION_CEILING_BYTES
+    if not (over_records or over_bytes):
+        return set(order)
+    survivors, dropped = set(order), 0
+    for i in order:                     # oldest first
+        if (len(survivors) <= RETENTION_CEILING_RECORDS
+                and total <= RETENTION_CEILING_BYTES):
+            break
+        if i in preserved:
+            continue                    # a live backoff is NEVER evicted (issue #82)
+        survivors.discard(i)
+        total -= _record_bytes(kept[i])
+        dropped += 1
+    coverage = (now - kept[min(survivors)]["ts"]) / 3600 if survivors else 0.0
+    bound = " and ".join(
+        part for part in
+        (f"records {len(order)} > {RETENTION_CEILING_RECORDS}" if over_records else "",
+         f"bytes {total} > {RETENTION_CEILING_BYTES}" if over_bytes else "") if part)
+    span_h = SUSTAINED_HEALTH_SPAN_SECONDS / 3600
+    tolerated = RETENTION_CEILING_RECORDS * 3600 // RETENTION_FLOOR_SECONDS
+    short = coverage < span_h
+    print(f"::warning::model-health: RETENTION CEILING BINDING ({bound}) — the "
+          f"{RETENTION_FLOOR_SECONDS // 3600} h retention floor selected more than the ledger may "
+          f"hold, so {dropped} oldest non-preserved record(s) were evicted; retained coverage is "
+          f"now {coverage:.2f} h, which is "
+          f"{'BELOW' if short else 'still at or above'} the {span_h:.0f} h sustained-health span, "
+          "so the registry #691 aged-out park exit is "
+          f"{'CLOSED until the record rate falls' if short else 'still open'} "
+          f"(registry #699: the fleet is sustaining more than ~{tolerated} records/h)",
+          file=sys.stderr)
+    return survivors
+
+
 def prune(records, now):
     """Keep the rolling window: drop records older than WINDOW_SECONDS — or stamped more than
     FUTURE_SKEW_SECONDS ahead of `now` (an implausibly-future forgery would never age out) — then
-    cap to the most recent MAX_RECORDS. Sorted by ts so the window/consecutive logic below is well
-    defined.
+    retain max(count-cap, time-floor) under an absolute ceiling. Sorted by ts so the
+    window/consecutive logic below is well defined.
+
+    TIME-BASED RETENTION FLOOR (registry #699): every record stamped within
+    RETENTION_FLOOR_SECONDS is retained REGARDLESS of the MAX_RECORDS count cap. Retention by
+    count alone made the retained window's COVERAGE equal MAX_RECORDS / record-rate, so a busier
+    fleet covered less wall-clock and the aged-out park exit (which needs the window to cover
+    SUSTAINED_HEALTH_SPAN_SECONDS) shut itself the moment throughput rose — see the constant block
+    at the top of this module. The floor makes coverage independent of the rate. It never EXTENDS
+    retention past WINDOW_SECONDS (7 h << 48 h); it only stops the count cap from cutting inside
+    it.
 
     ACTIVE-BACKOFF RETENTION (issue #82, fix-forward for #62): the MAX_RECORDS cap is GLOBAL, but
     account_backoffs derives backoff state from the PRUNED window (account-usage._load_backoffs
@@ -407,11 +538,17 @@ def prune(records, now):
     auth-run tail even though its cooldown has long expired — that evidence is the ONLY thing keeping
     a dead probe-exempt account out of dispatch, so the cap must not be able to erase it.
 
-    BOUND CONTRACT (PR #85 finding 1): preserved records spend the MAX_RECORDS budget first and
-    the newest non-preserved records fill only the REMAINING budget, so the total is bounded by
-    max(len(preserved), MAX_RECORDS) — never live-backoffs PLUS a full 200 of expired filler.
+    BOUND CONTRACT (PR #85 finding 1, extended for #699): preserved records spend the MAX_RECORDS
+    budget first and the newest non-preserved records fill only the REMAINING budget, so the
+    count-cap arm is bounded by max(len(preserved), MAX_RECORDS) — never live-backoffs PLUS a full
+    200 of expired filler. The time floor adds the records inside RETENTION_FLOOR_SECONDS on top,
+    so the total is max(len(preserved), MAX_RECORDS, records-inside-the-floor), and the whole
+    result is then clamped by _apply_retention_ceiling to
+    max(len(preserved), RETENTION_CEILING_RECORDS) records / RETENTION_CEILING_BYTES bytes.
     When the live-backoff set alone exceeds MAX_RECORDS, correctness wins over the cap — a live
-    backoff is never evicted — but NEVER silently: every expired/non-preserved record is evicted
+    backoff is never evicted, by the count cap OR by the ceiling — but NEVER silently: every
+    expired/non-preserved record OUTSIDE the retention floor is evicted (inside it a record is
+    coverage evidence, not filler, and is kept — #699)
     and a ::warning::
     diagnostic surfaces the overshoot (that many simultaneously backed-off accounts is a
     fleet-wide rate-limit saturation signal the maintainer must see, not a bookkeeping detail).
@@ -481,7 +618,17 @@ def prune(records, now):
               f"{MAX_RECORDS} cap — expired records evicted, live backoffs kept "
               "(fleet-wide rate-limit saturation)", file=sys.stderr)
     newest = [i for i in range(len(kept)) if i not in preserved][-budget:] if budget > 0 else []
-    return [kept[i] for i in sorted(preserved.union(newest))]
+    # THE TIME FLOOR (registry #699). Union, not a replacement: the count cap still reaches
+    # FURTHER back than the floor on a quiet ledger (200 records at 5 rec/h is 40 h), and the floor
+    # takes over exactly where the cap would otherwise start cutting inside the health span. It is
+    # applied AFTER the overshoot branch above for the same reason it is applied at all — a record
+    # inside the floor is coverage evidence, not filler — and its cost is bounded by the ceiling
+    # below.
+    floor_start = now - RETENTION_FLOOR_SECONDS
+    floor = {i for i, r in enumerate(kept) if r["ts"] >= floor_start}
+    selected = _apply_retention_ceiling(
+        kept, preserved | floor | set(newest), preserved, now)
+    return [kept[i] for i in sorted(selected)]
 
 
 def validate_ledger(document):
@@ -1009,25 +1156,27 @@ def _account_newest(window):
 #    records nothing while it is held; a span shorter than the cap could therefore be entirely
 #    covered by one account's silence. Six hours means a maximally-backed-off account has had to
 #    come back and record something inside the span.
-#  * COVERAGE. The retained window must itself reach back to the start of the span. prune's
-#    MAX_RECORDS = 200 cap evicts the OLDEST records first, so on a busy ledger the window can
-#    cover less than the span — and claiming six healthy hours from three observed ones is the
-#    exact dishonesty this predicate must not commit. Under-coverage DEFERS; it never releases.
+#  * COVERAGE. The retained window must itself reach back to the start of the span — claiming six
+#    healthy hours from three observed ones is the exact dishonesty this predicate must not
+#    commit. Under-coverage DEFERS; it never releases. THE CHECK IS UNCHANGED AND STILL LOAD
+#    BEARING; what changed (registry #699) is that it is no longer rate-fragile.
 #
-#    KNOWN LIVE LIMITATION, MEASURED, AND NOT A HYPOTHETICAL (registry #699). Coverage >= SPAN
-#    requires the ledger's record rate to stay at or below MAX_RECORDS / SPAN = 200/6h = ~33
-#    records/h. Both sides of that line were observed on 2026-07-26 within one hour: at 11.2
-#    rec/h (200 records / 17.9 h) this predicate fired; at 61.5 rec/h (200 records / 3.25 h) it
-#    correctly refused, because covering 6 h at that rate would need ~369 records and the cap is
-#    200. An EARLIER version of this comment estimated the trip point at "~3x the observed peak"
-#    — that estimate was wrong by about 2x and the live fleet crossed it the same day.
-#    CONSEQUENCE, stated plainly rather than buried: while the fleet sustains more than ~33
-#    records/h, the aged-out exit does not open. The failure direction is the safe one and the
-#    park simply waits for a quieter window, but a PERMANENTLY busy fleet would reinstate the
-#    stall this exit exists to remove. That is a LEDGER-RETENTION bound, not a predicate bound —
-#    fixing it means a time-based retention floor in prune (or a larger MAX_RECORDS), which is a
-#    change to the shared health window every other consumer reads and is deliberately NOT made
-#    here. Tracked in registry #699.
+#    THE LIMITATION THIS USED TO CARRY, AND WHY IT IS GONE (registry #699, FIXED). Retention was
+#    by COUNT alone, so coverage was MAX_RECORDS / record-rate and the check held only while the
+#    fleet stayed at or below MAX_RECORDS / SPAN = 200/6h = ~33 records/h. Both sides of that line
+#    were observed on 2026-07-26 within one hour: at 11.2 rec/h (200 records / 17.9 h) this
+#    predicate fired; at 61.5 rec/h (200 records / 3.25 h) it correctly refused, because covering
+#    6 h at that rate would need ~369 records and the cap was 200. Live at the time of the fix:
+#    200 records / 6.69 h = 29.9 rec/h — 41 minutes of span and 11% of rate headroom from the trip
+#    line. Because a higher record rate is exactly what more throughput produces, the count cap
+#    made the 60/60 throughput goal anti-correlated with keeping this exit open.
+#    prune now retains max(count-cap, TIME FLOOR): every record inside RETENTION_FLOOR_SECONDS
+#    (7 h = this SPAN + a 1 h margin) survives regardless of count, so coverage no longer depends
+#    on the rate at all. The residual bound is the ABSOLUTE ceiling
+#    (RETENTION_CEILING_RECORDS / RETENTION_CEILING_BYTES, ~285 records/h): above it the oldest
+#    non-preserved records are evicted and coverage can fall under the span again — but prune says
+#    so LOUDLY (a ::warning:: naming the condition, the binding bound and the resulting coverage),
+#    and the failure direction is unchanged: under-coverage DEFERS, it never releases.
 #  * FRESHNESS 1 h. Silence is NOT health: a fleet that recorded nothing for hours is unobserved,
 #    not proven. Requiring a SUCCESS inside the last hour is what makes "the fleet works" a
 #    present-tense claim. (Measured: the live ledger contains a 4.6 h silent gap; during it this
@@ -1070,6 +1219,52 @@ SUSTAINED_HEALTH_CAUSE = "aged-out"
 # so the two can never collide in the receipt set a PR consumes (park_policy refuses an evidence
 # key it has already receipted), and so a receipt says on its face WHICH gate released the park.
 SUSTAINED_HEALTH_KEY_PREFIX = "fleet-health"
+# [registry #699] THE COUPLING between prune's retention floor and this span, machine-checked at
+# import so the two constants cannot drift apart in a later edit. The floor bounds the OLDEST
+# RETAINED RECORD, not the coverage: at a floor of exactly SPAN the oldest survivor sits somewhere
+# INSIDE the span and the coverage check below still refuses, so the floor must exceed the span by
+# a margin big enough to absorb the inter-record gap at the floor boundary. A violation here is a
+# configuration error that would silently reinstate registry #699, so it fails LOUD at import
+# rather than at the first park that needed the exit.
+if RETENTION_FLOOR_SECONDS < SUSTAINED_HEALTH_SPAN_SECONDS + RETENTION_FLOOR_MARGIN_SECONDS:
+    raise RuntimeError(
+        f"model-health retention floor ({RETENTION_FLOOR_SECONDS}s) must exceed the "
+        f"sustained-health span ({SUSTAINED_HEALTH_SPAN_SECONDS}s) by at least "
+        f"{RETENTION_FLOOR_MARGIN_SECONDS}s — otherwise the aged-out park exit (registry "
+        "#691/#699) can never observe the coverage it requires")
+
+
+def health_window_coverage_seconds(window, now):
+    """Wall-clock the ALREADY-PRUNED `window` reaches back from `now`, i.e. the span it can
+    honestly speak about. 0 for an empty/unusable window. This is the quantity the coverage clause
+    of sustained_fleet_health_evidence compares against SUSTAINED_HEALTH_SPAN_SECONDS."""
+    stamps = [r["ts"] for r in window
+              if isinstance(r, dict) and isinstance(r.get("ts"), int)
+              and not isinstance(r.get("ts"), bool)]
+    return max(0, now - min(stamps)) if stamps else 0
+
+
+def sustained_health_coverage_shortfall(window, now):
+    """None when the pruned window covers the sustained-health span; otherwise a dict describing
+    WHY the aged-out exit cannot open — including whether the shortfall is RETENTION-bound.
+
+    WHY THIS EXISTS (registry #699). A refusal for under-coverage and a refusal because the parks
+    are simply younger than the span produce the SAME `no-evidence` census row, and that ambiguity
+    caused a wrong operational conclusion on 2026-07-26. Since prune gained the time floor, an
+    under-covered window has exactly two causes and they are distinguishable: the ledger is young
+    or sparse (nothing to fix — it fills in on its own), or the ABSOLUTE retention ceiling is
+    binding (a real, actionable capacity condition). `retention_bound` is that discriminator; the
+    caller logs it once per tick rather than once per park."""
+    coverage = health_window_coverage_seconds(window, now)
+    if coverage >= SUSTAINED_HEALTH_SPAN_SECONDS:
+        return None
+    return {
+        "coverage_seconds": coverage,
+        "span_seconds": SUSTAINED_HEALTH_SPAN_SECONDS,
+        "records": len(window),
+        "retention_bound": (len(window) >= RETENTION_CEILING_RECORDS
+                            or _ledger_bytes(window) >= RETENTION_CEILING_BYTES),
+    }
 
 
 def _fleet_health_ok(window, now):
@@ -1181,9 +1376,12 @@ def sustained_health_exit_reachable(records, now):
       * COUNT (successes / distinct real accounts) — WAITABLE. Successes accumulate while the
         fleet keeps working, which is exactly what the freshness probe below has just observed.
         Omitted.
-      * COVERAGE — **NOT WAITABLE, AND THIS IS THE WHOLE POINT.** Coverage is
-        MAX_RECORDS / record-rate: a property of the LEDGER'S RETENTION, not of elapsed time.
-        Waiting never improves it, and a BUSIER fleet makes it strictly worse. Omitting it made
+      * COVERAGE — **NOT WAITABLE, AND THIS IS THE WHOLE POINT.** Coverage is a property of the
+        LEDGER'S RETENTION, not of elapsed time: waiting never improves it. Under the old
+        count-only retention it was MAX_RECORDS / record-rate, so a BUSIER fleet made it strictly
+        worse; since registry #699 gave prune a time floor it is rate-independent up to the
+        absolute retention ceiling, and only that ceiling can still shrink it. Either way waiting
+        does not fix it, so the check stays. Omitting it made
         this predicate fail OPEN: at a measured 62 rec/h (coverage 3.2 h) it returned True while
         sustained_fleet_health_evidence returned None at +1, +2, +4 AND +8 spans — so the
         migration would convert a park into a class with BOTH exits shut. That is verbatim the
@@ -2466,6 +2664,32 @@ def _self_test():
         return any(a["condition"] == condition and a["provider"] == provider and a["fire"]
                    for a in actions)
 
+    import contextlib
+    import io
+
+    def prune_loud(records, at):
+        """(pruned window, captured stderr). [#699] prune's ceiling diagnostic is a ::warning:: on
+        stderr; a fixture that trips it must ASSERT the warning rather than leak it into the suite
+        log, and every retention fixture below goes through this one door so a warning can never
+        appear unnoticed."""
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            window = prune(records, at)
+        return window, err.getvalue()
+
+    def ceiling_flood(prefix, extra, start=200, per_second=8):
+        """[#699] A flood big enough to reach the ABSOLUTE RETENTION CEILING, packed densely enough
+        in time to stay inside a live backoff/cooldown.
+
+        WHY ceiling-scale and not MAX_RECORDS-scale, which is what these fixtures used before: a
+        LIVE backoff record is at most BACKOFF_CAP_SECONDS (5 h) old and a live auth cooldown at
+        most AUTH_COOLDOWN_SECONDS, so the 7 h retention floor already shields both from the COUNT
+        cap. A count-cap-sized flood would therefore evict NOTHING and the preservation assertions
+        it feeds would pass whether or not the preservation code existed. The ceiling is now the
+        only thing that can evict a live backoff, so it is the regime the guard must be tested in."""
+        return [rec("anthropic", f"{prefix}{i:04d}", SUCCESS, dt=start + i // per_second)
+                for i in range(RETENTION_CEILING_RECORDS + extra)]
+
     # ---- SALTING PRIVACY PROPERTY: no raw handle ever appears in a written record ------------
     r = rec("anthropic", "acct02", CLASS_LIMIT, reset="14:00 UTC")
     chk("record stores salted hash not handle", r["account"], account_hash("acct02", salt))
@@ -2984,14 +3208,19 @@ def _self_test():
     chk("a longer live rate-limit backoff is never SHORTENED by the auth cooldown",
         (merged.get("last_signal"), merged.get("backoff_until")),
         (CLASS_TRANSIENT, now + 20 + BACKOFF_BASE_SECONDS * 4))
-    # prune must not evict a live cooldown's evidence (the issue-#82 bug, for auth).
-    auth_flood = two_auth + [rec("anthropic", f"a{i:03d}", SUCCESS, dt=100 + i)
-                             for i in range(MAX_RECORDS + 5)]
-    auth_window = prune(auth_flood, now + 200)
+    # prune must not evict a live cooldown's evidence (the issue-#82 bug, for auth). [#699] The
+    # flood is CEILING-scale: since prune gained the 7 h time floor, a live cooldown's records
+    # (at most AUTH_COOLDOWN_SECONDS old) are inside the floor and the count cap cannot touch
+    # them — only the absolute ceiling can, so that is the regime this guard is exercised in.
+    auth_flood = two_auth + ceiling_flood("a", 50, start=100)
+    auth_at = now + 400
+    auth_window, auth_err = prune_loud(auth_flood, auth_at)
     chk("prune retains a live auth cooldown's evidence (no mid-cooldown readmission)",
-        (len(auth_window) <= MAX_RECORDS,
-         auth_cooldowns(auth_window, now + 200).get(ah, {}).get("last_signal")),
-        (True, CLASS_AUTH))
+        (len(auth_window), len(auth_flood) > RETENTION_CEILING_RECORDS,
+         auth_cooldowns(auth_window, auth_at).get(ah, {}).get("last_signal")),
+        (RETENTION_CEILING_RECORDS, True, CLASS_AUTH))
+    chk("the ceiling eviction that flood caused is SURFACED, never silent",
+        "RETENTION CEILING BINDING" in auth_err, True)
     # ---- [registry #639] CREDENTIAL REACHABILITY: the evidence question the probe-exemption seam
     # needs, distinct from the bounded #596 hold. "Exempt from the quota probe" must never imply
     # "reachable", so this predicate must be able to say DEAD — and must never say `live` off
@@ -3052,7 +3281,11 @@ def _self_test():
     # cooldown row above, whose `active` entry is what used to protect these records).
     dead_flood = two_auth + [rec("anthropic", f"d{i:03d}", SUCCESS, dt=100 + i)
                              for i in range(MAX_RECORDS + 5)]
-    dead_now = now + 60 + AUTH_COOLDOWN_SECONDS + 1
+    # [#699] Read at a point where the whole fixture has aged PAST the retention floor, so the
+    # COUNT cap is what would evict the dead run — a dead credential's evidence is not time-bounded
+    # the way a live backoff is, so this is the guard's real regime and it stays non-vacuous
+    # (without the #639 preservation the two oldest records, the auth run, are the first evicted).
+    dead_now = now + RETENTION_FLOOR_SECONDS + 1000
     dead_window = prune(dead_flood, dead_now)
     chk("prune retains a PROVEN-DEAD run under a 200+ record flood (no silent readmission)",
         (len(dead_window) <= MAX_RECORDS,
@@ -3478,8 +3711,13 @@ def _self_test():
         bool(sustained_fleet_health_evidence(continued, h_now, later)), True)
 
     # ---- prune / window bound ---------------------------------------------------------------
-    many = [rec("anthropic", "acct01", CLASS_TRANSIENT, dt=i) for i in range(MAX_RECORDS + 50)]
-    chk("prune caps to MAX_RECORDS", len(prune(many, now + MAX_RECORDS + 100)), MAX_RECORDS)
+    # [#699] The count cap now binds only OUTSIDE the retention floor, so this fixture is placed
+    # there; inside the floor the cap deliberately no longer evicts (that is the fix), which the
+    # dedicated floor tests below assert directly.
+    many = [rec("anthropic", "acct01", CLASS_TRANSIENT, dt=i - RETENTION_FLOOR_SECONDS - 1000)
+            for i in range(MAX_RECORDS + 50)]
+    chk("prune caps to MAX_RECORDS outside the retention floor",
+        len(prune(many, now + MAX_RECORDS + 100)), MAX_RECORDS)
     old_new = [rec("anthropic", "a", CLASS_AUTH, dt=-(WINDOW_SECONDS + 10)),
                rec("anthropic", "a", CLASS_AUTH, dt=0)]
     chk("prune drops out-of-window", len(prune(old_new, now)), 1)
@@ -3490,14 +3728,18 @@ def _self_test():
     # newest-MAX_RECORDS cap evicted the hit, so account_backoffs on the pruned window derived {}
     # and the capped account was readmitted hours early.
     hint_hit = [rec("openai", "codex01", "rate-limit", dt=0, reset="in 5 hours")]
-    flood = [rec("anthropic", f"bulk{i:03d}", SUCCESS, dt=100 + i)
-             for i in range(MAX_RECORDS + 30)]
-    window = prune(hint_hit + flood, now + 1000)
-    chk("live 5 h backoff survives a MAX_RECORDS flood of unrelated records",
+    # [#699] CEILING-scale, and deliberately so — see ceiling_flood's docstring. A live backoff
+    # record is now inside the retention floor by construction, so a MAX_RECORDS-scale flood would
+    # evict nothing and every assertion below would hold with the preservation code DELETED.
+    flood = ceiling_flood("bulk", 30)
+    window, window_err = prune_loud(hint_hit + flood, now + 1000)
+    chk("live 5 h backoff survives a flood that reaches the RETENTION CEILING",
         account_backoffs(window, now + 1000).get(ah, {}).get("backoff_until"),
         now + BACKOFF_CAP_SECONDS)
-    chk("retention keeps the window bounded at MAX_RECORDS", len(window), MAX_RECORDS)
-    nc_window = prune(nc_distinct + flood, now + 500)
+    chk("retention keeps the window bounded at the absolute ceiling, loudly",
+        (len(window), "RETENTION CEILING BINDING" in window_err),
+        (RETENTION_CEILING_RECORDS, True))
+    nc_window, _ = prune_loud(nc_distinct + flood, now + 500)
     chk("active derived no_change backoff retains its three-record evidence across the cap",
         (sum(1 for record in nc_window
              if record["account"] == ah and record["exit_class"] == CLASS_NO_CHANGE),
@@ -3505,17 +3747,17 @@ def _self_test():
         (3, CLASS_LIMIT))
     # a short consecutive chain is preserved WHOLE, so the doubled multiplier re-derives exactly
     chain = [rec("openai", "codex01", "rate-limit", dt=i * 30) for i in range(3)]
-    cb = account_backoffs(prune(chain + flood, now + 500), now + 500)
+    cb = account_backoffs(prune_loud(chain + flood, now + 500)[0], now + 500)
     chk("consecutive chain preserved across the cap (multiplier intact)",
         (cb.get(ah, {}).get("consecutive"), cb.get(ah, {}).get("backoff_until")),
         (3, now + 60 + 4 * BACKOFF_BASE_SECONDS))
     # a chain PAST cap-saturation keeps only its BACKOFF_CHAIN_KEEP tail — same derived
     # backoff_until (the exponential is capped either way), bound stays hard
     long_chain = [rec("openai", "codex01", "rate-limit", dt=i * 10) for i in range(20)]
-    lwindow = prune(long_chain + flood, now + 500)
+    lwindow, _ = prune_loud(long_chain + flood, now + 500)
     chk("saturated chain truncates to its tail yet derives the same capped backoff",
         (len(lwindow), account_backoffs(lwindow, now + 500).get(ah, {}).get("backoff_until")),
-        (MAX_RECORDS, now + 190 + BACKOFF_CAP_SECONDS))
+        (RETENTION_CEILING_RECORDS, now + 190 + BACKOFF_CAP_SECONDS))
     chk("chain-keep is the cap-saturation count", BACKOFF_CHAIN_KEEP, 6)
     # ...but truncation FLOORS the re-derived consecutive count at BACKOFF_CHAIN_KEEP (a 20-hit
     # chain re-derives as 6 — PR #85 finding 2), so a saturated count is only a LOWER BOUND and
@@ -3529,13 +3771,16 @@ def _self_test():
     chk("short chain: exact count, NOT saturated",
         (cb.get(ah, {}).get("consecutive"), cb.get(ah, {}).get("saturated")), (3, False))
     # mutation guards: only a LIVE backoff earns retention — an expired one, or one already
-    # cleared by the account's own success, prunes normally (no unbounded pinning)
-    ewindow = prune(hint_hit + flood, now + BACKOFF_CAP_SECONDS + 2000)
+    # cleared by the account's own success, prunes normally (no unbounded pinning). [#699] Read
+    # once the whole fixture has aged past the retention floor, so the COUNT cap is what applies:
+    # inside the floor nothing is evicted and these two guards would be vacuous.
+    aged = now + RETENTION_FLOOR_SECONDS + 2000
+    ewindow = prune(hint_hit + flood, aged)
     chk("EXPIRED backoff record is not preserved (cap applies normally)",
         (len(ewindow), any(r["account"] == ah for r in ewindow)), (MAX_RECORDS, False))
     cleared = [rec("openai", "codex01", "rate-limit", dt=0),
                rec("openai", "codex01", SUCCESS, dt=50)]
-    swindow = prune(cleared + flood, now + 1000)
+    swindow = prune(cleared + flood, aged)
     chk("success-cleared backoff record is not preserved",
         (len(swindow), any(r["account"] == ah for r in swindow)), (MAX_RECORDS, False))
     # ---- cap EXCEEDED by live backoffs alone (PR #85 finding 1) ------------------------------
@@ -3544,15 +3789,15 @@ def _self_test():
     # over the cap), every expired/non-preserved record is evicted (the total is the preserved
     # set, never preserved + expired filler), and the overshoot is surfaced LOUDLY as a
     # fleet-wide saturation ::warning:: — never a silent bound violation.
-    import contextlib
-    import io
     live_count = MAX_RECORDS + 10
     live = [rec("openai", f"live{i:03d}", "rate-limit", dt=0) for i in range(live_count)]
-    # expired: rate-limit hits whose 15-min backoff lapsed hours ago (still inside the 48 h window)
-    lapsed = [rec("openai", f"dead{i:03d}", "rate-limit", dt=-7200 - i) for i in range(40)]
-    sat_err = io.StringIO()
-    with contextlib.redirect_stderr(sat_err):
-        sat_window = prune(live + lapsed, now + 60)
+    # expired: rate-limit hits whose 15-min backoff lapsed hours ago (still inside the 48 h window).
+    # [#699] They are placed OUTSIDE the retention floor, because inside it they are no longer
+    # "filler" — a record inside the floor is coverage evidence and is deliberately retained (the
+    # separate check below pins that, so the two behaviours cannot be confused).
+    lapsed = [rec("openai", f"dead{i:03d}", "rate-limit",
+                  dt=-(RETENTION_FLOOR_SECONDS + 3600 + i)) for i in range(40)]
+    sat_window, sat_err = prune_loud(live + lapsed, now + 60)
     live_hashes = {account_hash(f"live{i:03d}", salt) for i in range(live_count)}
     chk("cap-exceeded: every live backoff survives the prune (correctness over cap)",
         sum(1 for r in sat_window if r["account"] in live_hashes), live_count)
@@ -3562,15 +3807,171 @@ def _self_test():
     chk("cap-exceeded: every live backoff still derives on the pruned window",
         len(account_backoffs(sat_window, now + 60)), live_count)
     chk("cap-exceeded: saturation is SURFACED (::warning:: names the cap)",
-        ("::warning::" in sat_err.getvalue(), f"MAX_RECORDS={MAX_RECORDS}" in sat_err.getvalue()),
-        (True, True))
+        ("::warning::" in sat_err, f"MAX_RECORDS={MAX_RECORDS}" in sat_err), (True, True))
+    # [#699] ...and under that SAME saturation a non-preserved record INSIDE the retention floor is
+    # still retained. The overshoot branch evicts filler, and a record the health span would have
+    # to speak about is not filler — without this the fix would be silently disabled in exactly the
+    # fleet-wide-rate-limit state where coverage is hardest to come by.
+    sat_floor, _ = prune_loud(
+        live + lapsed + [rec("anthropic", "insidefloor", SUCCESS, dt=-3600, run="if1")], now + 60)
+    fh = account_hash("insidefloor", salt)
+    chk("cap-exceeded: a record INSIDE the retention floor is retained, not treated as filler",
+        (any(r["account"] == fh for r in sat_floor), len(sat_floor)), (True, live_count + 1))
     # ...and an ordinary over-cap prune (live set within budget) stays silent — the saturation
     # warning must keep its operational signal, not fire on every routine bounded write.
-    quiet_err = io.StringIO()
-    with contextlib.redirect_stderr(quiet_err):
-        quiet = prune(many, now + MAX_RECORDS + 100)
+    quiet, quiet_err = prune_loud(many, now + MAX_RECORDS + 100)
     chk("under-saturation prune emits no warning (bound still hard)",
-        (len(quiet), quiet_err.getvalue()), (MAX_RECORDS, ""))
+        (len(quiet), quiet_err), (MAX_RECORDS, ""))
+
+    # ---- [registry #699] THE RATE-FRAGILE COVERAGE DEFECT, END TO END ------------------------
+    # The busy-ledger fixture far above hand-builds the window the OLD count-only prune PRODUCED at
+    # the measured 2026-07-26 peak (62.1 rec/h) and asserts the predicate correctly refuses it.
+    # That fixture is still right and is deliberately left alone: it is the control that proves the
+    # coverage CHECK is intact. These tests ask the question one layer down — at the layer that was
+    # actually broken — by feeding prune the RAW record stream at that rate and asking what window
+    # it retains.
+    chk("[#699] the retention floor exceeds the health span by the stated margin (the floor bounds "
+        "the OLDEST RETAINED RECORD, so coverage only clears the span if the floor overshoots it)",
+        RETENTION_FLOOR_SECONDS - SUSTAINED_HEALTH_SPAN_SECONDS >= RETENTION_FLOOR_MARGIN_SECONDS,
+        True)
+    # The floor boundary is INCLUSIVE: a record stamped exactly RETENTION_FLOOR_SECONDS ago is
+    # inside the floor. It is one record either way and the 1 h margin absorbs the difference, but
+    # the boundary is pinned so the intent survives an edit.
+    edge_at = now + RETENTION_FLOOR_SECONDS
+    edge = [rec("anthropic", "edge", SUCCESS, dt=0, run="e0")] + [
+        rec("anthropic", f"pad{i:03d}", SUCCESS, dt=RETENTION_FLOOR_SECONDS - 60 + i // 4,
+            run=f"p{i}") for i in range(MAX_RECORDS + 50)]
+    eh = account_hash("edge", salt)
+    chk("[#699] the retention floor boundary is inclusive (a record exactly at the floor stays)",
+        (any(r["account"] == eh for r in prune(edge, edge_at)),
+         any(r["account"] == eh for r in prune(edge, edge_at + 1))),
+        (True, False))
+    peak_park = h_now - SUSTAINED_HEALTH_SPAN_SECONDS - 60
+
+    def stream(span_seconds, rate, tag):
+        """A perfectly healthy two-real-account success stream at `rate` records/hour."""
+        gap = 3600.0 / rate
+        count = int(span_seconds / gap)
+        return sorted(
+            (rec("openai" if i % 2 else "anthropic", "codex01" if i % 2 else "acct02", SUCCESS,
+                 dt=int(7 * 3600 - i * gap), run=f"{tag}{i}") for i in range(count)),
+            key=lambda r: r["ts"])
+
+    # THE RED TEST. 62.1 rec/h — the rate at which the live fleet was MEASURED refusing this exit
+    # on 2026-07-26 — over more than one span of wall clock.
+    peak_stream = stream(9 * 3600, 62.1, "pk")
+    peak_window = prune(peak_stream, h_now)
+    peak_coverage = (h_now - peak_window[0]["ts"]) / 3600.0
+    chk("[#699] at the measured 62 rec/h peak the retained window now COVERS the health span "
+        "(retention is no longer MAX_RECORDS / record-rate)",
+        (len(peak_window) > MAX_RECORDS,
+         peak_coverage >= SUSTAINED_HEALTH_SPAN_SECONDS / 3600.0),
+        (True, True))
+    chk("[#699] SAME STREAM, SAME PREDICATE, ONLY RETENTION DIFFERS: truncated to the old count "
+        "cap it still refuses; retained under the time floor it ADMITS",
+        (sustained_fleet_health_evidence(peak_window[-MAX_RECORDS:], peak_park, h_now) is None,
+         bool(sustained_fleet_health_evidence(peak_window, peak_park, h_now)),
+         bool(sustained_health_exit_reachable(peak_window, h_now))),
+        (True, True, True))
+
+    # THE NON-VACUITY CONTROL — the single most important assertion in this block. If the fix had
+    # been made by weakening or deleting the coverage clause instead of widening retention, the red
+    # test above would still pass and THIS would flip to admitting. The window here is retained
+    # WHOLE (len == len(stream), asserted, so the refusal cannot be an artifact of truncation) and
+    # the evidence simply does not reach back a span.
+    young_stream = stream(3 * 3600, 62.1, "yg")
+    young_window = prune(young_stream, h_now)
+    chk("[#699] NON-VACUITY CONTROL: evidence that GENUINELY does not reach back a span still "
+        "REFUSES — retention was widened, the coverage check was not weakened",
+        (len(young_window) == len(young_stream),
+         (h_now - young_window[0]["ts"]) < SUSTAINED_HEALTH_SPAN_SECONDS,
+         sustained_fleet_health_evidence(young_window, peak_park, h_now),
+         sustained_health_exit_reachable(young_window, h_now)),
+        (True, True, None, False))
+
+    # THE CEILING, AND WHAT HAPPENS ABOVE IT. A pure time floor is unbounded at high rates, so the
+    # ceiling is real — and a ceiling that trimmed silently would have MOVED the cliff, not removed
+    # it. Above ~285 rec/h the oldest non-preserved records go, coverage falls back under the span,
+    # the exit closes again — and prune SAYS SO, naming the binding bound and the coverage left.
+    over_stream = stream(4 * 3600, 600.0, "ov")
+    over_window, over_err = prune_loud(over_stream, h_now)
+    over_coverage = (h_now - over_window[0]["ts"]) / 3600.0
+    chk("[#699] above the tolerated rate the RECORD ceiling binds, evicting oldest-first",
+        (len(over_stream) > RETENTION_CEILING_RECORDS, len(over_window)),
+        (True, RETENTION_CEILING_RECORDS))
+    chk("[#699] the ceiling is LOUD: the warning names the condition, the binding bound and the "
+        "coverage it left — a no-evidence census row must never read as 'parks are too young'",
+        ("RETENTION CEILING BINDING" in over_err,
+         f"records {len(over_stream)} > {RETENTION_CEILING_RECORDS}" in over_err,
+         f"{over_coverage:.2f} h" in over_err,
+         "BELOW" in over_err and "CLOSED" in over_err),
+        (True, True, True, True))
+    chk("[#699] and the failure DIRECTION above the ceiling is unchanged: under-coverage DEFERS",
+        (over_coverage < SUSTAINED_HEALTH_SPAN_SECONDS / 3600.0,
+         sustained_fleet_health_evidence(over_window, peak_park, h_now),
+         sustained_health_exit_reachable(over_window, h_now)),
+        (True, None, False))
+    # OBLIGATION 1 (issue #82) THROUGH THE CEILING: a live backoff is never evicted, by the count
+    # cap OR by the ceiling. `hint_hit` is the OLDEST record of that fixture — the first record the
+    # ceiling would take — and it is still there afterwards. That is preservation, not luck.
+    chk("[#699] a LIVE backoff is the first eviction candidate under the ceiling and survives it",
+        (sorted(hint_hit + flood, key=lambda r: r["ts"])[0]["account"] == ah,
+         len(window) < len(hint_hit + flood),
+         window[0]["account"] == ah),
+        (True, True, True))
+
+    # THE BYTE CEILING. The record ceiling bounds the COUNT; the contents API bounds the BLOB, and
+    # a ledger past its ~1 MB inline-content limit fails EVERY reader (account-usage then fails
+    # OPEN — accounts admitted with no rate-limit backoff). Validator-maximal records are ~2.5x the
+    # live mean, so at that shape the byte bound binds FIRST, before the record ceiling.
+    fat = [make_record("anthropic", account_hash(f"fat{i}", salt), "m" * RECORD_FIELD_MAX_LEN,
+                       CLASS_NO_CHANGE, "9" * RECORD_FIELD_MAX_LEN, now + 100 + i // 8,
+                       input_tokens=MAX_USAGE_TOKENS, output_tokens=MAX_USAGE_TOKENS,
+                       wall_seconds=MAX_WALL_SECONDS, issue=MAX_ISSUE_NUMBER,
+                       why_no_diff=sorted(NO_CHANGE_REASONS)[0])
+           for i in range(RETENTION_CEILING_RECORDS - 200)]
+    fat_window, fat_err = prune_loud(fat, now + 500)
+    chk("[#699] the BYTE ceiling binds before the record ceiling on validator-maximal records",
+        (len(fat) < RETENTION_CEILING_RECORDS, len(fat_window) < len(fat),
+         _ledger_bytes(fat_window) <= RETENTION_CEILING_BYTES,
+         f"> {RETENTION_CEILING_BYTES}" in fat_err and "RETENTION CEILING BINDING" in fat_err),
+        (True, True, True, True))
+    # ...and it is LOAD-BEARING, not belt-and-braces: the widest record the validator admits (a
+    # RESET_HINT_MAX_LEN hint) is fat enough that RETENTION_CEILING_RECORDS of them would blow past
+    # the contents-API inline limit on their own. The count ceiling does not bound the blob.
+    widest = make_record("openai", account_hash("widest", salt), "m" * RECORD_FIELD_MAX_LEN,
+                         "rate-limit", "9" * RECORD_FIELD_MAX_LEN, now,
+                         reset_hint="a" * RESET_HINT_MAX_LEN)
+    chk("[#699] the RECORD ceiling alone would NOT bound the blob — the byte ceiling is what "
+        "keeps a full ledger fetchable",
+        RETENTION_CEILING_RECORDS * _record_bytes(widest) > 1_000_000, True)
+    chk("[#699] the per-record byte estimate never UNDER-states the real serialized document "
+        "(an under-estimate would let the ceiling admit a blob no reader can fetch)",
+        [_ledger_bytes(sample) >= len(json.dumps({"records": sample}, indent=1)) + 1
+         for sample in (fat_window, peak_window, young_window, [])],
+        [True, True, True, True])
+    chk("[#699] a ceiling-full ledger of validator-maximal records still fits the contents-API "
+        "inline-content limit with headroom",
+        (RETENTION_CEILING_BYTES < 1_000_000,
+         len(json.dumps({"records": fat_window}, indent=1)) < 1_000_000),
+        (True, True))
+
+    # THE DIAGNOSTIC that makes an under-covered window tellable from a young one at the call site.
+    sf_young = sustained_health_coverage_shortfall(young_window, h_now)
+    sf_over = sustained_health_coverage_shortfall(over_window, h_now)
+    chk("[#699] coverage shortfall: a covered window reports none",
+        sustained_health_coverage_shortfall(peak_window, h_now), None)
+    chk("[#699] coverage shortfall discriminates a YOUNG ledger (nothing to fix) from a "
+        "CEILING-BOUND one (a real capacity condition)",
+        (sf_young["retention_bound"], sf_over["retention_bound"],
+         sf_young["coverage_seconds"] < SUSTAINED_HEALTH_SPAN_SECONDS,
+         sf_over["coverage_seconds"] < SUSTAINED_HEALTH_SPAN_SECONDS),
+        (False, True, True, True))
+    chk("[#699] coverage of an empty/unusable window is 0, never a fabricated span",
+        (health_window_coverage_seconds([], h_now),
+         health_window_coverage_seconds([{"nope": 1}], h_now),
+         sustained_health_coverage_shortfall([], h_now)["coverage_seconds"]),
+        (0, 0, 0))
 
     # ---- validate_ledger fail-closes on a malformed/poisoned record (enforced at READ) -------
     # The same _validate_record contract as construction: a poisoned ledger (raw handle, unknown

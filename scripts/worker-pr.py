@@ -179,6 +179,20 @@ MARKER_KINDS = {
 FIX_MODEL_MARKER = "<!-- sparq-fix-model:v1"
 MODEL_PIN_MARKER = "<!-- sparq-fix-modelpin:v1"
 PROGRESS_MARKER = "<!-- sparq-review-progress:v1"
+# [registry #814] THE THREE INJECTION-ESCALATION SPELLINGS THIS SCRIPT WRITES, named ONCE.
+#
+# These are the only prose this script emits under its own identity that must permanently
+# disqualify a PR from automatic re-classification out of the human-owned terminal, and they are
+# what park_policy.LEGACY_PARK_DENY_PROSE reads back. Naming them here is a readability
+# convenience ONLY — it is NOT what protects them. The self-test binds the WRITER to the CLASSIFIER
+# by RUNNING the three write sites under an injection flag and passing the text they actually
+# EMITTED through the real deny table, so rewording one of these constants, re-inlining a reworded
+# literal at a write site, or deleting a write site's injection branch all change (or remove) the
+# tested value and fail. No source-text assertion is involved anywhere — see the self-test.
+INJECTION_PROSE_REVIEW = "the reviewer flagged possible prompt injection"
+INJECTION_PROSE_FIX = "the fixer flagged the seeded findings as possible prompt injection"
+INJECTION_PROSE_FINDINGS = ("⚠️ The reviewer flagged possible prompt-injection content; "
+                            "escalating to a human.")
 # Budget-exhaustion window receipt (finding B; round-3 finding 1 made it label-INDEPENDENT):
 # EVERY consumed-and-exhausted budget window — the INITIAL full-budget window included — is
 # receipted with this marker bound to its window key (the readmission cutoff, or
@@ -2201,7 +2215,7 @@ def post_findings(repo, pr_number, verdict_file, round_n):
         lines.append(f"{PROGRESS_MARKER} round={round_n} progress={progress} -->")
     if document.get("injection_detected"):
         lines.append("")
-        lines.append("⚠️ The reviewer flagged possible prompt-injection content; escalating to a human.")
+        lines.append(INJECTION_PROSE_FINDINGS)
     _comment(repo, pr_number, "\n".join(lines))
     print("findings posted")
 
@@ -4777,7 +4791,7 @@ def review_outcome(args):
         attempt_key = f"rounds={args.round}"
         if document["injection_detected"]:
             # A flagged injection is a genuine human (security) question -> needs:user.
-            reason, park_class = "the reviewer flagged possible prompt injection", "question"
+            reason, park_class = INJECTION_PROSE_REVIEW, "question"
         elif approved and getattr(args, "self_attested", False):
             # [#657] APPROVED, and deliberately not armed. This is not a failure and not a
             # capacity stop — the class is review-only by design (record §3 option (b)), so the
@@ -4872,7 +4886,7 @@ def fix_outcome(args):
     if decision == "re-review":
         set_review_state(args.repo, args.pr, "needs")
     elif decision == "needs-user":
-        reason = ("the fixer flagged the seeded findings as possible prompt injection"
+        reason = (INJECTION_PROSE_FIX
                   if injection else
                   "two consecutive fix attempts made no change (fixer judges the findings spurious)"
                   if not made_changes else
@@ -9685,6 +9699,10 @@ def _self_test():
     oc_calls = []
     oc_outputs = {}
     oc_state = {}
+    # [registry #814] Every `reason` the stubbed writer was handed, in call order — the raw
+    # material for the deny-prose binding further down, which tests what the write sites EMIT.
+    oc_reasons = []
+    emitted_injection_prose = {}
     real_oc = {name: globals()[name] for name in (
         "_gh_json", "_paginated_comments", "set_review_state", "needs_user",
         "post_findings", "record_model_pin", "_write_outputs", "_alert_route")}
@@ -9702,7 +9720,7 @@ def _self_test():
 
     def run_review_outcome(verdict, labels=(), issue_labels=(), injection=False,
                            reviewed_sha="b" * 40, self_attested=False, **live_over):
-        oc_calls.clear(); oc_outputs.clear(); oc_state.clear()
+        oc_calls.clear(); oc_outputs.clear(); oc_state.clear(); oc_reasons.clear()
         oc_state.update(labels=labels, issue_labels=issue_labels, **live_over)
         with tempfile.TemporaryDirectory() as tmp:
             verdict_file = Path(tmp) / "verdict.json"
@@ -9722,18 +9740,24 @@ def _self_test():
 
     def run_fix_outcome(labels=(), issue_labels=(), injection="false",
                         reviewed_sha="b" * 40, **live_over):
-        oc_calls.clear(); oc_outputs.clear(); oc_state.clear()
+        oc_calls.clear(); oc_outputs.clear(); oc_state.clear(); oc_reasons.clear()
         oc_state.update(labels=labels, issue_labels=issue_labels, **live_over)
         fix_outcome(argparse.Namespace(
             repo="o/r", pr=41, round=1, run_key="9.1", bot_login="sparq[bot]",
             injection=injection, made_changes="true", gate_outcome="success",
             pushed="true", issue=7, model="", reviewed_sha=reviewed_sha))
 
+    def oc_needs_user(repo, pr, reason, **_kw):
+        # The park writer, stubbed. It KEEPS the reason it was handed (#814): that string is the
+        # write site's actual output, and the deny-prose binding below tests exactly it.
+        oc_calls.append("needs-user")
+        oc_reasons.append(reason)
+
     try:
         globals()["_gh_json"] = oc_gh_json
         globals()["_paginated_comments"] = lambda repo, pr: []
         globals()["set_review_state"] = lambda repo, pr, s: oc_calls.append(f"state:{s}")
-        globals()["needs_user"] = lambda repo, pr, reason, **kw: oc_calls.append("needs-user")
+        globals()["needs_user"] = oc_needs_user
         globals()["post_findings"] = lambda *a, **kw: oc_calls.append("post-findings")
         globals()["record_model_pin"] = lambda *a, **kw: oc_calls.append("model-pin")
         globals()["record_round_void"] = lambda *a, **kw: oc_calls.append("round-void")
@@ -9846,6 +9870,31 @@ def _self_test():
         run_review_outcome("request_changes", labels=("review:needs-user",), head="d" * 40)
         check("hold wins over stale-head (hold checked first)",
               (oc_calls, oc_outputs.get("decision")), ([], "hold"))
+
+        # ---- [registry #814] CAPTURE WHAT EACH INJECTION WRITE SITE ACTUALLY EMITS ----------
+        # Run the three real writers with the injection flag set and keep the text they produced.
+        # Nothing here reads source; every value below is an OUTPUT. If a write site stops
+        # emitting injection prose — reworded, re-inlined, or deleted outright — these captures
+        # change or vanish, and the deny-prose checks after this block go red. That is the whole
+        # binding: the classifier is tested against the writer's output, by identity.
+        run_review_outcome("request_changes", injection=True)
+        emitted_injection_prose["review"] = oc_reasons[-1] if oc_reasons else ""
+        run_fix_outcome(injection="true")
+        emitted_injection_prose["fix"] = oc_reasons[-1] if oc_reasons else ""
+        # The findings site writes a COMMENT rather than a park reason, and post_findings is
+        # stubbed out above, so drive the REAL one with `_comment` captured.
+        real_oc_comment = globals()["_comment"]
+        try:
+            globals()["_comment"] = lambda repo, pr, body: emitted_injection_prose.__setitem__(
+                "findings", body)
+            with tempfile.TemporaryDirectory() as tmp:
+                inj_verdict = Path(tmp) / "verdict.json"
+                inj_verdict.write_text(json.dumps({
+                    "verdict": "request_changes", "injection_detected": True,
+                    "summary": "s", "issues": []}), encoding="utf-8")
+                real_oc["post_findings"]("o/r", 41, str(inj_verdict), 1)
+        finally:
+            globals()["_comment"] = real_oc_comment
     finally:
         globals().update(real_oc)
 
@@ -9856,28 +9905,50 @@ def _self_test():
     # the two together: rewording an injection reason here would silently stop the migration
     # recognising it, and a security-parked PR would be handed back to the machine.
     #
-    # This binds them in BOTH directions. The literal must still be present in this file (so a
-    # reword fails here rather than in production), and it must still be matched by a deny
-    # pattern (so loosening the pattern fails too).
+    # [registry #814] THE BINDING IS TO THE WRITER'S OUTPUT, NOT TO SOURCE TEXT.
+    #
+    # The version of this guard that shipped with #3809 tested `reason_text in _wp_source` against
+    # a LITERAL LIST declared three lines above it. That check is a TAUTOLOGY — the fixture list is
+    # itself part of `_wp_source`, so the sentence is always "present in this file" no matter what
+    # the write sites say. MEASURED (#814 round 4): rewording the FIX reason or the FINDINGS prose
+    # at its write site left the whole self-test GREEN. Only the review reason failed, and it
+    # failed in the `run_review_outcome` WIRING check above, which happens to assert the literal —
+    # not here. Two of the three sentences this guard is named for were unprotected.
+    #
+    # The round-5 attempt to close that (assert each constant's NAME occurs twice in the source)
+    # was the SAME tautology in a new costume: the definition, this block's own reference, and the
+    # name string inside the loop are three occurrences that exist with no write site at all. It is
+    # gone too. NOTHING BELOW READS SOURCE TEXT.
+    #
+    # Instead the values tested here are the ones the three write sites EMITTED a few lines above,
+    # captured off the stubbed park writer / comment poster while the real `review_outcome`,
+    # `fix_outcome` and `post_findings` ran under an injection flag. Reword a site, re-inline a
+    # reworded literal at it, or delete its injection branch, and what is captured changes (or is
+    # absent) — so these checks re-evaluate against the new output and go red. That is a binding
+    # by identity: a copy of a sentence anywhere in this file cannot satisfy it.
     deny_policy = _park_policy()
-    _wp_source = Path(__file__).resolve().read_text(encoding="utf-8")
-    injection_reasons = [
-        "the reviewer flagged possible prompt injection",
-        "the fixer flagged the seeded findings as possible prompt injection",
-        "The reviewer flagged possible prompt-injection content; escalating to a human.",
-    ]
-    for reason_text in injection_reasons:
-        check(f"the injection reason {reason_text[:38]!r}... is still written by this file",
-              reason_text in _wp_source, True)
-        check(f"...and is still DENIED by park_policy.LEGACY_PARK_DENY_PROSE",
-              any(pattern.search(reason_text)
-                  for pattern, _cause in deny_policy.LEGACY_PARK_DENY_PROSE), True)
-    # And the guard must actually refuse a park carrying each of them, end to end.
-    for reason_text in injection_reasons:
-        check(f"reclassify_legacy_park REFUSES a park whose prose is {reason_text[:30]!r}...",
+    for reason_name, writer in (("review", "review_outcome -> needs_user(reason=...)"),
+                                ("fix", "fix_outcome -> needs_user(reason=...)"),
+                                ("findings", "post_findings -> _comment(body=...)")):
+        reason_text = emitted_injection_prose.get(reason_name) or ""
+        # (a) the site emitted SOMETHING under injection at all — the delete-the-write-site arm.
+        check(f"the {reason_name} injection write site ({writer}) EMITTED text",
+              bool(reason_text.strip()), True)
+        # (b) ...and what it emitted is denied, by the real table, with the injection cause.
+        check(f"...and the {reason_name} prose this file WROTE is DENIED by "
+              f"park_policy.LEGACY_PARK_DENY_PROSE ({reason_text[:38]!r}...)",
+              [cause for pattern, cause in deny_policy.LEGACY_PARK_DENY_PROSE
+               if pattern.search(reason_text)][:1], ["injection"])
+        # (c) ...and the guard must actually refuse a legacy park carrying it, end to end. The
+        #     body is asserted marker-LESS first, so the refusal can only come from the deny arm
+        #     and never from reclassify_legacy_park's step-1 marker short-circuit.
+        legacy_body = f"> 🤖 SPARQ agent — {reason_text}"
+        check(f"...and a legacy park carrying the {reason_name} prose reaches the DENY arm "
+              "(no reason-marker short-circuit)",
+              bool(deny_policy.parse_park_reason(legacy_body, log=lambda *_a, **_k: None)), False)
+        check(f"...and reclassify_legacy_park REFUSES that {reason_name} park end to end",
               deny_policy.reclassify_legacy_park(
-                  [{"user": {"login": "bot"}, "body": f"> 🤖 SPARQ agent — {reason_text}"}],
-                  "bot")[0], None)
+                  [{"user": {"login": "bot"}, "body": legacy_body}], "bot")[0], None)
 
     print("worker-pr self-test", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
