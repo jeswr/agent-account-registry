@@ -31,6 +31,7 @@ plan-snapshot.py
 policy-resolve.py
 ready-issues.py
 reconcile-park-misescalation.py
+regate-sweep.py
 resolve-conflicts.py
 retriage.py
 route-resolve.py
