@@ -1,0 +1,37 @@
+{
+ "host_envelope": {
+  "pr": 801,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "9f95cb56c2ad4303daf1903ff9ee1dace8955ecb",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "_issue_is_measurement_run still classifies a single live response, after which _escalate_repeated_declines posts the durable receipt and _gate_issue_as_measurement_run adds needs:ec2 without a final comparison of labels, title, body, state, or issue identity. A change after classification can therefore produce a stale durable gate. Worse, the marked_action == GATE_ACTION reconciliation path reapplies the label solely from the receipt and cached labels without reclassifying the current issue. The new relabel_live tests alter the classifier's own read; they do not mutate any classifier input after that read but before the comment or label write.",
+    "file": "scripts/dispatch-claim.py",
+    "fix_hint": "Bind the action and receipt to a validated snapshot and compare all classifier inputs immediately before persistence/mutation, aborting with no comment or label if any changed. Reconciliation must revalidate current qualification before restoring needs:ec2. Add tripwires that mutate labels, title, body, state, and identity after classification but before the receipt and label calls, and assert no durable action.",
+    "severity": "major",
+    "title": "Gate receipt and label remain unbound to the classified issue state"
+   },
+   {
+    "body": "_apply_cli obtains current labels through view(), then performs the separate live_text() read and classifies the earlier labels with the later title/body. The comment explicitly preserves the split, but the revision-bound mutation/post-condition mechanism does not prove that these classifier inputs coexisted. A bench-surface addition between reads can miss the gate and admit a measurement run; a removal can plan a false durable gate. The self-tests cover malformed text and static classifier cases, not either race direction between view() and live_text() or a change after classification.",
+    "file": "scripts/triage.py",
+    "fix_hint": "Acquire labels, title, and body in one coherent live document, or compare and abort if any classifier input changes before mutation. Add end-to-end race tests for bench-label addition and removal between the reads and after classification, asserting no admission and no stale gate write.",
+    "severity": "major",
+    "title": "Triage still classifies labels and text from separate live snapshots"
+   },
+   {
+    "body": "_apply_cli still gets labels via read_state() and then gets title, body, and state via the separate read_live_body() call. Adding title to the latter read fixes title/body coherence but not coherence with the load-bearing bench labels. plan() can therefore classify a state that never existed: a concurrent bench-label addition can allow an impossible run to be promoted, while a removal can cause a stale needs:ec2 gate. The added tests verify that live title reaches planning and malformed documents fail, but do not exercise either label/text race.",
+    "file": "scripts/retriage.py",
+    "fix_hint": "Read labels, title, body, and state atomically where possible, or re-read and compare every classifier input immediately before applying the decision and abort on change. Add mutation tests for both bench-surface transition directions between read_state() and read_live_body(), plus a post-classification change, and assert fail-closed behavior without a false durable gate.",
+    "severity": "major",
+    "title": "Retriage still plans from a mixed labels/text snapshot"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 4 does not resolve the three round-3 race findings. Dispatch still classifies one live snapshot, then persists an unbound receipt and adds needs:ec2 without revalidating the mutable labels/title/body; reconciliation still trusts that stale receipt. Triage still reads labels and text separately, and retriage still combines labels from read_state() with title/body from read_live_body(). The new tests exercise changes before the classifier read, not changes between classification and persistence/mutation, so they do not cover the reported TOCTOU windows. The same three major fail-closed defects remain at the same severity; progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
