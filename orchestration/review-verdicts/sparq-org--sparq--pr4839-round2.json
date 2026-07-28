@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4839,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "50878409ef50fbb451aa7d27401d788ec3e98478",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "Section 2.3 still says there are 24 `solid_oidc_verifier::` references across seven source files at commit `7f0cfbce`, but `git grep -o \"solid_oidc_verifier::\" 7f0cfbce -- crates/sparq-lws-core/src` yields 25 occurrences. The document explicitly says every count in section 2 was independently measured, so this figure should be accurate.",
+    "file": "research/lws-3-crate-split.md",
+    "fix_hint": "Change `24` to `25`, or state a precise counting rule that intentionally excludes one occurrence.",
+    "severity": "minor",
+    "title": "Solid-OIDC reference count remains off by one"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "The design record remains structurally sound and appropriately scoped as a non-ratified decision package. The sole prior-round finding remains: section 2.3 reports 24 solid_oidc_verifier references, while the stated commit contains 25. This minor measurement error does not undermine the architectural recommendation, but round-to-round progress is stagnant because it was not corrected.",
+  "verdict": "approve"
+ }
+}
