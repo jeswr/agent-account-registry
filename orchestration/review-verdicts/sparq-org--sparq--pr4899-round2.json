@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4899,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "bc68f490fc611e01cd292a179200202e56573cd1",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "improving",
+  "summary": "Round 2 resolves the prior major finding. The new record now defines pipeline::run_federated as the exact analyzed protocol, correctly states that step 5 performs no reconstruction, limits the call-graph inventory to opens reachable from that entry point, and explicitly enumerates excluded production reconstruction surfaces. The implementation supports the 64-open inventory: deal_full_field_solved_bits invokes the square protocol 61 times, secure_bit_decompose_rabbit performs one masked reconstruction, verify_value_in_range_rabbit performs one masked zero-test, and open_verdict performs the final output reconstruction. The existing threshold boundary test invokes disclose_threshold_verdict on actual aggregate sharings and checks strict comparison behavior, so it is not vacuous. The simulation claims remain carefully scoped to public opened values, with the absent per-party-view proof, trusted dealer, semi-honest limitation, and pending external audit stated explicitly. No new correctness, soundness, security, or hostile-instruction issue was found.",
+  "verdict": "approve"
+ }
+}
