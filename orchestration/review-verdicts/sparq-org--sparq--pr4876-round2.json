@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4876,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "fd84927471230021766da528a0908a85c7cf2cd8",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The revised text says the authorization decision runs before any existence probe for every GET/HEAD/PUT/POST/DELETE/PATCH handler. GET/HEAD do not have that ordering: serve_read calls authorize_read, and authorize_read first calls Store::read_plan, which fetches the target metadata and ACL candidates together, then calls authorize_read_planned to decide access. The implementation still avoids disclosure because plan.target is only consumed after an Allow, but the target existence probe itself precedes the decision. This remains an inaccurate security-boundary claim.",
+    "file": "crates/sparq-lws-core/src/ldp/mod.rs",
+    "fix_hint": "Describe the actual invariant instead of a universal call-order claim: unauthorized requests never receive a target-dependent response, and target content/metadata is not acted upon before authorization. If retaining a strict before-probe statement, scope it only to mutation handlers whose implementation genuinely authorizes before target-dependent metadata/existence access, and explain that GET/HEAD safely batch principal-independent target metadata with ACL metadata but consume it only after Allow.",
+    "severity": "major",
+    "title": "Module docs still misstate GET/HEAD authorization ordering"
+   }
+  ],
+  "progress": "stagnant",
+  "summary": "Round 1's OPTIONS exception is now documented accurately, but the same module-level security-boundary paragraph still overstates the ordering guarantee. GET/HEAD use the optimized authorize_read path, whose Store::read_plan fetches the target metadata (including whether it exists) before authorize_read_planned produces the WAC decision. The response remains non-disclosing because target metadata is not acted on until after authorization, but it is not true that the decision runs before every existence probe. Because the remaining defect is materially the same major honesty issue in the same claim, progress is stagnant.",
+  "verdict": "request_changes"
+ }
+}
