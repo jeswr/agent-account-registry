@@ -4,6 +4,17 @@
 # Also reclaims the short-TTL `review:`/`fix:` leases (20/60 min) from the cross-provider review
 # loop, so a crashed reviewer never pins a scarce codex slot: the dispatch sweep's stuck-state
 # reconciler then re-emits the PR (or escalates it to needs-user) on a later tick.
+#
+# The reclaim is NO LONGER BLIND (issue #35). A lease whose holder run is still ACTIVE has its
+# expiry RENEWED instead of dropped — this cron is the ledger's heartbeat. It has to renew rather
+# than merely skip, because every duplicate-suppression consumer reads `expires_at > now` and not
+# the row's presence, so an expired-but-present row would suppress nothing. Reading the holder
+# run's status is what `actions: read` below is for; a dead/absent run, a run outside the
+# lease-holding workflows, a holder with no run id, and any lease past its renewal ceiling are all
+# still reclaimed exactly as before. When the probe itself fails (403/5xx) the decision waits for
+# the next tick, and the row is HELD on a short grace expiry meanwhile — for the same reason: a
+# deferral that left the row expired would defer nothing and would re-open the double-dispatch on
+# any transient API blip. The renewal ceiling still bounds it.
 name: groom-leases
 on:
   schedule:
@@ -12,6 +23,7 @@ on:
 
 permissions:
   contents: write   # CAS-update data/leases.json on the `ledger` data-plane branch (issue #28)
+  actions: read     # read the holder run's status before reclaiming its lease (issue #35)
 
 # Scheduler-singleton semantics (#559 dup-dispatch storms; registry #563 adoption item 1): this
 # cron previously had NO concurrency group, so an overlapping fire (cron + keepalive/manual kick)

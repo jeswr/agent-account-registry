@@ -72,8 +72,28 @@ cache-affinity-preferred) has a free slot, append a lease with a **unique `claim
 then `PUT` the file with the read SHA. A concurrent writer changed the SHA → the `PUT` is rejected
 (409) → retry. Because every codebase CAS-updates the **same** ledger, capacity is enforced globally
 without reaction counting. **Release** and **heartbeat** are keyed by the unique `claim_id`
-(idempotent). The groomer **reclaims** leases past `expires_at` (a dead/cancelled worker frees its
-slot automatically — no receipt-guessing).
+(idempotent). The groomer (`groom-leases`, every 15 min) **reclaims** leases past `expires_at`, so a
+dead/cancelled worker frees its slot automatically — no receipt-guessing.
+
+That reclaim is **not blind** (issue #35). A lease whose holder records a still-**active** worker /
+review-fix run has its `expires_at` **renewed** instead, and renewed *before* it lapses rather than
+after, so a legitimately long run — the worker lease's TTL covers only the agent job, while the
+publish and review-prep jobs that follow it have their own timeouts — never has its slot handed to
+a second worker mid-run. It has to move `expires_at` rather than merely keep the row, because every
+duplicate-suppression consumer (`reclaim_expired`, `partition_available`, dispatch's
+`_live_holder_keys` / `sibling_lease_conflict`) reads *that field*, not the row's presence. A
+dead/absent run, a run outside the two lease-holding workflows, a holder with no run id (the
+TTL-managed `review:`/`fix:` repair leases), and any lease older than the **6-hour renewal ceiling**
+are all still reclaimed — the ceiling is what stops a run wedged in `in_progress` from trading the
+double-dispatch for a permanent capacity leak.
+
+When the Actions API does not answer at all (403/5xx/garbage body), the ownership decision is
+**deferred to the next tick — and the row is held on a short 30-minute grace deadline** while it
+waits. Deferring by leaving the expired row untouched would defer *nothing*: by the paragraph above
+an expired row suppresses nothing, so one transient probe failure would hand the account and the
+holder key straight to the next dispatcher while the original run may still be writing. The grace
+is shorter than a proven-live renewal, keeps the row inside its lead window so every tick re-probes
+it, and never outruns the same 6-hour ceiling — a probe that never recovers still cannot pin a slot.
 
 ### The `package` partition has ONE canonical derivation (and one pinned copy)
 
