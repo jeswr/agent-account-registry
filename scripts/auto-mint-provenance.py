@@ -1202,6 +1202,32 @@ def _self_test():                                                       # noqa: 
                                             ("Closes #7", issue(pull_request={"u": "x"})),
                                             ("Closes #7", issue(state="closed")))],
           [None, None, None, None])
+    # ---- THE DERIVATION'S OWN CALL SITE, argument by argument ---------------------------------
+    # WHY THIS BLOCK EXISTS. `derive_issue_number` is the ONLY production caller of
+    # `candidate_refusal`, and every negation and mention fixture above it stops at
+    # `closing_references` / `candidate_refusal` and hand-passes the very argument under test. That
+    # asserts a property of the FUNCTION while leaving the WIRING unobserved, and the wiring is the
+    # whole design: MEASURED, dropping the third argument at the one call site below turned
+    # `Closes #7. This does not close #8.` from an `ambiguous-issue-reference` refusal into a silent
+    # mint of the survivor — with the entire suite still green. Every argument of that call is
+    # therefore pinned here THROUGH the real derivation, so a dropped or rebound one reds a check
+    # named for what it costs.
+    negated_two = "Closes #7. This does not close #8."
+    check("ARG 3 (all_refs): a negated reference still reaches the AMBIGUITY gate through the "
+          "real derivation, so the survivor is never silently bound",
+          (derive(negated_two).number, derive(negated_two).reason), (None, REASON_AMBIGUOUS))
+    check("ARG 1 (declared): a body whose ONLY reference is negated refuses for having no "
+          "declaration — the suppressor really is applied on the production path",
+          (derive("This PR does not close #7.").number,
+           derive("This PR does not close #7.").reason), (None, REASON_NO_REFERENCE))
+    check("ARG 2 (mentions): the advisory numbers reach the refusal MESSAGE the author reads",
+          total(lambda: all(token in derive("it relates to #7 and to #8").message
+                            for token in ("#7", "#8"))), True)
+    # ...and the mention list itself reads the STRIPPED text, so the hint can never advertise a
+    # number that exists only inside quoted context the grammar already refused to read.
+    check("...and the mention list reads the same STRIPPED text the grammar does",
+          mentioned_issue_numbers("t", "`#1234`\n> #999\n<!-- #888 -->"), [])
+
     check("a malformed pull payload refuses rather than raising",
           total(lambda: derive_issue_number(None, lambda n: issue()).reason),
           REASON_ISSUE_UNREADABLE)
@@ -1336,12 +1362,18 @@ def _self_test():                                                       # noqa: 
             self.issues, self.comments = issues or {}, comments or {}
             self.actions = actions or {}
             self.written, self.posted = [], []
+            # WHAT THE WRITER WAS HANDED, recorded verbatim. A fixture that only looks at the
+            # RESULT cannot tell a dropped argument from a kept one, which is how a call site
+            # becomes an untested seam while its callee is exhaustively unit-tested.
+            self.handed = []
 
         def run(self, *, apply_changes=True, max_mints=DEFAULT_MAX_MINTS,
                 max_comments=DEFAULT_MAX_COMMENTS, annotate_repo="o/r",
                 targets=(("o/r", ("jeswr",)),), record_boom=False, pulls_boom=False,
                 mint_boom=False):
             def mint_pr(repo, number, issue_number, routing, authors, pl, iss):
+                self.handed.append({"repo": repo, "number": number, "issue_number": issue_number,
+                                    "routing": routing, "authors": authors, "issue": iss})
                 if mint_boom:
                     raise RuntimeError("registry PUT failed: HTTP 502")
                 action, reason = self.actions.get(
@@ -1379,6 +1411,19 @@ def _self_test():                                                       # noqa: 
           (row["minted"], rec.written), (1, [("o/r", 41, 7)]))
     check("...and the census counts it as lacking a record beforehand", row["lacking_record"], 1)
     check("...and posts no refusal comment", rec.posted, [])
+    # WHAT THE WRITER WAS HANDED. Asserting only the RESULT cannot distinguish a forwarded argument
+    # from a dropped one — both produce the same census row here — so each is read back off the
+    # recorded call. Dropping either is a silent TOTAL outage of the feature (the shared gate
+    # refuses an unreadable issue and an alias missing from the catalog), and an outage that
+    # censuses itself as `mint-refused` is exactly the shape this file exists to make impossible.
+    check("...and hands the writer the issue it ALREADY read, so the mint neither re-reads nor "
+          "re-derives it",
+          total(lambda: (rec.handed[0]["issue"] or {}).get("number")), 7)
+    check("...and the TARGET's own routing catalog, which is what the pinned alias resolves against",
+          total(lambda: rec.handed[0]["routing"]),
+          {"models": {AUTO_IMPL_ALIAS: {"provider": "anthropic"}}})
+    check("...and the derived issue number, not the PR's own",
+          total(lambda: (rec.handed[0]["number"], rec.handed[0]["issue_number"])), (41, 7))
 
     # IDEMPOTENCE: a second tick over the record the first one wrote is a NO-OP.
     rec2 = _Recorder(clean, records={41: json.dumps({"pr_number": 41})})
@@ -1421,6 +1466,48 @@ def _self_test():                                                       # noqa: 
         check(f"...and the refusal for {label} is VISIBLE on the PR",
               (len(rec.posted), posted[0], refusal_marker(reason) in posted[1]),
               (1, 41, True))
+
+    # THE NEGATED REFERENCE, END TO END THROUGH THE REAL SWEEP. The one fixture shape the negation
+    # rule never had: every other negation check stops before `derive_issue_number`, so nothing
+    # observed that the ambiguity gate is fed `all_refs` on the production path. This drives a
+    # negated body through the real writer and asserts the tick wrote NOTHING.
+    negated = _Recorder([pull(number=41, body="Closes #7. This does not close #8.")])
+    row = negated.run()
+    check("the sweep REFUSES a negated-reference PR end to end and writes nothing",
+          (row["minted"], row["refused"], row["refusals"], negated.written, negated.handed),
+          (0, 1, {REASON_AMBIGUOUS: 1}, [], []))
+    check("...and the refusal it posts is the AMBIGUITY one, naming both references",
+          total(lambda: (refusal_marker(REASON_AMBIGUOUS) in negated.posted[0][1],
+                         "#7" in negated.posted[0][1], "#8" in negated.posted[0][1])),
+          (True, True, True))
+    # ...and the suppressor really is applied on that path too: a body whose only reference is
+    # negated refuses for having NO declaration rather than binding the one it suppressed.
+    only_negated = _Recorder([pull(number=41, body="This PR does not close #7.")])
+    row = only_negated.run()
+    check("...while a body whose ONLY reference is negated refuses as un-declared, not by binding it",
+          (row["minted"], row["refusals"], only_negated.written),
+          (0, {REASON_NO_REFERENCE: 1}, []))
+
+    # THE ENROLLED-CLASS FILTER IS AT THE SWEEP'S OWN CALL SITE. `enrolled_class_pulls` is
+    # exhaustively unit-tested above, but nothing drove a NON-enrolled author through `sweep`, so
+    # dropping the filter there minted provenance for strangers and bots with the suite green — the
+    # blast-radius pin #916 deliberately deferred, undone by a one-line edit.
+    mixed_authors = _Recorder([pull(number=41, body="Closes #7"),
+                               pull(number=42, body="Closes #7", user={"login": "stranger"}),
+                               pull(number=43, body="Closes #7",
+                                    user={"login": "dependabot[bot]"})])
+    row = mixed_authors.run()
+    check("the sweep counts and mints the ENROLLED class ONLY — a stranger and a bot are neither",
+          (row["enrolled_pulls"], row["minted"], mixed_authors.written),
+          (1, 1, [("o/r", 41, 7)]))
+
+    # THE REFUSAL COMMENT CARRIES THE DERIVATION'S OWN MESSAGE. Without this, `refuse()` could be
+    # handed a constant and every author would get an unactionable comment naming no numbers.
+    messaged = _Recorder([pull(number=41, body="it relates to #7 and to #8")])
+    messaged.run()
+    check("the posted comment carries the DERIVATION's message, not a generic one",
+          total(lambda: all(token in messaged.posted[0][1]
+                            for token in ("#7", "#8", "declares no closing reference"))), True)
 
     refused_by_shared = _Recorder(
         clean, actions={41: (mint_provenance.ACTION_REFUSE, "the pull request is a DRAFT")})
