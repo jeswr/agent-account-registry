@@ -137,13 +137,18 @@ CLOSING_REF_RE = re.compile(
 # `strip_quoted_contexts`), which REWRITES line structure — so running either line-level strip after
 # one of them reads lines the author did not write.
 #
-# MEASURED, on the live population: with the blockquote strip last, substituting a newline for the
-# code span in PR #781's line 0 —
+# HOW THIS WAS FOUND, and what actually holds it. Substituting a newline for the code span in PR
+# #781's live line 0 —
 #     > 🤖 **SPARQ agent** … no `VERDICT:` line. Closes #777.
 # — split that ONE quoted line into two, the second of which no longer began with `>`, so the strip
 # stopped seeing it and `Closes #777` became a live declaration out of a self-identification banner
-# the author never meant as one. That is the round-1 blocking class exactly, reintroduced by the
-# substitution. The order below is what makes the newline safe; the self-test pins that shape.
+# the author never meant as one: the round-1 blocking class exactly, reintroduced by the fix.
+#
+# That particular vector no longer depends on the order, because `SPAN_SENTINEL` is not a newline
+# any more (see `strip_quoted_contexts`) — so do not read it as the thing this order buys. What
+# still separates the two orders, MEASURED both ways, is an INLINE HTML COMMENT in a quoted line
+# (`> 🤖 agent <!-- marker --> Closes #777.`), which is replaced by a real newline and un-quotes the
+# remainder if the blockquote strip runs after it. That is the shape --self-test pins the order to.
 #
 # Among the remaining three, an HTML comment can contain a fence and a fence can contain backticks.
 #
@@ -1464,7 +1469,7 @@ def _self_test():                                                       # noqa: 
     check("...and hands the writer the issue it ALREADY read, so the mint neither re-reads nor "
           "re-derives it",
           total(lambda: (rec.handed[0]["issue"] or {}).get("number")), 7)
-    check("...and the TARGET's own routing catalog, which is what the pinned alias resolves against",
+    check("...and the TARGET's own routing catalog, which the pinned alias resolves against",
           total(lambda: rec.handed[0]["routing"]),
           {"models": {AUTO_IMPL_ALIAS: {"provider": "anthropic"}}})
     check("...and the derived issue number, not the PR's own",
@@ -1529,7 +1534,7 @@ def _self_test():                                                       # noqa: 
     # negated refuses for having NO declaration rather than binding the one it suppressed.
     only_negated = _Recorder([pull(number=41, body="This PR does not close #7.")])
     row = only_negated.run()
-    check("...while a body whose ONLY reference is negated refuses as un-declared, not by binding it",
+    check("...while a body whose ONLY reference is negated refuses as un-declared, not by binding",
           (row["minted"], row["refusals"], only_negated.written),
           (0, {REASON_NO_REFERENCE: 1}, []))
 
