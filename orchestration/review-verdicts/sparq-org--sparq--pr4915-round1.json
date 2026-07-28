@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4915,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "ba20e74a9e077d37cfd38b2d69bb2f83f6127b03",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The PR changes `scripts/coverage.sh` so `sparq-reason` includes the entire feature-gated Datalog module in its line-coverage denominator, but leaves the floor at 90 from the prior default-feature-only measurement. The new note explicitly says no with-Datalog measurement was taken. Consequently the PR provides no evidence that the coverage gate passes, and the committed floor no longer represents the surface the script measures. Deferring re-seeding to a later CI-driven change makes this ratchet update incomplete and may make the coverage job deterministically fail if the expanded percentage is below 90.",
+    "file": "bench/coverage-floor.json",
+    "fix_hint": "Run the exact updated coverage command in the pinned CI/toolchain environment, capture the `sparq-reason` with-Datalog percentage, and update this entry in the same PR using the repository's seed procedure (including the intentional larger-denominator lowering path if required). If the measured result still supports floor 90, record that measurement in the note instead of saying the floor is unmeasured.",
+    "severity": "major",
+    "title": "Coverage floor is unvalidated for the newly expanded denominator"
+   }
+  ],
+  "progress": null,
+  "summary": "The coverage command is wired correctly to compile and test `sparq-reason` with its default features plus `datalog`, but the change is incomplete as a coverage-ratchet update: it deliberately retains a floor derived from a different, smaller denominator without providing any measurement showing that the expanded surface satisfies that floor. The accompanying documentation acknowledges that the number is not a measurement and defers the necessary re-seed. Land the measured floor (or evidence that the existing floor remains valid) with the wiring so the committed gate is reproducible and known to pass.",
+  "verdict": "request_changes"
+ }
+}
