@@ -19598,6 +19598,37 @@ def _partition_starvation_record_seam_self_test():
     print("  ok   [sparq#4821] YAML SEAM (executed): dispatch.yml RECORDS partition starvation for "
           "a starved lane and for neither a healthy nor an empty one — the sweep's only input")
 
+    # ---- ...and the `assemble-census` line it sits under, for the same reason one layer up.
+    # THIS LINE IS THE INSTRUMENT. `reason.global-reservation=` is the only per-tick record of
+    # whether the serializing partition was held, and the duty cycle of this defect class is
+    # measurable ONLY from it — 11 executed ticks in the sparq#4821 measurement window are
+    # permanently unmeasurable because they predate it. Nothing asserted its shape: mutant Y4
+    # (drop the `reason.` bucket list) survived the whole four-script suite, which would have made
+    # the class invisible again with everything green. Executed, on the production source.
+    census_block = _workflow_step_python(
+        "dispatch.yml", "plan", r'(?m)^[ \t]*print\("assemble-census " \+ " "\.join\(',
+        r'(?m)^[ \t]*# Recorded ONLY for a genuinely starved lane', "assemble-census emission")
+    census_out = io.StringIO()
+    with contextlib.redirect_stdout(census_out):
+        exec(compile(textwrap.dedent(census_block), "<dispatch.yml assemble census>",  # noqa: S102
+                     "exec"),
+             {"repo": "example/repo", "rows_before_assemble": 4,
+              "partition_census": {"total": 4, "kept": 0,
+                                   "by_reason": {"global-reservation": 4, "crate-conflict": 0},
+                                   "by_held_area": {GLOBAL_PACKAGE: 4},
+                                   "by_holder": {"4804": 4}}})
+    assert census_out.getvalue().strip() == (
+        "assemble-census example/repo rows_before=4 deferred=4 kept=0 reason.crate-conflict=0 "
+        f"reason.global-reservation=4 area.{GLOBAL_PACKAGE}=4 holder.pr4804=4"), \
+        census_out.getvalue()
+    # BRACE-FREE, asserted rather than described: GitHub's secret masker rewrites `{`/`}` to `***`,
+    # so a census that ever grew a JSON dump would arrive corrupted on the feed that reads it.
+    assert "{" not in census_out.getvalue() and "}" not in census_out.getvalue(), \
+        census_out.getvalue()
+    print("  ok   [sparq#4821] YAML SEAM (executed): the `assemble-census` line carries the "
+          "per-reason / per-held-area / per-holder buckets — the only per-tick record that the "
+          "serializing partition was held, and brace-free so the masker cannot eat it")
+
 
 def _starvation_sweep_self_test():
     item = {"number": 900, "package": "crate-a", "deferred": False}
