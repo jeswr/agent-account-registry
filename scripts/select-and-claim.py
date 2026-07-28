@@ -3076,8 +3076,9 @@ def _self_test():
     # hoisted read or a pinned expected-SHA could not fail the assertion no matter how wrong it was.
     def _drive_writer(transaction, ledger_rows, put_errors, accounts=()):
         """Drive one REAL writer transaction over a fake gh. `put_errors[i]` is attempt i's PUT
-        stderr ("" = success). Returns (outcome-or-'LeaseIOError:...', gh calls, throttle sleeps)."""
-        calls, sleeps = [], []
+        stderr ("" = success). Returns (outcome-or-'LeaseIOError:...', gh calls, throttle sleeps,
+        de-sync-jitter call positions)."""
+        calls, sleeps, jitter_at = [], [], []
 
         def fake_gh(args, **_kwargs):
             calls.append(list(args))
@@ -3094,7 +3095,7 @@ def _self_test():
                  ledger_retry.sleep_transient, globals()["read_accounts"])
         subprocess.run = fake_gh
         globals()["_sleep_backoff"] = lambda attempt: None
-        globals()["_pre_write_jitter"] = lambda: None
+        globals()["_pre_write_jitter"] = lambda: jitter_at.append(len(calls))
         ledger_retry.sleep_transient = (
             lambda attempt, retry_after=None, **_k: sleeps.append((attempt, retry_after)))
         globals()["read_accounts"] = lambda repo: [dict(a) for a in accounts]
@@ -3105,14 +3106,14 @@ def _self_test():
         finally:
             (subprocess.run, globals()["_sleep_backoff"], globals()["_pre_write_jitter"],
              ledger_retry.sleep_transient, globals()["read_accounts"]) = saved
-        return outcome, calls, sleeps
+        return outcome, calls, sleeps, jitter_at
 
     def _writer_budget_checks(label, transaction, ledger_rows, project, landed, accounts=()):
         """The four #558 properties, asserted through ONE REAL writer transaction end to end."""
         # (a) THE BUDGET IS WIRED AT THIS WRITER'S PUT. Drop `budget` from THIS call site and
         #     `_write_ledger` raises LeaseIOError on the first secondary-403 (the pre-#558
         #     fail-loud behaviour), so this writer's copy of the check — and only this one — reds.
-        outcome, calls, sleeps = _drive_writer(
+        outcome, calls, sleeps, jitter_at = _drive_writer(
             transaction, ledger_rows, [SECONDARY_403, ""], accounts)
         gets = [c for c in calls if "-X" not in c]
         puts = [c for c in calls if "-X" in c]
@@ -3121,6 +3122,13 @@ def _self_test():
         check(f"{label} secondary-403 retry RE-READ the ledger", len(gets), 2)
         check(f"{label} secondary-403 retry issued exactly two PUTs", len(puts), 2)
         check(f"{label} secondary-403 retry slept the throttle schedule once", sleeps, [(1, None)])
+        # THIS writer's de-sync jitter (#558 part b), asserted PER WRITER for the same reason the
+        # budget is: the suite-wide "at least one jitter call happened" check is satisfied by any
+        # one writer, so dropping `_pre_write_jitter()` from a single transaction left nothing red.
+        # Exactly once, and BEFORE the first gh call — jittering between the read and the PUT would
+        # widen the CAS window instead of de-phasing the writers.
+        check(f"{label} the transaction opened with the de-sync jitter, once, before the first "
+              "ledger read", jitter_at, [0])
         # (b) NO STALE-REVISION REPLAY: every PUT carries the revision returned by the read that
         #     PRECEDED it, and the reads returned DISTINCT revisions. Both halves are asserted —
         #     the second is what makes the first non-vacuous.
@@ -3131,7 +3139,7 @@ def _self_test():
               ([f"sha={rev}" for rev in read_revs], 2))
         # (c) FATAL still fails at ONCE for this writer: one PUT, loud, no sleep. The budget must
         #     widen the transient class only — never turn a permission verdict into four retries.
-        outcome, calls, sleeps = _drive_writer(
+        outcome, calls, sleeps, _j = _drive_writer(
             transaction, ledger_rows,
             ["gh: Resource not accessible by integration (HTTP 403)", ""], accounts)
         check(f"{label} a permission 403 is NOT retried (one PUT, loud failure, no sleep)",
@@ -3139,7 +3147,7 @@ def _self_test():
                sum(1 for c in calls if "-X" in c), sleeps), (True, 1, []))
         # (d) a PERSISTENT throttle terminates LOUD inside the bounded budget: it never spins, and
         #     it never silently skips the ledger write (which strands or double-issues a slot).
-        outcome, calls, _sl = _drive_writer(
+        outcome, calls, _sl, _j = _drive_writer(
             transaction, ledger_rows, [SECONDARY_403] * 12, accounts)
         check(f"{label} a persistent throttle fails loud inside the bounded budget",
               (str(outcome).startswith("LeaseIOError:"), "transient" in str(outcome),
@@ -3166,6 +3174,14 @@ def _self_test():
         "claim():", lambda: claim("o/r", "p", "impl", ["sol"], "o/r#559@run9.1", now),
         [], lambda outcome: isinstance(outcome, dict) and outcome.get("account"), "acctw558",
         accounts=W558_ACCOUNTS)
+    # release()'s LOST-RELEASE contract, which nothing pinned: a CAS that keeps CONFLICTING must
+    # return False. Returning True there is a SILENT SUCCESS — the caller stops retrying, believes
+    # the slot is free, and the lease sits stranded until groom's dead-lease sweep reaps it, which
+    # is the same stranded-slot outcome #558 exists to prevent, reached by a different route.
+    lost_release, lost_calls, _ls, _lj = _drive_writer(
+        lambda: release("o/r", RELEASE_CID, now), [release_row], ["gh: ... (HTTP 409)"] * 12)
+    check("release(): a CAS that keeps CONFLICTING returns False, never a silent success",
+          (lost_release, sum(1 for c in lost_calls if "-X" in c)), (False, 6))
 
     # Every CAS transaction driven above opened with the jitter (never zero — a lost call would mean
     # a writer path that no longer de-synchronizes).
