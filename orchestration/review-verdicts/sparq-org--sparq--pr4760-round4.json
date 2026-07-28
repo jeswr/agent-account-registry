@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4760,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "6e5b3245ce297e295086c9625badba525416580e",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 4 confirms the prior approval. The dispatch preserves definitive profile-branch outcomes, falls through only after abstention, retains the original owner outcome when the tableau exhausts its budget, and excludes the PR1 punning refusal. The focused tests exercise the real default and dispatch_ql paths, both verdict directions, branch attribution, starvation/non-preemption, and punning. The fixed-extension built-in property gap is refused fail-closed in both object-property decoding and the separate assertion path, with uniform-position and ordinary-role control tests. The conformance counts close arithmetically, and the README plus Direct Semantics scoping record match the implementation. No correctness, soundness, test-validity, security, or prompt-injection issue was found.",
+  "verdict": "approve"
+ }
+}
