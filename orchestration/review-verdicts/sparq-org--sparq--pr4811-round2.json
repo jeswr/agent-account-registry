@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 4811,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "cab76f3e350ad82d677e6bbbc8d3b92742866958",
+  "round": 2
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "For count legs, `bench` first prints the oxttl feature set and allocator, but `sed -n '/allocs\\/parse/,$p'` discards all of that metadata and starts at the allocation-table header. Consequently the default `count-alloc` and `rdf-12,count-alloc` outputs have the same visible build description and no visible feature identity. This contradicts the script comment and README guidance that the configuration is printed alongside every count, and the one-command output cannot demonstrate which row is the production-relevant rdf-12 measurement or that it matches default.",
+    "file": "bench/parse/oxttl-prefix-alloc/ab.sh",
+    "fix_hint": "Do not discard the metadata for count runs. Either print an explicit configuration heading from `$feats` before each invocation, or filter timing rows while retaining the corpus, oxttl-features, allocator, iterations, digest, and allocation table. Ensure captured stdout unambiguously labels both count configurations.",
+    "severity": "major",
+    "title": "Count-leg filtering discards the configuration identity needed to reproduce the recorded rows"
+   },
+   {
+    "body": "`before = counting::snapshot()` is taken before `Vec::with_capacity(iters)`, so allocation-mode results include the allocation of the harness's `runs` vector. The total is then integer-divided by `iters` and labeled `allocs/parse`, although this allocation occurs once per benchmark invocation rather than once per parse. This makes the exact count depend on iteration count and weakens the claimed parser-allocation metric.",
+    "file": "bench/parse/oxttl-prefix-alloc/src/main.rs",
+    "fix_hint": "Allocate `runs` before taking the `before` snapshot, or avoid retaining runs in count mode and validate each result against the warm-up as it is produced. Keep all harness bookkeeping allocations outside the measured window.",
+    "severity": "minor",
+    "title": "The allocation window counts a harness Vec allocation as parser work"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Both round-1 major findings were addressed: ab.sh now builds the documented feature combinations, and the allocation-count claims are scoped to a fixed build configuration. However, the new count-leg filtering removes the feature and allocator metadata immediately before presenting each result, so the registered one-command output cannot distinguish the default count from the rdf-12 count or substantiate the documented comparison. The measurement window also includes a harness-owned Vec allocation while labeling the quotient as allocations per parse. Because a new major reproducibility defect remains, progress is regressing under the required round-comparison scale.",
+  "verdict": "request_changes"
+ }
+}
