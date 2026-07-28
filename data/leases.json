@@ -32,16 +32,6 @@
   },
   {
    "account": "9e13ea21abf27e68",
-   "claim_id": "7a84bdf788aa49649aa3fb1854de7160",
-   "holder": "sparq-org/sparq#2655@30399014325.1",
-   "package": "sparq-vectors",
-   "role": "impl",
-   "model": "opus5",
-   "issued_at": 1785272615,
-   "expires_at": 1785278915
-  },
-  {
-   "account": "9e13ea21abf27e68",
    "claim_id": "75b03a22dce64c8fb20b3766d79342d3",
    "holder": "sparq-org/sparq#3147@30399021439.1",
    "package": "zk-xpath",
