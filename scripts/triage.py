@@ -1538,6 +1538,89 @@ def _self_test():
             (True, [], []))
 
     # -----------------------------------------------------------------------------------------------
+    # [registry #1054] THE READY+BUSY PAIR — triage must not re-mint `status:ready` over a live
+    # defer. The fixture below is the VERBATIM label set registry #1037 held at 2026-07-28T16:27:06Z,
+    # the instant `sparq-orchestrator[bot]` finished deferring it; 21 seconds later this classifier
+    # stamped `status:ready` back on, and the issue has been undispatchable ever since.
+    deferred_1037 = ["area:dispatch", "priority:P1", "role:impl", "self-improvement",
+                     "status:deferred"]
+    r = triage(deferred_1037, "task")
+    post = (set(deferred_1037) | r["add"]) - r["remove"]
+    chk("[#1054] a freshly-DEFERRED, classification-complete issue is NOT re-promoted to ready",
+        ("status:ready" in r["add"], "status:ready" in post,
+         {"status:ready", "status:deferred"} <= post),
+        (False, False, False))
+    # `ready` is the CLASSIFICATION verdict and MUST stay true — retriage.py (`classifier-incomplete`)
+    # and triage-stock-alert.py (`machine_owed`) both read it as "has the classifier finished with
+    # this issue", and a withheld LABEL is not an unfinished classification. Flipping the field
+    # instead of the write would silently re-open registry #799's untriaged deadlock.
+    chk("[#1054] ...but the classification VERDICT retriage/stock-alert consume is unchanged",
+        (r["ready"], r["role"], len(r["warnings"])), (True, "impl", 1))
+    chk("[#1054] ...and the withholding is NAMED in a warning, not silent",
+        ("status:deferred" in r["warnings"][0] and "withholding status:ready" in r["warnings"][0]),
+        True)
+    # The CONTROL, and the half that kills an inverted guard: with no dispatcher-owned status live,
+    # the promotion is unchanged. Without this row, `if not held` passes every assertion above.
+    chk("[#1054] CONTROL: with no dispatcher status live the promotion still fires",
+        sorted(triage(["area:dispatch", "priority:P1", "role:impl", "status:untriaged"],
+                      "task")["add"]), ["status:ready"])
+    # Every member of the set, individually — a guard that keeps the CONSTANT but drops one member
+    # is the mutation a whole-set assertion cannot see (`status:deferred` is 30/30 of the measured
+    # population, but the in-progress pair was re-minted on the same timelines).
+    for held_label in sorted(DISPATCHER_OWNED_STATUS):
+        seed = ["area:dispatch", "priority:P1", "role:impl", held_label]
+        chk(f"[#1054] ...for each dispatcher-owned status individually: {held_label}",
+            "status:ready" in triage(seed, "task")["add"], False)
+    # Still a FIXED POINT under the new branch: the withheld plan must be EMPTY, not oscillating.
+    chk("[#1054] the withheld plan is a fixed point (no add, no remove, no churn)",
+        (sorted(r["add"]), sorted(r["remove"])), ([], []))
+
+    # MUTATION. Every row above passes against a guard that is present but INERT, so the guard is
+    # re-derived from this file's own source with the behaviour broken and the STRUCTURE those rows
+    # inspect left intact — the constant still exists, `held` is still computed, the branch is still
+    # there. Each mutant must be killed by a NAMED assertion below, never by an exception.
+    import os as _os  # noqa: PLC0415 — this suite imports os function-locally throughout
+    _self_path = _os.path.abspath(__file__)
+    with open(_self_path, encoding="utf-8") as _fh:
+        _src = _fh.read()
+
+    def _mutant(old, new, label):
+        mutated = _src.replace(old, new)
+        assert mutated != _src, f"[#1054] mutation target moved ({label}) — refusing to pass"
+        namespace = {"__name__": "triage_mutant", "__file__": _self_path}
+        exec(compile(mutated, f"<mutant:{label}>", "exec"), namespace)  # noqa: S102
+        return namespace["triage"]
+
+    # (m1) the constant survives by NAME but is emptied — the "name inside a zero-valued counter"
+    # shape: every structural check for DISPATCHER_OWNED_STATUS still finds it.
+    _m1 = _mutant('DISPATCHER_OWNED_STATUS = frozenset({\n    "status:deferred",',
+                  'DISPATCHER_OWNED_STATUS = frozenset({\n    ' + '"__never__",', "emptied-set")
+    chk("[#1054] MUTANT emptied-set (constant present, membership gone) RE-MINTS the pair",
+        "status:ready" in _m1(deferred_1037, "task")["add"], True)
+    # (m2) the guard is computed and the warning still raised — but the write happens anyway. This
+    # is the mutant a warnings-only or `ready`-only assertion cannot distinguish.
+    _m2 = _mutant("        if held:\n", "        if False:\n", "guard-never-fires")
+    chk("[#1054] MUTANT guard-never-fires RE-MINTS the pair",
+        "status:ready" in _m2(deferred_1037, "task")["add"], True)
+    # (m3) inverted: withholds on the CLEAN issue and promotes on the deferred one. Killed only by
+    # the CONTROL row's mirror below, which is why the control exists.
+    _m3 = _mutant("        if held:\n", "        if not held:\n", "inverted-guard")
+    chk("[#1054] MUTANT inverted-guard RE-MINTS the pair",
+        "status:ready" in _m3(deferred_1037, "task")["add"], True)
+    chk("[#1054] MUTANT inverted-guard ALSO breaks the clean promotion (the control's mirror)",
+        "status:ready" in _m3(["area:dispatch", "priority:P1", "role:impl"], "task")["add"], False)
+    # (m4) the set keeps four of its five members and loses only `status:deferred` — structurally
+    # identical, non-empty, and the exact 30/30 measured population walks straight through it.
+    _m4 = _mutant('    "status:deferred",            # dispatch-claim bounded retry lane',
+                  '    # (removed by mutation)       # dispatch-claim bounded retry lane',
+                  "one-member-dropped")
+    chk("[#1054] MUTANT one-member-dropped (4 of 5 members intact) RE-MINTS the measured pair",
+        "status:ready" in _m4(deferred_1037, "task")["add"], True)
+    chk("[#1054] ...while its surviving members still withhold — so only the per-member rows kill it",
+        "status:ready" in _m4(["area:dispatch", "priority:P1", "role:impl",
+                               "status:in-progress"], "task")["add"], False)
+
+    # -----------------------------------------------------------------------------------------------
     # THE LIVE `gh` ARGV live_gh builds (shared by triage --apply and retriage --apply): an EMPTY
     # mutation must issue NO call at all — `gh issue edit <n> -R <repo>` with no flags is a usage
     # error, so emitting it would report a spurious mutation failure and drive the post-condition's
