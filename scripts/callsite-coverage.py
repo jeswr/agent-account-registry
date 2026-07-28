@@ -327,7 +327,12 @@ def site_fingerprints(site: dict) -> list[str]:
     check exists to catch; letting it count as evidence would make the check agree with the
     defect."""
     prints = [name.strip("_") for name in site["stack"] if len(name.strip("_")) >= MIN_NAME_TOKEN]
-    return prints + [arg for arg in site["args"] if len(arg) >= MIN_ARG_TOKEN]
+    # MIN_ARG_TOKEN is applied ONCE, at the producer (`_arg_literals`), and deliberately not
+    # re-applied here. MEASURED: with the floor written in both places, removing EITHER copy left
+    # the self-test green, because the surviving copy re-applied it to the same stripped text — two
+    # copies of one guard make each copy individually unkillable, and a guard no mutant can kill is
+    # not a tested guard.
+    return prints + list(site["args"])
 
 
 def discriminating_fingerprints(sites: list[dict]) -> list[list[str]]:
@@ -871,6 +876,15 @@ def _self_test() -> int:
     check("IDENTITY: ...and does NOT when two modules define it — the base is unresolvable and "
           "guessing would re-import the collision",
           audit(ambiguous, {"scripts/lib.py": {1}})["symbols_triggered"], 0)
+    # The SAME ambiguity, reached through the OTHER arm of the trigger. The row above touches
+    # lib.py's `def`, so it exercises the signature arm and `production_sites`' `unique_owner`
+    # gate; this one touches the CALL, so it exercises `touched_symbols`' own resolution. MEASURED:
+    # without this row, guessing an owner in the call-site arm survived every mutant.
+    check("IDENTITY SITE touched_symbols: an ATTRIBUTE call whose name TWO modules define "
+          "implicates NOTHING even when the CALL LINE is what changed — the call-site arm must "
+          "not guess an owner the signature arm refuses to guess",
+          (audit(ambiguous, {"scripts/user.py": {2}})["symbols_examined"],
+           audit(solo, {"scripts/user.py": {2}})["symbols_examined"]), (0, 1))
     foreign = {"scripts/lib.py": ("def render():\n    pass\n"
                                   "def p():\n    render()\ndef q():\n    render()\n"),
                "scripts/app.py": "from lib import render\ndef r():\n    render()\n"}
@@ -1018,8 +1032,12 @@ def _self_test() -> int:
                 os.environ["GITHUB_STEP_SUMMARY"] = previous
         emitted = buffer.getvalue().splitlines()
         headline = [line for line in emitted if line.startswith("callsite-coverage census: ")]
+        # Every read below is total: a mutant that emits nothing must make these checks FAIL by
+        # NAME, not raise. An exception from the harness is malformedness, not detection, and it
+        # would let a real hole be recorded as a kill.
+        first_line = headline[0] if headline else ""
         counters = dict(pair.split("=", 1)
-                        for pair in (headline[0].split(": ", 1)[1].split() if headline else []))
+                        for pair in (first_line.split(": ", 1)[1].split() if first_line else []))
         # `symbols_examined` and `files_changed` are read out of the EMITTED text, and the
         # expected values come from the fixture the diff describes: ONE changed file, and the TWO
         # PRODUCTION defs in `shared` (`_pr_needs_user` and `_dispatch_review_items`;
@@ -1038,10 +1056,14 @@ def _self_test() -> int:
               (code, counters.get("sites_without_distinct_named_check")), (0, "3"))
         check("EMISSION SITE run_advisory: the census is APPENDED to GITHUB_STEP_SUMMARY when "
               "the runner provides one",
-              summary_path.exists() and headline[0] in summary_path.read_text(encoding="utf-8"),
-              True)
+              (first_line != "",
+               first_line in (summary_path.read_text(encoding="utf-8")
+                              if summary_path.exists() else "")), (True, True))
+        written = json.loads(json_path.read_text(encoding="utf-8")) if json_path.exists() else None
         check("EMISSION SITE run_advisory: --json writes the same census that was printed",
-              census_line(json.loads(json_path.read_text(encoding="utf-8"))), headline[0])
+              census_line(written) if isinstance(written, dict)
+              and all(key in written for key in CENSUS_KEYS) else "<no census JSON was written>",
+              first_line or "<no census line was printed>")
 
     # ---- diff_against: `--unified=0`, pinned by BEHAVIOUR on a real repository ----------------
     # `--unified=0` is load-bearing, not cosmetic. `changed_lines` collects the whole `+` RANGE of
@@ -1060,32 +1082,65 @@ def _self_test() -> int:
         env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@invalid",
                    GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@invalid",
                    GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull)
-        first, git_ok = "", True
+        # A DIVERGED base, so `merge-base` is load-bearing too: the base branch carries a
+        # SIGNATURE edit that HEAD does not, and HEAD carries a BODY-only edit. Against the fork
+        # point (correct) that is a body-only change and nothing triggers; against the base TIP it
+        # reads as a signature touch and `_mech` triggers. So one assertion pins BOTH
+        # `--unified=0` and `merge-base`, by behaviour rather than by flag text.
+        diverged, git_ok = "", True
         try:
-            for args in (("init", "-q"), ("add", "-A"),
-                         ("commit", "-q", "--no-gpg-sign", "-m", "v1")):
-                subprocess.run(["git", "-C", str(repo), *args], env=env, check=True,
-                               capture_output=True, text=True)
-            first = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], env=env,
-                                   check=True, capture_output=True, text=True).stdout.strip()
+            def run_git(*args):
+                return subprocess.run(["git", "-C", str(repo), *args], env=env, check=True,
+                                      capture_output=True, text=True).stdout
+            run_git("init", "-q", "-b", "main")
+            run_git("add", "-A")
+            run_git("commit", "-q", "--no-gpg-sign", "-m", "fork point")
+            run_git("checkout", "-q", "-b", "diverged")
+            target.write_text(source.replace("def _mech(x, y):", "def _mech(x, y, z=None):"),
+                              encoding="utf-8")
+            run_git("add", "-A")
+            run_git("commit", "-q", "--no-gpg-sign", "-m", "base branch moves the SIGNATURE")
+            diverged = run_git("rev-parse", "HEAD").strip()
+            run_git("checkout", "-q", "main")
             target.write_text(source.replace("    return a + b\n", "    return a - b\n"),
                               encoding="utf-8")
-            for args in (("add", "-A"), ("commit", "-q", "--no-gpg-sign", "-m", "v2")):
-                subprocess.run(["git", "-C", str(repo), *args], env=env, check=True,
-                               capture_output=True, text=True)
+            run_git("add", "-A")
+            run_git("commit", "-q", "--no-gpg-sign", "-m", "PR head changes only a BODY line")
         except (OSError, subprocess.CalledProcessError) as exc:  # never a silent skip
-            git_ok, first = False, f"{exc}"
-        check("diff_against: a real `git` two-commit fixture was built, so the check below is "
-              "not silently skipped", (git_ok, len(first)), (True, 40))
+            git_ok, diverged = False, f"{exc}"
+        check("diff_against: a real `git` diverged-history fixture was built, so the check below "
+              "is not silently skipped", (git_ok, len(diverged)), (True, 40))
         if git_ok:
             buffer = io.StringIO()
             with contextlib.redirect_stdout(buffer):
-                main(["--advisory", "--root", str(repo), "--base", first])
-            printed = buffer.getvalue()
-            check("diff_against SITE run_advisory: the diff is `--unified=0`, so a BODY-only edit "
-                  "3 lines below the `def` is NOT read as a signature touch — with any context "
-                  "the false-positive valve disappears",
-                  ("files_changed=1" in printed, "symbols_triggered=0" in printed), (True, True))
+                main(["--advisory", "--root", str(repo), "--base", diverged])
+            counters = dict(pair.split("=", 1) for line in buffer.getvalue().splitlines()
+                            if line.startswith("callsite-coverage census: ")
+                            for pair in line.split(": ", 1)[1].split())
+            check("diff_against SITE run_advisory: `--unified=0` against the MERGE BASE — a "
+                  "body-only edit 3 lines under the `def` must not read as a signature touch "
+                  "(any diff context, or diffing the base TIP instead of the fork point, "
+                  "triggers `_mech` and removes the false-positive valve)",
+                  (counters.get("files_changed"), counters.get("symbols_examined"),
+                   counters.get("symbols_triggered")), ("1", "0", "0"))
+            # ...and the DEFAULT `--root` is the current directory, which is what the gate step
+            # relies on: `python3 scripts/callsite-coverage.py --advisory --base "$base"` passes no
+            # `--root` at all, so a mutant that no-ops for the default root would break the gate
+            # while every `--root`-passing check above stayed green.
+            previous_cwd = os.getcwd()
+            try:
+                os.chdir(repo)
+                buffer = io.StringIO()
+                with contextlib.redirect_stdout(buffer):
+                    main(["--advisory", "--base", diverged])
+            finally:
+                os.chdir(previous_cwd)
+            check("EMISSION: the DEFAULT --root is the working directory — the gate step passes "
+                  "no --root, so this is the only invocation shape production actually uses",
+                  buffer.getvalue().splitlines()[:1],
+                  ["callsite-coverage census: files_changed=1 symbols_examined=0 "
+                   "symbols_triggered=0 symbols_single_site=0 sites_found=0 sites_named=0 "
+                   "sites_without_distinct_named_check=0 sites_not_assessed=0"])
 
     # ---- The gate wiring is real ------------------------------------------------------------
     # #939 requires that a workflow change be pinned at the `if:`, the step AND the call site.
