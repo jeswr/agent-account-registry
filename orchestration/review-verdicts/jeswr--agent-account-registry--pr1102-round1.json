@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 1102,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "75237087019db592767d3c9d84edd59dbfbb8ca3",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`_dispatch_lane_rows` returns any matching rows found anywhere after the final `dispatcher complete:` marker. It neither requires a complete contiguous block nor verifies the expected dispatch lanes. Consequently, a truncated log containing only `lane worker`, or a block where the review/disarm line is malformed, produces a non-None lane list and the dashboard renders only the surviving apparently healthy rows. That contradicts the marquee claim that all four lanes render unconditionally and can hide exactly the stalled review/fix lane or failed disarm this feature is intended to expose. The malformed-line test currently blesses this fail-open behavior by expecting individual bad rows to be dropped while the remaining block is published.",
+    "file": "scripts/dashboard-gen.py",
+    "fix_hint": "Parse the bounded lane-summary block immediately following the completion/fix-dispatch output and validate it as a whole. Require exactly one valid row for every authoritative dispatch lane (or another independently authenticated completeness signal); on a missing, duplicate, malformed, out-of-order, or non-contiguous row, return `None` so the UI shows unknown rather than a selectively incomplete tick. Add literal tests where review or disarm is missing/malformed and assert that no partial lane set is published.",
+    "severity": "major",
+    "title": "Partial or malformed lane blocks fail open by hiding omitted lanes"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe end-to-end rendering and tests are substantial, but the log parser does not establish that it has received a complete, contiguous lane-summary block. It can therefore publish a partial tick as if the omitted lanes had never existed, defeating the stated requirement that every lane (especially review/fix/disarm) remain visible even at zero or on failure. This is a trust-plane observability gap, so the change is not safe to approve yet.",
+  "verdict": "request_changes"
+ }
+}
