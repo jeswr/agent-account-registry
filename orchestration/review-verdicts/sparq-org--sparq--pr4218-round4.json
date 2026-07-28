@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4218,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "7b5a0dadcc5746bbc7eeaff2ab35c7d28ecd063c",
+  "round": 4
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`refresh_prohibition` enters the ambiguous branch when at least one prohibition is unprovable, but `naming_prohibition_ids` then selects every rule whose action and target match. `rule_action_target_match` deliberately ignores assignee and constraints, so the emitted provenance can include a rule for another assignee or a rule whose constraint is definitely false. For example, with one matching prohibition missing required evidence and a second action/target-identical prohibition whose date window is provably lapsed, the retained deny is annotated with both rule IDs even though the second cannot be carving out the request. This contradicts the function's claim that it records rules that \"could still be carving\" and makes the delivered rule-level audit answer materially incorrect. The added tests do not exercise ambiguous refresh with mixed rule classifications.",
+    "file": "crates/sparq-solid/src/odrl_bridge.rs",
+    "fix_hint": "Derive provenance from the same per-rule three-valued classification used by `prohibition_status`, retaining only `RuleClass::Ambiguous` candidates (including the full structural match, especially assignee), or expose a policy-layer helper that returns those candidate IDs alongside the aggregate status. Add a real refresh regression test containing one ambiguous prohibition plus one structurally similar but definitely-false or assignee-mismatched prohibition, and assert that only the ambiguous rule is attributed.",
+    "severity": "major",
+    "title": "Ambiguous refresh attributes denies to definitely non-applicable prohibitions"
+   }
+  ],
+  "progress": "regressing",
+  "summary": "Round 3's provenance-collision fix remains intact, but round 4 introduces a new correctness issue in ambiguous prohibition refresh attribution. The refresh keeps the deny correctly, yet `naming_prohibition_ids` labels it with every action/target-compatible prohibition, including rules that `prohibition_status` has already classified as definitely false (and rules whose assignee does not match). That makes the new audit surface answer \"which rule\" incorrectly. Because this is a new major finding after a clean prior round, progress is regressing.",
+  "verdict": "request_changes"
+ }
+}
