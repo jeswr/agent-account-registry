@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4724,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "f587c592aaff3f040ab31514e01febad3a4783ab",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "In crosscheck(), found/not_found are incremented only for oracle(sig, &onto, None, max_n). The separate oracle(sig, &onto, Some(&class), max_n) result drives an assertion but is never counted. Both tests therefore prove that ontology-consistency queries receive finite-model witnesses, but do not prove that even one generated class-satisfiability query receives a witness. If that witness search is accidentally rendered ineffective (or generation drifts toward empty classes), a tableau regression that returns Unsatisfiable for every class query would no longer be challenged by the oracle, yet decided/found/not_found can all meet their floors. This contradicts the file's explicit claim that non-vacuity is enforced for the model cross-check as a whole.",
+    "file": "crates/sparq-reason-dl/tests/tableau_crosscheck.rs",
+    "fix_hint": "Return and assert a separate positive witness count for oracle(..., Some(&class), ...), with a deterministic floor for both WIDE and DEEP. Ideally also count no-witness class cases if that distribution is intended to be monitored. Keep ontology-model and class-witness coverage counters distinct so each API's oracle assertion is demonstrably exercised.",
+    "severity": "major",
+    "title": "Class-satisfiability oracle arm has no witness coverage floor"
+   }
+  ],
+  "progress": null,
+  "summary": "The explicit NNF complement expectations are a meaningful improvement over the former self-referential assertion, and the finite-model oracle is correctly used only as a one-sided witness. However, the new cross-check's stated non-vacuity guarantee does not cover one of its two tested APIs: it records and floors model witnesses only for ontology consistency, not witnesses for the generated class-satisfiability queries. Consequently the class-satisfiability oracle assertion can silently become vacuous while all current coverage floors remain green. The targeted test could not be executed in this checkout because cargo is unavailable.",
+  "verdict": "request_changes"
+ }
+}
