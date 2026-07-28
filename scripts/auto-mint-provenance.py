@@ -180,6 +180,10 @@ SETEXT_UNDERLINE_RE = re.compile(r"^[ \t]{0,3}(=+|-+)[ \t]*$")
 THEMATIC_BREAK_RE = re.compile(r"^[ \t]{0,3}((\*[ \t]*){3,}|(-[ \t]*){3,}|(_[ \t]*){3,})$")
 FENCE_MARKER_RE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
 TABLE_ROW_RE = re.compile(r"^[ \t]{0,3}\|")
+# ONE level of blockquote container: up to 3 spaces of indent, the marker, and its optional single
+# space. Applied repeatedly by `_continues_a_paragraph` so a nested quote unwraps to its content.
+# The space after `>` is optional because `>## Evidence` is a heading to GitHub too.
+BLOCKQUOTE_PREFIX_RE = re.compile(r"^[ \t]{0,3}>[ \t]?")
 
 # NEGATED PROSE — a best-effort suppressor, and honestly labelled as one.
 #
@@ -363,13 +367,27 @@ def _continues_a_paragraph(line):
     NOT-a-paragraph — which strips, which refuses. An enumeration that fails safe is the only kind
     worth having here.
 
-    Blockquote lines and HTML blocks other than a comment count as paragraph-ish ON PURPOSE, and
-    that is not a guess: GitHub renders `> quoted` + indented, and `<div>`/`</div>` + indented, as
-    PLAIN TEXT, because the indented line lazily continues the quote's paragraph in the first case
-    and is still inside the unterminated HTML block in the second. A comment is different — it is
-    the one HTML block that ends at its own terminator, so a line carrying `-->` really does close
-    it and the next indented line really is code. All of this is ground truth from GitHub's own
-    `POST /markdown`, not inference; see `_INDENTED_CODE_ORACLE` for the frozen table."""
+    A BLOCKQUOTE MARKER IS A CONTAINER, NOT CONTENT, so it is stripped (repeatedly, for nested
+    quotes) and the question is then asked of what it holds. This is the whole of a round-5 blocking
+    finding: the earlier version treated every `>`-prefixed line as paragraph-ish always, so
+    `> ## Evidence` followed by an indented line read as a lazy paragraph continuation and MINTED
+    from text GitHub renders as `<pre><code>`. MEASURED, 10 quoted sub-shapes did that.
+
+    The recursion has to be HERE, at the predicate, and not one layer out. Stripping blockquote
+    lines before `strip_indented_code` also silences those 10 — and breaks the control with them,
+    because a line erased wholesale can no longer say whether it held a paragraph or a heading, and
+    `> quoted paragraph` + indented really is a lazy continuation that GitHub resolves. Both layers
+    were measured before this one was chosen.
+
+    An HTML block other than a comment stays paragraph-ish on purpose: GitHub renders `<div>` /
+    `</div>` + indented as PLAIN TEXT, because the indented line is still inside the unterminated
+    block. A comment is the one HTML block that ends at its own terminator, so a line carrying
+    `-->` really does close it. All of this is ground truth from GitHub's `POST /markdown`."""
+    while True:
+        stripped = BLOCKQUOTE_PREFIX_RE.sub("", line, count=1)
+        if stripped == line:
+            break
+        line = stripped
     if not line.strip():
         return False                                  # a blank line closes any paragraph
     if "-->" in line:
@@ -389,20 +407,27 @@ def strip_indented_code(text):
     An earlier version of this function used "a BLANK line opened it", which is a DIFFERENT
     predicate, and the difference was in the minting direction: wherever the preceding line ended a
     NON-paragraph block, GitHub rendered `<pre><code>` while this file bound the reference as live.
-    MEASURED against GitHub's own renderer, 13 shapes diverged — ATX and setext headings, both
+    MEASURED against GitHub's own renderer in two rounds, because the first round's corpus was
+    mis-sampled. Round one found 13 unquoted shapes diverging (ATX and setext headings, both
     thematic-break forms, closed and multi-line HTML comments, closed ``` and ~~~ fences, a GFM
-    table, a tab or 8-space indent after a heading, and an indented FIRST body line. Each one minted
-    a real record end to end. That is round 1's blocking class, so the predicate is now the
-    CommonMark one and the seven-plus shapes are frozen as fixtures.
+    table, a tab or 8-space indent after a heading, an indented FIRST body line). Round two found 10
+    more, all BLOCKQUOTED versions of the same constructs, because the predicate then treated every
+    `>` line as paragraph-ish unconditionally — see `_continues_a_paragraph`. Each one minted a real
+    record end to end. All 23 are frozen as fixtures.
 
-    HONEST LIMIT — ONE divergence remains, and it is a false NEGATIVE, not a mint. A paragraph that
-    continues a LIST ITEM is blank-line-opened and four-space indented, so GitHub renders it as
-    prose and resolves a keyword in it while this file strips it and refuses `no-issue-reference`.
-    Closing it needs real list-context tracking (the marker's own content indent), which is the one
-    genuinely hard part of block parsing, and it buys a case nothing on the live population uses.
+    HONEST LIMITS — the divergences that REMAIN are all false NEGATIVES, none of them a mint, and
+    there are FIVE of them rather than the one an earlier version of this docstring claimed:
+
+      * a paragraph continuing a LIST ITEM (three sub-shapes: bullet, numbered, nested) — GitHub
+        renders it as prose and resolves a keyword in it; closing this needs real list-context
+        tracking (the marker's own content indent), the genuinely hard part of block parsing;
+      * a lone GFM table DELIMITER row, which is not a table to GitHub but is treated as one here;
+      * an indented line after prose that merely CONTAINS `-->`.
+
     The direction is the deliberate one for this file: a refusal is a comment naming the single edit
     that fixes it, while a wrong mint is silent, permanent and censused as a success. --self-test
-    pins BOTH directions, so this cannot drift into stripping ordinary prose."""
+    pins BOTH directions, so this cannot drift into stripping ordinary prose, and the count above is
+    what the 50-shape oracle corpus actually measures — not a summary of it."""
     kept, in_block, prev_opens_code = [], False, True
     for line in (text or "").split("\n"):
         blank = not line.strip()
@@ -1039,6 +1064,7 @@ def sweep_workflow_seam_report(workflow=None):
 # ---- self-test ---------------------------------------------------------------------------------
 def _self_test():                                                       # noqa: C901 - flat asserts
     import base64
+    import inspect
     import copy
 
     ok = True
@@ -1224,7 +1250,31 @@ def _self_test():                                                       # noqa: 
             # ...and the shapes GitHub renders as PROSE, which therefore MUST still bind. Without
             # these the strip could satisfy every row above by refusing everything.
             ("paragraph continuation", "some prose that wraps\n    Closes #4242", False),
+            # ---- BLOCKQUOTE SUB-SHAPES ------------------------------------------------------
+            # THE SAMPLING LESSON, kept where it happened. The previous table had 39 rows and
+            # exactly ONE blockquote row — this lazy-continuation one, which is the single quoted
+            # sub-shape where "a `>` line leaves a paragraph open" is TRUE. The corpus did not
+            # under-sample the category; it sampled precisely the confirming instance, and 10 other
+            # quoted sub-shapes minted from text GitHub renders as `<pre><code>`. Count samples PER
+            # CATEGORY, and for a rule of the form "X implies Y", enumerate the sub-shapes of X and
+            # cover the ones where Y is least obvious.
             ("blockquote then indented (lazy continuation)", "> quoted\n    Closes #4242", False),
+            ("quoted ATX heading then indented", "> ## Evidence\n    Closes #4242", True),
+            ("quoted setext heading then indented",
+             "> Evidence\n> ========\n    Closes #4242", True),
+            ("quoted *** break then indented", "> ***\n    Closes #4242", True),
+            ("quoted --- break then indented", "> ---\n    Closes #4242", True),
+            ("quoted closed fence then indented", "> ```\n> x\n> ```\n    Closes #4242", True),
+            ("quoted table then indented", "> | a | b |\n> |---|---|\n    Closes #4242", True),
+            ("quoted BLANK line then indented", "> quoted\n>\n    Closes #4242", True),
+            ("quote marker with no space", ">## Evidence\n    Closes #4242", True),
+            ("indented quote marker", "   > ## Evidence\n    Closes #4242", True),
+            ("composite: quoting a PR description that contains a heading",
+             "Superseded by #781, whose body reads:\n\n> ## Summary\n> text\n"
+             "> ## Evidence\n    Closes #4242", True),
+            ("nested quote then indented (still a paragraph)",
+             "> > inner\n    Closes #4242", False),
+            ("quoted list item then indented", "> - item\n    Closes #4242", False),
             ("unterminated HTML block then indented", "<div>\n</div>\n    Closes #4242", False),
             ("3-space indent is not code", "## E\n   Closes #4242", False),
             ("`#Evidence` is not a heading", "#Evidence\n    Closes #4242", False),
@@ -1510,6 +1560,18 @@ def _self_test():                                                       # noqa: 
     check("...while an enabled row that enrols someone IS one",
           enrolled_targets({"repos": {"o/r": {"enabled": True}}}, lambda name, doc: ["a", "B"]),
           [("o/r", ("B", "a"))])
+    # `enabled is not True` is a STRICTER test than `enabled is False`, and only an ABSENT or
+    # non-boolean `enabled` can tell them apart — which no fixture did, so `is not True` could be
+    # weakened to `is False` and nothing red. That is a missing fixture, not an equivalent mutant:
+    # the difference is opt-OUT versus opt-IN for a row that never states the field, and this is the
+    # gate deciding which repositories an unattended writer may touch.
+    for label, row in (("absent", {"review_enrolment_authors": ["x"]}),
+                       ("null", {"enabled": None, "review_enrolment_authors": ["x"]}),
+                       ("the STRING 'true'", {"enabled": "true",
+                                              "review_enrolment_authors": ["x"]}),
+                       ("1", {"enabled": 1, "review_enrolment_authors": ["x"]})):
+        check(f"...and a row whose `enabled` is {label} is NOT a target — enrolment is opt-IN",
+              enrolled_targets({"repos": {"o/r": row}}, lambda name, doc: ["x"]), [])
 
     check("the pinned implementing alias resolves to the pinned provider in the LIVE catalog",
           mint_provenance.alias_mint_refusal(
@@ -1876,6 +1938,22 @@ def _self_test():                                                       # noqa: 
         check("...and the record it writes pins the constant provider and the pinned alias",
               (good.document["impl_provider"], good.document["impl_alias"]),
               (mint_provenance.ORCHESTRATOR_IMPL_PROVIDER, AUTO_IMPL_ALIAS))
+        # THE CALLER'S SHAPE, not just its output. `AUTO_IMPL_ALIAS` being a pinned constant is the
+        # reason this class cannot choose the provider that reviews it — but the pin lives inside a
+        # closure, and nothing observed that the closure takes no alias parameter. Adding one
+        # survived every check: the pin still held, and the SHAPE that guarantees it went
+        # unasserted. The signature is the guarantee, so the signature is asserted.
+        check("...and the bound caller exposes NO lever for the alias or the global partition",
+              (sorted(inspect.signature(caller).parameters),
+               sorted(inspect.signature(_mint_caller).parameters)),
+              (["authors", "issue", "issue_number", "pr_number", "pull", "routing", "target_repo"],
+               ["apply_changes", "log", "mint_provenance", "registry_repo", "write_record"]))
+        # ...and `read_record` is pinned to None on purpose: the sweep has ALREADY probed for an
+        # existing record, and letting the shared writer re-read it would be a second, unsynced
+        # opinion on the one question idempotence turns on.
+        check("...and the shared writer is told the record probe was already done",
+              total(lambda: mint_provenance.mint.__doc__ is not None
+                    and "read_record" in inspect.signature(mint_provenance.mint).parameters), True)
         dry = []
         dry_caller = _mint_caller(mint_provenance, "reg/istry", False, lambda *_a, **_k: None,
                                   write_record=lambda: dry.append("put"))
@@ -1903,8 +1981,13 @@ def _self_test():                                                       # noqa: 
     # writer factory and `sweep` itself, and every argument it forwards is read back off the
     # recorded call. Coverage is the instrument that found this, and it is cheaper than mutation
     # testing: run it, list every function at 0%, and drive those first.
-    def main_call(argv, policy=None, targets_authors=("jeswr",)):
-        """Run the real `main()` with recorders installed. Returns what it forwarded."""
+    def main_call(argv, policy=None, targets_authors=("jeswr",), step_summary=None):
+        """Run the real `main()` with recorders installed. Returns what it forwarded.
+
+        GITHUB_STEP_SUMMARY IS PINNED, always. In Actions that variable is set, and `main()`
+        legitimately appends the census to whatever it points at — so a fixture that leaves it alone
+        writes one `### auto-mint` block into the REAL job summary per call, ten per run, on a green
+        gate. The env is a shared resource in the harness exactly as it is in production."""
         seen = {}
 
         def fake_sweep(targets, **kwargs):
@@ -1935,8 +2018,13 @@ def _self_test():                                                       # noqa: 
         }
         saved_globals = {name: globals()[name] for name in patches}
         saved_argv, saved_stderr = sys.argv[:], sys.stderr
+        saved_summary = os.environ.get("GITHUB_STEP_SUMMARY")
         globals().update(patches)
         sys.argv = ["auto-mint-provenance.py", *argv]
+        if step_summary is None:
+            os.environ.pop("GITHUB_STEP_SUMMARY", None)
+        else:
+            os.environ["GITHUB_STEP_SUMMARY"] = str(step_summary)
         # argparse prints usage to stderr on a refusal; swallow it so a PASSING run's log stays
         # readable, and assert the exit code instead of scraping the text.
         sys.stderr = io.StringIO()
@@ -1947,6 +2035,10 @@ def _self_test():                                                       # noqa: 
         finally:
             globals().update(saved_globals)
             sys.argv, sys.stderr = saved_argv, saved_stderr
+            if saved_summary is None:
+                os.environ.pop("GITHUB_STEP_SUMMARY", None)
+            else:
+                os.environ["GITHUB_STEP_SUMMARY"] = saved_summary
         return seen
 
     def fwd(seen, *keys):
@@ -2002,16 +2094,11 @@ def _self_test():                                                       # noqa: 
     # actually reads whether the tick did anything; a run that decides correctly and reports nowhere
     # is the silent-minter failure mode in another costume.
     summary_path = SCRIPTS_DIR.parent / ".git" / f"auto-mint-summary-probe-{os.getpid()}"
-    saved_summary = os.environ.get("GITHUB_STEP_SUMMARY")
-    os.environ["GITHUB_STEP_SUMMARY"] = str(summary_path)
     try:
-        main_call(["--registry-repo", "o/r", "--annotate-repo", "o/r"])
+        main_call(["--registry-repo", "o/r", "--annotate-repo", "o/r"],
+                  step_summary=summary_path)
         written_summary = summary_path.read_text(encoding="utf-8") if summary_path.exists() else ""
     finally:
-        if saved_summary is None:
-            os.environ.pop("GITHUB_STEP_SUMMARY", None)
-        else:
-            os.environ["GITHUB_STEP_SUMMARY"] = saved_summary
         summary_path.unlink(missing_ok=True)
     check("main() writes the census into the job summary an operator actually reads",
           ("### auto-mint" in written_summary, "enrolled_pulls=0" in written_summary), (True, True))
@@ -2079,7 +2166,16 @@ def _self_test():                                                       # noqa: 
             else {"repos": {"o/r": {"routing": "orchestration/routing.toml"}}})
         try:
             readers = _gh_readers(fake, "reg/istry")
-            return fake, readers, (None if call is None else total(lambda: call(readers)))
+            if call is None:
+                return fake, readers, None
+            try:
+                return fake, readers, call(readers)
+            except Exception as exc:              # noqa: BLE001 — the raise IS the observation
+                # The MESSAGE, not just the type. Asserting the type alone let a mutant that
+                # refused for an unrelated reason (without fetching) satisfy the row, because the
+                # reason was being read from a SEPARATE call to the pure predicate rather than
+                # from the raise the call site actually produced.
+                return fake, readers, ("RAISED", type(exc).__name__, str(exc))
         finally:
             globals()["_read_policy"] = saved_policy
 
@@ -2119,8 +2215,11 @@ def _self_test():                                                       # noqa: 
 
     # THE PATH-TRAVERSAL GUARD, at its ONLY call site. The predicate has an exhaustive fixture table
     # above; nothing observed that `read_routing` actually consults it.
-    # Each pointer asserts the guard's OWN reason text, so a fixture that refuses for some unrelated
-    # reason (a missing policy row, say) cannot stand in for the guard having fired.
+    #
+    # THE DISCRIMINATOR IS THE RAISE'S OWN MESSAGE, read off the call site. An earlier one paired
+    # "it refused without fetching" with a reason taken from a SEPARATE call to the pure predicate —
+    # so a mutant that refused for an unrelated reason, and still did not fetch, satisfied the row.
+    # The reason now has to come out of the exception `read_routing` itself raised.
     for pointer, because in (("../secrets.toml", "escapes the repository root"),
                              ("a/../../b", "escapes the repository root"),
                              ("/etc/passwd", "not a relative repository path"),
@@ -2129,9 +2228,12 @@ def _self_test():                                                       # noqa: 
                              ("", "carries no routing pointer")):
         fake, _readers, outcome = readers_for(policy={"repos": {"o/r": {"routing": pointer}}},
                                              call=lambda rs: rs[0]("o/r"))
+        raised_kind = outcome[:2] if isinstance(outcome, tuple) else outcome
+        raised_says = (because in outcome[2]) if (isinstance(outcome, tuple)
+                                                 and len(outcome) > 2) else outcome
         check(f"read_routing REFUSES the routing pointer {pointer!r} instead of fetching it, "
-              f"and says why: {because!r}",
-              (outcome, fake.calls, because in str(routing_pointer_error(pointer))),
+              f"and ITS OWN raise says why: {because!r}",
+              (raised_kind, fake.calls, raised_says),
               (("RAISED", "SweepError"), [], True))
     _fake, _readers, parsed = readers_for(
         payloads={"contents/": {"encoding": "base64",
@@ -2143,8 +2245,9 @@ def _self_test():                                                       # noqa: 
     _fake, _readers, refused = readers_for(
         payloads={"contents/": {"encoding": "utf-8", "content": "x"}},
         call=lambda rs: rs[0]("o/r"))
-    check("...and a payload that is not a base64 file refuses rather than being trusted",
-          refused, ("RAISED", "SweepError"))
+    check("...and a payload that is not a base64 file refuses rather than being trusted, saying so",
+          (refused[:2], "did not read back as a base64 file" in refused[2]),
+          (("RAISED", "SweepError"), True))
 
     # ---- sweep()'s two remaining uncovered branches ---------------------------------------------
     routing_boom = _Recorder(clean)
