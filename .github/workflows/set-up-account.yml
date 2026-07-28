@@ -88,6 +88,26 @@
 # the secret_ref LINE alone would flip status:available around a credential no worker can use.
 # A 404, a missing PAT, or an unprovable probe fails closed before resume is ever granted.
 #
+# STORE->REGISTER GAP fix (#534): the `request_issue:` line #211 reconciles on is written by the
+# REGISTER step, i.e. AFTER `gh secret set` — the one irreversible act in this workflow. A run that
+# died in that gap therefore left a stored credential with NO durable binding to its request: the
+# reconcile step found nothing, fell through to a fresh enrollment, and minted a SECOND slot while
+# the first (irreversible) capture was orphaned for the manual recovery the alarm describes. The
+# binding is now taken at CLAIM time, before anything irreversible has happened, as a create-only
+# ref `refs/acct-requests/<request>/<handle>/<provider>/<credential_format>/<grant-digest>`. It is
+# a NAME encoding pointing at $GITHUB_SHA — the same object shape as the claim ref — because a ref
+# pointing at a blob needs an object write BEFORE the binding (a second failure surface ahead of
+# the capture) and a second round trip to read, while `git/matching-refs/` reads the whole binding
+# in ONE listing; that is the trade-off research/914-account-identity-binding.md §3.2 settled. It
+# is a SEPARATE namespace, never the claim ref itself: `refs/acct-claims/<handle>` is
+# first-writer-wins ON THE HANDLE and that mutual exclusion is the whole of its value (#186/#237),
+# so it must stay create-only with exactly one component. The name carries precisely what a resumed
+# register step cannot re-derive — the slot, the provider the credential was captured for, the
+# CAPTURED credential format, and a digest of the authorized target set so a resumed enrollment
+# still inherits its ORIGINAL authorization (#579) rather than whatever the labels say at retry
+# time. It is deliberately NOT a fifth member of the pre-claim slot-freeness union: a binding can
+# only exist where a claim ref already exists, so it would be provably redundant.
+#
 # GRANT-SCOPING fix (#579, re-filed from #190; the closed PR #260 preserves six prior review
 # rounds): enrollment used to append the new handle to EVERY `account_pool` row in
 # policy/repos.toml — one unanchored global regex substitution over all rows, disabled and future
@@ -201,7 +221,12 @@ jobs:
       # Resume is granted only after the bound issue's secret_ref is proven to name a REAL
       # credential in the dispatch-secrets environment (review round 1 of #533) — see the
       # existence probe below.
-      - name: Reconcile a prior partial enrollment for this request (#211)
+      # #534: an account issue is not the ONLY evidence of a prior enrollment. It is written after
+      # `gh secret set`, so the store->register gap leaves a stored credential with no issue-side
+      # binding at all; the claim-time binding ref (written before the capture) is what lets that
+      # state be RESUMED — register/validate/policy-PR re-run on the SAME slot — instead of being
+      # left to the manual recovery the alarm describes while a retry burns a second slot.
+      - name: Reconcile a prior partial enrollment for this request (#211, #534)
         id: reconcile
         env:
           GH_TOKEN: ${{ github.token }}
@@ -213,7 +238,33 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          if ! raw=$(gh api --paginate "repos/$REPO/issues?state=open&per_page=100"); then
+          # Review round 1 of #533: the secret_ref LINE (or, on the #534 path, a claim-time
+          # binding) proves nothing about the CREDENTIAL — an account issue can outlive its
+          # secret, and a slot can be claimed and bound by a run that then died BEFORE the
+          # capture. Resume therefore requires the named secret to EXIST in the dispatch-secrets
+          # environment — the post-#101 canonical home every consumer resolves from — proven by
+          # the same PAT-scoped GET the store step's absence probe uses. Only an authenticated
+          # success proves existence; an explicit 404 proves absence; a missing PAT or ANY other
+          # probe outcome means existence cannot be proven and kills the step outright, so no
+          # caller can mistake "unprovable" for "absent".
+          probe_secret() {
+            local probe
+            if [ -z "${REGISTRY_PAT:-}" ]; then
+              echo "::error::REGISTRY_SECRETS_PAT is unavailable, so it cannot be proven that secret $1 still exists in the dispatch-secrets environment — refusing to resume (fail closed). Restore the PAT (see the preflight guidance), then re-apply set-up-account."; exit 1
+            fi
+            if probe=$(GH_TOKEN="$REGISTRY_PAT" gh api "repos/$REPO/environments/dispatch-secrets/secrets/$1" 2>&1); then
+              return 0
+            fi
+            if printf '%s' "$probe" | grep -q 'HTTP 404'; then
+              return 1
+            fi
+            echo "::error::could not prove whether secret $1 exists in the dispatch-secrets environment (the probe failed for a non-404 reason) — refusing to resume (fail closed). Re-apply set-up-account to retry."; exit 1
+          }
+          # #534: enumerated in ANY state, not just open. The BOUND-issue selection below still
+          # takes open issues only (a closed account issue is deliberately retired — never
+          # resumed), but the binding path needs the all-state view to refuse minting a DUPLICATE
+          # acctNN title, which both activation paths would then reject forever.
+          if ! raw=$(gh api --paginate "repos/$REPO/issues?state=all&per_page=100"); then
             echo "::error::could not enumerate account issues — cannot prove request #$ISSUE has no prior partial enrollment (fail closed)"; exit 1
           fi
           # `--paginate` emits one JSON array per page; jq iterates each top-level array, so no
@@ -221,6 +272,7 @@ jobs:
           # CRLF a web-UI edit can introduce.
           bound=$(printf '%s' "$raw" | jq -r --arg req "$ISSUE" '
             .[] | select(has("pull_request") | not)
+                | select(.state == "open")
                 | select(.title | test("^acct[0-9]+$"))
                 | select([.labels[].name] | any(. == "status:pending" or . == "status:available"))
                 | select((.body // "") | test("(?m)^request_issue:[[:space:]]*" + $req + "[[:space:]]*$"))
@@ -230,8 +282,83 @@ jobs:
             echo "::error::request #$ISSUE is bound to $count account issues ($(printf '%s' "$bound" | tr '\n' ' ')) — ambiguous identity, refusing to enroll or resume (fail closed)"; exit 1
           fi
           if [ "$count" -eq 0 ]; then
-            echo "resume=false" >> "$GITHUB_OUTPUT"
-            echo "no prior enrollment bound to request #$ISSUE — proceeding with a fresh enrollment"
+            # [#534] No account issue is bound to this request — which does NOT yet prove that no
+            # credential was captured for it. `gh secret set` is irreversible and lands BEFORE the
+            # register step writes the `request_issue:` line, so a run that died in that gap left a
+            # stored credential with no issue-side binding whatsoever. Falling straight through to a
+            # fresh enrollment here (what the code used to do) mints a SECOND slot and orphans the
+            # first capture. The claim-time binding ref is the durable record that closes the gap;
+            # it is written before the capture, in a namespace only a push-capable writer can touch
+            # (an issue comment would be forgeable by any public observer, and a forged binding
+            # names a handle whose secret already exists — i.e. somebody else's live account).
+            if ! refs=$(gh api --paginate "repos/$REPO/git/matching-refs/acct-requests/$ISSUE/"); then
+              echo "::error::could not list the claim-time slot bindings of request #$ISSUE — it cannot be proven that no credential was captured for it, and a fresh enrollment here would orphan one (fail closed)"; exit 1
+            fi
+            # `--paginate` emits one JSON array per page (an empty prefix is a legitimate `[]`, exit
+            # 0 — distinguishable from the unreadable case above). jq's status is CAPTURED, not read
+            # through a process substitution: a filter that emitted an early page's match and then
+            # died on a later one would otherwise resume off a TRUNCATED enumeration. The shape is
+            # re-asserted here rather than trusted from the prefix — every component must match the
+            # grammar the store step wrote, so a ref hand-created in this namespace with a bogus
+            # provider/format is ignored rather than parsed into a record.
+            if ! bindings=$(printf '%s' "$refs" | jq -r --arg req "$ISSUE" '
+                  .[].ref
+                  | select(test("^refs/acct-requests/" + $req + "/acct[0-9]+/(openai|anthropic)/[a-z0-9]+(-[a-z0-9]+)*/[0-9a-f]{64}$"))
+                  | ltrimstr("refs/acct-requests/" + $req + "/")'); then
+              echo "::error::could not parse the claim-time slot bindings of request #$ISSUE to the end — it cannot be proven that no credential was captured for it (fail closed)"; exit 1
+            fi
+            # A binding alone is not a credential: a run can claim a slot, bind it, and then die
+            # before `gh secret set`. Only a slot whose secret is PROVEN present is resumable; a
+            # bound-but-unstored slot is merely burned, which is the designed cost of a claim.
+            stored=""
+            stored_count=0
+            for entry in $bindings; do
+              bound_handle=${entry%%/*}
+              if probe_secret "${bound_handle^^}_TOKEN"; then
+                stored=$entry; stored_count=$((stored_count + 1))
+              else
+                echo "request #$ISSUE claimed and bound slot $bound_handle, but no credential was ever stored there — that slot stays burned (claims are never released, #186) and is not resumable"
+              fi
+            done
+            if [ "$stored_count" -gt 1 ]; then
+              echo "::error::request #$ISSUE has $stored_count claim-time slot bindings whose credential IS stored ($(printf '%s' "$bindings" | tr '\n' ' ')) — ambiguous identity, refusing to enroll or resume (fail closed). Resolve by hand: keep one slot and delete the other's dispatch-secrets secret."; exit 1
+            fi
+            if [ "$stored_count" -eq 0 ]; then
+              {
+                printf 'resume=false\n'
+                printf 'stage=fresh\n'
+              } >> "$GITHUB_OUTPUT"
+              echo "no prior enrollment bound to request #$ISSUE (no account issue, and no claim-time binding whose credential was stored) — proceeding with a fresh enrollment"
+              exit 0
+            fi
+            # Exactly one stored, bound slot: this is the store-complete/register-failed state.
+            handle=${stored%%/*}; rest=${stored#*/}
+            provider=${rest%%/*}; rest=${rest#*/}
+            fmt=${rest%%/*}
+            digest=${rest##*/}
+            # An account issue titled $handle in ANY state means the register step DID run for this
+            # slot (and the record was then unbound from this request, or retired). Resuming would
+            # mint a DUPLICATE acctNN title, which both activation paths refuse forever — the exact
+            # wedge #383/#896 fail closed on. Refuse here, where the operator still has both options.
+            if ! titled=$(printf '%s' "$raw" | jq -r --arg handle "$handle" '
+                  [.[] | select(has("pull_request") | not) | select(.title == $handle)] | length'); then
+              echo "::error::could not prove how many account issues are titled '$handle' — refusing to resume request #$ISSUE (fail closed)"; exit 1
+            fi
+            if [ "$titled" != 0 ]; then
+              echo "::error::request #$ISSUE claimed slot $handle and its credential IS stored, but $titled account issue(s) titled '$handle' already exist while none is bound to this request — refusing to mint a duplicate record (fail closed). Either add \`request_issue: $ISSUE\` to the '$handle' issue body and re-apply set-up-account to resume it, or retire that slot by hand."; exit 1
+            fi
+            {
+              printf 'resume=true\n'
+              printf 'stage=register\n'
+              printf 'handle=%s\n' "$handle"
+              printf 'secret=%s\n' "${handle^^}_TOKEN"
+              printf 'provider=%s\n' "$provider"
+              printf 'fmt=%s\n' "$fmt"
+              printf 'grant_digest=%s\n' "$digest"
+            } >> "$GITHUB_OUTPUT"
+            gh issue comment "$ISSUE" -R "$REPO" \
+              --body "♻️ Resuming the enrollment of **$handle** for this request — its credential was already captured and stored, but the account record was never created. There is no new sign-in and no new slot: registering **$handle** and completing validation and the account_pool policy PR now." || echo "::warning title=set-up-account::the resume notice failed to post — the refusal/outcome above is the authoritative record"
+            echo "resuming the store-complete/register-failed enrollment of $handle (provider $provider, format $fmt) for request #$ISSUE — login/store are skipped, register re-runs on the SAME slot"
             exit 0
           fi
           num=$(printf '%s' "$bound" | head -1)
@@ -272,25 +399,21 @@ jobs:
           # tampered or hand-edited record that cannot be trusted), and (b) the named secret
           # must EXIST in the dispatch-secrets environment — the post-#101 canonical home every
           # consumer resolves from — proven by the same PAT-scoped GET the store step's absence
-          # probe uses. Only an authenticated success proves existence; a 404 means the
-          # credential is GONE, and a missing PAT or any other probe outcome means existence
-          # cannot be proven — all fail closed BEFORE resume is granted, so
-          # validate/account_pool-PR/activation stay unreachable.
+          # probe uses (the shared `probe_secret` helper above). Only an authenticated success
+          # proves existence; a 404 means the credential is GONE, and a missing PAT or any other
+          # probe outcome means existence cannot be proven — all fail closed BEFORE resume is
+          # granted, so validate/account_pool-PR/activation stay unreachable.
           if [ "$secret" != "${handle^^}_TOKEN" ]; then
             echo "::error::account issue #$num ($handle) carries secret_ref '$secret' but the broker-minted binding for $handle is '${handle^^}_TOKEN' — a mismatched credential binding cannot be resumed (fail closed). Fix the issue body, then re-apply set-up-account."; exit 1
           fi
-          if [ -z "${REGISTRY_PAT:-}" ]; then
-            echo "::error::REGISTRY_SECRETS_PAT is unavailable, so it cannot be proven that secret $secret still exists in the dispatch-secrets environment — refusing to resume (fail closed). Restore the PAT (see the preflight guidance), then re-apply set-up-account."; exit 1
-          fi
-          if probe=$(GH_TOKEN="$REGISTRY_PAT" gh api "repos/$REPO/environments/dispatch-secrets/secrets/$secret" 2>&1); then
+          if probe_secret "$secret"; then
             echo "resume preflight: secret $secret exists in the dispatch-secrets environment"
-          elif printf '%s' "$probe" | grep -q 'HTTP 404'; then
-            echo "::error::account issue #$num ($handle) references secret $secret, which does NOT exist in the dispatch-secrets environment — resuming would activate an account with no usable credential (fail closed). Either restore the secret and re-apply set-up-account to resume, or close account issue #$num (its slot stays burned by design; claims are never released) and re-apply for a fresh enrollment."; exit 1
           else
-            echo "::error::could not prove secret $secret exists in the dispatch-secrets environment (the probe failed for a non-404 reason) — refusing to resume (fail closed). Re-apply set-up-account to retry."; exit 1
+            echo "::error::account issue #$num ($handle) references secret $secret, which does NOT exist in the dispatch-secrets environment — resuming would activate an account with no usable credential (fail closed). Either restore the secret and re-apply set-up-account to resume, or close account issue #$num (its slot stays burned by design; claims are never released) and re-apply for a fresh enrollment."; exit 1
           fi
           {
             printf 'resume=true\n'
+            printf 'stage=validate\n'
             printf 'handle=%s\n' "$handle"
             printf 'secret=%s\n' "$secret"
             printf 'models=%s\n' "$models"
@@ -308,7 +431,11 @@ jobs:
       # fail-closed gate here): a request with no authorization choice must never reach a
       # credential capture, because that capture is irreversible. On the #211 resume path the bound
       # account issue's recorded target set must ALSO still equal the live labels — a resumed
-      # enrollment inherits its original authorization, and a changed one is a refusal.
+      # enrollment inherits its original authorization, and a changed one is a refusal. On the #534
+      # store->register resume path there is no account issue to record that set, so the claim-time
+      # binding carries a sha256 DIGEST of the canonical `grant_targets:` line instead and the same
+      # equality is required against it — the authorization a credential was captured under can
+      # never be silently widened by editing labels on the request afterwards.
       # The resolved set is the pre-login SNAPSHOT; the policy-write step re-reads the labels LIVE
       # and requires exact equality (the sign-in can take ~13 minutes).
       # Untrusted label names cross into python as JSON in env — never interpolated into this
@@ -320,13 +447,15 @@ jobs:
           LABELS_JSON: ${{ toJSON(github.event.issue.labels.*.name) }}
           RESUME: ${{ steps.reconcile.outputs.resume }}
           RECORDED: ${{ steps.reconcile.outputs.targets }}
+          # #534: the resume path that has no account issue to read a snapshot from.
+          RECORDED_DIGEST: ${{ steps.reconcile.outputs.grant_digest }}
           ISSUE: ${{ github.event.issue.number }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           err="$RUNNER_TEMP/grant-authorize.err"
           if ! targets=$(python3 - 2>"$err" <<'PY'
-          import importlib.util, json, os, sys
+          import hashlib, importlib.util, json, os, sys
           spec = importlib.util.spec_from_file_location(
               "registry_grant_account", "scripts/grant-account.py")
           grant = importlib.util.module_from_spec(spec)
@@ -334,10 +463,30 @@ jobs:
           with open("policy/repos.toml", encoding="utf-8") as fh:
               policy = fh.read()
           labels = json.loads(os.environ["LABELS_JSON"])
-          snapshot = (json.loads(os.environ["RECORDED"] or "[]")
-                      if os.environ.get("RESUME") == "true" else None)
+          resume = os.environ.get("RESUME") == "true"
+          recorded = os.environ.get("RECORDED") or ""
+          digest = os.environ.get("RECORDED_DIGEST") or ""
           try:
-              print(json.dumps(grant.authorize(labels, policy, snapshot)))
+              # #534: a resume MUST carry one of the two recorded-authorization forms. Neither
+              # present means the original authorization cannot be proven, and re-authorizing from
+              # today's labels would let a credential captured under one grant be handed to
+              # another — so it refuses rather than falling back to the fresh-enrollment path.
+              if resume and not recorded and not digest:
+                  raise grant.GrantError(
+                      "this resumed enrollment carries neither a recorded target set nor a "
+                      "claim-time authorization digest, so the grant its credential was captured "
+                      "under cannot be proven — refusing")
+              snapshot = json.loads(recorded) if (resume and recorded) else None
+              authorized = grant.authorize(labels, policy, snapshot)
+              if digest:
+                  live = hashlib.sha256(
+                      grant.format_record_line(authorized).encode()).hexdigest()
+                  if live != digest:
+                      raise grant.GrantError(
+                          "the `grant:` labels on this request no longer authorize the target set "
+                          "recorded when its slot was claimed — a resumed enrollment inherits its "
+                          "ORIGINAL authorization, so a changed one is a refusal")
+              print(json.dumps(authorized))
           except grant.GrantError as exc:
               print(str(exc), file=sys.stderr)
               sys.exit(1)
@@ -420,7 +569,15 @@ jobs:
       - name: Determine provider (structured — no silent default)
         id: meta
         # #211 resume: provider/models/handle come from the bound account issue, not a fresh hint.
-        if: steps.reconcile.outputs.resume != 'true'
+        # #534: the store->register resume DOES need this step — it re-mints the account record, so
+        # it needs `models`/`max_concurrent_workers`, and the provider-defaults fragment below is
+        # the single source of truth for both (duplicating them in the reconcile step is exactly the
+        # drift that fragment exists to prevent). Nothing here starts a login or captures anything;
+        # the register step then refuses unless the provider resolved here still equals the one
+        # bound to the slot at claim time, so a label edited after the capture cannot re-mint the
+        # record against the wrong provider's aliases. The handle/secret hints stay unused (the
+        # resumed slot comes from the binding).
+        if: steps.reconcile.outputs.resume != 'true' || steps.reconcile.outputs.stage == 'register'
         env:
           GH_TOKEN: ${{ github.token }}
           # #579: label names are UNTRUSTED text and this step holds an issues:write token, so they
@@ -657,6 +814,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}   # default-identity refs/issues API; PAT probes override inline
           REGISTRY_PAT: ${{ secrets.REGISTRY_SECRETS_PAT }}
           RESERVED_HANDLE: ${{ steps.meta.outputs.handle }}
+          # #534: the claim-time request binding written below. All three cross as env DATA.
+          ISSUE: ${{ github.event.issue.number }}
+          PROVIDER: ${{ steps.meta.outputs.provider }}
+          GRANT_TARGETS: ${{ steps.grant.outputs.targets }}
         run: |
           set -euo pipefail
           # #186 stale-snapshot fix, hardened after review round 1 of #236. `meta` picked the slot
@@ -727,6 +888,56 @@ jobs:
           fi
           HANDLE=$(printf 'acct%02d' "$claimed")
           SECRET_NAME=$(printf 'ACCT%02d_TOKEN' "$claimed")
+          # [#534] BIND THE REQUEST TO THE SLOT, BEFORE THE IRREVERSIBLE CAPTURE. The register step's
+          # `request_issue:` line is the #211 reconcile key, but it is written AFTER `gh secret set`
+          # — so a run that dies in that gap leaves a stored credential with no durable binding at
+          # all, and the retry mints a fresh slot instead of completing this transaction. The binding
+          # is taken HERE, while nothing irreversible has happened: if it fails, the cost is exactly
+          # the burned claim a failed run already pays, and the retry enrolls cleanly.
+          #
+          # Its name carries what a resumed register step cannot re-derive (see the file header for
+          # why a NAME and a SEPARATE namespace): the provider the credential was captured for, the
+          # CAPTURED credential format, and a sha256 digest of the canonical `grant_targets:` line
+          # so the resumed enrollment inherits its ORIGINAL authorization (#579). Every component is
+          # shape-validated BEFORE it reaches the API path — an unvalidated capture is a
+          # path-injection sink into the git API, and `$fmt` is third-party CLI output.
+          if ! printf '%s' "$ISSUE" | grep -qE '^[0-9]+$'; then
+            echo "::error::request issue number '$ISSUE' is not digits-only — refusing to bind the slot or store (fail closed)"; exit 1
+          fi
+          if ! printf '%s' "$PROVIDER" | grep -qE '^(openai|anthropic)$'; then
+            echo "::error::provider '$PROVIDER' is not one of the two structured providers — refusing to bind the slot or store (fail closed)"; exit 1
+          fi
+          BIND_FMT=$(cat "$LOGIN_DIR/credential_format" 2>/dev/null || true)
+          if ! printf '%s' "$BIND_FMT" | grep -qE '^[a-z0-9]+(-[a-z0-9]+)*$'; then
+            echo "::error::captured credential format '$BIND_FMT' is not a plain lowercase token — refusing to bind the slot or store (fail closed)"; exit 1
+          fi
+          # The digest is the LIVE grant-account.py rendering of the authorized set, so it can only
+          # ever be compared against the same canonical line the account record would carry.
+          if ! BIND_DIGEST=$(python3 - <<'PY'
+          import hashlib, importlib.util, json, os, sys
+          spec = importlib.util.spec_from_file_location(
+              "registry_grant_account", "scripts/grant-account.py")
+          grant = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(grant)
+          try:
+              line = grant.format_record_line(json.loads(os.environ["GRANT_TARGETS"] or "[]"))
+          except (grant.GrantError, ValueError) as exc:
+              print(str(exc), file=sys.stderr)
+              sys.exit(1)
+          print(hashlib.sha256(line.encode()).hexdigest())
+          PY
+          ); then
+            echo "::error::could not render the authorized target set this enrollment was granted, so the slot cannot be bound to its authorization — refusing to store (fail closed)"; exit 1
+          fi
+          BINDING_REF="refs/acct-requests/$ISSUE/$HANDLE/$PROVIDER/$BIND_FMT/$BIND_DIGEST"
+          # Create-only, and EVERY failure is fatal — unlike the claim loop above, "already exists"
+          # is not a recoverable collision here: the claim ref proves this run is the only writer
+          # that has ever owned $HANDLE, so a pre-existing binding under it is state corruption.
+          if ! gh api "repos/${{ github.repository }}/git/refs" \
+                 -f ref="$BINDING_REF" -f sha="$GITHUB_SHA" >/dev/null 2>&1; then
+            echo "::error::could not bind request #$ISSUE to slot $HANDLE ($BINDING_REF) — refusing to store (fail closed). Nothing irreversible happened: no credential was captured, the claim on $HANDLE is burned (claims are never released, #186), and re-applying set-up-account enrolls cleanly on a fresh slot."; exit 1
+          fi
+          echo "request #$ISSUE is bound to slot $HANDLE ($BINDING_REF) — a run that dies before the account issue exists is now resumable (#534)"
           # Last probe before the irreversible upsert: the claim defeats every protocol-observing
           # writer; this narrows the residual out-of-protocol (manual) window to probe->set. Only an
           # explicit 404 proves absence — any other outcome (exists, network error) refuses.
@@ -767,21 +978,44 @@ jobs:
       # account body parser ignores unknown keys, so this is safe to add). It is also the #211
       # reconcile key: an exact `request_issue: <n>` line is how a retried run finds the one handle
       # already bound to its request instead of allocating a fresh slot — keep the format stable.
+      #
+      # #534: this step also runs on the store->register RESUME, where the credential for the slot
+      # is already stored but this record was never written. There is no LOGIN_DIR then, so the two
+      # facts a re-mint cannot re-derive — the provider the credential was captured for and its
+      # captured format — come from the claim-time binding, and the step refuses unless the live
+      # provider label still agrees with it.
       - name: Register the account issue in a status:pending state (#185)
         id: register
-        if: steps.login.outputs.status == 'ok'
+        if: steps.login.outputs.status == 'ok' || steps.reconcile.outputs.stage == 'register'
         env:
           GH_TOKEN: ${{ github.token }}
           PROVIDER: ${{ steps.meta.outputs.provider }}
           MODELS: ${{ steps.meta.outputs.models }}
           WORKERS: ${{ steps.meta.outputs.workers }}
-          HANDLE: ${{ steps.store.outputs.handle }}
-          SECRET_NAME: ${{ steps.store.outputs.secret }}
+          HANDLE: ${{ steps.store.outputs.handle || steps.reconcile.outputs.handle }}
+          SECRET_NAME: ${{ steps.store.outputs.secret || steps.reconcile.outputs.secret }}
           ISSUE: ${{ github.event.issue.number }}
           GRANT_TARGETS: ${{ steps.grant.outputs.targets }}
+          # #534: empty on a fresh enrollment, set only on the store->register resume.
+          BOUND_PROVIDER: ${{ steps.reconcile.outputs.provider }}
+          BOUND_FMT: ${{ steps.reconcile.outputs.fmt }}
         run: |
           set -euo pipefail
-          fmt=$(cat "$LOGIN_DIR/credential_format" 2>/dev/null || echo unknown)
+          fmt=$(cat "$LOGIN_DIR/credential_format" 2>/dev/null || echo "${BOUND_FMT:-unknown}")
+          # #534: on the resume path the record is re-minted from the LIVE provider label, so a
+          # label edited after the (irreversible) capture would otherwise mint this account with the
+          # OTHER provider's model aliases around a credential that can serve none of them — an
+          # account that enrolls and activates cleanly and then dies at every worker claim. The
+          # provider and the captured format were both bound to the slot before the capture; require
+          # them rather than trusting today's labels.
+          if [ -n "${BOUND_PROVIDER:-}" ]; then
+            if [ "$PROVIDER" != "$BOUND_PROVIDER" ]; then
+              echo "::error::this request's provider label now resolves to '$PROVIDER', but the credential already captured for $HANDLE was bound at claim time to '$BOUND_PROVIDER' — refusing to re-mint the record against the wrong provider (fail closed). Restore the \`provider:$BOUND_PROVIDER\` label, then re-apply set-up-account."; exit 1
+            fi
+            if [ -z "$fmt" ] || [ "$fmt" = unknown ]; then
+              echo "::error::the credential format captured for $HANDLE could not be recovered from its claim-time binding — refusing to register a record whose \`credential_format\` is unknown (worker.yml gates every claim on it) (fail closed)."; exit 1
+            fi
+          fi
           harness=$([ "$PROVIDER" = openai ] && echo codex || echo claude)
           # #579: record the authorized target repositories ON the account record. The post-merge
           # `activate` job runs on a different event with no access to this request's labels, so
@@ -1258,6 +1492,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           ISSUE: ${{ github.event.issue.number }}
           RESUME: ${{ steps.reconcile.outputs.resume }}
+          STAGE: ${{ steps.reconcile.outputs.stage }}
           HANDLE: ${{ steps.store.outputs.handle || steps.reconcile.outputs.handle }}
           SECRET: ${{ steps.store.outputs.secret || steps.reconcile.outputs.secret }}
           STORE: ${{ steps.store.outcome }}
@@ -1269,11 +1504,13 @@ jobs:
           set -uo pipefail
           comment() { gh issue comment "$ISSUE" -R "${{ github.repository }}" --body "$1" || echo "::warning title=set-up-account::a partial-enrollment alarm notice failed to post on #$ISSUE — the step log is the authoritative record"; }
           # #211: on the resume path store/register were deliberately skipped (their work is done —
-          # the resumed handle proves both), so only the resumed stages can be partial.
+          # the resumed handle proves both), so only the resumed stages can be partial. #534: the
+          # store->register resume is the exception — register RE-RUNS there, so its outcome is
+          # meaningful on that path and must not be filtered out by the resume guard.
           if [ "$RESUME" != true ] && [ "$STORE" != success ]; then
             comment "🚨 Enrollment aborted while claiming/storing the credential (store: \`$STORE\`). No usable account was registered; a slot claim ref may have been burned (claims are never released, by design). **Recovery:** re-apply \`set-up-account\` to retry on a fresh slot."
-          elif [ "$RESUME" != true ] && [ "$REGISTER" != success ]; then
-            comment "🚨 Credential for **$HANDLE** was STORED (secret \`$SECRET\`) but the \`status:pending\` account issue was not created (register: \`$REGISTER\`). The credential is captured with no account record. **Recovery:** create the \`$HANDLE\` issue (status:pending, \`secret_ref: $SECRET\`) or delete the orphaned \`dispatch-secrets\` secret \`$SECRET\`, then re-apply \`set-up-account\`."
+          elif { [ "$RESUME" != true ] || [ "$STAGE" = register ]; } && [ "$REGISTER" != success ]; then
+            comment "🚨 Credential for **$HANDLE** was STORED (secret \`$SECRET\`) but the \`status:pending\` account issue was not created (register: \`$REGISTER\`). The credential is captured with no account record. **Recovery:** re-apply \`set-up-account\` — the slot was bound to this request before the capture (#534), so the retry RESUMES \`$HANDLE\` and re-runs registration rather than minting a second slot. If it keeps failing, read the step log first: a provider label changed since the capture, or a \`grant:\` label set that no longer matches the authorization the slot was bound to, are both refusals — restore them. Otherwise create the \`$HANDLE\` issue by hand (status:pending, \`secret_ref: $SECRET\`, \`request_issue: $ISSUE\`), or delete the orphaned \`dispatch-secrets\` secret \`$SECRET\`."
           elif [ "$VALIDATE" != success ]; then
             comment "🚨 **$HANDLE** was stored and the pending issue created, but read_accounts validation failed (\`$VALIDATE\`) — the account body may be malformed, so no policy PR was opened. **Recovery:** fix the \`$HANDLE\` issue body (models / secret_ref), then re-apply \`set-up-account\` — enrollment resumes \`$HANDLE\` (#211) and opens the account_pool PR."
           elif [ "$POLICY_PR" != success ]; then

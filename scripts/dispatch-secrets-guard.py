@@ -1499,6 +1499,24 @@ SETUP_ACCOUNT_UNION_RE = re.compile(r'\btaken=\$\(')
 SETUP_ACCOUNT_SLOT_RE = re.compile(r"(?:^|\s)n=")
 SETUP_ACCOUNT_CAND_RE = re.compile(r"(?:^|\s)cand=")
 
+# ---- the #534 claim-time request binding (store step) --------------------------------------------
+# `gh secret set` is the one irreversible act in this workflow, and the `request_issue:` line the
+# #211 reconcile key reads is written by the LATER register step. The store step therefore binds the
+# request to the slot BEFORE the capture, in its own create-only namespace; without that binding a
+# run that dies in the store->register gap strands a credential no retry can find. The properties
+# below are the ones whose loss silently reopens that gap, so each is pinned textually — the union
+# contract above is the template (`refs/acct-claims/$cand` is asserted the same way).
+SETUP_ACCOUNT_BINDING_NAME_RE = re.compile(r"(?:^|\s)BINDING_REF=")
+SETUP_ACCOUNT_CAPTURE_RE = re.compile(r"\bgh secret set\b")
+# Every component the binding name interpolates that is NOT structurally minted by the step itself
+# (the handle is a `printf 'acct%02d'`, the digest a sha256 hexdigest) is untrusted or
+# operator-supplied text flowing into a git API PATH, so each must be shape-validated FIRST.
+SETUP_ACCOUNT_BINDING_GUARDS = (
+    ('"$ISSUE"', "^[0-9]+$"),
+    ('"$PROVIDER"', "^(openai|anthropic)$"),
+    ('"$BIND_FMT"', "^[a-z0-9]+(-[a-z0-9]+)*$"),
+)
+
 
 def strip_shell_comments(text):
     """Pure: `text` with inline shell comments removed, line by line, QUOTE-AWARELY — the ONE
@@ -1720,6 +1738,91 @@ def setup_account_union_verdict(step_lines):
         return False, ("the `git/refs` claim creation does not create `refs/acct-claims/$cand` "
                        "— the claimed ref is severed from the union-derived candidate, so the "
                        "union cannot have determined the claimed slot")
+    return True, "ok"
+
+
+def setup_account_binding_verdict(step_lines):
+    """Pure: (ok, reason). The store step must bind the request to the slot it just claimed BEFORE
+    the irreversible `gh secret set` capture (#534), so a run that dies before the register step
+    writes `request_issue:` can still be RESUMED onto the same slot instead of stranding a
+    credential and burning a second one on the retry. Four properties, each of whose loss silently
+    reopens that gap:
+
+    (a) EXISTENCE — a `BINDING_REF=` name under `refs/acct-requests/`, created through the
+        `git/refs` API;
+    (b) DERIVATION — that name interpolates BOTH `$ISSUE` and `$HANDLE`; a binding that does not
+        name the request cannot be found by reconcile, and one that does not name the handle
+        resumes the wrong slot;
+    (c) ORDERING — the creation sits AFTER the claim (the handle does not exist before it) and
+        BEFORE the capture; a binding written after `gh secret set` cannot cover the gap it exists
+        to cover, which is precisely the defect #534 reported;
+    (d) VALIDATION — every operator- or CLI-supplied component of the name is shape-validated
+        earlier in the step, because an unvalidated capture flowing into a git API path is an
+        injection sink (research/914 §4.2's first obligation).
+
+    A missing store step, or any missing property, is a refusal that NAMES what is missing (fail
+    closed). Comments are stripped before matching, as everywhere else in this guard, so commented
+    prose can never stand in for a real write or a real validation."""
+    if step_lines is None:
+        return False, "store step (`id: store`) not found in set-up-account.yml (fail closed)"
+    step_lines = [strip_shell_comments(line) for line in step_lines]
+
+    def joined(index):
+        parts = [step_lines[index].rstrip()]
+        follow = index
+        while parts[-1].endswith("\\") and follow + 1 < len(step_lines):
+            follow += 1
+            parts.append(step_lines[follow].rstrip())
+        return " ".join(part.rstrip("\\").strip() for part in parts)
+
+    claim_index = None
+    name_index = None
+    name_text = None
+    create_index = None
+    capture_index = None
+    for index, line in enumerate(step_lines):
+        if SETUP_ACCOUNT_CLAIM_RE.search(line):
+            text = joined(index)
+            if claim_index is None and "refs/acct-claims/" in text:
+                claim_index = index
+            elif create_index is None and "$BINDING_REF" in text:
+                create_index = index
+        if name_index is None and SETUP_ACCOUNT_BINDING_NAME_RE.search(line):
+            name_index = index
+            name_text = joined(index)
+        if capture_index is None and SETUP_ACCOUNT_CAPTURE_RE.search(line):
+            capture_index = index
+    if claim_index is None:
+        return False, ("the `refs/acct-claims/` claim creation is not in the store step — the "
+                       "request binding's position cannot be established (fail closed)")
+    if name_index is None or "refs/acct-requests/" not in (name_text or ""):
+        return False, ("no `BINDING_REF=refs/acct-requests/...` name is built in the store step — "
+                       "a request that dies in the store->register gap leaves a stored credential "
+                       "no retry can find, and the retry burns a second slot (#534)")
+    if create_index is None:
+        return False, ("the request binding is never CREATED through `git/refs` — building "
+                       "$BINDING_REF without writing it records nothing (#534)")
+    if capture_index is None:
+        return False, ("the irreversible `gh secret set` capture is not in the store step, so it "
+                       "cannot be proven the request binding precedes it (fail closed)")
+    for label, variants in (("request issue", ('$ISSUE', '${ISSUE}')),
+                            ("claimed handle", ('$HANDLE', '${HANDLE}'))):
+        if not any(variant in name_text for variant in variants):
+            return False, (f"the request binding name does not interpolate the {label} "
+                           f"({' / '.join(variants)}) — a binding that does not name both the "
+                           "request and the slot it claimed either cannot be found by reconcile "
+                           "or resumes the wrong slot")
+    if not claim_index < create_index < capture_index:
+        return False, ("the request binding is not created AFTER the `refs/acct-claims/` claim and "
+                       "BEFORE the irreversible `gh secret set` capture — a binding written after "
+                       "the capture cannot cover the store->register gap it exists to cover (#534)")
+    for variable, pattern in SETUP_ACCOUNT_BINDING_GUARDS:
+        if not any("grep -qE" in joined(index) and variable in joined(index)
+                   and pattern in joined(index)
+                   for index in range(0, name_index)):
+            return False, (f"the request binding component {variable} is not shape-validated "
+                           f"(`grep -qE '{pattern}'`) before the name is built — unvalidated text "
+                           "flowing into a git API path is an injection sink")
     return True, "ok"
 
 
@@ -2397,6 +2500,91 @@ def _self_test():
         "all paginated, all BEFORE the claim, all flowing into taken, taken determining the "
         "claimed ref (taken -> n -> cand -> claim)",
         live_union_verdict, (True, "ok"))
+
+    # [#534] CLAIM-TIME REQUEST BINDING, asserted in the same static style as the union above. The
+    # `request_issue:` line the #211 reconcile key reads is written by the LATER register step, so
+    # without a binding taken BEFORE `gh secret set` a run that dies in that gap strands an
+    # irreversibly captured credential AND burns a second slot on the retry. Every mutation below is
+    # a way of reopening that gap while leaving the union contract green.
+    binding_sample = [
+        "      - name: Claim slot atomically",
+        "        id: store",
+        "        run: |",
+        '          out=$(gh api "repos/${{ github.repository }}/git/refs" \\',
+        '                  -f ref="refs/acct-claims/$cand" -f sha="$GITHUB_SHA")',
+        "          HANDLE=$(printf 'acct%02d' \"$claimed\")",
+        "          if ! printf '%s' \"$ISSUE\" | grep -qE '^[0-9]+$'; then exit 1; fi",
+        "          if ! printf '%s' \"$PROVIDER\" | grep -qE '^(openai|anthropic)$'; then exit 1; fi",
+        '          BIND_FMT=$(cat "$LOGIN_DIR/credential_format")',
+        "          if ! printf '%s' \"$BIND_FMT\" | grep -qE '^[a-z0-9]+(-[a-z0-9]+)*$'; then exit 1; fi",
+        '          BINDING_REF="refs/acct-requests/$ISSUE/$HANDLE/$PROVIDER/$BIND_FMT/$BIND_DIGEST"',
+        '          if ! gh api "repos/${{ github.repository }}/git/refs" \\',
+        '                 -f ref="$BINDING_REF" -f sha="$GITHUB_SHA"; then exit 1; fi',
+        '          GH_TOKEN="$REGISTRY_PAT" gh secret set "$SECRET_NAME" --env dispatch-secrets < "$LOGIN_DIR/token"',
+        "      - name: Register the account issue",
+    ]
+    chk("[#534] binding: claim -> validated name -> git/refs create -> capture -> ok",
+        setup_account_binding_verdict(
+            setup_account_store_step_lines("\n".join(binding_sample))),
+        (True, "ok"))
+    no_create = [line for line in binding_sample if '-f ref="$BINDING_REF"' not in line]
+    verdict_no_create = setup_account_binding_verdict(
+        setup_account_store_step_lines("\n".join(no_create)))
+    chk("[#534] binding: the git/refs creation deleted (name still built) -> refuse, NAMED",
+        (verdict_no_create[0], "never CREATED" in verdict_no_create[1]), (False, True))
+    no_name = [line for line in binding_sample if "BINDING_REF" not in line]
+    verdict_no_name = setup_account_binding_verdict(
+        setup_account_store_step_lines("\n".join(no_name)))
+    chk("[#534] binding: no binding at all -> refuse, naming the store->register gap it reopens",
+        (verdict_no_name[0], "refs/acct-requests/" in verdict_no_name[1]), (False, True))
+    unbound_handle = "\n".join(binding_sample).replace("$ISSUE/$HANDLE/", "$ISSUE/acct99/", 1)
+    verdict_unbound_handle = setup_account_binding_verdict(
+        setup_account_store_step_lines(unbound_handle))
+    chk("[#534] binding: name severed from the CLAIMED handle -> refuse, component NAMED",
+        (verdict_unbound_handle[0], "claimed handle" in verdict_unbound_handle[1]),
+        (False, True))
+    unbound_request = "\n".join(binding_sample).replace(
+        'refs/acct-requests/$ISSUE/', "refs/acct-requests/0/", 1)
+    verdict_unbound_request = setup_account_binding_verdict(
+        setup_account_store_step_lines(unbound_request))
+    chk("[#534] binding: name severed from the REQUEST -> refuse (reconcile could never find it)",
+        (verdict_unbound_request[0], "request issue" in verdict_unbound_request[1]),
+        (False, True))
+    late = list(binding_sample)
+    late_create = [late.pop(11), late.pop(11)]   # the two git/refs creation lines
+    late[12:12] = late_create                    # ...re-inserted AFTER `gh secret set`
+    verdict_late = setup_account_binding_verdict(
+        setup_account_store_step_lines("\n".join(late)))
+    chk("[#534] binding: created AFTER the irreversible capture -> refuse, ordering NAMED (this is "
+        "exactly the gap the issue reported, so it must never read as satisfied)",
+        (verdict_late[0], "BEFORE the irreversible" in verdict_late[1]), (False, True))
+    no_fmt_guard = [line for line in binding_sample
+                    if "^[a-z0-9]+(-[a-z0-9]+)*$" not in line]
+    verdict_no_fmt_guard = setup_account_binding_verdict(
+        setup_account_store_step_lines("\n".join(no_fmt_guard)))
+    chk("[#534] binding: the CLI-supplied credential format reaches the git API path unvalidated "
+        "-> refuse, component NAMED",
+        (verdict_no_fmt_guard[0], "$BIND_FMT" in verdict_no_fmt_guard[1]), (False, True))
+    commented_guard = "\n".join(binding_sample).replace(
+        "          if ! printf '%s' \"$ISSUE\" | grep -qE '^[0-9]+$'; then exit 1; fi",
+        "          : # printf '%s' \"$ISSUE\" | grep -qE '^[0-9]+$'", 1)
+    verdict_commented_guard = setup_account_binding_verdict(
+        setup_account_store_step_lines(commented_guard))
+    chk("[#534] binding: a validation that survives only as COMMENT PROSE does not count "
+        "(comments are stripped before matching)",
+        (verdict_commented_guard[0], "$ISSUE" in verdict_commented_guard[1]), (False, True))
+    chk("[#534] binding: missing store step -> refuse (fail closed)",
+        setup_account_binding_verdict(
+            setup_account_store_step_lines("jobs:\n  login:\n"))[0], False)
+    try:
+        with open(setup_path, encoding="utf-8") as handle:
+            live_binding_verdict = setup_account_binding_verdict(
+                setup_account_store_step_lines(handle.read()))
+    except OSError:
+        live_binding_verdict = (False, "set-up-account.yml unreadable (fail closed)")
+    chk("workflow: set-up-account binds the request to the claimed slot, with every name component "
+        "shape-validated, AFTER the claim and BEFORE the irreversible capture (#534)",
+        live_binding_verdict, (True, "ok"))
 
     # BINDING-MAP CONTRACT (sol round 17 on the #275 PR): synthetic accept + every reject
     # direction, then the LIVE derivation over the real .github/workflows/ tree. The map is
@@ -3372,10 +3560,16 @@ def _self_test():
 
     gh_stub = r'''#!/usr/bin/env bash
 # Hermetic gh stub for the reconcile harness: keyed on EXACT argv so a reshaped reconcile
-# step fails LOUDLY (exit 64) instead of silently passing. STUB_MODE selects the probe fate.
+# step fails LOUDLY (exit 64) instead of silently passing. STUB_MODE selects the probe fate;
+# STUB_REFS_MODE the fate of the #534 claim-time binding listing.
 args="$*"
 case "$args" in
-  "api --paginate repos/$REPO/issues?state=open&per_page=100")
+  "api --paginate repos/$REPO/issues?state=all&per_page=100")
+    printf '[]\n' ;;
+  "api --paginate repos/$REPO/git/matching-refs/acct-requests/$ISSUE/")
+    if [ "${STUB_REFS_MODE:-ok}" = fail ]; then
+      printf 'gh: Internal Server Error (HTTP 500)\n' >&2; exit 1
+    fi
     printf '[]\n' ;;
   "api repos/$REPO/environments/dispatch-secrets/secrets/"*)
     if [ "${GH_TOKEN:-}" != "$EXPECTED_PROBE_TOKEN" ]; then
@@ -3397,11 +3591,22 @@ case "$args" in
 esac
 '''
     jq_stub = r'''#!/usr/bin/env bash
-# Hermetic jq stub: the harness controls the bound-issue set directly (the binding filter's
-# OUTPUT is injected), so the real jq binary is not required on the test host.
+# Hermetic jq stub: the harness controls each filter's OUTPUT directly (keyed on a fragment of
+# the filter PROGRAM, so the three filters the reconcile body runs stay distinguishable), and
+# the real jq binary is not required on the test host. NOTE the deliberate limit this inherits
+# from the #533 harness: injecting the outputs proves the reconcile body's CONTROL FLOW, not
+# the jq programs themselves — the ref-grammar `select(test(...))` is not exercised here.
+args="$*"
 cat > /dev/null 2>/dev/null || true
-if [ "$STUB_MODE" = fresh ]; then exit 0; fi
-printf '5\n'
+case "$args" in
+  *acct-requests*)
+    if [ -n "${STUB_BINDINGS:-}" ]; then printf '%s\n' "$STUB_BINDINGS"; fi
+    exit 0 ;;
+  *length*)
+    printf '%s\n' "${STUB_TITLED:-0}"; exit 0 ;;
+esac
+if [ "${STUB_BOUND:-}" = yes ]; then printf '5\n'; fi
+exit 0
 '''
 
     # The halted run's log showed only `(1, False, False, False)` — the harness discarded the body's
@@ -3411,8 +3616,15 @@ printf '5\n'
     reconcile_diag = {}
 
     def run_reconcile(mode, secret_ref="ACCT07_TOKEN", registry_pat="sentinel-registry-pat",
-                      grant_targets="jeswr/agent-account-registry"):
-        """rc + GITHUB_OUTPUT text from executing the real reconcile shell hermetically."""
+                      grant_targets="jeswr/agent-account-registry", bound=None,
+                      bindings="", titled="0", refs_mode="ok"):
+        """rc + GITHUB_OUTPUT text from executing the real reconcile shell hermetically.
+
+        `bound` selects whether an account issue is bound to the request (the #211 path; defaults
+        to "yes unless the mode is `fresh`", preserving the pre-#534 call sites). `bindings` is the
+        newline-separated set of claim-time request bindings the #534 path resolves when no account
+        issue is bound, `titled` how many account issues already carry the resumed handle's title,
+        and `refs_mode` the fate of the binding listing itself."""
         if reconcile_script is None:
             return None, ""
         with tempfile.TemporaryDirectory() as tmp:
@@ -3446,6 +3658,11 @@ printf '5\n'
                        REPO="jeswr/agent-account-registry",
                        GITHUB_OUTPUT=output_path,
                        STUB_MODE=mode,
+                       STUB_BOUND=("yes" if (mode != "fresh" if bound is None else bound)
+                                   else "no"),
+                       STUB_BINDINGS=bindings,
+                       STUB_TITLED=titled,
+                       STUB_REFS_MODE=refs_mode,
                        STUB_BODY_FILE=body_file)
             # cwd = the repository root: the extracted reconcile body loads
             # scripts/grant-account.py by the same relative path every workflow step uses (#579),
@@ -3453,7 +3670,7 @@ printf '5\n'
             proc = subprocess.run(["bash", "-c", reconcile_script], cwd=os.path.abspath(
                 os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir)),
                 env=env, capture_output=True, text=True)
-            reconcile_diag[(mode, secret_ref, bool(registry_pat), grant_targets)] = (
+            reconcile_diag[(mode, secret_ref, bool(registry_pat), grant_targets, bindings)] = (
                 proc.stderr or "") + (proc.stdout or "")
             with open(output_path, encoding="utf-8") as fh:
                 return proc.returncode, fh.read()
@@ -3463,10 +3680,13 @@ printf '5\n'
         (rc_fresh, "resume=false" in out_fresh, "resume=true" in out_fresh),
         (0, True, False))
     rc_resume, out_resume = run_reconcile("secret-exists")
-    chk("reconcile: bound issue + secret PROVEN present (PAT-scoped GET) -> resume granted",
+    chk("reconcile: bound issue + secret PROVEN present (PAT-scoped GET) -> resume granted, at the "
+        "VALIDATE stage (#534: registration must stay skipped — its issue already exists, and "
+        "re-running it would mint the duplicate acctNN title both activation paths refuse forever)",
         (rc_resume, "resume=true" in out_resume, "handle=acct07" in out_resume,
-         "secret=ACCT07_TOKEN" in out_resume),
-        (0, True, True, True))
+         "secret=ACCT07_TOKEN" in out_resume, "stage=validate" in out_resume,
+         "stage=register" in out_resume),
+        (0, True, True, True, True, False))
     rc_gone, out_gone = run_reconcile("secret-404")
     chk("reconcile: referenced secret 404s in dispatch-secrets -> refuse (rc!=0, resume NEVER "
         "granted; validate/policy-PR/activation unreachable)",
@@ -3513,12 +3733,68 @@ printf '5\n'
     # Any refusal on a path that must be GRANTED is a harness/checkout defect rather than a contract
     # finding, so surface the body's own diagnostics instead of leaving a bare tuple in the log.
     for key, expected_zero in ((("secret-exists", "ACCT07_TOKEN", True,
-                                 "jeswr/agent-account-registry"), rc_resume),
+                                 "jeswr/agent-account-registry", ""), rc_resume),
                                (("secret-exists", "ACCT07_TOKEN", True,
-                                 "o/beta, o/alpha, o/alpha"), rc_multi)):
+                                 "o/beta, o/alpha, o/alpha", ""), rc_multi)):
         if expected_zero not in (0, None) and key in reconcile_diag:
             print("  DIAG the reconcile body refused on a MUST-GRANT path; its own output was:")
             for line in reconcile_diag[key].strip().splitlines()[-6:]:
+                print(f"  DIAG   {line}")
+
+    # [#534] STORE->REGISTER GAP, same executable harness. `gh secret set` is irreversible and the
+    # `request_issue:` line the rows above reconcile on is written AFTER it, so a run that dies in
+    # that gap leaves a stored credential with NO bound account issue. Every row here runs the REAL
+    # reconcile body with no bound issue, and the pre-#534 behaviour (fall through to a fresh
+    # enrollment, minting a second slot and orphaning the capture) is what the first row forbids.
+    ONE_BINDING = "acct09/anthropic/claude-oauth-token/" + "a" * 64
+    rc_bind, out_bind = run_reconcile("secret-exists", bound=False, bindings=ONE_BINDING)
+    chk("[#534] reconcile: no bound issue, but a claim-time binding whose credential is PROVEN "
+        "stored -> resume at the REGISTER stage on the SAME slot (never a fresh one), publishing "
+        "the provider/format/authorization-digest the record cannot be re-minted without",
+        (rc_bind, "resume=true" in out_bind, "stage=register" in out_bind,
+         "handle=acct09" in out_bind, "secret=ACCT09_TOKEN" in out_bind,
+         "provider=anthropic" in out_bind, "fmt=claude-oauth-token" in out_bind,
+         "grant_digest=" + "a" * 64 in out_bind, "resume=false" in out_bind),
+        (0, True, True, True, True, True, True, True, False))
+    rc_unstored, out_unstored = run_reconcile("secret-404", bound=False, bindings=ONE_BINDING)
+    chk("[#534] reconcile: a bound slot whose credential was NEVER stored (404) is not resumable — "
+        "fresh enrollment, and resume is NEVER granted around a missing credential",
+        (rc_unstored, "resume=false" in out_unstored, "resume=true" in out_unstored),
+        (0, True, False))
+    rc_ambig, out_ambig = run_reconcile(
+        "secret-exists", bound=False,
+        bindings=ONE_BINDING + "\nacct10/anthropic/claude-oauth-token/" + "b" * 64)
+    chk("[#534] reconcile: TWO bound slots whose credentials are both stored -> ambiguous identity, "
+        "refuse (never guess which capture to complete)",
+        (rc_ambig != 0, "resume=true" in out_ambig), (True, False))
+    rc_dup, out_dup = run_reconcile("secret-exists", bound=False, bindings=ONE_BINDING,
+                                    titled="1")
+    chk("[#534] reconcile: an account issue already carries the bound handle's title (in ANY state) "
+        "-> refuse rather than mint the duplicate acctNN both activation paths then reject forever",
+        (rc_dup != 0, "resume=true" in out_dup), (True, False))
+    rc_refs, out_refs = run_reconcile("secret-exists", bound=False, bindings=ONE_BINDING,
+                                      refs_mode="fail")
+    chk("[#534] reconcile: the binding listing is UNREADABLE -> refuse; 'no prior enrollment' is a "
+        "PROVEN negative, never an unread one (proceeding blind is what orphans the credential)",
+        (rc_refs != 0, "resume=true" in out_refs, "resume=false" in out_refs),
+        (True, False, False))
+    rc_bind_probe, out_bind_probe = run_reconcile("probe-error", bound=False,
+                                                  bindings=ONE_BINDING)
+    chk("[#534] reconcile: the bound slot's credential probe fails for a non-404 reason -> refuse "
+        "(existence unprovable is not absence)",
+        (rc_bind_probe != 0, "resume=true" in out_bind_probe, "resume=false" in out_bind_probe),
+        (True, False, False))
+    rc_nobind, out_nobind = run_reconcile("fresh", bound=False, bindings="")
+    chk("[#534] reconcile: no bound issue AND no claim-time binding -> the fresh enrollment path is "
+        "still reachable (the new gate is not a blanket refusal)",
+        (rc_nobind, "resume=false" in out_nobind, "resume=true" in out_nobind),
+        (0, True, False))
+    for key, expected_zero in (
+            (("secret-exists", "ACCT07_TOKEN", True, "jeswr/agent-account-registry",
+              ONE_BINDING), rc_bind),):
+        if expected_zero not in (0, None) and key in reconcile_diag:
+            print("  DIAG the reconcile body refused on a MUST-GRANT #534 path; its output was:")
+            for line in reconcile_diag[key].strip().splitlines()[-8:]:
                 print(f"  DIAG   {line}")
 
     # Pure scope verdict — accept AND reject directions.

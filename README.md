@@ -291,6 +291,14 @@ slot is merely burned (safe), while reusing a number can silently overwrite a li
 (`gh secret set` is an upsert) or mint a duplicate issue title (GitHub does not enforce unique
 titles).
 
+**A sibling namespace you must also leave alone: `refs/acct-requests/`.** The `set-up-account`
+broker writes one of these per enrollment, immediately after its claim and *before* it stores the
+captured token, to bind the request issue to the slot (#534). It is what lets a broker run that
+dies between `gh secret set` and the account-issue creation be *resumed* onto the same slot instead
+of orphaning an irreversibly captured credential while a retry burns a second number. Deleting one
+silently reopens that gap. A manual enrolment writes no binding — it creates the account issue
+itself, so there is no window to cover — and does not need one.
+
 ### Step 0 — obtain a DURABLE, NON-ROTATING token (do NOT use a subscription blob)
 
 - **Anthropic** (Claude models): run `claude setup-token` while logged into the target account. It

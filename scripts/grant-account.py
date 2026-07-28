@@ -1671,8 +1671,18 @@ def _self_test():
     check("[#616 r2] the enrollment job fires only on the set-up-account label event",
           job_condition(workflow, "login"),
           "github.event_name == 'issues' && github.event.label.name == 'set-up-account'")
+    # #534: the store->register resume re-mints the account record, so it needs this step's
+    # provider-derived `models`/`max_concurrent_workers` defaults — the single source of truth for
+    # both. The condition is widened by exactly that one disjunct and no more; a login is still
+    # gated separately (`steps.reconcile.outputs.resume != 'true'` on the login/install/GPG steps),
+    # so widening this one can never restart a sign-in on a resumed enrollment.
     check("[#616 r2] the provider-label step's resume condition is pinned",
-          step_condition(workflow, "meta"), "steps.reconcile.outputs.resume != 'true'")
+          step_condition(workflow, "meta"),
+          "steps.reconcile.outputs.resume != 'true' || "
+          "steps.reconcile.outputs.stage == 'register'")
+    check("[#534] the sign-in step stays gated on a NON-resume — widening `meta` must never let a "
+          "resumed enrollment start a second login and orphan the captured credential",
+          step_condition(workflow, "login"), "steps.reconcile.outputs.resume != 'true'")
     check("[#616 r2] the privileged policy write runs only after a real login or a resume",
           step_condition(workflow, "policy_pr"),
           "steps.login.outputs.status == 'ok' || steps.reconcile.outputs.resume == 'true'")
@@ -1681,8 +1691,15 @@ def _self_test():
     # unconditionally True, so it passed whether `register` carried no `if:` or any non-empty one.
     # Pin the condition EXACTLY (like every other one), and prove the loud-refusal behaviour on a
     # step that genuinely has no `if:` of its own — `activate_merged` is gated by its JOB.
+    # #534: register also runs on the store->register resume — the state where the credential is
+    # already stored but its account record was never created. That disjunct keys off the reconcile
+    # step's `stage` output (which reconcile only sets after PROVING the bound slot's secret exists),
+    # never off `resume` alone: the #211 resume path must still skip registration, because its
+    # account issue already exists and re-running would mint a duplicate acctNN title.
     check("[#616 r4] the register step's condition is pinned exactly",
-          step_condition(workflow, "register"), "steps.login.outputs.status == 'ok'")
+          step_condition(workflow, "register"),
+          "steps.login.outputs.status == 'ok' || "
+          "steps.reconcile.outputs.stage == 'register'")
     check("an absent/renamed job — and a step with no `if:` — fail LOUDLY, never vacuously",
           (refuses(job_condition, workflow, "no_such_job", needle="found 0"),
            refuses(step_condition, workflow, "no_such_step", needle="found 0"),
