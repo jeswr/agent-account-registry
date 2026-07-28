@@ -525,6 +525,56 @@ def existing_record_admission_error(body, pr_number, admission_error):
     return admission_error(record, pr_number)
 
 
+# --- WHAT THE EXISTING RECORD MAKES THIS PR (registry #776) ------------------------------------
+# Three dispositions, not two. The middle one — a record that EXISTS but which every consumer
+# REFUSES — used to share the "leave it alone" branch with a healthy record and print NEEDS-HUMAN
+# forever. It is a distinct state with a distinct machine action, so it gets a distinct name.
+def seal_population(accounted, population):
+    """Assert that every worker PR in the population left `backfill()` through exactly one
+    COUNTED exit. Returns None, or RAISES BackfillError (registry #776).
+
+    A backfill that silently skips is another state with no exit — the class this estate found
+    eight times in one day. Two exits in `backfill()` printed `skip #N` and touched no counter,
+    so the completion line's arithmetic had quietly stopped describing the population; both were
+    unreached on live data, which is exactly why they survived review.
+
+    IT RAISES RATHER THAN RETURNING A REASON, deliberately. A `reason = check(...)` / `if reason:
+    raise` shape has a seam between deciding and acting, and a mutation run over this very change
+    proved the seam is where the vacuity lives: deleting the two-line `if ... raise` while leaving
+    the computation in place SURVIVED every test, because the tests exercised the predicate and
+    the call site's existence but nothing forced the result to have an effect. There is no seam to
+    delete when the decision and the raise are the same statement."""
+    if accounted == population:
+        return None
+    raise BackfillError(
+        f"backfill accounting is unsealed: {accounted} counted outcome(s) for a population "
+        f"of {population} worker PR(s) — some PR left the loop through an uncounted exit")
+
+
+RECORD_ABSENT = "absent"                 # nothing anywhere -> MINT from the run log
+RECORD_ADMITS = "admits"                 # healthy -> SKIP, never rewritten, on any path
+RECORD_INADMISSIBLE = "inadmissible"     # present but dead to every consumer -> REPAIR
+
+
+def record_disposition(body, pr_number, admission_error):
+    """PURE. What the EFFECTIVE existing record body (ledger-first, None when neither copy
+    exists) makes this PR: one of the RECORD_* constants, plus the admission diagnostic.
+
+    The whole point of naming the middle state is that its machine action DIFFERS. Measured on
+    the live estate 2026-07-27: 7 master records carry the attempt-less `backfill:<run>` stamp an
+    OLDER revision of THIS script wrote, which the post-#657 admission refuses. Two of them
+    (sparq#2439/#2456) are open worker PRs. `backfill()` printed NEEDS-HUMAN for them on every
+    run since #657 and could never do anything else, because a repair has to write a record and
+    the only writer refused to touch a PR that already had one. A state whose only exit is a
+    human is a state with no exit — this estate found that class eight times in one day."""
+    if body is None:
+        return RECORD_ABSENT, None
+    error = existing_record_admission_error(body, pr_number, admission_error)
+    if error is None:
+        return RECORD_ADMITS, None
+    return RECORD_INADMISSIBLE, error
+
+
 # --- DRAFT CONVERSION: the property is "not yet through review", NOT "is not a draft" (#726) ---
 # The old predicate was simply `if is_draft: return`, i.e. it drafted EVERY non-draft worker PR.
 # That is right for a freshly published worker PR — publish-never-arms is what keeps an unreviewed
@@ -734,7 +784,32 @@ def backfill(target_repo, registry_repo, routing_file, apply_changes, no_draft_c
     pulls = flatten_pull_pages(pages)
     if pulls is None:
         raise BackfillError("pull listing is malformed")
-    written = skipped = needs_human = 0
+    written = skipped = needs_human = repaired = blocked = 0
+    # [registry #776] The POPULATION this run is accountable for: every open, same-repo,
+    # bot-authored worker PR. Counted at the same branch that admits the PR into the loop, so
+    # the seal below compares two numbers derived from ONE walk. Without it "skipped 76" was
+    # unfalsifiable — a PR that fell out of an uncounted `continue` was indistinguishable from
+    # one that was never in the population, which is how two silent exits survived below.
+    population = 0
+    # [registry #776 x #876] THE #657 ORCHESTRATOR CLASS IS OUTSIDE THE POPULATION, and therefore
+    # outside the seal. This is a decision about what "the population" MEANS, not a loosening:
+    #
+    #   1. The seal's whole power comes from `population` being incremented at ONE branch that is
+    #      genuinely UPSTREAM of many exits — six of them below. The orchestrator branch has
+    #      exactly one counted outcome, immediately adjacent, so incrementing `population` there
+    #      too would be arithmetic that can never disagree with itself: zero added seal coverage,
+    #      and a denominator that means no more than "whatever I happened to count". A seal that
+    #      cannot fail is the thing this change exists to stop shipping.
+    #   2. Substantively, backfill CANNOT ever record this class and must not try (#876/#827:
+    #      there is no worker run to source an identity from, `mint-provenance.py` owns it). A
+    #      population containing PRs the script is structurally forbidden to act on makes
+    #      `recorded / population` a ratio of nothing.
+    #
+    # So it gets its OWN counter rather than riding `skipped`. #876's point — that the class must
+    # be VISIBLE rather than fall out of an accidental shape test — is fully preserved: it is
+    # named on the completion line, in its own bucket. What it stops doing is inflating a bucket
+    # that means "already carries an admissible record".
+    out_of_scope = 0
     for pull in pulls:
         if not isinstance(pull, dict):
             continue
@@ -766,12 +841,13 @@ def backfill(target_repo, registry_repo, routing_file, apply_changes, no_draft_c
                 # is not news: it stays invisible. Nothing is written, nothing is claimed.
                 continue
             if orchestrator_record is not None:
-                skipped += 1
+                out_of_scope += 1
                 print(f"skip #{number}: #657 orchestrator class — provenance is minted by "
                       "scripts/mint-provenance.py, never backfilled (there is no worker run to "
                       "source an identity from), and the class is NON-DRAFT by design so draft "
                       "conversion must not touch it")
             continue
+        population += 1
         is_draft = pull.get("draft") is True
         # Probe the LIVE review state only for an actual draft-conversion candidate (an
         # already-draft PR is never converted, so its state cannot change any outcome and the
@@ -796,21 +872,25 @@ def backfill(target_repo, registry_repo, routing_file, apply_changes, no_draft_c
                   f"recorded ({exc}); leaving untouched — rerun once the registry probe "
                   "succeeds")
             continue
-        if body is not None:
-            record_error = existing_record_admission_error(body, number, admission_error)
-            if record_error is None:
-                skipped += 1
-                print(f"skip #{number}: provenance already recorded")
-                # Still reconcile the draft state (an earlier pass may have crashed between
-                # the two).
-                _ensure_draft(target_repo, number, is_draft, apply_changes, state=state,
-                              no_draft_convert=no_draft_convert)
-                continue
-            needs_human += 1
-            print(f"NEEDS-HUMAN #{number}: an existing provenance record is present but NOT "
-                  f"admissible by the review loop ({record_error}); a human must repair or "
-                  "remove it before this PR becomes visible")
+        disposition, record_error = record_disposition(body, number, admission_error)
+        if disposition == RECORD_ADMITS:
+            skipped += 1
+            print(f"skip #{number}: provenance already recorded")
+            # Still reconcile the draft state (an earlier pass may have crashed between
+            # the two).
+            _ensure_draft(target_repo, number, is_draft, apply_changes, state=state,
+                          no_draft_convert=no_draft_convert)
             continue
+        if disposition == RECORD_INADMISSIBLE:
+            # [registry #776] The machine exit. Fall through to the SAME run-log re-derivation
+            # the mint path uses — no new trust is introduced, because a resolved identity here
+            # rests on exactly the evidence a fresh record rests on, and it is strictly HIGHER
+            # trust than the record being replaced (whose trust basis is what failed admission).
+            # Gating the repair on agreement with the refused record would let the lower-trust
+            # artifact veto its own repair, i.e. rebuild the dead end one layer down.
+            print(f"REPAIR #{number}: the existing provenance record is present but NOT "
+                  f"admissible by the review loop ({record_error}); re-deriving the implementer "
+                  "identity from the worker run log")
 
         # The worker RUN LOG is the only accepted identity source (no trailer fallback: trailers
         # on this pre-migration population are model-forgeable — see the module docstring).
@@ -851,32 +931,68 @@ def backfill(target_repo, registry_repo, routing_file, apply_changes, no_draft_c
                   "remap before this identity is recorded")
             continue
         commits = _gh_json(["api", f"repos/{target_repo}/pulls/{number}/commits?per_page=100"])
+        # [registry #776] COUNTED. These two exits printed `skip #N` and fell out of the loop
+        # touching no counter at all, so the completion line's arithmetic silently stopped
+        # describing the population. They are unreached on today's data, which is exactly why
+        # they survived: an uncounted exit is invisible until the day it fires.
         if not isinstance(commits, list) or not commits:
-            print(f"skip #{number}: PR has no commits")
+            blocked += 1
+            print(f"BLOCKED #{number}: PR has no commits, so there is no head sha to bind the "
+                  "record to; leaving fail-closed invisible")
             continue
         opened_sha = str((commits[0] or {}).get("sha", ""))
         if not re.fullmatch(r"[0-9a-f]{40}", opened_sha):
-            print(f"skip #{number}: first commit sha is malformed")
+            blocked += 1
+            print(f"BLOCKED #{number}: first commit sha is malformed, so the record cannot be "
+                  "bound to a head; leaving fail-closed invisible")
             continue
 
         impl_account_h = worker_pr.account_hash(account, salt)
+        # The replacement must itself ADMIT. A repair that writes a second refused record would
+        # convert a loud dead end into a silent one — and on the mint path this is the check that
+        # says the schema this script writes is the schema the review loop reads, which is
+        # precisely the drift that created the population being repaired.
+        candidate = {"pr_number": number, "head_sha_at_open": opened_sha,
+                     "impl_provider": provider, "impl_alias": alias,
+                     "impl_account_h": impl_account_h, "issue": issue,
+                     "recorded_at_run": run_key}
+        candidate_error = admission_error(candidate, number)
+        if candidate_error is not None:
+            blocked += 1
+            print(f"BLOCKED #{number}: the record this run would write is itself NOT admissible "
+                  f"by the review loop ({candidate_error}); refusing to write it")
+            continue
+        repair = disposition == RECORD_INADMISSIBLE
+        verb = "repair" if repair else "record"
         if apply_changes:
             worker_pr.provenance_record(registry_repo, target_repo, number, opened_sha,
-                                        provider, alias, impl_account_h, issue, run_key)
-            written += 1
+                                        provider, alias, impl_account_h, issue, run_key,
+                                        supersede_legacy=repair)
         else:
             # Privacy: never print the raw handle, only the (public-anyway) salted hash.
-            print(f"DRY-RUN #{number}: would record impl={provider}/{alias} "
+            print(f"DRY-RUN #{number}: would {verb} impl={provider}/{alias} "
                   f"account_h={impl_account_h} issue=#{issue} opened={opened_sha[:8]} "
                   f"({run_key})")
+        if repair:
+            repaired += 1
+        else:
             written += 1
         # Recording is DONE by this point and its count is already banked: draft conversion is an
         # INDEPENDENT action whose outcome can never withhold a provenance record (issue #726).
         _ensure_draft(target_repo, number, is_draft, apply_changes, state=state,
                       no_draft_convert=no_draft_convert)
     mode = "recorded" if apply_changes else "would record"
-    print(f"backfill complete: {mode} {written}, skipped {skipped}, "
-          f"needs-human {needs_human}")
+    # `out-of-scope` rides OUTSIDE the parenthesised population figure on purpose: the reader must
+    # be able to tell "this run adjudicated N worker PRs" from "and declined M PRs that were never
+    # its job", which is exactly the distinction folding the #657 class into `skipped` destroyed.
+    print(f"backfill complete: {mode} {written}, repaired {repaired}, skipped {skipped}, "
+          f"needs-human {needs_human}, blocked {blocked} "
+          f"(population {population}) out-of-scope {out_of_scope}")
+    # [registry #776] THE SEAL. Every worker PR left this loop through exactly one counted exit,
+    # or this raises. Bare statement on purpose — see seal_population's docstring: a
+    # `reason = ...` / `if reason: raise` shape has a deletable seam, and a mutant that deleted
+    # exactly that seam survived the whole suite.
+    seal_population(written + repaired + skipped + needs_human + blocked, population)
 
 
 def identity_from_run_log(log_readable, log_text, target_repo, pr_number, issue, live_author,
@@ -1566,37 +1682,62 @@ def _self_test():
     def e2e_no_write(*_args, **_kwargs):
         raise AssertionError("a DRY RUN must never write a provenance record")
 
-    stub_worker_pr = types.SimpleNamespace(
-        LEDGER_REF="ledger", WorkerPrError=BackfillError,
-        provenance_path=lambda repo, number: f"orchestration/provenance/{number}.json",
-        _probe_registry_file=lambda repo, path, ref=None: (None, None),
-        account_hash=lambda account, salt: "deadbeefdeadbeef",
-        provenance_record=e2e_no_write)
     e2e_state = {9001: QUEUED_ONLY, 9002: FRESH}
     routing_toml = Path(tempfile.mkdtemp()) / "routing.toml"
     routing_toml.write_text('[models.fable]\nprovider = "anthropic"\n', encoding="utf-8")
     patched = ("_gh_json", "_run_gh", "_load_worker_pr", "_load_dispatch_claim", "review_state")
-    saved_globals = {name: globals()[name] for name in patched}
-    saved_salt = os.environ.get("PROVENANCE_SALT")
-    e2e_buffer = io.StringIO()
-    try:
-        globals().update(
-            _gh_json=e2e_gh_json, _run_gh=e2e_run_gh,
-            _load_worker_pr=lambda: stub_worker_pr,
-            _load_dispatch_claim=lambda: types.SimpleNamespace(
-                provenance_admission_error=lambda record, pr: None),
-            review_state=lambda repo, number, runner=None: e2e_state[number])
-        os.environ["PROVENANCE_SALT"] = "self-test-only"
-        with contextlib.redirect_stdout(e2e_buffer):
-            backfill("sparq-org/sparq", "jeswr/agent-account-registry", str(routing_toml),
-                     False)
-    finally:
-        globals().update(saved_globals)
-        if saved_salt is None:
-            os.environ.pop("PROVENANCE_SALT", None)
-        else:
-            os.environ["PROVENANCE_SALT"] = saved_salt
-    e2e = e2e_buffer.getvalue()
+
+    def drive_backfill(pulls_pages, *, ledger=None, master=None, apply_changes=False,
+                       admission=None, writer=None, commits=None, no_draft_convert=False):
+        """Run the REAL backfill() loop over a stubbed registry/gh boundary and return its
+        stdout. `ledger`/`master` are {path-suffix-number: body-or-Exception} record stores, so
+        the ledger-first probe, the admission gate and the write path are all exercised as
+        wired rather than as described."""
+        ledger = ledger or {}
+        master = master or {}
+
+        def probe(_repo, path, ref=None):
+            number = int(Path(path).stem)
+            found = (ledger if ref is not None else master).get(number)
+            if isinstance(found, Exception):
+                raise found
+            return (found, "sha") if found is not None else (None, None)
+
+        def gh_json(args):
+            if "--slurp" in args:
+                return pulls_pages
+            return [{"sha": "ab" * 20}] if commits is None else commits
+
+        stub = types.SimpleNamespace(
+            LEDGER_REF="ledger", WorkerPrError=BackfillError,
+            provenance_path=lambda repo, number: f"orchestration/provenance/{number}.json",
+            _probe_registry_file=probe,
+            account_hash=lambda account, salt: "deadbeefdeadbeef",
+            provenance_record=writer or e2e_no_write)
+        saved_globals = {name: globals()[name] for name in patched}
+        saved_salt = os.environ.get("PROVENANCE_SALT")
+        buffer = io.StringIO()
+        try:
+            globals().update(
+                _gh_json=gh_json, _run_gh=e2e_run_gh,
+                _load_worker_pr=lambda: stub,
+                _load_dispatch_claim=lambda: types.SimpleNamespace(
+                    provenance_admission_error=admission or (lambda record, pr: None)),
+                review_state=lambda repo, number, runner=None: e2e_state.get(number, FRESH))
+            os.environ["PROVENANCE_SALT"] = "self-test-only"
+            with contextlib.redirect_stdout(buffer):
+                backfill("sparq-org/sparq", "jeswr/agent-account-registry", str(routing_toml),
+                         apply_changes, no_draft_convert=no_draft_convert)
+        finally:
+            globals().update(saved_globals)
+            if saved_salt is None:
+                os.environ.pop("PROVENANCE_SALT", None)
+            else:
+                os.environ["PROVENANCE_SALT"] = saved_salt
+        return buffer.getvalue()
+
+    e2e_pages = [[e2e_pull(9001, E2E_HEAD_QUEUED), e2e_pull(9002, E2E_HEAD_FRESH)]]
+    e2e = drive_backfill(e2e_pages)
     check("E2E: the QUEUED PR's provenance IS recorded",
           "DRY-RUN #9001: would record" in e2e, True)
     check("E2E: ...and it is NOT proposed for draft conversion (no queue eviction)",
@@ -1607,7 +1748,140 @@ def _self_test():
           ("DRY-RUN #9002: would record" in e2e,
            "DRY-RUN #9002: would convert to draft" in e2e), (True, True))
     check("E2E: BOTH records are counted — draft policy never withholds a record",
-          "backfill complete: would record 2, skipped 0, needs-human 0" in e2e, True)
+          "backfill complete: would record 2, repaired 0, skipped 0, needs-human 0, blocked 0 "
+          "(population 2)" in e2e, True)
+
+    # --- [registry #776] THE INADMISSIBLE-RECORD CLASS HAS A MACHINE EXIT ----------------------
+    # Measured on the live estate 2026-07-27: 7 master records carry the attempt-less
+    # `backfill:<run>` stamp an OLDER revision of THIS script wrote; the post-#657 admission
+    # refuses all 7, and 2 (sparq#2439/#2456) are open worker PRs that printed NEEDS-HUMAN on
+    # every run and could never do anything else.
+    STALE = json.dumps({"pr_number": 9001, "impl_provider": "anthropic", "impl_alias": "fable",
+                        "impl_account_h": "cd" * 8, "issue": 3404,
+                        "head_sha_at_open": "cd" * 20,
+                        # the exact live defect: a backfill stamp with no `.attempt`
+                        "recorded_at_run": "backfill:16234567890"})
+    HEALTHY = json.dumps({"pr_number": 9002, "impl_provider": "anthropic", "impl_alias": "fable",
+                          "impl_account_h": "ef" * 8, "issue": 3405,
+                          "head_sha_at_open": "ef" * 20,
+                          "recorded_at_run": "backfill:16234567891.1"})
+    real_admission = _load_dispatch_claim().provenance_admission_error
+    writes = []
+
+    def recording_writer(*args, **kwargs):
+        # provenance_record(registry_repo, target_repo, pr_number, ...)
+        writes.append((args[2], kwargs.get("supersede_legacy")))
+
+    check("a stale attempt-less backfill stamp is REFUSED by the shared admission (the live "
+          "defect, re-derived not assumed)",
+          real_admission(json.loads(STALE), 9001) is None, False)
+    check("record_disposition names the three states apart",
+          (record_disposition(None, 9001, real_admission)[0],
+           record_disposition(HEALTHY, 9002, real_admission)[0],
+           record_disposition(STALE, 9001, real_admission)[0]),
+          (RECORD_ABSENT, RECORD_ADMITS, RECORD_INADMISSIBLE))
+
+    # [registry #776] A LEDGER 404 IS NOT "RECORDLESS". Readers are ledger-FIRST, not
+    # ledger-ONLY: `effective_record_body` and both PLAN/CLAIM provenance maps fall back to the
+    # legacy master copy. Enumerating the recovery population by probing `?ref=ledger` alone
+    # therefore over-counts — measured 2026-07-27, it named 11 open sparq worker PRs where the
+    # real not-enumerable set was 8, because sparq#2465/#2493/#2521 hold ADMISSIBLE master
+    # records and are fully visible to the review loop. Pinned here because a wrong population
+    # is how a backfill talks itself into writing a record over a healthy one.
+    master_only = drive_backfill([[e2e_pull(9002, E2E_HEAD_FRESH)]], master={9002: HEALTHY},
+                                 admission=real_admission)
+    check("a PR with NO ledger record but an ADMISSIBLE master one is already recorded — a "
+          "ledger 404 alone never means recordless",
+          ("skip #9002: provenance already recorded" in master_only,
+           "would record 0, repaired 0, skipped 1, needs-human 0, blocked 0 (population 1)"
+           in master_only), (True, True))
+
+    repair_out = drive_backfill(e2e_pages, master={9001: STALE, 9002: HEALTHY},
+                                admission=real_admission)
+    check("E2E: a PR whose record is present but INADMISSIBLE is REPAIRED, not left to a human",
+          ("REPAIR #9001" in repair_out, "NEEDS-HUMAN #9001" in repair_out), (True, False))
+    check("E2E: ...and the repair is COUNTED in its own bucket",
+          "would record 0, repaired 1, skipped 1, needs-human 0, blocked 0 (population 2)"
+          in repair_out, True)
+    check("E2E: a PR whose record ALREADY ADMITS is skipped, never rewritten",
+          ("skip #9002: provenance already recorded" in repair_out,
+           "REPAIR #9002" in repair_out), (True, False))
+
+    writes.clear()
+    apply_out = drive_backfill(e2e_pages, master={9001: STALE, 9002: HEALTHY},
+                               admission=real_admission, apply_changes=True,
+                               writer=recording_writer, no_draft_convert=True)
+    check("APPLY: the repair write is the ONLY one, and it is the ONLY call that supersedes "
+          "the unwritable legacy master copy",
+          sorted(writes), [(9001, True)])
+    check("APPLY --no-draft-convert: a record-only pass issues NO merge-state gh call at all "
+          "(e2e_run_gh raises on one), and still repairs",
+          "repaired 1" in apply_out, True)
+
+    # IDEMPOTENCE — the run must converge. Second invocation over the state the first one leaves
+    # behind (the repaired record now on `ledger`) must write NOTHING and skip both.
+    REPAIRED = json.dumps({"pr_number": 9001, "impl_provider": "anthropic", "impl_alias": "fable",
+                           "impl_account_h": "deadbeefdeadbeef", "issue": 3404,
+                           "head_sha_at_open": "ab" * 20,
+                           "recorded_at_run": "backfill:16234567890.1"})
+    writes.clear()
+    second = drive_backfill(e2e_pages, ledger={9001: REPAIRED},
+                            master={9001: STALE, 9002: HEALTHY},
+                            admission=real_admission, apply_changes=True,
+                            writer=recording_writer, no_draft_convert=True)
+    check("IDEMPOTENT: a second run over the first run's output writes nothing at all", writes, [])
+    check("IDEMPOTENT: ...and reports both PRs as skipped",
+          "recorded 0, repaired 0, skipped 2, needs-human 0, blocked 0 (population 2)" in second,
+          True)
+    check("IDEMPOTENT: ...ledger-first — the repaired ledger copy beats the stale master one",
+          "REPAIR #9001" in second, False)
+
+    # --- [registry #776] EVERY EXIT IS COUNTED, and the seal is arithmetic that FAILS ----------
+    no_commits = drive_backfill(e2e_pages, commits=[])
+    check("a PR with no commits is a COUNTED terminal state, not a silent `continue`",
+          ("BLOCKED #9001: PR has no commits" in no_commits,
+           "would record 0, repaired 0, skipped 0, needs-human 0, blocked 2 (population 2)"
+           in no_commits), (True, True))
+    bad_sha = drive_backfill(e2e_pages, commits=[{"sha": "nothex"}])
+    check("a malformed first-commit sha is a COUNTED terminal state too",
+          ("BLOCKED #9001: first commit sha is malformed" in bad_sha,
+           "blocked 2 (population 2)" in bad_sha), (True, True))
+    check("a record this run would write that is ITSELF inadmissible is refused, and counted",
+          "BLOCKED #9001: the record this run would write is itself NOT admissible"
+          in drive_backfill(e2e_pages, admission=lambda record, pr: "synthetic refusal"), True)
+
+    # The seal is not decoration. It is the ONE check that a future uncounted `continue` cannot
+    # get past, so it is asserted as arithmetic that FAILS, on the same function backfill() calls.
+    unsealed = None
+    try:
+        drive_backfill(e2e_pages, master={9001: BackfillError("HTTP 403")},
+                       admission=real_admission)
+    except BackfillError as exc:
+        unsealed = str(exc)
+    check("an unreadable registry probe is a COUNTED terminal state, so the run still seals",
+          unsealed, None)
+    seal_raised = None
+    try:
+        seal_population(1, 2)
+    except BackfillError as exc:
+        seal_raised = str(exc)
+    check("the seal RAISES when a PR left through an uncounted exit",
+          seal_raised is not None and "unsealed" in seal_raised, True)
+    check("  ...and returns quietly when every PR is accounted for", seal_population(2, 2), None)
+    # The seam M8 exploited: `unsealed = seal(...)` computed and then discarded. There is no
+    # seam left to delete only if the call is a BARE STATEMENT of the function that itself
+    # raises — assert BOTH facts, because either one alone is satisfiable by a vacuous shape.
+    seal_calls = [n for n in ast.walk(backfill_tree) if isinstance(n, ast.Call)
+                  and getattr(n.func, "id", "") == "seal_population"]
+    seal_bare = [n.value for n in ast.walk(backfill_tree) if isinstance(n, ast.Expr)
+                 and isinstance(n.value, ast.Call)
+                 and getattr(n.value.func, "id", "") == "seal_population"]
+    check("backfill() seals through THAT function, as a BARE statement whose result cannot be "
+          "discarded by deleting an `if`",
+          (len(seal_calls), len(seal_bare)), (1, 1))
+    check("  ...and the sealing function is the one that RAISES (no reason-returning seam)",
+          any(isinstance(n, ast.Raise) for n in ast.walk(
+              ast.parse(textwrap.dedent(inspect.getsource(seal_population))))), True)
 
     # --- [registry #657 §7.4 step 2b] THE ORCHESTRATOR CLASS, THROUGH THE REAL LOOP -----------
     # Driven twice against the SAME tree with only `review_enrolment_authors` changing, because
@@ -1724,10 +1998,30 @@ def _self_test():
     orch_records = {"orchestration/provenance/9003.json":
                     real_claim.orchestrator_probe_record(9003)}
 
-    on_out, on_probes, on_states = orch_backfill(
-        True, [orch_pull_row, worker_pull_row], orch_records)
+    # [registry #776 x #876] THE COMPOSITION, and the red test for the population decision. This
+    # run carries BOTH classes at once — one worker PR and one ADMITTED #657 orchestrator PR —
+    # which is exactly the pair that broke: #876's orchestrator counter sits ABOVE this change's
+    # `population += 1`, so counting the class as a population OUTCOME made `accounted` exceed
+    # `population` and `seal_population` raised on every real run. backfill() records the decision
+    # that the class is OUTSIDE the population; this is the row that fails if it is ever folded
+    # back in, and it is a NAMED row rather than an uncaught traceback so the failure says so.
+    sealed = None
+    try:
+        on_out, on_probes, on_states = orch_backfill(
+            True, [orch_pull_row, worker_pull_row], orch_records)
+    except BackfillError as exc:
+        on_out, on_probes, on_states, sealed = "", [], [], str(exc)
+    check("[#776 x #876] a run carrying BOTH a worker PR and an admitted orchestrator PR SEALS: "
+          "the orchestrator class is outside the population, so it cannot outnumber it",
+          sealed, None)
     off_out, off_probes, off_states = orch_backfill(
         False, [orch_pull_row, worker_pull_row], orch_records)
+    # ...and it lands in its OWN bucket. Folding it into `skipped` would conflate "not this
+    # script's job" with "already carries an admissible record" — two facts a reader of the
+    # completion line has to be able to tell apart, and the reason the seal broke at all.
+    check("[#776 x #876] the orchestrator PR is counted OUT OF POPULATION, in its own bucket, "
+          "never as a `skipped` worker PR",
+          ("(population 1) out-of-scope 1" in on_out, "skipped 1" in on_out), (True, False))
 
     # (1) ENROLLED: the class is RECOGNISED and explicitly skipped — never minted (backfill's
     #     only identity source is a worker run log the class has no analogue for) and never
@@ -1756,9 +2050,16 @@ def _self_test():
         check(f"[#657] FROZEN worker-class control ({state}): the worker PR's outcome is "
               "byte-for-byte the pre-#657 one",
               [line for line in out.splitlines() if "#9002" in line], WORKER_LINES)
-    check("[#657] FROZEN worker-class control: the two runs agree on the count line",
-          ("backfill complete: would record 1, skipped 1, needs-human 0" in on_out,
-           "backfill complete: would record 1, skipped 0, needs-human 0" in off_out),
+    # STRONGER than the pre-#776 form of this control, which asserted `skipped 1` ON and
+    # `skipped 0` OFF — i.e. enrolment DID move a population counter. With the class out of the
+    # population, every population counter is now byte-identical between the two runs and only the
+    # out-of-scope bucket moves, which is what "enrolment must not move the worker lane" means.
+    POPULATION_LINE = ("backfill complete: would record 1, repaired 0, skipped 0, "
+                       "needs-human 0, blocked 0 (population 1)")
+    check("[#657] FROZEN worker-class control: enrolment moves ONLY the out-of-scope bucket — "
+          "every population counter is identical between the two runs",
+          (f"{POPULATION_LINE} out-of-scope 1" in on_out,
+           f"{POPULATION_LINE} out-of-scope 0" in off_out),
           (True, True))
     # (4) THE FORK GATE, hoisted above every waivable predicate: a fork head is never admitted
     #     to the class however enrolled its author is, and is never read for.

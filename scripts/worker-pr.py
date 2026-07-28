@@ -2403,7 +2403,8 @@ def _registry_record_equivalent(existing_text, document, volatile_fields):
     return True
 
 
-def _registry_put_file(registry_repo, path, document, message, volatile_fields=frozenset()):
+def _registry_put_file(registry_repo, path, document, message, volatile_fields=frozenset(),
+                       supersede_legacy=False):
     """Create-or-keep a registry data file via the contents API with the same read-SHA CAS retry
     the lease ledger uses. Probe AND write pin the unprotected `ledger` data-plane branch
     (issue #96): master's required `gate` status check permanently rejects every direct
@@ -2421,7 +2422,22 @@ def _registry_put_file(registry_repo, path, document, message, volatile_fields=f
     rate-limit failure retries under the small fixed _REGISTRY_TRANSIENT_MAX_ATTEMPTS budget
     (pr #357 review r1 — a brief outage must not permanently drop a record); a permanent PUT
     error fails loud immediately. On final failure the REAL last API error is raised, never a
-    generic conflict message."""
+    generic conflict message.
+
+    ``supersede_legacy`` (registry #776) lifts the LEGACY-MASTER veto ONLY — never the ledger
+    one. Master permanently rejects protected-path writes, so a legacy master record that every
+    consumer REFUSES can never be corrected in place; without this the divergence check below
+    turns "this record is unreadable" into a permanent dead end, because the corrected ledger
+    copy that would shadow it is exactly what the check forbids. Readers are ledger-first
+    (effective_record_body / the PLAN + CLAIM provenance maps), so writing the ledger copy fully
+    determines what every consumer sees and the stale master bytes become inert.
+
+    It is a PARAMETER, defaulting FALSE, for the same reason `admit_orchestrator` is: superseding
+    is safe ONLY for a caller that has already established the existing record is dead to every
+    consumer. The one caller that passes True (backfill-provenance's repair path) proves that by
+    running the shared `provenance_admission_error` first, and refuses to write a replacement
+    that would not itself admit. A divergent LEDGER record still fails closed on every path —
+    that is the "never silently rewrite a live record" invariant, and it is untouched."""
     body = json.dumps(document, indent=1, sort_keys=True) + "\n"
     encoded = base64.b64encode(body.encode()).decode()
     # BOTH record locations are probed before any success short-circuit (sol review r1 on
@@ -2431,8 +2447,18 @@ def _registry_put_file(registry_repo, path, document, message, volatile_fields=f
     # master records are immutable; the ledger probe re-runs inside the CAS retry loop.
     legacy, _legacy_sha = _probe_registry_file(registry_repo, path)
     if legacy is not None and not _registry_record_equivalent(legacy, document, volatile_fields):
-        raise WorkerPrError(
-            f"registry file {path} already exists with different content on the default branch")
+        if not supersede_legacy:
+            raise WorkerPrError(
+                f"registry file {path} already exists with different content on the default "
+                f"branch")
+        # SUPERSEDE (registry #776): the caller has proved the existing record is refused by the
+        # shared review-loop admission, i.e. it is already dead to every consumer. `legacy` is
+        # cleared so the ledger write below is a real create rather than the
+        # "identical pre-migration record" short-circuit — the corrected ledger copy is what
+        # readers consume, and the uncorrectable master bytes stop deciding anything.
+        print(f"superseding the legacy master copy of {path} with a corrected ledger record "
+              f"(the master copy is unwritable and its record is refused by every consumer)")
+        legacy = None
     deadline = _registry_now() + _REGISTRY_CAS_DEADLINE_S
     last_error = ""
     attempts = 0
@@ -2512,7 +2538,7 @@ _PROVENANCE_VOLATILE_FIELDS = frozenset({"recorded_at_run"})
 
 def provenance_record(registry_repo, target_repo, pr_number, head_sha, impl_provider, impl_alias,
                       impl_account_h, issue, run_key, verify_bot_login=None,
-                      verify_head_branch=None):
+                      verify_head_branch=None, supersede_legacy=False):
     """Write the registry provenance record (the review loop's root of trust).
 
     Privacy (locked decision 22a): the record stores ONLY the salted account hash, never the raw
@@ -2523,7 +2549,10 @@ def provenance_record(registry_repo, target_repo, pr_number, head_sha, impl_prov
     sha is taken from the API (never from the hostile job's outputs). When the caller also knows
     this run's exact head branch (`verify_head_branch`, the reconcile path), the live head ref
     must EQUAL it — the issue prefix alone would accept a sibling run's PR for the same issue and
-    record it under this run's implementer identity and run_key."""
+    record it under this run's implementer identity and run_key.
+
+    `supersede_legacy` (registry #776) is forwarded to _registry_put_file; see its docstring. It
+    defaults FALSE, so every worker-run call site keeps failing closed on a divergent record."""
     if impl_provider not in {"anthropic", "openai"}:
         raise WorkerPrError("impl_provider must be anthropic or openai")
     if not re.fullmatch(r"[0-9a-f]{16}", impl_account_h or ""):
@@ -2564,7 +2593,8 @@ def provenance_record(registry_repo, target_repo, pr_number, head_sha, impl_prov
     created = _registry_put_file(
         registry_repo, provenance_path(target_repo, pr_number), document,
         f"provenance {target_repo}#{pr_number}",
-        volatile_fields=_PROVENANCE_VOLATILE_FIELDS)
+        volatile_fields=_PROVENANCE_VOLATILE_FIELDS,
+        supersede_legacy=supersede_legacy)
     print(f"provenance {'recorded' if created else 'already recorded'} for {target_repo}#{pr_number}")
 
 
@@ -6265,8 +6295,8 @@ def _self_test():
     try:
         globals()["_gh_read_with_retry"] = _ok_read
         globals()["_registry_put_file"] = (
-            lambda _repo, _path, document, _msg, volatile_fields=frozenset():
-            prov_docs.append(document) or True)
+            lambda _repo, _path, document, _msg, volatile_fields=frozenset(),
+            supersede_legacy=False: prov_docs.append(document) or True)
         provenance_record("o/registry", repo, 42, "", "anthropic", "opus", "ab" * 8, 7,
                           "10.1", verify_bot_login=bot, verify_head_branch=branch)
         check("provenance verify records the exact run branch",
@@ -6302,7 +6332,8 @@ def _self_test():
                                                     len(prov_state["script"]) - 1)]
             return subprocess.CompletedProcess(cmd, rc, stdout=out, stderr=err)
 
-        def fake_put(_registry, path, document, _message, volatile_fields=frozenset()):
+        def fake_put(_registry, path, document, _message, volatile_fields=frozenset(),
+                     supersede_legacy=False):
             """The REAL idempotency contract of _registry_put_file, in-memory: it stores the same
             SERIALIZED bytes and adjudicates a repeat write with the production
             _registry_record_equivalent — so this stand-in cannot drift from the write path, and a
@@ -8225,6 +8256,47 @@ def _self_test():
               (_registry_put_file("reg/repo", "orchestration/provenance/o--r--pr7.json",
                                   doc, "m"),
                any("-X" in call for call in put_calls)), (False, False))
+
+        # --- [registry #776] supersede_legacy: the OPT-IN escape from a permanent dead end -----
+        # A legacy MASTER record that every consumer refuses cannot be corrected in place —
+        # master permanently rejects protected-path writes — and the divergence check above then
+        # forbids the corrected ledger copy that would shadow it. Measured 2026-07-27: 7 master
+        # provenance records carry the attempt-less `backfill:<run>` stamp an older revision of
+        # backfill-provenance.py wrote, which the post-#657 admission refuses; 2 are open worker
+        # PRs. The opt-in lifts the LEGACY veto only.
+        put_calls.clear()
+        put_state["files"] = {legacy_loc: record_meta({"pr_number": 8})}
+        superseded = _registry_put_file("reg/repo", "orchestration/provenance/o--r--pr7.json",
+                                        doc, "m", supersede_legacy=True)
+        # BEHAVIOURAL, not a return-value shape: the PUT has to actually be ISSUED. Clearing the
+        # divergence check without clearing `legacy` leaves the "identical pre-migration record"
+        # short-circuit in the path, so the write silently becomes a NO-OP that still reports
+        # success — the failure mode that makes a repair worse than the dead end it replaces.
+        check("supersede_legacy over a DIVERGENT legacy master copy actually WRITES",
+              (superseded, sum(1 for call in put_calls if "-X" in call)), (True, 1))
+        check("  ...and the write still pins the ledger branch, never the protected default",
+              [f"branch={LEDGER_REF}" in call for call in put_calls if "-X" in call], [True])
+        put_calls.clear()
+        put_state["files"] = {legacy_loc: record_meta({"pr_number": 8}),
+                              ledger_loc: record_meta({"pr_number": 8})}
+        try:
+            _registry_put_file("reg/repo", "orchestration/provenance/o--r--pr7.json", doc, "m",
+                               supersede_legacy=True)
+            check("supersede_legacy NEVER lifts the LEDGER veto", "no error", "error")
+        except WorkerPrError as exc:
+            check("supersede_legacy NEVER lifts the LEDGER veto",
+                  "different content" in str(exc) and LEDGER_REF in str(exc), True)
+        put_calls.clear()
+        put_state["files"] = {legacy_loc: record_meta({"pr_number": 8})}
+        try:
+            _registry_put_file("reg/repo", "orchestration/provenance/o--r--pr7.json", doc, "m")
+            check("supersede is OPT-IN — the default still fails closed on the same input",
+                  "no error", "error")
+        except WorkerPrError as exc:
+            check("supersede is OPT-IN — the default still fails closed on the same input",
+                  "default branch" in str(exc), True)
+        check("  ...and that default-path refusal issued no PUT",
+              any("-X" in call for call in put_calls), False)
 
         # issue #131: a rerun of a failed provenance job re-derives the record with a bumped
         # GITHUB_RUN_ATTEMPT, so `recorded_at_run` flips `.1` -> `.2` while every IDENTIFYING field
