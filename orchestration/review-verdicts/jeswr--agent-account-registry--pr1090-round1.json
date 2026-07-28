@@ -1,0 +1,30 @@
+{
+ "host_envelope": {
+  "pr": 1090,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "4dcdabd8daf782c386de791c4e62242abdedef46",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "`rewrite()` rejects only strings beginning with `refs/remotes/` or `remotes/`, before resolving the argument. Git commonly resolves `origin/ledger` to `refs/remotes/origin/ledger`, and `filter-branch` can update the resolved ref. Thus `rewrite --ref origin/ledger` bypasses the promised remote-tracking guard even though the README uses exactly that spelling for scans. The self-test covers only the already-expanded spelling, so it cannot detect this bypass. This violates the tool's stated one-local-branch safety boundary.",
+    "file": "scripts/ledger-history-purge.py",
+    "fix_hint": "Resolve the supplied revision to one unambiguous full ref before any scan or rewrite (for example with an exact symbolic-full-name check), require it to be under `refs/heads/`, and pass that resolved full name to every subsequent operation. Add red tests using a real `origin/ledger` shorthand and other non-head spellings, asserting that the ref and backup namespace remain unchanged.",
+    "severity": "major",
+    "title": "Remote-tracking shorthand bypasses the rewrite refusal"
+   },
+   {
+    "body": "`_commit_messages()` frames records with `\\x01` and fields with `\\x02` while claiming those bytes cannot occur in commit messages. Git commit messages prohibit NUL, but they can contain these control bytes. A message containing `\\x01` can be split into an extra pseudo-record; content after it may land in the parsed `sha` field and never be examined for legacy subjects or literal handles. The scan can consequently return zero exposures despite a supplied handle remaining in reachable history, contradicting the fail-closed verification contract.",
+    "file": "scripts/ledger-history-purge.py",
+    "fix_hint": "Use Git's NUL-safe output framing (such as `-z` with NUL-delimited fields/records, or read commit objects individually from an independently enumerated SHA list) and validate every parsed SHA/field count. Add a real commit-object fixture containing `\\x01` and `\\x02`, with a known handle after each byte, and assert the literal verification remains non-zero without printing the handle.",
+    "severity": "major",
+    "title": "Commit-message separators are valid data, allowing a false-clean scan"
+   }
+  ],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nThe purge and its self-test are substantial, but the rewrite boundary is not sound yet. The local-only ref check is performed on the caller's spelling rather than the ref Git resolves, so a normal remote-tracking shorthand bypasses it. Separately, the scan's commit-message framing relies on control bytes that Git does permit in commit messages; crafted history can therefore make the verifier omit message content and report a false clean result. Both defects affect the safety claims of the maintainer runbook and require changes.",
+  "verdict": "request_changes"
+ }
+}
