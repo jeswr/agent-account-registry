@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 995,
+  "repo": "jeswr/agent-account-registry",
+  "reviewed_sha": "055d435c1cbe29902a9cc97a7a7524eac47bf486",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "> \ud83e\udd16 SPARQ agent\n\nApproved. The metered-account classifier now matches the allocator's fail-closed status normalization and [0,1] utilization validation without incorrectly range-gating exempt-provider backoff epochs. The tests independently exercise missing/blank status, both utilization bounds and both windows, diagnostic routing for above-range values, the inclusive 1.0 boundary, and the main() binding layer. The upper-bound test avoids the otherwise value-identical eligibility result by asserting the malformed-window diagnosis, and the end-to-end forged-map case verifies that either newly rejected account is sufficient to change the fleet result and create the degraded alert. No trust check, workflow permission, secret handling, or audit trail is weakened.",
+  "verdict": "approve"
+ }
+}
