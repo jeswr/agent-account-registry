@@ -49,6 +49,54 @@ import sys
 ROLE_LABELS = frozenset({"docs", "impl", "ci", "research", "site"})
 
 # ---------------------------------------------------------------------------------------------------
+# STATUSES TRIAGE DOES NOT OWN — the `status:ready` promotion is WITHHELD while one is live.
+#
+# `status:ready` carries TWO meanings that this repository never separated:
+#   (a) triage's CLASSIFICATION attestation — "this issue has a role, a priority and an area";
+#   (b) the dispatcher's ORCHESTRATION posture — "no lane is holding this issue".
+# triage() is the sole author of (a) and has no business asserting (b): `status:deferred` belongs
+# to dispatch-claim's bounded retry lane, the in-progress pair to a live claim/lease, and
+# `status:parked` to park_policy. While any of them is live, (b) is FALSE, so writing the label
+# does not attest anything — it manufactures a contradictory pair.
+#
+# MEASURED (registry #1054, 2026-07-28, live board, 460 open issues): 30 of the 32 open
+# `status:ready` issues ALSO carried `status:deferred`, and the census of the LAST `status:ready`
+# addition on each of those 30 says 30/30 were created by adding `status:ready` to an issue that
+# ALREADY carried `status:deferred` — 24 of them by `github-actions[bot]` (this workflow) on that
+# one day, 6 by the maintainer on 2026-07-18. Not one arose the other way round.
+#
+# The trigger is `triage-issue.yml`'s `[labeled, unlabeled]` types (#607). The dispatcher defers an
+# issue as three App-token writes (+status:deferred, -status:in-progress, -status:ready); the App's
+# token is NOT the repository GITHUB_TOKEN, so those events DO start a run, and 18-21s later this
+# classifier — which reads only role/priority/area/needs/kind — re-stamps `status:ready` over the
+# defer that just happened. Verbatim from #1037's timeline:
+#     16:27:04 labeled   status:deferred    by sparq-orchestrator[bot]
+#     16:27:06 unlabeled status:ready       by sparq-orchestrator[bot]
+#     16:27:27 labeled   status:ready       by github-actions[bot]      <- here
+#
+# The resulting pair is invisible to BOTH lanes — `status:deferred` is in `ready-issues.BUSY_STATUS`
+# so the ready lane refuses it, and dispatch.yml's deferred-retry candidate filter skipped any row
+# already carrying `status:ready` on the (false) premise that the ready lane owned it. Each lane
+# excluded it believing the other had it, so the board's dispatchable frontier was EMPTY.
+#
+# WITHHOLD, never STRIP. This branch declines to ADD the label; it never removes one that is
+# already there. Removing it would silently revert a deliberate human gesture (the 6 rows above are
+# exactly that: the maintainer re-attesting readiness on a stuck deferred issue), and a classifier
+# firing on an unrelated `labeled` event is the wrong actor to retract someone else's attestation.
+# The pair that a human writes is instead HANDLED, by the deferred-retry lane in dispatch.yml.
+#
+# `status:untriaged` is deliberately ABSENT: it is triage's OWN label, the assertion that nothing
+# has classified this issue yet, and clearing it is in scope precisely because triage wrote it.
+# The `else` (not-classification-complete) branch is untouched — it was implicated in 0 of the 30.
+DISPATCHER_OWNED_STATUS = frozenset({
+    "status:deferred",            # dispatch-claim bounded retry lane (locked decision 20)
+    "status:in-progress",         # a live claim/lease
+    "status:in-progress-review",  # a published worker PR cycling through review
+    "status:parked",              # park_policy.py machine capacity park
+    "status:blocked",             # groom/curator hold
+})
+
+# ---------------------------------------------------------------------------------------------------
 # TRUST-PLANE ROLE — INTERIM MAPPING (TODO: registry #582 / #225).
 #
 # The maintainer has an OPEN decision (#582): either `role:soundness` becomes a real label in this
@@ -305,7 +353,21 @@ def triage(labels, issue_type="task", trusted=True, known_labels=None):
     ready = (bool(role) and _valid_priority(labels) and has_area and not gated
              and "kind:epic" not in labels)
     if ready:
-        add.add("status:ready")
+        # [registry #1054] `ready` stays the CLASSIFICATION verdict — retriage.py and
+        # triage-stock-alert.py both read it as exactly that ("is the classifier done with this
+        # issue"), and flipping it here would make them call a fully-classified issue incomplete.
+        # What is withheld is only the LABEL WRITE, because the label additionally asserts an
+        # orchestration posture that a live dispatcher status contradicts. See
+        # DISPATCHER_OWNED_STATUS for the measured census.
+        held = sorted(labels & DISPATCHER_OWNED_STATUS)
+        if held:
+            warnings.append(
+                f"withholding status:ready: {', '.join(held)} is live and is owned by the "
+                f"dispatcher/worker/park lane, not by triage (registry #1054) — adding the "
+                f"readiness attestation here would strand the issue in a ready+busy pair that "
+                f"NEITHER the ready lane nor the deferred-retry lane can select")
+        else:
+            add.add("status:ready")
         remove.add("status:untriaged")
         remove.add("needs:area")
     else:
