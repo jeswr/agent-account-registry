@@ -1,0 +1,23 @@
+{
+ "host_envelope": {
+  "pr": 4817,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "883b39ec621203d7967f88050ccdcf4e3ed0970a",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [
+   {
+    "body": "The new text says the requirement to put the policy in a shared module \"so the two cannot diverge\" was already honored, but immediately states that this federated module was deliberately not rewired. Inspection of f85d0180 confirms sparq-engine imports sparq_replan_policy::ReplanPolicy while sparq-fedplan retains its own ReplanPolicy and trigger/hysteresis implementation. Merely creating a shared crate for one consumer does not prevent the two paths from drifting, so this is an inaccurate architectural claim in the durable module documentation.",
+    "file": "crates/sparq-fedplan/src/adaptive.rs",
+    "fix_hint": "State precisely that the prior branch extracted a candidate shared policy and wired only the local evaluator to it, while the federated evaluator intentionally remained unchanged; therefore convergence onto one implementation was not completed and drift prevention was not achieved. Preserve the valid point that rewiring fedplan should not be done as a standalone change without a main-branch local consumer.",
+    "severity": "major",
+    "title": "Shared-policy claim contradicts the implementation"
+   }
+  ],
+  "progress": null,
+  "summary": "The historical commit and the scoped research record support most of the new prior-art note, including the unmerged feature, non-canonical negative benchmark, and missing pruning-arm measurement. However, the note materially overstates the shared-policy result: the cited branch only makes the local evaluator consume sparq-replan-policy and explicitly leaves sparq-fedplan on its independent in-file policy. Therefore the two implementations can still diverge, contrary to the claim that the sharing requirement was already honored.",
+  "verdict": "request_changes"
+ }
+}
