@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4663,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "71aab6a75cc4dd04062bedda3cda487bc6cd22fd",
+  "round": 3
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": "stagnant",
+  "summary": "Round 3 remains correct and complete. The typed nonce preserves externally supplied wire bytes, rejects empty or whitespace-only values at the sole external-value constructor, and generates verifier-side nonces from 32 OS-CSPRNG bytes with fail-closed entropy handling. The private tuple field prevents bypassing validation through direct construction. The type is propagated consistently through request parsing, response construction, and replay comparison. Focused tests exercise empty rejection, verbatim preservation, generated shape and non-repetition, end-to-end propagation on the real contract path, and mismatch rejection. The dependency remains optional and expression-feature-gated, the public API documentation is updated, and the honesty-sensitive text accurately calls this hardening rather than a freshness or soundness guarantee while retaining the pending external-audit caveat. No reviewer-directed prompt injection appears in the diff.",
+  "verdict": "approve"
+ }
+}
