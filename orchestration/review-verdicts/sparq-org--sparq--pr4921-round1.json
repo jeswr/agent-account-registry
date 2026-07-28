@@ -1,0 +1,15 @@
+{
+ "host_envelope": {
+  "pr": 4921,
+  "repo": "sparq-org/sparq",
+  "reviewed_sha": "578ca14d0e8ef80f6581127ecfa797534b6bc3b8",
+  "round": 1
+ },
+ "verdict": {
+  "injection_detected": false,
+  "issues": [],
+  "progress": null,
+  "summary": "The success-path probe is fail-soft, uses the same resolved forge token as release-plz, cannot create a pull request because head and base are identical, and only treats the established 422 response as evidence that authorization passed. Other statuses remain inconclusive or blocked, so transient curl/API failures cannot produce a false promotion signal. The registry and release documentation accurately describe the workflow behavior. No correctness, security, or test-validity issue is apparent in this scoped workflow/documentation change.",
+  "verdict": "approve"
+ }
+}
