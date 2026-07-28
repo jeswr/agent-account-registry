@@ -12,9 +12,16 @@ missing rule; it is the class of issues that genuinely span several surfaces.
 
 ## What was measured
 
-Ground truth is this repository's issues carrying **exactly one** `area:*` label (n=556, open and
+Ground truth is this repository's issues carrying **exactly one** `area:*` label (n=576, open and
 closed, at the 2026-07-28T13:07:14Z snapshot). The shipped deriver was evaluated with the area
 labels **stripped from its input**, otherwise it answers `"existing"` and measures nothing.
+
+An earlier draft of this record put the corpus at **n=556**. That count could not be reproduced
+against the snapshot above and is corrected here; every *rate* in this record (186 fires, 173
+correct, 93.0%) re-derives unchanged, because the discrepancy is entirely in rows on which the
+deriver declines. Counts in this record are reproducible by re-running the shipped `derive_area`
+over the issue list and the `LabeledEvent` timeline — do that rather than carrying a figure
+forward, which is how the 556 survived.
 
 **The corpus is partly self-graded, and the headline figure must be read on the hold-out.**
 `curate-frontier` writes its own derived area back when it stages an issue (`desired = (…, area)`
@@ -28,8 +35,8 @@ curator-authored rows written *after* the current rule landed (`6bea6cc2b`), 27 
 
 | signal | fires | precision | source |
 |---|---|---|---|
-| **shipped `derive_area`, HELD OUT** (curator-authored rows removed; n=503) | **147** | **92.5%** (136/147) | this record |
-| shipped `derive_area`, full corpus (self-graded rows included; n=556) | 186 | 93.0% (173/186) | this record |
+| **shipped `derive_area`, HELD OUT** (curator-authored rows removed; n=523) | **147** | **92.5%** (136/147) | this record |
+| shipped `derive_area`, full corpus (self-graded rows included; n=576) | 186 | 93.0% (173/186) | this record |
 | — of which, self-graded subset only (n=50) | 38 | 94.7% (36/38) | this record |
 | parent-issue inheritance via the `sparq-followup` provenance link | 239 | **56.1%** | this record |
 | declared file→area map, as a marginal fallback on the 370 declines | 38 (10.3% of declines) | **86.8%** (33/38) | this record |
@@ -50,8 +57,8 @@ non-circularity instead. That sentence was wrong, and the number it defended was
 ### Two provenance caveats on the ground truth itself
 
 1. **It is dominated by one recent bulk pass.** 315 of the 523 `jeswr`-authored area labels (60%)
-   were applied in scripted bursts on 2026-07-28 — 285 inside a single 45-minute window, ~2.5h
-   before this snapshot — and the corpus more than doubled (264 → 556) in it. That backfill is
+   were applied in scripted bursts on 2026-07-28 — 291 inside a single 45-minute window, ~2.5h
+   before this snapshot — and the corpus more than doubled (261 → 576) in it. That backfill is
    legitimately held out (`derive_area` was byte-identical throughout and its firing rows there
    disagree 9 times, which self-graded rows cannot), but it is a bulk labelling pass of unstated
    provenance, not accumulated independent judgment. The era split is visible: rows written before
